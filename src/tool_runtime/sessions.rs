@@ -1,4 +1,5 @@
 use super::metadata::{tool_metadata, ToolPathHint, ToolRisk};
+use super::project_instructions::ProjectInstructionsSnapshot;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -34,6 +35,7 @@ struct SessionRecord {
     session_id: String,
     project: Option<String>,
     title: Option<String>,
+    project_instructions: Option<ProjectInstructionsSnapshot>,
     created_at: i64,
     updated_at: i64,
     events: VecDeque<SessionEvent>,
@@ -118,6 +120,7 @@ pub(crate) struct SessionSummary {
     pub(crate) session_id: String,
     pub(crate) project: Option<String>,
     pub(crate) title: Option<String>,
+    pub(crate) project_instructions: Option<ProjectInstructionsSnapshot>,
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,
     pub(crate) counts: SessionCounts,
@@ -142,10 +145,20 @@ impl SessionStore {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn start_session(
         &self,
         project: Option<String>,
         title: Option<String>,
+    ) -> SessionSummary {
+        self.start_session_with_project_instructions(project, title, None)
+    }
+
+    pub(crate) fn start_session_with_project_instructions(
+        &self,
+        project: Option<String>,
+        title: Option<String>,
+        project_instructions: Option<ProjectInstructionsSnapshot>,
     ) -> SessionSummary {
         let session_id = format!("{SESSION_ID_PREFIX}{}", uuid::Uuid::new_v4().simple());
         let now = now_ts();
@@ -153,6 +166,7 @@ impl SessionStore {
             session_id: session_id.clone(),
             project,
             title,
+            project_instructions,
             created_at: now,
             updated_at: now,
             events: VecDeque::new(),
@@ -393,6 +407,7 @@ impl SessionStoreInner {
             session_id: record.session_id.clone(),
             project: record.project.clone(),
             title: record.title.clone(),
+            project_instructions: record.project_instructions.clone(),
             created_at: record.created_at,
             updated_at: record.updated_at,
             counts,

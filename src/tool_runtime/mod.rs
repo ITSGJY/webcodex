@@ -12,6 +12,7 @@ mod jobs;
 pub(crate) mod kernel;
 pub(crate) mod metadata;
 mod patch;
+mod project_instructions;
 mod projects;
 mod registry;
 pub(crate) mod sessions;
@@ -713,11 +714,16 @@ impl ToolRuntime {
                     },
                     None => None,
                 };
-                let summary = self.sessions.start_session(
+                let project_instructions = match resolved.as_ref() {
+                    Some(resolved) => Some(self.load_project_instructions(resolved).await),
+                    None => None,
+                };
+                let summary = self.sessions.start_session_with_project_instructions(
                     resolved
                         .as_ref()
                         .map(|resolved| resolved.resolved_id.clone()),
                     title,
+                    project_instructions.clone(),
                 );
                 ToolResult::ok(json!({
                     "success": true,
@@ -727,6 +733,7 @@ impl ToolRuntime {
                     "resolved_project": resolved.as_ref().map(|resolved| resolved.resolved_id.clone()),
                     "title": summary.title,
                     "created_at": summary.created_at,
+                    "project_instructions": project_instructions,
                 }))
             }
 
