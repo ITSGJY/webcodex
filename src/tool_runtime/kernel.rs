@@ -1,5 +1,5 @@
 use super::sessions::SessionTransport;
-use super::types::{is_checkpoint_kind, is_checkpoint_validation_status};
+use super::tool_audit::session_log_arguments_for_tool_request;
 use super::{
     run_codex_disabled_result, session_context, session_guard_denied_result,
     unknown_session_result, ToolCall, ToolResult, ToolRuntime,
@@ -133,7 +133,7 @@ impl ToolRuntime {
                     Some(session_id),
                     context.transport.into(),
                     &request.tool_name,
-                    &guard_denial_log_arguments(&request.tool_name, &request.arguments),
+                    &session_log_arguments_for_tool_request(&request.tool_name, &request.arguments),
                     Some(mismatch.request_project.clone()),
                 );
                 let mut result = session_context::session_project_mismatch_result(
@@ -169,7 +169,7 @@ impl ToolRuntime {
                     Some(session_id),
                     context.transport.into(),
                     &request.tool_name,
-                    &guard_denial_log_arguments(&request.tool_name, &request.arguments),
+                    &session_log_arguments_for_tool_request(&request.tool_name, &request.arguments),
                 );
                 let event_id = self.sessions.record_tool_call_finished(
                     session_event,
@@ -198,7 +198,7 @@ impl ToolRuntime {
                     Some(session_id),
                     context.transport.into(),
                     &request.tool_name,
-                    &guard_denial_log_arguments(&request.tool_name, &request.arguments),
+                    &session_log_arguments_for_tool_request(&request.tool_name, &request.arguments),
                 );
                 let mut result =
                     session_guard_denied_result(session_id, &request.tool_name, denial);
@@ -238,7 +238,7 @@ impl ToolRuntime {
         }
 
         let session_log_arguments =
-            guard_denial_log_arguments(&request.tool_name, &request.arguments);
+            session_log_arguments_for_tool_request(&request.tool_name, &request.arguments);
         let mut session_event = self.sessions.record_tool_call_started(
             context.session_id,
             context.transport.into(),
@@ -383,258 +383,6 @@ fn extract_bool_arg(arguments: &Value, key: &str) -> bool {
         .and_then(|obj| obj.get(key))
         .and_then(Value::as_bool)
         .unwrap_or(false)
-}
-
-fn guard_denial_log_arguments(tool_name: &str, arguments: &Value) -> Value {
-    let Some(obj) = arguments.as_object() else {
-        return Value::Null;
-    };
-    let mut out = serde_json::Map::new();
-    if let Some(project) = obj.get("project").cloned() {
-        out.insert("project".to_string(), project);
-    }
-    match tool_name {
-        "run_shell" | "run_job" => {
-            out.insert(
-                "command_present".to_string(),
-                Value::Bool(obj.contains_key("command")),
-            );
-            for key in ["timeout_secs", "cwd"] {
-                if let Some(value) = obj.get(key).cloned() {
-                    out.insert(key.to_string(), value);
-                }
-            }
-        }
-        "run_codex" => {
-            out.insert(
-                "prompt_present".to_string(),
-                Value::Bool(obj.contains_key("prompt")),
-            );
-            for key in ["approval_mode", "timeout_secs", "cwd"] {
-                if let Some(value) = obj.get(key).cloned() {
-                    out.insert(key.to_string(), value);
-                }
-            }
-            if let Some(count) = obj
-                .get("extra_args")
-                .and_then(Value::as_array)
-                .map(Vec::len)
-            {
-                out.insert("extra_args_count".to_string(), Value::from(count));
-            }
-        }
-        "write_project_file" => {
-            for key in [
-                "path",
-                "overwrite",
-                "expected_sha256",
-                "expected_content_prefix",
-            ] {
-                if let Some(value) = obj.get(key).cloned() {
-                    out.insert(key.to_string(), value);
-                }
-            }
-            out.insert(
-                "content_present".to_string(),
-                Value::Bool(obj.contains_key("content")),
-            );
-        }
-        "save_project_artifact" => {
-            for key in ["path", "mime_type", "overwrite"] {
-                if let Some(value) = obj.get(key).cloned() {
-                    out.insert(key.to_string(), value);
-                }
-            }
-            out.insert(
-                "content_base64_present".to_string(),
-                Value::Bool(obj.contains_key("content_base64")),
-            );
-        }
-        "artifact_upload_begin" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &["path", "expected_bytes", "mime_type", "overwrite"],
-            );
-            out.insert(
-                "expected_sha256_present".to_string(),
-                Value::Bool(obj.contains_key("expected_sha256")),
-            );
-        }
-        "artifact_upload_chunk" => {
-            copy_keys(obj, &mut out, &["path", "upload_id", "offset"]);
-            out.insert(
-                "content_base64_present".to_string(),
-                Value::Bool(obj.contains_key("content_base64")),
-            );
-        }
-        "artifact_upload_finish" | "artifact_upload_abort" => {
-            copy_keys(obj, &mut out, &["path", "upload_id"]);
-        }
-        "apply_patch" | "apply_patch_checked" | "validate_patch" => {
-            out.insert(
-                "patch_present".to_string(),
-                Value::Bool(obj.contains_key("patch")),
-            );
-            if let Some(value) = obj.get("deny_sensitive_paths").cloned() {
-                out.insert("deny_sensitive_paths".to_string(), value);
-            }
-        }
-        "replace_in_file" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &["path", "expected_replacements", "allow_multiple"],
-            );
-            out.insert(
-                "old_present".to_string(),
-                Value::Bool(obj.contains_key("old")),
-            );
-            out.insert(
-                "new_present".to_string(),
-                Value::Bool(obj.contains_key("new")),
-            );
-        }
-        "replace_exact_block" => {
-            copy_keys(obj, &mut out, &["path", "expected_old_sha256"]);
-            out.insert(
-                "old_text_present".to_string(),
-                Value::Bool(obj.contains_key("old_text")),
-            );
-            out.insert(
-                "new_text_present".to_string(),
-                Value::Bool(obj.contains_key("new_text")),
-            );
-        }
-        "insert_before_pattern" | "insert_after_pattern" => {
-            copy_keys(obj, &mut out, &["path"]);
-            out.insert(
-                "pattern_present".to_string(),
-                Value::Bool(obj.contains_key("pattern")),
-            );
-            out.insert(
-                "text_present".to_string(),
-                Value::Bool(obj.contains_key("text")),
-            );
-        }
-        "replace_line_range" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &[
-                    "path",
-                    "start_line",
-                    "end_line",
-                    "expected_old_sha256",
-                    "expected_old_prefix",
-                ],
-            );
-            out.insert(
-                "new_text_present".to_string(),
-                Value::Bool(obj.contains_key("new_text")),
-            );
-        }
-        "insert_at_line" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &[
-                    "path",
-                    "line",
-                    "expected_anchor_sha256",
-                    "expected_anchor_prefix",
-                ],
-            );
-            out.insert(
-                "text_present".to_string(),
-                Value::Bool(obj.contains_key("text")),
-            );
-        }
-        "delete_line_range" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &[
-                    "path",
-                    "start_line",
-                    "end_line",
-                    "expected_old_sha256",
-                    "expected_old_prefix",
-                ],
-            );
-        }
-        "delete_project_files" | "git_restore_paths" | "discard_untracked" => {
-            copy_keys(obj, &mut out, &["paths"]);
-        }
-        "workspace_checkpoint_create" => {
-            copy_keys(obj, &mut out, &["title", "include_untracked"]);
-            out.insert(
-                "note_present".to_string(),
-                Value::Bool(obj.contains_key("note")),
-            );
-            let kind = obj
-                .get("kind")
-                .and_then(Value::as_str)
-                .filter(|value| is_checkpoint_kind(value))
-                .unwrap_or(if obj.get("kind").is_some() {
-                    "invalid"
-                } else {
-                    "snapshot"
-                });
-            out.insert("kind".to_string(), Value::String(kind.to_string()));
-            let label_count = obj
-                .get("labels")
-                .and_then(Value::as_array)
-                .map(Vec::len)
-                .unwrap_or_default();
-            out.insert("label_count".to_string(), Value::from(label_count));
-            let validation_status = obj
-                .get("validation")
-                .and_then(Value::as_object)
-                .and_then(|validation| validation.get("status"))
-                .and_then(Value::as_str)
-                .filter(|value| is_checkpoint_validation_status(value))
-                .unwrap_or(
-                    if obj
-                        .get("validation")
-                        .and_then(Value::as_object)
-                        .and_then(|validation| validation.get("status"))
-                        .is_some()
-                    {
-                        "invalid"
-                    } else {
-                        "unknown"
-                    },
-                );
-            out.insert(
-                "validation_status".to_string(),
-                Value::String(validation_status.to_string()),
-            );
-        }
-        "workspace_checkpoint_list" => {
-            copy_keys(obj, &mut out, &["limit"]);
-        }
-        "workspace_checkpoint_show" => {
-            copy_keys(obj, &mut out, &["checkpoint_id", "include_diff_stat"]);
-        }
-        "workspace_checkpoint_restore" | "workspace_checkpoint_delete" => {
-            copy_keys(obj, &mut out, &["checkpoint_id", "confirm"]);
-        }
-        _ => return arguments.clone(),
-    }
-    Value::Object(out)
-}
-
-fn copy_keys(
-    obj: &serde_json::Map<String, Value>,
-    out: &mut serde_json::Map<String, Value>,
-    keys: &[&str],
-) {
-    for key in keys {
-        if let Some(value) = obj.get(*key).cloned() {
-            out.insert((*key).to_string(), value);
-        }
-    }
 }
 
 fn tool_project(call: &ToolCall) -> Option<String> {

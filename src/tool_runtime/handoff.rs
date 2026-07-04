@@ -17,7 +17,7 @@ use super::session_context::{
     session_project_mismatch_warning, SessionProjectMismatch, SESSION_PROJECT_MISMATCH_KIND,
 };
 use super::sessions::{SessionDiscussionCounts, SessionDiscussionSummary, SessionMessage};
-use super::types::ToolResult;
+use super::tool_result::ToolResult;
 use super::validation_events::validation_summary_for_session;
 use super::ToolRuntime;
 use crate::auth::AuthContext;
