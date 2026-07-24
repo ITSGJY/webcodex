@@ -268,7 +268,8 @@ impl ToolRuntime {
                 ))
             }
         };
-        let timed_out = looks_like_command_timeout(output.exit_code, &output.stderr, timeout_secs);
+        let timed_out = !output.command_completed
+            || looks_like_command_timeout(output.exit_code, &output.stderr, timeout_secs);
         if let Some(error) = output.error.as_ref().filter(|_| !timed_out) {
             return ToolResult::err(command_rejected_message(
                 error.clone(),
@@ -300,6 +301,8 @@ impl ToolRuntime {
             "stdout_truncated": stdout_truncated,
             "stderr_truncated": stderr_truncated,
             "passed": passed,
+            "command_started": output.command_started,
+            "command_completed": output.command_completed,
         });
         match adapter.validation_kind() {
             "check" => {

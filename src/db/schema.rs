@@ -297,7 +297,8 @@ impl Database {
                 owner_subject_id TEXT NOT NULL,
                 goal TEXT NOT NULL,
                 mode TEXT NOT NULL CHECK(mode IN ('normal', 'read_only')),
-                status TEXT NOT NULL CHECK(status IN ('active', 'ready_for_review')),
+                status TEXT NOT NULL
+                    CHECK(status IN ('active', 'ready_for_review', 'accepted', 'rejected')),
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 FOREIGN KEY(project_id) REFERENCES wc_projects(id)
@@ -366,6 +367,11 @@ impl Database {
                 decision TEXT NOT NULL CHECK(decision IN ('accepted', 'rejected')),
                 actor TEXT NOT NULL,
                 started_at INTEGER NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(state IN ('pending', 'needs_attention')),
+                error_code TEXT,
+                error_message TEXT,
+                last_attempt_at INTEGER,
                 FOREIGN KEY(task_id) REFERENCES wc_task_results(task_id),
                 FOREIGN KEY(result_id) REFERENCES wc_task_results(id)
             );

@@ -15,8 +15,8 @@ pub(crate) mod surface;
 pub(crate) mod workspace;
 
 use crate::auth::{
-    AuthContext, AuthKind, ProjectCredentialVerifier, SCOPE_JOB_RUN, SCOPE_PROJECT_READ,
-    SCOPE_PROJECT_WRITE, SCOPE_RUNTIME_READ,
+    AuthContext, AuthKind, ProjectAgentTokenVerifier, ProjectCredentialVerifier, SCOPE_JOB_RUN,
+    SCOPE_PROJECT_READ, SCOPE_PROJECT_WRITE, SCOPE_RUNTIME_READ,
 };
 use crate::connector_runtime::workspace::{LocalResultDecision, WorkspaceManager};
 use crate::db::{
@@ -115,6 +115,15 @@ impl ConnectorContext {
         )?;
         Ok(())
     }
+
+    fn executor_client_id(&self) -> Result<&str, String> {
+        self.executor_project
+            .strip_prefix("agent:")
+            .and_then(|value| value.split_once(':'))
+            .map(|(client_id, _)| client_id)
+            .filter(|client_id| !client_id.is_empty())
+            .ok_or_else(|| "connector executor reference is malformed".to_string())
+    }
 }
 
 #[derive(Clone, Default)]
@@ -127,6 +136,7 @@ pub(crate) struct ConnectorRuntime {
     workspace: workspace::WorkspaceManager,
     executions: execution::ExecutionService,
     credential: ProjectCredentialVerifier,
+    project_agent_token: Option<ProjectAgentTokenVerifier>,
     workspace_ops: tokio::sync::Mutex<()>,
     task_locks: StdMutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     #[cfg(test)]
@@ -206,6 +216,7 @@ impl ConnectorRuntime {
             workspace,
             executions,
             credential,
+            project_agent_token: None,
             workspace_ops: tokio::sync::Mutex::new(()),
             task_locks: StdMutex::new(HashMap::new()),
             #[cfg(test)]
@@ -213,6 +224,11 @@ impl ConnectorRuntime {
             #[cfg(test)]
             mutation_before_task_lock: StdMutex::new(None),
         })
+    }
+
+    pub(crate) fn with_project_agent_token(mut self, verifier: ProjectAgentTokenVerifier) -> Self {
+        self.project_agent_token = Some(verifier);
+        self
     }
 
     pub(crate) fn from_env(
@@ -227,9 +243,16 @@ impl ConnectorRuntime {
             context.project_grant_id.clone(),
             Path::new(&credential_path),
         )?;
-        Ok(ConnectorRuntimeSlot(Some(Arc::new(Self::new(
-            tools, db, context, credential,
-        )?))))
+        let agent_token_path = required_env("WEBCODEX_PROJECT_AGENT_TOKEN_FILE")?;
+        let agent_token = ProjectAgentTokenVerifier::from_file(
+            context.project_grant_id.clone(),
+            context.executor_client_id()?.to_string(),
+            "local-owner".to_string(),
+            Path::new(&agent_token_path),
+        )?;
+        Ok(ConnectorRuntimeSlot(Some(Arc::new(
+            Self::new(tools, db, context, credential)?.with_project_agent_token(agent_token),
+        ))))
     }
 
     pub(crate) fn context(&self) -> &ConnectorContext {
@@ -238,6 +261,12 @@ impl ConnectorRuntime {
 
     pub(crate) fn authenticate_project_credential(&self, token: &str) -> Option<AuthContext> {
         self.credential.authenticate(token)
+    }
+
+    pub(crate) fn authenticate_project_agent_token(&self, token: &str) -> Option<AuthContext> {
+        self.project_agent_token
+            .as_ref()
+            .and_then(|verifier| verifier.authenticate(token))
     }
 
     fn project_access_allowed(&self, auth: &AuthContext) -> bool {
@@ -2762,7 +2791,8 @@ pub(crate) fn result_projection(result: &ConnectorTaskResult) -> Value {
         "warnings": result.warnings,
         "decision_status": result.decision_status,
         "decided_at": result.decided_at,
-        "cleanup_warning": result.cleanup_warning
+        "cleanup_warning": result.cleanup_warning,
+        "recovery": result.recovery
     })
 }
 

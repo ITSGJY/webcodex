@@ -1,5 +1,5 @@
 use super::workspace::{LocalResultDecision, WorkspaceManager};
-use super::ConnectorContext;
+use super::{ConnectorContext, ConnectorRuntime};
 use crate::db::{ConnectorBinding, ConnectorTaskStoreError, NewConnectorResult, NewConnectorTask};
 use crate::Database;
 use std::fs;
@@ -169,6 +169,21 @@ fn target(context: &ConnectorContext) -> PathBuf {
     Path::new(&context.executor_root).join("README.md")
 }
 
+fn reopen_runtime(
+    context: ConnectorContext,
+    db: Arc<Database>,
+) -> Result<ConnectorRuntime, String> {
+    let registry = Arc::new(crate::shell_client::ShellClientRegistry::default());
+    let tools =
+        Arc::new(crate::tool_runtime::ToolRuntime::new_for_tests_with_shell_clients(registry));
+    let credential = crate::auth::ProjectCredentialVerifier::new(
+        context.project_grant_id.clone(),
+        "webcodex_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    )
+    .unwrap();
+    ConnectorRuntime::new(tools, db, context, credential)
+}
+
 #[test]
 fn queue_filters_completed_history_before_limit() {
     let fx = fixture(false);
@@ -322,6 +337,240 @@ fn finalization_failure_is_recovered_once_after_reopen() {
             &context.project_id,
             Path::new(&context.executor_root),
             6,
+        )
+        .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn unrecoverable_accept_is_quarantined_while_other_intents_recover_and_runtime_starts() {
+    const SECOND_TASK_ID: &str = "wc_task_e123456789abcdef0123456789abcdef";
+    const SECOND_RUN_ID: &str = "wc_run_e123456789abcdef0123456789abcdef";
+    const SECOND_RESULT_ID: &str = "wc_result_e123456789abcdef";
+
+    let fx = fixture(true);
+    {
+        let conn = fx.db.conn_for_tests();
+        conn.execute(
+            "INSERT INTO wc_tasks
+                (id, project_id, owner_subject_id, goal, mode, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'second result', 'normal', 'ready_for_review', 3, 3)",
+            rusqlite::params![SECOND_TASK_ID, fx.context.project_id, SUBJECT],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO wc_runs
+                (id, task_id, workspace_id, status, started_at, finished_at)
+             VALUES (?1, ?2, ?3, 'completed', 2, 3)",
+            rusqlite::params![SECOND_RUN_ID, SECOND_TASK_ID, fx.context.workspace_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO wc_run_contexts
+                (run_id, target_executor_ref, execution_executor_ref, target_root,
+                 execution_root, baseline_commit, baseline_tree, isolated, created_at)
+             VALUES (?1, ?2, ?2, ?3, ?3, NULL, NULL, 0, 2)",
+            rusqlite::params![
+                SECOND_RUN_ID,
+                fx.context.executor_project,
+                fx.context.executor_root
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO wc_task_results
+                (id, task_id, run_id, summary, patch_bytes, changed_paths_json,
+                 validation_json, warnings_json, decision_status, created_at)
+             VALUES (?1, ?2, ?3, 'no changes', 0, '[]',
+                     '{\"status\":\"not_run\"}', '[]', 'pending', 3)",
+            rusqlite::params![SECOND_RESULT_ID, SECOND_TASK_ID, SECOND_RUN_ID],
+        )
+        .unwrap();
+    }
+    fx.db
+        .begin_connector_result_decision(
+            TASK_ID,
+            &fx.context.project_id,
+            RESULT_ID,
+            "accepted",
+            "local_test",
+            4,
+        )
+        .unwrap();
+    fx.db
+        .begin_connector_result_decision(
+            SECOND_TASK_ID,
+            &fx.context.project_id,
+            SECOND_RESULT_ID,
+            "rejected",
+            "local_test",
+            5,
+        )
+        .unwrap();
+    git(
+        Path::new(&fx.context.executor_root),
+        &[
+            "-c",
+            "user.name=WebCodex Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "moved target",
+        ],
+    );
+
+    let Fixture { temp, context, db } = fx;
+    drop(db);
+    let reopened = Arc::new(Database::open(&temp.path().join("connector.db")).unwrap());
+    let runtime = reopen_runtime(context.clone(), reopened.clone())
+        .expect("one stale intent must not block ConnectorRuntime startup");
+
+    let bad = reopened
+        .local_connector_task_result(TASK_ID, &context.project_id)
+        .unwrap()
+        .unwrap();
+    let recovery = bad
+        .recovery
+        .as_ref()
+        .expect("stale intent must be observable");
+    assert_eq!(bad.decision_status, "pending");
+    assert_eq!(recovery.state, "needs_attention");
+    assert_eq!(
+        recovery.error_code.as_deref(),
+        Some("target_checkout_changed")
+    );
+    assert_eq!(
+        super::result_projection(&bad)["recovery"]["state"],
+        "needs_attention"
+    );
+    assert_eq!(
+        reopened
+            .local_connector_task_result(SECOND_TASK_ID, &context.project_id)
+            .unwrap()
+            .unwrap()
+            .decision_status,
+        "rejected"
+    );
+    let queue = reopened
+        .local_reviewable_tasks(&context.project_id, false, 20)
+        .unwrap();
+    assert!(queue
+        .iter()
+        .any(|task| task.task_id == TASK_ID && task.task_status == "needs_attention"));
+    assert_decision_error(
+        WorkspaceManager::decide_connector_result_local(
+            &reopened,
+            &context.project_id,
+            TASK_ID,
+            Some(RESULT_ID),
+            Path::new(&context.executor_root),
+            LocalResultDecision::Accept,
+            "local_test",
+            9,
+        ),
+        "result_decision_in_progress",
+    );
+
+    drop(runtime);
+    reopen_runtime(context.clone(), reopened.clone())
+        .expect("quarantined intent must remain non-blocking on later restarts");
+    let event_count: i64 = reopened
+        .conn_for_tests()
+        .query_row(
+            "SELECT COUNT(*) FROM wc_task_events
+             WHERE task_id = ?1 AND kind = 'result_recovery_needs_attention'",
+            [TASK_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(event_count, 1, "restart must not repeat quarantine effects");
+
+    let rejected = WorkspaceManager::decide_connector_result_local(
+        &reopened,
+        &context.project_id,
+        TASK_ID,
+        Some(RESULT_ID),
+        Path::new(&context.executor_root),
+        LocalResultDecision::Reject,
+        "local_test",
+        10,
+    )
+    .unwrap();
+    assert_eq!(rejected.decision_status, "rejected");
+    assert!(rejected.recovery.is_none());
+    let task = reopened
+        .local_connector_task(TASK_ID, &context.project_id)
+        .unwrap();
+    assert_eq!(task.task_status, "rejected");
+    assert_eq!(task.run_status, "completed");
+    let (stored_task_status, stored_run_status, finished_at): (String, String, Option<i64>) =
+        reopened
+            .conn_for_tests()
+            .query_row(
+                "SELECT t.status, r.status, r.finished_at
+                 FROM wc_tasks t JOIN wc_runs r ON r.task_id = t.id
+                 WHERE t.id = ?1",
+                [TASK_ID],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+    assert_eq!(stored_task_status, "rejected");
+    assert_eq!(stored_run_status, "completed");
+    assert!(finished_at.is_some());
+    let intent_count: i64 = reopened
+        .conn_for_tests()
+        .query_row(
+            "SELECT COUNT(*) FROM wc_result_decision_intents WHERE task_id = ?1",
+            [TASK_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(intent_count, 0);
+    assert!(!Path::new(&context.runs_root)
+        .join(".write-slot-01.lease.json")
+        .exists());
+    assert!(reopened
+        .connector_preserved_workspaces(&context.project_id)
+        .unwrap()
+        .iter()
+        .all(|workspace| workspace.task_id != TASK_ID));
+
+    let retry = WorkspaceManager::decide_connector_result_local(
+        &reopened,
+        &context.project_id,
+        TASK_ID,
+        Some(RESULT_ID),
+        Path::new(&context.executor_root),
+        LocalResultDecision::Reject,
+        "local_test",
+        11,
+    )
+    .unwrap();
+    assert_eq!(retry, rejected);
+
+    reopen_runtime(context.clone(), reopened.clone())
+        .expect("completed Reject must stay terminal on later restarts");
+    let event_counts: (i64, i64) = reopened
+        .conn_for_tests()
+        .query_row(
+            "SELECT
+                SUM(CASE WHEN kind = 'result_recovery_needs_attention' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN kind = 'task_rejected' THEN 1 ELSE 0 END)
+             FROM wc_task_events WHERE task_id = ?1",
+            [TASK_ID],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(event_counts, (1, 1));
+    assert_eq!(
+        WorkspaceManager::recover_result_decisions(
+            reopened.as_ref(),
+            &context.project_id,
+            Path::new(&context.executor_root),
+            12,
         )
         .unwrap(),
         0

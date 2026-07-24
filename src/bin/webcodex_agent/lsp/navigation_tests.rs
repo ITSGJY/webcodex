@@ -427,8 +427,8 @@ fn document_diagnostics_empty_and_one_error_are_fresh_successes() {
     assert_eq!(empty["success"], true, "{empty}");
     assert_eq!(empty["result"]["diagnostics"], serde_json::json!([]));
     assert_eq!(empty["result"]["total_count"], 0);
-    assert_eq!(empty["result"]["fresh"], true);
-    assert_eq!(empty["result"]["timed_out"], false);
+    assert_eq!(empty["result"]["status"], "complete");
+    assert_eq!(empty["result"]["clean"], true);
     assert_eq!(empty["result"]["published_version"], 1);
 
     let one = NavFixture::new("diagnostics_one").diagnostics(100);
@@ -520,22 +520,21 @@ fn document_diagnostics_bounds_and_sanitizes_text_fields() {
 #[test]
 fn document_diagnostics_handles_publication_timing_and_timeouts() {
     let delayed = NavFixture::new("diagnostics_delayed").diagnostics(100);
-    assert_eq!(delayed["result"]["fresh"], true, "{delayed}");
-    assert_eq!(delayed["result"]["timed_out"], false);
+    assert_eq!(delayed["result"]["status"], "complete", "{delayed}");
 
     let timeout = NavFixture::new("diagnostics_timeout").diagnostics(100);
     assert_eq!(timeout["success"], true, "{timeout}");
     assert_eq!(timeout["result"]["diagnostics"], serde_json::json!([]));
-    assert_eq!(timeout["result"]["fresh"], false);
-    assert_eq!(timeout["result"]["timed_out"], true);
+    assert_eq!(timeout["result"]["status"], "timeout");
+    assert_eq!(timeout["result"]["clean"], serde_json::Value::Null);
 
     let stale_fixture = NavFixture::new("diagnostics_stale_then_timeout");
     let first = stale_fixture.diagnostics(100);
-    assert_eq!(first["result"]["fresh"], true, "{first}");
+    assert_eq!(first["result"]["status"], "complete", "{first}");
     assert_eq!(first["result"]["published_version"], 0);
     let stale = stale_fixture.diagnostics(100);
-    assert_eq!(stale["result"]["fresh"], false, "{stale}");
-    assert_eq!(stale["result"]["timed_out"], true);
+    assert_eq!(stale["result"]["status"], "timeout");
+    assert_eq!(stale["result"]["clean"], serde_json::Value::Null);
     assert_eq!(stale["result"]["published_version"], 0);
 }
 
@@ -545,16 +544,14 @@ fn document_diagnostics_ignores_wrong_external_and_malformed_notifications() {
         let result = NavFixture::new(scenario).diagnostics(100);
         assert_eq!(result["success"], true, "scenario={scenario}: {result}");
         assert_eq!(result["result"]["returned_count"], 0);
-        assert_eq!(result["result"]["fresh"], false);
-        assert_eq!(result["result"]["timed_out"], true);
+        assert_eq!(result["result"]["status"], "timeout");
         assert!(!result.to_string().contains("file://"));
         assert!(!result.to_string().contains("/usr/lib"));
     }
 
     let malformed = NavFixture::new("diagnostics_malformed_notification").diagnostics(100);
     assert_eq!(malformed["success"], true, "{malformed}");
-    assert_eq!(malformed["result"]["fresh"], true);
-    assert_eq!(malformed["result"]["timed_out"], false);
+    assert_eq!(malformed["result"]["status"], "complete");
 }
 
 #[test]

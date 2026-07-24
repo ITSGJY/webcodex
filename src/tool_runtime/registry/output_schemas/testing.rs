@@ -41,6 +41,14 @@ fn cargo_output_schema(include_zero_tests_metadata: bool) -> Value {
                 schema_type("boolean", "Whether exit_code was zero."),
             ),
             (
+                "command_started",
+                schema_type("boolean", "Whether the command was dispatched to an executor."),
+            ),
+            (
+                "command_completed",
+                schema_type("boolean", "Whether the command reached a terminal executor result."),
+            ),
+            (
                 "failure_kind",
                 schema_type(
                     "string",

@@ -10,7 +10,7 @@ pub(crate) enum ShellClientAuthGroup {
 impl ShellClientAuthGroup {
     pub(crate) fn from_auth(auth: &crate::auth::AuthContext) -> Option<Self> {
         match auth.kind {
-            crate::auth::AuthKind::ProjectCredential => {
+            crate::auth::AuthKind::ProjectCredential | crate::auth::AuthKind::AgentToken => {
                 auth.project_grant_id.clone().map(Self::ProjectGrant)
             }
             crate::auth::AuthKind::SharedKey => auth.shared_key_hash.clone().map(Self::SharedKey),
@@ -142,9 +142,6 @@ pub(crate) fn enforce_register_owner(
     if auth.is_bootstrap {
         return Ok(());
     }
-    if auth.is_lightweight() {
-        return Ok(());
-    }
     // Phase 3: agent tokens are bound to an allowed_client_id and an owner.
     if auth.is_agent_token() {
         // allowed_client_id must match the registering client_id.
@@ -213,9 +210,6 @@ pub(crate) fn enforce_agent_transport(
     if auth.is_bootstrap {
         return Ok(());
     }
-    if auth.is_lightweight() {
-        return Ok(());
-    }
     if auth.is_agent_token() {
         match auth.allowed_client_id.as_deref() {
             Some(allowed) if allowed == client_id => Ok(()),
@@ -242,7 +236,7 @@ pub(crate) fn require_agent_transport_scope(
     if auth.is_admin() {
         return Ok(());
     }
-    if (auth.is_agent_token() || auth.is_lightweight()) && auth.scopes.iter().any(|s| s == scope) {
+    if auth.is_agent_token() && auth.scopes.iter().any(|s| s == scope) {
         Ok(())
     } else {
         Err(format!("missing required scope: {}", scope))

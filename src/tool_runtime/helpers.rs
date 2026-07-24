@@ -200,6 +200,44 @@ pub(crate) fn resolve_local_cwd(
     Ok(canonical)
 }
 
+/// Resolve an Agent command cwd against the registered project root.
+///
+/// The server cannot canonicalize paths on a remote Agent host, so this
+/// performs the project-relative/lexical boundary check before dispatch. The
+/// Agent remains responsible for canonicalizing the existing path against its
+/// configured `allowed_roots`, which rejects symlink escapes.
+pub(crate) fn resolve_agent_cwd(
+    proj: &crate::projects::ProjectConfig,
+    cwd: Option<&str>,
+) -> Result<String, String> {
+    let root = proj.root();
+    let requested = match cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) {
+        Some(cwd) => {
+            if cwd == "." {
+                return Ok(root.to_string_lossy().to_string());
+            }
+            let path = PathBuf::from(cwd);
+            if path.is_absolute() {
+                if path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+                {
+                    return Err("cwd cannot contain parent traversal".to_string());
+                }
+                path
+            } else {
+                validate_project_relative_path(cwd)?;
+                root.join(path)
+            }
+        }
+        None => root.clone(),
+    };
+    if requested != root && !requested.starts_with(&root) {
+        return Err("cwd is outside project directory".to_string());
+    }
+    Ok(requested.to_string_lossy().to_string())
+}
+
 pub(crate) fn validate_project_relative_path(path: &str) -> Result<(), String> {
     if path.contains('\0') {
         return Err("path cannot contain NUL bytes".to_string());

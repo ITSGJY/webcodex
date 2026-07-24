@@ -76,6 +76,8 @@ struct AuthenticatedProjectFixture {
     connector: Arc<ConnectorRuntime>,
     agent_auth: crate::auth::AuthContext,
     credential: String,
+    agent_token: String,
+    bootstrap: String,
     client_id: String,
     root: PathBuf,
     state: PathBuf,
@@ -144,10 +146,18 @@ async fn authenticated_project_fixture_for(recipe: &str) -> AuthenticatedProject
     let (config, paths) = ProjectConfig::resolve(&options).unwrap();
     let connector_key = read_private_value(&paths.connector_key).unwrap();
     let bootstrap_key = read_private_value(&paths.bootstrap_key).unwrap();
+    let agent_token = read_private_value(&paths.agent_token).unwrap();
     let grant_id = config.project_grant_id(&paths);
     let credential_verifier =
         crate::auth::ProjectCredentialVerifier::new(grant_id.clone(), &connector_key).unwrap();
-    let agent_auth = credential_verifier.authenticate(&connector_key).unwrap();
+    let project_agent_verifier = crate::auth::ProjectAgentTokenVerifier::new(
+        grant_id.clone(),
+        config.executor_client_id.clone(),
+        "local-owner".to_string(),
+        &agent_token,
+    )
+    .unwrap();
+    let agent_auth = project_agent_verifier.authenticate(&agent_token).unwrap();
     let registry = Arc::new(ShellClientRegistry::default());
     registry
         .register_with_auth(
@@ -212,13 +222,14 @@ async fn authenticated_project_fixture_for(recipe: &str) -> AuthenticatedProject
             },
             credential_verifier,
         )
-        .unwrap(),
+        .unwrap()
+        .with_project_agent_token(project_agent_verifier),
     );
     let recorded_requests = Arc::new(Mutex::new(Vec::new()));
     let http_config = Arc::new(crate::Config {
         addr: "127.0.0.1:0".to_string(),
         data_dir: state.join("data"),
-        token: Some(bootstrap_key),
+        token: Some(bootstrap_key.clone()),
         max_text_size: 2 * 1024 * 1024,
         max_file_size: 100 * 1024 * 1024,
         codex: crate::CodexConfig::default(),
@@ -228,6 +239,7 @@ async fn authenticated_project_fixture_for(recipe: &str) -> AuthenticatedProject
         .hoop(affix_state::inject(http_config))
         .hoop(affix_state::inject(db.clone()))
         .hoop(affix_state::inject(tools))
+        .hoop(affix_state::inject(registry.clone()))
         .hoop(affix_state::inject(ConnectorRuntimeSlot(Some(
             connector.clone(),
         ))))
@@ -239,7 +251,23 @@ async fn authenticated_project_fixture_for(recipe: &str) -> AuthenticatedProject
                 .hoop(crate::AuthMiddleware)
                 .hoop(record_authenticated_connector_request)
                 .push(crate::connector_runtime::http::routes())
-                .push(crate::host_console_http::routes()),
+                .push(crate::host_console_http::routes())
+                .push(
+                    Router::with_path("shell/agent/register")
+                        .post(crate::shell_client::shell_agent_register),
+                )
+                .push(
+                    Router::with_path("shell/agent/poll")
+                        .post(crate::shell_client::shell_agent_poll),
+                )
+                .push(
+                    Router::with_path("shell/agent/result")
+                        .post(crate::shell_client::shell_agent_result),
+                )
+                .push(
+                    Router::with_path("shell/agent/job_update")
+                        .post(crate::shell_client::shell_agent_job_update),
+                ),
         );
     AuthenticatedProjectFixture {
         _temp: temp,
@@ -249,6 +277,8 @@ async fn authenticated_project_fixture_for(recipe: &str) -> AuthenticatedProject
         connector,
         agent_auth,
         credential: connector_key,
+        agent_token,
+        bootstrap: bootstrap_key,
         client_id: config.executor_client_id,
         root,
         state,
@@ -279,7 +309,94 @@ async fn post_connector(
     (status, body)
 }
 
+fn agent_transport_cases(client_id: &str) -> [(&'static str, serde_json::Value); 4] {
+    [
+        (
+            "/api/shell/agent/register",
+            serde_json::json!({
+                "client_id": client_id,
+                "agent_instance_id": PROJECT_AGENT_INSTANCE,
+                "owner": "local-owner"
+            }),
+        ),
+        (
+            "/api/shell/agent/poll",
+            serde_json::json!({
+                "client_id": client_id,
+                "agent_instance_id": PROJECT_AGENT_INSTANCE
+            }),
+        ),
+        (
+            "/api/shell/agent/result",
+            serde_json::json!({
+                "client_id": client_id,
+                "agent_instance_id": PROJECT_AGENT_INSTANCE,
+                "request_id": "req-auth-boundary"
+            }),
+        ),
+        (
+            "/api/shell/agent/job_update",
+            serde_json::json!({
+                "client_id": client_id,
+                "agent_instance_id": PROJECT_AGENT_INSTANCE,
+                "job_id": "job-auth-boundary",
+                "status": "running"
+            }),
+        ),
+    ]
+}
+
 const PROJECT_AGENT_INSTANCE: &str = "project-agent-instance";
+
+#[tokio::test]
+async fn project_credential_is_rejected_from_every_agent_transport_route() {
+    let fixture = authenticated_project_fixture().await;
+    for (path, body) in agent_transport_cases(&fixture.client_id) {
+        let (status, response) = post_connector(&fixture, path, &fixture.credential, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {response}");
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("bound Agent Token"),
+            "{path}: {response}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn project_agent_token_enforces_client_id_and_bootstrap_still_registers() {
+    let fixture = authenticated_project_fixture().await;
+
+    let (status, response) = post_connector(
+        &fixture,
+        "/api/shell/agent/register",
+        &fixture.agent_token,
+        agent_transport_cases(&fixture.client_id)[0].1.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["success"], true);
+
+    for (path, body) in agent_transport_cases("wrong-project-client") {
+        let (status, response) = post_connector(&fixture, path, &fixture.agent_token, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {response}");
+    }
+
+    let (status, response) = post_connector(
+        &fixture,
+        "/api/shell/agent/register",
+        &fixture.bootstrap,
+        serde_json::json!({
+            "client_id": "bootstrap-client",
+            "agent_instance_id": "bootstrap-instance",
+            "owner": "local-owner"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["success"], true);
+}
 
 async fn next_project_agent_request(
     registry: &ShellClientRegistry,
@@ -785,6 +902,97 @@ async fn authenticated_golden_path_emits_no_discovery_or_session_calls() {
     }
 }
 
+fn assert_no_project_state_artifacts(root: &Path) {
+    for relative in [
+        "credentials",
+        "agent",
+        "project.toml",
+        "runs",
+        "results",
+        ".webcodex",
+    ] {
+        assert!(
+            !root.join(relative).exists(),
+            "unsafe state resolution created {relative} inside the checkout"
+        );
+    }
+}
+
+#[tokio::test]
+async fn state_directory_boundary_is_shared_and_has_no_failure_side_effects() {
+    let (temp, root, _) = repo("state-boundary");
+
+    let relative_inside = ProjectCommandOptions {
+        state_dir: Some(PathBuf::from(".webcodex")),
+        ..options(root.clone(), temp.path().join("unused"))
+    };
+    let relative_error =
+        setup_service::resolve_state_path_from(&relative_inside, &root, "unused-project-id", &root)
+            .unwrap_err();
+    assert_eq!(relative_error.code, "state_directory_unsafe");
+    assert_no_project_state_artifacts(&root);
+
+    for state in [root.clone(), root.join(".webcodex")] {
+        let unsafe_options = options(root.clone(), state);
+        let setup_error = setup(&unsafe_options).unwrap_err();
+        assert_eq!(setup_error.code, "state_directory_unsafe");
+        assert!(setup_error.message.contains("outside"));
+
+        let readiness = readiness_with_probe(&unsafe_options, RemoteProbe::Unreachable);
+        assert_eq!(
+            fact(&readiness, "state_directory_unsafe").status,
+            ReadinessStatus::Fail
+        );
+        let task_error =
+            resolve_local_task_state(&root, "personal", unsafe_options.state_dir.as_deref())
+                .unwrap_err();
+        assert!(task_error.contains("outside"));
+        let start_error = start_agent(&unsafe_options).await.unwrap_err();
+        assert_eq!(start_error.code, "state_directory_unsafe");
+        assert_no_project_state_artifacts(&root);
+    }
+}
+
+#[test]
+fn state_directory_allows_absolute_and_relative_paths_outside_checkout() {
+    let (temp, root, _) = repo("outside-state");
+
+    let absolute = temp.path().join("absolute-state");
+    setup(&options(root.clone(), absolute.clone())).unwrap();
+    assert!(absolute.join("credentials/connector-key").is_file());
+    assert!(absolute.join("credentials/agent-token").is_file());
+
+    let relative_options = ProjectCommandOptions {
+        state_dir: Some(PathBuf::from("../relative-state")),
+        ..options(root.clone(), temp.path().join("unused"))
+    };
+    let resolved = setup_service::resolve_state_path_from(
+        &relative_options,
+        &root,
+        "unused-project-id",
+        &root,
+    )
+    .unwrap();
+    assert_eq!(resolved, temp.path().join("relative-state"));
+    setup(&options(root, resolved.clone())).unwrap();
+    assert!(resolved.join("project.toml").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn state_directory_rejects_symlink_that_resolves_into_checkout() {
+    use std::os::unix::fs::symlink;
+
+    let (temp, root, _) = repo("symlink-state");
+    let link = temp.path().join("state-link");
+    symlink(&root, &link).unwrap();
+    let unsafe_state = link.join(".webcodex");
+    let error = setup(&options(root.clone(), unsafe_state)).unwrap_err();
+
+    assert_eq!(error.code, "state_directory_unsafe");
+    assert_no_project_state_artifacts(&root);
+}
+
 #[tokio::test]
 async fn checks_run_project_aware_golden_paths_cover_rust_node_python_and_go() {
     for recipe in ["rust", "node", "python", "go"] {
@@ -822,6 +1030,12 @@ fn fresh_setup_is_minimal_idempotent_and_does_not_expose_internal_ids() {
     .unwrap();
     let agent_toml: toml::Value = toml::from_str(&agent).unwrap();
     let registration_toml: toml::Value = toml::from_str(&registration).unwrap();
+    let connector_credential =
+        read_private_value(&state.join("credentials/connector-key")).unwrap();
+    let agent_token = read_private_value(&state.join("credentials/agent-token")).unwrap();
+    assert_ne!(connector_credential, agent_token);
+    assert!(agent_token.starts_with("wc_agent_"));
+    assert_eq!(agent_toml["token"].as_str(), Some(agent_token.as_str()));
     assert_eq!(
         registration_toml["path"].as_str(),
         Some(options.root.to_string_lossy().as_ref())
@@ -864,34 +1078,6 @@ fn fresh_setup_is_minimal_idempotent_and_does_not_expose_internal_ids() {
         );
     }
     assert!(output.contains("Next:\n  webcodex doctor"));
-}
-
-#[test]
-fn setup_preserves_a_valid_legacy_client_identity() {
-    let (_temp, root, state) = repo("legacy-client");
-    let options = options(root, state.clone());
-    setup(&options).unwrap();
-
-    let config_path = state.join("project.toml");
-    let mut config: ProjectConfig =
-        toml::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-    config.executor_client_id = "local-legacy-client".to_string();
-    fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
-
-    let agent_path = state.join("agent/agent.toml");
-    let mut agent: toml::Value = toml::from_str(&fs::read_to_string(&agent_path).unwrap()).unwrap();
-    agent["client_id"] = toml::Value::String(config.executor_client_id);
-    fs::write(&agent_path, toml::to_string_pretty(&agent).unwrap()).unwrap();
-    let before = (
-        fs::read(&config_path).unwrap(),
-        fs::read(&agent_path).unwrap(),
-    );
-
-    let report = setup(&options).unwrap();
-    assert_eq!(report.status, "already_configured");
-    assert!(report.changed.is_empty());
-    assert_eq!(fs::read(config_path).unwrap(), before.0);
-    assert_eq!(fs::read(agent_path).unwrap(), before.1);
 }
 
 #[test]
@@ -961,6 +1147,47 @@ fn setup_client_ids_include_project_grant_identity() {
         first_config.executor_client_id,
         second_config.executor_client_id
     );
+}
+
+#[test]
+fn setup_selects_stable_fallback_port_and_persists_it() {
+    let (_temp, root, state) = repo("port-collision");
+    let options = options(root, state.clone());
+    let (expected, _) = ProjectConfig::resolve(&options).unwrap();
+    let occupied = std::net::TcpListener::bind(("127.0.0.1", expected.port)).unwrap();
+
+    setup(&options).unwrap();
+    let persisted: ProjectConfig =
+        toml::from_str(&fs::read_to_string(state.join("project.toml")).unwrap()).unwrap();
+    assert_ne!(persisted.port, expected.port);
+    assert_eq!(
+        persisted.port,
+        20_000 + ((u32::from(expected.port - 20_000) + 7_919) % 20_000) as u16
+    );
+    drop(occupied);
+
+    let second = setup(&options).unwrap();
+    assert_eq!(second.status, "already_configured");
+    let again: ProjectConfig =
+        toml::from_str(&fs::read_to_string(state.join("project.toml")).unwrap()).unwrap();
+    assert_eq!(again.port, persisted.port);
+}
+
+#[test]
+fn setup_does_not_replace_persisted_port_when_temporarily_occupied() {
+    let (_temp, root, state) = repo("stable-port");
+    let options = options(root, state.clone());
+    setup(&options).unwrap();
+    let config_path = state.join("project.toml");
+    let before = fs::read(&config_path).unwrap();
+    let config: ProjectConfig = toml::from_str(std::str::from_utf8(&before).unwrap()).unwrap();
+    let occupied = std::net::TcpListener::bind(("127.0.0.1", config.port)).unwrap();
+
+    let report = setup(&options).unwrap();
+
+    assert_eq!(report.status, "already_configured");
+    assert_eq!(fs::read(config_path).unwrap(), before);
+    drop(occupied);
 }
 
 #[test]

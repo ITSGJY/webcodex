@@ -383,6 +383,64 @@ async fn workspace_hygiene_check_include_tracked_false_by_default() {
     );
 }
 
+#[tokio::test]
+async fn workspace_hygiene_check_does_not_mark_tracked_auth_source_names_critical() {
+    let runtime = test_runtime();
+    let (tmp, project) = setup_clean_git_repo(&runtime, "hyc-source-names", "demo").await;
+    for path in [
+        "src/auth/tokens.rs",
+        "src/auth/project_credential.rs",
+        "src/agent_tokens_http.rs",
+    ] {
+        let full = tmp.path().join(path);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        commit_file(
+            tmp.path(),
+            path,
+            "// ordinary authentication source\n",
+            &format!("add {path}"),
+        );
+    }
+    fs::create_dir_all(tmp.path().join("config")).unwrap();
+    commit_file(
+        tmp.path(),
+        "config/token.json",
+        "{}\n",
+        "add token data fixture",
+    );
+
+    let result = dispatch_hygiene_with_agent(
+        &runtime,
+        "hyc-source-names",
+        project,
+        None,
+        Some(true),
+        None,
+    )
+    .await;
+
+    assert!(result.success, "{:?}", result.error);
+    let findings = result.output["findings"].as_array().unwrap();
+    for path in [
+        "src/auth/tokens.rs",
+        "src/auth/project_credential.rs",
+        "src/agent_tokens_http.rs",
+    ] {
+        assert!(
+            findings.iter().all(|finding| finding["path"] != path),
+            "source name alone must not create a finding: {findings:?}"
+        );
+    }
+    assert!(
+        findings.iter().any(|finding| {
+            finding["path"] == "config/token.json"
+                && finding["kind"] == "secret_like_path"
+                && finding["severity"] == "critical"
+        }),
+        "explicit token data file must remain critical: {findings:?}"
+    );
+}
+
 // =========================================================================
 // 8. Bounds findings (max_findings clamp + truncation)
 // =========================================================================

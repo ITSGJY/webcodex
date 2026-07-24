@@ -91,6 +91,61 @@ async fn cargo_tools_reject_unsafe_cwd_before_project_dispatch() {
 }
 
 #[tokio::test]
+async fn agent_run_shell_resolves_relative_cwd_from_registered_project_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    let frontend = root.join("frontend");
+    std::fs::create_dir_all(&frontend).unwrap();
+    let runtime = runtime_with_agent_project("cwd-agent");
+    let project = register_agent_project_at_path(&runtime, "cwd-agent", "cwd-project", &root).await;
+
+    for (cwd, expected) in [
+        (Some("frontend".to_string()), frontend.clone()),
+        (Some(".".to_string()), root.clone()),
+        (
+            Some(frontend.to_string_lossy().to_string()),
+            frontend.clone(),
+        ),
+    ] {
+        let task = tokio::spawn({
+            let runtime = runtime.clone();
+            let project = project.clone();
+            async move {
+                runtime
+                    .run_shell(project, "pwd".to_string(), Some(10), cwd)
+                    .await
+            }
+        });
+        let request = next_patch_agent_request(&runtime, "cwd-agent")
+            .await
+            .expect("run_shell should enqueue");
+        assert_eq!(
+            request.cwd.as_deref(),
+            Some(expected.to_string_lossy().as_ref())
+        );
+        complete_patch_agent_request(&runtime, "cwd-agent", &request.request_id, 0, "", "").await;
+        assert!(task.await.unwrap().success);
+    }
+
+    for cwd in [
+        "../outside".to_string(),
+        temp.path().to_string_lossy().to_string(),
+    ] {
+        let result = runtime
+            .run_shell(project.clone(), "pwd".to_string(), Some(10), Some(cwd))
+            .await;
+        assert!(!result.success);
+        assert_eq!(result.output["failure_kind"], "permission_denied");
+    }
+    assert!(
+        next_patch_agent_request(&runtime, "cwd-agent")
+            .await
+            .is_none(),
+        "unsafe cwd must be rejected before Agent enqueue"
+    );
+}
+
+#[tokio::test]
 async fn cargo_check_failure_includes_stderr_tail_or_guidance() {
     let runtime = runtime_with_agent_project("cargo-checker");
     let mut caps = ShellClientCapabilities::default();

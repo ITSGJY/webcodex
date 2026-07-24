@@ -104,6 +104,62 @@ pub(crate) fn is_secret_like_path(path: &str) -> bool {
     false
 }
 
+/// Strong path-only evidence suitable for escalating a *tracked* file.
+///
+/// Source filenames such as `tokens.rs` or `project_credential.rs` document
+/// authentication code and are not credential dumps by name alone. Tracked
+/// paths therefore require an exact secret filename/directory or a
+/// secret-named data/config file. Untracked paths keep the broader
+/// `is_secret_like_path` review signal.
+pub(crate) fn is_strong_tracked_secret_path(path: &str) -> bool {
+    let normalized = path.to_ascii_lowercase();
+    let parts: Vec<&str> = normalized
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    let Some(last) = parts.last().copied() else {
+        return false;
+    };
+    if last == ".env"
+        || last.starts_with(".env.")
+        || matches!(
+            last,
+            "id_rsa" | "id_dsa" | "id_ed25519" | "passwd" | ".password"
+        )
+        || last.ends_with(".pem")
+        || last.ends_with(".key")
+        || last.ends_with(".p12")
+        || last.ends_with(".pfx")
+    {
+        return true;
+    }
+    if parts.iter().any(|part| {
+        matches!(
+            *part,
+            "secrets" | "credentials" | "tokens" | ".secrets" | ".credentials" | ".tokens"
+        )
+    }) {
+        return true;
+    }
+    let Some((stem, extension)) = last.rsplit_once('.') else {
+        return false;
+    };
+    matches!(
+        extension,
+        "json" | "yaml" | "yml" | "toml" | "ini" | "conf" | "config" | "txt" | "dat"
+    ) && matches!(
+        stem,
+        "token"
+            | "tokens"
+            | "credential"
+            | "credentials"
+            | "secret"
+            | "secrets"
+            | "password"
+            | "passwords"
+    )
+}
+
 /// True if the path matches a known cache/local-state pattern or a top-level
 /// generated/dependency directory.
 pub(crate) fn is_cache_path(path: &str) -> bool {
@@ -799,9 +855,10 @@ impl ToolRuntime {
                         recommendation: hygiene_recommendation(kind),
                     });
                 }
-            } else if include_tracked && is_secret_like_path(path) {
-                // For tracked entries, only report secret-like path names
-                // (suspicious tracked files). Never read contents.
+            } else if include_tracked && is_strong_tracked_secret_path(path) {
+                // Tracked source names are weak evidence. Escalate only exact
+                // secret files/directories or secret-named data/config files.
+                // Never read contents.
                 let kind = HygieneKind::SecretLikePath;
                 let severity = severity_for_hygiene_kind(kind, tracked_status);
                 findings.push(HygieneFinding {
@@ -875,6 +932,35 @@ mod tests {
         assert!(!is_secret_like_path("src/main.rs"));
         assert!(!is_secret_like_path("README.md"));
         assert!(!is_secret_like_path("environment.rs"));
+    }
+
+    #[test]
+    fn tracked_secret_path_requires_strong_path_evidence() {
+        for path in [
+            ".env",
+            ".env.production",
+            "id_ed25519",
+            "config/token.json",
+            "credentials/service.yaml",
+            "private.pem",
+        ] {
+            assert!(
+                is_strong_tracked_secret_path(path),
+                "expected strong secret path: {path}"
+            );
+        }
+        for path in [
+            "src/auth/tokens.rs",
+            "src/auth/project_credential.rs",
+            "src/agent_tokens_http.rs",
+            "docs/token-design.md",
+            "tests/credential_parser.ts",
+        ] {
+            assert!(
+                !is_strong_tracked_secret_path(path),
+                "ordinary source/doc path must not be critical: {path}"
+            );
+        }
     }
 
     #[test]

@@ -38,6 +38,7 @@ pub(super) struct PendingShellRequest {
     pub(super) request: ShellAgentShellRequest,
     pub(super) waiter: Option<oneshot::Sender<ShellRunResponse>>,
     pub(super) job_id: Option<String>,
+    pub(super) dispatched: bool,
 }
 
 #[derive(Debug, Clone)]

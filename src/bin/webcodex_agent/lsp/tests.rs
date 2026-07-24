@@ -375,8 +375,7 @@ fn diagnostics_cache_wait_has_version_generation_and_timeout_semantics() {
         .wait_for_publication(uri, 1, 0, Instant::now())
         .unwrap();
     assert!(no_cache.0.is_none());
-    assert!(!no_cache.1);
-    assert!(no_cache.2);
+    assert!(no_cache.1);
 
     cache.record_publish_diagnostics(Some(&json!({
         "uri": uri,
@@ -388,14 +387,12 @@ fn diagnostics_cache_wait_has_version_generation_and_timeout_semantics() {
         .wait_for_publication(uri, 1, baseline, Instant::now())
         .unwrap();
     assert_eq!(stale.0.unwrap().version, Some(0));
-    assert!(!stale.1);
-    assert!(stale.2);
+    assert!(stale.1);
 
     let version_match = cache
         .wait_for_publication(uri, 0, baseline, Instant::now())
         .unwrap();
-    assert!(version_match.1);
-    assert!(!version_match.2);
+    assert!(!version_match.1);
 
     let before = cache.generation();
     cache.record_publish_diagnostics(Some(&json!({
@@ -405,8 +402,7 @@ fn diagnostics_cache_wait_has_version_generation_and_timeout_semantics() {
     let new_generation = cache
         .wait_for_publication(uri, 1, before, Instant::now())
         .unwrap();
-    assert!(new_generation.1);
-    assert!(!new_generation.2);
+    assert!(!new_generation.1);
 }
 
 #[test]

@@ -19,10 +19,11 @@ use super::supervisor::{
 };
 use crate::lsp_bridge::{
     bound_error_message, error_codes, redact_absolute_paths, AgentLspPayload, AgentLspRequest,
-    AgentLspResultEnvelope, DocumentDiagnosticsResult, DocumentSymbolsResult, HoverResult,
-    LocationsResult, LspAvailabilityStatus, LspServerStatusEntry, LspStatusResult,
-    PublicDiagnostic, PublicHover, PublicLocation, PublicPosition, PublicRange, PublicSymbol,
-    PublicWorkspaceSymbol, WorkspaceSymbolsResult, AGENT_LSP_REQUEST_KIND,
+    AgentLspResultEnvelope, DocumentDiagnosticsResult, DocumentDiagnosticsStatus,
+    DocumentSymbolsResult, HoverResult, LocationsResult, LspAvailabilityStatus,
+    LspServerStatusEntry, LspStatusResult, PublicDiagnostic, PublicHover, PublicLocation,
+    PublicPosition, PublicRange, PublicSymbol, PublicWorkspaceSymbol, WorkspaceSymbolsResult,
+    AGENT_LSP_REQUEST_KIND,
 };
 use crate::shell_protocol::ShellAgentShellRequest;
 use serde_json::{json, Value};
@@ -438,6 +439,12 @@ fn document_diagnostics(
         || text_budget_count < diagnostics.len();
     diagnostics.truncate(text_budget_count);
     diagnostics.truncate(limit);
+    let status = if snapshot.timed_out {
+        DocumentDiagnosticsStatus::Timeout
+    } else {
+        DocumentDiagnosticsStatus::Complete
+    };
+    let clean = (status == DocumentDiagnosticsStatus::Complete).then_some(raw_count == 0);
 
     Ok(DocumentDiagnosticsResult {
         project: project_id.to_string(),
@@ -447,8 +454,8 @@ fn document_diagnostics(
         diagnostics,
         total_count: raw_count,
         truncated,
-        fresh: snapshot.fresh,
-        timed_out: snapshot.timed_out,
+        status,
+        clean,
         published_version: snapshot
             .publication
             .as_ref()

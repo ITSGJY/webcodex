@@ -5,8 +5,8 @@ use crate::lsp_bridge::{
     clamp_document_diagnostics_limit, clamp_document_symbols_limit, clamp_find_references_limit,
     clamp_goto_definition_limit, clamp_workspace_symbols_limit, error_codes, is_known_error_code,
     parse_agent_lsp_result_envelope, redact_absolute_paths, AgentLspPayload, AgentLspRequest,
-    DocumentDiagnosticsResult, DocumentSymbolsResult, HoverResult, LocationsResult,
-    LspStatusResult, WorkspaceSymbolsResult,
+    DocumentDiagnosticsResult, DocumentDiagnosticsStatus, DocumentSymbolsResult, HoverResult,
+    LocationsResult, LspStatusResult, WorkspaceSymbolsResult,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -234,7 +234,30 @@ impl ToolRuntime {
                         if let Some(obj) = result.as_object_mut() {
                             obj.insert("project".to_string(), json!(resolved.resolved_id));
                         }
-                        ToolResult::ok(result)
+                        match expected_result {
+                            AgentLspRequest::DocumentDiagnostics { .. } => {
+                                let status = result
+                                    .get("status")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("unknown");
+                                if status == "complete" {
+                                    ToolResult::ok(result)
+                                } else {
+                                    let code = if status == "timeout" {
+                                        error_codes::LSP_REQUEST_TIMEOUT
+                                    } else {
+                                        error_codes::LSP_PROTOCOL_ERROR
+                                    };
+                                    ToolResult::err_with_output(
+                                        format!(
+                                            "{code}: diagnostics are {status}; no fresh clean/diagnostic conclusion is available"
+                                        ),
+                                        result,
+                                    )
+                                }
+                            }
+                            _ => ToolResult::ok(result),
+                        }
                     }
                     Ok(envelope) => {
                         let err =
@@ -283,7 +306,14 @@ fn validate_agent_lsp_result(request: &AgentLspRequest, result: Value) -> Result
             roundtrip_typed_result::<DocumentSymbolsResult>(result)
         }
         AgentLspRequest::DocumentDiagnostics { .. } => {
-            roundtrip_typed_result::<DocumentDiagnosticsResult>(result)
+            serde_json::from_value::<DocumentDiagnosticsResult>(result).and_then(|typed| {
+                if validate_document_diagnostics_status(&typed).is_err() {
+                    return Err(serde_json::Error::io(std::io::Error::other(
+                        "inconsistent diagnostics status",
+                    )));
+                }
+                serde_json::to_value(typed)
+            })
         }
         AgentLspRequest::Hover { .. } => roundtrip_typed_result::<HoverResult>(result),
         AgentLspRequest::WorkspaceSymbols { .. } => {
@@ -306,6 +336,15 @@ fn validate_agent_lsp_result(request: &AgentLspRequest, result: Value) -> Result
         ));
     }
     Ok(result)
+}
+
+fn validate_document_diagnostics_status(result: &DocumentDiagnosticsResult) -> Result<(), ()> {
+    let clean =
+        (result.status == DocumentDiagnosticsStatus::Complete).then_some(result.total_count == 0);
+    if result.clean != clean {
+        return Err(());
+    }
+    Ok(())
 }
 
 fn roundtrip_typed_result<T>(result: Value) -> Result<Value, serde_json::Error>

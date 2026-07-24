@@ -117,7 +117,18 @@ pub(crate) struct ConnectorTaskResult {
     pub decided_by: Option<String>,
     pub decided_at: Option<i64>,
     pub cleanup_warning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<ConnectorResultDecisionRecovery>,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub(crate) struct ConnectorResultDecisionRecovery {
+    pub state: String,
+    pub decision: String,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub last_attempt_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -1205,7 +1216,17 @@ impl Database {
              FROM wc_tasks task JOIN wc_task_results result ON result.task_id = task.id
              WHERE task.id = ?1 AND task.project_id = ?2
                AND result.id = ?6 AND result.decision_status = 'pending'
-             ON CONFLICT(task_id) DO NOTHING",
+             ON CONFLICT(task_id) DO UPDATE SET
+                 decision = excluded.decision,
+                 actor = excluded.actor,
+                 started_at = excluded.started_at,
+                 state = 'pending',
+                 error_code = NULL,
+                 error_message = NULL,
+                 last_attempt_at = NULL
+             WHERE wc_result_decision_intents.result_id = excluded.result_id
+               AND wc_result_decision_intents.state = 'needs_attention'
+               AND excluded.decision = 'rejected'",
             params![task_id, project_id, decision, actor, now, result_id],
         )?;
         if inserted == 1 {
@@ -1239,12 +1260,74 @@ impl Database {
             "SELECT i.task_id, i.result_id, i.decision
              FROM wc_result_decision_intents i
              JOIN wc_tasks t ON t.id = i.task_id
-             WHERE t.project_id = ?1 ORDER BY i.started_at, i.task_id",
+             WHERE t.project_id = ?1 AND i.state = 'pending'
+             ORDER BY i.started_at, i.task_id",
         )?;
         let rows = statement.query_map([project_id], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub(crate) fn mark_connector_result_decision_needs_attention(
+        &self,
+        task_id: &str,
+        project_id: &str,
+        result_id: &str,
+        error_code: &str,
+        error_message: &str,
+        now: i64,
+    ) -> Result<(), ConnectorTaskStoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let (run_id, cursor) = tx
+            .query_row(
+                "SELECT r.id, COALESCE(MAX(e.sequence), 0)
+                 FROM wc_tasks t
+                 JOIN wc_runs r ON r.task_id = t.id
+                 LEFT JOIN wc_task_events e ON e.task_id = t.id
+                 WHERE t.id = ?1 AND t.project_id = ?2
+                 GROUP BY r.id ORDER BY r.started_at DESC LIMIT 1",
+                params![task_id, project_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or(ConnectorTaskStoreError::NotFound)?;
+        let updated = tx.execute(
+            "UPDATE wc_result_decision_intents
+             SET state = 'needs_attention', error_code = ?1, error_message = ?2,
+                 last_attempt_at = ?3
+             WHERE task_id = ?4 AND result_id = ?5 AND state = 'pending'",
+            params![error_code, error_message, now, task_id, result_id],
+        )?;
+        if updated != 1 {
+            return Err(ConnectorTaskStoreError::decision(
+                "result_recovery_state_changed",
+                "result recovery state changed while it was being quarantined",
+            ));
+        }
+        tx.execute(
+            "UPDATE wc_runs
+             SET status = 'interrupted', finished_at = COALESCE(finished_at, ?1)
+             WHERE id = ?2",
+            params![now, run_id],
+        )?;
+        insert_event(
+            &tx,
+            task_id,
+            &run_id,
+            cursor + 1,
+            "result_recovery_needs_attention",
+            &serde_json::json!({
+                "result_id": result_id,
+                "error_code": error_code,
+                "error_message": error_message
+            }),
+            now,
+        )?;
+        touch_task(&tx, task_id, now)?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub(crate) fn finalize_connector_result_decision(
@@ -1262,11 +1345,11 @@ impl Database {
                 "SELECT i.decision, i.actor, r.id, COALESCE(MAX(e.sequence), 0)
                  FROM wc_result_decision_intents i
                  JOIN wc_tasks t ON t.id = i.task_id
-                 JOIN wc_runs r ON r.task_id = t.id
-                 LEFT JOIN wc_task_events e ON e.task_id = t.id
                  JOIN wc_task_results result ON result.task_id = t.id
+                 JOIN wc_runs r ON r.id = result.run_id
+                 LEFT JOIN wc_task_events e ON e.task_id = t.id
                  WHERE i.task_id = ?1 AND i.result_id = ?2 AND t.project_id = ?3
-                   AND result.decision_status = 'pending'
+                   AND i.state = 'pending' AND result.decision_status = 'pending'
                  GROUP BY i.decision, i.actor, r.id
                  ORDER BY r.started_at DESC LIMIT 1",
                 params![task_id, result_id, project_id],
@@ -1299,6 +1382,16 @@ impl Database {
                 "task result was already decided",
             ));
         }
+        tx.execute(
+            "UPDATE wc_tasks SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            params![decision, now, task_id],
+        )?;
+        tx.execute(
+            "UPDATE wc_runs
+             SET status = 'completed', finished_at = COALESCE(finished_at, ?1)
+             WHERE id = ?2",
+            params![now, run_id],
+        )?;
         insert_event(
             &tx,
             task_id,
@@ -1320,7 +1413,6 @@ impl Database {
             "DELETE FROM wc_result_decision_intents WHERE task_id = ?1",
             [task_id],
         )?;
-        touch_task(&tx, task_id, now)?;
         tx.commit()?;
         load_result(&conn, task_id)?
             .ok_or_else(|| ConnectorTaskStoreError::Storage(anyhow::anyhow!("result disappeared")))
@@ -1473,10 +1565,17 @@ fn load_result(
     task_id: &str,
 ) -> Result<Option<ConnectorTaskResult>, ConnectorTaskStoreError> {
     conn.query_row(
-        "SELECT id, task_id, run_id, summary, patch_artifact, patch_sha256, patch_bytes,
-                changed_paths_json, validation_json, warnings_json, decision_status,
-                decided_by, decided_at, cleanup_warning, created_at
-         FROM wc_task_results WHERE task_id = ?1",
+        "SELECT result.id, result.task_id, result.run_id, result.summary,
+                result.patch_artifact, result.patch_sha256, result.patch_bytes,
+                result.changed_paths_json, result.validation_json, result.warnings_json,
+                result.decision_status, result.decided_by, result.decided_at,
+                result.cleanup_warning, result.created_at,
+                intent.state, intent.decision, intent.error_code, intent.error_message,
+                intent.last_attempt_at
+         FROM wc_task_results result
+         LEFT JOIN wc_result_decision_intents intent
+           ON intent.task_id = result.task_id AND intent.result_id = result.id
+         WHERE result.task_id = ?1",
         params![task_id],
         map_result,
     )
@@ -1496,6 +1595,16 @@ fn map_result(row: &rusqlite::Row<'_>) -> Result<ConnectorTaskResult, rusqlite::
     let patch_bytes_raw: i64 = row.get(6)?;
     let patch_bytes = usize::try_from(patch_bytes_raw)
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(6, Type::Integer, Box::new(e)))?;
+    let recovery = match row.get::<_, Option<String>>(15)? {
+        Some(state) => Some(ConnectorResultDecisionRecovery {
+            state,
+            decision: row.get(16)?,
+            error_code: row.get(17)?,
+            error_message: row.get(18)?,
+            last_attempt_at: row.get(19)?,
+        }),
+        None => None,
+    };
     Ok(ConnectorTaskResult {
         result_id: row.get(0)?,
         task_id: row.get(1)?,
@@ -1511,6 +1620,7 @@ fn map_result(row: &rusqlite::Row<'_>) -> Result<ConnectorTaskResult, rusqlite::
         decided_by: row.get(11)?,
         decided_at: row.get(12)?,
         cleanup_warning: row.get(13)?,
+        recovery,
         created_at: row.get(14)?,
     })
 }

@@ -43,6 +43,7 @@ pub(super) fn enqueue_pending_request_locked(
             request,
             waiter,
             job_id,
+            dispatched: false,
         },
     );
     Ok(())
@@ -214,9 +215,13 @@ impl ShellClientRegistry {
         Ok((request_id, rx))
     }
 
-    pub async fn cancel_request(&self, request_id: &str) {
+    /// Cancel a pending synchronous request and report whether an Agent had
+    /// already polled it. This lets timeout callers distinguish queue timeout
+    /// from an actually started command without retaining expired requests.
+    pub async fn cancel_request(&self, request_id: &str) -> bool {
         let mut inner = self.inner.lock().await;
-        remove_pending_request_locked(&mut inner, request_id);
+        remove_pending_request_locked(&mut inner, request_id)
+            .is_some_and(|pending| pending.dispatched)
     }
 
     /// Enqueue a project-management agent request (`register_project` or

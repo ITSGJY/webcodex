@@ -8,9 +8,10 @@
 mod setup_service;
 
 use setup_service::{
-    create_private_dir, local_readiness, read_private_value, read_project_credential,
-    read_toml_optional, validate_agent_credential, validate_existing_agent,
-    validate_existing_registration, validate_product_config, validate_profile, ProjectConfig,
+    create_private_dir, local_readiness, read_private_value, read_project_agent_token,
+    read_project_credential, read_toml_optional, validate_agent_authentication,
+    validate_existing_agent, validate_existing_registration, validate_product_config,
+    validate_profile, ProjectConfig,
 };
 pub(crate) use setup_service::{resolve_local_task_state, setup};
 
@@ -208,6 +209,7 @@ pub(crate) fn readiness_with_probe(
         && paths.as_ref().is_some_and(|paths| {
             paths.agent_config.is_file()
                 && paths.connector_key.is_file()
+                && paths.agent_token.is_file()
                 && paths.bootstrap_key.is_file()
         })
         && !findings
@@ -516,7 +518,8 @@ pub(crate) async fn start_agent(options: &ProjectCommandOptions) -> Result<(), P
     })?;
     let bootstrap = read_private_value(&paths.bootstrap_key)?;
     let connector_key = read_project_credential(&paths.connector_key)?;
-    validate_agent_credential(&config, &paths, &connector_key)?;
+    let _agent_token = read_project_agent_token(&paths.agent_token)?;
+    validate_agent_authentication(&config, &paths)?;
     let server_binary = std::env::current_exe().map_err(|error| {
         ProductError::new(
             "required_capability_unavailable",
@@ -545,6 +548,7 @@ pub(crate) async fn start_agent(options: &ProjectCommandOptions) -> Result<(), P
             config.project_grant_id(&paths),
         )
         .env("WEBCODEX_PROJECT_CREDENTIAL_FILE", &paths.connector_key)
+        .env("WEBCODEX_PROJECT_AGENT_TOKEN_FILE", &paths.agent_token)
         .env("WEBCODEX_CONNECTOR_PROJECT_ID", &config.logical_project_id)
         .env("WEBCODEX_CONNECTOR_PROJECT_NAME", &config.project_name)
         .env("WEBCODEX_CONNECTOR_WORKSPACE_ID", &config.workspace_id)

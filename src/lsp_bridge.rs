@@ -253,6 +253,13 @@ pub struct PublicDiagnostic {
     pub tags: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentDiagnosticsStatus {
+    Complete,
+    Timeout,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocumentDiagnosticsResult {
     pub project: String,
@@ -262,8 +269,8 @@ pub struct DocumentDiagnosticsResult {
     pub total_count: usize,
     pub returned_count: usize,
     pub truncated: bool,
-    pub fresh: bool,
-    pub timed_out: bool,
+    pub status: DocumentDiagnosticsStatus,
+    pub clean: Option<bool>,
     #[serde(default)]
     pub published_version: Option<i32>,
     pub invalid_results_omitted: usize,

@@ -105,12 +105,16 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 schema_type("boolean", "Whether cache or caller limits truncated diagnostics."),
             ),
             (
-                "fresh",
-                schema_type("boolean", "Whether a current-version or post-prepare publication was observed."),
+                "status",
+                json!({
+                    "type": "string",
+                    "enum": ["complete", "timeout"],
+                    "description": "Authoritative diagnostics outcome. Only complete may be interpreted as a current diagnostic conclusion."
+                }),
             ),
             (
-                "timed_out",
-                schema_type("boolean", "Whether no fresh publication arrived within the shared two-second wait budget."),
+                "clean",
+                nullable_schema("boolean", "True only for a fresh complete publication with zero raw diagnostics; null for timeout."),
             ),
             (
                 "published_version",

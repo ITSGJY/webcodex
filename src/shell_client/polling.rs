@@ -39,11 +39,10 @@ impl ShellClientRegistry {
             let Some(request_id) = request_id else {
                 return Ok(None);
             };
-            let Some((request, job_id)) = inner
-                .pending_by_id
-                .get(&request_id)
-                .map(|pending| (pending.request.clone(), pending.job_id.clone()))
-            else {
+            let Some((request, job_id)) = inner.pending_by_id.get_mut(&request_id).map(|pending| {
+                pending.dispatched = true;
+                (pending.request.clone(), pending.job_id.clone())
+            }) else {
                 continue;
             };
             if request.kind == "stop_job" {

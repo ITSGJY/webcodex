@@ -294,10 +294,17 @@ impl WorkspaceManager {
         }
         let mut warnings = Vec::new();
         if !snapshot.ignored_generated_paths.is_empty() {
-            let shown =
-                &snapshot.ignored_generated_paths[..snapshot.ignored_generated_paths.len().min(16)];
+            const MAX_IGNORED_PATHS_IN_WARNING: usize = 16;
+            let shown = &snapshot.ignored_generated_paths[..snapshot
+                .ignored_generated_paths
+                .len()
+                .min(MAX_IGNORED_PATHS_IN_WARNING)];
+            let omitted = snapshot
+                .ignored_generated_paths
+                .len()
+                .saturating_sub(shown.len());
             warnings.push(format!(
-                "ignored_generated_paths count={} paths=[{}]",
+                "ignored_generated_paths count={} paths=[{}] omitted={omitted}",
                 snapshot.ignored_generated_paths.len(),
                 shown.join(", ")
             ));
@@ -731,14 +738,14 @@ impl WorkspaceManager {
         if expected_result_id != Some(result.result_id.as_str()) {
             return Err(result_changed());
         }
-        if decision == LocalResultDecision::Reject
-            && result.decision_status == "rejected"
-            && result.cleanup_warning.is_some()
-        {
-            Self::release_and_record(db, project_id, &task, now)?;
-            return db
-                .local_connector_task_result(task_id, project_id)?
-                .ok_or(ConnectorTaskStoreError::NotFound);
+        if decision == LocalResultDecision::Reject && result.decision_status == "rejected" {
+            if result.cleanup_warning.is_some() {
+                Self::release_and_record(db, project_id, &task, now)?;
+                return db
+                    .local_connector_task_result(task_id, project_id)?
+                    .ok_or(ConnectorTaskStoreError::NotFound);
+            }
+            return Ok(result);
         }
         if result.decision_status != "pending" {
             return Err(ConnectorTaskStoreError::decision(
@@ -797,20 +804,59 @@ impl WorkspaceManager {
         now: i64,
     ) -> Result<usize, ConnectorTaskStoreError> {
         let intents = db.connector_result_decision_intents(project_id)?;
+        let mut recovered = 0;
         for (task_id, result_id, decision) in &intents {
             let decision = if decision == "accepted" {
                 LocalResultDecision::Accept
             } else {
                 LocalResultDecision::Reject
             };
-            let task = local_decision_task(db, project_id, task_id, target_root)?;
-            let result = db
-                .local_connector_task_result(task_id, project_id)?
-                .filter(|result| result.result_id == *result_id)
-                .ok_or_else(result_changed)?;
-            Self::complete_local_decision(db, project_id, task, result, decision, true, now)?;
+            let outcome = (|| {
+                let task = local_decision_task(db, project_id, task_id, target_root)?;
+                let result = db
+                    .local_connector_task_result(task_id, project_id)?
+                    .filter(|result| result.result_id == *result_id)
+                    .ok_or_else(result_changed)?;
+                Self::complete_local_decision(db, project_id, task, result, decision, true, now)
+            })();
+            match outcome {
+                Ok(_) => recovered += 1,
+                Err(ConnectorTaskStoreError::Decision(code, message)) => {
+                    let message = db
+                        .local_connector_task(task_id, project_id)
+                        .map(|task| sanitize_warning(&task, &message))
+                        .unwrap_or_else(|_| {
+                            "result recovery precondition is no longer valid".into()
+                        });
+                    if let Err(error) = db.mark_connector_result_decision_needs_attention(
+                        task_id, project_id, result_id, code, &message, now,
+                    ) {
+                        tracing::error!(
+                            task_id,
+                            result_id,
+                            error = %error,
+                            "Could not quarantine an unrecoverable result decision"
+                        );
+                    } else {
+                        tracing::warn!(
+                            task_id,
+                            result_id,
+                            error_code = code,
+                            "Result decision recovery needs manual attention"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        task_id,
+                        result_id,
+                        error = %error,
+                        "Result decision recovery will be retried later"
+                    );
+                }
+            }
         }
-        Ok(intents.len())
+        Ok(recovered)
     }
 
     fn release_and_record(
@@ -1113,9 +1159,6 @@ fn safe_agent_project_id(value: &str) -> bool {
 }
 
 fn sensitive_result_path(path: &str) -> bool {
-    if crate::tool_runtime::files::is_sensitive_artifact_path(path) {
-        return true;
-    }
     Path::new(path).components().any(|component| {
         let Component::Normal(name) = component else {
             return true;
@@ -1123,10 +1166,21 @@ fn sensitive_result_path(path: &str) -> bool {
         let name = name.to_string_lossy().to_ascii_lowercase();
         matches!(
             name.as_str(),
-            "credentials" | "id_rsa" | "id_ed25519" | "agent.toml" | "webcodex.env"
+            ".git"
+                | "target"
+                | "secrets"
+                | "tokens"
+                | "credentials"
+                | "id_rsa"
+                | "id_ed25519"
+                | "agent.toml"
+                | "webcodex.env"
         ) || name.ends_with(".key")
             || name.ends_with(".p12")
             || name.ends_with(".pfx")
+            || name.ends_with(".pem")
+            || name == ".env"
+            || name.starts_with(".env.")
     })
 }
 
@@ -1267,24 +1321,25 @@ fn is_safe_result_relative_path(path: &str) -> bool {
 
 /// Untracked-only filter; tracked same-named paths stay via `git add -u`.
 fn is_generated_untracked_path(path: &str) -> bool {
-    path.replace('\\', "/")
+    let normalized = path.replace('\\', "/");
+    let mut parts = normalized
         .trim_end_matches('/')
         .split('/')
-        .filter(|p| !p.is_empty() && *p != ".")
-        .any(|part| {
-            let lower = part.to_ascii_lowercase();
-            matches!(
-                lower.as_str(),
-                "__pycache__"
-                    | ".pytest_cache"
-                    | ".mypy_cache"
-                    | ".ruff_cache"
-                    | "htmlcov"
-                    | "node_modules"
-                    | ".coverage"
-            ) || lower.ends_with(".pyc")
-                || lower.ends_with(".pyo")
-        })
+        .filter(|part| !part.is_empty() && *part != ".");
+    let Some(root_name) = parts.next() else {
+        return false;
+    };
+    let root_name = root_name.to_ascii_lowercase();
+    matches!(
+        root_name.as_str(),
+        "__pycache__"
+            | ".pytest_cache"
+            | ".mypy_cache"
+            | ".ruff_cache"
+            | "htmlcov"
+            | "node_modules"
+            | ".coverage"
+    ) || (parts.next().is_none() && (root_name.ends_with(".pyc") || root_name.ends_with(".pyo")))
 }
 
 fn project_brief_evidence(root: &Path) -> (Option<Value>, Option<bool>, Option<usize>) {
@@ -1568,6 +1623,7 @@ mod tests {
             decided_by: None,
             decided_at: None,
             cleanup_warning: None,
+            recovery: None,
             created_at: 1,
         }
     }
@@ -1909,6 +1965,11 @@ mod tests {
             ("__pycache__/x.pyc", b"j"),
             ("package/__pycache__/nested.pyc", b"k"),
             (".pytest_cache/n", b"[]"),
+            ("node_modules/generated.js", b"generated\n"),
+            ("htmlcov/index.html", b"generated\n"),
+            ("fixtures/node_modules/package.json", b"{}\n"),
+            ("testdata/htmlcov/index.html", b"fixture\n"),
+            ("fixtures/.coverage", b"fixture coverage\n"),
             ("__pycache__/tracked.pyc", b"new"),
         ] {
             let full = root.join(path);
@@ -1943,25 +2004,33 @@ mod tests {
             "package/module.py",
             "package-lock.json",
             "binary.bin",
+            "fixtures/node_modules/package.json",
+            "testdata/htmlcov/index.html",
+            "fixtures/.coverage",
+            "package/__pycache__/nested.pyc",
             "__pycache__/tracked.pyc",
         ] {
             assert!(captured.changed_paths.iter().any(|p| p == keep), "{keep}");
         }
-        assert!(captured
+        assert!(!captured
             .changed_paths
             .iter()
-            .all(|p| !p.ends_with(".pyc") || p == "__pycache__/tracked.pyc"));
+            .any(|p| p == "__pycache__/x.pyc"));
         assert!(captured
             .changed_paths
             .iter()
             .all(|p| !p.contains(".pytest_cache")));
         let bytes = fs::read(captured.patch_artifact.as_deref().unwrap()).unwrap();
         let patch = String::from_utf8_lossy(&bytes);
-        assert!(!patch.contains("x.pyc") && !patch.contains("nested.pyc"));
+        assert!(!patch.contains("__pycache__/x.pyc"));
+        assert!(patch.contains("package/__pycache__/nested.pyc"));
         assert!(captured
             .warnings
             .iter()
-            .any(|w| w.contains("ignored_generated_paths")));
+            .any(|w| w.contains("ignored_generated_paths")
+                && w.contains("node_modules/generated.js")
+                && w.contains("htmlcov/index.html")
+                && w.contains("omitted=")));
         fs::write(root.join(".env"), "S=1\n").unwrap();
         assert!(manager
             .capture_result(&task)
@@ -1971,6 +2040,24 @@ mod tests {
             WorkspaceManager::accept_recoverable(&task, &result(&task, &captured), false).unwrap(),
             None
         );
-        assert!(is_generated_untracked_path("a.pyc") && !is_safe_result_relative_path("../x"));
+        for (path, generated) in [
+            ("node_modules/package.json", true),
+            ("fixtures/node_modules/package.json", false),
+            ("htmlcov/index.html", true),
+            ("testdata/htmlcov/index.html", false),
+            ("__pycache__/module.pyc", true),
+            ("package/__pycache__/module.pyc", false),
+            (".coverage", true),
+            ("fixtures/.coverage", false),
+            ("root.pyc", true),
+            ("package/module.pyc", false),
+        ] {
+            assert_eq!(
+                is_generated_untracked_path(path),
+                generated,
+                "generated-path policy for {path}"
+            );
+        }
+        assert!(!is_safe_result_relative_path("../x"));
     }
 }

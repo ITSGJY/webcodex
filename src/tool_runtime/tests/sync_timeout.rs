@@ -1,7 +1,9 @@
 //! Synchronous timeout contract for cargo_* and run_shell.
 
 use super::support::*;
-use crate::shell_protocol::{ShellAgentPollRequest, ShellClientCapabilities};
+use crate::shell_protocol::{
+    ShellAgentPollRequest, ShellAgentResultRequest, ShellClientCapabilities,
+};
 use crate::tool_runtime::helpers::{
     resolve_sync_timeout_secs, DEFAULT_CARGO_TIMEOUT_SECS, MAX_SYNC_TIMEOUT_SECS,
     MIN_SYNC_TIMEOUT_SECS,
@@ -149,6 +151,100 @@ async fn run_shell_rejects_timeout_above_120_before_enqueue() {
         assert_timeout_rejected(&result, "run_shell");
         assert_no_pending_shell_request(&runtime, "sync-timeout-shell").await;
     }
+}
+
+#[tokio::test]
+async fn full_cargo_test_timeout_reports_dispatched_state_and_cleans_request() {
+    let client_id = "sync-slow-full-test";
+    let runtime = runtime_with_agent_project(client_id);
+    let mut caps = ShellClientCapabilities::default();
+    caps.shell = true;
+    register_agent(&runtime, client_id, None, caps).await;
+    let project = agent_test_project_id(client_id);
+    let auth = auth_context(None, true);
+    let session = runtime.sessions.start_session(Some(project.clone()), None);
+    let session_id = session.session_id.clone();
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::CargoTest {
+                        project,
+                        session_id: Some(session_id),
+                        cwd: None,
+                        filter: None,
+                        all_targets: None,
+                        all_features: None,
+                        no_default_features: None,
+                        features: None,
+                        package: None,
+                        no_run: None,
+                        timeout_secs: Some(1),
+                    },
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    let request = next_patch_agent_request(&runtime, client_id)
+        .await
+        .expect("full cargo_test should be dispatched to the Agent");
+    assert_eq!(request.command, "cargo test");
+    let active_summary = runtime
+        .sessions
+        .summary(&session.session_id, Some(20))
+        .expect("active session summary");
+    assert!(active_summary
+        .events
+        .iter()
+        .any(|event| { event.kind == "tool_call_started" && event.tool_name == "cargo_test" }));
+
+    let result = task.await.unwrap();
+    assert!(!result.success);
+    assert_eq!(result.output["failure_kind"], "timeout");
+    assert_eq!(result.output["command_started"], true);
+    assert_eq!(result.output["command_completed"], false);
+    assert_eq!(result.output["passed"], false);
+    assert!(result
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("command was started")));
+
+    let client = runtime
+        .shell_clients
+        .get_client_view(client_id)
+        .await
+        .expect("registered client");
+    assert_eq!(client.pending_requests, 0);
+    assert!(runtime.shell_clients.list_jobs(Some(10)).await.is_empty());
+    let late = runtime
+        .shell_clients
+        .complete(ShellAgentResultRequest {
+            client_id: client_id.to_string(),
+            agent_instance_id: "inst".to_string(),
+            request_id: request.request_id,
+            exit_code: Some(0),
+            stdout: Some("late result".to_string()),
+            stderr: Some(String::new()),
+            duration_ms: Some(3_000),
+            error: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(late.contains("unknown or expired shell request"), "{late}");
+
+    let finished_summary = runtime
+        .sessions
+        .summary(&session.session_id, Some(20))
+        .expect("finished session summary");
+    assert!(finished_summary.events.iter().any(|event| {
+        event.kind == "tool_call_finished"
+            && event.tool_name == "cargo_test"
+            && event.status.as_deref() == Some("failed")
+    }));
 }
 
 #[tokio::test]

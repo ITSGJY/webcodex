@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use super::helpers::{
     bounded_tail, command_failed_message, command_rejected_message, command_timeout_message,
-    looks_like_command_timeout, resolve_local_cwd, resolve_sync_timeout_secs,
+    looks_like_command_timeout, resolve_agent_cwd, resolve_local_cwd, resolve_sync_timeout_secs,
     run_command_sync_bounded, sync_timeout_out_of_range_result, LocalRunFailure,
     COMMAND_STDIO_TAIL_CHARS, DEFAULT_RUN_SHELL_TIMEOUT_SECS, MAX_SYNC_TIMEOUT_SECS,
     MIN_SYNC_TIMEOUT_SECS,
@@ -18,6 +18,8 @@ pub(crate) struct ProjectCommandOutput {
     pub(crate) stderr: String,
     pub(crate) duration_ms: u64,
     pub(crate) error: Option<String>,
+    pub(crate) command_started: bool,
+    pub(crate) command_completed: bool,
 }
 
 impl ToolRuntime {
@@ -136,13 +138,7 @@ impl ToolRuntime {
         let timeout = timeout_secs;
         if proj.is_agent() {
             let client_id = proj.agent_client_id()?.to_string();
-            let effective_cwd = match cwd {
-                Some(cwd) => {
-                    let joined = std::path::Path::new(&proj.path).join(cwd);
-                    Some(joined.to_string_lossy().to_string())
-                }
-                None => Some(proj.path.clone()),
-            };
+            let effective_cwd = Some(resolve_agent_cwd(&proj, cwd.as_deref())?);
             let wait_timeout = timeout;
             let (request_id, rx) = self
                 .shell_clients
@@ -159,23 +155,37 @@ impl ToolRuntime {
                 )
                 .await?;
             match tokio::time::timeout(Duration::from_secs(wait_timeout + 2), rx).await {
-                Ok(Ok(response)) => Ok(ProjectCommandOutput {
-                    exit_code: response.exit_code,
-                    stdout: response.stdout.unwrap_or_default(),
-                    stderr: response.stderr.unwrap_or_default(),
-                    duration_ms: response.duration_ms.unwrap_or_default(),
-                    error: response.error,
-                }),
+                Ok(Ok(response)) => {
+                    let exit_code = response.exit_code;
+                    let stderr = response.stderr.unwrap_or_default();
+                    let timed_out = looks_like_command_timeout(exit_code, &stderr, timeout);
+                    Ok(ProjectCommandOutput {
+                        exit_code,
+                        stdout: response.stdout.unwrap_or_default(),
+                        stderr,
+                        duration_ms: response.duration_ms.unwrap_or_default(),
+                        command_started: exit_code.is_some(),
+                        command_completed: !timed_out,
+                        error: response.error,
+                    })
+                }
                 Ok(Err(_)) => {
                     self.shell_clients.cancel_request(&request_id).await;
                     Err("shell request waiter was dropped".to_string())
                 }
                 Err(_) => {
-                    self.shell_clients.cancel_request(&request_id).await;
-                    Err(format!(
-                        "timed out waiting {} seconds for agent shell result",
-                        wait_timeout
-                    ))
+                    let command_started = self.shell_clients.cancel_request(&request_id).await;
+                    Ok(ProjectCommandOutput {
+                        exit_code: None,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        duration_ms: wait_timeout.saturating_mul(1_000),
+                        error: Some(format!(
+                            "timed out waiting {wait_timeout} seconds for agent shell result"
+                        )),
+                        command_started,
+                        command_completed: false,
+                    })
                 }
             }
         } else {
@@ -189,12 +199,15 @@ impl ToolRuntime {
                     ),
                     LocalRunFailure::Join(e) => format!("task join error: {}", e),
                 })?;
+            let timed_out = looks_like_command_timeout(Some(result.0), &result.2, timeout);
             Ok(ProjectCommandOutput {
                 exit_code: Some(result.0),
                 stdout: result.1,
                 stderr: result.2,
                 duration_ms: result.3,
                 error: None,
+                command_started: true,
+                command_completed: !timed_out,
             })
         }
     }
@@ -244,7 +257,20 @@ impl ToolRuntime {
                         false,
                     ),
                 };
-            let effective_cwd = cwd.or_else(|| Some(proj.path.clone()));
+            let effective_cwd = match resolve_agent_cwd(&proj, cwd.as_deref()) {
+                Ok(cwd) => Some(cwd),
+                Err(e) => {
+                    return Self::run_shell_tool_failure_result(
+                        command_rejected_message(
+                            e,
+                            "choose '.', an existing project-relative cwd, or an absolute path inside the registered project root.",
+                        ),
+                        "permission_denied",
+                        false,
+                        false,
+                    )
+                }
+            };
             let wait_timeout = timeout;
             let (request_id, rx) = match self
                 .shell_clients
@@ -318,11 +344,11 @@ impl ToolRuntime {
                     )
                 }
                 Err(_) => {
-                    self.shell_clients.cancel_request(&request_id).await;
+                    let command_started = self.shell_clients.cancel_request(&request_id).await;
                     Self::run_shell_tool_failure_result(
                         command_timeout_message(wait_timeout, "", ""),
                         "timeout",
-                        true,
+                        command_started,
                         false,
                     )
                 }

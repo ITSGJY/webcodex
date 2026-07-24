@@ -1,10 +1,10 @@
 use super::support::*;
 use crate::lsp_bridge::{
-    parse_agent_lsp_result_envelope, AgentLspPayload, AgentLspResultEnvelope,
-    DocumentDiagnosticsResult, DocumentSymbolsResult, HoverResult, LocationsResult,
-    LspAvailabilityStatus, LspStatusResult, PublicDiagnostic, PublicHover, PublicLocation,
-    PublicPosition, PublicRange, PublicSymbol, PublicWorkspaceSymbol, WorkspaceSymbolsResult,
-    AGENT_LSP_REQUEST_KIND,
+    error_codes, parse_agent_lsp_result_envelope, AgentLspPayload, AgentLspResultEnvelope,
+    DocumentDiagnosticsResult, DocumentDiagnosticsStatus, DocumentSymbolsResult, HoverResult,
+    LocationsResult, LspAvailabilityStatus, LspStatusResult, PublicDiagnostic, PublicHover,
+    PublicLocation, PublicPosition, PublicRange, PublicSymbol, PublicWorkspaceSymbol,
+    WorkspaceSymbolsResult, AGENT_LSP_REQUEST_KIND,
 };
 use crate::shell_protocol::{
     ShellClientCapabilities, ShellClientRegisterRequest,
@@ -14,7 +14,7 @@ use crate::tool_runtime::tool_definition::{
     lookup_tool_definition, model_visible_tool_definitions, AgentCapability, TOOL_CATEGORY_LSP,
 };
 use crate::tool_runtime::{ToolCall, ToolResult};
-use serde_json::json;
+use serde_json::{json, Value};
 
 #[test]
 fn lsp_tools_are_registered_read_only_and_not_shell_like() {
@@ -89,8 +89,8 @@ fn lsp_input_schemas_have_required_bounds() {
         "total_count",
         "returned_count",
         "truncated",
-        "fresh",
-        "timed_out",
+        "status",
+        "clean",
         "published_version",
         "invalid_results_omitted",
         "related_information_omitted",
@@ -100,6 +100,8 @@ fn lsp_input_schemas_have_required_bounds() {
             "diagnostics output schema missing {field}"
         );
     }
+    assert!(output_properties.get("fresh").is_none());
+    assert!(output_properties.get("timed_out").is_none());
     let diagnostic_item = &output_properties["diagnostics"]["items"];
     assert_eq!(diagnostic_item["additionalProperties"], false);
     assert_eq!(diagnostic_item["properties"]["message"]["maxLength"], 4096);
@@ -327,8 +329,8 @@ fn document_diagnostics_result(path: &str) -> DocumentDiagnosticsResult {
         total_count: 1,
         returned_count: 1,
         truncated: false,
-        fresh: true,
-        timed_out: false,
+        status: DocumentDiagnosticsStatus::Complete,
+        clean: Some(false),
         published_version: Some(2),
         invalid_results_omitted: 0,
         related_information_omitted: 0,
@@ -593,12 +595,60 @@ async fn document_diagnostics_dispatches_typed_result_without_process_output() {
     let result = task.await.unwrap();
     assert!(result.success, "{result:?}");
     assert_eq!(result.output["diagnostics"][0]["severity"], "warning");
-    assert_eq!(result.output["fresh"], true);
-    assert_eq!(result.output["timed_out"], false);
+    assert_eq!(result.output["status"], "complete");
+    assert_eq!(result.output["clean"], false);
     let serialized = result.output.to_string();
     assert!(!serialized.contains("stdout"));
     assert!(!serialized.contains("stderr"));
     assert!(!serialized.contains("file://"));
+}
+
+#[tokio::test]
+async fn document_diagnostics_timeout_is_not_reported_as_clean_success() {
+    let runtime = test_runtime();
+    let tmp = tempfile::tempdir().unwrap();
+    let project = register_lsp_agent(
+        &runtime,
+        "lsp-diagnostics-timeout",
+        "demo",
+        tmp.path(),
+        true,
+    )
+    .await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::DocumentDiagnostics {
+                        project,
+                        path: "src/main.rs".into(),
+                        limit: Some(100),
+                        session_id: None,
+                    },
+                    Some(&auth_context(None, true)),
+                )
+                .await
+        }
+    });
+    let mut timeout = document_diagnostics_result("src/main.rs");
+    timeout.diagnostics.clear();
+    timeout.total_count = 0;
+    timeout.returned_count = 0;
+    timeout.status = DocumentDiagnosticsStatus::Timeout;
+    timeout.clean = None;
+    timeout.published_version = None;
+    complete_lsp_agent_request(&runtime, "lsp-diagnostics-timeout", timeout).await;
+
+    let result = task.await.unwrap();
+    assert!(!result.success, "{result:?}");
+    assert_eq!(result.output["status"], "timeout");
+    assert_eq!(result.output["clean"], Value::Null);
+    assert_eq!(result.output["diagnostics"], json!([]));
+    assert!(result
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains(error_codes::LSP_REQUEST_TIMEOUT)));
 }
 
 #[tokio::test]

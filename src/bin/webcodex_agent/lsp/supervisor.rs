@@ -494,11 +494,10 @@ impl LspSupervisor {
                 baseline_generation,
                 deadline,
             ) {
-                Ok((publication, fresh, timed_out)) => {
+                Ok((publication, timed_out)) => {
                     return Ok(DiagnosticsSnapshot {
                         position_encoding: server.position_encoding(),
                         publication,
-                        fresh,
                         timed_out,
                     });
                 }
@@ -1282,7 +1281,6 @@ pub(crate) struct DiagnosticsPublication {
 pub(crate) struct DiagnosticsSnapshot {
     pub(crate) position_encoding: PositionEncoding,
     pub(crate) publication: Option<DiagnosticsPublication>,
-    pub(crate) fresh: bool,
     pub(crate) timed_out: bool,
 }
 
@@ -1385,14 +1383,14 @@ impl DiagnosticsCache {
         document_version: i32,
         baseline_generation: u64,
         deadline: Instant,
-    ) -> Result<(Option<DiagnosticsPublication>, bool, bool), LspError> {
+    ) -> Result<(Option<DiagnosticsPublication>, bool), LspError> {
         let mut state = lock_unpoison(&self.state);
         loop {
             if let Some(publication) = state.publications.get(uri) {
                 let fresh = publication.generation > baseline_generation
                     || publication.version == Some(document_version);
                 if fresh {
-                    return Ok((Some(publication.clone()), true, false));
+                    return Ok((Some(publication.clone()), false));
                 }
             }
             if state.closed {
@@ -1400,7 +1398,7 @@ impl DiagnosticsCache {
             }
             let remaining = remaining_until(deadline);
             if remaining.is_zero() {
-                return Ok((state.publications.get(uri).cloned(), false, true));
+                return Ok((state.publications.get(uri).cloned(), true));
             }
             let waited = self.changed.wait_timeout(state, remaining);
             state = match waited {

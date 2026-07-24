@@ -139,9 +139,10 @@ pub(crate) fn enforce_token_surface(
     ctx: &AuthContext,
     path: &str,
 ) -> Result<(), (StatusCode, &'static str)> {
-    // Lightweight principals and shared-key OAuth subjects must never reach
-    // account-control management surfaces.
-    if (ctx.is_lightweight() || ctx.is_oauth_shared_key_subject()) && is_account_control_path(path)
+    // Lightweight principals, project credentials, and shared-key OAuth
+    // subjects must never reach account-control management surfaces.
+    if (ctx.is_lightweight() || ctx.is_project_credential() || ctx.is_oauth_shared_key_subject())
+        && is_account_control_path(path)
     {
         return Err((
             StatusCode::FORBIDDEN,
@@ -168,6 +169,12 @@ pub(crate) fn enforce_token_surface(
             "OAuth2 tokens are not allowed on agent transport endpoints",
         ));
     }
+    if is_agent_transport_path(path) && !ctx.is_bootstrap() && !ctx.is_agent_token() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "agent transport endpoints require bootstrap or a bound Agent Token",
+        ));
+    }
     Ok(())
 }
 
@@ -185,10 +192,7 @@ pub(crate) fn enforce_project_connector_surface(
         return Ok(());
     }
     if ctx.is_project_credential()
-        && (path == "/mcp"
-            || is_project_connector_path(path)
-            || is_project_console_path(path)
-            || is_agent_transport_path(path))
+        && (path == "/mcp" || is_project_connector_path(path) || is_project_console_path(path))
     {
         return Ok(());
     }
@@ -311,6 +315,15 @@ impl Handler for AuthMiddleware {
         // shared-key quick-start fallback below.
         if let Some(runtime) = project_connector_runtime(depot) {
             if let Some(ctx) = runtime.authenticate_project_credential(&token) {
+                if let Err((status, msg)) = enforce_request_surface(true, &ctx, req.uri().path()) {
+                    reject(res, ctrl, status, msg);
+                    return;
+                }
+                depot.inject(ctx);
+                ctrl.call_next(req, depot, res).await;
+                return;
+            }
+            if let Some(ctx) = runtime.authenticate_project_agent_token(&token) {
                 if let Err((status, msg)) = enforce_request_surface(true, &ctx, req.uri().path()) {
                     reject(res, ctrl, status, msg);
                     return;

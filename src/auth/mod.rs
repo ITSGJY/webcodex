@@ -58,7 +58,8 @@ pub(crate) mod tokens;
 #[allow(unused_imports)]
 pub use context::{AuthContext, AuthError, AuthKind};
 pub(crate) use project_credential::{
-    read_protected_secret, validate_credential as validate_project_credential,
+    read_protected_secret, validate_agent_token as validate_project_agent_token,
+    validate_credential as validate_project_credential, ProjectAgentTokenVerifier,
     ProjectCredentialVerifier,
 };
 
@@ -1584,10 +1585,18 @@ mod tests {
         assert!(!sk.scopes.iter().any(|s| s == SCOPE_ADMIN));
         let open = open_anonymous_context();
         assert!(!open.scopes.iter().any(|s| s == SCOPE_ADMIN));
-        // They do have runtime/project/agent scopes.
+        // They retain interactive runtime/project access but never Agent
+        // transport scopes.
         assert!(sk.scopes.contains(&SCOPE_RUNTIME_READ.to_string()));
         assert!(sk.scopes.contains(&SCOPE_PROJECT_WRITE.to_string()));
-        assert!(sk.scopes.contains(&SCOPE_AGENT_REGISTER.to_string()));
+        assert!(!sk.scopes.contains(&SCOPE_AGENT_REGISTER.to_string()));
+        assert!(!open.scopes.contains(&SCOPE_AGENT_REGISTER.to_string()));
+
+        let project =
+            crate::auth::shared_key::project_credential_context("wc_pgrant_1111111111111111");
+        assert!(project.is_project_credential());
+        assert!(!project.is_lightweight());
+        assert!(!project.scopes.contains(&SCOPE_AGENT_REGISTER.to_string()));
     }
 
     #[test]
@@ -1605,15 +1614,13 @@ mod tests {
     }
 
     #[test]
-    fn enforce_token_surface_allows_lightweight_on_runtime_and_agent_paths() {
+    fn enforce_token_surface_allows_lightweight_on_runtime_but_rejects_agent_transport() {
         let sk = shared_key_context("k");
         let open = open_anonymous_context();
         for path in [
             "/api/runtime/status",
             "/api/tools/list",
             "/api/projects/list",
-            "/api/shell/agent/register",
-            "/api/agents/ws",
             "/mcp",
         ] {
             assert!(
@@ -1624,6 +1631,10 @@ mod tests {
                 enforce_token_surface(&open, path).is_ok(),
                 "open should be allowed on {path}"
             );
+        }
+        for path in AGENT_TRANSPORT_PATHS {
+            assert!(enforce_token_surface(&sk, path).is_err());
+            assert!(enforce_token_surface(&open, path).is_err());
         }
     }
 

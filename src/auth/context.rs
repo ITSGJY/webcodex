@@ -112,6 +112,6 @@ impl AuthContext {
     }
 
     pub fn is_lightweight(&self) -> bool {
-        self.is_shared_key() || self.is_project_credential() || self.is_open_anonymous()
+        self.is_shared_key() || self.is_open_anonymous()
     }
 }

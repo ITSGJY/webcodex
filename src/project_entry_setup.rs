@@ -11,10 +11,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::net::TcpListener;
+use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
 const CONFIG_VERSION: u32 = 1;
+const PROJECT_PORT_BASE: u16 = 20_000;
+const PROJECT_PORT_COUNT: u32 = 20_000;
+const PROJECT_PORT_PROBE_STEP: u32 = 7_919;
+const PROJECT_PORT_PROBE_LIMIT: usize = 256;
 
 #[derive(Debug)]
 pub(super) struct ProjectPaths {
@@ -30,6 +35,7 @@ pub(super) struct ProjectPaths {
     pub(super) config: PathBuf,
     pub(super) bootstrap_key: PathBuf,
     pub(super) connector_key: PathBuf,
+    pub(super) agent_token: PathBuf,
     pub(super) agent_config: PathBuf,
 }
 
@@ -49,6 +55,7 @@ impl ProjectPaths {
             config: state.join("project.toml"),
             bootstrap_key: credentials.join("bootstrap-key"),
             connector_key: credentials.join("connector-key"),
+            agent_token: credentials.join("agent-token"),
             agent_config: agent.join("agent.toml"),
             credentials,
             state,
@@ -145,10 +152,10 @@ impl ProjectConfig {
         let identity = project_identity(&root);
         let project_name = safe_slug(&root);
         let executor_project_id = format!("{project_name}-{}", &identity[..10]);
-        let state = resolve_state_path(options, &executor_project_id)?;
+        let state = resolve_state_path(options, &root, &executor_project_id)?;
         let grant_id = project_grant_identity(&root, &options.profile, &state);
         let port_seed = u16::from_str_radix(&identity[..4], 16).unwrap_or_default();
-        let port = 20_000 + (port_seed % 20_000);
+        let port = PROJECT_PORT_BASE + (port_seed % PROJECT_PORT_COUNT as u16);
         Ok((
             Self {
                 version: CONFIG_VERSION,
@@ -215,21 +222,27 @@ pub(crate) fn resolve_local_task_state(
 }
 
 pub(crate) fn setup(options: &ProjectCommandOptions) -> Result<SetupReport, ProductError> {
-    let (expected, paths) = ProjectConfig::resolve(options)?;
+    let (mut expected, paths) = ProjectConfig::resolve(options)?;
     let config = match read_toml_optional::<ProjectConfig>(&paths.config)? {
         Some(existing) => {
             validate_product_config(&expected, &existing)?;
             existing
         }
-        None => expected,
+        None => {
+            expected.port = select_available_project_port(expected.port)?;
+            expected
+        }
     };
     validate_existing_agent(&config, &paths)?;
     validate_existing_registration(&config, &paths)?;
+    if paths.agent_config.exists() {
+        validate_agent_authentication(&config, &paths)?;
+    }
     paths.create()?;
 
     let mut changed = Vec::new();
-    let connector_key = if paths.connector_key.is_file() {
-        read_project_credential(&paths.connector_key)?
+    if paths.connector_key.is_file() {
+        let _ = read_project_credential(&paths.connector_key)?;
     } else {
         if paths.agent_config.exists() {
             return Err(ProductError::new(
@@ -245,10 +258,6 @@ pub(crate) fn setup(options: &ProjectCommandOptions) -> Result<SetupReport, Prod
         );
         write_new_private(&paths.connector_key, format!("{value}\n").as_bytes())?;
         changed.push("Connection".to_string());
-        value
-    };
-    if paths.agent_config.exists() {
-        validate_agent_credential(&config, &paths, &connector_key)?;
     }
     if !paths.bootstrap_key.is_file() {
         let value = format!(
@@ -264,10 +273,18 @@ pub(crate) fn setup(options: &ProjectCommandOptions) -> Result<SetupReport, Prod
         let _ = read_private_value(&paths.bootstrap_key)?;
     }
 
+    let agent_token = if paths.agent_token.is_file() {
+        read_project_agent_token(&paths.agent_token)?
+    } else {
+        let value = crate::auth::generate_agent_token();
+        write_new_private(&paths.agent_token, format!("{value}\n").as_bytes())?;
+        value
+    };
+
     if !paths.agent_config.is_file() {
         let content = generated_agent_config_toml(&AgentInitOptions {
             server_url: config.server_url(),
-            token: Some(connector_key.clone()),
+            token: Some(agent_token),
             token_file: None,
             client_id: config.executor_client_id.clone(),
             owner: "local-owner".to_string(),
@@ -319,7 +336,7 @@ pub(crate) fn setup(options: &ProjectCommandOptions) -> Result<SetupReport, Prod
         }
     }
     validate_existing_agent(&config, &paths)?;
-    validate_agent_credential(&config, &paths, &connector_key)?;
+    validate_agent_authentication(&config, &paths)?;
     validate_existing_registration(&config, &paths)?;
     let connection_url = config.server_url();
     Ok(SetupReport {
@@ -333,6 +350,28 @@ pub(crate) fn setup(options: &ProjectCommandOptions) -> Result<SetupReport, Prod
         changed,
         next_action: "webcodex doctor".to_string(),
     })
+}
+
+fn select_available_project_port(primary: u16) -> Result<u16, ProductError> {
+    let primary_offset = u32::from(primary.saturating_sub(PROJECT_PORT_BASE));
+    for attempt in 0..PROJECT_PORT_PROBE_LIMIT {
+        let offset = (primary_offset + (attempt as u32).saturating_mul(PROJECT_PORT_PROBE_STEP))
+            % PROJECT_PORT_COUNT;
+        let port = PROJECT_PORT_BASE + offset as u16;
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
+            drop(listener);
+            return Ok(port);
+        }
+    }
+    Err(ProductError::new(
+        "server_port_unavailable",
+        format!(
+            "no available loopback port was found after checking {PROJECT_PORT_PROBE_LIMIT} stable project port candidates"
+        ),
+        Some(
+            "Stop a conflicting local process or choose a separate project state/profile, then run webcodex setup again.",
+        ),
+    ))
 }
 
 pub(super) fn local_readiness(options: &ProjectCommandOptions) -> LocalReadiness {
@@ -383,7 +422,7 @@ pub(super) fn local_readiness(options: &ProjectCommandOptions) -> LocalReadiness
             can_probe_remote: false,
             findings: vec![ReadinessFact::fail(
                 "Workspace",
-                "workspace_unavailable",
+                &error.code,
                 error.message,
                 error
                     .next_action
@@ -502,8 +541,8 @@ fn local_project_state(options: &ProjectCommandOptions) -> LocalProjectState {
     let validation = validate_product_config(&expected, &config)
         .and_then(|_| validate_existing_agent(&config, &paths))
         .and_then(|_| validate_existing_registration(&config, &paths))
-        .and_then(|_| read_project_credential(&paths.connector_key))
-        .and_then(|credential| validate_agent_credential(&config, &paths, &credential))
+        .and_then(|_| read_project_credential(&paths.connector_key).map(|_| ()))
+        .and_then(|_| validate_agent_authentication(&config, &paths))
         .and_then(|_| read_private_value(&paths.bootstrap_key).map(|_| ()));
     if let Err(error) = validation {
         return LocalProjectState::invalid(Some(config), paths, error);
@@ -514,6 +553,7 @@ fn local_project_state(options: &ProjectCommandOptions) -> LocalProjectState {
 fn contains_setup_state(paths: &ProjectPaths) -> bool {
     paths.agent_config.exists()
         || paths.connector_key.exists()
+        || paths.agent_token.exists()
         || paths.bootstrap_key.exists()
         || paths.projects.exists()
         || paths.data.exists()
@@ -538,6 +578,10 @@ pub(super) fn validate_product_config(
         (
             "project identity",
             actual.logical_project_id == expected.logical_project_id,
+        ),
+        (
+            "Agent identity",
+            actual.executor_client_id == expected.executor_client_id,
         ),
     ] {
         if !same {
@@ -592,41 +636,45 @@ pub(super) fn validate_existing_agent(
     Ok(())
 }
 
-pub(super) fn validate_agent_credential(
+pub(super) fn validate_agent_authentication(
     config: &ProjectConfig,
     paths: &ProjectPaths,
-    credential: &str,
 ) -> Result<(), ProductError> {
-    let _ = read_private_value_with_code(&paths.agent_config, "project_credential_invalid")?;
+    let _ = read_private_value_with_code(&paths.agent_config, "agent_credential_invalid")?;
     let value: toml::Value = read_toml(&paths.agent_config)?;
-    let agent_credential = value
+    let configured_token = value
         .get("token")
         .and_then(toml::Value::as_str)
         .ok_or_else(|| {
             ProductError::new(
-                "project_credential_invalid",
-                "the Agent project credential is missing or invalid",
-                Some("Restore the private credential or explicitly rotate the project setup."),
+                "agent_credential_invalid",
+                "the bound project Agent Token is missing from Agent configuration",
+                Some("Restore the private Agent Token or recreate this project profile."),
             )
         })?;
-    let verifier =
-        crate::auth::ProjectCredentialVerifier::new(config.project_grant_id(paths), credential)
-            .map_err(|_| {
-                ProductError::new(
-                    "project_credential_invalid",
-                    "the configured project credential is invalid",
-                    Some("Restore the private credential or explicitly rotate the project setup."),
-                )
-            })?;
+    let agent_token = read_project_agent_token(&paths.agent_token)?;
+    let verifier = crate::auth::ProjectAgentTokenVerifier::new(
+        config.project_grant_id(paths),
+        config.executor_client_id.clone(),
+        "local-owner".to_string(),
+        &agent_token,
+    )
+    .map_err(|_| {
+        ProductError::new(
+            "agent_credential_invalid",
+            "the configured project Agent Token is invalid",
+            Some("Restore the private Agent Token or recreate this project profile."),
+        )
+    })?;
     verifier
-        .authenticate(agent_credential)
+        .authenticate(configured_token)
         .map(|_| ())
         .ok_or_else(|| {
             ProductError::new(
-            "project_credential_invalid",
-            "the Connector and Agent project credentials do not match",
-            Some("Restore the matching private credential or explicitly rotate the project setup."),
-        )
+                "agent_credential_invalid",
+                "the Agent configuration does not match the bound project Agent Token",
+                Some("Restore the matching private Agent Token or recreate this project profile."),
+            )
         })
 }
 
@@ -778,47 +826,98 @@ fn safe_slug(root: &Path) -> String {
 
 fn resolve_state_path(
     options: &ProjectCommandOptions,
+    root: &Path,
     executor_project_id: &str,
 ) -> Result<PathBuf, ProductError> {
-    match &options.state_dir {
-        Some(path) if path.is_absolute() => Ok(path.clone()),
-        Some(path) => std::env::current_dir()
-            .map(|cwd| cwd.join(path))
-            .map_err(|_| {
-                ProductError::new(
-                    "workspace_unavailable",
-                    "cannot resolve the requested state directory",
-                    Some("Use an accessible absolute --state-dir."),
-                )
-            }),
-        None => Ok(default_state_base()?
+    let cwd = std::env::current_dir().map_err(|_| state_path_unavailable())?;
+    resolve_state_path_from(options, root, executor_project_id, &cwd)
+}
+
+pub(super) fn resolve_state_path_from(
+    options: &ProjectCommandOptions,
+    root: &Path,
+    executor_project_id: &str,
+    cwd: &Path,
+) -> Result<PathBuf, ProductError> {
+    let requested = match &options.state_dir {
+        Some(path) if path.is_absolute() => path.clone(),
+        Some(path) => cwd.join(path),
+        None => default_state_base()?
             .join(&options.profile)
-            .join(executor_project_id)),
+            .join(executor_project_id),
+    };
+    let state = canonicalize_with_missing_tail(&requested)?;
+    if state == root || state.starts_with(root) {
+        return Err(ProductError::new(
+            "state_directory_unsafe",
+            "the WebCodex state directory must be outside the Git project checkout",
+            Some(
+                "Choose --state-dir in a private directory outside the checkout, or omit it to use the default user state directory.",
+            ),
+        ));
     }
+    Ok(state)
 }
 
 fn state_path_for_readiness(options: &ProjectCommandOptions) -> Result<PathBuf, ProductError> {
-    if let Some(path) = &options.state_dir {
-        return Ok(if path.is_absolute() {
-            path.clone()
-        } else {
-            std::env::current_dir()
-                .map_err(|_| {
-                    ProductError::new(
-                        "workspace_unavailable",
-                        "cannot resolve the requested state directory",
-                        Some("Use an accessible absolute --state-dir."),
-                    )
-                })?
-                .join(path)
-        });
+    ProjectConfig::resolve(options).map(|(_, paths)| paths.state)
+}
+
+fn canonicalize_with_missing_tail(path: &Path) -> Result<PathBuf, ProductError> {
+    let absolute = lexical_normalize_absolute(path)?;
+    let mut probe = absolute.clone();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&probe) {
+            Ok(_) => {
+                let mut resolved = probe.canonicalize().map_err(|_| state_path_unavailable())?;
+                if !missing.is_empty() && !resolved.is_dir() {
+                    return Err(state_path_unavailable());
+                }
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = probe.file_name().map(|name| name.to_os_string()) else {
+                    return Err(state_path_unavailable());
+                };
+                missing.push(name);
+                if !probe.pop() {
+                    return Err(state_path_unavailable());
+                }
+            }
+            Err(_) => return Err(state_path_unavailable()),
+        }
     }
-    let root = discover_project_root(&options.root)?;
-    let identity = project_identity(&root);
-    let project_id = format!("{}-{}", safe_slug(&root), &identity[..10]);
-    Ok(default_state_base()?
-        .join(&options.profile)
-        .join(project_id))
+}
+
+fn lexical_normalize_absolute(path: &Path) -> Result<PathBuf, ProductError> {
+    if !path.is_absolute() {
+        return Err(state_path_unavailable());
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(value) => normalized.push(value),
+        }
+    }
+    Ok(normalized)
+}
+
+fn state_path_unavailable() -> ProductError {
+    ProductError::new(
+        "workspace_unavailable",
+        "cannot safely resolve the requested state directory",
+        Some("Use an accessible absolute --state-dir outside the Git checkout."),
+    )
 }
 
 fn default_state_base() -> Result<PathBuf, ProductError> {
@@ -875,6 +974,18 @@ pub(super) fn read_project_credential(path: &Path) -> Result<String, ProductErro
             "project_credential_invalid",
             "the configured project credential is invalid",
             Some("Restore the private credential or explicitly rotate the project setup."),
+        )
+    })?;
+    Ok(value)
+}
+
+pub(super) fn read_project_agent_token(path: &Path) -> Result<String, ProductError> {
+    let value = read_private_value_with_code(path, "agent_credential_invalid")?;
+    crate::auth::validate_project_agent_token(&value).map_err(|_| {
+        ProductError::new(
+            "agent_credential_invalid",
+            "the configured project Agent Token is invalid",
+            Some("Restore the private Agent Token or recreate this project profile."),
         )
     })?;
     Ok(value)

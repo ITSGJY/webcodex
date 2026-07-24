@@ -5583,6 +5583,35 @@ shell_profile = "../rust"
         assert!(result.error.is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn shell_job_rejects_cwd_symlink_escape() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), project.path().join("outside")).unwrap();
+        let policy = AgentPolicy {
+            allow_cwd_anywhere: false,
+            allowed_roots: vec![project.path().to_path_buf()],
+            ..AgentPolicy::default()
+        };
+
+        let result = run_shell(
+            &policy,
+            &ShellConfig::default(),
+            Some(project.path().join("outside").to_string_lossy().as_ref()),
+            "pwd",
+            None,
+            10,
+            None,
+        );
+
+        assert_eq!(result.exit_code, None);
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("outside allowed_roots")));
+    }
+
     #[test]
     fn shell_job_timeout_returns_timeout_error() {
         let tmp = tempfile::tempdir().unwrap();
