@@ -83,6 +83,7 @@ impl ToolRuntime {
                     "shell_profiles": sanitized_shell_profiles_summary(
                         c.policy.as_ref().and_then(|p| p.shell_profiles.as_ref())
                     ),
+                    "tool_providers": c.policy.as_ref().and_then(|p| p.tool_providers.as_ref()),
                 })
             })
             .collect();
@@ -179,6 +180,7 @@ impl ToolRuntime {
                     "shell_profiles": sanitized_shell_profiles_summary(
                         c.policy.as_ref().and_then(|p| p.shell_profiles.as_ref())
                     ),
+                    "tool_providers": c.policy.as_ref().and_then(|p| p.tool_providers.as_ref()),
                 })
             })
             .collect();

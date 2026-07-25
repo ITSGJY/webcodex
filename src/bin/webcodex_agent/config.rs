@@ -49,6 +49,47 @@ pub(crate) struct AgentConfig {
     pub(crate) quic: Option<QuicClientConfig>,
     #[serde(default)]
     pub(crate) shell: ShellConfig,
+    #[serde(default)]
+    pub(crate) tool_providers: ToolProvidersConfig,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ToolProviderStrategy {
+    #[default]
+    Native,
+    ClaudeCode,
+    ClaudeCodeThenNative,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub(crate) struct ToolProvidersConfig {
+    #[serde(default)]
+    pub(crate) strategy: ToolProviderStrategy,
+    #[serde(default)]
+    pub(crate) claude_code: ClaudeCodeMcpConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub(crate) struct ClaudeCodeMcpConfig {
+    pub(crate) enabled: bool,
+    pub(crate) command: String,
+    pub(crate) args: Vec<String>,
+    pub(crate) mapping: HashMap<String, String>,
+    pub(crate) timeout_secs: u64,
+}
+
+impl Default for ClaudeCodeMcpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            command: "claude".to_string(),
+            args: vec!["mcp".to_string(), "serve".to_string()],
+            mapping: HashMap::new(),
+            timeout_secs: 30,
+        }
+    }
 }
 
 /// Agent-side QUIC transport configuration (`[quic]` in `agent.toml`). All
@@ -502,6 +543,14 @@ pub(crate) fn load_config(path: &Path) -> Result<AgentConfig, String> {
         effective_allowed_roots(&cfg.policy.allowed_roots, cfg.policy.allow_cwd_anywhere)?;
     cfg.policy.allowed_roots = effective;
     validate_shell_config(&cfg.shell)?;
+    if cfg.tool_providers.claude_code.enabled {
+        if cfg.tool_providers.claude_code.command.trim().is_empty() {
+            return Err("tool_providers.claude_code.command cannot be empty".to_string());
+        }
+        if cfg.tool_providers.claude_code.timeout_secs == 0 {
+            return Err("tool_providers.claude_code.timeout_secs must be > 0".to_string());
+        }
+    }
     Ok(cfg)
 }
 

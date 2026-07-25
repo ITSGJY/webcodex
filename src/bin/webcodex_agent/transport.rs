@@ -61,6 +61,7 @@ impl AgentRuntimeState {
     }
 
     fn shutdown(&self) {
+        super::external_tools::external_tools().shutdown();
         self.lsp.shutdown();
     }
 }
@@ -474,6 +475,7 @@ pub(crate) fn run_agent(cfg: AgentConfig, once: bool) -> Result<(), String> {
         .to_string();
     // The LSP supervisor belongs to the agent process rather than any server
     // transport session and is shared across reconnects.
+    super::configure_external_tools(&cfg.tool_providers);
     let runtime = AgentRuntimeState::new();
     let result = match transport.as_str() {
         TRANSPORT_WEBSOCKET => run_websocket_agent(cfg, once, &agent_instance_id, &runtime.lsp),
@@ -1711,6 +1713,7 @@ mod tests {
                 crate::webcodex_agent::default_websocket_connect_timeout_secs(),
             quic: None,
             shell: ShellConfig::default(),
+            tool_providers: Default::default(),
         }
     }
 

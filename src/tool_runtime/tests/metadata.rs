@@ -495,6 +495,7 @@ async fn list_projects_shows_shell_profile_resolution() {
         max_timeout_secs: 3600,
         max_output_bytes: 262144,
         shell_profiles: Some(summary),
+        tool_providers: None,
     };
     let mut configured = registered_project("rust-proj", "/root/git/rust");
     configured.shell_profile = Some("rust".to_string());
@@ -596,6 +597,7 @@ async fn runtime_status_shell_profiles_summary_is_sanitized() {
                 max_timeout_secs: 3600,
                 max_output_bytes: 262144,
                 shell_profiles: Some(summary),
+                tool_providers: None,
             }),
         })
         .await
@@ -1804,7 +1806,10 @@ async fn runtime_status_agent_summary_includes_protocol_version() {
 
 #[tokio::test]
 async fn runtime_status_includes_sanitized_policy_summary() {
-    use crate::shell_protocol::{AgentPolicySummary, ShellClientRegisterRequest};
+    use crate::shell_protocol::{
+        AgentPolicySummary, ClaudeCodeProviderStatus, ShellClientRegisterRequest,
+        ToolProvidersStatus,
+    };
     let registry = Arc::new(ShellClientRegistry::default());
     registry
         .register(ShellClientRegisterRequest {
@@ -1823,6 +1828,21 @@ async fn runtime_status_includes_sanitized_policy_summary() {
                 max_timeout_secs: 3600,
                 max_output_bytes: 262144,
                 shell_profiles: None,
+                tool_providers: Some(ToolProvidersStatus {
+                    strategy: "claude_code".to_string(),
+                    claude_code: ClaudeCodeProviderStatus {
+                        enabled: true,
+                        version: Some("test-version".to_string()),
+                        available: true,
+                        process_state: "running".to_string(),
+                        discovered_tool_names: vec!["Edit".to_string()],
+                        capabilities: std::collections::BTreeMap::from([
+                            ("search_project_text".to_string(), "unmapped".to_string()),
+                            ("edit_file".to_string(), "available".to_string()),
+                        ]),
+                        last_error_code: None,
+                    },
+                }),
             }),
         })
         .await
@@ -1841,6 +1861,13 @@ async fn runtime_status_includes_sanitized_policy_summary() {
     assert_eq!(policy["allowed_roots"], json!(["/root"]));
     assert_eq!(policy["max_timeout_secs"], 3600);
     assert_eq!(policy["max_output_bytes"], 262144);
+    let providers = &clients[0]["tool_providers"];
+    assert_eq!(providers["strategy"], "claude_code");
+    assert_eq!(providers["claude_code"]["process_state"], "running");
+    assert_eq!(
+        providers["claude_code"]["capabilities"]["edit_file"],
+        "available"
+    );
     // Sanitization: never expose token/env/init_script.
     assert!(policy.get("token").is_none());
     assert!(policy.get("env").is_none());
@@ -1899,6 +1926,7 @@ async fn list_agents_includes_sanitized_policy_summary() {
                 max_timeout_secs: 120,
                 max_output_bytes: 4096,
                 shell_profiles: None,
+                tool_providers: None,
             }),
         })
         .await

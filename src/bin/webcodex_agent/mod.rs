@@ -2,6 +2,7 @@ pub(crate) mod artifacts;
 pub(crate) mod checkpoints;
 pub(crate) mod config;
 pub(crate) mod dispatch;
+pub(crate) mod external_tools;
 pub(crate) mod files;
 pub(crate) mod lsp;
 pub(crate) mod output;
@@ -24,6 +25,7 @@ pub(crate) use config::{
     ShellProfileConfig, CLIENT_PROFILE_ERROR, DEFAULT_MAX_CONCURRENT_JOBS,
 };
 pub(super) use dispatch::{dispatch_request, is_project_op};
+pub(crate) use external_tools::configure_external_tools;
 #[cfg(test)]
 pub(crate) use files::sha256_hex_bytes;
 pub(crate) use files::{

@@ -25,7 +25,7 @@ use crate::project_overview::{
     normalize_project_overview_path,
 };
 use crate::projects::ProjectConfig;
-use crate::shell_protocol::{ShellFileOpRequest, ShellRunRequest};
+use crate::shell_protocol::{ShellFileOpRequest, ShellRunRequest, EXTERNAL_SEARCH_REQUEST_PREFIX};
 
 #[cfg(test)]
 pub(crate) fn read_file_content_result(
@@ -1046,7 +1046,7 @@ fn parse_search_backend_status(stdout: &str) -> SearchBackendStatus {
             let value = serde_json::from_str::<Value>(line).ok()?;
             let marker = value.get("webcodex_search").unwrap_or(&value);
             let backend = marker.get("backend").and_then(Value::as_str)?;
-            if !matches!(backend, "rg" | "grep" | "native") {
+            if !matches!(backend, "rg" | "grep" | "native" | "claude_code") {
                 return None;
             }
             Some(SearchBackendStatus {
@@ -1061,6 +1061,23 @@ fn parse_search_backend_status(stdout: &str) -> SearchBackendStatus {
             backend: "grep".to_string(),
             feature_unavailable: false,
         })
+}
+
+fn external_provider_error_result(stdout: &str) -> Option<ToolResult> {
+    let value: Value = serde_json::from_str(stdout.trim()).ok()?;
+    if value.get("format").and_then(Value::as_str) != Some("webcodex.external_provider_error.v1") {
+        return None;
+    }
+    let message = value
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("external tool provider failed")
+        .to_string();
+    Some(ToolResult {
+        success: false,
+        output: value,
+        error: Some(message),
+    })
 }
 
 fn parse_search_line_record(line: &str) -> Option<SearchLineRecord> {
@@ -3827,14 +3844,25 @@ impl ToolRuntime {
                 Ok(id) => id.to_string(),
                 Err(e) => return ToolResult::err(e),
             };
+            let payload = json!({
+                "pattern": options.pattern,
+                "path": options.path,
+                "limit": options.limit,
+                "context_before": options.context_before,
+                "context_after": options.context_after,
+                "include_globs": options.include_globs,
+                "exclude_globs": options.exclude_globs,
+                "result_mode": options.result_mode.as_str(),
+                "timeout_secs": command_timeout,
+            });
             let (req_id, rx) = match self
                 .shell_clients
                 .enqueue_run(
                     ShellRunRequest {
                         client_id,
                         cwd: Some(proj.path.clone()),
-                        command: cmd,
-                        stdin: None,
+                        command: format!("{EXTERNAL_SEARCH_REQUEST_PREFIX}\n{cmd}"),
+                        stdin: Some(payload.to_string()),
                         timeout_secs: command_timeout,
                         wait_timeout_secs: wait_timeout,
                     },
@@ -3847,7 +3875,11 @@ impl ToolRuntime {
             };
             return match tokio::time::timeout(Duration::from_secs(outer_timeout), rx).await {
                 Ok(Ok(resp)) => {
-                    let stdout = resp.stdout.unwrap_or_default();
+                    let raw_stdout = resp.stdout.unwrap_or_default();
+                    if let Some(result) = external_provider_error_result(&raw_stdout) {
+                        return result;
+                    }
+                    let stdout = raw_stdout;
                     let stderr = resp.stderr.unwrap_or_default();
                     let agent_error = resp.error.as_deref();
                     if looks_like_search_timeout(

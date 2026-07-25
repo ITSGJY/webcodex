@@ -706,6 +706,7 @@ fn register_policy_summary(cfg: &AgentConfig, prepared_cache_count: usize) -> Ag
             &cfg.shell,
             prepared_cache_count,
         )),
+        tool_providers: Some(webcodex_agent::external_tools::external_tools().status()),
     }
 }
 
@@ -1675,6 +1676,7 @@ mod tests {
             transport: None,
             websocket_connect_timeout_secs: default_websocket_connect_timeout_secs(),
             quic: None,
+            tool_providers: Default::default(),
         }
     }
 

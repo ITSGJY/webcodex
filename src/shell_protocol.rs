@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+pub(crate) const EXTERNAL_SEARCH_REQUEST_PREFIX: &str = "# webcodex:search_project_text:v1";
 
 fn default_shell_true() -> bool {
     true
@@ -194,6 +197,24 @@ pub struct ShellProfilesSummary {
     pub profiles: Vec<ShellProfileSummaryEntry>,
 }
 
+/// Bounded, non-secret snapshot of the agent's experimental tool providers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolProvidersStatus {
+    pub strategy: String,
+    pub claude_code: ClaudeCodeProviderStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeCodeProviderStatus {
+    pub enabled: bool,
+    pub version: Option<String>,
+    pub available: bool,
+    pub process_state: String,
+    pub discovered_tool_names: Vec<String>,
+    pub capabilities: BTreeMap<String, String>,
+    pub last_error_code: Option<String>,
+}
+
 /// Sanitized agent policy summary. Carried in the registration payload and
 /// exposed in `runtime_status` / `listAgents`. Contains ONLY non-secret
 /// fields: it never includes the agent token, shell env values, init_script
@@ -218,6 +239,9 @@ pub struct AgentPolicySummary {
     /// did not report one. Never carries env values or init_script bodies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell_profiles: Option<ShellProfilesSummary>,
+    /// Read-only provider state captured when the agent registers/reconnects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_providers: Option<ToolProvidersStatus>,
 }
 
 impl Default for AgentPolicySummary {
@@ -229,6 +253,7 @@ impl Default for AgentPolicySummary {
             max_timeout_secs: default_policy_max_timeout_secs(),
             max_output_bytes: default_policy_max_output_bytes(),
             shell_profiles: None,
+            tool_providers: None,
         }
     }
 }

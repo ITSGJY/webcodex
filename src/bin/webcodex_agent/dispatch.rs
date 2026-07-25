@@ -1,3 +1,4 @@
+use super::external_tools::{external_tools, ExternalRoute};
 use super::lsp::{handle_lsp_request, is_lsp_request_kind, LspSupervisor};
 use super::validation::{handle_validation_request, is_validation_request_kind};
 use super::{handle_project_op, run_shell_with_profiles, AgentPolicy, AgentSink, ShellConfig};
@@ -18,6 +19,9 @@ pub(crate) fn dispatch_request(
     lsp: &LspSupervisor,
     request: ShellAgentShellRequest,
 ) -> Result<bool, String> {
+    if let ExternalRoute::Handled(result) = external_tools().route(policy, &request) {
+        return sink.submit_result(request.request_id, result);
+    }
     match request.kind.as_str() {
         "start_job" | "start_validation_job" => {
             jobs.enqueue(
