@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use std::path::Path;
 use std::time::Duration;
 
 use super::tool_result::ToolResult;
@@ -97,22 +98,27 @@ pub(crate) fn validate_preflight_path(path: &str) -> Result<(), String> {
 
 /// Sensitive path components that `validate_patch` should warn about (but not
 /// hard-reject). The preflight still runs; the caller sees the warning and can
-/// decide whether to proceed with `apply_patch`. Matching is case-insensitive
-/// substring so it catches `foo/.env`, `agent.toml.bak`, `target/debug`, etc.
+/// decide whether to proceed with `apply_patch`. Sensitive filenames retain
+/// case-insensitive substring matching, while sensitive directories match
+/// complete normalized path components so names like `targeting.rs` stay safe.
 pub(crate) fn sensitive_path_warnings(path: &str) -> Vec<String> {
     let lower = path.to_lowercase();
-    let sensitive = [
-        "agent.toml",
-        "webcodex.env",
-        ".env",
-        "projects.d",
-        ".git",
-        "target",
-        "node_modules",
-    ];
+    let sensitive_files = ["agent.toml", "webcodex.env", ".env"];
+    let sensitive_directories = ["projects.d", ".git", "target", "node_modules"];
     let mut warnings = Vec::new();
-    for name in sensitive {
+    for name in sensitive_files {
         if lower.contains(name) {
+            warnings.push(format!(
+                "patch touches sensitive path component '{}': {}",
+                name, path
+            ));
+        }
+    }
+    for name in sensitive_directories {
+        if Path::new(&lower)
+            .components()
+            .any(|component| component.as_os_str() == name)
+        {
             warnings.push(format!(
                 "patch touches sensitive path component '{}': {}",
                 name, path

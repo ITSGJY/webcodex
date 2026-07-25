@@ -9,6 +9,48 @@ use crate::tool_runtime::ToolRuntime;
 use serde_json::json;
 use std::fs;
 
+#[tokio::test]
+async fn git_restore_paths_restores_tracked_filename_containing_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(
+        tmp.path(),
+        "SMOKE_TARGET.txt",
+        "original\n",
+        "track smoke target",
+    );
+    fs::write(tmp.path().join("SMOKE_TARGET.txt"), "modified\n").unwrap();
+
+    let runtime = test_runtime();
+    let project =
+        register_agent_project_at_path(&runtime, "restore-target-substring", "repo", tmp.path())
+            .await;
+    let restore = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .git_restore_paths(project, vec!["SMOKE_TARGET.txt".to_string()])
+                .await
+        }
+    });
+
+    let request = next_patch_agent_request(&runtime, "restore-target-substring")
+        .await
+        .expect("git_restore_paths should enqueue an agent shell request");
+    assert_eq!(request.command, "git restore -- 'SMOKE_TARGET.txt'");
+    complete_agent_request_by_running_locally(&runtime, "restore-target-substring", request).await;
+
+    let result = restore.await.unwrap();
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("SMOKE_TARGET.txt")).unwrap(),
+        "original\n"
+    );
+    let (exit_code, stdout, stderr, _) = run_command_sync("git status --porcelain", tmp.path(), 30);
+    assert_eq!(exit_code, 0, "git status failed: {stderr}");
+    assert!(stdout.is_empty(), "worktree should be clean: {stdout}");
+}
+
 #[test]
 fn git_diff_hunks_tool_is_known_and_schema_is_bounded() {
     assert!(is_known_tool_name("git_diff_hunks"));

@@ -891,16 +891,43 @@ async fn patch_tools_reject_server_configured_project() {
 }
 
 #[test]
-fn cleanup_paths_reject_sensitive_and_project_root() {
+fn cleanup_paths_match_sensitive_directories_by_complete_component() {
     let root = vec![".".to_string()];
     assert!(validate_limited_cleanup_paths(&root, true).is_err());
-    let sensitive = vec!["agent.toml".to_string()];
-    assert!(validate_limited_cleanup_paths(&sensitive, true).is_err());
-    let safe = vec!["tmp_web_codex_smoke.txt".to_string()];
-    assert_eq!(
-        validate_limited_cleanup_paths(&safe, true).unwrap(),
-        vec!["tmp_web_codex_smoke.txt".to_string()]
-    );
+
+    for path in [
+        "agent.toml",
+        ".env",
+        ".git/config",
+        "target",
+        "target/debug",
+        "foo/target/cache",
+        "./target/release",
+        "TARGET/release/output",
+    ] {
+        let paths = vec![path.to_string()];
+        assert!(
+            validate_limited_cleanup_paths(&paths, true).is_err(),
+            "sensitive path should be rejected: {path}"
+        );
+    }
+
+    for path in [
+        "SMOKE_TARGET.txt",
+        "targeting.rs",
+        "build_target.md",
+        "my-target.txt",
+        "not_target/file.rs",
+        "target-file.txt",
+        "src/targeting/mod.rs",
+    ] {
+        let paths = vec![path.to_string()];
+        assert_eq!(
+            validate_limited_cleanup_paths(&paths, true).unwrap(),
+            paths,
+            "ordinary target substring should be allowed: {path}"
+        );
+    }
 }
 
 #[test]

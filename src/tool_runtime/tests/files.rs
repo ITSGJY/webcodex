@@ -501,6 +501,7 @@ fn sensitive_path_warnings_flags_sensitive_names() {
     assert!(sensitive_path_warnings("target/debug/x")
         .iter()
         .any(|w| w.contains("target")));
+    assert!(sensitive_path_warnings("SMOKE_TARGET.txt").is_empty());
     assert!(sensitive_path_warnings("node_modules/x")
         .iter()
         .any(|w| w.contains("node_modules")));
