@@ -48,8 +48,9 @@ latter falls back to the existing bounded Native `rg`/`grep` command. Strict
 is available. The provider does not route search through Claude's `Bash` tool.
 
 The agent runs one lazy child per canonical registered project root, fixes the
-child `cwd` to that root, bounds requests/responses/pending calls/stderr, and
-terminates a timed-out child so a late request cannot keep running. The next
+child `cwd` to that root, bounds requests/responses/pending calls, discards
+child stderr, and terminates a timed-out child so a late request cannot keep
+running. The next
 call starts a fresh child lazily. It passes only a small environment allowlist
 needed for executable lookup, locale, temporary files, and Claude's local
 configuration. It does not inherit API-key or WebCodex credential variables.
@@ -57,18 +58,79 @@ configuration. It does not inherit API-key or WebCodex credential variables.
 WebCodex `read_file` always keeps its existing Native implementation. The
 experimental provider does not discover, map, or call Claude's `Read` tool.
 
+Claude tools remain an agent-internal implementation detail. WebCodex builds
+its public MCP `tools/list`, runtime registry, OAuth policy, and OpenAPI from
+the static WebCodex tool definitions only. Claude `tools/list` output is never
+inserted into those registries. A Claude upgrade may therefore add `Read`,
+`Bash`, `Write`, or other names to provider discovery without making any of
+them visible to an external WebCodex client. Public names and input schemas,
+including `replace_in_file`, are identical with the provider disabled or
+enabled.
+
 The bounded version reported by MCP `initialize.serverInfo` is exposed in
-provider status after a successful start; status queries never start Claude.
+provider status after a successful start. A version is retained only when it
+matches a small version-string character allowlist. Status queries are passive:
+`runtime_status`, `list_agents`, and local snapshot reads never start Claude.
 The executable path is not exposed, and a missing command never prevents the
 agent from starting.
 
-`runtime_status` and `listAgents` expose the agent's last registration snapshot
-under `tool_providers`. It includes the strategy, enabled/available flags,
-bounded MCP version, process state, at most 64 discovered tool names,
-`available` / `schema_mismatch` / `unmapped` for each of the two capabilities,
-and the last bounded error code. The snapshot is refreshed on agent
-registration or transport reconnect. It never contains environment variables,
-authentication data, Claude configuration, executable paths, or stderr.
+`runtime_status` and `listAgents` expose the current bounded snapshot under
+`tool_providers`. Registration and reconnect carry a complete snapshot. Later
+changed revisions reuse the existing agent transport: polling agents attach
+them to their next poll, while WebSocket/QUIC agents send a changed-only
+`runtime_metadata` envelope after a result or on the existing keepalive tick.
+There is no extra blocking round trip per tool call. Repeated identical state
+is not resent, metadata send failure does not change a tool result, and network
+I/O occurs after the provider state lock has been released.
+
+The provider lifecycle uses `not_started`, `starting`, `initializing`,
+`discovering`, `mapping`, `running`, and `stopped`. State revisions are produced
+when configuration is initialized, the child starts, initialize succeeds,
+tools/list succeeds, mappings are validated, a call succeeds or fails, a
+timeout/EOF/process exit occurs, shutdown runs, or a later call restarts the
+child lazily. `available=true` means an initialized/discovered provider process
+is reusable; a timeout or connection loss makes it unavailable until lazy
+restart succeeds.
+
+`claude_code.last_call` is one bounded summary, not an unbounded history:
+
+```json
+{
+  "capability": "edit_file",
+  "selected_provider": "claude_code",
+  "fallback_used": false,
+  "result": "success",
+  "write_state": "confirmed",
+  "duration_ms": 14,
+  "error_code": null
+}
+```
+
+`write_state` is absent for search and is one of `not_submitted`, `confirmed`,
+or `uncertain` for edit. A successful Native search fallback records
+`selected_provider=native`, `fallback_used=true`, and no final error code;
+`last_error_code` still identifies the Claude-side reason that caused the
+fallback. An Edit may fall back only from `not_submitted`. RPC error, EOF,
+timeout, Claude tool error, or failed post-write verification is `uncertain`
+and cannot execute a second Native write.
+
+All provider strings are allowlisted or bounded, discovered names are sorted,
+deduplicated, and capped at 64, and only the two configured WebCodex capability
+keys are accepted by the server. Provider status never contains environment
+variables, authentication data, Claude configuration, executable/project
+paths, request arguments, file contents, user code, stderr, raw RPC responses,
+tokens, or cookies.
+
+For a non-mutating active probe, use the opt-in diagnostic test. It creates an
+empty temporary directory, starts `claude mcp serve`, performs only initialize
+and tools/list, prints the safe status object, and shuts the process group down.
+It does not call Edit, read a project file, run Bash, install Claude, log in, or
+start a model conversation:
+
+```bash
+WEBCODEX_PROBE_CLAUDE_PROVIDER=1 \
+cargo test --bin webcodex-agent opt_in_real_claude_mcp_probe -- --nocapture
+```
 
 The default test suite uses a standalone fake stdio MCP server. A real local
 smoke check is opt-in:
@@ -78,6 +140,23 @@ WEBCODEX_TEST_CLAUDE_MCP=1 cargo test --bin webcodex-agent opt_in_real_claude_mc
 ```
 
 This smoke test prints a bounded tool/schema inventory, resolves configured or
-schema-compatible Grep/Edit mappings, calls both tools only inside a temporary
-fixture, verifies the edit, and confirms provider shutdown reaps its Claude
-process. It does not install Claude Code or perform login.
+schema-compatible Grep/Edit mappings, calls available tools only inside a
+temporary fixture, verifies Edit, reports Grep as unavailable when the installed
+version has none, and confirms provider shutdown reaps its Claude process. It
+does not install Claude Code or perform login.
+
+The full server/agent path is also opt-in:
+
+```bash
+WEBCODEX_E2E_CLAUDE_PROVIDER=1 \
+./scripts/test-claude-provider-e2e.sh
+```
+
+It builds a temporary Git fixture, uses independent server/agent configuration,
+an automatically selected loopback port, and a temporary HOME/XDG/Claude config
+directory. It checks the public MCP tool set before and after Claude discovery,
+Native read, Native `rg`/`grep` search fallback, strict Claude Edit evidence,
+file restoration, a clean worktree, provider process-group cleanup, and port
+release. The default suite never requires Claude Code, login, network, a fixed
+fixture path, or user-global configuration. Default `native` strategy behavior
+is unchanged.

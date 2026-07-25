@@ -8,7 +8,8 @@ use crate::shell_protocol::{
     ShellAgentResultResponse, AGENT_PROTOCOL_VERSION_QUIC_V1, AGENT_PROTOCOL_VERSION_WEBSOCKET_V1,
 };
 use crate::{
-    build_register_request, dispatch_request, handle_one_poll, register, CommandResult, JobManager,
+    build_register_request_with_provider_status, dispatch_request, handle_one_poll, register,
+    CommandResult, JobManager,
 };
 use reqwest::blocking::Client;
 use std::fmt;
@@ -48,6 +49,14 @@ const JOB_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Granularity for signal-aware sleeps in the blocking polling loop.
 const POLLING_SHUTDOWN_SLEEP_SLICE: Duration = Duration::from_millis(50);
+
+fn claim_provider_metadata() -> Option<(AgentEnvelope, u64)> {
+    super::external_tools::external_tools()
+        .claim_status_update()
+        .map(|(tool_providers, revision)| {
+            (AgentEnvelope::RuntimeMetadata { tool_providers }, revision)
+        })
+}
 
 struct AgentRuntimeState {
     lsp: LspSupervisor,
@@ -377,7 +386,7 @@ impl AgentSink {
             duration_ms: result.duration_ms,
             error: result.error,
         };
-        match self {
+        let submitted = match self {
             AgentSink::Http(h) => {
                 let resp: ShellAgentResultResponse = post_json_raw(
                     &h.client,
@@ -400,6 +409,24 @@ impl AgentSink {
                     .map_err(|_| "agent transport send failed".to_string())?;
                 Ok(true)
             }
+        };
+        if submitted.is_ok() {
+            self.send_provider_metadata_best_effort();
+        }
+        submitted
+    }
+
+    fn send_provider_metadata_best_effort(&self) {
+        let (AgentSink::WebSocket { tx, .. } | AgentSink::Quic { tx, .. }) = self else {
+            return;
+        };
+        let Some((metadata, revision)) = claim_provider_metadata() else {
+            return;
+        };
+        if tx.try_send(metadata).is_err() {
+            super::external_tools::external_tools().release_status_update(revision);
+        } else {
+            super::external_tools::external_tools().mark_status_reported(revision);
         }
     }
 
@@ -1048,7 +1075,7 @@ async fn quic_session(
     // Register. The token is carried in `auth_token`; the server authenticates
     // it exactly like the websocket/polling paths. It is never logged.
     let projects_count = enabled_projects_count(&projects);
-    let register_payload = build_register_request(
+    let (register_payload, provider_revision) = build_register_request_with_provider_status(
         cfg,
         projects,
         AGENT_PROTOCOL_VERSION_QUIC_V1,
@@ -1069,7 +1096,9 @@ async fn quic_session(
         .map_err(|_| "quic register ack timed out".to_string())?
         .map_err(|e| format!("failed to read quic register ack: {}", e))?;
     match ack {
-        AgentEnvelope::Registered { success: true, .. } => {}
+        AgentEnvelope::Registered { success: true, .. } => {
+            super::external_tools::external_tools().mark_status_reported(provider_revision);
+        }
         AgentEnvelope::Registered { error, .. } => {
             return Err(format!(
                 "register rejected by server: {}",
@@ -1210,11 +1239,16 @@ async fn quic_session(
                     transport = "quic",
                     "webcodex-agent quic keepalive ping"
                 );
-                let _ = out_tx
-                    .send(AgentEnvelope::Ping {
-                        ts: chrono::Utc::now().timestamp(),
-                    })
-                    .await;
+                if let Some((metadata, revision)) = claim_provider_metadata() {
+                    if out_tx.try_send(metadata).is_err() {
+                        super::external_tools::external_tools().release_status_update(revision);
+                    } else {
+                        super::external_tools::external_tools().mark_status_reported(revision);
+                    }
+                }
+                let _ = out_tx.send(AgentEnvelope::Ping {
+                    ts: chrono::Utc::now().timestamp(),
+                }).await;
             }
         }
     }
@@ -1435,7 +1469,7 @@ where
     // registration time (snapshots are prepared lazily on first use), so
     // `prepared_cache_count` is reported as 0 here.
     let projects_count = enabled_projects_count(&projects);
-    let register_payload = build_register_request(
+    let (register_payload, provider_revision) = build_register_request_with_provider_status(
         cfg,
         projects,
         AGENT_PROTOCOL_VERSION_WEBSOCKET_V1,
@@ -1465,7 +1499,9 @@ where
     let ack = AgentEnvelope::from_slice(ack_text.as_bytes())
         .map_err(|e| format!("register ack is not a valid envelope: {}", e))?;
     match ack {
-        AgentEnvelope::Registered { success: true, .. } => {}
+        AgentEnvelope::Registered { success: true, .. } => {
+            super::external_tools::external_tools().mark_status_reported(provider_revision);
+        }
         AgentEnvelope::Registered { error, .. } => {
             return Err(format!(
                 "register rejected by server: {}",
@@ -1623,11 +1659,16 @@ where
                     transport = "websocket",
                     "webcodex-agent websocket keepalive ping"
                 );
-                let _ = out_tx
-                    .send(AgentEnvelope::Ping {
-                        ts: chrono::Utc::now().timestamp(),
-                    })
-                    .await;
+                if let Some((metadata, revision)) = claim_provider_metadata() {
+                    if out_tx.try_send(metadata).is_err() {
+                        super::external_tools::external_tools().release_status_update(revision);
+                    } else {
+                        super::external_tools::external_tools().mark_status_reported(revision);
+                    }
+                }
+                let _ = out_tx.send(AgentEnvelope::Ping {
+                    ts: chrono::Utc::now().timestamp(),
+                }).await;
             }
         }
     }

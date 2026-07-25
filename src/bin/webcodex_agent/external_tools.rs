@@ -10,7 +10,7 @@ use super::patches::validate_line_edit_agent_path;
 use super::shell::cwd_allowed;
 use super::AgentPolicy;
 use crate::shell_protocol::{
-    ClaudeCodeProviderStatus, ShellAgentShellRequest, ToolProvidersStatus,
+    ClaudeCodeProviderStatus, ProviderCallSummary, ShellAgentShellRequest, ToolProvidersStatus,
     EXTERNAL_SEARCH_REQUEST_PREFIX,
 };
 use serde_json::{json, Value};
@@ -44,7 +44,7 @@ impl ProviderCapability {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WriteState {
-    NotStarted,
+    NotSubmitted,
     Uncertain,
 }
 
@@ -58,7 +58,7 @@ impl ProviderError {
     fn new(code: &'static str) -> Self {
         Self {
             code,
-            write_state: WriteState::NotStarted,
+            write_state: WriteState::NotSubmitted,
         }
     }
 
@@ -78,12 +78,20 @@ struct ToolExecutionContext<'a> {
 
 pub(crate) enum ExternalRoute {
     Native,
+    NativeFallback(NativeFallback),
     Handled(CommandResult),
+}
+
+pub(crate) struct NativeFallback {
+    capability: ProviderCapability,
+    started: Instant,
 }
 
 pub(crate) struct ExternalToolRouter {
     strategy: ToolProviderStrategy,
     claude: ClaudeCodeMcpProvider,
+    sent_status_revision: AtomicU64,
+    claimed_status_revision: AtomicU64,
 }
 
 static EXTERNAL_TOOLS: OnceLock<ExternalToolRouter> = OnceLock::new();
@@ -103,6 +111,8 @@ impl ExternalToolRouter {
         Self {
             strategy: config.strategy,
             claude: ClaudeCodeMcpProvider::new(config.claude_code.clone()),
+            sent_status_revision: AtomicU64::new(0),
+            claimed_status_revision: AtomicU64::new(0),
         }
     }
 
@@ -110,16 +120,68 @@ impl ExternalToolRouter {
         self.claude.shutdown();
     }
 
+    #[cfg(test)]
     pub(crate) fn status(&self) -> ToolProvidersStatus {
-        ToolProvidersStatus {
-            strategy: match self.strategy {
-                ToolProviderStrategy::Native => "native",
-                ToolProviderStrategy::ClaudeCode => "claude_code",
-                ToolProviderStrategy::ClaudeCodeThenNative => "claude_code_then_native",
-            }
-            .to_string(),
-            claude_code: self.claude.status(),
+        self.status_with_revision().0
+    }
+
+    fn status_with_revision(&self) -> (ToolProvidersStatus, u64) {
+        let (claude_code, revision) = self.claude.status_with_revision();
+        (
+            ToolProvidersStatus {
+                strategy: self.strategy_name().to_string(),
+                claude_code,
+            },
+            revision,
+        )
+    }
+
+    fn strategy_name(&self) -> &'static str {
+        match self.strategy {
+            ToolProviderStrategy::Native => "native",
+            ToolProviderStrategy::ClaudeCode => "claude_code",
+            ToolProviderStrategy::ClaudeCodeThenNative => "claude_code_then_native",
         }
+    }
+
+    /// Claim one changed status revision for an existing transport message.
+    /// Snapshotting completes before the caller performs any network I/O.
+    pub(crate) fn claim_status_update(&self) -> Option<(ToolProvidersStatus, u64)> {
+        if self.claimed_status_revision.load(Ordering::SeqCst) != 0 {
+            return None;
+        }
+        let (status, revision) = self.status_with_revision();
+        if revision <= self.sent_status_revision.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.claimed_status_revision
+            .compare_exchange(0, revision, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| (status, revision))
+    }
+
+    pub(crate) fn mark_status_reported(&self, revision: u64) {
+        self.sent_status_revision
+            .fetch_max(revision, Ordering::SeqCst);
+        let _ = self.claimed_status_revision.compare_exchange(
+            revision,
+            0,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+
+    pub(crate) fn release_status_update(&self, revision: u64) {
+        let _ = self.claimed_status_revision.compare_exchange(
+            revision,
+            0,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+
+    pub(crate) fn registration_status(&self) -> (ToolProvidersStatus, u64) {
+        self.status_with_revision()
     }
 
     pub(crate) fn route(
@@ -157,6 +219,18 @@ impl ExternalToolRouter {
             Ok(checked) => checked,
             Err(error) => {
                 self.claude.record_error(&error);
+                self.claude.record_call(
+                    call_summary(
+                        capability,
+                        "claude_code",
+                        false,
+                        false,
+                        error_write_state(capability, error.write_state),
+                        started,
+                        Some(error.code),
+                    ),
+                    false,
+                );
                 return ExternalRoute::Handled(provider_error_result(capability, error, started));
             }
         };
@@ -172,13 +246,27 @@ impl ExternalToolRouter {
             timeout_secs: request.timeout_secs.max(1).min(policy.max_timeout_secs),
         };
         match self.claude.call(capability, payload, context) {
-            Ok(output) => ExternalRoute::Handled(command_result(
-                output
-                    .as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| output.to_string()),
-                started,
-            )),
+            Ok(output) => {
+                self.claude.record_call(
+                    call_summary(
+                        capability,
+                        "claude_code",
+                        false,
+                        true,
+                        (capability == ProviderCapability::EditFile).then_some("confirmed"),
+                        started,
+                        None,
+                    ),
+                    true,
+                );
+                ExternalRoute::Handled(command_result(
+                    output
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| output.to_string()),
+                    started,
+                ))
+            }
             Err(error) => self.failure_or_native(capability, error, started),
         }
     }
@@ -192,11 +280,99 @@ impl ExternalToolRouter {
         self.claude.record_error(&error);
         if self.strategy == ToolProviderStrategy::ClaudeCodeThenNative
             && (capability != ProviderCapability::EditFile
-                || error.write_state == WriteState::NotStarted)
+                || error.write_state == WriteState::NotSubmitted)
         {
-            ExternalRoute::Native
+            ExternalRoute::NativeFallback(NativeFallback {
+                capability,
+                started,
+            })
         } else {
+            self.claude.record_call(
+                call_summary(
+                    capability,
+                    "claude_code",
+                    false,
+                    false,
+                    error_write_state(capability, error.write_state),
+                    started,
+                    Some(error.code),
+                ),
+                false,
+            );
             ExternalRoute::Handled(provider_error_result(capability, error, started))
+        }
+    }
+
+    pub(crate) fn complete_native_fallback(
+        &self,
+        fallback: NativeFallback,
+        result: &CommandResult,
+    ) {
+        let succeeded = native_result_succeeded(fallback.capability, result);
+        let write_state =
+            (fallback.capability == ProviderCapability::EditFile).then_some(if succeeded {
+                "confirmed"
+            } else {
+                "not_submitted"
+            });
+        self.claude.record_call(
+            call_summary(
+                fallback.capability,
+                "native",
+                true,
+                succeeded,
+                write_state,
+                fallback.started,
+                (!succeeded).then_some("native_tool_failed"),
+            ),
+            false,
+        );
+    }
+}
+
+fn call_summary(
+    capability: ProviderCapability,
+    selected_provider: &str,
+    fallback_used: bool,
+    succeeded: bool,
+    write_state: Option<&str>,
+    started: Instant,
+    error_code: Option<&str>,
+) -> ProviderCallSummary {
+    ProviderCallSummary {
+        capability: capability.name().to_string(),
+        selected_provider: selected_provider.to_string(),
+        fallback_used,
+        result: if succeeded { "success" } else { "failure" }.to_string(),
+        write_state: write_state.map(str::to_string),
+        duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        error_code: error_code.map(str::to_string),
+    }
+}
+
+fn error_write_state(
+    capability: ProviderCapability,
+    write_state: WriteState,
+) -> Option<&'static str> {
+    (capability == ProviderCapability::EditFile).then_some(match write_state {
+        WriteState::NotSubmitted => "not_submitted",
+        WriteState::Uncertain => "uncertain",
+    })
+}
+
+fn native_result_succeeded(capability: ProviderCapability, result: &CommandResult) -> bool {
+    if result.error.is_some() {
+        return false;
+    }
+    match capability {
+        ProviderCapability::SearchProjectText => matches!(result.exit_code, Some(0 | 1)),
+        ProviderCapability::EditFile => {
+            result.exit_code == Some(0)
+                && result
+                    .stdout
+                    .as_deref()
+                    .and_then(|stdout| serde_json::from_str::<Value>(stdout).ok())
+                    .is_some_and(|output| output.get("error").map_or(true, Value::is_null))
         }
     }
 }
@@ -207,7 +383,7 @@ fn provider_error_result(
     started: Instant,
 ) -> CommandResult {
     let (write_state, changed) = match error.write_state {
-        WriteState::NotStarted => ("not_started", Value::Bool(false)),
+        WriteState::NotSubmitted => ("not_submitted", Value::Bool(false)),
         WriteState::Uncertain => ("uncertain", Value::Null),
     };
     let output = json!({
@@ -269,76 +445,126 @@ fn path_error() -> ProviderError {
     ProviderError::new("provider_path_rejected")
 }
 
+fn unmapped_capabilities() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("edit_file".to_string(), "unmapped".to_string()),
+        ("search_project_text".to_string(), "unmapped".to_string()),
+    ])
+}
+
+struct ProviderState {
+    status: Mutex<ClaudeCodeProviderStatus>,
+    revision: AtomicU64,
+}
+
+impl ProviderState {
+    fn new(enabled: bool) -> Self {
+        Self {
+            status: Mutex::new(ClaudeCodeProviderStatus {
+                enabled,
+                version: None,
+                available: false,
+                process_state: "not_started".to_string(),
+                discovered_tool_names: Vec::new(),
+                capabilities: unmapped_capabilities(),
+                last_error_code: None,
+                last_call: None,
+            }),
+            // Revision one represents the initialized configuration snapshot.
+            revision: AtomicU64::new(1),
+        }
+    }
+
+    fn update(&self, update: impl FnOnce(&mut ClaudeCodeProviderStatus)) {
+        let mut status = self.status.lock().unwrap();
+        let previous = status.clone();
+        update(&mut status);
+        if *status != previous {
+            self.revision.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn snapshot_with_revision(&self) -> (ClaudeCodeProviderStatus, u64) {
+        let status = self.status.lock().unwrap();
+        (status.clone(), self.revision.load(Ordering::SeqCst))
+    }
+
+    fn stopped(&self, error_code: Option<&str>) {
+        self.update(|status| {
+            status.available = false;
+            status.process_state = "stopped".to_string();
+            if let Some(error_code) = error_code {
+                status.last_error_code = Some(error_code.to_string());
+            }
+        });
+    }
+}
+
 struct ClaudeCodeMcpProvider {
     config: ClaudeCodeMcpConfig,
     projects: Mutex<HashMap<PathBuf, Arc<ProjectMcpClient>>>,
-    version: Mutex<Option<String>>,
-    last_error_code: Mutex<Option<&'static str>>,
+    state: Arc<ProviderState>,
 }
 
 impl ClaudeCodeMcpProvider {
     fn new(config: ClaudeCodeMcpConfig) -> Self {
+        let state = Arc::new(ProviderState::new(config.enabled));
         Self {
             config,
             projects: Mutex::new(HashMap::new()),
-            version: Mutex::new(None),
-            last_error_code: Mutex::new(None),
+            state,
         }
     }
 
     fn shutdown(&self) {
-        for (_, client) in self.projects.lock().unwrap().drain() {
+        let clients = self
+            .projects
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, client)| client)
+            .collect::<Vec<_>>();
+        for client in clients {
             client.connection.shutdown();
         }
+        self.state.stopped(None);
     }
 
     fn record_error(&self, error: &ProviderError) {
-        *self.last_error_code.lock().unwrap() = Some(error.code);
+        self.state.update(|status| {
+            status.last_error_code = Some(error.code.to_string());
+        });
     }
 
-    fn status(&self) -> ClaudeCodeProviderStatus {
-        let projects = self.projects.lock().unwrap();
-        let client = projects.values().next();
-        let version = self.version.lock().unwrap().clone();
-        let last_error_code = self.last_error_code.lock().unwrap().map(str::to_string);
-        let running = projects.values().any(|client| client.connection.is_alive());
-        let mapping_status = |capability| {
-            client
-                .map(|client| client.mapping_status(capability, &self.config))
-                .unwrap_or("unmapped")
-                .to_string()
-        };
-        let capabilities = BTreeMap::from([
-            (
-                "search_project_text".to_string(),
-                mapping_status(ProviderCapability::SearchProjectText),
-            ),
-            (
-                "edit_file".to_string(),
-                mapping_status(ProviderCapability::EditFile),
-            ),
-        ]);
-        ClaudeCodeProviderStatus {
-            enabled: self.config.enabled,
-            version: version.clone(),
-            available: running,
-            process_state: if running {
-                "running"
-            } else if version.is_some() || last_error_code.is_some() {
-                "stopped"
-            } else {
-                "not_started"
+    fn record_call(&self, summary: ProviderCallSummary, clear_error: bool) {
+        self.state.update(|status| {
+            status.last_call = Some(summary);
+            if clear_error && status.process_state == "running" {
+                status.last_error_code = None;
             }
-            .to_string(),
-            discovered_tool_names: client
-                .into_iter()
-                .flat_map(|client| client.tools.keys())
-                .map(|name| sanitize_name(name))
-                .take(64)
-                .collect(),
-            capabilities,
-            last_error_code,
+        });
+    }
+
+    #[cfg(test)]
+    fn status(&self) -> ClaudeCodeProviderStatus {
+        self.status_with_revision().0
+    }
+
+    fn status_with_revision(&self) -> (ClaudeCodeProviderStatus, u64) {
+        if self
+            .projects
+            .try_lock()
+            .ok()
+            .is_some_and(|projects| projects.values().any(|client| client.connection.is_alive()))
+        {
+            self.state.update(|status| {
+                if status.process_state == "stopped" {
+                    status.available = true;
+                    status.process_state = "running".to_string();
+                }
+            });
         }
+        self.state.snapshot_with_revision()
     }
 
     fn project_client(
@@ -359,14 +585,23 @@ impl ClaudeCodeMcpProvider {
             client.connection.shutdown();
             projects.remove(root);
         }
-        let client = match ProjectMcpClient::start(root, &self.config, deadline) {
-            Ok(client) => Arc::new(client),
-            Err(error) => {
-                self.record_error(&error);
-                return Err(error);
-            }
-        };
-        *self.version.lock().unwrap() = client.version.clone();
+        self.state.update(|status| {
+            status.available = false;
+            status.process_state = "starting".to_string();
+            status.version = None;
+            status.discovered_tool_names.clear();
+            status.capabilities = unmapped_capabilities();
+            status.last_error_code = None;
+        });
+        let client =
+            match ProjectMcpClient::start(root, &self.config, deadline, Arc::clone(&self.state)) {
+                Ok(client) => Arc::new(client),
+                Err(error) => {
+                    self.state.stopped(Some(error.code));
+                    self.record_error(&error);
+                    return Err(error);
+                }
+            };
         projects.insert(root.to_path_buf(), Arc::clone(&client));
         Ok(client)
     }
@@ -394,7 +629,6 @@ impl ClaudeCodeMcpProvider {
 struct ProjectMcpClient {
     connection: Arc<McpConnection>,
     tools: BTreeMap<String, BTreeSet<String>>,
-    version: Option<String>,
 }
 
 impl ProjectMcpClient {
@@ -402,8 +636,9 @@ impl ProjectMcpClient {
         root: &Path,
         config: &ClaudeCodeMcpConfig,
         deadline: Instant,
+        state: Arc<ProviderState>,
     ) -> Result<Self, ProviderError> {
-        let connection = McpConnection::spawn(root, config)?;
+        let connection = McpConnection::spawn(root, config, Arc::clone(&state))?;
         let timeout = || {
             deadline
                 .saturating_duration_since(Instant::now())
@@ -417,17 +652,22 @@ impl ProjectMcpClient {
                 "clientInfo": {"name": "webcodex-agent", "version": env!("CARGO_PKG_VERSION")},
             }),
             timeout(),
-            WriteState::NotStarted,
+            WriteState::NotSubmitted,
         )?;
         let version = initialized
             .pointer("/serverInfo/version")
             .and_then(Value::as_str)
-            .map(sanitize_name);
+            .and_then(sanitize_version);
+        state.update(|status| {
+            status.version = version.clone();
+            status.process_state = "discovering".to_string();
+            status.last_error_code = None;
+        });
         connection.write_json(
             &json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
         )?;
         let listed =
-            connection.request("tools/list", json!({}), timeout(), WriteState::NotStarted)?;
+            connection.request("tools/list", json!({}), timeout(), WriteState::NotSubmitted)?;
         let tools = listed
             .get("tools")
             .and_then(Value::as_array)
@@ -444,11 +684,40 @@ impl ProjectMcpClient {
                 Some((name, fields))
             })
             .collect();
-        Ok(Self {
-            connection,
-            tools,
-            version,
-        })
+        let client = Self { connection, tools };
+        let mut discovered_tool_names = client
+            .tools
+            .keys()
+            .filter_map(|name| sanitize_tool_name(name))
+            .collect::<Vec<_>>();
+        discovered_tool_names.sort();
+        discovered_tool_names.dedup();
+        discovered_tool_names.truncate(64);
+        state.update(|status| {
+            status.discovered_tool_names = discovered_tool_names;
+            status.process_state = "mapping".to_string();
+        });
+        let capabilities = BTreeMap::from([
+            (
+                "edit_file".to_string(),
+                client
+                    .mapping_status(ProviderCapability::EditFile, config)
+                    .to_string(),
+            ),
+            (
+                "search_project_text".to_string(),
+                client
+                    .mapping_status(ProviderCapability::SearchProjectText, config)
+                    .to_string(),
+            ),
+        ]);
+        state.update(|status| {
+            status.capabilities = capabilities;
+            status.available = true;
+            status.process_state = "running".to_string();
+            status.last_error_code = None;
+        });
+        Ok(client)
     }
 
     fn tool_for<'a>(
@@ -505,7 +774,7 @@ impl ProjectMcpClient {
         let failure_state = if capability == ProviderCapability::EditFile {
             WriteState::Uncertain
         } else {
-            WriteState::NotStarted
+            WriteState::NotSubmitted
         };
         let timeout = deadline.saturating_duration_since(Instant::now());
         if timeout.is_zero() {
@@ -703,7 +972,8 @@ struct McpConnection {
     pending: Arc<Mutex<HashMap<u64, PendingSender>>>,
     next_id: AtomicU64,
     alive: Arc<AtomicBool>,
-    shutdown_started: AtomicBool,
+    shutdown_started: Arc<AtomicBool>,
+    state: Arc<ProviderState>,
 }
 
 impl Drop for McpConnection {
@@ -713,7 +983,11 @@ impl Drop for McpConnection {
 }
 
 impl McpConnection {
-    fn spawn(root: &Path, config: &ClaudeCodeMcpConfig) -> Result<Arc<Self>, ProviderError> {
+    fn spawn(
+        root: &Path,
+        config: &ClaudeCodeMcpConfig,
+        state: Arc<ProviderState>,
+    ) -> Result<Arc<Self>, ProviderError> {
         let mut command = Command::new(&config.command);
         command
             .args(&config.args)
@@ -734,15 +1008,20 @@ impl McpConnection {
         let stdout = child.stdout.take().ok_or_else(protocol_error)?;
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
+        let shutdown_started = Arc::new(AtomicBool::new(false));
+        state.update(|status| {
+            status.process_state = "initializing".to_string();
+        });
         let connection = Arc::new(Self {
             child: Mutex::new(child),
             stdin: Arc::clone(&stdin),
             pending: Arc::clone(&pending),
             next_id: AtomicU64::new(1),
             alive: Arc::clone(&alive),
-            shutdown_started: AtomicBool::new(false),
+            shutdown_started: Arc::clone(&shutdown_started),
+            state: Arc::clone(&state),
         });
-        spawn_stdout_reader(stdout, stdin, pending, alive);
+        spawn_stdout_reader(stdout, stdin, pending, alive, shutdown_started, state);
         Ok(connection)
     }
 
@@ -758,7 +1037,7 @@ impl McpConnection {
         failure_state: WriteState,
     ) -> Result<Value, ProviderError> {
         if !self.is_alive() {
-            return Err(protocol_error().with_state(failure_state));
+            return Err(protocol_error());
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
@@ -797,6 +1076,7 @@ impl McpConnection {
             return;
         }
         self.alive.store(false, Ordering::SeqCst);
+        self.state.stopped(None);
         let mut child = self.child.lock().unwrap();
         #[cfg(unix)]
         if child.id() != 0 {
@@ -829,22 +1109,25 @@ fn spawn_stdout_reader(
     stdin: Arc<Mutex<ChildStdin>>,
     pending: Arc<Mutex<HashMap<u64, PendingSender>>>,
     alive: Arc<AtomicBool>,
+    shutdown_started: Arc<AtomicBool>,
+    state: Arc<ProviderState>,
 ) {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
+        let mut terminal_error = ProviderError::new("mcp_connection_closed");
         loop {
             let bytes = match read_bounded_line(&mut reader) {
                 Ok(Some(bytes)) => bytes,
                 Ok(None) => break,
                 Err(error) => {
-                    fail_pending(&pending, error);
+                    terminal_error = error;
                     break;
                 }
             };
             let value: Value = match serde_json::from_slice(&bytes) {
                 Ok(value) => value,
                 Err(_) => {
-                    fail_pending(&pending, ProviderError::new("mcp_invalid_json"));
+                    terminal_error = ProviderError::new("mcp_invalid_json");
                     break;
                 }
             };
@@ -860,7 +1143,7 @@ fn spawn_stdout_reader(
                     "error": {"code": -32601, "message": "Method not found"},
                 });
                 if let Err(error) = write_json(&stdin, &response) {
-                    fail_pending(&pending, error);
+                    terminal_error = error;
                     break;
                 }
                 continue;
@@ -879,7 +1162,10 @@ fn spawn_stdout_reader(
             let _ = sender.send(response);
         }
         alive.store(false, Ordering::SeqCst);
-        fail_pending(&pending, ProviderError::new("mcp_connection_closed"));
+        if !shutdown_started.load(Ordering::SeqCst) {
+            state.stopped(Some(terminal_error.code));
+        }
+        fail_pending(&pending, terminal_error);
     });
 }
 
@@ -922,12 +1208,37 @@ fn apply_safe_environment(command: &mut Command) {
     }
 }
 
+fn sanitize_tool_name(value: &str) -> Option<String> {
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_-.:".contains(character))
+    {
+        return None;
+    }
+    Some(value.chars().take(120).collect())
+}
+
+#[cfg(test)]
 fn sanitize_name(value: &str) -> String {
     value
         .chars()
         .filter(|character| !character.is_control())
         .take(120)
         .collect()
+}
+
+fn sanitize_version(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.chars().any(|character| {
+            !(character.is_ascii_alphanumeric()
+                || matches!(character, ' ' | '.' | '_' | '-' | '+' | '(' | ')'))
+        })
+    {
+        return None;
+    }
+    Some(value.chars().take(80).collect())
 }
 
 #[cfg(test)]

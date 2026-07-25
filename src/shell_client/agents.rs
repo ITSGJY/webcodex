@@ -3,8 +3,8 @@ use super::jobs::{is_final_job_status, offline_last_seen};
 use super::requests::resolve_disconnected_sync_requests_locked;
 use super::state::{NotifierEntry, ShellClientRecord, ShellClientRegistryInner};
 use super::validation::{
-    normalize_project_summaries, trim_string, validate_agent_instance_id, validate_id,
-    validate_optional_field,
+    normalize_project_summaries, normalize_tool_providers, trim_string, validate_agent_instance_id,
+    validate_id, validate_optional_field,
 };
 use super::{now_ts, ShellClientRegistry, CLIENT_ONLINE_WINDOW_SECS, TRANSPORT_POLLING};
 use crate::shell_protocol::{ShellClientRegisterRequest, ShellClientView};
@@ -34,6 +34,10 @@ impl ShellClientRegistry {
 
         let client_id = body.client_id.trim().to_string();
         let agent_instance_id = body.agent_instance_id.trim().to_string();
+        let mut policy = body.policy;
+        if let Some(policy) = policy.as_mut() {
+            policy.tool_providers = normalize_tool_providers(policy.tool_providers.take());
+        }
         let record = ShellClientRecord {
             client_id: client_id.clone(),
             agent_instance_id: agent_instance_id.clone(),
@@ -49,7 +53,7 @@ impl ShellClientRegistry {
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| "unknown".to_string()),
             transport: TRANSPORT_POLLING.to_string(),
-            policy: body.policy,
+            policy,
             auth_group: auth.and_then(ShellClientAuthGroup::from_auth),
         };
         let mut inner = self.inner.lock().await;
@@ -119,6 +123,36 @@ impl ShellClientRegistry {
                 "agent client {} is no longer the active instance (stale or replaced)",
                 client_id
             ));
+        }
+        client.last_seen = now_ts();
+        Ok(())
+    }
+
+    /// Apply sanitized provider metadata to the active agent record. Optional
+    /// metadata is best-effort: malformed/unknown state is ignored by the
+    /// normalizer and never changes transport or tool completion semantics.
+    pub async fn update_tool_providers(
+        &self,
+        client_id: &str,
+        agent_instance_id: &str,
+        status: Option<crate::shell_protocol::ToolProvidersStatus>,
+    ) -> Result<(), String> {
+        let Some(status) = normalize_tool_providers(status) else {
+            return Ok(());
+        };
+        validate_agent_instance_id(agent_instance_id)?;
+        let mut inner = self.inner.lock().await;
+        let Some(client) = inner.clients.get_mut(client_id) else {
+            return Err(format!("unknown shell client: {}", client_id));
+        };
+        if client.agent_instance_id != agent_instance_id {
+            return Err(format!(
+                "agent client {} is no longer the active instance (stale or replaced)",
+                client_id
+            ));
+        }
+        if let Some(policy) = client.policy.as_mut() {
+            policy.tool_providers = Some(status);
         }
         client.last_seen = now_ts();
         Ok(())

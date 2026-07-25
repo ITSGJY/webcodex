@@ -46,11 +46,11 @@ mod job_manager_tests;
 mod webcodex_agent;
 
 use shell_protocol::{
-    AgentPolicySummary, ShellAgentJobUpdateRequest, ShellAgentPollRequest, ShellAgentPollResponse,
-    ShellAgentProjectSummary, ShellAgentShellRequest, ShellClientCapabilities,
-    ShellClientRegisterRequest, ShellClientRegisterResponse, ShellJobValidationProgress,
-    ShellJobValidationStep, ShellProfileSummaryEntry, ShellProfilesSummary,
-    AGENT_PROTOCOL_VERSION_POLLING_V1, VALIDATION_STEP_SPAWN_FAILED_CODE,
+    AgentPolicySummary, ShellAgentJobUpdateRequest, ShellAgentPollPayload, ShellAgentPollRequest,
+    ShellAgentPollResponse, ShellAgentProjectSummary, ShellAgentShellRequest,
+    ShellClientCapabilities, ShellClientRegisterRequest, ShellClientRegisterResponse,
+    ShellJobValidationProgress, ShellJobValidationStep, ShellProfileSummaryEntry,
+    ShellProfilesSummary, AGENT_PROTOCOL_VERSION_POLLING_V1, VALIDATION_STEP_SPAWN_FAILED_CODE,
     VALIDATION_TOOL_UNAVAILABLE_CODE,
 };
 
@@ -633,6 +633,7 @@ fn agent_register_capabilities(cfg: &AgentConfig) -> ShellClientCapabilities {
     capabilities
 }
 
+#[cfg(test)]
 fn build_register_request(
     cfg: &AgentConfig,
     projects: Vec<ShellAgentProjectSummary>,
@@ -640,18 +641,44 @@ fn build_register_request(
     agent_instance_id: &str,
     prepared_cache_count: usize,
 ) -> ShellClientRegisterRequest {
+    build_register_request_with_provider_status(
+        cfg,
+        projects,
+        protocol_version,
+        agent_instance_id,
+        prepared_cache_count,
+    )
+    .0
+}
+
+fn build_register_request_with_provider_status(
+    cfg: &AgentConfig,
+    projects: Vec<ShellAgentProjectSummary>,
+    protocol_version: &str,
+    agent_instance_id: &str,
+    prepared_cache_count: usize,
+) -> (ShellClientRegisterRequest, u64) {
     let capabilities = agent_register_capabilities(cfg);
-    ShellClientRegisterRequest {
-        client_id: cfg.client_id.clone(),
-        agent_instance_id: agent_instance_id.to_string(),
-        display_name: cfg.display_name.clone(),
-        owner: cfg.owner.clone(),
-        hostname: cfg.hostname.clone().or_else(hostname),
-        capabilities: Some(capabilities),
-        projects: Some(projects),
-        agent_protocol_version: Some(protocol_version.to_string()),
-        policy: Some(register_policy_summary(cfg, prepared_cache_count)),
-    }
+    let (tool_providers, revision) =
+        webcodex_agent::external_tools::external_tools().registration_status();
+    (
+        ShellClientRegisterRequest {
+            client_id: cfg.client_id.clone(),
+            agent_instance_id: agent_instance_id.to_string(),
+            display_name: cfg.display_name.clone(),
+            owner: cfg.owner.clone(),
+            hostname: cfg.hostname.clone().or_else(hostname),
+            capabilities: Some(capabilities),
+            projects: Some(projects),
+            agent_protocol_version: Some(protocol_version.to_string()),
+            policy: Some(register_policy_summary(
+                cfg,
+                prepared_cache_count,
+                tool_providers,
+            )),
+        },
+        revision,
+    )
 }
 
 /// Build the sanitized shell-profiles summary from the static shell config.
@@ -695,7 +722,11 @@ fn build_shell_profiles_summary(
 /// values and init_script path are intentionally NOT included. The sanitized
 /// shell-profiles summary is attached so observability can show which profile
 /// a project resolves to without exposing env values or init_script bodies.
-fn register_policy_summary(cfg: &AgentConfig, prepared_cache_count: usize) -> AgentPolicySummary {
+fn register_policy_summary(
+    cfg: &AgentConfig,
+    prepared_cache_count: usize,
+    tool_providers: shell_protocol::ToolProvidersStatus,
+) -> AgentPolicySummary {
     AgentPolicySummary {
         allow_raw_shell: cfg.policy.allow_raw_shell,
         allow_cwd_anywhere: cfg.policy.allow_cwd_anywhere,
@@ -706,7 +737,7 @@ fn register_policy_summary(cfg: &AgentConfig, prepared_cache_count: usize) -> Ag
             &cfg.shell,
             prepared_cache_count,
         )),
-        tool_providers: Some(webcodex_agent::external_tools::external_tools().status()),
+        tool_providers: Some(tool_providers),
     }
 }
 
@@ -719,7 +750,7 @@ fn register(
 ) -> Result<usize, String> {
     let projects = project_cache.get(cfg);
     let projects_count = projects.iter().filter(|project| !project.disabled).count();
-    let body = build_register_request(
+    let (body, provider_revision) = build_register_request_with_provider_status(
         cfg,
         projects,
         AGENT_PROTOCOL_VERSION_POLLING_V1,
@@ -729,6 +760,7 @@ fn register(
     let response: ShellClientRegisterResponse =
         post_json(client, cfg, AGENT_REGISTER_PATH, &body).map_err(|e| e.to_string())?;
     if response.success {
+        webcodex_agent::external_tools::external_tools().mark_status_reported(provider_revision);
         Ok(projects_count)
     } else {
         Err(response
@@ -1569,15 +1601,32 @@ fn handle_one_poll(
     agent_instance_id: &str,
     lsp: &webcodex_agent::LspSupervisor,
 ) -> Result<bool, PollError> {
-    let poll = ShellAgentPollRequest {
-        client_id: cfg.client_id.clone(),
-        agent_instance_id: agent_instance_id.to_string(),
-        projects: Some(project_cache.get(cfg)),
+    let provider_update = webcodex_agent::external_tools::external_tools().claim_status_update();
+    let poll = ShellAgentPollPayload {
+        request: ShellAgentPollRequest {
+            client_id: cfg.client_id.clone(),
+            agent_instance_id: agent_instance_id.to_string(),
+            projects: Some(project_cache.get(cfg)),
+        },
+        tool_providers: provider_update.as_ref().map(|(status, _)| status.clone()),
     };
-    let response: ShellAgentPollResponse =
-        post_json(client, cfg, AGENT_POLL_PATH, &poll).map_err(PollError::from_http)?;
+    let response: ShellAgentPollResponse = match post_json(client, cfg, AGENT_POLL_PATH, &poll) {
+        Ok(response) => response,
+        Err(error) => {
+            if let Some((_, revision)) = provider_update {
+                webcodex_agent::external_tools::external_tools().release_status_update(revision);
+            }
+            return Err(PollError::from_http(error));
+        }
+    };
     if !response.success {
+        if let Some((_, revision)) = provider_update {
+            webcodex_agent::external_tools::external_tools().release_status_update(revision);
+        }
         return Err(PollError::from_response_error(response.error));
+    }
+    if let Some((_, revision)) = provider_update {
+        webcodex_agent::external_tools::external_tools().mark_status_reported(revision);
     }
     let Some(request) = response.request else {
         return Ok(false);

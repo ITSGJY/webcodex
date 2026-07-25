@@ -360,6 +360,11 @@ async fn handle_agent_ws(
                     tracing::debug!(client_id = %client_id, error = %e, "ws pong liveness touch failed");
                 }
             }
+            AgentEnvelope::RuntimeMetadata { tool_providers } => {
+                let _ = registry
+                    .update_tool_providers(&client_id, &agent_instance_id, Some(tool_providers))
+                    .await;
+            }
             AgentEnvelope::Goodbye { reason } => {
                 tracing::debug!(
                     client_id = %client_id,
@@ -441,8 +446,9 @@ async fn send_envelope_or_log(ws: &mut WebSocket, env: AgentEnvelope, context: &
 mod tests {
     use super::*;
     use crate::shell_protocol::{
-        ShellAgentResultRequest, ShellClientCapabilities, ShellClientRegisterRequest,
-        ShellJobOpRequest, ShellRunRequest,
+        AgentPolicySummary, ClaudeCodeProviderStatus, ProviderCallSummary, ShellAgentResultRequest,
+        ShellClientCapabilities, ShellClientRegisterRequest, ShellJobOpRequest, ShellRunRequest,
+        ToolProvidersStatus,
     };
     use salvo::conn::{Acceptor, Listener};
     use std::net::SocketAddr;
@@ -476,7 +482,7 @@ mod tests {
                 agent_protocol_version: Some(
                     crate::shell_protocol::AGENT_PROTOCOL_VERSION_WEBSOCKET_V1.to_string(),
                 ),
-                policy: None,
+                policy: Some(AgentPolicySummary::default()),
             },
             auth_token: None,
         }
@@ -487,6 +493,33 @@ mod tests {
     /// in `shell_client` and is private, so we use a generous 2-minute age.
     fn aged_last_seen() -> i64 {
         chrono::Utc::now().timestamp() - 120
+    }
+
+    fn provider_status() -> ToolProvidersStatus {
+        ToolProvidersStatus {
+            strategy: "claude_code".to_string(),
+            claude_code: ClaudeCodeProviderStatus {
+                enabled: true,
+                version: Some("2.1.217".to_string()),
+                available: true,
+                process_state: "running".to_string(),
+                discovered_tool_names: vec!["Edit".to_string()],
+                capabilities: std::collections::BTreeMap::from([
+                    ("edit_file".to_string(), "available".to_string()),
+                    ("search_project_text".to_string(), "unmapped".to_string()),
+                ]),
+                last_error_code: None,
+                last_call: Some(ProviderCallSummary {
+                    capability: "edit_file".to_string(),
+                    selected_provider: "claude_code".to_string(),
+                    fallback_used: false,
+                    result: "success".to_string(),
+                    write_state: Some("confirmed".to_string()),
+                    duration_ms: 8,
+                    error_code: None,
+                }),
+            },
+        }
     }
 
     async fn recv_envelope(
@@ -610,6 +643,41 @@ mod tests {
         assert!(response.success);
         assert_eq!(response.stdout.as_deref(), Some("hi"));
         assert_eq!(response.exit_code, Some(0));
+
+        ws.send(TungsteniteMessage::Text(
+            AgentEnvelope::RuntimeMetadata {
+                tool_providers: provider_status(),
+            }
+            .to_json()
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        for _ in 0..20 {
+            let view = registry.get_client_view("ws-roundtrip").await.unwrap();
+            if view
+                .policy
+                .as_ref()
+                .and_then(|policy| policy.tool_providers.as_ref())
+                .and_then(|providers| providers.claude_code.last_call.as_ref())
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let view = registry.get_client_view("ws-roundtrip").await.unwrap();
+        let call = view
+            .policy
+            .unwrap()
+            .tool_providers
+            .unwrap()
+            .claude_code
+            .last_call
+            .unwrap();
+        assert_eq!(call.selected_provider, "claude_code");
+        assert_eq!(call.write_state.as_deref(), Some("confirmed"));
     }
 
     #[tokio::test]

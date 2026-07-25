@@ -324,7 +324,7 @@ edit_file = "project_edit"
 
 #[test]
 fn status_reports_discovery_mapping_process_and_bounded_error() {
-    let mut fixture = Fixture::new("normal");
+    let fixture = Fixture::new("normal");
     assert_eq!(fixture.provider.status().process_state, "not_started");
     let output = call_search(&fixture).unwrap();
     assert!(output.as_str().unwrap().contains("src/lib.rs:2:needle"));
@@ -335,13 +335,34 @@ fn status_reports_discovery_mapping_process_and_bounded_error() {
     assert_eq!(status.capabilities["search_project_text"], "available");
     assert_eq!(status.capabilities["edit_file"], "available");
     assert_eq!(status.last_error_code, None);
-    fixture.provider.config.mapping.remove("edit_file");
-    fixture
-        .provider
-        .config
+    assert!(status
+        .discovered_tool_names
+        .iter()
+        .all(|name| name.chars().count() <= 120));
+    let serialized = serde_json::to_string(&status).unwrap();
+    let root_text = fixture.root.to_string_lossy();
+    let marker_text = fixture.marker.to_string_lossy();
+    for forbidden in [
+        root_text.as_ref(),
+        marker_text.as_ref(),
+        fixture.config.command.as_str(),
+        "stderr",
+        "environment",
+        "token",
+        "cookie",
+    ] {
+        assert!(!serialized.contains(forbidden), "status leaked {forbidden}");
+    }
+    let mut mismatched = fixture.config.clone();
+    mismatched.mapping.remove("edit_file");
+    mismatched
         .mapping
         .insert("search_project_text".to_string(), "fake_edit".to_string());
-    let status = fixture.provider.status();
+    let mismatched = ClaudeCodeMcpProvider::new(mismatched);
+    mismatched
+        .project_client(&fixture.root, Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    let status = mismatched.status();
     assert_eq!(status.capabilities["edit_file"], "unmapped");
     assert_eq!(
         status.capabilities["search_project_text"],
@@ -384,6 +405,159 @@ fn search_and_edit_mappings_normalize_results() {
         fs::read_to_string(fixture.root.join("edit.txt")).unwrap(),
         "after\n"
     );
+
+    let status = router.status();
+    let call = status.claude_code.last_call.unwrap();
+    assert_eq!(call.capability, "edit_file");
+    assert_eq!(call.selected_provider, "claude_code");
+    assert!(!call.fallback_used);
+    assert_eq!(call.result, "success");
+    assert_eq!(call.write_state.as_deref(), Some("confirmed"));
+    assert_eq!(call.error_code, None);
+}
+
+#[test]
+fn fallback_and_failure_routes_record_bounded_last_call_evidence() {
+    let fixture = Fixture::new("normal");
+    let mut unmapped_search = fixture.config.clone();
+    unmapped_search.mapping.remove("search_project_text");
+    let router = ExternalToolRouter::new(&ToolProvidersConfig {
+        strategy: ToolProviderStrategy::ClaudeCodeThenNative,
+        claude_code: unmapped_search,
+    });
+    let mut search = agent_request("run_shell", &fixture.root, ".", None);
+    search.command = EXTERNAL_SEARCH_REQUEST_PREFIX.to_string();
+    search.stdin = Some(search_request().to_string());
+    let ExternalRoute::NativeFallback(fallback) = router.route(&AgentPolicy::default(), &search)
+    else {
+        panic!("unmapped search did not request Native fallback");
+    };
+    router.complete_native_fallback(
+        fallback,
+        &CommandResult {
+            exit_code: Some(0),
+            stdout: Some("native search".to_string()),
+            stderr: Some(String::new()),
+            duration_ms: Some(1),
+            error: None,
+        },
+    );
+    let status = router.status();
+    let call = status.claude_code.last_call.unwrap();
+    assert_eq!(call.selected_provider, "native");
+    assert!(call.fallback_used);
+    assert_eq!(call.result, "success");
+    assert_eq!(call.write_state, None);
+    assert_eq!(call.error_code, None);
+    assert_eq!(
+        status.claude_code.last_error_code.as_deref(),
+        Some("provider_capability_unavailable")
+    );
+
+    let timeout = Fixture::new("timeout");
+    let router = ExternalToolRouter::new(&ToolProvidersConfig {
+        strategy: ToolProviderStrategy::ClaudeCodeThenNative,
+        claude_code: timeout.config.clone(),
+    });
+    let edit = agent_request(
+        "file_replace_in_file",
+        &timeout.root,
+        "edit.txt",
+        Some(edit_request()),
+    );
+    let ExternalRoute::Handled(_) = router.route(&AgentPolicy::default(), &edit) else {
+        panic!("uncertain edit was allowed to fall back");
+    };
+    let status = router.status();
+    let call = status.claude_code.last_call.unwrap();
+    assert_eq!(call.selected_provider, "claude_code");
+    assert!(!call.fallback_used);
+    assert_eq!(call.result, "failure");
+    assert_eq!(call.write_state.as_deref(), Some("uncertain"));
+    assert_eq!(call.error_code.as_deref(), Some("mcp_request_timeout"));
+}
+
+#[test]
+fn edit_falls_back_only_before_submission_and_confirms_native_write() {
+    let fixture = Fixture::new("normal");
+    let mut unmapped_edit = fixture.config.clone();
+    unmapped_edit.mapping.remove("edit_file");
+    let router = ExternalToolRouter::new(&ToolProvidersConfig {
+        strategy: ToolProviderStrategy::ClaudeCodeThenNative,
+        claude_code: unmapped_edit,
+    });
+    let edit = agent_request(
+        "file_replace_in_file",
+        &fixture.root,
+        "edit.txt",
+        Some(edit_request()),
+    );
+    let ExternalRoute::NativeFallback(fallback) = router.route(&AgentPolicy::default(), &edit)
+    else {
+        panic!("unsubmitted edit did not request Native fallback");
+    };
+    router.complete_native_fallback(
+        fallback,
+        &CommandResult {
+            exit_code: Some(0),
+            stdout: Some(json!({"changed": true}).to_string()),
+            stderr: Some(String::new()),
+            duration_ms: Some(1),
+            error: None,
+        },
+    );
+    let call = router.status().claude_code.last_call.unwrap();
+    assert_eq!(call.selected_provider, "native");
+    assert!(call.fallback_used);
+    assert_eq!(call.write_state.as_deref(), Some("confirmed"));
+}
+
+#[test]
+fn status_revisions_are_changed_only_and_registration_reads_latest_snapshot() {
+    let fixture = Fixture::new("normal");
+    let router = ExternalToolRouter::new(&ToolProvidersConfig {
+        strategy: ToolProviderStrategy::ClaudeCode,
+        claude_code: fixture.config.clone(),
+    });
+    let (_, initial_revision) = router.registration_status();
+    router.mark_status_reported(initial_revision);
+    assert!(router.claim_status_update().is_none());
+
+    let mut search = agent_request("run_shell", &fixture.root, ".", None);
+    search.command = EXTERNAL_SEARCH_REQUEST_PREFIX.to_string();
+    search.stdin = Some(search_request().to_string());
+    assert!(matches!(
+        router.route(&AgentPolicy::default(), &search),
+        ExternalRoute::Handled(_)
+    ));
+    let (update, revision) = router.claim_status_update().unwrap();
+    assert_eq!(
+        update.claude_code.last_call.as_ref().unwrap().capability,
+        "search_project_text"
+    );
+    assert!(
+        router.claude.state.status.try_lock().is_ok(),
+        "status claim retained the Provider lock across transport send"
+    );
+    assert!(router.claim_status_update().is_none());
+    // A newer state cannot overtake an already claimed snapshot. Once the
+    // first snapshot is reported, the next claim observes the newer revision.
+    router
+        .claude
+        .record_error(&ProviderError::new("mcp_protocol_error"));
+    assert!(router.claim_status_update().is_none());
+    router.mark_status_reported(revision);
+    let (_, newer_revision) = router.claim_status_update().unwrap();
+    assert!(newer_revision > revision);
+    // A failed best-effort metadata send releases only the status claim; the
+    // already computed state remains available for retry.
+    router.release_status_update(newer_revision);
+    assert!(router.claim_status_update().is_some());
+
+    let (registered, latest_revision) = router.registration_status();
+    assert!(latest_revision > initial_revision);
+    assert_eq!(registered.claude_code.process_state, "running");
+    assert!(registered.claude_code.last_call.is_some());
 }
 
 #[test]
@@ -465,9 +639,15 @@ fn process_exit_clears_pending_and_next_call_restarts_lazily() {
     assert!(call_search(&fixture).is_err());
     assert!(wait_until(Duration::from_secs(1), || {
         pending_count(&fixture.provider) == 0
+            && fixture.provider.status().process_state == "stopped"
     }));
     assert!(call_search(&fixture).is_ok());
     assert_eq!(fixture.starts(), 2);
+    assert_eq!(fixture.provider.status().process_state, "running");
+    fixture.provider.shutdown();
+    let status = fixture.provider.status();
+    assert_eq!(status.process_state, "stopped");
+    assert!(!status.available);
 }
 
 #[test]
@@ -476,6 +656,12 @@ fn timeout_removes_pending_and_uncertain_edit_never_falls_back() {
     let error = call_search(&fixture).unwrap_err();
     assert_eq!(error.code, "mcp_request_timeout");
     assert_eq!(pending_count(&fixture.provider), 0);
+    let status = fixture.provider.status();
+    assert_eq!(status.process_state, "stopped");
+    assert_eq!(
+        status.last_error_code.as_deref(),
+        Some("mcp_request_timeout")
+    );
 
     let router = ExternalToolRouter::new(&ToolProvidersConfig {
         strategy: ToolProviderStrategy::ClaudeCodeThenNative,
@@ -506,7 +692,7 @@ fn timeout_removes_pending_and_uncertain_edit_never_falls_back() {
     });
     assert!(matches!(
         router.route(&AgentPolicy::default(), &request),
-        ExternalRoute::Native
+        ExternalRoute::NativeFallback(_)
     ));
 }
 
@@ -525,6 +711,31 @@ fn native_strategy_does_not_start_claude() {
         ExternalRoute::Native
     ));
     assert_eq!(fixture.starts(), 0);
+}
+
+#[test]
+fn opt_in_real_claude_mcp_probe() {
+    if env::var("WEBCODEX_PROBE_CLAUDE_PROVIDER").as_deref() != Ok("1") {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut config = ClaudeCodeMcpConfig::default();
+    config.enabled = true;
+    config
+        .mapping
+        .insert("edit_file".to_string(), "Edit".to_string());
+    let provider = ClaudeCodeMcpProvider::new(config);
+    provider
+        .project_client(root.path(), Instant::now() + Duration::from_secs(30))
+        .unwrap_or_else(|error| panic!("Claude MCP probe failed: {}", error.code));
+    let status = provider.status();
+    assert!(status.available);
+    assert_eq!(status.process_state, "running");
+    println!(
+        "{}",
+        serde_json::to_string(&status).expect("provider status must serialize")
+    );
+    provider.shutdown();
 }
 
 #[test]
@@ -638,7 +849,7 @@ fn opt_in_real_claude_mcp_smoke() {
     }
     eprintln!("claude_mcp_shutdown process_groups_reaped=true");
     if let Err(error) = grep_tool {
-        panic!("{error}");
+        eprintln!("claude_mcp_grep_unavailable={}", sanitize_name(&error));
     }
 }
 

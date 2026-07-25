@@ -3,7 +3,7 @@ use super::{
     require_agent_transport_scope,
 };
 use crate::shell_protocol::{
-    ShellAgentJobUpdateRequest, ShellAgentJobUpdateResponse, ShellAgentPollRequest,
+    ShellAgentJobUpdateRequest, ShellAgentJobUpdateResponse, ShellAgentPollPayload,
     ShellAgentPollResponse, ShellAgentResultRequest, ShellAgentResultResponse,
     ShellClientRegisterRequest, ShellClientRegisterResponse,
 };
@@ -86,7 +86,7 @@ pub async fn shell_agent_poll(req: &mut Request, depot: &mut Depot, res: &mut Re
         }));
         return;
     };
-    let body: ShellAgentPollRequest = match req.parse_json().await {
+    let body: ShellAgentPollPayload = match req.parse_json().await {
         Ok(body) => body,
         Err(e) => {
             res.status_code(StatusCode::BAD_REQUEST);
@@ -108,7 +108,7 @@ pub async fn shell_agent_poll(req: &mut Request, depot: &mut Depot, res: &mut Re
         }));
         return;
     }
-    if let Err(e) = enforce_agent_transport(auth.as_ref(), &body.client_id) {
+    if let Err(e) = enforce_agent_transport(auth.as_ref(), &body.request.client_id) {
         res.status_code(StatusCode::FORBIDDEN);
         res.render(Json(ShellAgentPollResponse {
             success: false,
@@ -118,7 +118,7 @@ pub async fn shell_agent_poll(req: &mut Request, depot: &mut Depot, res: &mut Re
         return;
     }
     if let Err(e) = registry
-        .assert_client_access(auth.as_ref(), &body.client_id)
+        .assert_client_access(auth.as_ref(), &body.request.client_id)
         .await
     {
         res.status_code(StatusCode::FORBIDDEN);
@@ -129,7 +129,14 @@ pub async fn shell_agent_poll(req: &mut Request, depot: &mut Depot, res: &mut Re
         }));
         return;
     }
-    match registry.poll(body).await {
+    let _ = registry
+        .update_tool_providers(
+            &body.request.client_id,
+            &body.request.agent_instance_id,
+            body.tool_providers,
+        )
+        .await;
+    match registry.poll(body.request).await {
         Ok(request) => res.render(Json(ShellAgentPollResponse {
             success: true,
             request,

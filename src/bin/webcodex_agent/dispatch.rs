@@ -19,8 +19,31 @@ pub(crate) fn dispatch_request(
     lsp: &LspSupervisor,
     request: ShellAgentShellRequest,
 ) -> Result<bool, String> {
-    if let ExternalRoute::Handled(result) = external_tools().route(policy, &request) {
-        return sink.submit_result(request.request_id, result);
+    match external_tools().route(policy, &request) {
+        ExternalRoute::Handled(result) => {
+            return sink.submit_result(request.request_id, result);
+        }
+        ExternalRoute::NativeFallback(fallback) => {
+            let request_id = request.request_id.clone();
+            let result = if is_file_request_kind(&request.kind) {
+                handle_file_request(policy, &request)
+            } else {
+                run_shell_with_profiles(
+                    policy,
+                    shell,
+                    projects_dir,
+                    &jobs.prepared_profiles,
+                    request.cwd.as_deref(),
+                    &request.command,
+                    request.stdin.as_deref(),
+                    request.timeout_secs,
+                    None,
+                )
+            };
+            external_tools().complete_native_fallback(fallback, &result);
+            return sink.submit_result(request_id, result);
+        }
+        ExternalRoute::Native => {}
     }
     match request.kind.as_str() {
         "start_job" | "start_validation_job" => {

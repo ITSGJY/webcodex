@@ -1,4 +1,7 @@
-use crate::shell_protocol::{ShellAgentProjectSummary, ShellFileOpRequest, ShellRunRequest};
+use crate::shell_protocol::{
+    ProviderCallSummary, ShellAgentProjectSummary, ShellFileOpRequest, ShellRunRequest,
+    ToolProvidersStatus,
+};
 use sha2::{Digest, Sha256};
 
 const MAX_CLIENT_ID_LEN: usize = 80;
@@ -17,6 +20,118 @@ const MAX_CHECKPOINT_PAYLOAD_BYTES: usize = 15 * 1024 * 1024;
 pub(super) const MAX_RUN_STDIN_BYTES: usize = 15 * 1024 * 1024;
 const MAX_SYNC_WAIT_SECS: u64 = 120;
 const MAX_COMMAND_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+const MAX_PROVIDER_TEXT_CHARS: usize = 120;
+const MAX_PROVIDER_TOOL_NAMES: usize = 64;
+
+fn bounded_provider_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_PROVIDER_TEXT_CHARS)
+        .collect()
+}
+
+fn safe_provider_identifier(value: &str) -> Option<String> {
+    let value = bounded_provider_text(value);
+    (!value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_-.:".contains(character)))
+    .then_some(value)
+}
+
+fn safe_provider_version(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, ' ' | '.' | '_' | '-' | '+' | '(' | ')')
+        }))
+    .then(|| bounded_provider_text(value))
+}
+
+/// Normalize untrusted provider metadata without making agent traffic fail.
+/// Unknown fields are already discarded by serde; unknown enum-like values or
+/// unsafe strings drop the entire optional update so tool completion continues.
+pub(super) fn normalize_tool_providers(
+    status: Option<ToolProvidersStatus>,
+) -> Option<ToolProvidersStatus> {
+    let mut status = status?;
+    if !matches!(
+        status.strategy.as_str(),
+        "native" | "claude_code" | "claude_code_then_native"
+    ) || !matches!(
+        status.claude_code.process_state.as_str(),
+        "not_started"
+            | "starting"
+            | "initializing"
+            | "discovering"
+            | "mapping"
+            | "running"
+            | "stopped"
+    ) {
+        return None;
+    }
+    status.claude_code.version = status
+        .claude_code
+        .version
+        .as_deref()
+        .and_then(safe_provider_version);
+    let mut names = status
+        .claude_code
+        .discovered_tool_names
+        .iter()
+        .filter_map(|name| safe_provider_identifier(name))
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names.truncate(MAX_PROVIDER_TOOL_NAMES);
+    status.claude_code.discovered_tool_names = names;
+    if status.claude_code.capabilities.len() > 2
+        || status.claude_code.capabilities.iter().any(|(name, state)| {
+            !matches!(name.as_str(), "edit_file" | "search_project_text")
+                || !matches!(state.as_str(), "available" | "unmapped" | "schema_mismatch")
+        })
+    {
+        return None;
+    }
+    status.claude_code.last_error_code = status
+        .claude_code
+        .last_error_code
+        .as_deref()
+        .and_then(safe_provider_identifier);
+    status.claude_code.last_call = status
+        .claude_code
+        .last_call
+        .and_then(normalize_provider_call);
+    Some(status)
+}
+
+fn normalize_provider_call(mut call: ProviderCallSummary) -> Option<ProviderCallSummary> {
+    if !matches!(
+        call.capability.as_str(),
+        "edit_file" | "search_project_text"
+    ) || !matches!(call.selected_provider.as_str(), "claude_code" | "native")
+        || !matches!(call.result.as_str(), "success" | "failure")
+        || !call.write_state.as_deref().map_or(true, |state| {
+            matches!(state, "not_submitted" | "confirmed" | "uncertain")
+        })
+    {
+        return None;
+    }
+    if (call.capability == "search_project_text" && call.write_state.is_some())
+        || (call.capability == "edit_file" && call.write_state.is_none())
+        || (call.fallback_used && call.selected_provider != "native")
+    {
+        return None;
+    }
+    call.duration_ms = call.duration_ms.min(24 * 60 * 60 * 1000);
+    call.error_code = call
+        .error_code
+        .as_deref()
+        .and_then(safe_provider_identifier);
+    Some(call)
+}
 
 pub(super) fn validate_id(value: &str, field: &str) -> Result<(), String> {
     if value.is_empty() || value.len() > MAX_CLIENT_ID_LEN {
@@ -492,4 +607,71 @@ fn validate_sha256(value: &Option<String>) -> Result<(), String> {
         return Err("expected_sha256 must be 64 hex characters".to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod provider_status_tests {
+    use super::*;
+    use crate::shell_protocol::ClaudeCodeProviderStatus;
+    use std::collections::BTreeMap;
+
+    fn provider_status() -> ToolProvidersStatus {
+        ToolProvidersStatus {
+            strategy: "claude_code_then_native".to_string(),
+            claude_code: ClaudeCodeProviderStatus {
+                enabled: true,
+                version: Some("2.1.217".to_string()),
+                available: true,
+                process_state: "running".to_string(),
+                discovered_tool_names: (0..100).map(|index| format!("Tool_{index}")).collect(),
+                capabilities: BTreeMap::from([
+                    ("edit_file".to_string(), "available".to_string()),
+                    ("search_project_text".to_string(), "unmapped".to_string()),
+                ]),
+                last_error_code: None,
+                last_call: Some(ProviderCallSummary {
+                    capability: "edit_file".to_string(),
+                    selected_provider: "claude_code".to_string(),
+                    fallback_used: false,
+                    result: "success".to_string(),
+                    write_state: Some("confirmed".to_string()),
+                    duration_ms: u64::MAX,
+                    error_code: None,
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn provider_status_is_bounded_and_rejects_path_like_version() {
+        let mut status = provider_status();
+        status.claude_code.version = Some("/tmp/private/project".to_string());
+        status
+            .claude_code
+            .discovered_tool_names
+            .push("/tmp/private/Edit".to_string());
+        let status = normalize_tool_providers(Some(status)).unwrap();
+        assert_eq!(status.claude_code.version, None);
+        assert_eq!(status.claude_code.discovered_tool_names.len(), 64);
+        assert!(status
+            .claude_code
+            .discovered_tool_names
+            .iter()
+            .all(|name| name.chars().count() <= MAX_PROVIDER_TEXT_CHARS));
+        assert_eq!(
+            status.claude_code.last_call.as_ref().unwrap().duration_ms,
+            24 * 60 * 60 * 1000
+        );
+        let serialized = serde_json::to_string(&status).unwrap();
+        for forbidden in ["/tmp/private", "stderr", "environment", "token", "cookie"] {
+            assert!(!serialized.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn unknown_provider_state_is_ignored_without_error() {
+        let mut status = provider_status();
+        status.claude_code.process_state = "raw stderr follows".to_string();
+        assert!(normalize_tool_providers(Some(status)).is_none());
+    }
 }

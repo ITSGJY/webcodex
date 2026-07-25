@@ -198,13 +198,29 @@ pub struct ShellProfilesSummary {
 }
 
 /// Bounded, non-secret snapshot of the agent's experimental tool providers.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolProvidersStatus {
     pub strategy: String,
     pub claude_code: ClaudeCodeProviderStatus,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Bounded evidence for the most recent allowlisted external-provider route.
+/// This is metadata only: it never carries tool arguments, file contents,
+/// project paths, stderr, or raw RPC payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCallSummary {
+    pub capability: String,
+    pub selected_provider: String,
+    pub fallback_used: bool,
+    pub result: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_state: Option<String>,
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeCodeProviderStatus {
     pub enabled: bool,
     pub version: Option<String>,
@@ -213,6 +229,8 @@ pub struct ClaudeCodeProviderStatus {
     pub discovered_tool_names: Vec<String>,
     pub capabilities: BTreeMap<String, String>,
     pub last_error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_call: Option<ProviderCallSummary>,
 }
 
 /// Sanitized agent policy summary. Carried in the registration payload and
@@ -385,6 +403,16 @@ pub struct ShellAgentPollRequest {
     pub agent_instance_id: String,
     #[serde(default)]
     pub projects: Option<Vec<ShellAgentProjectSummary>>,
+}
+
+/// Polling transport wrapper. Existing `ShellAgentPollRequest` JSON remains
+/// valid; current agents may attach changed-only sanitized runtime metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellAgentPollPayload {
+    #[serde(flatten)]
+    pub request: ShellAgentPollRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_providers: Option<ToolProvidersStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -941,6 +969,9 @@ pub enum AgentEnvelope {
     },
     /// Either direction. Liveness keepalive.
     Ping { ts: i64 },
+    /// Agent -> server changed-only sanitized runtime metadata. It reuses the
+    /// active transport and never requires an acknowledgement round trip.
+    RuntimeMetadata { tool_providers: ToolProvidersStatus },
     /// Either direction. Reply to `Ping`.
     Pong { ts: i64 },
     /// Agent -> server. Best-effort graceful shutdown notice. Older agents do
@@ -965,6 +996,7 @@ impl AgentEnvelope {
             AgentEnvelope::Result { .. } => "result",
             AgentEnvelope::JobUpdate { .. } => "job_update",
             AgentEnvelope::Ping { .. } => "ping",
+            AgentEnvelope::RuntimeMetadata { .. } => "runtime_metadata",
             AgentEnvelope::Pong { .. } => "pong",
             AgentEnvelope::Goodbye { .. } => "goodbye",
             AgentEnvelope::Error { .. } => "error",
@@ -1127,6 +1159,25 @@ mod envelope_tests {
         }
     }
 
+    fn sample_tool_providers() -> ToolProvidersStatus {
+        ToolProvidersStatus {
+            strategy: "claude_code_then_native".to_string(),
+            claude_code: ClaudeCodeProviderStatus {
+                enabled: true,
+                version: Some("2.1.217".to_string()),
+                available: true,
+                process_state: "running".to_string(),
+                discovered_tool_names: vec!["Edit".to_string()],
+                capabilities: BTreeMap::from([
+                    ("edit_file".to_string(), "available".to_string()),
+                    ("search_project_text".to_string(), "unmapped".to_string()),
+                ]),
+                last_error_code: None,
+                last_call: None,
+            },
+        }
+    }
+
     #[test]
     fn register_envelope_round_trips_with_type_tag() {
         let env = AgentEnvelope::Register {
@@ -1269,6 +1320,25 @@ mod envelope_tests {
             }
             other => panic!("expected error, got {:?}", other.kind()),
         }
+    }
+
+    #[test]
+    fn runtime_metadata_and_legacy_poll_payloads_round_trip() {
+        let env = AgentEnvelope::RuntimeMetadata {
+            tool_providers: sample_tool_providers(),
+        };
+        let json = env.to_json().unwrap();
+        assert!(json.contains(r#""type":"runtime_metadata""#));
+        assert!(json.contains(r#""last_error_code":null"#));
+        assert!(matches!(
+            AgentEnvelope::from_slice(json.as_bytes()).unwrap(),
+            AgentEnvelope::RuntimeMetadata { .. }
+        ));
+
+        let legacy = r#"{"client_id":"oe","agent_instance_id":"inst","projects":null}"#;
+        let payload: ShellAgentPollPayload = serde_json::from_str(legacy).unwrap();
+        assert_eq!(payload.request.client_id, "oe");
+        assert!(payload.tool_providers.is_none());
     }
 
     #[test]

@@ -1807,8 +1807,8 @@ async fn runtime_status_agent_summary_includes_protocol_version() {
 #[tokio::test]
 async fn runtime_status_includes_sanitized_policy_summary() {
     use crate::shell_protocol::{
-        AgentPolicySummary, ClaudeCodeProviderStatus, ShellClientRegisterRequest,
-        ToolProvidersStatus,
+        AgentPolicySummary, ClaudeCodeProviderStatus, ProviderCallSummary,
+        ShellClientRegisterRequest, ToolProvidersStatus,
     };
     let registry = Arc::new(ShellClientRegistry::default());
     registry
@@ -1841,10 +1841,45 @@ async fn runtime_status_includes_sanitized_policy_summary() {
                             ("edit_file".to_string(), "available".to_string()),
                         ]),
                         last_error_code: None,
+                        last_call: None,
                     },
                 }),
             }),
         })
+        .await
+        .unwrap();
+    registry
+        .update_tool_providers(
+            "policy-agent",
+            "inst-p",
+            Some(ToolProvidersStatus {
+                strategy: "claude_code".to_string(),
+                claude_code: ClaudeCodeProviderStatus {
+                    enabled: true,
+                    version: Some("2.1.217".to_string()),
+                    available: true,
+                    process_state: "running".to_string(),
+                    discovered_tool_names: ["Edit", "Read", "Bash", "FutureTool"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    capabilities: std::collections::BTreeMap::from([
+                        ("search_project_text".to_string(), "unmapped".to_string()),
+                        ("edit_file".to_string(), "available".to_string()),
+                    ]),
+                    last_error_code: None,
+                    last_call: Some(ProviderCallSummary {
+                        capability: "edit_file".to_string(),
+                        selected_provider: "claude_code".to_string(),
+                        fallback_used: false,
+                        result: "success".to_string(),
+                        write_state: Some("confirmed".to_string()),
+                        duration_ms: 14,
+                        error_code: None,
+                    }),
+                },
+            }),
+        )
         .await
         .unwrap();
     let runtime = ToolRuntime::new(
@@ -1864,6 +1899,15 @@ async fn runtime_status_includes_sanitized_policy_summary() {
     let providers = &clients[0]["tool_providers"];
     assert_eq!(providers["strategy"], "claude_code");
     assert_eq!(providers["claude_code"]["process_state"], "running");
+    assert_eq!(providers["claude_code"]["version"], "2.1.217");
+    assert_eq!(
+        providers["claude_code"]["last_call"]["selected_provider"],
+        "claude_code"
+    );
+    assert_eq!(
+        providers["claude_code"]["last_call"]["write_state"],
+        "confirmed"
+    );
     assert_eq!(
         providers["claude_code"]["capabilities"]["edit_file"],
         "available"
@@ -1872,6 +1916,105 @@ async fn runtime_status_includes_sanitized_policy_summary() {
     assert!(policy.get("token").is_none());
     assert!(policy.get("env").is_none());
     assert!(policy.get("init_script").is_none());
+
+    let listed = runtime.dispatch(ToolCall::ListAgents).await;
+    assert_eq!(
+        listed.output["agents"][0]["tool_providers"]["claude_code"]["last_call"]["fallback_used"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn external_provider_discovery_cannot_change_public_tool_or_openapi_surface() {
+    use crate::shell_protocol::{
+        AgentPolicySummary, ClaudeCodeProviderStatus, ShellClientRegisterRequest,
+        ToolProvidersStatus,
+    };
+    let before = crate::tool_runtime::registry::registered_tool_specs();
+    let names_before = before
+        .iter()
+        .map(|spec| spec.name.clone())
+        .collect::<BTreeSet<_>>();
+    let replace_schema_before = before
+        .iter()
+        .find(|spec| spec.name == "replace_in_file")
+        .unwrap()
+        .input_schema
+        .clone();
+    let registry = Arc::new(ShellClientRegistry::default());
+    registry
+        .register(ShellClientRegisterRequest {
+            client_id: "provider-surface".to_string(),
+            agent_instance_id: "inst-surface".to_string(),
+            display_name: None,
+            owner: None,
+            hostname: None,
+            capabilities: None,
+            projects: None,
+            agent_protocol_version: Some("websocket-v1".to_string()),
+            policy: Some(AgentPolicySummary {
+                tool_providers: Some(ToolProvidersStatus {
+                    strategy: "claude_code_then_native".to_string(),
+                    claude_code: ClaudeCodeProviderStatus {
+                        enabled: true,
+                        version: Some("2.1.217".to_string()),
+                        available: true,
+                        process_state: "running".to_string(),
+                        discovered_tool_names: ["Edit", "Read", "Bash", "Write", "FutureTool"]
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect(),
+                        capabilities: std::collections::BTreeMap::from([
+                            ("edit_file".to_string(), "available".to_string()),
+                            ("search_project_text".to_string(), "unmapped".to_string()),
+                        ]),
+                        last_error_code: None,
+                        last_call: None,
+                    },
+                }),
+                ..AgentPolicySummary::default()
+            }),
+        })
+        .await
+        .unwrap();
+    let runtime = ToolRuntime::new(
+        registry,
+        Arc::new(CodexConfig::default()),
+        Arc::new(RuntimeInfo::default()),
+    );
+    let status = runtime.dispatch(runtime_status_call()).await;
+    let public_names = status.output["tools"]["names"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    for internal in ["Edit", "Read", "Bash", "Write", "FutureTool"] {
+        assert!(!public_names.contains(internal));
+    }
+
+    let after = crate::tool_runtime::registry::registered_tool_specs();
+    let names_after = after
+        .iter()
+        .map(|spec| spec.name.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(names_after, names_before);
+    assert_eq!(
+        after
+            .iter()
+            .find(|spec| spec.name == "replace_in_file")
+            .unwrap()
+            .input_schema,
+        replace_schema_before
+    );
+    let openapi = crate::openapi::build_openapi_spec();
+    let operation_count: usize = openapi["paths"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|path| path.as_object().unwrap().len())
+        .sum();
+    assert_eq!(operation_count, 25);
 }
 
 #[tokio::test]

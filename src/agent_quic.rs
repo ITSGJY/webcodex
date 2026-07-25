@@ -501,6 +501,11 @@ async fn handle_quic_connection(
                     );
                 }
             }
+            AgentEnvelope::RuntimeMetadata { tool_providers } => {
+                let _ = registry
+                    .update_tool_providers(&client_id, &agent_instance_id, Some(tool_providers))
+                    .await;
+            }
             AgentEnvelope::Goodbye { reason } => {
                 tracing::debug!(
                     client_id = %client_id,
