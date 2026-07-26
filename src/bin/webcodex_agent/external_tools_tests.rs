@@ -334,7 +334,15 @@ fn status_reports_discovery_mapping_process_and_bounded_error() {
     assert_eq!(status.process_state, "running");
     assert_eq!(
         status.discovered_tool_names,
-        ["Bash", "Edit", "Read", "Write", "fake_edit", "fake_search"]
+        [
+            "Bash",
+            "Edit",
+            "Read",
+            "TaskCreate",
+            "Write",
+            "fake_edit",
+            "fake_search"
+        ]
     );
     assert_eq!(status.capabilities["search_project_text"], "available");
     assert_eq!(status.capabilities["edit_file"], "available");
@@ -902,7 +910,15 @@ fn experimental_list_tools_discovers_sorted_bounded_names_and_hashes() {
         .map(|tool| tool["name"].as_str().unwrap().to_string())
         .collect::<Vec<_>>();
     assert!(names.windows(2).all(|pair| pair[0] <= pair[1]));
-    for expected in ["Bash", "Edit", "Read", "Write", "fake_edit", "fake_search"] {
+    for expected in [
+        "Bash",
+        "Edit",
+        "Read",
+        "TaskCreate",
+        "Write",
+        "fake_edit",
+        "fake_search",
+    ] {
         assert!(
             names.iter().any(|name| name == expected),
             "missing {expected}"
@@ -912,7 +928,17 @@ fn experimental_list_tools_discovers_sorted_bounded_names_and_hashes() {
         tool["schema_hash"]
             .as_str()
             .is_some_and(|hash| hash.len() == 64)
+            && tool["schema_available"].as_bool() == Some(true)
+            && tool.get("callable").is_some()
     }));
+    for tool in listed["tools"].as_array().unwrap() {
+        let name = tool["name"].as_str().unwrap();
+        let expected_callable = matches!(name, "Read" | "Edit" | "Write" | "Bash");
+        assert_eq!(
+            tool["callable"], expected_callable,
+            "callable mismatch for {name}"
+        );
+    }
     assert!(!serde_json::to_string(&listed)
         .unwrap()
         .contains(&fixture.config.command));
@@ -932,6 +958,7 @@ fn experimental_describe_tool_returns_live_schema_hash_and_rejects_unknown() {
     );
     assert_eq!(described["tool_name"], "Bash");
     assert_eq!(described["experimental"], true);
+    assert_eq!(described["callable"], true);
     assert_eq!(described["schema_hash"].as_str().unwrap().len(), 64);
     assert!(described["input_schema"]["properties"]["command"].is_object());
     assert!(described["description"].as_str().unwrap().contains("shell"));
@@ -945,6 +972,7 @@ fn experimental_describe_tool_returns_live_schema_hash_and_rejects_unknown() {
         ),
     );
     assert_eq!(missing["code"], "claude_tool_not_found");
+    assert_eq!(missing["write_state"], "not_submitted");
 }
 
 #[test]
@@ -963,6 +991,8 @@ fn experimental_arguments_validation_and_schema_hash_are_stable() {
         ),
     );
     assert_eq!(invalid["code"], "claude_arguments_invalid");
+    assert_eq!(invalid["write_state"], "not_submitted");
+    assert_eq!(invalid["changed"], false);
 
     let schema = json!({
         "type": "object",
@@ -1002,6 +1032,7 @@ fn experimental_read_edit_write_bash_paths_and_process_reuse() {
         ),
     );
     assert_eq!(read["is_error"], false);
+    assert_eq!(read["tool_status"], "success");
     assert_eq!(read["process_reused"], false);
     assert!(read["result"]["content"][0]["text"]
         .as_str()
@@ -1025,6 +1056,7 @@ fn experimental_read_edit_write_bash_paths_and_process_reuse() {
         ),
     );
     assert_eq!(edit["is_error"], false);
+    assert_eq!(edit["tool_status"], "success");
     assert_eq!(edit["process_reused"], true);
     assert_eq!(
         fs::read_to_string(fixture.root.join("edit.txt")).unwrap(),
@@ -1048,6 +1080,7 @@ fn experimental_read_edit_write_bash_paths_and_process_reuse() {
         ),
     );
     assert_eq!(write["is_error"], false);
+    assert_eq!(write["tool_status"], "success");
     assert_eq!(
         fs::read_to_string(fixture.root.join("tmp-exp.txt")).unwrap(),
         "hello-experimental"
@@ -1066,10 +1099,14 @@ fn experimental_read_edit_write_bash_paths_and_process_reuse() {
         ),
     );
     assert_eq!(bash_ok["is_error"], false);
+    assert_eq!(bash_ok["tool_status"], "success");
     assert!(bash_ok["result"]["content"][0]["text"]
         .as_str()
         .unwrap()
         .contains("printf hi"));
+    let ok_call = router.status().claude_code.last_call.clone().unwrap();
+    assert_eq!(ok_call.result, "success");
+    assert_eq!(ok_call.error_code, None);
 
     let bash_err = experimental_stdout(
         &router,
@@ -1083,7 +1120,194 @@ fn experimental_read_edit_write_bash_paths_and_process_reuse() {
         ),
     );
     assert_eq!(bash_err["is_error"], true);
+    assert_eq!(bash_err["tool_status"], "failure");
+    assert_eq!(bash_err["result"]["isError"], true);
+    assert!(bash_err.get("code").is_none() || bash_err["code"].is_null());
+    // Transport succeeded; raw Claude result is preserved (not a provider envelope).
+    assert!(bash_err["result"]["content"].is_array());
+    let last_call = router.status().claude_code.last_call.unwrap();
+    assert_eq!(last_call.result, "failure");
+    assert_eq!(
+        last_call.error_code.as_deref(),
+        Some("claude_tool_error"),
+        "tool-level isError must record runtime failure without clearing error code"
+    );
     assert_eq!(fixture.starts(), 1);
+}
+
+#[test]
+fn experimental_list_describe_allowlist_and_not_allowed_call() {
+    let fixture = Fixture::new("normal");
+    let router = experimental_router(&fixture);
+
+    let listed = experimental_stdout(
+        &router,
+        experimental_request(EXPERIMENTAL_KIND_LIST, &fixture.root, None),
+    );
+    let task = listed["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "TaskCreate")
+        .expect("list must discover TaskCreate");
+    assert_eq!(task["callable"], false);
+    assert_eq!(task["schema_available"], true);
+
+    let described = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_DESCRIBE,
+            &fixture.root,
+            Some(json!({"tool_name": "TaskCreate"})),
+        ),
+    );
+    assert_eq!(described["tool_name"], "TaskCreate");
+    assert_eq!(described["callable"], false);
+    assert!(described["input_schema"]["properties"]["subject"].is_object());
+
+    let call = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_CALL,
+            &fixture.root,
+            Some(json!({
+                "tool_name": "TaskCreate",
+                "arguments": {"subject": "blocked"}
+            })),
+        ),
+    );
+    assert_eq!(call["code"], "claude_tool_not_allowed");
+    assert_eq!(call["write_state"], "not_submitted");
+    assert_eq!(call["changed"], false);
+    let marker = fs::read_to_string(&fixture.marker).unwrap_or_default();
+    assert!(
+        !marker
+            .lines()
+            .any(|line| line.contains("tools/call") && line.contains("TaskCreate")),
+        "fake MCP must not receive tools/call for TaskCreate: {marker}"
+    );
+
+    let unknown = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_CALL,
+            &fixture.root,
+            Some(json!({
+                "tool_name": "Agent",
+                "arguments": {}
+            })),
+        ),
+    );
+    assert_eq!(unknown["code"], "claude_tool_not_found");
+}
+
+#[test]
+fn experimental_mutating_tool_exit_returns_uncertain_write_state() {
+    let fixture = Fixture::new("exp_mutate_exit");
+    let router = experimental_router(&fixture);
+    let target = fixture.root.join("tmp-mutate-exit.txt");
+    let result = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_CALL,
+            &fixture.root,
+            Some(json!({
+                "tool_name": "Write",
+                "arguments": {
+                    "file_path": "tmp-mutate-exit.txt",
+                    "content": "mutated-before-exit"
+                }
+            })),
+        ),
+    );
+    assert_eq!(result["code"], "claude_mcp_process_exited");
+    assert_eq!(result["write_state"], "uncertain");
+    assert!(result["changed"].is_null());
+    assert_ne!(result["write_state"], "not_submitted");
+    assert_eq!(
+        fs::read_to_string(&target).unwrap_or_default(),
+        "mutated-before-exit",
+        "mutating tool may have already changed the file"
+    );
+    let _ = fs::remove_file(&target);
+    let marker = fs::read_to_string(&fixture.marker).unwrap_or_default();
+    assert!(
+        marker.contains("mutated_then_exit"),
+        "expected fake to mutate then exit: {marker}"
+    );
+}
+
+#[test]
+fn experimental_tools_list_truncated_flag_when_over_max() {
+    let fixture = Fixture::new("exp_many_tools");
+    let router = experimental_router(&fixture);
+    let listed = experimental_stdout(
+        &router,
+        experimental_request(EXPERIMENTAL_KIND_LIST, &fixture.root, None),
+    );
+    let tools = listed["tools"].as_array().unwrap();
+    assert_eq!(
+        tools.len(),
+        MAX_EXPERIMENTAL_TOOLS,
+        "must keep only {MAX_EXPERIMENTAL_TOOLS} tools"
+    );
+    assert_eq!(
+        listed["truncated"], true,
+        "truncated must be true when discovery saw a 65th+ valid tool"
+    );
+}
+
+#[test]
+fn experimental_oversized_schema_list_describe_and_call() {
+    let fixture = Fixture::new("exp_large_schema");
+    let router = experimental_router(&fixture);
+    let listed = experimental_stdout(
+        &router,
+        experimental_request(EXPERIMENTAL_KIND_LIST, &fixture.root, None),
+    );
+    let large = listed["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "LargeSchemaTool")
+        .expect("oversized-schema tool must still be listed by name");
+    assert_eq!(large["schema_available"], false);
+    assert_eq!(large["callable"], false);
+    let hash = large["schema_hash"].as_str().unwrap();
+    assert_eq!(hash.len(), 64);
+
+    let described = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_DESCRIBE,
+            &fixture.root,
+            Some(json!({"tool_name": "LargeSchemaTool"})),
+        ),
+    );
+    assert_eq!(described["tool_name"], "LargeSchemaTool");
+    assert_eq!(described["schema_hash"], hash);
+    assert_eq!(described["truncated"], true);
+    assert_eq!(described["input_schema"]["truncated"], true);
+    assert_eq!(described["callable"], false);
+    assert!(described["input_schema"]["note"]
+        .as_str()
+        .unwrap()
+        .contains("schema exceeded"));
+
+    let call = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_CALL,
+            &fixture.root,
+            Some(json!({
+                "tool_name": "LargeSchemaTool",
+                "arguments": {"payload": "x"}
+            })),
+        ),
+    );
+    assert_eq!(call["code"], "claude_schema_unavailable");
+    assert_ne!(call["code"], "claude_tool_not_found");
+    assert_eq!(call["write_state"], "not_submitted");
 }
 
 #[test]
@@ -1096,7 +1320,7 @@ fn experimental_rejects_unknown_tools_and_recovers_after_process_exit() {
             EXPERIMENTAL_KIND_CALL,
             &fixture.root,
             Some(json!({
-                "tool_name": "TaskCreate",
+                "tool_name": "Agent",
                 "arguments": {}
             })),
         ),
@@ -1110,8 +1334,8 @@ fn experimental_rejects_unknown_tools_and_recovers_after_process_exit() {
         experimental_request(EXPERIMENTAL_KIND_LIST, &exit.root, None),
     );
     assert_eq!(first["experimental"], true);
-    // Force a tools/call so the exit scenario ends the child after first call path.
-    let _ = experimental_stdout(
+    // Force a tools/call so the exit scenario ends the child without a response.
+    let result = experimental_stdout(
         &router,
         experimental_request(
             EXPERIMENTAL_KIND_CALL,
@@ -1122,6 +1346,8 @@ fn experimental_rejects_unknown_tools_and_recovers_after_process_exit() {
             })),
         ),
     );
+    assert_eq!(result["code"], "claude_mcp_process_exited");
+    assert_eq!(result["write_state"], "not_submitted");
     assert!(wait_until(Duration::from_secs(2), || exit.starts() >= 1));
     let second = experimental_stdout(
         &router,
@@ -1136,7 +1362,33 @@ fn experimental_rejects_unknown_tools_and_recovers_after_process_exit() {
 }
 
 #[test]
-fn experimental_result_bounding_marks_truncated_output() {
+fn experimental_result_soft_truncate_about_300kib() {
+    let fixture = Fixture::new("exp_soft_oversized");
+    let router = experimental_router(&fixture);
+    let result = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_CALL,
+            &fixture.root,
+            Some(json!({
+                "tool_name": "Bash",
+                "arguments": {"command": "big-soft"}
+            })),
+        ),
+    );
+    assert_ne!(
+        result["code"].as_str(),
+        Some("claude_result_too_large"),
+        "300 KiB must soft-truncate, not hard-fail: {result}"
+    );
+    assert_eq!(result["result_truncated"], true);
+    assert_eq!(result["result"]["truncated"], true);
+    assert_eq!(result["tool_status"], "success");
+    assert_eq!(result["is_error"], false);
+}
+
+#[test]
+fn experimental_result_hard_fail_about_600kib() {
     let fixture = Fixture::new("exp_oversized");
     let router = experimental_router(&fixture);
     let result = experimental_stdout(
@@ -1146,15 +1398,14 @@ fn experimental_result_bounding_marks_truncated_output() {
             &fixture.root,
             Some(json!({
                 "tool_name": "Bash",
-                "arguments": {"command": "big"}
+                "arguments": {"command": "big-hard"}
             })),
         ),
     );
-    // oversized responses are either hard-failed or soft-truncated.
-    let hard = result["code"].as_str() == Some("claude_result_too_large");
-    let soft = result["result_truncated"].as_bool() == Some(true)
-        || result["result"]["truncated"].as_bool() == Some(true);
-    assert!(hard || soft, "expected bounded oversized result: {result}");
+    assert_eq!(
+        result["code"], "claude_result_too_large",
+        "600 KiB must hard-fail: {result}"
+    );
 }
 
 #[test]

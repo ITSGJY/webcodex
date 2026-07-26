@@ -35,6 +35,47 @@ const EXPERIMENTAL_KIND_LIST: &str = "claude_list_tools";
 const EXPERIMENTAL_KIND_DESCRIBE: &str = "claude_describe_tool";
 const EXPERIMENTAL_KIND_CALL: &str = "claude_tool_call";
 
+/// Fixed experimental call allowlist. list/describe may observe other tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExperimentalClaudeToolKind {
+    Read,
+    Edit,
+    Write,
+    Bash,
+}
+
+impl ExperimentalClaudeToolKind {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "Read" => Some(Self::Read),
+            "Edit" => Some(Self::Edit),
+            "Write" => Some(Self::Write),
+            "Bash" => Some(Self::Bash),
+            _ => None,
+        }
+    }
+
+    fn is_callable(name: &str) -> bool {
+        Self::parse(name).is_some()
+    }
+
+    /// Mutating tools may have already executed if the MCP request was written.
+    fn post_send_failure_state(self) -> WriteState {
+        match self {
+            Self::Read => WriteState::NotSubmitted,
+            Self::Edit | Self::Write | Self::Bash => WriteState::Uncertain,
+        }
+    }
+}
+
+/// Experimental dispatch succeeded at the MCP transport layer.
+/// `tool_succeeded` is false when Claude returned `isError: true`.
+struct ExperimentalDispatchOutcome {
+    value: Value,
+    tool_succeeded: bool,
+    error_code: Option<&'static str>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ProviderCapability {
     SearchProjectText,
@@ -348,15 +389,23 @@ impl ExternalToolRouter {
     ) -> CommandResult {
         let started = Instant::now();
         match self.claude.experimental_dispatch(policy, request) {
-            Ok(value) => command_result(value.to_string(), started),
+            Ok(outcome) => command_result(outcome.value.to_string(), started),
             Err(error) => {
+                // Cover preflight path/payload errors that exit before record_call.
                 self.claude.record_error(&error);
+                let (write_state, changed) = match error.write_state {
+                    WriteState::NotSubmitted => ("not_submitted", Value::Bool(false)),
+                    WriteState::Uncertain => ("uncertain", Value::Null),
+                };
+                let code = experimental_error_code(error.code);
                 command_result(
                     json!({
                         "experimental": true,
-                        "error": experimental_error_code(error.code),
-                        "code": experimental_error_code(error.code),
-                        "message": experimental_error_code(error.code),
+                        "error": code,
+                        "code": code,
+                        "message": code,
+                        "write_state": write_state,
+                        "changed": changed,
                     })
                     .to_string(),
                     started,
@@ -376,6 +425,7 @@ fn is_experimental_claude_kind(kind: &str) -> bool {
 fn experimental_error_code(code: &str) -> &str {
     match code {
         "claude_tool_not_found"
+        | "claude_tool_not_allowed"
         | "claude_schema_unavailable"
         | "claude_arguments_invalid"
         | "claude_mcp_timeout"
@@ -396,6 +446,13 @@ fn experimental_error_code(code: &str) -> &str {
         "claude_tool_failed" => "claude_tool_error",
         "provider_response_too_large" => "claude_result_too_large",
         other => other,
+    }
+}
+
+fn experimental_write_state_label(write_state: WriteState) -> &'static str {
+    match write_state {
+        WriteState::NotSubmitted => "not_submitted",
+        WriteState::Uncertain => "uncertain",
     }
 }
 
@@ -699,7 +756,7 @@ impl ClaudeCodeMcpProvider {
         &self,
         policy: &AgentPolicy,
         request: &ShellAgentShellRequest,
-    ) -> Result<Value, ProviderError> {
+    ) -> Result<ExperimentalDispatchOutcome, ProviderError> {
         let root = request.cwd.as_deref().ok_or_else(path_error)?;
         let root = Path::new(root).canonicalize().map_err(|_| path_error())?;
         cwd_allowed(policy, &root).map_err(|_| path_error())?;
@@ -715,23 +772,73 @@ impl ClaudeCodeMcpProvider {
             .unwrap()
             .get(&root)
             .is_some_and(|client| client.connection.is_alive());
-        let client = self.project_client(&root, deadline)?;
-        let payload = request
+        let client = match self.project_client(&root, deadline) {
+            Ok(client) => client,
+            Err(error) => {
+                self.record_error(&error);
+                self.record_call(
+                    ProviderCallSummary {
+                        capability: request.kind.clone(),
+                        selected_provider: "claude_code".to_string(),
+                        fallback_used: false,
+                        result: "failure".to_string(),
+                        write_state: Some(
+                            experimental_write_state_label(error.write_state).to_string(),
+                        ),
+                        duration_ms: 0,
+                        error_code: Some(experimental_error_code(error.code).to_string()),
+                    },
+                    false,
+                );
+                return Err(error);
+            }
+        };
+        let payload = match request
             .content
             .as_deref()
             .filter(|raw| !raw.trim().is_empty())
             .map(|raw| serde_json::from_str::<Value>(raw).map_err(|_| request_error()))
-            .transpose()?
-            .unwrap_or_else(|| json!({}));
+            .transpose()
+        {
+            Ok(payload) => payload.unwrap_or_else(|| json!({})),
+            Err(error) => {
+                self.record_error(&error);
+                self.record_call(
+                    ProviderCallSummary {
+                        capability: request.kind.clone(),
+                        selected_provider: "claude_code".to_string(),
+                        fallback_used: false,
+                        result: "failure".to_string(),
+                        write_state: Some(
+                            experimental_write_state_label(error.write_state).to_string(),
+                        ),
+                        duration_ms: 0,
+                        error_code: Some(experimental_error_code(error.code).to_string()),
+                    },
+                    false,
+                );
+                return Err(error);
+            }
+        };
         let started = Instant::now();
         let outcome = match request.kind.as_str() {
-            EXPERIMENTAL_KIND_LIST => Ok(client.experimental_list_tools(process_reused)),
+            EXPERIMENTAL_KIND_LIST => Ok(ExperimentalDispatchOutcome {
+                value: client.experimental_list_tools(process_reused),
+                tool_succeeded: true,
+                error_code: None,
+            }),
             EXPERIMENTAL_KIND_DESCRIBE => {
                 let tool_name = payload
                     .get("tool_name")
                     .and_then(Value::as_str)
                     .ok_or_else(request_error)?;
-                client.experimental_describe_tool(tool_name, process_reused)
+                client
+                    .experimental_describe_tool(tool_name, process_reused)
+                    .map(|value| ExperimentalDispatchOutcome {
+                        value,
+                        tool_succeeded: true,
+                        error_code: None,
+                    })
             }
             EXPERIMENTAL_KIND_CALL => {
                 let tool_name = payload
@@ -750,17 +857,24 @@ impl ClaudeCodeMcpProvider {
             self.projects.lock().unwrap().remove(&root);
         }
         match &outcome {
-            Ok(_) => self.record_call(
+            Ok(success) => self.record_call(
                 ProviderCallSummary {
                     capability: request.kind.clone(),
                     selected_provider: "claude_code".to_string(),
                     fallback_used: false,
-                    result: "success".to_string(),
+                    result: if success.tool_succeeded {
+                        "success".to_string()
+                    } else {
+                        "failure".to_string()
+                    },
                     write_state: None,
                     duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-                    error_code: None,
+                    error_code: success
+                        .error_code
+                        .map(|code| experimental_error_code(code).to_string()),
                 },
-                true,
+                // Only clear last_error_code when the tool itself succeeded.
+                success.tool_succeeded,
             ),
             Err(error) => {
                 self.record_error(error);
@@ -770,7 +884,9 @@ impl ClaudeCodeMcpProvider {
                         selected_provider: "claude_code".to_string(),
                         fallback_used: false,
                         result: "failure".to_string(),
-                        write_state: None,
+                        write_state: Some(
+                            experimental_write_state_label(error.write_state).to_string(),
+                        ),
                         duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                         error_code: Some(experimental_error_code(error.code).to_string()),
                     },
@@ -786,14 +902,18 @@ impl ClaudeCodeMcpProvider {
 struct DiscoveredTool {
     fields: BTreeSet<String>,
     description: String,
-    input_schema: Value,
+    /// Full schema when within experimental size bound; `None` when oversized.
+    input_schema: Option<Value>,
     schema_hash: String,
+    schema_available: bool,
+    schema_truncated: bool,
 }
 
 struct ProjectMcpClient {
     connection: Arc<McpConnection>,
     tools: BTreeMap<String, DiscoveredTool>,
     version: Option<String>,
+    tools_truncated: bool,
 }
 
 impl ProjectMcpClient {
@@ -834,6 +954,7 @@ impl ProjectMcpClient {
         let listed =
             connection.request("tools/list", json!({}), timeout(), WriteState::NotSubmitted)?;
         let mut tools = BTreeMap::new();
+        let mut tools_truncated = false;
         for tool in listed
             .get("tools")
             .and_then(Value::as_array)
@@ -849,16 +970,21 @@ impl ProjectMcpClient {
                 .get("inputSchema")
                 .cloned()
                 .unwrap_or_else(|| json!({"type": "object"}));
+            // Hash the original full schema even when we drop the body for size.
+            let schema_hash = schema_hash_hex(&input_schema);
             let schema_bytes = serde_json::to_vec(&input_schema).unwrap_or_default();
-            if schema_bytes.len() > MAX_EXPERIMENTAL_SCHEMA_BYTES {
-                continue;
-            }
-            let fields = input_schema
-                .pointer("/properties")
-                .and_then(Value::as_object)
-                .into_iter()
-                .flat_map(|properties| properties.keys().cloned())
-                .collect();
+            let schema_truncated = schema_bytes.len() > MAX_EXPERIMENTAL_SCHEMA_BYTES;
+            let schema_available = !schema_truncated;
+            let fields = if schema_available {
+                input_schema
+                    .pointer("/properties")
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flat_map(|properties| properties.keys().cloned())
+                    .collect()
+            } else {
+                BTreeSet::new()
+            };
             let description = tool
                 .get("description")
                 .and_then(Value::as_str)
@@ -866,24 +992,28 @@ impl ProjectMcpClient {
                 .chars()
                 .take(MAX_EXPERIMENTAL_DESCRIPTION_CHARS)
                 .collect::<String>();
-            let schema_hash = schema_hash_hex(&input_schema);
+            if tools.len() >= MAX_EXPERIMENTAL_TOOLS {
+                // Valid 65th+ tool discovered; keep only 64 stored entries.
+                tools_truncated = true;
+                break;
+            }
             tools.insert(
                 name,
                 DiscoveredTool {
                     fields,
                     description,
-                    input_schema,
+                    input_schema: schema_available.then_some(input_schema),
                     schema_hash,
+                    schema_available,
+                    schema_truncated,
                 },
             );
-            if tools.len() >= MAX_EXPERIMENTAL_TOOLS {
-                break;
-            }
         }
         let client = Self {
             connection,
             tools,
             version,
+            tools_truncated,
         };
         let mut discovered_tool_names = client
             .tools
@@ -1008,18 +1138,18 @@ impl ProjectMcpClient {
                 Some(json!({
                     "name": name,
                     "schema_hash": tool.schema_hash,
+                    "schema_available": tool.schema_available,
+                    "callable": ExperimentalClaudeToolKind::is_callable(&name),
                 }))
             })
             .collect::<Vec<_>>();
         tools.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
-        let truncated = tools.len() > MAX_EXPERIMENTAL_TOOLS;
-        tools.truncate(MAX_EXPERIMENTAL_TOOLS);
         json!({
             "experimental": true,
             "claude_version": self.version,
             "process_reused": process_reused,
             "tools": tools,
-            "truncated": truncated,
+            "truncated": self.tools_truncated,
         })
     }
 
@@ -1033,18 +1163,17 @@ impl ProjectMcpClient {
             .get(tool_name)
             .ok_or_else(|| ProviderError::new("claude_tool_not_found"))?;
         let mut description = tool.description.clone();
-        let mut input_schema = tool.input_schema.clone();
-        let mut schema_bytes = serde_json::to_vec(&input_schema).map_err(|_| protocol_error())?;
-        let mut truncated = false;
-        if schema_bytes.len() > MAX_EXPERIMENTAL_SCHEMA_BYTES {
-            input_schema = json!({
+        let mut truncated = tool.schema_truncated;
+        let input_schema = if let Some(schema) = tool.input_schema.as_ref() {
+            schema.clone()
+        } else {
+            truncated = true;
+            json!({
                 "type": "object",
                 "truncated": true,
                 "note": "schema exceeded experimental describe bound",
-            });
-            schema_bytes = serde_json::to_vec(&input_schema).unwrap_or_default();
-            truncated = true;
-        }
+            })
+        };
         if description.chars().count() > MAX_EXPERIMENTAL_DESCRIPTION_CHARS {
             description = description
                 .chars()
@@ -1052,7 +1181,6 @@ impl ProjectMcpClient {
                 .collect();
             truncated = true;
         }
-        let _ = schema_bytes;
         Ok(json!({
             "experimental": true,
             "tool_name": tool_name,
@@ -1060,6 +1188,7 @@ impl ProjectMcpClient {
             "schema_hash": tool.schema_hash,
             "description": description,
             "input_schema": input_schema,
+            "callable": ExperimentalClaudeToolKind::is_callable(tool_name),
             "process_reused": process_reused,
             "truncated": truncated,
         }))
@@ -1071,26 +1200,33 @@ impl ProjectMcpClient {
         arguments: Value,
         process_reused: bool,
         deadline: Instant,
-    ) -> Result<Value, ProviderError> {
+    ) -> Result<ExperimentalDispatchOutcome, ProviderError> {
         let tool = self
             .tools
             .get(tool_name)
             .ok_or_else(|| ProviderError::new("claude_tool_not_found"))?;
-        if tool.input_schema.is_null() {
-            return Err(ProviderError::new("claude_schema_unavailable"));
-        }
-        validate_against_schema(&tool.input_schema, &arguments)
+        // Schema must be available before allowlist/validation so oversized schemas
+        // surface as claude_schema_unavailable (tool exists) rather than not_found.
+        let schema = tool
+            .input_schema
+            .as_ref()
+            .ok_or_else(|| ProviderError::new("claude_schema_unavailable"))?;
+        let kind = ExperimentalClaudeToolKind::parse(tool_name)
+            .ok_or_else(|| ProviderError::new("claude_tool_not_allowed"))?;
+        validate_against_schema(schema, &arguments)
             .map_err(|_| ProviderError::new("claude_arguments_invalid"))?;
         let timeout = deadline.saturating_duration_since(Instant::now());
         if timeout.is_zero() {
+            // Preflight: request never written to Claude stdin.
             return Err(ProviderError::new("mcp_request_timeout"));
         }
+        let failure_state = kind.post_send_failure_state();
         let started = Instant::now();
         let result = self.connection.request(
             "tools/call",
             json!({"name": tool_name, "arguments": arguments}),
             timeout,
-            WriteState::NotSubmitted,
+            failure_state,
         )?;
         let is_error = result
             .get("isError")
@@ -1111,17 +1247,23 @@ impl ProjectMcpClient {
                 return Err(ProviderError::new("claude_result_too_large"));
             }
         }
-        Ok(json!({
-            "experimental": true,
-            "tool_name": tool_name,
-            "claude_version": self.version,
-            "schema_hash": tool.schema_hash,
-            "duration_ms": started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-            "process_reused": process_reused,
-            "is_error": is_error,
-            "result": result_value,
-            "result_truncated": result_truncated,
-        }))
+        let tool_status = if is_error { "failure" } else { "success" };
+        Ok(ExperimentalDispatchOutcome {
+            value: json!({
+                "experimental": true,
+                "tool_name": tool_name,
+                "claude_version": self.version,
+                "schema_hash": tool.schema_hash,
+                "duration_ms": started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                "process_reused": process_reused,
+                "tool_status": tool_status,
+                "is_error": is_error,
+                "result": result_value,
+                "result_truncated": result_truncated,
+            }),
+            tool_succeeded: !is_error,
+            error_code: is_error.then_some("claude_tool_error"),
+        })
     }
 }
 
