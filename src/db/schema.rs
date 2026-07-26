@@ -485,6 +485,7 @@ impl Database {
                 surface TEXT NOT NULL,
                 success INTEGER NOT NULL,
                 session_id TEXT,
+                client TEXT,
                 command_preview TEXT,
                 paths_json TEXT NOT NULL DEFAULT '[]',
                 error_summary TEXT
@@ -569,6 +570,10 @@ impl Database {
                 "ALTER TABLE wc_tasks ADD COLUMN guidance_seen_seq INTEGER NOT NULL DEFAULT 0",
                 [],
             )?;
+        }
+        let activity_columns = table_columns(conn, "workspace_activity")?;
+        if !activity_columns.iter().any(|existing| existing == "client") {
+            conn.execute("ALTER TABLE workspace_activity ADD COLUMN client TEXT", [])?;
         }
         let approval_columns = table_columns(conn, "wc_approvals")?;
         if !approval_columns

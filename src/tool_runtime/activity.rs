@@ -13,6 +13,8 @@ pub struct ActivityRecord<'a> {
     pub project: Option<&'a str>,
     /// Client surface that issued the call ("mcp" | "api").
     pub surface: &'a str,
+    /// Executing device (agent client id) for agent-backed projects.
+    pub client: Option<&'a str>,
     pub success: bool,
     pub session_id: Option<&'a str>,
     /// Raw command text for shell-like tools. Recorders must truncate it to a
@@ -32,6 +34,16 @@ pub struct NoopActivityRecorder;
 
 impl ActivityRecorder for NoopActivityRecorder {
     fn record(&self, _record: ActivityRecord<'_>) {}
+}
+
+/// Executing device for an agent-backed project id (`agent:<client>:<name>`).
+/// Local projects have no device.
+pub(crate) fn agent_client_from_project(project: &str) -> Option<&str> {
+    project
+        .strip_prefix("agent:")
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(client, _)| client)
+        .filter(|client| !client.is_empty())
 }
 
 /// Extract the paths a call names from its audit-sanitized argument summary
@@ -80,5 +92,16 @@ mod tests {
             vec!["a.rs", "b.rs", "c.rs", "d.rs"]
         );
         assert!(paths_from_sanitized_arguments(&json!({}), 16).is_empty());
+    }
+
+    #[test]
+    fn client_extraction_handles_agent_and_local_projects() {
+        assert_eq!(
+            agent_client_from_project("agent:laptop:webcodex"),
+            Some("laptop")
+        );
+        assert_eq!(agent_client_from_project("agent::webcodex"), None);
+        assert_eq!(agent_client_from_project("demo"), None);
+        assert_eq!(agent_client_from_project("agent:solo"), None);
     }
 }

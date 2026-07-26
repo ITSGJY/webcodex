@@ -23,6 +23,7 @@ pub struct WorkspaceActivityRow {
     pub project: Option<String>,
     pub tool: String,
     pub surface: String,
+    pub client: Option<String>,
     pub success: bool,
     pub session_id: Option<String>,
     pub command_preview: Option<String>,
@@ -45,14 +46,15 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO workspace_activity (
-                created_at, project, tool, surface, success, session_id,
+                created_at, project, tool, surface, client, success, session_id,
                 command_preview, paths_json, error_summary
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 created_at,
                 record.project,
                 record.tool,
                 record.surface,
+                record.client,
                 record.success,
                 record.session_id,
                 command_preview,
@@ -74,26 +76,30 @@ impl Database {
     pub fn list_workspace_activity(
         &self,
         limit: usize,
+        client: Option<&str>,
     ) -> anyhow::Result<Vec<WorkspaceActivityRow>> {
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(
-            "SELECT id, created_at, project, tool, surface, success, session_id,
+            "SELECT id, created_at, project, tool, surface, client, success, session_id,
                     command_preview, paths_json, error_summary
-             FROM workspace_activity ORDER BY id DESC LIMIT ?1",
+             FROM workspace_activity
+             WHERE ?2 IS NULL OR client = ?2
+             ORDER BY id DESC LIMIT ?1",
         )?;
-        let rows = statement.query_map(params![limit as i64], |row| {
-            let paths_json: String = row.get(8)?;
+        let rows = statement.query_map(params![limit as i64, client], |row| {
+            let paths_json: String = row.get(9)?;
             Ok(WorkspaceActivityRow {
                 id: row.get(0)?,
                 created_at: row.get(1)?,
                 project: row.get(2)?,
                 tool: row.get(3)?,
                 surface: row.get(4)?,
-                success: row.get(5)?,
-                session_id: row.get(6)?,
-                command_preview: row.get(7)?,
+                client: row.get(5)?,
+                success: row.get(6)?,
+                session_id: row.get(7)?,
+                command_preview: row.get(8)?,
                 paths: serde_json::from_str(&paths_json).unwrap_or_default(),
-                error_summary: row.get(9)?,
+                error_summary: row.get(10)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -173,6 +179,7 @@ mod tests {
             tool,
             project: Some("demo"),
             surface: "mcp",
+            client: Some("laptop"),
             success,
             session_id: None,
             command: None,
@@ -194,14 +201,33 @@ mod tests {
             )
             .unwrap();
         }
-        let rows = db.list_workspace_activity(10).unwrap();
+        let rows = db.list_workspace_activity(10, None).unwrap();
         assert_eq!(rows.len(), 3, "prune keeps only max_rows newest rows");
         assert!(rows[0].id > rows[1].id && rows[1].id > rows[2].id);
         assert_eq!(rows[0].tool, "run_shell");
         assert_eq!(rows[0].surface, "mcp");
         assert_eq!(rows[0].paths, vec!["a.rs".to_string()]);
         assert_eq!(rows[0].command_preview.as_deref(), Some("cargo test"));
-        assert_eq!(db.list_workspace_activity(2).unwrap().len(), 2);
+        assert_eq!(db.list_workspace_activity(2, None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn activity_filter_by_client_matches_exactly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(&tmp.path().join("activity.db")).unwrap();
+        let mut other = sample("run_shell", true, None);
+        other.client = Some("desktop");
+        db.insert_workspace_activity(1, &sample("run_shell", true, None), None, 10)
+            .unwrap();
+        db.insert_workspace_activity(2, &other, None, 10).unwrap();
+        assert_eq!(db.list_workspace_activity(10, None).unwrap().len(), 2);
+        let filtered = db.list_workspace_activity(10, Some("laptop")).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].client.as_deref(), Some("laptop"));
+        assert!(db
+            .list_workspace_activity(10, Some("nobody"))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -216,7 +242,7 @@ mod tests {
             10,
         )
         .unwrap();
-        let rows = db.list_workspace_activity(1).unwrap();
+        let rows = db.list_workspace_activity(1, None).unwrap();
         let stored = rows[0].error_summary.as_deref().unwrap();
         assert!(stored.chars().count() <= ERROR_SUMMARY_MAX_CHARS + 1);
         assert!(stored.ends_with('…'));

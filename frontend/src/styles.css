@@ -383,6 +383,10 @@ input[type="text"] {
   border-left-color: var(--muted);
 }
 
+.device-clickable {
+  cursor: pointer;
+}
+
 .diff,
 .output {
   max-height: 360px;

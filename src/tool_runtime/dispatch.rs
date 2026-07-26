@@ -18,6 +18,7 @@ use crate::auth::AuthContext;
 struct WorkspaceActivityContext {
     tool: &'static str,
     project: Option<String>,
+    client: Option<String>,
     command: Option<String>,
     paths: Vec<String>,
 }
@@ -118,6 +119,10 @@ impl ToolRuntime {
         Some(WorkspaceActivityContext {
             tool,
             project: call.project().map(str::to_string),
+            client: call
+                .project()
+                .and_then(super::activity::agent_client_from_project)
+                .map(str::to_string),
             command: call.command_text().map(str::to_string),
             paths: super::activity::paths_from_sanitized_arguments(&sanitized, 16),
         })
@@ -367,6 +372,7 @@ impl ToolRuntime {
                 tool: context.tool,
                 project: context.project.as_deref(),
                 surface: transport.as_str(),
+                client: context.client.as_deref(),
                 success: result.success,
                 session_id: session_id.as_deref(),
                 command: context.command.as_deref(),

@@ -1056,7 +1056,17 @@ async fn dispatch_create_project_rejects_relative_path() {
 async fn mutating_dispatch_feeds_the_activity_recorder() {
     #[derive(Default)]
     struct CapturingRecorder(
-        std::sync::Mutex<Vec<(String, bool, Option<String>, Vec<String>, String)>>,
+        #[allow(clippy::type_complexity)]
+        std::sync::Mutex<
+            Vec<(
+                String,
+                bool,
+                Option<String>,
+                Vec<String>,
+                String,
+                Option<String>,
+            )>,
+        >,
     );
     impl crate::tool_runtime::activity::ActivityRecorder for CapturingRecorder {
         fn record(&self, record: crate::tool_runtime::activity::ActivityRecord<'_>) {
@@ -1066,6 +1076,7 @@ async fn mutating_dispatch_feeds_the_activity_recorder() {
                 record.command.map(str::to_string),
                 record.paths.clone(),
                 record.surface.to_string(),
+                record.client.map(str::to_string),
             ));
         }
     }
@@ -1115,12 +1126,13 @@ async fn mutating_dispatch_feeds_the_activity_recorder() {
 
     let records = recorder.0.lock().unwrap();
     assert_eq!(records.len(), 1, "only the mutating call is recorded");
-    let (tool, success, command, paths, surface) = &records[0];
+    let (tool, success, command, paths, surface, client) = &records[0];
     assert_eq!(tool, "run_shell");
     assert!(success);
     assert_eq!(command.as_deref(), Some("echo activity-probe"));
     assert!(paths.is_empty());
     assert_eq!(surface, "api");
+    assert_eq!(client.as_deref(), Some("activity-shell"));
 
     // Path extraction and mutating classification are pinned at the capture
     // level: edits carry their sanitized paths, reads yield no context.

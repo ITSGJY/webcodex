@@ -34,6 +34,7 @@ pub(crate) enum TaskCliCommand {
         location: TaskLocationOptions,
         limit: usize,
         json: bool,
+        client: Option<String>,
     },
     Guide {
         location: TaskLocationOptions,
@@ -90,6 +91,7 @@ Options:\n\
   --state-dir PATH           Override private hosted state directory\n\
   --limit N                  List at most N rows (1..=100; list/activity)\n\
   --json                     Emit JSON (list/activity)\n\
+  --client NAME              Filter activity to one device (activity only)\n\
   -h, --help                 Print help and exit\n"
 }
 
@@ -106,6 +108,7 @@ pub(crate) fn parse(args: &[String]) -> Result<TaskCliCommand, String> {
     let mut limit = DEFAULT_LIST_LIMIT;
     let mut limit_set = false;
     let mut json_output = false;
+    let mut client_filter: Option<String> = None;
     let mut positional = Vec::new();
     let mut index = 1;
     while index < args.len() {
@@ -130,6 +133,7 @@ pub(crate) fn parse(args: &[String]) -> Result<TaskCliCommand, String> {
                 }
             }
             "--json" => json_output = true,
+            "--client" => client_filter = Some(value(&mut index)?),
             "--help" | "-h" => return Err("help requested".to_string()),
             value if value.starts_with('-') => {
                 return Err(format!("unknown task option '{value}'"))
@@ -143,6 +147,9 @@ pub(crate) fn parse(args: &[String]) -> Result<TaskCliCommand, String> {
         state_dir,
         profile,
     };
+    if client_filter.is_some() && operation != "activity" {
+        return Err("--client is only valid with task activity".to_string());
+    }
     match operation.as_str() {
         "list" if positional.is_empty() => Ok(TaskCliCommand::List {
             location,
@@ -154,6 +161,7 @@ pub(crate) fn parse(args: &[String]) -> Result<TaskCliCommand, String> {
             location,
             limit,
             json: json_output,
+            client: client_filter,
         }),
         "activity" => Err("task activity accepts no positional arguments".to_string()),
         "guide" => {
@@ -273,9 +281,12 @@ pub(crate) fn run(command: TaskCliCommand) -> Result<String, String> {
             location,
             limit,
             json,
+            client,
         } => {
             let (_state, db) = open_state(&location)?;
-            let rows = db.list_workspace_activity(limit).map_err(store_error)?;
+            let rows = db
+                .list_workspace_activity(limit, client.as_deref())
+                .map_err(store_error)?;
             if json {
                 pretty_json(&json!({ "activity": rows }))
             } else if rows.is_empty() {
@@ -292,8 +303,9 @@ pub(crate) fn run(command: TaskCliCommand) -> Result<String, String> {
                         .clone()
                         .filter(|value| !value.is_empty())
                         .unwrap_or_else(|| row.paths.join(", "));
+                    let device = row.client.as_deref().unwrap_or("-");
                     output.push_str(&format!(
-                        "{time}  {status}  {:<24} {:<4} {detail}\n",
+                        "{time}  {status}  {:<24} {:<4} {device:<14} {detail}\n",
                         row.tool, row.surface
                     ));
                 }

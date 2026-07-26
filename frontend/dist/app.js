@@ -1049,6 +1049,14 @@ function renderDevices(agents: any[]) {
     body.className = "timeline-payload muted small";
     body.textContent = deviceDetail(agent);
     item.appendChild(body);
+    const clientId = agent && agent.client_id ? String(agent.client_id) : "";
+    if (clientId) {
+      item.classList.add("device-clickable");
+      item.title = "Show this device's recent activity";
+      item.addEventListener("click", () => {
+        setActivityClientFilter(clientId);
+      });
+    }
     node.appendChild(item);
   }
 }
@@ -1201,8 +1209,27 @@ async function decideApproval(row, approve, reason) {
   }
 }
 
+let activityClientFilter = "";
+
+// Devices rows toggle this filter; the ledger then shows one device's work.
+function setActivityClientFilter(client) {
+  activityClientFilter = activityClientFilter === client ? "" : client;
+  const clear = el("activity-filter-clear");
+  if (clear) {
+    clear.hidden = !activityClientFilter;
+    clear.textContent = activityClientFilter
+      ? "device: " + activityClientFilter + " ✕"
+      : "";
+  }
+  void fetchActivity();
+}
+
 async function fetchActivity() {
-  const res = await api("activity", { limit: 50 });
+  const body = { limit: 50 };
+  if (activityClientFilter) {
+    body.client = activityClientFilter;
+  }
+  const res = await api("activity", body);
   if (!res || !res.ok || !res.data) {
     return;
   }
@@ -1232,6 +1259,7 @@ function renderActivity(rows: any[]) {
     meta.className = "muted small";
     meta.textContent = [
       row && row.surface ? String(row.surface) : "",
+      row && row.client ? "device " + String(row.client) : "",
       timeLabel(row ? row.created_at : null),
     ]
       .filter((value) => !!value && value !== "not available")
@@ -1302,6 +1330,9 @@ function init() {
   el("show-completed")?.addEventListener("change", () => {
     showCompleted = inputChecked("show-completed");
     void fetchTasks();
+  });
+  el("activity-filter-clear")?.addEventListener("click", () => {
+    setActivityClientFilter(activityClientFilter);
   });
   el("guide-btn")?.addEventListener("click", () => {
     void sendGuidance();
