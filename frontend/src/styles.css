@@ -347,6 +347,14 @@ input[type="text"] {
   overflow-wrap: anywhere;
 }
 
+.activity {
+  max-height: 320px;
+}
+
+.activity-failed {
+  border-left-color: var(--fail);
+}
+
 .diff,
 .output {
   max-height: 360px;

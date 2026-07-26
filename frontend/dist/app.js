@@ -958,9 +958,75 @@ async function tick() {
   try {
     await fetchReadiness();
     await fetchTasks();
+    await fetchActivity();
   } finally {
     endRefresh(state, "tick");
   }
+}
+
+async function fetchActivity() {
+  const res = await api("activity", { limit: 50 });
+  if (!res || !res.ok || !res.data) {
+    return;
+  }
+  renderActivity(Array.isArray(res.data.activity) ? res.data.activity : []);
+}
+
+// Workspace ledger: every mutating tool execution from any client surface,
+// newest first. Facts render  only.
+function renderActivity(rows: any[]) {
+  const node = el("activity-list");
+  if (!node) {
+    return;
+  }
+  clearNode(node);
+  show("activity-empty", rows.length === 0);
+  setText("activity-count", rows.length ? "(" + rows.length + ")" : "");
+  for (const row of rows) {
+    const item = document.createElement("li");
+    item.className = "timeline-event" + (row && row.success ? "" : " activity-failed");
+    const head = document.createElement("div");
+    head.className = "timeline-head";
+    const kind = document.createElement("span");
+    kind.className = "timeline-kind";
+    kind.textContent =
+      (row && row.tool ? String(row.tool) : "tool") + (row && row.success ? "" : " (failed)");
+    const meta = document.createElement("span");
+    meta.className = "muted small";
+    meta.textContent = [
+      row && row.surface ? String(row.surface) : "",
+      timeLabel(row ? row.created_at : null),
+    ]
+      .filter((value) => !!value && value !== "not available")
+      .join(" · ");
+    head.appendChild(kind);
+    head.appendChild(meta);
+    item.appendChild(head);
+    const detailText = activityDetail(row);
+    if (detailText) {
+      const body = document.createElement("div");
+      body.className = "timeline-payload muted small";
+      body.textContent = detailText;
+      item.appendChild(body);
+    }
+    node.appendChild(item);
+  }
+}
+
+function activityDetail(row) {
+  if (!row) {
+    return "";
+  }
+  const parts = [];
+  if (typeof row.command_preview === "string" && row.command_preview) {
+    parts.push(row.command_preview);
+  } else if (Array.isArray(row.paths) && row.paths.length) {
+    parts.push(row.paths.map((path) => String(path)).join(", "));
+  }
+  if (!row.success && typeof row.error_summary === "string" && row.error_summary) {
+    parts.push(row.error_summary);
+  }
+  return parts.join(" — ");
 }
 
 function onTokenSubmit(event) {
