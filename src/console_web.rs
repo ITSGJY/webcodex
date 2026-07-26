@@ -155,7 +155,9 @@ mod tests {
     #[tokio::test]
     async fn http_readiness_requires_bearer_auth() {
         // The console page is public, but the data API it calls must still
-        // reject requests without a Bearer token.
+        // reject requests without a Bearer token. The 401 depends on
+        // open-anonymous mode being off, so hold the auth env guard.
+        let _env = crate::auth::AuthEnvGuard::auth_required();
         let config = test_config(Some("secret"));
         let (_tmp, db) = test_db();
         let service = Service::new(build_test_router(config, db));

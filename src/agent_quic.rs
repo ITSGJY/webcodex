@@ -1330,6 +1330,10 @@ mod tests {
 
     #[tokio::test]
     async fn quic_bootstrap_token_registers_and_wrong_token_is_rejected() {
+        // "wrong-secret" has no wc_ prefix, so a leaked shared-key mode would
+        // authenticate it and shift the failure from "unauthorized" to the
+        // scope gate. Hold the auth env guard to keep the rejection exact.
+        let _env = crate::auth::AuthEnvGuard::auth_required();
         let (cert_der, key_der) = self_signed_cert();
         let registry = Arc::new(ShellClientRegistry::default());
         let addr = start_quic_server(

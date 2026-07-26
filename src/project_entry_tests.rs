@@ -1789,6 +1789,10 @@ async fn console_review_and_accept_golden_path() {
 
 #[tokio::test]
 async fn console_requires_a_credential() {
+    // The bare 401 depends on open-anonymous mode being off: with a leaked
+    // WEBCODEX_ALLOW_ANONYMOUS the middleware would mint an anonymous context
+    // and the project surface gate would answer 403 instead.
+    let _env = crate::auth::AuthEnvGuard::auth_required();
     let fixture = authenticated_project_fixture().await;
     let response = TestClient::post("http://localhost/api/console/tasks")
         .json(&serde_json::json!({}))

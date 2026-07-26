@@ -1944,6 +1944,60 @@ mod tests {
         }
     }
 
+    // Regression for the parallel env pollution class: a test that enables
+    // shared-key or open-anonymous mode under AuthEnvGuard must never leak
+    // into another test's auth_required window. The toggler thread plays the
+    // role of "some other test"; every rejection assert below runs inside its
+    // own auth_required guard. Any future writer that bypasses the shared
+    // TEST_ENV_LOCK makes this test fail loudly instead of flaking elsewhere.
+    #[tokio::test]
+    async fn unknown_token_rejection_survives_concurrent_guarded_mode_toggles() {
+        let config = crate::Config {
+            addr: "127.0.0.1:0".to_string(),
+            data_dir: PathBuf::from("./data"),
+            token: Some("canary-secret".to_string()),
+            max_text_size: 2 * 1024 * 1024,
+            max_file_size: 100 * 1024 * 1024,
+            codex: crate::CodexConfig::default(),
+            oauth2: crate::OAuth2Config::default(),
+        };
+
+        let toggler = std::thread::spawn(|| {
+            for _ in 0..40 {
+                let env = AuthEnvGuard::new();
+                env.enable_direct_shared_key();
+                env.enable_open_anonymous();
+                assert!(shared_key_enabled(), "toggler must see its own enable");
+                assert!(allow_anonymous_enabled(), "toggler must see its own enable");
+                // Drop restores the pre-toggle values under the same lock.
+            }
+        });
+
+        for round in 0..40 {
+            let _env = AuthEnvGuard::auth_required();
+            assert!(
+                !shared_key_enabled(),
+                "round {round}: shared-key mode leaked into an auth_required window"
+            );
+            assert!(
+                !allow_anonymous_enabled(),
+                "round {round}: open-anonymous mode leaked into an auth_required window"
+            );
+            let unknown = authenticate_bearer(&config, None, Some("canary-unknown-key")).await;
+            assert!(
+                unknown.is_none(),
+                "round {round}: unknown token was accepted as a shared key"
+            );
+            let missing = authenticate_bearer(&config, None, None).await;
+            assert!(
+                missing.is_none(),
+                "round {round}: missing token was accepted anonymously"
+            );
+        }
+
+        toggler.join().expect("toggler thread must not panic");
+    }
+
     // -----------------------------------------------------------------------
     // AuthMiddleware integration: OAuth2 access token on HTTP surface
     // -----------------------------------------------------------------------

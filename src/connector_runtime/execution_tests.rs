@@ -3740,3 +3740,193 @@ async fn provenance_mismatch_fails_honestly_with_evidence() {
     assert_eq!(changes["changed_paths_total"], 0);
     assert!(changes["changed_paths"].as_array().is_some());
 }
+
+#[tokio::test]
+async fn provenance_mismatch_from_tracked_changes_keeps_gitignore_out_of_the_remedy() {
+    let fixture = fixture(1_000).await;
+    let arguments = checks(&fixture, "provenance-tracked-1", &["check"]);
+    let connector = fixture.connector.clone();
+    let owner = fixture.owner.clone();
+    let check_call =
+        tokio::spawn(async move { call(&connector, &owner, "checks_run", arguments).await });
+    let start = next_request(&fixture.registry).await;
+    assert_eq!(start.kind, "start_validation_job");
+    let job_id = start.job_id.unwrap();
+    // Simulate a check that rewrites a tracked file (e.g. a formatter or a
+    // build script touching committed sources) without creating anything
+    // untracked. The fingerprint must still change, but the remedy must not
+    // talk about .gitignore — ignoring a tracked file cannot fix this.
+    let readme = std::path::Path::new(&task(&fixture).execution_root).join("README.md");
+    assert!(readme.exists(), "fixture workspace must track README.md");
+    std::fs::write(&readme, "fixture rewritten by the check\n").unwrap();
+    update_validation_job(
+        &fixture.registry,
+        &job_id,
+        "completed",
+        None,
+        Some(0),
+        check_progress(1, None, None),
+    )
+    .await;
+    let outcome = check_call.await.unwrap();
+    assert!(outcome.ok, "{}", outcome.body);
+
+    let mut terminal = None;
+    for _ in 0..400 {
+        let execution = fixture
+            .connector
+            .db
+            .latest_connector_execution(
+                &fixture.task_id,
+                &fixture.connector.context.project_id,
+                tests::PROJECT_SUBJECT_ID,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        if execution.is_terminal() {
+            terminal = Some(execution);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let execution = terminal.expect("execution should reach a terminal state quickly");
+    assert_eq!(execution.state, "failed");
+    assert_eq!(execution.failure_source.as_deref(), Some("workspace"));
+    assert_eq!(
+        execution.failure_code.as_deref(),
+        Some("workspace_provenance_mismatch")
+    );
+    let projection = execution::execution_projection(&execution, 10, None);
+    assert_eq!(
+        projection["next_action"],
+        "inspect_workspace_changes_then_rerun_checks"
+    );
+    let evidence = execution.assertion_evidence.expect("evidence must persist");
+    assert_eq!(evidence["invariant"], "workspace_provenance");
+    let detail = evidence["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("no untracked files were detected"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("Inspect or revert workspace changes"),
+        "{detail}"
+    );
+    assert!(!detail.contains(".gitignore"), "{detail}");
+    assert!(
+        serde_json::to_vec(&evidence).unwrap().len() <= crate::db::MAX_ASSERTION_EVIDENCE_BYTES
+    );
+}
+
+#[tokio::test]
+async fn scan_failure_review_caps_applied_paths_and_reports_the_true_total() {
+    let fixture = fixture(20).await;
+    let project_id = fixture.connector.context.project_id.clone();
+
+    // Persist more distinct applied paths than the review will ever list,
+    // through the same durable edits_apply events the runtime writes.
+    let distinct = MAX_REVIEW_APPLIED_PATHS + 5;
+    let paths: Vec<String> = (0..distinct)
+        .map(|index| format!("src/gen/file-{index:03}.rs"))
+        .collect();
+    let mut now = 500;
+    for chunk in paths.chunks(16) {
+        fixture
+            .connector
+            .db
+            .append_connector_task_event(
+                &fixture.task_id,
+                &project_id,
+                tests::PROJECT_SUBJECT_ID,
+                "edits_apply",
+                &json!({ "ok": true, "dry_run": false, "changed_paths": chunk }),
+                now,
+            )
+            .unwrap();
+        now += 1;
+    }
+    // Re-applying paths after the cap is already crossed must not inflate
+    // the total: the count is over distinct paths, not over edit events.
+    fixture
+        .connector
+        .db
+        .append_connector_task_event(
+            &fixture.task_id,
+            &project_id,
+            tests::PROJECT_SUBJECT_ID,
+            "edits_apply",
+            &json!({ "ok": true, "dry_run": false, "changed_paths": &paths[..16] }),
+            now,
+        )
+        .unwrap();
+    // Bury the edit events under more noise than any recent-event window
+    // holds: the review must read the persisted applied-edit query, not the
+    // tail of the timeline.
+    for index in 0..60 {
+        now += 1;
+        fixture
+            .connector
+            .db
+            .append_connector_task_event(
+                &fixture.task_id,
+                &project_id,
+                tests::PROJECT_SUBJECT_ID,
+                "files_read",
+                &json!({ "index": index }),
+                now,
+            )
+            .unwrap();
+    }
+
+    let review_connector = fixture.connector.clone();
+    let review_owner = fixture.owner.clone();
+    let review_task = fixture.task_id.clone();
+    let review = tokio::spawn(async move {
+        call(
+            &review_connector,
+            &review_owner,
+            "task_review",
+            json!({"task_id": review_task}),
+        )
+        .await
+    });
+    let scan = next_request(&fixture.registry).await;
+    fixture
+        .registry
+        .complete(ShellAgentResultRequest {
+            client_id: "hosted".into(),
+            agent_instance_id: "instance".into(),
+            request_id: scan.request_id,
+            exit_code: Some(1),
+            stdout: Some("## main\n".into()),
+            stderr: Some("fatal: unable to read tree".into()),
+            duration_ms: Some(1),
+            error: None,
+        })
+        .await
+        .unwrap();
+    let review = review.await.unwrap();
+    assert!(review.ok, "{}", review.body);
+    let changes = &review.body["data"]["changes"];
+    assert_eq!(changes["source"], "workspace_scan_failed");
+    assert_eq!(changes["changed_paths_source"], "applied_edits");
+    assert_eq!(changes["changed_paths_complete"], false);
+    assert_eq!(changes["changed_paths_total"], distinct);
+    let listed = changes["changed_paths"].as_array().unwrap();
+    assert_eq!(listed.len(), MAX_REVIEW_APPLIED_PATHS);
+    // First-seen order, no duplicates, and nothing past the cap leaks in.
+    assert_eq!(listed[0], "src/gen/file-000.rs");
+    assert_eq!(
+        listed[MAX_REVIEW_APPLIED_PATHS - 1],
+        format!("src/gen/file-{:03}.rs", MAX_REVIEW_APPLIED_PATHS - 1)
+    );
+    let unique: std::collections::HashSet<&str> = listed.iter().filter_map(Value::as_str).collect();
+    assert_eq!(unique.len(), MAX_REVIEW_APPLIED_PATHS);
+    for overflow in &paths[MAX_REVIEW_APPLIED_PATHS..] {
+        assert!(
+            !unique.contains(overflow.as_str()),
+            "path past the cap leaked into the bounded list: {overflow}"
+        );
+    }
+}
