@@ -267,3 +267,23 @@
 现在的状态：基础留在树里、**关着**；`sandbox_read_only_commands` 硬编码 `false`；`doctor` 报告基础存在并**在同一句话里**说明这不改变任何事。缺口"读不受限"由 `command_sandbox.rs` 里一个断言读取成功的测试钉住，不会悄悄变得不真。重开的全部条件见 `docs/READ_ONLY_COMMAND_SANDBOX.md`。
 
 遗留（下批）：批次 5 跨会话 bootstrap（task_list/resume 合并设计）。~~B2 欠的 connector 级测试~~ 随批次 2 撤回一并作废——没有免审批派发路径需要测试了。
+
+## 9. 夜间批次（2026-07-27，main 直系）
+
+目标由用户定为三件："能反馈给模型、更好用、接入更简单"（"webUI 看见模型动作"经核查已基本完备：带 diff 的 review、浏览器内 accept/reject、auto-refresh 均已存在，未再投入）。
+
+| 项 | 内容 | 提交 |
+|---|---|---|
+| files_list 收尾 | 昨日实现的 files_list 能力（9→10）验绿入库；复盘文档补批次 2 撤回记录 | df586e1 / 21a1689 / b1023b7 |
+| 拒绝理由回流 | console/CLI 的 reject 增加可选理由，走 human_guidance 通道投递给模型 | 5db5fc9 |
+| 路由缺陷修复 | **files_list 在 Actions schema 里已宣告但 HTTP 路由从未注册**（GPT Actions 侧 404，MCP 不受影响）；补注册并加"每个宣告的能力路由必须应答"的漂移钉扎测试 | 0efe9ae |
+| 跨会话续接 | task_list / task_resume 两个只读能力（10→12），批次 5 落地 | fcf26a2 |
+| Connect 接入页 | console 新增 Connect 面板 + README 双语"接入托管窗口"最短路径 | 45d340b |
+
+**拒绝理由回流（5db5fc9）。** 拒绝是整个产品里人类最强的一次表态，此前对模型是哑的。现在 `result/reject`（console）与 `webcodex task reject TASK_ID [REASON]`（CLI）接受可选理由（trim、≤500 字节；accept 带理由直接拒绝而不是悄悄丢弃）；拒绝落库成功后以 `human_guidance` 事件记录（`source:"host_reject"`、附 result_id），由既有 deliver-once 水位在模型下一次能力调用时带出。要点：终态任务写 guidance 需绕过 `require_running` 守卫，为此新增 `append_connector_decision_guidance`（唯一读者 `claim_pending_connector_guidance` 本就不要求任务在跑，终态写+终态读自洽）；幂等重拒与 interrupted-abandon 路径不记录；console 的 host review 传 `deliver_guidance=false`，刷新不会抢在模型前消费理由；guidance 写失败只告警不连坐（拒绝本身已持久，不能因反馈写失败而看起来像拒绝失败）。
+
+**跨会话续接（fcf26a2，原批次 5）。** 窗口会过期、任务不会；此前进入持久状态的唯一入口是"同一个窗口记得 task_id"。新增：`task_list`（本凭证最近任务，SQL 里按 owner_subject_id 限定——所有权即可见性边界；返回 goal/计算态/能力词汇的 next_action；无任务绑定，task_id 为 null）与 `task_resume`（重绑会话：goal、状态、有界 applied paths、result 及其本地决定、最新 execution 投影、以及经同一 guidance 通道**一次性认领**的未投递指引——含隔夜拒绝理由；本地决定在 next_action 上压过过期的执行建议；运行中任务的每次重绑记 `task_resume` 事件上 console 时间线，终态任务刻意跳过 running-only 守卫）。工具描述钉扎新会话入口顺序（先 task_list）。设计取舍：`_meta["openai/session"]` 自动识别新会话**明确不做**——那是 ChatGPT 专属信号，GPT Actions 与其他 MCP 客户端拿不到，跨客户端行为统一靠工具描述，不引入隐藏会话态。golden：能力数 10→12（mcp/surface/project_entry 三处）。
+
+**Connect 接入页（45d340b）。** 接入的死点是"连上平台"那一段：MCP URL、Actions schema URL、OAuth discovery 散在三份文档。console 新增 Connect 面板（新路由 `/api/console/connect` 已入 CONSOLE_ROUTES 白名单）：服务端只投影非秘密事实（project/profile/可选 WEBCODEX_PUBLIC_URL/三个路径，测试钉住响应零凭据），前端用配置的公网地址或**当前页面自己的 origin** 拼出 Claude 自定义连接器与 ChatGPT Actions 导入的复制粘贴块，origin 是回环时明示"托管窗口够不着，先开隧道"。README 双语新增"接入托管窗口"：一行 cloudflared + console 面板闭环。
+
+三进制全量 1745 / 396 / 219 全绿，`cargo fmt --check` 干净，前端 tsc+build+15 测试全过。遗留：无新增；桌面 GUI、PTY、多窗口协调、QUIC 深化维持挂起。
