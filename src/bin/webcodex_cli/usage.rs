@@ -1,33 +1,38 @@
 pub(crate) fn usage() -> &'static str {
     "Usage: webcodex-cli <COMMAND>\n\n\
-     Management/setup commands for WebCodex.\n\n\
-     Commands:\n\
-       server up                                      Bootstrap server env with auto-generated admin key\n\
-       server init                                      Create server env bootstrap file\n\
-       server install-service                           Generate/install a systemd unit\n\
-       server status                                    Check service and runtime status\n\
-       pairing create                                   Create a temporary client pairing code\n\
-       client enroll                                    Enroll a client from a pairing code\n\
-       ops status|agents|projects|smoke-preflight       Read-only operator workflow checks\n\
-       user/users create/list                             Manage users\n\
-       token generate                                   Generate a local wc_pat_* value and hash\n\
-       token create-local                               Locally create and register a wc_pat_* with an account credential\n\
-       token register-hash                              Register a precomputed wc_pat_* hash\n\
-       token list/revoke                                Manage personal API tokens\n\
-       tokens create-local/register-hash/list/revoke    Manage personal API tokens\n\
-       agent-token create-local                         Locally create and register a wc_agent_* with an account credential\n\
-       agent-token register-hash                        Register a precomputed wc_agent_* hash\n\
-       agent-tokens create-local/register-hash/list/revoke Manage agent tokens\n\
-       agent init/install-service/status                  Manage client-side agent config/service\n\
-       setup single-user                                  Create a user + GPT + agent token set\n\n\
+     Management and setup commands for WebCodex.\n\n\
+     Commands:\n\n\
+     Run the server:\n\
+     \x20\x20server up                     Bootstrap server env with an auto-generated admin key\n\
+     \x20\x20server init                   Create the server env bootstrap file\n\
+     \x20\x20server install-service        Generate and install a systemd unit\n\
+     \x20\x20server status                 Check service and runtime status\n\n\
+     Connect a machine:\n\
+     \x20\x20pairing create                Create a short-lived pairing code (run on the server)\n\
+     \x20\x20client enroll                 Enroll this machine using that code\n\
+     \x20\x20agent init|install-service|status\n\
+     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20Manage this machine's agent config and service\n\n\
+     Accounts and credentials:\n\
+     \x20\x20users create|list             Manage users\n\
+     \x20\x20tokens create|create-local|generate|register-hash|list|revoke\n\
+     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20Personal API tokens (wc_pat_*)\n\
+     \x20\x20agent-tokens create|create-local|register-hash|list|revoke\n\
+     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20Agent tokens (wc_agent_*)\n\n\
+     Diagnostics:\n\
+     \x20\x20ops status|agents|projects|smoke-preflight\n\
+     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20Read-only operator workflow checks\n\n\
+     Quick start:\n\
+     \x20\x20setup single-user             Create a user, GPT client, and agent token in one step\n\n\
      Options:\n\
-       -h, --help       Print help and exit\n\
-       -V, --version    Print version and exit\n\n\
-     Common flags (users/tokens/agent-tokens/setup):\n\
-       --server-url URL    WebCodex server URL (required)\n\
-       --token TOKEN       Bootstrap/admin/self bearer token\n\
-       --token-file PATH   Read bearer token from file\n\
-       Token fallback: WEBCODEX_TOKEN\n\
+     \x20\x20-h, --help                    Print help and exit\n\
+     \x20\x20-V, --version                 Print version and exit\n\n\
+     Common flags (users / tokens / agent-tokens / setup):\n\
+     \x20\x20--server-url URL              WebCodex server URL (required)\n\
+     \x20\x20--token TOKEN                 Bootstrap, admin, or self bearer token\n\
+     \x20\x20--token-file PATH             Read the bearer token from a file\n\
+     \x20\x20Token fallback: WEBCODEX_TOKEN\n\n\
+     `generate` and `create-local` run locally; every other token action calls\n\
+     the server. Singular spellings (user, token, agent-token) are accepted.\n\
      Output: JSON unless noted otherwise.\n"
 }
 

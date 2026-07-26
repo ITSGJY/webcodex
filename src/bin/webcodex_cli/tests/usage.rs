@@ -62,12 +62,17 @@ fn webcodex_cli_help_mentions_management_commands() {
             assert_eq!(code, 0);
             assert!(stdout.contains("pairing create"));
             assert!(stdout.contains("client enroll"));
-            assert!(stdout.contains("token generate"));
-            assert!(stdout.contains("token create-local"));
-            assert!(stdout.contains("token register-hash"));
-            assert!(stdout.contains("agent-token create-local"));
-            assert!(stdout.contains("agent-token register-hash"));
-            assert!(stdout.contains("agent init/install-service/status"));
+            // The token actions are now listed once per group rather than one
+            // line per action, but every action must still appear.
+            for action in ["create-local", "generate", "register-hash", "list", "revoke"] {
+                assert!(
+                    stdout.contains(action),
+                    "help no longer mentions token action {action}"
+                );
+            }
+            assert!(stdout.contains("tokens create|"));
+            assert!(stdout.contains("agent-tokens create|"));
+            assert!(stdout.contains("agent init|install-service|status"));
         }
         other => panic!("expected help exit, got {other:?}"),
     }
@@ -158,4 +163,65 @@ fn client_enroll_help_documents_profile_and_output_dir_precedence() {
     assert!(help.contains("/etc/webcodex/clients/<profile>"));
     assert!(help.contains("~/.config/webcodex/clients/<profile>"));
     assert!(help.contains("Explicit --output-dir overrides"));
+}
+
+#[test]
+fn singular_and_plural_token_groups_dispatch_identically() {
+    // `tokens create-local` used to reach the admin parser, which has no such
+    // action, so it failed with "unknown admin command" while the documented
+    // `token create-local` worked. Both spellings now take the same path.
+    for group in ["token", "tokens", "agent-token", "agent-tokens"] {
+        match cli_action([group, "create-local", "--help"]) {
+            CliAction::Exit { stdout, stderr, .. } => {
+                let text = format!("{stdout}{stderr}");
+                assert!(
+                    text.contains("create-local"),
+                    "{group} create-local was not recognized: {text}"
+                );
+                assert!(
+                    !text.contains("unknown admin command"),
+                    "{group} create-local still falls through to the admin parser: {text}"
+                );
+            }
+            other => panic!("expected an exit for {group}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn admin_token_actions_still_reach_the_admin_parser_under_both_spellings() {
+    for group in ["token", "tokens"] {
+        match cli_action([
+            group,
+            "list",
+            "--server-url",
+            "https://example.test",
+            "--username",
+            "alice",
+        ]) {
+            CliAction::Admin(_) => {}
+            other => panic!("expected admin dispatch for {group} list, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn usage_lists_one_canonical_spelling_per_group() {
+    // The old help text listed `user/users`, `token`, and `tokens` as separate
+    // commands, which is what made the surface look twice its real size.
+    match cli_action(["--help"]) {
+        CliAction::Exit { stdout, .. } => {
+            for canonical in ["users create|list", "tokens create|", "agent-tokens create|"] {
+                assert!(
+                    stdout.contains(canonical),
+                    "help is missing {canonical}: {stdout}"
+                );
+            }
+            assert!(
+                !stdout.contains("user/users"),
+                "help still advertises both spellings: {stdout}"
+            );
+        }
+        other => panic!("expected help exit, got {other:?}"),
+    }
 }

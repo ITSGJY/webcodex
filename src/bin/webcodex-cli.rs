@@ -259,7 +259,7 @@ where
             parse_agent_token_subcommand(args[0].as_str(), &args[1..])
         }
         "setup" => parse_setup_subcommand(&args[1..]),
-        "token" => parse_token_subcommand(&args[1..]),
+        "token" | "tokens" => parse_token_subcommand(args[0].as_str(), &args[1..]),
         group if admin_cli::is_admin_group(group) => {
             // users / tokens / agent-tokens management: reuse admin_cli parser.
             match parse_admin_cli(&args) {
@@ -279,7 +279,7 @@ where
     }
 }
 
-fn parse_token_subcommand(args: &[String]) -> CliAction {
+fn parse_token_subcommand(group: &str, args: &[String]) -> CliAction {
     if args.is_empty() {
         return CliAction::Exit {
             code: 2,
@@ -290,32 +290,37 @@ fn parse_token_subcommand(args: &[String]) -> CliAction {
     match args[0].as_str() {
         "generate" => match parse_token_generate(&args[1..]) {
             Ok(opts) => CliAction::TokenGenerate(opts),
-            Err(e) => CliAction::Exit {
-                code: 2,
-                stdout: String::new(),
-                stderr: format!("{}\n", e),
-            },
+            Err(e) => local_token_parse_error(e),
         },
         "create-local" => match parse_token_create_local(&args[1..]) {
             Ok(opts) => CliAction::TokenCreateLocal(opts),
-            Err(e) => CliAction::Exit {
-                code: 2,
-                stdout: String::new(),
-                stderr: format!("{}\n", e),
-            },
+            Err(e) => local_token_parse_error(e),
         },
-        _ => {
-            let mut forwarded = vec!["token".to_string()];
-            forwarded.extend_from_slice(args);
-            match parse_admin_cli(&forwarded) {
-                Ok(cmd) => CliAction::Admin(cmd),
-                Err(e) => CliAction::Exit {
-                    code: 2,
-                    stdout: String::new(),
-                    stderr: format!("{}\n", e),
-                },
-            }
-        }
+        _ => forward_to_admin_cli(group, args),
+    }
+}
+
+/// `generate` and `create-local` are handled locally; every other action is an
+/// admin API call. Forwarding preserves the group word the caller typed so the
+/// singular and plural spellings behave identically.
+fn forward_to_admin_cli(group: &str, args: &[String]) -> CliAction {
+    let mut forwarded = vec![group.to_string()];
+    forwarded.extend_from_slice(args);
+    match parse_admin_cli(&forwarded) {
+        Ok(cmd) => CliAction::Admin(cmd),
+        Err(e) => CliAction::Exit {
+            code: 2,
+            stdout: String::new(),
+            stderr: format!("{}\n", e),
+        },
+    }
+}
+
+fn local_token_parse_error(error: String) -> CliAction {
+    CliAction::Exit {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("{}\n", error),
     }
 }
 
@@ -348,24 +353,9 @@ fn parse_agent_token_subcommand(group: &str, args: &[String]) -> CliAction {
     match args[0].as_str() {
         "create-local" => match parse_agent_token_create_local(&args[1..]) {
             Ok(opts) => CliAction::AgentTokenCreateLocal(opts),
-            Err(e) => CliAction::Exit {
-                code: 2,
-                stdout: String::new(),
-                stderr: format!("{}\n", e),
-            },
+            Err(e) => local_token_parse_error(e),
         },
-        _ => {
-            let mut forwarded = vec![group.to_string()];
-            forwarded.extend_from_slice(args);
-            match parse_admin_cli(&forwarded) {
-                Ok(cmd) => CliAction::Admin(cmd),
-                Err(e) => CliAction::Exit {
-                    code: 2,
-                    stdout: String::new(),
-                    stderr: format!("{}\n", e),
-                },
-            }
-        }
+        _ => forward_to_admin_cli(group, args),
     }
 }
 
