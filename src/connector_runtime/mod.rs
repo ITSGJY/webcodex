@@ -1644,20 +1644,27 @@ impl ConnectorRuntime {
                     // failed (e.g. the slot is wedged after a terminal
                     // failure): degrade to the durable applied-path record
                     // instead of failing the whole review.
-                    let applied_paths = self
-                        .db
-                        .connector_task_events(
-                            &task.task_id,
-                            &task.project_id,
-                            &task.owner_subject_id,
-                            MAX_EVENT_COUNT,
-                        )
-                        .map(|events| aggregate_applied_paths(&events))
-                        .unwrap_or_default();
+                    // Same durable source the active-execution branch uses, so
+                    // a path applied early in a long task is still reported and
+                    // a bounded list never claims to be the whole set. A
+                    // lookup that also fails reports nothing rather than
+                    // implying the task changed nothing.
+                    let applied = self.db.connector_task_applied_paths(
+                        &task.task_id,
+                        &task.project_id,
+                        &task.owner_subject_id,
+                        MAX_REVIEW_APPLIED_PATHS,
+                    );
+                    let (paths, total, complete) = match applied {
+                        Ok(applied) => (applied.paths, applied.total, applied.complete),
+                        Err(_) => (Vec::new(), 0, false),
+                    };
                     json!({
                         "source": "workspace_scan_failed",
-                        "changed_paths": applied_paths,
+                        "changed_paths": paths,
                         "changed_paths_source": "applied_edits",
+                        "changed_paths_complete": complete,
+                        "changed_paths_total": total,
                         "diff_preview": null
                     })
                 }
