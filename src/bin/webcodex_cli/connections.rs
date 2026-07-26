@@ -130,6 +130,75 @@ pub(crate) fn canonical_server_url(raw: &str) -> Result<CanonicalServerUrl, Stri
     Ok(CanonicalServerUrl { url, slug })
 }
 
+/// Resolve the directory that holds every user for one server, creating it if
+/// needed, and refuse anything that could place it outside `base`.
+///
+/// Everything a login writes — staging, the published connection, a backup, a
+/// recovery directory — hangs off the path this returns, so a symlink here
+/// would put freshly minted tokens outside the config directory entirely.
+/// `symlink_metadata` is used rather than `Path::exists`, because a dangling
+/// symlink reports `false` from `exists` and would otherwise be created
+/// through.
+pub(crate) fn resolve_connection_parent(
+    base: &Path,
+    canonical: &CanonicalServerUrl,
+) -> Result<PathBuf, String> {
+    match std::fs::symlink_metadata(base) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return Err(format!(
+                "{} is not a directory; refusing to store credentials there",
+                base.display()
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(base)
+                .map_err(|error| format!("failed to create {}: {error}", base.display()))?;
+        }
+        Err(error) => {
+            return Err(format!("failed to inspect {}: {error}", base.display()));
+        }
+    }
+    let canonical_base = base
+        .canonicalize()
+        .map_err(|error| format!("failed to resolve {}: {error}", base.display()))?;
+
+    let server_dir = canonical_base.join(&canonical.slug);
+    match std::fs::symlink_metadata(&server_dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return Err(format!(
+                "{} is not a directory; refusing to store credentials there",
+                server_dir.display()
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&server_dir)
+                .map_err(|error| format!("failed to create {}: {error}", server_dir.display()))?;
+        }
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect {}: {error}",
+                server_dir.display()
+            ));
+        }
+    }
+
+    // Re-resolve and confirm the directory really sits directly under the base
+    // rather than having been redirected on the way.
+    let resolved = server_dir
+        .canonicalize()
+        .map_err(|error| format!("failed to resolve {}: {error}", server_dir.display()))?;
+    if resolved.parent() != Some(canonical_base.as_path()) {
+        return Err(format!(
+            "{} does not live directly under {}",
+            resolved.display(),
+            canonical_base.display()
+        ));
+    }
+    Ok(resolved)
+}
+
 /// Validate a username for use as a directory component.
 ///
 /// A leading `.` is refused so that the reserved prefix used for staging,
@@ -171,6 +240,12 @@ impl ConnectionPaths {
         }
     }
 
+    /// Where a connection *would* live, without touching the filesystem.
+    ///
+    /// Production code goes through `resolve_connection_parent` instead, which
+    /// verifies the directories it hands back; this is the unchecked form and
+    /// exists for tests that are constructing fixtures.
+    #[cfg(test)]
     pub(crate) fn resolve(base: &Path, server_url: &str, username: &str) -> Result<Self, String> {
         let server = canonical_server_url(server_url)?;
         let user = user_slug(username)?;
@@ -261,7 +336,18 @@ fn read_connection(dir: PathBuf) -> Option<Connection> {
     // A descriptor naming a server we cannot canonicalize is malformed; listing
     // it would put an entry in `status` that no `logout` could ever match.
     let canonical = canonical_server_url(&server_url).ok()?;
-    user_slug(&username).ok()?;
+    let user = user_slug(&username).ok()?;
+
+    // The descriptor has to agree with where it was found. Otherwise a file
+    // dropped into one connection's directory could describe a different
+    // server or user, and `logout` for that other identity would select this
+    // directory and delete it.
+    let user_dir_name = paths.dir.file_name()?.to_str()?;
+    let server_dir_name = paths.dir.parent()?.file_name()?.to_str()?;
+    if canonical.slug != server_dir_name || user != user_dir_name {
+        return None;
+    }
+
     Some(Connection {
         server_url: canonical.url,
         username,
@@ -622,9 +708,113 @@ mod tests {
         )
         .unwrap();
 
+        // Neither identity may be honoured: the descriptor disagrees with the
+        // directory it sits in, so the whole connection is malformed.
+        assert!(list_connections(base).is_empty());
+    }
+
+    #[test]
+    fn descriptor_server_identity_must_match_server_directory() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path();
+        let paths = ConnectionPaths::resolve(base, "https://api.example.com", "alice").unwrap();
+        std::fs::create_dir_all(&paths.dir).unwrap();
+
+        // Right user, wrong server — including a scheme swap, which the slug
+        // alone would not have caught before.
+        for server in [
+            "https://other.example.com",
+            "http://api.example.com",
+            "https://api.example.com:8443",
+        ] {
+            std::fs::write(
+                &paths.descriptor,
+                descriptor_toml(server, "alice", "d", "t"),
+            )
+            .unwrap();
+            assert!(
+                list_connections(base).is_empty(),
+                "{server} should not have been listed under {}",
+                paths.dir.display()
+            );
+        }
+
+        // The matching one is listed.
+        std::fs::write(
+            &paths.descriptor,
+            descriptor_toml("https://api.example.com", "alice", "d", "t"),
+        )
+        .unwrap();
+        assert_eq!(list_connections(base).len(), 1);
+    }
+
+    #[test]
+    fn descriptor_username_must_match_user_directory() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path();
+        let paths = ConnectionPaths::resolve(base, "https://api.example.com", "alice").unwrap();
+        std::fs::create_dir_all(&paths.dir).unwrap();
+
+        for username in ["mallory", "alice2", "alic"] {
+            std::fs::write(
+                &paths.descriptor,
+                descriptor_toml("https://api.example.com", username, "d", "t"),
+            )
+            .unwrap();
+            assert!(
+                list_connections(base).is_empty(),
+                "{username} should not have been listed under {}",
+                paths.dir.display()
+            );
+        }
+
+        // Case folds through `user_slug`, so `Alice` still matches `alice/`.
+        std::fs::write(
+            &paths.descriptor,
+            descriptor_toml("https://api.example.com", "Alice", "d", "t"),
+        )
+        .unwrap();
         let listed = list_connections(base);
-        assert_eq!(listed.len(), 1);
-        // Path stays where it was found, so removal can only ever touch here.
-        assert_eq!(listed[0].paths.dir, paths.dir);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].username, "Alice");
+    }
+
+    #[test]
+    fn mismatched_descriptor_is_not_listed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path();
+        // base/https_api.example.com/alice/ describing a different identity.
+        let dir = base.join("https_api.example.com").join("alice");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("server.toml"),
+            descriptor_toml("https://other.example.com", "mallory", "laptop", "t"),
+        )
+        .unwrap();
+
+        assert!(list_connections(base).is_empty());
+    }
+
+    #[test]
+    fn mismatched_descriptor_cannot_be_selected_by_logout() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path();
+        let dir = base.join("https_api.example.com").join("alice");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("server.toml"),
+            descriptor_toml("https://other.example.com", "mallory", "laptop", "t"),
+        )
+        .unwrap();
+
+        // Neither the directory it lives in nor the server it claims can reach
+        // it, so no `logout` can be talked into deleting it.
+        for server in ["https://api.example.com", "https://other.example.com"] {
+            assert!(
+                connections_for_server(base, server).is_empty(),
+                "{server} selected a mismatched descriptor"
+            );
+        }
+        assert!(dir.exists());
     }
 }

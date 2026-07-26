@@ -20,7 +20,8 @@ use std::path::{Path, PathBuf};
 
 use super::connections::{
     canonical_server_url, connections_for_server, default_base_dir, descriptor_toml,
-    list_connections, Connection, ConnectionPaths, INTERNAL_DIR_PREFIX,
+    list_connections, resolve_connection_parent, user_slug, Connection, ConnectionPaths,
+    INTERNAL_DIR_PREFIX,
 };
 
 /// Device name reported to the server. The hostname is what a person would call
@@ -102,6 +103,9 @@ pub(crate) enum PublishOutcome {
     /// The final path was already taken and `--overwrite` was not given, so the
     /// new credentials were parked here instead of being thrown away.
     SavedForRecovery { path: PathBuf },
+    /// The new connection is live, but the replaced one could not be deleted
+    /// and its credentials are still on disk.
+    PublishedWithBackupResidue { path: PathBuf },
 }
 
 fn unique_internal_dir(parent: &Path, kind: &str) -> PathBuf {
@@ -137,12 +141,7 @@ fn harden_secret_file(_path: &Path) -> Result<(), String> {
 ///
 /// It has to share a parent with the destination so that publishing is a
 /// same-filesystem rename rather than a copy that could half-succeed.
-pub(crate) fn create_staging_dir(final_dir: &Path) -> Result<PathBuf, String> {
-    let parent = final_dir
-        .parent()
-        .ok_or_else(|| format!("{} has no parent directory", final_dir.display()))?;
-    std::fs::create_dir_all(parent)
-        .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+pub(crate) fn create_staging_dir(parent: &Path) -> Result<PathBuf, String> {
     let staging = unique_internal_dir(parent, "staging");
     std::fs::create_dir(&staging)
         .map_err(|error| format!("failed to create staging directory: {error}"))?;
@@ -150,10 +149,41 @@ pub(crate) fn create_staging_dir(final_dir: &Path) -> Result<PathBuf, String> {
     Ok(staging)
 }
 
-fn discard_staging(staging: &Path) {
-    // Best effort: the caller is already reporting a failure, and a leftover
-    // staging directory is skipped by `status` either way.
-    let _ = std::fs::remove_dir_all(staging);
+/// Removal of an internal (staging / backup / recovery) directory.
+///
+/// Wrapped so tests can force the failure path: these directories hold live
+/// tokens, so "could not delete" has to reach the user rather than being
+/// swallowed.
+fn remove_internal_dir(path: &Path) -> Result<(), String> {
+    #[cfg(test)]
+    if tests::removal_is_forced_to_fail() {
+        return Err("injected removal failure".to_string());
+    }
+    std::fs::remove_dir_all(path).map_err(|error| error.to_string())
+}
+
+/// Delete an internal directory, reporting the path if anything is left.
+///
+/// A leftover staging or backup directory still contains a usable agent token
+/// and user token. `status` will not show it, which is exactly why silence here
+/// would be wrong: nothing else would ever mention it again.
+#[must_use = "leftover internal directories hold live credentials"]
+fn discard_internal_dir(path: &Path) -> Option<PathBuf> {
+    match remove_internal_dir(path) {
+        Ok(()) => None,
+        Err(_) => Some(path.to_path_buf()),
+    }
+}
+
+/// Append a residue note to an error, naming the path but never its contents.
+fn note_residue(error: String, residue: Option<PathBuf>) -> String {
+    match residue {
+        None => error,
+        Some(path) => format!(
+            "{error}; credentials were also left behind at {} and should be deleted",
+            path.display()
+        ),
+    }
 }
 
 /// Move a fully-built staging directory into its final place.
@@ -174,14 +204,21 @@ pub(crate) fn publish_connection(
         .parent()
         .ok_or_else(|| format!("{} has no parent directory", final_dir.display()))?;
 
-    if !final_dir.exists() {
+    // `symlink_metadata` rather than `exists`, so a dangling symlink at the
+    // destination is seen as occupied instead of silently renamed through.
+    let destination_taken = std::fs::symlink_metadata(final_dir).is_ok();
+
+    if !destination_taken {
         return match std::fs::rename(staging, final_dir) {
             Ok(()) => Ok(PublishOutcome::Published),
             Err(error) => {
-                discard_staging(staging);
-                Err(format!(
-                    "failed to publish the connection to {}: {error}",
-                    final_dir.display()
+                let residue = discard_internal_dir(staging);
+                Err(note_residue(
+                    format!(
+                        "failed to publish the connection to {}: {error}",
+                        final_dir.display()
+                    ),
+                    residue,
                 ))
             }
         };
@@ -192,18 +229,24 @@ pub(crate) fn publish_connection(
         return match std::fs::rename(staging, &recovery) {
             Ok(()) => Ok(PublishOutcome::SavedForRecovery { path: recovery }),
             Err(error) => {
-                discard_staging(staging);
-                Err(format!("failed to save the new credentials: {error}"))
+                let residue = discard_internal_dir(staging);
+                Err(note_residue(
+                    format!("failed to save the new credentials: {error}"),
+                    residue,
+                ))
             }
         };
     }
 
     let backup = unique_internal_dir(parent, "backup");
     if let Err(error) = std::fs::rename(final_dir, &backup) {
-        discard_staging(staging);
-        return Err(format!(
-            "failed to move the existing connection aside: {error}; {} is unchanged",
-            final_dir.display()
+        let residue = discard_internal_dir(staging);
+        return Err(note_residue(
+            format!(
+                "failed to move the existing connection aside: {error}; {} is unchanged",
+                final_dir.display()
+            ),
+            residue,
         ));
     }
 
@@ -211,8 +254,8 @@ pub(crate) fn publish_connection(
         // Put the old connection back before reporting; a failed login must not
         // cost the user a working one.
         let restored = std::fs::rename(&backup, final_dir).is_ok();
-        discard_staging(staging);
-        return Err(if restored {
+        let residue = discard_internal_dir(staging);
+        let base = if restored {
             format!(
                 "failed to publish the connection: {error}; the previous connection at {} was restored",
                 final_dir.display()
@@ -222,13 +265,19 @@ pub(crate) fn publish_connection(
                 "failed to publish the connection: {error}; the previous connection is at {}",
                 backup.display()
             )
-        });
+        };
+        return Err(note_residue(base, residue));
     }
 
-    let _ = std::fs::remove_dir_all(&backup);
-    Ok(PublishOutcome::Published)
+    match discard_internal_dir(&backup) {
+        None => Ok(PublishOutcome::Published),
+        Some(path) => Ok(PublishOutcome::PublishedWithBackupResidue { path }),
+    }
 }
 
+/// Unchecked destination for tests; production resolves through a verified
+/// parent directory instead.
+#[cfg(test)]
 pub(crate) fn resolve_destination(
     base: &Path,
     server_url: &str,
@@ -499,18 +548,22 @@ pub(crate) async fn redeem_pairing_code(
 /// Log this device into a server.
 pub(crate) async fn run_login(opts: LoginOptions) -> Result<String, String> {
     // Reject a URL we could not turn into an identity *before* spending the
-    // one-time code on it.
+    // one-time code on it, and settle the directory it would be stored under
+    // for the same reason: a symlinked base is better found now than after the
+    // code is gone.
     let canonical = canonical_server_url(&opts.server_url)?;
-    let server_url = canonical.url;
+    let server_url = canonical.url.clone();
+    let parent = resolve_connection_parent(&opts.base_dir, &canonical)?;
 
     let identity = redeem_pairing_code(&server_url, &opts).await?;
-    let paths = resolve_destination(&opts.base_dir, &server_url, &identity.username)?;
+    let user = user_slug(&identity.username)?;
+    let paths = ConnectionPaths::new(parent.join(user));
 
-    let staging = create_staging_dir(&paths.dir)?;
+    let staging = create_staging_dir(&parent)?;
     let now = chrono::Utc::now().to_rfc3339();
     if let Err(error) = stage_connection(&staging, &opts, &server_url, &identity, &now) {
-        discard_staging(&staging);
-        return Err(error);
+        let residue = discard_internal_dir(&staging);
+        return Err(note_residue(error, residue));
     }
 
     match publish_connection(&staging, &paths.dir, opts.overwrite)? {
@@ -526,6 +579,17 @@ pub(crate) async fn run_login(opts: LoginOptions) -> Result<String, String> {
             &path,
             &server_url,
             &identity.username,
+        )),
+        // The login worked, but the credentials it replaced are still on disk.
+        // Reported as a failure so it cannot be mistaken for a clean run.
+        PublishOutcome::PublishedWithBackupResidue { path } => Err(format!(
+            "Logged in to {server_url} as {}, but the credentials this replaced could not be\n\
+             deleted and are still readable at {}.\n\n\
+             The new connection at {} is in place and usable. Delete the leftover\n\
+             directory once you have confirmed nothing else needs it.\n",
+            identity.username,
+            path.display(),
+            paths.dir.display(),
         )),
     }
 }
@@ -574,6 +638,25 @@ pub(crate) fn run_status(opts: StatusOptions) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// Forces `remove_internal_dir` to fail, so the residue-reporting paths
+        /// can be exercised. Deleting a directory otherwise always succeeds
+        /// here, and the process runs as root, so permissions cannot be used.
+        static FORCE_REMOVAL_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(super) fn removal_is_forced_to_fail() -> bool {
+        FORCE_REMOVAL_FAILURE.with(std::cell::Cell::get)
+    }
+
+    /// Run `body` with internal-directory removal forced to fail.
+    fn with_failing_removal<T>(body: impl FnOnce() -> T) -> T {
+        FORCE_REMOVAL_FAILURE.with(|flag| flag.set(true));
+        let result = body();
+        FORCE_REMOVAL_FAILURE.with(|flag| flag.set(false));
+        result
+    }
+
     const CODE: &str = "wc_pair_supersecretcode";
     const USER_TOKEN: &str = "wc_pat_usersecret";
     const AGENT_TOKEN: &str = "wc_agent_agentsecret";
@@ -608,10 +691,11 @@ mod tests {
         let opts = login_opts(base, server_url, overwrite);
         let canonical = canonical_server_url(server_url).unwrap();
         let identity = identity();
-        let paths = resolve_destination(base, &canonical.url, &identity.username).unwrap();
-        let staging = create_staging_dir(&paths.dir)?;
+        let parent = resolve_connection_parent(base, &canonical)?;
+        let paths = ConnectionPaths::new(parent.join(user_slug(&identity.username).unwrap()));
+        let staging = create_staging_dir(&parent)?;
         if let Err(error) = stage_connection(&staging, &opts, &canonical.url, &identity, "t") {
-            discard_staging(&staging);
+            let _ = discard_internal_dir(&staging);
             return Err(error);
         }
         publish_connection(&staging, &paths.dir, overwrite)
@@ -704,10 +788,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::TempDir::new().unwrap();
         let paths = resolve_destination(temp.path(), "https://api.example.com", "alice").unwrap();
-        let staging = create_staging_dir(&paths.dir).unwrap();
+        std::fs::create_dir_all(paths.dir.parent().unwrap()).unwrap();
+        let staging = create_staging_dir(paths.dir.parent().unwrap()).unwrap();
         let mode = std::fs::metadata(&staging).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "staging has mode {mode:o}");
-        discard_staging(&staging);
+        let _ = discard_internal_dir(&staging);
         assert!(!staging.exists());
     }
 
@@ -718,13 +803,14 @@ mod tests {
         let opts = login_opts(base, "https://api.example.com", false);
         let identity = identity();
         let paths = resolve_destination(base, "https://api.example.com", "alice").unwrap();
-        let staging = create_staging_dir(&paths.dir).unwrap();
+        std::fs::create_dir_all(paths.dir.parent().unwrap()).unwrap();
+        let staging = create_staging_dir(paths.dir.parent().unwrap()).unwrap();
 
         // Make agent.toml impossible to create by putting a directory there.
         std::fs::create_dir_all(staging.join("agent.toml")).unwrap();
         let result = stage_connection(&staging, &opts, "https://api.example.com", &identity, "t");
         assert!(result.is_err(), "staging should have failed");
-        discard_staging(&staging);
+        let _ = discard_internal_dir(&staging);
 
         assert!(all_connections(base).is_empty());
         assert!(!paths.dir.exists(), "no connection may have been published");
@@ -813,7 +899,7 @@ mod tests {
         publish_login(base, "https://api.example.com", false).unwrap();
 
         let server_dir = base.join("https_api.example.com");
-        let staging = create_staging_dir(&server_dir.join("alice")).unwrap();
+        let staging = create_staging_dir(&server_dir).unwrap();
         std::fs::write(
             staging.join("server.toml"),
             descriptor_toml("https://api.example.com", "alice", "laptop", "t"),
@@ -984,6 +1070,201 @@ mod tests {
             connections_for_server(base, "https://s1.example.com").len(),
             1
         );
+    }
+
+    // --- verified parent directory -------------------------------------------
+
+    /// Nothing a login writes may appear in a directory outside the base.
+    fn assert_no_credentials_in(dir: &Path) {
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().to_string();
+            if matches!(
+                name.as_str(),
+                "server.toml" | "agent.toml" | "webcodex-user-token"
+            ) || name.starts_with(INTERNAL_DIR_PREFIX)
+            {
+                offenders.push(name);
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "credentials leaked into {}: {offenders:?}",
+            dir.display()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_refuses_a_symlinked_base_directory() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let base = temp.path().join("config");
+        std::os::unix::fs::symlink(&outside, &base).unwrap();
+
+        let canonical = canonical_server_url("https://api.example.com").unwrap();
+        let error = resolve_connection_parent(&base, &canonical).unwrap_err();
+        assert!(!error.contains(CODE), "{error}");
+        assert_no_credentials_in(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_refuses_a_symlinked_server_directory() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let base = temp.path().join("config");
+        std::fs::create_dir_all(&base).unwrap();
+
+        let canonical = canonical_server_url("https://api.example.com").unwrap();
+        std::os::unix::fs::symlink(&outside, base.join(&canonical.slug)).unwrap();
+
+        let error = resolve_connection_parent(&base, &canonical).unwrap_err();
+        assert!(error.contains("not a directory"), "{error}");
+        assert!(!error.contains(CODE), "{error}");
+        assert_no_credentials_in(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_server_symlink_is_rejected() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path().join("config");
+        std::fs::create_dir_all(&base).unwrap();
+        let canonical = canonical_server_url("https://api.example.com").unwrap();
+        // `Path::exists` reports false for this, which is exactly why the
+        // resolution uses `symlink_metadata`.
+        let missing = temp.path().join("nowhere");
+        std::os::unix::fs::symlink(&missing, base.join(&canonical.slug)).unwrap();
+        assert!(!base.join(&canonical.slug).exists());
+
+        let error = resolve_connection_parent(&base, &canonical).unwrap_err();
+        assert!(error.contains("not a directory"), "{error}");
+        assert!(!missing.exists(), "the dangling target was created");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn login_does_not_create_staging_outside_base() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let base = temp.path().join("config");
+        std::fs::create_dir_all(&base).unwrap();
+
+        let canonical = canonical_server_url("https://api.example.com").unwrap();
+        std::os::unix::fs::symlink(&outside, base.join(&canonical.slug)).unwrap();
+
+        // A full login attempt must stop at parent resolution.
+        let opts = login_opts(&base, "https://api.example.com", false);
+        let error = run_login(opts).await.unwrap_err();
+        assert!(!error.contains(CODE), "{error}");
+        assert_no_credentials_in(&outside);
+        assert!(all_connections(&base).is_empty());
+    }
+
+    #[test]
+    fn resolve_connection_parent_creates_a_missing_base_and_server_directory() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path().join("nested/config");
+        let canonical = canonical_server_url("https://api.example.com").unwrap();
+        let parent = resolve_connection_parent(&base, &canonical).unwrap();
+        assert_eq!(parent, base.canonicalize().unwrap().join(&canonical.slug));
+        assert!(parent.is_dir());
+        // Re-resolving an existing directory is fine.
+        assert_eq!(
+            resolve_connection_parent(&base, &canonical).unwrap(),
+            parent
+        );
+    }
+
+    // --- cleanup failures ----------------------------------------------------
+
+    #[test]
+    fn successful_overwrite_does_not_silently_leave_backup() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path();
+        publish_login(base, "https://api.example.com", false).unwrap();
+        let outcome = publish_login(base, "https://api.example.com", true).unwrap();
+        assert_eq!(
+            outcome,
+            PublishOutcome::Published,
+            "a clean overwrite must not report residue"
+        );
+        assert_no_internal_residue(base.join("https_api.example.com").as_path());
+    }
+
+    #[test]
+    fn backup_cleanup_failure_is_reported() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path();
+        publish_login(base, "https://api.example.com", false).unwrap();
+
+        let outcome =
+            with_failing_removal(|| publish_login(base, "https://api.example.com", true).unwrap());
+        let PublishOutcome::PublishedWithBackupResidue { path } = outcome else {
+            panic!("a backup that could not be deleted must be reported, got {outcome:?}");
+        };
+        assert!(path.exists(), "the reported residue should still be there");
+        // The new connection is nonetheless live and is the only one listed.
+        let listed = all_connections(base);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+    }
+
+    #[test]
+    fn staging_cleanup_failure_is_reported() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path();
+        let canonical = canonical_server_url("https://api.example.com").unwrap();
+        let parent = resolve_connection_parent(base, &canonical).unwrap();
+        let final_dir = parent.join("alice");
+        std::fs::create_dir_all(&final_dir).unwrap();
+
+        // Renaming a staging directory that is not there fails; with removal
+        // also failing, both facts have to appear in the message.
+        let staging = parent.join(".staging-missing");
+        let error =
+            with_failing_removal(|| publish_connection(&staging, &final_dir, true).unwrap_err());
+        assert!(error.contains("left behind"), "{error}");
+        assert!(error.contains(".staging-missing"), "{error}");
+    }
+
+    #[test]
+    fn cleanup_errors_do_not_contain_credentials() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path();
+        let canonical = canonical_server_url("https://api.example.com").unwrap();
+        let parent = resolve_connection_parent(base, &canonical).unwrap();
+        let final_dir = parent.join("alice");
+
+        // Build a real staging directory holding real tokens, then force every
+        // cleanup path to fail and check none of the messages spill them.
+        let mut messages = Vec::new();
+        for overwrite in [false, true] {
+            std::fs::create_dir_all(&final_dir).unwrap();
+            let missing = parent.join(".staging-gone");
+            messages.push(with_failing_removal(|| {
+                publish_connection(&missing, &final_dir, overwrite).unwrap_err()
+            }));
+        }
+
+        let opts = login_opts(base, "https://api.example.com", false);
+        let staging = create_staging_dir(&parent).unwrap();
+        stage_connection(&staging, &opts, &canonical.url, &identity(), "t").unwrap();
+        std::fs::create_dir_all(&final_dir).unwrap();
+        let residue = with_failing_removal(|| discard_internal_dir(&staging));
+        messages.push(note_residue("staging failed".to_string(), residue));
+
+        for message in &messages {
+            for secret in [CODE, AGENT_TOKEN, USER_TOKEN] {
+                assert!(
+                    !message.contains(secret),
+                    "cleanup message leaked a credential: {message}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
