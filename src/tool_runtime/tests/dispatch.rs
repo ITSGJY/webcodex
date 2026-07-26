@@ -1065,6 +1065,8 @@ async fn mutating_dispatch_feeds_the_activity_recorder() {
                 Vec<String>,
                 String,
                 Option<String>,
+                Option<String>,
+                crate::tool_runtime::activity::ActivityScope,
             )>,
         >,
     );
@@ -1076,7 +1078,9 @@ async fn mutating_dispatch_feeds_the_activity_recorder() {
                 record.command.map(str::to_string),
                 record.paths.clone(),
                 record.surface.to_string(),
+                record.project.map(str::to_string),
                 record.client.map(str::to_string),
+                record.scope,
             ));
         }
     }
@@ -1118,6 +1122,35 @@ async fn mutating_dispatch_feeds_the_activity_recorder() {
     let shell = shell_task.await.unwrap();
     assert!(shell.success, "{:?}", shell.error);
 
+    // The runtime also accepts a unique short project id. Activity must record
+    // the canonical agent project and client, not the raw alias; otherwise the
+    // project-scoped console would hide this successful call as client-less.
+    let alias_task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            let bootstrap = auth_context(None, true);
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::RunShell {
+                        project: "agent-proj".to_string(),
+                        command: "echo activity-alias".to_string(),
+                        session_id: None,
+                        timeout_secs: Some(30),
+                        cwd: None,
+                    },
+                    Some(&bootstrap),
+                )
+                .await
+        }
+    });
+    let request = next_patch_agent_request(&runtime, "activity-shell")
+        .await
+        .expect("short project id should enqueue on the resolved client");
+    complete_patch_agent_request(&runtime, "activity-shell", &request.request_id, 0, "ok", "")
+        .await;
+    let alias = alias_task.await.unwrap();
+    assert!(alias.success, "{:?}", alias.error);
+
     // Read-only calls never reach the recorder.
     let list = runtime
         .dispatch(ToolCall::from_tool_name("list_tools", json!({})).unwrap())
@@ -1125,14 +1158,26 @@ async fn mutating_dispatch_feeds_the_activity_recorder() {
     assert!(list.success);
 
     let records = recorder.0.lock().unwrap();
-    assert_eq!(records.len(), 1, "only the mutating call is recorded");
-    let (tool, success, command, paths, surface, client) = &records[0];
-    assert_eq!(tool, "run_shell");
-    assert!(success);
-    assert_eq!(command.as_deref(), Some("echo activity-probe"));
-    assert!(paths.is_empty());
-    assert_eq!(surface, "api");
-    assert_eq!(client.as_deref(), Some("activity-shell"));
+    assert_eq!(records.len(), 2, "only the two mutating calls are recorded");
+    for (index, expected_command) in ["echo activity-probe", "echo activity-alias"]
+        .into_iter()
+        .enumerate()
+    {
+        let (tool, success, command, paths, surface, recorded_project, client, scope) =
+            &records[index];
+        assert_eq!(tool, "run_shell");
+        assert!(success);
+        assert_eq!(command.as_deref(), Some(expected_command));
+        assert!(paths.is_empty());
+        assert_eq!(surface, "api");
+        assert_eq!(recorded_project.as_deref(), Some(project.as_str()));
+        assert_eq!(client.as_deref(), Some("activity-shell"));
+        assert_eq!(
+            scope,
+            &crate::tool_runtime::activity::ActivityScope::HostGlobal,
+            "activity scope must come from the verified bootstrap auth"
+        );
+    }
 
     // Path extraction and mutating classification are pinned at the capture
     // level: edits carry their sanitized paths, reads yield no context.

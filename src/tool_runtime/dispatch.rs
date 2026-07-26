@@ -108,7 +108,10 @@ impl ToolRuntime {
 
     /// Everything the activity ledger needs from a call, captured before the
     /// call value is moved into execution. `None` for non-mutating tools.
-    fn capture_workspace_activity_context(call: &ToolCall) -> Option<WorkspaceActivityContext> {
+    fn capture_workspace_activity_context(
+        call: &ToolCall,
+        resolved_project: Option<&str>,
+    ) -> Option<WorkspaceActivityContext> {
         let tool = call.tool_name();
         let mutating = super::tool_definition::runtime_tool_is_write_like(tool)
             || super::tool_definition::runtime_tool_is_shell_like(tool);
@@ -116,11 +119,11 @@ impl ToolRuntime {
             return None;
         }
         let sanitized = call.session_log_arguments();
+        let project = resolved_project.or_else(|| call.project());
         Some(WorkspaceActivityContext {
             tool,
-            project: call.project().map(str::to_string),
-            client: call
-                .project()
+            project: project.map(str::to_string),
+            client: project
                 .and_then(super::activity::agent_client_from_project)
                 .map(str::to_string),
             command: call.command_text().map(str::to_string),
@@ -144,6 +147,12 @@ impl ToolRuntime {
                 .ok(),
             None => None,
         };
+        // Preserve the canonical project for activity attribution before the
+        // session recorder consumes the resolved value below. Short aliases
+        // must not turn a real agent execution into a client-less row.
+        let activity_project = resolved_project
+            .as_ref()
+            .map(|resolved| resolved.resolved_id.clone());
         if use_current_session && call.session_id().is_none() && is_current_session_eligible(&call)
         {
             if let Some(resolved) = resolved_project.as_ref() {
@@ -338,7 +347,8 @@ impl ToolRuntime {
                 return result;
             }
         }
-        let activity_context = Self::capture_workspace_activity_context(&call);
+        let activity_context =
+            Self::capture_workspace_activity_context(&call, activity_project.as_deref());
         let mut result = self.dispatch_authorized_inner(call, auth, transport).await;
         let permission = permission.filter(|_| {
             !permissions::is_hard_denied_output(&result.output, result.error.as_deref())
