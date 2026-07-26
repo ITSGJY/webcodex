@@ -215,7 +215,10 @@
 
 **事故记录（重要，含事后取证修正）**：本轮并行执行期间发生一次工作树清空事故。取证后的准确时间线（本地时间，UTC+8）：15:38 三个测试重构子代理启动；**15:42:47 files 子代理**为"还原被整仓 cargo fmt 顺带重排的无关文件"执行 `git checkout -- <13 个文件>`，把当时全部未提交改动打回 HEAD；**15:43:52 jobs 子代理**又执行了一次同类 checkout。最初曾怀疑本机存活的 `webcodex-agent` 守护进程（sg4.yyjeqhc.cn，polling 传输）参与还原，**取证否定了这一点**：其日志（agent.log）自 11:57 后零写入，事发窗口无任何活动，QUIC 未配置、WebSocket 超时、无活动连接——15:45 出现的"陌生" `cargo test files` 进程也是 files 子代理自己。**不存在远端线上会话。** 全部改动已按会话记录逐字节重放并验证。**教训**：(1) 并行子代理的任务书必须明令禁止 `git checkout/restore/stash` 与整仓 fmt（"改动只限本文件"的措辞会诱导代理用 checkout 清理别人的文件）；(2) 已用 `git stash store` 留下不改工作树的快照兜底；(3) 该守护进程 file_write/git/raw_shell 全开且注册了 17 个项目——虽然本次清白，但任何能触达 sg4 服务端的窗口都可写本机，开发期间不用时建议停掉。
 
-尚未执行：P2 全部、反盲盒速赢（timeline 渲染、执行中 changed_paths——涉及前端 TS 构建链，下一轮做）。
+**反盲盒第一批（同日，§2.4 的 #1 与 #4 + 部分 #5）**：
+- **console 渲染 timeline**：前端新增 Timeline 区块（`console.html` + `app.ts` 的 `renderTimeline`，倒序、textContent-only、payload 摘要化），消费后端一直在返回却被丢弃的 `recent_events`；`styles.css` 补配套样式；dist 已重建（tsc + build.mjs + 前端测试 15/15）。
+- **执行中不再全黑**：`edits_apply` 事件 payload 现在带有界 `changed_paths`（取自请求本身，schema 上限 16 文件）；执行活跃时 `task_review` 的 changes 从"全空"改为**从任务自己的事件日志聚合已应用路径**（`aggregate_applied_paths`，`changed_paths_source: "applied_edits"`），diff 仍延迟。设计要点：**没有**采用"执行中调 show_changes 扫工作区"的方案——那会让 review 长轮询卡在同步 agent 调用后面（现有测试钉了 500ms 内返回），事件日志聚合是零延迟、零 agent 往返的替代。
+- 新增链路测试 `active_review_surfaces_applied_paths_without_diff`（edits_apply → 长命令 running → review 断言路径/来源/空 diff/事件 payload）+ 现有活跃 review 测试补形状断言。
 
 ---
 
