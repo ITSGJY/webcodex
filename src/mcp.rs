@@ -465,8 +465,8 @@ async fn handle_mcp_request_with_lifecycle(
                     let category = if outcome.ok { "success" } else { "tool_error" };
                     lc.dispatch_finished(true, Some(outcome.ok), category);
                 }
-                let text = serde_json::to_string_pretty(&outcome.body)
-                    .unwrap_or_else(|_| "{}".to_string());
+                let text =
+                    serde_json::to_string(&outcome.body).unwrap_or_else(|_| "{}".to_string());
                 return McpOutcome::Ok(rpc_result(
                     id,
                     json!({
@@ -528,7 +528,7 @@ async fn handle_mcp_request_with_lifecycle(
                     lc.dispatch_finished(true, Some(false), category);
                 }
             }
-            let text = serde_json::to_string_pretty(&json!({
+            let text = serde_json::to_string(&json!({
                 "success": result.success,
                 "output": result.output.clone(),
                 "error": result.error.clone(),
