@@ -10,6 +10,9 @@ pub(crate) fn routes() -> Router {
     Router::with_path("connector")
         .push(Router::with_path("readiness").post(readiness))
         .push(Router::with_path("task/start").post(task_start))
+        .push(Router::with_path("task/list").post(task_list))
+        .push(Router::with_path("task/resume").post(task_resume))
+        .push(Router::with_path("files/list").post(files_list))
         .push(Router::with_path("files/read").post(files_read))
         .push(Router::with_path("files/search").post(files_search))
         .push(Router::with_path("edits/apply").post(edits_apply))
@@ -121,7 +124,7 @@ pub(crate) fn render(res: &mut Response, outcome: ConnectorCallOutcome) {
 }
 
 /// Each connector capability gets an identical `#[handler]` that forwards its
-/// own name to `dispatch`. The macro keeps the 9 handlers from being 9 copies.
+/// own name to `dispatch`. The macro keeps the handlers from being copies.
 macro_rules! connector_handlers {
     ($($name:ident),+ $(,)?) => {
         $(
@@ -135,6 +138,9 @@ macro_rules! connector_handlers {
 
 connector_handlers! {
     task_start,
+    task_list,
+    task_resume,
+    files_list,
     files_read,
     files_search,
     edits_apply,
@@ -143,4 +149,32 @@ connector_handlers! {
     task_review,
     task_cancel,
     task_finish,
+}
+
+#[cfg(test)]
+mod tests {
+    use salvo::test::{ResponseExt, TestClient};
+    use salvo::{Router, Service};
+
+    /// The Actions schema announces one route per capability, but nothing else
+    /// ties the announcement to a registered handler: files_list shipped in
+    /// the schema while its route 404ed. Every announced capability must
+    /// answer — the unconfigured-project body proves the route exists.
+    #[tokio::test]
+    async fn every_announced_capability_route_is_served() {
+        let service = Service::new(Router::with_path("api").push(super::routes()));
+        for name in crate::connector_runtime::surface::CAPABILITY_NAMES {
+            let route = crate::connector_runtime::surface::route_for(name)
+                .expect("registered connector capability has a route");
+            let mut response = TestClient::post(format!("http://127.0.0.1{route}"))
+                .json(&serde_json::json!({}))
+                .send(&service)
+                .await;
+            let body = response.take_string().await.unwrap_or_default();
+            assert!(
+                body.contains("connector_surface_disabled"),
+                "capability {name} is announced at {route} but not served: {body}"
+            );
+        }
+    }
 }
