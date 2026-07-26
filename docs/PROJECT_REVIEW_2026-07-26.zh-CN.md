@@ -230,7 +230,7 @@
 |---|---|---|
 | ① Activity | 所有 surface 的写操作统一账本：`workspace_activity` 表（插入即修剪，默认 2000 行，`WEBCODEX_ACTIVITY*` 三个 env 开关）；dispatch 咽喉在授权闸门后单点记录（工具/surface/成败/路径/命令预览，路径复用 `session_log_arguments` 脱敏纪律）；出口三个——console "Recent activity" 面板、`webcodex task activity`（顶层 `webcodex activity` 待加）、同一 SQLite | **已完成** |
 | ② Approvals 上台面 | console 列 pending 审批（TTL/预览）+ 批准/打回按钮 + 可选理由列（新列）；打回理由回流进 `approval_required`/denied 错误 payload 让窗口模型看到 | 未开工 |
-| ③ 引导留言 | console `task/guide` 路由 → `human_guidance` 持久事件 → 模型下次 `task_review` 看到（复用 Timeline 展示，高亮）；CLI `webcodex task guide` | 未开工 |
+| ③ 引导留言 | **按用户澄清的语义实现："命令执行完，响应直接携带新指令"**——`human_guidance` 持久事件 + `wc_tasks.guidance_seen_seq` 水位（deliver-once，失败降级 at-least-once）；挂载点：`execution_outcome`（commands_run/checks_run 共用终态出口）、`edits_apply` 成功、`task_review`；三个 capability 描述写明契约（"Responses may carry a `guidance` list…adjust course"）；入口：console 详情面板输入框（`task/guide` 路由，已入 CONSOLE_ROUTES）+ `webcodex task guide TASK_ID "MSG"`；Timeline 以强调色高亮引导事件；`append` 自带 require_running（只能引导运行中任务） | **已完成** |
 | ④ Devices | 多设备只读视图：agent 列表 + last_seen + capabilities + provider 健康（`RuntimeMetadata.tool_providers` 已有数据无 UI） | 未开工 |
 
 切片 ① 的记录语义：**只记"通过授权、实际执行"的尝试**（成功与失败都记），授权前被拒的请求不入账本——那是 audit 的职责边界。
