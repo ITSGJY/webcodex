@@ -17,7 +17,7 @@ fn experimental_request(kind: &str, root: &Path, payload: Option<Value>) -> Shel
 }
 
 fn experimental_stdout(router: &ExternalToolRouter, request: ShellAgentShellRequest) -> Value {
-    let ExternalRoute::Handled(result) = router.route(&AgentPolicy::default(), &request) else {
+    let ExternalRoute::Handled(result) = router.route(&permissive_test_policy(), &request) else {
         panic!("experimental request left the experimental path");
     };
     serde_json::from_str(result.stdout.as_deref().unwrap()).unwrap()
@@ -590,7 +590,7 @@ fn experimental_raw_edit_survives_generation_router_retirement() {
     );
     let worker_router = Arc::clone(&old);
     let worker = std::thread::spawn(move || {
-        let ExternalRoute::Handled(result) = worker_router.route(&AgentPolicy::default(), &request)
+        let ExternalRoute::Handled(result) = worker_router.route(&permissive_test_policy(), &request)
         else {
             panic!("raw edit left the experimental path");
         };

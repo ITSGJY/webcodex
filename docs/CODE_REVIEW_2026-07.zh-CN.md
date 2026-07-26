@@ -1,7 +1,7 @@
 # WebCodex 代码评审（2026-07-26）
 
 评审基线：`bd88a30`（`feat/claude-raw-tool-harness`）
-修复分支：`review/path-boundary-fixes`
+修复分支：`review/path-boundary-fixes-on-main`（基于 `main` @ `9018814`）
 
 ---
 
@@ -182,11 +182,12 @@ LEAKED FIRST LINE = Some("root:x:0:0:root:/root:/bin/bash")
 
 ### 4.3 测试夹具调整（因默认值收紧）
 
-`AgentPolicy::default()` 变为 fail-closed 后，31 处测试夹具需显式声明宽松策略——它们测的是 shell/profile 行为而非边界。改动是让**测试意图显式化**，而不是依赖不安全的生产默认值：
+`AgentPolicy::default()` 变为 fail-closed 后，33 处测试夹具需显式声明宽松策略——它们测的是 shell/profile 行为而非边界。改动是让**测试意图显式化**，而不是依赖不安全的生产默认值：
 
 - `webcodex-agent.rs`：新增 `unrestricted_test_policy()`，替换 `test_config` + 16 处调用点
 - `job_manager_tests.rs`：2 处
 - `external_tools_tests.rs`：新增 `permissive_test_policy()`，替换 12 处
+- `external_tools/experimental_tests.rs`：2 处（复用父模块 helper）
 - `transport.rs`：1 处
 
 **刻意保留 fail-closed 默认的边界测试**（未改动，且在新默认下仍通过）：
@@ -200,7 +201,7 @@ LEAKED FIRST LINE = Some("root:x:0:0:root:/root:/bin/bash")
 ```
 cargo test --bins
   webcodex        1712 passed; 0 failed
-  webcodex-agent   370 passed; 0 failed
+  webcodex-agent   381 passed; 0 failed
   webcodex-cli     165 passed; 0 failed
 cargo check --bins   0 warnings
 ```
