@@ -2824,6 +2824,163 @@ async fn unrecognized_executor_status_is_degraded_instead_of_running() {
     );
 }
 
+/// A read_only task must refuse commands before any durable trace exists.
+///
+/// The sandbox route made this conditional on an agent capability, which meant
+/// an agent could re-open unapproved arbitrary shell by advertising a flag. The
+/// denial is now unconditional: a filesystem write filter is one access class,
+/// and read_only promises no consequential execution at all.
+#[tokio::test]
+async fn read_only_commands_run_is_denied_even_when_agent_advertises_sandbox() {
+    let fixture = fixture(20).await;
+    // The agent claims full sandbox support; it must not matter.
+    fixture
+        .registry
+        .register_with_auth(
+            ShellClientRegisterRequest {
+                client_id: "hosted".into(),
+                agent_instance_id: "instance".into(),
+                display_name: None,
+                owner: Some("owner".into()),
+                hostname: None,
+                capabilities: Some(ShellClientCapabilities {
+                    shell: true,
+                    sandbox_read_only_commands: true,
+                    ..Default::default()
+                }),
+                projects: None,
+                agent_protocol_version: Some("test".into()),
+                policy: None,
+            },
+            Some(&fixture.owner),
+        )
+        .await
+        .unwrap();
+
+    let started = fixture
+        .call(
+            "task_start",
+            json!({ "goal": "inspect", "mode": "read_only" }),
+        )
+        .await;
+    let task_id = started.body["task_id"].as_str().unwrap().to_string();
+
+    let outcome = fixture
+        .call(
+            "commands_run",
+            json!({
+                "task_id": task_id,
+                "operation_id": "read-only-shell",
+                "command": "echo hello",
+                "timeout_secs": 30
+            }),
+        )
+        .await;
+    assert!(!outcome.ok, "{}", outcome.body);
+    assert_eq!(outcome.http_status, 403);
+    assert_eq!(outcome.body["error"]["code"], "read_only_task");
+}
+
+/// The denial has to happen before anything is created — an approval, a
+/// reservation, or an agent request would each be a durable trace of work that
+/// read_only said would not happen.
+#[tokio::test]
+async fn read_only_denial_creates_no_approval_reservation_or_agent_request() {
+    let fixture = fixture(20).await;
+    let started = fixture
+        .call(
+            "task_start",
+            json!({ "goal": "inspect", "mode": "read_only" }),
+        )
+        .await;
+    let task_id = started.body["task_id"].as_str().unwrap().to_string();
+
+    let outcome = fixture
+        .call(
+            "commands_run",
+            json!({
+                "task_id": task_id,
+                "operation_id": "read-only-shell",
+                "command": "echo hello",
+                "timeout_secs": 30
+            }),
+        )
+        .await;
+    assert_eq!(outcome.body["error"]["code"], "read_only_task");
+
+    // No approval was created for the human to accidentally grant.
+    let approvals = fixture
+        .connector
+        .db
+        .local_pending_connector_approvals(&fixture.connector.context.project_id, 10)
+        .expect("approvals");
+    assert!(approvals.is_empty(), "{approvals:?}");
+
+    // No execution was reserved.
+    let execution = fixture
+        .connector
+        .db
+        .latest_connector_execution(
+            &task_id,
+            &fixture.connector.context.project_id,
+            &super::stable_subject_id(&fixture.owner).unwrap(),
+            Some("read-only-shell"),
+        )
+        .expect("execution lookup");
+    assert!(execution.is_none(), "{execution:?}");
+
+    // And nothing was queued for the agent to run.
+    let queued = fixture
+        .registry
+        .poll(ShellAgentPollRequest {
+            client_id: "hosted".to_string(),
+            agent_instance_id: "instance".to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap();
+    assert!(queued.is_none(), "{queued:?}");
+}
+
+/// The normal path keeps its gate: the same command still needs one-time
+/// host-local approval before it runs.
+#[tokio::test]
+async fn normal_commands_run_still_requires_exact_one_time_approval() {
+    let fixture = fixture(20).await;
+    let arguments = json!({
+        "task_id": fixture.task_id,
+        "operation_id": "needs-approval",
+        "command": "echo hello",
+        "timeout_secs": 30
+    });
+    let waiting = fixture.call("commands_run", arguments.clone()).await;
+    assert_eq!(waiting.body["error"]["code"], "approval_required");
+    let approval_id = waiting.body["data"]["approval"]["approval_id"]
+        .as_str()
+        .expect("approval id");
+
+    // A different command cannot ride the same approval.
+    let other = fixture
+        .call(
+            "commands_run",
+            json!({
+                "task_id": fixture.task_id,
+                "operation_id": "different-command",
+                "command": "echo goodbye",
+                "timeout_secs": 30
+            }),
+        )
+        .await;
+    assert_eq!(other.body["error"]["code"], "approval_required");
+    assert_ne!(
+        other.body["data"]["approval"]["approval_id"]
+            .as_str()
+            .unwrap(),
+        approval_id,
+        "a second command reused the first command's approval"
+    );
+}
+
 #[tokio::test]
 async fn read_only_task_denies_consequential_capability_before_executor_dispatch() {
     let (_temp, connector) = tests::connector();

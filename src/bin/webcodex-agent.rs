@@ -26,6 +26,9 @@ mod apply_edits_shared;
 
 // The agent does not run glob-based search, so part of the shared policy
 // is unused here.
+// The agent enforces the sandbox but no longer probes for it: the capability is
+// never advertised, so the probe side of the module is unused here.
+#[allow(dead_code)]
 #[path = "../command_sandbox.rs"]
 mod command_sandbox;
 #[allow(dead_code)]
@@ -640,10 +643,13 @@ fn agent_register_capabilities(cfg: &AgentConfig) -> ShellClientCapabilities {
     // New agents always advertise read-only LSP navigation. Older agents omit
     // the field and deserialize as false on the server.
     capabilities.lsp_read_only_navigation = true;
-    // Advertised only when the kernel actually enforces it — the server keeps
-    // read_only commands disabled otherwise.
-    capabilities.sandbox_read_only_commands =
-        command_sandbox::read_only_sandbox_available().is_ok();
+    // Never advertised. The wire field stays so re-enabling later does not need
+    // a second protocol migration, but a write-denying Landlock ruleset is not
+    // a non-consequential execution boundary: a command under it still reads
+    // anything this user can read, inherits the environment, and reaches the
+    // network. See docs/READ_ONLY_COMMAND_SANDBOX.md for what has to be true
+    // before this may become dynamic again.
+    capabilities.sandbox_read_only_commands = false;
     capabilities
 }
 
@@ -1326,7 +1332,15 @@ impl JobManager {
                         return;
                     }
                     command.env("TMPDIR", &scratch);
-                    crate::command_sandbox::sandbox_command_read_only(&mut command, vec![scratch]);
+                    // A host that cannot sandbox must refuse the request, not
+                    // run the command unconfined.
+                    if let Err(error) = crate::command_sandbox::sandbox_command_read_only(
+                        &mut command,
+                        vec![scratch],
+                    ) {
+                        send_start_failure(&sink, request, format!("sandbox unavailable: {error}"));
+                        return;
+                    }
                 }
                 Some(other) => {
                     // Unknown mode: refuse rather than run unsandboxed.

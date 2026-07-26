@@ -229,24 +229,23 @@ pub(crate) fn readiness_with_probe(
             "Project setup is complete.",
         ));
     }
-    // Explicit, never silent: read_only tasks only regain shell commands when
-    // the kernel can enforce the write-denying sandbox.
+    // Reported, never acted on: read_only tasks do not run commands regardless
+    // of what the kernel supports.
     findings.push(
         match crate::command_sandbox::read_only_sandbox_available() {
             Ok(()) => ReadinessFact::pass(
                 "Command sandbox",
-                "command_sandbox_available",
-                "Kernel command sandbox (Landlock) is available; read_only tasks can run \
-             commands with project writes denied by the kernel. Commands can still read \
-             any file inside the checkout — do not keep plaintext credentials in the \
-             repository.",
+                "command_sandbox_foundation_detected",
+                "Landlock foundation detected, but arbitrary read_only shell remains disabled \
+                 because filesystem write filtering alone is not a complete non-consequential \
+                 execution boundary. read_only tasks refuse commands_run.",
             ),
             Err(reason) => ReadinessFact::pass(
                 "Command sandbox",
-                "command_sandbox_unavailable",
+                "command_sandbox_foundation_absent",
                 format!(
-                    "Kernel command sandbox is unavailable ({reason}); read_only tasks keep \
-                 commands_run disabled."
+                    "Landlock foundation is not available on this host ({reason}). This changes \
+                     nothing today: read_only tasks refuse commands_run either way."
                 ),
             ),
         },

@@ -52,6 +52,17 @@ Not yet a fit:
 - Legacy `/api/codex/*` routes are removed.
 - `run_codex` is removed from the model-facing runtime surface.
 - Operators who need Codex-specific workflows should run them outside WebCodex.
+- `read_file` with `with_line_numbers: true` now returns `numbered_text` only.
+  The parallel `lines` array carried the same line numbers and the same text a
+  second time, so a client paid for every numbered read twice. Clients that read
+  `lines` should parse `numbered_text`, whose format is unchanged. The duplicate
+  field is not restored.
+- `read_only` tasks refuse `commands_run`. A `read_only` task performs no
+  consequential execution, and a filesystem write filter does not establish
+  that: a command under one still reads anything the agent user can read,
+  inherits the environment, and reaches the network. See
+  [READ_ONLY_COMMAND_SANDBOX.md](READ_ONLY_COMMAND_SANDBOX.md) for the
+  conditions required before this could change.
 
 ## Security Model
 

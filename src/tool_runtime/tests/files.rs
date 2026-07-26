@@ -3355,3 +3355,107 @@ async fn read_file_still_allows_bulk_tree_paths_by_explicit_path() {
     assert_eq!(req.path.as_deref(), Some(".git/HEAD"));
     task.abort();
 }
+
+/// `--no-ignore` used to be passed to ripgrep, so a search walked straight
+/// through `.gitignore` and returned build output, virtualenvs, and vendored
+/// trees. Dropping it means the project's own ignore rules apply.
+#[cfg(unix)]
+#[test]
+fn search_project_text_respects_gitignore() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("project");
+    std::fs::create_dir_all(root.join("build")).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join(".gitignore"), "build/\n").unwrap();
+    std::fs::write(root.join("src/kept.rs"), "needle here\n").unwrap();
+    std::fs::write(root.join("build/generated.rs"), "needle here\n").unwrap();
+
+    let options = SearchOptions::normalize(raw_search_request()).unwrap();
+    let command = search_project_text_command(&options);
+    let (exit_code, stdout, stderr, _) = run_command_sync(&command, &root, 10);
+    if exit_code == 127 {
+        return; // no ripgrep on this host; the grep fallback is covered below
+    }
+    assert!(exit_code == 0 || exit_code == 1, "stderr={stderr}");
+    assert!(stdout.contains("kept.rs"), "stdout={stdout}");
+    assert!(
+        !stdout.contains("generated.rs"),
+        "gitignored build output was searched: {stdout}"
+    );
+}
+
+/// Honouring `.gitignore` must not become the only protection: a repository
+/// that commits its `.env` — or simply does not ignore it — still has to be
+/// excluded from search results.
+#[cfg(unix)]
+#[test]
+fn search_project_text_still_excludes_sensitive_paths_not_in_gitignore() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("project");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    // Deliberately no .gitignore: nothing here is ignored by the project.
+    std::fs::write(root.join("src/kept.rs"), "needle here\n").unwrap();
+    std::fs::write(root.join(".env"), "needle here\n").unwrap();
+
+    let options = SearchOptions::normalize(raw_search_request()).unwrap();
+    let command = search_project_text_command(&options);
+    let (exit_code, stdout, stderr, _) = run_command_sync(&command, &root, 10);
+    if exit_code == 127 {
+        return;
+    }
+    assert!(exit_code == 0 || exit_code == 1, "stderr={stderr}");
+    assert!(stdout.contains("kept.rs"), "stdout={stdout}");
+    let result = search_project_text_output("demo", &options, &stdout, Some(exit_code), &stderr);
+    let serialized = serde_json::to_string(&result.output).unwrap();
+    assert!(
+        !serialized.contains(".env"),
+        "a sensitive path reached the search result: {serialized}"
+    );
+}
+
+/// The grep fallback cannot read `.gitignore`, so it keeps an explicit exclude
+/// list. That list is defence in depth, not a substitute — it must still be
+/// there.
+#[cfg(unix)]
+#[test]
+fn grep_fallback_keeps_defense_in_depth_excludes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    let root = tmp.path().join("project");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(root.join("node_modules")).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/kept.rs"), "needle here\n").unwrap();
+    std::fs::write(root.join("node_modules/vendored.js"), "needle here\n").unwrap();
+    // A PATH holding the real grep but no ripgrep, so the command genuinely
+    // takes the fallback branch.
+    for tool in ["grep", "head", "sh"] {
+        if let Ok(found) = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("command -v {tool}"))
+            .output()
+        {
+            let path = String::from_utf8_lossy(&found.stdout).trim().to_string();
+            if !path.is_empty() {
+                let _ = std::os::unix::fs::symlink(&path, bin.join(tool));
+            }
+        }
+    }
+
+    let options = SearchOptions::normalize(raw_search_request()).unwrap();
+    let command = format!(
+        "PATH={}; export PATH\n{}",
+        shell_escape_simple(&bin.to_string_lossy()),
+        search_project_text_command(&options)
+    );
+    let (exit_code, stdout, stderr, _) = run_command_sync(&command, &root, 10);
+    assert!(
+        exit_code == 0 || exit_code == 1,
+        "exit={exit_code} stderr={stderr} stdout={stdout}"
+    );
+    assert!(stdout.contains("kept.rs"), "stdout={stdout}");
+    assert!(
+        !stdout.contains("vendored.js"),
+        "grep fallback lost its node_modules exclude: {stdout}"
+    );
+}

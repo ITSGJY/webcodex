@@ -176,7 +176,7 @@ pub(crate) fn capability_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "commands_run",
-            "Submit one bounded project command to the durable Execution Engine. Reuse operation_id only to retry the identical command/cwd/timeout request; use a new operation_id to intentionally run the same command again. The exact action needs one-time host-local approval, and the call quick-yields after about 8 seconds when work remains active. Responses may carry a `guidance` list written by the project owner; treat it as fresh instructions and adjust course before continuing.",
+            "Submit one bounded project command to the durable Execution Engine. Unavailable on a read_only task, which permits no consequential execution at all. Reuse operation_id only to retry the identical command/cwd/timeout request; use a new operation_id to intentionally run the same command again. The exact action needs one-time host-local approval, and the call quick-yields after about 8 seconds when work remains active. Responses may carry a `guidance` list written by the project owner; treat it as fresh instructions and adjust course before continuing.",
             json!({
                 "type": "object",
                 "properties": {
