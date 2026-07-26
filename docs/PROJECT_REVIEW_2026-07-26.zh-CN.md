@@ -238,3 +238,24 @@
 ---
 
 *本报告由三路并行深查（盲盒溯源 / 大型开发差距 / 测试重复度审计）+ 人工核实关键代码点合成；所有 file:line 均对照 main @ 9018814 验证。*
+## 8. 现场实测修复批次（feat/field-test-fixes，基于 spea）
+
+23GB 真实论文项目实测（docs/REAL_PROJECT_FIELD_TEST_2026-07.zh-CN.md）暴露的问题按批次执行，全部在本分支落地：
+
+| 批次 | 内容 | 提交 |
+|---|---|---|
+| 1 现场 P0 | `files_search` 尊重 .gitignore（rg 去 `--no-ignore`）+ 排除表补 Python/数据科学条目；`task_review` 默认瘦身（include_diff/include_output_tail 默认 false，198KB→摘要）；`files_read` 去掉 lines 数组冗余（12.6× 读放大）；cargo 检查共享 target 缓存（免每任务冷构建）；项目 brief 用 `git ls-files` 索引（不再扫进 .venv） | b20aec7 / 143846d / 512b124 / a029990 / aa55bf9 |
+| README | 中英双语加价值主张、30 秒流程图、三差异点、徽章与截图；正文未动 | 1654a9b |
+| 2 Landlock | `command_sandbox.rs` 共享模块：**只治理写类别、零路径枚举**（AccessFs::from_write + path_beneath_rules），探测→宣告→执行三级 fail-closed；read_only 任务在 agent 宣告 `sandbox_read_only_commands` 能力时拿回 commands_run（`sandbox:"read_only"`，免审批——内核即闸门；TMPDIR 指向任务私有 scratch）；无能力保持拒绝；normal 审批流一字未动；doctor 显式两态 + 读取侧残余风险声明 | dc14d7e / 6bafb64 |
+| 3 错误分类 | 见下 | 1aff8b8 |
+
+**批次 3：provenance 失败的诚实分类（卡死 bug 根因修复）。** 实测中"检查全绿但执行卡在 retry_status_check 直到 10 分钟死线、diff 全程不可见"的根因是分类抹除：monitor 已经探测到工作区指纹不匹配，但 db 守卫的拒绝被压平成 `task_store_error`/`storage`，模型对确定性失败反复重试。修复四件套：
+
+1. **新失败类别**：`ConnectorExecutionFailure::Workspace { code, evidence }`——业务不变量失败不再冒充传输/存储故障；映射为 `failure_source=workspace`、`terminal_reason=workspace_invariant_failed`，证据持久化进 `assertion_evidence`（`{invariant, detail}`，投影原样带出）。
+2. **monitor 就地检出 + fail-fast**：校验成功时指纹不匹配→采样至多 5 个未跟踪文件，消息带新旧 sha 前 12 位、文件清单、gitignore 补救指引；确定性失败**立即终态**，不烧 grace 窗口。`next_action` 覆盖为 `add_gitignore_for_build_artifacts_then_rerun_checks`。
+3. **review 不再连坐**：`task_review` 的 show_changes 扫描出错时降级为事件日志聚合的 applied paths（`source:"workspace_scan_failed"`），人永远能看到任务改了什么。
+4. **doctor 前置预警**：新增 Ignore hygiene fact（`ReadinessFact` 新增 Warn 档）——存在未跟踪构建产物（target/、__pycache__、.venv 等九类）报 `untracked_build_artifacts` 并点名，缺 .gitignore 报 `gitignore_missing`；Warn 不影响 ready 判定。
+
+测试：e2e 驱动全链路（检查期间出现未跟踪产物→快速诚实终态+证据内容+review 降级，0.3s 内跑完——review 降级分支靠应答一个带 `## ` 分支头的非零退出扫描结果触发，绕开 show_changes 自身的非 git 容错）；doctor 三档单测。已明确**不做**第 5 项（provenance 只覆盖任务改动路径）——那是单独决策。
+
+遗留（下批）：B2 欠的 connector 级测试（fixture 宣告 sandbox 能力→read_only commands_run 派发且 `request.sandbox=="read_only"` 免审批；能力关→拒绝）；批次 5 跨会话 bootstrap（task_list/resume 合并设计）。
