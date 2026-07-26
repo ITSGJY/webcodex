@@ -459,6 +459,125 @@ async fn malformed_token_requests_return_structured_errors() {
     }
 }
 
+// -----------------------------------------------------------------------
+// Authorization-code binding guards
+//
+// These three cannot join `malformed_token_requests_return_structured_errors`:
+// each one has to seed a real authorization code, and exchanging it consumes
+// it, so they need their own service and code. They are what stops an
+// intercepted code from being redeemed — a redirect_uri the client never
+// registered, a different client presenting someone else's code, and a PKCE
+// verifier that does not match the challenge. `verify_pkce_s256` has a unit
+// test, but only this one proves the endpoint actually consults it.
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn redirect_uri_mismatch_returns_invalid_grant() {
+    let config = test_config(oauth2_enabled_no_pkce());
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let (client, secret) = seed_client(&db, &user, "Test App");
+    let (_, code) = seed_auth_code(
+        &db,
+        &client,
+        &user,
+        "https://example.com/callback",
+        "runtime:read",
+        None,
+        None,
+    );
+
+    let service = Service::new(build_router(config, db));
+    let body = form_body(&[
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("redirect_uri", "https://evil.com/callback"),
+        ("client_id", &client.client_id),
+        ("client_secret", &secret),
+    ]);
+    let mut resp = post_form("http://localhost/oauth/token", body)
+        .send(&service)
+        .await;
+    assert_eq!(resp.status_code, Some(StatusCode::BAD_REQUEST));
+    let json: serde_json::Value = resp.take_json().await.unwrap();
+    assert_eq!(json["error"], "invalid_grant");
+}
+
+#[tokio::test]
+async fn client_id_mismatch_returns_invalid_grant() {
+    let config = test_config(oauth2_enabled_no_pkce());
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let (client, _secret) = seed_client(&db, &user, "Test App");
+    let (_, code) = seed_auth_code(
+        &db,
+        &client,
+        &user,
+        "https://example.com/callback",
+        "runtime:read",
+        None,
+        None,
+    );
+
+    // The code belongs to client1 but is exchanged with client2's credentials.
+    // Client authentication succeeds — client2's secret is genuine — so only
+    // the code's own client binding can reject this.
+    let (client2, secret2) = seed_client(&db, &user, "Other App");
+
+    let service = Service::new(build_router(config, db));
+    let body = form_body(&[
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("redirect_uri", "https://example.com/callback"),
+        ("client_id", &client2.client_id),
+        ("client_secret", &secret2),
+    ]);
+    let mut resp = post_form("http://localhost/oauth/token", body)
+        .send(&service)
+        .await;
+    assert_eq!(resp.status_code, Some(StatusCode::BAD_REQUEST));
+    let json: serde_json::Value = resp.take_json().await.unwrap();
+    assert_eq!(json["error"], "invalid_grant");
+}
+
+#[tokio::test]
+async fn wrong_verifier_returns_invalid_grant() {
+    let config = test_config(oauth2_enabled());
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let (client, secret) = seed_client(&db, &user, "Test App");
+
+    let code_verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    let digest = Sha256::digest(code_verifier.as_bytes());
+    let code_challenge = URL_SAFE_NO_PAD.encode(digest);
+
+    let (_, code) = seed_auth_code(
+        &db,
+        &client,
+        &user,
+        "https://example.com/callback",
+        "runtime:read",
+        Some(&code_challenge),
+        Some("S256"),
+    );
+
+    let service = Service::new(build_router(config, db));
+    let body = form_body(&[
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("redirect_uri", "https://example.com/callback"),
+        ("client_id", &client.client_id),
+        ("client_secret", &secret),
+        ("code_verifier", "wrong-verifier-value-here"),
+    ]);
+    let mut resp = post_form("http://localhost/oauth/token", body)
+        .send(&service)
+        .await;
+    assert_eq!(resp.status_code, Some(StatusCode::BAD_REQUEST));
+    let json: serde_json::Value = resp.take_json().await.unwrap();
+    assert_eq!(json["error"], "invalid_grant");
+}
+
 #[tokio::test]
 async fn expired_code_returns_invalid_grant() {
     let config = test_config(oauth2_enabled_no_pkce());
