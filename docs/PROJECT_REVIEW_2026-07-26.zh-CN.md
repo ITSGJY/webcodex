@@ -222,4 +222,19 @@
 
 ---
 
+## 7. 管理台（admin console）蓝图与进展
+
+用户拍板（2026-07-26）：activity 存 command preview（120 字符截断），config 开关默认开；低配/小磁盘部署靠行数上限自动修剪兜住，不做压缩加密。四个切片：
+
+| 切片 | 内容 | 状态 |
+|---|---|---|
+| ① Activity | 所有 surface 的写操作统一账本：`workspace_activity` 表（插入即修剪，默认 2000 行，`WEBCODEX_ACTIVITY*` 三个 env 开关）；dispatch 咽喉在授权闸门后单点记录（工具/surface/成败/路径/命令预览，路径复用 `session_log_arguments` 脱敏纪律）；出口三个——console "Recent activity" 面板、`webcodex task activity`（顶层 `webcodex activity` 待加）、同一 SQLite | **已完成** |
+| ② Approvals 上台面 | console 列 pending 审批（TTL/预览）+ 批准/打回按钮 + 可选理由列（新列）；打回理由回流进 `approval_required`/denied 错误 payload 让窗口模型看到 | 未开工 |
+| ③ 引导留言 | console `task/guide` 路由 → `human_guidance` 持久事件 → 模型下次 `task_review` 看到（复用 Timeline 展示，高亮）；CLI `webcodex task guide` | 未开工 |
+| ④ Devices | 多设备只读视图：agent 列表 + last_seen + capabilities + provider 健康（`RuntimeMetadata.tool_providers` 已有数据无 UI） | 未开工 |
+
+切片 ① 的记录语义：**只记"通过授权、实际执行"的尝试**（成功与失败都记），授权前被拒的请求不入账本——那是 audit 的职责边界。
+
+---
+
 *本报告由三路并行深查（盲盒溯源 / 大型开发差距 / 测试重复度审计）+ 人工核实关键代码点合成；所有 file:line 均对照 main @ 9018814 验证。*
