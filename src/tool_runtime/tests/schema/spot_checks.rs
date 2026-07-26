@@ -1,49 +1,6 @@
 use super::*;
 
 #[test]
-fn tool_specs_schema_spot_checks() {
-    // Table-driven: each entry is (tool_name, required_fields, forbidden_fields).
-    // Required fields are checked via exact equality to catch unexpected additions.
-    let cases: Vec<(&str, Vec<&str>, Vec<&str>)> = vec![
-        (
-            "apply_patch_checked",
-            vec!["project", "patch"],
-            vec!["deny_sensitive_paths"],
-        ),
-        (
-            "validate_patch",
-            vec!["project", "patch"],
-            vec!["deny_sensitive_paths"],
-        ),
-        ("git_diff_summary", vec!["project"], vec![]),
-    ];
-    let specs = registered_tool_specs();
-    for (name, expected_required, expected_forbidden) in &cases {
-        let spec = spec_named(&specs, name);
-        let required = required_fields(spec);
-        let mut expected_sorted: Vec<String> =
-            expected_required.iter().map(|s| s.to_string()).collect();
-        expected_sorted.sort();
-        let mut actual_sorted = required.clone();
-        actual_sorted.sort();
-        assert_eq!(
-                actual_sorted, expected_sorted,
-                "{name}: required fields mismatch (expected exactly {expected_sorted:?}, got {required:?})"
-            );
-        for field in expected_forbidden {
-            assert!(
-                !required.contains(&field.to_string()),
-                "{name}: field '{field}' should not be required"
-            );
-        }
-        assert!(
-            spec.description.chars().count() <= 300,
-            "{name}: description too long"
-        );
-    }
-}
-
-#[test]
 fn tool_specs_git_log_schema() {
     let specs = registered_tool_specs();
     let spec = spec_named(&specs, "git_log");
@@ -133,10 +90,21 @@ fn tool_specs_cargo_tools_schema_and_output() {
 }
 
 #[test]
-fn tool_specs_schema_spot_checks_extended() {
+fn tool_specs_schema_spot_checks() {
     // Table-driven: (tool_name, required_fields, forbidden_fields).
     // Required fields are checked via exact equality to catch unexpected additions.
     let cases: Vec<(&str, Vec<&str>, Vec<&str>)> = vec![
+        (
+            "apply_patch_checked",
+            vec!["project", "patch"],
+            vec!["deny_sensitive_paths"],
+        ),
+        (
+            "validate_patch",
+            vec!["project", "patch"],
+            vec!["deny_sensitive_paths"],
+        ),
+        ("git_diff_summary", vec!["project"], vec![]),
         ("delete_project_files", vec!["project", "paths"], vec![]),
         ("git_restore_paths", vec!["project", "paths"], vec![]),
         ("discard_untracked", vec!["project", "paths"], vec![]),

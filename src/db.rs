@@ -1622,34 +1622,7 @@ mod tests {
 
     #[test]
     fn consume_authorization_code_succeeds_once() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = Database::open(&tmp.path().join("oauth.db")).unwrap();
-        let user = oauth_seed_user(&db, "alice");
-        let (client, _) = oauth_seed_client(&db, &user, "Test App");
-
-        let plaintext_code = crate::auth::generate_oauth_authorization_code();
-        let code_hash = crate::auth::hash_token(&plaintext_code);
-        let now = chrono::Utc::now().timestamp();
-        let record = OAuthAuthorizationCodeRecord {
-            id: uuid::Uuid::new_v4().to_string(),
-            code_hash: code_hash.clone(),
-            client_id: client.client_id.clone(),
-            subject_kind: "managed_user".to_string(),
-            subject_id: user.id.clone(),
-            user_id: Some(user.id.clone()),
-            redirect_uri: "https://example.com/callback".to_string(),
-            scopes: "runtime:read".to_string(),
-            code_challenge: None,
-            code_challenge_method: None,
-            resource: None,
-            shared_key_hash: None,
-            created_at: now,
-            expires_at: now + 300,
-            used_at: None,
-            revoked_at: None,
-        };
-        db.insert_oauth_authorization_code(&record, &code_hash)
-            .unwrap();
+        let (_tmp, db, code_hash, record, now) = seed_consumable_code();
 
         // First consume succeeds.
         let consumed = db
@@ -1660,8 +1633,14 @@ mod tests {
         assert_eq!(consumed.id, record.id);
     }
 
-    #[test]
-    fn consume_authorization_code_second_consume_returns_none() {
+    /// Fresh DB with one unused, unexpired authorization code seeded.
+    fn seed_consumable_code() -> (
+        tempfile::TempDir,
+        Database,
+        String,
+        OAuthAuthorizationCodeRecord,
+        i64,
+    ) {
         let tmp = tempfile::tempdir().unwrap();
         let db = Database::open(&tmp.path().join("oauth.db")).unwrap();
         let user = oauth_seed_user(&db, "alice");
@@ -1690,6 +1669,12 @@ mod tests {
         };
         db.insert_oauth_authorization_code(&record, &code_hash)
             .unwrap();
+        (tmp, db, code_hash, record, now)
+    }
+
+    #[test]
+    fn consume_authorization_code_second_consume_returns_none() {
+        let (_tmp, db, code_hash, _record, now) = seed_consumable_code();
 
         // First consume succeeds.
         db.consume_oauth_authorization_code_by_hash(&code_hash, now + 10)
@@ -1705,34 +1690,7 @@ mod tests {
 
     #[test]
     fn consume_authorization_code_expired_returns_none() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = Database::open(&tmp.path().join("oauth.db")).unwrap();
-        let user = oauth_seed_user(&db, "alice");
-        let (client, _) = oauth_seed_client(&db, &user, "Test App");
-
-        let plaintext_code = crate::auth::generate_oauth_authorization_code();
-        let code_hash = crate::auth::hash_token(&plaintext_code);
-        let now = chrono::Utc::now().timestamp();
-        let record = OAuthAuthorizationCodeRecord {
-            id: uuid::Uuid::new_v4().to_string(),
-            code_hash: code_hash.clone(),
-            client_id: client.client_id.clone(),
-            subject_kind: "managed_user".to_string(),
-            subject_id: user.id.clone(),
-            user_id: Some(user.id.clone()),
-            redirect_uri: "https://example.com/callback".to_string(),
-            scopes: "runtime:read".to_string(),
-            code_challenge: None,
-            code_challenge_method: None,
-            resource: None,
-            shared_key_hash: None,
-            created_at: now,
-            expires_at: now + 300,
-            used_at: None,
-            revoked_at: None,
-        };
-        db.insert_oauth_authorization_code(&record, &code_hash)
-            .unwrap();
+        let (_tmp, db, code_hash, _record, now) = seed_consumable_code();
 
         // Consume after expiration returns None.
         let result = db
@@ -1743,34 +1701,7 @@ mod tests {
 
     #[test]
     fn consume_authorization_code_revoked_returns_none() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = Database::open(&tmp.path().join("oauth.db")).unwrap();
-        let user = oauth_seed_user(&db, "alice");
-        let (client, _) = oauth_seed_client(&db, &user, "Test App");
-
-        let plaintext_code = crate::auth::generate_oauth_authorization_code();
-        let code_hash = crate::auth::hash_token(&plaintext_code);
-        let now = chrono::Utc::now().timestamp();
-        let record = OAuthAuthorizationCodeRecord {
-            id: uuid::Uuid::new_v4().to_string(),
-            code_hash: code_hash.clone(),
-            client_id: client.client_id.clone(),
-            subject_kind: "managed_user".to_string(),
-            subject_id: user.id.clone(),
-            user_id: Some(user.id.clone()),
-            redirect_uri: "https://example.com/callback".to_string(),
-            scopes: "runtime:read".to_string(),
-            code_challenge: None,
-            code_challenge_method: None,
-            resource: None,
-            shared_key_hash: None,
-            created_at: now,
-            expires_at: now + 300,
-            used_at: None,
-            revoked_at: None,
-        };
-        db.insert_oauth_authorization_code(&record, &code_hash)
-            .unwrap();
+        let (_tmp, db, code_hash, record, now) = seed_consumable_code();
 
         // Revoke, then consume returns None.
         db.revoke_oauth_authorization_code(&record.id, now + 5)

@@ -1402,42 +1402,52 @@ mod tests {
     }
 
     #[test]
-    fn validate_file_request_rejects_read_with_only_start_line() {
-        let mut req = file_request("read");
-        req.start_line = Some(10);
+    fn validate_file_request_rejects_invalid_read_requests() {
+        let cases: Vec<(&str, fn(&mut ShellFileOpRequest), &str)> = vec![
+            (
+                "only start_line",
+                |req| req.start_line = Some(10),
+                "end_line is required when start_line is set for op=read",
+            ),
+            (
+                "only end_line",
+                |req| req.end_line = Some(20),
+                "start_line is required when end_line is set for op=read",
+            ),
+            (
+                "inverted line range",
+                |req| {
+                    req.start_line = Some(20);
+                    req.end_line = Some(10);
+                },
+                "invalid line range",
+            ),
+            (
+                "zero start_line",
+                |req| {
+                    req.start_line = Some(0);
+                    req.end_line = Some(10);
+                },
+                "invalid line range",
+            ),
+            (
+                "line field on read",
+                |req| req.line = Some(10),
+                "line is only allowed for op=insert_at_line",
+            ),
+            (
+                "expected_prefix on read",
+                |req| req.expected_prefix = Some("pub fn".to_string()),
+                "expected_prefix is only allowed for line edit ops",
+            ),
+        ];
 
-        let err = validate_file_request(&req).unwrap_err();
-        assert_eq!(
-            err,
-            "end_line is required when start_line is set for op=read"
-        );
-    }
-
-    #[test]
-    fn validate_file_request_rejects_read_with_only_end_line() {
-        let mut req = file_request("read");
-        req.end_line = Some(20);
-
-        let err = validate_file_request(&req).unwrap_err();
-        assert_eq!(
-            err,
-            "start_line is required when end_line is set for op=read"
-        );
-    }
-
-    #[test]
-    fn validate_file_request_rejects_read_with_invalid_range() {
-        let mut req = file_request("read");
-        req.start_line = Some(20);
-        req.end_line = Some(10);
-
-        let err = validate_file_request(&req).unwrap_err();
-        assert_eq!(err, "invalid line range");
-
-        req.start_line = Some(0);
-        req.end_line = Some(10);
-        let err = validate_file_request(&req).unwrap_err();
-        assert_eq!(err, "invalid line range");
+        for (case, mutate, expected) in cases {
+            let mut req = file_request("read");
+            mutate(&mut req);
+            let err = validate_file_request(&req).unwrap_err();
+            assert_eq!(err, expected, "case: {case}");
+        }
     }
 
     #[test]
@@ -1646,24 +1656,6 @@ mod tests {
             .get_client_view_for_auth("same-project-agent", Some(&grant_b))
             .await
             .is_none());
-    }
-
-    #[test]
-    fn validate_file_request_rejects_read_with_line_field() {
-        let mut req = file_request("read");
-        req.line = Some(10);
-
-        let err = validate_file_request(&req).unwrap_err();
-        assert_eq!(err, "line is only allowed for op=insert_at_line");
-    }
-
-    #[test]
-    fn validate_file_request_rejects_read_with_expected_prefix() {
-        let mut req = file_request("read");
-        req.expected_prefix = Some("pub fn".to_string());
-
-        let err = validate_file_request(&req).unwrap_err();
-        assert_eq!(err, "expected_prefix is only allowed for line edit ops");
     }
 
     #[test]
@@ -2759,33 +2751,10 @@ mod tests {
     }
 
     #[test]
-    fn enforce_register_owner_skips_when_no_auth() {
-        // No AuthMiddleware (unit tests): defer to the middleware, which in
-        // production rejects anonymous requests before the handler runs.
-        assert!(enforce_register_owner(None, "client-1", Some("anyone")).is_ok());
-        assert!(enforce_register_owner(None, "client-1", None).is_ok());
-    }
-
-    #[test]
-    fn enforce_register_owner_bootstrap_allows_any_owner() {
+    fn enforce_register_owner_cases() {
         let bootstrap = auth_context(None, true);
-        assert!(enforce_register_owner(Some(&bootstrap), "client-1", None).is_ok());
-        assert!(enforce_register_owner(Some(&bootstrap), "client-1", Some("bob")).is_ok());
-    }
-
-    #[test]
-    fn enforce_register_owner_user_token_is_rejected() {
-        // Phase 3: user tokens (Phase 2 personal API tokens) are no longer
-        // allowed on agent transport endpoints. Only bootstrap or agent tokens
-        // may register.
-        let alice = auth_context(Some("alice"), false);
-        let err = enforce_register_owner(Some(&alice), "client-1", Some("alice")).unwrap_err();
-        assert!(err.contains("user tokens are not allowed"), "got: {}", err);
-    }
-
-    #[test]
-    fn enforce_register_owner_agent_token_matching_client_id_succeeds() {
-        let alice = agent_auth_context(
+        let user_alice = auth_context(Some("alice"), false);
+        let agent_alice = agent_auth_context(
             "alice",
             "alice-laptop",
             vec![
@@ -2795,26 +2764,100 @@ mod tests {
                 "agent:job_update",
             ],
         );
-        // Matching client_id + matching owner -> Ok.
-        assert!(enforce_register_owner(Some(&alice), "alice-laptop", Some("alice")).is_ok());
-        // Matching client_id + missing owner -> Ok (owner filled in by the
-        // caller via effective_register_owner).
-        assert!(enforce_register_owner(Some(&alice), "alice-laptop", None).is_ok());
-    }
+        let agent_alice_register_only =
+            agent_auth_context("alice", "alice-laptop", vec!["agent:register"]);
 
-    #[test]
-    fn enforce_register_owner_agent_token_wrong_client_id_rejected() {
-        let alice = agent_auth_context("alice", "alice-laptop", vec!["agent:register"]);
-        let err = enforce_register_owner(Some(&alice), "other-laptop", None).unwrap_err();
-        assert!(err.contains("not bound to client_id"), "got: {}", err);
-    }
+        // (case, auth, client_id, owner, Ok or Err(required error fragments)).
+        let cases = vec![
+            // No AuthMiddleware (unit tests): defer to the middleware, which in
+            // production rejects anonymous requests before the handler runs.
+            (
+                "no auth skips with owner",
+                None,
+                "client-1",
+                Some("anyone"),
+                Ok(()),
+            ),
+            (
+                "no auth skips without owner",
+                None,
+                "client-1",
+                None,
+                Ok(()),
+            ),
+            // Bootstrap may register any owner.
+            (
+                "bootstrap allows missing owner",
+                Some(&bootstrap),
+                "client-1",
+                None,
+                Ok(()),
+            ),
+            (
+                "bootstrap allows any owner",
+                Some(&bootstrap),
+                "client-1",
+                Some("bob"),
+                Ok(()),
+            ),
+            // Phase 3: user tokens (Phase 2 personal API tokens) are no longer
+            // allowed on agent transport endpoints. Only bootstrap or agent
+            // tokens may register.
+            (
+                "user token is rejected",
+                Some(&user_alice),
+                "client-1",
+                Some("alice"),
+                Err(vec!["user tokens are not allowed"]),
+            ),
+            // Matching client_id + matching owner -> Ok.
+            (
+                "agent token matching client_id and owner",
+                Some(&agent_alice),
+                "alice-laptop",
+                Some("alice"),
+                Ok(()),
+            ),
+            // Matching client_id + missing owner -> Ok (owner filled in by the
+            // caller via effective_register_owner).
+            (
+                "agent token matching client_id, missing owner",
+                Some(&agent_alice),
+                "alice-laptop",
+                None,
+                Ok(()),
+            ),
+            (
+                "agent token wrong client_id rejected",
+                Some(&agent_alice_register_only),
+                "other-laptop",
+                None,
+                Err(vec!["not bound to client_id"]),
+            ),
+            (
+                "agent token owner mismatch rejected",
+                Some(&agent_alice_register_only),
+                "alice-laptop",
+                Some("bob"),
+                Err(vec!["agent token owner is 'alice'", "bob"]),
+            ),
+        ];
 
-    #[test]
-    fn enforce_register_owner_agent_token_owner_mismatch_rejected() {
-        let alice = agent_auth_context("alice", "alice-laptop", vec!["agent:register"]);
-        let err = enforce_register_owner(Some(&alice), "alice-laptop", Some("bob")).unwrap_err();
-        assert!(err.contains("agent token owner is 'alice'"), "got: {}", err);
-        assert!(err.contains("bob"), "got: {}", err);
+        for (case, auth, client_id, owner, expected) in cases {
+            let result = enforce_register_owner(auth, client_id, owner);
+            match expected {
+                Ok(()) => assert!(result.is_ok(), "case '{case}': got: {result:?}"),
+                Err(fragments) => {
+                    let err = result.expect_err(&format!("case '{case}': expected an error"));
+                    for fragment in fragments {
+                        assert!(
+                            err.contains(fragment),
+                            "case '{case}': missing '{fragment}' in error: {err}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

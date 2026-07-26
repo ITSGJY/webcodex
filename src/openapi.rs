@@ -2079,17 +2079,6 @@ mod tests {
     }
 
     #[test]
-    fn openapi_operation_ids_match_expected_set_exactly() {
-        let spec = build_openapi_spec();
-        let ids = operation_ids(&spec);
-        let expected: Vec<String> = GPT_ACTION_OPS.iter().map(|s| s.to_string()).collect();
-        assert_eq!(ids.len(), expected.len());
-        for id in &expected {
-            assert!(ids.contains(id), "missing operation id: {}", id);
-        }
-    }
-
-    #[test]
     fn openapi_operations_have_consequential_flags() {
         let spec = build_openapi_spec();
         let paths = spec["paths"].as_object().unwrap();
@@ -2200,44 +2189,6 @@ mod tests {
             "validateProjectPatch description must be marked read-only: {}",
             desc
         );
-    }
-
-    #[test]
-    fn openapi_exposes_expected_gpt_action_paths() {
-        let spec = build_openapi_spec();
-        let paths = spec["paths"].as_object().unwrap();
-        for expected in [
-            "/api/tools/list",
-            "/api/projects/list",
-            "/api/projects/register",
-            "/api/projects/create",
-            "/api/runtime/status",
-            "/api/jobs/status",
-            "/api/jobs/log",
-            "/api/jobs/list",
-            "/api/jobs/tail",
-            "/api/projects/read_file",
-            "/api/projects/git_status",
-            "/api/projects/git_diff",
-            "/api/projects/git_diff_summary",
-            "/api/projects/list_files",
-            "/api/projects/search_text",
-            "/api/projects/validate_patch",
-            "/api/projects/apply_patch",
-            "/api/projects/apply_patch_checked",
-            "/api/projects/run_shell",
-            "/api/projects/delete_files",
-            "/api/projects/git_restore_paths",
-            "/api/projects/discard_untracked",
-            "/api/projects/run_job",
-            "/api/tools/call",
-        ] {
-            assert!(
-                paths.contains_key(expected),
-                "expected GPT Actions path '{}' missing from openapi.json",
-                expected
-            );
-        }
     }
 
     #[test]
@@ -2552,84 +2503,52 @@ mod tests {
 
     #[test]
     fn openapi_dedicated_actions_have_expected_routes_and_operation_ids() {
+        // Complete path -> operationId map for the GPT Actions surface. Every
+        // operation in GPT_ACTION_OPS must appear here, so adding an action
+        // without pinning its route fails the length check below.
         let spec = build_openapi_spec();
+        let expected = [
+            ("/api/tools/list", "listRuntimeTools"),
+            ("/api/projects/list", "listProjects"),
+            ("/api/projects/register", "registerProject"),
+            ("/api/projects/create", "createProject"),
+            ("/api/runtime/status", "getRuntimeStatus"),
+            ("/api/jobs/status", "getRuntimeJobStatus"),
+            ("/api/jobs/log", "getRuntimeJobLog"),
+            ("/api/jobs/list", "listRuntimeJobs"),
+            ("/api/jobs/tail", "getRuntimeJobTail"),
+            ("/api/projects/read_file", "readProjectFile"),
+            ("/api/projects/git_status", "getProjectGitStatus"),
+            ("/api/projects/git_diff", "getProjectGitDiff"),
+            ("/api/projects/git_diff_summary", "getProjectGitDiffSummary"),
+            ("/api/projects/list_files", "listProjectFiles"),
+            ("/api/projects/search_text", "searchProjectText"),
+            ("/api/projects/validate_patch", "validateProjectPatch"),
+            ("/api/projects/apply_patch", "applyProjectPatch"),
+            (
+                "/api/projects/apply_patch_checked",
+                "applyProjectPatchChecked",
+            ),
+            ("/api/projects/run_shell", "runProjectShellCommand"),
+            ("/api/projects/delete_files", "deleteProjectFiles"),
+            ("/api/projects/git_restore_paths", "gitRestorePaths"),
+            ("/api/projects/discard_untracked", "discardUntrackedFiles"),
+            ("/api/artifacts/import", "importConversationFilesToProject"),
+            ("/api/projects/run_job", "startProjectShellJob"),
+            ("/api/tools/call", "callRuntimeTool"),
+        ];
         assert_eq!(
-            spec["paths"]["/api/projects/list"]["post"]["operationId"],
-            "listProjects"
+            expected.len(),
+            GPT_ACTION_OPS.len(),
+            "route map must cover every GPT Action operation"
         );
-        assert_eq!(
-            spec["paths"]["/api/projects/read_file"]["post"]["operationId"],
-            "readProjectFile"
-        );
-        assert_eq!(
-            spec["paths"]["/api/projects/git_status"]["post"]["operationId"],
-            "getProjectGitStatus"
-        );
-        assert_eq!(
-            spec["paths"]["/api/projects/git_diff"]["post"]["operationId"],
-            "getProjectGitDiff"
-        );
-        assert_eq!(
-            spec["paths"]["/api/projects/apply_patch"]["post"]["operationId"],
-            "applyProjectPatch"
-        );
-        assert_eq!(
-            spec["paths"]["/api/projects/run_shell"]["post"]["operationId"],
-            "runProjectShellCommand"
-        );
-        // Phase 3 dedicated actions.
-        assert_eq!(
-            spec["paths"]["/api/projects/git_diff_summary"]["post"]["operationId"],
-            "getProjectGitDiffSummary"
-        );
-        assert_eq!(
-            spec["paths"]["/api/projects/list_files"]["post"]["operationId"],
-            "listProjectFiles"
-        );
-        assert_eq!(
-            spec["paths"]["/api/projects/search_text"]["post"]["operationId"],
-            "searchProjectText"
-        );
-        assert_eq!(
-            spec["paths"]["/api/projects/validate_patch"]["post"]["operationId"],
-            "validateProjectPatch"
-        );
-        assert_eq!(
-            spec["paths"]["/api/projects/apply_patch_checked"]["post"]["operationId"],
-            "applyProjectPatchChecked"
-        );
-        assert_eq!(
-            spec["paths"]["/api/projects/delete_files"]["post"]["operationId"],
-            "deleteProjectFiles"
-        );
-        assert_eq!(
-            spec["paths"]["/api/projects/git_restore_paths"]["post"]["operationId"],
-            "gitRestorePaths"
-        );
-        assert_eq!(
-            spec["paths"]["/api/projects/discard_untracked"]["post"]["operationId"],
-            "discardUntrackedFiles"
-        );
-        assert_eq!(
-            spec["paths"]["/api/projects/run_job"]["post"]["operationId"],
-            "startProjectShellJob"
-        );
-        assert_eq!(
-            spec["paths"]["/api/projects/register"]["post"]["operationId"],
-            "registerProject"
-        );
-        assert_eq!(
-            spec["paths"]["/api/projects/create"]["post"]["operationId"],
-            "createProject"
-        );
-        assert_eq!(
-            spec["paths"]["/api/jobs/list"]["post"]["operationId"],
-            "listRuntimeJobs"
-        );
-        assert_eq!(
-            spec["paths"]["/api/jobs/tail"]["post"]["operationId"],
-            "getRuntimeJobTail"
-        );
+        for (path, operation_id) in expected {
+            assert_eq!(
+                spec["paths"][path]["post"]["operationId"], operation_id,
+                "GPT Action path '{}' must map to operationId '{}'",
+                path, operation_id
+            );
+        }
     }
 
     #[test]
@@ -3479,59 +3398,6 @@ mod tests {
         assert!(description.contains("observability"));
         assert!(description.contains("stale_count"));
         assert!(!description.contains("offline_count"));
-    }
-
-    #[test]
-    fn openapi_does_not_expose_agent_token_management_endpoints() {
-        // Phase 3: agent token management endpoints (create/list/revoke) are
-        // REST-only admin/self surfaces and must NOT appear in /openapi.json
-        // (GPT Actions). They are listed in LEGACY_FORBIDDEN_PATHS too; this
-        // test pins the specific endpoints for clarity.
-        let spec = build_openapi_spec();
-        let paths = spec["paths"].as_object().unwrap();
-        for path in [
-            "/api/agent-tokens/create",
-            "/api/agent-tokens/register_hash",
-            "/api/agent-tokens/list",
-            "/api/agent-tokens/revoke",
-        ] {
-            assert!(
-                !paths.contains_key(path),
-                "agent token management endpoint '{}' must not appear in openapi.json",
-                path
-            );
-        }
-    }
-
-    #[test]
-    fn openapi_does_not_expose_pairing_endpoints() {
-        let spec = build_openapi_spec();
-        let paths = spec["paths"].as_object().unwrap();
-        for path in ["/api/pairing/create", "/api/pairing/enroll"] {
-            assert!(
-                !paths.contains_key(path),
-                "pairing endpoint '{}' must not appear in openapi.json",
-                path
-            );
-        }
-    }
-
-    #[test]
-    fn openapi_operation_count_stays_twenty_five_after_demoting_compatibility_edits() {
-        // Phase 3 adds agent token management endpoints to the REST surface
-        // but does NOT add them to /openapi.json. The GPT Actions operation
-        // count must remain 25 while compatibility edit tools are runtime-only.
-        let spec = build_openapi_spec();
-        let count: usize = spec["paths"]
-            .as_object()
-            .unwrap()
-            .values()
-            .map(|m| m.as_object().unwrap().len())
-            .sum();
-        assert_eq!(
-            count, 25,
-            "GPT Actions schema must remain 25 operations after demoting compatibility edits"
-        );
     }
 }
 

@@ -145,66 +145,6 @@ fn tool_definitions_drive_metadata_visibility_and_categories() {
 }
 
 #[test]
-fn legacy_run_codex_surface_is_removed() {
-    use crate::tool_runtime::tool_definition::{
-        lookup_tool_definition, model_hidden_tool_names, tool_definitions,
-    };
-
-    assert!(
-        lookup_tool_definition("run_codex").is_none(),
-        "run_codex must not keep a ToolDefinition"
-    );
-    assert_eq!(
-        model_hidden_tool_names().collect::<Vec<_>>(),
-        Vec::<&'static str>::new(),
-        "there should be no model-hidden ToolDefinitions"
-    );
-
-    let model_visible_names = registered_tool_names();
-    assert_eq!(
-        tool_definitions().count(),
-        model_visible_names.len(),
-        "ToolDefinitions and model-visible tool names must stay synchronized"
-    );
-    assert!(
-        !model_visible_names.iter().any(|name| name == "run_codex"),
-        "tools.count/model-facing names must not include run_codex"
-    );
-
-    let openapi = crate::openapi::build_openapi_spec();
-    let tool_description = openapi["components"]["schemas"]["ToolCallRequest"]["properties"]
-        [TOOL_CALL_TOOL_FIELD]["description"]
-        .as_str()
-        .expect("ToolCallRequest.tool description");
-    assert!(
-        !tool_description.contains("run_codex"),
-        "callRuntimeTool accepted-name text must not advertise run_codex"
-    );
-    let operation_ids = openapi["paths"]
-        .as_object()
-        .unwrap()
-        .values()
-        .flat_map(|methods| methods.as_object().unwrap().values())
-        .map(|operation| operation["operationId"].as_str().unwrap())
-        .collect::<Vec<_>>();
-    assert!(
-        !operation_ids
-            .iter()
-            .any(|operation_id| operation_id.contains("runCodex")
-                || operation_id.contains("RunCodex")),
-        "run_codex must not have a dedicated OpenAPI operation: {operation_ids:?}"
-    );
-    assert!(
-        ToolCall::from_tool_name(
-            "run_codex",
-            json!({"project": SAMPLE_PROJECT, "prompt": "summarize"})
-        )
-        .is_err(),
-        "run_codex must not remain parser-known"
-    );
-}
-
-#[test]
 fn delete_files_remains_legacy_metadata_only_not_runtime_tool() {
     use crate::tool_runtime::metadata::lookup_tool_metadata;
     use crate::tool_runtime::tool_definition::lookup_tool_definition;

@@ -392,63 +392,71 @@ async fn token_endpoint_rejects_invalid_client_credentials() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-async fn unsupported_grant_type_returns_error() {
-    let config = test_config(oauth2_enabled_no_pkce());
-    let (_tmp, db) = test_db();
-
-    let service = Service::new(build_router(config, db));
-    let body = form_body(&[("grant_type", "client_credentials")]);
-    let mut resp = post_form("http://localhost/oauth/token", body)
-        .send(&service)
-        .await;
-    assert_eq!(resp.status_code, Some(StatusCode::BAD_REQUEST));
-    let json: serde_json::Value = resp.take_json().await.unwrap();
-    assert_eq!(json["error"], "unsupported_grant_type");
-}
-
-#[tokio::test]
-async fn missing_code_returns_invalid_request() {
+async fn malformed_token_requests_return_structured_errors() {
+    // Stateless error paths for both grant types share one service: none of
+    // these requests consume a code or rotate a token.
     let config = test_config(oauth2_enabled_no_pkce());
     let (_tmp, db) = test_db();
     let user = seed_user(&db, "alice");
     let (client, secret) = seed_client(&db, &user, "Test App");
-
     let service = Service::new(build_router(config, db));
-    let body = form_body(&[
-        ("grant_type", "authorization_code"),
-        ("redirect_uri", "https://example.com/callback"),
-        ("client_id", &client.client_id),
-        ("client_secret", &secret),
-    ]);
-    let mut resp = post_form("http://localhost/oauth/token", body)
-        .send(&service)
-        .await;
-    assert_eq!(resp.status_code, Some(StatusCode::BAD_REQUEST));
-    let json: serde_json::Value = resp.take_json().await.unwrap();
-    assert_eq!(json["error"], "invalid_request");
-}
 
-#[tokio::test]
-async fn unknown_code_returns_invalid_grant() {
-    let config = test_config(oauth2_enabled_no_pkce());
-    let (_tmp, db) = test_db();
-    let user = seed_user(&db, "alice");
-    let (client, secret) = seed_client(&db, &user, "Test App");
-
-    let service = Service::new(build_router(config, db));
-    let body = form_body(&[
-        ("grant_type", "authorization_code"),
-        ("code", "wc_oac_nonexistent"),
-        ("redirect_uri", "https://example.com/callback"),
-        ("client_id", &client.client_id),
-        ("client_secret", &secret),
-    ]);
-    let mut resp = post_form("http://localhost/oauth/token", body)
-        .send(&service)
-        .await;
-    assert_eq!(resp.status_code, Some(StatusCode::BAD_REQUEST));
-    let json: serde_json::Value = resp.take_json().await.unwrap();
-    assert_eq!(json["error"], "invalid_grant");
+    let cases: [(&str, Vec<(&str, &str)>, &str); 5] = [
+        (
+            "unsupported grant_type",
+            vec![("grant_type", "client_credentials")],
+            "unsupported_grant_type",
+        ),
+        (
+            "missing code",
+            vec![
+                ("grant_type", "authorization_code"),
+                ("redirect_uri", "https://example.com/callback"),
+                ("client_id", client.client_id.as_str()),
+                ("client_secret", secret.as_str()),
+            ],
+            "invalid_request",
+        ),
+        (
+            "unknown code",
+            vec![
+                ("grant_type", "authorization_code"),
+                ("code", "wc_oac_nonexistent"),
+                ("redirect_uri", "https://example.com/callback"),
+                ("client_id", client.client_id.as_str()),
+                ("client_secret", secret.as_str()),
+            ],
+            "invalid_grant",
+        ),
+        (
+            "missing refresh_token",
+            vec![
+                ("grant_type", "refresh_token"),
+                ("client_id", client.client_id.as_str()),
+                ("client_secret", secret.as_str()),
+            ],
+            "invalid_request",
+        ),
+        (
+            "unknown refresh_token",
+            vec![
+                ("grant_type", "refresh_token"),
+                ("refresh_token", "wc_ort_nonexistent"),
+                ("client_id", client.client_id.as_str()),
+                ("client_secret", secret.as_str()),
+            ],
+            "invalid_grant",
+        ),
+    ];
+    for (label, fields, expected_error) in &cases {
+        let body = form_body(fields);
+        let mut resp = post_form("http://localhost/oauth/token", body)
+            .send(&service)
+            .await;
+        assert_eq!(resp.status_code, Some(StatusCode::BAD_REQUEST), "{label}");
+        let json: serde_json::Value = resp.take_json().await.unwrap();
+        assert_eq!(json["error"], *expected_error, "{label}");
+    }
 }
 
 #[tokio::test]
@@ -500,75 +508,6 @@ async fn expired_code_returns_invalid_grant() {
 }
 
 #[tokio::test]
-async fn redirect_uri_mismatch_returns_invalid_grant() {
-    let config = test_config(oauth2_enabled_no_pkce());
-    let (_tmp, db) = test_db();
-    let user = seed_user(&db, "alice");
-    let (client, secret) = seed_client(&db, &user, "Test App");
-    let (_, code) = seed_auth_code(
-        &db,
-        &client,
-        &user,
-        "https://example.com/callback",
-        "runtime:read",
-        None,
-        None,
-    );
-
-    let service = Service::new(build_router(config, db));
-    let body = form_body(&[
-        ("grant_type", "authorization_code"),
-        ("code", &code),
-        ("redirect_uri", "https://evil.com/callback"),
-        ("client_id", &client.client_id),
-        ("client_secret", &secret),
-    ]);
-    let mut resp = post_form("http://localhost/oauth/token", body)
-        .send(&service)
-        .await;
-    assert_eq!(resp.status_code, Some(StatusCode::BAD_REQUEST));
-    let json: serde_json::Value = resp.take_json().await.unwrap();
-    assert_eq!(json["error"], "invalid_grant");
-}
-
-#[tokio::test]
-async fn client_id_mismatch_returns_invalid_grant() {
-    let config = test_config(oauth2_enabled_no_pkce());
-    let (_tmp, db) = test_db();
-    let user = seed_user(&db, "alice");
-    let (client, _secret) = seed_client(&db, &user, "Test App");
-    let (_, code) = seed_auth_code(
-        &db,
-        &client,
-        &user,
-        "https://example.com/callback",
-        "runtime:read",
-        None,
-        None,
-    );
-
-    // Create a second client. The code belongs to client1 but we exchange
-    // with client2's credentials. Client auth succeeds (client2's secret
-    // matches), but the code's client_id doesn't match client2.
-    let (client2, secret2) = seed_client(&db, &user, "Other App");
-
-    let service = Service::new(build_router(config, db));
-    let body = form_body(&[
-        ("grant_type", "authorization_code"),
-        ("code", &code),
-        ("redirect_uri", "https://example.com/callback"),
-        ("client_id", &client2.client_id),
-        ("client_secret", &secret2),
-    ]);
-    let mut resp = post_form("http://localhost/oauth/token", body)
-        .send(&service)
-        .await;
-    assert_eq!(resp.status_code, Some(StatusCode::BAD_REQUEST));
-    let json: serde_json::Value = resp.take_json().await.unwrap();
-    assert_eq!(json["error"], "invalid_grant");
-}
-
-#[tokio::test]
 async fn client_id_mismatch_consumes_code_but_no_tokens() {
     let config = test_config(oauth2_enabled_no_pkce());
     let (_tmp, db) = test_db();
@@ -595,10 +534,12 @@ async fn client_id_mismatch_consumes_code_but_no_tokens() {
         ("client_id", &client2.client_id),
         ("client_secret", &secret2),
     ]);
-    let resp = post_form("http://localhost/oauth/token", body)
+    let mut resp = post_form("http://localhost/oauth/token", body)
         .send(&service)
         .await;
     assert_eq!(resp.status_code, Some(StatusCode::BAD_REQUEST));
+    let json: serde_json::Value = resp.take_json().await.unwrap();
+    assert_eq!(json["error"], "invalid_grant");
 
     // Code SHOULD be consumed — validation failure.
     let conn = db.conn_for_tests();
@@ -668,44 +609,6 @@ async fn valid_s256_verifier_succeeds() {
         .as_str()
         .unwrap()
         .starts_with("wc_oat_"));
-}
-
-#[tokio::test]
-async fn wrong_verifier_returns_invalid_grant() {
-    let config = test_config(oauth2_enabled());
-    let (_tmp, db) = test_db();
-    let user = seed_user(&db, "alice");
-    let (client, secret) = seed_client(&db, &user, "Test App");
-
-    let code_verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-    let digest = Sha256::digest(code_verifier.as_bytes());
-    let code_challenge = URL_SAFE_NO_PAD.encode(digest);
-
-    let (_, code) = seed_auth_code(
-        &db,
-        &client,
-        &user,
-        "https://example.com/callback",
-        "runtime:read",
-        Some(&code_challenge),
-        Some("S256"),
-    );
-
-    let service = Service::new(build_router(config, db));
-    let body = form_body(&[
-        ("grant_type", "authorization_code"),
-        ("code", &code),
-        ("redirect_uri", "https://example.com/callback"),
-        ("client_id", &client.client_id),
-        ("client_secret", &secret),
-        ("code_verifier", "wrong-verifier-value-here"),
-    ]);
-    let mut resp = post_form("http://localhost/oauth/token", body)
-        .send(&service)
-        .await;
-    assert_eq!(resp.status_code, Some(StatusCode::BAD_REQUEST));
-    let json: serde_json::Value = resp.take_json().await.unwrap();
-    assert_eq!(json["error"], "invalid_grant");
 }
 
 #[tokio::test]
@@ -1106,10 +1009,12 @@ async fn redirect_uri_mismatch_consumes_code() {
         ("client_id", &client.client_id),
         ("client_secret", &secret),
     ]);
-    let resp = post_form("http://localhost/oauth/token", body)
+    let mut resp = post_form("http://localhost/oauth/token", body)
         .send(&service)
         .await;
     assert_eq!(resp.status_code, Some(StatusCode::BAD_REQUEST));
+    let json: serde_json::Value = resp.take_json().await.unwrap();
+    assert_eq!(json["error"], "invalid_grant");
 
     // Code SHOULD be consumed — validation failure.
     let conn = db.conn_for_tests();
@@ -1169,10 +1074,12 @@ async fn pkce_mismatch_consumes_code() {
         ("client_secret", &secret),
         ("code_verifier", "wrong-verifier"),
     ]);
-    let resp = post_form("http://localhost/oauth/token", body)
+    let mut resp = post_form("http://localhost/oauth/token", body)
         .send(&service)
         .await;
     assert_eq!(resp.status_code, Some(StatusCode::BAD_REQUEST));
+    let json: serde_json::Value = resp.take_json().await.unwrap();
+    assert_eq!(json["error"], "invalid_grant");
 
     // Code SHOULD be consumed — validation failure.
     let conn = db.conn_for_tests();
@@ -1575,49 +1482,6 @@ async fn refresh_token_revoked_client_returns_invalid_client() {
 // -----------------------------------------------------------------------
 // refresh_token grant — grant validation
 // -----------------------------------------------------------------------
-
-#[tokio::test]
-async fn missing_refresh_token_returns_invalid_request() {
-    let config = test_config(oauth2_enabled_no_pkce());
-    let (_tmp, db) = test_db();
-    let user = seed_user(&db, "alice");
-    let (client, secret) = seed_client(&db, &user, "Test App");
-
-    let service = Service::new(build_router(config, db));
-    let body = form_body(&[
-        ("grant_type", "refresh_token"),
-        ("client_id", &client.client_id),
-        ("client_secret", &secret),
-    ]);
-    let mut resp = post_form("http://localhost/oauth/token", body)
-        .send(&service)
-        .await;
-    assert_eq!(resp.status_code, Some(StatusCode::BAD_REQUEST));
-    let json: serde_json::Value = resp.take_json().await.unwrap();
-    assert_eq!(json["error"], "invalid_request");
-}
-
-#[tokio::test]
-async fn unknown_refresh_token_returns_invalid_grant() {
-    let config = test_config(oauth2_enabled_no_pkce());
-    let (_tmp, db) = test_db();
-    let user = seed_user(&db, "alice");
-    let (client, secret) = seed_client(&db, &user, "Test App");
-
-    let service = Service::new(build_router(config, db));
-    let body = form_body(&[
-        ("grant_type", "refresh_token"),
-        ("refresh_token", "wc_ort_nonexistent"),
-        ("client_id", &client.client_id),
-        ("client_secret", &secret),
-    ]);
-    let mut resp = post_form("http://localhost/oauth/token", body)
-        .send(&service)
-        .await;
-    assert_eq!(resp.status_code, Some(StatusCode::BAD_REQUEST));
-    let json: serde_json::Value = resp.take_json().await.unwrap();
-    assert_eq!(json["error"], "invalid_grant");
-}
 
 #[tokio::test]
 async fn expired_refresh_token_returns_invalid_grant() {

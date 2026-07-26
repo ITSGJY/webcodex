@@ -1411,45 +1411,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_tools_call_params_omitted_works_for_list_tools() {
+    async fn http_tools_call_accepts_omitted_null_and_alias_params() {
+        // `params` may be omitted or null, and `arguments` is accepted as a
+        // compatibility alias for `params`.
         let (_tmp, service) = phase2_service();
-        let mut resp = TestClient::post("http://localhost/api/tools/call")
-            .bearer_auth("secret")
-            .json(&json!({"tool": "list_tools"}))
-            .send(&service)
-            .await;
-        assert_eq!(effective_status(&resp), StatusCode::OK);
-        let body: Value = resp.take_json().await.unwrap();
-        assert_eq!(body["success"], true);
-        assert!(body["output"]["tools"].is_array());
-    }
-
-    #[tokio::test]
-    async fn http_tools_call_params_null_works_for_list_tools() {
-        let (_tmp, service) = phase2_service();
-        let mut resp = TestClient::post("http://localhost/api/tools/call")
-            .bearer_auth("secret")
-            .json(&json!({"tool": "list_tools", "params": null}))
-            .send(&service)
-            .await;
-        assert_eq!(effective_status(&resp), StatusCode::OK);
-        let body: Value = resp.take_json().await.unwrap();
-        assert_eq!(body["success"], true);
-        assert!(body["output"]["tools"].is_array());
-    }
-
-    #[tokio::test]
-    async fn http_tools_call_arguments_alias_works() {
-        // `arguments` is accepted as a compatibility alias for `params`.
-        let (_tmp, service) = phase2_service();
-        let mut resp = TestClient::post("http://localhost/api/tools/call")
-            .bearer_auth("secret")
-            .json(&json!({"tool": "list_tools", "arguments": null}))
-            .send(&service)
-            .await;
-        assert_eq!(effective_status(&resp), StatusCode::OK);
-        let body: Value = resp.take_json().await.unwrap();
-        assert_eq!(body["success"], true);
+        for body in [
+            json!({"tool": "list_tools"}),
+            json!({"tool": "list_tools", "params": null}),
+            json!({"tool": "list_tools", "arguments": null}),
+        ] {
+            let mut resp = TestClient::post("http://localhost/api/tools/call")
+                .bearer_auth("secret")
+                .json(&body)
+                .send(&service)
+                .await;
+            assert_eq!(effective_status(&resp), StatusCode::OK, "body: {body}");
+            let out: Value = resp.take_json().await.unwrap();
+            assert_eq!(out["success"], true, "body: {body}");
+            assert!(out["output"]["tools"].is_array(), "body: {body}");
+        }
     }
 
     #[tokio::test]
@@ -1980,69 +1960,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_tools_call_git_diff_summary_dispatches() {
-        // callRuntimeTool routes git_diff_summary to the runtime. With an
-        // unknown agent project the runtime returns a structured error (not a
-        // 401/404), proving the generic path deserializes + dispatches.
+    async fn http_tools_call_generic_path_dispatches_git_tools() {
+        // callRuntimeTool routes these tools to the runtime. With an unknown
+        // agent project the runtime returns a structured error (not a 401/404),
+        // proving the generic path deserializes + dispatches each tool.
         let (_tmp, service) = phase2_service();
-        let mut resp = TestClient::post("http://localhost/api/tools/call")
-            .bearer_auth("secret")
-            .json(&json!({
-                "tool": "git_diff_summary",
-                "params": {"project": "agent:nope:nope"}
-            }))
-            .send(&service)
-            .await;
-        assert_eq!(effective_status(&resp), StatusCode::BAD_REQUEST);
-        let body: Value = resp.take_json().await.unwrap();
-        assert_eq!(body["success"], false);
-        assert!(
-            body["error"].as_str().is_some_and(|e| !e.is_empty()),
-            "git_diff_summary should return a structured runtime error"
-        );
-    }
-
-    #[tokio::test]
-    async fn http_tools_call_git_log_dispatches() {
-        let (_tmp, service) = phase2_service();
-        let mut resp = TestClient::post("http://localhost/api/tools/call")
-            .bearer_auth("secret")
-            .json(&json!({
-                "tool": "git_log",
-                "params": {"project": "agent:nope:nope", "limit": 5, "skip": 1}
-            }))
-            .send(&service)
-            .await;
-        assert_eq!(effective_status(&resp), StatusCode::BAD_REQUEST);
-        let body: Value = resp.take_json().await.unwrap();
-        assert_eq!(body["success"], false);
-        assert!(
-            body["error"].as_str().is_some_and(|e| !e.is_empty()),
-            "git_log should return a structured runtime error"
-        );
-    }
-
-    #[tokio::test]
-    async fn http_tools_call_show_changes_dispatches() {
-        // callRuntimeTool routes show_changes to the runtime. With an unknown
-        // agent project the runtime returns a structured error, proving the
-        // generic path deserializes + dispatches.
-        let (_tmp, service) = phase2_service();
-        let mut resp = TestClient::post("http://localhost/api/tools/call")
-            .bearer_auth("secret")
-            .json(&json!({
-                "tool": "show_changes",
-                "params": {"project": "agent:nope:nope", "include_diff": false}
-            }))
-            .send(&service)
-            .await;
-        assert_eq!(effective_status(&resp), StatusCode::BAD_REQUEST);
-        let body: Value = resp.take_json().await.unwrap();
-        assert_eq!(body["success"], false);
-        assert!(
-            body["error"].as_str().is_some_and(|e| !e.is_empty()),
-            "show_changes should return a structured runtime error"
-        );
+        for (tool, params) in [
+            ("git_diff_summary", json!({"project": "agent:nope:nope"})),
+            (
+                "git_log",
+                json!({"project": "agent:nope:nope", "limit": 5, "skip": 1}),
+            ),
+            (
+                "show_changes",
+                json!({"project": "agent:nope:nope", "include_diff": false}),
+            ),
+        ] {
+            let mut resp = TestClient::post("http://localhost/api/tools/call")
+                .bearer_auth("secret")
+                .json(&json!({"tool": tool, "params": params}))
+                .send(&service)
+                .await;
+            assert_eq!(effective_status(&resp), StatusCode::BAD_REQUEST, "{tool}");
+            let body: Value = resp.take_json().await.unwrap();
+            assert_eq!(body["success"], false, "{tool}");
+            assert!(
+                body["error"].as_str().is_some_and(|e| !e.is_empty()),
+                "{tool} should return a structured runtime error"
+            );
+        }
     }
 
     #[tokio::test]

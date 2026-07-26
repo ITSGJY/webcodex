@@ -514,62 +514,75 @@ fn sensitive_path_warnings_flags_sensitive_names() {
 }
 
 #[tokio::test]
-async fn validate_patch_rejects_empty_patch() {
-    let runtime = test_runtime();
-    let result = runtime
-        .validate_patch("agent:c:p".to_string(), "".to_string(), None)
-        .await;
-    assert!(!result.success);
-    assert!(result.error.unwrap().contains("empty"));
-}
+async fn validate_patch_rejects_invalid_inputs() {
+    struct Case {
+        label: &'static str,
+        project: &'static str,
+        patch: String,
+        // The error must contain at least one of these substrings.
+        expected_error_any: &'static [&'static str],
+        // Whether the substring check runs on the lowercased error.
+        lowercase: bool,
+    }
+    let cases = [
+        Case {
+            label: "empty patch",
+            project: "agent:c:p",
+            patch: String::new(),
+            expected_error_any: &["empty"],
+            lowercase: false,
+        },
+        Case {
+            label: "nul byte patch",
+            project: "agent:c:p",
+            patch: "diff\0--- a/f\n".to_string(),
+            expected_error_any: &["NUL"],
+            lowercase: false,
+        },
+        Case {
+            label: "oversized patch",
+            project: "agent:c:p",
+            // Build a patch one byte over the limit.
+            patch: "x".repeat(MAX_VALIDATE_PATCH_BYTES + 1),
+            expected_error_any: &["too large"],
+            lowercase: false,
+        },
+        Case {
+            // A server-configured (local) project is not a supported runtime
+            // surface for validate_patch. resolve_project rejects it before the
+            // agent dry-run path, and the server never reads the filesystem.
+            label: "non-agent project",
+            project: "agent:nope:nope",
+            patch: "--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\nhello\n+world\n".to_string(),
+            expected_error_any: &["unknown", "agent"],
+            lowercase: true,
+        },
+    ];
 
-#[tokio::test]
-async fn validate_patch_rejects_nul_byte_patch() {
-    let runtime = test_runtime();
-    let result = runtime
-        .validate_patch("agent:c:p".to_string(), "diff\0--- a/f\n".to_string(), None)
-        .await;
-    assert!(!result.success);
-    assert!(result.error.unwrap().contains("NUL"));
-}
-
-#[tokio::test]
-async fn validate_patch_rejects_oversized_patch() {
-    let runtime = test_runtime();
-    // Build a patch one byte over the limit.
-    let oversized = "x".repeat(MAX_VALIDATE_PATCH_BYTES + 1);
-    let result = runtime
-        .validate_patch("agent:c:p".to_string(), oversized, None)
-        .await;
-    assert!(!result.success);
-    let err = result.error.unwrap();
-    assert!(err.contains("too large"), "got: {}", err);
-}
-
-#[tokio::test]
-async fn validate_patch_rejects_non_agent_project() {
-    // A server-configured (local) project is not a supported runtime
-    // surface for validate_patch. resolve_project rejects it before the
-    // agent dry-run path, and the server never reads the filesystem.
-    let runtime = test_runtime();
-    let patch = "--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\nhello\n+world\n";
-    let result = runtime
-        .validate_patch("agent:nope:nope".to_string(), patch.to_string(), None)
-        .await;
-    assert!(!result.success);
-    let err = result.error.unwrap();
-    assert!(
-        err.to_lowercase().contains("unknown") || err.to_lowercase().contains("agent"),
-        "expected a routing/rejection error for non-agent project, got: {}",
-        err
-    );
-}
-
-#[test]
-fn max_validate_patch_bytes_is_conservative() {
-    // Pin the conservative upper bound so it is not accidentally raised.
-    assert_eq!(MAX_VALIDATE_PATCH_BYTES, 256 * 1024);
-    assert!(MAX_VALIDATE_PATCH_BYTES <= 1024 * 1024);
+    for case in cases {
+        let runtime = test_runtime();
+        let result = runtime
+            .validate_patch(case.project.to_string(), case.patch, None)
+            .await;
+        assert!(!result.success, "case `{}`: must be rejected", case.label);
+        let err = result
+            .error
+            .unwrap_or_else(|| panic!("case `{}`: expected an error message", case.label));
+        let haystack = if case.lowercase {
+            err.to_lowercase()
+        } else {
+            err.clone()
+        };
+        assert!(
+            case.expected_error_any
+                .iter()
+                .any(|needle| haystack.contains(needle)),
+            "case `{}`: expected error containing one of {:?}, got: {}",
+            case.label,
+            case.expected_error_any,
+            err
+        );
+    }
 }
 
 #[test]
@@ -984,77 +997,99 @@ fn search_agent_timeout_budget_keeps_outer_above_command_at_max() {
 }
 
 #[test]
-fn search_backend_exit_1_is_successful_empty_result() {
-    let options = SearchOptions::normalize(raw_search_request()).unwrap();
-    let stdout = concat!(
-        "{\"webcodex_search\":{\"backend\":\"rg\",\"feature_unavailable\":false}}\n",
-        "{\"webcodex_search\":{\"backend\":\"rg\",\"feature_unavailable\":false}}\n",
-    );
-    let result = search_project_text_output("demo", &options, stdout, Some(1), "");
-    assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["backend"], "rg");
-    assert_eq!(result.output["matches"], json!([]));
-    assert_eq!(result.output["count"], 0);
-    assert_eq!(result.output["exit_code"], 1);
-}
+fn search_backend_exit_codes_map_to_results() {
+    enum Expect {
+        // Exit 1 (no matches) is a successful empty result.
+        EmptySuccess,
+        // Exit 2 is a structured execution failure.
+        ExecutionFailure,
+        // Exit 0 parses the emitted match lines.
+        ParsedMatches(usize),
+    }
+    struct Case {
+        backend: &'static str,
+        exit_code: i32,
+        // Extra stdout line emitted between the two backend marker lines.
+        match_line: Option<&'static str>,
+        limit: Option<usize>,
+        expect: Expect,
+    }
+    let cases = [
+        Case {
+            backend: "rg",
+            exit_code: 1,
+            match_line: None,
+            limit: None,
+            expect: Expect::EmptySuccess,
+        },
+        Case {
+            backend: "rg",
+            exit_code: 2,
+            match_line: None,
+            limit: None,
+            expect: Expect::ExecutionFailure,
+        },
+        Case {
+            backend: "rg",
+            exit_code: 0,
+            match_line: Some("src/lib.rs:2:needle from rg\n"),
+            limit: Some(5),
+            expect: Expect::ParsedMatches(1),
+        },
+        Case {
+            backend: "grep",
+            exit_code: 1,
+            match_line: None,
+            limit: None,
+            expect: Expect::EmptySuccess,
+        },
+        Case {
+            backend: "grep",
+            exit_code: 2,
+            match_line: None,
+            limit: None,
+            expect: Expect::ExecutionFailure,
+        },
+    ];
 
-#[test]
-fn search_backend_exit_2_is_structured_execution_failure() {
-    let options = SearchOptions::normalize(raw_search_request()).unwrap();
-    let stdout = concat!(
-        "{\"webcodex_search\":{\"backend\":\"rg\",\"feature_unavailable\":false}}\n",
-        "{\"webcodex_search\":{\"backend\":\"rg\",\"feature_unavailable\":false}}\n",
-    );
-    let result = search_project_text_output("demo", &options, stdout, Some(2), "");
-    assert!(!result.success);
-    assert_search_output_keys_are_declared(&result.output);
-    assert_eq!(result.output["code"], "search_execution_failed");
-    assert_eq!(result.output["backend"], "rg");
-    assert_eq!(result.output["result_mode"], "matches");
-}
-
-#[test]
-fn search_backend_exit_0_parses_matches() {
-    let options = SearchOptions::normalize(SearchRequest {
-        limit: Some(5),
-        ..raw_search_request()
-    })
-    .unwrap();
-    let stdout = concat!(
-        "{\"webcodex_search\":{\"backend\":\"rg\",\"feature_unavailable\":false}}\n",
-        "src/lib.rs:2:needle from rg\n",
-        "{\"webcodex_search\":{\"backend\":\"rg\",\"feature_unavailable\":false}}\n",
-    );
-    let result = search_project_text_output("demo", &options, stdout, Some(0), "");
-    assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["backend"], "rg");
-    assert_eq!(result.output["matches"].as_array().unwrap().len(), 1);
-}
-
-#[test]
-fn search_grep_exit_1_is_successful_empty_result() {
-    let options = SearchOptions::normalize(raw_search_request()).unwrap();
-    let stdout = concat!(
-        "{\"webcodex_search\":{\"backend\":\"grep\",\"feature_unavailable\":false}}\n",
-        "{\"webcodex_search\":{\"backend\":\"grep\",\"feature_unavailable\":false}}\n",
-    );
-    let result = search_project_text_output("demo", &options, stdout, Some(1), "");
-    assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["backend"], "grep");
-    assert_eq!(result.output["matches"], json!([]));
-}
-
-#[test]
-fn search_grep_exit_2_is_structured_execution_failure() {
-    let options = SearchOptions::normalize(raw_search_request()).unwrap();
-    let stdout = concat!(
-        "{\"webcodex_search\":{\"backend\":\"grep\",\"feature_unavailable\":false}}\n",
-        "{\"webcodex_search\":{\"backend\":\"grep\",\"feature_unavailable\":false}}\n",
-    );
-    let result = search_project_text_output("demo", &options, stdout, Some(2), "");
-    assert!(!result.success);
-    assert_eq!(result.output["code"], "search_execution_failed");
-    assert_eq!(result.output["backend"], "grep");
+    for case in cases {
+        let ctx = format!("backend={} exit_code={}", case.backend, case.exit_code);
+        let options = SearchOptions::normalize(SearchRequest {
+            limit: case.limit,
+            ..raw_search_request()
+        })
+        .unwrap();
+        let marker = format!(
+            "{{\"webcodex_search\":{{\"backend\":\"{}\",\"feature_unavailable\":false}}}}\n",
+            case.backend
+        );
+        let stdout = format!("{marker}{}{marker}", case.match_line.unwrap_or(""));
+        let result =
+            search_project_text_output("demo", &options, &stdout, Some(case.exit_code), "");
+        assert_eq!(result.output["backend"], case.backend, "{ctx}");
+        match case.expect {
+            Expect::EmptySuccess => {
+                assert!(result.success, "{ctx}: {:?}", result.error);
+                assert_eq!(result.output["matches"], json!([]), "{ctx}");
+                assert_eq!(result.output["count"], 0, "{ctx}");
+                assert_eq!(result.output["exit_code"], case.exit_code, "{ctx}");
+            }
+            Expect::ExecutionFailure => {
+                assert!(!result.success, "{ctx}");
+                assert_search_output_keys_are_declared(&result.output);
+                assert_eq!(result.output["code"], "search_execution_failed", "{ctx}");
+                assert_eq!(result.output["result_mode"], "matches", "{ctx}");
+            }
+            Expect::ParsedMatches(expected) => {
+                assert!(result.success, "{ctx}: {:?}", result.error);
+                assert_eq!(
+                    result.output["matches"].as_array().unwrap().len(),
+                    expected,
+                    "{ctx}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(unix)]

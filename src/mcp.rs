@@ -14,6 +14,17 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// Single source of truth for the JSON-RPC methods advertised by `GET /mcp`.
+/// Must match the dispatch arms in `handle_mcp_request_with_lifecycle`;
+/// pinned by `mcp_info_advertised_methods_match_dispatch`.
+const MCP_INFO_METHODS: &[&str] = &[
+    "initialize",
+    "ping",
+    "tools/list",
+    "tools/call",
+    "notifications/initialized",
+];
 const MCP_RESERVED_SESSION_ID_FIELD: &str = "_session_id";
 
 /// Hard upper bound on a single MCP JSON-RPC dispatch, applied in `mcp_post`.
@@ -126,13 +137,7 @@ pub async fn mcp_info(depot: &mut Depot, res: &mut Response) {
         "protocolVersion": MCP_PROTOCOL_VERSION,
         "transport": "streamable-http-jsonrpc",
         "endpoint": "/mcp",
-        "methods": [
-            "initialize",
-            "ping",
-            "tools/list",
-            "tools/call",
-            "notifications/initialized"
-        ],
+        "methods": MCP_INFO_METHODS,
         "auth": {
             "type": "bearer",
             "required": auth_required,
@@ -620,6 +625,29 @@ mod tests {
                 assert!(value["result"].as_object().unwrap().is_empty());
             }
             other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_info_advertised_methods_match_dispatch() {
+        let runtime = test_runtime();
+        for method in MCP_INFO_METHODS {
+            let outcome =
+                handle_mcp_request(&runtime, rpc(method, Some(json!(1)), json!({})), None).await;
+            assert!(
+                !matches!(&outcome, McpOutcome::BadRequest(value) if value["error"]["code"] == -32601),
+                "advertised method {method} must be dispatchable"
+            );
+        }
+        let outcome = handle_mcp_request(
+            &runtime,
+            rpc("not/a/method", Some(json!(1)), json!({})),
+            None,
+        )
+        .await;
+        match outcome {
+            McpOutcome::BadRequest(value) => assert_eq!(value["error"]["code"], -32601),
+            other => panic!("unknown method must return -32601, got {other:?}"),
         }
     }
 

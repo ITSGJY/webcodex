@@ -191,78 +191,106 @@ fn normalize_local_status_maps_known_and_unknown_values() {
     assert_eq!(normalize_local_status("weird-state"), "lost");
 }
 
-#[test]
-fn read_lines_from_is_bounded_by_default() {
+/// Write a log file with `lines` lines of `line N` (1-based) and return the
+/// tempdir guard plus the file path.
+fn log_fixture(lines: usize) -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("stdout.log");
-    let content = (1..=1000)
+    let content = (1..=lines)
         .map(|i| format!("line {}", i))
         .collect::<Vec<_>>()
         .join("\n");
     fs::write(&path, &content).unwrap();
-    let (text, next) = read_lines_from(path, None, None);
-    let lines: Vec<&str> = text.lines().collect();
-    assert!(lines.len() <= MAX_LOCAL_LOG_LINES);
-    assert_eq!(lines.len(), MAX_LOCAL_LOG_LINES);
-    // Default is tail: last 500 lines.
-    assert_eq!(lines[0], "line 501");
-    assert_eq!(lines.last().unwrap(), &"line 1000");
-    assert_eq!(next, 1001);
+    (tmp, path)
 }
 
 #[test]
-fn read_lines_from_supports_offset_pagination() {
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("stdout.log");
-    let content = (1..=600)
-        .map(|i| format!("line {}", i))
-        .collect::<Vec<_>>()
-        .join("\n");
-    fs::write(&path, &content).unwrap();
-    let (text, next) = read_lines_from(path.clone(), Some(1), None);
-    let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines.len(), MAX_LOCAL_LOG_LINES);
-    assert_eq!(lines[0], "line 1");
-    assert_eq!(lines.last().unwrap(), &"line 500");
-    assert_eq!(next, 501);
-
-    let (text2, next2) = read_lines_from(path, Some(501), None);
-    let lines2: Vec<&str> = text2.lines().collect();
-    assert_eq!(lines2.len(), 100);
-    assert_eq!(lines2[0], "line 501");
-    assert_eq!(lines2.last().unwrap(), &"line 600");
-    assert_eq!(next2, 601);
-}
-
-#[test]
-fn read_lines_from_supports_tail_lines() {
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("stdout.log");
-    let content = (1..=1000)
-        .map(|i| format!("line {}", i))
-        .collect::<Vec<_>>()
-        .join("\n");
-    fs::write(&path, &content).unwrap();
-    let (text, _next) = read_lines_from(path, None, Some(10));
-    let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines.len(), 10);
-    assert_eq!(lines[0], "line 991");
-    assert_eq!(lines.last().unwrap(), &"line 1000");
-}
-
-#[test]
-fn read_lines_from_tail_is_capped_to_max() {
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("stdout.log");
-    let content = (1..=1000)
-        .map(|i| format!("line {}", i))
-        .collect::<Vec<_>>()
-        .join("\n");
-    fs::write(&path, &content).unwrap();
-    // Requesting more than MAX returns at most MAX.
-    let (text, _) = read_lines_from(path, None, Some(5000));
-    let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines.len(), MAX_LOCAL_LOG_LINES);
+fn read_lines_from_bounds_offsets_and_tails() {
+    struct Case {
+        name: &'static str,
+        file_lines: usize,
+        offset: Option<usize>,
+        tail: Option<usize>,
+        expect_len: usize,
+        expect_first: Option<&'static str>,
+        expect_last: Option<&'static str>,
+        expect_next: Option<usize>,
+    }
+    let cases = [
+        // Default is tail: last MAX_LOCAL_LOG_LINES (500) lines.
+        Case {
+            name: "default_is_bounded_tail",
+            file_lines: 1000,
+            offset: None,
+            tail: None,
+            expect_len: MAX_LOCAL_LOG_LINES,
+            expect_first: Some("line 501"),
+            expect_last: Some("line 1000"),
+            expect_next: Some(1001),
+        },
+        Case {
+            name: "offset_first_page",
+            file_lines: 600,
+            offset: Some(1),
+            tail: None,
+            expect_len: MAX_LOCAL_LOG_LINES,
+            expect_first: Some("line 1"),
+            expect_last: Some("line 500"),
+            expect_next: Some(501),
+        },
+        Case {
+            name: "offset_second_page",
+            file_lines: 600,
+            offset: Some(501),
+            tail: None,
+            expect_len: 100,
+            expect_first: Some("line 501"),
+            expect_last: Some("line 600"),
+            expect_next: Some(601),
+        },
+        Case {
+            name: "tail_lines",
+            file_lines: 1000,
+            offset: None,
+            tail: Some(10),
+            expect_len: 10,
+            expect_first: Some("line 991"),
+            expect_last: Some("line 1000"),
+            expect_next: None,
+        },
+        // Requesting more than MAX returns at most MAX.
+        Case {
+            name: "tail_capped_to_max",
+            file_lines: 1000,
+            offset: None,
+            tail: Some(5000),
+            expect_len: MAX_LOCAL_LOG_LINES,
+            expect_first: None,
+            expect_last: None,
+            expect_next: None,
+        },
+    ];
+    for case in cases {
+        let (_tmp, path) = log_fixture(case.file_lines);
+        let (text, next) = read_lines_from(path, case.offset, case.tail);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines.len() <= MAX_LOCAL_LOG_LINES,
+            "[{}] output must stay bounded, got {} lines",
+            case.name,
+            lines.len()
+        );
+        assert_eq!(lines.len(), case.expect_len, "[{}] line count", case.name);
+        if let Some(first) = case.expect_first {
+            assert_eq!(lines[0], first, "[{}] first line", case.name);
+        }
+        if let Some(last) = case.expect_last {
+            assert_eq!(lines.last().unwrap(), &last, "[{}] last line", case.name);
+        }
+        if let Some(expected_next) = case.expect_next {
+            assert_eq!(next, expected_next, "[{}] next cursor", case.name);
+        }
+    }
 }
 
 #[tokio::test]
@@ -428,37 +456,54 @@ async fn recover_local_job_unknown_when_no_metadata_anywhere() {
     assert!(result.error.unwrap().contains("unknown job"));
 }
 
-#[tokio::test]
-async fn run_shell_failure_reports_command_started_and_output_tail() {
-    let runtime = runtime_with_agent_project("shell-failer");
+/// Drive `run_shell` end to end against a freshly registered shell-capable
+/// agent: spawn the call, wait for the enqueued agent request, and complete it
+/// with the given `(exit_code, stdout, stderr)`. Passing `completion: None`
+/// leaves the request unanswered (e.g. to exercise the run_shell timeout).
+async fn run_shell_via_agent(
+    client_id: &str,
+    command: &str,
+    timeout_secs: Option<u64>,
+    completion: Option<(i32, &str, &str)>,
+) -> ToolResult {
+    let runtime = runtime_with_agent_project(client_id);
     let mut caps = ShellClientCapabilities::default();
     caps.shell = true;
-    register_agent(&runtime, "shell-failer", None, caps).await;
-    let project = agent_test_project_id("shell-failer");
+    register_agent(&runtime, client_id, None, caps).await;
+    let project = agent_test_project_id(client_id);
     let runtime_for_task = runtime.clone();
+    let command = command.to_string();
     let task = tokio::spawn(async move {
         runtime_for_task
-            .run_shell(
-                project,
-                "printf run-shell-out; printf run-shell-err >&2; exit 7".to_string(),
-                Some(30),
-                None,
-            )
+            .run_shell(project, command, timeout_secs, None)
             .await
     });
-    let req = next_patch_agent_request(&runtime, "shell-failer")
+    let req = next_patch_agent_request(&runtime, client_id)
         .await
         .expect("run_shell should enqueue a shell command");
-    complete_patch_agent_request(
-        &runtime,
+    if let Some((exit_code, stdout, stderr)) = completion {
+        complete_patch_agent_request(
+            &runtime,
+            client_id,
+            &req.request_id,
+            exit_code,
+            stdout,
+            stderr,
+        )
+        .await;
+    }
+    task.await.unwrap()
+}
+
+#[tokio::test]
+async fn run_shell_failure_reports_command_started_and_output_tail() {
+    let result = run_shell_via_agent(
         "shell-failer",
-        &req.request_id,
-        7,
-        "run-shell-out",
-        "run-shell-err",
+        "printf run-shell-out; printf run-shell-err >&2; exit 7",
+        Some(30),
+        Some((7, "run-shell-out", "run-shell-err")),
     )
     .await;
-    let result = task.await.unwrap();
     assert!(!result.success);
     let error = result.error.as_deref().unwrap_or("");
     assert!(error.contains("Command exited with status 7"));
@@ -500,92 +545,121 @@ async fn run_shell_rejection_reports_not_started_and_no_files_modified() {
 }
 
 #[tokio::test]
-async fn run_shell_exit_zero_reports_structured_command_success() {
-    let runtime = runtime_with_agent_project("shell-ok");
-    let mut caps = ShellClientCapabilities::default();
-    caps.shell = true;
-    register_agent(&runtime, "shell-ok", None, caps).await;
-    let project = agent_test_project_id("shell-ok");
-    let runtime_for_task = runtime.clone();
-    let task = tokio::spawn(async move {
-        runtime_for_task
-            .run_shell(
-                project,
-                "printf ok; printf err >&2".to_string(),
-                Some(30),
-                None,
-            )
-            .await
-    });
-    let req = next_patch_agent_request(&runtime, "shell-ok")
-        .await
-        .expect("run_shell should enqueue a shell command");
-    complete_patch_agent_request(&runtime, "shell-ok", &req.request_id, 0, "ok", "err").await;
-    let result = task.await.unwrap();
+async fn run_shell_exit_codes_report_structured_command_results() {
+    struct Case {
+        name: &'static str,
+        client_id: &'static str,
+        command: &'static str,
+        exit_code: i32,
+        stdout: &'static str,
+        stderr: &'static str,
+        expect_success: bool,
+        expect_command_ok: bool,
+        // None => failure_kind must be JSON null.
+        expect_failure_kind: Option<&'static str>,
+        // Success reports full bodies (stdout/stderr); nonzero exits report
+        // bounded tails (stdout_tail/stderr_tail).
+        stdout_field: &'static str,
+        stderr_field: &'static str,
+    }
+    let cases = [
+        Case {
+            name: "exit_zero",
+            client_id: "shell-ok",
+            command: "printf ok; printf err >&2",
+            exit_code: 0,
+            stdout: "ok",
+            stderr: "err",
+            expect_success: true,
+            expect_command_ok: true,
+            expect_failure_kind: None,
+            stdout_field: "stdout",
+            stderr_field: "stderr",
+        },
+        Case {
+            name: "exit_seven",
+            client_id: "shell-seven",
+            command: "printf out; printf err >&2; exit 7",
+            exit_code: 7,
+            stdout: "out",
+            stderr: "err",
+            expect_success: false,
+            expect_command_ok: false,
+            expect_failure_kind: Some("command_exit_nonzero"),
+            stdout_field: "stdout_tail",
+            stderr_field: "stderr_tail",
+        },
+    ];
+    for case in cases {
+        let result = run_shell_via_agent(
+            case.client_id,
+            case.command,
+            Some(30),
+            Some((case.exit_code, case.stdout, case.stderr)),
+        )
+        .await;
 
-    assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["exit_code"], 0);
-    assert_eq!(result.output["stdout"], "ok");
-    assert_eq!(result.output["stderr"], "err");
-    assert_eq!(result.output["command_started"], true);
-    assert_eq!(result.output["command_completed"], true);
-    assert_eq!(result.output["command_ok"], true);
-    assert!(result.output["failure_kind"].is_null());
-    assert_eq!(result.output["tool_failure"], false);
-}
-
-#[tokio::test]
-async fn run_shell_exit_seven_reports_structured_command_nonzero() {
-    let runtime = runtime_with_agent_project("shell-seven");
-    let mut caps = ShellClientCapabilities::default();
-    caps.shell = true;
-    register_agent(&runtime, "shell-seven", None, caps).await;
-    let project = agent_test_project_id("shell-seven");
-    let runtime_for_task = runtime.clone();
-    let task = tokio::spawn(async move {
-        runtime_for_task
-            .run_shell(
-                project,
-                "printf out; printf err >&2; exit 7".to_string(),
-                Some(30),
-                None,
-            )
-            .await
-    });
-    let req = next_patch_agent_request(&runtime, "shell-seven")
-        .await
-        .expect("run_shell should enqueue a shell command");
-    complete_patch_agent_request(&runtime, "shell-seven", &req.request_id, 7, "out", "err").await;
-    let result = task.await.unwrap();
-
-    assert!(!result.success);
-    assert_eq!(result.output["command_started"], true);
-    assert_eq!(result.output["command_completed"], true);
-    assert_eq!(result.output["command_ok"], false);
-    assert_eq!(result.output["exit_code"], 7);
-    assert_eq!(result.output["failure_kind"], "command_exit_nonzero");
-    assert_eq!(result.output["tool_failure"], false);
-    assert_eq!(result.output["stdout_tail"], "out");
-    assert_eq!(result.output["stderr_tail"], "err");
+        assert_eq!(
+            result.success, case.expect_success,
+            "[{}] success flag, error: {:?}",
+            case.name, result.error
+        );
+        assert_eq!(
+            result.output["exit_code"], case.exit_code,
+            "[{}] exit_code",
+            case.name
+        );
+        assert_eq!(
+            result.output[case.stdout_field], case.stdout,
+            "[{}] {}",
+            case.name, case.stdout_field
+        );
+        assert_eq!(
+            result.output[case.stderr_field], case.stderr,
+            "[{}] {}",
+            case.name, case.stderr_field
+        );
+        assert_eq!(
+            result.output["command_started"], true,
+            "[{}] command_started",
+            case.name
+        );
+        assert_eq!(
+            result.output["command_completed"], true,
+            "[{}] command_completed",
+            case.name
+        );
+        assert_eq!(
+            result.output["command_ok"], case.expect_command_ok,
+            "[{}] command_ok",
+            case.name
+        );
+        match case.expect_failure_kind {
+            Some(kind) => assert_eq!(
+                result.output["failure_kind"], kind,
+                "[{}] failure_kind",
+                case.name
+            ),
+            None => assert!(
+                result.output["failure_kind"].is_null(),
+                "[{}] failure_kind should be null, got {:?}",
+                case.name,
+                result.output["failure_kind"]
+            ),
+        }
+        assert_eq!(
+            result.output["tool_failure"], false,
+            "[{}] tool_failure",
+            case.name
+        );
+    }
 }
 
 #[tokio::test]
 async fn run_shell_timeout_reports_structured_timeout_failure_kind() {
-    let runtime = runtime_with_agent_project("shell-timeout");
-    let mut caps = ShellClientCapabilities::default();
-    caps.shell = true;
-    register_agent(&runtime, "shell-timeout", None, caps).await;
-    let project = agent_test_project_id("shell-timeout");
-    let runtime_for_task = runtime.clone();
-    let task = tokio::spawn(async move {
-        runtime_for_task
-            .run_shell(project, "sleep 2".to_string(), Some(1), None)
-            .await
-    });
-    let _req = next_patch_agent_request(&runtime, "shell-timeout")
-        .await
-        .expect("run_shell should enqueue a shell command");
-    let result = task.await.unwrap();
+    // The enqueued agent request is intentionally never completed, so the
+    // 1-second run_shell timeout fires while the command is still pending.
+    let result = run_shell_via_agent("shell-timeout", "sleep 2", Some(1), None).await;
 
     assert!(!result.success);
     assert_eq!(result.output["command_started"], true);

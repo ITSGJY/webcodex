@@ -1502,50 +1502,130 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn enforce_token_surface_allows_bootstrap_on_any_path() {
-        let ctx = bootstrap_ctx();
-        assert!(enforce_token_surface(&ctx, "/api/runtime/status").is_ok());
-        assert!(enforce_token_surface(&ctx, "/api/shell/agent/register").is_ok());
-        assert!(enforce_token_surface(&ctx, "/api/users/me").is_ok());
-    }
-
-    #[test]
-    fn enforce_token_surface_allows_user_pat_on_any_path() {
-        let ctx = user_ctx("alice");
-        assert!(enforce_token_surface(&ctx, "/api/runtime/status").is_ok());
-        assert!(enforce_token_surface(&ctx, "/api/tools/list").is_ok());
-        assert!(enforce_token_surface(&ctx, "/api/projects/list").is_ok());
-    }
-
-    #[test]
-    fn enforce_token_surface_allows_agent_token_on_agent_transport_paths() {
-        let ctx = agent_ctx("alice", "laptop", vec![SCOPE_AGENT_REGISTER.to_string()]);
-        assert!(enforce_token_surface(&ctx, "/api/shell/agent/register").is_ok());
-        assert!(enforce_token_surface(&ctx, "/api/shell/agent/poll").is_ok());
-        assert!(enforce_token_surface(&ctx, "/api/shell/agent/result").is_ok());
-        assert!(enforce_token_surface(&ctx, "/api/shell/agent/job_update").is_ok());
-        assert!(enforce_token_surface(&ctx, "/api/agents/ws").is_ok());
-    }
-
-    #[test]
-    fn enforce_token_surface_rejects_agent_token_on_normal_paths() {
-        let ctx = agent_ctx("alice", "laptop", vec![SCOPE_AGENT_REGISTER.to_string()]);
-        for path in [
+    fn enforce_token_surface_matrix() {
+        let mut account = user_ctx("alice");
+        account.kind = AuthKind::AccountCredential;
+        let mut oauth2 = user_ctx("alice");
+        oauth2.kind = AuthKind::OAuth2Token;
+        let agent_transport = [
+            "/api/shell/agent/register",
+            "/api/shell/agent/poll",
+            "/api/shell/agent/result",
+            "/api/shell/agent/job_update",
+            "/api/agents/ws",
+        ];
+        let runtime_paths = [
             "/api/runtime/status",
             "/api/tools/list",
             "/api/projects/list",
             "/mcp",
-            "/api/users/me",
-        ] {
-            let result = enforce_token_surface(&ctx, path);
-            assert!(
-                result.is_err(),
-                "agent token should be rejected on {}",
-                path
-            );
-            let (status, msg) = result.unwrap_err();
-            assert_eq!(status, StatusCode::FORBIDDEN);
-            assert!(msg.contains("agent tokens"));
+        ];
+        let mut lightweight_rejected: Vec<&str> = ACCOUNT_CONTROL_PATHS.to_vec();
+        lightweight_rejected.extend(AGENT_TRANSPORT_PATHS);
+
+        // Rows: (label, ctx, allowed paths, rejected paths, rejection message
+        // substring; "" skips the message check). Every rejection must be
+        // FORBIDDEN — the surface gate never masquerades as unauthenticated.
+        let cases: Vec<(&str, AuthContext, Vec<&str>, Vec<&str>, &str)> = vec![
+            (
+                "bootstrap",
+                bootstrap_ctx(),
+                vec![
+                    "/api/runtime/status",
+                    "/api/shell/agent/register",
+                    "/api/users/me",
+                ],
+                vec![],
+                "",
+            ),
+            (
+                "user pat",
+                user_ctx("alice"),
+                vec![
+                    "/api/runtime/status",
+                    "/api/tools/list",
+                    "/api/projects/list",
+                ],
+                vec![],
+                "",
+            ),
+            (
+                "agent token",
+                agent_ctx("alice", "laptop", vec![SCOPE_AGENT_REGISTER.to_string()]),
+                agent_transport.to_vec(),
+                vec![
+                    "/api/runtime/status",
+                    "/api/tools/list",
+                    "/api/projects/list",
+                    "/mcp",
+                    "/api/users/me",
+                ],
+                "agent tokens",
+            ),
+            (
+                "shared key",
+                shared_key_context("k"),
+                runtime_paths.to_vec(),
+                lightweight_rejected.clone(),
+                "",
+            ),
+            (
+                "open anonymous",
+                open_anonymous_context(),
+                runtime_paths.to_vec(),
+                lightweight_rejected,
+                "",
+            ),
+            (
+                "account credential",
+                account,
+                vec![
+                    "/api/users/me",
+                    "/api/tokens/list",
+                    "/api/tokens/register_hash",
+                    "/api/tokens/revoke",
+                    "/api/agent-tokens/register_hash",
+                ],
+                vec![
+                    "/api/runtime/status",
+                    "/api/projects/list",
+                    "/api/tools/list",
+                    "/mcp",
+                    "/api/shell/agent/register",
+                ],
+                "account credentials",
+            ),
+            (
+                "oauth2 token",
+                oauth2,
+                vec![
+                    "/api/runtime/status",
+                    "/api/projects/list",
+                    "/api/tools/list",
+                    "/api/jobs/list",
+                    "/mcp",
+                ],
+                agent_transport.to_vec(),
+                "",
+            ),
+        ];
+        for (label, ctx, allowed, rejected, expected_msg) in &cases {
+            for path in allowed {
+                assert!(
+                    enforce_token_surface(ctx, path).is_ok(),
+                    "{label} should be allowed on {path}"
+                );
+            }
+            for path in rejected {
+                let result = enforce_token_surface(ctx, path);
+                assert!(result.is_err(), "{label} should be rejected on {path}");
+                let (status, msg) = result.unwrap_err();
+                assert_eq!(status, StatusCode::FORBIDDEN, "{label} on {path}");
+                assert!(
+                    msg.contains(expected_msg),
+                    "{label} rejection on {path} should mention '{expected_msg}', got: {msg}"
+                );
+            }
         }
     }
 
@@ -1597,45 +1677,6 @@ mod tests {
         assert!(project.is_project_credential());
         assert!(!project.is_lightweight());
         assert!(!project.scopes.contains(&SCOPE_AGENT_REGISTER.to_string()));
-    }
-
-    #[test]
-    fn enforce_token_surface_rejects_lightweight_on_account_control() {
-        let sk = shared_key_context("k");
-        let open = open_anonymous_context();
-        for path in ACCOUNT_CONTROL_PATHS {
-            let r1 = enforce_token_surface(&sk, path);
-            assert!(r1.is_err(), "shared key should be rejected on {path}");
-            let (status, _) = r1.unwrap_err();
-            assert_eq!(status, StatusCode::FORBIDDEN);
-            let r2 = enforce_token_surface(&open, path);
-            assert!(r2.is_err(), "open should be rejected on {path}");
-        }
-    }
-
-    #[test]
-    fn enforce_token_surface_allows_lightweight_on_runtime_but_rejects_agent_transport() {
-        let sk = shared_key_context("k");
-        let open = open_anonymous_context();
-        for path in [
-            "/api/runtime/status",
-            "/api/tools/list",
-            "/api/projects/list",
-            "/mcp",
-        ] {
-            assert!(
-                enforce_token_surface(&sk, path).is_ok(),
-                "shared key should be allowed on {path}"
-            );
-            assert!(
-                enforce_token_surface(&open, path).is_ok(),
-                "open should be allowed on {path}"
-            );
-        }
-        for path in AGENT_TRANSPORT_PATHS {
-            assert!(enforce_token_surface(&sk, path).is_err());
-            assert!(enforce_token_surface(&open, path).is_err());
-        }
     }
 
     #[test]
@@ -1720,79 +1761,6 @@ mod tests {
             r.is_some_and(|ctx| ctx.is_shared_key()),
             "direct shared-key fallback must not require OAuth bridge"
         );
-    }
-
-    #[test]
-    fn enforce_token_surface_allows_account_credential_on_account_control_paths() {
-        let mut ctx = user_ctx("alice");
-        ctx.kind = AuthKind::AccountCredential;
-        assert!(enforce_token_surface(&ctx, "/api/users/me").is_ok());
-        assert!(enforce_token_surface(&ctx, "/api/tokens/list").is_ok());
-        assert!(enforce_token_surface(&ctx, "/api/tokens/register_hash").is_ok());
-        assert!(enforce_token_surface(&ctx, "/api/tokens/revoke").is_ok());
-        assert!(enforce_token_surface(&ctx, "/api/agent-tokens/register_hash").is_ok());
-    }
-
-    #[test]
-    fn enforce_token_surface_rejects_account_credential_on_normal_paths() {
-        let mut ctx = user_ctx("alice");
-        ctx.kind = AuthKind::AccountCredential;
-        for path in [
-            "/api/runtime/status",
-            "/api/projects/list",
-            "/api/tools/list",
-            "/mcp",
-            "/api/shell/agent/register",
-        ] {
-            let result = enforce_token_surface(&ctx, path);
-            assert!(
-                result.is_err(),
-                "account credential should be rejected on {}",
-                path
-            );
-            let (status, msg) = result.unwrap_err();
-            assert_eq!(status, StatusCode::FORBIDDEN);
-            assert!(msg.contains("account credentials"));
-        }
-    }
-
-    #[test]
-    fn enforce_token_surface_allows_oauth2_token_on_regular_paths() {
-        let mut ctx = user_ctx("alice");
-        ctx.kind = AuthKind::OAuth2Token;
-        for path in [
-            "/api/runtime/status",
-            "/api/projects/list",
-            "/api/tools/list",
-            "/api/jobs/list",
-            "/mcp",
-        ] {
-            assert!(
-                enforce_token_surface(&ctx, path).is_ok(),
-                "OAuth2 token should be allowed on {}",
-                path
-            );
-        }
-    }
-
-    #[test]
-    fn enforce_token_surface_rejects_oauth2_token_on_agent_transport_paths() {
-        let mut ctx = user_ctx("alice");
-        ctx.kind = AuthKind::OAuth2Token;
-        for path in [
-            "/api/shell/agent/register",
-            "/api/shell/agent/poll",
-            "/api/shell/agent/result",
-            "/api/shell/agent/job_update",
-            "/api/agents/ws",
-        ] {
-            let result = enforce_token_surface(&ctx, path);
-            assert!(
-                result.is_err(),
-                "OAuth2 token should be rejected on agent path {}",
-                path
-            );
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -2192,45 +2160,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth2_token_with_runtime_read_can_call_runtime_status() {
-        let (_tmp, service, token) = gate_oauth2_token_with_scopes("runtime:read").await;
-        let (status, body) = gate_send(&service, "/api/runtime/status", Some(&token)).await;
-        assert_eq!(status, StatusCode::OK, "body: {:?}", body);
-    }
-
-    #[tokio::test]
-    async fn oauth2_token_without_runtime_read_cannot_call_runtime_status() {
-        let (_tmp, service, token) = gate_oauth2_token_with_scopes("project:read").await;
-        let (status, body) = gate_send(&service, "/api/runtime/status", Some(&token)).await;
-        assert_insufficient_scope(status, &body, Some(SCOPE_RUNTIME_READ));
-    }
-
-    #[tokio::test]
-    async fn oauth2_token_with_project_read_can_read_project_file() {
-        let (_tmp, service, token) = gate_oauth2_token_with_scopes("project:read").await;
-        let (status, body) = gate_send(&service, "/api/projects/read_file", Some(&token)).await;
-        assert_eq!(status, StatusCode::OK, "body: {:?}", body);
-    }
-
-    #[tokio::test]
-    async fn oauth2_token_without_project_read_cannot_read_project_file() {
-        let (_tmp, service, token) = gate_oauth2_token_with_scopes("runtime:read").await;
-        let (status, body) = gate_send(&service, "/api/projects/read_file", Some(&token)).await;
-        assert_insufficient_scope(status, &body, Some(SCOPE_PROJECT_READ));
-    }
-
-    #[tokio::test]
-    async fn oauth2_token_with_job_run_can_run_job_or_shell() {
-        let (_tmp, service, token) = gate_oauth2_token_with_scopes("job:run").await;
-        let (status, body) = gate_send(&service, "/api/projects/run_job", Some(&token)).await;
-        assert_eq!(status, StatusCode::OK, "body: {:?}", body);
-    }
-
-    #[tokio::test]
-    async fn oauth2_token_without_job_run_cannot_run_job_or_shell() {
-        let (_tmp, service, token) = gate_oauth2_token_with_scopes("project:write").await;
-        let (status, body) = gate_send(&service, "/api/projects/run_job", Some(&token)).await;
-        assert_insufficient_scope(status, &body, Some(SCOPE_JOB_RUN));
+    async fn oauth2_scope_gate_matrix() {
+        // A granted scope opens exactly its own surface…
+        for (scopes, path) in [
+            ("runtime:read", "/api/runtime/status"),
+            ("project:read", "/api/projects/read_file"),
+            ("job:run", "/api/projects/run_job"),
+        ] {
+            let (_tmp, service, token) = gate_oauth2_token_with_scopes(scopes).await;
+            let (status, body) = gate_send(&service, path, Some(&token)).await;
+            assert_eq!(status, StatusCode::OK, "{scopes} on {path}: {body:?}");
+        }
+        // …every other surface stays closed with insufficient_scope, including
+        // the OAuth authorize page, the agent transport, and unknown routes
+        // (fail closed).
+        let insufficient: [(&str, &str, Option<&str>); 6] = [
+            (
+                "project:read",
+                "/api/runtime/status",
+                Some(SCOPE_RUNTIME_READ),
+            ),
+            (
+                "runtime:read",
+                "/api/projects/read_file",
+                Some(SCOPE_PROJECT_READ),
+            ),
+            (
+                "project:write",
+                "/api/projects/run_job",
+                Some(SCOPE_JOB_RUN),
+            ),
+            ("runtime:read", "/oauth/authorize", None),
+            ("runtime:read", "/api/shell/agent/register", None),
+            ("runtime:read", "/api/future/authenticated-route", None),
+        ];
+        for (scopes, path, expected_scope) in insufficient {
+            let (_tmp, service, token) = gate_oauth2_token_with_scopes(scopes).await;
+            let (status, body) = gate_send(&service, path, Some(&token)).await;
+            assert_insufficient_scope(status, &body, expected_scope);
+        }
+        // Shared-key-minted OAuth2 tokens can never reach account control,
+        // with or without account:manage.
+        for scopes in ["account:manage", "runtime:read"] {
+            let (_tmp, service, token) = gate_oauth2_token_with_scopes(scopes).await;
+            let (status, body) = gate_send(&service, "/api/users/me", Some(&token)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{scopes}: {body:?}");
+            assert_eq!(
+                body["error"].as_str(),
+                Some("shared-key principals are not allowed on account control endpoints")
+            );
+        }
     }
 
     #[tokio::test]
@@ -2243,50 +2222,6 @@ mod tests {
         let service = Service::new(gate_router(config, db));
         let (status, body) = gate_send(&service, "/api/users/me", Some(&token)).await;
         assert_eq!(status, StatusCode::OK, "body: {:?}", body);
-    }
-
-    #[tokio::test]
-    async fn shared_key_oauth2_token_with_account_manage_still_cannot_call_account_route() {
-        let (_tmp, service, token) = gate_oauth2_token_with_scopes("account:manage").await;
-        let (status, body) = gate_send(&service, "/api/users/me", Some(&token)).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "body: {:?}", body);
-        assert_eq!(
-            body["error"].as_str(),
-            Some("shared-key principals are not allowed on account control endpoints")
-        );
-    }
-
-    #[tokio::test]
-    async fn shared_key_oauth2_token_without_account_manage_cannot_call_account_route() {
-        let (_tmp, service, token) = gate_oauth2_token_with_scopes("runtime:read").await;
-        let (status, body) = gate_send(&service, "/api/users/me", Some(&token)).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "body: {:?}", body);
-        assert_eq!(
-            body["error"].as_str(),
-            Some("shared-key principals are not allowed on account control endpoints")
-        );
-    }
-
-    #[tokio::test]
-    async fn oauth2_token_cannot_call_authorize() {
-        let (_tmp, service, token) = gate_oauth2_token_with_scopes("runtime:read").await;
-        let (status, body) = gate_send(&service, "/oauth/authorize", Some(&token)).await;
-        assert_insufficient_scope(status, &body, None);
-    }
-
-    #[tokio::test]
-    async fn oauth2_token_cannot_call_agent_surface() {
-        let (_tmp, service, token) = gate_oauth2_token_with_scopes("runtime:read").await;
-        let (status, body) = gate_send(&service, "/api/shell/agent/register", Some(&token)).await;
-        assert_insufficient_scope(status, &body, None);
-    }
-
-    #[tokio::test]
-    async fn oauth2_token_unknown_route_fails_closed() {
-        let (_tmp, service, token) = gate_oauth2_token_with_scopes("runtime:read").await;
-        let (status, body) =
-            gate_send(&service, "/api/future/authenticated-route", Some(&token)).await;
-        assert_insufficient_scope(status, &body, None);
     }
 
     #[tokio::test]
