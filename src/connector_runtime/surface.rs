@@ -205,7 +205,7 @@ pub(crate) fn capability_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "task_id": task_id_schema(),
-                    "include_diff": { "type": "boolean", "default": true },
+                    "include_diff": { "type": "boolean", "default": false, "description": "Bounded diff preview. Default false: a real-project diff can dominate the response; request it only when reviewing changes." },
                     "after_cursor": {
                         "type": "integer",
                         "minimum": 0,
@@ -224,7 +224,7 @@ pub(crate) fn capability_specs() -> Vec<ToolSpec> {
                         "maximum": 50,
                         "default": 50
                     },
-                    "include_output_tail": { "type": "boolean", "default": true }
+                    "include_output_tail": { "type": "boolean", "default": false, "description": "Bounded execution output tail. Default false; request it when diagnosing a failing run." }
                 },
                 "required": ["task_id"],
                 "additionalProperties": false
