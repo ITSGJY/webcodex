@@ -389,6 +389,18 @@ Recommended production smoke sequence:
 5. Read-only project tools work on a known project.
 6. Write/replace/validate tests are limited to disposable smoke projects.
 
+For a repeatable process-level SIGHUP reload smoke:
+
+```bash
+WEBCODEX_E2E_AGENT_RELOAD=1 \
+./scripts/test-agent-config-reload-e2e.sh
+```
+
+The smoke does not use systemd or require Claude Code. It creates a temporary
+Server, Agent, project, config, and Git fixture; verifies valid, invalid, and
+mixed reload semantics through real Agent requests; and checks process, port,
+fixture, and temporary-directory cleanup.
+
 ## Troubleshooting
 
 See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for the operational checklist and common deployment fixes, including existing systemd services, `HTTP reachable: no`, missing client CLI on `PATH`, server-side pairing vs client-side enrollment, agent-only client warnings, and `client online: no`.

@@ -125,6 +125,19 @@ starts at 1 and advances only after a valid reload. `projects.d/*.toml` keeps
 its existing independent cache refresh. Reload does not change public MCP
 tools, refresh MCP metadata, or add an OpenAPI operation.
 
+The opt-in process-level smoke exercises the real Server-to-Agent dispatch and
+Unix signal path:
+
+```bash
+WEBCODEX_E2E_AGENT_RELOAD=1 \
+./scripts/test-agent-config-reload-e2e.sh
+```
+
+It runs a temporary Server, Agent, project, Git fixture, and config without
+systemd or Claude Code. It verifies valid, invalid, mixed, and recovery SIGHUP
+reloads, then checks Agent/Server process groups, the loopback port, fixture,
+and temporary-directory cleanup.
+
 The provider lifecycle uses `not_started`, `starting`, `initializing`,
 `discovering`, `mapping`, `running`, and `stopped`. State revisions are produced
 when configuration is initialized, the child starts, initialize succeeds,
