@@ -115,6 +115,12 @@ pub struct ShellClientCapabilities {
     /// false for wire compatibility with older agents.
     #[serde(default)]
     pub lsp_read_only_navigation: bool,
+    /// Kernel (Landlock) write-denying sandbox for commands in read_only
+    /// tasks. Missing on older agents or unsupported kernels and therefore
+    /// fail-closed: the server keeps commands_run disabled for read_only
+    /// tasks unless this is advertised.
+    #[serde(default)]
+    pub sandbox_read_only_commands: bool,
 }
 
 /// Bounded, non-secret status for the agent's active configuration generation.
@@ -153,6 +159,7 @@ impl Default for ShellClientCapabilities {
             async_shell_jobs: false,
             structured_validation_argv: false,
             lsp_read_only_navigation: false,
+            sandbox_read_only_commands: false,
         }
     }
 }
@@ -1193,6 +1200,7 @@ mod envelope_tests {
                 async_shell_jobs: true,
                 structured_validation_argv: true,
                 lsp_read_only_navigation: false,
+                sandbox_read_only_commands: false,
             }),
             projects: None,
             agent_protocol_version: Some(AGENT_PROTOCOL_VERSION_WEBSOCKET_V1.to_string()),

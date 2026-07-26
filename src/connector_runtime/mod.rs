@@ -3438,6 +3438,7 @@ pub(crate) mod tests {
                         async_shell_jobs: true,
                         structured_validation_argv: true,
                         lsp_read_only_navigation: false,
+                        sandbox_read_only_commands: false,
                     }),
                     projects: Some(vec![ShellAgentProjectSummary {
                         id: project_id.to_string(),
