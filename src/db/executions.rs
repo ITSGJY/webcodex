@@ -592,6 +592,12 @@ impl Database {
             tx.commit()?;
             return Ok(execution);
         }
+        let workspace_evidence = match &failure {
+            ConnectorExecutionFailure::Workspace { evidence, .. } => {
+                Some(json!({ "invariant": "workspace_provenance", "detail": evidence }).to_string())
+            }
+            _ => None,
+        };
         let (state, source, code, reason) = match failure {
             ConnectorExecutionFailure::Submission(_) if execution.state == "cancel_requested" => (
                 "cancelled",
@@ -605,11 +611,15 @@ impl Database {
             ConnectorExecutionFailure::Unknown(code) => {
                 ("unknown", "transport", code, "executor_terminal_unknown")
             }
+            ConnectorExecutionFailure::Workspace { code, .. } => {
+                ("failed", "workspace", code, "workspace_invariant_failed")
+            }
         };
         tx.execute(
             "UPDATE wc_executions SET state = ?1, finished_at = ?2, exit_code = ?3,
-                        failure_source = ?4, failure_code = ?5, terminal_reason = ?6
-             WHERE id = ?7",
+                        failure_source = ?4, failure_code = ?5, terminal_reason = ?6,
+                        assertion_evidence_json = COALESCE(?7, assertion_evidence_json)
+             WHERE id = ?8",
             params![
                 state,
                 now,
@@ -617,6 +627,7 @@ impl Database {
                 source,
                 code,
                 reason,
+                workspace_evidence,
                 execution.execution_id
             ],
         )?;

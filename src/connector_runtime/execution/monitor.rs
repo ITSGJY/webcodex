@@ -98,6 +98,19 @@ impl ExecutionService {
                             return;
                         }
                     };
+                    if failure_code == "workspace_provenance_mismatch" {
+                        // Deterministic invariant failure: finishing now beats
+                        // burning the grace window on identical retries.
+                        let _ = self.db.finish_connector_execution(
+                            &execution_id,
+                            ConnectorExecutionFailure::Workspace {
+                                code: failure_code,
+                                evidence: error,
+                            },
+                            chrono::Utc::now().timestamp(),
+                        );
+                        return;
+                    }
                     if failure_started.elapsed() >= self.monitor_timing.grace {
                         tracing::warn!(
                             execution_id,
@@ -212,23 +225,65 @@ impl ExecutionService {
         } else {
             None
         };
-        let validated_workspace_sha256 = if execution.kind == "check"
+        let check_succeeded_completely = execution.kind == "check"
             && job.status == "completed"
             && job.exit_code == Some(0)
             && progress.is_some_and(|progress| {
                 progress.completed == execution.check_plan.len()
                     && progress.current_step.is_none()
                     && progress.failed_step.is_none()
-            }) {
+            });
+        let validated_workspace_sha256 = if check_succeeded_completely {
             let manager = self.workspace.clone();
-            let task = task.clone();
-            tokio::task::spawn_blocking(move || manager.action_precondition(&task))
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .filter(|current| {
-                    execution.check_workspace_sha256.as_deref() == Some(current.as_str())
-                })
+            let precondition_task = task.clone();
+            let current = tokio::task::spawn_blocking(move || {
+                manager.action_precondition(&precondition_task)
+            })
+            .await
+            .ok()
+            .and_then(Result::ok);
+            match current {
+                Some(current)
+                    if execution.check_workspace_sha256.as_deref() == Some(current.as_str()) =>
+                {
+                    Some(current)
+                }
+                Some(current) => {
+                    // The checks passed; only the bookkeeping invariant broke.
+                    // This is deterministic — grace retries cannot help — so
+                    // fail with the honest category and the evidence the
+                    // operator needs, instead of the transport/storage lies.
+                    let manager = self.workspace.clone();
+                    let sample_task = task.clone();
+                    let untracked = tokio::task::spawn_blocking(move || {
+                        manager.untracked_sample(&sample_task, 5)
+                    })
+                    .await
+                    .unwrap_or_default();
+                    let untracked = if untracked.is_empty() {
+                        "none detected".to_string()
+                    } else {
+                        untracked.join(", ")
+                    };
+                    return Err((
+                        "workspace_provenance_mismatch",
+                        format!(
+                            "the checks passed but the workspace fingerprint changed during \
+                             validation (expected {}, found {}); untracked files present: {}. \
+                             Add a .gitignore covering build artifacts, then rerun the checks \
+                             with a new operation_id",
+                            execution
+                                .check_workspace_sha256
+                                .as_deref()
+                                .map(|sha| &sha[..sha.len().min(12)])
+                                .unwrap_or("unknown"),
+                            &current[..current.len().min(12)],
+                            untracked
+                        ),
+                    ));
+                }
+                None => None,
+            }
         } else {
             None
         };

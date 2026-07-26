@@ -649,6 +649,9 @@ fn execution_next_action(execution: &ConnectorExecution) -> &'static str {
     {
         return "upgrade_agent_and_rerun_checks";
     }
+    if execution.failure_code.as_deref() == Some("workspace_provenance_mismatch") {
+        return "add_gitignore_for_build_artifacts_then_rerun_checks";
+    }
     match execution.state.as_str() {
         "accepted" | "queued" | "starting" | "running" => "review_or_cancel",
         "cancel_requested" => "wait_for_cancellation",
