@@ -14,13 +14,17 @@ use crate::shell_protocol::{
     EXTERNAL_SEARCH_REQUEST_PREFIX,
 };
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
+
+mod experimental;
+
+use experimental::{discovered_tool_entry, DiscoveredTool, MAX_EXPERIMENTAL_TOOLS};
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const MAX_MCP_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -193,6 +197,10 @@ impl ExternalToolRouter {
         policy: &AgentPolicy,
         request: &ShellAgentShellRequest,
     ) -> ExternalRoute {
+        // Fixed experimental harness surface — independent of production strategy.
+        if experimental::is_experimental_claude_kind(&request.kind) {
+            return ExternalRoute::Handled(self.handle_experimental(policy, request));
+        }
         if self.strategy == ToolProviderStrategy::Native {
             return ExternalRoute::Native;
         }
@@ -638,7 +646,9 @@ impl ClaudeCodeMcpProvider {
 
 struct ProjectMcpClient {
     connection: Arc<McpConnection>,
-    tools: BTreeMap<String, BTreeSet<String>>,
+    tools: BTreeMap<String, DiscoveredTool>,
+    version: Option<String>,
+    tools_truncated: bool,
 }
 
 impl ProjectMcpClient {
@@ -678,23 +688,32 @@ impl ProjectMcpClient {
         )?;
         let listed =
             connection.request("tools/list", json!({}), timeout(), WriteState::NotSubmitted)?;
-        let tools = listed
+        let mut tools = BTreeMap::new();
+        let mut tools_truncated = false;
+        for tool in listed
             .get("tools")
             .and_then(Value::as_array)
             .ok_or_else(protocol_error)?
-            .iter()
-            .filter_map(|tool| {
-                let name = tool.get("name")?.as_str()?.to_string();
-                let fields = tool
-                    .pointer("/inputSchema/properties")
-                    .and_then(Value::as_object)
-                    .into_iter()
-                    .flat_map(|properties| properties.keys().cloned())
-                    .collect();
-                Some((name, fields))
-            })
-            .collect();
-        let client = Self { connection, tools };
+        {
+            let Some((name, discovered)) = discovered_tool_entry(tool) else {
+                continue;
+            };
+            if tools.contains_key(&name) {
+                continue;
+            }
+            if tools.len() >= MAX_EXPERIMENTAL_TOOLS {
+                // Valid 65th+ tool discovered; keep only the stored bound.
+                tools_truncated = true;
+                break;
+            }
+            tools.insert(name, discovered);
+        }
+        let client = Self {
+            connection,
+            tools,
+            version,
+            tools_truncated,
+        };
         let mut discovered_tool_names = client
             .tools
             .keys()
@@ -702,7 +721,7 @@ impl ProjectMcpClient {
             .collect::<Vec<_>>();
         discovered_tool_names.sort();
         discovered_tool_names.dedup();
-        discovered_tool_names.truncate(64);
+        discovered_tool_names.truncate(MAX_EXPERIMENTAL_TOOLS);
         state.update(|status| {
             status.discovered_tool_names = discovered_tool_names;
             status.process_state = "mapping".to_string();
@@ -753,17 +772,17 @@ impl ProjectMcpClient {
         capability: ProviderCapability,
         config: &ClaudeCodeMcpConfig,
     ) -> &'static str {
-        let fields = config
+        let tool = config
             .mapping
             .get(capability.name())
             .filter(|name| !name.trim().is_empty())
             .and_then(|name| self.tools.get(name));
-        match fields {
+        match tool {
             None => "unmapped",
-            Some(fields)
+            Some(tool)
                 if required_fields(capability)
                     .iter()
-                    .all(|field| fields.contains(*field)) =>
+                    .all(|field| tool.fields.contains(*field)) =>
             {
                 "available"
             }
@@ -1046,6 +1065,7 @@ impl McpConnection {
         timeout: Duration,
         failure_state: WriteState,
     ) -> Result<Value, ProviderError> {
+        // Pre-send failures keep default NotSubmitted (do not apply failure_state).
         if !self.is_alive() {
             return Err(protocol_error());
         }
@@ -1059,7 +1079,17 @@ impl McpConnection {
             pending.insert(id, tx);
         }
         let message = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
-        if let Err(error) = self.write_json(&message) {
+        // Encode + size-check before any stdin write so serialization / oversize
+        // rejections stay pre-send (not_submitted) even for mutating tools.
+        let encoded = match encode_mcp_message(&message) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.pending.lock().unwrap().remove(&id);
+                return Err(error);
+            }
+        };
+        // Write/flush may partially deliver bytes; treat as post-send.
+        if let Err(error) = write_mcp_message(&self.stdin, &encoded) {
             self.pending.lock().unwrap().remove(&id);
             return Err(error.with_state(failure_state));
         }
@@ -1103,15 +1133,26 @@ impl McpConnection {
     }
 }
 
-fn write_json(stdin: &Mutex<ChildStdin>, value: &Value) -> Result<(), ProviderError> {
+/// Serialize and size-check an MCP JSON line. Does not touch stdin.
+fn encode_mcp_message(value: &Value) -> Result<Vec<u8>, ProviderError> {
     let mut bytes = serde_json::to_vec(value).map_err(|_| protocol_error())?;
     if bytes.len() > MAX_MCP_MESSAGE_BYTES {
-        return Err(protocol_error());
+        return Err(ProviderError::new("mcp_message_too_large"));
     }
     bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Write a previously encoded MCP line to stdin (may partially write).
+fn write_mcp_message(stdin: &Mutex<ChildStdin>, bytes: &[u8]) -> Result<(), ProviderError> {
     let mut writer = stdin.lock().unwrap();
-    writer.write_all(&bytes).map_err(|_| protocol_error())?;
+    writer.write_all(bytes).map_err(|_| protocol_error())?;
     writer.flush().map_err(|_| protocol_error())
+}
+
+fn write_json(stdin: &Mutex<ChildStdin>, value: &Value) -> Result<(), ProviderError> {
+    let bytes = encode_mcp_message(value)?;
+    write_mcp_message(stdin, &bytes)
 }
 
 fn spawn_stdout_reader(

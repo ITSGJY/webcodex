@@ -6,6 +6,9 @@ use std::process::Command;
 use std::sync::{Arc, OnceLock, Weak};
 use tempfile::TempDir;
 
+#[path = "external_tools/experimental_tests.rs"]
+mod experimental_tests;
+
 static FAKE_SERVER: OnceLock<Mutex<Weak<FakeBinary>>> = OnceLock::new();
 
 struct FakeBinary {
@@ -204,8 +207,9 @@ fn wait_until(timeout: Duration, condition: impl Fn() -> bool) -> bool {
     condition()
 }
 
-fn schema_fields(schema: &BTreeSet<String>) -> Vec<String> {
-    let mut fields = schema
+fn schema_fields(tool: &DiscoveredTool) -> Vec<String> {
+    let mut fields = tool
+        .fields
         .iter()
         .map(|name| sanitize_name(name))
         .collect::<Vec<_>>();
@@ -218,8 +222,8 @@ fn discovery_inventory(client: &ProjectMcpClient) -> Value {
     let mut tools = client
         .tools
         .iter()
-        .map(|(name, schema)| {
-            json!({"name": sanitize_name(name), "schema_fields": schema_fields(schema)})
+        .map(|(name, tool)| {
+            json!({"name": sanitize_name(name), "schema_fields": schema_fields(tool)})
         })
         .collect::<Vec<_>>();
     tools.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
@@ -233,14 +237,14 @@ fn real_tool_name(
     env_key: &str,
 ) -> Result<String, String> {
     if let Ok(name) = env::var(env_key) {
-        let Some(schema) = client.tools.get(&name) else {
+        let Some(tool) = client.tools.get(&name) else {
             return Err(format!(
                 "{env_key} selected {:?}, but discovered tools were {}",
                 sanitize_name(&name),
                 discovery_inventory(client)
             ));
         };
-        let fields = schema_fields(schema);
+        let fields = schema_fields(tool);
         let missing = required_fields(capability)
             .iter()
             .filter(|field| !fields.iter().any(|actual| actual == **field))
@@ -263,11 +267,11 @@ fn real_tool_name(
     let candidates = client
         .tools
         .iter()
-        .filter(|(name, schema)| {
+        .filter(|(name, tool)| {
             name.to_ascii_lowercase().contains(needle)
                 && required_fields(capability)
                     .iter()
-                    .all(|field| schema.contains(*field))
+                    .all(|field| tool.fields.contains(*field))
         })
         .map(|(name, _)| name.clone())
         .collect::<Vec<_>>();
@@ -331,7 +335,18 @@ fn status_reports_discovery_mapping_process_and_bounded_error() {
     let status = fixture.provider.status();
     assert_eq!(status.version.as_deref(), Some("Claude Fake 1.2.3"));
     assert_eq!(status.process_state, "running");
-    assert_eq!(status.discovered_tool_names, ["fake_edit", "fake_search"]);
+    assert_eq!(
+        status.discovered_tool_names,
+        [
+            "Bash",
+            "Edit",
+            "Read",
+            "TaskCreate",
+            "Write",
+            "fake_edit",
+            "fake_search"
+        ]
+    );
     assert_eq!(status.capabilities["search_project_text"], "available");
     assert_eq!(status.capabilities["edit_file"], "available");
     assert_eq!(status.last_error_code, None);
