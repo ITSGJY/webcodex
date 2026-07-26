@@ -4,7 +4,7 @@
 //! grow without bound.
 
 use super::Database;
-use crate::tool_runtime::activity::{ActivityRecord, ActivityRecorder};
+use crate::tool_runtime::activity::{ActivityRecord, ActivityRecorder, ActivityVisibility};
 use rusqlite::params;
 use serde::Serialize;
 use std::sync::Arc;
@@ -64,8 +64,8 @@ impl Database {
         conn.execute(
             "INSERT INTO workspace_activity (
                 created_at, project, tool, surface, client, success, session_id,
-                command_preview, paths_json, error_summary
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                command_preview, paths_json, error_summary, scope_kind, scope_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 created_at,
                 record.project,
@@ -77,6 +77,8 @@ impl Database {
                 command_preview,
                 paths_json,
                 error_summary,
+                record.scope.kind(),
+                record.scope.id(),
             ],
         )?;
         // Keep the ledger bounded: prune oldest rows beyond the cap in the
@@ -104,58 +106,82 @@ impl Database {
     ///
     /// The limit applies after filtering, in SQL, so a busy neighbouring
     /// project cannot push this caller's rows out of the window.
+    /// Activity rows the caller is allowed to see.
+    ///
+    /// Attribution comes from the row's own `scope_kind`/`scope_id`, fixed when
+    /// it was written. A client id is not an authorization boundary: the
+    /// registry that owns it is in-memory, so after a restart a different grant
+    /// can register the same id, and filtering on it alone would hand that
+    /// grant the previous one's history.
+    ///
+    /// A project grant therefore sees only rows carrying its own grant, and
+    /// within those only its currently visible clients. Rows with no client —
+    /// and every `host_global`, `unscoped`, or `legacy_unscoped` row — stay
+    /// invisible to it, because nothing proves they belong to this project.
+    ///
+    /// `requested_client` only narrows. The limit applies after every filter,
+    /// in SQL, so a busy neighbour cannot crowd a caller's rows out.
     pub fn list_workspace_activity_for_clients(
         &self,
         limit: usize,
         requested_client: Option<&str>,
-        allowed_clients: Option<&[String]>,
+        visibility: ActivityVisibility<'_>,
+        allowed_clients: &[String],
     ) -> anyhow::Result<Vec<WorkspaceActivityRow>> {
-        let effective: Option<Vec<String>> = match (allowed_clients, requested_client) {
-            // Global view, optionally narrowed to one client.
-            (None, Some(requested)) => Some(vec![requested.to_string()]),
-            (None, None) => None,
-            (Some(allowed), Some(requested)) => {
-                if allowed.iter().any(|client| client == requested) {
+        let clients: Option<Vec<String>> = match (visibility, requested_client) {
+            (ActivityVisibility::Global, Some(requested)) => Some(vec![requested.to_string()]),
+            (ActivityVisibility::Global, None) => None,
+            (ActivityVisibility::ProjectGrant(_), Some(requested)) => {
+                if allowed_clients.iter().any(|client| client == requested) {
                     Some(vec![requested.to_string()])
                 } else {
-                    // Asking for a client this caller cannot see is not an
-                    // error to distinguish from an idle one — both are empty.
+                    // Naming a client this caller cannot see is indistinguishable
+                    // from naming an idle one: both are empty, never someone
+                    // else's rows.
                     Some(Vec::new())
                 }
             }
-            (Some(allowed), None) => Some(allowed.to_vec()),
+            (ActivityVisibility::ProjectGrant(_), None) => Some(allowed_clients.to_vec()),
         };
+        if clients.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(Vec::new());
+        }
 
         let conn = self.conn.lock().unwrap();
         let select = "SELECT id, created_at, project, tool, surface, client, success, session_id,
                     command_preview, paths_json, error_summary
              FROM workspace_activity";
 
-        let Some(clients) = effective else {
-            let mut statement = conn.prepare(&format!("{select} ORDER BY id DESC LIMIT ?1"))?;
-            let rows = statement.query_map(params![limit as i64], row_to_activity)?;
-            return rows.collect::<Result<Vec<_>, _>>().map_err(Into::into);
+        // `?1` is always the limit; scope and client values follow, all bound.
+        let mut bound: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(limit as i64)];
+        let mut wheres: Vec<String> = Vec::new();
+        if let ActivityVisibility::ProjectGrant(grant) = visibility {
+            bound.push(Box::new(grant.to_string()));
+            wheres.push(format!(
+                "scope_kind = 'project_grant' AND scope_id = ?{}",
+                bound.len()
+            ));
+        }
+        if let Some(clients) = clients.as_ref() {
+            let placeholders = clients
+                .iter()
+                .map(|client| {
+                    bound.push(Box::new(client.clone()));
+                    format!("?{}", bound.len())
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            wheres.push(format!("client IN ({placeholders})"));
+        }
+        let filter = if wheres.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", wheres.join(" AND "))
         };
-        if clients.is_empty() {
-            return Ok(Vec::new());
-        }
 
-        // Parameterized `IN` list: one placeholder per allowed client, never
-        // interpolated values.
-        let placeholders = (0..clients.len())
-            .map(|index| format!("?{}", index + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut statement = conn.prepare(&format!(
-            "{select} WHERE client IN ({placeholders}) ORDER BY id DESC LIMIT ?1"
-        ))?;
-        let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(clients.len() + 1);
-        let limit = limit as i64;
-        bound.push(&limit);
-        for client in &clients {
-            bound.push(client);
-        }
-        let rows = statement.query_map(bound.as_slice(), row_to_activity)?;
+        let mut statement = conn.prepare(&format!("{select}{filter} ORDER BY id DESC LIMIT ?1"))?;
+        let params: Vec<&dyn rusqlite::ToSql> = bound.iter().map(|value| value.as_ref()).collect();
+        let rows = statement.query_map(params.as_slice(), row_to_activity)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 }
@@ -236,6 +262,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool_runtime::activity::ActivityScope;
 
     fn sample<'a>(tool: &'a str, success: bool, error: Option<&'a str>) -> ActivityRecord<'a> {
         ActivityRecord {
@@ -248,7 +275,36 @@ mod tests {
             command: None,
             paths: vec!["a.rs".to_string()],
             error_summary: error,
+            scope: ActivityScope::ProjectGrant(GRANT_A.to_string()),
         }
+    }
+
+    const GRANT_A: &str = "wc_pgrant_aaaaaaaaaaaaaaaa";
+    const GRANT_B: &str = "wc_pgrant_bbbbbbbbbbbbbbbb";
+
+    /// Record attributed to `grant` and `client`.
+    fn scoped<'a>(client: Option<&'a str>, grant: &str) -> ActivityRecord<'a> {
+        ActivityRecord {
+            client,
+            scope: ActivityScope::ProjectGrant(grant.to_string()),
+            ..sample("run_shell", true, Some("boom"))
+        }
+    }
+
+    fn as_grant(db: &Database, grant: &str, clients: &[&str]) -> Vec<WorkspaceActivityRow> {
+        let clients: Vec<String> = clients.iter().map(|c| c.to_string()).collect();
+        db.list_workspace_activity_for_clients(
+            50,
+            None,
+            ActivityVisibility::ProjectGrant(grant),
+            &clients,
+        )
+        .unwrap()
+    }
+
+    fn as_global(db: &Database) -> Vec<WorkspaceActivityRow> {
+        db.list_workspace_activity_for_clients(50, None, ActivityVisibility::Global, &[])
+            .unwrap()
     }
 
     #[test]
@@ -265,7 +321,7 @@ mod tests {
             .unwrap();
         }
         let rows = db
-            .list_workspace_activity_for_clients(10, None, None)
+            .list_workspace_activity_for_clients(10, None, ActivityVisibility::Global, &[])
             .unwrap();
         assert_eq!(rows.len(), 3, "prune keeps only max_rows newest rows");
         assert!(rows[0].id > rows[1].id && rows[1].id > rows[2].id);
@@ -274,7 +330,7 @@ mod tests {
         assert_eq!(rows[0].paths, vec!["a.rs".to_string()]);
         assert_eq!(rows[0].command_preview.as_deref(), Some("cargo test"));
         assert_eq!(
-            db.list_workspace_activity_for_clients(2, None, None)
+            db.list_workspace_activity_for_clients(2, None, ActivityVisibility::Global, &[])
                 .unwrap()
                 .len(),
             2
@@ -291,18 +347,28 @@ mod tests {
             .unwrap();
         db.insert_workspace_activity(2, &other, None, 10).unwrap();
         assert_eq!(
-            db.list_workspace_activity_for_clients(10, None, None)
+            db.list_workspace_activity_for_clients(10, None, ActivityVisibility::Global, &[])
                 .unwrap()
                 .len(),
             2
         );
         let filtered = db
-            .list_workspace_activity_for_clients(10, Some("laptop"), None)
+            .list_workspace_activity_for_clients(
+                10,
+                Some("laptop"),
+                ActivityVisibility::Global,
+                &[],
+            )
             .unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].client.as_deref(), Some("laptop"));
         assert!(db
-            .list_workspace_activity_for_clients(10, Some("nobody"), None)
+            .list_workspace_activity_for_clients(
+                10,
+                Some("nobody"),
+                ActivityVisibility::Global,
+                &[]
+            )
             .unwrap()
             .is_empty());
     }
@@ -320,7 +386,7 @@ mod tests {
         )
         .unwrap();
         let rows = db
-            .list_workspace_activity_for_clients(1, None, None)
+            .list_workspace_activity_for_clients(1, None, ActivityVisibility::Global, &[])
             .unwrap();
         let stored = rows[0].error_summary.as_deref().unwrap();
         assert!(stored.chars().count() <= ERROR_SUMMARY_MAX_CHARS + 1);
@@ -328,123 +394,281 @@ mod tests {
         assert!(rows[0].command_preview.is_none());
     }
 
-    /// A record attributed to `client`, otherwise the same as `sample`.
-    fn sample_for<'a>(tool: &'a str, client: Option<&'a str>) -> ActivityRecord<'a> {
-        ActivityRecord {
-            client,
-            ..sample(tool, true, Some("boom"))
+    #[test]
+    fn activity_history_is_bound_to_original_project_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("activity.db");
+        {
+            let db = Database::open(&path).unwrap();
+            db.insert_workspace_activity(
+                1,
+                &ActivityRecord {
+                    client: Some("laptop"),
+                    paths: vec!["private/a.rs".to_string()],
+                    error_summary: Some("grant-a-error"),
+                    scope: ActivityScope::ProjectGrant(GRANT_A.to_string()),
+                    ..sample("run_shell", true, None)
+                },
+                Some("grant-a-command"),
+                50,
+            )
+            .unwrap();
         }
+
+        // Reopen: the in-memory registry is gone, which is exactly the moment a
+        // different grant can claim the same client id.
+        let db = Database::open(&path).unwrap();
+
+        // Grant B sees `laptop` among its live clients, but the row was not
+        // written by it.
+        let leaked = as_grant(&db, GRANT_B, &["laptop"]);
+        assert!(leaked.is_empty(), "{leaked:?}");
+        let serialized = serde_json::to_string(&leaked).unwrap();
+        for secret in ["grant-a-command", "private/a.rs", "grant-a-error"] {
+            assert!(
+                !serialized.contains(secret),
+                "{secret} leaked: {serialized}"
+            );
+        }
+
+        // The grant that wrote it still sees it, and so does a global reader.
+        assert_eq!(as_grant(&db, GRANT_A, &["laptop"]).len(), 1);
+        assert_eq!(as_global(&db).len(), 1);
     }
 
     #[test]
-    fn activity_scoped_to_allowed_clients_hides_other_projects() {
+    fn reused_client_id_does_not_reassign_activity_history() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Database::open(&tmp.path().join("activity.db")).unwrap();
-        db.insert_workspace_activity(
-            1,
-            &sample_for("run_shell", Some("laptop")),
-            Some("mine"),
-            10,
-        )
-        .unwrap();
-        db.insert_workspace_activity(
-            2,
-            &sample_for("run_shell", Some("neighbour")),
-            Some("their secret command"),
-            10,
-        )
-        .unwrap();
-
-        let mine = db
-            .list_workspace_activity_for_clients(10, None, Some(&["laptop".to_string()]))
+        db.insert_workspace_activity(1, &scoped(Some("laptop"), GRANT_A), Some("a"), 50)
             .unwrap();
-        assert_eq!(mine.len(), 1);
-        assert_eq!(mine[0].client.as_deref(), Some("laptop"));
+        db.insert_workspace_activity(2, &scoped(Some("laptop"), GRANT_B), Some("b"), 50)
+            .unwrap();
 
-        // Nothing of the neighbouring row leaks: not the client, not the
-        // command preview, not the error summary.
-        let serialized = serde_json::to_string(&mine).unwrap();
-        assert!(!serialized.contains("neighbour"), "{serialized}");
-        assert!(!serialized.contains("their secret command"), "{serialized}");
+        // One client id, two grants: each sees only what it wrote.
+        let a = as_grant(&db, GRANT_A, &["laptop"]);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].command_preview.as_deref(), Some("a"));
+        let b = as_grant(&db, GRANT_B, &["laptop"]);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].command_preview.as_deref(), Some("b"));
+        assert_eq!(as_global(&db).len(), 2);
     }
 
     #[test]
-    fn activity_client_filter_cannot_widen_the_allowed_set() {
+    fn legacy_activity_rows_are_hidden_from_project_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("activity.db");
+        // A database written before the scope columns existed.
+        {
+            let db = Database::open(&path).unwrap();
+            let conn = db.conn.lock().unwrap();
+            conn.execute("DROP TABLE workspace_activity", []).unwrap();
+            conn.execute(
+                "CREATE TABLE workspace_activity (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at INTEGER NOT NULL,
+                    project TEXT,
+                    tool TEXT NOT NULL,
+                    surface TEXT NOT NULL,
+                    client TEXT,
+                    success INTEGER NOT NULL,
+                    session_id TEXT,
+                    command_preview TEXT,
+                    paths_json TEXT NOT NULL DEFAULT '[]',
+                    error_summary TEXT
+                )",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO workspace_activity
+                    (created_at, project, tool, surface, client, success, paths_json)
+                 VALUES (1, 'demo', 'run_shell', 'mcp', 'laptop', 1, '[]')",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Reopening runs the migration.
+        let db = Database::open(&path).unwrap();
+        let kind: String = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT scope_kind FROM workspace_activity", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(kind, "legacy_unscoped");
+
+        // Attribution cannot be established after the fact, so no project
+        // credential sees it — not even one whose live clients include `laptop`.
+        assert!(as_grant(&db, GRANT_A, &["laptop"]).is_empty());
+        assert!(as_grant(&db, GRANT_B, &["laptop"]).is_empty());
+    }
+
+    #[test]
+    fn legacy_activity_rows_remain_visible_to_bootstrap() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Database::open(&tmp.path().join("activity.db")).unwrap();
-        db.insert_workspace_activity(1, &sample_for("run_shell", Some("laptop")), None, 10)
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO workspace_activity
+                    (created_at, tool, surface, client, success, paths_json, scope_kind)
+                 VALUES (1, 'run_shell', 'mcp', 'laptop', 1, '[]', 'legacy_unscoped')",
+                [],
+            )
             .unwrap();
-        db.insert_workspace_activity(2, &sample_for("run_shell", Some("neighbour")), None, 10)
+        // Not deleted, not re-attributed: still readable by the host operator.
+        assert_eq!(as_global(&db).len(), 1);
+    }
+
+    #[test]
+    fn activity_client_filter_only_narrows_within_the_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(&tmp.path().join("activity.db")).unwrap();
+        db.insert_workspace_activity(1, &scoped(Some("laptop"), GRANT_A), None, 50)
+            .unwrap();
+        db.insert_workspace_activity(2, &scoped(Some("desktop"), GRANT_A), None, 50)
+            .unwrap();
+        db.insert_workspace_activity(3, &scoped(Some("laptop"), GRANT_B), None, 50)
             .unwrap();
 
-        // Naming a client outside the allowed set returns nothing rather than
-        // that client's rows.
+        // Narrowing inside the grant works.
+        let narrowed = db
+            .list_workspace_activity_for_clients(
+                50,
+                Some("laptop"),
+                ActivityVisibility::ProjectGrant(GRANT_A),
+                &["laptop".to_string(), "desktop".to_string()],
+            )
+            .unwrap();
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(narrowed[0].client.as_deref(), Some("laptop"));
+
+        // Naming a client outside the visible set returns nothing…
+        assert!(db
+            .list_workspace_activity_for_clients(
+                50,
+                Some("desktop"),
+                ActivityVisibility::ProjectGrant(GRANT_B),
+                &["laptop".to_string()],
+            )
+            .unwrap()
+            .is_empty());
+        // …and even a visible client id cannot reach another grant's row.
+        let b = as_grant(&db, GRANT_B, &["laptop"]);
+        assert_eq!(b.len(), 1);
+    }
+
+    #[test]
+    fn empty_client_allow_set_is_closed_even_within_the_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(&tmp.path().join("activity.db")).unwrap();
+        db.insert_workspace_activity(1, &scoped(Some("laptop"), GRANT_A), None, 50)
+            .unwrap();
+        // No client attached: cannot be shown to a project credential either.
+        db.insert_workspace_activity(2, &scoped(None, GRANT_A), None, 50)
+            .unwrap();
+
+        assert!(as_grant(&db, GRANT_A, &[]).is_empty());
+        // With a visible client, only the client-bearing row comes back.
+        let rows = as_grant(&db, GRANT_A, &["laptop"]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].client.as_deref(), Some("laptop"));
+        // Global sees both.
+        assert_eq!(as_global(&db).len(), 2);
+    }
+
+    #[test]
+    fn host_global_and_unscoped_rows_are_never_shown_to_a_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(&tmp.path().join("activity.db")).unwrap();
+        for scope in [ActivityScope::HostGlobal, ActivityScope::Unscoped] {
+            db.insert_workspace_activity(
+                1,
+                &ActivityRecord {
+                    client: Some("laptop"),
+                    scope,
+                    ..sample("run_shell", true, None)
+                },
+                Some("admin-only"),
+                50,
+            )
+            .unwrap();
+        }
+        assert!(as_grant(&db, GRANT_A, &["laptop"]).is_empty());
+        assert_eq!(as_global(&db).len(), 2);
+    }
+
+    #[test]
+    fn activity_limit_applies_after_scope_and_client_filtering() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(&tmp.path().join("activity.db")).unwrap();
+        // Another grant floods the table using the same client id.
+        for index in 0..60 {
+            db.insert_workspace_activity(index, &scoped(Some("laptop"), GRANT_B), None, 500)
+                .unwrap();
+        }
+        for index in 0..3 {
+            db.insert_workspace_activity(100 + index, &scoped(Some("laptop"), GRANT_A), None, 500)
+                .unwrap();
+        }
         let rows = db
             .list_workspace_activity_for_clients(
-                10,
-                Some("neighbour"),
-                Some(&["laptop".to_string()]),
+                50,
+                None,
+                ActivityVisibility::ProjectGrant(GRANT_A),
+                &["laptop".to_string()],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 3, "scoped rows were crowded out by the limit");
+    }
+
+    #[test]
+    fn activity_scope_values_are_parameterized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(&tmp.path().join("activity.db")).unwrap();
+        db.insert_workspace_activity(1, &scoped(Some("laptop"), GRANT_A), None, 50)
+            .unwrap();
+        // Quote-bearing input is bound, not interpolated: it matches nothing
+        // and does not disturb the query.
+        let rows = db
+            .list_workspace_activity_for_clients(
+                50,
+                None,
+                ActivityVisibility::ProjectGrant("' OR 1=1 --"),
+                &["laptop' OR '1'='1".to_string()],
             )
             .unwrap();
         assert!(rows.is_empty(), "{rows:?}");
+        assert_eq!(as_grant(&db, GRANT_A, &["laptop"]).len(), 1);
     }
 
     #[test]
-    fn activity_empty_allow_set_is_closed_and_global_sees_client_less_rows() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = Database::open(&tmp.path().join("activity.db")).unwrap();
-        db.insert_workspace_activity(1, &sample_for("run_shell", Some("laptop")), None, 10)
-            .unwrap();
-        db.insert_workspace_activity(2, &sample_for("run_shell", None), None, 10)
-            .unwrap();
-
-        assert!(db
-            .list_workspace_activity_for_clients(10, None, Some(&[]))
-            .unwrap()
-            .is_empty());
-        // A scoped caller never sees the row with no client attached.
-        let scoped = db
-            .list_workspace_activity_for_clients(10, None, Some(&["laptop".to_string()]))
-            .unwrap();
-        assert_eq!(scoped.len(), 1);
-        assert_eq!(scoped[0].client.as_deref(), Some("laptop"));
-        // Global visibility sees both.
+    fn activity_rows_never_store_credentials_as_scope_identity() {
+        // Only a project grant carries an id, and a grant id is not secret.
+        // Shared-key and anonymous callers become `unscoped` precisely so a
+        // key hash never reaches the table.
         assert_eq!(
-            db.list_workspace_activity_for_clients(10, None, None)
-                .unwrap()
-                .len(),
-            2
+            ActivityScope::ProjectGrant(GRANT_A.to_string()).id(),
+            Some(GRANT_A)
         );
+        assert_eq!(ActivityScope::HostGlobal.id(), None);
+        assert_eq!(ActivityScope::Unscoped.id(), None);
+        // Each security meaning has its own kind; none is overloaded.
+        let kinds = [
+            ActivityScope::ProjectGrant(GRANT_A.to_string()).kind(),
+            ActivityScope::HostGlobal.kind(),
+            ActivityScope::Unscoped.kind(),
+        ];
+        let unique: std::collections::HashSet<_> = kinds.iter().collect();
+        assert_eq!(unique.len(), kinds.len());
     }
 
-    #[test]
-    fn activity_limit_counts_rows_after_filtering() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = Database::open(&tmp.path().join("activity.db")).unwrap();
-        // A noisy neighbour must not crowd this caller's rows out of the window.
-        for index in 0..60 {
-            db.insert_workspace_activity(
-                index,
-                &sample_for("run_shell", Some("neighbour")),
-                None,
-                500,
-            )
-            .unwrap();
-        }
-        for index in 0..3 {
-            db.insert_workspace_activity(
-                100 + index,
-                &sample_for("run_shell", Some("laptop")),
-                None,
-                500,
-            )
-            .unwrap();
-        }
-        let rows = db
-            .list_workspace_activity_for_clients(50, None, Some(&["laptop".to_string()]))
-            .unwrap();
-        assert_eq!(rows.len(), 3, "filtered rows were crowded out by the limit");
-    }
     #[test]
     fn disabling_the_preview_stores_no_command_text() {
         let tmp = tempfile::tempdir().unwrap();
@@ -459,7 +683,7 @@ mod tests {
             ..sample("run_shell", true, None)
         });
         let rows = db
-            .list_workspace_activity_for_clients(10, None, None)
+            .list_workspace_activity_for_clients(10, None, ActivityVisibility::Global, &[])
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert!(
@@ -478,7 +702,7 @@ mod tests {
             ..sample("run_shell", true, None)
         });
         let rows = db
-            .list_workspace_activity_for_clients(10, None, None)
+            .list_workspace_activity_for_clients(10, None, ActivityVisibility::Global, &[])
             .unwrap();
         assert_eq!(rows[0].command_preview.as_deref(), Some("cargo test"));
     }

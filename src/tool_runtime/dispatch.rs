@@ -378,6 +378,9 @@ impl ToolRuntime {
                 command: context.command.as_deref(),
                 paths: context.paths,
                 error_summary: result.error.as_deref(),
+                // Derived from the verified caller here, not looked up later
+                // from whoever holds this client id at read time.
+                scope: super::activity::ActivityScope::from_auth(auth),
             });
         }
         result

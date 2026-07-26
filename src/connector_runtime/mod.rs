@@ -7,7 +7,7 @@
 
 mod execution;
 #[cfg(test)]
-mod execution_tests;
+pub(crate) mod execution_tests;
 #[cfg(test)]
 mod host_tests;
 pub(crate) mod http;
@@ -2108,19 +2108,38 @@ impl ConnectorRuntime {
     /// Shares its source with [`Self::host_devices`] on purpose: the devices
     /// panel and the activity ledger must never disagree about which agents
     /// exist for a given caller.
-    pub(crate) async fn visible_activity_clients(&self, auth: &AuthContext) -> Option<Vec<String>> {
+    /// What this caller may read from the activity ledger: the durable scope
+    /// its rows must carry, plus the agent clients it can currently see.
+    ///
+    /// The client list shares its source with [`Self::host_devices`] so the
+    /// devices panel and the ledger agree about which agents exist. It is a
+    /// display filter within the scope, though — never the authorization
+    /// boundary, which is the grant recorded on each row.
+    pub(crate) async fn activity_visibility<'a>(
+        &self,
+        auth: &'a AuthContext,
+    ) -> (
+        crate::tool_runtime::activity::ActivityVisibility<'a>,
+        Vec<String>,
+    ) {
+        use crate::tool_runtime::activity::ActivityVisibility;
+        let clients: Vec<String> = self
+            .tools
+            .shell_clients
+            .list_clients_for_auth(Some(auth))
+            .await
+            .into_iter()
+            .map(|client| client.client_id)
+            .collect();
         if auth.is_bootstrap() || auth.is_admin() {
-            return None;
+            return (ActivityVisibility::Global, clients);
         }
-        Some(
-            self.tools
-                .shell_clients
-                .list_clients_for_auth(Some(auth))
-                .await
-                .into_iter()
-                .map(|client| client.client_id)
-                .collect(),
-        )
+        match auth.project_grant_id.as_deref() {
+            Some(grant) if !grant.is_empty() => (ActivityVisibility::ProjectGrant(grant), clients),
+            // No provable grant: scoped to a grant that no row can carry, so
+            // the result is empty rather than accidentally global.
+            _ => (ActivityVisibility::ProjectGrant(""), Vec::new()),
+        }
     }
 
     pub(crate) async fn host_devices(&self, auth: &AuthContext) -> crate::tool_runtime::ToolResult {
@@ -3368,7 +3387,7 @@ struct TaskFinishInput {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::shell_client::ShellClientRegistry;
     use crate::shell_protocol::{
@@ -3463,7 +3482,7 @@ mod tests {
         ]);
     }
 
-    pub(super) fn auth(user_id: &str) -> AuthContext {
+    pub(crate) fn auth(user_id: &str) -> AuthContext {
         let project_grant_id = if user_id == "u1" {
             PROJECT_GRANT_ID.to_string()
         } else {

@@ -297,3 +297,11 @@ you cannot judge a command you cannot see. That has a consequence:
 
 The ledger stays in the local state directory and is never sent anywhere. It is
 row-capped and prunes its oldest entries.
+
+Each entry also records which project it belonged to **when it was written**.
+That attribution is fixed and never recalculated, which matters because agent
+names are not unique over time: if a device called `laptop` reconnects later
+under a different project, it gets its own history and cannot read the earlier
+project's commands, paths, or errors. Entries written by an older version, whose
+project cannot be established after the fact, stay in the ledger but are visible
+only to the host operator.

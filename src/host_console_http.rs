@@ -153,10 +153,10 @@ async fn activity(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     // Scoped to the agents this caller can already see in the devices panel.
     // A project credential must not read another project's command previews,
     // paths, or errors out of the shared database.
-    let allowed = runtime.visible_activity_clients(&auth).await;
+    let (visibility, allowed) = runtime.activity_visibility(&auth).await;
     match runtime
         .db
-        .list_workspace_activity_for_clients(limit, client, allowed.as_deref())
+        .list_workspace_activity_for_clients(limit, client, visibility, &allowed)
     {
         Ok(rows) => res.render(Json(json!({ "activity": rows }))),
         Err(error) => render(res, failure(500, "activity_store_error", error.to_string())),
@@ -332,4 +332,193 @@ async fn result_accept(req: &mut Request, depot: &mut Depot, res: &mut Response)
 #[handler]
 async fn result_reject(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     decide(req, depot, res, false).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tool_runtime::activity::{ActivityRecord, ActivityScope};
+    use salvo::test::{ResponseExt, TestClient};
+
+    /// The console router behind the same depot the auth middleware fills in:
+    /// the handler can only learn who is calling from there, never from the
+    /// request body or query.
+    fn service(runtime: Arc<ConnectorRuntime>, auth: AuthContext) -> Service {
+        Service::new(
+            Router::new()
+                .hoop(
+                    salvo::affix_state::inject(crate::connector_runtime::ConnectorRuntimeSlot(
+                        Some(runtime),
+                    ))
+                    .inject(auth),
+                )
+                .push(routes()),
+        )
+    }
+
+    async fn activity_as(
+        runtime: &Arc<ConnectorRuntime>,
+        auth: &AuthContext,
+        body: serde_json::Value,
+    ) -> serde_json::Value {
+        let service = service(runtime.clone(), auth.clone());
+        let mut response = TestClient::post("http://127.0.0.1/console/activity")
+            .add_header("host", "127.0.0.1", true)
+            .add_header("origin", "http://127.0.0.1", true)
+            .add_header("content-type", "application/json", true)
+            .json(&body)
+            .send(&service)
+            .await;
+        let body: serde_json::Value = response.take_json().await.unwrap();
+        // An error body would trivially satisfy "does not contain the other
+        // grant's data", so require a real answer before asserting on it.
+        assert!(
+            body["activity"].is_array(),
+            "expected an activity list, got {body}"
+        );
+        body
+    }
+
+    fn record<'a>(client: &'a str, grant: &str) -> ActivityRecord<'a> {
+        ActivityRecord {
+            tool: "run_shell",
+            project: Some("agent:laptop:demo"),
+            surface: "mcp",
+            client: Some(client),
+            success: true,
+            session_id: Some("wc_sess_grant_a_session"),
+            command: None,
+            paths: vec!["private/a.rs".to_string()],
+            error_summary: Some("grant-a-error"),
+            scope: ActivityScope::ProjectGrant(grant.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn console_activity_isolates_grants_that_share_a_client_id() {
+        let fixture = crate::connector_runtime::execution_tests::console_fixture().await;
+        let grant_a = crate::connector_runtime::tests::auth("u1");
+        let grant_b = crate::connector_runtime::tests::auth("u2");
+        assert_ne!(grant_a.project_grant_id, grant_b.project_grant_id);
+
+        fixture
+            .runtime
+            .db
+            .insert_workspace_activity(
+                1,
+                &record(
+                    &fixture.shared_client_id,
+                    grant_a.project_grant_id.as_deref().unwrap(),
+                ),
+                Some("grant-a-command"),
+                50,
+            )
+            .unwrap();
+
+        // Grant B holds a live `laptop` client, but never wrote this row.
+        let denied = activity_as(&fixture.runtime, &grant_b, serde_json::json!({})).await;
+        let serialized = serde_json::to_string(&denied).unwrap();
+        for secret in [
+            "grant-a-command",
+            "private/a.rs",
+            "grant-a-error",
+            "wc_sess_grant_a_session",
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "{secret} leaked: {serialized}"
+            );
+        }
+
+        // Naming the client explicitly does not get around the grant scope.
+        let named = activity_as(
+            &fixture.runtime,
+            &grant_b,
+            serde_json::json!({ "client": fixture.shared_client_id }),
+        )
+        .await;
+        assert!(
+            !serde_json::to_string(&named)
+                .unwrap()
+                .contains("grant-a-command"),
+            "{named}"
+        );
+    }
+
+    #[tokio::test]
+    async fn console_activity_scope_is_not_taken_from_the_request() {
+        let fixture = crate::connector_runtime::execution_tests::console_fixture().await;
+        let grant_a = crate::connector_runtime::tests::auth("u1");
+        let grant_b = crate::connector_runtime::tests::auth("u2");
+        fixture
+            .runtime
+            .db
+            .insert_workspace_activity(
+                1,
+                &record(
+                    &fixture.shared_client_id,
+                    grant_a.project_grant_id.as_deref().unwrap(),
+                ),
+                Some("grant-a-command"),
+                50,
+            )
+            .unwrap();
+
+        // The request has no field that could carry attribution: the input
+        // struct denies unknown fields outright, so an attempt to name a grant
+        // is rejected before any lookup.
+        let service = service(fixture.runtime.clone(), grant_b.clone());
+        let mut response = TestClient::post("http://127.0.0.1/console/activity")
+            .add_header("host", "127.0.0.1", true)
+            .add_header("origin", "http://127.0.0.1", true)
+            .add_header("content-type", "application/json", true)
+            .json(&serde_json::json!({
+                "scope_id": grant_a.project_grant_id,
+                "client": fixture.shared_client_id
+            }))
+            .send(&service)
+            .await;
+        let spoofed: serde_json::Value = response.take_json().await.unwrap();
+        assert_eq!(spoofed["error"]["code"], "invalid_arguments", "{spoofed}");
+
+        // And a well-formed request from grant B still cannot reach the row,
+        // because the scope comes from the depot's AuthContext.
+        let honest = activity_as(
+            &fixture.runtime,
+            &grant_b,
+            serde_json::json!({ "client": fixture.shared_client_id }),
+        )
+        .await;
+        assert!(
+            honest["activity"].as_array().unwrap().is_empty(),
+            "{honest}"
+        );
+        assert!(!serde_json::to_string(&honest)
+            .unwrap()
+            .contains("grant-a-command"));
+    }
+
+    #[tokio::test]
+    async fn console_activity_shows_a_grant_its_own_rows() {
+        let fixture = crate::connector_runtime::execution_tests::console_fixture().await;
+        let grant_a = crate::connector_runtime::tests::auth("u1");
+        fixture
+            .runtime
+            .db
+            .insert_workspace_activity(
+                1,
+                &record(
+                    &fixture.own_client_id,
+                    grant_a.project_grant_id.as_deref().unwrap(),
+                ),
+                Some("grant-a-command"),
+                50,
+            )
+            .unwrap();
+
+        let mine = activity_as(&fixture.runtime, &grant_a, serde_json::json!({})).await;
+        let rows = mine["activity"].as_array().expect("activity list");
+        assert_eq!(rows.len(), 1, "{mine}");
+        assert_eq!(rows[0]["command_preview"], "grant-a-command");
+    }
 }

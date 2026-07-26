@@ -76,6 +76,50 @@ impl Fixture {
     }
 }
 
+/// Fixture for the console HTTP tests: the runtime plus the client id the
+/// registry knows, so a test can write activity for a client that is genuinely
+/// visible to grant A and also live for grant B.
+pub(crate) struct ConsoleFixture {
+    pub(crate) _temp: tempfile::TempDir,
+    pub(crate) runtime: Arc<ConnectorRuntime>,
+    /// Registered under grant A only.
+    pub(crate) own_client_id: String,
+    /// Registered under grant B, so grant A can see the id exists without
+    /// that meaning it may read grant B's history.
+    pub(crate) shared_client_id: String,
+}
+
+pub(crate) async fn console_fixture() -> ConsoleFixture {
+    let fixture = fixture(20).await;
+    // The same registered client is visible to both grants in these tests,
+    // which is exactly the situation a client id must not authorize.
+    let grant_b = tests::auth("u2");
+    fixture
+        .registry
+        .register_with_auth(
+            ShellClientRegisterRequest {
+                client_id: "laptop".into(),
+                agent_instance_id: "instance-b".into(),
+                display_name: None,
+                owner: Some("owner".into()),
+                hostname: None,
+                capabilities: Some(ShellClientCapabilities::default()),
+                projects: None,
+                agent_protocol_version: Some("test".into()),
+                policy: None,
+            },
+            Some(&grant_b),
+        )
+        .await
+        .unwrap();
+    ConsoleFixture {
+        _temp: fixture._temp,
+        runtime: fixture.connector,
+        own_client_id: "hosted".to_string(),
+        shared_client_id: "laptop".to_string(),
+    }
+}
+
 async fn fixture(yield_ms: u64) -> Fixture {
     fixture_configured(yield_ms, |service| service).await
 }

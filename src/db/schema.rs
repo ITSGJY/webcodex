@@ -488,7 +488,11 @@ impl Database {
                 client TEXT,
                 command_preview TEXT,
                 paths_json TEXT NOT NULL DEFAULT '[]',
-                error_summary TEXT
+                error_summary TEXT,
+                -- Attribution fixed at write time. 'legacy_unscoped' marks rows
+                -- from before this column existed, whose owner cannot be proven.
+                scope_kind TEXT NOT NULL DEFAULT 'legacy_unscoped',
+                scope_id TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_workspace_activity_id
                 ON workspace_activity(id DESC);
@@ -502,6 +506,7 @@ impl Database {
         Self::ensure_users_and_api_key_columns(&conn)?;
         Self::ensure_connector_execution_columns(&conn)?;
         Self::ensure_connector_task_columns(&conn)?;
+        Self::ensure_activity_scope_columns(&conn)?;
         Ok(())
     }
 
@@ -555,6 +560,38 @@ impl Database {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    /// Add durable attribution to `workspace_activity` on existing databases.
+    ///
+    /// Rows that predate these columns keep `legacy_unscoped`: which grant
+    /// produced them cannot be established after the fact, and guessing from
+    /// the client id is exactly the reinterpretation this is meant to stop. So
+    /// they stay readable to bootstrap/admin and invisible to any project
+    /// credential rather than being deleted or re-attributed.
+    fn ensure_activity_scope_columns(conn: &Connection) -> anyhow::Result<()> {
+        let columns = table_columns(conn, "workspace_activity")?;
+        if !columns.iter().any(|existing| existing == "scope_kind") {
+            conn.execute(
+                "ALTER TABLE workspace_activity
+                 ADD COLUMN scope_kind TEXT NOT NULL DEFAULT 'legacy_unscoped'",
+                [],
+            )?;
+        }
+        if !columns.iter().any(|existing| existing == "scope_id") {
+            conn.execute(
+                "ALTER TABLE workspace_activity ADD COLUMN scope_id TEXT",
+                [],
+            )?;
+        }
+        // Created here rather than in the base DDL: on an existing database the
+        // columns do not exist until the ALTERs above have run.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_workspace_activity_scope
+             ON workspace_activity(scope_kind, scope_id, id DESC)",
+            [],
+        )?;
         Ok(())
     }
 
