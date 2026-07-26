@@ -713,6 +713,64 @@ fn native_strategy_does_not_start_claude() {
     assert_eq!(fixture.starts(), 0);
 }
 
+#[cfg(unix)]
+#[test]
+fn retiring_router_keeps_inflight_edit_alive_then_reaps_its_process() {
+    let fixture = Fixture::with_timeout("delayed", 2);
+    let old = Arc::new(ExternalToolRouter::new(&ToolProvidersConfig {
+        strategy: ToolProviderStrategy::ClaudeCode,
+        claude_code: fixture.config.clone(),
+    }));
+    let weak = Arc::downgrade(&old);
+    let request = agent_request(
+        "file_replace_in_file",
+        &fixture.root,
+        "edit.txt",
+        Some(edit_request()),
+    );
+    let worker_router = Arc::clone(&old);
+    let worker = std::thread::spawn(move || {
+        assert!(matches!(
+            worker_router.route(&AgentPolicy::default(), &request),
+            ExternalRoute::Handled(_)
+        ));
+    });
+    assert!(wait_until(Duration::from_secs(1), || {
+        fs::read_to_string(&fixture.marker)
+            .unwrap_or_default()
+            .contains(r#""method":"tools/call""#)
+    }));
+    let pid = process_ids(&old.claude)[0];
+
+    let replacement = ExternalToolRouter::new(&ToolProvidersConfig::default());
+    let mut new_request = agent_request("run_shell", &fixture.root, ".", None);
+    new_request.command = EXTERNAL_SEARCH_REQUEST_PREFIX.to_string();
+    new_request.stdin = Some(search_request().to_string());
+    assert!(matches!(
+        replacement.route(&AgentPolicy::default(), &new_request),
+        ExternalRoute::Native
+    ));
+    drop(old);
+    assert!(
+        weak.upgrade().is_some(),
+        "in-flight edit lost its old router"
+    );
+    assert_eq!(unsafe { libc::kill(pid as i32, 0) }, 0);
+
+    worker.join().unwrap();
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("edit.txt")).unwrap(),
+        "after\n"
+    );
+    assert!(wait_until(Duration::from_secs(1), || weak
+        .upgrade()
+        .is_none()));
+    assert!(wait_until(Duration::from_secs(1), || {
+        (unsafe { libc::kill(pid as i32, 0) }) == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }));
+}
+
 #[test]
 fn opt_in_real_claude_mcp_probe() {
     if env::var("WEBCODEX_PROBE_CLAUDE_PROVIDER").as_deref() != Ok("1") {

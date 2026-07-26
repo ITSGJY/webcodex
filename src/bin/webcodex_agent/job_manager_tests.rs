@@ -131,6 +131,7 @@ fn validation_job_progress_is_executor_owned_and_fail_fast() {
     let manager = JobManager::new(1);
     manager.enqueue(
         sink,
+        1,
         AgentPolicy::default(),
         shell,
         temp.path().join("projects.d"),
@@ -204,6 +205,7 @@ fn validation_spawn_failure_is_infrastructure_without_failed_assertion() {
     let manager = JobManager::new(1);
     manager.enqueue(
         sink,
+        1,
         AgentPolicy::default(),
         shell,
         temp.path().join("projects.d"),

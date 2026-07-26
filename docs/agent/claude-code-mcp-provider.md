@@ -90,6 +90,41 @@ older snapshot cannot overwrite a newer `last_call`. Metadata send failure
 releases the claim for a later keepalive/reconnect retry, does not change a tool
 result, and network I/O occurs after the provider state lock has been released.
 
+## Explicit agent config reload
+
+`agent.toml` is loaded at startup. On Unix, an operator can explicitly reload
+the same config path without disconnecting the agent:
+
+```bash
+sudo systemctl reload webcodex-agent
+```
+
+The generated unit maps this to `SIGHUP`. A valid reload atomically replaces
+one request-time generation for `policy` (`allow_raw_shell`,
+`allow_cwd_anywhere`, `allowed_roots`, `max_timeout_secs`, `max_output_bytes`),
+`shell` (`default_profile`, `profiles`, `program`, `args`, `path_prepend`,
+`env`, `init_script`), and `tool_providers` (strategy plus the Claude Code
+enabled flag, command, args, mapping, and timeout). Requests and jobs that
+already captured the old generation keep its
+policy, timeout, shell environment, and Provider route. In-flight Claude edits
+are allowed to finish; their old Provider process is shut down when the last
+old-generation caller releases it. New calls cannot enter a disabled Provider.
+
+Identity, server/auth, registration, project source, concurrency, and transport
+fields still require restart: `server_url`, `token`, `client_id`,
+`display_name`, `owner`, `hostname`, `projects_dir`, `poll_interval_ms`,
+`capabilities`, `max_concurrent_jobs`, `transport`,
+`websocket_connect_timeout_secs`, and `quic.*`. A mixed reload applies the hot
+sections and reports these field names as `restart_required_fields`; it never
+reports their values. Read, parse, validation, or Provider-config failure keeps
+the active generation unchanged.
+
+The latest bounded result is exposed as `tool_providers.config_reload`
+(`generation`, result/error code, and restart-required summary). Generation
+starts at 1 and advances only after a valid reload. `projects.d/*.toml` keeps
+its existing independent cache refresh. Reload does not change public MCP
+tools, refresh MCP metadata, or add an OpenAPI operation.
+
 The provider lifecycle uses `not_started`, `starting`, `initializing`,
 `discovering`, `mapping`, `running`, and `stopped`. State revisions are produced
 when configuration is initialized, the child starts, initialize succeeds,

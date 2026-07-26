@@ -21,6 +21,7 @@ pub(crate) fn render_agent_systemd_unit(opts: &AgentInstallServiceOptions) -> St
         opts.bin.display(),
         opts.config.display()
     ));
+    unit.push_str("ExecReload=/bin/kill -HUP $MAINPID\n");
     unit.push_str("Restart=always\n");
     unit.push_str("RestartSec=5s\n");
     unit.push_str("StandardOutput=journal\n");

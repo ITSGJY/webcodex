@@ -50,6 +50,9 @@ fn main() -> io::Result<()> {
                     return Ok(());
                 }
                 _ => {
+                    if scenario == "delayed" {
+                        thread::sleep(Duration::from_millis(250));
+                    }
                     if scenario == "unknown_id" {
                         send(
                             &mut writer,

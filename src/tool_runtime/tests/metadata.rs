@@ -1807,7 +1807,7 @@ async fn runtime_status_agent_summary_includes_protocol_version() {
 #[tokio::test]
 async fn runtime_status_includes_sanitized_policy_summary() {
     use crate::shell_protocol::{
-        AgentPolicySummary, ClaudeCodeProviderStatus, ProviderCallSummary,
+        AgentConfigReloadStatus, AgentPolicySummary, ClaudeCodeProviderStatus, ProviderCallSummary,
         ShellClientRegisterRequest, ToolProvidersStatus,
     };
     let registry = Arc::new(ShellClientRegistry::default());
@@ -1843,43 +1843,46 @@ async fn runtime_status_includes_sanitized_policy_summary() {
                         last_error_code: None,
                         last_call: None,
                     },
+                    config_reload: AgentConfigReloadStatus::default(),
                 }),
             }),
         })
         .await
         .unwrap();
-    registry
-        .update_tool_providers(
-            "policy-agent",
-            "inst-p",
-            Some(ToolProvidersStatus {
-                strategy: "claude_code".to_string(),
-                claude_code: ClaudeCodeProviderStatus {
-                    enabled: true,
-                    version: Some("2.1.217".to_string()),
-                    available: true,
-                    process_state: "running".to_string(),
-                    discovered_tool_names: ["Edit", "Read", "Bash", "FutureTool"]
-                        .into_iter()
-                        .map(str::to_string)
-                        .collect(),
-                    capabilities: std::collections::BTreeMap::from([
-                        ("search_project_text".to_string(), "unmapped".to_string()),
-                        ("edit_file".to_string(), "available".to_string()),
-                    ]),
-                    last_error_code: None,
-                    last_call: Some(ProviderCallSummary {
-                        capability: "edit_file".to_string(),
-                        selected_provider: "claude_code".to_string(),
-                        fallback_used: false,
-                        result: "success".to_string(),
-                        write_state: Some("confirmed".to_string()),
-                        duration_ms: 14,
-                        error_code: None,
-                    }),
-                },
+    let current_provider = ToolProvidersStatus {
+        strategy: "claude_code".to_string(),
+        claude_code: ClaudeCodeProviderStatus {
+            enabled: true,
+            version: Some("2.1.217".to_string()),
+            available: true,
+            process_state: "running".to_string(),
+            discovered_tool_names: ["Edit", "Read", "Bash", "FutureTool"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            capabilities: std::collections::BTreeMap::from([
+                ("search_project_text".to_string(), "unmapped".to_string()),
+                ("edit_file".to_string(), "available".to_string()),
+            ]),
+            last_error_code: None,
+            last_call: Some(ProviderCallSummary {
+                capability: "edit_file".to_string(),
+                selected_provider: "claude_code".to_string(),
+                fallback_used: false,
+                result: "success".to_string(),
+                write_state: Some("confirmed".to_string()),
+                duration_ms: 14,
+                error_code: None,
             }),
-        )
+        },
+        config_reload: AgentConfigReloadStatus {
+            generation: 2,
+            last_reload_result: "success".to_string(),
+            ..AgentConfigReloadStatus::default()
+        },
+    };
+    registry
+        .update_tool_providers("policy-agent", "inst-p", Some(current_provider))
         .await
         .unwrap();
     let runtime = ToolRuntime::new(
@@ -1900,6 +1903,7 @@ async fn runtime_status_includes_sanitized_policy_summary() {
     assert_eq!(providers["strategy"], "claude_code");
     assert_eq!(providers["claude_code"]["process_state"], "running");
     assert_eq!(providers["claude_code"]["version"], "2.1.217");
+    assert_eq!(providers["config_reload"]["generation"], 2);
     assert_eq!(
         providers["claude_code"]["last_call"]["selected_provider"],
         "claude_code"
@@ -1971,6 +1975,7 @@ async fn external_provider_discovery_cannot_change_public_tool_or_openapi_surfac
                         last_error_code: None,
                         last_call: None,
                     },
+                    config_reload: Default::default(),
                 }),
                 ..AgentPolicySummary::default()
             }),

@@ -16,7 +16,8 @@ pub(crate) use artifacts::{handle_artifact_file_request, is_artifact_request_kin
 pub(crate) use checkpoints::{handle_checkpoint_file_request, is_checkpoint_request_kind};
 pub(crate) use config::{
     client_profile_agent_config, default_config_path, hostname, load_config, projects_dir,
-    validate_client_profile, AgentConfig, AgentPolicy, ShellConfig,
+    validate_client_profile, AgentConfig, AgentPolicy, HotAgentConfig, ReloadableAgentConfig,
+    ShellConfig,
 };
 #[cfg(test)]
 pub(crate) use config::{
@@ -25,7 +26,6 @@ pub(crate) use config::{
     ShellProfileConfig, CLIENT_PROFILE_ERROR, DEFAULT_MAX_CONCURRENT_JOBS,
 };
 pub(super) use dispatch::{dispatch_request, is_project_op};
-pub(crate) use external_tools::configure_external_tools;
 #[cfg(test)]
 pub(crate) use files::sha256_hex_bytes;
 pub(crate) use files::{
@@ -56,6 +56,6 @@ pub(crate) use shell::{
 pub(crate) use transport::{
     auto_transport_plan, build_ws_request, effective_transport, non_empty_token,
     quic_client_bind_addr_for, resolve_quic_config, resolve_quic_server_addrs, server_url_to_ws,
-    websocket_session, WS_OUTGOING_CAPACITY,
+    websocket_session, AgentRuntimeState, WS_OUTGOING_CAPACITY,
 };
 pub(crate) use transport::{run_agent, AgentSink, HttpSendConfig};

@@ -91,7 +91,7 @@ pub const SHELL_CLIENT_CAPABILITY_NAMES: &[&str] = &[
     SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
 ];
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShellClientCapabilities {
     #[serde(default = "default_shell_true")]
     pub shell: bool,
@@ -115,6 +115,30 @@ pub struct ShellClientCapabilities {
     /// false for wire compatibility with older agents.
     #[serde(default)]
     pub lsp_read_only_navigation: bool,
+}
+
+/// Bounded, non-secret status for the agent's active configuration generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentConfigReloadStatus {
+    pub generation: u64,
+    pub last_reload_result: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reload_error_code: Option<String>,
+    pub restart_required: bool,
+    #[serde(default)]
+    pub restart_required_fields: Vec<String>,
+}
+
+impl Default for AgentConfigReloadStatus {
+    fn default() -> Self {
+        Self {
+            generation: 1,
+            last_reload_result: "not_attempted".to_string(),
+            last_reload_error_code: None,
+            restart_required: false,
+            restart_required_fields: Vec::new(),
+        }
+    }
 }
 
 impl Default for ShellClientCapabilities {
@@ -202,6 +226,8 @@ pub struct ShellProfilesSummary {
 pub struct ToolProvidersStatus {
     pub strategy: String,
     pub claude_code: ClaudeCodeProviderStatus,
+    #[serde(default)]
+    pub config_reload: AgentConfigReloadStatus,
 }
 
 /// Bounded evidence for the most recent allowlisted external-provider route.
@@ -1175,6 +1201,7 @@ mod envelope_tests {
                 last_error_code: None,
                 last_call: None,
             },
+            config_reload: AgentConfigReloadStatus::default(),
         }
     }
 

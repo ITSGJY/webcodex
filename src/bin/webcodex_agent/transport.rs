@@ -1,4 +1,7 @@
-use super::config::{max_concurrent_jobs, projects_dir, AgentConfig, QuicClientConfig};
+use super::config::{
+    max_concurrent_jobs, projects_dir, validate_quic_config, AgentConfig, HotAgentConfig,
+    QuicClientConfig, ReloadableAgentConfig,
+};
 use super::lsp::LspSupervisor;
 use super::projects::AgentProjectCache;
 use crate::agent_init::{TRANSPORT_AUTO, TRANSPORT_POLLING, TRANSPORT_QUIC, TRANSPORT_WEBSOCKET};
@@ -14,6 +17,7 @@ use crate::{
 use reqwest::blocking::Client;
 use std::fmt;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -50,27 +54,47 @@ const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Granularity for signal-aware sleeps in the blocking polling loop.
 const POLLING_SHUTDOWN_SLEEP_SLICE: Duration = Duration::from_millis(50);
 
-fn claim_provider_metadata() -> Option<(AgentEnvelope, u64)> {
-    super::external_tools::external_tools()
-        .claim_status_update()
-        .map(|(tool_providers, revision)| {
-            (AgentEnvelope::RuntimeMetadata { tool_providers }, revision)
-        })
+fn send_provider_metadata(
+    tx: &tokio::sync::mpsc::Sender<AgentEnvelope>,
+    runtime: &ReloadableAgentConfig,
+    expected_generation: Option<u64>,
+) {
+    runtime.with_active(|config| {
+        if expected_generation.is_some_and(|expected| expected != config.generation) {
+            return;
+        }
+        let Some((mut status, revision)) = config.external_tools.claim_status_update() else {
+            return;
+        };
+        status.config_reload = config.reload_status();
+        if tx
+            .try_send(AgentEnvelope::RuntimeMetadata {
+                tool_providers: status,
+            })
+            .is_err()
+        {
+            config.external_tools.release_status_update(revision);
+        } else {
+            config.external_tools.mark_status_reported(revision);
+        }
+    });
 }
 
-struct AgentRuntimeState {
+#[derive(Clone)]
+pub(crate) struct AgentRuntimeState {
     lsp: LspSupervisor,
+    config: Arc<ReloadableAgentConfig>,
 }
 
 impl AgentRuntimeState {
-    fn new() -> Self {
+    pub(crate) fn new(cfg: &AgentConfig, path: PathBuf) -> Self {
         Self {
             lsp: LspSupervisor::default(),
+            config: Arc::new(ReloadableAgentConfig::new(cfg.clone(), path)),
         }
     }
 
     fn shutdown(&self) {
-        super::external_tools::external_tools().shutdown();
         self.lsp.shutdown();
     }
 }
@@ -310,6 +334,37 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+#[cfg(unix)]
+fn install_reload_listener(
+    runtime: Arc<ReloadableAgentConfig>,
+) -> Result<std::thread::JoinHandle<()>, String> {
+    let signal_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "failed to initialize config reload signal listener".to_string())?;
+    let mut sighup = {
+        let _guard = signal_runtime.enter();
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .map_err(|_| "failed to install config reload signal listener".to_string())?
+    };
+    std::thread::Builder::new()
+        .name("webcodex-agent-reload".to_string())
+        .spawn(move || {
+            signal_runtime.block_on(async move {
+                while !runtime.is_stopping() {
+                    match tokio::time::timeout(Duration::from_millis(100), sighup.recv()).await {
+                        Ok(Some(_)) => {
+                            runtime.reload();
+                        }
+                        Ok(None) => break,
+                        Err(_) => {}
+                    }
+                }
+            });
+        })
+        .map_err(|_| "failed to start config reload signal listener".to_string())
+}
+
 /// Minimal HTTP send configuration used by the polling `AgentSink`. We do not
 /// store the whole `AgentConfig` here: policy and concurrency limits stay
 /// with the agent config and are passed alongside the sink.
@@ -410,24 +465,28 @@ impl AgentSink {
                 Ok(true)
             }
         };
+        submitted
+    }
+
+    pub(crate) fn submit_result_with_metadata(
+        &self,
+        request_id: String,
+        result: CommandResult,
+        config: &HotAgentConfig,
+        runtime: &ReloadableAgentConfig,
+    ) -> Result<bool, String> {
+        let submitted = self.submit_result(request_id, result);
         if submitted.is_ok() {
-            self.send_provider_metadata_best_effort();
+            self.send_provider_metadata_best_effort(config.generation, runtime);
         }
         submitted
     }
 
-    fn send_provider_metadata_best_effort(&self) {
+    fn send_provider_metadata_best_effort(&self, generation: u64, runtime: &ReloadableAgentConfig) {
         let (AgentSink::WebSocket { tx, .. } | AgentSink::Quic { tx, .. }) = self else {
             return;
         };
-        let Some((metadata, revision)) = claim_provider_metadata() else {
-            return;
-        };
-        if tx.try_send(metadata).is_err() {
-            super::external_tools::external_tools().release_status_update(revision);
-        } else {
-            super::external_tools::external_tools().mark_status_reported(revision);
-        }
+        send_provider_metadata(tx, runtime, Some(generation));
     }
 
     /// Push an incremental/final job update. Mirrors the old `send_job_update`
@@ -487,7 +546,7 @@ pub(crate) fn non_empty_token(token: &str) -> Option<String> {
     }
 }
 
-pub(crate) fn run_agent(cfg: AgentConfig, once: bool) -> Result<(), String> {
+pub(crate) fn run_agent(cfg: AgentConfig, config_path: PathBuf, once: bool) -> Result<(), String> {
     // Generate the per-process agent instance identity once. It is stable for
     // the whole process lifetime, including across WebSocket reconnects, so the
     // server can treat this process as a single active lease for `client_id`.
@@ -502,14 +561,18 @@ pub(crate) fn run_agent(cfg: AgentConfig, once: bool) -> Result<(), String> {
         .to_string();
     // The LSP supervisor belongs to the agent process rather than any server
     // transport session and is shared across reconnects.
-    super::configure_external_tools(&cfg.tool_providers);
-    let runtime = AgentRuntimeState::new();
+    let runtime = AgentRuntimeState::new(&cfg, config_path);
+    #[cfg(unix)]
+    let reload_listener = install_reload_listener(Arc::clone(&runtime.config))?;
     let result = match transport.as_str() {
-        TRANSPORT_WEBSOCKET => run_websocket_agent(cfg, once, &agent_instance_id, &runtime.lsp),
-        TRANSPORT_QUIC => run_quic_agent(cfg, once, &agent_instance_id, &runtime.lsp),
-        TRANSPORT_AUTO => run_auto_agent(cfg, once, &agent_instance_id, &runtime.lsp),
-        _ => run_polling_agent(cfg, once, &agent_instance_id, &runtime.lsp),
+        TRANSPORT_WEBSOCKET => run_websocket_agent(cfg, once, &agent_instance_id, &runtime),
+        TRANSPORT_QUIC => run_quic_agent(cfg, once, &agent_instance_id, &runtime),
+        TRANSPORT_AUTO => run_auto_agent(cfg, once, &agent_instance_id, &runtime),
+        _ => run_polling_agent(cfg, once, &agent_instance_id, &runtime),
     };
+    runtime.config.begin_shutdown();
+    #[cfg(unix)]
+    let _ = reload_listener.join();
     runtime.shutdown();
     result
 }
@@ -593,7 +656,7 @@ fn run_auto_agent(
     cfg: AgentConfig,
     once: bool,
     agent_instance_id: &str,
-    lsp: &LspSupervisor,
+    runtime: &AgentRuntimeState,
 ) -> Result<(), String> {
     let mut backoff = ReconnectBackoff::new();
     'supervisor: loop {
@@ -605,7 +668,7 @@ fn run_auto_agent(
                 TRANSPORT_QUIC => {
                     eprintln!("{}", auto_trying_log_line(TRANSPORT_QUIC));
                     let session_started = Instant::now();
-                    match run_quic_agent_single_session(&cfg, once, agent_instance_id, lsp) {
+                    match run_quic_agent_single_session(&cfg, once, agent_instance_id, runtime) {
                         Ok(AgentSessionExit::Shutdown) => return Ok(()),
                         Ok(AgentSessionExit::Completed) if once => return Ok(()),
                         Ok(AgentSessionExit::Completed) => return Ok(()),
@@ -637,7 +700,7 @@ fn run_auto_agent(
                 TRANSPORT_WEBSOCKET => {
                     eprintln!("{}", auto_trying_log_line(TRANSPORT_WEBSOCKET));
                     let session_started = Instant::now();
-                    match run_websocket_agent_single_session(&cfg, agent_instance_id, lsp) {
+                    match run_websocket_agent_single_session(&cfg, agent_instance_id, runtime) {
                         Ok(AgentSessionExit::Shutdown) => return Ok(()),
                         Ok(AgentSessionExit::Completed) if once => return Ok(()),
                         Ok(AgentSessionExit::Completed) => return Ok(()),
@@ -674,7 +737,7 @@ fn run_auto_agent(
                 }
                 TRANSPORT_POLLING => {
                     eprintln!("{}", auto_trying_log_line(TRANSPORT_POLLING));
-                    return run_polling_agent(cfg, once, agent_instance_id, lsp);
+                    return run_polling_agent(cfg, once, agent_instance_id, runtime);
                 }
                 _ => {}
             }
@@ -686,10 +749,10 @@ fn run_polling_agent(
     cfg: AgentConfig,
     once: bool,
     agent_instance_id: &str,
-    lsp: &LspSupervisor,
+    runtime: &AgentRuntimeState,
 ) -> Result<(), String> {
     let shutdown = install_polling_shutdown_flag();
-    run_polling_agent_with_shutdown(cfg, once, agent_instance_id, shutdown, lsp)
+    run_polling_agent_with_shutdown(cfg, once, agent_instance_id, shutdown, runtime)
 }
 
 fn run_polling_agent_with_shutdown(
@@ -697,7 +760,7 @@ fn run_polling_agent_with_shutdown(
     once: bool,
     agent_instance_id: &str,
     shutdown: Arc<AtomicBool>,
-    lsp: &LspSupervisor,
+    runtime: &AgentRuntimeState,
 ) -> Result<(), String> {
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
@@ -706,11 +769,13 @@ fn run_polling_agent_with_shutdown(
     let jobs = JobManager::new(max_concurrent_jobs(&cfg));
     let mut project_cache = AgentProjectCache::default();
     if shutdown.load(Ordering::SeqCst) {
+        runtime.config.begin_shutdown();
         return Ok(());
     }
     let projects_count = register(
         &client,
         &cfg,
+        &runtime.config,
         &mut project_cache,
         agent_instance_id,
         jobs.prepared_profiles.len(),
@@ -721,16 +786,18 @@ fn run_polling_agent_with_shutdown(
     );
     loop {
         if shutdown.load(Ordering::SeqCst) {
+            runtime.config.begin_shutdown();
             finish_polling_shutdown(&jobs, cfg.poll_interval_ms);
             return Ok(());
         }
         match handle_one_poll(
             &client,
             &cfg,
+            &runtime.config,
             &jobs,
             &mut project_cache,
             agent_instance_id,
-            lsp,
+            &runtime.lsp,
         ) {
             Ok(ran_request) => {
                 if once {
@@ -739,6 +806,7 @@ fn run_polling_agent_with_shutdown(
                             Duration::from_millis(cfg.poll_interval_ms),
                             shutdown.as_ref(),
                         ) {
+                            runtime.config.begin_shutdown();
                             finish_polling_shutdown(&jobs, cfg.poll_interval_ms);
                             return Ok(());
                         }
@@ -750,6 +818,7 @@ fn run_polling_agent_with_shutdown(
                         Duration::from_millis(cfg.poll_interval_ms),
                         shutdown.as_ref(),
                     ) {
+                        runtime.config.begin_shutdown();
                         finish_polling_shutdown(&jobs, cfg.poll_interval_ms);
                         return Ok(());
                     }
@@ -766,12 +835,14 @@ fn run_polling_agent_with_shutdown(
                     Duration::from_millis(cfg.poll_interval_ms),
                     shutdown.as_ref(),
                 ) {
+                    runtime.config.begin_shutdown();
                     finish_polling_shutdown(&jobs, cfg.poll_interval_ms);
                     return Ok(());
                 }
                 let _ = register(
                     &client,
                     &cfg,
+                    &runtime.config,
                     &mut project_cache,
                     agent_instance_id,
                     jobs.prepared_profiles.len(),
@@ -808,10 +879,10 @@ fn run_quic_agent(
     cfg: AgentConfig,
     once: bool,
     agent_instance_id: &str,
-    lsp: &LspSupervisor,
+    runtime: &AgentRuntimeState,
 ) -> Result<(), String> {
     let agent_instance_id = agent_instance_id.to_string();
-    let lsp = lsp.clone();
+    let runtime = runtime.clone();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -822,7 +893,7 @@ fn run_quic_agent(
         loop {
             let projects = project_cache.get(&cfg);
             let session_started = Instant::now();
-            match quic_session(&cfg, projects, &agent_instance_id, once, &lsp).await {
+            match quic_session(&cfg, projects, &agent_instance_id, once, &runtime).await {
                 Ok(AgentSessionExit::Shutdown) => {
                     project_cache.invalidate();
                     eprintln!("webcodex-agent quic shutdown complete");
@@ -869,9 +940,9 @@ fn run_quic_agent_single_session(
     cfg: &AgentConfig,
     once: bool,
     agent_instance_id: &str,
-    lsp: &LspSupervisor,
+    runtime: &AgentRuntimeState,
 ) -> Result<AgentSessionExit, String> {
-    let lsp = lsp.clone();
+    let runtime = runtime.clone();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -879,7 +950,7 @@ fn run_quic_agent_single_session(
     let result = rt.block_on(async move {
         let mut project_cache = AgentProjectCache::default();
         let projects = project_cache.get(cfg);
-        quic_session(cfg, projects, agent_instance_id, once, &lsp).await
+        quic_session(cfg, projects, agent_instance_id, once, &runtime).await
     });
     rt.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
     result
@@ -892,21 +963,7 @@ pub(crate) fn resolve_quic_config(cfg: &AgentConfig) -> Result<QuicClientConfig,
         .quic
         .clone()
         .ok_or_else(|| "transport=quic requires a [quic] section in agent.toml".to_string())?;
-    if quic.server_addr.trim().is_empty() {
-        return Err("[quic] server_addr is required for transport=quic".to_string());
-    }
-    if quic.server_name.trim().is_empty() {
-        return Err("[quic] server_name is required for transport=quic".to_string());
-    }
-    if quic.alpn.trim().is_empty() {
-        return Err("[quic] alpn cannot be empty".to_string());
-    }
-    if quic.connect_timeout_secs == 0 {
-        return Err("[quic] connect_timeout_secs must be > 0".to_string());
-    }
-    if quic.keepalive_interval_secs == 0 {
-        return Err("[quic] keepalive_interval_secs must be > 0".to_string());
-    }
+    validate_quic_config(&quic)?;
     Ok(quic)
 }
 
@@ -1001,7 +1058,7 @@ async fn quic_session(
     projects: Vec<ShellAgentProjectSummary>,
     agent_instance_id: &str,
     once: bool,
-    lsp: &LspSupervisor,
+    runtime: &AgentRuntimeState,
 ) -> Result<AgentSessionExit, String> {
     let quic = resolve_quic_config(cfg)?;
     let client_crypto = build_quic_client_crypto(&quic)?;
@@ -1075,13 +1132,15 @@ async fn quic_session(
     // Register. The token is carried in `auth_token`; the server authenticates
     // it exactly like the websocket/polling paths. It is never logged.
     let projects_count = enabled_projects_count(&projects);
-    let (register_payload, provider_revision) = build_register_request_with_provider_status(
-        cfg,
-        projects,
-        AGENT_PROTOCOL_VERSION_QUIC_V1,
-        agent_instance_id,
-        0,
-    );
+    let (register_payload, provider, provider_revision) =
+        build_register_request_with_provider_status(
+            cfg,
+            &runtime.config,
+            projects,
+            AGENT_PROTOCOL_VERSION_QUIC_V1,
+            agent_instance_id,
+            0,
+        );
     let reg_env = AgentEnvelope::Register {
         payload: register_payload,
         auth_token: non_empty_token(&cfg.token),
@@ -1097,7 +1156,7 @@ async fn quic_session(
         .map_err(|e| format!("failed to read quic register ack: {}", e))?;
     match ack {
         AgentEnvelope::Registered { success: true, .. } => {
-            super::external_tools::external_tools().mark_status_reported(provider_revision);
+            provider.mark_status_reported(provider_revision);
         }
         AgentEnvelope::Registered { error, .. } => {
             return Err(format!(
@@ -1175,6 +1234,7 @@ async fn quic_session(
         tokio::select! {
             _ = &mut shutdown => {
                 eprintln!("webcodex-agent received process shutdown signal; exiting");
+                runtime.config.begin_shutdown();
                 shutdown_requested = true;
                 break;
             }
@@ -1196,16 +1256,16 @@ async fn quic_session(
                 match env {
                     AgentEnvelope::Request { request } => {
                         let sink_handle = sink_handle.clone();
-                        let policy = cfg.policy.clone();
-                        let shell = cfg.shell.clone();
+                        let config = Arc::clone(&runtime.config);
+                        let hot = config.snapshot();
                         let jobs = jobs.clone();
                         let projects_dir = projects_dir(cfg);
-                        let lsp = lsp.clone();
+                        let lsp = runtime.lsp.clone();
                         tokio::task::spawn_blocking(move || {
                             let _ = dispatch_request(
                                 &sink_handle,
-                                &policy,
-                                &shell,
+                                &hot,
+                                &config,
                                 &jobs,
                                 &projects_dir,
                                 &lsp,
@@ -1239,13 +1299,7 @@ async fn quic_session(
                     transport = "quic",
                     "webcodex-agent quic keepalive ping"
                 );
-                if let Some((metadata, revision)) = claim_provider_metadata() {
-                    if out_tx.try_send(metadata).is_err() {
-                        super::external_tools::external_tools().release_status_update(revision);
-                    } else {
-                        super::external_tools::external_tools().mark_status_reported(revision);
-                    }
-                }
+                send_provider_metadata(&out_tx, &runtime.config, None);
                 let _ = out_tx.send(AgentEnvelope::Ping {
                     ts: chrono::Utc::now().timestamp(),
                 }).await;
@@ -1350,10 +1404,10 @@ fn run_websocket_agent(
     cfg: AgentConfig,
     once: bool,
     agent_instance_id: &str,
-    lsp: &LspSupervisor,
+    runtime: &AgentRuntimeState,
 ) -> Result<(), String> {
     let agent_instance_id = agent_instance_id.to_string();
-    let lsp = lsp.clone();
+    let runtime = runtime.clone();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1364,7 +1418,7 @@ fn run_websocket_agent(
         loop {
             let projects = project_cache.get(&cfg);
             let session_started = Instant::now();
-            match websocket_session(&cfg, projects, &agent_instance_id, &lsp).await {
+            match websocket_session(&cfg, projects, &agent_instance_id, &runtime).await {
                 Ok(AgentSessionExit::Shutdown) => {
                     project_cache.invalidate();
                     eprintln!("webcodex-agent websocket shutdown complete");
@@ -1410,9 +1464,9 @@ fn run_websocket_agent(
 fn run_websocket_agent_single_session(
     cfg: &AgentConfig,
     agent_instance_id: &str,
-    lsp: &LspSupervisor,
+    runtime: &AgentRuntimeState,
 ) -> Result<AgentSessionExit, String> {
-    let lsp = lsp.clone();
+    let runtime = runtime.clone();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1420,7 +1474,7 @@ fn run_websocket_agent_single_session(
     let result = rt.block_on(async move {
         let mut project_cache = AgentProjectCache::default();
         let projects = project_cache.get(cfg);
-        websocket_session(cfg, projects, agent_instance_id, &lsp).await
+        websocket_session(cfg, projects, agent_instance_id, &runtime).await
     });
     rt.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
     result
@@ -1432,16 +1486,17 @@ pub(crate) async fn websocket_session(
     cfg: &AgentConfig,
     projects: Vec<ShellAgentProjectSummary>,
     agent_instance_id: &str,
-    lsp: &LspSupervisor,
+    runtime: &AgentRuntimeState,
 ) -> Result<AgentSessionExit, String> {
-    websocket_session_with_shutdown(cfg, projects, agent_instance_id, lsp, shutdown_signal()).await
+    websocket_session_with_shutdown(cfg, projects, agent_instance_id, runtime, shutdown_signal())
+        .await
 }
 
 async fn websocket_session_with_shutdown<F>(
     cfg: &AgentConfig,
     projects: Vec<ShellAgentProjectSummary>,
     agent_instance_id: &str,
-    lsp: &LspSupervisor,
+    runtime: &AgentRuntimeState,
     shutdown: F,
 ) -> Result<AgentSessionExit, String>
 where
@@ -1469,13 +1524,15 @@ where
     // registration time (snapshots are prepared lazily on first use), so
     // `prepared_cache_count` is reported as 0 here.
     let projects_count = enabled_projects_count(&projects);
-    let (register_payload, provider_revision) = build_register_request_with_provider_status(
-        cfg,
-        projects,
-        AGENT_PROTOCOL_VERSION_WEBSOCKET_V1,
-        agent_instance_id,
-        0,
-    );
+    let (register_payload, provider, provider_revision) =
+        build_register_request_with_provider_status(
+            cfg,
+            &runtime.config,
+            projects,
+            AGENT_PROTOCOL_VERSION_WEBSOCKET_V1,
+            agent_instance_id,
+            0,
+        );
     let reg_env = AgentEnvelope::Register {
         payload: register_payload,
         auth_token: None,
@@ -1500,7 +1557,7 @@ where
         .map_err(|e| format!("register ack is not a valid envelope: {}", e))?;
     match ack {
         AgentEnvelope::Registered { success: true, .. } => {
-            super::external_tools::external_tools().mark_status_reported(provider_revision);
+            provider.mark_status_reported(provider_revision);
         }
         AgentEnvelope::Registered { error, .. } => {
             return Err(format!(
@@ -1559,6 +1616,7 @@ where
     loop {
         tokio::select! {
             _ = &mut shutdown => {
+                runtime.config.begin_shutdown();
                 quit_after_session = true;
                 eprintln!("webcodex-agent received process shutdown signal; exiting");
                 break;
@@ -1612,19 +1670,19 @@ where
                 match env {
                     AgentEnvelope::Request { request } => {
                         let sink_handle = sink_handle.clone();
-                        let policy = cfg.policy.clone();
-                        let shell = cfg.shell.clone();
+                        let config = Arc::clone(&runtime.config);
+                        let hot = config.snapshot();
                         let jobs = jobs.clone();
                         let projects_dir = projects_dir(&cfg);
-                        let lsp = lsp.clone();
+                        let lsp = runtime.lsp.clone();
                         // Execution is blocking (shell/file/jobs/lsp); run it off
                         // the async runtime thread. dispatch_request sends
                         // results/updates via the shared AgentSink.
                         tokio::task::spawn_blocking(move || {
                             let _ = dispatch_request(
                                 &sink_handle,
-                                &policy,
-                                &shell,
+                                &hot,
+                                &config,
                                 &jobs,
                                 &projects_dir,
                                 &lsp,
@@ -1659,13 +1717,7 @@ where
                     transport = "websocket",
                     "webcodex-agent websocket keepalive ping"
                 );
-                if let Some((metadata, revision)) = claim_provider_metadata() {
-                    if out_tx.try_send(metadata).is_err() {
-                        super::external_tools::external_tools().release_status_update(revision);
-                    } else {
-                        super::external_tools::external_tools().mark_status_reported(revision);
-                    }
-                }
+                send_provider_metadata(&out_tx, &runtime.config, None);
                 let _ = out_tx.send(AgentEnvelope::Ping {
                     ts: chrono::Utc::now().timestamp(),
                 }).await;
@@ -1763,6 +1815,10 @@ mod tests {
         cfg.transport = Some(TRANSPORT_POLLING.to_string());
         cfg.projects_dir = Some(projects_dir);
         cfg
+    }
+
+    fn test_runtime(cfg: &AgentConfig) -> AgentRuntimeState {
+        AgentRuntimeState::new(cfg, PathBuf::new())
     }
 
     fn test_project(id: &str) -> ShellAgentProjectSummary {
@@ -1927,19 +1983,15 @@ mod tests {
             start_polling_http_server(poll_status, poll_content_type, poll_body);
         let tmp = tempfile::tempdir().unwrap();
         let cfg = polling_agent_config(server_url, tmp.path().join("projects.d"));
+        let runtime = test_runtime(&cfg);
         let shutdown = Arc::new(AtomicBool::new(false));
         let failsafe = Arc::clone(&shutdown);
         thread::spawn(move || {
             thread::sleep(Duration::from_secs(2));
             failsafe.store(true, Ordering::SeqCst);
         });
-        let result = run_polling_agent_with_shutdown(
-            cfg,
-            once,
-            "inst-poll-test",
-            shutdown,
-            &LspSupervisor::default(),
-        );
+        let result =
+            run_polling_agent_with_shutdown(cfg, once, "inst-poll-test", shutdown, &runtime);
         server.join().unwrap();
         (result, poll_count.load(Ordering::SeqCst))
     }
@@ -2100,7 +2152,8 @@ mod tests {
         cfg.projects_dir = Some(tmp.path().join("projects.d"));
         cfg.websocket_connect_timeout_secs = 1;
 
-        let err = run_auto_agent(cfg, false, "inst-auto-fallback", &LspSupervisor::default())
+        let runtime = test_runtime(&cfg);
+        let err = run_auto_agent(cfg, false, "inst-auto-fallback", &runtime)
             .expect_err("polling 502 should be returned after fallback");
         server.join().unwrap();
         assert_eq!(poll_count.load(Ordering::SeqCst), 1);
@@ -2242,7 +2295,7 @@ mod tests {
                 &cfg,
                 vec![test_project("close-test")],
                 "inst-close",
-                &LspSupervisor::default(),
+                &test_runtime(&cfg),
             ),
         )
         .await
@@ -2301,7 +2354,7 @@ mod tests {
                 &cfg,
                 vec![test_project("active-job-test")],
                 "inst-active-job",
-                &LspSupervisor::default(),
+                &test_runtime(&cfg),
             ),
         )
         .await
@@ -2332,7 +2385,7 @@ mod tests {
             &cfg,
             vec![test_project("reject-test")],
             "inst-reject",
-            &LspSupervisor::default(),
+            &test_runtime(&cfg),
         )
         .await
         .expect_err("register rejection must error");
@@ -2356,9 +2409,10 @@ mod tests {
         });
 
         let cfg = test_agent_config(format!("http://{}", addr));
+        let runtime = test_runtime(&cfg);
         let started = Instant::now();
         let runner = tokio::task::spawn_blocking(move || {
-            run_websocket_agent(cfg, false, "inst-retry", &LspSupervisor::default())
+            run_websocket_agent(cfg, false, "inst-retry", &runtime)
         });
         let error = tokio::time::timeout(Duration::from_secs(5), runner)
             .await
@@ -2387,8 +2441,9 @@ mod tests {
 
         let mut cfg = test_agent_config(format!("http://{}", addr));
         cfg.transport = Some(TRANSPORT_AUTO.to_string());
+        let runtime = test_runtime(&cfg);
         let runner = tokio::task::spawn_blocking(move || {
-            run_auto_agent(cfg, false, "inst-auto-reject", &LspSupervisor::default())
+            run_auto_agent(cfg, false, "inst-auto-reject", &runtime)
         });
         let error = tokio::time::timeout(Duration::from_secs(5), runner)
             .await
@@ -2421,7 +2476,7 @@ mod tests {
         for instance in ["inst-reconnect", "inst-reconnect"] {
             let exit = tokio::time::timeout(
                 Duration::from_secs(5),
-                websocket_session(&cfg, projects.clone(), instance, &LspSupervisor::default()),
+                websocket_session(&cfg, projects.clone(), instance, &test_runtime(&cfg)),
             )
             .await
             .expect("session completed")
@@ -2478,13 +2533,14 @@ mod tests {
         });
 
         let cfg = test_agent_config(format!("http://{}", addr));
+        let runtime = test_runtime(&cfg);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let session = tokio::spawn(async move {
             websocket_session_with_shutdown(
                 &cfg,
                 vec![test_project("shutdown-test")],
                 "inst-shutdown",
-                &LspSupervisor::default(),
+                &runtime,
                 async {
                     let _ = shutdown_rx.await;
                 },

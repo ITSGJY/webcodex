@@ -90,6 +90,7 @@ fn agent_install_service_generates_expected_unit_without_tokens() {
         "ExecStart=/opt/webcodex/bin/webcodex-agent --config {}\n",
         config.display()
     )));
+    assert!(unit.contains("ExecReload=/bin/kill -HUP $MAINPID\n"));
     assert!(unit.contains("Restart=always\n"));
     assert!(unit.contains("RestartSec=5s\n"));
     assert!(unit.contains("StandardOutput=journal\n"));

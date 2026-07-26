@@ -344,7 +344,7 @@ max_output_bytes = 262144
 
 Agent project files in `projects_dir` may set `shell_profile = "rust"` to bind a project to a configured profile.
 
-Shell profiles prepare a one-time environment snapshot per project/profile (no persistent shell, no `.bashrc`/`.profile` sourced by default). See [SHELL_PROFILES.md](SHELL_PROFILES.md) for Rust/Cargo, Python venv, and Conda examples, resolution rules, and safety boundaries. Changing a profile requires restarting `webcodex-agent` (no reload API).
+Shell profiles prepare a one-time environment snapshot per project/profile (no persistent shell, no `.bashrc`/`.profile` sourced by default). See [SHELL_PROFILES.md](SHELL_PROFILES.md) for Rust/Cargo, Python venv, Conda examples, resolution rules, and safety boundaries. After editing `agent.toml`, `sudo systemctl reload webcodex-agent` atomically applies policy, shell, and tool-provider settings to new requests. Identity, server/auth, project source, concurrency, capabilities, and transport changes still require a restart. Invalid reloads keep the active generation; `projects.d` continues to refresh independently. Provider lifecycle and the exact field boundary are documented in [agent/claude-code-mcp-provider.md](agent/claude-code-mcp-provider.md#explicit-agent-config-reload).
 
 `runtime_status` and `listAgents` expose a redacted policy summary plus a sanitized `shell_profiles` summary (profile names, `has_init_script`, `env_keys_count`, `program`, `args_count`). `listProjects` exposes `shell_profile`, `resolved_shell_profile`, and `shell_profile_status` (`configured` / `missing` / `not_configured` / `unknown`). They do not expose tokens, env values, `Authorization` headers, full `agent.toml`, the full env snapshot, or shell profile `init_script` bodies.
 

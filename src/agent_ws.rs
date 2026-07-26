@@ -519,6 +519,7 @@ mod tests {
                     error_code: None,
                 }),
             },
+            config_reload: Default::default(),
         }
     }
 

@@ -74,8 +74,8 @@ use webcodex_agent::{
     load_agent_project_summaries_from_dir, max_concurrent_jobs, non_empty_token,
     parse_agent_project_toml, quic_client_bind_addr_for, resolve_quic_config,
     resolve_quic_server_addrs, run_shell, run_shell_with_profiles, server_url_to_ws,
-    sha256_hex_bytes, validate_project_path_policy, websocket_session, ShellProfileConfig,
-    CLIENT_PROFILE_ERROR, DEFAULT_MAX_CONCURRENT_JOBS, WS_OUTGOING_CAPACITY,
+    sha256_hex_bytes, validate_project_path_policy, websocket_session, AgentRuntimeState,
+    ShellProfileConfig, CLIENT_PROFILE_ERROR, DEFAULT_MAX_CONCURRENT_JOBS, WS_OUTGOING_CAPACITY,
 };
 use webcodex_agent::{
     client_profile_agent_config, configured_prepared_shell_job_command,
@@ -87,8 +87,9 @@ use webcodex_agent::{
     is_basic_file_request_kind, is_checkpoint_request_kind, is_line_edit_request_kind,
     is_project_op, load_config, ok_cmd, projects_dir, resolve_prepared_shell_profile,
     resolve_requested_path, run_agent, validate_client_profile, validate_line_edit_agent_path,
-    AgentConfig, AgentPolicy, AgentProjectCache, AgentSink, CommandResult, HttpSendConfig,
-    PreparedShellProfile, PreparedShellProfileCache, ShellConfig,
+    AgentConfig, AgentPolicy, AgentProjectCache, AgentSink, CommandResult, HotAgentConfig,
+    HttpSendConfig, PreparedShellProfile, PreparedShellProfileCache, ReloadableAgentConfig,
+    ShellConfig,
 };
 
 const JOB_UPDATE_INTERVAL_MS: u64 = 250;
@@ -103,6 +104,7 @@ struct JobManager {
         Mutex<
             VecDeque<(
                 AgentSink,
+                u64,
                 AgentPolicy,
                 ShellConfig,
                 PathBuf,
@@ -641,8 +643,10 @@ fn build_register_request(
     agent_instance_id: &str,
     prepared_cache_count: usize,
 ) -> ShellClientRegisterRequest {
+    let runtime = ReloadableAgentConfig::new(cfg.clone(), PathBuf::new());
     build_register_request_with_provider_status(
         cfg,
+        &runtime,
         projects,
         protocol_version,
         agent_instance_id,
@@ -653,14 +657,20 @@ fn build_register_request(
 
 fn build_register_request_with_provider_status(
     cfg: &AgentConfig,
+    runtime: &ReloadableAgentConfig,
     projects: Vec<ShellAgentProjectSummary>,
     protocol_version: &str,
     agent_instance_id: &str,
     prepared_cache_count: usize,
-) -> (ShellClientRegisterRequest, u64) {
+) -> (
+    ShellClientRegisterRequest,
+    Arc<webcodex_agent::external_tools::ExternalToolRouter>,
+    u64,
+) {
+    let hot = runtime.snapshot();
     let capabilities = agent_register_capabilities(cfg);
-    let (tool_providers, revision) =
-        webcodex_agent::external_tools::external_tools().registration_status();
+    let (mut tool_providers, revision) = hot.external_tools.registration_status();
+    tool_providers.config_reload = hot.reload_status();
     (
         ShellClientRegisterRequest {
             client_id: cfg.client_id.clone(),
@@ -672,16 +682,17 @@ fn build_register_request_with_provider_status(
             projects: Some(projects),
             agent_protocol_version: Some(protocol_version.to_string()),
             policy: Some(register_policy_summary(
-                cfg,
+                &hot,
                 prepared_cache_count,
                 tool_providers,
             )),
         },
+        Arc::clone(&hot.external_tools),
         revision,
     )
 }
 
-/// Build the sanitized shell-profiles summary from the static shell config.
+/// Build the sanitized shell-profiles summary from the active shell config.
 /// Exposes only safe metadata: profile names, whether each has an init_script
 /// (boolean, never the body), env key counts (never values), the resolved
 /// program, and arg counts. `prepared_cache_count` is the number of snapshots
@@ -723,7 +734,7 @@ fn build_shell_profiles_summary(
 /// shell-profiles summary is attached so observability can show which profile
 /// a project resolves to without exposing env values or init_script bodies.
 fn register_policy_summary(
-    cfg: &AgentConfig,
+    cfg: &HotAgentConfig,
     prepared_cache_count: usize,
     tool_providers: shell_protocol::ToolProvidersStatus,
 ) -> AgentPolicySummary {
@@ -744,14 +755,16 @@ fn register_policy_summary(
 fn register(
     client: &Client,
     cfg: &AgentConfig,
+    runtime: &ReloadableAgentConfig,
     project_cache: &mut AgentProjectCache,
     agent_instance_id: &str,
     prepared_cache_count: usize,
 ) -> Result<usize, String> {
     let projects = project_cache.get(cfg);
     let projects_count = projects.iter().filter(|project| !project.disabled).count();
-    let (body, provider_revision) = build_register_request_with_provider_status(
+    let (body, provider, provider_revision) = build_register_request_with_provider_status(
         cfg,
+        runtime,
         projects,
         AGENT_PROTOCOL_VERSION_POLLING_V1,
         agent_instance_id,
@@ -760,7 +773,7 @@ fn register(
     let response: ShellClientRegisterResponse =
         post_json(client, cfg, AGENT_REGISTER_PATH, &body).map_err(|e| e.to_string())?;
     if response.success {
-        webcodex_agent::external_tools::external_tools().mark_status_reported(provider_revision);
+        provider.mark_status_reported(provider_revision);
         Ok(projects_count)
     } else {
         Err(response
@@ -1093,6 +1106,7 @@ impl JobManager {
     fn enqueue(
         &self,
         sink: AgentSink,
+        generation: u64,
         policy: AgentPolicy,
         shell: ShellConfig,
         projects_dir: PathBuf,
@@ -1120,24 +1134,29 @@ impl JobManager {
                 validation_progress: None,
                 finished: false,
             });
-            self.queued
-                .lock()
-                .unwrap()
-                .push_back((sink, policy, shell, projects_dir, request));
+            self.queued.lock().unwrap().push_back((
+                sink,
+                generation,
+                policy,
+                shell,
+                projects_dir,
+                request,
+            ));
             return;
         }
-        self.start_now(sink, policy, shell, projects_dir, request);
+        self.start_now(sink, generation, policy, shell, projects_dir, request);
     }
 
     fn start_now(
         &self,
         sink: AgentSink,
+        generation: u64,
         policy: AgentPolicy,
         shell: ShellConfig,
         projects_dir: PathBuf,
         request: ShellAgentShellRequest,
     ) {
-        self.start_shell_job(sink, policy, shell, projects_dir, request);
+        self.start_shell_job(sink, generation, policy, shell, projects_dir, request);
     }
 
     fn start_available_queued(&self) {
@@ -1146,7 +1165,8 @@ impl JobManager {
                 let jobs = self.jobs.lock().unwrap();
                 let mut queued = self.queued.lock().unwrap();
                 let mut selected = None;
-                for (idx, (_, _policy, _shell, _projects_dir, request)) in queued.iter().enumerate()
+                for (idx, (_, _, _policy, _shell, _projects_dir, request)) in
+                    queued.iter().enumerate()
                 {
                     let active = jobs
                         .values()
@@ -1159,16 +1179,17 @@ impl JobManager {
                 }
                 selected.and_then(|idx| queued.remove(idx))
             };
-            let Some((sink, policy, shell, projects_dir, request)) = next else {
+            let Some((sink, generation, policy, shell, projects_dir, request)) = next else {
                 return;
             };
-            self.start_now(sink, policy, shell, projects_dir, request);
+            self.start_now(sink, generation, policy, shell, projects_dir, request);
         }
     }
 
     fn start_shell_job(
         &self,
         sink: AgentSink,
+        generation: u64,
         policy: AgentPolicy,
         shell: ShellConfig,
         projects_dir: PathBuf,
@@ -1221,6 +1242,7 @@ impl JobManager {
             Vec::new()
         };
         let prepared_profile = match resolve_prepared_shell_profile(
+            generation,
             &shell,
             &projects_dir,
             &cwd_path,
@@ -1550,14 +1572,14 @@ impl JobManager {
             let mut queued = self.queued.lock().unwrap();
             if let Some(pos) = queued
                 .iter()
-                .position(|(_, _, _, _, request)| request.job_id.as_deref() == Some(job_id))
+                .position(|(_, _, _, _, _, request)| request.job_id.as_deref() == Some(job_id))
             {
                 queued.remove(pos)
             } else {
                 None
             }
         };
-        if let Some((sink, _policy, _shell, _projects_dir, request)) = queued_job {
+        if let Some((sink, _generation, _policy, _shell, _projects_dir, request)) = queued_job {
             let request_id = request.request_id.clone();
             let job_id = request.job_id.clone().unwrap_or_default();
             let _ = sink.send_job_update(&ShellAgentJobUpdateRequest {
@@ -1596,37 +1618,52 @@ impl JobManager {
 fn handle_one_poll(
     client: &Client,
     cfg: &AgentConfig,
+    runtime: &ReloadableAgentConfig,
     jobs: &JobManager,
     project_cache: &mut AgentProjectCache,
     agent_instance_id: &str,
     lsp: &webcodex_agent::LspSupervisor,
 ) -> Result<bool, PollError> {
-    let provider_update = webcodex_agent::external_tools::external_tools().claim_status_update();
+    let metadata_config = runtime.snapshot();
+    let provider_update =
+        metadata_config
+            .external_tools
+            .claim_status_update()
+            .map(|(mut status, revision)| {
+                status.config_reload = metadata_config.reload_status();
+                (
+                    status,
+                    Arc::clone(&metadata_config.external_tools),
+                    revision,
+                )
+            });
     let poll = ShellAgentPollPayload {
         request: ShellAgentPollRequest {
             client_id: cfg.client_id.clone(),
             agent_instance_id: agent_instance_id.to_string(),
             projects: Some(project_cache.get(cfg)),
         },
-        tool_providers: provider_update.as_ref().map(|(status, _)| status.clone()),
+        tool_providers: provider_update
+            .as_ref()
+            .map(|(status, _, _)| status.clone()),
     };
     let response: ShellAgentPollResponse = match post_json(client, cfg, AGENT_POLL_PATH, &poll) {
         Ok(response) => response,
         Err(error) => {
-            if let Some((_, revision)) = provider_update {
-                webcodex_agent::external_tools::external_tools().release_status_update(revision);
+            if let Some((_, provider, revision)) = provider_update {
+                provider.release_status_update(revision);
             }
             return Err(PollError::from_http(error));
         }
     };
     if !response.success {
-        if let Some((_, revision)) = provider_update {
-            webcodex_agent::external_tools::external_tools().release_status_update(revision);
+        if let Some((_, provider, revision)) = provider_update {
+            provider.release_status_update(revision);
         }
         return Err(PollError::from_response_error(response.error));
     }
-    if let Some((_, revision)) = provider_update {
-        webcodex_agent::external_tools::external_tools().mark_status_reported(revision);
+    if let Some((_, provider, revision)) = provider_update {
+        provider.mark_status_reported(revision);
     }
     let Some(request) = response.request else {
         return Ok(false);
@@ -1639,10 +1676,11 @@ fn handle_one_poll(
         client_id: cfg.client_id.clone(),
         agent_instance_id: agent_instance_id.to_string(),
     });
+    let hot = runtime.snapshot();
     let result = dispatch_request(
         &sink,
-        &cfg.policy,
-        &cfg.shell,
+        &hot,
+        runtime,
         jobs,
         &projects_dir(&cfg),
         lsp,
@@ -1697,7 +1735,7 @@ fn main() {
             "webcodex-agent warning: agent token is empty; connecting without Authorization; the server must be started with --open"
         );
     }
-    if let Err(e) = run_agent(cfg, once) {
+    if let Err(e) = run_agent(cfg, config_path, once) {
         eprintln!("webcodex-agent failed: {}", e);
         std::process::exit(1);
     }
@@ -1727,6 +1765,216 @@ mod tests {
             quic: None,
             tool_providers: Default::default(),
         }
+    }
+
+    fn runtime_config(cfg: &AgentConfig) -> Arc<ReloadableAgentConfig> {
+        Arc::new(ReloadableAgentConfig::new(cfg.clone(), PathBuf::new()))
+    }
+
+    fn reload_toml(
+        client_id: &str,
+        max_jobs: Option<usize>,
+        max_timeout: u64,
+        max_output: usize,
+        shell_program: &str,
+        strategy: &str,
+        claude_enabled: bool,
+        claude_command: &str,
+    ) -> String {
+        let max_jobs = max_jobs
+            .map(|value| format!("max_concurrent_jobs = {value}\n"))
+            .unwrap_or_default();
+        format!(
+            r#"server_url = "http://127.0.0.1:8000"
+token = "test-token"
+client_id = "{client_id}"
+owner = "alice"
+poll_interval_ms = 1000
+{max_jobs}
+policy.allow_raw_shell = true
+policy.allow_cwd_anywhere = true
+policy.allowed_roots = ["/"]
+policy.max_timeout_secs = {max_timeout}
+policy.max_output_bytes = {max_output}
+shell.program = "{shell_program}"
+shell.args = ["-c"]
+tool_providers.strategy = "{strategy}"
+tool_providers.claude_code.enabled = {claude_enabled}
+tool_providers.claude_code.command = "{claude_command}"
+tool_providers.claude_code.args = ["mcp", "serve"]
+tool_providers.claude_code.timeout_secs = 30
+"#
+        )
+    }
+
+    fn reload_fixture() -> (tempfile::TempDir, PathBuf, ReloadableAgentConfig) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("agent.toml");
+        std::fs::write(
+            &path,
+            reload_toml("oe", None, 60, 1024, "sh", "native", false, "claude"),
+        )
+        .unwrap();
+        let runtime = ReloadableAgentConfig::new(load_config(&path).unwrap(), path.clone());
+        (tmp, path, runtime)
+    }
+
+    #[test]
+    fn reload_field_classification_is_exhaustive_and_allowlisted() {
+        let startup = test_config(PathBuf::from("projects-a"));
+        let mut hot_only = startup.clone();
+        hot_only.policy.max_timeout_secs += 1;
+        hot_only.shell.program = "bash".to_string();
+        hot_only.tool_providers.strategy =
+            webcodex_agent::config::ToolProviderStrategy::ClaudeCodeThenNative;
+        assert!(webcodex_agent::config::restart_required_fields(&startup, &hot_only).is_empty());
+
+        let mut changed = hot_only;
+        changed.server_url.push_str("/other");
+        changed.token.push('2');
+        changed.client_id.push('2');
+        changed.display_name = Some("changed".to_string());
+        changed.owner = Some("changed".to_string());
+        changed.hostname = Some("changed".to_string());
+        changed.projects_dir = Some(PathBuf::from("projects-b"));
+        changed.poll_interval_ms += 1;
+        changed.capabilities = Some(ShellClientCapabilities::default());
+        changed.max_concurrent_jobs = Some(4);
+        changed.transport = Some(TRANSPORT_QUIC.to_string());
+        changed.websocket_connect_timeout_secs += 1;
+        changed.quic = Some(quic_client_config());
+        assert_eq!(
+            webcodex_agent::config::restart_required_fields(&startup, &changed).join(" "),
+            "capabilities client_id display_name hostname max_concurrent_jobs owner poll_interval_ms projects_dir quic server_url token transport websocket_connect_timeout_secs"
+        );
+    }
+
+    #[test]
+    fn valid_reload_switches_one_complete_generation_and_preserves_old_snapshot() {
+        let (_tmp, path, runtime) = reload_fixture();
+        let old = runtime.snapshot();
+
+        std::fs::write(
+            &path,
+            reload_toml(
+                "oe",
+                None,
+                120,
+                2048,
+                "bash",
+                "claude_code_then_native",
+                false,
+                "claude",
+            ),
+        )
+        .unwrap();
+        let status = runtime.reload();
+        let new = runtime.snapshot();
+
+        assert_eq!(status.last_reload_result, "success");
+        assert_eq!(status.generation, 2);
+        assert!(!status.restart_required);
+        assert_eq!(
+            (
+                old.generation,
+                old.policy.max_timeout_secs,
+                old.shell.program.as_str()
+            ),
+            (1, 60, "sh")
+        );
+        assert_eq!(old.external_tools.status().strategy, "native");
+        assert_eq!(
+            (
+                new.policy.max_timeout_secs,
+                new.policy.max_output_bytes,
+                new.shell.program.as_str()
+            ),
+            (120, 2048, "bash")
+        );
+        assert_eq!(
+            new.external_tools.status().strategy,
+            "claude_code_then_native"
+        );
+    }
+
+    #[test]
+    fn failed_reload_keeps_generation_and_can_recover() {
+        let (_tmp, path, runtime) = reload_fixture();
+        let old = runtime.snapshot();
+
+        std::fs::remove_file(&path).unwrap();
+        let status = runtime.reload();
+        assert_eq!(status.generation, 1);
+        assert_eq!(
+            status.last_reload_error_code.as_deref(),
+            Some("config_read_failed")
+        );
+
+        for (candidate, code) in [
+            ("{ invalid toml".to_string(), "config_parse_failed"),
+            (
+                reload_toml("oe", None, 60, 1024, "", "native", false, "claude"),
+                "config_validation_failed",
+            ),
+            (
+                reload_toml("oe", None, 60, 1024, "sh", "native", true, ""),
+                "provider_config_invalid",
+            ),
+        ] {
+            std::fs::write(&path, candidate).unwrap();
+            let status = runtime.reload();
+            assert_eq!(status.generation, 1);
+            assert_eq!(status.last_reload_result, "failure");
+            assert_eq!(status.last_reload_error_code.as_deref(), Some(code));
+        }
+        assert_eq!(old.policy.max_timeout_secs, 60);
+        let serialized = serde_json::to_string(&runtime.snapshot().reload_status()).unwrap();
+        assert!(!serialized.contains(path.to_string_lossy().as_ref()));
+        assert!(!serialized.contains("test-token"));
+
+        std::fs::write(
+            &path,
+            reload_toml("oe", None, 90, 1024, "sh", "native", false, "claude"),
+        )
+        .unwrap();
+        assert_eq!(runtime.reload().generation, 2);
+        assert_eq!(runtime.snapshot().policy.max_timeout_secs, 90);
+    }
+
+    #[test]
+    fn mixed_reload_applies_hot_fields_and_reports_static_restart_fields() {
+        let (_tmp, path, runtime) = reload_fixture();
+        std::fs::write(
+            &path,
+            reload_toml(
+                "oe-new",
+                Some(8),
+                180,
+                4096,
+                "bash",
+                "native",
+                false,
+                "claude",
+            ),
+        )
+        .unwrap();
+
+        let status = runtime.reload();
+        let active = runtime.snapshot();
+        assert_eq!(status.last_reload_result, "partial");
+        assert!(status.restart_required);
+        assert_eq!(
+            status.restart_required_fields,
+            ["client_id", "max_concurrent_jobs"]
+        );
+        assert_eq!(
+            (
+                active.policy.max_timeout_secs,
+                active.policy.max_output_bytes,
+                active.shell.program.as_str()
+            ),
+            (180, 4096, "bash")
+        );
     }
 
     fn quic_client_config() -> QuicClientConfig {
@@ -2515,6 +2763,7 @@ shell_profile = "../rust"
     ) -> CommandResult {
         let cwd = cwd.to_string_lossy().to_string();
         run_shell_with_profiles(
+            1,
             policy,
             shell,
             projects_dir,
@@ -5331,10 +5580,13 @@ shell_profile = "../rust"
 
         let (sink, mut rx) = ws_sink("ws-client");
         let lsp = webcodex_agent::LspSupervisor::default();
+        let mut cfg = test_config(projects_dir.clone());
+        cfg.shell = shell.clone();
+        let hot = runtime_config(&cfg);
         dispatch_request(
             &sink,
-            &AgentPolicy::default(),
-            &shell,
+            &hot.snapshot(),
+            &hot,
             &jobs,
             &projects_dir,
             &lsp,
@@ -5345,7 +5597,7 @@ shell_profile = "../rust"
     }
 
     #[test]
-    fn prepared_profile_init_script_runs_once_per_project_profile() {
+    fn prepared_profile_init_script_runs_once_per_project_profile_generation() {
         let tmp = tempfile::tempdir().unwrap();
         let counter = tmp.path().join("prepare-count");
         let init_script = format!(
@@ -5378,7 +5630,55 @@ shell_profile = "../rust"
             assert_eq!(result.exit_code, Some(0), "{result:?}");
             assert_eq!(result.stdout.as_deref(), Some("counted"));
         }
-        assert_eq!(std::fs::read_to_string(counter).unwrap().trim(), "1");
+        assert_eq!(std::fs::read_to_string(&counter).unwrap().trim(), "1");
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let result = run_shell_with_profiles(
+            2,
+            &AgentPolicy::default(),
+            &shell,
+            tmp.path(),
+            &cache,
+            Some(&cwd),
+            "printf %s \"$WEBCODEX_TEST_PROFILE\"",
+            None,
+            10,
+            None,
+        );
+        assert_eq!(result.stdout.as_deref(), Some("counted"));
+        assert_eq!(std::fs::read_to_string(&counter).unwrap().trim(), "2");
+
+        // A late request that still holds generation 1 may prepare its own
+        // snapshot, but it must not evict the already-cached active generation.
+        let stale = run_shell_with_profiles(
+            1,
+            &AgentPolicy::default(),
+            &shell,
+            tmp.path(),
+            &cache,
+            Some(&cwd),
+            "printf %s \"$WEBCODEX_TEST_PROFILE\"",
+            None,
+            10,
+            None,
+        );
+        assert_eq!(stale.stdout.as_deref(), Some("counted"));
+        assert_eq!(std::fs::read_to_string(&counter).unwrap().trim(), "3");
+
+        let current = run_shell_with_profiles(
+            2,
+            &AgentPolicy::default(),
+            &shell,
+            tmp.path(),
+            &cache,
+            Some(&cwd),
+            "printf %s \"$WEBCODEX_TEST_PROFILE\"",
+            None,
+            10,
+            None,
+        );
+        assert_eq!(current.stdout.as_deref(), Some("counted"));
+        assert_eq!(std::fs::read_to_string(counter).unwrap().trim(), "3");
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]
@@ -6011,6 +6311,7 @@ shell_profile = "../rust"
 
         jobs.enqueue(
             sink,
+            1,
             cfg.policy.clone(),
             cfg.shell.clone(),
             projects_dir(&cfg),
@@ -6114,8 +6415,9 @@ shell_profile = "../rust"
         };
         let pdir = projects_dir(&cfg);
         let lsp = webcodex_agent::LspSupervisor::default();
+        let hot = runtime_config(&cfg);
         let ran =
-            dispatch_request(&sink, &cfg.policy, &cfg.shell, &jobs, &pdir, &lsp, request).unwrap();
+            dispatch_request(&sink, &hot.snapshot(), &hot, &jobs, &pdir, &lsp, request).unwrap();
         assert!(ran);
         let env = rx.try_recv().expect("result envelope was sent");
         match env {
@@ -6139,6 +6441,7 @@ shell_profile = "../rust"
         let cfg = test_config(tmp.path().join("config/projects.d"));
         let jobs = JobManager::new(max_concurrent_jobs(&cfg));
         let pdir = projects_dir(&cfg);
+        let hot = runtime_config(&cfg);
 
         type SinkFactory = fn(&str) -> (AgentSink, tokio::sync::mpsc::Receiver<AgentEnvelope>);
         for (label, make_sink, client_id, cmd) in [
@@ -6178,8 +6481,8 @@ shell_profile = "../rust"
             };
             let ran = dispatch_request(
                 &sink,
-                &cfg.policy,
-                &cfg.shell,
+                &hot.snapshot(),
+                &hot,
                 &jobs,
                 &pdir,
                 &webcodex_agent::LspSupervisor::default(),
@@ -6697,7 +7000,16 @@ shell_profile = "../rust"
 
         let client = Client::builder().no_proxy().build().unwrap();
         let mut project_cache = AgentProjectCache::default();
-        register(&client, &cfg, &mut project_cache, "inst-empty-token", 0).unwrap();
+        let runtime = ReloadableAgentConfig::new(cfg.clone(), PathBuf::new());
+        register(
+            &client,
+            &cfg,
+            &runtime,
+            &mut project_cache,
+            "inst-empty-token",
+            0,
+        )
+        .unwrap();
         server.join().unwrap();
     }
 
@@ -6780,15 +7092,11 @@ shell_profile = "../rust"
         let mut cfg = test_config(tmp.path().join("config/projects.d"));
         cfg.server_url = format!("http://{}", addr);
         cfg.transport = Some(TRANSPORT_WEBSOCKET.to_string());
+        let runtime = AgentRuntimeState::new(&cfg, PathBuf::new());
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(10),
-            websocket_session(
-                &cfg,
-                Vec::new(),
-                "inst-1",
-                &webcodex_agent::LspSupervisor::default(),
-            ),
+            websocket_session(&cfg, Vec::new(), "inst-1", &runtime),
         )
         .await
         .expect("websocket_session did not complete in time");

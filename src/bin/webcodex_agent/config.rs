@@ -1,12 +1,15 @@
+use super::external_tools::ExternalToolRouter;
 use crate::agent_init::{
     effective_allowed_roots, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_MAX_TIMEOUT_SECS,
     DEFAULT_POLL_INTERVAL_MS, TRANSPORT_AUTO, TRANSPORT_POLLING, TRANSPORT_QUIC,
     TRANSPORT_WEBSOCKET,
 };
-use crate::shell_protocol::ShellClientCapabilities;
+use crate::shell_protocol::{AgentConfigReloadStatus, ShellClientCapabilities};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/webcodex/agent.toml";
 pub(crate) const CLIENT_PROFILE_ERROR: &str =
@@ -62,7 +65,7 @@ pub(crate) enum ToolProviderStrategy {
     ClaudeCodeThenNative,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
 pub(crate) struct ToolProvidersConfig {
     #[serde(default)]
     pub(crate) strategy: ToolProviderStrategy,
@@ -70,7 +73,7 @@ pub(crate) struct ToolProvidersConfig {
     pub(crate) claude_code: ClaudeCodeMcpConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub(crate) struct ClaudeCodeMcpConfig {
     pub(crate) enabled: bool,
@@ -98,7 +101,7 @@ impl Default for ClaudeCodeMcpConfig {
 /// top-level `token` field and is carried in the `Register` envelope's
 /// `auth_token` field, mirroring the `Authorization: Bearer` header used by
 /// the websocket/polling paths.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub(crate) struct QuicClientConfig {
     /// `host:port` of the server's QUIC listener (e.g. `host:8443`).
     pub(crate) server_addr: String,
@@ -129,7 +132,7 @@ pub(crate) fn default_websocket_connect_timeout_secs() -> u64 {
     DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_SECS
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub(crate) struct AgentPolicy {
     #[serde(default = "default_true")]
     pub(crate) allow_raw_shell: bool,
@@ -199,6 +202,159 @@ pub(crate) struct ShellProfileConfig {
     pub(crate) env: BTreeMap<String, String>,
     #[serde(default)]
     pub(crate) init_script: Option<String>,
+}
+
+pub(crate) struct HotAgentConfig {
+    pub(crate) generation: u64,
+    pub(crate) policy: AgentPolicy,
+    pub(crate) shell: ShellConfig,
+    pub(crate) external_tools: Arc<ExternalToolRouter>,
+    reload_status: Mutex<AgentConfigReloadStatus>,
+}
+
+impl HotAgentConfig {
+    fn new(generation: u64, cfg: &AgentConfig, status: AgentConfigReloadStatus) -> Self {
+        Self {
+            generation,
+            policy: cfg.policy.clone(),
+            shell: cfg.shell.clone(),
+            external_tools: Arc::new(ExternalToolRouter::new(&cfg.tool_providers)),
+            reload_status: Mutex::new(status),
+        }
+    }
+
+    pub(crate) fn reload_status(&self) -> AgentConfigReloadStatus {
+        self.reload_status.lock().unwrap().clone()
+    }
+}
+
+pub(crate) struct ReloadableAgentConfig {
+    startup: AgentConfig,
+    path: PathBuf,
+    current: RwLock<Arc<HotAgentConfig>>,
+    stopping: AtomicBool,
+}
+
+impl ReloadableAgentConfig {
+    pub(crate) fn new(startup: AgentConfig, path: PathBuf) -> Self {
+        let mut status = AgentConfigReloadStatus::default();
+        if !cfg!(unix) {
+            status.last_reload_result = "unsupported".to_string();
+            status.last_reload_error_code = Some("reload_unsupported".to_string());
+        }
+        let current = Arc::new(HotAgentConfig::new(1, &startup, status));
+        Self {
+            startup,
+            path,
+            current: RwLock::new(current),
+            stopping: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> Arc<HotAgentConfig> {
+        Arc::clone(&self.current.read().unwrap())
+    }
+
+    pub(crate) fn with_active(&self, f: impl FnOnce(&HotAgentConfig)) {
+        f(&self.current.read().unwrap());
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn reload(&self) -> AgentConfigReloadStatus {
+        if self.is_stopping() {
+            return self.snapshot().reload_status();
+        }
+        let candidate = match load_config(&self.path) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                let code = reload_error_code(&error);
+                let active = self.snapshot();
+                let status = {
+                    let mut status = active.reload_status.lock().unwrap();
+                    status.last_reload_result = "failure".to_string();
+                    status.last_reload_error_code = Some(code.to_string());
+                    status.clone()
+                };
+                active.external_tools.configuration_status_changed();
+                eprintln!("webcodex-agent config reload failed: {code}");
+                return status;
+            }
+        };
+        let active = self.snapshot();
+        let generation = active.generation.saturating_add(1);
+        let restart_required_fields = restart_required_fields(&self.startup, &candidate);
+        let status = AgentConfigReloadStatus {
+            generation,
+            last_reload_result: if restart_required_fields.is_empty() {
+                "success"
+            } else {
+                "partial"
+            }
+            .to_string(),
+            last_reload_error_code: None,
+            restart_required: !restart_required_fields.is_empty(),
+            restart_required_fields,
+        };
+        let next = Arc::new(HotAgentConfig::new(generation, &candidate, status.clone()));
+        let mut current = self.current.write().unwrap();
+        if self.is_stopping() {
+            return current.reload_status();
+        }
+        *current = next;
+        eprintln!("webcodex-agent config reload {}", status.last_reload_result);
+        status
+    }
+}
+
+fn reload_error_code(error: &str) -> &'static str {
+    if error.starts_with("failed to read config") {
+        "config_read_failed"
+    } else if error.starts_with("failed to parse config") {
+        "config_parse_failed"
+    } else if error.starts_with("tool_providers.") {
+        "provider_config_invalid"
+    } else {
+        "config_validation_failed"
+    }
+}
+
+pub(crate) fn restart_required_fields(
+    startup: &AgentConfig,
+    candidate: &AgentConfig,
+) -> Vec<String> {
+    macro_rules! classify {
+        ($($field:ident),+ $(,)?) => {{
+            let AgentConfig {
+                policy: _, shell: _, tool_providers: _, $($field: _),+
+            } = candidate;
+            [$((stringify!($field), startup.$field != candidate.$field)),+]
+                .into_iter()
+                .filter_map(|(name, changed)| changed.then(|| name.to_string()))
+                .collect()
+        }};
+    }
+    classify!(
+        capabilities,
+        client_id,
+        display_name,
+        hostname,
+        max_concurrent_jobs,
+        owner,
+        poll_interval_ms,
+        projects_dir,
+        quic,
+        server_url,
+        token,
+        transport,
+        websocket_connect_timeout_secs,
+    )
 }
 
 fn default_shell_program() -> String {
@@ -424,6 +580,25 @@ pub(crate) fn validate_shell_config(shell: &ShellConfig) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn validate_quic_config(quic: &QuicClientConfig) -> Result<(), String> {
+    if quic.server_addr.trim().is_empty() {
+        return Err("[quic] server_addr is required for transport=quic".to_string());
+    }
+    if quic.server_name.trim().is_empty() {
+        return Err("[quic] server_name is required for transport=quic".to_string());
+    }
+    if quic.alpn.trim().is_empty() {
+        return Err("[quic] alpn cannot be empty".to_string());
+    }
+    if quic.connect_timeout_secs == 0 {
+        return Err("[quic] connect_timeout_secs must be > 0".to_string());
+    }
+    if quic.keepalive_interval_secs == 0 {
+        return Err("[quic] keepalive_interval_secs must be > 0".to_string());
+    }
+    Ok(())
+}
+
 fn validate_optional_toml_string(
     table: &toml::map::Map<String, toml::Value>,
     field: &str,
@@ -543,6 +718,11 @@ pub(crate) fn load_config(path: &Path) -> Result<AgentConfig, String> {
         effective_allowed_roots(&cfg.policy.allowed_roots, cfg.policy.allow_cwd_anywhere)?;
     cfg.policy.allowed_roots = effective;
     validate_shell_config(&cfg.shell)?;
+    if let Some(quic) = &cfg.quic {
+        validate_quic_config(quic)?;
+    } else if cfg.transport.as_deref().map(str::trim) == Some(TRANSPORT_QUIC) {
+        return Err("transport=quic requires a [quic] section in agent.toml".to_string());
+    }
     if cfg.tool_providers.claude_code.enabled {
         if cfg.tool_providers.claude_code.command.trim().is_empty() {
             return Err("tool_providers.claude_code.command cannot be empty".to_string());

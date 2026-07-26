@@ -19,7 +19,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
@@ -90,20 +90,10 @@ pub(crate) struct NativeFallback {
 pub(crate) struct ExternalToolRouter {
     strategy: ToolProviderStrategy,
     claude: ClaudeCodeMcpProvider,
+    metadata_revision: AtomicU64,
+    observed_provider_revision: AtomicU64,
     sent_status_revision: AtomicU64,
     claimed_status_revision: AtomicU64,
-}
-
-static EXTERNAL_TOOLS: OnceLock<ExternalToolRouter> = OnceLock::new();
-
-pub(crate) fn configure_external_tools(
-    config: &ToolProvidersConfig,
-) -> &'static ExternalToolRouter {
-    EXTERNAL_TOOLS.get_or_init(|| ExternalToolRouter::new(config))
-}
-
-pub(crate) fn external_tools() -> &'static ExternalToolRouter {
-    EXTERNAL_TOOLS.get_or_init(|| ExternalToolRouter::new(&ToolProvidersConfig::default()))
 }
 
 impl ExternalToolRouter {
@@ -111,6 +101,8 @@ impl ExternalToolRouter {
         Self {
             strategy: config.strategy,
             claude: ClaudeCodeMcpProvider::new(config.claude_code.clone()),
+            metadata_revision: AtomicU64::new(1),
+            observed_provider_revision: AtomicU64::new(1),
             sent_status_revision: AtomicU64::new(0),
             claimed_status_revision: AtomicU64::new(0),
         }
@@ -126,14 +118,26 @@ impl ExternalToolRouter {
     }
 
     fn status_with_revision(&self) -> (ToolProvidersStatus, u64) {
-        let (claude_code, revision) = self.claude.status_with_revision();
+        let (claude_code, provider_revision) = self.claude.status_with_revision();
+        if self
+            .observed_provider_revision
+            .fetch_max(provider_revision, Ordering::SeqCst)
+            < provider_revision
+        {
+            self.metadata_revision.fetch_add(1, Ordering::SeqCst);
+        }
         (
             ToolProvidersStatus {
                 strategy: self.strategy_name().to_string(),
                 claude_code,
+                config_reload: Default::default(),
             },
-            revision,
+            self.metadata_revision.load(Ordering::SeqCst),
         )
+    }
+
+    pub(crate) fn configuration_status_changed(&self) {
+        self.metadata_revision.fetch_add(1, Ordering::SeqCst);
     }
 
     fn strategy_name(&self) -> &'static str {
@@ -327,6 +331,12 @@ impl ExternalToolRouter {
             ),
             false,
         );
+    }
+}
+
+impl Drop for ExternalToolRouter {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 

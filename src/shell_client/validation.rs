@@ -1,6 +1,6 @@
 use crate::shell_protocol::{
-    ProviderCallSummary, ShellAgentProjectSummary, ShellFileOpRequest, ShellRunRequest,
-    ToolProvidersStatus,
+    AgentConfigReloadStatus, ProviderCallSummary, ShellAgentProjectSummary, ShellFileOpRequest,
+    ShellRunRequest, ToolProvidersStatus,
 };
 use sha2::{Digest, Sha256};
 
@@ -22,6 +22,33 @@ const MAX_SYNC_WAIT_SECS: u64 = 120;
 const MAX_COMMAND_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 const MAX_PROVIDER_TEXT_CHARS: usize = 120;
 const MAX_PROVIDER_TOOL_NAMES: usize = 64;
+
+pub(super) fn normalize_config_reload(
+    status: Option<AgentConfigReloadStatus>,
+) -> Option<AgentConfigReloadStatus> {
+    let mut status = status?;
+    const RESULTS: &str = "not_attempted success partial failure unsupported";
+    const ERRORS: &str = "config_read_failed config_parse_failed config_validation_failed provider_config_invalid reload_unsupported";
+    const FIELDS: &str = "capabilities client_id display_name hostname max_concurrent_jobs owner poll_interval_ms projects_dir quic server_url token transport websocket_connect_timeout_secs";
+    if status.generation == 0
+        || !RESULTS
+            .split_whitespace()
+            .any(|v| v == status.last_reload_result)
+        || status
+            .last_reload_error_code
+            .as_deref()
+            .is_some_and(|code| !ERRORS.split_whitespace().any(|v| v == code))
+    {
+        return None;
+    }
+    status
+        .restart_required_fields
+        .retain(|field| FIELDS.split_whitespace().any(|v| v == field));
+    status.restart_required_fields.sort();
+    status.restart_required_fields.dedup();
+    status.restart_required = !status.restart_required_fields.is_empty();
+    Some(status)
+}
 
 fn bounded_provider_text(value: &str) -> String {
     value
@@ -57,6 +84,7 @@ pub(super) fn normalize_tool_providers(
     status: Option<ToolProvidersStatus>,
 ) -> Option<ToolProvidersStatus> {
     let mut status = status?;
+    status.config_reload = normalize_config_reload(Some(status.config_reload))?;
     if !matches!(
         status.strategy.as_str(),
         "native" | "claude_code" | "claude_code_then_native"
@@ -639,6 +667,7 @@ mod provider_status_tests {
                     error_code: None,
                 }),
             },
+            config_reload: Default::default(),
         }
     }
 
@@ -673,5 +702,29 @@ mod provider_status_tests {
         let mut status = provider_status();
         status.claude_code.process_state = "raw stderr follows".to_string();
         assert!(normalize_tool_providers(Some(status)).is_none());
+    }
+
+    #[test]
+    fn config_reload_status_is_whitelisted_sorted_and_bounded() {
+        let status = normalize_config_reload(Some(AgentConfigReloadStatus {
+            generation: 3,
+            last_reload_result: "partial".to_string(),
+            last_reload_error_code: None,
+            restart_required: false,
+            restart_required_fields: vec![
+                "transport".to_string(),
+                "/private/project".to_string(),
+                "token".to_string(),
+                "transport".to_string(),
+            ],
+        }))
+        .unwrap();
+        assert!(status.restart_required);
+        assert_eq!(status.restart_required_fields, ["token", "transport"]);
+        assert!(normalize_config_reload(Some(AgentConfigReloadStatus {
+            last_reload_result: "raw error follows".to_string(),
+            ..AgentConfigReloadStatus::default()
+        }))
+        .is_none());
     }
 }

@@ -23,6 +23,7 @@ Type=simple
 User=root
 Group=root
 ExecStart=/opt/webcodex/webcodex-agent --config /etc/webcodex/clients/workstation/agent.toml
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5s
 StandardOutput=journal

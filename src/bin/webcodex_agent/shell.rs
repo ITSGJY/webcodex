@@ -13,6 +13,7 @@ const SHELL_PROFILE_PREPARE_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PreparedShellProfileKey {
+    generation: u64,
     project_key: String,
     profile_name: String,
 }
@@ -26,9 +27,10 @@ pub(crate) struct PreparedShellProfile {
 }
 
 /// Lazily prepared shell environment snapshots. Snapshots are keyed by
-/// project/cwd plus profile name because inline init scripts such as
-/// `. .venv/bin/activate` are intentionally resolved from the project cwd.
-/// Profile config changes require restarting the agent in this phase.
+/// config generation, project/cwd, and profile name because inline init
+/// scripts such as `. .venv/bin/activate` are intentionally resolved from the
+/// project cwd. A successful hot reload retires older cached generations after
+/// the new generation prepares its first snapshot.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PreparedShellProfileCache {
     profiles: Arc<Mutex<HashMap<PreparedShellProfileKey, Arc<PreparedShellProfile>>>>,
@@ -420,18 +422,22 @@ impl PreparedShellProfileCache {
 
     fn get_or_prepare(
         &self,
+        generation: u64,
         shell: &ShellConfig,
         profile_name: &str,
         project_key: String,
         prepare_cwd: &Path,
     ) -> Result<Arc<PreparedShellProfile>, String> {
         let key = PreparedShellProfileKey {
+            generation,
             project_key,
             profile_name: profile_name.to_string(),
         };
-        if let Some(prepared) = self.profiles.lock().unwrap().get(&key).cloned() {
+        let profiles = self.profiles.lock().unwrap();
+        if let Some(prepared) = profiles.get(&key).cloned() {
             return Ok(prepared);
         }
+        drop(profiles);
         let profile = shell.profiles.get(profile_name).ok_or_else(|| {
             format!(
                 "shell profile '{}' is not configured for project/cwd {}",
@@ -459,7 +465,15 @@ impl PreparedShellProfileCache {
             args,
             env_snapshot,
         });
-        self.profiles.lock().unwrap().insert(key, prepared.clone());
+        let mut profiles = self.profiles.lock().unwrap();
+        if let Some(cached) = profiles.get(&key).cloned() {
+            return Ok(cached);
+        }
+        if profiles.keys().any(|cached| cached.generation > generation) {
+            return Ok(prepared);
+        }
+        profiles.retain(|cached, _| cached.generation == generation);
+        profiles.insert(key, prepared.clone());
         Ok(prepared)
     }
 }
@@ -477,6 +491,7 @@ fn shell_profile_project_key(project_id: Option<&str>, path: &Path) -> String {
 }
 
 pub(crate) fn resolve_prepared_shell_profile(
+    generation: u64,
     shell: &ShellConfig,
     projects_dir: &Path,
     cwd_path: &Path,
@@ -512,7 +527,7 @@ pub(crate) fn resolve_prepared_shell_profile(
         &prepare_cwd,
     );
     cache
-        .get_or_prepare(shell, profile_name, project_key, &prepare_cwd)
+        .get_or_prepare(generation, shell, profile_name, project_key, &prepare_cwd)
         .map(Some)
 }
 
@@ -612,6 +627,7 @@ pub(crate) fn run_shell(
 }
 
 pub(crate) fn run_shell_with_profiles(
+    generation: u64,
     policy: &AgentPolicy,
     shell: &ShellConfig,
     projects_dir: &Path,
@@ -625,7 +641,7 @@ pub(crate) fn run_shell_with_profiles(
     run_shell_impl(
         policy,
         shell,
-        Some((projects_dir, cache)),
+        Some((generation, projects_dir, cache)),
         cwd,
         command,
         stdin,
@@ -637,7 +653,7 @@ pub(crate) fn run_shell_with_profiles(
 fn run_shell_impl(
     policy: &AgentPolicy,
     shell: &ShellConfig,
-    profiles: Option<(&Path, &PreparedShellProfileCache)>,
+    profiles: Option<(u64, &Path, &PreparedShellProfileCache)>,
     cwd: Option<&str>,
     command: &str,
     stdin: Option<&str>,
@@ -669,8 +685,9 @@ fn run_shell_impl(
     let start = Instant::now();
     let mut prepared_profile_name = None;
     let mut cmd = match profiles {
-        Some((projects_dir, cache)) => {
+        Some((generation, projects_dir, cache)) => {
             match resolve_prepared_shell_profile(
+                generation,
                 shell,
                 projects_dir,
                 &cwd_path,

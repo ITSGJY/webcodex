@@ -1,7 +1,9 @@
-use super::external_tools::{external_tools, ExternalRoute};
+use super::external_tools::ExternalRoute;
 use super::lsp::{handle_lsp_request, is_lsp_request_kind, LspSupervisor};
 use super::validation::{handle_validation_request, is_validation_request_kind};
-use super::{handle_project_op, run_shell_with_profiles, AgentPolicy, AgentSink, ShellConfig};
+use super::{
+    handle_project_op, run_shell_with_profiles, AgentSink, HotAgentConfig, ReloadableAgentConfig,
+};
 use crate::shell_protocol::ShellAgentShellRequest;
 use crate::{handle_file_request, is_file_request_kind, JobManager};
 use std::path::Path;
@@ -12,16 +14,19 @@ use std::path::Path;
 /// no transport-specific code: all outgoing traffic goes through `sink`.
 pub(crate) fn dispatch_request(
     sink: &AgentSink,
-    policy: &AgentPolicy,
-    shell: &ShellConfig,
+    config: &HotAgentConfig,
+    runtime: &ReloadableAgentConfig,
     jobs: &JobManager,
     projects_dir: &Path,
     lsp: &LspSupervisor,
     request: ShellAgentShellRequest,
 ) -> Result<bool, String> {
-    match external_tools().route(policy, &request) {
+    let policy = &config.policy;
+    let shell = &config.shell;
+    let external_tools = &config.external_tools;
+    match external_tools.route(policy, &request) {
         ExternalRoute::Handled(result) => {
-            return sink.submit_result(request.request_id, result);
+            return sink.submit_result_with_metadata(request.request_id, result, config, runtime);
         }
         ExternalRoute::NativeFallback(fallback) => {
             let request_id = request.request_id.clone();
@@ -29,6 +34,7 @@ pub(crate) fn dispatch_request(
                 handle_file_request(policy, &request)
             } else {
                 run_shell_with_profiles(
+                    config.generation,
                     policy,
                     shell,
                     projects_dir,
@@ -40,8 +46,8 @@ pub(crate) fn dispatch_request(
                     None,
                 )
             };
-            external_tools().complete_native_fallback(fallback, &result);
-            return sink.submit_result(request_id, result);
+            external_tools.complete_native_fallback(fallback, &result);
+            return sink.submit_result_with_metadata(request_id, result, config, runtime);
         }
         ExternalRoute::Native => {}
     }
@@ -49,6 +55,7 @@ pub(crate) fn dispatch_request(
         "start_job" | "start_validation_job" => {
             jobs.enqueue(
                 sink.clone(),
+                config.generation,
                 policy.clone(),
                 shell.clone(),
                 projects_dir.to_path_buf(),
@@ -67,28 +74,29 @@ pub(crate) fn dispatch_request(
         kind if is_file_request_kind(kind) => {
             let request_id = request.request_id.clone();
             let result = handle_file_request(policy, &request);
-            sink.submit_result(request_id, result)
+            sink.submit_result_with_metadata(request_id, result, config, runtime)
         }
         "register_project" | "create_project" => {
             let request_id = request.request_id.clone();
             let result = handle_project_op(policy, projects_dir, &request);
-            sink.submit_result(request_id, result)
+            sink.submit_result_with_metadata(request_id, result, config, runtime)
         }
         kind if is_lsp_request_kind(kind) => {
             // Explicit LSP branch — must never fall through to shell execution.
             let request_id = request.request_id.clone();
             let result = handle_lsp_request(policy, projects_dir, lsp, &request);
-            sink.submit_result(request_id, result)
+            sink.submit_result_with_metadata(request_id, result, config, runtime)
         }
         kind if is_validation_request_kind(kind) => {
             // Explicit validation bridge branch — never fall through to shell.
             let request_id = request.request_id.clone();
             let result = handle_validation_request(policy, projects_dir, &request);
-            sink.submit_result(request_id, result)
+            sink.submit_result_with_metadata(request_id, result, config, runtime)
         }
         _ => {
             let request_id = request.request_id.clone();
             let result = run_shell_with_profiles(
+                config.generation,
                 policy,
                 shell,
                 projects_dir,
@@ -99,7 +107,7 @@ pub(crate) fn dispatch_request(
                 request.timeout_secs,
                 None,
             );
-            sink.submit_result(request_id, result)
+            sink.submit_result_with_metadata(request_id, result, config, runtime)
         }
     }
 }
