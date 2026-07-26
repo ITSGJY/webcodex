@@ -1,8 +1,7 @@
 use serde_json::{json, Value};
 
 use super::common::{
-    array_schema, nullable_schema, open_object_schema, schema_type, search_match_schema,
-    wrapped_output_schema,
+    array_schema, nullable_schema, schema_type, search_match_schema, wrapped_output_schema,
 };
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {

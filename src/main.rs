@@ -22,6 +22,8 @@ mod artifact_policy;
 mod audit_http;
 mod auth;
 mod build_info;
+#[allow(dead_code)]
+mod command_sandbox;
 mod config;
 mod connector_runtime;
 mod console_web;

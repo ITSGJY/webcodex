@@ -26,6 +26,8 @@ mod apply_edits_shared;
 
 // The agent does not run glob-based search, so part of the shared policy
 // is unused here.
+#[path = "../command_sandbox.rs"]
+mod command_sandbox;
 #[allow(dead_code)]
 #[path = "../sensitive_paths.rs"]
 mod sensitive_paths;
@@ -638,6 +640,10 @@ fn agent_register_capabilities(cfg: &AgentConfig) -> ShellClientCapabilities {
     // New agents always advertise read-only LSP navigation. Older agents omit
     // the field and deserialize as false on the server.
     capabilities.lsp_read_only_navigation = true;
+    // Advertised only when the kernel actually enforces it — the server keeps
+    // read_only commands disabled otherwise.
+    capabilities.sandbox_read_only_commands =
+        command_sandbox::read_only_sandbox_available().is_ok();
     capabilities
 }
 

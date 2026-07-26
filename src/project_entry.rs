@@ -229,6 +229,28 @@ pub(crate) fn readiness_with_probe(
             "Project setup is complete.",
         ));
     }
+    // Explicit, never silent: read_only tasks only regain shell commands when
+    // the kernel can enforce the write-denying sandbox.
+    findings.push(
+        match crate::command_sandbox::read_only_sandbox_available() {
+            Ok(()) => ReadinessFact::pass(
+                "Command sandbox",
+                "command_sandbox_available",
+                "Kernel command sandbox (Landlock) is available; read_only tasks can run \
+             commands with project writes denied by the kernel. Commands can still read \
+             any file inside the checkout — do not keep plaintext credentials in the \
+             repository.",
+            ),
+            Err(reason) => ReadinessFact::pass(
+                "Command sandbox",
+                "command_sandbox_unavailable",
+                format!(
+                    "Kernel command sandbox is unavailable ({reason}); read_only tasks keep \
+                 commands_run disabled."
+                ),
+            ),
+        },
+    );
     let ready =
         local_complete && connection == "connected" && agent == "online" && capabilities == "ready";
     if ready {
