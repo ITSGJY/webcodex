@@ -1,28 +1,9 @@
 use super::*;
 use crate::auth::hash_token;
+use crate::test_support::{seed_user_with_role as seed_user, test_config, test_db};
 use salvo::test::{ResponseExt, TestClient};
 use salvo::Service;
-use std::path::PathBuf;
 use std::sync::Arc;
-
-/// Minimal `Config` for tests (token sets whether auth is enabled).
-fn test_config(token: Option<&str>) -> Arc<crate::Config> {
-    Arc::new(crate::Config {
-        addr: "127.0.0.1:0".to_string(),
-        data_dir: PathBuf::from("./data"),
-        token: token.map(str::to_string),
-        max_text_size: 2 * 1024 * 1024,
-        max_file_size: 100 * 1024 * 1024,
-        codex: crate::CodexConfig::default(),
-        oauth2: crate::OAuth2Config::default(),
-    })
-}
-
-fn test_db() -> (tempfile::TempDir, Arc<crate::Database>) {
-    let tmp = tempfile::tempdir().unwrap();
-    let db = crate::Database::open(&tmp.path().join("test.db")).unwrap();
-    (tmp, Arc::new(db))
-}
 
 /// Build a router mirroring the production agent-token management wiring.
 fn build_router(config: Arc<crate::Config>, db: Arc<crate::Database>) -> Router {
@@ -44,24 +25,6 @@ fn build_router(config: Arc<crate::Config>, db: Arc<crate::Database>) -> Router 
 
 fn effective_status(resp: &Response) -> StatusCode {
     resp.status_code.unwrap_or(StatusCode::OK)
-}
-
-/// Bootstrap helper: create a user directly via the DB so tests can mint
-/// tokens for them.
-fn seed_user(db: &crate::Database, username: &str, role: &str) -> crate::models::UserRecord {
-    let now = chrono::Utc::now().timestamp();
-    let user = crate::models::UserRecord {
-        id: uuid::Uuid::new_v4().to_string(),
-        username: username.to_string(),
-        created_at: now,
-        disabled: 0,
-        display_name: None,
-        role: role.to_string(),
-        disabled_at: None,
-        updated_at: Some(now),
-    };
-    db.create_user(&user).unwrap();
-    user
 }
 
 fn seed_account_credential(db: &crate::Database, user: &crate::models::UserRecord) -> String {

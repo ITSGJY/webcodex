@@ -45,6 +45,8 @@ mod shell_client;
 mod shell_protocol;
 mod startup;
 mod task_cli;
+#[cfg(test)]
+mod test_support;
 mod tool_request_trace;
 mod tool_runtime;
 mod users_http;

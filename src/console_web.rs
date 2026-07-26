@@ -58,31 +58,10 @@ pub async fn console_styles_css(res: &mut Response) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{test_config, test_db};
     use salvo::test::{ResponseExt, TestClient};
     use salvo::Service;
-    use std::path::PathBuf;
     use std::sync::Arc;
-
-    fn test_config(token: Option<&str>) -> Arc<crate::Config> {
-        Arc::new(crate::Config {
-            addr: "127.0.0.1:0".to_string(),
-            data_dir: PathBuf::from("./data"),
-            token: token.map(str::to_string),
-            max_text_size: 2 * 1024 * 1024,
-            max_file_size: 100 * 1024 * 1024,
-            codex: crate::CodexConfig::default(),
-            oauth2: crate::OAuth2Config::default(),
-        })
-    }
-
-    /// Create an empty Database in a temp dir. The TempDir must be kept alive
-    /// for the lifetime of the returned Database so the sqlite file is not
-    /// deleted mid-test.
-    fn test_db() -> (tempfile::TempDir, Arc<crate::Database>) {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = crate::Database::open(&tmp.path().join("test.db")).unwrap();
-        (tmp, Arc::new(db))
-    }
 
     /// Build a router that mirrors the production `/console` wiring (public,
     /// no AuthMiddleware) plus the protected Connector readiness route

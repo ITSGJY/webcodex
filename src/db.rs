@@ -913,28 +913,7 @@ mod tests {
         user
     }
 
-    fn oauth_seed_client(
-        db: &Database,
-        user: &UserRecord,
-        name: &str,
-    ) -> (OAuthClientRecord, String) {
-        let now = chrono::Utc::now().timestamp();
-        let plaintext_secret = crate::auth::generate_oauth_client_secret();
-        let secret_hash = crate::auth::hash_token(&plaintext_secret);
-        let record = OAuthClientRecord {
-            id: uuid::Uuid::new_v4().to_string(),
-            client_id: crate::auth::generate_oauth_client_id(),
-            client_secret_hash: secret_hash.clone(),
-            name: name.to_string(),
-            owner_user_id: user.id.clone(),
-            redirect_uris: "https://example.com/callback".to_string(),
-            allowed_scopes: "runtime:read project:read".to_string(),
-            created_at: now,
-            revoked_at: None,
-        };
-        db.insert_oauth_client(&record).unwrap();
-        (record, plaintext_secret)
-    }
+    use crate::test_support::seed_oauth_client_named as oauth_seed_client;
 
     fn table_column_names(conn: &Connection, table: &str) -> Vec<String> {
         let mut stmt = conn

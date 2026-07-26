@@ -384,46 +384,17 @@ mod tests {
     // gate in AuthMiddleware rejects agent tokens before any handler runs, and
     // that bootstrap/user tokens still reach the handler.
 
+    use crate::test_support::{
+        seed_oauth_client_named as gate_seed_oauth_client, seed_user as gate_seed_user,
+        test_config as gate_test_config, test_config_oauth2 as gate_test_config_oauth2,
+        test_db as gate_test_db,
+    };
     use salvo::prelude::{affix_state, Json};
     use salvo::test::{ResponseExt, TestClient};
     use salvo::Router;
     use salvo::Service;
     use std::path::PathBuf;
     use std::sync::Arc;
-
-    fn gate_test_config(token: Option<&str>) -> Arc<crate::Config> {
-        Arc::new(crate::Config {
-            addr: "127.0.0.1:0".to_string(),
-            data_dir: PathBuf::from("./data"),
-            token: token.map(str::to_string),
-            max_text_size: 2 * 1024 * 1024,
-            max_file_size: 100 * 1024 * 1024,
-            codex: crate::CodexConfig::default(),
-            oauth2: crate::OAuth2Config::default(),
-        })
-    }
-
-    fn gate_test_db() -> (tempfile::TempDir, Arc<crate::Database>) {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = crate::Database::open(&tmp.path().join("gate.db")).unwrap();
-        (tmp, Arc::new(db))
-    }
-
-    fn gate_seed_user(db: &crate::Database, username: &str) -> crate::models::UserRecord {
-        let now = chrono::Utc::now().timestamp();
-        let user = crate::models::UserRecord {
-            id: uuid::Uuid::new_v4().to_string(),
-            username: username.to_string(),
-            created_at: now,
-            disabled: 0,
-            display_name: None,
-            role: "user".to_string(),
-            disabled_at: None,
-            updated_at: Some(now),
-        };
-        db.create_user(&user).unwrap();
-        user
-    }
 
     /// Create an agent token for `username` bound to `client_id` via the DB
     /// layer directly, returning the plaintext token. Used by the gate tests
@@ -495,48 +466,6 @@ mod tests {
         };
         db.insert_account_credential(&record, &hash).unwrap();
         plaintext
-    }
-
-    /// Create a config with OAuth2 enabled.
-    fn gate_test_config_oauth2(token: Option<&str>) -> Arc<crate::Config> {
-        Arc::new(crate::Config {
-            addr: "127.0.0.1:0".to_string(),
-            data_dir: PathBuf::from("./data"),
-            token: token.map(str::to_string),
-            max_text_size: 2 * 1024 * 1024,
-            max_file_size: 100 * 1024 * 1024,
-            codex: crate::CodexConfig::default(),
-            oauth2: crate::OAuth2Config {
-                enabled: true,
-                access_token_ttl_secs: 3600,
-                refresh_token_ttl_secs: 2_592_000,
-                ..crate::OAuth2Config::default()
-            },
-        })
-    }
-
-    /// Seed an OAuth2 client and return `(record, plaintext_secret)`.
-    fn gate_seed_oauth_client(
-        db: &crate::Database,
-        user: &crate::models::UserRecord,
-        name: &str,
-    ) -> (crate::models::OAuthClientRecord, String) {
-        let now = chrono::Utc::now().timestamp();
-        let plaintext_secret = generate_oauth_client_secret();
-        let secret_hash = hash_token(&plaintext_secret);
-        let record = crate::models::OAuthClientRecord {
-            id: uuid::Uuid::new_v4().to_string(),
-            client_id: generate_oauth_client_id(),
-            client_secret_hash: secret_hash,
-            name: name.to_string(),
-            owner_user_id: user.id.clone(),
-            redirect_uris: "https://example.com/callback".to_string(),
-            allowed_scopes: "runtime:read project:read".to_string(),
-            created_at: now,
-            revoked_at: None,
-        };
-        db.insert_oauth_client(&record).unwrap();
-        (record, plaintext_secret)
     }
 
     /// Seed an OAuth2 access token and return `(record, plaintext_token)`.

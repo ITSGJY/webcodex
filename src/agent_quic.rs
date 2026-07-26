@@ -682,17 +682,7 @@ mod tests {
         }
     }
 
-    fn test_config(token: Option<&str>) -> Arc<Config> {
-        Arc::new(Config {
-            addr: "0.0.0.0:8080".to_string(),
-            data_dir: std::path::PathBuf::from("./data"),
-            token: token.map(str::to_string),
-            max_text_size: 2 * 1024 * 1024,
-            max_file_size: 100 * 1024 * 1024,
-            codex: crate::CodexConfig::default(),
-            oauth2: crate::OAuth2Config::default(),
-        })
-    }
+    use crate::test_support::test_config;
 
     /// Bind a QUIC server endpoint on 127.0.0.1:0 and return (endpoint, addr).
     fn bind_server(
