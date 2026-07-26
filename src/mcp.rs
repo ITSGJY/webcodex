@@ -1,3 +1,4 @@
+use crate::action_audit::{ActionAudit, ActionAuditRecord};
 use crate::auth::AuthContext;
 use crate::connector_runtime::{ConnectorRuntime, ConnectorTransport};
 use crate::json_error;
@@ -63,6 +64,10 @@ fn tool_name_from_params(params: &Value) -> Option<String> {
         .get("name")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+fn project_from_tool_call_params(params: &Value) -> Option<String> {
+    params["arguments"]["project"].as_str().map(str::to_string)
 }
 
 /// MCP tools/list payload. When `WEBCODEX_MCP_COMPACT_SCHEMAS=true`, omit
@@ -184,8 +189,30 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
     } else {
         None
     };
-    guard.set_tool_name(tool_name);
+    guard.set_tool_name(tool_name.clone());
     guard.parsed("ok");
+
+    // Chat-window MCP tool calls must land in the action audit exactly like
+    // the REST surface (they were previously invisible there). Summary-level
+    // only: tool name and project — never arguments or outputs.
+    let audit = if request.method == "tools/call" {
+        Some((
+            ActionAudit::start(req, depot, "/mcp", "toolsCall"),
+            tool_name.unwrap_or_else(|| "unknown".to_string()),
+            project_from_tool_call_params(&request.params),
+        ))
+    } else {
+        None
+    };
+    let record_audit = |success: bool, status: StatusCode, error: Option<String>| {
+        if let Some((audit, tool, project)) = audit.as_ref() {
+            let mut event = ActionAuditRecord::new(tool.clone(), success, status)
+                .error(error)
+                .summary(json!({ "transport": "mcp" }));
+            event.project = project.clone();
+            audit.record(event);
+        }
+    };
 
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
     let connector = crate::connector_runtime::http::runtime(depot);
@@ -217,6 +244,11 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
                     MCP_DISPATCH_HARD_TIMEOUT.as_secs()
                 ),
             );
+            record_audit(
+                false,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Some("mcp dispatch hard timeout".to_string()),
+            );
             let estimated = estimate_json_bytes(&body);
             guard.response_serialized(500, estimated, Some(false), None, "dispatch_hard_timeout");
             res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
@@ -235,12 +267,29 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
                 .and_then(|r| r.get("structuredContent"))
                 .and_then(|s| s.get("success").or_else(|| s.get("ok")))
                 .and_then(|v| v.as_bool());
+            let audit_success = tool_success.unwrap_or(true);
+            record_audit(
+                audit_success,
+                StatusCode::OK,
+                if audit_success {
+                    None
+                } else {
+                    body["result"]["structuredContent"]["error"]
+                        .as_str()
+                        .map(str::to_string)
+                },
+            );
             let estimated = estimate_json_bytes(&body);
             guard.response_serialized(200, estimated, Some(true), tool_success, "ok");
             res.render(Json(body));
             guard.handler_returned(200, estimated, Some(true), tool_success, "ok");
         }
         McpOutcome::BadRequest(body) => {
+            record_audit(
+                false,
+                StatusCode::BAD_REQUEST,
+                body["error"]["message"].as_str().map(str::to_string),
+            );
             let estimated = estimate_json_bytes(&body);
             guard.response_serialized(400, estimated, Some(false), None, "bad_request");
             res.status_code(StatusCode::BAD_REQUEST);
@@ -251,6 +300,14 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
             body,
             required_scope,
         } => {
+            record_audit(
+                false,
+                StatusCode::FORBIDDEN,
+                Some(format!(
+                    "insufficient scope: {}",
+                    required_scope.unwrap_or("unknown")
+                )),
+            );
             let estimated = estimate_json_bytes(&body);
             guard.response_serialized(403, estimated, Some(false), None, "forbidden");
             res.status_code(StatusCode::FORBIDDEN);
@@ -262,6 +319,7 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
             guard.handler_returned(403, estimated, Some(false), None, "forbidden");
         }
         McpOutcome::Notification => {
+            record_audit(true, StatusCode::ACCEPTED, None);
             // JSON-RPC notifications carry no `id`; the server MUST NOT reply
             // with a JSON-RPC body. Acknowledge with 202 and an empty body.
             // Empty body size is known (0) without JSON serialization.
@@ -1387,6 +1445,60 @@ mod tests {
         };
         db.insert_oauth_access_token(&record).unwrap();
         plaintext
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_call_writes_a_summary_action_audit_row() {
+        let config = test_config(Some("secret"));
+        let (_tmp, db) = test_db();
+        let runtime = Arc::new(test_runtime());
+        let service = Service::new(build_test_router(config, db.clone(), runtime));
+        let resp = TestClient::post("http://localhost/mcp")
+            .bearer_auth("secret")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "list_tools", "arguments": {}}
+            }))
+            .send(&service)
+            .await;
+        assert_eq!(resp.status_code, Some(StatusCode::OK));
+
+        let conn = db.conn_for_tests();
+        let (endpoint, action, operation, status): (String, String, String, String) = conn
+            .query_row(
+                "SELECT endpoint, action_name, operation, status FROM action_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(endpoint, "/mcp");
+        assert_eq!(action, "toolsCall");
+        assert_eq!(operation, "list_tools");
+        assert_eq!(status, "success");
+        // Summary-level discipline: no tool output is persisted for MCP rows.
+        let summary: String = conn
+            .query_row("SELECT summary_json FROM action_events", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(
+            !summary.contains("tools"),
+            "summary must not embed output: {summary}"
+        );
+
+        // Non-tool methods stay out of the audit.
+        let resp = TestClient::post("http://localhost/mcp")
+            .bearer_auth("secret")
+            .json(&json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}))
+            .send(&service)
+            .await;
+        assert_eq!(resp.status_code, Some(StatusCode::OK));
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM action_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     fn oauth_mcp_service(scopes: &str) -> (tempfile::TempDir, Service, String) {
