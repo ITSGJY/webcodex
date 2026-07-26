@@ -141,6 +141,7 @@ fn decide(
         Path::new(&context.executor_root),
         decision,
         "local_test",
+        None,
         now,
     )
 }
@@ -469,6 +470,7 @@ fn unrecoverable_accept_is_quarantined_while_other_intents_recover_and_runtime_s
             Path::new(&context.executor_root),
             LocalResultDecision::Accept,
             "local_test",
+            None,
             9,
         ),
         "result_decision_in_progress",
@@ -496,6 +498,7 @@ fn unrecoverable_accept_is_quarantined_while_other_intents_recover_and_runtime_s
         Path::new(&context.executor_root),
         LocalResultDecision::Reject,
         "local_test",
+        None,
         10,
     )
     .unwrap();
@@ -546,6 +549,7 @@ fn unrecoverable_accept_is_quarantined_while_other_intents_recover_and_runtime_s
         Path::new(&context.executor_root),
         LocalResultDecision::Reject,
         "local_test",
+        None,
         11,
     )
     .unwrap();
@@ -663,4 +667,91 @@ fn validate_path_rejects_parent_traversal() {
             "validate_path rejected legitimate path {path:?}"
         );
     }
+}
+
+#[test]
+fn reject_reason_reaches_the_model_as_guidance_once() {
+    let fixture = fixture(true);
+    let rejected = WorkspaceManager::decide_connector_result_local(
+        &fixture.db,
+        &fixture.context.project_id,
+        TASK_ID,
+        Some(RESULT_ID),
+        Path::new(&fixture.context.executor_root),
+        LocalResultDecision::Reject,
+        "local_test",
+        Some("  the tests were not actually run  "),
+        5,
+    )
+    .unwrap();
+    assert_eq!(rejected.decision_status, "rejected");
+    let payload: String = fixture
+        .db
+        .conn_for_tests()
+        .query_row(
+            "SELECT payload_json FROM wc_task_events
+             WHERE task_id = ?1 AND kind = 'human_guidance'",
+            [TASK_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    let message = payload["message"].as_str().unwrap();
+    assert!(message.contains("rejected"));
+    assert!(
+        message.ends_with("the tests were not actually run"),
+        "reason must be trimmed into the message: {message}"
+    );
+    assert_eq!(payload["source"], "host_reject");
+    assert_eq!(payload["result_id"], RESULT_ID);
+
+    // An idempotent re-reject reports the same terminal decision and must not
+    // append a second guidance message with a different meaning.
+    WorkspaceManager::decide_connector_result_local(
+        &fixture.db,
+        &fixture.context.project_id,
+        TASK_ID,
+        Some(RESULT_ID),
+        Path::new(&fixture.context.executor_root),
+        LocalResultDecision::Reject,
+        "local_test",
+        Some("a different reason"),
+        6,
+    )
+    .unwrap();
+    let count: i64 = fixture
+        .db
+        .conn_for_tests()
+        .query_row(
+            "SELECT COUNT(*) FROM wc_task_events
+             WHERE task_id = ?1 AND kind = 'human_guidance'",
+            [TASK_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "re-reject must not duplicate guidance");
+}
+
+#[test]
+fn reject_without_reason_records_no_guidance() {
+    let fixture = fixture(true);
+    decide(
+        &fixture.db,
+        &fixture.context,
+        Some(RESULT_ID),
+        LocalResultDecision::Reject,
+        5,
+    )
+    .unwrap();
+    let count: i64 = fixture
+        .db
+        .conn_for_tests()
+        .query_row(
+            "SELECT COUNT(*) FROM wc_task_events
+             WHERE task_id = ?1 AND kind = 'human_guidance'",
+            [TASK_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0, "a silent reject must stay silent");
 }

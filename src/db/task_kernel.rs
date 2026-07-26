@@ -438,6 +438,39 @@ impl Database {
         Ok(sequence)
     }
 
+    /// Append a `human_guidance` event on a task that has already left the
+    /// running state. Reserved for decision feedback (a rejection reason):
+    /// the only reader, `claim_pending_connector_guidance`, never required a
+    /// running task, so a terminal-state write stays consistent with it.
+    /// Everything else goes through [`Self::append_connector_task_event`],
+    /// which enforces the running guard.
+    pub(crate) fn append_connector_decision_guidance(
+        &self,
+        task_id: &str,
+        project_id: &str,
+        subject_id: &str,
+        payload: &Value,
+        now: i64,
+    ) -> Result<i64, ConnectorTaskStoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let task = load_task(&tx, task_id, project_id, subject_id)?
+            .ok_or(ConnectorTaskStoreError::NotFound)?;
+        let sequence = task.event_cursor + 1;
+        insert_event(
+            &tx,
+            &task.task_id,
+            &task.run_id,
+            sequence,
+            "human_guidance",
+            payload,
+            now,
+        )?;
+        touch_task(&tx, task_id, now)?;
+        tx.commit()?;
+        Ok(sequence)
+    }
+
     pub(crate) fn begin_connector_edit_operation(
         &self,
         task_id: &str,

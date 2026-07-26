@@ -400,6 +400,7 @@ impl ConnectorRuntime {
         task_id: &str,
         result_id: Option<&str>,
         decision: LocalResultDecision,
+        reason: Option<&str>,
         now: i64,
     ) -> Result<ConnectorTaskResult, ConnectorTaskStoreError> {
         WorkspaceManager::decide_connector_result_local(
@@ -410,6 +411,7 @@ impl ConnectorRuntime {
             Path::new(&self.context.executor_root),
             decision,
             "local_console",
+            reason,
             now,
         )
     }
@@ -862,7 +864,10 @@ impl ConnectorRuntime {
         {
             return invalid_input("files_list", "each glob must be 1..=256 bytes");
         }
-        if input.limit.is_some_and(|limit| !(1..=1000).contains(&limit)) {
+        if input
+            .limit
+            .is_some_and(|limit| !(1..=1000).contains(&limit))
+        {
             return invalid_input("files_list", "limit must be 1..=1000");
         }
         if input.depth.is_some_and(|depth| !(1..=16).contains(&depth)) {
@@ -3893,6 +3898,7 @@ pub(crate) mod tests {
                 task_id,
                 Some(&result_id),
                 LocalResultDecision::Reject,
+                Some("the diff touches files outside the agreed scope"),
                 chrono::Utc::now().timestamp(),
             )
             .unwrap();
@@ -3902,6 +3908,41 @@ pub(crate) mod tests {
             temp.path().join("cargo-target").as_path(),
         );
         assert_eq!(resources.slot_state, "idle");
+
+        // The rejection reason travels the same guidance channel as task
+        // guide: claimed exactly once, on the model's next capability
+        // response for this task.
+        let review = connector
+            .call(
+                "task_review",
+                json!({ "task_id": task_id }),
+                Some(&owner),
+                ConnectorTransport::Mcp,
+            )
+            .await;
+        assert!(review.ok, "{}", review.body);
+        let message = review.body["data"]["guidance"][0]["message"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            message.contains("rejected") && message.contains("outside the agreed scope"),
+            "guidance must carry the rejection reason: {}",
+            review.body
+        );
+        let review_again = connector
+            .call(
+                "task_review",
+                json!({ "task_id": task_id }),
+                Some(&owner),
+                ConnectorTransport::Mcp,
+            )
+            .await;
+        assert!(review_again.ok, "{}", review_again.body);
+        assert!(
+            review_again.body["data"]["guidance"].is_null(),
+            "guidance is claimed exactly once: {}",
+            review_again.body
+        );
     }
 
     #[tokio::test]

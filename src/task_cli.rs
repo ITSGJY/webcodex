@@ -52,6 +52,7 @@ pub(crate) enum TaskCliCommand {
     Reject {
         location: TaskLocationOptions,
         task_id: String,
+        reason: Option<String>,
     },
     Resume {
         location: TaskLocationOptions,
@@ -80,7 +81,7 @@ Commands:\n\
   guide TASK_ID MESSAGE      Send course-correcting guidance to the running task\n\
   show TASK_ID               Show result, approvals, and timeline\n\
   accept TASK_ID             Apply a reviewed result to this checkout\n\
-  reject TASK_ID             Reject the stable result; release matching leftover slot\n\
+  reject TASK_ID [REASON]    Reject the stable result; the reason reaches the model\n\
   resume TASK_ID             Resume a preserved run after runtime restart\n\
   approve TASK_ID APPROVAL [REASON]  Approve one exact raw command for one use\n\
   deny TASK_ID APPROVAL [REASON]     Deny it; the reason is shown to the model\n\
@@ -184,17 +185,33 @@ pub(crate) fn parse(args: &[String]) -> Result<TaskCliCommand, String> {
             })
         }
         "show" | "accept" | "reject" | "resume" => {
-            if positional.len() != 1 {
-                return Err(format!("task {operation} requires exactly one TASK_ID"));
+            let max_positional = if operation == "reject" { 2 } else { 1 };
+            if positional.is_empty() || positional.len() > max_positional {
+                return Err(if operation == "reject" {
+                    "task reject requires TASK_ID, plus an optional quoted REASON".to_string()
+                } else {
+                    format!("task {operation} requires exactly one TASK_ID")
+                });
             }
             if limit_set || json_output {
                 return Err(format!("--limit/--json are only valid with task list"));
             }
             let task_id = positional.remove(0);
+            let reason = positional
+                .pop()
+                .map(|reason| reason.trim().to_string())
+                .filter(|reason| !reason.is_empty());
+            if reason.as_deref().is_some_and(|reason| reason.len() > 500) {
+                return Err("decision reason must be at most 500 bytes".to_string());
+            }
             Ok(match operation.as_str() {
                 "show" => TaskCliCommand::Show { location, task_id },
                 "accept" => TaskCliCommand::Accept { location, task_id },
-                "reject" => TaskCliCommand::Reject { location, task_id },
+                "reject" => TaskCliCommand::Reject {
+                    location,
+                    task_id,
+                    reason,
+                },
                 "resume" => TaskCliCommand::Resume { location, task_id },
                 _ => unreachable!(),
             })
@@ -396,8 +413,14 @@ pub(crate) fn run(command: TaskCliCommand) -> Result<String, String> {
             review["available_actions"] = json!(available_actions);
             pretty_json(&json!({ "project": state.root, "review": review }))
         }
-        TaskCliCommand::Accept { location, task_id } => decide_result(&location, &task_id, true),
-        TaskCliCommand::Reject { location, task_id } => decide_result(&location, &task_id, false),
+        TaskCliCommand::Accept { location, task_id } => {
+            decide_result(&location, &task_id, true, None)
+        }
+        TaskCliCommand::Reject {
+            location,
+            task_id,
+            reason,
+        } => decide_result(&location, &task_id, false, reason.as_deref()),
         TaskCliCommand::Resume { location, task_id } => resume_task(&location, &task_id),
         TaskCliCommand::Approve {
             location,
@@ -439,6 +462,7 @@ fn decide_result(
     location: &TaskLocationOptions,
     task_id: &str,
     accept: bool,
+    reason: Option<&str>,
 ) -> Result<String, String> {
     let (state, db) = open_state(location)?;
     let now = chrono::Utc::now().timestamp();
@@ -461,6 +485,7 @@ fn decide_result(
         &state.root,
         decision,
         LOCAL_ACTOR,
+        reason,
         now,
     )
     .map_err(store_error)?;
@@ -473,15 +498,23 @@ fn decide_result(
             state.root.display()
         )
     } else if expected_result_id.is_none() {
-        format!(
+        let mut line = format!(
             "Rejected interrupted {}; its uncaptured workspace changes were discarded.",
             task_id
-        )
+        );
+        if reason.is_some() {
+            line.push_str(" The task had no stable result, so the reason was discarded with it.");
+        }
+        line
     } else {
-        format!(
+        let mut line = format!(
             "Rejected {}; its stable result was discarded and the reusable workspace is available.",
             task_id
-        )
+        );
+        if reason.is_some() {
+            line.push_str(" The reason reaches the model as guidance on its next capability call.");
+        }
+        line
     };
     if let Some(warning) = outcome.cleanup_warning {
         output.push_str(&format!("\nCleanup warning: {warning}"));
@@ -661,6 +694,31 @@ mod tests {
     }
 
     #[test]
+    fn reject_takes_an_optional_reason_and_other_decisions_do_not() {
+        let task_id = "wc_task_0123456789abcdef0123456789abcdef".to_string();
+        let command = parse(&[
+            "reject".to_string(),
+            task_id.clone(),
+            "  the tests were not run  ".to_string(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            command,
+            TaskCliCommand::Reject { reason: Some(reason), .. }
+                if reason == "the tests were not run"
+        ));
+        let command = parse(&["reject".to_string(), task_id.clone()]).unwrap();
+        assert!(matches!(
+            command,
+            TaskCliCommand::Reject { reason: None, .. }
+        ));
+        let error = parse(&["reject".to_string(), task_id.clone(), "r".repeat(501)]).unwrap_err();
+        assert!(error.contains("at most 500"));
+        let error = parse(&["accept".to_string(), task_id, "why".to_string()]).unwrap_err();
+        assert!(error.contains("exactly one TASK_ID"));
+    }
+
+    #[test]
     fn one_line_bounds_human_list_output() {
         assert_eq!(one_line("a\n  b", 10), "a b");
         assert_eq!(one_line("abcdefghij", 5), "abcd…");
@@ -806,6 +864,7 @@ mod tests {
                 profile: "personal".to_string(),
             },
             task_id: abandoned_task_id.to_string(),
+            reason: None,
         })
         .unwrap();
         assert!(output.contains("uncaptured workspace changes were discarded"));

@@ -10,7 +10,7 @@ use crate::db::{
     ConnectorTaskStoreError, Database,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -728,6 +728,7 @@ impl WorkspaceManager {
         target_root: &Path,
         decision: LocalResultDecision,
         actor: &str,
+        reason: Option<&str>,
         now: i64,
     ) -> Result<ConnectorTaskResult, ConnectorTaskStoreError> {
         let task = local_decision_task(db, project_id, task_id, target_root)?;
@@ -782,7 +783,37 @@ impl WorkspaceManager {
             actor,
             now,
         )?;
-        Self::complete_local_decision(db, project_id, task, result, decision, false, now)
+        let record_reason = decision == LocalResultDecision::Reject;
+        let owner_subject_id = task.owner_subject_id.clone();
+        let finalized =
+            Self::complete_local_decision(db, project_id, task, result, decision, false, now)?;
+        if record_reason {
+            if let Some(reason) = reason.map(str::trim).filter(|reason| !reason.is_empty()) {
+                // Best-effort on purpose: the rejection above is already
+                // durable, and a failed guidance write must not make a
+                // completed decision look failed and invite a retry.
+                if let Err(error) = db.append_connector_decision_guidance(
+                    task_id,
+                    project_id,
+                    &owner_subject_id,
+                    &json!({
+                        "message": format!(
+                            "The project owner rejected the delivered result: {reason}"
+                        ),
+                        "source": "host_reject",
+                        "result_id": finalized.result_id,
+                    }),
+                    now,
+                ) {
+                    tracing::warn!(
+                        task_id,
+                        error = %error,
+                        "rejection reason was not recorded as guidance",
+                    );
+                }
+            }
+        }
+        Ok(finalized)
     }
 
     fn complete_local_decision(

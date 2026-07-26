@@ -619,11 +619,16 @@ function openConfirmUi(action: string) {
       addLine(body, "Effect", "The active execution is stopped.");
     }
   }
-  // Only cancel carries an optional reason; reject has no durable reason field.
-  show("confirm-reason-row", action === "cancel");
+  // Cancel and reject carry an optional reason; a rejection reason is
+  // delivered to the model as guidance on its next capability call.
+  show("confirm-reason-row", action === "cancel" || action === "reject");
   const reason = el("confirm-reason");
   if (reason) {
     (reason as HTMLInputElement).value = "";
+    (reason as HTMLInputElement).placeholder =
+      action === "reject"
+        ? "Optional reason (delivered to the model as guidance)"
+        : "Optional reason";
   }
   show("confirm-overlay", true);
 }
@@ -648,9 +653,9 @@ function closeConfirmUi() {
 async function performAction() {
   const pending = state.pending;
   const req = actionRequest(pending);
-  // A cancel may carry an optional human reason; identity still comes only from
-  // the bound snapshot, never the live selection.
-  if (req && req.path === "task/cancel") {
+  // Cancel and reject may carry an optional human reason; identity still comes
+  // only from the bound snapshot, never the live selection.
+  if (req && (req.path === "task/cancel" || req.path === "result/reject")) {
     const reason = inputValue("confirm-reason").trim();
     if (reason) {
       req.body.reason = reason;

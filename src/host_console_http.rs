@@ -115,6 +115,9 @@ struct ActivityInput {
 struct DecideInput {
     task_id: String,
     result_id: Option<String>,
+    /// Reject only: delivered to the model as guidance on its next
+    /// capability call, exactly like `task guide`.
+    reason: Option<String>,
 }
 
 #[handler]
@@ -298,9 +301,16 @@ async fn decide(req: &mut Request, depot: &Depot, res: &mut Response, accept: bo
         .result_id
         .as_deref()
         .is_none_or(|id| validate_opaque_id(id, "wc_result_", "result_id").is_ok());
+    let reason = input
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty());
     if validate_opaque_id(&input.task_id, "wc_task_", "task_id").is_err()
         || !result_valid
         || (accept && input.result_id.is_none())
+        || reason.is_some_and(|reason| reason.len() > 500)
+        || (accept && reason.is_some())
     {
         return invalid(res, "invalid decision input");
     }
@@ -313,6 +323,7 @@ async fn decide(req: &mut Request, depot: &Depot, res: &mut Response, accept: bo
         &input.task_id,
         input.result_id.as_deref(),
         decision,
+        reason,
         chrono::Utc::now().timestamp(),
     );
     match result {
@@ -520,5 +531,53 @@ mod tests {
         let rows = mine["activity"].as_array().expect("activity list");
         assert_eq!(rows.len(), 1, "{mine}");
         assert_eq!(rows[0]["command_preview"], "grant-a-command");
+    }
+
+    #[tokio::test]
+    async fn result_decisions_reject_malformed_reasons_before_any_lookup() {
+        let fixture = crate::connector_runtime::execution_tests::console_fixture().await;
+        let auth = crate::connector_runtime::tests::auth("u1");
+        let service = service(fixture.runtime.clone(), auth);
+        let task_id = "wc_task_0123456789abcdef0123456789abcdef";
+        let cases = [
+            // An oversized reason never reaches the decision.
+            (
+                "reject",
+                serde_json::json!({ "task_id": task_id, "reason": "r".repeat(501) }),
+            ),
+            // Accept has no delivery channel for a reason; refusing beats
+            // silently discarding what the reviewer typed.
+            (
+                "accept",
+                serde_json::json!({
+                    "task_id": task_id,
+                    "result_id": "wc_result_0123456789abcdef",
+                    "reason": "looks good"
+                }),
+            ),
+        ];
+        for (action, body) in cases {
+            let mut response =
+                TestClient::post(format!("http://127.0.0.1/console/result/{action}"))
+                    .add_header("host", "127.0.0.1", true)
+                    .add_header("origin", "http://127.0.0.1", true)
+                    .add_header("content-type", "application/json", true)
+                    .json(&body)
+                    .send(&service)
+                    .await;
+            assert_eq!(
+                response.status_code.map(|status| status.as_u16()),
+                Some(400),
+                "{action} must refuse the malformed reason"
+            );
+            let body: serde_json::Value = response.take_json().await.unwrap();
+            assert_eq!(
+                serde_json::to_string(&body)
+                    .unwrap()
+                    .contains("invalid decision input"),
+                true,
+                "unexpected error body: {body}"
+            );
+        }
     }
 }
