@@ -751,9 +751,119 @@ async function tick() {
   try {
     await fetchReadiness();
     await fetchTasks();
+    await fetchApprovals();
     await fetchActivity();
   } finally {
     endRefresh(state, "tick");
+  }
+}
+
+async function fetchApprovals() {
+  const res = await api("approvals", {});
+  if (!res || !res.ok || !res.data) {
+    return;
+  }
+  renderApprovals(Array.isArray(res.data.approvals) ? res.data.approvals : []);
+}
+
+// Pending one-time command approvals for the whole project. Each row shows
+// the bounded command preview (informed consent) and decides with an
+// optional reason; a denial reason is delivered to the model on its retry.
+function renderApprovals(rows: any[]) {
+  show("approvals-panel", rows.length > 0);
+  setText("approvals-count", rows.length ? "(" + rows.length + ")" : "");
+  const node = el("approvals-list");
+  if (!node) {
+    return;
+  }
+  clearNode(node);
+  for (const row of rows) {
+    const item = document.createElement("li");
+    item.className = "timeline-event approval-row";
+    const head = document.createElement("div");
+    head.className = "timeline-head";
+    const goal = document.createElement("span");
+    goal.className = "timeline-kind";
+    goal.textContent = row && row.goal ? String(row.goal) : String(row.task_id || "task");
+    const meta = document.createElement("span");
+    meta.className = "muted small";
+    meta.textContent = expiresLabel(row ? row.expires_at : null);
+    head.appendChild(goal);
+    head.appendChild(meta);
+    item.appendChild(head);
+    const summary = document.createElement("div");
+    summary.className = "timeline-payload";
+    summary.textContent = row && row.action_summary ? String(row.action_summary) : "";
+    item.appendChild(summary);
+    const controls = document.createElement("div");
+    controls.className = "field-row approval-controls";
+    const reason = document.createElement("input");
+    reason.type = "text";
+    reason.maxLength = 500;
+    reason.placeholder = "Optional reason (a denial reason is shown to the model)";
+    const deny = document.createElement("button");
+    deny.type = "button";
+    deny.className = "btn";
+    deny.textContent = "Deny";
+    const approve = document.createElement("button");
+    approve.type = "button";
+    approve.className = "btn btn-primary";
+    approve.textContent = "Approve";
+    deny.addEventListener("click", () => {
+      void decideApproval(row, false, reason.value);
+    });
+    approve.addEventListener("click", () => {
+      void decideApproval(row, true, reason.value);
+    });
+    controls.appendChild(reason);
+    controls.appendChild(deny);
+    controls.appendChild(approve);
+    item.appendChild(controls);
+    node.appendChild(item);
+  }
+}
+
+function expiresLabel(expiresAt: any): string {
+  if (typeof expiresAt !== "number" || expiresAt <= 0) {
+    return "";
+  }
+  const remaining = expiresAt - Math.floor(Date.now() / 1000);
+  if (remaining <= 0) {
+    return "expired";
+  }
+  const minutes = Math.floor(remaining / 60);
+  return minutes >= 1 ? "expires in " + minutes + " min" : "expires in <1 min";
+}
+
+async function decideApproval(row: any, approve: boolean, reason: string) {
+  if (!row || !row.task_id || !row.approval_id) {
+    return;
+  }
+  const body: any = {
+    task_id: String(row.task_id),
+    approval_id: String(row.approval_id),
+    approve: approve,
+  };
+  const trimmed = reason.trim();
+  if (trimmed) {
+    body.reason = trimmed;
+  }
+  const res = await api("approval/decide", body);
+  if (!res) {
+    return;
+  }
+  if (res.status === 401) {
+    lock("Credential rejected. Re-enter it.");
+    return;
+  }
+  if (!res.ok) {
+    showError(errorMessage(res.data));
+    return;
+  }
+  hideError();
+  await fetchApprovals();
+  if (state.selectedTaskId === String(row.task_id)) {
+    reviewLoop.restart();
   }
 }
 

@@ -363,6 +363,18 @@ input[type="text"] {
   margin-top: 12px;
 }
 
+.approval-row {
+  border-left-color: var(--warn);
+}
+
+.approval-controls {
+  margin-top: 6px;
+}
+
+.approval-controls input {
+  flex: 1;
+}
+
 .diff,
 .output {
   max-height: 360px;
