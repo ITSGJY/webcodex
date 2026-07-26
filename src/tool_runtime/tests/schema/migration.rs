@@ -728,6 +728,40 @@ fn assert_model_facing_surfaces_do_not_list_name(name: &str) {
         !serde_json::to_string(&list_tools).unwrap().contains(name),
         "{name} must not appear in bounded list_tools discovery"
     );
+    let full_list_tools = runtime.list_tools_payload(ListToolsOptions {
+        category: None,
+        features: None,
+        summary_only: false,
+        limit: None,
+    });
+    assert!(
+        !serde_json::to_string(&full_list_tools)
+            .unwrap()
+            .contains(name),
+        "{name} must not appear in full list_tools discovery"
+    );
+
+    // Static discovery surfaces: category groups and recommended flows are
+    // compiled straight into the model-facing catalog.
+    for group in crate::tool_runtime::tool_definition::TOOL_DISCOVERY_GROUPS {
+        assert!(
+            !group.tools.contains(&name),
+            "{name} must not appear in discovery group {}",
+            group.name
+        );
+    }
+    for flow in crate::tool_runtime::tool_catalog::TOOL_RECOMMENDED_FLOWS {
+        assert!(
+            !flow.tools.contains(&name),
+            "{name} must not appear in recommended flow {}",
+            flow.name
+        );
+        assert!(
+            !flow.summary.contains(name) && !flow.manifest_purpose.contains(name),
+            "{name} must not appear in recommended flow text for {}",
+            flow.name
+        );
+    }
 }
 
 fn assert_agent_capability_lookup_rejects_non_runtime_name(name: &str) {

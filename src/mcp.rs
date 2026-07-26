@@ -1396,11 +1396,6 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect();
-        assert!(
-            !mcp_names.iter().any(|name| name == "run_codex"),
-            "MCP tools/list must not include run_codex: {:?}",
-            mcp_names
-        );
         let rest_names: Vec<String> = registered_tool_specs()
             .iter()
             .map(|s| s.name.clone())

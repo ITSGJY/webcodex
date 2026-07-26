@@ -1235,11 +1235,6 @@ mod tests {
         assert!(names.iter().any(|n| n == "git_diff_summary"));
         assert!(names.iter().any(|n| n == "git_log"));
         assert!(names.iter().any(|n| n == "show_changes"));
-        assert!(
-            !names.iter().any(|n| n == "run_codex"),
-            "model-facing tools/list names must not include run_codex: {:?}",
-            names
-        );
         assert_eq!(body["count"], names.len());
         for tool in body["tools"].as_array().unwrap() {
             assert!(tool["inputSchema"].is_object());

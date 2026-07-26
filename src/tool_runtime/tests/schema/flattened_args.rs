@@ -207,12 +207,6 @@ fn openapi_generic_call_runtime_tool_schema_remains_strict_model_visible_surface
             "ToolCallRequest.tool description must list model-visible tool {name}"
         );
     }
-    for forbidden in ["run_codex", "delete_files"] {
-        assert!(
-            !tool_description.contains(forbidden),
-            "ToolCallRequest.tool description must not advertise hidden/runtime-only name {forbidden}"
-        );
-    }
     if let Some(values) = tool_property.get("enum").and_then(Value::as_array) {
         let enum_names = values
             .iter()

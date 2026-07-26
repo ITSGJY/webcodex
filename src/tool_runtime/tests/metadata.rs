@@ -1013,32 +1013,6 @@ fn project_overview_metadata_schema_and_flattened_args_are_read_only() {
 }
 
 #[tokio::test]
-async fn tool_manifest_hides_run_codex_from_model_facing_surface() {
-    let runtime = test_runtime();
-    let result = runtime
-        .dispatch(ToolCall::ToolManifest {
-            category: None,
-            intent: None,
-            include_recommended_flows: true,
-            include_risk_summary: true,
-        })
-        .await;
-    assert!(result.success, "{:?}", result.error);
-    let tools = result.output["tools"].as_array().unwrap();
-    assert!(
-        !tools.iter().any(|tool| tool["name"] == "run_codex"),
-        "tool_manifest tools must not include run_codex: {:?}",
-        tools
-    );
-    let serialized = result.output.to_string();
-    assert!(
-        !serialized.contains("run_codex"),
-        "tool_manifest output must not advertise run_codex: {}",
-        serialized
-    );
-}
-
-#[tokio::test]
 async fn tool_manifest_reports_accepted_flattened_args_without_schemas() {
     let runtime = test_runtime();
     let result = runtime

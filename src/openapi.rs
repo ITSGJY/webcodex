@@ -2371,14 +2371,6 @@ mod tests {
             !serialized.contains("CodexRunRequest"),
             "legacy CodexRunRequest schema must stay absent from OpenAPI"
         );
-        let tool_desc = spec["components"]["schemas"]["ToolCallRequest"]["properties"]
-            [TOOL_CALL_TOOL_FIELD]["description"]
-            .as_str()
-            .unwrap();
-        assert!(
-            !tool_desc.contains("run_codex"),
-            "callRuntimeTool allowed-name description must not advertise run_codex"
-        );
         // callRuntimeTool should be marked advanced/generic.
         let call_tool = &spec["paths"]["/api/tools/call"]["post"]["description"]
             .as_str()

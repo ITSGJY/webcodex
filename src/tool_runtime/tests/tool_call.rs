@@ -197,23 +197,6 @@ fn from_tool_name_parses_run_shell_with_optional_fields() {
 }
 
 #[test]
-fn from_tool_name_rejects_removed_run_codex() {
-    let err = ToolCall::from_tool_name(
-        "run_codex",
-        json!({
-            "project": "demo",
-            "prompt": "fix tests",
-            "approval_mode": "suggest",
-            "timeout_secs": 120,
-            "cwd": "src",
-            "extra_args": ["--verbose"]
-        }),
-    )
-    .unwrap_err();
-    assert!(err.contains("unknown tool"), "{err}");
-}
-
-#[test]
 fn from_tool_name_parses_job_status_and_job_log() {
     let call = ToolCall::from_tool_name("job_status", json!({"job_id": "abc"})).unwrap();
     assert!(matches!(

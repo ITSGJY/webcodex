@@ -365,16 +365,6 @@ fn tool_discovery_groups_drive_tool_categories() {
             .tools
             .iter()
             .map(|name| {
-                assert_ne!(
-                    *name, "run_codex",
-                    "discovery group {} must not include removed runtime tool run_codex",
-                    group.name
-                );
-                assert_ne!(
-                    *name, "delete_files",
-                    "discovery group {} must not include legacy route metadata delete_files",
-                    group.name
-                );
                 let definition = lookup_tool_definition(name)
                     .unwrap_or_else(|| panic!("{name} discovery group entry missing definition"));
                 assert!(
@@ -613,12 +603,6 @@ fn tool_manifest_compact_categories_match_single_tool_definition_category() {
             definition.name
         );
     }
-    for forbidden in ["delete_files", "run_codex"] {
-        assert!(
-            !memberships.contains_key(forbidden),
-            "{forbidden} must not appear in model-facing tool_manifest categories"
-        );
-    }
 
     let tools = manifest["tools"].as_array().expect("tool_manifest tools");
     assert_eq!(
@@ -749,8 +733,6 @@ fn tool_manifest_category_filter_matches_tool_definition_categories() {
                 Some(category.as_str()),
                 "filtered tool_manifest must not mix categories: {tool:?}"
             );
-            assert_ne!(tool["name"].as_str(), Some("run_codex"));
-            assert_ne!(tool["name"].as_str(), Some("delete_files"));
         }
     }
 }
@@ -827,8 +809,6 @@ fn list_tools_category_filter_matches_tool_definition_categories() {
                 Some(category.as_str()),
                 "filtered list_tools must not mix categories: {tool:?}"
             );
-            assert_ne!(tool["name"].as_str(), Some("run_codex"));
-            assert_ne!(tool["name"].as_str(), Some("delete_files"));
         }
     }
 }
@@ -877,16 +857,6 @@ fn tool_manifest_recommended_flows_reference_visible_defined_tools() {
                     .values()
                     .any(|members| members.contains(*expected_tool)),
                 "{} recommended flow references {expected_tool}, which is missing from compact manifest categories",
-                expected.name
-            );
-            assert_ne!(
-                *expected_tool, "run_codex",
-                "{} recommended flow must not expose run_codex",
-                expected.name
-            );
-            assert_ne!(
-                *expected_tool, "delete_files",
-                "{} recommended flow must not expose delete_files",
                 expected.name
             );
         }
