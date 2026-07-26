@@ -1663,13 +1663,27 @@ impl ConnectorRuntime {
                 .await
             {
                 Ok(output) => output,
-                Err(error) => {
-                    return self.kernel_error_outcome(
-                        error,
-                        &task,
-                        Ok(task.event_cursor),
-                        Value::Null,
-                    )
+                Err(_) => {
+                    // Never blind the reviewer because the workspace scan
+                    // failed (e.g. the slot is wedged after a terminal
+                    // failure): degrade to the durable applied-path record
+                    // instead of failing the whole review.
+                    let applied_paths = self
+                        .db
+                        .connector_task_events(
+                            &task.task_id,
+                            &task.project_id,
+                            &task.owner_subject_id,
+                            MAX_EVENT_COUNT,
+                        )
+                        .map(|events| aggregate_applied_paths(&events))
+                        .unwrap_or_default();
+                    json!({
+                        "source": "workspace_scan_failed",
+                        "changed_paths": applied_paths,
+                        "changed_paths_source": "applied_edits",
+                        "diff_preview": null
+                    })
                 }
             }
         };

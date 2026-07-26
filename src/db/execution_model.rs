@@ -84,6 +84,14 @@ pub(crate) enum ConnectorExecutionReservation {
 pub(crate) enum ConnectorExecutionFailure {
     Submission(&'static str),
     Unknown(&'static str),
+    /// A business invariant failed deterministically (e.g. workspace
+    /// provenance mismatch): retrying cannot help and neither transport nor
+    /// storage is at fault, so it must not masquerade as either. `evidence`
+    /// is the model-visible explanation with the concrete mismatch facts.
+    Workspace {
+        code: &'static str,
+        evidence: String,
+    },
 }
 
 pub(crate) struct ConnectorExecutionObservation<'a> {

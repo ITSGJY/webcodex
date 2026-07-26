@@ -3470,3 +3470,111 @@ async fn checks_run_steers_cargo_at_the_shared_target_cache() {
     .await;
     assert!(check_call.await.unwrap().ok);
 }
+
+#[tokio::test]
+async fn provenance_mismatch_fails_honestly_with_evidence() {
+    let fixture = fixture(1_000).await;
+    let arguments = checks(&fixture, "provenance-1", &["check"]);
+    let connector = fixture.connector.clone();
+    let owner = fixture.owner.clone();
+    let check_call =
+        tokio::spawn(async move { call(&connector, &owner, "checks_run", arguments).await });
+    let start = next_request(&fixture.registry).await;
+    assert_eq!(start.kind, "start_validation_job");
+    let job_id = start.job_id.unwrap();
+    // Simulate a check that generates an untracked build artifact.
+    std::fs::write(
+        std::path::Path::new(&task(&fixture).execution_root).join("build-artifact.tmp"),
+        "junk",
+    )
+    .unwrap();
+    update_validation_job(
+        &fixture.registry,
+        &job_id,
+        "completed",
+        None,
+        Some(0),
+        check_progress(1, None, None),
+    )
+    .await;
+    let outcome = check_call.await.unwrap();
+    assert!(outcome.ok, "{}", outcome.body);
+
+    // Deterministic invariant failure: terminal quickly (no grace burn),
+    // honestly categorized, with the evidence and the remedy in the message.
+    let mut terminal = None;
+    for _ in 0..400 {
+        let execution = fixture
+            .connector
+            .db
+            .latest_connector_execution(
+                &fixture.task_id,
+                &fixture.connector.context.project_id,
+                tests::PROJECT_SUBJECT_ID,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        if execution.is_terminal() {
+            terminal = Some(execution);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let execution = terminal.expect("execution should reach a terminal state quickly");
+    assert_eq!(execution.state, "failed");
+    assert_eq!(execution.failure_source.as_deref(), Some("workspace"));
+    assert_eq!(
+        execution.failure_code.as_deref(),
+        Some("workspace_provenance_mismatch")
+    );
+    let projection = execution::execution_projection(&execution, 10, None);
+    assert_eq!(
+        projection["next_action"],
+        "add_gitignore_for_build_artifacts_then_rerun_checks"
+    );
+    let evidence = execution.assertion_evidence.expect("evidence must persist");
+    assert_eq!(evidence["invariant"], "workspace_provenance");
+    let detail = evidence["detail"].as_str().unwrap();
+    assert!(detail.contains("build-artifact.tmp"), "{detail}");
+    assert!(detail.contains(".gitignore"), "{detail}");
+
+    // The reviewer is never blinded by the wedged workspace: when the
+    // show_changes scan errors, the review degrades to the durable
+    // applied-path record instead of failing outright.
+    let review_connector = fixture.connector.clone();
+    let review_owner = fixture.owner.clone();
+    let review_task = fixture.task_id.clone();
+    let review = tokio::spawn(async move {
+        call(
+            &review_connector,
+            &review_owner,
+            "task_review",
+            json!({"task_id": review_task}),
+        )
+        .await
+    });
+    let scan = next_request(&fixture.registry).await;
+    fixture
+        .registry
+        .complete(ShellAgentResultRequest {
+            client_id: "hosted".into(),
+            agent_instance_id: "instance".into(),
+            request_id: scan.request_id,
+            // A branch header marks a real repository, so the non-zero exit is
+            // a hard scan failure rather than the tolerated non-git degrade.
+            exit_code: Some(1),
+            stdout: Some("## main\n".into()),
+            stderr: Some("fatal: unable to read tree".into()),
+            duration_ms: Some(1),
+            error: None,
+        })
+        .await
+        .unwrap();
+    let review = review.await.unwrap();
+    assert!(review.ok, "{}", review.body);
+    let changes = &review.body["data"]["changes"];
+    assert_eq!(changes["source"], "workspace_scan_failed");
+    assert_eq!(changes["changed_paths_source"], "applied_edits");
+    assert!(changes["changed_paths"].as_array().is_some());
+}

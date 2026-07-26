@@ -519,6 +519,27 @@ impl WorkspaceManager {
         }
     }
 
+    /// Bounded sample of untracked paths in the task workspace, for
+    /// provenance-mismatch evidence. Best effort: failures return an empty
+    /// sample rather than masking the underlying error.
+    pub(crate) fn untracked_sample(
+        &self,
+        task: &ConnectorTaskSnapshot,
+        limit: usize,
+    ) -> Vec<String> {
+        let execution_root = Path::new(&task.execution_root);
+        git_text(execution_root, ["status", "--porcelain"])
+            .map(|status| {
+                status
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("?? "))
+                    .take(limit)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub(crate) fn action_precondition(
         &self,
         task: &ConnectorTaskSnapshot,

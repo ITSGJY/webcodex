@@ -1941,3 +1941,29 @@ fn console_is_not_a_model_facing_capability() {
         .all(|name| !crate::connector_runtime::surface::route_for(name)
             .is_some_and(|route| route.starts_with("/api/console/"))));
 }
+
+#[test]
+fn gitignore_hygiene_fact_grades_setup_before_the_first_task() {
+    let (_temp, root, _state) = repo("hygiene");
+    // The fixture repo has a clean status but no .gitignore: warn about the
+    // gap before build artifacts poison workspace provenance.
+    let missing = gitignore_hygiene_fact(&root);
+    assert_eq!(missing.status, ReadinessStatus::Warn);
+    assert_eq!(missing.code, "gitignore_missing");
+
+    // Untracked build artifacts outrank the missing file: they are the exact
+    // provenance poison, and the summary names them.
+    fs::create_dir(root.join("target")).unwrap();
+    fs::write(root.join("target/junk.o"), "x").unwrap();
+    let poisoned = gitignore_hygiene_fact(&root);
+    assert_eq!(poisoned.status, ReadinessStatus::Warn);
+    assert_eq!(poisoned.code, "untracked_build_artifacts");
+    assert!(poisoned.summary.contains("target/"), "{}", poisoned.summary);
+
+    // A .gitignore covering the artifacts settles both complaints.
+    fs::write(root.join(".gitignore"), "target/\n").unwrap();
+    git(&["add", ".gitignore"], &root);
+    let clean = gitignore_hygiene_fact(&root);
+    assert_eq!(clean.status, ReadinessStatus::Pass);
+    assert_eq!(clean.code, "gitignore_present");
+}

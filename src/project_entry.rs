@@ -103,6 +103,16 @@ impl ReadinessFact {
         }
     }
 
+    fn warn(name: &str, code: &str, summary: impl Into<String>, action: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            status: ReadinessStatus::Warn,
+            code: code.to_string(),
+            summary: summary.into(),
+            next_action: Some(action.to_string()),
+        }
+    }
+
     fn fail(name: &str, code: &str, summary: impl Into<String>, action: &str) -> Self {
         Self {
             name: name.to_string(),
@@ -229,6 +239,7 @@ pub(crate) fn readiness_with_probe(
             "Project setup is complete.",
         ));
     }
+    findings.push(gitignore_hygiene_fact(&options.root));
     // Explicit, never silent: read_only tasks only regain shell commands when
     // the kernel can enforce the write-denying sandbox.
     findings.push(
@@ -373,6 +384,70 @@ pub(crate) fn runtime_readiness(project: Option<String>, probe: RemoteProbe) -> 
         ready: probe == RemoteProbe::Ready,
         next_action: (probe != RemoteProbe::Ready).then(|| "webcodex doctor".to_string()),
         findings,
+    }
+}
+
+/// Untracked build artifacts poison the workspace provenance fingerprint and
+/// used to wedge check validation irrecoverably; catch the setup before the
+/// first task does.
+const IGNORE_HYGIENE_DIRS: &[&str] = &[
+    "target/",
+    "node_modules/",
+    "__pycache__/",
+    ".venv/",
+    "venv/",
+    "dist/",
+    "build/",
+    "coverage/",
+    ".pytest_cache/",
+];
+
+fn gitignore_hygiene_fact(root: &Path) -> ReadinessFact {
+    let untracked_artifacts: Vec<String> = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| line.strip_prefix("?? ").map(str::to_string))
+                .filter(|path| {
+                    IGNORE_HYGIENE_DIRS
+                        .iter()
+                        .any(|dir| path == dir || path.starts_with(dir))
+                })
+                .take(3)
+                .collect()
+        })
+        .unwrap_or_default();
+    let has_gitignore = root.join(".gitignore").exists();
+    if !untracked_artifacts.is_empty() {
+        ReadinessFact::warn(
+            "Ignore hygiene",
+            "untracked_build_artifacts",
+            format!(
+                "Untracked build artifacts present ({}); checks that touch them will fail \
+                 workspace provenance validation.",
+                untracked_artifacts.join(", ")
+            ),
+            "Add a .gitignore covering build artifacts (target/, __pycache__/, ...), then rerun webcodex doctor.",
+        )
+    } else if !has_gitignore {
+        ReadinessFact::warn(
+            "Ignore hygiene",
+            "gitignore_missing",
+            "The project has no .gitignore; checks that generate build artifacts will fail \
+             workspace provenance validation.",
+            "Add a .gitignore covering build artifacts before running checks.",
+        )
+    } else {
+        ReadinessFact::pass(
+            "Ignore hygiene",
+            "gitignore_present",
+            "No untracked build artifacts detected.",
+        )
     }
 }
 
