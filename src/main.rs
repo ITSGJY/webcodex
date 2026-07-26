@@ -18,7 +18,6 @@ mod agent_quic;
 mod agent_tokens_http;
 mod agent_ws;
 mod apply_edits_shared;
-mod sensitive_paths;
 mod artifact_policy;
 mod audit_http;
 mod auth;
@@ -33,6 +32,7 @@ mod models;
 mod oauth_http;
 mod openapi;
 mod pairing_http;
+mod sensitive_paths;
 // The server uses only normalization/bounds helpers; the same module's
 // filesystem scanner is compiled for and invoked by webcodex-agent.
 mod lsp_bridge;

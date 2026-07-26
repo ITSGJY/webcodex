@@ -610,7 +610,6 @@ mod tests {
             .consume_pairing_code(&hash_token("wc_pair_wrong"), "other", now)
             .unwrap();
         assert!(matches!(wrong, PairingConsumeResult::ClientMismatch(_)));
-    
     }
 
     #[test]

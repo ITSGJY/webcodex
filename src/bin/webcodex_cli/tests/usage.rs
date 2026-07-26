@@ -64,7 +64,13 @@ fn webcodex_cli_help_mentions_management_commands() {
             assert!(stdout.contains("client enroll"));
             // The token actions are now listed once per group rather than one
             // line per action, but every action must still appear.
-            for action in ["create-local", "generate", "register-hash", "list", "revoke"] {
+            for action in [
+                "create-local",
+                "generate",
+                "register-hash",
+                "list",
+                "revoke",
+            ] {
                 assert!(
                     stdout.contains(action),
                     "help no longer mentions token action {action}"
@@ -211,7 +217,11 @@ fn usage_lists_one_canonical_spelling_per_group() {
     // commands, which is what made the surface look twice its real size.
     match cli_action(["--help"]) {
         CliAction::Exit { stdout, .. } => {
-            for canonical in ["users create|list", "tokens create|", "agent-tokens create|"] {
+            for canonical in [
+                "users create|list",
+                "tokens create|",
+                "agent-tokens create|",
+            ] {
                 assert!(
                     stdout.contains(canonical),
                     "help is missing {canonical}: {stdout}"

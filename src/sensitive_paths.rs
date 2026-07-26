@@ -70,7 +70,9 @@ pub fn glob_targets_protected_path(glob: &str) -> bool {
     let normalized = glob.strip_prefix("./").unwrap_or(glob);
     let lowered = normalized.to_lowercase();
     let last = lowered.rsplit('/').next().unwrap_or(&lowered);
-    if SECRET_PREFIXES.iter().any(|prefix| last.starts_with(prefix))
+    if SECRET_PREFIXES
+        .iter()
+        .any(|prefix| last.starts_with(prefix))
         || SECRET_SUFFIXES.iter().any(|suffix| last.ends_with(suffix))
     {
         return true;
@@ -183,7 +185,10 @@ mod tests {
             "secrets/**",
             "./**/.env",
         ] {
-            assert!(glob_targets_protected_path(glob), "expected protected: {glob}");
+            assert!(
+                glob_targets_protected_path(glob),
+                "expected protected: {glob}"
+            );
         }
     }
 
