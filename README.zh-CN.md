@@ -2,6 +2,48 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
+[![CI](https://github.com/yyjeqhc/webcodex/actions/workflows/ci.yml/badge.svg)](https://github.com/yyjeqhc/webcodex/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/%40yyjeqhc%2Fwebcodex)](https://www.npmjs.com/package/@yyjeqhc/webcodex)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+
+**让网页版 ChatGPT / Claude 直接改你的私有代码——但没有你的审核，一行都落不了地。**
+AI 在你机器上的隔离工作区里编辑、跑测试、提交结果；你看 diff、点 Accept 才真正生效。
+这道人工审核闸门是整个产品的核心：那些让模型直接写盘的工具，架构上补不回这一层。
+
+```
+ChatGPT / Claude（网页聊天窗口）
+        │  MCP 或 GPT Actions（HTTPS）
+        ▼
+WebCodex server ──▶ 本地 Agent：编辑 → 跑检查 → 提交结果
+        │                    （隔离工作区，不碰你的 checkout）
+        ▼
+你：浏览器 console 或 CLI ── 审核 diff ──▶ Accept ✓ / Reject ✗
+        │  仅 accept 后
+        ▼
+你的仓库
+```
+
+- **人工审核闸门** —— 结果先隔离，`/console` 网页或 `webcodex task accept` 审核通过才落地。
+- **一切留在你的机器** —— 源码、Git、修改、检查都在拥有仓库的主机上；对外只暴露九个有界、可审计的能力，而不是裸 shell。
+- **为真实开发准备** —— LSP 语义导航、带 sha256 守卫的结构化编辑、四语言校验配方（Rust/Node/Python/Go）、服务端强制的幂等重试、完整的任务事件时间线。
+
+| ChatGPT 通过 MCP 驱动任务 | 本机审核与落地 |
+| --- | --- |
+| ![MCP 会话](docs/assets/mcp-1.png) | ![GPT Action 审核](docs/assets/gpt-action-1.png) |
+
+<details>
+<summary>更多截图</summary>
+
+![MCP](docs/assets/mcp-2.png)
+![MCP](docs/assets/mcp-3.png)
+![MCP](docs/assets/mcp-4.png)
+![GPT Actions](docs/assets/gpt-action-2.png)
+![GPT Actions](docs/assets/gpt-action-3.png)
+![GPT Actions](docs/assets/gpt-action-4.png)
+![GPT Actions](docs/assets/gpt-action-5.png)
+
+</details>
+
 WebCodex 让 coding client 通过项目级 server 和本地 Agent 操作私有代码。源码、
 Git、修改和验证仍留在拥有仓库的机器上。
 
