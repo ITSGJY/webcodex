@@ -18,6 +18,19 @@ jobs:
         with:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        run: npm ci --prefix frontend
+      - name: Type-check frontend
+        run: npm --prefix frontend run typecheck
+      - name: Test frontend
+        run: npm --prefix frontend test
+      - name: Verify committed frontend build
+        run: npm --prefix frontend run check:dist
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Run tests

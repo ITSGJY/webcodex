@@ -194,8 +194,10 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
 
     // Chat-window MCP tool calls must land in the action audit exactly like
     // the REST surface (they were previously invisible there). Summary-level
-    // only: tool name and project — never arguments or outputs.
-    let audit = if request.method == "tools/call" {
+    // only: tool name and project — never arguments or outputs. JSON-RPC
+    // notifications are acknowledged but never dispatched, so they must not be
+    // represented as executed actions.
+    let audit = if request.method == "tools/call" && request.id.is_some() {
         Some((
             ActionAudit::start(req, depot, "/mcp", "toolsCall"),
             tool_name.unwrap_or_else(|| "unknown".to_string()),
@@ -319,7 +321,6 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
             guard.handler_returned(403, estimated, Some(false), None, "forbidden");
         }
         McpOutcome::Notification => {
-            record_audit(true, StatusCode::ACCEPTED, None);
             // JSON-RPC notifications carry no `id`; the server MUST NOT reply
             // with a JSON-RPC body. Acknowledge with 202 and an empty body.
             // Empty body size is known (0) without JSON serialization.
@@ -1490,6 +1491,21 @@ mod tests {
             .send(&service)
             .await;
         assert_eq!(resp.status_code, Some(StatusCode::OK));
+
+        // A no-id tools/call is a JSON-RPC notification. The core dispatcher
+        // intentionally ignores every notification, so it must not create a
+        // successful action row for work that never ran.
+        let resp = TestClient::post("http://localhost/mcp")
+            .bearer_auth("secret")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "list_tools", "arguments": {}}
+            }))
+            .send(&service)
+            .await;
+        assert_eq!(resp.status_code, Some(StatusCode::ACCEPTED));
+
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM action_events", [], |row| row.get(0))
             .unwrap();
