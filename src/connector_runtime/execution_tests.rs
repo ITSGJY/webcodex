@@ -2899,7 +2899,10 @@ async fn read_only_files_list_reaches_the_agent_as_a_git_index_listing() {
 async fn files_list_rejects_out_of_range_input_without_reaching_the_agent() {
     let fixture = fixture(20).await;
     let started = fixture
-        .call("task_start", json!({ "goal": "inspect", "mode": "read_only" }))
+        .call(
+            "task_start",
+            json!({ "goal": "inspect", "mode": "read_only" }),
+        )
         .await;
     let task_id = started.body["task_id"].as_str().unwrap().to_string();
 
@@ -2910,7 +2913,11 @@ async fn files_list_rejects_out_of_range_input_without_reaching_the_agent() {
         json!({ "task_id": task_id, "globs": [""] }),
     ] {
         let outcome = fixture.call("files_list", arguments.clone()).await;
-        assert!(!outcome.ok, "{arguments} should be rejected: {}", outcome.body);
+        assert!(
+            !outcome.ok,
+            "{arguments} should be rejected: {}",
+            outcome.body
+        );
     }
     assert!(
         poll(&fixture.registry).await.is_none(),

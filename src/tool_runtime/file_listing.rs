@@ -247,7 +247,11 @@ pub(crate) fn build_listing(
                     let is_dir = key.ends_with('/');
                     ListingEntry {
                         path: format!("{scope}{key}"),
-                        kind: if is_dir { EntryKind::Dir } else { EntryKind::File },
+                        kind: if is_dir {
+                            EntryKind::Dir
+                        } else {
+                            EntryKind::File
+                        },
                         file_count: is_dir.then_some(count),
                     }
                 })
@@ -440,7 +444,12 @@ mod tests {
 
     #[test]
     fn depth_is_counted_inside_the_requested_scope() {
-        let files = paths(&["src/db/mod.rs", "src/db/row.rs", "src/http/mod.rs", "top.rs"]);
+        let files = paths(&[
+            "src/db/mod.rs",
+            "src/db/row.rs",
+            "src/http/mod.rs",
+            "top.rs",
+        ]);
         let listing = build_listing(&files, "src/", &[], Some(1), 50, 0);
 
         // Scoped to src/, depth 1 shows src's children, not src itself.

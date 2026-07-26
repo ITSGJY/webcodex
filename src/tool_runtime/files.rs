@@ -874,10 +874,7 @@ const LIST_TRACKED_MAX_BYTES: usize = 1024 * 1024;
 /// Structured failure shaped like the other file-tool errors, so a caller can
 /// branch on `code` instead of matching prose.
 fn list_tracked_error(code: &str, message: String) -> ToolResult {
-    ToolResult::err_with_output(
-        message.clone(),
-        json!({ "code": code, "message": message }),
-    )
+    ToolResult::err_with_output(message.clone(), json!({ "code": code, "message": message }))
 }
 
 /// First non-empty line of command stderr, bounded — enough to diagnose,
@@ -3808,11 +3805,8 @@ impl ToolRuntime {
                 Ok(pending) => pending,
                 Err(error) => return ToolResult::err(error),
             };
-            match tokio::time::timeout(
-                Duration::from_secs(LIST_TRACKED_TIMEOUT_SECS + 10),
-                rx,
-            )
-            .await
+            match tokio::time::timeout(Duration::from_secs(LIST_TRACKED_TIMEOUT_SECS + 10), rx)
+                .await
             {
                 Ok(Ok(response)) => (
                     response.stdout.unwrap_or_default(),
@@ -3853,13 +3847,11 @@ impl ToolRuntime {
         // `list_tracked_files_command`): 2 = no usable `head`, 3 = not a Git
         // repository, 141 = SIGPIPE once `head` closed a large stream early.
         match exit_code {
-            Some(3) => {
-                return list_tracked_error(
-                    "not_a_git_repository",
-                    "this project is not a Git repository, so its tracked-file index cannot be read"
-                        .to_string(),
-                )
-            }
+            Some(3) => return list_tracked_error(
+                "not_a_git_repository",
+                "this project is not a Git repository, so its tracked-file index cannot be read"
+                    .to_string(),
+            ),
             Some(2) => {
                 return list_tracked_error(
                     "list_unavailable",
@@ -3870,7 +3862,10 @@ impl ToolRuntime {
             Some(code) => {
                 return list_tracked_error(
                     "list_failed",
-                    format!("listing command failed with exit {code}: {}", first_line(&stderr)),
+                    format!(
+                        "listing command failed with exit {code}: {}",
+                        first_line(&stderr)
+                    ),
                 )
             }
         }
