@@ -375,6 +375,14 @@ input[type="text"] {
   flex: 1;
 }
 
+.device-online {
+  border-left-color: var(--pass);
+}
+
+.device-offline {
+  border-left-color: var(--muted);
+}
+
 .diff,
 .output {
   max-height: 360px;

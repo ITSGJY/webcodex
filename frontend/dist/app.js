@@ -998,9 +998,98 @@ async function tick() {
     await fetchTasks();
     await fetchApprovals();
     await fetchActivity();
+    await fetchDevices();
   } finally {
     endRefresh(state, "tick");
   }
+}
+
+async function fetchDevices() {
+  const res = await api("devices", {});
+  if (!res || !res.ok || !res.data) {
+    return;
+  }
+  renderDevices(Array.isArray(res.data.agents) ? res.data.agents : []);
+}
+
+// Read-only device roster: every agent this credential can see, with its
+// connection state, transport, capabilities, and provider health.
+function renderDevices(agents: any[]) {
+  show("devices-panel", agents.length > 0);
+  setText("devices-count", agents.length ? "(" + agents.length + ")" : "");
+  const node = el("devices-list");
+  if (!node) {
+    return;
+  }
+  clearNode(node);
+  for (const agent of agents) {
+    const item = document.createElement("li");
+    const online = !!(agent && agent.connected);
+    item.className = "timeline-event " + (online ? "device-online" : "device-offline");
+    const head = document.createElement("div");
+    head.className = "timeline-head";
+    const name = document.createElement("span");
+    name.className = "timeline-kind";
+    name.textContent =
+      String((agent && (agent.display_name || agent.client_id)) || "agent") +
+      (online ? "" : " (offline)");
+    const meta = document.createElement("span");
+    meta.className = "muted small";
+    meta.textContent = [
+      agent && agent.transport ? String(agent.transport) : "",
+      agent && agent.hostname ? String(agent.hostname) : "",
+      lastSeenLabel(agent ? agent.last_seen_age_secs : null),
+    ]
+      .filter((value) => !!value)
+      .join(" · ");
+    head.appendChild(name);
+    head.appendChild(meta);
+    item.appendChild(head);
+    const body = document.createElement("div");
+    body.className = "timeline-payload muted small";
+    body.textContent = deviceDetail(agent);
+    item.appendChild(body);
+    node.appendChild(item);
+  }
+}
+
+function lastSeenLabel(ageSecs) {
+  if (typeof ageSecs !== "number" || ageSecs < 0) {
+    return "";
+  }
+  if (ageSecs < 60) {
+    return "seen just now";
+  }
+  if (ageSecs < 3600) {
+    return "seen " + Math.floor(ageSecs / 60) + " min ago";
+  }
+  return "seen " + Math.floor(ageSecs / 3600) + " h ago";
+}
+
+function deviceDetail(agent) {
+  const parts = [];
+  const caps = agent && agent.capabilities && typeof agent.capabilities === "object"
+    ? Object.keys(agent.capabilities).filter((key) => !!agent.capabilities[key])
+    : [];
+  if (caps.length) {
+    parts.push("caps: " + caps.join(", "));
+  }
+  if (agent && typeof agent.projects_count === "number") {
+    parts.push("projects " + agent.projects_count);
+  }
+  if (agent && typeof agent.active_jobs === "number" && agent.active_jobs > 0) {
+    parts.push("active jobs " + agent.active_jobs);
+  }
+  const providers = agent ? agent.tool_providers : null;
+  if (!providers) {
+    parts.push("providers: native");
+  } else {
+    try {
+      const text = JSON.stringify(providers);
+      parts.push("providers: " + (text.length > 120 ? text.slice(0, 120) + "…" : text));
+    } catch {}
+  }
+  return parts.join(" · ");
 }
 
 async function fetchApprovals() {
