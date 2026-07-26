@@ -1039,6 +1039,19 @@ impl ConnectorRuntime {
                 ) {
                     return store_error_outcome(error, Some(&task));
                 }
+                // Paths are part of the durable event so review surfaces can
+                // show what changed without a workspace scan (bounded by the
+                // 16-change schema limit).
+                let mut changed_paths: Vec<&str> = Vec::new();
+                for change in &input.changes {
+                    for path in [Some(change.path.as_str()), change.to_path.as_deref()] {
+                        if let Some(path) = path {
+                            if !changed_paths.contains(&path) {
+                                changed_paths.push(path);
+                            }
+                        }
+                    }
+                }
                 let cursor = match self.record_event(
                     &task,
                     "edits_apply",
@@ -1046,7 +1059,8 @@ impl ConnectorRuntime {
                         "ok": true,
                         "dry_run": input.dry_run.unwrap_or(false),
                         "operation_id": input.operation_id,
-                        "change_count": input.changes.len()
+                        "change_count": input.changes.len(),
+                        "changed_paths": changed_paths
                     }),
                     now,
                 ) {
@@ -1544,10 +1558,24 @@ impl ConnectorRuntime {
             .as_ref()
             .is_some_and(crate::db::ConnectorExecution::is_active)
         {
+            // The diff stays deferred while a command runs — a synchronous
+            // workspace scan here would stall the review long-poll behind the
+            // executor. The paths this task has applied are already durable
+            // facts in its event log, so surface those instead of going dark.
+            let applied_paths = match self.db.connector_task_events(
+                &task.task_id,
+                &task.project_id,
+                &task.owner_subject_id,
+                MAX_EVENT_COUNT,
+            ) {
+                Ok(events) => aggregate_applied_paths(&events),
+                Err(error) => return store_error_outcome(error, Some(&task)),
+            };
             json!({
                 "source": "live_workspace_deferred",
                 "reason": "execution_active",
-                "changed_paths": [],
+                "changed_paths": applied_paths,
+                "changed_paths_source": "applied_edits",
                 "diff_preview": null
             })
         } else {
@@ -2752,6 +2780,30 @@ fn paginate_search_output(
         "view": "live_sorted"
     });
     output
+}
+
+/// Distinct paths this task has applied via successful, non-dry-run
+/// `edits_apply` calls, in first-seen order. Derived purely from the durable
+/// event log so callers never pay for a workspace scan.
+fn aggregate_applied_paths(events: &[crate::db::ConnectorTaskEvent]) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    for event in events {
+        if event.kind != "edits_apply"
+            || event.payload["ok"] != true
+            || event.payload["dry_run"] == true
+        {
+            continue;
+        }
+        let Some(list) = event.payload["changed_paths"].as_array() else {
+            continue;
+        };
+        for path in list.iter().filter_map(Value::as_str) {
+            if !paths.iter().any(|existing| existing == path) {
+                paths.push(path.to_string());
+            }
+        }
+    }
+    paths
 }
 
 fn kernel_failure_may_have_applied(error: &KernelFailure) -> bool {

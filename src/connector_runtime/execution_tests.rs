@@ -1113,6 +1113,87 @@ async fn edits_apply_after_a_passed_check_makes_finish_stale() {
 }
 
 #[tokio::test]
+async fn active_review_surfaces_applied_paths_without_diff() {
+    let fixture = fixture(20).await;
+    // Apply one edit so the task has durable changed paths on record.
+    let connector = fixture.connector.clone();
+    let owner = fixture.owner.clone();
+    let task_id = fixture.task_id.clone();
+    let edit_call = tokio::spawn(async move {
+        call(
+            &connector,
+            &owner,
+            "edits_apply",
+            json!({
+                "task_id": task_id,
+                "operation_id": "active-review-edit-1",
+                "changes": [{
+                    "kind": "create",
+                    "path": "active-review.txt",
+                    "content": "x"
+                }]
+            }),
+        )
+        .await
+    });
+    let request = next_request(&fixture.registry).await;
+    assert_eq!(request.kind, "file_apply_text_edits");
+    complete_create_edit(&fixture, request, "active-review.txt", "x").await;
+    assert!(edit_call.await.unwrap().ok);
+
+    // Start a long command and let it reach running.
+    let arguments = approve(&fixture, "active-review-cmd-1", "sleep 30").await;
+    let connector = fixture.connector.clone();
+    let owner = fixture.owner.clone();
+    let command_call =
+        tokio::spawn(async move { call(&connector, &owner, "commands_run", arguments).await });
+    let start = next_request(&fixture.registry).await;
+    assert_eq!(start.kind, "start_job");
+    let job_id = start.job_id.unwrap();
+    update_job(&fixture.registry, &job_id, "running", None, None).await;
+    let quick_yield = command_call.await.unwrap();
+    assert!(quick_yield.ok, "{}", quick_yield.body);
+
+    // Review during the active execution: diff stays deferred, but the
+    // applied paths and the enriched edits_apply event are visible.
+    let review = fixture
+        .call(
+            "task_review",
+            json!({"task_id": fixture.task_id, "include_diff": true}),
+        )
+        .await;
+    assert!(review.ok, "{}", review.body);
+    let changes = &review.body["data"]["changes"];
+    assert_eq!(changes["source"], "live_workspace_deferred");
+    assert_eq!(changes["changed_paths_source"], "applied_edits");
+    assert_eq!(changes["changed_paths"], json!(["active-review.txt"]));
+    assert!(changes["diff_preview"].is_null());
+    let events = review.body["data"]["recent_events"].as_array().unwrap();
+    let edit_event = events
+        .iter()
+        .find(|event| event["kind"] == "edits_apply")
+        .expect("edits_apply event in timeline");
+    assert_eq!(
+        edit_event["payload"]["changed_paths"],
+        json!(["active-review.txt"])
+    );
+
+    // Release the workspace slot.
+    let stop_registry = fixture.registry.clone();
+    let stop_job = job_id.clone();
+    let stopper = tokio::spawn(async move {
+        let stop = next_request(&stop_registry).await;
+        assert_eq!(stop.kind, "stop_job");
+        update_job(&stop_registry, &stop_job, "stopped", None, Some(-1)).await;
+    });
+    let cancelled = fixture
+        .call("task_cancel", json!({"task_id": fixture.task_id}))
+        .await;
+    assert!(cancelled.ok, "{}", cancelled.body);
+    stopper.await.unwrap();
+}
+
+#[tokio::test]
 async fn finish_fingerprint_and_result_capture_exclude_a_concurrent_edit() {
     let fixture = fixture(1_000).await;
     let command_arguments = approve(&fixture, "atomic-finish-command-1", "printf late").await;
@@ -2277,6 +2358,11 @@ async fn running_check_allows_review_wait_cancel_and_releases_slot() {
         Some("queued" | "running")
     ));
     assert_eq!(initial.body["data"]["active_execution"]["kind"], "check");
+    // Active execution with no applied edits: diff deferred, empty path list.
+    let changes = &initial.body["data"]["changes"];
+    assert_eq!(changes["source"], "live_workspace_deferred");
+    assert_eq!(changes["changed_paths"], json!([]));
+    assert!(changes["diff_preview"].is_null());
 
     let waiting_connector = fixture.connector.clone();
     let waiting_owner = fixture.owner.clone();
