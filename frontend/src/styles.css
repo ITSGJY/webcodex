@@ -316,6 +316,37 @@ input[type="text"] {
   font-size: 0.82rem;
 }
 
+.timeline {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 260px;
+  overflow: auto;
+}
+
+.timeline-event {
+  padding: 4px 8px;
+  border-left: 3px solid var(--border);
+  background: var(--bg);
+}
+
+.timeline-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.timeline-kind {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.82rem;
+}
+
+.timeline-payload {
+  overflow-wrap: anywhere;
+}
+
 .diff,
 .output {
   max-height: 360px;

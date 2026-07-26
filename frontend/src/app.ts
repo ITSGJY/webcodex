@@ -376,6 +376,7 @@ function renderDetail(d: any) {
   renderFiles(d);
   renderDiff(d);
   renderOutput(execution);
+  renderTimeline(d);
   renderActions(d);
   setText("detail-next", "Next: " + (d.next_action || "not available"));
 }
@@ -481,6 +482,83 @@ function renderOutput(execution: any) {
   if (pre) {
     pre.textContent = combined || "not available";
   }
+}
+
+// Newest-first durable event log for the selected task. Facts only, rendered
+// as text — the payload is never trusted as markup.
+function renderTimeline(d: any) {
+  const events = Array.isArray(d.recent_events) ? d.recent_events : null;
+  const node = el("detail-timeline");
+  clearNode(node);
+  show("detail-timeline-section", true);
+  setText("detail-timeline-count", events ? "(" + events.length + ")" : "");
+  if (!node) {
+    return;
+  }
+  if (!events || !events.length) {
+    const item = document.createElement("li");
+    item.textContent = events ? "none" : "not available";
+    node.appendChild(item);
+    return;
+  }
+  for (const event of [...events].reverse()) {
+    const item = document.createElement("li");
+    item.className = "timeline-event";
+    const head = document.createElement("div");
+    head.className = "timeline-head";
+    const kind = document.createElement("span");
+    kind.className = "timeline-kind";
+    kind.textContent = event && event.kind ? String(event.kind) : "event";
+    const meta = document.createElement("span");
+    meta.className = "muted small";
+    const seq = event && typeof event.sequence === "number" ? "#" + event.sequence : "";
+    meta.textContent = [seq, eventTime(event)].filter((value) => !!value).join(" · ");
+    head.appendChild(kind);
+    head.appendChild(meta);
+    item.appendChild(head);
+    const summary = eventSummary(event ? event.payload : null);
+    if (summary) {
+      const body = document.createElement("div");
+      body.className = "timeline-payload muted small";
+      body.textContent = summary;
+      item.appendChild(body);
+    }
+    node.appendChild(item);
+  }
+}
+
+function eventTime(event: any): string {
+  return event && typeof event.created_at === "number" && event.created_at > 0
+    ? new Date(event.created_at * 1000).toLocaleTimeString()
+    : "";
+}
+
+// Compact scalar-first payload summary; long payloads degrade to truncated
+// JSON text rather than being hidden.
+function eventSummary(payload: any): string {
+  if (!payload || typeof payload !== "object") {
+    return "";
+  }
+  const parts: string[] = [];
+  for (const key of ["ok", "dry_run", "exit_code", "change_count", "status", "reason"]) {
+    if (payload[key] !== undefined && payload[key] !== null) {
+      parts.push(key + "=" + String(payload[key]));
+    }
+  }
+  if (Array.isArray(payload.changed_paths) && payload.changed_paths.length) {
+    const paths = payload.changed_paths.slice(0, 3).map((path: any) => String(path));
+    const extra = payload.changed_paths.length - paths.length;
+    parts.push("paths: " + paths.join(", ") + (extra > 0 ? " +" + extra : ""));
+  }
+  if (!parts.length) {
+    try {
+      const text = JSON.stringify(payload);
+      return text.length > 140 ? text.slice(0, 140) + "…" : text;
+    } catch {
+      return "";
+    }
+  }
+  return parts.join(" · ");
 }
 
 // Buttons are offered only when the current snapshot is live (actionsEnabled)
