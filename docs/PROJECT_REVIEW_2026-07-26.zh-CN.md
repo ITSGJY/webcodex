@@ -246,7 +246,7 @@
 |---|---|---|
 | 1 现场 P0 | `files_search` 尊重 .gitignore（rg 去 `--no-ignore`）+ 排除表补 Python/数据科学条目；`task_review` 默认瘦身（include_diff/include_output_tail 默认 false，198KB→摘要）；`files_read` 去掉 lines 数组冗余（12.6× 读放大）；cargo 检查共享 target 缓存（免每任务冷构建）；项目 brief 用 `git ls-files` 索引（不再扫进 .venv） | b20aec7 / 143846d / 512b124 / a029990 / aa55bf9 |
 | README | 中英双语加价值主张、30 秒流程图、三差异点、徽章与截图；正文未动 | 1654a9b |
-| 2 Landlock | `command_sandbox.rs` 共享模块：**只治理写类别、零路径枚举**（AccessFs::from_write + path_beneath_rules），探测→宣告→执行三级 fail-closed；read_only 任务在 agent 宣告 `sandbox_read_only_commands` 能力时拿回 commands_run（`sandbox:"read_only"`，免审批——内核即闸门；TMPDIR 指向任务私有 scratch）；无能力保持拒绝；normal 审批流一字未动；doctor 显式两态 + 读取侧残余风险声明 | dc14d7e / 6bafb64 |
+| 2 Landlock | **已实现 → 同日撤回**。`command_sandbox.rs` 共享模块保留（只治理写类别、零路径枚举：`AccessFs::from_write` + `path_beneath_rules`），但**read_only 拿回 commands_run 这一步已经撤销**：写过滤器只是一个访问类别，不是"无后果执行"边界。详见下方"批次 2 的撤回"与 `docs/READ_ONLY_COMMAND_SANDBOX.md` | dc14d7e / 6bafb64 → c700219 / 5637d29 |
 | 3 错误分类 | 见下 | 1aff8b8 |
 
 **批次 3：provenance 失败的诚实分类（卡死 bug 根因修复）。** 实测中"检查全绿但执行卡在 retry_status_check 直到 10 分钟死线、diff 全程不可见"的根因是分类抹除：monitor 已经探测到工作区指纹不匹配，但 db 守卫的拒绝被压平成 `task_store_error`/`storage`，模型对确定性失败反复重试。修复四件套：
@@ -258,4 +258,12 @@
 
 测试：e2e 驱动全链路（检查期间出现未跟踪产物→快速诚实终态+条件化 `.gitignore` 证据+review 降级；仅改写已跟踪文件→通用工作区检查建议且不出现 `.gitignore`；超过 applied-path 上限并混入重复路径与事件窗口外噪音→列表有界、首见有序、总数完整去重、`changed_paths_complete=false`）；review 降级分支靠应答一个带 `## ` 分支头的非零退出扫描结果触发，绕开 show_changes 自身的非 git 容错。doctor 三档单测。已明确**不做**第 5 项（provenance 只覆盖任务改动路径）——那是单独决策。
 
-遗留（下批）：B2 欠的 connector 级测试（fixture 宣告 sandbox 能力→read_only commands_run 派发且 `request.sandbox=="read_only"` 免审批；能力关→拒绝）；批次 5 跨会话 bootstrap（task_list/resume 合并设计）。
+**批次 2 的撤回（c700219 / 5637d29）。** 批次 2 曾让 read_only 任务在 agent 宣告 `sandbox_read_only_commands` 时免审批拿回 `commands_run`。**这一步是错的，同日撤回。** 两类原因：
+
+*概念上不成立。* `read_only` 向启动它的人承诺的是"不发生任何有后果的事"，不只是"checkout 没变"。写过滤器只治理一个访问类别，另外三个全开着——读完全不受限（`~/.ssh`、`~/.aws`、别的项目与租户状态目录）、环境变量原样继承（部署放进去的 token 与云凭证）、网络完全没碰（Landlock 文件系统规则管不了 socket，命令可以把刚读到的内容 POST 出去）。这三件事**事后在工作区里都看不出来**，正是 read_only 说过不会发生的。
+
+*实现上四处 fail-open，一并修掉。* ① 探测只创建 ruleset fd——证明 syscall 存在，不证明策略生效；现在在一次性子进程里真的 apply 并验证"该写的写得进、该拒的拒得掉"。② `PartiallyEnforced` 曾算成功；现在拒绝，且规则集用 `CompatLevel::HardRequirement` 而非默认 BestEffort。③ 非 Linux 上安排沙箱是 no-op，显式沙箱请求变成无约束执行；现在 spawn 前报错。④ **闸门是 agent 自报的能力位**——agent 声称支持就能重开免审批 shell；现在 `commands_run` 回到与其他有后果能力相同的 writable 守卫，read_only 在审批、预留、agent 请求存在之前就被拒。
+
+现在的状态：基础留在树里、**关着**；`sandbox_read_only_commands` 硬编码 `false`；`doctor` 报告基础存在并**在同一句话里**说明这不改变任何事。缺口"读不受限"由 `command_sandbox.rs` 里一个断言读取成功的测试钉住，不会悄悄变得不真。重开的全部条件见 `docs/READ_ONLY_COMMAND_SANDBOX.md`。
+
+遗留（下批）：批次 5 跨会话 bootstrap（task_list/resume 合并设计）。~~B2 欠的 connector 级测试~~ 随批次 2 撤回一并作废——没有免审批派发路径需要测试了。
