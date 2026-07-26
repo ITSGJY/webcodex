@@ -430,6 +430,7 @@ fn step(check: SemanticCheck, program: &str, args: Vec<String>) -> ShellJobValid
         name: check.as_str().to_string(),
         program: program.to_string(),
         args,
+        env: Vec::new(),
     }
 }
 

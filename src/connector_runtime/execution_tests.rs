@@ -1647,6 +1647,7 @@ async fn structured_progress_rejects_invalid_order_and_preserves_fail_fast_plan(
                     "test" => vec!["test".into()],
                     _ => unreachable!(),
                 },
+                env: Vec::new(),
             })
             .collect(),
     };
@@ -3427,4 +3428,44 @@ async fn host_devices_returns_the_agent_projection() {
         assert!(agent.get("last_seen_age_secs").is_some());
         assert!(agent.get("capabilities").is_some());
     }
+}
+
+#[tokio::test]
+async fn checks_run_steers_cargo_at_the_shared_target_cache() {
+    let fixture = fixture(1_000).await;
+    let arguments = checks(&fixture, "shared-cache-1", &["check", "test"]);
+    let connector = fixture.connector.clone();
+    let owner = fixture.owner.clone();
+    let check_call =
+        tokio::spawn(async move { call(&connector, &owner, "checks_run", arguments).await });
+    let start = next_request(&fixture.registry).await;
+    assert_eq!(start.kind, "start_validation_job");
+    let steps: Vec<crate::shell_protocol::ShellJobValidationStep> =
+        serde_json::from_str(&start.command).expect("validation steps json");
+    assert!(!steps.is_empty());
+    for step in &steps {
+        assert!(step.is_canonical(), "{} must stay canonical", step.name);
+        let target = step
+            .env
+            .iter()
+            .find(|(key, _)| key == "CARGO_TARGET_DIR")
+            .map(|(_, value)| value.as_str())
+            .unwrap_or_else(|| panic!("{} step missing CARGO_TARGET_DIR", step.name));
+        assert!(
+            target.ends_with("cache/cargo-target"),
+            "shared cache path expected, got {target}"
+        );
+    }
+    // Unblock the slot.
+    let job_id = start.job_id.unwrap();
+    update_validation_job(
+        &fixture.registry,
+        &job_id,
+        "completed",
+        None,
+        Some(0),
+        check_progress(2, None, None),
+    )
+    .await;
+    assert!(check_call.await.unwrap().ok);
 }

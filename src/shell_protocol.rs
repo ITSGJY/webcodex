@@ -710,6 +710,12 @@ pub struct ShellJobValidationStep {
     pub program: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Cache-steering variables applied at spawn (e.g. CARGO_TARGET_DIR so
+    /// the shared build cache survives slot resets). Key-allowlisted by
+    /// `is_canonical`; omitted from the wire when empty so older agents keep
+    /// parsing unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<(String, String)>,
 }
 
 impl ShellJobValidationStep {
@@ -719,6 +725,15 @@ impl ShellJobValidationStep {
             .iter()
             .any(|arg| arg.contains('\0') || arg.len() > 500)
         {
+            return false;
+        }
+        const ALLOWED_STEP_ENV_KEYS: &[&str] = &["CARGO_TARGET_DIR"];
+        if !self.env.iter().all(|(key, value)| {
+            ALLOWED_STEP_ENV_KEYS.contains(&key.as_str())
+                && !value.is_empty()
+                && !value.contains('\0')
+                && value.len() <= 500
+        }) {
             return false;
         }
         let args = self.args.iter().map(String::as_str).collect::<Vec<_>>();
@@ -1622,7 +1637,25 @@ mod filter_canonical_tests {
             name: "test".to_string(),
             program: "cargo".to_string(),
             args: vec!["test".to_string(), filter.to_string()],
+            env: Vec::new(),
         }
+    }
+
+    #[test]
+    fn step_env_allowlist_gates_canonicality() {
+        let mut step = cargo_test("tool_runtime");
+        assert!(step.is_canonical());
+        step.env
+            .push(("CARGO_TARGET_DIR".to_string(), "/state/cache".to_string()));
+        assert!(
+            step.is_canonical(),
+            "allowlisted env key must stay canonical"
+        );
+        step.env.push(("PATH".to_string(), "/tmp/evil".to_string()));
+        assert!(
+            !step.is_canonical(),
+            "non-allowlisted env keys must break canonicality"
+        );
     }
 
     #[test]
@@ -1672,6 +1705,7 @@ mod filter_canonical_tests {
             name: "test".to_string(),
             program: "cargo".to_string(),
             args: vec!["test".to_string()],
+            env: Vec::new(),
         };
         assert!(no_filter.is_canonical());
         let max_len = "a".repeat(RUST_TEST_FILTER_MAX_BYTES);
