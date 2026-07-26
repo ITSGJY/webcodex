@@ -204,8 +204,9 @@ fn wait_until(timeout: Duration, condition: impl Fn() -> bool) -> bool {
     condition()
 }
 
-fn schema_fields(schema: &BTreeSet<String>) -> Vec<String> {
-    let mut fields = schema
+fn schema_fields(tool: &DiscoveredTool) -> Vec<String> {
+    let mut fields = tool
+        .fields
         .iter()
         .map(|name| sanitize_name(name))
         .collect::<Vec<_>>();
@@ -218,8 +219,8 @@ fn discovery_inventory(client: &ProjectMcpClient) -> Value {
     let mut tools = client
         .tools
         .iter()
-        .map(|(name, schema)| {
-            json!({"name": sanitize_name(name), "schema_fields": schema_fields(schema)})
+        .map(|(name, tool)| {
+            json!({"name": sanitize_name(name), "schema_fields": schema_fields(tool)})
         })
         .collect::<Vec<_>>();
     tools.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
@@ -233,14 +234,14 @@ fn real_tool_name(
     env_key: &str,
 ) -> Result<String, String> {
     if let Ok(name) = env::var(env_key) {
-        let Some(schema) = client.tools.get(&name) else {
+        let Some(tool) = client.tools.get(&name) else {
             return Err(format!(
                 "{env_key} selected {:?}, but discovered tools were {}",
                 sanitize_name(&name),
                 discovery_inventory(client)
             ));
         };
-        let fields = schema_fields(schema);
+        let fields = schema_fields(tool);
         let missing = required_fields(capability)
             .iter()
             .filter(|field| !fields.iter().any(|actual| actual == **field))
@@ -263,11 +264,11 @@ fn real_tool_name(
     let candidates = client
         .tools
         .iter()
-        .filter(|(name, schema)| {
+        .filter(|(name, tool)| {
             name.to_ascii_lowercase().contains(needle)
                 && required_fields(capability)
                     .iter()
-                    .all(|field| schema.contains(*field))
+                    .all(|field| tool.fields.contains(*field))
         })
         .map(|(name, _)| name.clone())
         .collect::<Vec<_>>();
@@ -331,7 +332,10 @@ fn status_reports_discovery_mapping_process_and_bounded_error() {
     let status = fixture.provider.status();
     assert_eq!(status.version.as_deref(), Some("Claude Fake 1.2.3"));
     assert_eq!(status.process_state, "running");
-    assert_eq!(status.discovered_tool_names, ["fake_edit", "fake_search"]);
+    assert_eq!(
+        status.discovered_tool_names,
+        ["Bash", "Edit", "Read", "Write", "fake_edit", "fake_search"]
+    );
     assert_eq!(status.capabilities["search_project_text"], "available");
     assert_eq!(status.capabilities["edit_file"], "available");
     assert_eq!(status.last_error_code, None);
@@ -858,4 +862,456 @@ fn process_group_exists(process_group: u32) -> bool {
     // SAFETY: signal 0 only probes the private process group captured above.
     (unsafe { libc::kill(-(process_group as i32), 0) == 0 })
         || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn experimental_router(fixture: &Fixture) -> ExternalToolRouter {
+    // Experimental kinds ignore production strategy; native keeps default path safe.
+    ExternalToolRouter::new(&ToolProvidersConfig {
+        strategy: ToolProviderStrategy::Native,
+        claude_code: fixture.config.clone(),
+    })
+}
+
+fn experimental_request(kind: &str, root: &Path, payload: Option<Value>) -> ShellAgentShellRequest {
+    agent_request(kind, root, ".", payload)
+}
+
+fn experimental_stdout(router: &ExternalToolRouter, request: ShellAgentShellRequest) -> Value {
+    let ExternalRoute::Handled(result) = router.route(&AgentPolicy::default(), &request) else {
+        panic!("experimental request left the experimental path");
+    };
+    serde_json::from_str(result.stdout.as_deref().unwrap()).unwrap()
+}
+
+#[test]
+fn experimental_list_tools_discovers_sorted_bounded_names_and_hashes() {
+    let fixture = Fixture::new("normal");
+    let router = experimental_router(&fixture);
+    let listed = experimental_stdout(
+        &router,
+        experimental_request(EXPERIMENTAL_KIND_LIST, &fixture.root, None),
+    );
+    assert_eq!(listed["experimental"], true);
+    assert_eq!(listed["claude_version"], "Claude Fake 1.2.3");
+    assert_eq!(listed["process_reused"], false);
+    assert_eq!(listed["truncated"], false);
+    let names = listed["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(names.windows(2).all(|pair| pair[0] <= pair[1]));
+    for expected in ["Bash", "Edit", "Read", "Write", "fake_edit", "fake_search"] {
+        assert!(
+            names.iter().any(|name| name == expected),
+            "missing {expected}"
+        );
+    }
+    assert!(listed["tools"].as_array().unwrap().iter().all(|tool| {
+        tool["schema_hash"]
+            .as_str()
+            .is_some_and(|hash| hash.len() == 64)
+    }));
+    assert!(!serde_json::to_string(&listed)
+        .unwrap()
+        .contains(&fixture.config.command));
+}
+
+#[test]
+fn experimental_describe_tool_returns_live_schema_hash_and_rejects_unknown() {
+    let fixture = Fixture::new("normal");
+    let router = experimental_router(&fixture);
+    let described = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_DESCRIBE,
+            &fixture.root,
+            Some(json!({"tool_name": "Bash"})),
+        ),
+    );
+    assert_eq!(described["tool_name"], "Bash");
+    assert_eq!(described["experimental"], true);
+    assert_eq!(described["schema_hash"].as_str().unwrap().len(), 64);
+    assert!(described["input_schema"]["properties"]["command"].is_object());
+    assert!(described["description"].as_str().unwrap().contains("shell"));
+
+    let missing = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_DESCRIBE,
+            &fixture.root,
+            Some(json!({"tool_name": "Agent"})),
+        ),
+    );
+    assert_eq!(missing["code"], "claude_tool_not_found");
+}
+
+#[test]
+fn experimental_arguments_validation_and_schema_hash_are_stable() {
+    let fixture = Fixture::new("normal");
+    let router = experimental_router(&fixture);
+    let invalid = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_CALL,
+            &fixture.root,
+            Some(json!({
+                "tool_name": "Read",
+                "arguments": {"not_file_path": true}
+            })),
+        ),
+    );
+    assert_eq!(invalid["code"], "claude_arguments_invalid");
+
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "b": {"type": "string"},
+            "a": {"type": "integer"}
+        },
+        "required": ["a"]
+    });
+    let reordered = json!({
+        "required": ["a"],
+        "type": "object",
+        "properties": {
+            "a": {"type": "integer"},
+            "b": {"type": "string"}
+        }
+    });
+    assert_eq!(schema_hash_hex(&schema), schema_hash_hex(&reordered));
+    assert!(validate_against_schema(&schema, &json!({"a": 1})).is_ok());
+    assert!(validate_against_schema(&schema, &json!({"b": "x"})).is_err());
+}
+
+#[test]
+fn experimental_read_edit_write_bash_paths_and_process_reuse() {
+    let fixture = Fixture::new("normal");
+    let router = experimental_router(&fixture);
+
+    let read = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_CALL,
+            &fixture.root,
+            Some(json!({
+                "tool_name": "Read",
+                "arguments": {"file_path": "src/lib.rs"}
+            })),
+        ),
+    );
+    assert_eq!(read["is_error"], false);
+    assert_eq!(read["process_reused"], false);
+    assert!(read["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("needle"));
+    assert_eq!(fixture.starts(), 1);
+
+    let edit = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_CALL,
+            &fixture.root,
+            Some(json!({
+                "tool_name": "Edit",
+                "arguments": {
+                    "file_path": "edit.txt",
+                    "old_string": "before",
+                    "new_string": "after"
+                }
+            })),
+        ),
+    );
+    assert_eq!(edit["is_error"], false);
+    assert_eq!(edit["process_reused"], true);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("edit.txt")).unwrap(),
+        "after\n"
+    );
+    // restore fixture file
+    fs::write(fixture.root.join("edit.txt"), "before\n").unwrap();
+
+    let write = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_CALL,
+            &fixture.root,
+            Some(json!({
+                "tool_name": "Write",
+                "arguments": {
+                    "file_path": "tmp-exp.txt",
+                    "content": "hello-experimental"
+                }
+            })),
+        ),
+    );
+    assert_eq!(write["is_error"], false);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("tmp-exp.txt")).unwrap(),
+        "hello-experimental"
+    );
+    let _ = fs::remove_file(fixture.root.join("tmp-exp.txt"));
+
+    let bash_ok = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_CALL,
+            &fixture.root,
+            Some(json!({
+                "tool_name": "Bash",
+                "arguments": {"command": "printf hi"}
+            })),
+        ),
+    );
+    assert_eq!(bash_ok["is_error"], false);
+    assert!(bash_ok["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("printf hi"));
+
+    let bash_err = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_CALL,
+            &fixture.root,
+            Some(json!({
+                "tool_name": "Bash",
+                "arguments": {"command": "nonzero"}
+            })),
+        ),
+    );
+    assert_eq!(bash_err["is_error"], true);
+    assert_eq!(fixture.starts(), 1);
+}
+
+#[test]
+fn experimental_rejects_unknown_tools_and_recovers_after_process_exit() {
+    let fixture = Fixture::new("normal");
+    let router = experimental_router(&fixture);
+    let unknown = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_CALL,
+            &fixture.root,
+            Some(json!({
+                "tool_name": "TaskCreate",
+                "arguments": {}
+            })),
+        ),
+    );
+    assert_eq!(unknown["code"], "claude_tool_not_found");
+
+    let exit = Fixture::new("exit");
+    let router = experimental_router(&exit);
+    let first = experimental_stdout(
+        &router,
+        experimental_request(EXPERIMENTAL_KIND_LIST, &exit.root, None),
+    );
+    assert_eq!(first["experimental"], true);
+    // Force a tools/call so the exit scenario ends the child after first call path.
+    let _ = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_CALL,
+            &exit.root,
+            Some(json!({
+                "tool_name": "Read",
+                "arguments": {"file_path": "src/lib.rs"}
+            })),
+        ),
+    );
+    assert!(wait_until(Duration::from_secs(2), || exit.starts() >= 1));
+    let second = experimental_stdout(
+        &router,
+        experimental_request(EXPERIMENTAL_KIND_LIST, &exit.root, None),
+    );
+    assert_eq!(second["experimental"], true);
+    assert!(
+        exit.starts() >= 2,
+        "expected lazy restart after Claude process exit, starts={}",
+        exit.starts()
+    );
+}
+
+#[test]
+fn experimental_result_bounding_marks_truncated_output() {
+    let fixture = Fixture::new("exp_oversized");
+    let router = experimental_router(&fixture);
+    let result = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_CALL,
+            &fixture.root,
+            Some(json!({
+                "tool_name": "Bash",
+                "arguments": {"command": "big"}
+            })),
+        ),
+    );
+    // oversized responses are either hard-failed or soft-truncated.
+    let hard = result["code"].as_str() == Some("claude_result_too_large");
+    let soft = result["result_truncated"].as_bool() == Some(true)
+        || result["result"]["truncated"].as_bool() == Some(true);
+    assert!(hard || soft, "expected bounded oversized result: {result}");
+}
+
+#[test]
+fn opt_in_experimental_real_claude_tools_smoke() {
+    if env::var_os("WEBCODEX_EXPERIMENTAL_CLAUDE_TOOLS").is_none() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/sample.txt"), "alpha\nbeta\n").unwrap();
+    fs::write(root.join("edit.txt"), "before\n").unwrap();
+    let config = ClaudeCodeMcpConfig {
+        enabled: true,
+        command: "claude".to_string(),
+        args: vec!["mcp".to_string(), "serve".to_string()],
+        mapping: HashMap::new(),
+        timeout_secs: 45,
+    };
+    let router = ExternalToolRouter::new(&ToolProvidersConfig {
+        strategy: ToolProviderStrategy::Native,
+        claude_code: config,
+    });
+    let listed = experimental_stdout(
+        &router,
+        experimental_request(EXPERIMENTAL_KIND_LIST, &root, None),
+    );
+    eprintln!(
+        "experimental_real_claude_list version={:?} tools={}",
+        listed["claude_version"], listed["tools"]
+    );
+    for name in ["Read", "Edit", "Write", "Bash"] {
+        assert!(
+            listed["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == name),
+            "real Claude tools/list missing {name}: {listed}"
+        );
+        let described = experimental_stdout(
+            &router,
+            experimental_request(
+                EXPERIMENTAL_KIND_DESCRIBE,
+                &root,
+                Some(json!({"tool_name": name})),
+            ),
+        );
+        eprintln!(
+            "experimental_real_claude_describe tool={name} hash={} required={:?}",
+            described["schema_hash"], described["input_schema"]["required"]
+        );
+    }
+
+    let read = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_CALL,
+            &root,
+            Some(json!({
+                "tool_name": "Read",
+                "arguments": {"file_path": root.join("src/sample.txt").to_string_lossy()}
+            })),
+        ),
+    );
+    assert_eq!(read["is_error"], false, "{read}");
+    assert!(format!("{read}").contains("alpha"), "{read}");
+
+    // Claude Code Edit requires a prior Read of the same path in-session.
+    let edit_path = root.join("edit.txt");
+    let pre_read = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_CALL,
+            &root,
+            Some(json!({
+                "tool_name": "Read",
+                "arguments": {"file_path": edit_path.to_string_lossy()}
+            })),
+        ),
+    );
+    assert_eq!(pre_read["is_error"], false, "{pre_read}");
+    let edit = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_CALL,
+            &root,
+            Some(json!({
+                "tool_name": "Edit",
+                "arguments": {
+                    "file_path": edit_path.to_string_lossy(),
+                    "old_string": "before",
+                    "new_string": "after"
+                }
+            })),
+        ),
+    );
+    assert_eq!(edit["is_error"], false, "{edit}");
+    assert_eq!(fs::read_to_string(&edit_path).unwrap(), "after\n");
+    fs::write(&edit_path, "before\n").unwrap();
+
+    let write_path = root.join("tmp-real-claude.txt");
+    let write = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_CALL,
+            &root,
+            Some(json!({
+                "tool_name": "Write",
+                "arguments": {
+                    "file_path": write_path.to_string_lossy(),
+                    "content": "temporary"
+                }
+            })),
+        ),
+    );
+    assert_eq!(write["is_error"], false, "{write}");
+    assert_eq!(fs::read_to_string(&write_path).unwrap(), "temporary");
+    let _ = fs::remove_file(&write_path);
+
+    let bash = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_CALL,
+            &root,
+            Some(json!({
+                "tool_name": "Bash",
+                "arguments": {"command": "printf 'ok-from-bash'"}
+            })),
+        ),
+    );
+    assert_eq!(bash["is_error"], false, "{bash}");
+    assert!(format!("{bash}").contains("ok-from-bash"), "{bash}");
+
+    let bash_fail = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_CALL,
+            &root,
+            Some(json!({
+                "tool_name": "Bash",
+                "arguments": {"command": "exit 7"}
+            })),
+        ),
+    );
+    // Claude may surface non-zero exits as isError or as structured text.
+    eprintln!("experimental_real_claude_bash_nonzero={bash_fail}");
+
+    let process_groups = process_ids(&router.claude);
+    router.shutdown();
+    #[cfg(unix)]
+    for process_group in process_groups {
+        assert!(
+            wait_until(Duration::from_secs(2), || !process_group_exists(
+                process_group
+            )),
+            "Claude process group {process_group} remained after experimental shutdown"
+        );
+    }
 }

@@ -26,6 +26,14 @@ const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const MAX_MCP_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_MCP_OUTPUT_BYTES: usize = 512 * 1024;
 const MAX_PENDING_REQUESTS: usize = 32;
+/// Experimental raw Claude harness bounds (branch-local; not production API).
+const MAX_EXPERIMENTAL_TOOLS: usize = 64;
+const MAX_EXPERIMENTAL_SCHEMA_BYTES: usize = 64 * 1024;
+const MAX_EXPERIMENTAL_RESULT_BYTES: usize = 256 * 1024;
+const MAX_EXPERIMENTAL_DESCRIPTION_CHARS: usize = 4_096;
+const EXPERIMENTAL_KIND_LIST: &str = "claude_list_tools";
+const EXPERIMENTAL_KIND_DESCRIBE: &str = "claude_describe_tool";
+const EXPERIMENTAL_KIND_CALL: &str = "claude_tool_call";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ProviderCapability {
@@ -189,6 +197,10 @@ impl ExternalToolRouter {
         policy: &AgentPolicy,
         request: &ShellAgentShellRequest,
     ) -> ExternalRoute {
+        // Fixed experimental harness surface — independent of production strategy.
+        if is_experimental_claude_kind(&request.kind) {
+            return ExternalRoute::Handled(self.handle_experimental(policy, request));
+        }
         if self.strategy == ToolProviderStrategy::Native {
             return ExternalRoute::Native;
         }
@@ -327,6 +339,63 @@ impl ExternalToolRouter {
             ),
             false,
         );
+    }
+
+    fn handle_experimental(
+        &self,
+        policy: &AgentPolicy,
+        request: &ShellAgentShellRequest,
+    ) -> CommandResult {
+        let started = Instant::now();
+        match self.claude.experimental_dispatch(policy, request) {
+            Ok(value) => command_result(value.to_string(), started),
+            Err(error) => {
+                self.claude.record_error(&error);
+                command_result(
+                    json!({
+                        "experimental": true,
+                        "error": experimental_error_code(error.code),
+                        "code": experimental_error_code(error.code),
+                        "message": experimental_error_code(error.code),
+                    })
+                    .to_string(),
+                    started,
+                )
+            }
+        }
+    }
+}
+
+fn is_experimental_claude_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        EXPERIMENTAL_KIND_LIST | EXPERIMENTAL_KIND_DESCRIBE | EXPERIMENTAL_KIND_CALL
+    )
+}
+
+fn experimental_error_code(code: &str) -> &str {
+    match code {
+        "claude_tool_not_found"
+        | "claude_schema_unavailable"
+        | "claude_arguments_invalid"
+        | "claude_mcp_timeout"
+        | "claude_mcp_process_exited"
+        | "claude_tool_error"
+        | "claude_result_too_large"
+        | "claude_code_unavailable"
+        | "provider_path_rejected"
+        | "provider_invalid_request" => code,
+        "mcp_request_timeout" => "claude_mcp_timeout",
+        "mcp_connection_closed"
+        | "claude_code_spawn_failed"
+        | "mcp_protocol_error"
+        | "mcp_invalid_json"
+        | "mcp_message_too_large"
+        | "mcp_rpc_error"
+        | "mcp_pending_limit" => "claude_mcp_process_exited",
+        "claude_tool_failed" => "claude_tool_error",
+        "provider_response_too_large" => "claude_result_too_large",
+        other => other,
     }
 }
 
@@ -624,11 +693,107 @@ impl ClaudeCodeMcpProvider {
         }
         result
     }
+
+    /// Experimental: list/describe/call raw Claude MCP tools for one project root.
+    fn experimental_dispatch(
+        &self,
+        policy: &AgentPolicy,
+        request: &ShellAgentShellRequest,
+    ) -> Result<Value, ProviderError> {
+        let root = request.cwd.as_deref().ok_or_else(path_error)?;
+        let root = Path::new(root).canonicalize().map_err(|_| path_error())?;
+        cwd_allowed(policy, &root).map_err(|_| path_error())?;
+        let timeout_secs = request
+            .timeout_secs
+            .max(1)
+            .min(policy.max_timeout_secs)
+            .min(self.config.timeout_secs.max(1));
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let process_reused = self
+            .projects
+            .lock()
+            .unwrap()
+            .get(&root)
+            .is_some_and(|client| client.connection.is_alive());
+        let client = self.project_client(&root, deadline)?;
+        let payload = request
+            .content
+            .as_deref()
+            .filter(|raw| !raw.trim().is_empty())
+            .map(|raw| serde_json::from_str::<Value>(raw).map_err(|_| request_error()))
+            .transpose()?
+            .unwrap_or_else(|| json!({}));
+        let started = Instant::now();
+        let outcome = match request.kind.as_str() {
+            EXPERIMENTAL_KIND_LIST => Ok(client.experimental_list_tools(process_reused)),
+            EXPERIMENTAL_KIND_DESCRIBE => {
+                let tool_name = payload
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(request_error)?;
+                client.experimental_describe_tool(tool_name, process_reused)
+            }
+            EXPERIMENTAL_KIND_CALL => {
+                let tool_name = payload
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(request_error)?;
+                let arguments = payload
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                client.experimental_tool_call(tool_name, arguments, process_reused, deadline)
+            }
+            _ => Err(request_error()),
+        };
+        if !client.connection.is_alive() {
+            self.projects.lock().unwrap().remove(&root);
+        }
+        match &outcome {
+            Ok(_) => self.record_call(
+                ProviderCallSummary {
+                    capability: request.kind.clone(),
+                    selected_provider: "claude_code".to_string(),
+                    fallback_used: false,
+                    result: "success".to_string(),
+                    write_state: None,
+                    duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                    error_code: None,
+                },
+                true,
+            ),
+            Err(error) => {
+                self.record_error(error);
+                self.record_call(
+                    ProviderCallSummary {
+                        capability: request.kind.clone(),
+                        selected_provider: "claude_code".to_string(),
+                        fallback_used: false,
+                        result: "failure".to_string(),
+                        write_state: None,
+                        duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                        error_code: Some(experimental_error_code(error.code).to_string()),
+                    },
+                    false,
+                );
+            }
+        }
+        outcome
+    }
+}
+
+#[derive(Clone)]
+struct DiscoveredTool {
+    fields: BTreeSet<String>,
+    description: String,
+    input_schema: Value,
+    schema_hash: String,
 }
 
 struct ProjectMcpClient {
     connection: Arc<McpConnection>,
-    tools: BTreeMap<String, BTreeSet<String>>,
+    tools: BTreeMap<String, DiscoveredTool>,
+    version: Option<String>,
 }
 
 impl ProjectMcpClient {
@@ -668,23 +833,58 @@ impl ProjectMcpClient {
         )?;
         let listed =
             connection.request("tools/list", json!({}), timeout(), WriteState::NotSubmitted)?;
-        let tools = listed
+        let mut tools = BTreeMap::new();
+        for tool in listed
             .get("tools")
             .and_then(Value::as_array)
             .ok_or_else(protocol_error)?
-            .iter()
-            .filter_map(|tool| {
-                let name = tool.get("name")?.as_str()?.to_string();
-                let fields = tool
-                    .pointer("/inputSchema/properties")
-                    .and_then(Value::as_object)
-                    .into_iter()
-                    .flat_map(|properties| properties.keys().cloned())
-                    .collect();
-                Some((name, fields))
-            })
-            .collect();
-        let client = Self { connection, tools };
+        {
+            let Some(name) = tool.get("name").and_then(Value::as_str).map(str::to_string) else {
+                continue;
+            };
+            if sanitize_tool_name(&name).is_none() || tools.contains_key(&name) {
+                continue;
+            }
+            let input_schema = tool
+                .get("inputSchema")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object"}));
+            let schema_bytes = serde_json::to_vec(&input_schema).unwrap_or_default();
+            if schema_bytes.len() > MAX_EXPERIMENTAL_SCHEMA_BYTES {
+                continue;
+            }
+            let fields = input_schema
+                .pointer("/properties")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flat_map(|properties| properties.keys().cloned())
+                .collect();
+            let description = tool
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .chars()
+                .take(MAX_EXPERIMENTAL_DESCRIPTION_CHARS)
+                .collect::<String>();
+            let schema_hash = schema_hash_hex(&input_schema);
+            tools.insert(
+                name,
+                DiscoveredTool {
+                    fields,
+                    description,
+                    input_schema,
+                    schema_hash,
+                },
+            );
+            if tools.len() >= MAX_EXPERIMENTAL_TOOLS {
+                break;
+            }
+        }
+        let client = Self {
+            connection,
+            tools,
+            version,
+        };
         let mut discovered_tool_names = client
             .tools
             .keys()
@@ -692,7 +892,7 @@ impl ProjectMcpClient {
             .collect::<Vec<_>>();
         discovered_tool_names.sort();
         discovered_tool_names.dedup();
-        discovered_tool_names.truncate(64);
+        discovered_tool_names.truncate(MAX_EXPERIMENTAL_TOOLS);
         state.update(|status| {
             status.discovered_tool_names = discovered_tool_names;
             status.process_state = "mapping".to_string();
@@ -743,17 +943,17 @@ impl ProjectMcpClient {
         capability: ProviderCapability,
         config: &ClaudeCodeMcpConfig,
     ) -> &'static str {
-        let fields = config
+        let tool = config
             .mapping
             .get(capability.name())
             .filter(|name| !name.trim().is_empty())
             .and_then(|name| self.tools.get(name));
-        match fields {
+        match tool {
             None => "unmapped",
-            Some(fields)
+            Some(tool)
                 if required_fields(capability)
                     .iter()
-                    .all(|field| fields.contains(*field)) =>
+                    .all(|field| tool.fields.contains(*field)) =>
             {
                 "available"
             }
@@ -796,6 +996,274 @@ impl ProjectMcpClient {
         match capability {
             ProviderCapability::SearchProjectText => normalize_search_result(&result, context),
             ProviderCapability::EditFile => normalize_edit_result(expected_after.unwrap(), context),
+        }
+    }
+
+    fn experimental_list_tools(&self, process_reused: bool) -> Value {
+        let mut tools = self
+            .tools
+            .iter()
+            .filter_map(|(name, tool)| {
+                let name = sanitize_tool_name(name)?;
+                Some(json!({
+                    "name": name,
+                    "schema_hash": tool.schema_hash,
+                }))
+            })
+            .collect::<Vec<_>>();
+        tools.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+        let truncated = tools.len() > MAX_EXPERIMENTAL_TOOLS;
+        tools.truncate(MAX_EXPERIMENTAL_TOOLS);
+        json!({
+            "experimental": true,
+            "claude_version": self.version,
+            "process_reused": process_reused,
+            "tools": tools,
+            "truncated": truncated,
+        })
+    }
+
+    fn experimental_describe_tool(
+        &self,
+        tool_name: &str,
+        process_reused: bool,
+    ) -> Result<Value, ProviderError> {
+        let tool = self
+            .tools
+            .get(tool_name)
+            .ok_or_else(|| ProviderError::new("claude_tool_not_found"))?;
+        let mut description = tool.description.clone();
+        let mut input_schema = tool.input_schema.clone();
+        let mut schema_bytes = serde_json::to_vec(&input_schema).map_err(|_| protocol_error())?;
+        let mut truncated = false;
+        if schema_bytes.len() > MAX_EXPERIMENTAL_SCHEMA_BYTES {
+            input_schema = json!({
+                "type": "object",
+                "truncated": true,
+                "note": "schema exceeded experimental describe bound",
+            });
+            schema_bytes = serde_json::to_vec(&input_schema).unwrap_or_default();
+            truncated = true;
+        }
+        if description.chars().count() > MAX_EXPERIMENTAL_DESCRIPTION_CHARS {
+            description = description
+                .chars()
+                .take(MAX_EXPERIMENTAL_DESCRIPTION_CHARS)
+                .collect();
+            truncated = true;
+        }
+        let _ = schema_bytes;
+        Ok(json!({
+            "experimental": true,
+            "tool_name": tool_name,
+            "claude_version": self.version,
+            "schema_hash": tool.schema_hash,
+            "description": description,
+            "input_schema": input_schema,
+            "process_reused": process_reused,
+            "truncated": truncated,
+        }))
+    }
+
+    fn experimental_tool_call(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+        process_reused: bool,
+        deadline: Instant,
+    ) -> Result<Value, ProviderError> {
+        let tool = self
+            .tools
+            .get(tool_name)
+            .ok_or_else(|| ProviderError::new("claude_tool_not_found"))?;
+        if tool.input_schema.is_null() {
+            return Err(ProviderError::new("claude_schema_unavailable"));
+        }
+        validate_against_schema(&tool.input_schema, &arguments)
+            .map_err(|_| ProviderError::new("claude_arguments_invalid"))?;
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            return Err(ProviderError::new("mcp_request_timeout"));
+        }
+        let started = Instant::now();
+        let result = self.connection.request(
+            "tools/call",
+            json!({"name": tool_name, "arguments": arguments}),
+            timeout,
+            WriteState::NotSubmitted,
+        )?;
+        let is_error = result
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut result_value = result;
+        let mut result_truncated = false;
+        let encoded = serde_json::to_vec(&result_value).map_err(|_| protocol_error())?;
+        if encoded.len() > MAX_EXPERIMENTAL_RESULT_BYTES {
+            result_truncated = true;
+            result_value = json!({
+                "truncated": true,
+                "note": "claude tool result exceeded experimental bound",
+                "original_bytes": encoded.len(),
+                "isError": is_error,
+            });
+            if encoded.len() > MAX_EXPERIMENTAL_RESULT_BYTES * 2 {
+                return Err(ProviderError::new("claude_result_too_large"));
+            }
+        }
+        Ok(json!({
+            "experimental": true,
+            "tool_name": tool_name,
+            "claude_version": self.version,
+            "schema_hash": tool.schema_hash,
+            "duration_ms": started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            "process_reused": process_reused,
+            "is_error": is_error,
+            "result": result_value,
+            "result_truncated": result_truncated,
+        }))
+    }
+}
+
+fn schema_hash_hex(schema: &Value) -> String {
+    let canonical = canonicalize_json(schema);
+    sha256_hex_bytes(canonical.as_bytes())
+}
+
+fn canonicalize_json(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let mut keys = map.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            let parts = keys
+                .into_iter()
+                .map(|key| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(&key).unwrap_or_else(|_| "\"\"".into()),
+                        canonicalize_json(&map[&key])
+                    )
+                })
+                .collect::<Vec<_>>();
+            format!("{{{}}}", parts.join(","))
+        }
+        Value::Array(items) => {
+            let parts = items.iter().map(canonicalize_json).collect::<Vec<_>>();
+            format!("[{}]", parts.join(","))
+        }
+        other => serde_json::to_string(other).unwrap_or_else(|_| "null".into()),
+    }
+}
+
+/// Minimal JSON Schema subset for Claude harness tools (not a full engine).
+fn validate_against_schema(schema: &Value, value: &Value) -> Result<(), ()> {
+    validate_schema_node(schema, value)
+}
+
+fn validate_schema_node(schema: &Value, value: &Value) -> Result<(), ()> {
+    if let Some(enum_values) = schema.get("enum").and_then(Value::as_array) {
+        if !enum_values.iter().any(|item| item == value) {
+            return Err(());
+        }
+    }
+    let type_name = schema.get("type").and_then(Value::as_str);
+    match type_name {
+        Some("object") => {
+            let object = value.as_object().ok_or(())?;
+            if let Some(required) = schema.get("required").and_then(Value::as_array) {
+                for key in required {
+                    let key = key.as_str().ok_or(())?;
+                    if !object.contains_key(key) {
+                        return Err(());
+                    }
+                }
+            }
+            let properties = schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let additional = schema
+                .get("additionalProperties")
+                .cloned()
+                .unwrap_or(Value::Bool(true));
+            for (key, item) in object {
+                if let Some(property_schema) = properties.get(key) {
+                    validate_schema_node(property_schema, item)?;
+                } else {
+                    match &additional {
+                        Value::Bool(false) => return Err(()),
+                        Value::Bool(true) | Value::Null => {}
+                        other => validate_schema_node(other, item)?,
+                    }
+                }
+            }
+            Ok(())
+        }
+        Some("array") => {
+            let items = value.as_array().ok_or(())?;
+            if let Some(item_schema) = schema.get("items") {
+                for item in items {
+                    validate_schema_node(item_schema, item)?;
+                }
+            }
+            Ok(())
+        }
+        Some("string") => {
+            if value.is_string() {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+        Some("integer") => {
+            if value.as_i64().is_some() || value.as_u64().is_some() {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+        Some("number") => {
+            if value.as_f64().is_some() {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+        Some("boolean") => {
+            if value.is_boolean() {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+        Some("null") => {
+            if value.is_null() {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+        _ => {
+            if let Some(one_of) = schema.get("oneOf").and_then(Value::as_array) {
+                if one_of
+                    .iter()
+                    .any(|branch| validate_schema_node(branch, value).is_ok())
+                {
+                    return Ok(());
+                }
+                return Err(());
+            }
+            if let Some(any_of) = schema.get("anyOf").and_then(Value::as_array) {
+                if any_of
+                    .iter()
+                    .any(|branch| validate_schema_node(branch, value).is_ok())
+                {
+                    return Ok(());
+                }
+                return Err(());
+            }
+            Ok(())
         }
     }
 }

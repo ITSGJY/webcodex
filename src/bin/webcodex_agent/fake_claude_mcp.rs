@@ -34,7 +34,8 @@ fn main() -> io::Result<()> {
             Some("tools/list") => send(
                 &mut writer,
                 &format!(
-                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"tools":[{{"name":"fake_search","inputSchema":{{"type":"object","properties":{{"pattern":{{"type":"string"}},"path":{{"type":"string"}},"output_mode":{{"type":"string"}},"head_limit":{{"type":"integer"}},"-n":{{"type":"boolean"}},"-B":{{"type":"integer"}},"-A":{{"type":"integer"}}}}}}}},{{"name":"fake_edit","inputSchema":{{"type":"object","properties":{{"file_path":{{"type":"string"}},"old_string":{{"type":"string"}},"new_string":{{"type":"string"}}}}}}}}]}}}}"#
+                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"tools":[{tools}]}}}}"#,
+                    tools = FAKE_TOOLS_JSON
                 ),
             )?,
             Some("tools/call") => match scenario {
@@ -42,7 +43,13 @@ fn main() -> io::Result<()> {
                 "timeout" => thread::sleep(Duration::from_secs(5)),
                 "oversized" => {
                     let text = "x".repeat(1024 * 1024 + 100);
-                    send(&mut writer, &tool_result(id, &text))?;
+                    send(&mut writer, &tool_result(id, &text, false))?;
+                }
+                "exp_oversized" => {
+                    // Between experimental result bound (256 KiB) and MCP message
+                    // bound (1 MiB) so the harness classifies truncation itself.
+                    let text = "x".repeat(600 * 1024);
+                    send(&mut writer, &tool_result(id, &text, false))?;
                 }
                 "exit" => return Ok(()),
                 "restart_once" if !marker_contains(marker, "crashed") => {
@@ -75,20 +82,65 @@ fn main() -> io::Result<()> {
                         append(marker, "server_request_error_received\n")?;
                     }
                     let name = string_field(&body, "name").unwrap_or_default();
-                    let text = match name.as_str() {
-                        "fake_search" => format!(
-                            "{}/src/lib.rs:2:needle",
-                            env::current_dir()?.display()
+                    let (text, is_error) = match name.as_str() {
+                        "fake_search" => (
+                            format!("{}/src/lib.rs:2:needle", env::current_dir()?.display()),
+                            false,
                         ),
                         "fake_edit" => {
                             let path = env::current_dir()?.join("edit.txt");
                             let before = fs::read_to_string(&path)?;
                             fs::write(path, before.replacen("before", "after", 1))?;
-                            "edited".to_string()
+                            ("edited".to_string(), false)
                         }
-                        _ => "unknown tool".to_string(),
+                        "Read" => {
+                            let path = string_field(&body, "file_path").unwrap_or_default();
+                            let target = resolve_path(&path);
+                            match fs::read_to_string(&target) {
+                                Ok(content) => (content, false),
+                                Err(error) => (format!("ENOENT: {error}"), true),
+                            }
+                        }
+                        "Edit" => {
+                            let path = string_field(&body, "file_path").unwrap_or_default();
+                            let old = string_field(&body, "old_string").unwrap_or_default();
+                            let new = string_field(&body, "new_string").unwrap_or_default();
+                            let target = resolve_path(&path);
+                            match fs::read_to_string(&target) {
+                                Ok(before) => {
+                                    let count = before.matches(&old).count();
+                                    if count == 0 {
+                                        ("old_string not found".to_string(), true)
+                                    } else if count > 1 {
+                                        ("old_string matched multiple times".to_string(), true)
+                                    } else {
+                                        fs::write(&target, before.replacen(&old, &new, 1))?;
+                                        ("ok".to_string(), false)
+                                    }
+                                }
+                                Err(error) => (format!("edit failed: {error}"), true),
+                            }
+                        }
+                        "Write" => {
+                            let path = string_field(&body, "file_path").unwrap_or_default();
+                            let content = string_field(&body, "content").unwrap_or_default();
+                            let target = resolve_path(&path);
+                            match fs::write(&target, content) {
+                                Ok(()) => ("wrote".to_string(), false),
+                                Err(error) => (format!("write failed: {error}"), true),
+                            }
+                        }
+                        "Bash" => {
+                            let command = string_field(&body, "command").unwrap_or_default();
+                            if command.contains("nonzero") {
+                                ("exit=1\nstderr=fail".to_string(), true)
+                            } else {
+                                (format!("stdout:{command}"), false)
+                            }
+                        }
+                        _ => ("unknown tool".to_string(), true),
                     };
-                    send(&mut writer, &tool_result(id, &text))?;
+                    send(&mut writer, &tool_result(id, &text, is_error))?;
                 }
             },
             _ => {}
@@ -102,11 +154,27 @@ fn send(writer: &mut impl Write, body: &str) -> io::Result<()> {
     writer.flush()
 }
 
-fn tool_result(id: u64, text: &str) -> String {
+// Keep production fake_search/fake_edit plus harness tools used by the
+// experimental Claude raw-tool surface.
+const FAKE_TOOLS_JSON: &str = r#"{"name":"fake_search","description":"search","inputSchema":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"output_mode":{"type":"string"},"head_limit":{"type":"integer"},"-n":{"type":"boolean"},"-B":{"type":"integer"},"-A":{"type":"integer"}}}},{"name":"fake_edit","description":"edit","inputSchema":{"type":"object","properties":{"file_path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"}}}},{"name":"Read","description":"read a file","inputSchema":{"type":"object","properties":{"file_path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["file_path"]}},{"name":"Edit","description":"edit a file","inputSchema":{"type":"object","properties":{"file_path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["file_path","old_string","new_string"]}},{"name":"Write","description":"write a file","inputSchema":{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}},"required":["file_path","content"]}},{"name":"Bash","description":"run a shell command","inputSchema":{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"}},"required":["command"]}}"#;
+
+fn tool_result(id: u64, text: &str, is_error: bool) -> String {
     format!(
-        r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"text","text":"{}"}}],"isError":false}}}}"#,
-        escape(text)
+        r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"text","text":"{}"}}],"isError":{}}}}}"#,
+        escape(text),
+        if is_error { "true" } else { "false" }
     )
+}
+
+fn resolve_path(path: &str) -> std::path::PathBuf {
+    let candidate = std::path::Path::new(path);
+    if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(candidate)
+    }
 }
 
 fn u64_field(body: &str, field: &str) -> Option<u64> {
