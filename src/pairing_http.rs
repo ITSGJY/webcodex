@@ -45,6 +45,8 @@ pub(crate) struct PairingCreateRequest {
     pub username: String,
     #[serde(default)]
     pub display_name: Option<String>,
+    /// Optional. Empty issues an unbound code that any device can claim.
+    #[serde(default)]
     pub client_id: String,
     #[serde(default)]
     pub ttl_secs: Option<i64>,
@@ -158,12 +160,19 @@ pub(crate) async fn pairing_create(req: &mut Request, depot: &mut Depot, res: &m
             return;
         }
     };
-    let client_id = match validate_allowed_client_id(&body.client_id) {
-        Ok(v) => v,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(StatusCode::BAD_REQUEST, e));
-            return;
+    // An empty client_id issues an unbound code: the device names itself when
+    // it redeems, so the same name does not have to be agreed on both sides
+    // before anyone can log in.
+    let client_id = if body.client_id.trim().is_empty() {
+        String::new()
+    } else {
+        match validate_allowed_client_id(&body.client_id) {
+            Ok(v) => v,
+            Err(e) => {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(json_error(StatusCode::BAD_REQUEST, e));
+                return;
+            }
         }
     };
     let display_name = match clean_display_name(body.display_name) {
@@ -601,6 +610,99 @@ mod tests {
             .consume_pairing_code(&hash_token("wc_pair_wrong"), "other", now)
             .unwrap();
         assert!(matches!(wrong, PairingConsumeResult::ClientMismatch(_)));
+    
+    }
+
+    #[test]
+    fn unbound_pairing_code_is_claimed_by_whichever_device_redeems_it() {
+        // A code created without a client_id lets the device name itself, so
+        // the same name no longer has to be agreed on both sides before anyone
+        // can log in. The claiming device is recorded on the consumed record.
+        let db = test_db();
+        let now = chrono::Utc::now().timestamp();
+        db.create_user(&UserRecord {
+            id: "u-1".to_string(),
+            username: "alice".to_string(),
+            created_at: now,
+            disabled: 0,
+            display_name: None,
+            role: "user".to_string(),
+            disabled_at: None,
+            updated_at: Some(now),
+        })
+        .unwrap();
+        db.insert_pairing_code(&PairingCodeRecord {
+            id: "p-open".to_string(),
+            code_hash: hash_token("wc_pair_open"),
+            user_id: "u-1".to_string(),
+            username: "alice".to_string(),
+            client_id: String::new(),
+            created_at: now,
+            expires_at: now + 600,
+            used_at: None,
+            user_token_name: None,
+            agent_token_name: None,
+        })
+        .unwrap();
+
+        let claimed = db
+            .consume_pairing_code(&hash_token("wc_pair_open"), "some-laptop", now)
+            .unwrap();
+        match claimed {
+            PairingConsumeResult::Consumed(record) => {
+                assert_eq!(record.client_id, "some-laptop", "claiming device recorded");
+                assert_eq!(record.username, "alice");
+            }
+            other => panic!("expected the unbound code to be consumed, got {other:?}"),
+        }
+
+        // Still one-time: a second device cannot reuse it.
+        let reused = db
+            .consume_pairing_code(&hash_token("wc_pair_open"), "other-laptop", now)
+            .unwrap();
+        assert!(matches!(reused, PairingConsumeResult::AlreadyUsed(_)));
+    }
+
+    #[test]
+    fn a_bound_pairing_code_still_rejects_a_different_device() {
+        let db = test_db();
+        let now = chrono::Utc::now().timestamp();
+        db.create_user(&UserRecord {
+            id: "u-1".to_string(),
+            username: "alice".to_string(),
+            created_at: now,
+            disabled: 0,
+            display_name: None,
+            role: "user".to_string(),
+            disabled_at: None,
+            updated_at: Some(now),
+        })
+        .unwrap();
+        db.insert_pairing_code(&PairingCodeRecord {
+            id: "p-bound".to_string(),
+            code_hash: hash_token("wc_pair_bound"),
+            user_id: "u-1".to_string(),
+            username: "alice".to_string(),
+            client_id: "alice-laptop".to_string(),
+            created_at: now,
+            expires_at: now + 600,
+            used_at: None,
+            user_token_name: None,
+            agent_token_name: None,
+        })
+        .unwrap();
+
+        let mismatched = db
+            .consume_pairing_code(&hash_token("wc_pair_bound"), "someone-else", now)
+            .unwrap();
+        assert!(matches!(
+            mismatched,
+            PairingConsumeResult::ClientMismatch(_)
+        ));
+        let matched = db
+            .consume_pairing_code(&hash_token("wc_pair_bound"), "alice-laptop", now)
+            .unwrap();
+        assert!(matches!(matched, PairingConsumeResult::Consumed(_)));
     }
 
     #[tokio::test]

@@ -234,18 +234,24 @@ impl Database {
         if record.expires_at <= now {
             return Ok(PairingConsumeResult::Expired(record));
         }
-        if record.client_id != client_id {
+        // An empty stored client_id means the code was issued without naming a
+        // device, so whichever device redeems it claims the code and its name
+        // is recorded here. A code that named a device still has to match: it
+        // was issued for that one.
+        if !record.client_id.is_empty() && record.client_id != client_id {
             return Ok(PairingConsumeResult::ClientMismatch(record));
         }
         let changed = tx.execute(
-            "UPDATE pairing_codes SET used_at = ?2
-             WHERE id = ?1 AND used_at IS NULL AND expires_at > ?2 AND client_id = ?3",
+            "UPDATE pairing_codes SET used_at = ?2, client_id = ?3
+             WHERE id = ?1 AND used_at IS NULL AND expires_at > ?2
+               AND (client_id = ?3 OR client_id = '')",
             params![record.id, now, client_id],
         )?;
         tx.commit()?;
         if changed == 1 {
             Ok(PairingConsumeResult::Consumed(PairingCodeRecord {
                 used_at: Some(now),
+                client_id: client_id.to_string(),
                 ..record
             }))
         } else {

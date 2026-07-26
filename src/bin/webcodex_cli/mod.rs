@@ -1,6 +1,8 @@
 pub(crate) mod agent_service;
+pub(crate) mod connections;
 pub(crate) mod env;
 pub(crate) mod http;
+pub(crate) mod login;
 pub(crate) mod ops;
 pub(crate) mod output;
 pub(crate) mod pairing;
@@ -29,6 +31,10 @@ pub(crate) use env::{
 pub(crate) use http::format_error_body;
 pub(crate) use http::{
     fetch_runtime_status, http_post_json_status, post_json_authed, post_json_unauthed, ApiCall,
+};
+pub(crate) use login::{
+    base_dir_or_default, default_device_name, run_login, run_logout, run_status, LoginOptions,
+    LogoutOptions, StatusOptions,
 };
 pub(crate) use ops::{run_ops_command, OpsCommand, OpsCommonOptions, OpsSmokePreflightOptions};
 #[cfg(test)]
@@ -66,7 +72,8 @@ pub(crate) use tokens::{
 };
 pub(crate) use usage::{
     agent_init_usage, agent_install_service_usage, agent_status_usage, agent_usage,
-    client_enroll_usage, client_usage, ops_agents_usage, ops_projects_usage,
+    client_enroll_usage, client_usage, login_usage, logout_usage, ops_agents_usage,
+    ops_projects_usage, status_usage,
     ops_smoke_preflight_usage, ops_status_usage, ops_usage, pairing_create_usage, pairing_usage,
     server_init_usage, server_install_service_usage, server_status_usage, server_up_usage,
     server_usage, usage,

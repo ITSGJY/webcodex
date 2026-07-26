@@ -2,6 +2,11 @@ pub(crate) fn usage() -> &'static str {
     "Usage: webcodex-cli <COMMAND>\n\n\
      Management and setup commands for WebCodex.\n\n\
      Commands:\n\n\
+     Everyday:\n\
+     \x20\x20login <server-url> --code CODE\n\
+     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20Log this device into a server\n\
+     \x20\x20logout <server-url>           Remove this device's credentials for a server\n\
+     \x20\x20status                        Show which servers this device is logged in to\n\n\
      Run the server:\n\
      \x20\x20server up                     Bootstrap server env with an auto-generated admin key\n\
      \x20\x20server init                   Create the server env bootstrap file\n\
@@ -50,7 +55,7 @@ pub(crate) fn pairing_create_usage() -> &'static str {
        --token-file PATH         Read bootstrap/admin bearer token from file\n\
        --token TOKEN             Bootstrap/admin bearer token (discouraged in shell history)\n\
        --username USER           User to ensure/create for enrollment\n\
-       --client-id CLIENT_ID     Client id the code is bound to\n\
+       --client-id CLIENT_ID     Bind the code to one device [default: any device may claim it]\n\
        --display-name NAME       Optional display name for a newly created user\n\
        --ttl-secs SECS           Pairing code lifetime [default: 600; range: 60..3600]\n\
        --user-token-name NAME    Name for the user API token created during enroll\n\
@@ -319,4 +324,43 @@ pub(crate) fn agent_status_usage() -> &'static str {
      ~/.config/webcodex/clients/<profile> for non-root users. Explicit path\n\
      flags override profile-derived defaults. Status prints safe metadata only:\n\
      no tokens, Authorization headers, full agent.toml, env files, or secrets.\n"
+}
+
+pub(crate) fn login_usage() -> &'static str {
+    "Usage: webcodex-cli login <SERVER-URL> --code <PAIRING-CODE> [OPTIONS]\n\n\
+     Log this device into a WebCodex server. Ask whoever runs the server for a\n\
+     pairing code (`webcodex-cli pairing create`), then run this.\n\n\
+     Options:\n\
+     \x20\x20--code CODE          Pairing code from the server (required)\n\
+     \x20\x20--device NAME        Name for this device [default: hostname]\n\
+     \x20\x20--allowed-root PATH  Repeatable project root the agent may touch\n\
+     \x20\x20--transport NAME     websocket|polling|quic|auto [default: websocket]\n\
+     \x20\x20--dir PATH           Where connections are stored [default: ~/.config/webcodex]\n\
+     \x20\x20--overwrite          Replace an existing login for this server and user\n\
+     \x20\x20--json               Print machine-readable output\n\
+     \x20\x20-h, --help           Print help and exit\n\n\
+     Credentials are written to <dir>/<server>/<user>/ with 0600 permissions.\n\
+     The same user can be logged in on several servers, and several users can\n\
+     be logged in on one server; each is a separate directory.\n"
+}
+
+pub(crate) fn logout_usage() -> &'static str {
+    "Usage: webcodex-cli logout <SERVER-URL> [OPTIONS]\n\n\
+     Remove this device's stored credentials for a server.\n\n\
+     Options:\n\
+     \x20\x20--user NAME    Only log out this user [default: every user on that server]\n\
+     \x20\x20--dir PATH     Where connections are stored [default: ~/.config/webcodex]\n\
+     \x20\x20-y, --yes      Confirm removal\n\
+     \x20\x20--json         Print machine-readable output\n\
+     \x20\x20-h, --help     Print help and exit\n\n\
+     Without --yes this only reports what would be removed.\n"
+}
+
+pub(crate) fn status_usage() -> &'static str {
+    "Usage: webcodex-cli status [OPTIONS]\n\n\
+     Show which servers this device is logged in to.\n\n\
+     Options:\n\
+     \x20\x20--dir PATH     Where connections are stored [default: ~/.config/webcodex]\n\
+     \x20\x20--json         Print machine-readable output\n\
+     \x20\x20-h, --help     Print help and exit\n"
 }

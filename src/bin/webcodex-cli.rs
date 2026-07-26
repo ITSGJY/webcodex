@@ -54,6 +54,8 @@ use webcodex_cli::{
     client_profile_projects_dir, client_profile_service_file, client_profile_user_token_file,
     client_usage, default_client_output_dir_for_profile, default_server_paths,
     discover_named_binary_absolute, discover_webcodex_binary, is_systemd_platform,
+    base_dir_or_default, default_device_name, login_usage, logout_usage, status_usage,
+    run_login, run_logout, run_status, LoginOptions, LogoutOptions, StatusOptions,
     ops_agents_usage, ops_projects_usage, ops_smoke_preflight_usage, ops_status_usage, ops_usage,
     pairing_create_usage, pairing_usage, query_systemd_service_status, read_optional_token,
     render_token_generate, run_agent_install_service, run_agent_status,
@@ -82,6 +84,9 @@ enum CliAction {
     SetupSingleUser(SetupSingleUserOptions),
     PairingCreate(PairingCreateOptions),
     ClientEnroll(ClientEnrollOptions),
+    Login(LoginOptions),
+    Logout(LogoutOptions),
+    Status(StatusOptions),
     Ops(OpsCommand),
     AgentInstallService(AgentInstallServiceOptions),
     AgentStatus(AgentStatusOptions),
@@ -253,6 +258,9 @@ where
         "server" => parse_server_subcommand(&args[1..]),
         "pairing" => parse_pairing_subcommand(&args[1..]),
         "client" => parse_client_subcommand(&args[1..]),
+        "login" => parse_login(&args[1..]),
+        "logout" => parse_logout(&args[1..]),
+        "status" => parse_status(&args[1..]),
         "ops" => parse_ops_subcommand(&args[1..]),
         "agent" => parse_agent_subcommand(&args[1..]),
         "agent-token" | "agent-tokens" => {
@@ -276,6 +284,184 @@ where
             stdout: String::new(),
             stderr: format!("unknown command: {command}\n\n{}", usage()),
         },
+    }
+}
+
+/// `login <server-url> --code CODE`. Everything else has a default: the device
+/// name comes from the hostname and the destination from the username the
+/// server returns, so neither has to be agreed on both sides beforehand.
+fn parse_login(args: &[String]) -> CliAction {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        return CliAction::Exit {
+            code: 0,
+            stdout: login_usage().to_string(),
+            stderr: String::new(),
+        };
+    }
+    let mut server_url: Option<String> = None;
+    let mut code: Option<String> = None;
+    let mut device: Option<String> = None;
+    let mut base_dir: Option<PathBuf> = None;
+    let mut transport = TRANSPORT_WEBSOCKET.to_string();
+    let mut allowed_roots: Vec<PathBuf> = Vec::new();
+    let mut overwrite = false;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].clone();
+        let take = |index: &mut usize| -> Option<String> {
+            *index += 1;
+            args.get(*index).cloned()
+        };
+        match arg.as_str() {
+            "--code" | "--pairing-code" => match take(&mut index) {
+                Some(value) => code = Some(value),
+                None => return cli_parse_error(format!("{arg} requires a value")),
+            },
+            "--device" | "--device-name" => match take(&mut index) {
+                Some(value) => device = Some(value),
+                None => return cli_parse_error(format!("{arg} requires a value")),
+            },
+            "--dir" => match take(&mut index) {
+                Some(value) => base_dir = Some(PathBuf::from(value)),
+                None => return cli_parse_error("--dir requires a value".to_string()),
+            },
+            "--transport" => match take(&mut index) {
+                Some(value) => transport = value,
+                None => return cli_parse_error("--transport requires a value".to_string()),
+            },
+            "--allowed-root" => match take(&mut index) {
+                Some(value) => allowed_roots.push(PathBuf::from(value)),
+                None => return cli_parse_error("--allowed-root requires a value".to_string()),
+            },
+            "--overwrite" => overwrite = true,
+            "--json" => json = true,
+            other if other.starts_with('-') => {
+                return cli_parse_error(format!("unknown flag {other}"))
+            }
+            other => {
+                if server_url.is_some() {
+                    return cli_parse_error(format!("unexpected argument {other}"));
+                }
+                server_url = Some(other.to_string());
+            }
+        }
+        index += 1;
+    }
+    let Some(server_url) = server_url else {
+        return cli_parse_error(
+            "login needs a server URL, e.g. `webcodex-cli login https://example.com --code wc_pair_...`"
+                .to_string(),
+        );
+    };
+    let Some(code) = code else {
+        return cli_parse_error("login needs --code with the pairing code".to_string());
+    };
+    CliAction::Login(LoginOptions {
+        server_url,
+        code,
+        device: device.unwrap_or_else(default_device_name),
+        base_dir: base_dir_or_default(base_dir),
+        transport,
+        allowed_roots,
+        overwrite,
+        json,
+    })
+}
+
+fn parse_logout(args: &[String]) -> CliAction {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        return CliAction::Exit {
+            code: 0,
+            stdout: logout_usage().to_string(),
+            stderr: String::new(),
+        };
+    }
+    let mut server_url: Option<String> = None;
+    let mut username: Option<String> = None;
+    let mut base_dir: Option<PathBuf> = None;
+    let mut yes = false;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].clone();
+        match arg.as_str() {
+            "--user" | "--username" => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) => username = Some(value.clone()),
+                    None => return cli_parse_error(format!("{arg} requires a value")),
+                }
+            }
+            "--dir" => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) => base_dir = Some(PathBuf::from(value)),
+                    None => return cli_parse_error("--dir requires a value".to_string()),
+                }
+            }
+            "--yes" | "-y" => yes = true,
+            "--json" => json = true,
+            other if other.starts_with('-') => {
+                return cli_parse_error(format!("unknown flag {other}"))
+            }
+            other => {
+                if server_url.is_some() {
+                    return cli_parse_error(format!("unexpected argument {other}"));
+                }
+                server_url = Some(other.to_string());
+            }
+        }
+        index += 1;
+    }
+    let Some(server_url) = server_url else {
+        return cli_parse_error("logout needs a server URL".to_string());
+    };
+    CliAction::Logout(LogoutOptions {
+        server_url,
+        username,
+        base_dir: base_dir_or_default(base_dir),
+        yes,
+        json,
+    })
+}
+
+fn parse_status(args: &[String]) -> CliAction {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        return CliAction::Exit {
+            code: 0,
+            stdout: status_usage().to_string(),
+            stderr: String::new(),
+        };
+    }
+    let mut base_dir: Option<PathBuf> = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--dir" => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) => base_dir = Some(PathBuf::from(value)),
+                    None => return cli_parse_error("--dir requires a value".to_string()),
+                }
+            }
+            "--json" => json = true,
+            other => return cli_parse_error(format!("unknown argument {other}")),
+        }
+        index += 1;
+    }
+    CliAction::Status(StatusOptions {
+        base_dir: base_dir_or_default(base_dir),
+        json,
+    })
+}
+
+fn cli_parse_error(message: String) -> CliAction {
+    CliAction::Exit {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("{message}\n"),
     }
 }
 
@@ -1209,9 +1395,6 @@ fn parse_pairing_create(args: &[String]) -> Result<PairingCreateOptions, String>
     if opts.username.trim().is_empty() {
         return Err("--username is required".to_string());
     }
-    if opts.client_id.trim().is_empty() {
-        return Err("--client-id is required".to_string());
-    }
     if !(60..=3600).contains(&opts.ttl_secs) {
         return Err("--ttl-secs must be between 60 and 3600".to_string());
     }
@@ -1557,6 +1740,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if !stdout.ends_with('\n') {
                     println!();
                 }
+                std::process::exit(0);
+            }
+            Err(stderr) => {
+                eprintln!("{}", stderr);
+                std::process::exit(1);
+            }
+        },
+        CliAction::Login(opts) => match run_login(opts).await {
+            Ok(stdout) => {
+                print!("{}", stdout);
+                std::process::exit(0);
+            }
+            Err(stderr) => {
+                eprintln!("{}", stderr);
+                std::process::exit(1);
+            }
+        },
+        CliAction::Logout(opts) => match run_logout(opts) {
+            Ok(stdout) => {
+                print!("{}", stdout);
+                std::process::exit(0);
+            }
+            Err(stderr) => {
+                eprintln!("{}", stderr);
+                std::process::exit(1);
+            }
+        },
+        CliAction::Status(opts) => match run_status(opts) {
+            Ok(stdout) => {
+                print!("{}", stdout);
                 std::process::exit(0);
             }
             Err(stderr) => {
