@@ -185,19 +185,6 @@ impl ClaudeCodeMcpProvider {
             .min(policy.max_timeout_secs)
             .min(self.config.timeout_secs.max(1));
         let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-        let process_reused = self
-            .projects
-            .lock()
-            .unwrap()
-            .get(&root)
-            .is_some_and(|client| client.connection.is_alive());
-        let client = match self.project_client(&root, deadline) {
-            Ok(client) => client,
-            Err(error) => {
-                self.record_experimental_failure(&request.kind, &error, None);
-                return Err(error);
-            }
-        };
         let payload = match request
             .content
             .as_deref()
@@ -211,6 +198,32 @@ impl ClaudeCodeMcpProvider {
                 return Err(error);
             }
         };
+        let tool_name = match request.kind.as_str() {
+            EXPERIMENTAL_KIND_DESCRIBE | EXPERIMENTAL_KIND_CALL => {
+                match payload.get("tool_name").and_then(Value::as_str) {
+                    Some(tool_name) => Some(tool_name),
+                    None => {
+                        let error = request_error();
+                        self.record_experimental_failure(&request.kind, &error, None);
+                        return Err(error);
+                    }
+                }
+            }
+            _ => None,
+        };
+        let process_reused = self
+            .projects
+            .lock()
+            .unwrap()
+            .get(&root)
+            .is_some_and(|client| client.connection.is_alive());
+        let client = match self.project_client(&root, deadline) {
+            Ok(client) => client,
+            Err(error) => {
+                self.record_experimental_failure(&request.kind, &error, None);
+                return Err(error);
+            }
+        };
         let started = Instant::now();
         let outcome = match request.kind.as_str() {
             EXPERIMENTAL_KIND_LIST => Ok(ExperimentalDispatchOutcome {
@@ -219,30 +232,28 @@ impl ClaudeCodeMcpProvider {
                 error_code: None,
                 write_state: None,
             }),
-            EXPERIMENTAL_KIND_DESCRIBE => {
-                let tool_name = payload
-                    .get("tool_name")
-                    .and_then(Value::as_str)
-                    .ok_or_else(request_error)?;
-                client
-                    .experimental_describe_tool(tool_name, process_reused)
-                    .map(|value| ExperimentalDispatchOutcome {
-                        value,
-                        tool_succeeded: true,
-                        error_code: None,
-                        write_state: None,
-                    })
-            }
+            EXPERIMENTAL_KIND_DESCRIBE => client
+                .experimental_describe_tool(
+                    tool_name.expect("describe preflight tool name"),
+                    process_reused,
+                )
+                .map(|value| ExperimentalDispatchOutcome {
+                    value,
+                    tool_succeeded: true,
+                    error_code: None,
+                    write_state: None,
+                }),
             EXPERIMENTAL_KIND_CALL => {
-                let tool_name = payload
-                    .get("tool_name")
-                    .and_then(Value::as_str)
-                    .ok_or_else(request_error)?;
                 let arguments = payload
                     .get("arguments")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
-                client.experimental_tool_call(tool_name, arguments, process_reused, deadline)
+                client.experimental_tool_call(
+                    tool_name.expect("call preflight tool name"),
+                    arguments,
+                    process_reused,
+                    deadline,
+                )
             }
             _ => Err(request_error()),
         };

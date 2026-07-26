@@ -28,6 +28,39 @@ fn call_payload(tool_name: &str, arguments: Value) -> Option<Value> {
 }
 
 #[test]
+fn experimental_invalid_payload_is_rejected_before_claude_start() {
+    let fixture = Fixture::new("normal");
+    let router = experimental_router(&fixture);
+
+    let mut malformed = experimental_request(EXPERIMENTAL_KIND_CALL, &fixture.root, None);
+    malformed.content = Some("{".to_string());
+    let malformed = experimental_stdout(&router, malformed);
+    assert_eq!(malformed["code"], "provider_invalid_request");
+    assert_eq!(malformed["write_state"], "not_submitted");
+    assert_eq!(fixture.starts(), 0);
+    let last_call = router.status().claude_code.last_call.clone().unwrap();
+    assert_eq!(last_call.capability, EXPERIMENTAL_KIND_CALL);
+    assert_eq!(
+        last_call.error_code.as_deref(),
+        Some("provider_invalid_request")
+    );
+
+    let missing = experimental_stdout(
+        &router,
+        experimental_request(EXPERIMENTAL_KIND_DESCRIBE, &fixture.root, Some(json!({}))),
+    );
+    assert_eq!(missing["code"], "provider_invalid_request");
+    assert_eq!(missing["write_state"], "not_submitted");
+    assert_eq!(fixture.starts(), 0);
+    let last_call = router.status().claude_code.last_call.unwrap();
+    assert_eq!(last_call.capability, EXPERIMENTAL_KIND_DESCRIBE);
+    assert_eq!(
+        last_call.error_code.as_deref(),
+        Some("provider_invalid_request")
+    );
+}
+
+#[test]
 fn experimental_list_describe_and_fixed_allowlist() {
     let fixture = Fixture::new("normal");
     let router = experimental_router(&fixture);
