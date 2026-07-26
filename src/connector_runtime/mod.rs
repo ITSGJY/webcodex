@@ -1296,6 +1296,7 @@ impl ConnectorRuntime {
                     timeout_secs,
                     auth.clone(),
                     validation_steps,
+                    None,
                 )
                 .await,
             &task,
@@ -1339,10 +1340,21 @@ impl ConnectorRuntime {
         }
         let task_lock = self.task_lock(&input.task_id);
         let task_guard = task_lock.lock().await;
-        let task = match self.active_writable_task(&input.task_id, subject_id, "commands_run", now)
-        {
+        let task = match self.active_task(&input.task_id, subject_id) {
             Ok(task) => task,
             Err(outcome) => return outcome,
+        };
+        // read_only tasks regain commands only under the kernel write
+        // sandbox; the sandbox is the gate, so no per-command approval
+        // applies there. Agents that do not advertise enforcement keep the
+        // fail-closed refusal.
+        let sandbox_mode = if task.mode == "read_only" {
+            match self.read_only_command_sandbox_mode(&task, auth, now).await {
+                Ok(mode) => Some(mode),
+                Err(outcome) => return outcome,
+            }
+        } else {
+            None
         };
         let timeout_secs = input.timeout_secs.unwrap_or(120);
         let request_sha256 =
@@ -1364,6 +1376,24 @@ impl ConnectorRuntime {
         };
         let reservation = match existing {
             Some(existing) => existing,
+            None if sandbox_mode.is_some() => {
+                // Kernel-sandboxed read-only command: no precondition capture,
+                // no one-time approval — reserve directly.
+                match self.executions.reserve(
+                    &task,
+                    "command",
+                    &input.operation_id,
+                    &request_sha256,
+                    &[],
+                    None,
+                    None,
+                    timeout_secs,
+                    chrono::Utc::now().timestamp(),
+                ) {
+                    Ok(reservation) => reservation,
+                    Err(error) => return store_error_outcome(error, Some(&task)),
+                }
+            }
             None => {
                 let manager = self.workspace.clone();
                 let task_for_precondition = task.clone();
@@ -1466,6 +1496,7 @@ impl ConnectorRuntime {
                     timeout_secs,
                     auth.clone(),
                     Vec::new(),
+                    sandbox_mode,
                 )
                 .await,
             &task,
@@ -2003,6 +2034,54 @@ impl ConnectorRuntime {
         self.db
             .connector_task(task_id, &self.context.project_id, subject_id)
             .map_err(|error| store_error_outcome(error, None))
+    }
+
+    /// Decide whether a read_only task may run this command under the kernel
+    /// write sandbox. Fail closed: only agents that advertised enforcement
+    /// qualify; everyone else keeps the read_only refusal.
+    async fn read_only_command_sandbox_mode(
+        &self,
+        task: &ConnectorTaskSnapshot,
+        auth: &AuthContext,
+        now: i64,
+    ) -> Result<String, ConnectorCallOutcome> {
+        let supported = match crate::tool_runtime::activity::agent_client_from_project(
+            &task.execution_executor_ref,
+        ) {
+            Some(client_id) => self
+                .tools
+                .shell_clients
+                .get_client_view_for_auth(client_id, Some(auth))
+                .await
+                .is_some_and(|view| view.capabilities.sandbox_read_only_commands),
+            None => false,
+        };
+        if supported {
+            return Ok("read_only".to_string());
+        }
+        let cursor = self
+            .record_event(
+                task,
+                "commands_run",
+                json!({ "ok": false, "denied": "read_only" }),
+                now,
+            )
+            .unwrap_or(task.event_cursor);
+        Err(ConnectorCallOutcome::error_for_task_at(
+            403,
+            "read_only_task",
+            "commands_run is unavailable: this task is read_only and the agent kernel does not \
+             enforce the command sandbox",
+            false,
+            true,
+            Some(
+                "Upgrade the agent host to Linux >= 5.13 with Landlock for sandboxed read-only \
+                 commands, or start a normal task after the user authorizes execution.",
+            ),
+            task,
+            cursor,
+            Value::Null,
+        ))
     }
 
     fn active_task(

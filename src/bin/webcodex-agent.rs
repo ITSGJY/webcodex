@@ -1308,6 +1308,32 @@ impl JobManager {
                         .map(|(key, value)| (key.as_str(), value.as_str())),
                 );
             }
+            let sandbox_mode = request.sandbox.clone();
+            match sandbox_mode.as_deref() {
+                None => {}
+                Some("read_only") => {
+                    // Kernel write sandbox: the command may write only into a
+                    // request-private scratch directory. pre_exec fails the
+                    // spawn if the kernel cannot fully enforce the policy.
+                    let scratch =
+                        std::env::temp_dir().join(format!("webcodex-ro-{}", request.request_id));
+                    if let Err(error) = std::fs::create_dir_all(&scratch) {
+                        send_start_failure(
+                            &sink,
+                            request,
+                            format!("could not create sandbox scratch dir: {error}"),
+                        );
+                        return;
+                    }
+                    command.env("TMPDIR", &scratch);
+                    crate::command_sandbox::sandbox_command_read_only(&mut command, vec![scratch]);
+                }
+                Some(other) => {
+                    // Unknown mode: refuse rather than run unsandboxed.
+                    send_start_failure(&sink, request, format!("unknown sandbox mode '{other}'"));
+                    return;
+                }
+            }
             command
                 .current_dir(&cwd_path)
                 .stdout(Stdio::piped())
@@ -2959,6 +2985,7 @@ shell_profile = "../rust"
             created_at: 0,
             validation: None,
             lsp: None,
+            sandbox: None,
         }
     }
 
@@ -3020,6 +3047,7 @@ shell_profile = "../rust"
             created_at: 0,
             validation: None,
             lsp: None,
+            sandbox: None,
         }
     }
 
@@ -3056,6 +3084,7 @@ shell_profile = "../rust"
             created_at: 0,
             validation: None,
             lsp: None,
+            sandbox: None,
         }
     }
 
@@ -3090,6 +3119,7 @@ shell_profile = "../rust"
             created_at: 0,
             validation: None,
             lsp: None,
+            sandbox: None,
         }
     }
 
@@ -3609,6 +3639,7 @@ shell_profile = "../rust"
             created_at: 0,
             validation: None,
             lsp: None,
+            sandbox: None,
         }
     }
 
@@ -3642,6 +3673,7 @@ shell_profile = "../rust"
             created_at: 0,
             validation: None,
             lsp: None,
+            sandbox: None,
         }
     }
 
@@ -6363,6 +6395,7 @@ shell_profile = "../rust"
             created_at: 0,
             validation: None,
             lsp: None,
+            sandbox: None,
         };
 
         jobs.enqueue(
@@ -6468,6 +6501,7 @@ shell_profile = "../rust"
             created_at: 0,
             validation: None,
             lsp: None,
+            sandbox: None,
         };
         let pdir = projects_dir(&cfg);
         let lsp = webcodex_agent::LspSupervisor::default();
@@ -6534,6 +6568,7 @@ shell_profile = "../rust"
                 created_at: 0,
                 validation: None,
                 lsp: None,
+                sandbox: None,
             };
             let ran = dispatch_request(
                 &sink,
@@ -6594,6 +6629,7 @@ shell_profile = "../rust"
             created_at: 0,
             validation: None,
             lsp: None,
+            sandbox: None,
         }
     }
 

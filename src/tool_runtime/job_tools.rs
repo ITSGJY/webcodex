@@ -24,6 +24,7 @@ impl ToolRuntime {
                     timeout_secs,
                     cwd,
                     Vec::new(),
+                    None,
                     auth,
                 )
                 .await

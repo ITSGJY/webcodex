@@ -2066,6 +2066,7 @@ mod tests {
             created_at: 0,
             validation: None,
             lsp: None,
+            sandbox: None,
         }
     }
 
