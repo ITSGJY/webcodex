@@ -1125,6 +1125,9 @@ fn experimental_read_edit_write_bash_paths_and_process_reuse() {
     assert!(bash_err.get("code").is_none() || bash_err["code"].is_null());
     // Transport succeeded; raw Claude result is preserved (not a provider envelope).
     assert!(bash_err["result"]["content"].is_array());
+    // Mutating tool + isError: tools/call completed → post-send write-state.
+    assert_eq!(bash_err["write_state"], "uncertain");
+    assert!(bash_err["changed"].is_null());
     let last_call = router.status().claude_code.last_call.unwrap();
     assert_eq!(last_call.result, "failure");
     assert_eq!(
@@ -1132,6 +1135,7 @@ fn experimental_read_edit_write_bash_paths_and_process_reuse() {
         Some("claude_tool_error"),
         "tool-level isError must record runtime failure without clearing error code"
     );
+    assert_eq!(last_call.write_state.as_deref(), Some("uncertain"));
     assert_eq!(fixture.starts(), 1);
 }
 
@@ -1406,6 +1410,118 @@ fn experimental_result_hard_fail_about_600kib() {
         result["code"], "claude_result_too_large",
         "600 KiB must hard-fail: {result}"
     );
+    // tools/call already completed; mutating tool keeps post-send write-state.
+    assert_eq!(result["write_state"], "uncertain");
+    assert!(result["changed"].is_null());
+    let last_call = router.status().claude_code.last_call.unwrap();
+    assert_eq!(last_call.result, "failure");
+    assert_eq!(last_call.write_state.as_deref(), Some("uncertain"));
+    assert_eq!(
+        last_call.error_code.as_deref(),
+        Some("claude_result_too_large")
+    );
+}
+
+#[test]
+fn experimental_read_result_hard_fail_keeps_not_submitted() {
+    let fixture = Fixture::new("exp_oversized");
+    let router = experimental_router(&fixture);
+    let result = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_CALL,
+            &fixture.root,
+            Some(json!({
+                "tool_name": "Read",
+                "arguments": {"file_path": "src/lib.rs"}
+            })),
+        ),
+    );
+    assert_eq!(
+        result["code"], "claude_result_too_large",
+        "Read hard oversized must still hard-fail: {result}"
+    );
+    // Read is read-only even after tools/call completed.
+    assert_eq!(result["write_state"], "not_submitted");
+    assert_eq!(result["changed"], false);
+    let last_call = router.status().claude_code.last_call.unwrap();
+    assert_eq!(last_call.result, "failure");
+    assert_eq!(last_call.write_state.as_deref(), Some("not_submitted"));
+    assert_eq!(
+        last_call.error_code.as_deref(),
+        Some("claude_result_too_large")
+    );
+}
+
+#[test]
+fn experimental_oversized_mcp_request_is_pre_send_not_submitted() {
+    let fixture = Fixture::new("normal");
+    let router = experimental_router(&fixture);
+    // Warm process so marker has only non-tools/call traffic before the huge call.
+    let listed = experimental_stdout(
+        &router,
+        experimental_request(EXPERIMENTAL_KIND_LIST, &fixture.root, None),
+    );
+    assert_eq!(listed["experimental"], true);
+
+    // Command payload alone exceeds MAX_MCP_MESSAGE_BYTES; encode rejects before stdin write.
+    let huge = "x".repeat(MAX_MCP_MESSAGE_BYTES);
+    let result = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_CALL,
+            &fixture.root,
+            Some(json!({
+                "tool_name": "Bash",
+                "arguments": {"command": huge}
+            })),
+        ),
+    );
+    assert_eq!(result["write_state"], "not_submitted");
+    assert_eq!(result["changed"], false);
+    assert_ne!(
+        result["write_state"], "uncertain",
+        "pre-send size rejection must not look post-send: {result}"
+    );
+    let marker = fs::read_to_string(&fixture.marker).unwrap_or_default();
+    assert!(
+        !marker
+            .lines()
+            .any(|line| line.contains("tools/call") && line.contains("Bash")),
+        "oversized tools/call must not be written to Claude stdin: {marker}"
+    );
+    let last_call = router.status().claude_code.last_call.unwrap();
+    assert_eq!(last_call.result, "failure");
+    assert_eq!(last_call.write_state.as_deref(), Some("not_submitted"));
+}
+
+#[test]
+fn experimental_bash_is_error_keeps_raw_result_and_uncertain_write_state() {
+    let fixture = Fixture::new("normal");
+    let router = experimental_router(&fixture);
+    let result = experimental_stdout(
+        &router,
+        experimental_request(
+            EXPERIMENTAL_KIND_CALL,
+            &fixture.root,
+            Some(json!({
+                "tool_name": "Bash",
+                "arguments": {"command": "nonzero"}
+            })),
+        ),
+    );
+    // Not a WebCodex provider error envelope — raw Claude result preserved.
+    assert!(result.get("code").is_none() || result["code"].is_null());
+    assert_eq!(result["tool_status"], "failure");
+    assert_eq!(result["is_error"], true);
+    assert_eq!(result["result"]["isError"], true);
+    assert!(result["result"]["content"].is_array());
+    assert_eq!(result["write_state"], "uncertain");
+    assert!(result["changed"].is_null());
+    let last_call = router.status().claude_code.last_call.unwrap();
+    assert_eq!(last_call.result, "failure");
+    assert_eq!(last_call.write_state.as_deref(), Some("uncertain"));
+    assert_eq!(last_call.error_code.as_deref(), Some("claude_tool_error"));
 }
 
 #[test]

@@ -69,6 +69,8 @@ When `tools/call` successfully receives a Claude MCP response, the raw result is
   "tool_name": "Bash",
   "tool_status": "failure",
   "is_error": true,
+  "write_state": "uncertain",
+  "changed": null,
   "result": {
     "content": [...],
     "isError": true
@@ -76,10 +78,11 @@ When `tools/call` successfully receives a Claude MCP response, the raw result is
 }
 ```
 
-`isError: true` means **tool-level execution failure** with a **successful MCP transport**. It is **not** converted into a WebCodex transport/provider error. Runtime status records:
+`isError: true` means **tool-level execution failure** with a **successful MCP transport**. It is **not** converted into a WebCodex transport/provider error that drops the raw result. Runtime status records:
 
 - `last_call.result = "failure"`
 - `last_call.error_code = "claude_tool_error"`
+- `last_call.write_state` matches the tool class (Read → `not_submitted`; Edit/Write/Bash → `uncertain`)
 
 `isError: false` records `tool_status: "success"` and runtime `last_call.result = "success"`.
 
@@ -96,14 +99,33 @@ Outer fields may include: `tool_status`, `schema_hash`, `claude_version`, `durat
 | `Write` | potentially mutating | `uncertain` |
 | `Bash` | potentially mutating | `uncertain` |
 
-Preflight failures (not allowed, missing schema, argument validation, path policy, timeout exhausted **before** the MCP request is written) always use `write_state: "not_submitted"`.
+### Pre-send failures → always `not_submitted` / `changed=false`
 
-After the MCP request is written, timeout / connection closed / process exit / protocol failure on Edit/Write/Bash returns:
+Applies when the MCP `tools/call` was **not** written to Claude stdin:
 
-```text
-write_state = uncertain
-changed = null
-```
+- allowlist / schema / argument validation
+- path / policy rejection
+- deadline expired before request
+- connection already dead / pending limit
+- JSON serialization failure
+- MCP message exceeds `MAX_MCP_MESSAGE_BYTES` (encode/size-check before write)
+
+### Post-send failures → tool class write-state
+
+After encode succeeds and write/flush is attempted (or a response is received), failures use:
+
+| Tool | `write_state` | `changed` |
+|---|---|---|
+| `Read` | `not_submitted` | `false` |
+| `Edit` / `Write` / `Bash` | `uncertain` | `null` |
+
+This includes:
+
+- write/flush failure after a write may have started
+- timeout / EOF / process exit after successful send
+- JSON-RPC / provider failure after successful send
+- hard oversized result (`claude_result_too_large`) after a completed `tools/call`
+- Claude `isError: true` (raw result retained; not a lost-result provider envelope)
 
 **Do not automatically retry** uncertain Edit/Write/Bash. The tool may already have mutated the workspace.
 
@@ -171,7 +193,7 @@ Rules:
 |---|---|
 | ≤ 256 KiB | returned as raw Claude result |
 | ~300 KiB (above 256 KiB, ≤ ~512 KiB) | **soft truncate**: `result_truncated: true`, `result.truncated: true` |
-| ~600 KiB (above ~512 KiB) | **hard fail**: `code: claude_result_too_large` |
+| ~600 KiB (above ~512 KiB) | **hard fail**: `code: claude_result_too_large` with **post-send** write-state (Read `not_submitted`; Edit/Write/Bash `uncertain`) |
 
 ### Discovery count
 

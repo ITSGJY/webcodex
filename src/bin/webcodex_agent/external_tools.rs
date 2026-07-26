@@ -74,6 +74,8 @@ struct ExperimentalDispatchOutcome {
     value: Value,
     tool_succeeded: bool,
     error_code: Option<&'static str>,
+    /// Present for tool-level failures after a tools/call was sent (isError / hard oversized path via Err).
+    write_state: Option<WriteState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -826,6 +828,7 @@ impl ClaudeCodeMcpProvider {
                 value: client.experimental_list_tools(process_reused),
                 tool_succeeded: true,
                 error_code: None,
+                write_state: None,
             }),
             EXPERIMENTAL_KIND_DESCRIBE => {
                 let tool_name = payload
@@ -838,6 +841,7 @@ impl ClaudeCodeMcpProvider {
                         value,
                         tool_succeeded: true,
                         error_code: None,
+                        write_state: None,
                     })
             }
             EXPERIMENTAL_KIND_CALL => {
@@ -867,7 +871,9 @@ impl ClaudeCodeMcpProvider {
                     } else {
                         "failure".to_string()
                     },
-                    write_state: None,
+                    write_state: success
+                        .write_state
+                        .map(|state| experimental_write_state_label(state).to_string()),
                     duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                     error_code: success
                         .error_code
@@ -1220,6 +1226,7 @@ impl ProjectMcpClient {
             // Preflight: request never written to Claude stdin.
             return Err(ProviderError::new("mcp_request_timeout"));
         }
+        // tools/call has not been written yet; post-send failure_state applies only after send.
         let failure_state = kind.post_send_failure_state();
         let started = Instant::now();
         let result = self.connection.request(
@@ -1244,25 +1251,41 @@ impl ProjectMcpClient {
                 "isError": is_error,
             });
             if encoded.len() > MAX_EXPERIMENTAL_RESULT_BYTES * 2 {
-                return Err(ProviderError::new("claude_result_too_large"));
+                // Hard bound after a completed tools/call: preserve post-send write-state.
+                // Do not auto-retry mutating tools.
+                return Err(ProviderError::new("claude_result_too_large").with_state(failure_state));
             }
         }
         let tool_status = if is_error { "failure" } else { "success" };
+        let mut value = json!({
+            "experimental": true,
+            "tool_name": tool_name,
+            "claude_version": self.version,
+            "schema_hash": tool.schema_hash,
+            "duration_ms": started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            "process_reused": process_reused,
+            "tool_status": tool_status,
+            "is_error": is_error,
+            "result": result_value,
+            "result_truncated": result_truncated,
+        });
+        // Tool-level isError still completed tools/call; apply class write-state.
+        let outcome_write_state = if is_error {
+            let (label, changed) = match failure_state {
+                WriteState::NotSubmitted => ("not_submitted", Value::Bool(false)),
+                WriteState::Uncertain => ("uncertain", Value::Null),
+            };
+            value["write_state"] = json!(label);
+            value["changed"] = changed;
+            Some(failure_state)
+        } else {
+            None
+        };
         Ok(ExperimentalDispatchOutcome {
-            value: json!({
-                "experimental": true,
-                "tool_name": tool_name,
-                "claude_version": self.version,
-                "schema_hash": tool.schema_hash,
-                "duration_ms": started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-                "process_reused": process_reused,
-                "tool_status": tool_status,
-                "is_error": is_error,
-                "result": result_value,
-                "result_truncated": result_truncated,
-            }),
+            value,
             tool_succeeded: !is_error,
             error_code: is_error.then_some("claude_tool_error"),
+            write_state: outcome_write_state,
         })
     }
 }
@@ -1646,6 +1669,7 @@ impl McpConnection {
         timeout: Duration,
         failure_state: WriteState,
     ) -> Result<Value, ProviderError> {
+        // Pre-send failures keep default NotSubmitted (do not apply failure_state).
         if !self.is_alive() {
             return Err(protocol_error());
         }
@@ -1659,7 +1683,17 @@ impl McpConnection {
             pending.insert(id, tx);
         }
         let message = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
-        if let Err(error) = self.write_json(&message) {
+        // Encode + size-check before any stdin write so serialization / oversize
+        // rejections stay pre-send (not_submitted) even for mutating tools.
+        let encoded = match encode_mcp_message(&message) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.pending.lock().unwrap().remove(&id);
+                return Err(error);
+            }
+        };
+        // Write/flush may partially deliver bytes; treat as post-send.
+        if let Err(error) = write_mcp_message(&self.stdin, &encoded) {
             self.pending.lock().unwrap().remove(&id);
             return Err(error.with_state(failure_state));
         }
@@ -1703,15 +1737,26 @@ impl McpConnection {
     }
 }
 
-fn write_json(stdin: &Mutex<ChildStdin>, value: &Value) -> Result<(), ProviderError> {
+/// Serialize and size-check an MCP JSON line. Does not touch stdin.
+fn encode_mcp_message(value: &Value) -> Result<Vec<u8>, ProviderError> {
     let mut bytes = serde_json::to_vec(value).map_err(|_| protocol_error())?;
     if bytes.len() > MAX_MCP_MESSAGE_BYTES {
-        return Err(protocol_error());
+        return Err(ProviderError::new("mcp_message_too_large"));
     }
     bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Write a previously encoded MCP line to stdin (may partially write).
+fn write_mcp_message(stdin: &Mutex<ChildStdin>, bytes: &[u8]) -> Result<(), ProviderError> {
     let mut writer = stdin.lock().unwrap();
-    writer.write_all(&bytes).map_err(|_| protocol_error())?;
+    writer.write_all(bytes).map_err(|_| protocol_error())?;
     writer.flush().map_err(|_| protocol_error())
+}
+
+fn write_json(stdin: &Mutex<ChildStdin>, value: &Value) -> Result<(), ProviderError> {
+    let bytes = encode_mcp_message(value)?;
+    write_mcp_message(stdin, &bytes)
 }
 
 fn spawn_stdout_reader(
