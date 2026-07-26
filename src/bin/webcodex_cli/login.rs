@@ -1165,6 +1165,138 @@ mod tests {
         assert!(all_connections(&base).is_empty());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn login_refuses_a_symlinked_base_ancestor() {
+        // safe/link -> outside, base = safe/link/config. `create_dir_all` walks
+        // straight through `link` and the canonicalize afterwards then reports
+        // the relocated path as if it were fine.
+        let temp = tempfile::TempDir::new().unwrap();
+        let outside = temp.path().join("outside");
+        let safe = temp.path().join("safe");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&safe).unwrap();
+        std::os::unix::fs::symlink(&outside, safe.join("link")).unwrap();
+        let base = safe.join("link").join("config");
+
+        let canonical = canonical_server_url("https://api.example.com").unwrap();
+        let error = resolve_connection_parent(&base, &canonical).unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+        assert!(!error.contains(CODE), "{error}");
+        assert!(
+            !outside.join("config").exists(),
+            "a directory was created through the symlinked ancestor"
+        );
+        assert_no_credentials_in(&outside);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn login_refuses_a_symlinked_base_ancestor_before_redeeming() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let outside = temp.path().join("outside");
+        let safe = temp.path().join("safe");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&safe).unwrap();
+        std::os::unix::fs::symlink(&outside, safe.join("link")).unwrap();
+        let base = safe.join("link").join("config");
+
+        // No network is reachable in tests; reaching redemption at all would
+        // surface as a connection error rather than this one.
+        let error = run_login(login_opts(&base, "https://api.example.com", false))
+            .await
+            .unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+        for secret in [CODE, AGENT_TOKEN, USER_TOKEN] {
+            assert!(!error.contains(secret), "{error}");
+        }
+        assert!(!outside.join("config").exists());
+        assert_no_credentials_in(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_refuses_a_dangling_symlinked_base_ancestor() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let safe = temp.path().join("safe");
+        std::fs::create_dir_all(&safe).unwrap();
+        let nowhere = temp.path().join("nowhere");
+        std::os::unix::fs::symlink(&nowhere, safe.join("link")).unwrap();
+        let base = safe.join("link").join("config");
+
+        let canonical = canonical_server_url("https://api.example.com").unwrap();
+        let error = resolve_connection_parent(&base, &canonical).unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+        assert!(
+            !nowhere.exists(),
+            "the dangling ancestor target was created"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_refuses_a_file_in_the_base_path() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let safe = temp.path().join("safe");
+        std::fs::create_dir_all(&safe).unwrap();
+        std::fs::write(safe.join("blocker"), "not a directory").unwrap();
+        let base = safe.join("blocker").join("config");
+
+        let canonical = canonical_server_url("https://api.example.com").unwrap();
+        let error = resolve_connection_parent(&base, &canonical).unwrap_err();
+        assert!(error.contains("not a directory"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(safe.join("blocker")).unwrap(),
+            "not a directory",
+            "the blocking file was modified"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_base_components_are_created_without_following_symlinks() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        // A symlink that shares a name with a component that will be created
+        // further along a *different* branch must not be consulted.
+        let base = temp.path().join("a/b/c/config");
+
+        let canonical = canonical_server_url("https://api.example.com").unwrap();
+        let parent = resolve_connection_parent(&base, &canonical).unwrap();
+
+        // Every level exists as a real directory, none of them a symlink.
+        let mut walk = temp.path().to_path_buf();
+        for part in ["a", "b", "c", "config"] {
+            walk.push(part);
+            let meta = std::fs::symlink_metadata(&walk).unwrap();
+            assert!(meta.is_dir() && !meta.is_symlink(), "{}", walk.display());
+        }
+        assert_eq!(parent, walk.join(&canonical.slug));
+        assert_no_credentials_in(&outside);
+    }
+
+    #[test]
+    fn base_paths_may_be_relative_and_contain_dot_components() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let anchor = temp.path().canonicalize().unwrap();
+        let canonical = canonical_server_url("https://api.example.com").unwrap();
+
+        // `.` components are skipped and `..` is resolved lexically against
+        // components already verified to be real directories.
+        let base = anchor.join("./nested/./deeper/../deeper/config");
+        let parent = resolve_connection_parent(&base, &canonical).unwrap();
+        assert_eq!(
+            parent,
+            anchor
+                .join("nested")
+                .join("deeper")
+                .join("config")
+                .join(&canonical.slug)
+        );
+        assert!(parent.is_dir());
+    }
+
     #[test]
     fn resolve_connection_parent_creates_a_missing_base_and_server_directory() {
         let temp = tempfile::TempDir::new().unwrap();

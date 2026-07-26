@@ -28,7 +28,7 @@
 //! because a different consumer reads it (GPT Actions / MCP clients), not the
 //! agent.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use super::env::is_effective_root;
 
@@ -130,6 +130,102 @@ pub(crate) fn canonical_server_url(raw: &str) -> Result<CanonicalServerUrl, Stri
     Ok(CanonicalServerUrl { url, slug })
 }
 
+/// Verify one already-resolved path component and create it if it is missing.
+fn ensure_component(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_symlink() => Err(format!(
+            "{} is a symlink; refusing to store credentials through it",
+            path.display()
+        )),
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => Err(format!(
+            "{} is not a directory; refusing to store credentials there",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // `create_dir`, never `create_dir_all`: only this one component may
+            // come into existence, and only here where the parent has already
+            // been checked.
+            std::fs::create_dir(path)
+                .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
+            let meta = std::fs::symlink_metadata(path)
+                .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+            if meta.is_symlink() || !meta.is_dir() {
+                return Err(format!(
+                    "{} was replaced while it was being created",
+                    path.display()
+                ));
+            }
+            Ok(())
+        }
+        Err(error) => Err(format!("failed to inspect {}: {error}", path.display())),
+    }
+}
+
+/// Walk `path` component by component, requiring every existing part to be a
+/// real directory and creating the missing tail one level at a time.
+///
+/// `create_dir_all` cannot be used for this. It happily walks *through* a
+/// symlinked ancestor, so a base of `safe/link/config` where `safe/link` points
+/// at `outside` puts the credential directory in `outside/config` — and the
+/// `canonicalize` afterwards then faithfully reports the relocated path, so a
+/// check on the result alone can never notice. The ancestors have to be checked
+/// before they are traversed.
+///
+/// Returns the canonical path, which by construction equals the chain that was
+/// just verified.
+pub(crate) fn ensure_real_directory_tree(path: &Path) -> Result<PathBuf, String> {
+    // Anchor relative paths to a canonical working directory so the walk starts
+    // from a prefix that is already known to be symlink-free.
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        let cwd = std::env::current_dir()
+            .map_err(|error| format!("failed to read the working directory: {error}"))?;
+        let cwd = cwd
+            .canonicalize()
+            .map_err(|error| format!("failed to resolve the working directory: {error}"))?;
+        cwd.join(path)
+    };
+
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            // The root and any platform prefix cannot themselves be symlinks.
+            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            Component::RootDir => resolved.push(Component::RootDir.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Safe to resolve lexically: every component pushed so far has
+                // been verified to be a real directory, so `..` cannot be
+                // redirected by a link.
+                if !resolved.pop() {
+                    return Err(format!(
+                        "{} climbs above the filesystem root",
+                        absolute.display()
+                    ));
+                }
+            }
+            Component::Normal(name) => {
+                resolved.push(name);
+                ensure_component(&resolved)?;
+            }
+        }
+    }
+
+    let canonical = resolved
+        .canonicalize()
+        .map_err(|error| format!("failed to resolve {}: {error}", resolved.display()))?;
+    if canonical != resolved {
+        return Err(format!(
+            "{} resolves to {}; refusing to store credentials there",
+            resolved.display(),
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
+}
+
 /// Resolve the directory that holds every user for one server, creating it if
 /// needed, and refuse anything that could place it outside `base`.
 ///
@@ -143,25 +239,7 @@ pub(crate) fn resolve_connection_parent(
     base: &Path,
     canonical: &CanonicalServerUrl,
 ) -> Result<PathBuf, String> {
-    match std::fs::symlink_metadata(base) {
-        Ok(meta) if meta.is_dir() => {}
-        Ok(_) => {
-            return Err(format!(
-                "{} is not a directory; refusing to store credentials there",
-                base.display()
-            ))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(base)
-                .map_err(|error| format!("failed to create {}: {error}", base.display()))?;
-        }
-        Err(error) => {
-            return Err(format!("failed to inspect {}: {error}", base.display()));
-        }
-    }
-    let canonical_base = base
-        .canonicalize()
-        .map_err(|error| format!("failed to resolve {}: {error}", base.display()))?;
+    let canonical_base = ensure_real_directory_tree(base)?;
 
     let server_dir = canonical_base.join(&canonical.slug);
     match std::fs::symlink_metadata(&server_dir) {
