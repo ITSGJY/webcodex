@@ -3,6 +3,7 @@
 //! Both protocol adapters call `ToolRuntime::dispatch()`.
 //! No HTTP framework types here — pure Rust input/output.
 
+pub mod activity;
 mod agent_authorization;
 mod cargo;
 mod cargo_tools;

@@ -13,6 +13,15 @@ use super::{
 };
 use crate::auth::AuthContext;
 
+/// Snapshot of the activity-relevant request facts, captured before the
+/// `ToolCall` is moved into execution.
+struct WorkspaceActivityContext {
+    tool: &'static str,
+    project: Option<String>,
+    command: Option<String>,
+    paths: Vec<String>,
+}
+
 impl ToolRuntime {
     /// Main dispatch — call from MCP handler or GPT Actions handler.
     ///
@@ -94,6 +103,24 @@ impl ToolRuntime {
             guard.finish_with_result(&result);
         }
         result
+    }
+
+    /// Everything the activity ledger needs from a call, captured before the
+    /// call value is moved into execution. `None` for non-mutating tools.
+    fn capture_workspace_activity_context(call: &ToolCall) -> Option<WorkspaceActivityContext> {
+        let tool = call.tool_name();
+        let mutating = super::tool_definition::runtime_tool_is_write_like(tool)
+            || super::tool_definition::runtime_tool_is_shell_like(tool);
+        if !mutating {
+            return None;
+        }
+        let sanitized = call.session_log_arguments();
+        Some(WorkspaceActivityContext {
+            tool,
+            project: call.project().map(str::to_string),
+            command: call.command_text().map(str::to_string),
+            paths: super::activity::paths_from_sanitized_arguments(&sanitized, 16),
+        })
     }
 
     async fn dispatch_with_auth_transport_options_and_metadata_inner(
@@ -306,6 +333,7 @@ impl ToolRuntime {
                 return result;
             }
         }
+        let activity_context = Self::capture_workspace_activity_context(&call);
         let mut result = self.dispatch_authorized_inner(call, auth, transport).await;
         let permission = permission.filter(|_| {
             !permissions::is_hard_denied_output(&result.output, result.error.as_deref())
@@ -333,6 +361,18 @@ impl ToolRuntime {
                 None,
             );
             add_session_telemetry_hint(&mut result, &self.sessions, session_id, event_id);
+        }
+        if let Some(context) = activity_context {
+            self.activity.record(super::activity::ActivityRecord {
+                tool: context.tool,
+                project: context.project.as_deref(),
+                surface: transport.as_str(),
+                success: result.success,
+                session_id: session_id.as_deref(),
+                command: context.command.as_deref(),
+                paths: context.paths,
+                error_summary: result.error.as_deref(),
+            });
         }
         result
     }

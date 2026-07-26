@@ -8,6 +8,7 @@ use rusqlite::Connection;
 use std::sync::Mutex;
 
 mod accounts;
+mod activity;
 mod audit;
 mod execution_model;
 mod executions;
@@ -15,6 +16,7 @@ mod oauth;
 mod schema;
 mod task_kernel;
 
+pub use self::activity::WorkspaceActivityStore;
 pub(crate) use self::execution_model::{
     ConnectorExecution, ConnectorExecutionFailure, ConnectorExecutionObservation,
     ConnectorExecutionReservation, MAX_ASSERTION_EVIDENCE_BYTES,

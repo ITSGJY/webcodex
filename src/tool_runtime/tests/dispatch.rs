@@ -1051,3 +1051,89 @@ async fn dispatch_create_project_rejects_relative_path() {
         result.error
     );
 }
+
+#[tokio::test]
+async fn mutating_dispatch_feeds_the_activity_recorder() {
+    #[derive(Default)]
+    struct CapturingRecorder(
+        std::sync::Mutex<Vec<(String, bool, Option<String>, Vec<String>, String)>>,
+    );
+    impl crate::tool_runtime::activity::ActivityRecorder for CapturingRecorder {
+        fn record(&self, record: crate::tool_runtime::activity::ActivityRecord<'_>) {
+            self.0.lock().unwrap().push((
+                record.tool.to_string(),
+                record.success,
+                record.command.map(str::to_string),
+                record.paths.clone(),
+                record.surface.to_string(),
+            ));
+        }
+    }
+    let recorder = std::sync::Arc::new(CapturingRecorder::default());
+    let runtime =
+        runtime_with_agent_project("activity-shell").with_activity_recorder(recorder.clone());
+    let mut caps = ShellClientCapabilities::default();
+    caps.shell = true;
+    register_agent(&runtime, "activity-shell", None, caps).await;
+    let project = agent_test_project_id("activity-shell");
+
+    // A successful mutating execution lands in the ledger with its raw
+    // command (the durable store truncates it to a preview and honors the
+    // operator's config switch).
+    let shell_task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        async move {
+            let bootstrap = auth_context(None, true);
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::RunShell {
+                        project,
+                        command: "echo activity-probe".to_string(),
+                        session_id: None,
+                        timeout_secs: Some(30),
+                        cwd: None,
+                    },
+                    Some(&bootstrap),
+                )
+                .await
+        }
+    });
+    let request = next_patch_agent_request(&runtime, "activity-shell")
+        .await
+        .expect("run_shell should enqueue a request");
+    complete_patch_agent_request(&runtime, "activity-shell", &request.request_id, 0, "ok", "")
+        .await;
+    let shell = shell_task.await.unwrap();
+    assert!(shell.success, "{:?}", shell.error);
+
+    // Read-only calls never reach the recorder.
+    let list = runtime
+        .dispatch(ToolCall::from_tool_name("list_tools", json!({})).unwrap())
+        .await;
+    assert!(list.success);
+
+    let records = recorder.0.lock().unwrap();
+    assert_eq!(records.len(), 1, "only the mutating call is recorded");
+    let (tool, success, command, paths, surface) = &records[0];
+    assert_eq!(tool, "run_shell");
+    assert!(success);
+    assert_eq!(command.as_deref(), Some("echo activity-probe"));
+    assert!(paths.is_empty());
+    assert_eq!(surface, "api");
+
+    // Path extraction and mutating classification are pinned at the capture
+    // level: edits carry their sanitized paths, reads yield no context.
+    let edit = ToolCall::from_tool_name(
+        "delete_project_files",
+        json!({"project": "agent:oe:demo", "paths": ["a.rs", "b.rs"]}),
+    )
+    .unwrap();
+    assert_eq!(edit.command_text(), None);
+    let shell_call = ToolCall::from_tool_name(
+        "run_shell",
+        json!({"project": "demo", "command": "echo hi"}),
+    )
+    .unwrap();
+    assert_eq!(shell_call.command_text(), Some("echo hi"));
+}

@@ -1,3 +1,4 @@
+use super::activity::{ActivityRecorder, NoopActivityRecorder};
 use super::checkpoint;
 use super::local_jobs::{LocalJobKiller, LocalJobRecord, SystemJobKiller};
 use super::permissions::PermissionEvaluator;
@@ -26,6 +27,9 @@ pub struct ToolRuntime {
     /// Resolved once at construction (`WEBCODEX_PERMISSION_MODE`); dispatch
     /// evaluates once per tool request before mutation.
     pub(crate) permission_evaluator: PermissionEvaluator,
+    /// Sink for the workspace activity ledger (mutating tool executions).
+    /// No-op unless the host injects a durable recorder.
+    pub(crate) activity: Arc<dyn ActivityRecorder>,
 }
 
 impl ToolRuntime {
@@ -45,7 +49,14 @@ impl ToolRuntime {
             semantic_navigation_probe_timeout:
                 super::semantic_navigation::DEFAULT_SEMANTIC_NAVIGATION_PROBE_TIMEOUT,
             permission_evaluator: PermissionEvaluator::from_env(),
+            activity: Arc::new(NoopActivityRecorder),
         }
+    }
+
+    /// Attach a durable workspace-activity recorder (server wiring).
+    pub fn with_activity_recorder(mut self, recorder: Arc<dyn ActivityRecorder>) -> Self {
+        self.activity = recorder;
+        self
     }
 
     #[cfg(test)]

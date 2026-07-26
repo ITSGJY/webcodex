@@ -1072,6 +1072,16 @@ impl ToolCall {
         Ok((call, recorder_metadata))
     }
 
+    /// Raw command text for shell-like calls. Consumed only by the workspace
+    /// activity recorder, which truncates it to a bounded preview and honors
+    /// the operator's preview config switch — it is never logged verbatim.
+    pub(crate) fn command_text(&self) -> Option<&str> {
+        match self {
+            Self::RunShell { command, .. } | Self::RunJob { command, .. } => Some(command),
+            _ => None,
+        }
+    }
+
     pub(crate) fn tool_name(&self) -> &'static str {
         match self {
             Self::ListTools { .. } => "list_tools",

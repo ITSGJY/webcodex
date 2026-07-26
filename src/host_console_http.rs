@@ -13,6 +13,7 @@ use std::sync::Arc;
 pub(crate) const CONSOLE_ROUTES: &[&str] = &[
     "/api/console/readiness",
     "/api/console/tasks",
+    "/api/console/activity",
     "/api/console/task/review",
     "/api/console/task/cancel",
     "/api/console/result/accept",
@@ -23,6 +24,7 @@ pub(crate) fn routes() -> Router {
     Router::with_path("console")
         .push(Router::with_path("readiness").post(readiness))
         .push(Router::with_path("tasks").post(tasks))
+        .push(Router::with_path("activity").post(activity))
         .push(Router::with_path("task/review").post(task_review))
         .push(Router::with_path("task/cancel").post(task_cancel))
         .push(Router::with_path("result/accept").post(result_accept))
@@ -93,6 +95,13 @@ struct ListInput {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ActivityInput {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DecideInput {
     task_id: String,
     result_id: Option<String>,
@@ -118,6 +127,17 @@ async fn tasks(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     ) {
         Ok(rows) => res.render(Json(json!({ "tasks": rows }))),
         Err(error) => render(res, store_error_outcome(error, None)),
+    }
+}
+
+#[handler]
+async fn activity(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let (runtime, _) = prepare!(req, depot, res);
+    let input = parse!(ActivityInput, req, res);
+    let limit = input.limit.unwrap_or(50).clamp(1, 200);
+    match runtime.db.list_workspace_activity(limit) {
+        Ok(rows) => res.render(Json(json!({ "activity": rows }))),
+        Err(error) => render(res, failure(500, "activity_store_error", error.to_string())),
     }
 }
 

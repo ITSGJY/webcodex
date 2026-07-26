@@ -476,6 +476,21 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_wc_task_events_task_sequence
                 ON wc_task_events(task_id, sequence);
+
+            CREATE TABLE IF NOT EXISTS workspace_activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at INTEGER NOT NULL,
+                project TEXT,
+                tool TEXT NOT NULL,
+                surface TEXT NOT NULL,
+                success INTEGER NOT NULL,
+                session_id TEXT,
+                command_preview TEXT,
+                paths_json TEXT NOT NULL DEFAULT '[]',
+                error_summary TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_workspace_activity_id
+                ON workspace_activity(id DESC);
             ",
         )?;
 

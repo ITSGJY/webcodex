@@ -30,6 +30,11 @@ pub(crate) enum TaskCliCommand {
         limit: usize,
         json: bool,
     },
+    Activity {
+        location: TaskLocationOptions,
+        limit: usize,
+        json: bool,
+    },
     Show {
         location: TaskLocationOptions,
         task_id: String,
@@ -63,6 +68,7 @@ pub(crate) fn usage() -> &'static str {
 \n\
 Commands:\n\
   list                       List recent tasks for this project\n\
+  activity                   Show recent mutating tool executions (workspace ledger)\n\
   show TASK_ID               Show result, approvals, and timeline\n\
   accept TASK_ID             Apply a reviewed result to this checkout\n\
   reject TASK_ID             Reject the stable result; release matching leftover slot\n\
@@ -74,8 +80,8 @@ Options:\n\
   --root PATH                Project path; defaults to current directory\n\
   --profile NAME             Hosted connector profile; default personal\n\
   --state-dir PATH           Override private hosted state directory\n\
-  --limit N                  List at most N tasks (1..=100; list only)\n\
-  --json                     Emit JSON (list only)\n\
+  --limit N                  List at most N rows (1..=100; list/activity)\n\
+  --json                     Emit JSON (list/activity)\n\
   -h, --help                 Print help and exit\n"
 }
 
@@ -136,6 +142,12 @@ pub(crate) fn parse(args: &[String]) -> Result<TaskCliCommand, String> {
             json: json_output,
         }),
         "list" => Err("task list accepts no positional arguments".to_string()),
+        "activity" if positional.is_empty() => Ok(TaskCliCommand::Activity {
+            location,
+            limit,
+            json: json_output,
+        }),
+        "activity" => Err("task activity accepts no positional arguments".to_string()),
         "show" | "accept" | "reject" | "resume" => {
             if positional.len() != 1 {
                 return Err(format!("task {operation} requires exactly one TASK_ID"));
@@ -217,6 +229,37 @@ pub(crate) fn run(command: TaskCliCommand) -> Result<String, String> {
                     ));
                 }
                 Ok(output.trim_end().to_string())
+            }
+        }
+        TaskCliCommand::Activity {
+            location,
+            limit,
+            json,
+        } => {
+            let (_state, db) = open_state(&location)?;
+            let rows = db.list_workspace_activity(limit).map_err(store_error)?;
+            if json {
+                pretty_json(&json!({ "activity": rows }))
+            } else if rows.is_empty() {
+                Ok("No workspace activity recorded yet.".to_string())
+            } else {
+                let mut output = format!("Recent workspace activity ({} rows):\n", rows.len());
+                for row in &rows {
+                    let time = chrono::DateTime::from_timestamp(row.created_at, 0)
+                        .map(|value| value.format("%Y-%m-%d %H:%M:%SZ").to_string())
+                        .unwrap_or_else(|| row.created_at.to_string());
+                    let status = if row.success { "ok  " } else { "FAIL" };
+                    let detail = row
+                        .command_preview
+                        .clone()
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| row.paths.join(", "));
+                    output.push_str(&format!(
+                        "{time}  {status}  {:<24} {:<4} {detail}\n",
+                        row.tool, row.surface
+                    ));
+                }
+                Ok(output)
             }
         }
         TaskCliCommand::Show { location, task_id } => {
