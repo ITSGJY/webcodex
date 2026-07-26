@@ -355,6 +355,14 @@ input[type="text"] {
   border-left-color: var(--fail);
 }
 
+.timeline-guidance {
+  border-left-color: var(--accent);
+}
+
+.guide-row {
+  margin-top: 12px;
+}
+
 .diff,
 .output {
   max-height: 360px;

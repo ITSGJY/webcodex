@@ -761,7 +761,14 @@ function renderTimeline(d) {
     head.appendChild(kind);
     head.appendChild(meta);
     item.appendChild(head);
-    const summary = eventSummary(event ? event.payload : null);
+    const guidance =
+      event && event.kind === "human_guidance" && event.payload
+        ? String(event.payload.message || "")
+        : "";
+    if (guidance) {
+      item.classList.add("timeline-guidance");
+    }
+    const summary = guidance || eventSummary(event ? event.payload : null);
     if (summary) {
       const body = document.createElement("div");
       body.className = "timeline-payload muted small";
@@ -923,6 +930,37 @@ async function performAction() {
   }
 }
 
+// Course correction: the message becomes a durable human_guidance event and
+// is delivered inside the model's next capability response for this task.
+async function sendGuidance() {
+  if (!state.selectedTaskId) {
+    return;
+  }
+  const message = inputValue("guide-input").trim();
+  if (!message) {
+    return;
+  }
+  const res = await api("task/guide", { task_id: state.selectedTaskId, message: message });
+  if (!res) {
+    return;
+  }
+  if (res.status === 401) {
+    lock("Credential rejected. Re-enter it.");
+    return;
+  }
+  if (!res.ok) {
+    showError(errorMessage(res.data));
+    return;
+  }
+  hideError();
+  const input = el("guide-input");
+  if (input) {
+    (input ).value = "";
+  }
+  setText("detail-next", "Guidance recorded — delivered with the model's next response.");
+  reviewLoop.restart();
+}
+
 function stopAuto() {
   if (timer) {
     window.clearTimeout(timer);
@@ -1065,6 +1103,9 @@ function init() {
   el("show-completed")?.addEventListener("change", () => {
     showCompleted = inputChecked("show-completed");
     void fetchTasks();
+  });
+  el("guide-btn")?.addEventListener("click", () => {
+    void sendGuidance();
   });
   el("accept-btn")?.addEventListener("click", () => {
     openConfirmUi("accept");
