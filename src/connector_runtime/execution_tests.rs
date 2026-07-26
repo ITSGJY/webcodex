@@ -3214,7 +3214,26 @@ async fn guidance_is_delivered_once_inside_the_next_capability_response() {
         .host_guide(&fixture.task_id, "focus on the parser first");
     assert!(guided.ok, "{}", guided.body);
 
-    // The next capability response carries the guidance…
+    // The host console continuously reviews the selected task. That host-side
+    // projection must not claim guidance intended for the model.
+    let host = fixture
+        .connector
+        .host_review(
+            &fixture.owner,
+            TaskReviewInput {
+                task_id: fixture.task_id.clone(),
+                include_diff: None,
+                after_cursor: None,
+                wait_ms: None,
+                max_events: None,
+                include_output_tail: None,
+            },
+        )
+        .await;
+    assert!(host.ok, "{}", host.body);
+    assert!(host.body["guidance"].is_null());
+
+    // The next model-facing capability response carries the guidance…
     let review = fixture
         .call("task_review", json!({"task_id": fixture.task_id}))
         .await;

@@ -370,6 +370,7 @@ impl ConnectorRuntime {
                 &task.owner_subject_id,
                 auth,
                 ConnectorTransport::Api,
+                false,
             )
             .await;
         if outcome.ok {
@@ -533,7 +534,7 @@ impl ConnectorRuntime {
                     .await
             }
             "task_review" => {
-                self.task_review(arguments, &subject_id, auth, transport)
+                self.task_review(arguments, &subject_id, auth, transport, true)
                     .await
             }
             "task_cancel" => self.task_cancel(arguments, &subject_id, auth).await,
@@ -1488,6 +1489,7 @@ impl ConnectorRuntime {
         subject_id: &str,
         auth: &AuthContext,
         transport: ConnectorTransport,
+        deliver_guidance: bool,
     ) -> ConnectorCallOutcome {
         let input: TaskReviewInput = match parse_input("task_review", arguments) {
             Ok(input) => input,
@@ -1685,7 +1687,9 @@ impl ConnectorRuntime {
         data["recent_events"] = json!(events);
         data["heartbeat"] = json!(review.heartbeat);
         data["next_action"] = json!(next_action);
-        self.attach_pending_guidance(&task, &mut data);
+        if deliver_guidance {
+            self.attach_pending_guidance(&task, &mut data);
+        }
         ConnectorCallOutcome::success_blocking_at(&task, task.event_cursor, data, blocking)
     }
 
@@ -2051,15 +2055,14 @@ impl ConnectorRuntime {
         Ok(task)
     }
 
-    /// Attach human guidance recorded since the last delivery, so a finished
-    /// capability call comes back carrying the operator's course correction.
-    /// Deliver-once via the task watermark; a failed watermark advance means
-    /// at-least-once delivery, never a lost message.
+    /// Attach human guidance to a model-facing capability response.
+    /// The task watermark provides an atomic, single-consumer claim across
+    /// concurrent server responses. It does not provide an end-to-end delivery
+    /// acknowledgement if the response is lost after the transaction commits.
     fn attach_pending_guidance(&self, task: &ConnectorTaskSnapshot, data: &mut Value) {
         // One transaction claims the guidance and advances the watermark, so a
-        // second capability response running concurrently cannot deliver the
-        // same message again, and guidance older than the timeline window is
-        // still found.
+        // second capability response running concurrently cannot claim the same
+        // message, and guidance older than the timeline window is still found.
         let claimed = match self.db.claim_pending_connector_guidance(
             &task.task_id,
             &self.context.project_id,

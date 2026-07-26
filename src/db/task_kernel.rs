@@ -9,6 +9,7 @@ use rusqlite::types::Type;
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashSet;
 use uuid::Uuid;
 
 pub(crate) struct ConnectorBinding<'a> {
@@ -819,7 +820,7 @@ impl Database {
             .map_err(|error| ConnectorTaskStoreError::Storage(error.into()))?;
 
         let mut paths: Vec<String> = Vec::new();
-        let mut total = 0usize;
+        let mut seen = HashSet::new();
         for row in rows {
             let payload = row.map_err(|error| ConnectorTaskStoreError::Storage(error.into()))?;
             let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload) else {
@@ -832,15 +833,15 @@ impl Database {
                 continue;
             };
             for path in list.iter().filter_map(serde_json::Value::as_str) {
-                if paths.iter().any(|existing| existing == path) {
+                if !seen.insert(path.to_string()) {
                     continue;
                 }
-                total += 1;
                 if paths.len() < cap {
                     paths.push(path.to_string());
                 }
             }
         }
+        let total = seen.len();
         Ok(AppliedPaths {
             complete: paths.len() == total,
             paths,
@@ -2667,9 +2668,21 @@ mod tests {
                 "changed_paths": ["a.rs", "b.rs", "c.rs"]
             }),
         );
+        edits(
+            &db,
+            &task,
+            json!({
+                "ok": true,
+                "dry_run": false,
+                "changed_paths": ["c.rs", "d.rs", "c.rs"]
+            }),
+        );
         let applied = applied(&db, &task, 2);
         assert_eq!(applied.paths, vec!["a.rs".to_string(), "b.rs".to_string()]);
-        assert_eq!(applied.total, 3);
+        assert_eq!(
+            applied.total, 4,
+            "duplicates beyond the returned cap must not inflate the distinct total"
+        );
         assert!(!applied.complete, "a truncated list claimed completeness");
     }
 }
