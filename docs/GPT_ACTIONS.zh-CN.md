@@ -22,10 +22,12 @@ bootstrap/admin、account 或 Agent credential 粘贴进 GPT。
 
 ## Canonical hosted operations
 
-project-bound Connector 的 OpenAPI 与 MCP 来自同一份十项 capability registry：
+project-bound Connector 的 OpenAPI 与 MCP 来自同一份十二项 capability registry：
 
 ```text
 task_start
+task_list
+task_resume
 files_list
 files_read
 files_search
@@ -49,6 +51,8 @@ prompt 也不包含 Agent client ID 或 runtime project ID。
 ```text
 Use the configured WebCodex project.
 Start each bounded request with task_start.
+In a fresh chat session, call task_list first and continue durable work
+with task_resume before starting anything new.
 Use files_list to see what the project contains before guessing paths.
 Use files_read/files_search before edits_apply.
 Use a stable operation_id for exact retry.

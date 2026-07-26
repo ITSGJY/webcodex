@@ -119,7 +119,9 @@ task_start
 
 It does not need to call `list_projects`, `runtime_status`, `tool_manifest`,
 `start_session`, or `current_session`, and it does not put an
-`agent:<client>:<project>` value in the prompt.
+`agent:<client>:<project>` value in the prompt. A returning chat session
+begins with `task_list` instead and rebinds to durable work with
+`task_resume`.
 
 Hosted ChatGPT cannot reach a loopback address. An operator must provide an
 approved HTTPS endpoint and authentication without changing the project

@@ -515,6 +515,8 @@ impl ConnectorRuntime {
                 self.task_start(arguments, &subject_id, auth, transport, now)
                     .await
             }
+            "task_list" => self.task_list(arguments, &subject_id).await,
+            "task_resume" => self.task_resume(arguments, &subject_id, now).await,
             "files_list" => {
                 self.files_list(arguments, &subject_id, auth, transport, now)
                     .await
@@ -1819,6 +1821,173 @@ impl ConnectorRuntime {
         ConnectorCallOutcome::success_blocking_at(&task, task.event_cursor, data, blocking)
     }
 
+    /// A new chat session's entry point: the durable tasks this credential
+    /// may continue, most actionable first. Project-scoped on purpose — no
+    /// task binding exists yet, so the response carries no task_id.
+    async fn task_list(&self, arguments: Value, subject_id: &str) -> ConnectorCallOutcome {
+        let input: TaskListInput = match parse_input("task_list", arguments) {
+            Ok(input) => input,
+            Err(outcome) => return outcome,
+        };
+        let limit = input.limit.unwrap_or(DEFAULT_TASK_LIST_LIMIT);
+        if !(1..=MAX_TASK_LIST_LIMIT).contains(&limit) {
+            return invalid_input("task_list", "limit must be 1..=20");
+        }
+        let tasks =
+            match self
+                .db
+                .connector_tasks_for_subject(&self.context.project_id, subject_id, limit)
+            {
+                Ok(tasks) => tasks,
+                Err(error) => return store_error_outcome(error, None),
+            };
+        let items: Vec<Value> = tasks
+            .iter()
+            .map(|task| {
+                json!({
+                    "task_id": task.task_id,
+                    "goal": bounded_goal(&task.goal),
+                    "task_status": task.task_status,
+                    "updated_at": task.updated_at,
+                    "execution_status": task.execution_status,
+                    "validation_status": task.validation_status,
+                    "next_action": model_next_action(&task.task_status, &task.next_action),
+                })
+            })
+            .collect();
+        ConnectorCallOutcome::success_project(json!({
+            "tasks": items,
+            "count": items.len(),
+            "note": "Continue one task with task_resume, or start new work with task_start."
+        }))
+    }
+
+    /// Rebind a fresh chat session to an existing task: one compact, durable
+    /// bootstrap instead of guesses recalled from an expired context window.
+    /// Claims pending human guidance exactly like task_review does.
+    async fn task_resume(
+        &self,
+        arguments: Value,
+        subject_id: &str,
+        now: i64,
+    ) -> ConnectorCallOutcome {
+        let input: TaskResumeInput = match parse_input("task_resume", arguments) {
+            Ok(input) => input,
+            Err(outcome) => return outcome,
+        };
+        let task = match self.task(&input.task_id, subject_id) {
+            Ok(task) => task,
+            Err(outcome) => return outcome,
+        };
+        let result =
+            match self
+                .db
+                .connector_task_result(&task.task_id, &self.context.project_id, subject_id)
+            {
+                Ok(result) => result,
+                Err(error) => return store_error_outcome(error, Some(&task)),
+            };
+        let applied = match self.db.connector_task_applied_paths(
+            &task.task_id,
+            &task.project_id,
+            &task.owner_subject_id,
+            MAX_REVIEW_APPLIED_PATHS,
+        ) {
+            Ok(applied) => applied,
+            Err(error) => return store_error_outcome(error, Some(&task)),
+        };
+        let execution = match self.db.latest_connector_execution(
+            &task.task_id,
+            &self.context.project_id,
+            subject_id,
+            None,
+        ) {
+            Ok(execution) => execution,
+            Err(error) => return store_error_outcome(error, Some(&task)),
+        };
+        let execution_value =
+            execution.map(|execution| execution::execution_projection(&execution, now, None));
+        // A local decision outranks stale execution advice: an accepted or
+        // rejected result decides the story, whatever the last run said.
+        let decision_action = result.as_ref().and_then(|result| {
+            match result.decision_status.as_str() {
+                "accepted" => {
+                    Some("the result was accepted locally; start the next piece of work with task_start")
+                }
+                "rejected" => Some(
+                    "the result was rejected; apply the guidance and start a corrected task with task_start",
+                ),
+                _ => None,
+            }
+        });
+        let next_action = decision_action
+            .map(str::to_string)
+            .or_else(|| {
+                execution_value
+                    .as_ref()
+                    .and_then(|value| value["next_action"].as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| {
+                if result.is_some() {
+                    "task_review, then ask the project owner to accept or reject locally"
+                } else if task.task_status == "cancelled" {
+                    "start_a_new_task"
+                } else if task.run_status == "interrupted" {
+                    "ask the project owner to resume or reject this task on the host"
+                } else {
+                    "continue with files_read/edits_apply, then task_review"
+                }
+                .to_string()
+            });
+        let result_value = result
+            .as_ref()
+            .map(|result| {
+                json!({
+                    "result_id": result.result_id,
+                    "summary": result.summary,
+                    "changed_paths": result.changed_paths,
+                    "patch_bytes": result.patch_bytes,
+                    "decision_status": result.decision_status,
+                })
+            })
+            .unwrap_or(Value::Null);
+        let mut data = json!({
+            "goal": task.goal,
+            "mode": task.mode,
+            "task_status": task.task_status,
+            "run_status": task.run_status,
+            "isolated": task.isolated,
+            "created_at": task.created_at,
+            "updated_at": task.updated_at,
+            "result": result_value,
+            "applied_paths": applied.paths,
+            "applied_paths_total": applied.total,
+            "applied_paths_complete": applied.complete,
+            "recent_execution": execution_value.unwrap_or(Value::Null),
+            "next_action": next_action,
+            "resume_note": "This session is now the task's continuation. Trust this bootstrap over assumptions from earlier sessions, and apply any guidance below before acting."
+        });
+        self.attach_pending_guidance(&task, &mut data);
+        // Timeline visibility for the console; terminal tasks skip the
+        // running-only event guard on purpose, and a failed advisory event
+        // must not fail the bootstrap.
+        let cursor = if task.task_status == "active" && task.run_status == "running" {
+            match self.record_event(
+                &task,
+                "task_resume",
+                json!({ "session_rebound": true }),
+                now,
+            ) {
+                Ok(cursor) => cursor,
+                Err(_) => task.event_cursor,
+            }
+        } else {
+            task.event_cursor
+        };
+        ConnectorCallOutcome::success_at(&task, cursor, self.sanitize_task_value(&task, data))
+    }
+
     async fn task_cancel(
         &self,
         arguments: Value,
@@ -2479,6 +2648,26 @@ enum KernelFailure {
 impl ConnectorCallOutcome {
     fn success(task: &ConnectorTaskSnapshot, data: Value) -> Self {
         Self::success_at(task, task.event_cursor, data)
+    }
+
+    /// A successful project-scoped response with no task binding — the shape
+    /// task_list needs, because a fresh session has no task yet.
+    fn success_project(data: Value) -> Self {
+        Self {
+            ok: true,
+            body: json!({
+                "ok": true,
+                "task_id": null,
+                "run_id": null,
+                "event_cursor": null,
+                "data": data,
+                "warnings": [],
+                "blocking": false
+            }),
+            http_status: 200,
+            required_scope: None,
+            protocol_error: false,
+        }
     }
 
     fn success_at(task: &ConnectorTaskSnapshot, cursor: i64, data: Value) -> Self {
@@ -3241,10 +3430,41 @@ fn short_oid(value: &str) -> &str {
     value.get(..12).unwrap_or(value)
 }
 
+const DEFAULT_TASK_LIST_LIMIT: usize = 10;
+const MAX_TASK_LIST_LIMIT: usize = 20;
+const TASK_LIST_GOAL_BYTES: usize = 200;
+
+/// Bound a goal for the list projection without splitting a UTF-8 character.
+fn bounded_goal(goal: &str) -> String {
+    if goal.len() <= TASK_LIST_GOAL_BYTES {
+        return goal.to_string();
+    }
+    let mut end = TASK_LIST_GOAL_BYTES;
+    while !goal.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &goal[..end])
+}
+
+/// The host queue speaks reviewer verbs; the model needs capability verbs.
+fn model_next_action(task_status: &str, host_action: &str) -> &'static str {
+    match host_action {
+        "in_progress" => "task_resume",
+        "review_and_accept" => "task_review_then_ask_the_owner_to_decide_locally",
+        "resume_or_reject" => "ask_the_owner_to_resume_or_reject_on_the_host",
+        _ => match task_status {
+            "rejected" => "task_resume_for_the_rejection_reason",
+            _ => "task_start_new_work",
+        },
+    }
+}
+
 fn required_scope(capability: &str) -> &'static str {
     match capability {
         "task_start" => SCOPE_RUNTIME_READ,
-        "files_read" | "files_search" | "task_review" => SCOPE_PROJECT_READ,
+        "files_read" | "files_search" | "task_review" | "task_list" | "task_resume" => {
+            SCOPE_PROJECT_READ
+        }
         "edits_apply" | "task_finish" => SCOPE_PROJECT_WRITE,
         "checks_run" | "commands_run" | "task_cancel" => SCOPE_JOB_RUN,
         _ => SCOPE_RUNTIME_READ,
@@ -3499,6 +3719,19 @@ struct CommandsRunInput {
     cwd: Option<String>,
     #[serde(default)]
     timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskListInput {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskResumeInput {
+    task_id: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

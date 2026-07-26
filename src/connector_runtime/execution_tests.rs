@@ -4031,3 +4031,98 @@ async fn scan_failure_review_caps_applied_paths_and_reports_the_true_total() {
         );
     }
 }
+
+#[tokio::test]
+async fn task_list_and_task_resume_bootstrap_a_new_session() {
+    let fixture = fixture(20).await;
+
+    // A fresh session discovers durable work without knowing any task_id, so
+    // the response carries no task binding.
+    let listed = fixture.call("task_list", json!({})).await;
+    assert!(listed.ok, "{}", listed.body);
+    assert_eq!(listed.body["task_id"], Value::Null);
+    let tasks = listed.body["data"]["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 1, "{}", listed.body);
+    assert_eq!(tasks[0]["task_id"], json!(fixture.task_id));
+    assert_eq!(tasks[0]["goal"], "exercise durable execution");
+    assert_eq!(tasks[0]["task_status"], "active");
+    assert_eq!(tasks[0]["next_action"], "task_resume");
+
+    for arguments in [json!({ "limit": 0 }), json!({ "limit": 21 })] {
+        let outcome = fixture.call("task_list", arguments).await;
+        assert_eq!(
+            outcome.body["error"]["code"], "invalid_arguments",
+            "{}",
+            outcome.body
+        );
+    }
+
+    // Resume rebinds the session: goal, state, and a next step; no guidance
+    // is pending yet.
+    let resumed = fixture
+        .call("task_resume", json!({ "task_id": fixture.task_id }))
+        .await;
+    assert!(resumed.ok, "{}", resumed.body);
+    assert_eq!(resumed.body["data"]["goal"], "exercise durable execution");
+    assert_eq!(resumed.body["data"]["task_status"], "active");
+    assert_eq!(resumed.body["data"]["applied_paths"], json!([]));
+    assert_eq!(resumed.body["data"]["result"], Value::Null);
+    assert!(
+        resumed.body["data"]["guidance"].is_null(),
+        "{}",
+        resumed.body
+    );
+
+    // Guidance recorded between sessions is claimed by the next resume,
+    // exactly once — the same channel task_review uses.
+    let guided = fixture
+        .connector
+        .host_guide(&fixture.task_id, "focus on the parser first");
+    assert!(guided.ok, "{}", guided.body);
+    let resumed = fixture
+        .call("task_resume", json!({ "task_id": fixture.task_id }))
+        .await;
+    assert!(resumed.ok, "{}", resumed.body);
+    assert!(
+        resumed.body["data"]["guidance"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("parser"),
+        "{}",
+        resumed.body
+    );
+    let resumed_again = fixture
+        .call("task_resume", json!({ "task_id": fixture.task_id }))
+        .await;
+    assert!(
+        resumed_again.body["data"]["guidance"].is_null(),
+        "guidance is claimed exactly once: {}",
+        resumed_again.body
+    );
+
+    // Each rebind of a running task is visible on the console timeline.
+    let rebinds: i64 = fixture
+        .connector
+        .db
+        .conn_for_tests()
+        .query_row(
+            "SELECT COUNT(*) FROM wc_task_events
+             WHERE task_id = ?1 AND kind = 'task_resume'",
+            [fixture.task_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rebinds, 3);
+
+    let unknown = fixture
+        .call(
+            "task_resume",
+            json!({ "task_id": "wc_task_00000000000000000000000000000000" }),
+        )
+        .await;
+    assert_eq!(
+        unknown.body["error"]["code"], "task_not_found",
+        "{}",
+        unknown.body
+    );
+}

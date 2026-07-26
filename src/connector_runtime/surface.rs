@@ -9,6 +9,8 @@ use serde_json::{json, Map, Value};
 
 pub(crate) const CAPABILITY_NAMES: &[&str] = &[
     "task_start",
+    "task_list",
+    "task_resume",
     "files_list",
     "files_read",
     "files_search",
@@ -35,6 +37,37 @@ pub(crate) fn capability_specs() -> Vec<ToolSpec> {
                 "additionalProperties": false
             }),
             false,
+            false,
+        ),
+        spec(
+            "task_list",
+            "Chat sessions do not persist, but tasks do. In a new session, call this before task_start to find this project's recent tasks — status, goal, and the recommended next step — then continue one with task_resume or start fresh with task_start.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer", "minimum": 1, "maximum": 20, "default": 10,
+                        "description": "Maximum tasks to return, most actionable first."
+                    }
+                },
+                "required": [],
+                "additionalProperties": false
+            }),
+            true,
+            true,
+        ),
+        spec(
+            "task_resume",
+            "Rebind this chat session to an existing task and return a compact bootstrap: goal, status, applied paths, the result and its local decision, the latest execution, undelivered human guidance (including a rejection reason), and the recommended next step. Guidance is claimed on delivery — treat it as fresh instructions.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "task_id": task_id_schema()
+                },
+                "required": ["task_id"],
+                "additionalProperties": false
+            }),
+            true,
             false,
         ),
         spec(
@@ -304,6 +337,8 @@ pub(crate) fn capability_spec(name: &str) -> Option<ToolSpec> {
 pub(crate) fn route_for(name: &str) -> Option<&'static str> {
     match name {
         "task_start" => Some("/api/connector/task/start"),
+        "task_list" => Some("/api/connector/task/list"),
+        "task_resume" => Some("/api/connector/task/resume"),
         "files_list" => Some("/api/connector/files/list"),
         "files_read" => Some("/api/connector/files/read"),
         "files_search" => Some("/api/connector/files/search"),
@@ -494,7 +529,7 @@ mod tests {
             .map(|name| name.to_string())
             .collect::<BTreeSet<_>>();
         assert_eq!(operations, expected);
-        assert_eq!(spec["paths"].as_object().unwrap().len(), 10);
+        assert_eq!(spec["paths"].as_object().unwrap().len(), 12);
         let commands = &spec["paths"]["/api/connector/commands/run"]["post"]["requestBody"]
             ["content"]["application/json"]["schema"];
         assert!(commands["required"]

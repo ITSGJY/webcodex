@@ -24,7 +24,7 @@ WebCodex server ──▶ 本地 Agent：编辑 → 跑检查 → 提交结果
 ```
 
 - **人工审核闸门** —— 结果先隔离，`/console` 网页或 `webcodex task accept` 审核通过才落地。
-- **一切留在你的机器** —— 源码、Git、修改、检查都在拥有仓库的主机上；对外只暴露十个有界、可审计的能力，而不是裸 shell。
+- **一切留在你的机器** —— 源码、Git、修改、检查都在拥有仓库的主机上；对外只暴露十二个有界、可审计的能力，而不是裸 shell。
 - **为真实开发准备** —— LSP 语义导航、带 sha256 守卫的结构化编辑、四语言校验配方（Rust/Node/Python/Go）、服务端强制的幂等重试、完整的任务事件时间线。
 
 | ChatGPT 通过 MCP 驱动任务 | 本机审核与落地 |
@@ -98,7 +98,7 @@ reference、workflow session 或 transport 细节。
 
 ## Canonical coding path
 
-配置完成的 MCP/OpenAPI Connector 只暴露十项项目级能力：
+配置完成的 MCP/OpenAPI Connector 只暴露十二项项目级能力：
 
 ```text
 task_start
@@ -110,6 +110,10 @@ task_start
 → task_review
 → task_cancel（需要时）
 ```
+
+聊天会话会过期，任务不会。新会话先用 `task_list` 找到可继续的工作，再用
+`task_resume` 拿到单个任务的紧凑 bootstrap——目标、状态、已应用路径，以及评审者
+留下的 guidance（包括拒绝理由）。
 
 Connector context 确定性解析项目。普通 coding 不需要先调用 `list_projects`、
 `runtime_status`、`tool_manifest`、`start_session`、`current_session`、Agent listing
@@ -135,7 +139,7 @@ review 和 accept；executor routing 和 queue ID 保持内部实现。
 
 ### Project-aware validation
 
-`checks_run` 仍是十项 capability 之一。省略可选 `recipe` 时，从 Task execution
+`checks_run` 仍是十二项 capability 之一。省略可选 `recipe` 时，从 Task execution
 workspace 的相对 `cwd` 开始解析最近的 supported manifest；仅在同目录歧义时显式
 提供 `recipe: rust|node|python|go`。解析不会扫描 sibling project，绝对路径、
 父目录穿越和 symlink escape 都 fail closed。

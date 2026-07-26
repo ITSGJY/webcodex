@@ -1200,6 +1200,74 @@ impl Database {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// The durable tasks one credential may continue from a fresh chat
+    /// session: everything [`Self::local_reviewable_tasks`] computes, but
+    /// scoped to the owning subject and always including closed history — a
+    /// new session often needs the context of an already-decided task.
+    pub(crate) fn connector_tasks_for_subject(
+        &self,
+        project_id: &str,
+        subject_id: &str,
+        limit: usize,
+    ) -> Result<Vec<LocalReviewableTask>, ConnectorTaskStoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT q.task_id, q.goal, q.task_status, q.updated_at, q.execution_status,
+                    json_extract(q.validation_json, '$.status'),
+                    CASE
+                        WHEN q.task_status IN ('accepted', 'rejected', 'cancelled') THEN 'closed'
+                        WHEN q.run_status = 'interrupted' THEN 'resume_or_reject'
+                        WHEN q.task_status = 'ready_for_review' AND q.result_id IS NOT NULL THEN 'review_and_accept'
+                        WHEN q.task_status = 'active' THEN 'in_progress'
+                        ELSE 'review'
+                    END
+             FROM (
+                SELECT t.id AS task_id, t.goal, t.updated_at,
+                    CASE
+                        WHEN EXISTS (SELECT 1 FROM wc_task_events c
+                                     WHERE c.task_id = t.id AND c.kind = 'task_cancelled') THEN 'cancelled'
+                        WHEN res.decision_status = 'accepted' THEN 'accepted'
+                        WHEN res.decision_status = 'rejected' THEN 'rejected'
+                        WHEN r.status = 'interrupted' THEN 'needs_attention'
+                        ELSE t.status
+                    END AS task_status,
+                    r.status AS run_status, res.id AS result_id, res.validation_json,
+                    (SELECT ex.state FROM wc_executions ex WHERE ex.task_id = t.id
+                     ORDER BY ex.submitted_at DESC, ex.rowid DESC LIMIT 1) AS execution_status
+                FROM wc_tasks t
+                JOIN wc_runs r ON r.task_id = t.id
+                    AND r.started_at = (SELECT MAX(started_at) FROM wc_runs WHERE task_id = t.id)
+                LEFT JOIN wc_task_results res ON res.run_id = r.id
+                WHERE t.project_id = ?1 AND t.owner_subject_id = ?2
+             ) q
+             ORDER BY
+                CASE q.task_status
+                    WHEN 'needs_attention' THEN 0
+                    WHEN 'active' THEN 1
+                    WHEN 'ready_for_review' THEN 2
+                    ELSE 3
+                END,
+                q.updated_at DESC,
+                q.task_id ASC
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![project_id, subject_id, limit.max(1) as i64],
+            |row| {
+                Ok(LocalReviewableTask {
+                    task_id: row.get(0)?,
+                    goal: row.get(1)?,
+                    task_status: row.get(2)?,
+                    updated_at: row.get(3)?,
+                    execution_status: row.get(4)?,
+                    validation_status: row.get(5)?,
+                    next_action: row.get(6)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub(crate) fn local_connector_task(
         &self,
         task_id: &str,

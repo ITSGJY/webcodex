@@ -755,3 +755,24 @@ fn reject_without_reason_records_no_guidance() {
         .unwrap();
     assert_eq!(count, 0, "a silent reject must stay silent");
 }
+
+#[test]
+fn connector_tasks_for_subject_scopes_to_the_owner() {
+    let fixture = fixture(true);
+    let mine = fixture
+        .db
+        .connector_tasks_for_subject(&fixture.context.project_id, SUBJECT, 10)
+        .unwrap();
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].task_id, TASK_ID);
+    assert_eq!(mine[0].task_status, "ready_for_review");
+    assert_eq!(mine[0].next_action, "review_and_accept");
+
+    // Ownership is the visibility boundary: another subject sees nothing,
+    // not a filtered view of someone else's history.
+    let strangers = fixture
+        .db
+        .connector_tasks_for_subject(&fixture.context.project_id, "user:someone_else", 10)
+        .unwrap();
+    assert!(strangers.is_empty());
+}

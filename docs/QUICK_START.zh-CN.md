@@ -111,7 +111,8 @@ task_start
 ```
 
 它不需要 `list_projects`、`runtime_status`、`tool_manifest`、`start_session` 或
-`current_session`，prompt 中也不需要 `agent:<client>:<project>`。
+`current_session`，prompt 中也不需要 `agent:<client>:<project>`。回访的聊天
+会话则从 `task_list` 开始，用 `task_resume` 重新接上持久的任务。
 
 ChatGPT hosted client 无法访问 loopback address。operator 必须提供批准的 HTTPS
 endpoint 和认证，同时保持 project binding 不变。见

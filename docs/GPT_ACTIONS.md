@@ -22,11 +22,13 @@ not paste bootstrap/admin, account, or Agent credentials into a GPT.
 
 ## Canonical Hosted Operations
 
-For a project-bound Connector, OpenAPI is generated from the same ten
+For a project-bound Connector, OpenAPI is generated from the same twelve
 capabilities as MCP:
 
 ```text
 task_start
+task_list
+task_resume
 files_list
 files_read
 files_search
@@ -52,6 +54,8 @@ client ID or runtime project ID.
 ```text
 Use the configured WebCodex project.
 Start each bounded request with task_start.
+In a fresh chat session, call task_list first and continue durable work
+with task_resume before starting anything new.
 Use files_list to see what the project contains before guessing paths.
 Use files_read/files_search before edits_apply.
 Use a stable operation_id for exact retry.

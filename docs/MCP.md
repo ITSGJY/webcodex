@@ -35,6 +35,8 @@ exactly:
 
 ```text
 task_start
+task_list
+task_resume
 files_list
 files_read
 files_search
@@ -45,6 +47,11 @@ task_review
 task_cancel
 task_finish
 ```
+
+Chat sessions expire; tasks are durable on the server. A new session starts
+with `task_list` to discover unfinished work, then `task_resume` for a compact
+bootstrap — goal, state, applied paths, the result decision, and undelivered
+human guidance (including a rejection reason).
 
 The Connector context already binds the project. Start with `task_start`; do
 not call `list_projects`, `runtime_status`, `tool_manifest`, `start_session`,

@@ -34,6 +34,8 @@ runtime 由 `webcodex setup` 配置时，MCP `tools/list` 恰好包含：
 
 ```text
 task_start
+task_list
+task_resume
 files_list
 files_read
 files_search
@@ -44,6 +46,10 @@ task_review
 task_cancel
 task_finish
 ```
+
+聊天会话会过期，任务在服务端是持久的。新会话先用 `task_list` 发现未完成的
+工作，再用 `task_resume` 拿到紧凑 bootstrap——目标、状态、已应用路径、结果
+决定，以及尚未投递的人工 guidance（包括拒绝理由）。
 
 Connector context 已绑定项目。直接从 `task_start` 开始；不要调用
 `list_projects`、`runtime_status`、`tool_manifest`、`start_session` 或

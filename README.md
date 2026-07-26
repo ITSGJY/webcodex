@@ -28,7 +28,7 @@ Your repository
 - **Human review gate** — results stay isolated until you accept them, from
   the `/console` web UI or `webcodex task accept`.
 - **Everything stays on your machine** — source, Git, edits, and checks run
-  on the host that owns the repository; the server exposes ten bounded,
+  on the host that owns the repository; the server exposes twelve bounded,
   audited capabilities instead of a raw shell.
 - **Built for real work** — LSP navigation, structured edits with sha256
   guards, project-aware check recipes (Rust/Node/Python/Go), idempotent
@@ -109,7 +109,7 @@ The complete walkthrough is in [docs/QUICK_START.md](docs/QUICK_START.md).
 
 ## Canonical Coding Path
 
-A configured MCP/OpenAPI Connector exposes exactly ten project-bound
+A configured MCP/OpenAPI Connector exposes exactly twelve project-bound
 capabilities:
 
 ```text
@@ -122,6 +122,11 @@ task_start
 → task_review
 → task_cancel (when needed)
 ```
+
+Chat sessions expire; tasks do not. A new session starts with `task_list` to
+find durable work, then `task_resume` for a compact bootstrap of one task —
+goal, state, applied paths, and any guidance the reviewer left, including a
+rejection reason.
 
 The configured Connector context resolves the project deterministically.
 Ordinary coding does not need `list_projects`, `runtime_status`,
@@ -151,7 +156,7 @@ queue IDs stay internal.
 
 ### Project-aware validation
 
-`checks_run` remains one of the ten capabilities. Omit its optional `recipe`
+`checks_run` remains one of the twelve capabilities. Omit its optional `recipe`
 field to resolve the nearest supported manifest from the Task execution
 workspace and relative `cwd`; use `recipe: rust|node|python|go` only to resolve
 a same-directory ambiguity. Resolution never scans sibling projects, and
