@@ -156,16 +156,8 @@ fn content_is_empty_instruction(content: &str) -> bool {
 }
 
 fn add_line_number_fields<T: AsRef<str>>(output: &mut Value, start_line: usize, texts: &[T]) {
-    let lines: Vec<Value> = texts
-        .iter()
-        .enumerate()
-        .map(|(idx, text)| {
-            json!({
-                "line": start_line.saturating_add(idx),
-                "text": text.as_ref(),
-            })
-        })
-        .collect();
+    // One numbered representation only. The old per-line object array tripled
+    // the paid bytes for the same information the model already has here.
     let numbered_text = texts
         .iter()
         .enumerate()
@@ -174,7 +166,6 @@ fn add_line_number_fields<T: AsRef<str>>(output: &mut Value, start_line: usize, 
         .join("\n");
     if let Some(obj) = output.as_object_mut() {
         obj.insert("numbered_text".to_string(), Value::String(numbered_text));
-        obj.insert("lines".to_string(), Value::Array(lines));
     }
 }
 
@@ -291,6 +282,19 @@ const SEARCH_PROJECT_TEXT_EXCLUDES: &[&str] = &[
     "--exclude-dir=.git",
     "--exclude-dir=target",
     "--exclude-dir=node_modules",
+    "--exclude-dir=.venv",
+    "--exclude-dir=venv",
+    "--exclude-dir=__pycache__",
+    "--exclude-dir=.pytest_cache",
+    "--exclude-dir=.mypy_cache",
+    "--exclude-dir=.ruff_cache",
+    "--exclude-dir=.tox",
+    "--exclude-dir=site-packages",
+    "--exclude-dir=.ipynb_checkpoints",
+    "--exclude-dir=dist",
+    "--exclude-dir=build",
+    "--exclude-dir=coverage",
+    "--exclude-dir=.next",
     "--exclude-dir=secrets",
     "--exclude-dir=tokens",
     "--exclude=.env",
@@ -308,6 +312,19 @@ const SEARCH_PROJECT_TEXT_RG_EXCLUDE_GLOBS: &[&str] = &[
     "!**/target/**",
     "!node_modules/**",
     "!**/node_modules/**",
+    "!**/.venv/**",
+    "!**/venv/**",
+    "!**/__pycache__/**",
+    "!**/.pytest_cache/**",
+    "!**/.mypy_cache/**",
+    "!**/.ruff_cache/**",
+    "!**/.tox/**",
+    "!**/site-packages/**",
+    "!**/.ipynb_checkpoints/**",
+    "!**/dist/**",
+    "!**/build/**",
+    "!**/coverage/**",
+    "!**/.next/**",
     "!secrets/**",
     "!**/secrets/**",
     "!tokens/**",
@@ -826,7 +843,7 @@ fn ripgrep_search_command(options: &SearchOptions) -> String {
         SearchResultMode::Count => "--count --null".to_string(),
     };
     format!(
-        "rg {mode_args} --color never --hidden --no-ignore --sort path {globs} -e {pattern} -- {target} 2>/dev/null"
+        "rg {mode_args} --color never --hidden --sort path {globs} -e {pattern} -- {target} 2>/dev/null"
     )
 }
 
@@ -4017,7 +4034,7 @@ mod tests {
     }
 
     #[test]
-    fn read_file_with_line_numbers_returns_numbered_text_and_lines() {
+    fn read_file_with_line_numbers_returns_numbered_text() {
         let result = read_file_content_result_with_options(
             "alpha\nbeta\ngamma".to_string(),
             None,
@@ -4030,14 +4047,6 @@ mod tests {
         assert_eq!(
             result.output["numbered_text"],
             "1 | alpha\n2 | beta\n3 | gamma"
-        );
-        assert_eq!(
-            result.output["lines"],
-            json!([
-                {"line": 1, "text": "alpha"},
-                {"line": 2, "text": "beta"},
-                {"line": 3, "text": "gamma"},
-            ])
         );
     }
 
@@ -4055,13 +4064,6 @@ mod tests {
         assert_eq!(result.output["start_line"], 2);
         assert_eq!(result.output["limit"], 2);
         assert_eq!(result.output["numbered_text"], "2 | two\n3 | three");
-        assert_eq!(
-            result.output["lines"],
-            json!([
-                {"line": 2, "text": "two"},
-                {"line": 3, "text": "three"},
-            ])
-        );
     }
 
     #[test]
@@ -4075,7 +4077,6 @@ mod tests {
         assert_eq!(result.output["start_line"], 5);
         assert_eq!(result.output["limit"], 3);
         assert_eq!(result.output["numbered_text"], "");
-        assert_eq!(result.output["lines"], json!([]));
     }
 
     #[test]
@@ -4097,13 +4098,6 @@ mod tests {
         assert!(result.success);
         assert_eq!(result.output["content"], "\nsecond");
         assert_eq!(result.output["numbered_text"], "1 | \n2 | second");
-        assert_eq!(
-            result.output["lines"],
-            json!([
-                {"line": 1, "text": ""},
-                {"line": 2, "text": "second"},
-            ])
-        );
     }
 
     #[test]
