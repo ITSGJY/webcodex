@@ -2393,7 +2393,7 @@ async fn running_check_allows_review_wait_cancel_and_releases_slot() {
     let initial = fixture
         .call(
             "task_review",
-            json!({"task_id": fixture.task_id, "include_diff": false}),
+            json!({"task_id": fixture.task_id, "include_diff": false, "include_output_tail": true}),
         )
         .await;
     assert!(review_started.elapsed() < Duration::from_millis(500));
@@ -2422,7 +2422,8 @@ async fn running_check_allows_review_wait_cancel_and_releases_slot() {
                 "task_id": waiting_task,
                 "after_cursor": cursor,
                 "wait_ms": 1_000,
-                "include_diff": false
+                "include_diff": false,
+                "include_output_tail": true
             }),
         )
         .await

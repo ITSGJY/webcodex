@@ -1529,7 +1529,7 @@ impl ConnectorRuntime {
                 Err(error) => return store_error_outcome(error, Some(&task)),
             };
         let changes = if let Some(result) = result.as_ref() {
-            let diff_preview = if input.include_diff.unwrap_or(true) {
+            let diff_preview = if input.include_diff.unwrap_or(false) {
                 match workspace::WorkspaceManager::patch_preview(
                     result,
                     CONNECTOR_PATCH_PREVIEW_BYTES,
@@ -1604,7 +1604,7 @@ impl ConnectorRuntime {
                     "show_changes",
                     json!({
                         "project": task.execution_executor_ref,
-                        "include_diff": input.include_diff.unwrap_or(true),
+                        "include_diff": input.include_diff.unwrap_or(false),
                         "max_hunks": 20,
                         "max_hunk_lines": 80,
                         "session_event_limit": 0
@@ -1648,7 +1648,7 @@ impl ConnectorRuntime {
         let execution = match review.execution.as_ref() {
             Some(execution) => Some(
                 self.executions
-                    .projection(execution, auth, input.include_output_tail.unwrap_or(true))
+                    .projection(execution, auth, input.include_output_tail.unwrap_or(false))
                     .await,
             ),
             None => None,
