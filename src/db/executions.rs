@@ -594,7 +594,17 @@ impl Database {
         }
         let workspace_evidence = match &failure {
             ConnectorExecutionFailure::Workspace { evidence, .. } => {
-                Some(json!({ "invariant": "workspace_provenance", "detail": evidence }).to_string())
+                let evidence =
+                    json!({ "invariant": "workspace_provenance", "detail": evidence }).to_string();
+                Some(if evidence.len() <= super::MAX_ASSERTION_EVIDENCE_BYTES {
+                    evidence
+                } else {
+                    json!({
+                        "invariant": "workspace_provenance",
+                        "detail": "workspace provenance mismatch evidence exceeded the durable size limit"
+                    })
+                    .to_string()
+                })
             }
             _ => None,
         };

@@ -260,25 +260,12 @@ impl ExecutionService {
                     })
                     .await
                     .unwrap_or_default();
-                    let untracked = if untracked.is_empty() {
-                        "none detected".to_string()
-                    } else {
-                        untracked.join(", ")
-                    };
                     return Err((
                         "workspace_provenance_mismatch",
-                        format!(
-                            "the checks passed but the workspace fingerprint changed during \
-                             validation (expected {}, found {}); untracked files present: {}. \
-                             Add a .gitignore covering build artifacts, then rerun the checks \
-                             with a new operation_id",
-                            execution
-                                .check_workspace_sha256
-                                .as_deref()
-                                .map(|sha| &sha[..sha.len().min(12)])
-                                .unwrap_or("unknown"),
-                            &current[..current.len().min(12)],
-                            untracked
+                        workspace_provenance_mismatch_detail(
+                            execution.check_workspace_sha256.as_deref(),
+                            &current,
+                            &untracked,
                         ),
                     ));
                 }
@@ -333,6 +320,56 @@ impl ExecutionService {
         } else {
             CancelDispatch::Failed
         }
+    }
+}
+
+fn workspace_provenance_mismatch_detail(
+    expected: Option<&str>,
+    current: &str,
+    untracked: &[String],
+) -> String {
+    let expected = expected
+        .map(|sha| &sha[..sha.len().min(12)])
+        .unwrap_or("unknown");
+    let current = &current[..current.len().min(12)];
+    if untracked.is_empty() {
+        return format!(
+            "the checks passed but the workspace fingerprint changed during validation \
+             (expected {expected}, found {current}); no untracked files were detected. \
+             Inspect or revert workspace changes made during validation, then rerun the \
+             checks with a new operation_id"
+        );
+    }
+    format!(
+        "the checks passed but the workspace fingerprint changed during validation \
+         (expected {expected}, found {current}); untracked files present: {}. Add a \
+         .gitignore covering generated build artifacts, then rerun the checks with a new \
+         operation_id",
+        untracked.join(", ")
+    )
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::workspace_provenance_mismatch_detail;
+
+    #[test]
+    fn mismatch_detail_only_recommends_gitignore_for_untracked_paths() {
+        let untracked = workspace_provenance_mismatch_detail(
+            Some("aaaaaaaaaaaaaaaa"),
+            "bbbbbbbbbbbbbbbb",
+            &["target/junk.o".to_string()],
+        );
+        assert!(untracked.contains("target/junk.o"), "{untracked}");
+        assert!(untracked.contains(".gitignore"), "{untracked}");
+
+        let tracked =
+            workspace_provenance_mismatch_detail(Some("aaaaaaaaaaaaaaaa"), "bbbbbbbbbbbbbbbb", &[]);
+        assert!(
+            tracked.contains("Inspect or revert workspace changes"),
+            "{tracked}"
+        );
+        assert!(!tracked.contains(".gitignore"), "{tracked}");
     }
 }
 

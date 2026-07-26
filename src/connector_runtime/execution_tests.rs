@@ -3688,13 +3688,16 @@ async fn provenance_mismatch_fails_honestly_with_evidence() {
     let projection = execution::execution_projection(&execution, 10, None);
     assert_eq!(
         projection["next_action"],
-        "add_gitignore_for_build_artifacts_then_rerun_checks"
+        "inspect_workspace_changes_then_rerun_checks"
     );
     let evidence = execution.assertion_evidence.expect("evidence must persist");
     assert_eq!(evidence["invariant"], "workspace_provenance");
     let detail = evidence["detail"].as_str().unwrap();
     assert!(detail.contains("build-artifact.tmp"), "{detail}");
     assert!(detail.contains(".gitignore"), "{detail}");
+    assert!(
+        serde_json::to_vec(&evidence).unwrap().len() <= crate::db::MAX_ASSERTION_EVIDENCE_BYTES
+    );
 
     // The reviewer is never blinded by the wedged workspace: when the
     // show_changes scan errors, the review degrades to the durable
@@ -3733,5 +3736,7 @@ async fn provenance_mismatch_fails_honestly_with_evidence() {
     let changes = &review.body["data"]["changes"];
     assert_eq!(changes["source"], "workspace_scan_failed");
     assert_eq!(changes["changed_paths_source"], "applied_edits");
+    assert_eq!(changes["changed_paths_complete"], true);
+    assert_eq!(changes["changed_paths_total"], 0);
     assert!(changes["changed_paths"].as_array().is_some());
 }
