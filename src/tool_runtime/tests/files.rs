@@ -3229,3 +3229,94 @@ async fn read_file_still_routes_project_relative_paths_to_agent() {
     assert_eq!(req.path.as_deref(), Some("src/main.rs"));
     task.abort();
 }
+
+#[tokio::test]
+async fn read_file_refuses_secret_paths_before_reaching_agent() {
+    // Search excluded credentials, artifacts and edits rejected them, but
+    // read_file returned them verbatim. Case variants must be refused too:
+    // the old search predicate was case-sensitive.
+    let runtime = runtime_with_agent_project("secret-read");
+    let mut caps = ShellClientCapabilities::default();
+    caps.file_read = true;
+    register_agent(&runtime, "secret-read", None, caps).await;
+    let project = agent_test_project_id("secret-read");
+
+    for path in [
+        ".env",
+        ".env.production",
+        "app/.env.local",
+        ".ENV",
+        "certs/server.pem",
+        "certs/server.key",
+        "certs/Server.PEM",
+        "agent.toml",
+        "secrets/token",
+        "tokens/agent",
+        "projects.d/demo.toml",
+    ] {
+        let result = runtime
+            .read_file(project.clone(), path.to_string(), None, None, None)
+            .await;
+        assert!(!result.success, "read_file returned secret path {path:?}");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("sensitive")),
+            "unexpected error for {path:?}: {:?}",
+            result.error
+        );
+    }
+
+    let queued = runtime
+        .shell_clients
+        .poll(ShellAgentPollRequest {
+            client_id: "secret-read".to_string(),
+            agent_instance_id: "inst".to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        queued.is_none(),
+        "a refused secret path still reached the agent: {queued:?}"
+    );
+}
+
+#[tokio::test]
+async fn read_file_still_allows_bulk_tree_paths_by_explicit_path() {
+    // `.git` and `target` are skipped by bulk operations for cost, not
+    // secrecy. Reading one by explicit path must keep working.
+    let runtime = runtime_with_agent_project("bulk-read");
+    let mut caps = ShellClientCapabilities::default();
+    caps.file_read = true;
+    register_agent(&runtime, "bulk-read", None, caps).await;
+    let project = agent_test_project_id("bulk-read");
+
+    let runtime_for_task = runtime.clone();
+    let task = tokio::spawn(async move {
+        runtime_for_task
+            .read_file(project, ".git/HEAD".to_string(), None, None, None)
+            .await
+    });
+
+    let mut req = None;
+    for _ in 0..20 {
+        req = runtime
+            .shell_clients
+            .poll(ShellAgentPollRequest {
+                client_id: "bulk-read".to_string(),
+                agent_instance_id: "inst".to_string(),
+                projects: None,
+            })
+            .await
+            .unwrap();
+        if req.is_some() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let req = req.expect(".git/HEAD must still reach the agent");
+    assert_eq!(req.path.as_deref(), Some(".git/HEAD"));
+    task.abort();
+}

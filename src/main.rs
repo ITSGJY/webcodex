@@ -18,6 +18,7 @@ mod agent_quic;
 mod agent_tokens_http;
 mod agent_ws;
 mod apply_edits_shared;
+mod sensitive_paths;
 mod artifact_policy;
 mod audit_http;
 mod auth;

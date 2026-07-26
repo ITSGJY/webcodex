@@ -24,6 +24,12 @@ mod shell_protocol;
 #[path = "../apply_edits_shared.rs"]
 mod apply_edits_shared;
 
+// The agent does not run glob-based search, so part of the shared policy
+// is unused here.
+#[allow(dead_code)]
+#[path = "../sensitive_paths.rs"]
+mod sensitive_paths;
+
 #[allow(dead_code)]
 #[path = "../agent_init.rs"]
 mod agent_init;

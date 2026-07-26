@@ -101,22 +101,8 @@ pub const MAX_APPLY_TEXT_EDIT_FIELD_BYTES: usize = 512 * 1024; // 512 KiB
 /// `service.env` or `config.toml.bak`). This is the single source of truth for
 /// both the host write path and the agent wire boundary.
 pub fn is_sensitive_edit_path(path: &str) -> bool {
-    for comp in path.to_lowercase().split('/') {
-        if matches!(
-            comp,
-            ".git" | "target" | "node_modules" | "projects.d" | "secrets"
-        ) {
-            return true;
-        }
-        if comp.starts_with(".env")
-            || comp.starts_with("agent.toml")
-            || comp.starts_with("webcodex.env")
-        {
-            return true;
-        }
-        if comp.ends_with(".env") || comp.ends_with(".toml.bak") {
-            return true;
-        }
-    }
-    false
+    // Edits are denied for credentials *and* for the bulk trees: writing into
+    // `.git`, `target`, or `node_modules` through the tool surface is never
+    // intended. Reads use the narrower `is_secret_path`.
+    crate::sensitive_paths::is_bulk_skipped_path(path)
 }

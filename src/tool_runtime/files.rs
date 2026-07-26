@@ -569,42 +569,7 @@ fn validate_search_globs(
 }
 
 fn include_glob_explicitly_targets_protected_path(glob: &str) -> bool {
-    const PROTECTED_GLOBS: &[&str] = &[
-        ".env",
-        "**/.env",
-        ".env.*",
-        "**/.env.*",
-        "agent.toml",
-        "**/agent.toml",
-        "webcodex.env",
-        "**/webcodex.env",
-        "*.pem",
-        "**/*.pem",
-        "*.key",
-        "**/*.key",
-    ];
-    let normalized = glob.strip_prefix("./").unwrap_or(glob);
-    if PROTECTED_GLOBS.contains(&normalized) {
-        return true;
-    }
-    normalized.split('/').any(|component| {
-        !component
-            .chars()
-            .any(|ch| matches!(ch, '*' | '?' | '[' | ']'))
-            && (matches!(
-                component,
-                ".git"
-                    | "target"
-                    | "node_modules"
-                    | "secrets"
-                    | "tokens"
-                    | "agent.toml"
-                    | "webcodex.env"
-                    | ".env"
-            ) || component.starts_with(".env.")
-                || component.ends_with(".pem")
-                || component.ends_with(".key"))
-    })
+    crate::sensitive_paths::glob_targets_protected_path(glob)
 }
 
 fn search_project_text_exclude_args() -> String {
@@ -960,24 +925,9 @@ fn search_timeout_tool_result(options: &SearchOptions, backend: Option<&str>) ->
 }
 
 fn is_search_project_text_excluded_path(path: &str) -> bool {
-    Path::new(path).components().any(|component| {
-        let Some(component) = component.as_os_str().to_str() else {
-            return false;
-        };
-        matches!(
-            component,
-            ".git"
-                | "target"
-                | "node_modules"
-                | "secrets"
-                | "tokens"
-                | "agent.toml"
-                | "webcodex.env"
-                | ".env"
-        ) || component.starts_with(".env.")
-            || component.ends_with(".pem")
-            || component.ends_with(".key")
-    })
+    // Search skips credentials and the bulk trees alike: the first for
+    // confidentiality, the second for cost and noise.
+    crate::sensitive_paths::is_bulk_skipped_path(path)
 }
 
 #[derive(Debug, Clone)]
@@ -1490,18 +1440,9 @@ pub(crate) fn validate_artifact_file_path(path: &str) -> Result<(), String> {
 }
 
 pub(crate) fn is_sensitive_artifact_path(path: &str) -> bool {
-    for comp in path.to_lowercase().split('/') {
-        if matches!(
-            comp,
-            ".git" | "target" | "node_modules" | "secrets" | "tokens"
-        ) {
-            return true;
-        }
-        if comp == ".env" || comp.starts_with(".env") || comp.ends_with(".pem") {
-            return true;
-        }
-    }
-    false
+    // Artifacts previously missed `*.key` and `agent.toml`; they now share the
+    // same policy as edits.
+    crate::sensitive_paths::is_bulk_skipped_path(path)
 }
 
 fn validate_artifact_mime(mime_type: Option<&str>) -> Result<Option<String>, String> {
@@ -3387,6 +3328,14 @@ impl ToolRuntime {
         // and `project_overview` already do.
         if let Err(e) = validate_project_relative_path(&path) {
             return ToolResult::err(e);
+        }
+        // Every other surface already refuses credentials: search excludes
+        // them, artifacts and edits reject them. Reading was the one way left
+        // to get a `.env` or a private key back verbatim. Only the narrow
+        // secret policy applies here — reading `.git/HEAD` or a file under
+        // `target/` by explicit path stays allowed.
+        if crate::sensitive_paths::is_secret_path(&path) {
+            return ToolResult::err("refusing to read sensitive path");
         }
         let proj = match self.resolve_project(&project).await {
             Ok(p) => p,
