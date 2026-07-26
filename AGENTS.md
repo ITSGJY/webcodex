@@ -84,9 +84,10 @@ Test layout guidance (soft limits, domain folders):
 
 ### Project-first refinement work
 
-For broad work on `refactor/project-first-experience`, read
+For broad Project-first refinement work, read
 [`docs/PROJECT_FIRST_REFINEMENT_PLAN.zh-CN.md`](docs/PROJECT_FIRST_REFINEMENT_PLAN.zh-CN.md)
-before editing.
+before editing. The historical `refactor/project-first-experience` branch has
+been merged into `main`; do not assume that branch is still the active base.
 
 - Record production/test LOC and largest files before and after the iteration.
 - A new abstraction must replace an existing responsibility; report the old

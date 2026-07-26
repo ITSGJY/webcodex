@@ -2,7 +2,9 @@
 
 > 状态：当前长期开发基线
 >
-> 适用分支：`refactor/project-first-experience`
+> 当前开发分支：`main`
+>
+> 历史实现分支：`refactor/project-first-experience`（已并入 `main`）
 >
 > 基线日期：2026-07-23
 >
@@ -10,9 +12,9 @@
 
 ## 1. 结论
 
-`refactor/project-first-experience` 仍然是后续开发基础，不回到 main 的 76-tool Hosted 模型面，也不重新把旧 session、client id、runtime project id 和 ops 工具暴露给 Hosted Chat。
+`main` 现在是后续开发基础。`refactor/project-first-experience` 已并入 `main`；后续开发继续保持 9 个 project-bound Hosted capabilities，不把 76 项内部 runtime、session、client、project id 和 ops 工具重新暴露给 Hosted Chat。
 
-这个分支已经完成正确的产品层重构：
+这条 Project-first 基线已经完成正确的产品层重构：
 
 - Hosted 模型面收敛为 9 个 project-bound capabilities；
 - Project、Workspace、Task、Run、Event、Result 和 Approval 成为独立事实；
@@ -28,7 +30,7 @@ Iteration 6 已把 `commands_run` 从旧同步 `run_shell` 路径迁出，Iterat
 
 ## 2. 当前规模基线
 
-基于 2026-07-23、HEAD `9dc8aa9e834c` 的简单 path-based 统计：
+以下为 2026-07-23、HEAD `9dc8aa9e834c` 的历史 path-based 快照；其中“相对 main”指当时的 `main`，不是当前分支差异：
 
 | 指标 | 当前值 |
 |---|---:|
@@ -36,8 +38,8 @@ Iteration 6 已把 `commands_run` 从旧同步 `run_shell` 路径迁出，Iterat
 | production Rust LOC | 120,995 |
 | test-path Rust 文件 | 90 |
 | test-path Rust LOC | 56,454 |
-| 分支相对 main 的 production Rust 净增长 | +11,439 |
-| 分支相对 main 的 test-path Rust 净增长 | +41 |
+| 当时分支相对当时 main 的 production Rust 净增长 | +11,439 |
+| 当时分支相对当时 main 的 test-path Rust 净增长 | +41 |
 
 最大的 Project-first 新模块：
 
@@ -65,7 +67,7 @@ Iteration 6 已把 `commands_run` 从旧同步 `run_shell` 路径迁出，Iterat
 
 ### 3.3 不变边界
 
-- 不内置 LLM、prompt loop、agent loop 或 provider routing；
+- 不内置 LLM、prompt loop 或 agent loop；受限外部工具 Provider 只能作为 Agent 内部执行后端，不进入 Hosted capability surface；
 - 不变成完整 IDE；
 - 不让模型代替人类 accept/reject；
 - 不默认提供 autonomous DevOps；

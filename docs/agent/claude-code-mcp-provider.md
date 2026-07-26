@@ -18,12 +18,14 @@ args = ["mcp", "serve"]
 timeout_secs = 30
 
 [tool_providers.claude_code.mapping]
-search_project_text = "Grep"
 edit_file = "Edit"
 ```
 
-The mapping values are explicit examples, not built-in assumptions. On every
-project process start the provider performs MCP `initialize`, sends
+The mapping values are explicit examples, not built-in assumptions. Configure
+`search_project_text` only after a probe confirms that the installed Claude Code
+version exposes a schema-compatible search tool; otherwise leave it unmapped so
+`claude_code_then_native` uses bounded Native `rg`/`grep`. On every project
+process start the provider performs MCP `initialize`, sends
 `notifications/initialized`, and calls `tools/list`. A capability is available
 only when its configured tool name is present and the discovered input schema
 contains all fields required by the adapter. Use the names exposed by the
@@ -41,7 +43,7 @@ Strategies:
   executed again through Native.
 
 Claude Code builds do not necessarily expose a Grep tool. The real smoke with
-Claude Code 2.1.217 exposed `Edit` but no schema-compatible Grep. This does not
+Claude Code 2.1.220 exposed `Edit` but no schema-compatible Grep. This does not
 disable WebCodex search when using `native` or `claude_code_then_native`: the
 latter falls back to the existing bounded Native `rg`/`grep` command. Strict
 `claude_code` strategy instead returns a capability error when no mapped Grep
@@ -71,8 +73,11 @@ The bounded version reported by MCP `initialize.serverInfo` is exposed in
 provider status after a successful start. A version is retained only when it
 matches a small version-string character allowlist. Status queries are passive:
 `runtime_status`, `list_agents`, and local snapshot reads never start Claude.
-The executable path is not exposed, and a missing command never prevents the
-agent from starting.
+With the default agent configuration, the expected snapshot is
+`strategy=native`, `enabled=false`, and `process_state=not_started`; this confirms
+that observability is deployed but does not mean Claude has been configured or
+started. The executable path is not exposed, and a missing command never
+prevents the agent from starting.
 
 `runtime_status` and `listAgents` expose the current bounded snapshot under
 `tool_providers`. Registration and reconnect carry a complete snapshot. Later
@@ -80,8 +85,10 @@ changed revisions reuse the existing agent transport: polling agents attach
 them to their next poll, while WebSocket/QUIC agents send a changed-only
 `runtime_metadata` envelope after a result or on the existing keepalive tick.
 There is no extra blocking round trip per tool call. Repeated identical state
-is not resent, metadata send failure does not change a tool result, and network
-I/O occurs after the provider state lock has been released.
+is not resent, and only one metadata snapshot may be in flight at a time so an
+older snapshot cannot overwrite a newer `last_call`. Metadata send failure
+releases the claim for a later keepalive/reconnect retry, does not change a tool
+result, and network I/O occurs after the provider state lock has been released.
 
 The provider lifecycle uses `not_started`, `starting`, `initializing`,
 `discovering`, `mapping`, `running`, and `stopped`. State revisions are produced

@@ -100,7 +100,7 @@ WebCodex 当前最根本的问题不是依赖线上 GPT，而是把某次聊天�
 
 WebCodex 应吸收上述顺序，但保持自己的产品边界：模型来自支持 Connector、MCP 或 GPT Actions 的线上平台；代码执行仍在用户控制的设备上；Task Result 可以跨窗口查看，并在共享 control plane 模式下跨设备查看。
 
-不借鉴的部分同样明确：WebCodex 不提供 prompt loop、模型选择、context compaction、token budget、provider retry 或本地推理。对 Codex/Claude Code 的研究只用于改进 workspace 工具、安全语义和结果反馈，不用于把 WebCodex 变成另一个 coding agent。
+不借鉴的部分同样明确：WebCodex 不提供 prompt loop、模型选择、context compaction、token budget 或本地推理。实验性 Claude Code Provider 只允许作为 Agent 内部、白名单化的单次工具执行后端；它不承担模型推理或 agent loop，也不改变 Hosted/MCP 的公开能力面。对 Codex/Claude Code 的研究和受限复用用于改进 workspace 工具、安全语义和结果反馈，不用于把 WebCodex 变成另一个 coding agent。
 
 ## 4. 目标：打开一个新项目时实际发生什么
 
