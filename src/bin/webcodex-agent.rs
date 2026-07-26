@@ -1294,6 +1294,14 @@ impl JobManager {
                     return;
                 }
             };
+            if validation {
+                command.envs(
+                    steps[index]
+                        .env
+                        .iter()
+                        .map(|(key, value)| (key.as_str(), value.as_str())),
+                );
+            }
             command
                 .current_dir(&cwd_path)
                 .stdout(Stdio::piped())

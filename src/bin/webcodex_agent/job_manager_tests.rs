@@ -114,16 +114,19 @@ fn validation_job_progress_is_executor_owned_and_fail_fast() {
             name: "format".into(),
             program: "cargo".into(),
             args: vec!["fmt".into(), "--".into(), "--check".into()],
+            env: Vec::new(),
         },
         ShellJobValidationStep {
             name: "check".into(),
             program: "cargo".into(),
             args: vec!["check".into(), "--all-targets".into()],
+            env: Vec::new(),
         },
         ShellJobValidationStep {
             name: "test".into(),
             program: "cargo".into(),
             args: vec!["test".into()],
+            env: Vec::new(),
         },
     ];
     let mut shell = ShellConfig::default();
@@ -229,6 +232,7 @@ fn validation_spawn_failure_is_infrastructure_without_failed_assertion() {
                 name: "check".into(),
                 program: "cargo".into(),
                 args: vec!["check".into(), "--all-targets".into()],
+            env: Vec::new(),
             }]).unwrap(),
             "timeout_secs": 10,
             "requested_by": "test",
@@ -295,6 +299,7 @@ fn python_module_probe_reports_tool_unavailable_without_running_recipe() {
             .into_iter()
             .map(str::to_string)
             .collect(),
+        env: Vec::new(),
     };
     assert!(!validation_module_available(
         &shell,

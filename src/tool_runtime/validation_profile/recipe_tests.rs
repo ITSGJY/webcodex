@@ -596,6 +596,7 @@ fn manifestless_explicit_python_uses_stable_unittest_plan() {
             .into_iter()
             .map(str::to_string)
             .collect(),
+        env: Vec::new(),
     }
     .is_canonical());
     write(

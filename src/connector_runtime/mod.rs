@@ -1178,7 +1178,23 @@ impl ConnectorRuntime {
             Ok(resolved) => resolved,
             Err(error) => return validation_recipe_error(&task, error),
         };
-        let validation_steps = resolved.steps.clone();
+        let mut validation_steps = resolved.steps.clone();
+        // Steer cargo at the shared cache outside the slot: reset uses
+        // `git clean -ffdx`, which would otherwise wipe target/ and force a
+        // cold build on every task.
+        let shared_cargo_target = std::path::Path::new(&self.context.runs_root)
+            .parent()
+            .map(|state| state.join("cache/cargo-target"));
+        if let Some(shared_cargo_target) = shared_cargo_target {
+            for step in &mut validation_steps {
+                if step.program == "cargo" {
+                    step.env.push((
+                        "CARGO_TARGET_DIR".to_string(),
+                        shared_cargo_target.to_string_lossy().to_string(),
+                    ));
+                }
+            }
+        }
         let recipe_identity = resolved.durable_identity();
         let timeout_secs = input.timeout_secs.unwrap_or(120);
         let request_sha256 = check_request_hash(
