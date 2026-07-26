@@ -31,6 +31,23 @@ pub struct WorkspaceActivityRow {
     pub error_summary: Option<String>,
 }
 
+fn row_to_activity(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceActivityRow> {
+    let paths_json: String = row.get(9)?;
+    Ok(WorkspaceActivityRow {
+        id: row.get(0)?,
+        created_at: row.get(1)?,
+        project: row.get(2)?,
+        tool: row.get(3)?,
+        surface: row.get(4)?,
+        client: row.get(5)?,
+        success: row.get(6)?,
+        session_id: row.get(7)?,
+        command_preview: row.get(8)?,
+        paths: serde_json::from_str(&paths_json).unwrap_or_default(),
+        error_summary: row.get(10)?,
+    })
+}
+
 impl Database {
     pub fn insert_workspace_activity(
         &self,
@@ -73,36 +90,73 @@ impl Database {
         Ok(())
     }
 
-    pub fn list_workspace_activity(
+    /// Activity rows the caller is allowed to see.
+    ///
+    /// `allowed_clients` is `None` only for principals entitled to host-global
+    /// activity (bootstrap/admin). Otherwise it is the exact set of agent
+    /// clients visible to this `AuthContext`, and rows outside it — including
+    /// rows with no client at all — stay hidden: a row carries a command
+    /// preview, the paths a call touched, and its error, so leaking one leaks
+    /// another project's work.
+    ///
+    /// `requested_client` only narrows further. It can never widen the set,
+    /// so a caller cannot name someone else's client to read their rows.
+    ///
+    /// The limit applies after filtering, in SQL, so a busy neighbouring
+    /// project cannot push this caller's rows out of the window.
+    pub fn list_workspace_activity_for_clients(
         &self,
         limit: usize,
-        client: Option<&str>,
+        requested_client: Option<&str>,
+        allowed_clients: Option<&[String]>,
     ) -> anyhow::Result<Vec<WorkspaceActivityRow>> {
+        let effective: Option<Vec<String>> = match (allowed_clients, requested_client) {
+            // Global view, optionally narrowed to one client.
+            (None, Some(requested)) => Some(vec![requested.to_string()]),
+            (None, None) => None,
+            (Some(allowed), Some(requested)) => {
+                if allowed.iter().any(|client| client == requested) {
+                    Some(vec![requested.to_string()])
+                } else {
+                    // Asking for a client this caller cannot see is not an
+                    // error to distinguish from an idle one — both are empty.
+                    Some(Vec::new())
+                }
+            }
+            (Some(allowed), None) => Some(allowed.to_vec()),
+        };
+
         let conn = self.conn.lock().unwrap();
-        let mut statement = conn.prepare(
-            "SELECT id, created_at, project, tool, surface, client, success, session_id,
+        let select = "SELECT id, created_at, project, tool, surface, client, success, session_id,
                     command_preview, paths_json, error_summary
-             FROM workspace_activity
-             WHERE ?2 IS NULL OR client = ?2
-             ORDER BY id DESC LIMIT ?1",
-        )?;
-        let rows = statement.query_map(params![limit as i64, client], |row| {
-            let paths_json: String = row.get(9)?;
-            Ok(WorkspaceActivityRow {
-                id: row.get(0)?,
-                created_at: row.get(1)?,
-                project: row.get(2)?,
-                tool: row.get(3)?,
-                surface: row.get(4)?,
-                client: row.get(5)?,
-                success: row.get(6)?,
-                session_id: row.get(7)?,
-                command_preview: row.get(8)?,
-                paths: serde_json::from_str(&paths_json).unwrap_or_default(),
-                error_summary: row.get(10)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+             FROM workspace_activity";
+
+        let Some(clients) = effective else {
+            let mut statement = conn.prepare(&format!("{select} ORDER BY id DESC LIMIT ?1"))?;
+            let rows = statement.query_map(params![limit as i64], row_to_activity)?;
+            return rows.collect::<Result<Vec<_>, _>>().map_err(Into::into);
+        };
+        if clients.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Parameterized `IN` list: one placeholder per allowed client, never
+        // interpolated values.
+        let placeholders = (0..clients.len())
+            .map(|index| format!("?{}", index + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut statement = conn.prepare(&format!(
+            "{select} WHERE client IN ({placeholders}) ORDER BY id DESC LIMIT ?1"
+        ))?;
+        let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(clients.len() + 1);
+        let limit = limit as i64;
+        bound.push(&limit);
+        for client in &clients {
+            bound.push(client);
+        }
+        let rows = statement.query_map(bound.as_slice(), row_to_activity)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 }
 
@@ -118,6 +172,15 @@ pub struct WorkspaceActivityStore {
 }
 
 impl WorkspaceActivityStore {
+    #[cfg(test)]
+    fn with_preview(db: Arc<Database>, preview_enabled: bool) -> Self {
+        Self {
+            db,
+            preview_enabled,
+            max_rows: DEFAULT_MAX_ROWS,
+        }
+    }
+
     pub fn from_env(db: Arc<Database>) -> Option<Self> {
         if env_flag_disabled("WEBCODEX_ACTIVITY") {
             return None;
@@ -201,14 +264,21 @@ mod tests {
             )
             .unwrap();
         }
-        let rows = db.list_workspace_activity(10, None).unwrap();
+        let rows = db
+            .list_workspace_activity_for_clients(10, None, None)
+            .unwrap();
         assert_eq!(rows.len(), 3, "prune keeps only max_rows newest rows");
         assert!(rows[0].id > rows[1].id && rows[1].id > rows[2].id);
         assert_eq!(rows[0].tool, "run_shell");
         assert_eq!(rows[0].surface, "mcp");
         assert_eq!(rows[0].paths, vec!["a.rs".to_string()]);
         assert_eq!(rows[0].command_preview.as_deref(), Some("cargo test"));
-        assert_eq!(db.list_workspace_activity(2, None).unwrap().len(), 2);
+        assert_eq!(
+            db.list_workspace_activity_for_clients(2, None, None)
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -220,12 +290,19 @@ mod tests {
         db.insert_workspace_activity(1, &sample("run_shell", true, None), None, 10)
             .unwrap();
         db.insert_workspace_activity(2, &other, None, 10).unwrap();
-        assert_eq!(db.list_workspace_activity(10, None).unwrap().len(), 2);
-        let filtered = db.list_workspace_activity(10, Some("laptop")).unwrap();
+        assert_eq!(
+            db.list_workspace_activity_for_clients(10, None, None)
+                .unwrap()
+                .len(),
+            2
+        );
+        let filtered = db
+            .list_workspace_activity_for_clients(10, Some("laptop"), None)
+            .unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].client.as_deref(), Some("laptop"));
         assert!(db
-            .list_workspace_activity(10, Some("nobody"))
+            .list_workspace_activity_for_clients(10, Some("nobody"), None)
             .unwrap()
             .is_empty());
     }
@@ -242,10 +319,167 @@ mod tests {
             10,
         )
         .unwrap();
-        let rows = db.list_workspace_activity(1, None).unwrap();
+        let rows = db
+            .list_workspace_activity_for_clients(1, None, None)
+            .unwrap();
         let stored = rows[0].error_summary.as_deref().unwrap();
         assert!(stored.chars().count() <= ERROR_SUMMARY_MAX_CHARS + 1);
         assert!(stored.ends_with('…'));
         assert!(rows[0].command_preview.is_none());
+    }
+
+    /// A record attributed to `client`, otherwise the same as `sample`.
+    fn sample_for<'a>(tool: &'a str, client: Option<&'a str>) -> ActivityRecord<'a> {
+        ActivityRecord {
+            client,
+            ..sample(tool, true, Some("boom"))
+        }
+    }
+
+    #[test]
+    fn activity_scoped_to_allowed_clients_hides_other_projects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(&tmp.path().join("activity.db")).unwrap();
+        db.insert_workspace_activity(
+            1,
+            &sample_for("run_shell", Some("laptop")),
+            Some("mine"),
+            10,
+        )
+        .unwrap();
+        db.insert_workspace_activity(
+            2,
+            &sample_for("run_shell", Some("neighbour")),
+            Some("their secret command"),
+            10,
+        )
+        .unwrap();
+
+        let mine = db
+            .list_workspace_activity_for_clients(10, None, Some(&["laptop".to_string()]))
+            .unwrap();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].client.as_deref(), Some("laptop"));
+
+        // Nothing of the neighbouring row leaks: not the client, not the
+        // command preview, not the error summary.
+        let serialized = serde_json::to_string(&mine).unwrap();
+        assert!(!serialized.contains("neighbour"), "{serialized}");
+        assert!(!serialized.contains("their secret command"), "{serialized}");
+    }
+
+    #[test]
+    fn activity_client_filter_cannot_widen_the_allowed_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(&tmp.path().join("activity.db")).unwrap();
+        db.insert_workspace_activity(1, &sample_for("run_shell", Some("laptop")), None, 10)
+            .unwrap();
+        db.insert_workspace_activity(2, &sample_for("run_shell", Some("neighbour")), None, 10)
+            .unwrap();
+
+        // Naming a client outside the allowed set returns nothing rather than
+        // that client's rows.
+        let rows = db
+            .list_workspace_activity_for_clients(
+                10,
+                Some("neighbour"),
+                Some(&["laptop".to_string()]),
+            )
+            .unwrap();
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    #[test]
+    fn activity_empty_allow_set_is_closed_and_global_sees_client_less_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(&tmp.path().join("activity.db")).unwrap();
+        db.insert_workspace_activity(1, &sample_for("run_shell", Some("laptop")), None, 10)
+            .unwrap();
+        db.insert_workspace_activity(2, &sample_for("run_shell", None), None, 10)
+            .unwrap();
+
+        assert!(db
+            .list_workspace_activity_for_clients(10, None, Some(&[]))
+            .unwrap()
+            .is_empty());
+        // A scoped caller never sees the row with no client attached.
+        let scoped = db
+            .list_workspace_activity_for_clients(10, None, Some(&["laptop".to_string()]))
+            .unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].client.as_deref(), Some("laptop"));
+        // Global visibility sees both.
+        assert_eq!(
+            db.list_workspace_activity_for_clients(10, None, None)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn activity_limit_counts_rows_after_filtering() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(&tmp.path().join("activity.db")).unwrap();
+        // A noisy neighbour must not crowd this caller's rows out of the window.
+        for index in 0..60 {
+            db.insert_workspace_activity(
+                index,
+                &sample_for("run_shell", Some("neighbour")),
+                None,
+                500,
+            )
+            .unwrap();
+        }
+        for index in 0..3 {
+            db.insert_workspace_activity(
+                100 + index,
+                &sample_for("run_shell", Some("laptop")),
+                None,
+                500,
+            )
+            .unwrap();
+        }
+        let rows = db
+            .list_workspace_activity_for_clients(50, None, Some(&["laptop".to_string()]))
+            .unwrap();
+        assert_eq!(rows.len(), 3, "filtered rows were crowded out by the limit");
+    }
+    #[test]
+    fn disabling_the_preview_stores_no_command_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(Database::open(&tmp.path().join("activity.db")).unwrap());
+
+        // Operators who turn previews off must get a NULL column, not a
+        // truncated command: the point of the switch is that the text never
+        // reaches the database at all.
+        let off = WorkspaceActivityStore::with_preview(db.clone(), false);
+        off.record(ActivityRecord {
+            command: Some("deploy --token wc_pat_supersecret"),
+            ..sample("run_shell", true, None)
+        });
+        let rows = db
+            .list_workspace_activity_for_clients(10, None, None)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].command_preview.is_none(),
+            "command text was stored with previews disabled: {:?}",
+            rows[0].command_preview
+        );
+        // The rest of the row is still recorded, so the ledger stays useful.
+        assert_eq!(rows[0].tool, "run_shell");
+        assert_eq!(rows[0].paths, vec!["a.rs".to_string()]);
+
+        // With previews on, the same call records a bounded preview.
+        let on = WorkspaceActivityStore::with_preview(db.clone(), true);
+        on.record(ActivityRecord {
+            command: Some("cargo test"),
+            ..sample("run_shell", true, None)
+        });
+        let rows = db
+            .list_workspace_activity_for_clients(10, None, None)
+            .unwrap();
+        assert_eq!(rows[0].command_preview.as_deref(), Some("cargo test"));
     }
 }

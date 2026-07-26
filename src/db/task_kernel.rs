@@ -165,6 +165,15 @@ pub(crate) enum ConnectorEditOperationGate {
     Conflict,
 }
 
+/// Paths a task has applied, with the total so a bounded list is never
+/// mistaken for the whole set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AppliedPaths {
+    pub(crate) paths: Vec<String>,
+    pub(crate) total: usize,
+    pub(crate) complete: bool,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct ConnectorTaskEvent {
     pub event_id: String,
@@ -690,42 +699,153 @@ impl Database {
 
     /// Deliver-once watermark for human guidance attached to capability
     /// responses. Reads/advances are scoped like every other task accessor.
-    pub(crate) fn guidance_seen_seq(
+
+    /// Claim the guidance a task has not yet delivered, advancing the
+    /// watermark in the same transaction.
+    ///
+    /// Reading the watermark, selecting events, and advancing it used to be
+    /// three separate statements over a generic "last 50 events" query. Two
+    /// concurrent capability responses could therefore both read the same
+    /// watermark and deliver the same guidance twice, and guidance older than
+    /// fifty events fell out of the window and was never delivered at all.
+    ///
+    /// One transaction, one query scoped to `human_guidance`, so neither is
+    /// possible: the second claimer sees the advanced watermark, and unrelated
+    /// event volume cannot push guidance out of view.
+    pub(crate) fn claim_pending_connector_guidance(
         &self,
         task_id: &str,
         project_id: &str,
         subject_id: &str,
-    ) -> Result<i64, ConnectorTaskStoreError> {
-        let conn = self.conn.lock().unwrap();
-        if load_task(&conn, task_id, project_id, subject_id)?.is_none() {
+        max_guidance: usize,
+    ) -> Result<Vec<ConnectorTaskEvent>, ConnectorTaskStoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|error| ConnectorTaskStoreError::Storage(error.into()))?;
+        if load_task(&tx, task_id, project_id, subject_id)?.is_none() {
             return Err(ConnectorTaskStoreError::NotFound);
         }
-        conn.query_row(
-            "SELECT guidance_seen_seq FROM wc_tasks WHERE id = ?1 AND project_id = ?2",
-            rusqlite::params![task_id, project_id],
-            |row| row.get(0),
-        )
-        .map_err(|error| ConnectorTaskStoreError::Storage(error.into()))
+        let seen: i64 = tx
+            .query_row(
+                "SELECT guidance_seen_seq FROM wc_tasks WHERE id = ?1 AND project_id = ?2",
+                rusqlite::params![task_id, project_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| ConnectorTaskStoreError::Storage(error.into()))?;
+
+        let claimed = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT id, sequence, kind, payload_json, created_at
+                     FROM wc_task_events
+                     WHERE task_id = ?1 AND kind = 'human_guidance' AND sequence > ?2
+                     ORDER BY sequence ASC
+                     LIMIT ?3",
+                )
+                .map_err(|error| ConnectorTaskStoreError::Storage(error.into()))?;
+            let rows = statement
+                .query_map(
+                    rusqlite::params![task_id, seen, max_guidance as i64],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    },
+                )
+                .map_err(|error| ConnectorTaskStoreError::Storage(error.into()))?;
+            let mut claimed = Vec::new();
+            for row in rows {
+                let (event_id, sequence, kind, payload_json, created_at) =
+                    row.map_err(|error| ConnectorTaskStoreError::Storage(error.into()))?;
+                claimed.push(ConnectorTaskEvent {
+                    event_id,
+                    sequence,
+                    kind,
+                    payload: serde_json::from_str(&payload_json).map_err(|error| {
+                        ConnectorTaskStoreError::Storage(anyhow::Error::from(error))
+                    })?,
+                    created_at,
+                });
+            }
+            claimed
+        };
+
+        // Nothing to deliver leaves the watermark alone, so a later claim still
+        // sees guidance recorded in the meantime.
+        if let Some(max_seq) = claimed.iter().map(|event| event.sequence).max() {
+            tx.execute(
+                "UPDATE wc_tasks SET guidance_seen_seq = MAX(guidance_seen_seq, ?3)
+                 WHERE id = ?1 AND project_id = ?2",
+                rusqlite::params![task_id, project_id, max_seq],
+            )
+            .map_err(|error| ConnectorTaskStoreError::Storage(error.into()))?;
+        }
+        tx.commit()
+            .map_err(|error| ConnectorTaskStoreError::Storage(error.into()))?;
+        Ok(claimed)
     }
 
-    pub(crate) fn advance_guidance_seen_seq(
+    /// Every path this task has actually applied, in first-seen order.
+    ///
+    /// Scoped to `edits_apply` in SQL rather than filtered out of the recent
+    /// timeline, so a path applied early in a long task is still reported. The
+    /// caller gets the total alongside a bounded list and must say which it is
+    /// showing — a truncated list must never be presented as complete.
+    pub(crate) fn connector_task_applied_paths(
         &self,
         task_id: &str,
         project_id: &str,
         subject_id: &str,
-        seq: i64,
-    ) -> Result<(), ConnectorTaskStoreError> {
+        cap: usize,
+    ) -> Result<AppliedPaths, ConnectorTaskStoreError> {
         let conn = self.conn.lock().unwrap();
         if load_task(&conn, task_id, project_id, subject_id)?.is_none() {
             return Err(ConnectorTaskStoreError::NotFound);
         }
-        conn.execute(
-            "UPDATE wc_tasks SET guidance_seen_seq = MAX(guidance_seen_seq, ?3)
-             WHERE id = ?1 AND project_id = ?2",
-            rusqlite::params![task_id, project_id, seq],
-        )
-        .map_err(|error| ConnectorTaskStoreError::Storage(error.into()))?;
-        Ok(())
+        let mut statement = conn
+            .prepare(
+                "SELECT payload_json FROM wc_task_events
+                 WHERE task_id = ?1 AND kind = 'edits_apply'
+                 ORDER BY sequence ASC",
+            )
+            .map_err(|error| ConnectorTaskStoreError::Storage(error.into()))?;
+        let rows = statement
+            .query_map(rusqlite::params![task_id], |row| row.get::<_, String>(0))
+            .map_err(|error| ConnectorTaskStoreError::Storage(error.into()))?;
+
+        let mut paths: Vec<String> = Vec::new();
+        let mut total = 0usize;
+        for row in rows {
+            let payload = row.map_err(|error| ConnectorTaskStoreError::Storage(error.into()))?;
+            let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload) else {
+                continue;
+            };
+            if payload["ok"] != true || payload["dry_run"] == true {
+                continue;
+            }
+            let Some(list) = payload["changed_paths"].as_array() else {
+                continue;
+            };
+            for path in list.iter().filter_map(serde_json::Value::as_str) {
+                if paths.iter().any(|existing| existing == path) {
+                    continue;
+                }
+                total += 1;
+                if paths.len() < cap {
+                    paths.push(path.to_string());
+                }
+            }
+        }
+        Ok(AppliedPaths {
+            complete: paths.len() == total,
+            paths,
+            total,
+        })
     }
 
     pub(crate) fn connector_task_events(
@@ -1815,6 +1935,7 @@ fn new_id(prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn database() -> (tempfile::TempDir, Database) {
         let temp = tempfile::tempdir().unwrap();
@@ -2274,5 +2395,281 @@ mod tests {
             .connector_task(&task.task_id, "wc_proj_demo", "user:one")
             .unwrap();
         assert_eq!(decided.task_status, "accepted");
+    }
+    // -----------------------------------------------------------------------
+    // Guidance claim
+    // -----------------------------------------------------------------------
+
+    fn guide(db: &Database, task: &ConnectorTaskSnapshot, message: &str) -> i64 {
+        db.append_connector_task_event(
+            &task.task_id,
+            "wc_proj_demo",
+            "user:one",
+            "human_guidance",
+            &json!({ "message": message, "source": "host" }),
+            200,
+        )
+        .unwrap()
+    }
+
+    fn claim(db: &Database, task: &ConnectorTaskSnapshot) -> Vec<ConnectorTaskEvent> {
+        db.claim_pending_connector_guidance(&task.task_id, "wc_proj_demo", "user:one", 16)
+            .unwrap()
+    }
+
+    #[test]
+    fn concurrent_capability_responses_claim_guidance_once() {
+        let (_temp, db) = database();
+        bind(&db, "user:one");
+        let task = start(&db, "user:one", "fix the parser");
+        guide(&db, &task, "focus on the parser first");
+
+        // Two capability responses racing for the same message: the claim and
+        // the watermark advance share a transaction, so the loser sees nothing
+        // rather than delivering a duplicate.
+        let db = std::sync::Arc::new(db);
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let db = db.clone();
+                let task = task.clone();
+                std::thread::spawn(move || claim(&db, &task))
+            })
+            .collect();
+        let claimed: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+
+        let total: usize = claimed.iter().map(Vec::len).sum();
+        assert_eq!(
+            total, 1,
+            "guidance was delivered {total} times: {claimed:?}"
+        );
+    }
+
+    #[test]
+    fn guidance_survives_more_than_fifty_unrelated_events() {
+        let (_temp, db) = database();
+        bind(&db, "user:one");
+        let task = start(&db, "user:one", "fix the parser");
+        let sequence = guide(&db, &task, "look at the lexer");
+
+        // Far more than the timeline window, so a "recent events" scan would
+        // no longer see the guidance at all.
+        for index in 0..60 {
+            db.append_connector_task_event(
+                &task.task_id,
+                "wc_proj_demo",
+                "user:one",
+                "files_read",
+                &json!({ "index": index }),
+                300,
+            )
+            .unwrap();
+        }
+
+        let claimed = claim(&db, &task);
+        assert_eq!(claimed.len(), 1, "{claimed:?}");
+        assert_eq!(claimed[0].sequence, sequence);
+        assert_eq!(claimed[0].payload["message"], "look at the lexer");
+    }
+
+    #[test]
+    fn multiple_guidance_messages_are_delivered_in_sequence() {
+        let (_temp, db) = database();
+        bind(&db, "user:one");
+        let task = start(&db, "user:one", "fix the parser");
+        for message in ["first", "second", "third"] {
+            guide(&db, &task, message);
+        }
+
+        let claimed = claim(&db, &task);
+        let messages: Vec<&str> = claimed
+            .iter()
+            .map(|event| event.payload["message"].as_str().unwrap())
+            .collect();
+        assert_eq!(messages, ["first", "second", "third"]);
+        assert!(
+            claimed
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence),
+            "guidance is not in sequence order: {claimed:?}"
+        );
+        // Claimed once, and a message recorded afterwards is still delivered.
+        assert!(claim(&db, &task).is_empty());
+        guide(&db, &task, "fourth");
+        let later = claim(&db, &task);
+        assert_eq!(later.len(), 1);
+        assert_eq!(later[0].payload["message"], "fourth");
+    }
+
+    #[test]
+    fn failed_claim_does_not_advance_the_watermark() {
+        let (_temp, db) = database();
+        bind(&db, "user:one");
+        bind(&db, "user:two");
+        let task = start(&db, "user:one", "fix the parser");
+        guide(&db, &task, "still pending");
+
+        // A claim for the wrong subject fails and must not consume anything.
+        let denied =
+            db.claim_pending_connector_guidance(&task.task_id, "wc_proj_demo", "user:two", 16);
+        assert!(matches!(denied, Err(ConnectorTaskStoreError::NotFound)));
+
+        let claimed = claim(&db, &task);
+        assert_eq!(claimed.len(), 1, "the failed claim swallowed the guidance");
+        assert_eq!(claimed[0].payload["message"], "still pending");
+    }
+
+    #[test]
+    fn an_empty_claim_leaves_the_watermark_alone() {
+        let (_temp, db) = database();
+        bind(&db, "user:one");
+        let task = start(&db, "user:one", "fix the parser");
+        assert!(claim(&db, &task).is_empty());
+        guide(&db, &task, "arrived later");
+        assert_eq!(claim(&db, &task).len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Applied paths
+    // -----------------------------------------------------------------------
+
+    fn applied(db: &Database, task: &ConnectorTaskSnapshot, cap: usize) -> AppliedPaths {
+        db.connector_task_applied_paths(&task.task_id, "wc_proj_demo", "user:one", cap)
+            .unwrap()
+    }
+
+    fn edits(db: &Database, task: &ConnectorTaskSnapshot, payload: Value) {
+        db.append_connector_task_event(
+            &task.task_id,
+            "wc_proj_demo",
+            "user:one",
+            "edits_apply",
+            &payload,
+            400,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn active_review_keeps_paths_older_than_fifty_events() {
+        let (_temp, db) = database();
+        bind(&db, "user:one");
+        let task = start(&db, "user:one", "fix the parser");
+        edits(
+            &db,
+            &task,
+            json!({ "ok": true, "dry_run": false, "changed_paths": ["src/early.rs"] }),
+        );
+        for index in 0..60 {
+            db.append_connector_task_event(
+                &task.task_id,
+                "wc_proj_demo",
+                "user:one",
+                "files_read",
+                &json!({ "index": index }),
+                401,
+            )
+            .unwrap();
+        }
+
+        let applied = applied(&db, &task, 200);
+        assert_eq!(applied.paths, vec!["src/early.rs".to_string()]);
+        assert!(applied.complete);
+    }
+
+    #[test]
+    fn applied_paths_ignore_failed_and_dry_run_edits() {
+        let (_temp, db) = database();
+        bind(&db, "user:one");
+        let task = start(&db, "user:one", "fix the parser");
+        edits(
+            &db,
+            &task,
+            json!({ "ok": true, "dry_run": true, "changed_paths": ["dry.rs"] }),
+        );
+        edits(
+            &db,
+            &task,
+            json!({ "ok": false, "dry_run": false, "changed_paths": ["failed.rs"] }),
+        );
+        edits(
+            &db,
+            &task,
+            json!({ "ok": true, "dry_run": false, "changed_paths": ["real.rs"] }),
+        );
+
+        let applied = applied(&db, &task, 200);
+        assert_eq!(applied.paths, vec!["real.rs".to_string()]);
+        assert!(applied.complete);
+    }
+
+    #[test]
+    fn renames_include_source_and_destination() {
+        let (_temp, db) = database();
+        bind(&db, "user:one");
+        let task = start(&db, "user:one", "fix the parser");
+        // The recorded payload carries both sides of a rename.
+        edits(
+            &db,
+            &task,
+            json!({
+                "ok": true,
+                "dry_run": false,
+                "changed_paths": ["src/old.rs", "src/new.rs"]
+            }),
+        );
+        let applied = applied(&db, &task, 200);
+        assert_eq!(
+            applied.paths,
+            vec!["src/old.rs".to_string(), "src/new.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn applied_paths_are_distinct_and_stably_ordered() {
+        let (_temp, db) = database();
+        bind(&db, "user:one");
+        let task = start(&db, "user:one", "fix the parser");
+        for paths in [
+            json!(["a.rs", "b.rs"]),
+            json!(["b.rs", "c.rs"]),
+            json!(["a.rs"]),
+        ] {
+            edits(
+                &db,
+                &task,
+                json!({ "ok": true, "dry_run": false, "changed_paths": paths }),
+            );
+        }
+        let applied = applied(&db, &task, 200);
+        // First-seen order, each path once.
+        assert_eq!(
+            applied.paths,
+            vec!["a.rs".to_string(), "b.rs".to_string(), "c.rs".to_string()]
+        );
+        assert_eq!(applied.total, 3);
+        assert!(applied.complete);
+    }
+
+    #[test]
+    fn a_truncated_applied_path_list_never_claims_to_be_complete() {
+        let (_temp, db) = database();
+        bind(&db, "user:one");
+        let task = start(&db, "user:one", "fix the parser");
+        edits(
+            &db,
+            &task,
+            json!({
+                "ok": true,
+                "dry_run": false,
+                "changed_paths": ["a.rs", "b.rs", "c.rs"]
+            }),
+        );
+        let applied = applied(&db, &task, 2);
+        assert_eq!(applied.paths, vec!["a.rs".to_string(), "b.rs".to_string()]);
+        assert_eq!(applied.total, 3);
+        assert!(!applied.complete, "a truncated list claimed completeness");
     }
 }

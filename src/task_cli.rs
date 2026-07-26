@@ -285,7 +285,9 @@ pub(crate) fn run(command: TaskCliCommand) -> Result<String, String> {
         } => {
             let (_state, db) = open_state(&location)?;
             let rows = db
-                .list_workspace_activity(limit, client.as_deref())
+                // Host-side operator CLI: it already has the state directory,
+                // so it sees the whole ledger.
+                .list_workspace_activity_for_clients(limit, client.as_deref(), None)
                 .map_err(store_error)?;
             if json {
                 pretty_json(&json!({ "activity": rows }))

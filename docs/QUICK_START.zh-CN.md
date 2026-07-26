@@ -248,3 +248,23 @@ webcodex doctor
 
 高级 server、enrollment、OAuth、transport 和 fleet diagnostics 继续放在
 `webcodex-cli` 与 operations 文档中，不是 onboarding 步骤。
+
+## 本机活动记录与命令预览
+
+控制台的活动账本会把每次改动型工具调用**持久化到本机状态库**：工具名、发起面、
+涉及路径、错误摘要，以及 shell 类调用的**命令预览**（前 120 个字符）。
+
+命令预览默认开启。它是"知情审批"的依据——看不到命令内容就无从判断该不该批准。
+但也因此：
+
+- **不要把 token、密码或密钥直接写在命令行里。** 它们会连同命令一起落库，
+  并显示在控制台上。改用文件或环境变量传递。
+- 需要完全关闭预览时：
+
+  ```bash
+  WEBCODEX_ACTIVITY_COMMAND_PREVIEW=0 webcodex agent start
+  ```
+
+  关闭后仍会记录工具名、路径和结果，只是命令文本存为空。
+
+账本只存在本机状态目录，不会外发。行数有上限，超出后自动修剪最旧的记录。

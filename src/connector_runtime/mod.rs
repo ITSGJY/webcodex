@@ -43,6 +43,12 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 const CONNECTOR_SURFACE_ENV: &str = "WEBCODEX_CONNECTOR_SURFACE";
 const CONNECTOR_SURFACE_TASK_V1: &str = "task-v1";
 const MAX_EVENT_COUNT: usize = 50;
+/// Guidance messages delivered in one capability response. Bounded so a burst
+/// cannot bloat a response; the rest is claimed by the next one.
+const MAX_GUIDANCE_PER_RESPONSE: usize = 16;
+/// Applied paths reported by an active review. The total is reported alongside
+/// so a truncated list is never presented as complete.
+const MAX_REVIEW_APPLIED_PATHS: usize = 200;
 const COMMAND_APPROVAL_TTL_SECS: i64 = 60 * 60;
 const CONNECTOR_PATCH_PREVIEW_BYTES: usize = 128 * 1024;
 const CONNECTOR_SEARCH_WINDOW: usize = 200;
@@ -1569,20 +1575,25 @@ impl ConnectorRuntime {
             // workspace scan here would stall the review long-poll behind the
             // executor. The paths this task has applied are already durable
             // facts in its event log, so surface those instead of going dark.
-            let applied_paths = match self.db.connector_task_events(
+            // Queried straight from the applied-edit events rather than
+            // filtered out of the recent timeline, so a path applied early in a
+            // long task is still reported.
+            let applied = match self.db.connector_task_applied_paths(
                 &task.task_id,
                 &task.project_id,
                 &task.owner_subject_id,
-                MAX_EVENT_COUNT,
+                MAX_REVIEW_APPLIED_PATHS,
             ) {
-                Ok(events) => aggregate_applied_paths(&events),
+                Ok(applied) => applied,
                 Err(error) => return store_error_outcome(error, Some(&task)),
             };
             json!({
                 "source": "live_workspace_deferred",
                 "reason": "execution_active",
-                "changed_paths": applied_paths,
+                "changed_paths": applied.paths,
                 "changed_paths_source": "applied_edits",
+                "changed_paths_complete": applied.complete,
+                "changed_paths_total": applied.total,
                 "diff_preview": null
             })
         } else {
@@ -2045,24 +2056,33 @@ impl ConnectorRuntime {
     /// Deliver-once via the task watermark; a failed watermark advance means
     /// at-least-once delivery, never a lost message.
     fn attach_pending_guidance(&self, task: &ConnectorTaskSnapshot, data: &mut Value) {
-        let Ok(seen) = self.db.guidance_seen_seq(
+        // One transaction claims the guidance and advances the watermark, so a
+        // second capability response running concurrently cannot deliver the
+        // same message again, and guidance older than the timeline window is
+        // still found.
+        let claimed = match self.db.claim_pending_connector_guidance(
             &task.task_id,
             &self.context.project_id,
             &task.owner_subject_id,
-        ) else {
-            return;
+            MAX_GUIDANCE_PER_RESPONSE,
+        ) {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                // A claim that failed delivered nothing and advanced nothing;
+                // say so rather than letting the message look consumed.
+                tracing::warn!(
+                    task_id = %task.task_id,
+                    error = %error,
+                    "guidance claim failed; guidance stays pending",
+                );
+                return;
+            }
         };
-        let Ok(events) = self.db.connector_task_events(
-            &task.task_id,
-            &self.context.project_id,
-            &task.owner_subject_id,
-            MAX_EVENT_COUNT,
-        ) else {
+        if claimed.is_empty() {
             return;
-        };
-        let pending: Vec<Value> = events
+        }
+        let pending: Vec<Value> = claimed
             .iter()
-            .filter(|event| event.kind == "human_guidance" && event.sequence > seen)
             .map(|event| {
                 json!({
                     "sequence": event.sequence,
@@ -2071,19 +2091,6 @@ impl ConnectorRuntime {
                 })
             })
             .collect();
-        let Some(max_seq) = pending
-            .iter()
-            .filter_map(|entry| entry["sequence"].as_i64())
-            .max()
-        else {
-            return;
-        };
-        let _ = self.db.advance_guidance_seen_seq(
-            &task.task_id,
-            &self.context.project_id,
-            &task.owner_subject_id,
-            max_seq,
-        );
         data["guidance"] = json!(pending);
         data["guidance_note"] =
             json!("Human guidance from the project owner — adjust course before continuing.");
@@ -2092,6 +2099,27 @@ impl ConnectorRuntime {
     /// Host-side entry: the read-only devices view. Reuses the list_agents
     /// projection (connection, transport, last_seen, capabilities, provider
     /// health) under the caller's own visibility rules.
+    /// Agent clients this caller may see, or `None` for principals entitled to
+    /// host-global visibility.
+    ///
+    /// Shares its source with [`Self::host_devices`] on purpose: the devices
+    /// panel and the activity ledger must never disagree about which agents
+    /// exist for a given caller.
+    pub(crate) async fn visible_activity_clients(&self, auth: &AuthContext) -> Option<Vec<String>> {
+        if auth.is_bootstrap() || auth.is_admin() {
+            return None;
+        }
+        Some(
+            self.tools
+                .shell_clients
+                .list_clients_for_auth(Some(auth))
+                .await
+                .into_iter()
+                .map(|client| client.client_id)
+                .collect(),
+        )
+    }
+
     pub(crate) async fn host_devices(&self, auth: &AuthContext) -> crate::tool_runtime::ToolResult {
         self.tools.list_agents(Some(auth)).await
     }
@@ -2886,26 +2914,6 @@ fn paginate_search_output(
 /// Distinct paths this task has applied via successful, non-dry-run
 /// `edits_apply` calls, in first-seen order. Derived purely from the durable
 /// event log so callers never pay for a workspace scan.
-fn aggregate_applied_paths(events: &[crate::db::ConnectorTaskEvent]) -> Vec<String> {
-    let mut paths: Vec<String> = Vec::new();
-    for event in events {
-        if event.kind != "edits_apply"
-            || event.payload["ok"] != true
-            || event.payload["dry_run"] == true
-        {
-            continue;
-        }
-        let Some(list) = event.payload["changed_paths"].as_array() else {
-            continue;
-        };
-        for path in list.iter().filter_map(Value::as_str) {
-            if !paths.iter().any(|existing| existing == path) {
-                paths.push(path.to_string());
-            }
-        }
-    }
-    paths
-}
 
 fn kernel_failure_may_have_applied(error: &KernelFailure) -> bool {
     let KernelFailure::Tool(result) = error else {

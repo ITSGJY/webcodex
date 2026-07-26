@@ -272,3 +272,28 @@ Common stable codes:
 Advanced server, enrollment, OAuth, transport, and fleet diagnostics remain in
 `webcodex-cli` and the operations documentation. They are not onboarding
 steps.
+
+## Local activity and command previews
+
+The console's activity ledger **persists every mutating tool call to the local
+state database**: the tool, the surface that issued it, the paths it named, an
+error summary, and — for shell-like calls — a **command preview** of the first
+120 characters.
+
+Command previews are on by default. They are what makes an approval informed:
+you cannot judge a command you cannot see. That has a consequence:
+
+- **Do not put tokens, passwords, or keys directly on a command line.** They are
+  stored with the command and shown in the console. Pass them through a file or
+  an environment variable instead.
+- To turn previews off entirely:
+
+  ```bash
+  WEBCODEX_ACTIVITY_COMMAND_PREVIEW=0 webcodex agent start
+  ```
+
+  The tool, paths, and outcome are still recorded; only the command text is
+  stored empty.
+
+The ledger stays in the local state directory and is never sent anywhere. It is
+row-capped and prunes its oldest entries.

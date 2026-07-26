@@ -142,7 +142,7 @@ async fn tasks(req: &mut Request, depot: &mut Depot, res: &mut Response) {
 
 #[handler]
 async fn activity(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let (runtime, _) = prepare!(req, depot, res);
+    let (runtime, auth) = prepare!(req, depot, res);
     let input = parse!(ActivityInput, req, res);
     let limit = input.limit.unwrap_or(50).clamp(1, 200);
     let client = input
@@ -150,7 +150,14 @@ async fn activity(req: &mut Request, depot: &mut Depot, res: &mut Response) {
         .as_deref()
         .map(str::trim)
         .filter(|client| !client.is_empty());
-    match runtime.db.list_workspace_activity(limit, client) {
+    // Scoped to the agents this caller can already see in the devices panel.
+    // A project credential must not read another project's command previews,
+    // paths, or errors out of the shared database.
+    let allowed = runtime.visible_activity_clients(&auth).await;
+    match runtime
+        .db
+        .list_workspace_activity_for_clients(limit, client, allowed.as_deref())
+    {
         Ok(rows) => res.render(Json(json!({ "activity": rows }))),
         Err(error) => render(res, failure(500, "activity_store_error", error.to_string())),
     }
