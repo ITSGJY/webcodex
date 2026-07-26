@@ -28,16 +28,31 @@ fn fake_server_binary() -> &'static FakeServerBinary {
         let path = dir.path().join("fake-lsp-server");
         let src =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/webcodex_agent/lsp/fake_server.rs");
-        let status = Command::new("rustc")
-            .arg("--edition=2021")
-            .arg("--crate-name=webcodex_lsp_fake")
-            .arg("-O")
-            .arg("-o")
-            .arg(&path)
-            .arg(&src)
-            .status()
-            .expect("rustc fake server");
-        assert!(status.success());
+        // The spawned rustc competes with every other test process when the
+        // whole suite runs in parallel and can fail transiently; retry once
+        // and keep any real failure diagnosable by capturing stderr.
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let output = Command::new("rustc")
+                .arg("--edition=2021")
+                .arg("--crate-name=webcodex_lsp_fake")
+                .arg("-o")
+                .arg(&path)
+                .arg(&src)
+                .output()
+                .expect("rustc fake server");
+            if output.status.success() {
+                break;
+            }
+            if attempts >= 2 {
+                panic!(
+                    "fake LSP server failed to compile after {attempts} attempts ({}):\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
         FakeServerBinary { path, _dir: dir }
     })
 }
