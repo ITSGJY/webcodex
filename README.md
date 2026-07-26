@@ -107,6 +107,23 @@ transport details.
 
 The complete walkthrough is in [docs/QUICK_START.md](docs/QUICK_START.md).
 
+## Connect a Hosted Chat
+
+The runtime listens on loopback; hosted ChatGPT/Claude need a public HTTPS
+URL. Any tunnel you trust works:
+
+```bash
+cloudflared tunnel --url http://127.0.0.1:8080
+```
+
+Open `https://<tunnel-host>/console` and use the **Connect a chat client**
+panel: it renders the exact MCP URL for Claude (Settings → Connectors → Add
+custom connector) and the GPT Actions schema URL for ChatGPT (Create a GPT →
+Actions → Import from URL), with copy buttons. Authentication stays the
+Project Credential from setup — the console never displays it. Set
+`WEBCODEX_PUBLIC_URL` when the advertised schema should pin a fixed public
+address.
+
 ## Canonical Coding Path
 
 A configured MCP/OpenAPI Connector exposes exactly twelve project-bound

@@ -476,3 +476,17 @@ input[type="text"] {
     grid-column: span 1;
   }
 }
+
+.connect-block {
+  margin-top: 14px;
+}
+
+.connect-row {
+  align-items: center;
+}
+
+.connect-url {
+  flex: 1;
+  user-select: all;
+  overflow-wrap: anywhere;
+}

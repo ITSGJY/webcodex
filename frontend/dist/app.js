@@ -278,6 +278,7 @@ const WORK_QUEUE_HINT = "No tasks need attention.";
 // page. A refresh intentionally requires re-entering it.
 let token = "";
 let autoEnabled = true;
+let connectLoaded = false;
 let showCompleted = false;
 let timer = 0;
 let reviewLoop = null;
@@ -1004,9 +1005,38 @@ async function tick() {
     await fetchApprovals();
     await fetchActivity();
     await fetchDevices();
+    await fetchConnect();
   } finally {
     endRefresh(state, "tick");
   }
+}
+
+// The connect targets are static per process: fetch them once per unlock.
+async function fetchConnect() {
+  if (connectLoaded) {
+    return;
+  }
+  const res = await api("connect", {});
+  if (!res || !res.ok || !res.data) {
+    return;
+  }
+  connectLoaded = true;
+  renderConnect(res.data);
+}
+
+// Copy-paste targets for hosted chat clients. URLs prefer the configured
+// public URL and fall back to the address this page is already reached on;
+// credentials never appear here.
+function renderConnect(data) {
+  const base =
+    typeof data.public_url === "string" && data.public_url
+      ? data.public_url
+      : window.location.origin;
+  setText("connect-mcp-url", base + data.mcp_path);
+  setText("connect-schema-url", base + data.actions_schema_path);
+  setText("connect-oauth", base + data.oauth_discovery_path);
+  show("connect-public-warning", /^https?:\/\/(localhost|127\.)/.test(base));
+  show("connect-panel", true);
 }
 
 async function fetchDevices() {
@@ -1318,6 +1348,20 @@ function onTokenSubmit(event) {
 
 function init() {
   el("token-form")?.addEventListener("submit", onTokenSubmit);
+  for (const button of Array.from(document.querySelectorAll("[data-copy]"))) {
+    button.addEventListener("click", () => {
+      const id = (button ).getAttribute("data-copy") || "";
+      const node = el(id);
+      const text = node ? node.textContent || "" : "";
+      if (text && text !== "—" && navigator.clipboard) {
+        void navigator.clipboard.writeText(text);
+        (button ).textContent = "Copied";
+        window.setTimeout(() => {
+          (button ).textContent = "Copy";
+        }, 1200);
+      }
+    });
+  }
   el("refresh-btn")?.addEventListener("click", () => {
     void tick();
   });

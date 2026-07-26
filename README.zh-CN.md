@@ -96,6 +96,22 @@ reference、workflow session 或 transport 细节。
 
 完整步骤见 [docs/QUICK_START.zh-CN.md](docs/QUICK_START.zh-CN.md)。
 
+## 接入托管窗口
+
+runtime 监听 loopback；托管 ChatGPT/Claude 需要公网 HTTPS 地址。任何你信任的
+隧道都可以：
+
+```bash
+cloudflared tunnel --url http://127.0.0.1:8080
+```
+
+打开 `https://<tunnel-host>/console`，使用 **Connect a chat client** 面板：它会
+渲染 Claude 自定义连接器（Settings → Connectors → Add custom connector）要粘贴
+的 MCP URL，以及 ChatGPT GPT Action（Create a GPT → Actions → Import from URL）
+要导入的 schema URL，均带复制按钮。认证始终使用 setup 生成的 Project
+Credential——console 永远不会显示它。需要在 schema 里固定公网地址时设置
+`WEBCODEX_PUBLIC_URL`。
+
 ## Canonical coding path
 
 配置完成的 MCP/OpenAPI Connector 只暴露十二项项目级能力：

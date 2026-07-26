@@ -22,6 +22,7 @@ pub(crate) const CONSOLE_ROUTES: &[&str] = &[
     "/api/console/devices",
     "/api/console/result/accept",
     "/api/console/result/reject",
+    "/api/console/connect",
 ];
 
 pub(crate) fn routes() -> Router {
@@ -37,6 +38,7 @@ pub(crate) fn routes() -> Router {
         .push(Router::with_path("devices").post(devices))
         .push(Router::with_path("result/accept").post(result_accept))
         .push(Router::with_path("result/reject").post(result_reject))
+        .push(Router::with_path("connect").post(connect))
 }
 
 fn failure(status: u16, code: &str, message: impl Into<String>) -> ConnectorCallOutcome {
@@ -335,6 +337,27 @@ async fn decide(req: &mut Request, depot: &Depot, res: &mut Response, accept: bo
     }
 }
 
+/// Non-secret connection targets for the Connect panel. The page composes
+/// absolute URLs from its own origin unless a public URL is configured, and
+/// credential material never appears in this projection by construction.
+#[handler]
+async fn connect(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let (runtime, _) = prepare!(req, depot, res);
+    let public_url = std::env::var("WEBCODEX_PUBLIC_URL")
+        .ok()
+        .map(|url| url.trim().trim_end_matches('/').to_string())
+        .filter(|url| !url.is_empty());
+    let context = runtime.context();
+    res.render(Json(json!({
+        "project": context.project_name,
+        "profile": context.profile,
+        "public_url": public_url,
+        "mcp_path": "/mcp",
+        "actions_schema_path": "/openapi.json",
+        "oauth_discovery_path": "/.well-known/oauth-authorization-server"
+    })));
+}
+
 #[handler]
 async fn result_accept(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     decide(req, depot, res, true).await;
@@ -531,6 +554,34 @@ mod tests {
         let rows = mine["activity"].as_array().expect("activity list");
         assert_eq!(rows.len(), 1, "{mine}");
         assert_eq!(rows[0]["command_preview"], "grant-a-command");
+    }
+
+    #[tokio::test]
+    async fn connect_targets_stay_secret_free() {
+        let fixture = crate::connector_runtime::execution_tests::console_fixture().await;
+        let auth = crate::connector_runtime::tests::auth("u1");
+        let service = service(fixture.runtime.clone(), auth);
+        let mut response = TestClient::post("http://127.0.0.1/console/connect")
+            .add_header("host", "127.0.0.1", true)
+            .add_header("origin", "http://127.0.0.1", true)
+            .add_header("content-type", "application/json", true)
+            .json(&serde_json::json!({}))
+            .send(&service)
+            .await;
+        let body: serde_json::Value = response.take_json().await.unwrap();
+        assert_eq!(body["mcp_path"], "/mcp", "{body}");
+        assert_eq!(body["actions_schema_path"], "/openapi.json");
+        assert_eq!(
+            body["oauth_discovery_path"],
+            "/.well-known/oauth-authorization-server"
+        );
+        // The panel must be safe to screenshot: no credential material, ever.
+        let serialized = serde_json::to_string(&body).unwrap();
+        assert!(!serialized.contains("webcodex_"), "{serialized}");
+        assert!(
+            !serialized.to_lowercase().contains("bearer"),
+            "{serialized}"
+        );
     }
 
     #[tokio::test]

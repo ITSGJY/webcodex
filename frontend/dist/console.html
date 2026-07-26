@@ -128,6 +128,32 @@
         <ol id="devices-list" class="timeline devices"></ol>
       </section>
 
+      <section class="panel" id="connect-panel" hidden>
+        <div class="panel-head">
+          <h2>Connect a chat client</h2>
+        </div>
+        <p class="muted small">Copy-paste targets for this instance. The Project Credential from <code>webcodex setup</code> stays out of this page by design.</p>
+        <div class="connect-block">
+          <h3>Claude — custom connector (MCP)</h3>
+          <div class="field-row connect-row">
+            <code id="connect-mcp-url" class="connect-url">—</code>
+            <button class="btn" type="button" data-copy="connect-mcp-url">Copy</button>
+          </div>
+          <p class="muted small">Claude → Settings → Connectors → Add custom connector → paste this URL. OAuth metadata is discovered from <code id="connect-oauth">—</code>.</p>
+        </div>
+        <div class="connect-block">
+          <h3>ChatGPT — GPT Action (OpenAPI)</h3>
+          <div class="field-row connect-row">
+            <code id="connect-schema-url" class="connect-url">—</code>
+            <button class="btn" type="button" data-copy="connect-schema-url">Copy</button>
+          </div>
+          <p class="muted small">Create a GPT → Actions → Import from URL → Authentication: API key (Bearer) with the Project Credential.</p>
+        </div>
+        <p class="muted small" id="connect-public-warning" hidden>
+          This address is local. Hosted ChatGPT/Claude need a public HTTPS URL — start a tunnel and open the console through it, or set <code>WEBCODEX_PUBLIC_URL</code>.
+        </p>
+      </section>
+
       <section class="panel" id="approvals-panel" hidden>
         <div class="panel-head">
           <h2>Pending approvals <span class="muted small" id="approvals-count"></span></h2>
