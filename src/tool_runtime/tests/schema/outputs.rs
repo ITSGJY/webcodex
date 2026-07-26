@@ -185,7 +185,6 @@ fn key_tool_output_schemas_include_expected_fields() {
         "limit",
         "total_lines",
         "numbered_text",
-        "lines",
     ] {
         assert!(
             has_output_field("read_file", field),

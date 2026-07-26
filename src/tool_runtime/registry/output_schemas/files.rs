@@ -68,13 +68,6 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                     "Optional line-numbered content when with_line_numbers=true.",
                 ),
             ),
-            (
-                "lines",
-                array_schema(
-                    open_object_schema("Line object with 1-based line and text fields."),
-                    "Optional structured lines when with_line_numbers=true.",
-                ),
-            ),
         ])),
         "search_project_text" => {
             Some(wrapped_output_schema(vec![
