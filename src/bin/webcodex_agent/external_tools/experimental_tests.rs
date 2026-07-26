@@ -590,7 +590,8 @@ fn experimental_raw_edit_survives_generation_router_retirement() {
     );
     let worker_router = Arc::clone(&old);
     let worker = std::thread::spawn(move || {
-        let ExternalRoute::Handled(result) = worker_router.route(&permissive_test_policy(), &request)
+        let ExternalRoute::Handled(result) =
+            worker_router.route(&permissive_test_policy(), &request)
         else {
             panic!("raw edit left the experimental path");
         };

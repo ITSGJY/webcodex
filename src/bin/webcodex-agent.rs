@@ -3108,6 +3108,30 @@ shell_profile = "../rust"
         assert_eq!(out.stdout.as_deref(), Some("one\ntwo\n"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn agent_file_read_rejects_symlink_escape_even_when_policy_allows_target() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "outside-secret").unwrap();
+        std::os::unix::fs::symlink(&secret, project.path().join("leak.txt")).unwrap();
+
+        let mut policy = project_policy(project.path());
+        policy.allowed_roots.push(outside.path().to_path_buf());
+        let out = handle_file_request(
+            &policy,
+            &file_read_request(project.path(), "leak.txt", None, None, Some(1024)),
+        );
+
+        assert_eq!(out.exit_code, None);
+        assert_eq!(
+            out.error.as_deref(),
+            Some("file_read path escapes project root")
+        );
+        assert!(!out.stdout.unwrap_or_default().contains("outside-secret"));
+    }
+
     #[test]
     fn agent_file_read_range_reads_large_file_subset_under_max_bytes() {
         let tmp = tempfile::tempdir().unwrap();

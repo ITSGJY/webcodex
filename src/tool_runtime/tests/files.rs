@@ -3198,7 +3198,13 @@ async fn read_file_still_routes_project_relative_paths_to_agent() {
     let project_for_task = project.clone();
     let task = tokio::spawn(async move {
         runtime_for_task
-            .read_file(project_for_task, "src/main.rs".to_string(), None, None, None)
+            .read_file(
+                project_for_task,
+                "src/main.rs".to_string(),
+                None,
+                None,
+                None,
+            )
             .await
     });
 

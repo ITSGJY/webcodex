@@ -139,12 +139,41 @@ fn handle_project_overview_request(
     }
 }
 
+fn ensure_file_read_target_in_project(
+    request: &ShellAgentShellRequest,
+    resolved: &Path,
+) -> Result<(), String> {
+    let project_root = request
+        .cwd
+        .as_deref()
+        .ok_or_else(|| "file_read requires a project root".to_string())?;
+    let project_root = Path::new(project_root)
+        .canonicalize()
+        .map_err(|_| "file_read project root is unavailable".to_string())?;
+    let target = resolved
+        .canonicalize()
+        .map_err(|_| "file_read target is unavailable".to_string())?;
+    if !target.starts_with(&project_root) {
+        return Err("file_read path escapes project root".to_string());
+    }
+    Ok(())
+}
+
 fn handle_file_read_request(
     policy: &AgentPolicy,
     request: &ShellAgentShellRequest,
     resolved: &Path,
     start: Instant,
 ) -> CommandResult {
+    if let Err(error) = ensure_file_read_target_in_project(request, resolved) {
+        return CommandResult {
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            duration_ms: Some(start.elapsed().as_millis() as u64),
+            error: Some(error),
+        };
+    }
     let max = request
         .max_bytes
         .unwrap_or(DEFAULT_MAX_OUTPUT_BYTES)
