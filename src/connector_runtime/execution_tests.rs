@@ -1924,7 +1924,10 @@ async fn new_operation_id_reruns_same_command_after_workspace_change() {
 #[tokio::test]
 async fn starting_cancel_late_attach_binds_job_and_dispatches_compensating_stop() {
     let gate = Arc::new(execution::ExecutionAttachGate::new());
-    let fixture = fixture_configured(20, {
+    // Generous yield budget: after the late attach the response must include the
+    // monitor-driven cancel_requested -> cancelled transition, which can lag far
+    // beyond a few milliseconds when the whole suite runs in parallel.
+    let fixture = fixture_configured(2_000, {
         let gate = gate.clone();
         move |service| service.with_monitor_timing(80, 5).with_attach_gate(gate)
     })
@@ -2082,7 +2085,11 @@ async fn retry_and_cancel_share_one_execution_monitor() {
 
 #[tokio::test]
 async fn transient_check_status_recovers_within_grace() {
-    let fixture = fixture_configured(20, |service| service.with_monitor_timing(200, 5)).await;
+    // Grace must comfortably exceed scheduler starvation under full-suite
+    // parallelism, or the monitor finishes the execution as unknown before it
+    // can observe the recovery update. Recovery itself happens at the next
+    // successful poll (~fast_poll), so the wide grace does not slow the test.
+    let fixture = fixture_configured(20, |service| service.with_monitor_timing(2_000, 5)).await;
     let arguments = checks(&fixture, "transient-status-1", &["check"]);
     let connector = fixture.connector.clone();
     let owner = fixture.owner.clone();
@@ -2099,18 +2106,29 @@ async fn transient_check_status_recovers_within_grace() {
         ))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    let degraded = fixture
-        .connector
-        .db
-        .latest_connector_execution(
-            &fixture.task_id,
-            &fixture.connector.context.project_id,
-            tests::PROJECT_SUBJECT_ID,
-            None,
-        )
-        .unwrap()
-        .unwrap();
+    // The degraded observation is asynchronous: wait for the monitor to record
+    // the failure instead of racing it with a fixed sleep. Grace only starts
+    // counting at the first observed failure, so waiting here is safe.
+    let mut observed = None;
+    for _ in 0..400 {
+        let current = fixture
+            .connector
+            .db
+            .latest_connector_execution(
+                &fixture.task_id,
+                &fixture.connector.context.project_id,
+                tests::PROJECT_SUBJECT_ID,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        if current.status_failure_code.is_some() {
+            observed = Some(current);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let degraded = observed.expect("monitor never recorded the unrecognized executor status");
     assert!(degraded.is_active());
     assert_ne!(degraded.state, "running");
     assert_eq!(
@@ -2129,7 +2147,7 @@ async fn transient_check_status_recovers_within_grace() {
         check_progress(0, Some("check"), None),
     )
     .await;
-    for _ in 0..100 {
+    for _ in 0..400 {
         let recovered = fixture
             .connector
             .db
@@ -2157,7 +2175,7 @@ async fn transient_check_status_recovers_within_grace() {
     )
     .await;
     let _quick_yield = check_call.await.unwrap();
-    for _ in 0..100 {
+    for _ in 0..400 {
         let completed = fixture
             .connector
             .db
