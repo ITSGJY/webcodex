@@ -2089,6 +2089,13 @@ impl ConnectorRuntime {
             json!("Human guidance from the project owner — adjust course before continuing.");
     }
 
+    /// Host-side entry: the read-only devices view. Reuses the list_agents
+    /// projection (connection, transport, last_seen, capabilities, provider
+    /// health) under the caller's own visibility rules.
+    pub(crate) async fn host_devices(&self, auth: &AuthContext) -> crate::tool_runtime::ToolResult {
+        self.tools.list_agents(Some(auth)).await
+    }
+
     /// Host-side entry: record a human guidance message on a task. Delivered
     /// to the model inside its next capability response for this task.
     pub(crate) fn host_guide(&self, task_id: &str, message: &str) -> ConnectorCallOutcome {

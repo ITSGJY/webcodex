@@ -19,6 +19,7 @@ pub(crate) const CONSOLE_ROUTES: &[&str] = &[
     "/api/console/task/guide",
     "/api/console/approvals",
     "/api/console/approval/decide",
+    "/api/console/devices",
     "/api/console/result/accept",
     "/api/console/result/reject",
 ];
@@ -33,6 +34,7 @@ pub(crate) fn routes() -> Router {
         .push(Router::with_path("task/guide").post(task_guide))
         .push(Router::with_path("approvals").post(approvals))
         .push(Router::with_path("approval/decide").post(approval_decide))
+        .push(Router::with_path("devices").post(devices))
         .push(Router::with_path("result/accept").post(result_accept))
         .push(Router::with_path("result/reject").post(result_reject))
 }
@@ -196,6 +198,26 @@ async fn approvals(req: &mut Request, depot: &mut Depot, res: &mut Response) {
             res.render(Json(json!({ "approvals": pending })));
         }
         Err(error) => render(res, store_error_outcome(error, None)),
+    }
+}
+
+#[handler]
+async fn devices(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let (runtime, auth) = prepare!(req, depot, res);
+    let result = runtime.host_devices(&auth).await;
+    if result.success {
+        res.render(Json(result.output));
+    } else {
+        render(
+            res,
+            failure(
+                500,
+                "devices_unavailable",
+                result
+                    .error
+                    .unwrap_or_else(|| "devices view failed".to_string()),
+            ),
+        );
     }
 }
 

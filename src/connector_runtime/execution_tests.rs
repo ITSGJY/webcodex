@@ -3349,3 +3349,18 @@ async fn denied_approval_reason_reaches_the_model() {
         .unwrap();
     assert!(pending.is_empty());
 }
+
+#[tokio::test]
+async fn host_devices_returns_the_agent_projection() {
+    let fixture = fixture(20).await;
+    let devices = fixture.connector.host_devices(&fixture.owner).await;
+    assert!(devices.success, "{:?}", devices.error);
+    let agents = devices.output["agents"].as_array().expect("agents array");
+    assert!(devices.output["count"].is_number());
+    if let Some(agent) = agents.first() {
+        assert!(agent["client_id"].is_string());
+        assert!(agent.get("connected").is_some());
+        assert!(agent.get("last_seen_age_secs").is_some());
+        assert!(agent.get("capabilities").is_some());
+    }
+}
