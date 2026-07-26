@@ -115,10 +115,9 @@ pub struct ShellClientCapabilities {
     /// false for wire compatibility with older agents.
     #[serde(default)]
     pub lsp_read_only_navigation: bool,
-    /// Kernel (Landlock) write-denying sandbox for commands in read_only
-    /// tasks. Missing on older agents or unsupported kernels and therefore
-    /// fail-closed: the server keeps commands_run disabled for read_only
-    /// tasks unless this is advertised.
+    /// Reserved wire capability for a future kernel command sandbox. Current
+    /// agents always advertise false and the server keeps commands_run disabled
+    /// for every read_only task; the field remains only for wire compatibility.
     #[serde(default)]
     pub sandbox_read_only_commands: bool,
 }
@@ -532,10 +531,10 @@ pub struct ShellAgentShellRequest {
     /// Defaults to `None` so older request bodies continue to deserialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lsp: Option<crate::lsp_bridge::AgentLspPayload>,
-    /// Kernel sandbox mode for this request ("read_only"): the agent must
-    /// deny project writes at spawn. Absent on the wire when unset so older
-    /// agents keep parsing; the server only sets it for agents that
-    /// advertised enforcement.
+    /// Reserved kernel sandbox mode for a future request ("read_only"). The
+    /// current server never sets it, but agents still fail closed if a request
+    /// arrives: unsupported, partial, or unknown modes must not run unconfined.
+    /// Absent on the wire when unset so older agents continue to deserialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<String>,
 }

@@ -1821,6 +1821,7 @@ mod tests {
 
     #[tokio::test]
     async fn authenticate_bearer_bootstrap_and_no_token() {
+        let _env = AuthEnvGuard::auth_required();
         // Auth disabled → bootstrap.
         let config = crate::Config {
             addr: "127.0.0.1:0".to_string(),
@@ -1901,6 +1902,7 @@ mod tests {
     // that exercise the QUIC/agent-transport surface (not HTTP middleware).
     #[tokio::test]
     async fn authenticate_bearer_accepts_and_rejects_by_token_type() {
+        let _env = AuthEnvGuard::auth_required();
         let config = gate_test_config(Some("secret"));
         let (_tmp, db) = gate_test_db();
         let user = gate_seed_user(&db, "alice");

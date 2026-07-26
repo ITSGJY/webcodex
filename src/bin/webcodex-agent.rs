@@ -6142,7 +6142,13 @@ shell_profile = "../rust"
     #[test]
     fn register_request_announces_correct_protocol_version() {
         let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_config(tmp.path().join("config/projects.d"));
+        let mut cfg = test_config(tmp.path().join("config/projects.d"));
+        // Even a stale or hand-edited config cannot re-enable the disabled
+        // read_only shell capability at registration time.
+        cfg.capabilities = Some(ShellClientCapabilities {
+            sandbox_read_only_commands: true,
+            ..Default::default()
+        });
         for (version, expected_str) in [
             (AGENT_PROTOCOL_VERSION_POLLING_V1, "polling-v1"),
             (AGENT_PROTOCOL_VERSION_WEBSOCKET_V1, "websocket-v1"),
@@ -6172,6 +6178,8 @@ shell_profile = "../rust"
         assert!(caps.async_jobs);
         assert!(caps.async_shell_jobs);
         assert!(caps.structured_validation_argv);
+        assert!(caps.lsp_read_only_navigation);
+        assert!(!caps.sandbox_read_only_commands);
     }
 
     #[test]
