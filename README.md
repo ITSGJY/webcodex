@@ -2,6 +2,55 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
+[![CI](https://github.com/yyjeqhc/webcodex/actions/workflows/ci.yml/badge.svg)](https://github.com/yyjeqhc/webcodex/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/%40yyjeqhc%2Fwebcodex)](https://www.npmjs.com/package/@yyjeqhc/webcodex)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+
+**Let ChatGPT or Claude work on your private code — and nothing lands until
+you review and accept it.** The AI edits and tests in an isolated workspace on
+your machine; you see the diff and click Accept. That review gate is the whole
+point: coding tools that let a model write straight to your repository cannot
+retrofit it.
+
+```
+ChatGPT / Claude (web chat)
+        │  MCP or GPT Actions over HTTPS
+        ▼
+WebCodex server ──▶ local Agent: edit → run checks → propose result
+        │                      (isolated workspace, never your checkout)
+        ▼
+You: browser console or CLI ── review the diff ──▶ Accept ✓ / Reject ✗
+        │  accept only
+        ▼
+Your repository
+```
+
+- **Human review gate** — results stay isolated until you accept them, from
+  the `/console` web UI or `webcodex task accept`.
+- **Everything stays on your machine** — source, Git, edits, and checks run
+  on the host that owns the repository; the server exposes nine bounded,
+  audited capabilities instead of a raw shell.
+- **Built for real work** — LSP navigation, structured edits with sha256
+  guards, project-aware check recipes (Rust/Node/Python/Go), idempotent
+  retries, and a full per-task event timeline.
+
+| ChatGPT drives a task over MCP | Review and accept locally |
+| --- | --- |
+| ![MCP session](docs/assets/mcp-1.png) | ![GPT Action review](docs/assets/gpt-action-1.png) |
+
+<details>
+<summary>More screenshots</summary>
+
+![MCP](docs/assets/mcp-2.png)
+![MCP](docs/assets/mcp-3.png)
+![MCP](docs/assets/mcp-4.png)
+![GPT Actions](docs/assets/gpt-action-2.png)
+![GPT Actions](docs/assets/gpt-action-3.png)
+![GPT Actions](docs/assets/gpt-action-4.png)
+![GPT Actions](docs/assets/gpt-action-5.png)
+
+</details>
+
 WebCodex lets a coding client work on private code through a project-scoped
 server and local Agent. Source files, Git operations, edits, and checks remain
 on the machine that owns the repository.
