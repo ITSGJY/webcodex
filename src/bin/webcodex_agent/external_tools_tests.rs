@@ -9,6 +9,17 @@ use tempfile::TempDir;
 #[path = "external_tools/experimental_tests.rs"]
 mod experimental_tests;
 
+/// Routing tests that operate inside the fixture root and are not about the
+/// filesystem boundary. `AgentPolicy::default()` is fail-closed, so these opt
+/// out explicitly; `router_rejects_absolute_parent_and_symlink_escape_paths`
+/// deliberately keeps the default to assert the boundary still rejects.
+fn permissive_test_policy() -> AgentPolicy {
+    AgentPolicy {
+        allow_cwd_anywhere: true,
+        ..AgentPolicy::default()
+    }
+}
+
 static FAKE_SERVER: OnceLock<Mutex<Weak<FakeBinary>>> = OnceLock::new();
 
 struct FakeBinary {
@@ -320,7 +331,7 @@ edit_file = "project_edit"
     let mut request = agent_request("run_shell", root.path(), ".", None);
     request.command = EXTERNAL_SEARCH_REQUEST_PREFIX.to_string();
     request.stdin = Some(search_request().to_string());
-    let ExternalRoute::Handled(result) = router.route(&AgentPolicy::default(), &request) else {
+    let ExternalRoute::Handled(result) = router.route(&permissive_test_policy(), &request) else {
         panic!("disabled provider routed to native");
     };
     assert!(result.stdout.unwrap().contains("claude_code_unavailable"));
@@ -397,7 +408,7 @@ fn search_and_edit_mappings_normalize_results() {
     let mut search = agent_request("run_shell", &fixture.root, ".", None);
     search.command = format!("{EXTERNAL_SEARCH_REQUEST_PREFIX}\nignored native command");
     search.stdin = Some(search_request().to_string());
-    let ExternalRoute::Handled(search) = router.route(&AgentPolicy::default(), &search) else {
+    let ExternalRoute::Handled(search) = router.route(&permissive_test_policy(), &search) else {
         panic!("search routed to native");
     };
     assert!(search.stdout.unwrap().contains("src/lib.rs:2:needle"));
@@ -411,7 +422,7 @@ fn search_and_edit_mappings_normalize_results() {
         "edit.txt",
         Some(edit_request()),
     );
-    let ExternalRoute::Handled(edit) = router.route(&AgentPolicy::default(), &edit) else {
+    let ExternalRoute::Handled(edit) = router.route(&permissive_test_policy(), &edit) else {
         panic!("edit routed to native");
     };
     let edit: Value = serde_json::from_str(edit.stdout.as_deref().unwrap()).unwrap();
@@ -443,7 +454,7 @@ fn fallback_and_failure_routes_record_bounded_last_call_evidence() {
     let mut search = agent_request("run_shell", &fixture.root, ".", None);
     search.command = EXTERNAL_SEARCH_REQUEST_PREFIX.to_string();
     search.stdin = Some(search_request().to_string());
-    let ExternalRoute::NativeFallback(fallback) = router.route(&AgentPolicy::default(), &search)
+    let ExternalRoute::NativeFallback(fallback) = router.route(&permissive_test_policy(), &search)
     else {
         panic!("unmapped search did not request Native fallback");
     };
@@ -480,7 +491,7 @@ fn fallback_and_failure_routes_record_bounded_last_call_evidence() {
         "edit.txt",
         Some(edit_request()),
     );
-    let ExternalRoute::Handled(_) = router.route(&AgentPolicy::default(), &edit) else {
+    let ExternalRoute::Handled(_) = router.route(&permissive_test_policy(), &edit) else {
         panic!("uncertain edit was allowed to fall back");
     };
     let status = router.status();
@@ -507,7 +518,7 @@ fn edit_falls_back_only_before_submission_and_confirms_native_write() {
         "edit.txt",
         Some(edit_request()),
     );
-    let ExternalRoute::NativeFallback(fallback) = router.route(&AgentPolicy::default(), &edit)
+    let ExternalRoute::NativeFallback(fallback) = router.route(&permissive_test_policy(), &edit)
     else {
         panic!("unsubmitted edit did not request Native fallback");
     };
@@ -542,7 +553,7 @@ fn status_revisions_are_changed_only_and_registration_reads_latest_snapshot() {
     search.command = EXTERNAL_SEARCH_REQUEST_PREFIX.to_string();
     search.stdin = Some(search_request().to_string());
     assert!(matches!(
-        router.route(&AgentPolicy::default(), &search),
+        router.route(&permissive_test_policy(), &search),
         ExternalRoute::Handled(_)
     ));
     let (update, revision) = router.claim_status_update().unwrap();
@@ -688,7 +699,7 @@ fn timeout_removes_pending_and_uncertain_edit_never_falls_back() {
         "edit.txt",
         Some(edit_request()),
     );
-    let ExternalRoute::Handled(result) = router.route(&AgentPolicy::default(), &request) else {
+    let ExternalRoute::Handled(result) = router.route(&permissive_test_policy(), &request) else {
         panic!("uncertain edit fell back to native");
     };
     let output: Value = serde_json::from_str(result.stdout.as_deref().unwrap()).unwrap();
@@ -706,7 +717,7 @@ fn timeout_removes_pending_and_uncertain_edit_never_falls_back() {
         claude_code: unmapped,
     });
     assert!(matches!(
-        router.route(&AgentPolicy::default(), &request),
+        router.route(&permissive_test_policy(), &request),
         ExternalRoute::NativeFallback(_)
     ));
 }
@@ -722,7 +733,7 @@ fn native_strategy_does_not_start_claude() {
     request.command = EXTERNAL_SEARCH_REQUEST_PREFIX.to_string();
     request.stdin = Some(search_request().to_string());
     assert!(matches!(
-        router.route(&AgentPolicy::default(), &request),
+        router.route(&permissive_test_policy(), &request),
         ExternalRoute::Native
     ));
     assert_eq!(fixture.starts(), 0);
@@ -746,7 +757,7 @@ fn retiring_router_keeps_inflight_edit_alive_then_reaps_its_process() {
     let worker_router = Arc::clone(&old);
     let worker = std::thread::spawn(move || {
         assert!(matches!(
-            worker_router.route(&AgentPolicy::default(), &request),
+            worker_router.route(&permissive_test_policy(), &request),
             ExternalRoute::Handled(_)
         ));
     });
@@ -762,7 +773,7 @@ fn retiring_router_keeps_inflight_edit_alive_then_reaps_its_process() {
     new_request.command = EXTERNAL_SEARCH_REQUEST_PREFIX.to_string();
     new_request.stdin = Some(search_request().to_string());
     assert!(matches!(
-        replacement.route(&AgentPolicy::default(), &new_request),
+        replacement.route(&permissive_test_policy(), &new_request),
         ExternalRoute::Native
     ));
     drop(old);

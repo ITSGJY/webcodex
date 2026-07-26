@@ -3142,3 +3142,84 @@ async fn artifact_upload_finish_and_abort_reject_invalid_upload_id_before_resolv
     assert!(!abort.success);
     assert!(abort.error.unwrap().contains("upload_id must start"));
 }
+
+#[tokio::test]
+async fn read_file_rejects_parent_traversal_before_reaching_agent() {
+    // The agent host scopes file ops to `allowed_roots`, which is broader than
+    // the project, so a traversal that stays inside `allowed_roots` would read
+    // a file the caller was never granted. The project boundary therefore has
+    // to be enforced server-side, before the request is queued for the agent.
+    let runtime = runtime_with_agent_project("traversal-read");
+    let mut caps = ShellClientCapabilities::default();
+    caps.file_read = true;
+    register_agent(&runtime, "traversal-read", None, caps).await;
+    let project = agent_test_project_id("traversal-read");
+
+    for path in [
+        "../outside.txt",
+        "src/../../outside.txt",
+        "/etc/passwd",
+        "sub/../../../etc/passwd",
+    ] {
+        let result = runtime
+            .read_file(project.clone(), path.to_string(), None, None, None)
+            .await;
+        assert!(
+            !result.success,
+            "read_file accepted out-of-project path {path:?}"
+        );
+    }
+
+    // Nothing may have been queued for the agent for any rejected path.
+    let queued = runtime
+        .shell_clients
+        .poll(ShellAgentPollRequest {
+            client_id: "traversal-read".to_string(),
+            agent_instance_id: "inst".to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        queued.is_none(),
+        "rejected traversal still reached the agent queue: {queued:?}"
+    );
+}
+
+#[tokio::test]
+async fn read_file_still_routes_project_relative_paths_to_agent() {
+    let runtime = runtime_with_agent_project("traversal-ok");
+    let mut caps = ShellClientCapabilities::default();
+    caps.file_read = true;
+    register_agent(&runtime, "traversal-ok", None, caps).await;
+    let project = agent_test_project_id("traversal-ok");
+
+    let runtime_for_task = runtime.clone();
+    let project_for_task = project.clone();
+    let task = tokio::spawn(async move {
+        runtime_for_task
+            .read_file(project_for_task, "src/main.rs".to_string(), None, None, None)
+            .await
+    });
+
+    let mut req = None;
+    for _ in 0..20 {
+        req = runtime
+            .shell_clients
+            .poll(ShellAgentPollRequest {
+                client_id: "traversal-ok".to_string(),
+                agent_instance_id: "inst".to_string(),
+                projects: None,
+            })
+            .await
+            .unwrap();
+        if req.is_some() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let req = req.expect("a project-relative read must still reach the agent");
+    assert_eq!(req.kind, "file_read");
+    assert_eq!(req.path.as_deref(), Some("src/main.rs"));
+    task.abort();
+}

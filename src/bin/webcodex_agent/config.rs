@@ -136,7 +136,10 @@ pub(crate) fn default_websocket_connect_timeout_secs() -> u64 {
 pub(crate) struct AgentPolicy {
     #[serde(default = "default_true")]
     pub(crate) allow_raw_shell: bool,
-    #[serde(default = "default_true")]
+    /// Fail closed: an `agent.toml` that omits `[policy]` must not disable the
+    /// filesystem boundary. When false, `allowed_roots` (defaulted to `$HOME`
+    /// by `effective_allowed_roots`) is the outer bound for every file op.
+    #[serde(default)]
     pub(crate) allow_cwd_anywhere: bool,
     #[serde(default)]
     pub(crate) allowed_roots: Vec<PathBuf>,
@@ -150,7 +153,7 @@ impl Default for AgentPolicy {
     fn default() -> Self {
         Self {
             allow_raw_shell: true,
-            allow_cwd_anywhere: true,
+            allow_cwd_anywhere: false,
             allowed_roots: Vec::new(),
             max_timeout_secs: DEFAULT_MAX_TIMEOUT_SECS,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,

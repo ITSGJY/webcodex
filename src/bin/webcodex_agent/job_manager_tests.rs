@@ -132,7 +132,12 @@ fn validation_job_progress_is_executor_owned_and_fail_fast() {
     manager.enqueue(
         sink,
         1,
-        AgentPolicy::default(),
+        AgentPolicy {
+            // These tests run jobs in a temp dir; the boundary itself is
+            // covered separately, and AgentPolicy::default() is fail-closed.
+            allow_cwd_anywhere: true,
+            ..AgentPolicy::default()
+        },
         shell,
         temp.path().join("projects.d"),
         serde_json::from_value(json!({
@@ -206,7 +211,12 @@ fn validation_spawn_failure_is_infrastructure_without_failed_assertion() {
     manager.enqueue(
         sink,
         1,
-        AgentPolicy::default(),
+        AgentPolicy {
+            // These tests run jobs in a temp dir; the boundary itself is
+            // covered separately, and AgentPolicy::default() is fail-closed.
+            allow_cwd_anywhere: true,
+            ..AgentPolicy::default()
+        },
         shell,
         temp.path().join("projects.d"),
         serde_json::from_value(json!({

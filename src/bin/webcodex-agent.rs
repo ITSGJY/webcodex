@@ -1746,6 +1746,18 @@ mod tests {
     use super::*;
     static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Policy for tests that exercise shell/profile behavior inside a temp dir
+    /// rather than the filesystem boundary itself. `AgentPolicy::default()` is
+    /// now fail-closed (empty `allowed_roots` reaches nothing), so these tests
+    /// opt out of the boundary explicitly instead of leaning on a permissive
+    /// production default.
+    fn unrestricted_test_policy() -> AgentPolicy {
+        AgentPolicy {
+            allow_cwd_anywhere: true,
+            ..AgentPolicy::default()
+        }
+    }
+
     fn test_config(projects_dir: PathBuf) -> AgentConfig {
         AgentConfig {
             server_url: "http://127.0.0.1:8000".to_string(),
@@ -1758,7 +1770,7 @@ mod tests {
             poll_interval_ms: 1000,
             capabilities: None,
             max_concurrent_jobs: None,
-            policy: AgentPolicy::default(),
+            policy: unrestricted_test_policy(),
             shell: ShellConfig::default(),
             transport: None,
             websocket_connect_timeout_secs: default_websocket_connect_timeout_secs(),
@@ -2790,7 +2802,7 @@ shell_profile = "../rust"
             )],
         );
         let result = run_profile_shell(
-            &AgentPolicy::default(),
+            &unrestricted_test_policy(),
             &shell,
             tmp.path(),
             &PreparedShellProfileCache::default(),
@@ -2817,7 +2829,7 @@ shell_profile = "../rust"
             )],
         );
         let result = run_profile_shell(
-            &AgentPolicy::default(),
+            &unrestricted_test_policy(),
             &shell,
             tmp.path(),
             &PreparedShellProfileCache::default(),
@@ -2853,7 +2865,7 @@ shell_profile = "../rust"
             )],
         );
         let result = run_profile_shell(
-            &AgentPolicy::default(),
+            &unrestricted_test_policy(),
             &shell,
             &projects_dir,
             &PreparedShellProfileCache::default(),
@@ -2891,7 +2903,7 @@ shell_profile = "../rust"
             ],
         );
         let result = run_profile_shell(
-            &AgentPolicy::default(),
+            &unrestricted_test_policy(),
             &shell,
             &projects_dir,
             &PreparedShellProfileCache::default(),
@@ -5569,7 +5581,7 @@ shell_profile = "../rust"
         );
         let jobs = JobManager::new(1);
         let shell_result = run_profile_shell(
-            &AgentPolicy::default(),
+            &unrestricted_test_policy(),
             &shell,
             &projects_dir,
             &jobs.prepared_profiles,
@@ -5620,7 +5632,7 @@ shell_profile = "../rust"
         let cache = PreparedShellProfileCache::default();
         for _ in 0..2 {
             let result = run_profile_shell(
-                &AgentPolicy::default(),
+                &unrestricted_test_policy(),
                 &shell,
                 tmp.path(),
                 &cache,
@@ -5634,7 +5646,7 @@ shell_profile = "../rust"
         let cwd = tmp.path().to_string_lossy().to_string();
         let result = run_shell_with_profiles(
             2,
-            &AgentPolicy::default(),
+            &unrestricted_test_policy(),
             &shell,
             tmp.path(),
             &cache,
@@ -5651,7 +5663,7 @@ shell_profile = "../rust"
         // snapshot, but it must not evict the already-cached active generation.
         let stale = run_shell_with_profiles(
             1,
-            &AgentPolicy::default(),
+            &unrestricted_test_policy(),
             &shell,
             tmp.path(),
             &cache,
@@ -5666,7 +5678,7 @@ shell_profile = "../rust"
 
         let current = run_shell_with_profiles(
             2,
-            &AgentPolicy::default(),
+            &unrestricted_test_policy(),
             &shell,
             tmp.path(),
             &cache,
@@ -5699,7 +5711,7 @@ shell_profile = "../rust"
             )],
         );
         let result = run_profile_shell(
-            &AgentPolicy::default(),
+            &unrestricted_test_policy(),
             &shell,
             tmp.path(),
             &PreparedShellProfileCache::default(),
@@ -5727,7 +5739,7 @@ shell_profile = "../rust"
             )],
         );
         let result = run_profile_shell(
-            &AgentPolicy::default(),
+            &unrestricted_test_policy(),
             &shell,
             tmp.path(),
             &PreparedShellProfileCache::default(),
@@ -5748,7 +5760,7 @@ shell_profile = "../rust"
         let shell =
             shell_with_profiles(Some("test"), vec![("test", ShellProfileConfig::default())]);
         let result = run_profile_shell(
-            &AgentPolicy::default(),
+            &unrestricted_test_policy(),
             &shell,
             tmp.path(),
             &PreparedShellProfileCache::default(),
@@ -5780,7 +5792,7 @@ shell_profile = "../rust"
             )],
         );
         let result = run_profile_shell(
-            &AgentPolicy::default(),
+            &unrestricted_test_policy(),
             &shell,
             tmp.path(),
             &PreparedShellProfileCache::default(),
@@ -5819,7 +5831,7 @@ shell_profile = "../rust"
             )],
         );
         let result = run_profile_shell(
-            &AgentPolicy::default(),
+            &unrestricted_test_policy(),
             &shell,
             tmp.path(),
             &PreparedShellProfileCache::default(),
@@ -5845,7 +5857,7 @@ shell_profile = "../rust"
             )],
         );
         let result = run_profile_shell(
-            &AgentPolicy::default(),
+            &unrestricted_test_policy(),
             &shell,
             tmp.path(),
             &PreparedShellProfileCache::default(),
@@ -5867,7 +5879,7 @@ shell_profile = "../rust"
         std::fs::create_dir_all(&project_dir).unwrap();
         write_agent_project(&projects_dir, "demo", &project_dir, Some("missing"));
         let result = run_profile_shell(
-            &AgentPolicy::default(),
+            &unrestricted_test_policy(),
             &ShellConfig::default(),
             &projects_dir,
             &PreparedShellProfileCache::default(),
@@ -6651,6 +6663,58 @@ shell_profile = "../rust"
                 "empty allowed_roots must default to HOME"
             );
         }
+    }
+
+    #[test]
+    fn load_config_defaults_allow_cwd_anywhere_to_false() {
+        let _guard = agent_init::TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = "server_url = \"http://x\"\ntoken = \"t\"\nclient_id = \"c\"\n";
+
+        // A config that omits `[policy]` entirely falls back to
+        // `AgentPolicy::default()`; one that has `[policy]` without the field
+        // falls back to the per-field serde default. Both must fail closed —
+        // otherwise the agent runs with no filesystem boundary at all.
+        for (label, body) in [
+            ("no [policy] section", base.to_string()),
+            (
+                "[policy] without allow_cwd_anywhere",
+                format!("{base}\n[policy]\nallow_raw_shell = true\n"),
+            ),
+        ] {
+            let path = tmp.path().join("agent.toml");
+            std::fs::write(&path, body).unwrap();
+            let cfg = load_config(&path).unwrap();
+            assert!(
+                !cfg.policy.allow_cwd_anywhere,
+                "{label}: allow_cwd_anywhere must default to false"
+            );
+        }
+    }
+
+    #[test]
+    fn default_policy_denies_paths_outside_allowed_roots() {
+        // The shipped default must not resolve an absolute path outside the
+        // configured roots. `AgentPolicy::default()` has no roots at all, so
+        // every path is out of bounds.
+        let policy = AgentPolicy::default();
+        assert!(!policy.allow_cwd_anywhere);
+        let err = resolve_requested_path(&policy, Some("/tmp"), "/etc/passwd")
+            .expect_err("default policy must not reach /etc/passwd");
+        assert!(err.contains("outside allowed_roots"), "{err}");
+
+        // With HOME as the root — what `effective_allowed_roots` fills in — a
+        // path inside the root still resolves, so the default is restrictive
+        // rather than broken.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join("in-bounds.txt"), "ok").unwrap();
+        let scoped = AgentPolicy {
+            allowed_roots: vec![root.clone()],
+            ..AgentPolicy::default()
+        };
+        resolve_requested_path(&scoped, Some(root.to_str().unwrap()), "in-bounds.txt")
+            .expect("in-bounds path must still resolve under the fail-closed default");
     }
 
     #[test]

@@ -637,3 +637,30 @@ fn rejected_cleanup_can_be_retried() {
         .unwrap();
     assert!(retry.cleanup_warning.is_none());
 }
+
+#[test]
+fn validate_path_rejects_parent_traversal() {
+    use super::validate_path;
+
+    // Leading `/` and NUL were already rejected. Parent traversal was not, so a
+    // connector-surface path could resolve outside the granted project once the
+    // agent joined it against the project root.
+    for path in [
+        "../outside.txt",
+        "src/../../outside.txt",
+        "a/b/../../../etc/passwd",
+        "..",
+    ] {
+        assert!(
+            validate_path(path).is_err(),
+            "validate_path accepted traversal {path:?}"
+        );
+    }
+
+    for path in ["src/main.rs", "a/b/c.txt", "README.md", "./src/lib.rs"] {
+        assert!(
+            validate_path(path).is_ok(),
+            "validate_path rejected legitimate path {path:?}"
+        );
+    }
+}

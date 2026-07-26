@@ -3380,6 +3380,14 @@ impl ToolRuntime {
         with_line_numbers: Option<bool>,
     ) -> ToolResult {
         let with_line_numbers = with_line_numbers.unwrap_or(false);
+        // Bound the request to the project before it can reach an executor.
+        // The agent branch below forwards `path` to a remote host that scopes
+        // file ops to `allowed_roots` — which is broader than the project — so
+        // the project boundary has to be enforced here, as `list_project_files`
+        // and `project_overview` already do.
+        if let Err(e) = validate_project_relative_path(&path) {
+            return ToolResult::err(e);
+        }
         let proj = match self.resolve_project(&project).await {
             Ok(p) => p,
             Err(e) => return ToolResult::err(e),

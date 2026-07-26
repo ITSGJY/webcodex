@@ -2995,6 +2995,12 @@ fn validate_path(path: &str) -> Result<(), &'static str> {
     if path.starts_with('/') || path.contains('\0') {
         return Err("path must be project-relative and contain no NUL byte");
     }
+    if std::path::Path::new(path)
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err("path cannot contain parent traversal");
+    }
     Ok(())
 }
 

@@ -1800,7 +1800,12 @@ mod tests {
                 ..ShellClientCapabilities::default()
             }),
             max_concurrent_jobs: Some(1),
-            policy: AgentPolicy::default(),
+            // Transport tests run jobs in a temp dir and are not about the
+            // filesystem boundary; AgentPolicy::default() is fail-closed.
+            policy: AgentPolicy {
+                allow_cwd_anywhere: true,
+                ..AgentPolicy::default()
+            },
             transport: Some(TRANSPORT_WEBSOCKET.to_string()),
             websocket_connect_timeout_secs:
                 crate::webcodex_agent::default_websocket_connect_timeout_secs(),
