@@ -125,6 +125,14 @@ pub(crate) fn build_project_overview(
         return Err("path is not a directory".to_string());
     }
 
+    // Project detection trusts the git index: the author's own statement of
+    // what belongs to the project. Untracked tool state (.opencode/, .codex/,
+    // caches, virtualenvs) otherwise pollutes language/manifest detection —
+    // the field test misclassified a pure-Python thesis repo as node because
+    // of a gitignored .opencode/package.json. Non-git directories (and empty
+    // indexes, e.g. fresh `git init`) fall back to the filesystem walk.
+    let tracked = git_tracked_index(&canonical_root);
+
     let mut queue = VecDeque::from([PendingDirectory {
         absolute_path: canonical_scope,
         scoped_path: String::new(),
@@ -189,6 +197,15 @@ pub(crate) fn build_project_overview(
             } else {
                 continue;
             };
+            if let Some((tracked_files, tracked_dirs)) = tracked.as_ref() {
+                let known = match kind {
+                    EntryKind::File => tracked_files.contains(&project_path),
+                    EntryKind::Directory => tracked_dirs.contains(&project_path),
+                };
+                if !known {
+                    continue;
+                }
+            }
             if entries.len() >= limit {
                 limit_truncated = true;
                 break 'directories;
@@ -326,6 +343,45 @@ fn is_excluded_component(component: &str) -> bool {
 
 fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Tracked files and their ancestor directories from `git ls-files -z`,
+/// project-root-relative with `/` separators. `None` when the directory is
+/// not a usable git checkout or the index is empty, so the caller falls back
+/// to the plain filesystem walk.
+fn git_tracked_index(
+    root: &std::path::Path,
+) -> Option<(
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+)> {
+    let output = std::process::Command::new("git")
+        .args(["ls-files", "-z"])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut files = std::collections::HashSet::new();
+    let mut dirs = std::collections::HashSet::new();
+    for path in String::from_utf8_lossy(&output.stdout).split('\0') {
+        if path.is_empty() {
+            continue;
+        }
+        files.insert(path.to_string());
+        let mut ancestor = path;
+        while let Some((parent, _)) = ancestor.rsplit_once('/') {
+            if !dirs.insert(parent.to_string()) {
+                break;
+            }
+            ancestor = parent;
+        }
+    }
+    if files.is_empty() {
+        return None;
+    }
+    Some((files, dirs))
 }
 
 fn project_types(entries: &[ScanEntry]) -> Vec<Value> {
@@ -797,5 +853,71 @@ mod tests {
             assert!(!output.to_string().contains("escape"));
             assert_eq!(output["warnings"], json!(["symlinks_skipped"]));
         }
+    }
+}
+
+#[cfg(test)]
+mod git_index_tests {
+    use super::*;
+
+    #[test]
+    fn detection_trusts_the_git_index_over_untracked_tool_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("pyproject.toml"), "[project]\nname=\"x\"\n").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.py"), "print()\n").unwrap();
+        git(&["add", "pyproject.toml", "src/main.py"]);
+        // Untracked tool state that used to pollute language detection.
+        std::fs::create_dir_all(root.join(".opencode")).unwrap();
+        std::fs::write(root.join(".opencode/package.json"), "{}").unwrap();
+
+        let output = build_project_overview(root, "", None, None).unwrap();
+        let kinds: Vec<&str> = output["project_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["kind"].as_str())
+            .collect();
+        assert!(kinds.contains(&"python"), "kinds: {kinds:?}");
+        assert!(
+            !kinds.contains(&"node"),
+            "untracked .opencode/package.json must not classify the project as node: {kinds:?}"
+        );
+        let manifests: Vec<&str> = output["manifests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["path"].as_str())
+            .collect();
+        assert!(manifests.contains(&"pyproject.toml"));
+        assert!(!manifests.iter().any(|path| path.contains(".opencode")));
+    }
+
+    #[test]
+    fn non_git_directories_keep_the_filesystem_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("package.json"), "{}").unwrap();
+        let output = build_project_overview(temp.path(), "", None, None).unwrap();
+        let kinds: Vec<&str> = output["project_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["kind"].as_str())
+            .collect();
+        assert!(
+            kinds.contains(&"node"),
+            "fallback scan must still detect: {kinds:?}"
+        );
     }
 }
