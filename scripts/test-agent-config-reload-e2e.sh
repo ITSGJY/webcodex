@@ -106,7 +106,7 @@ wait_for_port() {
     return 1
 }
 api_post() {
-    curl -sS --max-time 12 -H "Authorization: Bearer ${TOKEN}" \
+    curl -sS --noproxy '*' --max-time 12 -H "Authorization: Bearer ${TOKEN}" \
         -H 'Content-Type: application/json' -X POST \
         "http://127.0.0.1:${PORT}$1" -d "$2"
 }
@@ -228,7 +228,9 @@ STATUS_FILE="$TMP_ROOT/status.json"
 RESPONSE_FILE="$TMP_ROOT/response.json"
 GATE="$TMP_ROOT/concurrency-gate"
 mkdir -p "$DATA_DIR" "$PROJECTS_DIR" "$FIXTURE" "$RUNTIME_TMP" \
-    "$ISOLATED_HOME/.config" "$ISOLATED_HOME/.local/share" "$ISOLATED_HOME/.cache"
+    "$ISOLATED_HOME/.config" "$ISOLATED_HOME/.local/share" \
+    "$ISOLATED_HOME/.local/state" "$ISOLATED_HOME/.cache"
+: >"$TMP_ROOT/empty.env"
 git -C "$FIXTURE" init -b main >/dev/null
 git -C "$FIXTURE" config user.email e2e@example.invalid
 git -C "$FIXTURE" config user.name 'WebCodex E2E'
@@ -245,16 +247,19 @@ shell_profile = "reload-test"
 EOF
 PORT="$(find_port)"
 write_agent_config generation-1 5 65536 native false 30 "$STARTUP_DISPLAY" 1
-setsid env HOME="$ISOLATED_HOME" XDG_CONFIG_HOME="$ISOLATED_HOME/.config" \
-    XDG_DATA_HOME="$ISOLATED_HOME/.local/share" XDG_CACHE_HOME="$ISOLATED_HOME/.cache" \
-    TMPDIR="$RUNTIME_TMP" WEBCODEX_ADDR="127.0.0.1:${PORT}" WEBCODEX_DATA="$DATA_DIR" \
-    WEBCODEX_TOKEN="$TOKEN" RUST_LOG=warn target/debug/webcodex >"$SERVER_LOG" 2>&1 &
+setsid env -i PATH="$PATH" LANG=C HOME="$ISOLATED_HOME" \
+    XDG_CONFIG_HOME="$ISOLATED_HOME/.config" XDG_DATA_HOME="$ISOLATED_HOME/.local/share" \
+    XDG_STATE_HOME="$ISOLATED_HOME/.local/state" XDG_CACHE_HOME="$ISOLATED_HOME/.cache" \
+    TMPDIR="$RUNTIME_TMP" WEBCODEX_ENV_FILE="$TMP_ROOT/empty.env" \
+    WEBCODEX_ADDR="127.0.0.1:${PORT}" WEBCODEX_DATA="$DATA_DIR" WEBCODEX_TOKEN="$TOKEN" \
+    RUST_LOG=warn target/debug/webcodex >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 wait_for_port open || fail "isolated server port did not open"
-setsid env HOME="$ISOLATED_HOME" XDG_CONFIG_HOME="$ISOLATED_HOME/.config" \
-    XDG_DATA_HOME="$ISOLATED_HOME/.local/share" XDG_CACHE_HOME="$ISOLATED_HOME/.cache" \
-    TMPDIR="$RUNTIME_TMP" RUST_LOG=warn target/debug/webcodex-agent --config "$AGENT_CONFIG" \
-    >"$AGENT_LOG" 2>&1 &
+setsid env -i PATH="$PATH" LANG=C HOME="$ISOLATED_HOME" \
+    XDG_CONFIG_HOME="$ISOLATED_HOME/.config" XDG_DATA_HOME="$ISOLATED_HOME/.local/share" \
+    XDG_STATE_HOME="$ISOLATED_HOME/.local/state" XDG_CACHE_HOME="$ISOLATED_HOME/.cache" \
+    TMPDIR="$RUNTIME_TMP" WEBCODEX_ENV_FILE="$TMP_ROOT/empty.env" RUST_LOG=warn \
+    target/debug/webcodex-agent --config "$AGENT_CONFIG" >"$AGENT_LOG" 2>&1 &
 AGENT_PID=$!
 START_AGENT_PID="$AGENT_PID"
 STAGE="generation 1 baseline"
