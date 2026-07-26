@@ -28,7 +28,7 @@ Your repository
 - **Human review gate** — results stay isolated until you accept them, from
   the `/console` web UI or `webcodex task accept`.
 - **Everything stays on your machine** — source, Git, edits, and checks run
-  on the host that owns the repository; the server exposes nine bounded,
+  on the host that owns the repository; the server exposes ten bounded,
   audited capabilities instead of a raw shell.
 - **Built for real work** — LSP navigation, structured edits with sha256
   guards, project-aware check recipes (Rust/Node/Python/Go), idempotent
@@ -109,11 +109,12 @@ The complete walkthrough is in [docs/QUICK_START.md](docs/QUICK_START.md).
 
 ## Canonical Coding Path
 
-A configured MCP/OpenAPI Connector exposes exactly nine project-bound
+A configured MCP/OpenAPI Connector exposes exactly ten project-bound
 capabilities:
 
 ```text
 task_start
+→ files_list
 → files_read / files_search
 → edits_apply
 → checks_run
@@ -150,7 +151,7 @@ queue IDs stay internal.
 
 ### Project-aware validation
 
-`checks_run` remains one of the nine capabilities. Omit its optional `recipe`
+`checks_run` remains one of the ten capabilities. Omit its optional `recipe`
 field to resolve the nearest supported manifest from the Task execution
 workspace and relative `cwd`; use `recipe: rust|node|python|go` only to resolve
 a same-directory ambiguity. Resolution never scans sibling projects, and

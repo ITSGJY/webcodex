@@ -9,6 +9,7 @@ use serde_json::{json, Map, Value};
 
 pub(crate) const CAPABILITY_NAMES: &[&str] = &[
     "task_start",
+    "files_list",
     "files_read",
     "files_search",
     "edits_apply",
@@ -35,6 +36,35 @@ pub(crate) fn capability_specs() -> Vec<ToolSpec> {
             }),
             false,
             false,
+        ),
+        spec(
+            "files_list",
+            "List what the project contains, from the Git index, so ignored directories such as .venv, target, and node_modules never appear. Call this before guessing paths for files_read. A project too large to list file by file rolls up to the deepest directory depth that fits and reports the depth it used.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "task_id": task_id_schema(),
+                    "path": path_schema(),
+                    "globs": {
+                        "type": "array", "maxItems": 20,
+                        "items": { "type": "string", "minLength": 1, "maxLength": 256 },
+                        "description": "Optional path globs; an entry matches if it matches any of them. * does not cross /, ** does, ? is one character. A pattern without / also matches the basename, so *.py works at any depth."
+                    },
+                    "depth": {
+                        "type": "integer", "minimum": 1, "maximum": 16,
+                        "description": "Optional directory rollup depth. Omit to list every file when the result fits limit, and otherwise roll up automatically."
+                    },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 200 },
+                    "offset": {
+                        "type": "integer", "minimum": 0,
+                        "description": "Entry offset for paging; pass the next_offset value from the previous page."
+                    }
+                },
+                "required": ["task_id"],
+                "additionalProperties": false
+            }),
+            true,
+            true,
         ),
         spec(
             "files_read",
@@ -274,6 +304,7 @@ pub(crate) fn capability_spec(name: &str) -> Option<ToolSpec> {
 pub(crate) fn route_for(name: &str) -> Option<&'static str> {
     match name {
         "task_start" => Some("/api/connector/task/start"),
+        "files_list" => Some("/api/connector/files/list"),
         "files_read" => Some("/api/connector/files/read"),
         "files_search" => Some("/api/connector/files/search"),
         "edits_apply" => Some("/api/connector/edits/apply"),
@@ -450,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn hosted_openapi_is_generated_from_same_nine_capabilities() {
+    fn hosted_openapi_is_generated_from_the_same_capability_list() {
         let spec = build_openapi_spec("https://connector.example".to_string());
         let operations = spec["paths"]
             .as_object()
@@ -463,7 +494,7 @@ mod tests {
             .map(|name| name.to_string())
             .collect::<BTreeSet<_>>();
         assert_eq!(operations, expected);
-        assert_eq!(spec["paths"].as_object().unwrap().len(), 9);
+        assert_eq!(spec["paths"].as_object().unwrap().len(), 10);
         let commands = &spec["paths"]["/api/connector/commands/run"]["post"]["requestBody"]
             ["content"]["application/json"]["schema"];
         assert!(commands["required"]

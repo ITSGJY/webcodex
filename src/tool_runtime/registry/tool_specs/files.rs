@@ -1,6 +1,6 @@
 use super::super::input_schemas::{
-    list_project_files_input_schema, project_overview_input_schema, read_file_input_schema,
-    search_project_text_input_schema,
+    list_project_files_input_schema, list_project_tracked_files_input_schema,
+    project_overview_input_schema, read_file_input_schema, search_project_text_input_schema,
 };
 use super::tool_spec;
 use crate::tool_runtime::tool_spec::ToolSpec;
@@ -20,6 +20,11 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
                 + "to the owning registered agent; the server never reads the agent project "
                 + "path directly.",
             list_project_files_input_schema(),
+        ),
+        tool_spec(
+            "list_project_tracked_files",
+            "Default discovery tool: what files does this project contain? Lists Git-tracked paths in one bounded call, so ignored directories like .venv and target never appear. Supports globs, a scope, and paging; a project too large to list file by file rolls up to the deepest directory depth that fits.",
+            list_project_tracked_files_input_schema(),
         ),
         tool_spec(
             "search_project_text",

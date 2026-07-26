@@ -35,6 +35,7 @@ exactly:
 
 ```text
 task_start
+files_list
 files_read
 files_search
 edits_apply
@@ -63,12 +64,17 @@ Agent transport, executor routing, and pending request IDs remain internal.
 
 ```text
 task_start
+→ files_list
 → files_read / files_search
 → edits_apply
 → checks_run
 → task_finish
 → task_review
 ```
+
+`files_list` answers "what is in this project" from the Git index, so ignored
+directories never appear. Call it before guessing paths for `files_read` —
+especially in a `read_only` task, which has no shell to list files with.
 
 Use `commands_run` only as an approved escape hatch. Use `task_cancel` for a
 queued/running execution that should stop.
@@ -97,8 +103,8 @@ supports `check` and `test`, with `format` unavailable. No recipe installs
 dependencies, changes lockfiles, or uses the network. Tool absence is an
 executor failure; a started validator returning non-zero is an assertion
 failure. Recipe version, relative root, and invocation/manifest evidence bind
-the operation exact-retry identity. This does not add a tenth MCP tool; MCP,
-OpenAPI, and the capability registry still share the same nine-item source.
+the operation exact-retry identity. A recipe never adds an MCP tool; MCP,
+OpenAPI, and the capability registry all share one capability list.
 At finish, untracked interpreter/test caches, coverage output, and
 `node_modules` are omitted with bounded warnings; tracked paths are retained.
 

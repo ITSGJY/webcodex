@@ -25,6 +25,7 @@ pub(crate) const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "runtime_status",
             "start_coding_task",
             "project_overview",
+            "list_project_tracked_files",
             "read_file",
             "search_project_text",
             "document_symbols",
@@ -263,6 +264,7 @@ pub(crate) const TOOL_MANIFEST_INTENTS: &[ToolManifestIntent] = &[
             "start_coding_task",
             // project discovery
             "project_overview",
+            "list_project_tracked_files",
             // inspect
             "read_file",
             "search_project_text",
@@ -295,6 +297,7 @@ pub(crate) const TOOL_MANIFEST_INTENTS: &[ToolManifestIntent] = &[
         tools: &[
             "start_coding_task",
             "project_overview",
+            "list_project_tracked_files",
             "read_file",
             "search_project_text",
             "list_project_files",
@@ -317,6 +320,7 @@ pub(crate) const TOOL_MANIFEST_INTENTS: &[ToolManifestIntent] = &[
             "list_projects",
             "runtime_status",
             "project_overview",
+            "list_project_tracked_files",
             "list_project_files",
             "search_project_text",
             "read_file",

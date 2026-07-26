@@ -20,6 +20,50 @@ pub(crate) fn list_project_files_input_schema() -> Value {
     ]))
 }
 
+pub(crate) fn list_project_tracked_files_input_schema() -> Value {
+    let mut schema = object_schema(with_optional_session_id(vec![
+        ("project", "string", "Agent-registered project id.", true),
+        (
+            "path",
+            "string",
+            "Optional project-relative directory scope (default: project root). Rollup depth is counted inside this scope.",
+            false,
+        ),
+        (
+            "globs",
+            "array",
+            "Optional path globs; an entry matches if it matches any of them. Supports * (not crossing /), ** (crossing /), and ?. A pattern without / also matches the basename, so *.py works at any depth.",
+            false,
+        ),
+        (
+            "depth",
+            "integer",
+            "Optional directory rollup depth, clamped to 1..16. Omit to list every file when the result fits limit, and otherwise roll up automatically to the deepest depth that does fit.",
+            false,
+        ),
+        (
+            "limit",
+            "integer",
+            "Maximum entries to return; clamped to 1..1000 (default 200).",
+            false,
+        ),
+        (
+            "offset",
+            "integer",
+            "Entry offset for paging; use the next_offset value from the previous page.",
+            false,
+        ),
+    ]));
+    schema["properties"]["globs"] = json!({
+        "type": "array",
+        "maxItems": 20,
+        "items": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "description": schema["properties"]["globs"]["description"].clone(),
+    });
+    schema["properties"]["limit"]["default"] = json!(200);
+    schema
+}
+
 pub(crate) fn project_overview_input_schema() -> Value {
     let mut schema = object_schema(with_optional_session_id(vec![
         ("project", "string", "Full agent runtime project id.", true),

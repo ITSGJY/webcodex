@@ -522,6 +522,27 @@ pub enum ToolCall {
         limit: Option<usize>,
     },
 
+    /// List the project's tracked files from the Git index, with glob
+    /// filtering and automatic directory rollup. Unlike `ListProjectFiles`
+    /// (one directory, filesystem order) this answers "what is in this
+    /// project" in a single bounded call and never descends into ignored
+    /// directories such as `.venv` or `target`.
+    ListProjectTrackedFiles {
+        project: String,
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        globs: Option<Vec<String>>,
+        #[serde(default)]
+        depth: Option<usize>,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        offset: Option<usize>,
+    },
+
     /// Return a deterministic, bounded, metadata-only overview of an
     /// agent-registered project. The owning agent scans directory entries;
     /// file contents are never read and no LLM is used.
@@ -1124,6 +1145,7 @@ impl ToolCall {
             Self::JobStatus { .. } => "job_status",
             Self::JobLog { .. } => "job_log",
             Self::ListProjectFiles { .. } => "list_project_files",
+            Self::ListProjectTrackedFiles { .. } => "list_project_tracked_files",
             Self::ProjectOverview { .. } => "project_overview",
             Self::SearchProjectText { .. } => "search_project_text",
             Self::GitDiffSummary { .. } => "git_diff_summary",
@@ -1183,6 +1205,7 @@ impl ToolCall {
             | Self::RunJob { session_id, .. }
             | Self::StopJob { session_id, .. }
             | Self::ListProjectFiles { session_id, .. }
+            | Self::ListProjectTrackedFiles { session_id, .. }
             | Self::ProjectOverview { session_id, .. }
             | Self::SearchProjectText { session_id, .. }
             | Self::GitDiffSummary { session_id, .. }
@@ -1240,6 +1263,7 @@ impl ToolCall {
             | Self::RunJob { session_id, .. }
             | Self::StopJob { session_id, .. }
             | Self::ListProjectFiles { session_id, .. }
+            | Self::ListProjectTrackedFiles { session_id, .. }
             | Self::ProjectOverview { session_id, .. }
             | Self::SearchProjectText { session_id, .. }
             | Self::GitDiffSummary { session_id, .. }
@@ -1302,6 +1326,7 @@ impl ToolCall {
             | Self::RunJob { project, .. }
             | Self::StopJob { project, .. }
             | Self::ListProjectFiles { project, .. }
+            | Self::ListProjectTrackedFiles { project, .. }
             | Self::ProjectOverview { project, .. }
             | Self::SearchProjectText { project, .. }
             | Self::GitDiffSummary { project, .. }

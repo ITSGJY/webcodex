@@ -34,6 +34,7 @@ runtime 由 `webcodex setup` 配置时，MCP `tools/list` 恰好包含：
 
 ```text
 task_start
+files_list
 files_read
 files_search
 edits_apply
@@ -62,6 +63,7 @@ Agent transport、executor routing 和 pending request ID 保持内部实现。
 
 ```text
 task_start
+→ files_list
 → files_read / files_search
 → edits_apply
 → checks_run
@@ -93,8 +95,8 @@ Ruff/Black、Ruff/Mypy 或 pytest，manifestless Python 则只支持
 unavailable。所有 recipe 都不安装依赖、不修改 lockfile、不联网。tool 缺失属于
 executor failure；validator 启动后 non-zero 才属于 assertion failure。recipe
 version、相对 root 和 invocation/manifest evidence 绑定 operation exact-retry
-identity。这不会增加第十项 MCP tool；MCP、OpenAPI 与 capability registry 仍共享
-同一九项 source。finish 时会排除 untracked interpreter/test cache、coverage
+identity。recipe 永远不会新增 MCP tool；MCP、OpenAPI 与 capability registry 共享
+同一份 capability 清单。finish 时会排除 untracked interpreter/test cache、coverage
 output 和 `node_modules` 并返回 bounded warning；tracked 路径始终保留。
 
 review 后由人类在 host 上接受或拒绝：

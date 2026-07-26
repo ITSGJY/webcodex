@@ -133,6 +133,7 @@ Ask the client for a small, reversible change. The canonical calls are:
 
 ```text
 task_start
+→ files_list
 → files_read or files_search
 → edits_apply
 → checks_run

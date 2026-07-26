@@ -861,6 +861,71 @@ fn grep_search_command(options: &SearchOptions) -> String {
 /// Build one bounded capability-selecting command for every search mode. Basic
 /// matches calls retain grep fallback; requests that need full capabilities
 /// emit a machine-readable marker when ripgrep is unavailable.
+/// Wall-clock budget for one tracked-file listing. `git ls-files` reads the
+/// index and does no tree walk, so a project that needs longer than this is
+/// reporting a sick repository, not a big one.
+const LIST_TRACKED_TIMEOUT_SECS: u64 = 20;
+
+/// Transport cap on raw `git ls-files -z` output. Roughly 25k paths at typical
+/// lengths; beyond it the listing reports `list_truncated` rather than
+/// pretending the index ended there.
+const LIST_TRACKED_MAX_BYTES: usize = 1024 * 1024;
+
+/// Structured failure shaped like the other file-tool errors, so a caller can
+/// branch on `code` instead of matching prose.
+fn list_tracked_error(code: &str, message: String) -> ToolResult {
+    ToolResult::err_with_output(
+        message.clone(),
+        json!({ "code": code, "message": message }),
+    )
+}
+
+/// First non-empty line of command stderr, bounded — enough to diagnose,
+/// short enough not to spend model context on a stack of Git noise.
+fn first_line(stderr: &str) -> String {
+    stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .chars()
+        .take(200)
+        .collect()
+}
+
+/// Build the tracked-file listing command.
+///
+/// `git rev-parse` guards the pipeline so "not a repository" arrives as a
+/// distinct exit code rather than as an empty listing that looks like an empty
+/// project. Exit contract: 2 = no usable `head`, 3 = not a Git repository.
+pub(crate) fn list_tracked_files_command(scope: &str) -> String {
+    list_tracked_files_command_with_head_fallbacks(scope, DEFAULT_SEARCH_HEAD_ABSOLUTE_CANDIDATES)
+}
+
+pub(crate) fn list_tracked_files_command_with_head_fallbacks(
+    scope: &str,
+    absolute_head_candidates: &[&str],
+) -> String {
+    let head_setup = search_head_resolution_shell(absolute_head_candidates);
+    // `:(literal)` disables pathspec globbing, so a directory named `*` or
+    // `[a]` scopes to itself instead of matching siblings.
+    let pathspec = if scope.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " -- {}",
+            shell_escape_simple(&format!(":(literal){}", scope.trim_end_matches('/')))
+        )
+    };
+    format!(
+        r#"{head_setup}if git rev-parse --git-dir >/dev/null 2>&1; then
+  git ls-files -z --cached{pathspec} | "$head_cmd" -c {LIST_TRACKED_MAX_BYTES}
+else
+  exit 3
+fi"#
+    )
+}
+
 pub(crate) fn search_project_text_command(options: &SearchOptions) -> String {
     search_project_text_command_with_head_fallbacks(
         options,
@@ -3665,6 +3730,155 @@ impl ToolRuntime {
             "entries": entries,
             "truncated": truncated,
         }))
+    }
+
+    /// `list_project_tracked_files`: enumerate what the project actually
+    /// contains, using the Git index as the definition of "contains".
+    ///
+    /// Deliberately not `read_dir` (which `list_project_files` uses): a
+    /// filesystem walk of a real project descends into `.venv`, `target`, and
+    /// datasets, and reports tool state such as `.opencode/` as project
+    /// content. `git ls-files` is the same definition `files_search`, project
+    /// detection, and workspace provenance already use, so all four agree on
+    /// what belongs to the project.
+    ///
+    /// The agent runs one deterministic command; scope, globs, rollup, and
+    /// pagination are decided server-side in [`super::file_listing`].
+    pub(crate) async fn list_project_tracked_files(
+        &self,
+        project: String,
+        path: Option<String>,
+        globs: Option<Vec<String>>,
+        depth: Option<usize>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> ToolResult {
+        let scope_input = path.as_deref().unwrap_or("").trim().to_string();
+        if !scope_input.is_empty() && scope_input != "." {
+            if let Err(error) = validate_project_relative_path(&scope_input) {
+                return list_tracked_error("invalid_path", error);
+            }
+        }
+        let globs = globs.unwrap_or_default();
+        if globs.len() > 20 {
+            return list_tracked_error(
+                "invalid_globs",
+                "at most 20 globs are accepted".to_string(),
+            );
+        }
+        if let Some(bad) = globs
+            .iter()
+            .find(|glob| glob.is_empty() || glob.len() > 256 || glob.contains('\0'))
+        {
+            return list_tracked_error(
+                "invalid_globs",
+                format!("glob must be 1..=256 bytes without NUL: {bad:?}"),
+            );
+        }
+        let scope = super::file_listing::normalize_scope(Some(&scope_input));
+        let limit = limit.unwrap_or(200).clamp(1, 1000);
+        let offset = offset.unwrap_or(0);
+        let depth = depth.map(|depth| depth.clamp(1, 16));
+
+        let proj = match self.resolve_project(&project).await {
+            Ok(project) => project,
+            Err(error) => return ToolResult::err(error),
+        };
+        let command = list_tracked_files_command(&scope);
+        let (raw, exit_code, stderr) = if proj.is_agent() {
+            let client_id = match proj.agent_client_id() {
+                Ok(client_id) => client_id.to_string(),
+                Err(error) => return ToolResult::err(error),
+            };
+            let (request_id, rx) = match self
+                .shell_clients
+                .enqueue_run(
+                    ShellRunRequest {
+                        client_id,
+                        cwd: Some(proj.path.clone()),
+                        command,
+                        stdin: None,
+                        timeout_secs: LIST_TRACKED_TIMEOUT_SECS,
+                        wait_timeout_secs: LIST_TRACKED_TIMEOUT_SECS + 5,
+                    },
+                    "tool_runtime".to_string(),
+                )
+                .await
+            {
+                Ok(pending) => pending,
+                Err(error) => return ToolResult::err(error),
+            };
+            match tokio::time::timeout(
+                Duration::from_secs(LIST_TRACKED_TIMEOUT_SECS + 10),
+                rx,
+            )
+            .await
+            {
+                Ok(Ok(response)) => (
+                    response.stdout.unwrap_or_default(),
+                    response.exit_code,
+                    response.stderr.unwrap_or_default(),
+                ),
+                Ok(Err(_)) => {
+                    self.shell_clients.cancel_request(&request_id).await;
+                    return list_tracked_error(
+                        "list_request_dropped",
+                        "the agent request was dropped before a listing arrived".to_string(),
+                    );
+                }
+                Err(_) => {
+                    self.shell_clients.cancel_request(&request_id).await;
+                    return list_tracked_error(
+                        "list_timeout",
+                        "timed out waiting for the project file listing".to_string(),
+                    );
+                }
+            }
+        } else {
+            match run_command_sync_bounded(command, proj.root(), LIST_TRACKED_TIMEOUT_SECS).await {
+                Ok((exit_code, stdout, stderr, _)) => (stdout, Some(exit_code), stderr),
+                Err(LocalRunFailure::HardTimeout { bound_secs: _ }) => {
+                    return list_tracked_error(
+                        "list_timeout",
+                        "timed out waiting for the project file listing".to_string(),
+                    )
+                }
+                Err(LocalRunFailure::Join(error)) => {
+                    return ToolResult::err(format!("task join error: {error}"))
+                }
+            }
+        };
+
+        // Exit codes are the command's own contract (see
+        // `list_tracked_files_command`): 2 = no usable `head`, 3 = not a Git
+        // repository, 141 = SIGPIPE once `head` closed a large stream early.
+        match exit_code {
+            Some(3) => {
+                return list_tracked_error(
+                    "not_a_git_repository",
+                    "this project is not a Git repository, so its tracked-file index cannot be read"
+                        .to_string(),
+                )
+            }
+            Some(2) => {
+                return list_tracked_error(
+                    "list_unavailable",
+                    "the agent host has no usable head command to bound the listing".to_string(),
+                )
+            }
+            Some(0) | Some(141) | None => {}
+            Some(code) => {
+                return list_tracked_error(
+                    "list_failed",
+                    format!("listing command failed with exit {code}: {}", first_line(&stderr)),
+                )
+            }
+        }
+
+        let (paths, list_truncated) = super::file_listing::parse_nul_separated(&raw);
+        let listing =
+            super::file_listing::build_listing(&paths, &scope, &globs, depth, limit, offset);
+        ToolResult::ok(listing.to_json(&project, &scope, list_truncated))
     }
 
     /// `project_overview`: deterministic, bounded project metadata routed to

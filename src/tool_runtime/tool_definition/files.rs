@@ -35,6 +35,21 @@ pub(super) const SEARCH_DEFINITIONS: &[ToolDefinition] = &[
         false,
     ),
     def(
+        "list_project_tracked_files",
+        ModelVisible,
+        TOOL_CATEGORY_FILE,
+        // Runs `git ls-files` on the agent, so the shell capability is what
+        // the agent must actually hold — not FileRead's directory op.
+        Some(Shell),
+        TOOL_PROVIDER_AGENT,
+        ReadOnly,
+        Some(PROJECT_READ),
+        true,
+        NoPath,
+        false,
+        false,
+    ),
+    def(
         "search_project_text",
         ModelVisible,
         TOOL_CATEGORY_FILE,

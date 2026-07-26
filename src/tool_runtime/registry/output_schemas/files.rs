@@ -41,6 +41,67 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ),
             ),
         ])),
+        "list_project_tracked_files" => Some(wrapped_output_schema(vec![
+            ("project", schema_type("string", "Resolved project id.")),
+            (
+                "path",
+                schema_type("string", "Project-relative scope; empty means project root."),
+            ),
+            (
+                "entries",
+                array_schema(
+                    tracked_list_entry_schema(),
+                    "Tracked files, plus rolled-up directories carrying file_count.",
+                ),
+            ),
+            ("returned", schema_type("integer", "Entries in this page.")),
+            (
+                "total_files",
+                schema_type("integer", "Tracked files matching scope and globs, before rollup."),
+            ),
+            (
+                "total_entries",
+                schema_type("integer", "Entries after rollup, before paging."),
+            ),
+            (
+                "depth",
+                nullable_schema(
+                    "integer",
+                    "Effective rollup depth; null means every matching file is listed individually.",
+                ),
+            ),
+            (
+                "depth_auto",
+                schema_type(
+                    "boolean",
+                    "True when depth was chosen automatically because the flat list exceeded limit.",
+                ),
+            ),
+            (
+                "truncated",
+                schema_type("boolean", "Whether more entries remain on a later page."),
+            ),
+            (
+                "next_offset",
+                nullable_schema("integer", "Offset that continues the listing; null when complete."),
+            ),
+            (
+                "list_truncated",
+                schema_type(
+                    "boolean",
+                    "True when the raw index listing hit the transport cap, so total_files undercounts. Distinct from truncated, which is paging.",
+                ),
+            ),
+            (
+                "source",
+                schema_type("string", "Listing source; git_index."),
+            ),
+            (
+                "code",
+                schema_type("string", "Stable structured error code on failure."),
+            ),
+            ("message", schema_type("string", "Structured failure message.")),
+        ])),
         "read_file" => Some(wrapped_output_schema(vec![
             ("content", schema_type("string", "File content.")),
             ("path", schema_type("string", "Project-relative path.")),
@@ -310,6 +371,27 @@ fn search_file_result_schema() -> Value {
         },
         "required": ["path"],
         "additionalProperties": false,
+    })
+}
+
+fn tracked_list_entry_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "A tracked file, or a directory standing in for the files rolled up beneath it.",
+        "properties": {
+            "path": schema_type("string", "Project-relative path; rolled-up directories keep a trailing slash."),
+            "kind": {
+                "type": "string",
+                "enum": ["file", "dir"],
+                "description": "Entry kind."
+            },
+            "file_count": schema_type(
+                "integer",
+                "Tracked files beneath a rolled-up directory; absent for files.",
+            ),
+        },
+        "required": ["path", "kind"],
+        "additionalProperties": false
     })
 }
 

@@ -451,6 +451,7 @@ impl ToolRuntime {
             call @ (ToolCall::DeleteProjectFiles { .. }
             | ToolCall::ReadFile { .. }
             | ToolCall::ListProjectFiles { .. }
+            | ToolCall::ListProjectTrackedFiles { .. }
             | ToolCall::ProjectOverview { .. }
             | ToolCall::SearchProjectText { .. }
             | ToolCall::ReplaceInFile { .. }

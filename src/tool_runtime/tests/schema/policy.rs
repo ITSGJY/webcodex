@@ -503,6 +503,11 @@ fn required_agent_capability_matches_metadata_risk_table() {
             AgentCapability::FileRead,
         ),
         (
+            "list_project_tracked_files",
+            ToolRisk::ReadOnly,
+            AgentCapability::Shell,
+        ),
+        (
             "search_project_text",
             ToolRisk::ReadOnly,
             AgentCapability::Shell,

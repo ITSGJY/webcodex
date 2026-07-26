@@ -513,6 +513,10 @@ impl ConnectorRuntime {
                 self.task_start(arguments, &subject_id, auth, transport, now)
                     .await
             }
+            "files_list" => {
+                self.files_list(arguments, &subject_id, auth, transport, now)
+                    .await
+            }
             "files_read" => {
                 self.files_read(arguments, &subject_id, auth, transport, now)
                     .await
@@ -824,6 +828,79 @@ impl ConnectorRuntime {
             Err(outcome) => return outcome,
         };
         ConnectorCallOutcome::success_at(&task, cursor, json!({ "files": results }))
+    }
+
+    /// Discovery: what does this project contain?
+    ///
+    /// Read-only and available in `read_only` tasks, which have no shell — so
+    /// for those this is the only way to learn the project's shape instead of
+    /// guessing paths for `files_read`.
+    async fn files_list(
+        &self,
+        arguments: Value,
+        subject_id: &str,
+        auth: &AuthContext,
+        transport: ConnectorTransport,
+        now: i64,
+    ) -> ConnectorCallOutcome {
+        let input: FilesListInput = match parse_input("files_list", arguments) {
+            Ok(input) => input,
+            Err(outcome) => return outcome,
+        };
+        if let Some(path) = input.path.as_deref() {
+            if let Err(message) = validate_path(path) {
+                return invalid_input("files_list", message);
+            }
+        }
+        if input.globs.len() > 20 {
+            return invalid_input("files_list", "globs are limited to 20 entries");
+        }
+        if input
+            .globs
+            .iter()
+            .any(|glob| glob.is_empty() || glob.len() > 256)
+        {
+            return invalid_input("files_list", "each glob must be 1..=256 bytes");
+        }
+        if input.limit.is_some_and(|limit| !(1..=1000).contains(&limit)) {
+            return invalid_input("files_list", "limit must be 1..=1000");
+        }
+        if input.depth.is_some_and(|depth| !(1..=16).contains(&depth)) {
+            return invalid_input("files_list", "depth must be 1..=16");
+        }
+        let task = match self.active_task(&input.task_id, subject_id) {
+            Ok(task) => task,
+            Err(outcome) => return outcome,
+        };
+        let args = json!({
+            "project": task.execution_executor_ref,
+            "path": input.path,
+            "globs": input.globs,
+            "depth": input.depth,
+            "limit": input.limit.unwrap_or(200),
+            "offset": input.offset.unwrap_or(0),
+        });
+        match self
+            .invoke_kernel("list_project_tracked_files", args, &task, auth, transport)
+            .await
+        {
+            Ok(output) => {
+                let cursor = match self.record_event(
+                    &task,
+                    "files_list",
+                    json!({ "ok": true, "returned": output.get("returned").cloned() }),
+                    now,
+                ) {
+                    Ok(cursor) => cursor,
+                    Err(outcome) => return outcome,
+                };
+                ConnectorCallOutcome::success_at(&task, cursor, output)
+            }
+            Err(error) => {
+                let cursor = self.record_event(&task, "files_list", json!({ "ok": false }), now);
+                self.kernel_error_outcome(error, &task, cursor, Value::Null)
+            }
+        }
     }
 
     async fn files_search(
@@ -3340,6 +3417,22 @@ struct FileReadInput {
     limit: Option<usize>,
     #[serde(default)]
     with_line_numbers: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FilesListInput {
+    task_id: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    globs: Vec<String>,
+    #[serde(default)]
+    depth: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]

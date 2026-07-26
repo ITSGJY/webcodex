@@ -13,6 +13,7 @@ mod coding_task_tools;
 mod discovery_tools;
 mod dispatch;
 mod edit_tool_telemetry;
+mod file_listing;
 mod file_tools;
 pub(crate) mod files;
 mod git;

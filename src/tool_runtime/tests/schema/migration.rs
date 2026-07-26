@@ -144,6 +144,11 @@ fn tool_definition_runtime_tool_policy_inventory_is_stable() {
         ("job_log", "job", "none"),
         ("project_overview", "project", "current_session_fallback"),
         ("list_project_files", "file", "current_session_fallback"),
+        (
+            "list_project_tracked_files",
+            "file",
+            "current_session_fallback",
+        ),
         ("search_project_text", "file", "current_session_fallback"),
         ("git_diff_summary", "git", "current_session_fallback"),
         ("show_changes", "git", "current_session_fallback"),

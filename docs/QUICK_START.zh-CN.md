@@ -124,6 +124,7 @@ endpoint 和认证，同时保持 project binding 不变。见
 
 ```text
 task_start
+→ files_list
 → files_read 或 files_search
 → edits_apply
 → checks_run

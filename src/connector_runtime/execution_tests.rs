@@ -2824,6 +2824,100 @@ async fn unrecognized_executor_status_is_degraded_instead_of_running() {
     );
 }
 
+/// A `read_only` task has no shell, so `files_list` is its only way to learn
+/// what the project contains. It must reach the agent as a Git-index listing
+/// and come back rolled up, not as a filesystem walk.
+#[tokio::test]
+async fn read_only_files_list_reaches_the_agent_as_a_git_index_listing() {
+    let fixture = fixture(20).await;
+    let started = fixture
+        .call(
+            "task_start",
+            json!({ "goal": "understand the project", "mode": "read_only" }),
+        )
+        .await;
+    let task_id = started.body["task_id"].as_str().unwrap().to_string();
+
+    let list_connector = fixture.connector.clone();
+    let list_owner = fixture.owner.clone();
+    let list_task = task_id.clone();
+    let listing = tokio::spawn(async move {
+        call(
+            &list_connector,
+            &list_owner,
+            "files_list",
+            json!({ "task_id": list_task, "depth": 1 }),
+        )
+        .await
+    });
+
+    let request = next_request(&fixture.registry).await;
+    // The agent is asked for the index, never for a directory walk: that is
+    // what keeps .venv and target out of the answer.
+    assert!(
+        request.command.contains("git ls-files -z --cached"),
+        "{}",
+        request.command
+    );
+    assert!(
+        request.command.contains("git rev-parse --git-dir"),
+        "a non-repository must be distinguishable from an empty project: {}",
+        request.command
+    );
+    fixture
+        .registry
+        .complete(ShellAgentResultRequest {
+            client_id: "hosted".into(),
+            agent_instance_id: "instance".into(),
+            request_id: request.request_id,
+            exit_code: Some(0),
+            stdout: Some("README.md\0src/main.rs\0src/db/mod.rs\0".to_string()),
+            stderr: None,
+            duration_ms: Some(2),
+            error: None,
+        })
+        .await
+        .unwrap();
+
+    let outcome = listing.await.unwrap();
+    assert!(outcome.ok, "{}", outcome.body);
+    let data = &outcome.body["data"];
+    assert_eq!(data["source"], "git_index");
+    assert_eq!(data["total_files"], 3);
+    assert_eq!(
+        data["entries"],
+        json!([
+            { "path": "README.md", "kind": "file" },
+            { "path": "src/", "kind": "dir", "file_count": 2 },
+        ])
+    );
+}
+
+/// Bad input must be refused before an agent request exists, so a malformed
+/// call cannot occupy the executor.
+#[tokio::test]
+async fn files_list_rejects_out_of_range_input_without_reaching_the_agent() {
+    let fixture = fixture(20).await;
+    let started = fixture
+        .call("task_start", json!({ "goal": "inspect", "mode": "read_only" }))
+        .await;
+    let task_id = started.body["task_id"].as_str().unwrap().to_string();
+
+    for arguments in [
+        json!({ "task_id": task_id, "depth": 0 }),
+        json!({ "task_id": task_id, "limit": 5000 }),
+        json!({ "task_id": task_id, "path": "../escape" }),
+        json!({ "task_id": task_id, "globs": [""] }),
+    ] {
+        let outcome = fixture.call("files_list", arguments.clone()).await;
+        assert!(!outcome.ok, "{arguments} should be rejected: {}", outcome.body);
+    }
+    assert!(
+        poll(&fixture.registry).await.is_none(),
+        "rejected input must not reach the agent"
+    );
+}
+
 /// A read_only task must refuse commands before any durable trace exists.
 ///
 /// The sandbox route made this conditional on an agent capability, which meant
