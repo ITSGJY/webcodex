@@ -16,6 +16,7 @@ pub(crate) const CONSOLE_ROUTES: &[&str] = &[
     "/api/console/activity",
     "/api/console/task/review",
     "/api/console/task/cancel",
+    "/api/console/task/guide",
     "/api/console/result/accept",
     "/api/console/result/reject",
 ];
@@ -27,6 +28,7 @@ pub(crate) fn routes() -> Router {
         .push(Router::with_path("activity").post(activity))
         .push(Router::with_path("task/review").post(task_review))
         .push(Router::with_path("task/cancel").post(task_cancel))
+        .push(Router::with_path("task/guide").post(task_guide))
         .push(Router::with_path("result/accept").post(result_accept))
         .push(Router::with_path("result/reject").post(result_reject))
 }
@@ -151,6 +153,27 @@ async fn task_review(req: &mut Request, depot: &mut Depot, res: &mut Response) {
         return invalid(res, "invalid review input");
     }
     render(res, runtime.host_review(&auth, input).await);
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuideInput {
+    task_id: String,
+    message: String,
+}
+
+#[handler]
+async fn task_guide(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let (runtime, _) = prepare!(req, depot, res);
+    let input = parse!(GuideInput, req, res);
+    let message = input.message.trim();
+    if validate_opaque_id(&input.task_id, "wc_task_", "task_id").is_err()
+        || message.is_empty()
+        || message.len() > 2000
+    {
+        return invalid(res, "guidance message must be 1..=2000 bytes");
+    }
+    render(res, runtime.host_guide(&input.task_id, message));
 }
 
 #[handler]

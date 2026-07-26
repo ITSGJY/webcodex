@@ -35,6 +35,11 @@ pub(crate) enum TaskCliCommand {
         limit: usize,
         json: bool,
     },
+    Guide {
+        location: TaskLocationOptions,
+        task_id: String,
+        message: String,
+    },
     Show {
         location: TaskLocationOptions,
         task_id: String,
@@ -69,6 +74,7 @@ pub(crate) fn usage() -> &'static str {
 Commands:\n\
   list                       List recent tasks for this project\n\
   activity                   Show recent mutating tool executions (workspace ledger)\n\
+  guide TASK_ID MESSAGE      Send course-correcting guidance to the running task\n\
   show TASK_ID               Show result, approvals, and timeline\n\
   accept TASK_ID             Apply a reviewed result to this checkout\n\
   reject TASK_ID             Reject the stable result; release matching leftover slot\n\
@@ -148,6 +154,25 @@ pub(crate) fn parse(args: &[String]) -> Result<TaskCliCommand, String> {
             json: json_output,
         }),
         "activity" => Err("task activity accepts no positional arguments".to_string()),
+        "guide" => {
+            if positional.len() != 2 {
+                return Err("task guide requires TASK_ID and one quoted MESSAGE".to_string());
+            }
+            if limit_set || json_output {
+                return Err("--limit/--json are not valid with task guide".to_string());
+            }
+            let task_id = positional.remove(0);
+            let message = positional.remove(0);
+            let message = message.trim().to_string();
+            if message.is_empty() || message.len() > 2000 {
+                return Err("guidance message must be 1..=2000 bytes".to_string());
+            }
+            Ok(TaskCliCommand::Guide {
+                location,
+                task_id,
+                message,
+            })
+        }
         "show" | "accept" | "reject" | "resume" => {
             if positional.len() != 1 {
                 return Err(format!("task {operation} requires exactly one TASK_ID"));
@@ -261,6 +286,29 @@ pub(crate) fn run(command: TaskCliCommand) -> Result<String, String> {
                 }
                 Ok(output)
             }
+        }
+        TaskCliCommand::Guide {
+            location,
+            task_id,
+            message,
+        } => {
+            let (state, db) = open_state(&location)?;
+            let task = db
+                .local_connector_task(&task_id, &state.logical_project_id)
+                .map_err(store_error)?;
+            let sequence = db
+                .append_connector_task_event(
+                    &task.task_id,
+                    &state.logical_project_id,
+                    &task.owner_subject_id,
+                    "human_guidance",
+                    &json!({ "message": message, "source": "host_cli" }),
+                    chrono::Utc::now().timestamp(),
+                )
+                .map_err(store_error)?;
+            Ok(format!(
+                "Guidance recorded as event #{sequence}. The model receives it inside its next capability response for this task.\n"
+            ))
         }
         TaskCliCommand::Show { location, task_id } => {
             let (state, db) = open_state(&location)?;

@@ -1067,6 +1067,7 @@ impl ConnectorRuntime {
                     Ok(cursor) => cursor,
                     Err(outcome) => return outcome,
                 };
+                self.attach_pending_guidance(&task, &mut output);
                 ConnectorCallOutcome::success_at(&task, cursor, output)
             }
             Err(error) => {
@@ -1458,10 +1459,12 @@ impl ConnectorRuntime {
         match result {
             Ok(execution) => {
                 let projection = self.executions.projection(&execution, auth, true).await;
+                let mut data = json!({ "execution": projection });
+                self.attach_pending_guidance(&current, &mut data);
                 ConnectorCallOutcome::success_blocking_at(
                     &current,
                     current.event_cursor,
-                    json!({ "execution": projection }),
+                    data,
                     execution.blocks_finish(),
                 )
             }
@@ -1667,6 +1670,7 @@ impl ConnectorRuntime {
         data["recent_events"] = json!(events);
         data["heartbeat"] = json!(review.heartbeat);
         data["next_action"] = json!(next_action);
+        self.attach_pending_guidance(&task, &mut data);
         ConnectorCallOutcome::success_blocking_at(&task, task.event_cursor, data, blocking)
     }
 
@@ -2030,6 +2034,81 @@ impl ConnectorRuntime {
             ));
         }
         Ok(task)
+    }
+
+    /// Attach human guidance recorded since the last delivery, so a finished
+    /// capability call comes back carrying the operator's course correction.
+    /// Deliver-once via the task watermark; a failed watermark advance means
+    /// at-least-once delivery, never a lost message.
+    fn attach_pending_guidance(&self, task: &ConnectorTaskSnapshot, data: &mut Value) {
+        let Ok(seen) = self.db.guidance_seen_seq(
+            &task.task_id,
+            &self.context.project_id,
+            &task.owner_subject_id,
+        ) else {
+            return;
+        };
+        let Ok(events) = self.db.connector_task_events(
+            &task.task_id,
+            &self.context.project_id,
+            &task.owner_subject_id,
+            MAX_EVENT_COUNT,
+        ) else {
+            return;
+        };
+        let pending: Vec<Value> = events
+            .iter()
+            .filter(|event| event.kind == "human_guidance" && event.sequence > seen)
+            .map(|event| {
+                json!({
+                    "sequence": event.sequence,
+                    "message": event.payload["message"],
+                    "created_at": event.created_at,
+                })
+            })
+            .collect();
+        let Some(max_seq) = pending
+            .iter()
+            .filter_map(|entry| entry["sequence"].as_i64())
+            .max()
+        else {
+            return;
+        };
+        let _ = self.db.advance_guidance_seen_seq(
+            &task.task_id,
+            &self.context.project_id,
+            &task.owner_subject_id,
+            max_seq,
+        );
+        data["guidance"] = json!(pending);
+        data["guidance_note"] =
+            json!("Human guidance from the project owner — adjust course before continuing.");
+    }
+
+    /// Host-side entry: record a human guidance message on a task. Delivered
+    /// to the model inside its next capability response for this task.
+    pub(crate) fn host_guide(&self, task_id: &str, message: &str) -> ConnectorCallOutcome {
+        let task = match self
+            .db
+            .local_connector_task(task_id, &self.context.project_id)
+        {
+            Ok(task) => task,
+            Err(error) => return store_error_outcome(error, None),
+        };
+        let now = chrono::Utc::now().timestamp();
+        match self.record_event(
+            &task,
+            "human_guidance",
+            json!({ "message": message, "source": "host" }),
+            now,
+        ) {
+            Ok(cursor) => ConnectorCallOutcome::success_at(
+                &task,
+                cursor,
+                json!({ "recorded": true, "sequence": cursor }),
+            ),
+            Err(outcome) => outcome,
+        }
     }
 
     fn record_event(

@@ -3192,3 +3192,87 @@ async fn manifestless_python_unittest_checks_finish_with_clean_result() {
     .trim()
     .is_empty());
 }
+
+#[tokio::test]
+async fn guidance_is_delivered_once_inside_the_next_capability_response() {
+    let fixture = fixture(20).await;
+    // Keep an execution active so task_review stays on the deferred branch
+    // (no workspace scan) for both polls.
+    let arguments = approve(&fixture, "guided-review-1", "sleep 30").await;
+    let connector = fixture.connector.clone();
+    let owner = fixture.owner.clone();
+    let command_call =
+        tokio::spawn(async move { call(&connector, &owner, "commands_run", arguments).await });
+    let start = next_request(&fixture.registry).await;
+    let job_id = start.job_id.unwrap();
+    update_job(&fixture.registry, &job_id, "running", None, None).await;
+    assert!(command_call.await.unwrap().ok);
+
+    let guided = fixture
+        .connector
+        .host_guide(&fixture.task_id, "focus on the parser first");
+    assert!(guided.ok, "{}", guided.body);
+
+    // The next capability response carries the guidance…
+    let review = fixture
+        .call("task_review", json!({"task_id": fixture.task_id}))
+        .await;
+    assert!(review.ok, "{}", review.body);
+    let guidance = review.body["data"]["guidance"]
+        .as_array()
+        .expect("guidance list");
+    assert_eq!(guidance.len(), 1);
+    assert_eq!(guidance[0]["message"], "focus on the parser first");
+    assert!(review.body["data"]["guidance_note"].is_string());
+
+    // …and exactly once: the following response does not repeat it, while
+    // the durable event stays visible in the timeline for humans.
+    let second = fixture
+        .call("task_review", json!({"task_id": fixture.task_id}))
+        .await;
+    assert!(second.ok, "{}", second.body);
+    assert!(second.body["data"]["guidance"].is_null());
+    let events = second.body["data"]["recent_events"].as_array().unwrap();
+    assert!(events.iter().any(|event| event["kind"] == "human_guidance"));
+
+    // Release the workspace slot.
+    let stop_registry = fixture.registry.clone();
+    let stop_job = job_id.clone();
+    let stopper = tokio::spawn(async move {
+        let stop = next_request(&stop_registry).await;
+        assert_eq!(stop.kind, "stop_job");
+        update_job(&stop_registry, &stop_job, "stopped", None, Some(-1)).await;
+    });
+    let cancelled = fixture
+        .call("task_cancel", json!({"task_id": fixture.task_id}))
+        .await;
+    assert!(cancelled.ok, "{}", cancelled.body);
+    stopper.await.unwrap();
+}
+
+#[tokio::test]
+async fn finished_command_response_carries_pending_guidance() {
+    let fixture = fixture(1_000).await;
+    let arguments = approve(&fixture, "guided-cmd-1", "printf done").await;
+    let connector = fixture.connector.clone();
+    let owner = fixture.owner.clone();
+    let command_call =
+        tokio::spawn(async move { call(&connector, &owner, "commands_run", arguments).await });
+    let start = next_request(&fixture.registry).await;
+    let job_id = start.job_id.unwrap();
+    // Operator guidance lands while the command is still running; the
+    // completed command's own response must carry it back to the model.
+    assert!(
+        fixture
+            .connector
+            .host_guide(&fixture.task_id, "stop after this and run the tests")
+            .ok
+    );
+    update_job(&fixture.registry, &job_id, "completed", None, Some(0)).await;
+    let completed = command_call.await.unwrap();
+    assert!(completed.ok, "{}", completed.body);
+    let guidance = completed.body["data"]["guidance"]
+        .as_array()
+        .expect("guidance on command completion");
+    assert_eq!(guidance[0]["message"], "stop after this and run the tests");
+}

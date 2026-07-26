@@ -500,6 +500,7 @@ impl Database {
         // layouts are unsupported (recreate the OAuth tables if needed).
         Self::ensure_users_and_api_key_columns(&conn)?;
         Self::ensure_connector_execution_columns(&conn)?;
+        Self::ensure_connector_task_columns(&conn)?;
         Ok(())
     }
 
@@ -552,6 +553,22 @@ impl Database {
                     [],
                 )?;
             }
+        }
+        Ok(())
+    }
+
+    fn ensure_connector_task_columns(conn: &Connection) -> anyhow::Result<()> {
+        let columns = table_columns(conn, "wc_tasks")?;
+        // Watermark for deliver-once human guidance: capability responses
+        // attach guidance events above this sequence, then advance it.
+        if !columns
+            .iter()
+            .any(|existing| existing == "guidance_seen_seq")
+        {
+            conn.execute(
+                "ALTER TABLE wc_tasks ADD COLUMN guidance_seen_seq INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
         }
         Ok(())
     }

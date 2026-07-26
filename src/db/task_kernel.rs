@@ -687,6 +687,46 @@ impl Database {
         Ok(sequence)
     }
 
+    /// Deliver-once watermark for human guidance attached to capability
+    /// responses. Reads/advances are scoped like every other task accessor.
+    pub(crate) fn guidance_seen_seq(
+        &self,
+        task_id: &str,
+        project_id: &str,
+        subject_id: &str,
+    ) -> Result<i64, ConnectorTaskStoreError> {
+        let conn = self.conn.lock().unwrap();
+        if load_task(&conn, task_id, project_id, subject_id)?.is_none() {
+            return Err(ConnectorTaskStoreError::NotFound);
+        }
+        conn.query_row(
+            "SELECT guidance_seen_seq FROM wc_tasks WHERE id = ?1 AND project_id = ?2",
+            rusqlite::params![task_id, project_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| ConnectorTaskStoreError::Storage(error.into()))
+    }
+
+    pub(crate) fn advance_guidance_seen_seq(
+        &self,
+        task_id: &str,
+        project_id: &str,
+        subject_id: &str,
+        seq: i64,
+    ) -> Result<(), ConnectorTaskStoreError> {
+        let conn = self.conn.lock().unwrap();
+        if load_task(&conn, task_id, project_id, subject_id)?.is_none() {
+            return Err(ConnectorTaskStoreError::NotFound);
+        }
+        conn.execute(
+            "UPDATE wc_tasks SET guidance_seen_seq = MAX(guidance_seen_seq, ?3)
+             WHERE id = ?1 AND project_id = ?2",
+            rusqlite::params![task_id, project_id, seq],
+        )
+        .map_err(|error| ConnectorTaskStoreError::Storage(error.into()))?;
+        Ok(())
+    }
+
     pub(crate) fn connector_task_events(
         &self,
         task_id: &str,
