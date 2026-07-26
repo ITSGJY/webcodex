@@ -105,6 +105,7 @@ pub(crate) struct ShellJobStartMetadata {
     pub(crate) project_id: Option<String>,
     pub(crate) session_id: Option<String>,
     pub(crate) validation_steps: Vec<ShellJobValidationStep>,
+    pub(crate) sandbox: Option<String>,
 }
 
 impl ShellClientRegistry {
@@ -154,6 +155,7 @@ impl ShellClientRegistry {
         let request_id = next_request_id();
         let job_id = Uuid::new_v4().to_string();
         let created_at = now_ts();
+        let sandbox = metadata.sandbox;
         let validation_steps = metadata.validation_steps;
         if validation_steps.len() > 3
             || validation_steps.iter().any(|step| !step.is_canonical())
@@ -201,6 +203,7 @@ impl ShellClientRegistry {
             created_at,
             validation: None,
             lsp: None,
+            sandbox,
         };
         let mut inner = self.inner.lock().await;
         let Some(client) = inner.clients.get(&client_id) else {
@@ -456,6 +459,7 @@ impl ShellClientRegistry {
                     created_at: now_ts(),
                     validation: None,
                     lsp: None,
+                    sandbox: None,
                 };
                 enqueue_pending_request_locked(
                     &mut inner,

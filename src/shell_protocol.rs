@@ -532,6 +532,12 @@ pub struct ShellAgentShellRequest {
     /// Defaults to `None` so older request bodies continue to deserialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lsp: Option<crate::lsp_bridge::AgentLspPayload>,
+    /// Kernel sandbox mode for this request ("read_only"): the agent must
+    /// deny project writes at spawn. Absent on the wire when unset so older
+    /// agents keep parsing; the server only sets it for agents that
+    /// advertised enforcement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1282,6 +1288,7 @@ mod envelope_tests {
             created_at: 123,
             validation: None,
             lsp: None,
+            sandbox: None,
         };
         let env = AgentEnvelope::Request { request };
         let json = env.to_json().unwrap();

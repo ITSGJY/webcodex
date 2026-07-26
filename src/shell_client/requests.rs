@@ -155,6 +155,7 @@ impl ShellClientRegistry {
             created_at: now_ts(),
             validation: None,
             lsp: None,
+            sandbox: None,
         };
         let mut inner = self.inner.lock().await;
         enqueue_pending_request_locked(
@@ -201,6 +202,7 @@ impl ShellClientRegistry {
             created_at: now_ts(),
             validation: None,
             lsp: None,
+            sandbox: None,
         };
         let mut inner = self.inner.lock().await;
         enqueue_pending_request_locked(
@@ -270,6 +272,7 @@ impl ShellClientRegistry {
             created_at: now_ts(),
             validation: None,
             lsp: None,
+            sandbox: None,
         };
         let mut inner = self.inner.lock().await;
         enqueue_pending_request_locked(
@@ -332,6 +335,7 @@ impl ShellClientRegistry {
             created_at: now_ts(),
             validation: None,
             lsp: Some(payload),
+            sandbox: None,
         };
         let mut inner = self.inner.lock().await;
         enqueue_pending_request_locked(

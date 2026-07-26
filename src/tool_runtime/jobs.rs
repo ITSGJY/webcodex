@@ -594,6 +594,7 @@ impl ToolRuntime {
         timeout_secs: Option<i64>,
         cwd: Option<String>,
         validation_steps: Vec<ShellJobValidationStep>,
+        sandbox: Option<String>,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
         let resolved = match self.resolve_project_input_for_auth(&project, auth).await {
@@ -637,6 +638,7 @@ impl ToolRuntime {
                         project_id: Some(project_id.clone()),
                         session_id: session_id.clone(),
                         validation_steps,
+                        sandbox,
                     },
                     auth,
                 )

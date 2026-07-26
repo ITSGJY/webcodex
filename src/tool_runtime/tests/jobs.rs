@@ -731,6 +731,7 @@ async fn run_job_rejects_server_configured_project_without_local_spawn() {
             None,
             Vec::new(),
             None,
+            None,
         )
         .await;
     assert!(!result.success);
