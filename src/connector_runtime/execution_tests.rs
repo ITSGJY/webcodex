@@ -278,6 +278,7 @@ async fn approve(fixture: &Fixture, operation_id: &str, command: &str) -> Value 
                 .unwrap(),
             true,
             "local_cli",
+            None,
             chrono::Utc::now().timestamp(),
         )
         .unwrap();
@@ -3275,4 +3276,76 @@ async fn finished_command_response_carries_pending_guidance() {
         .as_array()
         .expect("guidance on command completion");
     assert_eq!(guidance[0]["message"], "stop after this and run the tests");
+}
+
+#[tokio::test]
+async fn denied_approval_reason_reaches_the_model() {
+    let fixture = fixture(20).await;
+    let arguments = json!({
+        "task_id": fixture.task_id,
+        "operation_id": "denied-cmd-1",
+        "command": "rm -rf target && echo done",
+        "timeout_secs": 30
+    });
+    let waiting = fixture.call("commands_run", arguments.clone()).await;
+    assert_eq!(waiting.body["error"]["code"], "approval_required");
+    let approval_id = waiting.body["data"]["approval"]["approval_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // The pending summary must show the human what would run (first line,
+    // bounded preview) — approvals are informed consent, not blind signing.
+    let summary = waiting.body["data"]["approval"]["action_summary"]
+        .as_str()
+        .unwrap();
+    assert!(
+        summary.contains("rm -rf target && echo done"),
+        "summary must carry the command preview: {summary}"
+    );
+    let pending = fixture
+        .connector
+        .db
+        .local_pending_connector_approvals(
+            &fixture.connector.context.project_id,
+            chrono::Utc::now().timestamp(),
+        )
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].0.approval_id, approval_id);
+
+    // Host denies with a reason; the model's retry carries it back.
+    fixture
+        .connector
+        .db
+        .decide_connector_approval(
+            &fixture.task_id,
+            &fixture.connector.context.project_id,
+            &approval_id,
+            false,
+            "host_console",
+            Some("use cargo clean instead of rm"),
+            chrono::Utc::now().timestamp(),
+        )
+        .unwrap();
+    let retry = fixture.call("commands_run", arguments).await;
+    assert_eq!(retry.body["error"]["code"], "approval_denied");
+    let message = retry.body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("use cargo clean instead of rm"),
+        "denial reason must reach the model: {message}"
+    );
+    assert_eq!(
+        retry.body["data"]["approval"]["decision_reason"],
+        "use cargo clean instead of rm"
+    );
+    // Decided approvals leave the pending queue.
+    let pending = fixture
+        .connector
+        .db
+        .local_pending_connector_approvals(
+            &fixture.connector.context.project_id,
+            chrono::Utc::now().timestamp(),
+        )
+        .unwrap();
+    assert!(pending.is_empty());
 }

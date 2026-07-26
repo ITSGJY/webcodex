@@ -1385,15 +1385,19 @@ impl ConnectorRuntime {
                     }
                 };
                 let action_hash = command_action_hash(&request_sha256, &precondition);
+                // The human decides on this summary: it must show what runs.
+                // The preview is first-line/120-char bounded, never the full
+                // command body.
                 let action_summary = format!(
-                    "raw project command ({} bytes{}, workspace {})",
+                    "raw project command ({} bytes{}, workspace {}): {}",
                     input.command.len(),
                     input
                         .cwd
                         .as_deref()
                         .map(|cwd| format!(", cwd {cwd}"))
                         .unwrap_or_default(),
-                    short_oid(&precondition)
+                    short_oid(&precondition),
+                    crate::shell_client::command_preview(&input.command)
                 );
                 let gate = match self.db.request_or_consume_connector_approval(
                     &task.task_id,
@@ -2620,25 +2624,33 @@ fn approval_gate_outcome(
         ConnectorApprovalGate::Pending(approval) => (
             approval,
             "approval_required",
-            "this raw command is waiting for one-time approval on the WebCodex host",
+            "this raw command is waiting for one-time approval on the WebCodex host".to_string(),
             "Ask the user to approve this exact action locally, then retry commands_run unchanged.",
         ),
-        ConnectorApprovalGate::Denied(approval) => (
-            approval,
-            "approval_denied",
-            "the user denied this exact raw command",
-            "Choose a safer action or ask the user for revised instructions.",
-        ),
+        ConnectorApprovalGate::Denied(approval) => {
+            // The operator's stated reason is the course correction — put it
+            // where the model cannot miss it.
+            let message = match approval.decision_reason.as_deref() {
+                Some(reason) => format!("the user denied this exact raw command: {reason}"),
+                None => "the user denied this exact raw command".to_string(),
+            };
+            (
+                approval,
+                "approval_denied",
+                message,
+                "Choose a safer action or ask the user for revised instructions.",
+            )
+        }
         ConnectorApprovalGate::Expired(approval) => (
             approval,
             "approval_expired",
-            "the one-time approval request expired",
+            "the one-time approval request expired".to_string(),
             "Retry commands_run unchanged to create a fresh local approval window.",
         ),
         ConnectorApprovalGate::Consumed(approval) => (
             approval,
             "approval_consumed",
-            "the approval for this exact raw command was already consumed",
+            "the approval for this exact raw command was already consumed".to_string(),
             "Review the task state before proposing a different action; approvals cannot be replayed.",
         ),
         ConnectorApprovalGate::Authorized(_) => {
@@ -2664,7 +2676,7 @@ fn approval_gate_outcome(
     )
 }
 
-fn approval_projection(approval: &ConnectorApproval) -> Value {
+pub(crate) fn approval_projection(approval: &ConnectorApproval) -> Value {
     json!({
         "approval_id": approval.approval_id,
         "action_kind": approval.action_kind,
@@ -2672,7 +2684,10 @@ fn approval_projection(approval: &ConnectorApproval) -> Value {
         "action_summary": approval.action_summary,
         "state": approval.state,
         "requested_at": approval.requested_at,
-        "expires_at": approval.expires_at
+        "expires_at": approval.expires_at,
+        "decided_by": approval.decided_by,
+        "decided_at": approval.decided_at,
+        "decision_reason": approval.decision_reason
     })
 }
 

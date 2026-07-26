@@ -570,6 +570,16 @@ impl Database {
                 [],
             )?;
         }
+        let approval_columns = table_columns(conn, "wc_approvals")?;
+        if !approval_columns
+            .iter()
+            .any(|existing| existing == "decision_reason")
+        {
+            conn.execute(
+                "ALTER TABLE wc_approvals ADD COLUMN decision_reason TEXT",
+                [],
+            )?;
+        }
         Ok(())
     }
 

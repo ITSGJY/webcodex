@@ -60,11 +60,13 @@ pub(crate) enum TaskCliCommand {
         location: TaskLocationOptions,
         task_id: String,
         approval_id: String,
+        reason: Option<String>,
     },
     Deny {
         location: TaskLocationOptions,
         task_id: String,
         approval_id: String,
+        reason: Option<String>,
     },
 }
 
@@ -79,8 +81,8 @@ Commands:\n\
   accept TASK_ID             Apply a reviewed result to this checkout\n\
   reject TASK_ID             Reject the stable result; release matching leftover slot\n\
   resume TASK_ID             Resume a preserved run after runtime restart\n\
-  approve TASK_ID APPROVAL   Approve one exact raw command for one use\n\
-  deny TASK_ID APPROVAL      Deny one exact raw command\n\
+  approve TASK_ID APPROVAL [REASON]  Approve one exact raw command for one use\n\
+  deny TASK_ID APPROVAL [REASON]     Deny it; the reason is shown to the model\n\
 \n\
 Options:\n\
   --root PATH                Project path; defaults to current directory\n\
@@ -190,25 +192,36 @@ pub(crate) fn parse(args: &[String]) -> Result<TaskCliCommand, String> {
             })
         }
         "approve" | "deny" => {
-            if positional.len() != 2 {
-                return Err(format!("task {operation} requires TASK_ID and APPROVAL_ID"));
+            if !(2..=3).contains(&positional.len()) {
+                return Err(format!(
+                    "task {operation} requires TASK_ID and APPROVAL_ID, plus an optional quoted REASON"
+                ));
             }
             if limit_set || json_output {
                 return Err(format!("--limit/--json are only valid with task list"));
             }
             let task_id = positional.remove(0);
             let approval_id = positional.remove(0);
+            let reason = positional
+                .pop()
+                .map(|reason| reason.trim().to_string())
+                .filter(|reason| !reason.is_empty());
+            if reason.as_deref().is_some_and(|reason| reason.len() > 500) {
+                return Err("decision reason must be at most 500 bytes".to_string());
+            }
             Ok(if operation == "approve" {
                 TaskCliCommand::Approve {
                     location,
                     task_id,
                     approval_id,
+                    reason,
                 }
             } else {
                 TaskCliCommand::Deny {
                     location,
                     task_id,
                     approval_id,
+                    reason,
                 }
             })
         }
@@ -371,12 +384,14 @@ pub(crate) fn run(command: TaskCliCommand) -> Result<String, String> {
             location,
             task_id,
             approval_id,
-        } => decide_approval(&location, &task_id, &approval_id, true),
+            reason,
+        } => decide_approval(&location, &task_id, &approval_id, true, reason.as_deref()),
         TaskCliCommand::Deny {
             location,
             task_id,
             approval_id,
-        } => decide_approval(&location, &task_id, &approval_id, false),
+            reason,
+        } => decide_approval(&location, &task_id, &approval_id, false, reason.as_deref()),
     }
 }
 
@@ -460,6 +475,7 @@ fn decide_approval(
     task_id: &str,
     approval_id: &str,
     approve: bool,
+    reason: Option<&str>,
 ) -> Result<String, String> {
     let (state, db) = open_state(location)?;
     let approval = db
@@ -469,6 +485,7 @@ fn decide_approval(
             approval_id,
             approve,
             LOCAL_ACTOR,
+            reason,
             chrono::Utc::now().timestamp(),
         )
         .map_err(store_error)?;

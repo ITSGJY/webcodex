@@ -2,8 +2,8 @@ use crate::auth::AuthContext;
 use crate::connector_runtime::http::{render, runtime};
 use crate::connector_runtime::workspace::LocalResultDecision;
 use crate::connector_runtime::{
-    result_projection, store_error_outcome, validate_opaque_id, ConnectorCallOutcome,
-    ConnectorRuntime, TaskCancelInput, TaskReviewInput,
+    approval_projection, result_projection, store_error_outcome, validate_opaque_id,
+    ConnectorCallOutcome, ConnectorRuntime, TaskCancelInput, TaskReviewInput,
 };
 use salvo::prelude::*;
 use serde::Deserialize;
@@ -17,6 +17,8 @@ pub(crate) const CONSOLE_ROUTES: &[&str] = &[
     "/api/console/task/review",
     "/api/console/task/cancel",
     "/api/console/task/guide",
+    "/api/console/approvals",
+    "/api/console/approval/decide",
     "/api/console/result/accept",
     "/api/console/result/reject",
 ];
@@ -29,6 +31,8 @@ pub(crate) fn routes() -> Router {
         .push(Router::with_path("task/review").post(task_review))
         .push(Router::with_path("task/cancel").post(task_cancel))
         .push(Router::with_path("task/guide").post(task_guide))
+        .push(Router::with_path("approvals").post(approvals))
+        .push(Router::with_path("approval/decide").post(approval_decide))
         .push(Router::with_path("result/accept").post(result_accept))
         .push(Router::with_path("result/reject").post(result_reject))
 }
@@ -160,6 +164,71 @@ async fn task_review(req: &mut Request, depot: &mut Depot, res: &mut Response) {
 struct GuideInput {
     task_id: String,
     message: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalDecideInput {
+    task_id: String,
+    approval_id: String,
+    approve: bool,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[handler]
+async fn approvals(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let (runtime, _) = prepare!(req, depot, res);
+    match runtime.db.local_pending_connector_approvals(
+        &runtime.context().project_id,
+        chrono::Utc::now().timestamp(),
+    ) {
+        Ok(rows) => {
+            let pending: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|(approval, goal)| {
+                    let mut projection = approval_projection(approval);
+                    projection["task_id"] = json!(approval.task_id);
+                    projection["goal"] = json!(goal);
+                    projection
+                })
+                .collect();
+            res.render(Json(json!({ "approvals": pending })));
+        }
+        Err(error) => render(res, store_error_outcome(error, None)),
+    }
+}
+
+#[handler]
+async fn approval_decide(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let (runtime, _) = prepare!(req, depot, res);
+    let input = parse!(ApprovalDecideInput, req, res);
+    let reason = input
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty());
+    if validate_opaque_id(&input.task_id, "wc_task_", "task_id").is_err()
+        || validate_opaque_id(&input.approval_id, "wc_apr_", "approval_id").is_err()
+        || reason.is_some_and(|reason| reason.len() > 500)
+    {
+        return invalid(res, "invalid approval decision input");
+    }
+    match runtime.db.decide_connector_approval(
+        &input.task_id,
+        &runtime.context().project_id,
+        &input.approval_id,
+        input.approve,
+        "host_console",
+        reason,
+        chrono::Utc::now().timestamp(),
+    ) {
+        Ok(approval) => res.render(Json(json!({
+            "decision": approval.state,
+            "approval": approval_projection(&approval)
+        }))),
+        Err(error) => render(res, store_error_outcome(error, None)),
+    }
 }
 
 #[handler]

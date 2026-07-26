@@ -145,6 +145,7 @@ pub(crate) struct ConnectorApproval {
     pub decided_by: Option<String>,
     pub decided_at: Option<i64>,
     pub consumed_at: Option<i64>,
+    pub decision_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1117,6 +1118,29 @@ impl Database {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Pending, unexpired approvals across the whole project, newest first,
+    /// each with its task goal for the console approvals panel.
+    pub(crate) fn local_pending_connector_approvals(
+        &self,
+        project_id: &str,
+        now: i64,
+    ) -> Result<Vec<(ConnectorApproval, String)>, ConnectorTaskStoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT a.id, a.task_id, a.run_id, a.action_kind, a.action_hash, a.action_summary,
+                    a.state, a.requested_at, a.expires_at, a.decided_by, a.decided_at,
+                    a.consumed_at, a.decision_reason, t.goal
+             FROM wc_approvals a
+             JOIN wc_tasks t ON t.id = a.task_id
+             WHERE t.project_id = ?1 AND a.state = 'pending' AND a.expires_at > ?2
+             ORDER BY a.requested_at DESC",
+        )?;
+        let rows = statement.query_map(params![project_id, now], |row| {
+            Ok((map_approval(row)?, row.get::<_, String>(13)?))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub(crate) fn resume_connector_task(
         &self,
         task_id: &str,
@@ -1465,6 +1489,7 @@ impl Database {
         approval_id: &str,
         approve: bool,
         actor: &str,
+        reason: Option<&str>,
         now: i64,
     ) -> Result<ConnectorApproval, ConnectorTaskStoreError> {
         let mut conn = self.conn.lock().unwrap();
@@ -1500,10 +1525,12 @@ impl Database {
             ));
         }
         let state = if approve { "approved" } else { "denied" };
+        let reason = reason.map(str::trim).filter(|reason| !reason.is_empty());
         tx.execute(
-            "UPDATE wc_approvals SET state = ?1, decided_by = ?2, decided_at = ?3
+            "UPDATE wc_approvals SET state = ?1, decided_by = ?2, decided_at = ?3,
+                    decision_reason = ?5
              WHERE id = ?4 AND state = 'pending'",
-            params![state, actor, now, approval_id],
+            params![state, actor, now, approval_id, reason],
         )?;
         let cursor: i64 = tx.query_row(
             "SELECT COALESCE(MAX(sequence), 0) FROM wc_task_events WHERE task_id = ?1",
@@ -1523,7 +1550,8 @@ impl Database {
             &serde_json::json!({
                 "approval_id": approval_id,
                 "action_hash": approval.action_hash,
-                "actor": actor
+                "actor": actor,
+                "reason": reason
             }),
             now,
         )?;
@@ -1698,7 +1726,7 @@ fn load_approval(
 /// Column list backing every `wc_approvals` read that feeds `map_approval`.
 /// Order must match `map_approval`'s positional `row.get` indices.
 const APPROVAL_COLUMNS: &str = "id, task_id, run_id, action_kind, action_hash, action_summary, \
-     state, requested_at, expires_at, decided_by, decided_at, consumed_at";
+     state, requested_at, expires_at, decided_by, decided_at, consumed_at, decision_reason";
 
 fn map_approval(row: &rusqlite::Row<'_>) -> Result<ConnectorApproval, rusqlite::Error> {
     Ok(ConnectorApproval {
@@ -1714,6 +1742,7 @@ fn map_approval(row: &rusqlite::Row<'_>) -> Result<ConnectorApproval, rusqlite::
         decided_by: row.get(9)?,
         decided_at: row.get(10)?,
         consumed_at: row.get(11)?,
+        decision_reason: row.get(12)?,
     })
 }
 
@@ -2012,6 +2041,7 @@ mod tests {
                 &approval.approval_id,
                 true,
                 "local_cli",
+                None,
                 103,
             )
             .unwrap();
@@ -2108,6 +2138,7 @@ mod tests {
                 &approval.approval_id,
                 true,
                 "local_cli",
+                None,
                 104
             ),
             Err(ConnectorTaskStoreError::InvalidState(_))
