@@ -37,6 +37,53 @@ than a new test suite:
   `openapi` cover the single read representation, layered readiness, and
   project-bound versus operator surfaces.
 
+## Iteration 9 Final Acceptance
+
+The Iteration 9 close-out is a real-process, real-protocol pass, not in-process
+function calls. Run these lanes and procedures against binaries built from the
+current tree:
+
+Focused and real-process lanes:
+
+```bash
+cargo test --bin webcodex trusted_smoke
+cargo test --bin webcodex reconnect
+cargo test --bin webcodex select_lines_tests   # bounded job-log tail + non-duplicating cursor
+bash scripts/e2e_reconnect_ws.sh               # real server+runner restart/reconnect, durable session
+bash scripts/e2e_zero_config_ws.sh             # real MCP initialize/tools_list/tools_call + REST workflow
+```
+
+Real project-bound MCP and OpenAPI/HTTP acceptance against a connector-configured
+process (no operator token, no `/opt/webcodex`):
+
+```bash
+tmp=$(mktemp -d); repo="$tmp/repo"; state="$tmp/state"
+git -C "$repo" init -q 2>/dev/null || { mkdir -p "$repo"; git -C "$repo" init -q; }
+# ... seed a commit in "$repo" ...
+webcodex setup --root "$repo" --state-dir "$state" --json
+webcodex agent start --root "$repo" --state-dir "$state" &   # boots server+runner+connector
+port=$(grep -oP 'port = \K[0-9]+' "$state/project.toml")
+conn=$(cat "$state/credentials/connector-key")
+# MCP JSON-RPC: initialize, tools/list (exactly 12 canonical, no operator runtime),
+# then task_start → files_read → edits_apply → commands_run → checks_run →
+# task_review → task_finish, and task_resume after a fresh initialize:
+curl -fsS -H "Authorization: Bearer $conn" -H 'Content-Type: application/json' \
+  -X POST "http://127.0.0.1:$port/mcp" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+# OpenAPI projection is the same 12 operations:
+curl -fsS -H "Authorization: Bearer $conn" "http://127.0.0.1:$port/openapi.json"
+# Boundary: a project credential must be denied operator-only routes (HTTP 403):
+curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $conn" \
+  -H 'Content-Type: application/json' -X POST "http://127.0.0.1:$port/api/tools/call" \
+  -d '{"tool":"read_file","params":{"project":"x","path":"README.md"}}'
+```
+
+Verify `trusted_agent` auto-authorizes `commands_run` (no approval interruption)
+while `WEBCODEX_AUTHORITY_MODE=restricted agent start` makes the same call return
+`approval_required`. For the deployed-host equivalent (runtime status, authority,
+connection layers, version compatibility, shell dialect, and the finish/handoff
+smoke), see [OPERATIONS.md](OPERATIONS.md) *Post-Deployment Acceptance Smoke*.
+
 ## Default Test Principles
 
 - No external network by default. Tests that need HTTP should use in-process

@@ -13,7 +13,7 @@ This roadmap is intentionally short. Detailed boundaries, LOC/test budgets, acce
 - Hard cut from `webcodex-agent` to `webcodex-runner` across binary, service, npm command, and QUIC ALPN.
 - WebSocket and polling release acceptance, package smoke, full binary suites, and the 0.3.0 release baseline.
 
-## Current: Iteration 9 — Agent-Aligned Evidence and Task Reporting
+## Completed: Iteration 9 — Agent-Aligned Evidence and Task Reporting
 
 Keep the hosted capability surface stable. Do not make code-size reduction or smooth legacy migration a current goal. Prioritize the runtime and reporting problems exposed by real coding work:
 
@@ -41,6 +41,14 @@ Keep the hosted capability surface stable. Do not make code-size reduction or sm
 - `runtime_status.version_compatibility` diagnoses mixed server/runner versions (compatible / version_mismatch / capability_mismatch / no_runners) with per-runner build and protocol facts and no fallback shims. Runners report `process_started_at`, build version/commit, and shell profile dialects (`default_dialect`, `available_dialects`, per-profile `dialect`).
 - `start_coding_task` hard cut: the legacy startup flags are removed from the wire and internals; `detail=minimal|standard|full` is the only projection control and unknown fields error strictly.
 - New validation lanes: `cargo test --bin webcodex reconnect`, `cargo test --bin webcodex trusted_smoke`, and the real-process harness `scripts/e2e_reconnect_ws.sh`.
+
+### Stage 3 delivered — Final Acceptance and Release Readiness
+
+- Real project-bound MCP acceptance over JSON-RPC against a connector-configured `webcodex` plus `webcodex-runner`: `initialize`, `tools/list` exposes exactly the 12 canonical capabilities and no operator runtime, and `task_start → files_read → edits_apply → commands_run (fail then fix then pass) → checks_run → task_review → task_finish` runs with zero approval interruptions under `trusted_agent`. Operator-only tool names are rejected on the connector surface, `files_read` returns one text representation, the `task_review` event cursor is bounded and non-duplicating, and a fresh client resumes the durable task via `task_resume`.
+- Real OpenAPI/HTTP acceptance: `/openapi.json` projects the same 12 canonical operations with schema parity to the MCP business contract, project credentials are denied operator-only routes (`/api/tools/*` → 403), unknown fields are strictly rejected with no alias, `restricted` authority requires one-time approval for `commands_run` while `trusted_agent` auto-authorizes, and durable tasks survive server/runner restart.
+- Recorded response byte baselines for `start_coding_task` (minimal/standard/full), `read_file` (plain/numbered), `job_log` (default page and follow cursor), `finish_coding_task summary_only`, and the project-bound `tools/list`; added a bounded/non-duplication `select_lines` regression test guarding job-log payload size and cursor advance without building any telemetry system.
+- Temporary install and rollback smoke: release binaries install into a disposable directory, server/runner/CLI launch from it and report the deployed version/commit, services stop with no orphan processes, and the documented `cp -a` rollback restores a runnable binary — all without touching `/opt/webcodex` or production services.
+- Fixed the reconnect harness fixture that omitted `allowed_roots`, which defaulted the runner to `$HOME` and rejected the `/tmp` test repo, making the running-job-goes-`lost` and read-recovers assertions host-dependent; the acceptance now passes on hosts whose `TMPDIR` is outside `$HOME`.
 
 ## Deferred
 

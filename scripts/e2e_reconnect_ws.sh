@@ -202,6 +202,7 @@ transport = "websocket"
 [policy]
 allow_raw_shell = true
 allow_cwd_anywhere = false
+allowed_roots = ["${TEST_REPO}"]
 max_timeout_secs = 60
 max_output_bytes = 262144
 EOF

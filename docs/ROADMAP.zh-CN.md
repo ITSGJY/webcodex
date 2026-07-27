@@ -107,7 +107,7 @@ Iteration 8.1 已完成 focused/full suite、LOC 门禁与人工 review，并随
   `webcodex-runner`，不保留旧名称 alias。
 - 真实 ChatGPT MCP/OpenAPI acceptance、release smoke 和 0.3.0 发布门禁已经完成。
 
-## 当前：Iteration 9 — Agent-Aligned Evidence and Task Reporting
+## 已完成：Iteration 9 — Agent-Aligned Evidence and Task Reporting
 
 本轮不扩大 Hosted capability surface，也不以代码瘦身或旧版本平滑迁移为目标。
 优先修复软件自身在真实 coding 任务中的判断与交互问题，使 WebCodex 更接近本地
@@ -181,6 +181,30 @@ coding agent 的工作方式：
 - 新验证 lane：`cargo test --bin webcodex reconnect`、
   `cargo test --bin webcodex trusted_smoke` 与真实进程 harness
   `scripts/e2e_reconnect_ws.sh`。
+
+### 第三阶段已交付 — Final Acceptance and Release Readiness
+
+- 真实 project-bound MCP acceptance（JSON-RPC，对接 connector 配置下的 `webcodex`
+  与 `webcodex-runner`）：`initialize`、`tools/list` 只暴露 12 项 canonical 能力、
+  不暴露 operator runtime；`task_start → files_read → edits_apply →
+  commands_run（先失败、修复、再通过）→ checks_run → task_review → task_finish`
+  在 `trusted_agent` 下零审批中断完成。connector surface 拒绝 operator-only 工具名，
+  `files_read` 只返回一种文本表示，`task_review` 事件 cursor 有界且不重复，新客户端
+  经 `task_resume` 继续 durable 任务。
+- 真实 OpenAPI/HTTP acceptance：`/openapi.json` 投影同一 12 项 canonical operation，
+  与 MCP 业务合同 schema 一致；project credential 被拒绝调用 operator-only 路由
+  （`/api/tools/*` → 403），未知字段严格拒绝且无 alias；`restricted` 下 `commands_run`
+  需一次性审批，`trusted_agent` 自动授权；durable 任务在 server/runner 重启后仍可继续。
+- 记录 `start_coding_task`（minimal/standard/full）、`read_file`（普通/numbered）、
+  `job_log`（默认页与 follow cursor）、`finish_coding_task summary_only` 与 project-bound
+  `tools/list` 的返回体字节基线；新增 `select_lines` 有界/不重复回归测试，守护 job log
+  payload 大小与 cursor 前进，且不建立任何遥测系统。
+- 临时安装与回滚 smoke：release binaries 安装到临时目录，server/runner/CLI 从中启动并
+  报告部署 version/commit，服务停止后无孤儿进程，文档化的 `cp -a` 回滚可恢复可运行
+  binary——全程不触碰 `/opt/webcodex` 或生产服务。
+- 修复 reconnect harness fixture 遗漏 `allowed_roots` 的问题：该遗漏使 runner 默认回退到
+  `$HOME` 并拒绝 `/tmp` 测试仓库，导致 running-job 变 `lost` 与 read 恢复断言依赖宿主
+  环境；现在在 `TMPDIR` 位于 `$HOME` 之外的宿主上也能通过。
 
 暂缓代码瘦身与 LOC 门禁、旧版本迁移兼容、SSH、PTY、Workflow DSL、更多 Hosted
 capability 和完整 Browser IDE。

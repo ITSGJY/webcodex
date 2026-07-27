@@ -35,6 +35,79 @@ mod command_preview_tests {
     }
 }
 
+#[cfg(test)]
+mod select_lines_tests {
+    use super::select_lines;
+
+    fn lines(text: &str) -> Vec<String> {
+        text.lines().map(str::to_string).collect()
+    }
+
+    // A default bounded tail returns only the last `tail_lines`, flags earlier
+    // content, and points the cursor one past the last known line.
+    #[test]
+    fn tail_is_bounded_and_reports_next_cursor() {
+        let value = (1..=10)
+            .map(|n| format!("l{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (text, next, total, has_earlier) = select_lines(Some(&value), None, Some(3));
+        assert_eq!(lines(&text.unwrap()), ["l8", "l9", "l10"]);
+        assert_eq!(next, 11, "cursor is one past the last line");
+        assert_eq!(total, 10);
+        assert!(has_earlier, "earlier lines were skipped by the tail bound");
+    }
+
+    // Offset-only follow reads never re-emit consumed lines: reading from the
+    // returned cursor yields nothing new, so a follower cannot loop on a tail.
+    #[test]
+    fn offset_follow_does_not_duplicate_consumed_lines() {
+        let value = (1..=5)
+            .map(|n| format!("l{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (first, next, _, has_earlier) = select_lines(Some(&value), Some(1), None);
+        assert_eq!(lines(&first.unwrap()), ["l1", "l2", "l3", "l4", "l5"]);
+        assert_eq!(next, 6);
+        assert!(!has_earlier);
+        // Following from the returned cursor returns no already-seen lines.
+        let (second, next_again, _, _) = select_lines(Some(&value), Some(next), None);
+        assert_eq!(
+            second.unwrap(),
+            "",
+            "cursor past the end yields nothing new"
+        );
+        assert_eq!(next_again, 6, "cursor stays stable when drained");
+        // A mid-stream offset returns only the forward slice.
+        let (mid, _, _, mid_earlier) = select_lines(Some(&value), Some(4), None);
+        assert_eq!(lines(&mid.unwrap()), ["l4", "l5"]);
+        assert!(mid_earlier);
+    }
+
+    // When both bounds are supplied the tail wins, but the cursor still points
+    // past the end so the next follow read drains rather than repeats the tail.
+    #[test]
+    fn tail_takes_precedence_but_cursor_still_advances() {
+        let value = (1..=8)
+            .map(|n| format!("l{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (text, next, _, _) = select_lines(Some(&value), Some(2), Some(3));
+        assert_eq!(
+            lines(&text.unwrap()),
+            ["l6", "l7", "l8"],
+            "tail_lines bounds the segment even when an offset is passed"
+        );
+        assert_eq!(next, 9);
+        let (drained, _, _, _) = select_lines(Some(&value), Some(next), None);
+        assert_eq!(
+            drained.unwrap(),
+            "",
+            "following the cursor does not repeat the tail"
+        );
+    }
+}
+
 pub(super) fn truncate_output(value: Option<String>) -> Option<String> {
     value.map(|s| {
         if s.len() <= MAX_OUTPUT_BYTES {
