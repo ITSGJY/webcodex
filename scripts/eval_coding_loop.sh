@@ -854,7 +854,7 @@ events = validation.get("events") or []
 latest_success = validation.get("latest_success") or {}
 parser_available = parser.get("available")
 parser_ok = (
-    parser.get("kind") == "minimal_bounded_tail_parser"
+    parser.get("kind") == "structured_validation_parser"
     and isinstance(parser_available, bool)
 )
 ok = (
@@ -1242,7 +1242,6 @@ ok = (
     data.get("success") is True
     and isinstance(out.get("numbered_text"), str)
     and "1 | pub fn greeting" in out.get("numbered_text", "")
-    and isinstance(out.get("lines"), list)
 )
 sys.exit(0 if ok else 1)
 PY

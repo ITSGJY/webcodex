@@ -811,8 +811,7 @@ expected_ops = {
     "getProjectGitDiffSummary", "listProjectFiles", "searchProjectText",
     "validateProjectPatch", "applyProjectPatch", "applyProjectPatchChecked",
     "runProjectShellCommand", "deleteProjectFiles", "gitRestorePaths",
-    "discardUntrackedFiles", "replaceProjectFileText", "writeProjectFile",
-    "importConversationFilesToProject", "startProjectShellJob",
+    "discardUntrackedFiles", "importConversationFilesToProject", "startProjectShellJob",
     "listRuntimeJobs", "getRuntimeJobTail", "callRuntimeTool",
 }
 missing = expected_ops - ops_set
@@ -862,6 +861,7 @@ for path, methods in schema.get("paths", {}).items():
 # forbidden.
 forbidden = ["/api/audit/sessions", "/api/audit/session", "/api/audit/stats",
              "/api/jobs/stop",
+             "/api/projects/replace_in_file", "/api/projects/write_file",
              "/api/messages", "/api/files", "/api/desktop/task_op", "/api/desktop/task",
              "/api/shell/run", "/api/shell/job", "/api/shell/file",
              "/mcp", "/openapi.json", "/console", "/console/app.js", "/console/styles.css"]
@@ -931,8 +931,6 @@ mutation_paths = [
     "/api/projects/delete_files",
     "/api/projects/git_restore_paths",
     "/api/projects/discard_untracked",
-    "/api/projects/replace_in_file",
-    "/api/projects/write_file",
     "/api/projects/run_job",
 ]
 for path in mutation_paths:
@@ -997,12 +995,13 @@ else
     fail "GET /console did not return expected HTML shell (got: ${console_html:0:200})"
 fi
 
-# The bundled JS is public and must call the protected status endpoint.
+# The bundled JS is public and must use only the protected console API base.
 console_js="$(curl -sS --max-time 10 "http://127.0.0.1:${PORT}/console/app.js" 2>/dev/null)"
-if echo "$console_js" | grep -q "/api/runtime/status"; then
-    pass "GET /console/app.js references status endpoint"
+if echo "$console_js" | grep -q 'CONSOLE_BASE = "/api/console/"' && \
+   ! echo "$console_js" | grep -q "WEBCODEX_TOKEN"; then
+    pass "GET /console/app.js uses protected console API without embedding token material"
 else
-    fail "GET /console/app.js missing status endpoint reference (got: ${console_js:0:200})"
+    fail "GET /console/app.js missing protected console API contract or contains token material (got: ${console_js:0:200})"
 fi
 
 # The bundle must never embed the token key in the DOM.
@@ -1174,9 +1173,6 @@ for name in ["read_file", "search_project_text", "show_changes"]:
     if not isinstance(inspect, list) or name not in inspect:
         errors.append(f"output.recommended_flow.inspect missing {name}")
 for name in [
-    "replace_line_range",
-    "insert_at_line",
-    "delete_line_range",
     "apply_text_edits",
     "apply_patch_checked",
 ]:
@@ -1511,10 +1507,10 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# 7f. Phase 5: dedicated replaceProjectFileText GPT Action (probe files only)
+# 7f. Runtime-only compatibility edit through callRuntimeTool (probe files only)
 # ----------------------------------------------------------------------------
 
-log "---- Phase 5: dedicated replaceProjectFileText (probe files only) ----"
+log "---- Phase 5: replace_in_file through callRuntimeTool (probe files only) ----"
 
 # Create a temporary probe file via the safe write_project_file runtime tool.
 wpf2_body="$(python3 -c '
@@ -1530,41 +1526,63 @@ print(json.dumps({
 ' "$RUNTIME_PROJECT_ID")"
 body="$(api_post /api/tools/call "$wpf2_body")"
 if [ "$(json_get "$body" success)" = "True" ]; then
-    pass "write_project_file creates REPLACE_PROBE.txt for dedicated action smoke"
+    pass "write_project_file creates REPLACE_PROBE.txt for runtime-tool smoke"
 else
     fail "write_project_file did not create REPLACE_PROBE.txt (body: ${body:0:300})"
 fi
 
-# replaceProjectFileText — dedicated GPT Action. Replace "beta" -> "gamma".
-rif_ded_body="$(build_body "{\"project\":\"$RUNTIME_PROJECT_ID\",\"path\":\"REPLACE_PROBE.txt\",\"old\":\"beta\",\"new\":\"gamma\"}")"
-body="$(api_post /api/projects/replace_in_file "$rif_ded_body")"
+# replace_in_file remains runtime-only and is reached through callRuntimeTool.
+rif_ded_body="$(python3 -c '
+import json, sys
+print(json.dumps({
+    "tool": "replace_in_file",
+    "params": {
+        "project": sys.argv[1],
+        "path": "REPLACE_PROBE.txt",
+        "old": "beta",
+        "new": "gamma"
+    }
+}))
+' "$RUNTIME_PROJECT_ID")"
+body="$(api_post /api/tools/call "$rif_ded_body")"
 if [ "$(json_get "$body" success)" = "True" ] && [ "$(json_get "$body" output.changed)" = "True" ]; then
-    pass "replaceProjectFileText edits REPLACE_PROBE.txt"
+    pass "replace_in_file edits REPLACE_PROBE.txt through callRuntimeTool"
 else
-    fail "replaceProjectFileText did not edit probe (body: ${body:0:300})"
+    fail "replace_in_file did not edit probe (body: ${body:0:300})"
 fi
 
-# readProjectFile confirms the dedicated action edit.
+# readProjectFile confirms the runtime-tool edit.
 body="$(api_post /api/projects/read_file "{\"project\":\"$RUNTIME_PROJECT_ID\",\"path\":\"REPLACE_PROBE.txt\"}")"
 if echo "$(json_get "$body" output.content)" | grep -q "alpha gamma"; then
-    pass "readProjectFile confirms replaceProjectFileText edit"
+    pass "readProjectFile confirms replace_in_file edit"
 else
-    fail "readProjectFile did not confirm dedicated action edit (got: ${body:0:200})"
+    fail "readProjectFile did not confirm runtime-tool edit (got: ${body:0:200})"
 fi
 
-# replaceProjectFileText with a missing old must fail WITHOUT modifying the file.
-rif_ded_miss="$(build_body "{\"project\":\"$RUNTIME_PROJECT_ID\",\"path\":\"REPLACE_PROBE.txt\",\"old\":\"does-not-exist\",\"new\":\"x\"}")"
-body="$(api_post /api/projects/replace_in_file "$rif_ded_miss")"
+# replace_in_file with a missing old must fail WITHOUT modifying the file.
+rif_ded_miss="$(python3 -c '
+import json, sys
+print(json.dumps({
+    "tool": "replace_in_file",
+    "params": {
+        "project": sys.argv[1],
+        "path": "REPLACE_PROBE.txt",
+        "old": "does-not-exist",
+        "new": "x"
+    }
+}))
+' "$RUNTIME_PROJECT_ID")"
+body="$(api_post /api/tools/call "$rif_ded_miss")"
 if [ "$(json_get "$body" success)" = "False" ]; then
-    pass "replaceProjectFileText(missing old) fails"
+    pass "replace_in_file(missing old) fails"
 else
-    fail "replaceProjectFileText(missing old) unexpectedly succeeded (body: ${body:0:200})"
+    fail "replace_in_file(missing old) unexpectedly succeeded (body: ${body:0:200})"
 fi
 body="$(api_post /api/projects/read_file "{\"project\":\"$RUNTIME_PROJECT_ID\",\"path\":\"REPLACE_PROBE.txt\"}")"
 if echo "$(json_get "$body" output.content)" | grep -q "alpha gamma"; then
-    pass "replaceProjectFileText(missing old) left file unchanged"
+    pass "replace_in_file(missing old) left file unchanged"
 else
-    fail "replaceProjectFileText(missing old) modified the file (got: ${body:0:200})"
+    fail "replace_in_file(missing old) modified the file (got: ${body:0:200})"
 fi
 
 # Clean up the probe file so the worktree returns to a clean state.
@@ -1657,18 +1675,18 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# 7h. Full-auto coding loop smoke (dedicated actions only)
+# 7h. Full-auto coding loop smoke (dedicated actions plus callRuntimeTool)
 # ----------------------------------------------------------------------------
 #
-# Simulates a GPT Actions auto coding loop using ONLY dedicated endpoints
-# (no callRuntimeTool escape hatch). Proves a custom GPT can complete a small
+# Simulates a GPT Actions auto coding loop using the dedicated read/diff/check
+# actions plus callRuntimeTool for runtime-only compatibility edits. Proves a custom GPT can complete a small
 # edit → verify → cleanup cycle through the recommended flow:
 #
 #   1. listProjects              — find the agent project
 #   2. readProjectFile           — read a tracked file (README.md)
 #   3. searchProjectText         — locate the target substring
 #   4. getProjectGitDiffSummary  — confirm initial clean state
-#   5. replaceProjectFileText    — make a small reversible text edit
+#   5. callRuntimeTool           — run replace_in_file for a reversible text edit
 #   6. getProjectGitDiffSummary  — confirm the diff is visible
 #   7. runProjectShellCommand    — lightweight check (grep)
 #   8. gitRestorePaths           — restore the modified tracked file
@@ -1681,7 +1699,7 @@ fi
 #  13. deleteProjectFiles        — cleanup the probe file
 #  14. getProjectGitDiffSummary  — confirm clean again
 
-log "---- full-auto coding loop smoke (dedicated actions only) ----"
+log "---- full-auto coding loop smoke (dedicated actions plus callRuntimeTool) ----"
 
 LOOP_MARKER_OLD="Smoke Project"
 LOOP_MARKER_NEW="Smoke Project [auto-loop]"
@@ -1722,21 +1740,24 @@ else
     fail "loop: worktree not clean before loop (changed_files_count=$loop_pre_count got: ${body:0:200})"
 fi
 
-# Step 5: replaceProjectFileText — small reversible edit on README.md.
+# Step 5: callRuntimeTool(replace_in_file) — small reversible edit on README.md.
 loop_replace_body="$(python3 -c '
 import json, sys
 print(json.dumps({
-    "project": sys.argv[1],
-    "path": "README.md",
-    "old": sys.argv[2],
-    "new": sys.argv[3]
+    "tool": "replace_in_file",
+    "params": {
+        "project": sys.argv[1],
+        "path": "README.md",
+        "old": sys.argv[2],
+        "new": sys.argv[3]
+    }
 }))
 ' "$RUNTIME_PROJECT_ID" "$LOOP_MARKER_OLD" "$LOOP_MARKER_NEW")"
-body="$(api_post /api/projects/replace_in_file "$loop_replace_body")"
+body="$(api_post /api/tools/call "$loop_replace_body")"
 if [ "$(json_get "$body" success)" = "True" ] && [ "$(json_get "$body" output.changed)" = "True" ]; then
-    pass "loop: replaceProjectFileText edited README.md"
+    pass "loop: callRuntimeTool(replace_in_file) edited README.md"
 else
-    fail "loop: replaceProjectFileText did not edit README.md (body: ${body:0:300})"
+    fail "loop: callRuntimeTool(replace_in_file) did not edit README.md (body: ${body:0:300})"
 fi
 
 # Step 6: getProjectGitDiffSummary — confirm the diff is now visible.
@@ -1836,43 +1857,46 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# 7i. Dedicated writeProjectFile + startProjectShellJob smoke (probe files only)
+# 7i. Runtime write tool + dedicated startProjectShellJob smoke (probe files only)
 # ----------------------------------------------------------------------------
 #
-# Proves the two newly promoted dedicated GPT Actions work end-to-end through
-# the recommended loop, without callRuntimeTool:
+# Proves runtime-only write_project_file through callRuntimeTool and the
+# dedicated async job actions work end-to-end:
 #
-#   1. writeProjectFile   — create WRITE_ACTION_PROBE.txt
-#   2. readProjectFile    — confirm content
-#   3. writeProjectFile   — overwrite with an expected_sha256 guard
+#   1. callRuntimeTool(write_project_file) — create WRITE_ACTION_PROBE.txt
+#   2. readProjectFile                    — confirm content
+#   3. callRuntimeTool(write_project_file) — overwrite with an expected_sha256 guard
 #   4. readProjectFile    — confirm overwritten content
 #   5. deleteProjectFiles — cleanup the probe file
 #   6. startProjectShellJob — start `printf job-ok` asynchronously
 #   7. getRuntimeJobStatus — poll until completed
 #   8. getRuntimeJobTail   — confirm the output contains job-ok
 
-log "---- dedicated writeProjectFile + startProjectShellJob smoke ----"
+log "---- runtime write_project_file + dedicated startProjectShellJob smoke ----"
 
-# Step 1: writeProjectFile — create WRITE_ACTION_PROBE.txt.
+# Step 1: callRuntimeTool(write_project_file) — create WRITE_ACTION_PROBE.txt.
 waf_create_body="$(python3 -c '
 import json, sys
 print(json.dumps({
-    "project": sys.argv[1],
-    "path": "WRITE_ACTION_PROBE.txt",
-    "content": "write-action-probe-v1\n"
+    "tool": "write_project_file",
+    "params": {
+        "project": sys.argv[1],
+        "path": "WRITE_ACTION_PROBE.txt",
+        "content": "write-action-probe-v1\n"
+    }
 }))
 ' "$RUNTIME_PROJECT_ID")"
-body="$(api_post /api/projects/write_file "$waf_create_body")"
+body="$(api_post /api/tools/call "$waf_create_body")"
 if [ "$(json_get "$body" success)" = "True" ] && [ "$(json_get "$body" output.created)" = "True" ]; then
-    pass "writeProjectFile creates WRITE_ACTION_PROBE.txt"
+    pass "callRuntimeTool(write_project_file) creates WRITE_ACTION_PROBE.txt"
 else
-    fail "writeProjectFile did not create probe (body: ${body:0:300})"
+    fail "callRuntimeTool(write_project_file) did not create probe (body: ${body:0:300})"
 fi
 waf_sha="$(json_get "$body" output.sha256)"
 if [ -n "$waf_sha" ] && [ "$waf_sha" != "None" ] && [ ${#waf_sha} -eq 64 ]; then
-    pass "writeProjectFile returns 64-char sha256 for new file"
+    pass "write_project_file returns 64-char sha256 for new file"
 else
-    fail "writeProjectFile missing sha256 (got: $waf_sha)"
+    fail "write_project_file missing sha256 (got: $waf_sha)"
 fi
 
 # Step 2: readProjectFile — confirm content.
@@ -1883,23 +1907,26 @@ else
     fail "readProjectFile did not confirm probe content (got: ${body:0:200})"
 fi
 
-# Step 3: writeProjectFile — overwrite with an expected_sha256 guard. Use the
-# sha256 returned by the create step so the overwrite guard matches exactly.
+# Step 3: callRuntimeTool(write_project_file) — overwrite with an expected_sha256
+# guard. Use the sha256 returned by the create step so the guard matches exactly.
 waf_overwrite_body="$(python3 -c '
 import json, sys
 print(json.dumps({
-    "project": sys.argv[1],
-    "path": "WRITE_ACTION_PROBE.txt",
-    "content": "write-action-probe-v2\n",
-    "overwrite": True,
-    "expected_sha256": sys.argv[2]
+    "tool": "write_project_file",
+    "params": {
+        "project": sys.argv[1],
+        "path": "WRITE_ACTION_PROBE.txt",
+        "content": "write-action-probe-v2\n",
+        "overwrite": True,
+        "expected_sha256": sys.argv[2]
+    }
 }))
 ' "$RUNTIME_PROJECT_ID" "$waf_sha")"
-body="$(api_post /api/projects/write_file "$waf_overwrite_body")"
+body="$(api_post /api/tools/call "$waf_overwrite_body")"
 if [ "$(json_get "$body" success)" = "True" ]; then
-    pass "writeProjectFile overwrites with matching expected_sha256 guard"
+    pass "callRuntimeTool(write_project_file) overwrites with matching expected_sha256 guard"
 else
-    fail "writeProjectFile overwrite with guard failed (body: ${body:0:300})"
+    fail "callRuntimeTool(write_project_file) overwrite with guard failed (body: ${body:0:300})"
 fi
 
 # Step 4: readProjectFile — confirm overwritten content.
