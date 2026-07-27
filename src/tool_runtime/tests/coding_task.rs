@@ -37,22 +37,24 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
 
     let start = spec_named(&specs, "start_coding_task");
     assert_eq!(required_fields(start), vec!["project"]);
-    assert!(start.input_schema["properties"]
-        .as_object()
-        .unwrap()
-        .contains_key("include_tool_manifest"));
-    assert!(start.input_schema["properties"]
-        .as_object()
-        .unwrap()
-        .contains_key("tool_manifest_intent"));
-    assert!(start.input_schema["properties"]
-        .as_object()
-        .unwrap()
-        .contains_key("tool_manifest_categories"));
-    assert!(start.input_schema["properties"]
-        .as_object()
-        .unwrap()
-        .contains_key("tool_manifest_limit"));
+    let start_props = start.input_schema["properties"].as_object().unwrap();
+    assert!(start_props.contains_key("detail"));
+    for removed in [
+        "include_runtime_status",
+        "compact_startup",
+        "include_git",
+        "include_recent_commits",
+        "include_rules",
+        "include_tool_manifest",
+        "tool_manifest_intent",
+        "tool_manifest_categories",
+        "tool_manifest_limit",
+    ] {
+        assert!(
+            !start_props.contains_key(removed),
+            "start_coding_task must expose detail instead of legacy {removed}"
+        );
+    }
     let start_output = crate::tool_runtime::registry::output_schema_for_tool("start_coding_task");
     assert!(
         start_output["properties"]["output"]["properties"]
@@ -73,7 +75,7 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
     let finish_props = finish.input_schema["properties"].as_object().unwrap();
     assert!(
         finish_props.contains_key("include_workspace"),
-        "finish_coding_task input schema should accept include_workspace as a compatibility flag"
+        "finish_coding_task input schema should accept include_workspace"
     );
     assert!(
         !required_fields(finish)
@@ -87,7 +89,14 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
         .unwrap();
     assert!(!finish_output_props.contains_key("verdict"));
     assert!(!finish_output_props.contains_key("finish_verdict"));
-    for field in ["task_outcome", "evidence_history", "evidence_integrity"] {
+    for field in [
+        "facts",
+        "hard_blockers",
+        "advisories",
+        "task_outcome",
+        "evidence_history",
+        "evidence_integrity",
+    ] {
         assert!(
             finish_output_props.contains_key(field),
             "finish_coding_task output schema should include {field}"
@@ -103,15 +112,7 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
     assert!(tool_desc.contains("finish_coding_task"));
     let properties = tool_call["properties"].as_object().unwrap();
     for field in [
-        "include_runtime_status",
-        "compact_startup",
-        "include_git",
-        "include_recent_commits",
-        "include_rules",
-        "include_tool_manifest",
-        "tool_manifest_intent",
-        "tool_manifest_categories",
-        "tool_manifest_limit",
+        "detail",
         "bind_current",
         "include_hygiene",
         "include_handoff",
@@ -138,16 +139,13 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
 
     let call = ToolCall::from_tool_name(
         "start_coding_task",
-        json!({
-            "project": "agent:test:demo",
-            "tool_manifest_intent": "audit"
-        }),
+        json!({"project": "agent:test:demo", "detail": "full"}),
     )
-    .expect("tool_manifest_intent should deserialize through ToolCall");
+    .expect("detail should deserialize through ToolCall");
     assert_eq!(
-        call.session_log_arguments()["tool_manifest_intent"],
-        "audit",
-        "ToolCall audit serialization must preserve tool_manifest_intent"
+        call.session_log_arguments()["detail"],
+        "full",
+        "ToolCall audit serialization must preserve detail"
     );
 }
 
@@ -158,7 +156,15 @@ async fn start_coding_task_returns_session_and_does_not_bind_current_by_default(
     commit_file(
         tmp.path(),
         "AGENTS.md",
-        "# Rules\n\nUse focused tests.\n",
+        &json!({
+            "format": "webcodex.file_read_range.v1",
+            "content": "# Rules\n\nUse focused tests.\n",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "total_lines": 3,
+            "start_line": 1,
+            "limit": 2000
+        })
+        .to_string(),
         "add instructions",
     );
     commit_file(tmp.path(), "README.md", "hello\n", "add readme");
@@ -178,6 +184,7 @@ async fn start_coding_task_returns_session_and_does_not_bind_current_by_default(
                         project,
                         title: Some("implement deterministic aggregate".to_string()),
                         mode: SessionMode::Normal,
+                        detail: crate::tool_runtime::StartupDetail::Full,
                         deny_write_tools: false,
                         deny_shell_tools: false,
                         include_runtime_status: Some(false),
@@ -206,7 +213,7 @@ async fn start_coding_task_returns_session_and_does_not_bind_current_by_default(
         "coding-start",
         &rules_req.request_id,
         0,
-        "# Rules\n\nUse focused tests.\n",
+        &canonical_agent_file_read_output("# Rules\n\nUse focused tests.\n", 3),
         "",
     )
     .await;
@@ -326,27 +333,20 @@ async fn start_coding_task_returns_session_and_does_not_bind_current_by_default(
         .as_array()
         .unwrap()
         .iter()
-        .any(|field| field == "include_tool_manifest"));
-    assert!(start_tool["accepted_flattened_args"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|field| field == "tool_manifest_intent"));
-    assert!(start_tool["accepted_flattened_args"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|field| field == "compact_startup"));
-    assert!(start_tool["accepted_flattened_args"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|field| field == "tool_manifest_categories"));
-    assert!(start_tool["accepted_flattened_args"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|field| field == "tool_manifest_limit"));
+        .any(|field| field == "detail"));
+    for removed in [
+        "include_tool_manifest",
+        "tool_manifest_intent",
+        "compact_startup",
+        "tool_manifest_categories",
+        "tool_manifest_limit",
+    ] {
+        assert!(!start_tool["accepted_flattened_args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == removed));
+    }
     assert!(start_tool.get("inputSchema").is_none());
     assert!(start_tool.get("outputSchema").is_none());
     assert_eq!(result.output["git"]["clean"], true);
@@ -374,6 +374,7 @@ async fn start_coding_task_can_omit_compact_tool_manifest() {
                 project,
                 title: Some("small startup payload".to_string()),
                 mode: SessionMode::Normal,
+                detail: Default::default(),
                 deny_write_tools: false,
                 deny_shell_tools: false,
                 include_runtime_status: Some(false),
@@ -399,7 +400,7 @@ async fn start_coding_task_can_omit_compact_tool_manifest() {
 }
 
 #[tokio::test]
-async fn start_coding_task_runtime_status_defaults_to_full_output() {
+async fn start_coding_task_minimal_runtime_status_is_compact_and_path_safe() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     let runtime = test_runtime();
@@ -417,32 +418,53 @@ async fn start_coding_task_runtime_status_defaults_to_full_output() {
     let auth = auth_context(None, true);
     let project = "agent:coding-full-status:demo".to_string();
 
-    let result = runtime
-        .dispatch_with_auth(
-            ToolCall::from_tool_name(
-                "start_coding_task",
-                json!({
-                    "project": project,
-                    "include_runtime_status": true,
-                    "include_git": false,
-                    "include_recent_commits": false,
-                    "include_rules": false,
-                    "include_tool_manifest": false
-                }),
-            )
-            .unwrap(),
-            Some(&auth),
-        )
-        .await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        let auth = auth.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::from_tool_name(
+                        "start_coding_task",
+                        json!({
+                            "project": project,
+                            "detail": "minimal"
+                        }),
+                    )
+                    .unwrap(),
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    let request = next_patch_agent_request(&runtime, "coding-full-status")
+        .await
+        .expect("minimal startup should inspect workspace state");
+    complete_agent_request_by_running_locally(&runtime, "coding-full-status", request).await;
+    let result = task.await.unwrap();
 
     assert!(result.success, "{:?}", result.error);
     let runtime_status = &result.output["runtime_status"];
-    assert!(runtime_status["tools"]["names"].is_array());
-    assert!(runtime_status["configured_public_url"].is_null());
-    assert_eq!(
-        runtime_status["agents"]["clients"][0]["policy"]["allowed_roots"][0],
-        "/tmp/startup-full-allowed-root"
-    );
+    assert_eq!(runtime_status["compact"], true);
+    assert!(runtime_status["tools"]["names"].is_null());
+    assert!(!serde_json::to_string(runtime_status)
+        .unwrap()
+        .contains("/tmp/startup-full-allowed-root"));
+    assert!(result.output["connection_state"]["runner_process"]["status"].is_string());
+    for omitted in [
+        "tool_manifest",
+        "rules",
+        "recent_commits",
+        "permissions",
+        "recommended_flow",
+    ] {
+        assert!(
+            result.output.get(omitted).is_none(),
+            "minimal startup must omit {omitted}"
+        );
+    }
+    assert!(result.output["git"].get("recent_commits").is_none());
 }
 
 #[tokio::test]
@@ -867,7 +889,7 @@ async fn start_coding_task_mixed_dirty_workspace_summarizes_counts_without_block
 }
 
 #[tokio::test]
-async fn start_coding_task_conflict_state_is_nonblocking_warning() {
+async fn start_coding_task_conflict_state_is_a_hard_blocker_but_remains_inspectable() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     commit_file(tmp.path(), "conflicted.rs", "base\n", "base");
@@ -897,7 +919,15 @@ async fn start_coding_task_conflict_state_is_nonblocking_warning() {
     let result =
         start_coding_task_with_git_inspection(&runtime, client_id, &project, &auth, true).await;
 
-    assert_startup_nonblocking_dirty(&result, "workspace_conflicts");
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["startup_verdict"]["status"], "fail");
+    assert_eq!(result.output["startup_verdict"]["blocking"], true);
+    assert_check_status(&result.output["startup_verdict"], "workspace", "fail");
+    assert_check_reason(
+        &result.output["startup_verdict"],
+        "workspace",
+        "workspace_conflicts",
+    );
     assert!(
         result.output["git"]["counts"]["conflicted"]
             .as_u64()
@@ -1158,6 +1188,7 @@ async fn start_coding_task_available_manifest_intents_match_direct_tool_manifest
                     "start_coding_task",
                     json!({
                         "project": project,
+                        "detail": "full",
                         "include_runtime_status": false,
                         "include_git": false,
                         "include_recent_commits": false,
@@ -1240,6 +1271,7 @@ async fn start_coding_task_manifest_intent_composes_with_categories_then_limit()
                 "start_coding_task",
                 json!({
                     "project": project,
+                    "detail": "full",
                     "include_runtime_status": false,
                     "include_git": false,
                     "include_recent_commits": false,
@@ -1275,6 +1307,7 @@ async fn start_coding_task_manifest_intent_composes_with_categories_then_limit()
                 "start_coding_task",
                 json!({
                     "project": project,
+                    "detail": "full",
                     "include_runtime_status": false,
                     "include_git": false,
                     "include_recent_commits": false,
@@ -1333,6 +1366,7 @@ async fn start_coding_task_unknown_manifest_intent_precedes_session_creation_and
                 "start_coding_task",
                 json!({
                     "project": project,
+                    "detail": "full",
                     "tool_manifest_intent": "not_a_real_intent",
                     "bind_current": true,
                 }),
@@ -1378,6 +1412,7 @@ async fn finish_coding_task_requires_explicit_session_and_returns_structured_fie
                 project: project.clone(),
                 title: Some("finish contract".to_string()),
                 mode: SessionMode::Normal,
+                detail: Default::default(),
                 deny_write_tools: false,
                 deny_shell_tools: false,
                 include_runtime_status: Some(false),
@@ -1490,11 +1525,16 @@ async fn finish_coding_task_requires_explicit_session_and_returns_structured_fie
         .unwrap()
         .iter()
         .any(|warning| warning["kind"] == "dirty_worktree"));
-    assert_eq!(result.output["task_outcome"]["status"], "fail");
+    assert_eq!(result.output["task_outcome"]["status"], "warn");
     assert_eq!(result.output["evidence_history"]["status"], "clean");
     assert_eq!(result.output["evidence_integrity"]["status"], "clean");
     assert!(result.output["informational_notes"].is_array());
-    assert_eq!(result.output["task_outcome"]["blocking"], true);
+    assert_eq!(result.output["task_outcome"]["blocking"], false);
+    assert!(result.output["advisories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|reason| reason == "workspace_dirty"));
     assert_finish_uses_canonical_outcomes(&result.output);
 }
 
@@ -1769,7 +1809,7 @@ async fn finish_coding_task_summary_only_includes_review_evidence_for_docs_only_
 }
 
 #[tokio::test]
-async fn finish_coding_task_summary_only_outcome_fails_for_dirty_workspace() {
+async fn finish_coding_task_summary_only_treats_dirty_workspace_as_advisory() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     commit_file(tmp.path(), "README.md", "hello\n", "add readme");
@@ -1814,19 +1854,19 @@ async fn finish_coding_task_summary_only_outcome_fails_for_dirty_workspace() {
 
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["workspace_clean"], false);
-    assert_eq!(result.output["task_outcome"]["status"], "fail");
-    assert_eq!(result.output["task_outcome"]["blocking"], true);
+    assert_eq!(result.output["task_outcome"]["status"], "warn");
+    assert_eq!(result.output["task_outcome"]["blocking"], false);
     assert_task_outcome_shape(&result.output["task_outcome"]);
     assert_reason_list_contains(
         &result.output["task_outcome"],
-        "blocking_reasons",
+        "warning_reasons",
         "workspace_dirty",
     );
     assert_finish_uses_canonical_outcomes(&result.output);
 }
 
 #[tokio::test]
-async fn finish_coding_task_summary_only_passes_with_resolved_historical_validation_failures() {
+async fn finish_coding_task_does_not_resolve_a_different_validation_identity() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     commit_file(tmp.path(), "README.md", "hello\n", "add readme");
@@ -1918,41 +1958,25 @@ async fn finish_coding_task_summary_only_passes_with_resolved_historical_validat
     );
     assert_eq!(
         result.output["validation"]["historical_failures"]["resolved"],
-        true
+        false
     );
     assert_eq!(
         result.output["validation"]["historical_failures"]["unresolved"],
-        false
+        true
     );
-    assert_eq!(result.output["task_outcome"]["status"], "pass");
-    assert_eq!(result.output["task_outcome"]["blocking"], false);
+    assert_eq!(result.output["task_outcome"]["status"], "fail");
+    assert_eq!(result.output["task_outcome"]["blocking"], true);
     assert_task_outcome_shape(&result.output["task_outcome"]);
     assert_eq!(
         result.output["evidence_history"]["status"],
-        "mixed_resolved"
+        "mixed_unresolved"
     );
     assert_eq!(result.output["evidence_integrity"]["status"], "clean");
-    assert_reason_list_not_contains(
+    assert_reason_list_contains(
         &result.output["task_outcome"],
         "blocking_reasons",
         "validation_mixed",
     );
-    assert!(!result.output["suggested_next_actions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|action| action.as_str()
-            == Some(
-                "historical validation failures were resolved by later successful validation"
-            )));
-    assert!(result.output["informational_notes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|note| note.as_str()
-            == Some(
-                "historical validation failures were resolved by later successful validation"
-            )));
     assert_finish_uses_canonical_outcomes(&result.output);
 }
 
@@ -2012,8 +2036,13 @@ async fn finish_coding_task_summary_only_passes_with_resolved_unexpected_cargo_f
         result.output["validation"]["historical_failures"]["unresolved"],
         false
     );
-    assert_eq!(result.output["task_outcome"]["status"], "pass");
+    assert_eq!(result.output["task_outcome"]["status"], "warn");
     assert_eq!(result.output["task_outcome"]["blocking"], false);
+    assert!(result.output["advisories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|reason| reason == "historical_validation_failures_resolved"));
     assert_eq!(
         result.output["evidence_history"]["status"],
         "mixed_resolved"
@@ -2085,7 +2114,7 @@ async fn finish_coding_task_summary_only_passes_with_resolved_unexpected_cargo_c
         result.output["validation"]["historical_failures"]["resolved"],
         true
     );
-    assert_eq!(result.output["task_outcome"]["status"], "pass");
+    assert_eq!(result.output["task_outcome"]["status"], "warn");
     assert_eq!(
         result.output["evidence_history"]["status"],
         "mixed_resolved"
@@ -2138,7 +2167,7 @@ async fn finish_coding_task_summary_only_keeps_cargo_fmt_failure_blocking_when_o
     assert_eq!(result.output["validation"]["latest_status"], "passed");
     assert_eq!(
         result.output["validation"]["historical_failures"]["resolved"],
-        true
+        false
     );
     assert_eq!(result.output["task_outcome"]["status"], "fail");
     assert_eq!(result.output["task_outcome"]["blocking"], true);
@@ -2442,6 +2471,7 @@ async fn finish_coding_task_includes_active_jobs_warning_without_logs() {
                 project: project.clone(),
                 title: Some("finish active jobs".to_string()),
                 mode: SessionMode::Normal,
+                detail: Default::default(),
                 deny_write_tools: false,
                 deny_shell_tools: false,
                 include_runtime_status: Some(false),
@@ -2472,6 +2502,8 @@ async fn finish_coding_task_includes_active_jobs_warning_without_logs() {
                 session_id: Some(session_id.clone()),
                 timeout_secs: None,
                 cwd: None,
+                purpose: None,
+                shell: None,
             },
             Some(&auth),
         )
@@ -2572,6 +2604,7 @@ async fn finish_coding_task_treats_stop_requested_jobs_as_nonblocking() {
                 project: project.clone(),
                 title: Some("finish stop pending".to_string()),
                 mode: SessionMode::Normal,
+                detail: Default::default(),
                 deny_write_tools: false,
                 deny_shell_tools: false,
                 include_runtime_status: Some(false),
@@ -2602,6 +2635,8 @@ async fn finish_coding_task_treats_stop_requested_jobs_as_nonblocking() {
                 session_id: Some(session_id.clone()),
                 timeout_secs: None,
                 cwd: None,
+                purpose: None,
+                shell: None,
             },
             Some(&auth),
         )
@@ -2997,6 +3032,7 @@ async fn start_coding_task_top_level_recommended_flow_projects_to_visible_manife
                 "start_coding_task",
                 json!({
                     "project": project,
+                    "detail": "full",
                     "include_runtime_status": false,
                     "include_git": false,
                     "include_recent_commits": false,
@@ -3064,7 +3100,7 @@ async fn start_coding_task_top_level_recommended_flow_projects_to_visible_manife
 }
 
 #[tokio::test]
-async fn start_coding_task_without_manifest_keeps_full_default_recommended_flow() {
+async fn start_coding_task_standard_omits_repeated_manifest_and_recommended_flow() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     let runtime = test_runtime();
@@ -3072,64 +3108,34 @@ async fn start_coding_task_without_manifest_keeps_full_default_recommended_flow(
         register_agent_project_at_path(&runtime, "coding-flow-full", "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
-    let result = runtime
-        .dispatch_with_auth(
-            ToolCall::from_tool_name(
-                "start_coding_task",
-                json!({
-                    "project": project,
-                    "include_runtime_status": false,
-                    "include_git": false,
-                    "include_recent_commits": false,
-                    "include_rules": false,
-                    "include_tool_manifest": false
-                }),
-            )
-            .unwrap(),
-            Some(&auth),
-        )
-        .await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        let auth = auth.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::from_tool_name(
+                        "start_coding_task",
+                        json!({
+                            "project": project,
+                            "detail": "standard"
+                        }),
+                    )
+                    .unwrap(),
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    let request = next_patch_agent_request(&runtime, "coding-flow-full")
+        .await
+        .expect("standard startup should inspect workspace state");
+    complete_agent_request_by_running_locally(&runtime, "coding-flow-full", request).await;
+    let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["detail"], "standard");
     assert!(result.output.get("tool_manifest").is_none());
-
-    let flow = &result.output["recommended_flow"];
-    for tool in [
-        "apply_text_edits",
-        "apply_patch_checked",
-        "write_project_file",
-    ] {
-        assert!(
-            flow["edit"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|entry| entry == tool),
-            "full default edit flow should include {tool}"
-        );
-    }
-    for tool in [
-        "replace_line_range",
-        "insert_at_line",
-        "delete_line_range",
-        "replace_in_file",
-        "apply_patch",
-    ] {
-        assert!(
-            !flow["edit"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|entry| entry == tool),
-            "full default edit flow should not rank compatibility/advanced tool {tool}"
-        );
-    }
-    assert!(
-        flow["handoff"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|entry| entry == "finish_coding_task"),
-        "full default handoff must include finish_coding_task: {:?}",
-        flow["handoff"]
-    );
+    assert!(result.output.get("recommended_flow").is_none());
+    assert!(result.output.get("rules").is_none());
 }

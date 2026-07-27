@@ -301,7 +301,7 @@ pub(crate) fn build_openapi_spec() -> Value {
                 "post": operation_with_examples(
                     "getRuntimeJobLog",
                     "Get job log",
-                    "Read-only. Returns bounded stdout/stderr text for a runtime job. Use the job_id returned by run_job. Output is always bounded; use tail_lines to limit the trailing stdout window and offset (next_stdout_line) for pagination.",
+                    "Read-only. Returns bounded tails, line totals, truncation, cursor, exit status, and detected summary for a job_id. Use cursor.stdout as offset to continue.",
                     "JobLogRequest",
                     "ToolResult",
                     json!({
@@ -365,7 +365,7 @@ pub(crate) fn build_openapi_spec() -> Value {
                 "post": operation_with_examples(
                     "readProjectFile",
                     "Read a project file",
-                    "Read-only. Reads a UTF-8 file from an agent-registered project. Paths are resolved by the owning agent within that project. Output is bounded; use start_line and limit for pagination. Set with_line_numbers=true to include 1-based numbered_text and lines for edit tools.",
+                    "Read-only. Reads a UTF-8 project file through its owning agent. Output is bounded; use start_line and limit for pagination. The response carries one text representation only: plain by default or 1-based numbered text when with_line_numbers=true.",
                     "ReadProjectFileRequest",
                     "ToolResult",
                     json!({
@@ -1154,46 +1154,14 @@ fn schemas() -> Value {
                     "type": "string",
                     "description": "Flattened resolve_session_message resolution note. Used only when `params` and `arguments` are absent."
                 },
-                "include_runtime_status": {
-                    "type": "boolean",
-                    "description": "Flattened start_coding_task flag. Defaults to true. Used only when `params` and `arguments` are absent."
-                },
-                "compact_startup": {
-                    "type": "boolean",
-                    "description": "Flattened start_coding_task flag. Defaults to false. When include_runtime_status=true, returns compact startup runtime observability instead of full runtime_status. Used only when `params` and `arguments` are absent."
+                "detail": {
+                    "type": "string",
+                    "enum": ["minimal", "standard", "full"],
+                    "description": "Flattened start_coding_task detail level. Defaults to standard. Use minimal for the continuous coding loop and full only when the rules, manifest, recent commits, and full runtime projection are needed."
                 },
                 "compact": {
                     "type": "boolean",
                     "description": "Flattened runtime_status flag. Defaults to false. When true, returns compact runtime observability for sanity checks instead of the full status payload. Used only when `params` and `arguments` are absent."
-                },
-                "include_git": {
-                    "type": "boolean",
-                    "description": "Flattened start_coding_task flag. Defaults to true. Used only when `params` and `arguments` are absent."
-                },
-                "include_recent_commits": {
-                    "type": "boolean",
-                    "description": "Flattened start_coding_task flag. Defaults to true. Used only when `params` and `arguments` are absent."
-                },
-                "include_rules": {
-                    "type": "boolean",
-                    "description": "Flattened start_coding_task flag. Defaults to true. Used only when `params` and `arguments` are absent."
-                },
-                "include_tool_manifest": {
-                    "type": "boolean",
-                    "description": "Flattened start_coding_task flag. Defaults to true and returns compact tool_manifest output without full schemas. Used only when `params` and `arguments` are absent."
-                },
-                "tool_manifest_intent": {
-                    "type": "string",
-                    "description": "Flattened start_coding_task compact manifest intent profile. Accepts the same coding, audit, exploration, release, and discovery values and aliases as tool_manifest; filtering affects only the returned manifest view. Used only when `params` and `arguments` are absent."
-                },
-                "tool_manifest_categories": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Flattened start_coding_task compact manifest category filter. When include_tool_manifest=true, prefer a bounded set such as workflow, session, git, edit, artifact, and cleanup instead of all tools. Used only when `params` and `arguments` are absent."
-                },
-                "tool_manifest_limit": {
-                    "type": "integer",
-                    "description": "Flattened start_coding_task compact manifest entry limit; clamped by the runtime to 1..100. Used only when `params` and `arguments` are absent."
                 },
                 "bind_current": {
                     "type": "boolean",
@@ -1249,7 +1217,7 @@ fn schemas() -> Value {
                 },
                 "include_workspace": {
                     "type": "boolean",
-                    "description": "Flattened session_handoff_summary/finish_coding_task flag. For handoff, include a bounded workspace/git status summary when project is provided. For finish, this is a compatibility flag for the nested handoff workspace block; the top-level finish workspace/show_changes check keeps its existing default behavior. Used only when params and arguments are absent."
+                    "description": "Flattened session_handoff_summary/finish_coding_task flag. For handoff, include a bounded workspace/git status summary when project is provided. For finish, control the nested handoff workspace block; the top-level finish workspace/show_changes check still runs. Used only when params and arguments are absent."
                 },
                 "include_checkpoints": {
                     "type": "boolean",
@@ -1301,11 +1269,11 @@ fn schemas() -> Value {
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "Optional 1-based stdout line cursor. Use the next_stdout_line value from a previous response for pagination."
+                    "description": "Optional 1-based continuation offset. Use cursor.stdout from the previous response."
                 },
                 "tail_lines": {
                     "type": "integer",
-                    "description": "Optional number of trailing stdout lines to return. Logs are always bounded; large values are capped server-side."
+                    "description": "Optional number of trailing stdout/stderr lines. Logs are always bounded; large values are capped server-side."
                 }
             }
         },
@@ -1337,7 +1305,7 @@ fn schemas() -> Value {
                 },
                 "with_line_numbers": {
                     "type": "boolean",
-                    "description": "Optional. When true, output includes numbered_text and lines with 1-based line numbers."
+                    "description": "Optional. When true, the single text field uses numbered format with 1-based line numbers; plain and numbered content are never duplicated."
                 }
             }
         },
@@ -2964,7 +2932,7 @@ mod tests {
     }
 
     #[test]
-    fn openapi_tool_call_request_exposes_handoff_flattened_flags() {
+    fn openapi_tool_call_request_exposes_canonical_closeout_and_detail_fields() {
         let spec = build_openapi_spec();
         let tool_call = &spec["components"]["schemas"]["ToolCallRequest"];
         let properties = tool_call["properties"].as_object().unwrap();
@@ -2973,12 +2941,8 @@ mod tests {
             "include_validation",
             "include_workspace",
             "include_checkpoints",
-            "compact_startup",
+            "detail",
             "compact",
-            "include_tool_manifest",
-            "tool_manifest_intent",
-            "tool_manifest_categories",
-            "tool_manifest_limit",
             "include_recommended_flows",
             "include_risk_summary",
         ] {
@@ -2991,14 +2955,26 @@ mod tests {
         assert_eq!(properties["include_validation"]["type"], "boolean");
         assert_eq!(properties["include_workspace"]["type"], "boolean");
         assert_eq!(properties["include_checkpoints"]["type"], "boolean");
-        assert_eq!(properties["compact_startup"]["type"], "boolean");
+        assert_eq!(properties["detail"]["type"], "string");
+        assert_eq!(
+            properties["detail"]["enum"],
+            json!(["minimal", "standard", "full"])
+        );
         assert_eq!(properties["compact"]["type"], "boolean");
-        assert_eq!(properties["include_tool_manifest"]["type"], "boolean");
-        assert_eq!(properties["tool_manifest_intent"]["type"], "string");
-        assert_eq!(properties["tool_manifest_categories"]["type"], "array");
-        assert_eq!(properties["tool_manifest_limit"]["type"], "integer");
         assert_eq!(properties["include_recommended_flows"]["type"], "boolean");
         assert_eq!(properties["include_risk_summary"]["type"], "boolean");
+        for removed_startup_field in [
+            "compact_startup",
+            "include_tool_manifest",
+            "tool_manifest_intent",
+            "tool_manifest_categories",
+            "tool_manifest_limit",
+        ] {
+            assert!(
+                !properties.contains_key(removed_startup_field),
+                "removed startup compatibility field {removed_startup_field} must stay absent"
+            );
+        }
         assert_eq!(
             tool_call["additionalProperties"], false,
             "ToolCallRequest must keep explicit flattened fields with additionalProperties=false"

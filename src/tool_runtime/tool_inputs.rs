@@ -8,6 +8,74 @@ pub fn default_true() -> bool {
     true
 }
 
+/// Declared intent for a shell/job execution. This is evidence metadata, not
+/// an authorization or command-selection policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionPurpose {
+    Validation,
+    Test,
+    Build,
+    Format,
+    Release,
+    Diagnostic,
+    Operation,
+    #[default]
+    Other,
+}
+
+impl ExecutionPurpose {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Validation => "validation",
+            Self::Test => "test",
+            Self::Build => "build",
+            Self::Format => "format",
+            Self::Release => "release",
+            Self::Diagnostic => "diagnostic",
+            Self::Operation => "operation",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Explicit command-language selection. Omission preserves the configured
+/// executor shell; callers can choose portable `sh` or `bash` deliberately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionShell {
+    Sh,
+    Bash,
+}
+
+impl ExecutionShell {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Sh => "sh",
+            Self::Bash => "bash",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupDetail {
+    Minimal,
+    #[default]
+    Standard,
+    Full,
+}
+
+impl StartupDetail {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Standard => "standard",
+            Self::Full => "full",
+        }
+    }
+}
+
 pub(crate) const CHECKPOINT_KIND_VALUES: &[&str] = &[
     "snapshot",
     "baseline",

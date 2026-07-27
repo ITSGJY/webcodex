@@ -11,6 +11,7 @@
 //! secrets, tokens, or raw session input payloads.
 
 use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::permissions::permission_summary_from_events;
 use super::session_context::{
@@ -22,7 +23,6 @@ use super::sessions::{
 };
 use super::sessions::{SessionDiscussionCounts, SessionDiscussionSummary, SessionMessage};
 use super::tool_result::ToolResult;
-use super::validation_events::validation_summary_for_session;
 use super::ToolRuntime;
 use crate::auth::AuthContext;
 
@@ -227,13 +227,22 @@ impl ToolRuntime {
 
         // --- optional ledger-derived validation summary ---
         if include_validation {
-            let validation_summary = self
+            let validation_session = self
                 .sessions
                 .summary(&session_id, Some(HANDOFF_VALIDATION_SESSION_EVENT_LIMIT))
-                .map(|summary| validation_summary_for_session(&summary))
-                .unwrap_or_else(|| validation_summary_for_session(&summary));
+                .unwrap_or_else(|| summary.clone());
+            let validation_summary = self
+                .validation_summary_for_session_with_jobs(
+                    &validation_session,
+                    DEFAULT_HANDOFF_LIMIT,
+                    auth,
+                )
+                .await;
             output["validation"] = validation_summary;
         }
+        let (work_performed, changed_paths) = closeout_work_projection(&summary.events);
+        output["work_performed"] = work_performed;
+        output["changed_paths"] = changed_paths;
 
         let workspace_checked = output.get("workspace").is_some();
         let resolved_unexpected_validation_failures = resolved_unexpected_validation_failure_count(
@@ -264,6 +273,9 @@ impl ToolRuntime {
             return ToolResult::ok(compact);
         }
         for field in [
+            "facts",
+            "hard_blockers",
+            "advisories",
             "task_outcome",
             "evidence_history",
             "evidence_integrity",
@@ -304,6 +316,7 @@ impl ToolRuntime {
                 "branch": null,
                 "head": null,
                 "changed_files_count": 0,
+                "counts": {},
                 "warnings": json!(warnings),
                 "suggested_next_actions": [],
             });
@@ -322,7 +335,8 @@ impl ToolRuntime {
                 let renamed = obj.get("renamed").and_then(Value::as_u64).unwrap_or(0);
                 let copied = obj.get("copied").and_then(Value::as_u64).unwrap_or(0);
                 let untracked = obj.get("untracked").and_then(Value::as_u64).unwrap_or(0);
-                Some(modified + added + deleted + renamed + copied + untracked)
+                let conflicted = obj.get("conflicted").and_then(Value::as_u64).unwrap_or(0);
+                Some(modified + added + deleted + renamed + copied + untracked + conflicted)
             })
             .unwrap_or(0);
 
@@ -354,6 +368,7 @@ impl ToolRuntime {
             "branch": show_result.output.get("branch").cloned().unwrap_or(Value::Null),
             "head": show_result.output.get("head").cloned().unwrap_or(Value::Null),
             "changed_files_count": changed_files_count,
+            "counts": counts,
             "warnings": json!(warnings),
             "suggested_next_actions": show_result.output.get("suggested_next_actions").cloned().unwrap_or_else(|| json!([])),
         })
@@ -496,17 +511,24 @@ fn compact_handoff_output(output: &Value, resolved_unexpected_validation_failure
         .and_then(|workspace| workspace.get("clean"))
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    let workspace_conflicts = output
+        .pointer("/workspace/counts/conflicted")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let mut compact = json!({
         "summary_only": true,
         "project": output.get("project").cloned().unwrap_or(Value::Null),
         "session_id": output.get("session_id").cloned().unwrap_or(Value::Null),
         "workspace_clean": workspace_clean,
+        "workspace_conflicts": workspace_conflicts,
         "hygiene_clean": true,
         "jobs": compact_jobs(output.get("jobs").unwrap_or(&Value::Null)),
         "permissions": compact_permissions(output.get("permissions").unwrap_or(&Value::Null)),
         "tool_failures": compact_tool_failures(output.get("tool_failures").unwrap_or(&Value::Null)),
         "validation": compact_validation(output.get("validation").unwrap_or(&Value::Null)),
         "review_evidence": compact_review_evidence(output.get("review_evidence").unwrap_or(&Value::Null)),
+        "work_performed": output.get("work_performed").cloned().unwrap_or_else(|| json!([])),
+        "changed_paths": output.get("changed_paths").cloned().unwrap_or_else(|| json!([])),
         "warnings": output.get("warnings").cloned().unwrap_or_else(|| json!([])),
         "suggested_next_actions": output.get("suggested_next_actions").cloned().unwrap_or_else(|| json!([])),
     });
@@ -748,12 +770,16 @@ fn compact_workflow_outcomes(
         push_unique(&mut warning_reasons, "workspace_not_checked");
         push_unique_action(&mut actions, "run show_changes before final handoff");
     }
-    if output
+    let workspace_conflicts = count_field(output, "workspace_conflicts");
+    if workspace_conflicts > 0 {
+        push_unique(&mut blocking_reasons, "workspace_conflicts");
+        push_unique_action(&mut actions, "resolve workspace conflicts before closeout");
+    } else if output
         .get("workspace_clean")
         .and_then(Value::as_bool)
         .is_some_and(|clean| !clean)
     {
-        push_unique(&mut blocking_reasons, "workspace_dirty");
+        push_unique(&mut warning_reasons, "workspace_dirty");
         push_unique_action(&mut actions, "review workspace changes with show_changes");
     }
 
@@ -766,8 +792,19 @@ fn compact_workflow_outcomes(
         .and_then(Value::as_bool)
         .is_some_and(|clean| !clean)
     {
-        push_unique(&mut blocking_reasons, "hygiene_failed");
+        push_unique(&mut warning_reasons, "workspace_hygiene_findings");
         push_unique_action(&mut actions, "review workspace hygiene before closeout");
+    }
+    if count_field(output, "hygiene_secret_like_paths") > 0 {
+        push_unique(&mut blocking_reasons, "sensitive_path_risk");
+        push_unique_action(&mut actions, "review secret-like paths before closeout");
+    }
+    if output
+        .get("hygiene_truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        push_unique(&mut warning_reasons, "workspace_hygiene_truncated");
     }
 
     let jobs = output.get("jobs").unwrap_or(&Value::Null);
@@ -831,6 +868,14 @@ fn compact_workflow_outcomes(
     }
 
     let validation_status = validation.get("status").and_then(Value::as_str);
+    let resolved_failure_count = validation
+        .pointer("/resolved_failures/count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let unresolved_failure_count = validation
+        .pointer("/unresolved_failures/count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let evidence_history_status = match validation_status {
         Some("mixed") if validation_historical_failures_resolved(validation) => "mixed_resolved",
         Some("mixed") => "mixed_unresolved",
@@ -863,15 +908,15 @@ fn compact_workflow_outcomes(
                 );
             }
         }
-        Some("failed") => {
+        Some("failed") if unresolved_failure_count > 0 => {
             push_unique(&mut blocking_reasons, "validation_failed");
             push_unique_action(&mut actions, "review validation failures before closeout");
         }
         Some("mixed") => {
-            if validation_historical_failures_resolved(validation) {
+            if unresolved_failure_count == 0 {
                 push_unique(
-                    &mut informational_notes,
-                    "historical validation failures were resolved by later successful validation",
+                    &mut warning_reasons,
+                    "historical_validation_failures_resolved",
                 );
             } else {
                 push_unique(&mut blocking_reasons, "validation_mixed");
@@ -884,11 +929,10 @@ fn compact_workflow_outcomes(
         Some("unknown") | None => {
             push_unique(&mut warning_reasons, "validation_unknown");
         }
+        Some("failed") => {}
         Some(_) => {}
     }
-    if validation_historical_failures_unresolved(validation)
-        && !matches!(validation_status, Some("failed" | "mixed"))
-    {
+    if unresolved_failure_count > 0 && !matches!(validation_status, Some("failed" | "mixed")) {
         push_unique(
             &mut blocking_reasons,
             "validation_historical_failures_unresolved",
@@ -943,8 +987,46 @@ fn compact_workflow_outcomes(
         "warning_reasons": warning_reasons.clone(),
         "suggested_next_actions": actions.clone(),
     });
+    let executions = validation
+        .get("events")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let validation_skipped = matches!(validation_status, Some("not_run"))
+        || validation
+            .get("skipped")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    let facts = json!({
+        "work_performed": output.get("work_performed").cloned().unwrap_or_else(|| json!([])),
+        "changed_paths": output.get("changed_paths").cloned().unwrap_or_else(|| json!([])),
+        "executions": executions,
+        "validations_passed": validation.get("successes").and_then(Value::as_u64).unwrap_or(0),
+        "validations_failed": validation.get("failures").and_then(Value::as_u64).unwrap_or(0),
+        "validations_skipped": {
+            "count": u64::from(validation_skipped),
+            "reason": validation.get("reason").cloned().unwrap_or(Value::Null),
+        },
+        "resolved_failures": validation.get("resolved_failures").cloned().unwrap_or_else(|| json!({"count": resolved_failure_count, "events": []})),
+        "unresolved_failures": validation.get("unresolved_failures").cloned().unwrap_or_else(|| json!({"count": unresolved_failure_count, "events": []})),
+        "workspace_state": {
+            "checked": workspace_checked,
+            "clean": output.get("workspace_clean").cloned().unwrap_or(Value::Null),
+            "conflicts": workspace_conflicts,
+            "hygiene_checked": hygiene_checked,
+            "hygiene_clean": output.get("hygiene_clean").cloned().unwrap_or(Value::Null),
+        },
+        "active_jobs": output.get("jobs").cloned().unwrap_or_else(|| json!({})),
+        "evidence_integrity": {
+            "status": evidence_integrity_status,
+            "error_reasons": integrity_errors,
+            "warning_reasons": integrity_warnings,
+        },
+    });
 
     json!({
+        "facts": facts,
+        "hard_blockers": blocking_reasons,
+        "advisories": warning_reasons,
         "task_outcome": {
             "status": task_status,
             "blocking": task_status == "fail",
@@ -967,31 +1049,33 @@ fn compact_workflow_outcomes(
 pub(crate) fn resolved_unexpected_validation_failure_count(
     events: &[SessionEvent],
     validation: &Value,
-    workspace_checked: bool,
-    workspace_clean: bool,
-    hygiene_clean: bool,
-    blocking_active_job_count: u64,
+    _workspace_checked: bool,
+    _workspace_clean: bool,
+    _hygiene_clean: bool,
+    _blocking_active_job_count: u64,
 ) -> usize {
-    if !workspace_checked
-        || !workspace_clean
-        || !hygiene_clean
-        || blocking_active_job_count > 0
-        || !validation_historical_failures_resolved(validation)
-    {
+    let resolved = validation
+        .pointer("/resolved_failures/events")
+        .and_then(Value::as_array);
+    let Some(resolved) = resolved else {
         return 0;
-    }
-
+    };
     events
         .iter()
-        .enumerate()
-        .filter(|(index, event)| {
-            is_resolvable_unexpected_validation_failure(event)
-                && events[index + 1..].iter().any(|later| {
-                    later.kind == "tool_call_finished"
-                        && later.session_id == event.session_id
-                        && later.tool_name == event.tool_name
-                        && later.status.as_deref() == Some("succeeded")
-                        && !cargo_test_zero_tests_success(later)
+        .filter(|event| {
+            event.kind == "tool_call_finished"
+                && event.status.as_deref() == Some("failed")
+                && event
+                    .failure_expectation_result
+                    .as_deref()
+                    .unwrap_or(TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE)
+                    == TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE
+                && resolved.iter().any(|resolved| {
+                    resolved.get("tool_name").and_then(Value::as_str)
+                        == Some(event.tool_name.as_str())
+                        && resolved.get("session_id").and_then(Value::as_str)
+                            == Some(event.session_id.as_str())
+                        && resolved.get("completed_at").and_then(Value::as_i64) == event.finished_at
                 })
         })
         .count()
@@ -1005,39 +1089,11 @@ pub(crate) fn unresolved_unexpected_failure_count(
         .saturating_sub(resolved_unexpected_validation_failures as u64)
 }
 
-fn cargo_test_zero_tests_success(event: &SessionEvent) -> bool {
-    event.tool_name == "cargo_test"
-        && event.status.as_deref() == Some("succeeded")
-        && event
-            .validation_output_summary
-            .as_ref()
-            .and_then(|summary| summary.get("zero_tests_run"))
-            .and_then(Value::as_bool)
-            == Some(true)
-}
-
-fn is_resolvable_unexpected_validation_failure(event: &SessionEvent) -> bool {
-    matches!(
-        event.tool_name.as_str(),
-        "cargo_fmt" | "cargo_check" | "cargo_test"
-    ) && event.kind == "tool_call_finished"
-        && event.status.as_deref() == Some("failed")
-        && event.failure_kind.as_deref() == Some("validation_failed")
-        && event
-            .failure_expectation_result
-            .as_deref()
-            .unwrap_or_else(|| {
-                if event.status.as_deref() == Some("failed") {
-                    TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE
-                } else {
-                    "none"
-                }
-            })
-            == TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE
-}
-
 fn install_compact_workflow_outcomes(target: &mut Value, outcomes: Value) {
     for field in [
+        "facts",
+        "hard_blockers",
+        "advisories",
         "task_outcome",
         "evidence_history",
         "evidence_integrity",
@@ -1046,6 +1102,41 @@ fn install_compact_workflow_outcomes(target: &mut Value, outcomes: Value) {
     ] {
         target[field] = outcomes.get(field).cloned().unwrap_or(Value::Null);
     }
+}
+
+pub(crate) fn closeout_work_projection(events: &[SessionEvent]) -> (Value, Value) {
+    let mut tools = BTreeMap::<String, (u64, u64, u64, Option<i64>)>::new();
+    let mut changed_paths = BTreeSet::<String>::new();
+    for event in events
+        .iter()
+        .filter(|event| event.kind == "tool_call_finished")
+    {
+        let counts = tools.entry(event.tool_name.clone()).or_default();
+        counts.0 = counts.0.saturating_add(1);
+        match event.status.as_deref() {
+            Some("succeeded") => counts.1 = counts.1.saturating_add(1),
+            Some("failed") => counts.2 = counts.2.saturating_add(1),
+            _ => {}
+        }
+        counts.3 = event.finished_at.or(Some(event.timestamp));
+        changed_paths.extend(event.changed_paths.iter().cloned());
+    }
+    let work = tools
+        .into_iter()
+        .map(|(tool_name, (count, succeeded, failed, completed_at))| {
+            json!({
+                "tool_name": tool_name,
+                "count": count,
+                "succeeded": succeeded,
+                "failed": failed,
+                "last_completed_at": completed_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    (
+        json!(work),
+        json!(changed_paths.into_iter().take(200).collect::<Vec<_>>()),
+    )
 }
 
 fn validation_historical_failures_resolved(validation: &Value) -> bool {

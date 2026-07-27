@@ -18,7 +18,13 @@ pub(crate) fn session_log_arguments_for_tool_request(tool_name: &str, arguments:
                 "command_present".to_string(),
                 Value::Bool(obj.contains_key("command")),
             );
-            copy_keys(obj, &mut out, &["timeout_secs", "cwd"]);
+            copy_keys(obj, &mut out, &["timeout_secs", "cwd", "purpose", "shell"]);
+            if let Some(command) = obj.get("command").and_then(Value::as_str) {
+                out.insert(
+                    "command_summary".to_string(),
+                    Value::String(crate::shell_client::command_preview(command)),
+                );
+            }
         }
         "search_project_text" => {
             copy_keys(
@@ -262,25 +268,37 @@ impl ToolCall {
         match self {
             Self::RunShell {
                 project,
+                command,
                 timeout_secs,
                 cwd,
+                purpose,
+                shell,
                 ..
             } => serde_json::json!({
                 "project": project,
                 "command_present": true,
+                "command_summary": crate::shell_client::command_preview(command),
                 "timeout_secs": timeout_secs,
                 "cwd": cwd,
+                "purpose": purpose,
+                "shell": shell,
             }),
             Self::RunJob {
                 project,
+                command,
                 timeout_secs,
                 cwd,
+                purpose,
+                shell,
                 ..
             } => serde_json::json!({
                 "project": project,
                 "command_present": true,
+                "command_summary": crate::shell_client::command_preview(command),
                 "timeout_secs": timeout_secs,
                 "cwd": cwd,
+                "purpose": purpose,
+                "shell": shell,
             }),
             Self::StopJob {
                 project,
@@ -815,31 +833,16 @@ impl ToolCall {
                 mode,
                 deny_write_tools,
                 deny_shell_tools,
-                include_runtime_status,
-                compact_startup,
-                include_git,
-                include_recent_commits,
-                include_rules,
-                include_tool_manifest,
-                tool_manifest_intent,
-                tool_manifest_categories,
-                tool_manifest_limit,
+                detail,
                 bind_current,
+                ..
             } => serde_json::json!({
                 "project": project,
                 "title": title,
                 "mode": mode,
                 "deny_write_tools": deny_write_tools,
                 "deny_shell_tools": deny_shell_tools,
-                "include_runtime_status": include_runtime_status,
-                "compact_startup": compact_startup,
-                "include_git": include_git,
-                "include_recent_commits": include_recent_commits,
-                "include_rules": include_rules,
-                "include_tool_manifest": include_tool_manifest,
-                "tool_manifest_intent": tool_manifest_intent,
-                "tool_manifest_categories": tool_manifest_categories,
-                "tool_manifest_limit": tool_manifest_limit,
+                "detail": detail,
                 "bind_current": bind_current,
             }),
             Self::FinishCodingTask {

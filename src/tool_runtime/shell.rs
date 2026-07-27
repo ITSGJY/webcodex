@@ -3,13 +3,15 @@ use std::time::Duration;
 
 use super::helpers::{
     bounded_tail, command_failed_message, command_rejected_message, command_timeout_message,
-    looks_like_command_timeout, resolve_agent_cwd, resolve_local_cwd, resolve_sync_timeout_secs,
-    run_command_sync_bounded, sync_timeout_out_of_range_result, LocalRunFailure,
-    COMMAND_STDIO_TAIL_CHARS, DEFAULT_RUN_SHELL_TIMEOUT_SECS, MAX_SYNC_TIMEOUT_SECS,
-    MIN_SYNC_TIMEOUT_SECS,
+    looks_like_command_timeout, project_relative_agent_cwd, project_relative_cwd,
+    resolve_agent_cwd, resolve_local_cwd, resolve_sync_timeout_secs, run_command_sync_bounded,
+    run_command_sync_bounded_with_shell, shell_escape_simple, sync_timeout_out_of_range_result,
+    LocalRunFailure, COMMAND_STDIO_TAIL_CHARS, DEFAULT_RUN_SHELL_TIMEOUT_SECS,
+    MAX_SYNC_TIMEOUT_SECS, MIN_SYNC_TIMEOUT_SECS,
 };
 use super::tool_result::ToolResult;
-use super::ToolRuntime;
+use super::{ExecutionPurpose, ExecutionShell, ToolRuntime};
+use crate::shell_client::command_preview;
 use crate::shell_protocol::ShellRunRequest;
 
 pub(crate) struct ProjectCommandOutput {
@@ -29,10 +31,16 @@ impl ToolRuntime {
         stderr: String,
         duration_ms: Option<u64>,
     ) -> serde_json::Value {
+        let (stdout_tail, stdout_truncated) = bounded_tail(&stdout, COMMAND_STDIO_TAIL_CHARS);
+        let (stderr_tail, stderr_truncated) = bounded_tail(&stderr, COMMAND_STDIO_TAIL_CHARS);
         json!({
             "exit_code": exit_code,
-            "stdout": stdout,
-            "stderr": stderr,
+            "stdout_tail": stdout_tail,
+            "stderr_tail": stderr_tail,
+            "stdout_lines": stdout.lines().count(),
+            "stderr_lines": stderr.lines().count(),
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
             "duration_ms": duration_ms,
             "command_started": true,
             "command_completed": true,
@@ -57,6 +65,8 @@ impl ToolRuntime {
             "duration_ms": duration_ms,
             "stdout_tail": stdout_tail,
             "stderr_tail": stderr_tail,
+            "stdout_lines": stdout.lines().count(),
+            "stderr_lines": stderr.lines().count(),
             "stdout_truncated": stdout_truncated,
             "stderr_truncated": stderr_truncated,
             "command_started": true,
@@ -219,6 +229,19 @@ impl ToolRuntime {
         timeout_secs: Option<u64>,
         cwd: Option<String>,
     ) -> ToolResult {
+        self.run_shell_with_contract(project, command, timeout_secs, cwd, None, None)
+            .await
+    }
+
+    pub(crate) async fn run_shell_with_contract(
+        &self,
+        project: String,
+        command: String,
+        timeout_secs: Option<u64>,
+        cwd: Option<String>,
+        purpose: Option<ExecutionPurpose>,
+        shell: Option<ExecutionShell>,
+    ) -> ToolResult {
         let timeout = match resolve_sync_timeout_secs(timeout_secs, DEFAULT_RUN_SHELL_TIMEOUT_SECS)
         {
             Ok(timeout) => timeout,
@@ -243,6 +266,8 @@ impl ToolRuntime {
                 )
             }
         };
+        let declared_purpose = purpose.unwrap_or_default();
+        let command_summary = command_preview(&command);
         if proj.is_agent() {
             let client_id =
                 match proj.agent_client_id() {
@@ -258,7 +283,7 @@ impl ToolRuntime {
                     ),
                 };
             let effective_cwd = match resolve_agent_cwd(&proj, cwd.as_deref()) {
-                Ok(cwd) => Some(cwd),
+                Ok(cwd) => cwd,
                 Err(e) => {
                     return Self::run_shell_tool_failure_result(
                         command_rejected_message(
@@ -271,14 +296,26 @@ impl ToolRuntime {
                     )
                 }
             };
+            let resolved_cwd = project_relative_agent_cwd(&proj, &effective_cwd)
+                .unwrap_or_else(|_| ".".to_string());
+            let actual_shell = shell.map(ExecutionShell::as_str).unwrap_or("configured");
+            let dispatched_command = shell
+                .map(|shell| {
+                    format!(
+                        "exec {} -c {}",
+                        shell.as_str(),
+                        shell_escape_simple(&command)
+                    )
+                })
+                .unwrap_or_else(|| command.clone());
             let wait_timeout = timeout;
             let (request_id, rx) = match self
                 .shell_clients
                 .enqueue_run(
                     ShellRunRequest {
                         client_id,
-                        cwd: effective_cwd,
-                        command,
+                        cwd: Some(effective_cwd),
+                        command: dispatched_command,
                         stdin: None,
                         timeout_secs: timeout,
                         wait_timeout_secs: wait_timeout,
@@ -304,7 +341,7 @@ impl ToolRuntime {
             match tokio::time::timeout(Duration::from_secs(wait_timeout + 2), rx).await {
                 Ok(Ok(response)) => {
                     let success = response.error.is_none() && response.exit_code == Some(0);
-                    if success {
+                    let mut result = if success {
                         ToolResult::ok(Self::run_shell_success_output(
                             0,
                             response.stdout.unwrap_or_default(),
@@ -329,7 +366,16 @@ impl ToolRuntime {
                             response.duration_ms,
                             timeout,
                         )
-                    }
+                    };
+                    decorate_execution_output(
+                        &mut result.output,
+                        declared_purpose,
+                        &command_summary,
+                        &resolved_cwd,
+                        actual_shell,
+                        "agent",
+                    );
+                    result
                 }
                 Ok(Err(_)) => {
                     self.shell_clients.cancel_request(&request_id).await;
@@ -368,7 +414,17 @@ impl ToolRuntime {
                     )
                 }
             };
-            match run_command_sync_bounded(command, cwd_path, timeout).await {
+            let resolved_cwd =
+                project_relative_cwd(&proj, &cwd_path).unwrap_or_else(|_| ".".to_string());
+            let actual_shell = shell.map(ExecutionShell::as_str).unwrap_or("sh");
+            let result = match run_command_sync_bounded_with_shell(
+                command,
+                cwd_path,
+                timeout,
+                actual_shell.to_string(),
+            )
+            .await
+            {
                 Ok((exit_code, stdout, stderr, duration_ms)) => {
                     if exit_code == 0 {
                         ToolResult::ok(Self::run_shell_success_output(
@@ -409,7 +465,42 @@ impl ToolRuntime {
                     false,
                     false,
                 ),
-            }
+            };
+            let mut result = result;
+            decorate_execution_output(
+                &mut result.output,
+                declared_purpose,
+                &command_summary,
+                &resolved_cwd,
+                actual_shell,
+                "local",
+            );
+            result
         }
     }
+}
+
+fn decorate_execution_output(
+    output: &mut serde_json::Value,
+    purpose: ExecutionPurpose,
+    command_summary: &str,
+    cwd: &str,
+    shell: &str,
+    executor: &str,
+) {
+    output["execution_source"] = json!("run_shell");
+    output["purpose"] = json!(purpose.as_str());
+    output["command_summary"] = json!(command_summary);
+    output["cwd"] = json!(cwd);
+    output["shell"] = json!(shell);
+    output["executor"] = json!(executor);
+    output["execution_state"] = json!(if output
+        .get("failure_kind")
+        .and_then(serde_json::Value::as_str)
+        == Some("timeout")
+    {
+        "timed_out"
+    } else {
+        "completed"
+    });
 }

@@ -331,7 +331,15 @@ async fn read_only_tool_skips_permission_decision() {
     let req = next_patch_agent_request(&runtime, client_id)
         .await
         .expect("read_file should still execute under require_approval");
-    complete_patch_agent_request(&runtime, client_id, &req.request_id, 0, "hello\n", "").await;
+    complete_patch_agent_request(
+        &runtime,
+        client_id,
+        &req.request_id,
+        0,
+        &canonical_agent_file_read_output("hello\n", 1),
+        "",
+    )
+    .await;
     let result = task.await.unwrap();
 
     assert!(result.success, "{:?}", result.error);

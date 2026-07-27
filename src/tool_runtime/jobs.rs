@@ -2,14 +2,15 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 use super::helpers::{
-    command_rejected_message, is_safe_job_id, normalize_local_status, read_json, read_lines_from,
-    read_trim, shell_escape_simple,
+    command_rejected_message, is_safe_job_id, normalize_local_status, project_relative_agent_cwd,
+    project_relative_cwd, read_json, read_lines_from, read_trim, resolve_agent_cwd,
+    resolve_local_cwd, shell_escape_simple,
 };
 use super::local_jobs::{
     LocalJobKiller, LocalJobRecord, TerminateOutcome, ACTIVE_JOB_STATUSES, ACTIVE_LOCAL_STATUSES,
 };
 use super::tool_result::ToolResult;
-use super::ToolRuntime;
+use super::{ExecutionPurpose, ExecutionShell, ToolRuntime};
 use crate::auth::AuthContext;
 use crate::shell_client::{command_preview, ShellJobStartMetadata, COMMAND_PREVIEW_MAX_CHARS};
 use crate::shell_protocol::{ShellJobInfo, ShellJobOpRequest, ShellJobValidationStep};
@@ -27,6 +28,61 @@ pub(crate) fn is_terminal_job_status(status: &str) -> bool {
         status,
         "completed" | "failed" | "stopped" | "lost" | "timeout" | "timed_out" | "cancelled"
     )
+}
+
+fn detected_job_summary(
+    command_summary: Option<&str>,
+    purpose: Option<&str>,
+    status: &str,
+    exit_code: Option<i64>,
+    stdout: &str,
+    stderr: &str,
+) -> Value {
+    let normalized = command_summary
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let kind = if normalized.starts_with("cargo test") {
+        "test"
+    } else if normalized.starts_with("cargo check") {
+        "check"
+    } else if normalized.starts_with("cargo fmt") {
+        "format"
+    } else if normalized.starts_with("cargo build") {
+        "build"
+    } else {
+        match purpose {
+            Some("other") | None => "operation",
+            Some(purpose) => purpose,
+        }
+    };
+    let outcome = if !is_terminal_job_status(status) {
+        "in_progress"
+    } else if status == "completed" && exit_code == Some(0) {
+        "passed"
+    } else if matches!(status, "timeout" | "timed_out") {
+        "timed_out"
+    } else if matches!(status, "stopped" | "cancelled") {
+        "cancelled"
+    } else {
+        "failed"
+    };
+    let mut detected = json!({
+        "kind": kind,
+        "outcome": outcome,
+    });
+    if kind == "test" {
+        let combined = format!("{stdout}\n{stderr}");
+        let metadata = super::cargo::parse_cargo_test_run_metadata(&combined);
+        let (passed, failed) = super::cargo::parse_cargo_test_counts(&combined);
+        detected["tests_detected"] = json!(metadata.tests_detected);
+        detected["tests_run_count"] = json!(metadata.tests_run_count);
+        detected["zero_tests_run"] = json!(metadata.zero_tests_run);
+        detected["tests_passed"] = json!(passed);
+        detected["tests_failed"] = json!(failed);
+    }
+    detected
 }
 
 fn is_lifecycle_active_status(status: &str) -> bool {
@@ -186,13 +242,45 @@ pub(crate) fn local_job_log(
     let stderr = read_lines_from(record.dir.join("stderr.log"), offset, tail_lines);
     let raw_status = read_trim(record.dir.join("status")).unwrap_or_default();
     let status = normalize_local_status(&raw_status);
+    let exit_code = read_trim(record.dir.join("exit_code")).and_then(|v| v.parse::<i32>().ok());
+    let meta = read_json(record.dir.join("metadata.json"));
+    let purpose = meta
+        .get("purpose")
+        .and_then(Value::as_str)
+        .unwrap_or("other");
+    let command_summary = meta
+        .get("command")
+        .and_then(Value::as_str)
+        .map(command_preview)
+        .unwrap_or_default();
+    let detected_summary = detected_job_summary(
+        Some(&command_summary),
+        Some(purpose),
+        &status,
+        exit_code.map(i64::from),
+        &stdout.0,
+        &stderr.0,
+    );
     let mut output = json!({
         "job_id": job_id,
         "status": status,
-        "stdout": stdout.0,
-        "stderr": stderr.0,
-        "next_stdout_line": stdout.1,
-        "next_stderr_line": stderr.1,
+        "exit_code": exit_code,
+        "stdout_tail": stdout.0,
+        "stderr_tail": stderr.0,
+        "stdout_lines": stdout.2,
+        "stderr_lines": stderr.2,
+        "stdout_truncated": stdout.3,
+        "stderr_truncated": stderr.3,
+        "cursor": {
+            "stdout": stdout.1,
+            "stderr": stderr.1,
+        },
+        "executor": "local",
+        "cwd": meta.get("cwd").cloned().unwrap_or_else(|| json!(".")),
+        "shell": meta.get("shell").cloned().unwrap_or_else(|| json!("bash")),
+        "purpose": purpose,
+        "command_summary": command_summary,
+        "detected_summary": detected_summary,
     });
     if let Some(note) = timeout_note {
         output["note"] = Value::String(note);
@@ -385,7 +473,6 @@ fn confirmation_required_result(project: &str, job_id: &str) -> ToolResult {
             "failure_kind": "confirmation_required",
             "project": project,
             "job_id": job_id,
-            "stopped": false,
             "already_finished": false,
             "already_stop_requested": false,
             "stop_request_accepted": false,
@@ -407,7 +494,6 @@ fn job_not_found_result(project: &str, job_id: &str) -> ToolResult {
             "failure_kind": "job_not_found",
             "project": project,
             "job_id": job_id,
-            "stopped": false,
             "already_finished": false,
             "already_stop_requested": false,
             "stop_request_accepted": false,
@@ -437,7 +523,6 @@ fn job_project_mismatch_result(
             "project": request_project,
             "job_project": job_project,
             "job_id": job_id,
-            "stopped": false,
             "already_finished": false,
             "already_stop_requested": false,
             "stop_request_accepted": false,
@@ -469,7 +554,6 @@ fn job_stop_forbidden_result(
             "job_id": job_id,
             "request_session_id": request_session_id,
             "job_session_id": job_session_id,
-            "stopped": false,
             "already_finished": false,
             "already_stop_requested": false,
             "stop_request_accepted": false,
@@ -540,7 +624,6 @@ fn stop_job_output(
         "requested"
     };
     let mut output = json!({
-        "stopped": stopped,
         "already_finished": already_finished,
         "already_stop_requested": already_stop_requested,
         "stop_request_accepted": stop_request_accepted,
@@ -597,6 +680,35 @@ impl ToolRuntime {
         sandbox: Option<String>,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
+        self.run_job_for_auth_with_contract(
+            project,
+            command,
+            session_id,
+            timeout_secs,
+            cwd,
+            validation_steps,
+            sandbox,
+            auth,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_job_for_auth_with_contract(
+        &self,
+        project: String,
+        command: String,
+        session_id: Option<String>,
+        timeout_secs: Option<i64>,
+        cwd: Option<String>,
+        validation_steps: Vec<ShellJobValidationStep>,
+        sandbox: Option<String>,
+        auth: Option<&AuthContext>,
+        purpose: Option<ExecutionPurpose>,
+        shell: Option<ExecutionShell>,
+    ) -> ToolResult {
         let resolved = match self.resolve_project_input_for_auth(&project, auth).await {
             Ok(resolved) => resolved,
             Err(e) => return ToolResult::err(command_rejected_message(
@@ -607,6 +719,8 @@ impl ToolRuntime {
         let project_id = resolved.resolved_id.clone();
         let proj = resolved.config;
         let max_runtime = timeout_secs.unwrap_or(3600).clamp(1, 604800);
+        let declared_purpose = purpose.unwrap_or_default();
+        let command_summary = command_preview(&command);
         if proj.is_agent() {
             let client_id = match proj.agent_client_id() {
                 Ok(id) => id.to_string(),
@@ -617,14 +731,35 @@ impl ToolRuntime {
                     ))
                 }
             };
+            let effective_cwd = match resolve_agent_cwd(&proj, cwd.as_deref()) {
+                Ok(cwd) => cwd,
+                Err(error) => {
+                    return ToolResult::err(command_rejected_message(
+                        error,
+                        "choose '.', an existing project-relative cwd, or a path inside the registered project root.",
+                    ))
+                }
+            };
+            let resolved_cwd = project_relative_agent_cwd(&proj, &effective_cwd)
+                .unwrap_or_else(|_| ".".to_string());
+            let actual_shell = shell.map(ExecutionShell::as_str).unwrap_or("configured");
+            let dispatched_command = shell
+                .map(|shell| {
+                    format!(
+                        "exec {} -c {}",
+                        shell.as_str(),
+                        shell_escape_simple(&command)
+                    )
+                })
+                .unwrap_or_else(|| command.clone());
             match self
                 .shell_clients
                 .start_job_with_metadata_for_auth(
                     ShellJobOpRequest {
                         op: "start".to_string(),
                         client_id: Some(client_id),
-                        cwd: cwd.or_else(|| Some(proj.path.clone())),
-                        command: Some(command),
+                        cwd: Some(effective_cwd),
+                        command: Some(dispatched_command),
                         timeout_secs: Some(max_runtime as u64),
                         job_id: None,
                         since_stdout_line: None,
@@ -637,6 +772,9 @@ impl ToolRuntime {
                     ShellJobStartMetadata {
                         project_id: Some(project_id.clone()),
                         session_id: session_id.clone(),
+                        project_cwd: Some(resolved_cwd.clone()),
+                        purpose: Some(declared_purpose.as_str().to_string()),
+                        shell: Some(actual_shell.to_string()),
                         validation_steps,
                         sandbox,
                     },
@@ -649,6 +787,20 @@ impl ToolRuntime {
                     "kind": job.kind,
                     "status": job.status,
                     "project": project_id,
+                    "execution_source": "run_job",
+                    "purpose": declared_purpose.as_str(),
+                    "command_summary": command_summary,
+                    "cwd": resolved_cwd,
+                    "shell": actual_shell,
+                    "executor": "agent",
+                    "execution_state": "started",
+                    "created_at": job.created_at,
+                    "stdout_tail": "",
+                    "stderr_tail": "",
+                    "stdout_lines": 0,
+                    "stderr_lines": 0,
+                    "stdout_truncated": false,
+                    "stderr_truncated": false,
                 })),
                 Err(e) => ToolResult::err(command_rejected_message(
                     e,
@@ -662,6 +814,20 @@ impl ToolRuntime {
                 );
             }
             let root = proj.root();
+            let cwd_path = match resolve_local_cwd(&proj, cwd.as_deref()) {
+                Ok(path) => path,
+                Err(error) => {
+                    return ToolResult::err(command_rejected_message(
+                        error,
+                        "choose '.', an existing project-relative cwd, or a path inside the project root.",
+                    ))
+                }
+            };
+            let resolved_cwd =
+                project_relative_cwd(&proj, &cwd_path).unwrap_or_else(|_| ".".to_string());
+            // Preserve the existing local async-job command language (bash)
+            // when omitted; explicit sh/bash selects the requested language.
+            let actual_shell = shell.map(ExecutionShell::as_str).unwrap_or("bash");
             let job_id = uuid::Uuid::new_v4().to_string();
             let dir = root.join(format!(".codex/jobs/{}", job_id));
             if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -679,6 +845,9 @@ impl ToolRuntime {
                 "executor": "local",
                 "path": proj.path.clone(),
                 "kind": "shell",
+                "purpose": declared_purpose.as_str(),
+                "cwd": resolved_cwd,
+                "shell": actual_shell,
             });
             if let Some(session_id) = session_id.as_ref() {
                 meta["session_id"] = json!(session_id);
@@ -689,7 +858,7 @@ impl ToolRuntime {
             ) {
                 return ToolResult::err(format!("Failed to write metadata: {}", e));
             }
-            let cmd_content = format!("#!/usr/bin/env bash\n{}\n", command);
+            let cmd_content = format!("#!/usr/bin/env {actual_shell}\n{command}\n");
             if let Err(e) = std::fs::write(dir.join("command.sh"), &cmd_content) {
                 return ToolResult::err(format!("Failed to write command.sh: {}", e));
             }
@@ -702,14 +871,15 @@ impl ToolRuntime {
             }
             let dir_s = dir.to_string_lossy().to_string();
             let wrapper = format!(
-                "bash {0}/command.sh > {0}/stdout.log 2> {0}/stderr.log; code=$?; echo $code > {0}/exit_code; finished=$(date +%s); echo $finished > {0}/finished_at; if [ $code -eq 0 ]; then echo completed > {0}/status; else echo failed > {0}/status; fi",
-                shell_escape_simple(&dir_s)
+                "{1} {0}/command.sh > {0}/stdout.log 2> {0}/stderr.log; code=$?; echo $code > {0}/exit_code; finished=$(date +%s); echo $finished > {0}/finished_at; if [ $code -eq 0 ]; then echo completed > {0}/status; else echo failed > {0}/status; fi",
+                shell_escape_simple(&dir_s),
+                actual_shell,
             );
             match std::process::Command::new("setsid")
                 .arg("sh")
                 .arg("-c")
                 .arg(wrapper)
-                .current_dir(&root)
+                .current_dir(&cwd_path)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -751,6 +921,20 @@ impl ToolRuntime {
                         "kind": "shell",
                         "status": "running",
                         "project": project_id,
+                        "execution_source": "run_job",
+                        "purpose": declared_purpose.as_str(),
+                        "command_summary": command_summary,
+                        "cwd": resolved_cwd,
+                        "shell": actual_shell,
+                        "executor": "local",
+                        "execution_state": "started",
+                        "created_at": now,
+                        "stdout_tail": "",
+                        "stderr_tail": "",
+                        "stdout_lines": 0,
+                        "stderr_lines": 0,
+                        "stdout_truncated": false,
+                        "stderr_truncated": false,
                     }))
                 }
                 Err(e) => ToolResult::err(format!("Failed to spawn job: {}", e)),
@@ -837,6 +1021,11 @@ impl ToolRuntime {
         tail_lines: Option<usize>,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
+        let tail_lines = if offset.is_none() && tail_lines.is_none() {
+            Some(super::helpers::DEFAULT_JOB_LOG_TAIL_LINES)
+        } else {
+            tail_lines
+        };
         let killer = self.job_killer.as_ref();
         if let Some(record) = self.local_jobs.lock().await.get(&job_id).cloned() {
             if !local_jobs_visible_to_auth(auth) {
@@ -860,17 +1049,46 @@ impl ToolRuntime {
         }
         match self
             .shell_clients
-            .job_log_for_auth(auth, &job_id, offset, None, tail_lines.or(Some(500)))
+            .job_log_for_auth(auth, &job_id, offset, None, tail_lines)
             .await
         {
             Ok((job, stdout, stderr, next_stdout_line, next_stderr_line)) => {
+                let stdout = stdout.unwrap_or_default();
+                let stderr = stderr.unwrap_or_default();
+                let stdout_lines = stdout.lines().count();
+                let stderr_lines = stderr.lines().count();
+                let command_summary = job.command_preview.clone();
+                let purpose = job.purpose.clone().unwrap_or_else(|| "other".to_string());
+                let detected_summary = detected_job_summary(
+                    Some(&command_summary),
+                    Some(&purpose),
+                    &job.status,
+                    job.exit_code.map(i64::from),
+                    &stdout,
+                    &stderr,
+                );
                 ToolResult::ok(json!({
                     "job_id": job.job_id,
                     "status": job.status,
-                    "stdout": stdout,
-                    "stderr": stderr,
-                    "next_stdout_line": next_stdout_line,
-                    "next_stderr_line": next_stderr_line,
+                    "exit_code": job.exit_code,
+                    "stdout_tail": stdout,
+                    "stderr_tail": stderr,
+                    "stdout_lines": next_stdout_line.saturating_sub(1),
+                    "stderr_lines": next_stderr_line.saturating_sub(1),
+                    "stdout_returned_lines": stdout_lines,
+                    "stderr_returned_lines": stderr_lines,
+                    "stdout_truncated": stdout_lines < next_stdout_line.saturating_sub(1),
+                    "stderr_truncated": stderr_lines < next_stderr_line.saturating_sub(1),
+                    "cursor": {
+                        "stdout": next_stdout_line,
+                        "stderr": next_stderr_line,
+                    },
+                    "executor": "agent",
+                    "cwd": job.project_cwd,
+                    "shell": job.shell,
+                    "purpose": purpose,
+                    "command_summary": command_summary,
+                    "detected_summary": detected_summary,
                 }))
             }
             Err(_) => ToolResult::err(format!("unknown job: {}", job_id)),

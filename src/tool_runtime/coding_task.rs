@@ -8,10 +8,10 @@
 use serde_json::{json, Value};
 
 use super::handoff::{
-    apply_compact_workflow_outcomes, compact_jobs, compact_permissions, compact_review_evidence,
-    compact_tool_failures, compact_validation, resolved_unexpected_validation_failure_count,
-    review_evidence_summary_for_session, unresolved_unexpected_failure_count,
-    validation_has_cargo_test_zero_tests,
+    apply_compact_workflow_outcomes, closeout_work_projection, compact_jobs, compact_permissions,
+    compact_review_evidence, compact_tool_failures, compact_validation,
+    resolved_unexpected_validation_failure_count, review_evidence_summary_for_session,
+    unresolved_unexpected_failure_count, validation_has_cargo_test_zero_tests,
 };
 use super::permissions::{permission_profile_payload, permission_summary_from_events};
 use super::project_instructions::{ProjectInstructionFile, ProjectInstructionsSnapshot};
@@ -23,9 +23,9 @@ use super::session_context::{
 use super::sessions::tool_failure_summary_from_events;
 use super::sessions::{self, SessionTransport, TOOL_CALL_RECORDING_SESSION_ID_FIELD};
 use super::tool_catalog::TOOL_RECOMMENDED_FLOWS;
-use super::tool_inputs::SessionMode;
+use super::tool_inputs::{SessionMode, StartupDetail};
 use super::tool_result::ToolResult;
-use super::validation_events::{skipped_validation_summary, validation_summary_for_session};
+use super::validation_events::skipped_validation_summary;
 use super::{current_session_key, unknown_session_result};
 use super::{ToolCall, ToolRuntime};
 use crate::auth::AuthContext;
@@ -45,6 +45,7 @@ impl ToolRuntime {
         mode: SessionMode,
         deny_write_tools: bool,
         deny_shell_tools: bool,
+        detail: StartupDetail,
         include_runtime_status: Option<bool>,
         compact_startup: bool,
         include_git: Option<bool>,
@@ -59,10 +60,12 @@ impl ToolRuntime {
         transport: SessionTransport,
     ) -> ToolResult {
         let include_runtime_status = include_runtime_status.unwrap_or(true);
+        let compact_startup = compact_startup || detail != StartupDetail::Full;
         let include_git = include_git.unwrap_or(true);
-        let include_recent_commits = include_recent_commits.unwrap_or(true);
-        let include_rules = include_rules.unwrap_or(true);
-        let include_tool_manifest = include_tool_manifest.unwrap_or(true);
+        let include_recent_commits =
+            include_recent_commits.unwrap_or(detail == StartupDetail::Full);
+        let include_rules = include_rules.unwrap_or(detail == StartupDetail::Full);
+        let include_tool_manifest = include_tool_manifest.unwrap_or(detail == StartupDetail::Full);
         let tool_manifest = if include_tool_manifest {
             match self.compact_tool_manifest_payload_bounded(
                 tool_manifest_categories,
@@ -167,6 +170,30 @@ impl ToolRuntime {
         } else {
             Value::Null
         };
+        let mut connection_state = runtime_status
+            .get("connection_layers")
+            .cloned()
+            .unwrap_or_else(|| {
+                json!({
+                    "runner_process": {"status": "not_observed"},
+                    "server_transport": {"status": "not_observed"},
+                    "server_registration": {"status": "not_observed"},
+                    "project_registry": {"status": "resolved", "resolved_project": resolved.resolved_id},
+                    "connector_endpoint": {"status": "not_observed"},
+                    "session_binding": {"status": "not_observed"},
+                    "last_successful_tool_call": {"status": "not_observed"},
+                })
+            });
+        connection_state["project_registry"]["resolved_project"] = json!(resolved.resolved_id);
+        connection_state["session_binding"] = json!({
+            "status": if current_binding.get("bound").and_then(Value::as_bool).unwrap_or(false) {
+                "bound"
+            } else {
+                "not_bound"
+            },
+            "process_local_in_memory": true,
+            "transport": transport.as_str(),
+        });
 
         let git = if include_git || include_recent_commits {
             self.start_coding_task_git_summary(
@@ -189,6 +216,7 @@ impl ToolRuntime {
             None => recommended_flow_payload(),
         };
         let mut output = json!({
+            "detail": detail.as_str(),
             "project": project,
             "resolved_project": resolved_project_payload(&resolved),
             "session": {
@@ -204,6 +232,7 @@ impl ToolRuntime {
                 "current_binding": current_binding,
             },
             "runtime_status": runtime_status,
+            "connection_state": connection_state,
             "permissions": permission_profile_payload(),
             "rules": rules_summary(project_instructions.as_ref()),
             "git": git,
@@ -215,6 +244,19 @@ impl ToolRuntime {
         });
         if let Some(tool_manifest) = tool_manifest {
             output["tool_manifest"] = tool_manifest;
+        }
+        if !include_rules {
+            output.as_object_mut().map(|object| object.remove("rules"));
+        }
+        if detail != StartupDetail::Full {
+            if let Some(object) = output.as_object_mut() {
+                object.remove("recommended_flow");
+            }
+        }
+        if detail == StartupDetail::Minimal {
+            if let Some(object) = output.as_object_mut() {
+                object.remove("permissions");
+            }
         }
         output["startup_verdict"] = startup_verdict(
             &output,
@@ -319,7 +361,8 @@ impl ToolRuntime {
         append_workspace_warnings(&workspace, &mut final_warnings);
 
         let validation = if include_validation_summary {
-            validation_summary_for_session(&session_summary)
+            self.validation_summary_for_session_with_jobs(&session_summary, 10, auth)
+                .await
         } else {
             skipped_validation_summary()
         };
@@ -404,6 +447,8 @@ impl ToolRuntime {
             .summary(&session_id, Some(FINISH_SESSION_EVENT_LIMIT))
             .unwrap_or_else(|| session_summary.clone());
         let review_evidence = review_evidence_summary_for_session(&closeout_session_summary);
+        let (work_performed, changed_paths) =
+            closeout_work_projection(&closeout_session_summary.events);
 
         let mut output = json!({
             "project": project,
@@ -421,6 +466,8 @@ impl ToolRuntime {
             "permissions": permissions,
             "tool_failures": tool_failure_summary_from_events(&session_summary.events, 10),
             "review_evidence": review_evidence,
+            "work_performed": work_performed,
+            "changed_paths": changed_paths,
             "hygiene": hygiene,
             "handoff": handoff,
             "jobs": jobs,
@@ -464,6 +511,9 @@ impl ToolRuntime {
             return ToolResult::ok(compact);
         }
         for field in [
+            "facts",
+            "hard_blockers",
+            "advisories",
             "task_outcome",
             "evidence_history",
             "evidence_integrity",
@@ -547,6 +597,8 @@ impl ToolRuntime {
                 output["recent_commits"] = json!([]);
                 output["recent_commits_truncated"] = json!(false);
             }
+        } else if let Some(object) = output.as_object_mut() {
+            object.remove("recent_commits");
         }
 
         output
@@ -730,22 +782,39 @@ fn compact_finish_output(output: &Value, resolved_unexpected_validation_failures
         .and_then(|workspace| workspace.get("clean"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let workspace_conflicts = output
+        .pointer("/workspace/counts/conflicted")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let hygiene_clean = output
         .get("hygiene")
         .and_then(|hygiene| hygiene.get("clean"))
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    let hygiene_secret_like_paths = output
+        .pointer("/hygiene/counts/secret_like_paths")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let hygiene_truncated = output
+        .pointer("/hygiene/truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let mut compact = json!({
         "summary_only": true,
         "project": output.get("project").cloned().unwrap_or(Value::Null),
         "session_id": output.get("session_id").cloned().unwrap_or(Value::Null),
         "workspace_clean": workspace_clean,
+        "workspace_conflicts": workspace_conflicts,
         "hygiene_clean": hygiene_clean,
+        "hygiene_secret_like_paths": hygiene_secret_like_paths,
+        "hygiene_truncated": hygiene_truncated,
         "jobs": compact_jobs(output.get("jobs").unwrap_or(&Value::Null)),
         "permissions": compact_permissions(output.get("permissions").unwrap_or(&Value::Null)),
         "tool_failures": compact_tool_failures(output.get("tool_failures").unwrap_or(&Value::Null)),
         "validation": compact_validation(output.get("validation").unwrap_or(&Value::Null)),
         "review_evidence": compact_review_evidence(output.get("review_evidence").unwrap_or(&Value::Null)),
+        "work_performed": output.get("work_performed").cloned().unwrap_or_else(|| json!([])),
+        "changed_paths": output.get("changed_paths").cloned().unwrap_or_else(|| json!([])),
         "warnings": output.get("final_warnings").cloned().unwrap_or_else(|| json!([])),
         "suggested_next_actions": output.get("suggested_next_actions").cloned().unwrap_or_else(|| json!([])),
     });
@@ -886,16 +955,15 @@ fn workspace_check(output: &Value, git_requested: bool) -> (&'static str, Option
     if git.get("available").and_then(Value::as_bool) == Some(false) {
         return ("warn", Some("git_unavailable"));
     }
-    // Dirty worktrees (tracked, staged, untracked, or conflicted) are expected
-    // development state. Startup must warn and continue — never block session
-    // creation solely because git status is not clean. Blocking remains for
-    // infrastructure/safety failures handled by other startup checks.
+    // Ordinary tracked/staged/untracked edits are expected development state.
+    // An unresolved merge/rebase conflict is a deterministic blocker until it
+    // is resolved; the session itself remains usable for inspection and repair.
     let conflicted = git
         .pointer("/counts/conflicted")
         .and_then(Value::as_u64)
         .unwrap_or(0);
     if conflicted > 0 {
-        return ("warn", Some("workspace_conflicts"));
+        return ("fail", Some("workspace_conflicts"));
     }
     match git.get("clean").and_then(Value::as_bool) {
         Some(true) => ("pass", None),

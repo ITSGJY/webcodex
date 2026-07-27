@@ -23,42 +23,11 @@ pub(crate) fn start_coding_task_input_schema() -> Value {
                 "type": "boolean",
                 "description": "Optional task guard for the created session. Defaults to false unless mode=read_only."
             },
-            "include_runtime_status": {
-                "type": "boolean",
-                "description": "Include runtime_status output. Defaults to true."
-            },
-            "compact_startup": {
-                "type": "boolean",
-                "description": "When include_runtime_status=true, return compact startup runtime observability instead of full runtime_status. Defaults to false."
-            },
-            "include_git": {
-                "type": "boolean",
-                "description": "Include structured git/worktree status derived from show_changes. Defaults to true."
-            },
-            "include_recent_commits": {
-                "type": "boolean",
-                "description": "Include recent commits from git_log. Defaults to true."
-            },
-            "include_rules": {
-                "type": "boolean",
-                "description": "Include a deterministic project instruction source summary. Defaults to true."
-            },
-            "include_tool_manifest": {
-                "type": "boolean",
-                "description": "Include compact tool_manifest output without full input/output schemas. Defaults to true."
-            },
-            "tool_manifest_intent": {
+            "detail": {
                 "type": "string",
-                "description": "When include_tool_manifest=true, optionally apply the same coding, audit, exploration, release, or discovery intent profile as tool_manifest. Intent filtering runs before category intersection and limit. This shapes discovery output only and does not change session mode, guards, permissions, policy, execution, or verdicts."
-            },
-            "tool_manifest_categories": {
-                "type": "array",
-                "items": { "type": "string" },
-                "description": "When include_tool_manifest=true, optionally return only compact manifest entries for these categories. For startup, prefer a bounded set such as workflow, session, git, edit, artifact, and cleanup instead of the full tool set."
-            },
-            "tool_manifest_limit": {
-                "type": "integer",
-                "description": "When include_tool_manifest=true, maximum compact manifest entries to return; clamped to 1..100."
+                "enum": ["minimal", "standard", "full"],
+                "default": "standard",
+                "description": "Startup projection detail. minimal returns the session/project/Git/readiness/navigation essentials; standard adds the permission profile while retaining the compact continuous-coding projection; full explicitly adds full runtime status, recent commits, rules, recommended flow, and compact tool manifest."
             },
             "bind_current": {
                 "type": "boolean",
@@ -88,7 +57,7 @@ pub(crate) fn finish_coding_task_input_schema() -> Value {
             },
             "include_workspace": {
                 "type": "boolean",
-                "description": "Compatibility flag matching session_handoff_summary.include_workspace. Defaults to true. When include_handoff=true, controls whether the nested handoff summary includes its workspace block; the top-level finish workspace/show_changes check remains unchanged."
+                "description": "Defaults to true. When include_handoff=true, controls whether the nested handoff summary includes its workspace block; the top-level finish workspace/show_changes check remains unchanged."
             },
             "include_hygiene": {
                 "type": "boolean",

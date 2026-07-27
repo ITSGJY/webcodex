@@ -104,6 +104,9 @@ fn validate_validation_progress(
 pub(crate) struct ShellJobStartMetadata {
     pub(crate) project_id: Option<String>,
     pub(crate) session_id: Option<String>,
+    pub(crate) project_cwd: Option<String>,
+    pub(crate) purpose: Option<String>,
+    pub(crate) shell: Option<String>,
     pub(crate) validation_steps: Vec<ShellJobValidationStep>,
     pub(crate) sandbox: Option<String>,
 }
@@ -240,6 +243,9 @@ impl ShellClientRegistry {
             project_id: metadata.project_id,
             session_id: metadata.session_id,
             cwd: run.cwd.clone(),
+            project_cwd: metadata.project_cwd,
+            purpose: metadata.purpose,
+            shell: metadata.shell,
             command_preview: if validation_steps.is_empty() {
                 command_preview(&run.command)
             } else {
@@ -385,9 +391,9 @@ impl ShellClientRegistry {
         if !shell_job_visible_to_auth(auth, &inner, &job.client_id) {
             return Err(format!("unknown shell job: {}", job_id));
         }
-        let (stdout, next_stdout_line) =
+        let (stdout, next_stdout_line, _, _) =
             select_lines(job.stdout.as_ref(), since_stdout_line, tail_lines);
-        let (stderr, next_stderr_line) =
+        let (stderr, next_stderr_line, _, _) =
             select_lines(job.stderr.as_ref(), since_stderr_line, tail_lines);
         Ok((
             job_view(job),

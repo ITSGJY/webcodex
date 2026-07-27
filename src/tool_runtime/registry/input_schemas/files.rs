@@ -174,7 +174,7 @@ pub(crate) fn read_file_input_schema() -> Value {
         (
             "with_line_numbers",
             "boolean",
-            "When true, include numbered_text and lines with 1-based line numbers.",
+            "When true, return the single text field in numbered format instead of plain format.",
             false,
         ),
     ]))

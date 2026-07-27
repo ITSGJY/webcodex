@@ -43,10 +43,12 @@ async fn run_shell_session_events_record_exit_without_stdio_bodies() {
                 .dispatch_with_auth(
                     ToolCall::RunShell {
                         project,
-                        command: "printf shell-secret-out; printf shell-secret-err >&2".to_string(),
+                        command: "printf success-output".to_string(),
                         session_id: Some(session_id),
                         timeout_secs: Some(30),
                         cwd: None,
+                        purpose: None,
+                        shell: None,
                     },
                     Some(&bootstrap),
                 )
@@ -83,11 +85,12 @@ async fn run_shell_session_events_record_exit_without_stdio_bodies() {
                 .dispatch_with_auth(
                     ToolCall::RunShell {
                         project,
-                        command: "printf fail-secret-out; printf fail-secret-err >&2; exit 7"
-                            .to_string(),
+                        command: "printf failure-output; exit 7".to_string(),
                         session_id: Some(session_id),
                         timeout_secs: Some(30),
                         cwd: None,
+                        purpose: None,
+                        shell: None,
                     },
                     Some(&bootstrap),
                 )
@@ -217,14 +220,14 @@ fn read_lines_from_bounds_offsets_and_tails() {
         expect_next: Option<usize>,
     }
     let cases = [
-        // Default is tail: last MAX_LOCAL_LOG_LINES (500) lines.
+        // Default is a compact tail, below the explicit per-page maximum.
         Case {
             name: "default_is_bounded_tail",
             file_lines: 1000,
             offset: None,
             tail: None,
-            expect_len: MAX_LOCAL_LOG_LINES,
-            expect_first: Some("line 501"),
+            expect_len: 200,
+            expect_first: Some("line 801"),
             expect_last: Some("line 1000"),
             expect_next: Some(1001),
         },
@@ -272,7 +275,7 @@ fn read_lines_from_bounds_offsets_and_tails() {
     ];
     for case in cases {
         let (_tmp, path) = log_fixture(case.file_lines);
-        let (text, next) = read_lines_from(path, case.offset, case.tail);
+        let (text, next, _, _) = read_lines_from(path, case.offset, case.tail);
         let lines: Vec<&str> = text.lines().collect();
         assert!(
             lines.len() <= MAX_LOCAL_LOG_LINES,
@@ -385,9 +388,9 @@ async fn local_job_log_reads_in_memory_local_job() {
     seed_local_job(&runtime, job_id, "demo", dir).await;
     let result = runtime.job_log(job_id.to_string(), None, None).await;
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["stdout"], "stdout line");
-    assert_eq!(result.output["stderr"], "stderr line");
-    assert!(result.output["next_stdout_line"].is_number());
+    assert_eq!(result.output["stdout_tail"], "stdout line");
+    assert_eq!(result.output["stderr_tail"], "stderr line");
+    assert!(result.output["cursor"]["stdout"].is_number());
 }
 
 #[tokio::test]
@@ -573,8 +576,8 @@ async fn run_shell_exit_codes_report_structured_command_results() {
             expect_success: true,
             expect_command_ok: true,
             expect_failure_kind: None,
-            stdout_field: "stdout",
-            stderr_field: "stderr",
+            stdout_field: "stdout_tail",
+            stderr_field: "stderr_tail",
         },
         Case {
             name: "exit_seven",
@@ -1003,7 +1006,6 @@ async fn model_facing_stop_job_stops_local_job_and_records_permission() {
         .await;
 
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["stopped"], true);
     assert_eq!(result.output["already_finished"], false);
     assert_eq!(result.output["already_stop_requested"], false);
     assert_eq!(result.output["stop_request_accepted"], true);
@@ -1058,7 +1060,6 @@ async fn model_facing_stop_job_noops_already_finished_with_permission() {
         .await;
 
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["stopped"], false);
     assert_eq!(result.output["already_finished"], true);
     assert_eq!(result.output["already_stop_requested"], false);
     assert_eq!(result.output["stop_request_accepted"], false);
@@ -1102,7 +1103,6 @@ async fn model_facing_stop_job_allows_unknown_session_with_project_warning() {
         .await;
 
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["stopped"], true);
     assert_eq!(
         result.output["ownership_basis"],
         "unknown_session_project_only"
@@ -1202,6 +1202,8 @@ async fn model_facing_stop_job_stops_agent_job_with_same_session() {
                 session_id: Some(session.session_id.clone()),
                 timeout_secs: None,
                 cwd: None,
+                purpose: None,
+                shell: None,
             },
             Some(&auth),
         )
@@ -1222,7 +1224,6 @@ async fn model_facing_stop_job_stops_agent_job_with_same_session() {
         .await;
 
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["stopped"], true);
     assert_eq!(result.output["status_before"], "queued");
     assert_eq!(result.output["status_after"], "stopped");
     assert_eq!(result.output["ownership_basis"], "project_and_session");
@@ -1259,6 +1260,8 @@ async fn model_facing_stop_job_reports_requested_and_already_stop_requested() {
                 session_id: Some(session.session_id.clone()),
                 timeout_secs: None,
                 cwd: None,
+                purpose: None,
+                shell: None,
             },
             Some(&auth),
         )
@@ -1283,7 +1286,6 @@ async fn model_facing_stop_job_reports_requested_and_already_stop_requested() {
         .await;
 
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["stopped"], true);
     assert_eq!(result.output["already_finished"], false);
     assert_eq!(result.output["already_stop_requested"], false);
     assert_eq!(result.output["status_before"], "agent_queued");
@@ -1324,7 +1326,6 @@ async fn model_facing_stop_job_reports_requested_and_already_stop_requested() {
         )
         .await;
     assert!(second.success, "{:?}", second.error);
-    assert_eq!(second.output["stopped"], true);
     assert_eq!(second.output["already_finished"], false);
     assert_eq!(second.output["already_stop_requested"], true);
     assert_eq!(second.output["status_before"], "stop_requested");
@@ -1414,11 +1415,19 @@ async fn job_log_returns_bounded_output_for_in_memory_local_job() {
     seed_local_job(&runtime, job_id, "demo", dir).await;
     let result = runtime.job_log(job_id.to_string(), None, None).await;
     assert!(result.success);
-    let out = result.output["stdout"].as_str().unwrap();
+    let out = result.output["stdout_tail"].as_str().unwrap();
     let lines: Vec<&str> = out.lines().collect();
     assert!(lines.len() <= MAX_LOCAL_LOG_LINES);
     assert!(out.contains("line 1000"));
     assert!(!out.contains("line 1\n"));
+    assert_eq!(result.output["status"], "lost");
+    assert!(result.output["exit_code"].is_null());
+    assert_eq!(result.output["stdout_lines"], 1000);
+    assert_eq!(result.output["stdout_truncated"], true);
+    assert_eq!(result.output["cursor"]["stdout"], 1001);
+    assert_eq!(result.output["command_summary"], "echo test");
+    assert_eq!(result.output["detected_summary"]["kind"], "operation");
+    assert_eq!(result.output["detected_summary"]["outcome"], "failed");
 }
 
 #[tokio::test]
@@ -1444,18 +1453,18 @@ async fn job_log_paginates_with_offset_for_in_memory_local_job() {
     seed_local_job(&runtime, job_id, "demo", dir).await;
     let first = runtime.job_log(job_id.to_string(), Some(1), None).await;
     assert!(first.success);
-    let out = first.output["stdout"].as_str().unwrap();
+    let out = first.output["stdout_tail"].as_str().unwrap();
     assert!(out.contains("line 1"));
     assert!(out.contains("line 500"));
     assert!(!out.contains("line 501"));
-    assert_eq!(first.output["next_stdout_line"], 501);
+    assert_eq!(first.output["cursor"]["stdout"], 501);
 
     let second = runtime.job_log(job_id.to_string(), Some(501), None).await;
     assert!(second.success);
-    let out2 = second.output["stdout"].as_str().unwrap();
+    let out2 = second.output["stdout_tail"].as_str().unwrap();
     assert!(out2.contains("line 501"));
     assert!(out2.contains("line 600"));
-    assert_eq!(second.output["next_stdout_line"], 601);
+    assert_eq!(second.output["cursor"]["stdout"], 601);
 }
 
 async fn register_job_agent_for_auth(
@@ -1503,6 +1512,8 @@ async fn start_agent_runtime_job(
                 session_id: None,
                 timeout_secs: None,
                 cwd: None,
+                purpose: None,
+                shell: None,
             },
             Some(auth),
         )
@@ -1707,7 +1718,7 @@ async fn runtime_job_tools_filter_agent_jobs_by_auth_group() {
         )
         .await;
     assert!(log_b.success, "{:?}", log_b.error);
-    assert_eq!(log_b.output["stdout"], "b-out\n");
+    assert_eq!(log_b.output["stdout_tail"], "b-out\n");
 
     let tail_b = runtime
         .dispatch_with_auth(
@@ -1719,7 +1730,7 @@ async fn runtime_job_tools_filter_agent_jobs_by_auth_group() {
         )
         .await;
     assert!(tail_b.success, "{:?}", tail_b.error);
-    assert_eq!(tail_b.output["stdout"], "b-out\n");
+    assert_eq!(tail_b.output["stdout_tail"], "b-out\n");
 }
 
 #[tokio::test]

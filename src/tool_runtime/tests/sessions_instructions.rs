@@ -123,7 +123,7 @@ async fn start_session_loads_agents_md_from_agent_project() {
         "instr-loader",
         &req.request_id,
         0,
-        "# Agent Guide\n\nRespect the AGENTS.md rules.\n",
+        &canonical_agent_file_read_output("# Agent Guide\n\nRespect the AGENTS.md rules.\n", 3),
         "",
     )
     .await;
@@ -194,7 +194,15 @@ async fn start_session_truncates_large_instruction_file() {
         .map(|i| format!("rule line {i}"))
         .collect::<Vec<_>>()
         .join("\n");
-    complete_patch_agent_request(&runtime, "instr-trunc", &req.request_id, 0, &body, "").await;
+    complete_patch_agent_request(
+        &runtime,
+        "instr-trunc",
+        &req.request_id,
+        0,
+        &canonical_agent_file_read_output(&body, project_instructions::MAX_LINES_PER_FILE + 1),
+        "",
+    )
+    .await;
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
     let pi = &result.output["project_instructions"];
@@ -257,7 +265,10 @@ async fn session_summary_returns_project_instructions_without_content() {
         "instr-summary",
         &req.request_id,
         0,
-        "secret project rule that must not leak into session_summary\n",
+        &canonical_agent_file_read_output(
+            "secret project rule that must not leak into session_summary\n",
+            1,
+        ),
         "",
     )
     .await;
@@ -350,7 +361,7 @@ async fn load_project_instructions_first_match_wins_from_agent_project() {
             "instr-order",
             &present.request_id,
             0,
-            "# lower agents\n\nlower agents rules\n",
+            &canonical_agent_file_read_output("# lower agents\n\nlower agents rules\n", 3),
             "",
         )
         .await;

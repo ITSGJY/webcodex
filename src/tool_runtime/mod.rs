@@ -92,7 +92,8 @@ pub(crate) use tool_definition::{known_tool_names, model_hidden_tool_names};
 #[allow(unused_imports)]
 pub use tool_inputs::{
     default_true, ApplyFileChangeInput, ApplyFileChangeKind, ApplyTextEditInput, ApplyTextEditKind,
-    CheckpointValidationInput, ListToolsOptions, SessionMode,
+    CheckpointValidationInput, ExecutionPurpose, ExecutionShell, ListToolsOptions, SessionMode,
+    StartupDetail,
 };
 #[allow(unused_imports)]
 pub use tool_result::ToolResult;

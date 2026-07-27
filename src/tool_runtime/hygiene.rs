@@ -488,18 +488,12 @@ fn hygiene_verdict(
     }
 
     if !findings.is_empty() {
-        let has_blocking_finding = findings.iter().any(|finding| {
-            matches!(finding.severity, "critical" | "high" | "medium")
-                || matches!(
-                    finding.kind,
-                    HygieneKind::DirtyWorktree
-                        | HygieneKind::SecretLikePath
-                        | HygieneKind::LargeUntrackedFile
-                )
-        });
-        if has_blocking_finding {
-            push_unique_reason(&mut blocking_reasons, "hygiene_failed");
-            push_unique_action(&mut actions, "review workspace hygiene before closeout");
+        if findings
+            .iter()
+            .any(|finding| finding.kind == HygieneKind::SecretLikePath)
+        {
+            push_unique_reason(&mut blocking_reasons, "sensitive_path_risk");
+            push_unique_action(&mut actions, "review secret-like paths before closeout");
         } else {
             push_unique_reason(&mut warning_reasons, "hygiene_findings_present");
         }

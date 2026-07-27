@@ -49,7 +49,8 @@ pub(crate) fn read_file_content_result_with_options(
     let eff_limit = limit.unwrap_or(2000).clamp(1, 2000);
     if eff_start > total_lines {
         let mut output = json!({
-            "content": "",
+            "text": "",
+            "format": if with_line_numbers { "numbered" } else { "plain" },
             "sha256": sha256,
             "total_lines": total_lines,
             "start_line": eff_start,
@@ -65,7 +66,8 @@ pub(crate) fn read_file_content_result_with_options(
     let selected_lines = &all_lines[start_idx..end_idx];
     let slice = selected_lines.join("\n");
     let mut output = json!({
-        "content": slice,
+        "text": slice,
+        "format": if with_line_numbers { "numbered" } else { "plain" },
         "sha256": sha256,
         "total_lines": total_lines,
         "start_line": eff_start,
@@ -97,13 +99,25 @@ pub(crate) fn read_file_agent_stdout_result_with_options(
         if value.get("format").and_then(|format| format.as_str())
             == Some("webcodex.file_read_range.v1")
         {
+            let content = value
+                .as_object_mut()
+                .and_then(|object| object.remove("content"))
+                .unwrap_or_else(|| Value::String(String::new()));
+            value["text"] = content;
+            value["format"] = json!(if with_line_numbers {
+                "numbered"
+            } else {
+                "plain"
+            });
             if with_line_numbers {
                 add_agent_read_file_line_number_fields(&mut value, start_line, limit);
             }
             return ToolResult::ok(value);
         }
     }
-    read_file_content_result_with_options(stdout, start_line, limit, with_line_numbers)
+    ToolResult::err(
+        "agent read_file returned an unsupported response envelope; expected webcodex.file_read_range.v1",
+    )
 }
 
 pub(crate) fn effective_read_file_range(
@@ -117,10 +131,8 @@ pub(crate) fn effective_read_file_range(
 }
 
 /// Parse the stdout of a best-effort agent `file_read` for an instruction
-/// candidate. Recognizes the `webcodex.file_read_range.v1` JSON envelope
-/// (which carries the true `total_lines` of the file) and falls back to
-/// treating stdout as raw text (where the returned line count is a lower
-/// bound on the true total). Returns `None` for empty/unusable output so the
+/// candidate. Only the canonical `webcodex.file_read_range.v1` JSON envelope
+/// is accepted. Returns `None` for empty, malformed, or obsolete output so the
 /// caller skips to the next candidate.
 fn parse_instruction_agent_stdout(stdout: String) -> Option<(String, usize)> {
     let trimmed = stdout.trim();
@@ -141,11 +153,7 @@ fn parse_instruction_agent_stdout(stdout: String) -> Option<(String, usize)> {
             }
         }
     }
-    if content_is_empty_instruction(&stdout) {
-        return None;
-    }
-    let total_lines = stdout.lines().count();
-    Some((stdout, total_lines))
+    None
 }
 
 /// True when an instruction body carries no meaningful content (empty or
@@ -156,8 +164,6 @@ fn content_is_empty_instruction(content: &str) -> bool {
 }
 
 fn add_line_number_fields<T: AsRef<str>>(output: &mut Value, start_line: usize, texts: &[T]) {
-    // One numbered representation only. The old per-line object array tripled
-    // the paid bytes for the same information the model already has here.
     let numbered_text = texts
         .iter()
         .enumerate()
@@ -165,7 +171,8 @@ fn add_line_number_fields<T: AsRef<str>>(output: &mut Value, start_line: usize, 
         .collect::<Vec<_>>()
         .join("\n");
     if let Some(obj) = output.as_object_mut() {
-        obj.insert("numbered_text".to_string(), Value::String(numbered_text));
+        obj.insert("text".to_string(), Value::String(numbered_text));
+        obj.insert("format".to_string(), Value::String("numbered".to_string()));
     }
 }
 
@@ -175,7 +182,7 @@ fn add_agent_read_file_line_number_fields(
     request_limit: Option<usize>,
 ) {
     let content = output
-        .get("content")
+        .get("text")
         .and_then(|content| content.as_str())
         .unwrap_or("");
     let start_line = output
@@ -2167,12 +2174,12 @@ impl ToolRuntime {
         if result.success {
             let stdout_present = result
                 .output
-                .get("stdout")
+                .get("stdout_tail")
                 .and_then(Value::as_str)
                 .is_some_and(|value| !value.is_empty());
             let stderr_present = result
                 .output
-                .get("stderr")
+                .get("stderr_tail")
                 .and_then(Value::as_str)
                 .is_some_and(|value| !value.is_empty());
             ToolResult::ok(json!({
@@ -3555,9 +3562,8 @@ impl ToolRuntime {
         path: &str,
     ) -> Option<(String, usize)> {
         use super::project_instructions::MAX_LINES_PER_FILE;
-        // Request one extra line so a returned line count strictly greater
-        // than the per-file cap reliably signals line truncation regardless of
-        // the agent response format (JSON sentinel vs plain-text fallback).
+        // Request one extra line so canonical envelope total/selection metadata
+        // reliably signals truncation beyond the per-file cap.
         let read_limit = MAX_LINES_PER_FILE + 1;
         const WAIT_TIMEOUT: u64 = 6;
 
@@ -4155,7 +4161,8 @@ mod tests {
         let result = read_file_content_result("one\ntwo\nthree".to_string(), Some(2), Some(1));
 
         assert!(result.success);
-        assert_eq!(result.output["content"], "two");
+        assert_eq!(result.output["text"], "two");
+        assert_eq!(result.output["format"], "plain");
         assert_eq!(result.output["total_lines"], 3);
         assert_eq!(result.output["start_line"], 2);
         assert_eq!(result.output["limit"], 1);
@@ -4163,7 +4170,7 @@ mod tests {
             result.output["sha256"],
             sha256_hex_bytes(b"one\ntwo\nthree")
         );
-        assert!(result.output.get("numbered_text").is_none());
+        assert!(result.output.get("content").is_none());
         assert!(result.output.get("lines").is_none());
     }
 
@@ -4201,14 +4208,14 @@ mod tests {
             result.output["sha256"],
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
-        assert_eq!(result.output["content"], "line-560\nline-561");
+        assert_eq!(result.output["text"], "line-560\nline-561");
         assert_eq!(result.output["total_lines"], 7348);
         assert_eq!(result.output["start_line"], 560);
         assert_eq!(result.output["limit"], 2);
     }
 
     #[test]
-    fn read_file_agent_stdout_json_without_sentinel_uses_legacy_fallback() {
+    fn read_file_agent_stdout_json_without_canonical_envelope_is_rejected() {
         let result = read_file_agent_stdout_result(
             serde_json::json!({
                 "content": "file-json-content",
@@ -4221,29 +4228,27 @@ mod tests {
             Some(1),
         );
 
-        assert!(result.success);
-        assert_eq!(result.output["content"], "{\"content\":\"file-json-content\",\"limit\":2,\"start_line\":560,\"total_lines\":7348}");
-        assert_eq!(result.output["total_lines"], 1);
-        assert_eq!(result.output["start_line"], 1);
-        assert_eq!(result.output["limit"], 1);
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap()
+            .contains("unsupported response envelope"));
     }
 
     #[test]
-    fn read_file_agent_stdout_plain_text_keeps_legacy_fallback() {
+    fn read_file_agent_stdout_plain_text_is_rejected() {
         let result =
             read_file_agent_stdout_result("one\ntwo\nthree\n".to_string(), Some(2), Some(1));
 
-        assert!(result.success);
-        assert_eq!(result.output["content"], "two");
-        assert_eq!(result.output["total_lines"], 3);
-        assert_eq!(result.output["start_line"], 2);
-        assert_eq!(result.output["limit"], 1);
-        assert!(result.output.get("numbered_text").is_none());
-        assert!(result.output.get("lines").is_none());
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap()
+            .contains("unsupported response envelope"));
     }
 
     #[test]
-    fn read_file_with_line_numbers_returns_numbered_text() {
+    fn read_file_with_line_numbers_returns_one_numbered_representation() {
         let result = read_file_content_result_with_options(
             "alpha\nbeta\ngamma".to_string(),
             None,
@@ -4252,11 +4257,10 @@ mod tests {
         );
 
         assert!(result.success);
-        assert_eq!(result.output["content"], "alpha\nbeta\ngamma");
-        assert_eq!(
-            result.output["numbered_text"],
-            "1 | alpha\n2 | beta\n3 | gamma"
-        );
+        assert_eq!(result.output["text"], "1 | alpha\n2 | beta\n3 | gamma");
+        assert_eq!(result.output["format"], "numbered");
+        assert!(result.output.get("content").is_none());
+        assert!(result.output.get("numbered_text").is_none());
     }
 
     #[test]
@@ -4269,10 +4273,10 @@ mod tests {
         );
 
         assert!(result.success);
-        assert_eq!(result.output["content"], "two\nthree");
+        assert_eq!(result.output["text"], "2 | two\n3 | three");
         assert_eq!(result.output["start_line"], 2);
         assert_eq!(result.output["limit"], 2);
-        assert_eq!(result.output["numbered_text"], "2 | two\n3 | three");
+        assert_eq!(result.output["format"], "numbered");
     }
 
     #[test]
@@ -4281,11 +4285,11 @@ mod tests {
             read_file_content_result_with_options("one\ntwo".to_string(), Some(5), Some(3), true);
 
         assert!(result.success);
-        assert_eq!(result.output["content"], "");
+        assert_eq!(result.output["text"], "");
         assert_eq!(result.output["total_lines"], 2);
         assert_eq!(result.output["start_line"], 5);
         assert_eq!(result.output["limit"], 3);
-        assert_eq!(result.output["numbered_text"], "");
+        assert_eq!(result.output["format"], "numbered");
     }
 
     #[test]
@@ -4305,8 +4309,8 @@ mod tests {
         );
 
         assert!(result.success);
-        assert_eq!(result.output["content"], "\nsecond");
-        assert_eq!(result.output["numbered_text"], "1 | \n2 | second");
+        assert_eq!(result.output["text"], "1 | \n2 | second");
+        assert_eq!(result.output["format"], "numbered");
     }
 
     #[test]

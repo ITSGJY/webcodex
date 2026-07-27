@@ -598,7 +598,7 @@ fn tool_definition_surface_counts_stay_fixed_during_fallback_migration() {
         "assertion_name",
         "summary_only",
         "include_command_preview",
-        "compact_startup",
+        "detail",
         "compact",
     ] {
         assert!(

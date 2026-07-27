@@ -103,7 +103,17 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ("message", schema_type("string", "Structured failure message.")),
         ])),
         "read_file" => Some(wrapped_output_schema(vec![
-            ("content", schema_type("string", "File content.")),
+            (
+                "text",
+                schema_type(
+                    "string",
+                    "The single primary text representation: plain content or numbered text according to format.",
+                ),
+            ),
+            (
+                "format",
+                schema_type("string", "Primary text format: plain or numbered."),
+            ),
             ("path", schema_type("string", "Project-relative path.")),
             (
                 "sha256",
@@ -120,13 +130,6 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             (
                 "total_lines",
                 schema_type("integer", "Total line count, when available."),
-            ),
-            (
-                "numbered_text",
-                schema_type(
-                    "string",
-                    "Optional line-numbered content when with_line_numbers=true.",
-                ),
             ),
         ])),
         "search_project_text" => {

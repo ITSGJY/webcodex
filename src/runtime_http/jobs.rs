@@ -208,6 +208,8 @@ pub async fn projects_run_job(req: &mut Request, depot: &mut Depot, res: &mut Re
                 session_id: body.session_id,
                 timeout_secs: body.timeout_secs,
                 cwd: body.cwd,
+                purpose: None,
+                shell: None,
             },
             auth.as_ref(),
         )
@@ -255,6 +257,8 @@ pub async fn projects_run_shell(req: &mut Request, depot: &mut Depot, res: &mut 
                 session_id: body.session_id,
                 timeout_secs: body.timeout_secs,
                 cwd: body.cwd,
+                purpose: None,
+                shell: None,
             },
             auth.as_ref(),
         )

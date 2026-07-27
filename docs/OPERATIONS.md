@@ -400,35 +400,25 @@ create and close out a session while keeping all continuity explicit.
   "params": {
     "project": "agent:workstation:my-repo",
     "title": "fix authentication bug",
-    "include_tool_manifest": true,
+    "detail": "standard",
     "bind_current": false
   }
 }
 ```
 
 Returns a `wc_sess_*` session id in `output.session.session_id`. Keep that id
-and pass it explicitly to subsequent project tools. By default,
-`start_coding_task` also returns compact `output.tool_manifest` without full
-input/output schemas; set `include_tool_manifest=false` to omit it.
-For bounded startup context, keep `include_tool_manifest=true` but pass
-`tool_manifest_categories` such as `["workflow","session","git","edit",
-"artifact","cleanup"]` and optionally `tool_manifest_limit`; the runtime clamps
-the limit to 1..100 and reports whether the compact manifest was truncated. A
-limit-driven `truncated=true` is expected bounded output, not `ResponseTooLarge`;
-acceptance scripts should inspect the explicit limit and returned/total counts,
-plus `truncation_reason="limit"`, `limit_applied=true`, `requested_limit`,
-`returned_count`, and `total_count`.
+and pass it explicitly to subsequent project tools. `detail` is the canonical
+startup projection:
 
-For lightweight MCP direct or GPT Action sanity, call startup with
-`include_runtime_status=true`, `compact_startup=true`,
-`include_tool_manifest=true`, and a small `tool_manifest_limit`. Compact startup
-returns build version/commit/dirty state, `tools.count`, `jobs.active_count`,
-`agents.summary`, and effective/agent/server project status without `tools.names`,
-full agent policy, `allowed_roots`, shell profile internals, command text,
-stdout/stderr, env values, tokens, secrets, or full config values. Full
-`include_runtime_status=true` without `compact_startup` remains available for
-deeper troubleshooting and can include non-secret observability details such as
-the public URL, tool names, agent policy summary, and allowed roots.
+- `minimal`: session id, resolved project, branch/head/workspace state, compact
+  runtime/readiness layers, semantic-navigation summary, hard blockers, and
+  advisories;
+- `standard` (default): minimal plus the permission profile;
+- `full`: explicitly adds full runtime status, recent commits, project rules,
+  recommended flow, and the compact tool manifest.
+
+Minimal and standard do not return repeated manifest/rules/recent-commit
+payloads. Use `tool_manifest` directly when focused discovery is needed.
 Read `output.startup_verdict.status` first. If it is `warn` or `fail`, inspect
 `startup_verdict.checks` and `startup_verdict.suggested_next_actions`; detailed
 startup fields remain the audit source.
@@ -443,17 +433,24 @@ Startup sanity verdict rules:
   `jobs.active_count=0`, an agent is online when the task depends on an agent
   project, and requested git/workspace status is clean.
 - WARN: runtime status or git/workspace was not requested, validation has not
-  run yet, `tool_manifest.truncated=true` with `truncation_reason="limit"`, or
-  the requested git/workspace status is dirty (tracked, staged, untracked, or
-  conflicted). Dirty workspace is an expected development state and does **not**
-  prevent starting a coding task. Existing worktree changes must be inspected
-  and preserved; they are not automatically reverted, stashed, cleaned, or
-  overwritten.
+  run yet, or the requested workspace contains ordinary tracked, staged, or
+  untracked changes. Existing changes must be inspected and preserved; they
+  are not automatically reverted, stashed, cleaned, or overwritten.
 - FAIL: runtime status failed, blocking jobs are active, agent required for the
-  task is offline, tool manifest generation failed, or another infrastructure /
-  safety condition makes the project inaccessible or the requested work unsafe
-  or impossible. Startup blocking is reserved for those conditions — not for a
-  dirty Git worktree.
+  task is offline, unresolved merge/rebase conflicts exist, or another
+  infrastructure/safety condition makes the project inaccessible or the
+  requested work unsafe or impossible. Ordinary dirty state is not a blocker.
+
+`output.connection_state` reports runner process, server transport, server
+registration, project registry, connector endpoint, session binding, and last
+successful tool call separately. `not_observed` means that layer has no evidence;
+it must not be collapsed into an overall offline verdict.
+
+Console **Connect a chat client** targets the project-bound canonical capability
+surface by default. Its connection projection reports
+`surface.mode=project_bound` and `operator_runtime_exposed=false`. The complete
+operator runtime remains available for management, development, and internal
+execution, but it is not the model-default project chat endpoint.
 
 The response also includes `output.permissions`. The current self-hosted
 development profile is `policy=dev_auto_approve`, `auto_approve=true`, and
@@ -469,6 +466,11 @@ development profile is `policy=dev_auto_approve`, `auto_approve=true`, and
 {"tool": "search_project_text", "params": {"project": "agent:workstation:my-repo", "pattern": "authenticate", "path": "src"}}
 {"tool": "show_changes", "params": {"project": "agent:workstation:my-repo", "session_id": "wc_sess_example", "include_diff": false}}
 ```
+
+`read_file` returns exactly one primary representation in `output.text`.
+`output.format` is `plain` by default or `numbered` when
+`with_line_numbers=true`; it never duplicates the full body into a second
+`content`/`numbered_text` field.
 
 When choosing a smoke target from `list_projects`, prefer
 entries in `projects` whose `capabilities.recommended_for_smoke=true`. The
@@ -512,15 +514,31 @@ require `capabilities.git_available=true`; a project such as
 {"tool": "validate_patch", "params": {"project": "agent:workstation:my-repo", "patch": "diff --git ..."}}
 ```
 
-Use `run_shell` only when structured Cargo helpers, `validate_patch`, and
-`apply_patch_checked` are insufficient. `run_shell` is not classified as
-validation by default. Use `run_job` for bounded async diagnostics/build/test
-work, then supervise it with `job_status`, `job_tail`, or `list_jobs`. To stop a
-WebCodex-started job, call `stop_job` through `callRuntimeTool`/MCP with the
-same `project`, the returned `job_id`, the explicit `session_id` when available,
-and `confirm=true`. `stop_job` enforces job project/session ownership and never
-returns stdout/stderr. It keeps the compatibility `stopped` field, but models
-should prefer `stop_effect`, `terminal`, `terminal_pending`, and `final_status`.
+Specialized Cargo tools automatically declare purpose and parser metadata.
+General execution is equally valid evidence when its intent is explicit:
+
+```json
+{"tool": "run_shell", "params": {"project": "agent:workstation:my-repo", "session_id": "wc_sess_example", "purpose": "test", "shell": "bash", "cwd": ".", "command": "cargo test --bin webcodex focused"}}
+{"tool": "run_job", "params": {"project": "agent:workstation:my-repo", "session_id": "wc_sess_example", "purpose": "validation", "shell": "sh", "command": "make check"}}
+```
+
+Purposes are `validation`, `test`, `build`, `format`, `release`, `diagnostic`,
+`operation`, and `other`. Purpose records evidence; it does not change
+authorization. `run_shell` defaults to local `sh`; `run_job` preserves local
+`bash`; an explicit `shell=sh|bash` selects the command language. Agent-backed
+omission uses the Agent's configured shell and records it as configured.
+
+For both tools, omitted cwd, `cwd=""`, and `cwd="."` mean the project root.
+Other cwd values are project-relative and cannot escape the project root.
+Responses expose only `.` or a project-relative cwd.
+
+Use `run_job` for async diagnostics/build/test work, then supervise it with
+`job_status`, `job_log`/`job_tail`, or `list_jobs`. Job log responses default to
+200 bounded lines per stream (maximum 500) and return status, exit code, total
+line counts, bounded tails, truncation flags, detected summary, and `cursor`;
+continue with `offset=cursor.stdout`. They never return an unbounded full log.
+To stop a WebCodex-started job, call `stop_job` with the same project, job id,
+explicit session id when available, and `confirm=true`.
 
 ### 5. Review and summarize
 
@@ -554,10 +572,10 @@ Review order for coding closeout is deterministic: call `show_changes`, inspect
 `finish_coding_task` with `summary_only=true` for compact canonical outcomes.
 `show_changes` and `workspace_hygiene_check` expose top-level `verdict`
 summaries; read them first, but keep the detailed fields as the auditable basis.
-For final closeout reporting, use `finish_coding_task.task_outcome`,
-`finish_coding_task.evidence_history`, and
-`finish_coding_task.evidence_integrity`, not nested `show_changes.verdict` or
-`workspace_hygiene_check.verdict`.
+For final Agent reporting, use `finish_coding_task.facts`,
+`finish_coding_task.hard_blockers`, and `finish_coding_task.advisories`, not
+nested component verdicts. These are a compact fact package; the Agent still
+decides test sufficiency and the task-specific engineering conclusion.
 
 Discovery taxonomy is intentional: `start_coding_task` and
 `finish_coding_task` are `workflow` category tools for the coding lifecycle.
@@ -590,17 +608,14 @@ pass `include_workspace=true` and `include_validation=true`. For finish, pass
 `include_workspace=true`, `include_hygiene=true`,
 `include_validation_summary=true`, `include_diff=false`, and keep
 `include_handoff=true` when a handoff aggregate is useful.
-`finish_coding_task.include_workspace` is a compatibility flag matching
-`session_handoff_summary.include_workspace`: it controls the nested handoff
-workspace block when `include_handoff=true`; the top-level finish
-workspace/show_changes check keeps its existing default behavior.
-For `finish_coding_task`, including `summary_only=true`, read final task
-completion from `output.task_outcome`, validation history from
-`output.evidence_history`, and assertion/evidence quality from
-`output.evidence_integrity`. These canonical fields do not change
-authorization, permissions, guards, session binding, expected-failure
-classification, MCP direct errors, or job lifecycle behavior. Top-level
-`suggested_next_actions` contains the bounded final closeout actions.
+`finish_coding_task.include_workspace` controls the nested handoff workspace
+projection when handoff is included; the top-level finish workspace inspection
+still runs. For `summary_only=true`, `facts` contains `work_performed`,
+`changed_paths`, `executions`, passed/failed/skipped validation counts,
+resolved/unresolved failures, workspace state, active jobs, and evidence
+integrity. `hard_blockers` and `advisories` classify only deterministic facts.
+They do not change authorization, guards, session binding, expected-failure
+classification, or job lifecycle behavior.
 
 For `summary_only=true` final outputs, sanity checks should reject stdout/stderr
 bodies, command text, tails, and excerpts. Raw lower-level diagnostic/status
@@ -609,8 +624,8 @@ stdout/stderr bodies as sensitive/high-noise unless explicitly requested, and
 never allow env values, tokens, or secrets to appear.
 
 `finish_coding_task` and `session_handoff_summary` include a bounded `jobs`
-section. `active_count` remains a compatibility broad active count. New fields
-split it into `blocking_active_count` and `nonblocking_active_count`, with
+section. `active_count` is the broad active count; `blocking_active_count` and
+`nonblocking_active_count`, with
 `running_count`, `stop_requested_count`, and `terminal_pending_count` for model
 closeout decisions. `queued`, `running`, `started`, and `agent_queued` are
 blocking active states and produce `active_jobs_present`. `stop_requested` is
@@ -620,33 +635,18 @@ itself. The jobs summary includes only metadata such as `job_id`, `kind`,
 `status`, `project`, and timestamps; it does not include raw stdout/stderr,
 tails, excerpts, or command text.
 
-Compact handoff/finish outcome rules:
+Compact handoff/finish classification:
 
-- PASS: `workspace_clean=true`, `jobs.blocking_active_count=0`,
-  `tool_failures.unexpected_count=0`,
-  `tool_failures.expectation_mismatch_count=0`,
-  `tool_failures.unexpected_success_count=0`, and `hygiene_clean=true`.
-- WARN: `validation.status=not_run` with or without ledger-derived
-  `review_evidence`, resolved historical validation failures are present
-  (`validation.status=mixed`, `latest_status=passed`,
-  `historical_failures.resolved=true`, and
-  `historical_failures.unresolved=false`), resolved validation-like historical
-  tool failures from `cargo_fmt`, `cargo_check`, or `cargo_test` were followed
-  by passed structured validation while workspace and hygiene checks are clean,
-  matched expected failures are present (`expected_count>0` while
-  unexpected/mismatch/unexpected-success counts are all zero),
-  non-git/git-unavailable review context, terminal-pending
-  nonblocking jobs, or bounded startup/manifest/review output was truncated only
-  because of an explicit limit.
-- FAIL: workspace is dirty, blocking jobs are active, unexpected tool failures
-  exist, expected-failure mismatches exist, expected-failure calls unexpectedly
-  succeeded, hygiene failed, validation failed, or mixed validation still has an
-  unresolved/latest failure.
+- hard blockers: unresolved workspace conflicts, blocking active jobs,
+  unexpected command/tool failures, expectation mismatches, unresolved
+  validation failures, sensitive-path risk, and evidence-integrity errors;
+- advisories: ordinary dirty worktree, task-optional validation not observed
+  (including docs/review-only work), resolved historical failures, bounded
+  truncation, non-git context, and terminal-pending nonblocking jobs.
 
 Unresolved validation failures and non-validation tool failures remain
-blocking. Callers should inspect `validation.historical_failures`,
-`evidence_history.status`, and `evidence_integrity.warning_reasons` to
-distinguish resolved validation feedback from a clean first-pass run.
+blocking. Inspect `validation.historical_failures`, `resolved_failures`, and
+`unresolved_failures` to distinguish resolved feedback from a clean first pass.
 
 For a read-only handoff without finish aggregation:
 
@@ -724,21 +724,22 @@ guards, `session_project_mismatch`, confirmation requirements, schema checks,
 invalid JSON handling, or unknown-tool failure semantics.
 
 `finish_coding_task.validation` and `session_handoff_summary.validation` are
-ledger-derived summaries. They do not expose raw stdout/stderr, excerpt fields,
-or `validation_output_summary`; the parser extracts only stable facts from safe
-bounded metadata and does not infer root causes or suggest fixes. Summaries
-include `status` and `reason`: `events_total=0` yields `status=not_run` and
-`reason=no_validation_tool_invoked`; all-success, all-failure, and mixed ledgers
-yield `passed`, `failed`, and `mixed`. `validation.status=mixed` remains strict
-ledger history. Summary outputs also include `latest_status` and
-`historical_failures`; a mixed ledger with a later successful validation and no
-unresolved historical failure may warn instead of fail. `finish_coding_task`
-may also downgrade resolved historical `cargo_fmt`, `cargo_check`, or
-`cargo_test` tool failures when later structured validation passed and the
-workspace/hygiene checks are clean. Non-validation tool failures and unresolved
-validation failures remain blocking. `not_run` means no structured validation
-tool was invoked, so docs-only or read-only work should interpret it with task
-context.
+ledger-derived unified execution summaries. Evidence sources include dedicated
+Cargo validation tools and `run_shell`/terminal `run_job` executions declaring
+`validation`, `test`, `build`, `format`, or `release` purpose. Summaries never
+depend on tool name alone and never expose unbounded stdout/stderr.
+
+Each evidence item carries a stable identity. An explicit assertion name wins;
+otherwise purpose plus normalized bounded command identity is hashed. A later
+success resolves only failures with the same identity. The original failure
+remains in `historical_failures`, moves into `resolved_failures`, and is removed
+only from `unresolved_failures`; a different assertion can never resolve it.
+
+`events_total=0` yields `status=not_run` and
+`reason=no_validation_tool_invoked`. This is an observed fact, not an automatic
+task failure. Docs-only, review-only, or otherwise validation-optional work is
+classified with task context as an advisory. Non-validation command failures
+and unresolved validation failures remain blockers.
 
 For `cargo_test`, validation events preserve parsed zero-tests metadata when
 available. A successful zero-test run remains visible through closeout warnings
@@ -754,9 +755,10 @@ hygiene inspection tools such as `read_file`, `search_project_text`,
 bounded `tools` list for explainability. It never includes file contents,
 stdout/stderr, diff hunks, command text, tokens, secrets, or raw input payloads.
 For docs-only or read-only audit tasks, `validation.status=not_run` can coexist
-with `review_evidence.total>0`; compact verdicts remain `warn` and use
-`validation_not_run_with_review_evidence` instead of treating the task as passed.
-Review evidence is not a replacement for structured validation.
+with `review_evidence.total>0`; closeout uses the
+`validation_not_run_with_review_evidence` advisory and does not manufacture a
+failed task. Review evidence is not a replacement for validation when the task
+explicitly requires validation.
 
 `finish_coding_task.permissions` and `session_handoff_summary.permissions`
 summarize high-risk permission decisions from the session ledger. A high-risk
@@ -848,7 +850,7 @@ After deploying a new server, agent, or runtime build:
    confirm `projects.effective.status`, `projects.effective.count`, and
    `projects.agent_registered.online_count`. Projects are registered by agents,
    not by server-side `projects.toml`. For workflow sanity, also use
-   `start_coding_task(include_runtime_status=true, compact_startup=true)` and
+   `start_coding_task(detail=minimal)` and
    inspect `startup_verdict.status`; reserve full runtime status for deeper
    troubleshooting.
 4. Confirm `start_coding_task` and `finish_coding_task` are available through

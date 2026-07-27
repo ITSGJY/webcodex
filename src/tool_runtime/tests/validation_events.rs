@@ -8,7 +8,7 @@ use crate::tool_runtime::validation_parser::{
     NO_STABLE_DIAGNOSTICS_REASON, PARSER_KIND, PARSER_VERSION,
     VALIDATION_OUTPUT_METADATA_ABSENT_REASON,
 };
-use crate::tool_runtime::{SessionMode, ToolCall};
+use crate::tool_runtime::{ExecutionPurpose, ExecutionShell, SessionMode, ToolCall};
 use serde_json::{json, Value};
 
 #[test]
@@ -112,7 +112,12 @@ fn cargo_check_success_produces_validation_event() {
     assert_eq!(event["success"], true);
     assert_eq!(event["exit_code"], 0);
     assert_eq!(event["summary"], "cargo_check succeeded");
-    assert_eq!(event["input_summary"]["project"], "agent:eval:demo");
+    assert!(event.get("input_summary").is_none());
+    assert!(event["identity"]
+        .as_str()
+        .is_some_and(|identity| identity.starts_with("command:")));
+    assert_eq!(event["execution_source"], "cargo_check");
+    assert_eq!(event["purpose"], "validation");
     assert_eq!(validation["parser"]["available"], false);
     assert_eq!(
         validation["parser"]["reason"],
@@ -521,7 +526,7 @@ fn validation_summary_exposes_cargo_test_zero_tests_metadata() {
 }
 
 #[test]
-fn run_shell_output_tail_does_not_create_validation_metadata_or_events() {
+fn run_shell_without_declared_validation_purpose_is_not_validation_evidence() {
     let store = SessionStore::default();
     let session = store.start_session(Some("agent:eval:demo".to_string()), None);
     record_finished_tool(
@@ -545,7 +550,7 @@ fn run_shell_output_tail_does_not_create_validation_metadata_or_events() {
         .iter()
         .find(|event| event.kind == "tool_call_finished")
         .unwrap();
-    assert!(finished.validation_output_summary.is_none());
+    assert!(finished.validation_output_summary.is_some());
     let validation = validation_summary_for_session(&session);
     assert_eq!(validation["available"], false);
     assert_eq!(validation["status"], "not_run");
@@ -651,7 +656,7 @@ fn latest_success_and_failure_follow_session_ledger_order() {
 }
 
 #[test]
-fn failed_validation_followed_by_success_marks_historical_failure_resolved() {
+fn different_validation_identity_success_does_not_resolve_failure() {
     let store = SessionStore::default();
     let session = store.start_session(Some("agent:eval:demo".to_string()), None);
     record_finished_tool(
@@ -678,8 +683,10 @@ fn failed_validation_followed_by_success_marks_historical_failure_resolved() {
     assert_eq!(validation["status"], "mixed");
     assert_eq!(validation["latest_status"], "passed");
     assert_eq!(validation["historical_failures"]["count"], 1);
-    assert_eq!(validation["historical_failures"]["resolved"], true);
-    assert_eq!(validation["historical_failures"]["unresolved"], false);
+    assert_eq!(validation["historical_failures"]["resolved"], false);
+    assert_eq!(validation["historical_failures"]["unresolved"], true);
+    assert_eq!(validation["resolved_failures"]["count"], 0);
+    assert_eq!(validation["unresolved_failures"]["count"], 1);
     assert_eq!(validation["latest"]["tool_name"], "cargo_check");
     assert_eq!(validation["latest"]["success"], true);
     assert_eq!(validation["latest_success"]["tool_name"], "cargo_check");
@@ -730,7 +737,7 @@ fn failed_cargo_test_followed_by_zero_tests_remains_historically_unresolved() {
 }
 
 #[test]
-fn normal_success_after_zero_tests_resolves_historical_failure() {
+fn different_check_success_after_zero_tests_does_not_resolve_test_failure() {
     let store = SessionStore::default();
     let session = store.start_session(Some("agent:eval:demo".to_string()), None);
     record_finished_tool(
@@ -773,8 +780,252 @@ fn normal_success_after_zero_tests_resolves_historical_failure() {
     assert_eq!(validation["status"], "mixed");
     assert_eq!(validation["latest_status"], "passed");
     assert_eq!(validation["historical_failures"]["count"], 1);
-    assert_eq!(validation["historical_failures"]["resolved"], true);
-    assert_eq!(validation["historical_failures"]["unresolved"], false);
+    assert_eq!(validation["historical_failures"]["resolved"], false);
+    assert_eq!(validation["historical_failures"]["unresolved"], true);
+    assert_eq!(validation["resolved_failures"]["count"], 0);
+    assert_eq!(validation["unresolved_failures"]["count"], 1);
+}
+
+#[test]
+fn same_validation_identity_success_resolves_failure_without_deleting_history() {
+    let store = SessionStore::default();
+    let session = store.start_session(Some("agent:eval:demo".to_string()), None);
+    record_finished_tool(
+        &store,
+        &session.session_id,
+        "cargo_test",
+        json!({"project": "agent:eval:demo"}),
+        false,
+        json!({"exit_code": 101}),
+    );
+    record_finished_tool(
+        &store,
+        &session.session_id,
+        "cargo_test",
+        json!({"project": "agent:eval:demo"}),
+        true,
+        json!({
+            "exit_code": 0,
+            "stdout_tail": "running 1 test\n\ntest result: ok. 1 passed; 0 failed; 0 ignored\n",
+            "stderr_tail": "",
+            "stdout_truncated": false,
+            "stderr_truncated": false,
+            "tests_detected": true,
+            "tests_run_count": 1,
+            "zero_tests_run": false
+        }),
+    );
+
+    let session = store.summary(&session.session_id, Some(50)).unwrap();
+    let validation = validation_summary_for_session(&session);
+
+    assert_eq!(validation["historical_failures"]["count"], 1);
+    assert_eq!(validation["resolved_failures"]["count"], 1);
+    assert_eq!(validation["unresolved_failures"]["count"], 0);
+    assert_eq!(
+        validation["resolved_failures"]["events"][0]["unresolved_failure"],
+        false
+    );
+    assert_eq!(validation["events_total"], 2);
+}
+
+#[test]
+fn same_assertion_identity_resolves_only_its_own_failure() {
+    let store = SessionStore::default();
+    let session = store.start_session(Some("agent:eval:demo".to_string()), None);
+    for (assertion_name, success, exit_code) in [
+        ("release_check", false, 101),
+        ("other_check", true, 0),
+        ("release_check", true, 0),
+    ] {
+        record_finished_tool(
+            &store,
+            &session.session_id,
+            "cargo_check",
+            json!({
+                "project": "agent:eval:demo",
+                "assertion_name": assertion_name,
+            }),
+            success,
+            json!({"exit_code": exit_code}),
+        );
+    }
+
+    let session = store.summary(&session.session_id, Some(50)).unwrap();
+    let validation = validation_summary_for_session(&session);
+    assert_eq!(validation["historical_failures"]["count"], 1);
+    assert_eq!(validation["resolved_failures"]["count"], 1);
+    assert_eq!(validation["unresolved_failures"]["count"], 0);
+    assert_eq!(
+        validation["resolved_failures"]["events"][0]["identity"],
+        "assertion:release_check"
+    );
+}
+
+#[tokio::test]
+async fn run_shell_declared_validation_enters_unified_summary_with_shell_and_root_cwd() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let project =
+        register_agent_project_at_path(&runtime, "validation-shell", "demo", tmp.path()).await;
+    let auth = auth_context(None, true);
+    let session = runtime
+        .sessions
+        .start_session(Some(project.clone()), Some("shell validation".to_string()));
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        let session_id = session.session_id.clone();
+        let auth = auth.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::RunShell {
+                        project,
+                        command: "cargo test focused".to_string(),
+                        session_id: Some(session_id),
+                        timeout_secs: Some(30),
+                        cwd: Some(".".to_string()),
+                        purpose: Some(ExecutionPurpose::Test),
+                        shell: Some(ExecutionShell::Bash),
+                    },
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    let request = next_patch_agent_request(&runtime, "validation-shell")
+        .await
+        .expect("run_shell should reach the Agent");
+    assert_eq!(request.kind, "run_shell");
+    assert!(request.command.starts_with("exec bash -c "));
+    complete_patch_agent_request(
+        &runtime,
+        "validation-shell",
+        &request.request_id,
+        0,
+        "running 1 test\n\ntest result: ok. 1 passed; 0 failed; 0 ignored\n",
+        "",
+    )
+    .await;
+    let execution = task.await.unwrap();
+    assert!(execution.success, "{:?}", execution.error);
+    assert_eq!(execution.output["cwd"], ".");
+    assert_eq!(execution.output["shell"], "bash");
+    assert_eq!(execution.output["purpose"], "test");
+
+    let summary = runtime
+        .dispatch_with_auth(
+            ToolCall::ValidationSummary {
+                project,
+                session_id: session.session_id,
+                limit: Some(20),
+            },
+            Some(&auth),
+        )
+        .await;
+    assert!(summary.success, "{:?}", summary.error);
+    let event = &summary.output["validation"]["latest"];
+    assert_eq!(event["execution_source"], "run_shell");
+    assert_eq!(event["purpose"], "test");
+    assert_eq!(event["validation_kind"], "test");
+    assert_eq!(event["cwd"], ".");
+    assert_eq!(event["shell"], "bash");
+    assert_eq!(event["tests_run_count"], 1);
+}
+
+#[tokio::test]
+async fn completed_run_job_validation_enters_handoff_from_job_authority() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let auth = open_auth_context();
+    let mut capabilities = crate::shell_protocol::ShellClientCapabilities::default();
+    capabilities.async_shell_jobs = true;
+    register_agent_projects_for_auth(
+        &runtime,
+        "validation-job",
+        &auth,
+        capabilities,
+        vec![registered_project("demo", &tmp.path().to_string_lossy())],
+    )
+    .await;
+    let project = "agent:validation-job:demo".to_string();
+    let session = runtime
+        .sessions
+        .start_session(Some(project.clone()), Some("job validation".to_string()));
+
+    let execution = runtime
+        .dispatch_with_auth(
+            ToolCall::RunJob {
+                project: project.clone(),
+                command: "cargo test focused".to_string(),
+                session_id: Some(session.session_id.clone()),
+                timeout_secs: Some(30),
+                cwd: Some(".".to_string()),
+                purpose: Some(ExecutionPurpose::Test),
+                shell: Some(ExecutionShell::Bash),
+            },
+            Some(&auth),
+        )
+        .await;
+    assert!(execution.success, "{:?}", execution.error);
+    assert_eq!(execution.output["cwd"], ".");
+    assert_eq!(execution.output["shell"], "bash");
+    let job_id = execution.output["job_id"].as_str().unwrap().to_string();
+    let request = next_agent_request_for_client(&runtime, "validation-job")
+        .await
+        .expect("run_job should enqueue a start_job request");
+    assert_eq!(request.kind, "start_job");
+    runtime
+        .shell_clients
+        .update_job(crate::shell_protocol::ShellAgentJobUpdateRequest {
+            client_id: "validation-job".to_string(),
+            agent_instance_id: "inst-validation-job".to_string(),
+            job_id: job_id.clone(),
+            request_id: Some(request.request_id),
+            status: "completed".to_string(),
+            stdout_chunk: None,
+            stderr_chunk: None,
+            stdout_tail: Some(
+                "running 1 test\n\ntest result: ok. 1 passed; 0 failed; 0 ignored\n".to_string(),
+            ),
+            stderr_tail: Some(String::new()),
+            exit_code: Some(0),
+            duration_ms: Some(12),
+            error: None,
+            validation_progress: None,
+            finished: true,
+        })
+        .await
+        .unwrap();
+
+    let handoff = runtime
+        .dispatch_with_auth(
+            ToolCall::SessionHandoffSummary {
+                session_id: session.session_id,
+                project: Some(project),
+                include_workspace: Some(false),
+                include_checkpoints: Some(false),
+                include_validation: Some(true),
+                summary_only: true,
+                limit: Some(20),
+            },
+            Some(&auth),
+        )
+        .await;
+    assert!(handoff.success, "{:?}", handoff.error);
+    assert_eq!(handoff.output["validation"]["status"], "passed");
+    let event = &handoff.output["validation"]["latest"];
+    assert_eq!(event["execution_source"], "run_job");
+    assert_eq!(event["purpose"], "test");
+    assert_eq!(event["execution_state"], "completed");
+    assert_eq!(event["exit_code"], 0);
+    assert_eq!(
+        handoff.output["facts"]["executions"][0]["identity"],
+        event["identity"]
+    );
+    assert_eq!(handoff.output["hard_blockers"], json!([]));
 }
 
 #[test]
@@ -836,6 +1087,7 @@ async fn finish_coding_task_validation_available_when_ledger_has_validation_even
                 project: project.clone(),
                 title: Some("validation finish".to_string()),
                 mode: SessionMode::Normal,
+                detail: Default::default(),
                 deny_write_tools: false,
                 deny_shell_tools: false,
                 include_runtime_status: Some(false),

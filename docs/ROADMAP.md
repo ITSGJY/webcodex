@@ -24,6 +24,14 @@ Keep the hosted capability surface stable. Do not make code-size reduction or sm
 - Clarify shell/cwd behavior, layered reconnect status, and oversized startup/read/log payloads to reduce meaningless failures, polling, and context consumption.
 - Default project chat connections to the project-bound minimal surface while keeping the full operator runtime for administration; do not try to predict every project situation by adding dedicated tools.
 
+### Stage 1 implemented
+
+- `cargo_fmt`, `cargo_check`, `cargo_test`, declared-purpose `run_shell`, and terminal declared-purpose `run_job` now share one bounded execution-evidence projection. Stable assertion/command identities preserve `historical_failures` while separating `resolved_failures` from `unresolved_failures`.
+- `validation_summary`, `session_handoff_summary`, and `finish_coding_task` reuse that projection. Closeout exposes `facts`, `hard_blockers`, and `advisories`; an ordinary dirty worktree and absent task-optional validation are advisory, while unresolved conflicts, command/test failures, active blocking jobs, and sensitive-path risks are blockers.
+- `run_shell` and `run_job` accept `purpose` and `shell=sh|bash`, resolve omitted/empty/`.` cwd to the project root, and report project-relative cwd plus executor/shell facts. Job logs default to bounded tails with line counts, truncation, detected summary, and continuation cursors.
+- `start_coding_task(detail=minimal|standard|full)` replaces startup flag combinations, `read_file` returns one text representation, and readiness is split across runner process, server transport/registration, project registry, connector endpoint, session binding, and last successful call.
+- Console chat connection data names the project-bound surface explicitly and does not expose the operator runtime as the model default; the full operator runtime remains available for management and internal execution.
+
 ## Deferred
 
 - Code-size reduction and LOC gates.

@@ -4279,7 +4279,7 @@ pub(crate) mod tests {
         responder.await.unwrap();
         assert!(outcome.ok, "{}", outcome.body);
         assert_eq!(outcome.body["event_cursor"], 2);
-        assert!(outcome.body["data"]["files"][0]["content"]
+        assert!(outcome.body["data"]["files"][0]["text"]
             .as_str()
             .unwrap()
             .contains("fn entry"));

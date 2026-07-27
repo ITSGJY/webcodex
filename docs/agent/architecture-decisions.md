@@ -141,14 +141,31 @@ See also [`TESTING.md`](../TESTING.md).
 
 ## 4. Validation evidence semantics (product)
 
-- Validation tools record evidence into the **workflow session ledger**.
-- Closeout and review must distinguish **latest / current run status** from
-  **historical failures** still visible as audit evidence.
-- Resolved historical failures may remain in the ledger without forcing a
-  failing final task outcome when the latest decisive run is clean; agents
-  must not "fix" this by deleting history or weakening assertions.
+- Dedicated validation tools and `run_shell`/terminal `run_job` calls declaring
+  `validation`, `test`, `build`, `format`, or `release` purpose project into the
+  same bounded execution-evidence contract. Tool name is not the source of
+  truth for whether validation occurred.
+- Evidence carries execution source, stable assertion/command identity,
+  purpose, bounded command summary, project-relative cwd, shell/executor,
+  execution state, exit code, detected summary, bounded output metadata,
+  timestamps, and failure classification. Full unbounded logs are not ledger
+  evidence.
+- Retry resolution is exact by stable identity. A later success resolves only
+  failures for that identity; it never deletes or rewrites the historical
+  failure and cannot resolve a different assertion.
+- Closeout and review expose `historical_failures`, `resolved_failures`, and
+  `unresolved_failures`. Resolved history is advisory; unresolved command/test
+  failure is a hard blocker.
 - `validation_summary` is a read of existing ledger evidence; it does not
-  re-run Cargo/shell or replace `finish_coding_task`.
+  re-run Cargo/shell or replace `finish_coding_task`. Handoff and finish reuse
+  this projection instead of building independent validation truth.
+
+Closeout is an Agent-ready fact package, not a context-free engineering judge.
+Its primary layers are `facts`, `hard_blockers`, and `advisories`. Ordinary
+dirty worktrees, bounded truncation, optional validation not observed, and
+resolved history are advisory. Permission/session-guard denial, unresolved
+workspace conflicts, command/test failures, blocking active executions,
+sensitive-path risks, and consistency errors are deterministic blockers.
 
 ---
 

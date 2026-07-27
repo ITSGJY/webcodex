@@ -181,8 +181,13 @@ async fn workspace_hygiene_check_detects_untracked_smoke_temp_file() {
     assert_eq!(smoke_finding["tracked_status"], "untracked");
     assert_eq!(smoke_finding["path"], ".webcodex-smoke-acceptance.txt");
     assert_review_verdict_shape(&result.output["verdict"]);
-    assert_ne!(result.output["verdict"]["status"], "pass");
-    assert!(!verdict_reasons(&result.output["verdict"]).is_empty());
+    assert_eq!(result.output["verdict"]["status"], "warn");
+    assert_eq!(result.output["verdict"]["blocking"], false);
+    assert_reason_list_contains(
+        &result.output["verdict"],
+        "warning_reasons",
+        "hygiene_findings_present",
+    );
 }
 
 #[tokio::test]
@@ -224,7 +229,7 @@ async fn workspace_hygiene_check_detects_dirty_untracked_and_suspicious_paths() 
     assert_reason_list_contains(
         &result.output["verdict"],
         "blocking_reasons",
-        "hygiene_failed",
+        "sensitive_path_risk",
     );
     assert_verdict_omits_raw_output_and_sensitive_values(
         &result.output["verdict"],
@@ -322,6 +327,8 @@ async fn workspace_hygiene_check_detects_large_untracked_file() {
         .find(|f| f["kind"] == "large_untracked_file")
         .unwrap_or_else(|| panic!("expected large_untracked_file finding: {findings:?}"));
     assert_eq!(large_finding["path"], "big_blob.dat");
+    assert_eq!(result.output["verdict"]["status"], "warn");
+    assert_eq!(result.output["verdict"]["blocking"], false);
 
     // The output must NOT contain file contents.
     let output_str = serde_json::to_string(&result.output).unwrap();
@@ -691,20 +698,6 @@ fn assert_reason_list_contains(verdict: &serde_json::Value, key: &str, reason: &
         reasons.iter().any(|value| value.as_str() == Some(reason)),
         "{key} should contain {reason}: {verdict}"
     );
-}
-
-fn verdict_reasons(verdict: &serde_json::Value) -> Vec<&str> {
-    let mut reasons = Vec::new();
-    for key in ["blocking_reasons", "warning_reasons"] {
-        reasons.extend(
-            verdict[key]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(serde_json::Value::as_str),
-        );
-    }
-    reasons
 }
 
 fn assert_verdict_omits_raw_output_and_sensitive_values(

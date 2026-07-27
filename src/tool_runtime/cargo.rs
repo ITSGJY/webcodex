@@ -290,14 +290,41 @@ impl ToolRuntime {
         } else {
             None
         };
+        let (resolved_cwd, shell, executor) = match self.resolve_project(&project).await {
+            Ok(config) if config.is_agent() => {
+                let resolved = super::helpers::resolve_agent_cwd(&config, cwd.as_deref())
+                    .and_then(|path| super::helpers::project_relative_agent_cwd(&config, &path))
+                    .unwrap_or_else(|_| ".".to_string());
+                (resolved, "configured", "agent")
+            }
+            Ok(config) => {
+                let resolved = super::helpers::resolve_local_cwd(&config, cwd.as_deref())
+                    .and_then(|path| super::helpers::project_relative_cwd(&config, &path))
+                    .unwrap_or_else(|_| ".".to_string());
+                (resolved, "sh", "local")
+            }
+            Err(_) => (".".to_string(), "configured", "unknown"),
+        };
+        let purpose = match adapter.validation_kind() {
+            "test" => "test",
+            "format" => "format",
+            _ => "validation",
+        };
         let mut payload = json!({
             "project": project,
-            "command": command,
-            "cwd": cwd.unwrap_or_default(),
+            "command_summary": crate::shell_client::command_preview(&command),
+            "cwd": resolved_cwd,
+            "shell": shell,
+            "executor": executor,
+            "execution_source": adapter.tool_identity(),
+            "purpose": purpose,
+            "execution_state": if timed_out { "timed_out" } else { "completed" },
             "exit_code": output.exit_code,
             "duration_ms": output.duration_ms,
             "stdout_tail": stdout_tail,
             "stderr_tail": stderr_tail,
+            "stdout_lines": output.stdout.lines().count(),
+            "stderr_lines": output.stderr.lines().count(),
             "stdout_truncated": stdout_truncated,
             "stderr_truncated": stderr_truncated,
             "passed": passed,

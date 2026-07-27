@@ -191,6 +191,12 @@ impl ToolRuntime {
             "clients": clients_summary,
             "summary": agent_health_summary(&clients, &agent_jobs, now),
         });
+        let connection_layers = connection_layers(
+            agent_count,
+            online_count,
+            agent_registered_count,
+            agent_registered_online_count,
+        );
 
         // -- jobs summary -----------------------------------------------------
         // Agent-known jobs come from the registry; local jobs come from the
@@ -262,6 +268,7 @@ impl ToolRuntime {
             "configured_public_url": self.runtime_info.configured_public_url,
             "projects": projects,
             "agents": agents,
+            "connection_layers": connection_layers,
             "jobs": jobs,
             "tools": tools,
             "permissions": permissions::permission_profile_payload(),
@@ -329,6 +336,54 @@ pub(crate) fn compact_runtime_status(status: &Value) -> Value {
                 "online_count": 0,
             })),
             "mode": status.pointer("/projects/mode").cloned().unwrap_or_else(|| json!("agent_registered")),
+        },
+        "connection_layers": status.get("connection_layers").cloned().unwrap_or_else(|| json!({
+            "runner_process": {"status": "not_observed"},
+            "server_transport": {"status": "not_observed"},
+            "server_registration": {"status": "not_observed"},
+            "project_registry": {"status": "not_observed"},
+            "connector_endpoint": {"status": "not_observed"},
+            "session_binding": {"status": "not_observed"},
+            "last_successful_tool_call": {"status": "not_observed"},
+        })),
+    })
+}
+
+fn connection_layers(
+    registered_clients: usize,
+    online_clients: usize,
+    registered_projects: usize,
+    online_projects: usize,
+) -> Value {
+    json!({
+        "runner_process": {
+            "status": if online_clients > 0 { "observed_running" } else { "not_observed" },
+            "basis": "server_client_lease",
+        },
+        "server_transport": {
+            "status": if online_clients > 0 { "connected" } else { "not_connected" },
+            "connected_clients": online_clients,
+        },
+        "server_registration": {
+            "status": if registered_clients > 0 { "registered" } else { "not_registered" },
+            "registered_clients": registered_clients,
+        },
+        "project_registry": {
+            "status": if registered_projects > 0 { "registered" } else { "empty" },
+            "registered_projects": registered_projects,
+            "online_projects": online_projects,
+        },
+        "connector_endpoint": {
+            "status": "not_observed",
+            "reason": "connector_runtime_is_separate",
+        },
+        "session_binding": {
+            "status": "not_observed",
+            "reason": "binding_is_request_principal_and_transport_scoped",
+        },
+        "last_successful_tool_call": {
+            "status": "not_observed",
+            "reason": "no_connector_call_history_in_runtime_registry",
         },
     })
 }

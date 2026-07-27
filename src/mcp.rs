@@ -2300,7 +2300,12 @@ mod tests {
         let start_props = tool("start_coding_task")["inputSchema"]["properties"]
             .as_object()
             .expect("start_coding_task inputSchema properties");
-        assert_eq!(start_props["tool_manifest_intent"]["type"], "string");
+        assert_eq!(start_props["detail"]["type"], "string");
+        assert_eq!(
+            start_props["detail"]["enum"],
+            json!(["minimal", "standard", "full"])
+        );
+        assert!(!start_props.contains_key("tool_manifest_intent"));
 
         let runtime_props = tool("runtime_status")["inputSchema"]["properties"]
             .as_object()

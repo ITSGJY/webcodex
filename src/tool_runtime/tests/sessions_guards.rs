@@ -111,7 +111,15 @@ async fn same_project_session_records_without_project_mismatch_warning() {
     let req = next_patch_agent_request(&runtime, "alpha-client")
         .await
         .expect("read_file should enqueue an agent request");
-    complete_patch_agent_request(&runtime, "alpha-client", &req.request_id, 0, "alpha\n", "").await;
+    complete_patch_agent_request(
+        &runtime,
+        "alpha-client",
+        &req.request_id,
+        0,
+        &canonical_agent_file_read_output("alpha\n", 1),
+        "",
+    )
+    .await;
     let result = task.await.unwrap();
 
     assert!(result.success, "{:?}", result.error);
@@ -160,7 +168,15 @@ async fn read_only_cross_project_session_succeeds_with_structured_warning() {
     let req = next_patch_agent_request(&runtime, "bravo-client")
         .await
         .expect("read_file should enqueue an agent request");
-    complete_patch_agent_request(&runtime, "bravo-client", &req.request_id, 0, "bravo\n", "").await;
+    complete_patch_agent_request(
+        &runtime,
+        "bravo-client",
+        &req.request_id,
+        0,
+        &canonical_agent_file_read_output("bravo\n", 1),
+        "",
+    )
+    .await;
     let result = task.await.unwrap();
 
     assert!(result.success, "{:?}", result.error);
@@ -405,7 +421,15 @@ async fn current_session_binding_cannot_cross_project_boundary() {
     let req = next_patch_agent_request(&runtime, "bravo-client")
         .await
         .expect("read_file should enqueue an agent request");
-    complete_patch_agent_request(&runtime, "bravo-client", &req.request_id, 0, "bravo\n", "").await;
+    complete_patch_agent_request(
+        &runtime,
+        "bravo-client",
+        &req.request_id,
+        0,
+        &canonical_agent_file_read_output("bravo\n", 1),
+        "",
+    )
+    .await;
     let read = task.await.unwrap();
     assert!(read.success, "{:?}", read.error);
     assert!(read.output.get("session_recorded").is_none());
@@ -547,7 +571,15 @@ async fn read_only_session_allows_read_file_and_records_success() {
         .await
         .expect("read_file should be allowed in read_only session");
     assert_eq!(req.kind, "file_read");
-    complete_patch_agent_request(&runtime, "guard-read", &req.request_id, 0, "hello\n", "").await;
+    complete_patch_agent_request(
+        &runtime,
+        "guard-read",
+        &req.request_id,
+        0,
+        &canonical_agent_file_read_output("hello\n", 1),
+        "",
+    )
+    .await;
     let result = task.await.unwrap();
 
     assert!(result.success, "{:?}", result.error);
@@ -791,6 +823,8 @@ async fn read_only_session_rejects_run_shell_before_agent_enqueue() {
                 session_id: Some(session.session_id.clone()),
                 timeout_secs: Some(30),
                 cwd: None,
+                purpose: None,
+                shell: None,
             },
             Some(&bootstrap),
         )
@@ -891,7 +925,7 @@ async fn deny_write_only_allows_read_and_shell_tools() {
         "guard-write-only",
         &req.request_id,
         0,
-        "hello\n",
+        &canonical_agent_file_read_output("hello\n", 1),
         "",
     )
     .await;
@@ -911,6 +945,8 @@ async fn deny_write_only_allows_read_and_shell_tools() {
                         session_id: Some(session_id),
                         timeout_secs: Some(30),
                         cwd: None,
+                        purpose: None,
+                        shell: None,
                     },
                     Some(&bootstrap),
                 )
@@ -958,6 +994,8 @@ async fn deny_shell_only_allows_write_tools() {
                 session_id: Some(session.session_id.clone()),
                 timeout_secs: Some(30),
                 cwd: None,
+                purpose: None,
+                shell: None,
             },
             Some(&bootstrap),
         )

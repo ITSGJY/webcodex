@@ -72,13 +72,23 @@ fn key_tool_output_schemas_include_expected_fields() {
     for field in [
         "duration_ms",
         "exit_code",
-        "stdout",
-        "stderr",
+        "stdout_tail",
+        "stderr_tail",
+        "stdout_lines",
+        "stderr_lines",
+        "stdout_truncated",
+        "stderr_truncated",
         "command_started",
         "command_completed",
         "command_ok",
         "failure_kind",
         "tool_failure",
+        "purpose",
+        "command_summary",
+        "cwd",
+        "shell",
+        "executor",
+        "execution_state",
     ] {
         assert!(
             has_output_field("run_shell", field),
@@ -179,16 +189,16 @@ fn key_tool_output_schemas_include_expected_fields() {
             "cargo_test diagnostics.test_summary missing {field}"
         );
     }
-    for field in [
-        "content",
-        "start_line",
-        "limit",
-        "total_lines",
-        "numbered_text",
-    ] {
+    for field in ["text", "format", "start_line", "limit", "total_lines"] {
         assert!(
             has_output_field("read_file", field),
             "read_file missing {field}"
+        );
+    }
+    for removed in ["content", "numbered_text"] {
+        assert!(
+            !has_output_field("read_file", removed),
+            "read_file must not duplicate its primary text as {removed}"
         );
     }
     for field in [
@@ -258,7 +268,6 @@ fn key_tool_output_schemas_include_expected_fields() {
         );
     }
     for field in [
-        "stopped",
         "already_finished",
         "already_stop_requested",
         "stop_request_accepted",
@@ -304,11 +313,21 @@ fn key_tool_output_schemas_include_expected_fields() {
     }
     for field in [
         "job_id",
-        "stdout",
-        "stderr",
-        "next_stdout_line",
-        "next_stderr_line",
+        "exit_code",
+        "stdout_tail",
+        "stderr_tail",
+        "stdout_lines",
+        "stderr_lines",
+        "stdout_truncated",
+        "stderr_truncated",
+        "cursor",
         "status",
+        "executor",
+        "cwd",
+        "shell",
+        "purpose",
+        "command_summary",
+        "detected_summary",
     ] {
         assert!(
             has_output_field("job_log", field),
@@ -357,37 +376,45 @@ fn key_tool_output_schemas_include_expected_fields() {
     }
     for field in [
         "job_id",
-        "stdout",
-        "stderr",
-        "next_stdout_line",
-        "next_stderr_line",
+        "exit_code",
+        "stdout_tail",
+        "stderr_tail",
+        "stdout_lines",
+        "stderr_lines",
+        "stdout_truncated",
+        "stderr_truncated",
+        "cursor",
         "status",
+        "executor",
+        "cwd",
+        "shell",
+        "purpose",
+        "command_summary",
+        "detected_summary",
     ] {
         assert!(
             has_output_field("job_tail", field),
             "job_tail missing {field}"
         );
     }
-    for field in ["stdout", "stderr"] {
+    for field in ["stdout_tail", "stderr_tail"] {
         let description = output_schema_property(&specs, "job_tail", field)["description"]
             .as_str()
             .expect("job_tail stream description")
             .to_lowercase();
         assert!(
-            description.contains("bounded") && description.contains("not an unbounded"),
+            description.contains("bounded"),
             "job_tail {field} description must describe bounded tail text: {description}"
         );
     }
-    for field in ["next_stdout_line", "next_stderr_line"] {
-        let description = output_schema_property(&specs, "job_tail", field)["description"]
-            .as_str()
-            .expect("job_tail offset description")
-            .to_lowercase();
-        assert!(
-            description.contains("offset") && description.contains("bounded tail"),
-            "job_tail {field} description must describe bounded tail offset metadata: {description}"
-        );
-    }
+    let cursor_description = output_schema_property(&specs, "job_tail", "cursor")["description"]
+        .as_str()
+        .expect("job_tail cursor description")
+        .to_lowercase();
+    assert!(
+        cursor_description.contains("cursor") && cursor_description.contains("bounded"),
+        "job_tail cursor must describe bounded continuation metadata: {cursor_description}"
+    );
     for field in [
         "path",
         "exists",
@@ -884,18 +911,14 @@ fn finish_coding_task_output_schema_describes_ledger_validation_summary() {
         .unwrap();
     let description = description.to_lowercase();
     for phrase in [
-        "ledger-based",
-        "validation-like tool-call summary",
-        "status/reason",
-        "does not include stdout/stderr",
-        "structured diagnostics",
-        "bounded validation metadata",
-        "parser version 3",
-        "canonical diagnostics",
-        "failed_test_details",
-        "no root-cause inference",
-        "latest_status",
-        "historical_failures",
+        "unified bounded execution evidence",
+        "dedicated validation tools",
+        "run_shell/run_job",
+        "validation/test/build/format/release",
+        "historical",
+        "resolved",
+        "unresolved",
+        "stable identity",
     ] {
         assert!(
             description.contains(phrase),

@@ -860,20 +860,16 @@ mod tests {
         }
     }
 
-    fn start_coding_task_call_body(project: &str) -> Value {
+    fn standard_start_coding_task_call_body(project: &str) -> Value {
         json!({
             "tool": "start_coding_task",
             "project": project,
-            "include_runtime_status": false,
-            "include_git": false,
-            "include_recent_commits": false,
-            "include_rules": false,
-            "include_tool_manifest": true,
+            "detail": "standard",
         })
     }
 
     #[tokio::test]
-    async fn http_start_coding_task_default_response_is_full() {
+    async fn http_start_coding_task_default_response_is_standard() {
         let _compact = ActionCompactEnvGuard::disabled();
 
         let config = test_config(Some("secret"));
@@ -884,7 +880,10 @@ mod tests {
 
         let mut resp = TestClient::post("http://localhost/api/tools/call")
             .bearer_auth("secret")
-            .json(&start_coding_task_call_body("agent:importer:demo"))
+            .json(&json!({
+                "tool": "start_coding_task",
+                "project": "agent:importer:demo"
+            }))
             .send(&service)
             .await;
 
@@ -894,10 +893,12 @@ mod tests {
         assert!(body["output"].get("compact").is_none());
         let session_id = body["output"]["session"]["session_id"]
             .as_str()
-            .expect("full response keeps nested session.session_id");
+            .expect("standard response keeps nested session.session_id");
         assert!(session_id.starts_with("wc_sess_"));
-        assert!(body["output"]["tool_manifest"].is_object());
-        assert!(body["output"]["recommended_flow"].is_object());
+        assert_eq!(body["output"]["detail"], "standard");
+        assert!(body["output"].get("tool_manifest").is_none());
+        assert!(body["output"].get("recommended_flow").is_none());
+        assert!(body["output"].get("rules").is_none());
         assert!(body["output"]["startup_verdict"].is_object());
     }
 
@@ -915,7 +916,7 @@ mod tests {
         std::env::set_var("WEBCODEX_ACTION_COMPACT_RESPONSES", "false");
         let mut full_resp = TestClient::post("http://localhost/api/tools/call")
             .bearer_auth("secret")
-            .json(&start_coding_task_call_body("agent:importer:demo"))
+            .json(&standard_start_coding_task_call_body("agent:importer:demo"))
             .send(&service)
             .await;
         assert_eq!(effective_status(&full_resp), StatusCode::OK);
@@ -925,12 +926,13 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        assert!(full_body["output"]["tool_manifest"].is_object());
+        assert_eq!(full_body["output"]["detail"], "standard");
+        assert!(full_body["output"]["runtime_status"].is_object());
 
         std::env::set_var("WEBCODEX_ACTION_COMPACT_RESPONSES", "true");
         let mut compact_resp = TestClient::post("http://localhost/api/tools/call")
             .bearer_auth("secret")
-            .json(&start_coding_task_call_body("agent:importer:demo"))
+            .json(&standard_start_coding_task_call_body("agent:importer:demo"))
             .send(&service)
             .await;
         assert_eq!(effective_status(&compact_resp), StatusCode::OK);
@@ -975,9 +977,7 @@ mod tests {
             .json(&json!({
                 "tool": "start_coding_task",
                 "project": "agent:importer:does-not-exist",
-                "include_runtime_status": false,
-                "include_git": false,
-                "include_tool_manifest": false,
+                "detail": "minimal",
             }))
             .send(&service)
             .await;

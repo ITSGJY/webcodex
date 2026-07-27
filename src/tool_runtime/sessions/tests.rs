@@ -339,40 +339,43 @@ fn malicious_persisted_validation_output_summary_is_resanitized_on_restore() {
         .iter()
         .find(|event| event.kind == "tool_call_finished" && event.tool_name == "run_shell")
         .unwrap();
-    let output_summary = cargo_finished.validation_output_summary.as_ref().unwrap();
-    let stdout_excerpt = output_summary["stdout_tail_excerpt"].as_str().unwrap();
-    let stderr_excerpt = output_summary["stderr_tail_excerpt"].as_str().unwrap();
-    let serialized = serde_json::to_string(output_summary).unwrap();
-
-    assert!(stdout_excerpt.contains("STDOUT_SAFE_END"));
-    assert!(stderr_excerpt.contains("STDERR_SAFE_END"));
-    assert!(stdout_excerpt.chars().count() <= MAX_VALIDATION_EXCERPT_CHARS);
-    assert!(stderr_excerpt.chars().count() <= MAX_VALIDATION_EXCERPT_CHARS);
-    assert_eq!(
-        output_summary["max_excerpt_chars"],
-        MAX_VALIDATION_EXCERPT_CHARS
-    );
-    assert_eq!(output_summary["stdout_truncated"], true);
-    assert_eq!(output_summary["stderr_truncated"], true);
-    for leaked in [
-        "token=abc",
-        "secret=abc",
-        "password=abc",
-        "api_key=abc",
-        "authorization: basic abc",
-        "bearer abc",
-        "private key abc",
-        "access key abc",
+    for output_summary in [
+        cargo_finished.validation_output_summary.as_ref().unwrap(),
+        run_shell_finished
+            .validation_output_summary
+            .as_ref()
+            .unwrap(),
     ] {
-        assert!(
-            !serialized.contains(leaked),
-            "restored validation_output_summary leaked {leaked}: {serialized}"
+        let stdout_excerpt = output_summary["stdout_tail_excerpt"].as_str().unwrap();
+        let stderr_excerpt = output_summary["stderr_tail_excerpt"].as_str().unwrap();
+        let serialized = serde_json::to_string(output_summary).unwrap();
+
+        assert!(stdout_excerpt.contains("STDOUT_SAFE_END"));
+        assert!(stderr_excerpt.contains("STDERR_SAFE_END"));
+        assert!(stdout_excerpt.chars().count() <= MAX_VALIDATION_EXCERPT_CHARS);
+        assert!(stderr_excerpt.chars().count() <= MAX_VALIDATION_EXCERPT_CHARS);
+        assert_eq!(
+            output_summary["max_excerpt_chars"],
+            MAX_VALIDATION_EXCERPT_CHARS
         );
+        assert_eq!(output_summary["stdout_truncated"], true);
+        assert_eq!(output_summary["stderr_truncated"], true);
+        for leaked in [
+            "token=abc",
+            "secret=abc",
+            "password=abc",
+            "api_key=abc",
+            "authorization: basic abc",
+            "bearer abc",
+            "private key abc",
+            "access key abc",
+        ] {
+            assert!(
+                !serialized.contains(leaked),
+                "restored validation_output_summary leaked {leaked}: {serialized}"
+            );
+        }
     }
-    assert!(
-        run_shell_finished.validation_output_summary.is_none(),
-        "non-cargo tool validation_output_summary must be discarded"
-    );
 }
 
 #[test]

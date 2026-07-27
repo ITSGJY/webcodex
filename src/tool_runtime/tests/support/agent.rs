@@ -566,6 +566,21 @@ pub(in crate::tool_runtime::tests) async fn register_agent_with_shell_profiles(
         .unwrap();
 }
 
+pub(in crate::tool_runtime::tests) fn canonical_agent_file_read_output(
+    content: &str,
+    total_lines: usize,
+) -> String {
+    serde_json::json!({
+        "format": "webcodex.file_read_range.v1",
+        "content": content,
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "total_lines": total_lines,
+        "start_line": 1,
+        "limit": total_lines.max(1),
+    })
+    .to_string()
+}
+
 pub(in crate::tool_runtime::tests) fn profile_summary_entry(
     name: &str,
     has_init_script: bool,

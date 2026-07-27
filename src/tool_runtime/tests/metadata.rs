@@ -276,7 +276,7 @@ async fn list_projects_and_dispatch_are_filtered_by_lightweight_auth_group() {
         "inst-client-a",
         &req.request_id,
         0,
-        "bridge\n",
+        &canonical_agent_file_read_output("bridge\n", 1),
         "",
     )
     .await;
@@ -370,7 +370,7 @@ async fn list_projects_and_dispatch_are_filtered_by_lightweight_auth_group() {
         "inst-client-open",
         &req.request_id,
         0,
-        "open\n",
+        &canonical_agent_file_read_output("open\n", 1),
         "",
     )
     .await;
@@ -652,6 +652,8 @@ async fn unique_short_agent_project_id_is_resolved_by_runtime_surface() {
                         session_id: None,
                         timeout_secs: Some(1),
                         cwd: None,
+                        purpose: None,
+                        shell: None,
                     },
                     Some(&bootstrap),
                 )
@@ -695,6 +697,8 @@ async fn agent_run_shell_without_shell_capability_is_rejected() {
                 session_id: None,
                 timeout_secs: None,
                 cwd: None,
+                purpose: None,
+                shell: None,
             },
             Some(&bootstrap),
         )
@@ -743,6 +747,8 @@ async fn agent_run_job_without_async_capability_is_rejected() {
                 session_id: None,
                 timeout_secs: None,
                 cwd: None,
+                purpose: None,
+                shell: None,
             },
             Some(&bootstrap),
         )
@@ -786,6 +792,8 @@ async fn agent_tool_unknown_client_returns_unknown_project_error() {
                 session_id: None,
                 timeout_secs: None,
                 cwd: None,
+                purpose: None,
+                shell: None,
             },
             Some(&bootstrap),
         )
@@ -814,6 +822,8 @@ async fn agent_tool_rejects_non_owner_api_key() {
                 session_id: None,
                 timeout_secs: None,
                 cwd: None,
+                purpose: None,
+                shell: None,
             },
             Some(&bob),
         )
@@ -839,6 +849,8 @@ async fn agent_tool_rejects_missing_auth_context() {
                 session_id: None,
                 timeout_secs: None,
                 cwd: None,
+                purpose: None,
+                shell: None,
             },
             None,
         )
@@ -867,6 +879,8 @@ async fn agent_tool_allows_owner_api_key_for_run_job() {
                 session_id: None,
                 timeout_secs: None,
                 cwd: None,
+                purpose: None,
+                shell: None,
             },
             Some(&alice),
         )
@@ -890,6 +904,8 @@ async fn agent_tool_allows_bootstrap_token_for_run_job() {
                 session_id: None,
                 timeout_secs: None,
                 cwd: None,
+                purpose: None,
+                shell: None,
             },
             Some(&bootstrap),
         )
@@ -1085,16 +1101,11 @@ async fn tool_manifest_reports_accepted_flattened_args_without_schemas() {
     for field in [
         "project",
         "title",
+        "mode",
+        "deny_write_tools",
+        "deny_shell_tools",
+        "detail",
         "bind_current",
-        "include_runtime_status",
-        "compact_startup",
-        "include_git",
-        "include_recent_commits",
-        "include_rules",
-        "include_tool_manifest",
-        "tool_manifest_intent",
-        "tool_manifest_categories",
-        "tool_manifest_limit",
         "session_id",
         TOOL_CALL_RECORDING_SESSION_ID_FIELD,
     ] {
@@ -1506,6 +1517,13 @@ async fn runtime_status_compact_and_summary_only_return_sanitized_summary() {
             "/projects/effective/count",
             "/projects/agent_registered/count",
             "/projects/agent_registered/online_count",
+            "/connection_layers/runner_process/status",
+            "/connection_layers/server_transport/status",
+            "/connection_layers/server_registration/status",
+            "/connection_layers/project_registry/status",
+            "/connection_layers/connector_endpoint/status",
+            "/connection_layers/session_binding/status",
+            "/connection_layers/last_successful_tool_call/status",
         ] {
             assert!(
                 summary.pointer(pointer).is_some(),
@@ -2088,7 +2106,7 @@ async fn list_agents_includes_sanitized_policy_summary() {
 }
 
 #[tokio::test]
-async fn runtime_status_marks_stale_websocket_agent_with_last_seen() {
+async fn runtime_status_distinguishes_stale_registration_from_transport_connection() {
     use crate::shell_client::TRANSPORT_WEBSOCKET;
     use crate::shell_protocol::ShellClientRegisterRequest;
     let registry = Arc::new(ShellClientRegistry::default());
@@ -2132,6 +2150,13 @@ async fn runtime_status_marks_stale_websocket_agent_with_last_seen() {
     assert_eq!(entry["status"], "stale");
     assert_eq!(entry["connected"], false);
     assert_eq!(entry["last_seen"], stale_ts);
+    let layers = &result.output["connection_layers"];
+    assert_eq!(layers["runner_process"]["status"], "not_observed");
+    assert_eq!(layers["server_transport"]["status"], "not_connected");
+    assert_eq!(layers["server_registration"]["status"], "registered");
+    assert_eq!(layers["project_registry"]["status"], "empty");
+    assert_eq!(layers["connector_endpoint"]["status"], "not_observed");
+    assert_eq!(layers["session_binding"]["status"], "not_observed");
 }
 
 #[tokio::test]

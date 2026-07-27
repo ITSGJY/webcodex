@@ -270,7 +270,7 @@ fn show_changes_clean_worktree() {
 }
 
 #[test]
-fn show_changes_without_session_id_keeps_existing_behavior() {
+fn show_changes_without_session_id_treats_dirty_workspace_as_advisory() {
     let mut output = parse_show_changes_output(
         "agent:oe:webcodex",
         "## main\n M src/lib.rs",
@@ -286,9 +286,9 @@ fn show_changes_without_session_id_keeps_existing_behavior() {
     assert_eq!(output["clean"], false);
     assert_eq!(output["counts"]["modified"], 1);
     assert_review_verdict_shape(&output["verdict"]);
-    assert_eq!(output["verdict"]["status"], "fail");
-    assert_eq!(output["verdict"]["blocking"], true);
-    assert_reason_list_contains(&output["verdict"], "blocking_reasons", "workspace_dirty");
+    assert_eq!(output["verdict"]["status"], "warn");
+    assert_eq!(output["verdict"]["blocking"], false);
+    assert_reason_list_contains(&output["verdict"], "warning_reasons", "workspace_dirty");
     assert!(output["session"].is_null());
     assert!(output["suggested_next_actions"]
         .as_array()
@@ -473,8 +473,8 @@ fn show_changes_reports_modified_file() {
     assert_eq!(output["clean"], false);
     assert_eq!(output["counts"]["modified"], 1);
     assert_eq!(output["counts"]["unstaged"], 1);
-    assert_eq!(output["verdict"]["status"], "fail");
-    assert_reason_list_contains(&output["verdict"], "blocking_reasons", "workspace_dirty");
+    assert_eq!(output["verdict"]["status"], "warn");
+    assert_reason_list_contains(&output["verdict"], "warning_reasons", "workspace_dirty");
     assert_eq!(output["files"][0]["path"], "src/users_http.rs");
     assert_eq!(output["files"][0]["status"], "modified");
     assert_eq!(output["files"][0]["kind"], "tracked");
@@ -503,8 +503,8 @@ fn show_changes_reports_untracked_file() {
     assert_eq!(output["files"][0]["status"], "untracked");
     assert_eq!(output["files"][0]["staged"], false);
     assert_eq!(output["warnings"][0]["kind"], "untracked_smoke_file");
-    assert_eq!(output["verdict"]["status"], "fail");
-    assert_reason_list_contains(&output["verdict"], "blocking_reasons", "workspace_dirty");
+    assert_eq!(output["verdict"]["status"], "warn");
+    assert_reason_list_contains(&output["verdict"], "warning_reasons", "workspace_dirty");
     assert!(output["suggested_next_actions"]
         .as_array()
         .unwrap()
@@ -540,9 +540,14 @@ fn show_changes_reports_conflicted_file() {
         "expected workspace_conflicts warning: {}",
         output["warnings"]
     );
-    // Review/closeout verdict still treats dirty worktree as fail; startup is separate.
+    // A real merge conflict is a hard blocker; ordinary dirty state is advisory.
     assert_eq!(output["verdict"]["status"], "fail");
-    assert_reason_list_contains(&output["verdict"], "blocking_reasons", "workspace_dirty");
+    assert_reason_list_contains(
+        &output["verdict"],
+        "blocking_reasons",
+        "workspace_conflicts",
+    );
+    assert_reason_list_contains(&output["verdict"], "warning_reasons", "workspace_dirty");
 }
 
 #[test]
@@ -768,7 +773,7 @@ async fn show_changes_with_session_id_returns_session_block_and_records_call() {
         "telemetry-show",
         &req.request_id,
         0,
-        "hello\n",
+        &canonical_agent_file_read_output("hello\n", 1),
         "",
     )
     .await;

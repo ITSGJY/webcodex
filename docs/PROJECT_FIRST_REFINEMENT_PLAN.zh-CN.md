@@ -792,6 +792,56 @@ validation 工具等默认是提示；权限拒绝、冲突、命令失败、测
 
 代码瘦身和旧版本平滑迁移均暂缓，待上述功能问题收敛后再重新排序。
 
+### 11.2 Iteration 9 第一阶段落地合同
+
+本阶段没有扩大 Hosted 九项 capability，也没有增加语言/release 专用工具。落地后的
+唯一合同如下：
+
+- execution evidence 以 `execution_source`、稳定 `identity`、声明 `purpose`、
+  bounded `command_summary`、project-relative `cwd`、`shell`/`executor`、execution
+  state、exit code、detected summary、行数/截断、bounded evidence 与时间/失败类别为
+  核心；专用 Cargo 工具和声明为 validation/test/build/format/release 的通用
+  shell/job execution 进入同一投影；
+- retry resolution 只按稳定 identity 发生。后续同 identity 成功把旧失败列入
+  `resolved_failures`，不同 assertion/operation 的成功不能消解它；历史 evidence
+  不删除、不改写；
+- closeout 从 session ledger、execution/job authority、Git/workspace 与 validation
+  evidence 投影 `facts`、`hard_blockers`、`advisories`。普通 dirty worktree、bounded
+  truncation、已消解历史失败、full suite 未运行、docs/review-only 没有 validation
+  默认是 advisory；未解决 workspace conflict、权限/session guard 拒绝、命令/测试
+  失败、blocking active job、敏感路径风险与 evidence consistency error 才是 blocker；
+- `run_shell` 默认 local `sh`，`run_job` 保持既有 local `bash`；两者可显式选择
+  `sh|bash`。cwd 省略、`""`、`.` 都是项目根，其他相对路径从项目根解析，越界拒绝，
+  model-facing surface 只返回 `.` 或 project-relative cwd；
+- `start_coding_task` canonical 参数是 `detail=minimal|standard|full`，默认 standard；
+  minimal 不带完整 manifest/rules/recent commits/recommended flow。`read_file` 只返回
+  `text + format` 一份主文本。`job_log`/`job_tail` 默认 200 行、最大 500 行，通过
+  cursor 继续读取；
+- runtime readiness 不再压成 online/offline，而是分别报告 runner process、server
+  transport、server registration、project registry、connector endpoint、session
+  binding 和 last successful tool call；
+- Console 默认 chat connection 是 project-bound canonical surface；完整 operator
+  runtime 明确保留为管理、开发与内部执行入口，不作为 model default。
+
+本阶段替换的旧判断路径包括：按 tool name 才承认 validation、任意后续 Cargo 成功
+消解旧失败、dirty worktree 自动 fail、`validation_not_run_with_review_evidence` 自动
+fail、`read_file` 双份全文、job log 默认全量正文，以及 startup flag 组合。没有保留
+canonical schema alias 或 dual response shape。
+
+按本计划既有 path-based 口径记录，本阶段 production Rust 为
+`267 files / 135,436 LOC -> 267 files / 136,779 LOC`（`+1,343 LOC`），test-path
+Rust 为 `90 files / 64,811 LOC -> 90 files / 65,287 LOC`（`+476 LOC`）。本轮明确
+不以 LOC 为门禁；记录用于后续评审。最大文件中 `src/bin/webcodex-runner.rs`
+保持 `7,598 LOC`，`src/tool_runtime/files.rs` 从 `4,457` 变为 `4,461 LOC`，
+`src/connector_runtime/mod.rs` 保持 `4,345 LOC`，
+`src/connector_runtime/execution_tests.rs` 从 `4,160` 变为 `4,163 LOC`。
+
+最终验证为：`cargo test --bin webcodex` 通过
+`1,756 passed / 0 failed / 4 ignored`，`cargo test --bin webcodex-cli` 通过
+`220 passed / 0 failed`，`cargo test --bin webcodex-runner` 通过
+`402 passed / 0 failed / 2 ignored`；同时 `cargo fmt --check`、
+`cargo check --all-targets` 与 `git diff --check` 通过。
+
 ## 12. 还需要多久
 
 这是工程估算，不是发布日期承诺。
@@ -808,10 +858,12 @@ validation 工具等默认是提示；权限拒绝、冲突、命令失败、测
 
 最大不确定性：
 
-- shell/job 与专用 validation evidence 能否在不伪造结论的前提下统一；
 - ChatGPT MCP/OpenAPI 对 long-poll、取消和重连的真实行为；
-- deterministic closeout 如何区分事实、提示和需要 Agent 解释的语境；
-- 当前工具返回体和测试日志对模型上下文的实际放大程度。
+- readiness 的 connector endpoint、session binding 与 last successful call 目前仍有
+  `not_observed` 层，需要后续 connector/session telemetry 才能变成可持久确认的事实；
+- bounded startup/read/job-log 在真实长任务中节省的上下文量仍需产品遥测验证；
+- complete operator runtime 与 project-bound chat surface 的真实外部客户端 acceptance
+  仍需部署环境 smoke。
 
 如果继续增加专用能力来覆盖每种项目情形，工具面和语境误判都会持续扩大；当前阶段应先让证据准确、合同清楚，并由 Agent 对完整事实做综合判断。
 

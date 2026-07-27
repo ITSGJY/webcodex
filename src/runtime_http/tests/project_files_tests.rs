@@ -82,7 +82,16 @@ async fn dedicated_read_project_file_with_session_id_records_event() {
             .send(&service)
             .await
     };
-    let complete = super::complete_one_agent_request(registry.clone(), "secret read body\n", "", 0);
+    let file_output = json!({
+        "format": "webcodex.file_read_range.v1",
+        "content": "secret read body\n",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "total_lines": 1,
+        "start_line": 1,
+        "limit": 1
+    })
+    .to_string();
+    let complete = super::complete_one_agent_request(registry.clone(), &file_output, "", 0);
     let (mut resp, _) = tokio::join!(request, complete);
     assert_eq!(super::effective_status(&resp), StatusCode::OK);
     let body: Value = resp.take_json().await.unwrap();
@@ -109,7 +118,7 @@ async fn dedicated_read_project_file_with_session_id_records_event() {
 }
 
 #[tokio::test]
-async fn dedicated_read_project_file_without_session_id_remains_compatible() {
+async fn dedicated_read_project_file_without_session_id_succeeds() {
     let config = super::test_config(Some("secret"));
     let (_tmp, db) = super::test_db();
     let tmp_proj = tempfile::tempdir().unwrap();
@@ -126,12 +135,22 @@ async fn dedicated_read_project_file_without_session_id_remains_compatible() {
             .send(&service)
             .await
     };
-    let complete = super::complete_one_agent_request(registry.clone(), "hello\n", "", 0);
+    let file_output = json!({
+        "format": "webcodex.file_read_range.v1",
+        "content": "hello\n",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "total_lines": 1,
+        "start_line": 1,
+        "limit": 2000
+    })
+    .to_string();
+    let complete = super::complete_one_agent_request(registry.clone(), &file_output, "", 0);
     let (mut resp, _) = tokio::join!(request, complete);
     assert_eq!(super::effective_status(&resp), StatusCode::OK);
     let body: Value = resp.take_json().await.unwrap();
     assert_eq!(body["success"], true);
-    assert_eq!(body["output"]["content"], "hello");
+    assert_eq!(body["output"]["text"], "hello\n");
+    assert_eq!(body["output"]["format"], "plain");
     assert!(body["output"].get("session_recorded").is_none());
 }
 

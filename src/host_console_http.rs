@@ -355,6 +355,18 @@ async fn connect(req: &mut Request, depot: &mut Depot, res: &mut Response) {
         "public_url": public_url,
         "mcp_path": "/mcp",
         "actions_schema_path": "/openapi.json",
+        "surface": {
+            "mode": "project_bound",
+            "capability_count": crate::connector_runtime::surface::CAPABILITY_NAMES.len(),
+            "operator_runtime_exposed": false,
+        },
+        "operator_runtime": {
+            "available": true,
+            "model_default": false,
+            "purpose": "management_development_internal_execution",
+            "tool_count": crate::tool_runtime::registered_tool_specs().len(),
+            "access": "operator_authenticated_host_runtime",
+        },
         "oauth_discovery_path": "/.well-known/oauth-authorization-server"
     })));
 }
@@ -582,6 +594,18 @@ mod tests {
                 "public_url": public_url,
                 "mcp_path": "/mcp",
                 "actions_schema_path": "/openapi.json",
+                "surface": {
+                    "mode": "project_bound",
+                    "capability_count": crate::connector_runtime::surface::CAPABILITY_NAMES.len(),
+                    "operator_runtime_exposed": false,
+                },
+                "operator_runtime": {
+                    "available": true,
+                    "model_default": false,
+                    "purpose": "management_development_internal_execution",
+                    "tool_count": crate::tool_runtime::registered_tool_specs().len(),
+                    "access": "operator_authenticated_host_runtime",
+                },
                 "oauth_discovery_path": "/.well-known/oauth-authorization-server",
             }),
             "the screenshot-safe response must not grow credential-bearing fields"

@@ -16,8 +16,10 @@ impl ToolRuntime {
                 session_id,
                 timeout_secs,
                 cwd,
+                purpose,
+                shell,
             } => {
-                self.run_job_for_auth(
+                self.run_job_for_auth_with_contract(
                     project,
                     command,
                     session_id,
@@ -26,6 +28,8 @@ impl ToolRuntime {
                     Vec::new(),
                     None,
                     auth,
+                    purpose,
+                    shell,
                 )
                 .await
             }

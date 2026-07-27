@@ -13,15 +13,21 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "exit_code",
                 nullable_schema("integer", "Process exit code, when available."),
             ),
-            ("stdout", schema_type("string", "Captured stdout.")),
-            ("stderr", schema_type("string", "Captured stderr.")),
             (
                 "stdout_tail",
-                schema_type("string", "Bounded stdout tail on failure."),
+                schema_type("string", "Bounded stdout tail."),
             ),
             (
                 "stderr_tail",
-                schema_type("string", "Bounded stderr tail on failure."),
+                schema_type("string", "Bounded stderr tail."),
+            ),
+            (
+                "stdout_lines",
+                schema_type("integer", "Total captured stdout line count."),
+            ),
+            (
+                "stderr_lines",
+                schema_type("integer", "Total captured stderr line count."),
             ),
             (
                 "stdout_truncated",
@@ -60,12 +66,52 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                     "True for WebCodex tool/runtime failures; false for command exit status failures.",
                 ),
             ),
+            ("purpose", schema_type("string", "Declared execution purpose.")),
+            (
+                "command_summary",
+                schema_type("string", "Bounded first-line command summary."),
+            ),
+            (
+                "cwd",
+                schema_type("string", "Resolved project-relative cwd; project root is '.'."),
+            ),
+            (
+                "shell",
+                schema_type("string", "Actual selected shell or configured executor shell."),
+            ),
+            ("executor", schema_type("string", "Executor type: local or agent.")),
+            (
+                "execution_state",
+                schema_type("string", "Terminal execution state."),
+            ),
         ])),
         "run_job" => Some(wrapped_output_schema(vec![
             ("job_id", schema_type("string", "Runtime job id.")),
             ("kind", schema_type("string", "Job kind.")),
             ("status", schema_type("string", "Initial job status.")),
             ("project", schema_type("string", "Project id.")),
+            ("purpose", schema_type("string", "Declared execution purpose.")),
+            (
+                "command_summary",
+                schema_type("string", "Bounded first-line command summary."),
+            ),
+            (
+                "cwd",
+                schema_type("string", "Resolved project-relative cwd; project root is '.'."),
+            ),
+            (
+                "shell",
+                schema_type("string", "Selected or configured executor shell."),
+            ),
+            ("executor", schema_type("string", "Executor type: local or agent.")),
+            (
+                "execution_state",
+                schema_type("string", "Initial execution state; started after acceptance."),
+            ),
+            (
+                "created_at",
+                schema_type("integer", "Job creation timestamp."),
+            ),
         ])),
         "list_jobs" => Some(wrapped_output_schema(vec![
             (
@@ -85,10 +131,6 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
         ])),
         "stop_job" => Some(wrapped_output_schema(vec![
-            (
-                "stopped",
-                schema_type("boolean", "Compatibility field; true when a stop was requested, already pending, or applied. Prefer stop_effect, terminal, and terminal_pending."),
-            ),
             (
                 "already_finished",
                 schema_type("boolean", "True when the job was already terminal."),
@@ -194,65 +236,74 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "command_preview_bounded",
-                schema_type("boolean", "True when command_preview is bounded; this does not claim secret redaction."),
+                schema_type("boolean", "True when command_preview is bounded and secret-like command text is replaced with [redacted]."),
             ),
         ])),
-        "job_log" => Some(wrapped_output_schema(vec![
+        "job_log" | "job_tail" => Some(wrapped_output_schema(vec![
             ("job_id", schema_type("string", "Runtime job id.")),
             (
-                "stdout",
-                schema_type("string", "Captured stdout or selected stdout tail."),
+                "exit_code",
+                nullable_schema("integer", "Process exit code, when available."),
             ),
             (
-                "stderr",
-                schema_type("string", "Captured stderr or selected stderr tail."),
+                "stdout_tail",
+                schema_type("string", "Bounded stdout tail or cursor segment."),
             ),
             (
-                "next_stdout_line",
-                schema_type("integer", "Next stdout line offset."),
+                "stderr_tail",
+                schema_type("string", "Bounded stderr tail or cursor segment."),
             ),
             (
-                "next_stderr_line",
-                schema_type("integer", "Next stderr line offset."),
+                "stdout_lines",
+                schema_type("integer", "Total observed stdout line count."),
+            ),
+            (
+                "stderr_lines",
+                schema_type("integer", "Total observed stderr line count."),
+            ),
+            (
+                "stdout_truncated",
+                schema_type("boolean", "Whether stdout_tail omits observed lines."),
+            ),
+            (
+                "stderr_truncated",
+                schema_type("boolean", "Whether stderr_tail omits observed lines."),
+            ),
+            (
+                "cursor",
+                super::common::open_object_schema(
+                    "Next 1-based stdout/stderr cursors for bounded continuation.",
+                ),
             ),
             (
                 "status",
                 schema_type("string", "Job status observed with the log."),
             ),
-        ])),
-        "job_tail" => Some(wrapped_output_schema(vec![
-            ("job_id", schema_type("string", "Runtime job id.")),
             (
-                "stdout",
-                schema_type(
-                    "string",
-                    "Bounded stdout tail text. Defaults to the last 200 lines and clamps requested tail_lines to runtime bounds; this is not an unbounded stdout dump.",
-                ),
+                "executor",
+                schema_type("string", "Executor backing the job: local or agent."),
             ),
             (
-                "stderr",
-                schema_type(
-                    "string",
-                    "Bounded stderr tail text. Defaults to the last 200 lines and clamps requested tail_lines to runtime bounds; this is not an unbounded stderr dump.",
-                ),
+                "cwd",
+                nullable_schema("string", "Resolved project-relative cwd, when recorded."),
             ),
             (
-                "next_stdout_line",
-                schema_type(
-                    "integer",
-                    "Next 1-based stdout line offset after the bounded tail selection.",
-                ),
+                "shell",
+                nullable_schema("string", "Selected or configured shell, when recorded."),
             ),
             (
-                "next_stderr_line",
-                schema_type(
-                    "integer",
-                    "Next 1-based stderr line offset after the bounded tail selection.",
-                ),
+                "purpose",
+                nullable_schema("string", "Declared execution purpose, when recorded."),
             ),
             (
-                "status",
-                schema_type("string", "Job status observed with the bounded tail."),
+                "command_summary",
+                nullable_schema("string", "Bounded first-line command summary, when recorded."),
+            ),
+            (
+                "detected_summary",
+                super::common::open_object_schema(
+                    "Compact detected operation/build/check/test summary from bounded evidence.",
+                ),
             ),
         ])),
         _ => None,

@@ -1108,6 +1108,8 @@ async fn mutating_dispatch_feeds_the_activity_recorder() {
                         session_id: None,
                         timeout_secs: Some(30),
                         cwd: None,
+                        purpose: None,
+                        shell: None,
                     },
                     Some(&bootstrap),
                 )
@@ -1137,6 +1139,8 @@ async fn mutating_dispatch_feeds_the_activity_recorder() {
                         session_id: None,
                         timeout_secs: Some(30),
                         cwd: None,
+                        purpose: None,
+                        shell: None,
                     },
                     Some(&bootstrap),
                 )

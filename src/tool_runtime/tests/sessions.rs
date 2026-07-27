@@ -56,7 +56,15 @@ async fn read_agent_file_for_session(
     let req = next_agent_request_for_instance(runtime, client_id, "inst")
         .await
         .expect("read_file should enqueue an agent request");
-    complete_patch_agent_request(runtime, client_id, &req.request_id, 0, "hello\n", "").await;
+    complete_patch_agent_request(
+        runtime,
+        client_id,
+        &req.request_id,
+        0,
+        &canonical_agent_file_read_output("hello\n", 1),
+        "",
+    )
+    .await;
     task.await.unwrap()
 }
 
@@ -107,7 +115,7 @@ async fn read_file_with_session_id_records_event_without_content() {
         "telemetry-read",
         &req.request_id,
         0,
-        "secret line\nsecond\n",
+        &canonical_agent_file_read_output("secret line\nsecond\n", 2),
         "",
     )
     .await;
@@ -137,7 +145,7 @@ async fn read_file_with_session_id_records_event_without_content() {
 }
 
 #[tokio::test]
-async fn no_session_id_keeps_old_behavior_without_telemetry_hint() {
+async fn read_file_without_session_id_omits_session_telemetry() {
     let runtime = runtime_with_agent_project("telemetry-nosession");
     register_agent(
         &runtime,
@@ -177,14 +185,15 @@ async fn no_session_id_keeps_old_behavior_without_telemetry_hint() {
         "telemetry-nosession",
         &req.request_id,
         0,
-        "hello\n",
+        &canonical_agent_file_read_output("hello\n", 1),
         "",
     )
     .await;
     let result = task.await.unwrap();
 
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["content"], "hello");
+    assert_eq!(result.output["text"], "hello\n");
+    assert_eq!(result.output["format"], "plain");
     assert!(result.output.get("session_recorded").is_none());
     assert!(result.output.get("session_hint").is_none());
 }

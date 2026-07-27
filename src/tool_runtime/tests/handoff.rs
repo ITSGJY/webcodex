@@ -4,11 +4,53 @@ use super::super::*;
 use super::support::*;
 use crate::auth::AuthContext;
 use crate::shell_protocol::ShellClientCapabilities;
+use crate::tool_runtime::handoff::apply_compact_workflow_outcomes;
 use crate::tool_runtime::kernel::{ToolCallContext, ToolCallRequest, ToolTransport};
 use crate::tool_runtime::sessions::SessionTransport;
 use crate::tool_runtime::validation_events::validation_summary_for_session;
 use crate::tool_runtime::validation_parser::VALIDATION_OUTPUT_METADATA_ABSENT_REASON;
 use serde_json::{json, Value};
+
+#[test]
+fn closeout_projection_classifies_workspace_conflicts_as_hard_blockers() {
+    let mut output = json!({
+        "workspace_clean": false,
+        "workspace_conflicts": 1,
+        "hygiene_clean": true,
+        "hygiene_secret_like_paths": 0,
+        "hygiene_truncated": false,
+        "jobs": {"blocking_active_count": 0},
+        "tool_failures": {
+            "unexpected_count": 0,
+            "expectation_mismatch_count": 0,
+            "unexpected_success_count": 0
+        },
+        "validation": {
+            "status": "not_run",
+            "reason": "no_validation_tool_invoked",
+            "resolved_failures": {"count": 0, "events": []},
+            "unresolved_failures": {"count": 0, "events": []}
+        },
+        "review_evidence": {"total": 1},
+        "work_performed": [],
+        "changed_paths": [],
+        "suggested_next_actions": []
+    });
+
+    apply_compact_workflow_outcomes(&mut output, true, None, 0);
+
+    assert!(output["hard_blockers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|reason| reason == "workspace_conflicts"));
+    assert!(!output["advisories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|reason| reason == "workspace_dirty"));
+    assert_eq!(output["facts"]["workspace_state"]["conflicts"], 1);
+}
 
 // =========================================================================
 // 1. Known / spec / metadata / manifest consistency
@@ -1523,6 +1565,8 @@ async fn session_handoff_summary_includes_active_jobs_and_clears_after_stop() {
                 session_id: Some(sid.clone()),
                 timeout_secs: None,
                 cwd: None,
+                purpose: None,
+                shell: None,
             },
             Some(&auth),
         )
@@ -1629,6 +1673,8 @@ async fn session_handoff_summary_treats_stop_requested_as_nonblocking() {
                 session_id: Some(sid.clone()),
                 timeout_secs: None,
                 cwd: None,
+                purpose: None,
+                shell: None,
             },
             Some(&auth),
         )
@@ -2051,7 +2097,7 @@ async fn session_handoff_summary_only_verdict_allows_clean_workspace_without_fai
 }
 
 #[tokio::test]
-async fn session_handoff_summary_only_passes_with_resolved_historical_validation_failures() {
+async fn session_handoff_does_not_resolve_a_different_validation_identity() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     commit_file(tmp.path(), "README.md", "hello\n", "initial");
@@ -2111,39 +2157,23 @@ async fn session_handoff_summary_only_passes_with_resolved_historical_validation
     );
     assert_eq!(
         result.output["validation"]["historical_failures"]["resolved"],
-        true
+        false
     );
     assert_eq!(
         result.output["validation"]["historical_failures"]["unresolved"],
-        false
+        true
     );
     let verdict = &result.output["verdict"];
     assert_workflow_verdict_shape(verdict);
-    assert_eq!(result.output["task_outcome"]["status"], "pass");
+    assert_eq!(result.output["task_outcome"]["status"], "fail");
     assert_eq!(
         result.output["evidence_history"]["status"],
-        "mixed_resolved"
+        "mixed_unresolved"
     );
     assert_eq!(result.output["evidence_integrity"]["status"], "clean");
-    assert_eq!(verdict["status"], "pass");
-    assert_eq!(verdict["blocking"], false);
-    assert_reason_list_not_contains(verdict, "blocking_reasons", "validation_mixed");
-    assert!(!verdict["suggested_next_actions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|action| action.as_str()
-            == Some(
-                "historical validation failures were resolved by later successful validation"
-            )));
-    assert!(result.output["informational_notes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|note| note.as_str()
-            == Some(
-                "historical validation failures were resolved by later successful validation"
-            )));
+    assert_eq!(verdict["status"], "fail");
+    assert_eq!(verdict["blocking"], true);
+    assert_reason_list_contains(verdict, "blocking_reasons", "validation_mixed");
 }
 
 #[tokio::test]
@@ -2217,14 +2247,19 @@ async fn session_handoff_summary_only_passes_with_resolved_unexpected_cargo_test
         result.output["validation"]["historical_failures"]["unresolved"],
         false
     );
-    assert_eq!(result.output["task_outcome"]["status"], "pass");
+    assert_eq!(result.output["task_outcome"]["status"], "warn");
     assert_eq!(
         result.output["evidence_history"]["status"],
         "mixed_resolved"
     );
     assert_eq!(result.output["evidence_integrity"]["status"], "clean");
-    assert_eq!(result.output["verdict"]["status"], "pass");
+    assert_eq!(result.output["verdict"]["status"], "warn");
     assert_eq!(result.output["verdict"]["blocking"], false);
+    assert!(result.output["advisories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|reason| reason == "historical_validation_failures_resolved"));
     assert_reason_list_not_contains(
         &result.output["verdict"],
         "blocking_reasons",

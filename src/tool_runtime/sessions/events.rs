@@ -343,11 +343,11 @@ pub(super) fn extract_job_id(output: &Value) -> Option<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
 }
-pub(super) fn validation_output_summary_for_tool_result(
+pub(crate) fn validation_output_summary_for_tool_result(
     tool_name: &str,
     output: &Value,
 ) -> Option<Value> {
-    if !is_cargo_validation_tool(tool_name) {
+    if !is_cargo_validation_tool(tool_name) && !matches!(tool_name, "run_shell" | "run_job") {
         return None;
     }
     let stdout_value = output.get("stdout_tail")?;
@@ -374,6 +374,14 @@ pub(super) fn validation_output_summary_for_tool_result(
         "stdout_truncated": stdout_truncated,
         "stderr_truncated": stderr_truncated,
         "max_excerpt_chars": MAX_VALIDATION_EXCERPT_CHARS,
+        "stdout_lines": output.get("stdout_lines").and_then(Value::as_u64),
+        "stderr_lines": output.get("stderr_lines").and_then(Value::as_u64),
+        "purpose": output.get("purpose").cloned().unwrap_or(Value::Null),
+        "command_summary": output.get("command_summary").cloned().unwrap_or(Value::Null),
+        "cwd": output.get("cwd").cloned().unwrap_or(Value::Null),
+        "shell": output.get("shell").cloned().unwrap_or(Value::Null),
+        "executor": output.get("executor").cloned().unwrap_or(Value::Null),
+        "execution_state": output.get("execution_state").cloned().unwrap_or(Value::Null),
     });
     if tool_name == "cargo_test" {
         summary["tests_detected"] = cargo_test_tests_detected(output);
@@ -387,7 +395,7 @@ pub(super) fn sanitize_persisted_validation_output_summary(
     tool_name: &str,
     value: &Value,
 ) -> Option<Value> {
-    if !is_cargo_validation_tool(tool_name) {
+    if !is_cargo_validation_tool(tool_name) && !matches!(tool_name, "run_shell" | "run_job") {
         return None;
     }
     let object = value.as_object()?;
@@ -419,6 +427,14 @@ pub(super) fn sanitize_persisted_validation_output_summary(
         "stdout_truncated": stdout_truncated,
         "stderr_truncated": stderr_truncated,
         "max_excerpt_chars": MAX_VALIDATION_EXCERPT_CHARS,
+        "stdout_lines": object.get("stdout_lines").and_then(Value::as_u64),
+        "stderr_lines": object.get("stderr_lines").and_then(Value::as_u64),
+        "purpose": object.get("purpose").and_then(Value::as_str),
+        "command_summary": object.get("command_summary").and_then(Value::as_str),
+        "cwd": object.get("cwd").and_then(Value::as_str),
+        "shell": object.get("shell").and_then(Value::as_str),
+        "executor": object.get("executor").and_then(Value::as_str),
+        "execution_state": object.get("execution_state").and_then(Value::as_str),
     });
     if tool_name == "cargo_test" {
         summary["tests_detected"] = persisted_cargo_test_tests_detected(object);

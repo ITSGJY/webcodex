@@ -9,6 +9,10 @@ use super::common::{
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
         "start_coding_task" => Some(wrapped_output_schema(vec![
+            (
+                "detail",
+                schema_type("string", "Effective startup detail: minimal, standard, or full."),
+            ),
             ("project", schema_type("string", "Original project input.")),
             (
                 "resolved_project",
@@ -20,7 +24,11 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "runtime_status",
-                nullable_schema("object", "Full runtime_status output, or compact startup runtime observability when compact_startup=true; null when not requested."),
+                nullable_schema("object", "Compact runtime observability for minimal/standard detail, full runtime_status for full detail."),
+            ),
+            (
+                "connection_state",
+                open_object_schema("Layered runner process, server transport/registration, project registry, connector endpoint, session binding, and last successful tool-call observations."),
             ),
             (
                 "permissions",
@@ -71,6 +79,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 schema_type("boolean", "Compact summary_only workspace cleanliness verdict."),
             ),
             (
+                "workspace_conflicts",
+                schema_type("integer", "Unresolved workspace conflict count."),
+            ),
+            (
                 "hygiene_clean",
                 schema_type("boolean", "Compact summary_only hygiene cleanliness verdict."),
             ),
@@ -84,7 +96,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "validation",
-                open_object_schema("Ledger-based validation-like tool-call summary with status/reason: not_run, passed, failed, mixed, or unknown. Parser version 3 provides bounded structured diagnostics from bounded validation metadata using canonical diagnostics and failed_test_details fields only. Full and summary_only closeout preserve the same validation evidence. Does not include stdout/stderr bodies and performs no root-cause inference. latest_status and historical_failures retain the existing final-state and resolved-history semantics."),
+                open_object_schema("Unified bounded execution evidence from dedicated validation tools and run_shell/run_job calls that declare validation/test/build/format/release purpose. Preserves historical, resolved, and unresolved failures by stable identity."),
             ),
             (
                 "review_evidence",
@@ -113,6 +125,18 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             (
                 "final_warnings",
                 array_schema(open_object_schema("Finish warning."), "Bounded finish warnings."),
+            ),
+            (
+                "facts",
+                open_object_schema("Canonical closeout facts: work_performed, changed_paths, executions, validation counts, resolved/unresolved failures, workspace state, active jobs, and evidence integrity."),
+            ),
+            (
+                "hard_blockers",
+                array_schema(schema_type("string", "Deterministic blocker identifier."), "Only confirmed command/safety/consistency blockers."),
+            ),
+            (
+                "advisories",
+                array_schema(schema_type("string", "Non-blocking advisory identifier."), "Context-dependent facts for Agent judgment."),
             ),
             (
                 "warnings",

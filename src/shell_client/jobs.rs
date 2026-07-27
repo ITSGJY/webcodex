@@ -7,7 +7,9 @@ pub(crate) const COMMAND_PREVIEW_MAX_CHARS: usize = 120;
 
 pub(crate) fn command_preview(command: &str) -> String {
     let first_line = command.lines().next().unwrap_or_default().trim();
-    if first_line.chars().count() <= COMMAND_PREVIEW_MAX_CHARS {
+    if crate::action_audit_sessions::secret_like_value(first_line) {
+        "[redacted]".to_string()
+    } else if first_line.chars().count() <= COMMAND_PREVIEW_MAX_CHARS {
         first_line.to_string()
     } else {
         let preview = first_line
@@ -15,6 +17,21 @@ pub(crate) fn command_preview(command: &str) -> String {
             .take(COMMAND_PREVIEW_MAX_CHARS)
             .collect::<String>();
         format!("{}…", preview)
+    }
+}
+
+#[cfg(test)]
+mod command_preview_tests {
+    use super::*;
+
+    #[test]
+    fn command_preview_redacts_secret_like_first_lines() {
+        assert_eq!(
+            command_preview("curl -H 'Authorization: Bearer example' https://example.invalid"),
+            "[redacted]"
+        );
+        assert_eq!(command_preview("echo token=example"), "[redacted]");
+        assert_eq!(command_preview("cargo test focused"), "cargo test focused");
     }
 }
 
@@ -65,6 +82,9 @@ pub(super) fn job_view(job: &ShellJobRecord) -> ShellJobInfo {
         project_id: job.project_id.clone(),
         session_id: job.session_id.clone(),
         cwd: job.cwd.clone(),
+        project_cwd: job.project_cwd.clone(),
+        purpose: job.purpose.clone(),
+        shell: job.shell.clone(),
         command_preview: job.command_preview.clone(),
         status: job.status.clone(),
         created_at: job.created_at,
@@ -84,9 +104,9 @@ pub(super) fn select_lines(
     value: Option<&String>,
     since_line: Option<usize>,
     tail_lines: Option<usize>,
-) -> (Option<String>, usize) {
+) -> (Option<String>, usize, usize, bool) {
     let Some(value) = value else {
-        return (Some(String::new()), since_line.unwrap_or(1));
+        return (Some(String::new()), since_line.unwrap_or(1), 0, false);
     };
     let lines = value.lines().collect::<Vec<_>>();
     if let Some(tail) = tail_lines.filter(|n| *n > 0) {
@@ -97,7 +117,7 @@ pub(super) fn select_lines(
         } else {
             format!("{}\n", selected)
         };
-        return (Some(text), lines.len() + 1);
+        return (Some(text), lines.len() + 1, lines.len(), start > 0);
     }
     let start_line = since_line.unwrap_or(1).max(1);
     let start_idx = start_line.saturating_sub(1).min(lines.len());
@@ -107,7 +127,7 @@ pub(super) fn select_lines(
     } else {
         format!("{}\n", selected)
     };
-    (Some(text), lines.len() + 1)
+    (Some(text), lines.len() + 1, lines.len(), start_idx > 0)
 }
 
 pub(super) fn append_limited(target: &mut Option<String>, chunk: Option<String>) {

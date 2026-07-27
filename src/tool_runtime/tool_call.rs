@@ -10,7 +10,8 @@ use super::sessions::{
 };
 use super::tool_definition::{lookup_tool_definition, model_visible_tool_names_csv};
 use super::tool_inputs::{
-    default_true, ApplyFileChangeInput, CheckpointValidationInput, SessionMode,
+    default_true, ApplyFileChangeInput, CheckpointValidationInput, ExecutionPurpose,
+    ExecutionShell, SessionMode, StartupDetail,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -77,6 +78,8 @@ pub enum ToolCall {
         deny_write_tools: bool,
         #[serde(default)]
         deny_shell_tools: bool,
+        #[serde(default)]
+        detail: StartupDetail,
         #[serde(default)]
         include_runtime_status: Option<bool>,
         #[serde(default)]
@@ -296,6 +299,10 @@ pub enum ToolCall {
         timeout_secs: Option<u64>,
         #[serde(default)]
         cwd: Option<String>,
+        #[serde(default)]
+        purpose: Option<ExecutionPurpose>,
+        #[serde(default)]
+        shell: Option<ExecutionShell>,
     },
 
     /// Apply a unified diff patch to a project.
@@ -480,6 +487,10 @@ pub enum ToolCall {
         timeout_secs: Option<i64>,
         #[serde(default)]
         cwd: Option<String>,
+        #[serde(default)]
+        purpose: Option<ExecutionPurpose>,
+        #[serde(default)]
+        shell: Option<ExecutionShell>,
     },
 
     /// Stop a bounded runtime job after explicit confirmation.

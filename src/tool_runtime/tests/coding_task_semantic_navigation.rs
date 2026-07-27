@@ -47,6 +47,7 @@ fn start_call(project: String, compact_startup: bool, mode: SessionMode) -> Tool
         project,
         title: Some("semantic navigation startup".to_string()),
         mode,
+        detail: Default::default(),
         deny_write_tools: false,
         deny_shell_tools: false,
         include_runtime_status: Some(false),

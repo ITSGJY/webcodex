@@ -128,6 +128,25 @@ coding agent 的工作方式：
 - 项目聊天默认面向 project-bound 精简能力，完整 operator runtime 保留给管理入口，
   但不试图用不断增加专用工具覆盖所有项目情形。
 
+### 第一阶段已实现
+
+- `cargo_fmt`、`cargo_check`、`cargo_test`、显式声明 purpose 的 `run_shell`，以及进入
+  terminal 的 `run_job` 复用同一 bounded execution evidence 投影。稳定 assertion/
+  command identity 保留 `historical_failures`，并明确拆分 `resolved_failures` 与
+  `unresolved_failures`。
+- `validation_summary`、`session_handoff_summary` 与 `finish_coding_task` 直接复用该
+  投影；closeout 以 `facts`、`hard_blockers`、`advisories` 为主。普通 dirty worktree
+  和任务可选 validation 未运行是 advisory；未解决冲突、命令/测试失败、blocking
+  active job 与敏感路径风险是 blocker。
+- `run_shell`/`run_job` 接受 `purpose` 和 `shell=sh|bash`；cwd 省略、空字符串或 `.`
+  都解析为项目根，并返回 project-relative cwd、executor 和 shell 事实。job log
+  默认只返回 bounded tail、总行数、截断、detected summary 和 continuation cursor。
+- `start_coding_task(detail=minimal|standard|full)` 替代启动 flag 组合；`read_file`
+  只返回一种文本表示；readiness 拆为 runner process、server transport/registration、
+  project registry、connector endpoint、session binding 与 last successful call。
+- Console chat connection 明确生成 project-bound surface，model 默认不会得到 operator
+  runtime；完整 operator runtime 继续用于管理与内部执行。
+
 暂缓代码瘦身与 LOC 门禁、旧版本迁移兼容、SSH、PTY、Workflow DSL、更多 Hosted
 capability 和完整 Browser IDE。
 

@@ -2,13 +2,23 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 pub(crate) fn run_command_sync(
     cmd: &str,
     cwd: &Path,
     timeout_secs: u64,
 ) -> (i32, String, String, u64) {
+    run_command_sync_with_shell(cmd, cwd, timeout_secs, "sh")
+}
+
+pub(crate) fn run_command_sync_with_shell(
+    cmd: &str,
+    cwd: &Path,
+    timeout_secs: u64,
+    shell: &str,
+) -> (i32, String, String, u64) {
     let start = Instant::now();
-    let mut command = std::process::Command::new("sh");
+    let mut command = std::process::Command::new(shell);
     command
         .arg("-c")
         .arg(cmd)
@@ -163,8 +173,19 @@ pub(crate) async fn run_command_sync_bounded(
     cwd: PathBuf,
     timeout_secs: u64,
 ) -> Result<(i32, String, String, u64), LocalRunFailure> {
+    run_command_sync_bounded_with_shell(cmd, cwd, timeout_secs, "sh".to_string()).await
+}
+
+pub(crate) async fn run_command_sync_bounded_with_shell(
+    cmd: String,
+    cwd: PathBuf,
+    timeout_secs: u64,
+    shell: String,
+) -> Result<(i32, String, String, u64), LocalRunFailure> {
     let bound_secs = timeout_secs.saturating_add(LOCAL_RUN_HARD_GRACE_SECS);
-    let task = tokio::task::spawn_blocking(move || run_command_sync(&cmd, &cwd, timeout_secs));
+    let task = tokio::task::spawn_blocking(move || {
+        run_command_sync_with_shell(&cmd, &cwd, timeout_secs, &shell)
+    });
     match tokio::time::timeout(Duration::from_secs(bound_secs), task).await {
         Ok(Ok(result)) => Ok(result),
         Ok(Err(e)) => Err(LocalRunFailure::Join(e.to_string())),
@@ -198,6 +219,40 @@ pub(crate) fn resolve_local_cwd(
         return Err("cwd is outside project directory".to_string());
     }
     Ok(canonical)
+}
+
+pub(crate) fn project_relative_cwd(
+    proj: &crate::projects::ProjectConfig,
+    resolved: &Path,
+) -> Result<String, String> {
+    let root = proj
+        .root()
+        .canonicalize()
+        .map_err(|e| format!("Project root does not exist: {e}"))?;
+    let relative = resolved
+        .strip_prefix(&root)
+        .map_err(|_| "cwd is outside project directory".to_string())?;
+    if relative.as_os_str().is_empty() {
+        Ok(".".to_string())
+    } else {
+        Ok(relative.to_string_lossy().replace('\\', "/"))
+    }
+}
+
+pub(crate) fn project_relative_agent_cwd(
+    proj: &crate::projects::ProjectConfig,
+    resolved: &str,
+) -> Result<String, String> {
+    let root = proj.root();
+    let resolved = Path::new(resolved);
+    let relative = resolved
+        .strip_prefix(root)
+        .map_err(|_| "cwd is outside project directory".to_string())?;
+    if relative.as_os_str().is_empty() {
+        Ok(".".to_string())
+    } else {
+        Ok(relative.to_string_lossy().replace('\\', "/"))
+    }
 }
 
 /// Resolve an Agent command cwd against the registered project root.
@@ -454,12 +509,13 @@ pub(crate) fn read_trim(path: PathBuf) -> Option<String> {
 }
 
 pub(crate) const MAX_LOCAL_LOG_LINES: usize = 500;
+pub(crate) const DEFAULT_JOB_LOG_TAIL_LINES: usize = 200;
 
 pub(crate) fn read_lines_from(
     path: PathBuf,
     offset: Option<usize>,
     tail_lines: Option<usize>,
-) -> (String, usize) {
+) -> (String, usize, usize, bool) {
     let content = std::fs::read_to_string(path).unwrap_or_default();
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
@@ -474,14 +530,14 @@ pub(crate) fn read_lines_from(
         let tail = tail_lines
             .filter(|t| *t > 0)
             .map(|t| t.min(MAX_LOCAL_LOG_LINES))
-            .unwrap_or(MAX_LOCAL_LOG_LINES);
+            .unwrap_or(DEFAULT_JOB_LOG_TAIL_LINES);
         (total.saturating_sub(tail), tail)
     };
     let end_idx = (start_idx + limit).min(total);
     let selected = lines[start_idx..end_idx].join("\n");
     // 1-based line number to request for the next chunk.
     let next_line = end_idx + 1;
-    (selected, next_line)
+    (selected, next_line, total, start_idx > 0 || end_idx < total)
 }
 
 #[cfg(test)]

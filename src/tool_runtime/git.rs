@@ -941,8 +941,16 @@ fn set_show_changes_verdict(output: &mut Value) {
         .and_then(Value::as_bool)
         .is_some_and(|clean| !clean)
     {
-        push_unique_reason(&mut blocking_reasons, "workspace_dirty");
+        push_unique_reason(&mut warning_reasons, "workspace_dirty");
         push_unique_action(&mut actions, "review workspace changes with show_changes");
+    }
+    if output
+        .pointer("/counts/conflicted")
+        .and_then(Value::as_u64)
+        .is_some_and(|count| count > 0)
+    {
+        push_unique_reason(&mut blocking_reasons, "workspace_conflicts");
+        push_unique_action(&mut actions, "resolve workspace conflicts before closeout");
     }
 
     if git_available

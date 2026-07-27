@@ -15,10 +15,33 @@ pub(crate) fn run_shell_input_schema() -> Value {
         (
             "cwd",
             "string",
-            "Optional project-relative working directory.",
+            "Working directory contract: omit, empty string, or '.' selects the project root; any other value is project-relative and may not escape the project root.",
+            false,
+        ),
+        (
+            "purpose",
+            "string",
+            "Declared execution intent: validation, test, build, format, release, diagnostic, operation, or other. This records evidence and never changes authorization.",
+            false,
+        ),
+        (
+            "shell",
+            "string",
+            "Optional explicit command language: sh or bash. When omitted, local run_shell uses sh and an agent-backed run_shell uses that Agent's configured shell. The response always records the actual selection.",
             false,
         ),
     ]));
+    schema["properties"]["purpose"]["enum"] = json!([
+        "validation",
+        "test",
+        "build",
+        "format",
+        "release",
+        "diagnostic",
+        "operation",
+        "other"
+    ]);
+    schema["properties"]["shell"]["enum"] = json!(["sh", "bash"]);
     schema["properties"]["timeout_secs"]["minimum"] = json!(1);
     schema["properties"]["timeout_secs"]["maximum"] = json!(120);
     schema["properties"]["timeout_secs"]["default"] = json!(60);
@@ -26,7 +49,7 @@ pub(crate) fn run_shell_input_schema() -> Value {
 }
 
 pub(crate) fn run_job_input_schema() -> Value {
-    object_schema(with_optional_session_id(vec![
+    let mut schema = object_schema(with_optional_session_id(vec![
         ("project", "string", "Configured project id.", true),
         (
             "command",
@@ -43,10 +66,34 @@ pub(crate) fn run_job_input_schema() -> Value {
         (
             "cwd",
             "string",
-            "Optional project-relative working directory.",
+            "Working directory contract: omit, empty string, or '.' selects the project root; any other value is project-relative and may not escape the project root.",
             false,
         ),
-    ]))
+        (
+            "purpose",
+            "string",
+            "Declared execution intent: validation, test, build, format, release, diagnostic, operation, or other. This records evidence and never changes authorization.",
+            false,
+        ),
+        (
+            "shell",
+            "string",
+            "Optional explicit command language: sh or bash. When omitted, local run_job preserves its existing bash contract and an agent-backed run_job uses that Agent's configured shell. The response always records the actual selection.",
+            false,
+        ),
+    ]));
+    schema["properties"]["purpose"]["enum"] = json!([
+        "validation",
+        "test",
+        "build",
+        "format",
+        "release",
+        "diagnostic",
+        "operation",
+        "other"
+    ]);
+    schema["properties"]["shell"]["enum"] = json!(["sh", "bash"]);
+    schema
 }
 
 pub(crate) fn stop_job_input_schema() -> Value {
@@ -85,13 +132,13 @@ pub(crate) fn job_log_input_schema() -> Value {
         (
             "offset",
             "integer",
-            "Optional 1-based stdout line cursor.",
+            "Optional 1-based cursor returned by a previous call. Reads the next bounded segment.",
             false,
         ),
         (
             "tail_lines",
             "integer",
-            "Optional number of trailing stdout lines to return.",
+            "Optional number of trailing lines per stream. Defaults to 200 and is capped at 500.",
             false,
         ),
     ])
@@ -120,7 +167,7 @@ pub(crate) fn job_tail_input_schema() -> Value {
         (
             "tail_lines",
             "integer",
-            "Optional number of trailing lines to return per stream.",
+            "Optional number of trailing lines to return per stream. Defaults to 200 and is capped at 500.",
             false,
         ),
     ])

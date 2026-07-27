@@ -11,7 +11,12 @@ impl ToolRuntime {
                 session_id: _,
                 timeout_secs,
                 cwd,
-            } => self.run_shell(project, command, timeout_secs, cwd).await,
+                purpose,
+                shell,
+            } => {
+                self.run_shell_with_contract(project, command, timeout_secs, cwd, purpose, shell)
+                    .await
+            }
             _ => unreachable!("non-shell tool routed to shell dispatcher"),
         }
     }

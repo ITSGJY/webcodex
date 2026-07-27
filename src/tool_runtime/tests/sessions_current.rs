@@ -249,7 +249,15 @@ async fn bound_current_session_records_project_tool_without_session_id() {
     let req = next_agent_request_for_instance(&runtime, "current-read", "inst")
         .await
         .expect("read_file should enqueue with current session");
-    complete_patch_agent_request(&runtime, "current-read", &req.request_id, 0, "hello\n", "").await;
+    complete_patch_agent_request(
+        &runtime,
+        "current-read",
+        &req.request_id,
+        0,
+        &canonical_agent_file_read_output("hello\n", 1),
+        "",
+    )
+    .await;
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["session_recorded"], true);
@@ -361,7 +369,7 @@ async fn open_anonymous_can_bind_current_session_and_record_project_read() {
         "inst-open-current",
         &req.request_id,
         0,
-        "hello\n",
+        &canonical_agent_file_read_output("hello\n", 1),
         "",
     )
     .await;
@@ -434,7 +442,7 @@ async fn generic_tool_call_uses_bound_current_session_without_session_id() {
         "current-generic",
         &req.request_id,
         0,
-        "hello\n",
+        &canonical_agent_file_read_output("hello\n", 1),
         "",
     )
     .await;
@@ -530,7 +538,7 @@ async fn explicit_session_id_wins_over_current_session() {
         "current-explicit",
         &req.request_id,
         0,
-        "hello\n",
+        &canonical_agent_file_read_output("hello\n", 1),
         "",
     )
     .await;
@@ -700,8 +708,15 @@ async fn stale_current_session_is_cleared_and_project_tool_runs_without_session(
     let req = next_agent_request_for_instance(&runtime, "current-stale", "inst")
         .await
         .expect("stale current session should not block no-session call");
-    complete_patch_agent_request(&runtime, "current-stale", &req.request_id, 0, "hello\n", "")
-        .await;
+    complete_patch_agent_request(
+        &runtime,
+        "current-stale",
+        &req.request_id,
+        0,
+        &canonical_agent_file_read_output("hello\n", 1),
+        "",
+    )
+    .await;
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
     assert!(result.output.get("session_recorded").is_none());

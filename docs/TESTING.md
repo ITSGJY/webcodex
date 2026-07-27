@@ -19,6 +19,20 @@ tests with different cost profiles sharing the same default lane.
 | e2e/deployment smoke | Prove that binaries, local services, GPT Actions schema, MCP, artifact transfer, and an agent can work together. | Temporary local services and loopback ports; real deployment only when explicitly requested. | `bash scripts/e2e_zero_config_ws.sh`; `bash scripts/smoke_deployment.sh`; `bash scripts/smoke_artifact_transfer.sh` |
 | security auth matrix | Cover OAuth, scope policy, shared-key behavior, token classes, read-only session guards, and denied mutations. | No external identity provider by default; use local fixtures and synthetic tokens. | `cargo test --bin webcodex oauth -- --nocapture`; `cargo test --bin webcodex scope -- --nocapture`; `cargo test --bin webcodex metadata -- --nocapture` |
 
+Iteration 9 execution/reporting changes use the existing domain lanes rather
+than a new test suite:
+
+- `cargo test --bin webcodex validation_events -- --nocapture` covers dedicated
+  and declared-purpose generic execution evidence plus exact retry identity;
+- `cargo test --bin webcodex tool_runtime::tests::jobs -- --nocapture` covers
+  shell/cwd metadata, bounded job tails, detected summaries, and cursors;
+- `cargo test --bin webcodex tool_runtime::tests::coding_task -- --nocapture`
+  and `cargo test --bin webcodex tool_runtime::tests::handoff -- --nocapture`
+  cover facts/advisories/hard blockers and compact startup;
+- `cargo test --bin webcodex read_file -- --nocapture`, `metadata`, `mcp`, and
+  `openapi` cover the single read representation, layered readiness, and
+  project-bound versus operator surfaces.
+
 ## Default Test Principles
 
 - No external network by default. Tests that need HTTP should use in-process

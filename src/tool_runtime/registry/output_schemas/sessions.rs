@@ -234,8 +234,24 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ),
             ),
             (
+                "workspace_conflicts",
+                schema_type("integer", "Unresolved workspace conflict count."),
+            ),
+            (
                 "hygiene_clean",
                 schema_type("boolean", "Compact summary_only hygiene cleanliness verdict."),
+            ),
+            (
+                "facts",
+                open_object_schema("Canonical closeout facts: work_performed, changed_paths, executions, validation counts, resolved/unresolved failures, workspace state, active jobs, and evidence integrity."),
+            ),
+            (
+                "hard_blockers",
+                array_schema(schema_type("string", "Deterministic blocker identifier."), "Only confirmed command/safety/consistency blockers."),
+            ),
+            (
+                "advisories",
+                array_schema(schema_type("string", "Non-blocking advisory identifier."), "Context-dependent facts for Agent judgment."),
             ),
             ("title", nullable_schema("string", "Optional session title.")),
             ("mode", session_mode_schema("Session mode.")),
@@ -476,6 +492,8 @@ fn validation_evidence_schema() -> Value {
             "latest": { "anyOf": [event.clone(), {"type": "null"}] },
             "latest_status": { "type": "string", "enum": ["not_run", "passed", "failed", "unknown"] },
             "historical_failures": validation_historical_failures_schema(),
+            "resolved_failures": validation_failure_set_schema(),
+            "unresolved_failures": validation_failure_set_schema(),
             "source": { "type": "string", "enum": ["session_ledger"] },
             "events_total": { "type": "integer", "minimum": 0 },
             "successes": { "type": "integer", "minimum": 0 },
@@ -494,7 +512,8 @@ fn validation_evidence_schema() -> Value {
         },
         "required": [
             "available", "status", "reason", "latest", "latest_status",
-            "historical_failures", "source", "events_total", "events", "parser",
+            "historical_failures", "resolved_failures", "unresolved_failures",
+            "source", "events_total", "events", "parser",
             "cargo_test_zero_tests_run"
         ]
     })
@@ -510,6 +529,22 @@ fn validation_historical_failures_schema() -> Value {
             "unresolved": { "type": "boolean" }
         },
         "required": ["count", "resolved", "unresolved"]
+    })
+}
+
+fn validation_failure_set_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "count": { "type": "integer", "minimum": 0 },
+            "events": {
+                "type": "array",
+                "maxItems": 100,
+                "items": validation_event_schema()
+            }
+        },
+        "required": ["count", "events"]
     })
 }
 
@@ -539,12 +574,21 @@ fn validation_event_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "tool_name": { "type": "string", "enum": ["cargo_fmt", "cargo_check", "cargo_test", "validate_patch", "apply_patch_checked"] },
-            "validation_kind": { "type": "string", "enum": ["format", "check", "test", "patch_preflight", "patch_apply_checked"] },
+            "tool_name": { "type": "string", "enum": ["cargo_fmt", "cargo_check", "cargo_test", "validate_patch", "apply_patch_checked", "run_shell", "run_job"] },
+            "execution_source": { "type": "string" },
+            "identity": { "type": "string", "maxLength": 256 },
+            "purpose": { "type": "string", "enum": ["validation", "test", "build", "format", "release"] },
+            "validation_kind": { "type": "string", "enum": ["format", "check", "test", "build", "release", "validation", "patch_preflight", "patch_apply_checked"] },
             "success": { "type": "boolean" },
             "failure_kind": { "type": "string", "enum": ["compile_error", "test_failure", "timeout", "process_exit", "format_diff", "unknown"] },
+            "failure_category": { "type": "string", "enum": ["compile_error", "test_failure", "timeout", "process_exit", "format_diff", "unknown"] },
+            "unresolved_failure": { "type": "boolean" },
             "exit_code": { "type": "integer" },
             "summary": { "type": "string", "maxLength": 80 },
+            "command_summary": { "type": "string", "maxLength": 512 },
+            "cwd": { "type": "string", "maxLength": 512 },
+            "shell": { "type": "string", "enum": ["sh", "bash", "configured"] },
+            "execution_state": { "type": "string", "enum": ["started", "completed", "cancelled", "timed_out"] },
             "project": { "type": "string", "maxLength": 512 },
             "session_id": { "type": "string", "maxLength": 128 },
             "started_at": { "type": "integer" },
@@ -556,11 +600,26 @@ fn validation_event_schema() -> Value {
                 "items": { "type": "string", "maxLength": 512 }
             },
             "diagnostics": validation_diagnostics_schema(),
+            "detected_summary": {
+                "type": "object",
+                "additionalProperties": true
+            },
             "tests_detected": { "type": "boolean" },
             "tests_run_count": { "type": "integer", "minimum": 0 },
-            "zero_tests_run": { "type": "boolean" }
+            "zero_tests_run": { "type": "boolean" },
+            "stdout_lines": { "type": "integer", "minimum": 0 },
+            "stderr_lines": { "type": "integer", "minimum": 0 },
+            "stdout_truncated": { "type": "boolean" },
+            "stderr_truncated": { "type": "boolean" },
+            "stdout_evidence": { "type": "string" },
+            "stderr_evidence": { "type": "string" }
         },
-        "required": ["tool_name", "validation_kind", "success", "failure_kind", "summary", "session_id"]
+        "required": [
+            "tool_name", "execution_source", "identity", "purpose",
+            "validation_kind", "success", "failure_kind", "failure_category",
+            "unresolved_failure", "summary", "cwd", "shell", "execution_state",
+            "session_id", "stdout_truncated", "stderr_truncated"
+        ]
     })
 }
 

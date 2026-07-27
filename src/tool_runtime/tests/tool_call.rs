@@ -540,7 +540,7 @@ fn from_tool_name_parses_runtime_status() {
 }
 
 #[test]
-fn from_tool_name_parses_finish_coding_task_include_workspace_compatibility() {
+fn from_tool_name_parses_finish_coding_task_workspace_projection_flag() {
     let call = ToolCall::from_tool_name(
         "finish_coding_task",
         json!({
