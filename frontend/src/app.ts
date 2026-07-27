@@ -547,7 +547,7 @@ function eventSummary(payload: any): string {
   if (!payload || typeof payload !== "object") {
     return "";
   }
-  const parts: string[] = [];
+  const parts = [];
   for (const key of ["ok", "dry_run", "exit_code", "change_count", "status", "reason"]) {
     if (payload[key] !== undefined && payload[key] !== null) {
       parts.push(key + "=" + String(payload[key]));
