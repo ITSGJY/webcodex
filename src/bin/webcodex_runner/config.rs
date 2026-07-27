@@ -286,7 +286,7 @@ impl ReloadableAgentConfig {
                     status.clone()
                 };
                 active.external_tools.configuration_status_changed();
-                eprintln!("webcodex-agent config reload failed: {code}");
+                eprintln!("webcodex-runner config reload failed: {code}");
                 return status;
             }
         };
@@ -311,7 +311,10 @@ impl ReloadableAgentConfig {
             return current.reload_status();
         }
         *current = next;
-        eprintln!("webcodex-agent config reload {}", status.last_reload_result);
+        eprintln!(
+            "webcodex-runner config reload {}",
+            status.last_reload_result
+        );
         status
     }
 }

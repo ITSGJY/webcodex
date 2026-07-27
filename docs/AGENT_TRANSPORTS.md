@@ -2,7 +2,7 @@
 
 [English](AGENT_TRANSPORTS.md) | [简体中文](AGENT_TRANSPORTS.zh-CN.md)
 
-`webcodex-agent` supports QUIC, WebSocket, polling, and an `auto` selector.
+`webcodex-runner` supports QUIC, WebSocket, polling, and an `auto` selector.
 For new deployments, prefer `transport = "auto"` with a configured `[quic]`
 section. In that mode the agent tries QUIC first, falls back to WebSocket, and
 then falls back to polling when needed.
@@ -25,12 +25,12 @@ ChatGPT / GPT Actions / MCP -> HTTPS TCP 443 -> reverse proxy -> WebCodex HTTP s
 QUIC is a separate agent transport path:
 
 ```text
-webcodex-agent -> QUIC UDP 8443 -> WebCodex QUIC listener
+webcodex-runner -> QUIC UDP 8443 -> WebCodex QUIC listener
 ```
 
 Important boundaries:
 
-- QUIC is for `webcodex-agent` connectivity. It is not HTTP/3 and does not replace the GPT Actions or MCP HTTPS endpoint.
+- QUIC is for `webcodex-runner` connectivity. It is not HTTP/3 and does not replace the GPT Actions or MCP HTTPS endpoint.
 - Reverse proxies such as Nginx usually remain on TCP 443 for HTTPS. The QUIC listener is a separate UDP endpoint owned by WebCodex.
 - WebSocket and polling remain supported fallback transports.
 
@@ -160,12 +160,12 @@ Strict transport values mean exactly one transport:
 Auto startup logs show the decision path, for example:
 
 ```text
-webcodex-agent transport auto: quic trying
-webcodex-agent transport auto: quic unavailable: <reason>; trying websocket
-webcodex-agent transport auto: websocket trying
-webcodex-agent transport auto: websocket failed: <reason>; falling back to polling
-webcodex-agent transport auto: polling trying
-webcodex-agent registered client_id=... server=https://your-domain.example preferred_transport=auto actual_transport=polling projects=11
+webcodex-runner transport auto: quic trying
+webcodex-runner transport auto: quic unavailable: <reason>; trying websocket
+webcodex-runner transport auto: websocket trying
+webcodex-runner transport auto: websocket failed: <reason>; falling back to polling
+webcodex-runner transport auto: polling trying
+webcodex-runner registered client_id=... server=https://your-domain.example preferred_transport=auto actual_transport=polling projects=11
 ```
 
 The registered line prints the final `actual_transport` and a server label with only scheme, host, and port. It does not print tokens, headers, query strings, or the full agent config.
@@ -177,7 +177,7 @@ Projects are registered by agents. Use `runtime_status.projects.effective` and
 
 ### Foreground polling failures
 
-When `webcodex-agent` is run in the foreground with polling as the active
+When `webcodex-runner` is run in the foreground with polling as the active
 transport, server-unavailable poll failures are terminal. HTTP 502, 503, and
 504 responses from `/api/shell/agent/poll`, including proxy HTML error pages,
 cause the agent to print a concise status summary and exit with a non-zero

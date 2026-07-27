@@ -39,7 +39,7 @@ The server is the stable online entry point. It should be deployed behind HTTPS 
 
 ### WebCodex Agent
 
-`webcodex-agent` runs on the machine that has the code. It connects back to the server, registers allowed projects, and executes file, Git, patch, validation, shell, job, artifact, and checkpoint requests inside those project boundaries.
+`webcodex-runner` runs on the machine that has the code. It connects back to the server, registers allowed projects, and executes file, Git, patch, validation, shell, job, artifact, and checkpoint requests inside those project boundaries.
 
 The agent is the trust boundary closest to your repository. Configure it with narrow allowed roots and shell profiles appropriate for the projects it serves.
 

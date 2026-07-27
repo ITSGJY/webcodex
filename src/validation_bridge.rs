@@ -1,6 +1,6 @@
 //! Typed agent-side validation bridge contract.
 //!
-//! Shared by the server runtime and `webcodex-agent`. This module intentionally
+//! Shared by the server runtime and `webcodex-runner`. This module intentionally
 //! carries only declarative, project-relative validation requests — never
 //! arbitrary shell command strings, absolute project roots, or raw tool JSON
 //! bodies. Adapter ids resolve on the agent; the agent builds argv, executes,

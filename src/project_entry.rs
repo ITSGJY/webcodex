@@ -746,10 +746,10 @@ fn locate_agent_binary() -> Option<PathBuf> {
     let current = std::env::current_exe().ok()?;
     let parent = current.parent()?;
     for candidate in [
-        parent.join(executable_name("webcodex-agent")),
+        parent.join(executable_name("webcodex-runner")),
         parent
             .parent()
-            .map(|path| path.join(executable_name("webcodex-agent")))
+            .map(|path| path.join(executable_name("webcodex-runner")))
             .unwrap_or_default(),
     ] {
         if candidate.is_file() {
@@ -758,7 +758,7 @@ fn locate_agent_binary() -> Option<PathBuf> {
     }
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
-        .map(|directory| directory.join(executable_name("webcodex-agent")))
+        .map(|directory| directory.join(executable_name("webcodex-runner")))
         .find(|candidate| candidate.is_file())
 }
 

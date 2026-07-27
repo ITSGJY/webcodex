@@ -1,4 +1,4 @@
-//! Shared agent-config initialization logic used by both the `webcodex-agent`
+//! Shared agent-config initialization logic used by both the `webcodex-runner`
 //! binary (`agent init`) and the `webcodex-cli` binary (`agent init`).
 //!
 //! This module is included via `#[path]` from each binary and depends only on

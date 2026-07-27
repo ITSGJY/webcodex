@@ -111,7 +111,7 @@ pub(crate) async fn run_setup_single_user(opts: SetupSingleUserOptions) -> Resul
 
     // 4. Persist tokens to 0600 files.
     let user_token_path = opts.output_dir.join("webcodex-user-token");
-    let agent_token_path = opts.output_dir.join("webcodex-agent-token");
+    let agent_token_path = opts.output_dir.join("webcodex-runner-token");
     write_secret_file(&user_token_path, &format!("{}\n", user_token))?;
     write_secret_file(&agent_token_path, &format!("{}\n", agent_token))?;
 

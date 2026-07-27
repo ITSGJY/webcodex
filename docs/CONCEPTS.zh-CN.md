@@ -39,7 +39,7 @@ server 是稳定的线上入口。连接 hosted client 前，应把它放到 HTT
 
 ### WebCodex Agent
 
-`webcodex-agent` 运行在拥有代码的机器上。它反向连接 server，注册允许的项目，并在项目边界内执行 file、Git、patch、validation、shell、job、artifact 和 checkpoint 请求。
+`webcodex-runner` 运行在拥有代码的机器上。它反向连接 server，注册允许的项目，并在项目边界内执行 file、Git、patch、validation、shell、job、artifact 和 checkpoint 请求。
 
 agent 是离仓库最近的信任边界。应为它配置尽量窄的 allowed roots，以及适合项目的 shell profiles。
 

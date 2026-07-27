@@ -266,7 +266,7 @@ fn pyright_read_only_initialization_options() -> Value {
 /// `lsp_initialize_uses_constrained_typescript_profile` in lockstep.
 fn typescript_read_only_initialization_options() -> Value {
     json!({
-        "hostInfo": "webcodex-agent",
+        "hostInfo": "webcodex-runner",
         "disableAutomaticTypingAcquisition": true,
         "preferences": {
             "includePackageJsonAutoImports": "off"

@@ -66,7 +66,7 @@ pub(crate) fn dispatch_request(
         "stop_job" => {
             if let Some(job_id) = request.job_id.as_deref() {
                 if let Err(e) = jobs.stop(job_id) {
-                    eprintln!("webcodex-agent stop_job error: {}", e);
+                    eprintln!("webcodex-runner stop_job error: {}", e);
                 }
             }
             Ok(true)

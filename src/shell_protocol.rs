@@ -39,8 +39,8 @@ fn default_transport_polling() -> String {
     "polling".to_string()
 }
 
-/// Protocol version announced by current `webcodex-agent` builds. Used by
-/// the `webcodex-agent` binary target; allowed dead-code here because the
+/// Protocol version announced by current `webcodex-runner` builds. Used by
+/// the `webcodex-runner` binary target; allowed dead-code here because the
 /// main server binary does not reference it directly.
 #[allow(dead_code)]
 pub const AGENT_PROTOCOL_VERSION_POLLING_V1: &str = "polling-v1";
@@ -49,13 +49,13 @@ pub const VALIDATION_TOOL_UNAVAILABLE_CODE: &str = "validation_tool_unavailable"
 /// Maximum byte length of the single argv value that may follow `cargo test`.
 pub const RUST_TEST_FILTER_MAX_BYTES: usize = 200;
 
-/// Protocol version announced by `webcodex-agent` builds that connect over
+/// Protocol version announced by `webcodex-runner` builds that connect over
 /// WebSocket. Kept in the shared protocol module so both the server and the
 /// agent binary reference the same literal.
 #[allow(dead_code)]
 pub const AGENT_PROTOCOL_VERSION_WEBSOCKET_V1: &str = "websocket-v1";
 
-/// Protocol version announced by `webcodex-agent` builds that connect over the
+/// Protocol version announced by `webcodex-runner` builds that connect over the
 /// custom QUIC stream transport. Kept in the shared protocol module so the
 /// server and the agent binary reference the same literal.
 ///
@@ -320,7 +320,7 @@ fn default_policy_max_output_bytes() -> usize {
 pub struct ShellClientRegisterRequest {
     pub client_id: String,
     /// Stable per-process identity for the registering agent. Generated once
-    /// by `webcodex-agent` at startup and reused for the whole process
+    /// by `webcodex-runner` at startup and reused for the whole process
     /// lifetime (including WebSocket reconnects). The server treats this as
     /// the active agent lease identity: a second agent process with the same
     /// `client_id` but a different `agent_instance_id` is rejected while the
@@ -974,7 +974,7 @@ pub struct ShellClientJobsListResponse {
 // and could be framed over QUIC streams unchanged.
 
 /// One agent transport message. Used by both the server WebSocket handler and
-/// the `webcodex-agent` WebSocket client mode.
+/// the `webcodex-runner` WebSocket client mode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEnvelope {
@@ -1078,7 +1078,7 @@ impl AgentEnvelope {
 //
 // Length-prefixing (rather than newline-delimited JSON) avoids boundary
 // problems when a payload contains embedded newlines. The codec lives in this
-// shared module so the server (`agent_quic.rs`) and the `webcodex-agent`
+// shared module so the server (`agent_quic.rs`) and the `webcodex-runner`
 // binary (which inlines this file) use byte-identical framing.
 //
 // This is a custom QUIC *stream* transport, NOT HTTP/3. It is transport-

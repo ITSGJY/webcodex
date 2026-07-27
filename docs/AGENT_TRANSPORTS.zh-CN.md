@@ -2,7 +2,7 @@
 
 [English](AGENT_TRANSPORTS.md) | [简体中文](AGENT_TRANSPORTS.zh-CN.md)
 
-`webcodex-agent` 支持 QUIC、WebSocket、polling，以及 `auto` selector。
+`webcodex-runner` 支持 QUIC、WebSocket、polling，以及 `auto` selector。
 新的生产部署建议使用 `transport = "auto"`，并配置 `[quic]` section。在该模式下，agent 会优先尝试 QUIC；失败时 fallback 到 WebSocket，再 fallback 到 polling。
 
 | Transport | Config value | 推荐用途 | Status |
@@ -23,12 +23,12 @@ ChatGPT / GPT Actions / MCP -> HTTPS TCP 443 -> reverse proxy -> WebCodex HTTP s
 QUIC 是独立的 agent transport path：
 
 ```text
-webcodex-agent -> QUIC UDP 8443 -> WebCodex QUIC listener
+webcodex-runner -> QUIC UDP 8443 -> WebCodex QUIC listener
 ```
 
 关键边界：
 
-- QUIC 用于 `webcodex-agent` 连接。它不是 HTTP/3，也不会替代 GPT Actions 或 MCP 的 HTTPS endpoint。
+- QUIC 用于 `webcodex-runner` 连接。它不是 HTTP/3，也不会替代 GPT Actions 或 MCP 的 HTTPS endpoint。
 - Nginx 等 reverse proxy 通常继续在 TCP 443 上处理 HTTPS。QUIC listener 是 WebCodex 自己的独立 UDP endpoint。
 - WebSocket 和 polling 继续作为 fallback transports 支持。
 
@@ -155,12 +155,12 @@ Strict transport values 表示只使用一个 transport：
 Auto startup logs 会显示决策路径，例如：
 
 ```text
-webcodex-agent transport auto: trying quic
-webcodex-agent transport auto: quic failed: <reason>; trying websocket
-webcodex-agent transport auto: websocket failed: <reason>; falling back to polling
-webcodex-agent registered client_id=... server=... preferred_transport=auto actual_transport=websocket transport=websocket
-webcodex-agent websocket connection closed; reconnecting
-webcodex-agent reconnect attempt scheduled transport=websocket delay=1s
+webcodex-runner transport auto: trying quic
+webcodex-runner transport auto: quic failed: <reason>; trying websocket
+webcodex-runner transport auto: websocket failed: <reason>; falling back to polling
+webcodex-runner registered client_id=... server=... preferred_transport=auto actual_transport=websocket transport=websocket
+webcodex-runner websocket connection closed; reconnecting
+webcodex-runner reconnect attempt scheduled transport=websocket delay=1s
 ```
 
 `runtime_status` 和 `listAgents` 显示实际连接的 transport label，而不只是 preferred setting。

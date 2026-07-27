@@ -1,6 +1,6 @@
 # Claude Code MCP provider (experimental)
 
-`webcodex-agent` can use `claude mcp serve` for two allowlisted, single-call
+`webcodex-runner` can use `claude mcp serve` for two allowlisted, single-call
 capabilities while WebCodex remains the online MCP/API, authorization, session,
 project, permission, timeout, and audit boundary.
 
@@ -103,7 +103,7 @@ result, and network I/O occurs after the provider state lock has been released.
 the same config path without disconnecting the agent:
 
 ```bash
-sudo systemctl reload webcodex-agent
+sudo systemctl reload webcodex-runner
 ```
 
 The generated unit maps this to `SIGHUP`. A valid reload atomically replaces
@@ -191,14 +191,14 @@ start a model conversation:
 
 ```bash
 WEBCODEX_PROBE_CLAUDE_PROVIDER=1 \
-cargo test --bin webcodex-agent opt_in_real_claude_mcp_probe -- --nocapture
+cargo test --bin webcodex-runner opt_in_real_claude_mcp_probe -- --nocapture
 ```
 
 The default test suite uses a standalone fake stdio MCP server. A real local
 smoke check is opt-in:
 
 ```bash
-WEBCODEX_TEST_CLAUDE_MCP=1 cargo test --bin webcodex-agent opt_in_real_claude_mcp_smoke -- --nocapture
+WEBCODEX_TEST_CLAUDE_MCP=1 cargo test --bin webcodex-runner opt_in_real_claude_mcp_smoke -- --nocapture
 ```
 
 This smoke test prints a bounded tool/schema inventory, resolves configured or

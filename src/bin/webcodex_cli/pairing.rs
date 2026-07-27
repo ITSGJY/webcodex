@@ -120,7 +120,7 @@ pub(crate) fn ensure_enroll_outputs_available(opts: &ClientEnrollOptions) -> Res
     }
     for path in [
         opts.output_dir.join("webcodex-user-token"),
-        opts.output_dir.join("webcodex-agent-token"),
+        opts.output_dir.join("webcodex-runner-token"),
         opts.agent_config.clone(),
     ] {
         if path.exists() {
@@ -180,7 +180,7 @@ pub(crate) async fn run_client_enroll(opts: ClientEnrollOptions) -> Result<Strin
         .unwrap_or_else(|| token_prefix(&agent_token));
 
     let user_token_path = opts.output_dir.join("webcodex-user-token");
-    let agent_token_path = opts.output_dir.join("webcodex-agent-token");
+    let agent_token_path = opts.output_dir.join("webcodex-runner-token");
     write_text_file(
         &user_token_path,
         &format!("{}\n", user_token),
@@ -221,7 +221,7 @@ pub(crate) async fn run_client_enroll(opts: ClientEnrollOptions) -> Result<Strin
             "agent_config": opts.agent_config.to_string_lossy(),
             "projects_dir": opts.projects_dir.to_string_lossy(),
             "next_steps": [
-                "start webcodex-agent with the generated agent.toml",
+                "start webcodex-runner with the generated agent.toml",
                 "configure GPT Actions with the user-token file"
             ],
         });
@@ -247,7 +247,7 @@ pub(crate) async fn run_client_enroll(opts: ClientEnrollOptions) -> Result<Strin
         ));
         out.push_str("\nNext steps:\n");
         out.push_str(&format!(
-            "  - Start the agent: `webcodex-agent --config {}`\n",
+            "  - Start the agent: `webcodex-runner --config {}`\n",
             opts.agent_config.display()
         ));
         out.push_str(&format!(

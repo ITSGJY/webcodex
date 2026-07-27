@@ -4,7 +4,7 @@ set -euo pipefail
 # ============================================================================
 # WebCodex — Zero-Config Agent Transport E2E Smoke
 #
-# Starts a real `webcodex` server and a `webcodex-agent` connected over
+# Starts a real `webcodex` server and a `webcodex-runner` connected over
 # the selected agent transport, defaulting to WebSocket, then exercises the
 # full GPT Actions + MCP surface via curl to prove the runtime is wired
 # end-to-end on a single host.
@@ -362,8 +362,8 @@ pass "server listening on $PORT"
 # 4. Start the agent
 # ----------------------------------------------------------------------------
 
-log "starting agent (cargo run --bin webcodex-agent, transport=$TRANSPORT)"
-"$CARGO_BIN" run --quiet --bin webcodex-agent -- --config "$AGENT_TOML" >"$AGENT_LOG" 2>&1 &
+log "starting agent (cargo run --bin webcodex-runner, transport=$TRANSPORT)"
+"$CARGO_BIN" run --quiet --bin webcodex-runner -- --config "$AGENT_TOML" >"$AGENT_LOG" 2>&1 &
 AGENT_PID=$!
 
 # Wait for the agent to register by polling runtime_status for the client.

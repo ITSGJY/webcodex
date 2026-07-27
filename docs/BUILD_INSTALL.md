@@ -10,15 +10,30 @@ Build the three current binaries for your host:
 
 ```text
 webcodex
-webcodex-agent
+webcodex-runner
 webcodex-cli
 ```
+
+`webcodex-agent` was renamed to `webcodex-runner`, because it runs shell
+commands the server sends rather than an agent loop. Two things did *not*
+change with it, on purpose:
+
+- The QUIC ALPN stays `webcodex-agent/1`. It is a wire identifier, and
+  changing it would stop a renamed runner from talking to any existing server.
+- An installed systemd unit keeps whatever name it was installed under.
+  `webcodex-cli agent status` reads `webcodex-runner.service` and falls back to
+  `webcodex-agent.service`, reports which unit it used, and tells you to rerun
+  `webcodex-cli agent install-service` to migrate.
+
+The npm command `webcodex-agent` still works and forwards to the new binary
+with a deprecation line on stderr. It will be removed in the next major
+version.
 
 Do not run unauthenticated production deployments.
 
 ## Help-verified command shape
 
-The examples in this guide were checked against the current binary help output from `webcodex-cli -h`, `webcodex-agent -h`, and `webcodex -h`. Keep these flag differences in mind:
+The examples in this guide were checked against the current binary help output from `webcodex-cli -h`, `webcodex-runner -h`, and `webcodex -h`. Keep these flag differences in mind:
 
 | Task | Preferred command shape |
 | --- | --- |
@@ -32,7 +47,7 @@ The examples in this guide were checked against the current binary help output f
 | User-created agent token | `webcodex-cli agent-token create-local --server ... --user ... --credential ... --client-id ...` |
 | Pairing code | `webcodex-cli pairing create --server-url ... --username ... --client-id ...` |
 | Client enrollment | `webcodex-cli client enroll --server-url ... --pairing-code ... --client-id ...` |
-| Agent foreground run | `webcodex-agent --profile ...` |
+| Agent foreground run | `webcodex-runner --profile ...` |
 | Agent service | `webcodex-cli agent install-service --profile ... --bin ...` |
 
 The account-management command uses `users create` and `--server-url`; local token creation commands use `--server`. That difference comes from the current CLI surface and is intentionally reflected in the examples.
@@ -58,8 +73,8 @@ The `deploy/` directory contains short examples you can adapt:
 
 - `deploy/webcodex.env.example`
 - `deploy/webcodex.service.example`
-- `deploy/webcodex-agent.toml.example`
-- `deploy/webcodex-agent.service.example`
+- `deploy/webcodex-runner.toml.example`
+- `deploy/webcodex-runner.service.example`
 - `deploy/nginx.webcodex.example.conf`
 
 The nginx file is only an example. WebCodex CLI does not automate reverse proxy setup.
@@ -114,7 +129,7 @@ webcodex-cli pairing create \
 
 Client:
 
-6. Install `webcodex-agent` and `webcodex-cli` binaries.
+6. Install `webcodex-runner` and `webcodex-cli` binaries.
 7. Exchange the pairing code over HTTPS and write client-side credentials/config:
 
 ```bash
@@ -133,10 +148,10 @@ Client enroll creates the `wc_pat_*` user token, `wc_agent_*` agent token, and `
 ```bash
 sudo webcodex-cli agent install-service \
   --profile workstation \
-  --bin /opt/webcodex/bin/webcodex-agent \
+  --bin /opt/webcodex/bin/webcodex-runner \
   --overwrite
 sudo systemctl daemon-reload
-sudo systemctl enable --now webcodex-agent-workstation
+sudo systemctl enable --now webcodex-runner-workstation
 webcodex-cli agent status \
   --profile workstation \
   --server-url https://your-domain.example
@@ -161,11 +176,11 @@ webcodex-cli setup single-user
 Client enroll writes `agent.toml`. For a systemd service, use `webcodex-cli agent install-service`; for a foreground test, run:
 
 ```bash
-webcodex-agent --profile workstation
+webcodex-runner --profile workstation
 ```
 
 For advanced manual generation, use the single low-level entry
-`webcodex-cli agent init`. The `webcodex-agent init` alias was removed.
+`webcodex-cli agent init`. The `webcodex-runner init` alias was removed.
 
 ## Project readiness
 

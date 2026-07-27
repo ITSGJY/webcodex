@@ -9,7 +9,7 @@ reference 或内部 config path。
 ## 前置条件
 
 - 已安装三个 WebCodex binaries：`webcodex`、`webcodex-cli`、
-  `webcodex-agent`；
+  `webcodex-runner`；
 - `PATH` 中有 Git；
 - 一个可以安全查看和修改的 Git 项目。
 

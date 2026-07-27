@@ -7,7 +7,7 @@ This guide covers the current WebCodex production shape: server bootstrap, servi
 ## Components
 
 - `webcodex`: server exposing REST, GPT Actions OpenAPI, MCP, and agent endpoints.
-- `webcodex-agent`: long-lived worker connected by `auto` transport (QUIC first, then WebSocket, then polling) or by an explicitly selected transport.
+- `webcodex-runner`: long-lived worker connected by `auto` transport (QUIC first, then WebSocket, then polling) or by an explicitly selected transport.
 - `webcodex-cli`: recommended management CLI for server bootstrap, pairing/enrollment, status, and doctor checks.
 
 ## Server configuration
@@ -148,15 +148,15 @@ Server/admin:
 
 Client:
 
-8. Install `webcodex-agent` and `webcodex-cli` binaries.
+8. Install `webcodex-runner` and `webcodex-cli` binaries.
 9. Run `webcodex-cli client enroll`.
 10. Run `webcodex-cli agent install-service`.
 11. Run `sudo systemctl daemon-reload`.
-12. Run `sudo systemctl enable --now webcodex-agent`.
+12. Run `sudo systemctl enable --now webcodex-runner`.
 13. Run `webcodex-cli agent status`.
 14. Run `webcodex-cli ops status --strict`.
 
-`/etc/webcodex/webcodex.env` is server-side only. Client-side files live under a profile directory such as `/etc/webcodex/clients/workstation/agent.toml`, `/etc/webcodex/clients/workstation/webcodex-user-token`, `/etc/webcodex/clients/workstation/webcodex-agent-token`, and `/etc/webcodex/clients/workstation/projects.d` when multiple users or clients share one machine.
+`/etc/webcodex/webcodex.env` is server-side only. Client-side files live under a profile directory such as `/etc/webcodex/clients/workstation/agent.toml`, `/etc/webcodex/clients/workstation/webcodex-user-token`, `/etc/webcodex/clients/workstation/webcodex-runner-token`, and `/etc/webcodex/clients/workstation/projects.d` when multiple users or clients share one machine.
 
 ## Account credential onboarding flow
 
@@ -165,8 +165,8 @@ For deployments that do not use pairing, use the account credential flow below. 
 1. Start the server with `WEBCODEX_TOKEN` in the server env file. This is the bootstrap/root/admin credential only.
 2. Create a user with `webcodex-cli users create --issue-credential` and give the returned `wc_acct_xxx` to that user once. The binary help for this path uses `users create` plus `--server-url`, while `token create-local` and `agent-token create-local` use `--server`.
 3. The user runs `webcodex-cli token create-local` with `wc_acct_xxx` to locally generate a `wc_pat_xxx` and register only its hash. Use this PAT for GPT Actions, MCP, and runtime API calls.
-4. The user runs `webcodex-cli agent-token create-local` with `wc_acct_xxx` and `--client-id <client_id>` to locally generate a `wc_agent_xxx` and register only its hash. Use this token only for `webcodex-agent`.
-5. Initialize `webcodex-agent`, add top-level agent `projects.d/*.toml` files, start the agent, then verify `runtime_status`, `projects/list`, and a read-only `tools/call` such as `git_status`.
+4. The user runs `webcodex-cli agent-token create-local` with `wc_acct_xxx` and `--client-id <client_id>` to locally generate a `wc_agent_xxx` and register only its hash. Use this token only for `webcodex-runner`.
+5. Initialize `webcodex-runner`, add top-level agent `projects.d/*.toml` files, start the agent, then verify `runtime_status`, `projects/list`, and a read-only `tools/call` such as `git_status`.
 
 Do not use `wc_acct_xxx` as a GPT Action/MCP token and do not put it in `agent.toml`.
 
@@ -201,11 +201,11 @@ webcodex-cli client enroll \
 
 webcodex-cli agent install-service \
   --profile workstation \
-  --bin /opt/webcodex/bin/webcodex-agent \
+  --bin /opt/webcodex/bin/webcodex-runner \
   --overwrite
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now webcodex-agent-workstation
+sudo systemctl enable --now webcodex-runner-workstation
 
 webcodex-cli ops status \
   --server-url https://your-domain.example \
@@ -213,7 +213,7 @@ webcodex-cli ops status \
   --strict
 ```
 
-`client enroll` is client/friend-side. GPT Actions should use the client-side `webcodex-user-token`; the generated agent config uses the client-side agent token for `webcodex-agent`. Do not copy `WEBCODEX_TOKEN`, `wc_pat_*`, `wc_agent_*`, complete env files, or complete `agent.toml` files between machines. Each friend should use a unique `username` and `client_id`.
+`client enroll` is client/friend-side. GPT Actions should use the client-side `webcodex-user-token`; the generated agent config uses the client-side agent token for `webcodex-runner`. Do not copy `WEBCODEX_TOKEN`, `wc_pat_*`, `wc_agent_*`, complete env files, or complete `agent.toml` files between machines. Each friend should use a unique `username` and `client_id`.
 
 ## Runtime console
 
@@ -295,9 +295,9 @@ Client enroll generates the agent config. Install a systemd unit with:
 ```bash
 sudo webcodex-cli agent install-service \
   --profile workstation \
-  --bin /opt/webcodex/bin/webcodex-agent
+  --bin /opt/webcodex/bin/webcodex-runner
 sudo systemctl daemon-reload
-sudo systemctl enable --now webcodex-agent-workstation
+sudo systemctl enable --now webcodex-runner-workstation
 webcodex-cli agent status \
   --profile workstation \
   --server-url https://your-domain.example
@@ -306,11 +306,11 @@ webcodex-cli agent status \
 For a foreground test, start the agent with:
 
 ```bash
-webcodex-agent --profile workstation
+webcodex-runner --profile workstation
 ```
 
 Advanced manual initialization uses `webcodex-cli agent init`; the duplicate
-`webcodex-agent init` alias was removed.
+`webcodex-runner init` alias was removed.
 
 Important agent settings:
 
@@ -344,7 +344,7 @@ max_output_bytes = 262144
 
 Agent project files in `projects_dir` may set `shell_profile = "rust"` to bind a project to a configured profile.
 
-Shell profiles prepare a one-time environment snapshot per project/profile (no persistent shell, no `.bashrc`/`.profile` sourced by default). See [SHELL_PROFILES.md](SHELL_PROFILES.md) for Rust/Cargo, Python venv, Conda examples, resolution rules, and safety boundaries. After editing `agent.toml`, `sudo systemctl reload webcodex-agent` atomically applies policy, shell, and tool-provider settings to new requests. Identity, server/auth, project source, concurrency, capabilities, and transport changes still require a restart. Invalid reloads keep the active generation; `projects.d` continues to refresh independently. Provider lifecycle and the exact field boundary are documented in [agent/claude-code-mcp-provider.md](agent/claude-code-mcp-provider.md#explicit-agent-config-reload).
+Shell profiles prepare a one-time environment snapshot per project/profile (no persistent shell, no `.bashrc`/`.profile` sourced by default). See [SHELL_PROFILES.md](SHELL_PROFILES.md) for Rust/Cargo, Python venv, Conda examples, resolution rules, and safety boundaries. After editing `agent.toml`, `sudo systemctl reload webcodex-runner` atomically applies policy, shell, and tool-provider settings to new requests. Identity, server/auth, project source, concurrency, capabilities, and transport changes still require a restart. Invalid reloads keep the active generation; `projects.d` continues to refresh independently. Provider lifecycle and the exact field boundary are documented in [agent/claude-code-mcp-provider.md](agent/claude-code-mcp-provider.md#explicit-agent-config-reload).
 
 `runtime_status` and `listAgents` expose a redacted policy summary plus a sanitized `shell_profiles` summary (profile names, `has_init_script`, `env_keys_count`, `program`, `args_count`). `listProjects` exposes `shell_profile`, `resolved_shell_profile`, and `shell_profile_status` (`configured` / `missing` / `not_configured` / `unknown`). They do not expose tokens, env values, `Authorization` headers, full `agent.toml`, the full env snapshot, or shell profile `init_script` bodies.
 

@@ -21,7 +21,7 @@ fn fake_server_binary() -> Arc<FakeServerBinary> {
         return binary;
     }
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let source = manifest.join("src/bin/webcodex_agent/lsp/fake_server.rs");
+    let source = manifest.join("src/bin/webcodex_runner/lsp/fake_server.rs");
     let temp = tempfile::tempdir().unwrap();
     let output = temp
         .path()
@@ -1070,7 +1070,7 @@ fn lsp_initialize_uses_constrained_typescript_profile() {
     );
     assert_eq!(
         options.pointer("/hostInfo"),
-        Some(&json!("webcodex-agent")),
+        Some(&json!("webcodex-runner")),
         "{options}"
     );
 }

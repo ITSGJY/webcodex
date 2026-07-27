@@ -152,7 +152,7 @@ const LEGACY_FORBIDDEN_PATHS: &[&str] = &[
     "/api/tokens/revoke",
     // Phase 3 agent token management: same REST-only admin/self surface, also
     // excluded from GPT Actions. Agent tokens are bound to an owner and an
-    // allowed_client_id and are only used by the webcodex-agent transport.
+    // allowed_client_id and are only used by the webcodex-runner transport.
     "/api/agent-tokens/create",
     "/api/agent-tokens/register_hash",
     "/api/agent-tokens/list",

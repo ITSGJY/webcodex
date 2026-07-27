@@ -40,7 +40,7 @@ bash scripts/smoke_artifact_transfer.sh
 
 The smoke project should be a disposable, agent-backed git repository such as
 `agent:special:webcodex-smoke`. Do not use `wc_agent_*` for GPT Actions, MCP, or
-this smoke script; that token type is only for `webcodex-agent`.
+this smoke script; that token type is only for `webcodex-runner`.
 
 ## Authentication
 
@@ -66,12 +66,12 @@ webcodex-cli server install-service
 webcodex-cli server status
 webcodex-cli pairing create --server-url URL --username alice --client-id alice-laptop
 webcodex-cli client enroll --server-url URL --pairing-code CODE --client-id alice-laptop
-webcodex-cli agent install-service --profile workstation --bin /opt/webcodex/bin/webcodex-agent
+webcodex-cli agent install-service --profile workstation --bin /opt/webcodex/bin/webcodex-runner
 webcodex-cli agent status --profile workstation --server-url URL
 webcodex-cli ops status --strict --server-url URL --token-file PATH
 ```
 
-`pairing create` is server/admin-side. `client enroll`, `agent install-service`, and `agent status` are client-side for the machine running `webcodex-agent`. Do not copy server tokens to the client; copy only the short-lived pairing code.
+`pairing create` is server/admin-side. `client enroll`, `agent install-service`, and `agent status` are client-side for the machine running `webcodex-runner`. Do not copy server tokens to the client; copy only the short-lived pairing code.
 ## Binary help validation
 
 Before release or large documentation changes, verify the command examples against the binaries:
@@ -87,7 +87,7 @@ webcodex-cli agent install-service -h
 webcodex-cli agent status -h
 webcodex doctor -h
 webcodex-cli ops status -h
-webcodex-agent -h
+webcodex-runner -h
 webcodex -h
 ```
 

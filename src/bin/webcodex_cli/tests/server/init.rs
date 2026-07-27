@@ -400,7 +400,7 @@ async fn setup_single_user_runs_expected_calls_and_writes_0600_files() {
     // Files written with 0600 and contain the full one-time tokens.
     let user_token = std::fs::read_to_string(tmp.path().join("webcodex-user-token")).unwrap();
     assert_eq!(user_token.trim(), "wc_user_fake_plaintext_12345");
-    let agent_token = std::fs::read_to_string(tmp.path().join("webcodex-agent-token")).unwrap();
+    let agent_token = std::fs::read_to_string(tmp.path().join("webcodex-runner-token")).unwrap();
     assert_eq!(agent_token.trim(), "agent_fake_plaintext_67890");
     #[cfg(unix)]
     {
@@ -411,7 +411,7 @@ async fn setup_single_user_runs_expected_calls_and_writes_0600_files() {
             .mode()
             & 0o777;
         assert_eq!(m, 0o600);
-        let m = std::fs::metadata(tmp.path().join("webcodex-agent-token"))
+        let m = std::fs::metadata(tmp.path().join("webcodex-runner-token"))
             .unwrap()
             .permissions()
             .mode()

@@ -7,7 +7,7 @@
 ## 组件
 
 - `webcodex`：服务器进程，暴露 REST、GPT Actions OpenAPI、MCP 和 agent endpoints。
-- `webcodex-agent`：长驻 worker，通过 `auto` transport 连接（先 QUIC，再 WebSocket，再 polling），也可显式指定单一 transport。
+- `webcodex-runner`：长驻 worker，通过 `auto` transport 连接（先 QUIC，再 WebSocket，再 polling），也可显式指定单一 transport。
 - `webcodex-cli`：推荐的管理 CLI，用于 server bootstrap、pairing/enrollment、status 和 doctor checks。
 
 ## 服务器配置
@@ -147,15 +147,15 @@ Server/admin：
 
 Client：
 
-8. 安装 `webcodex-agent` 和 `webcodex-cli` binaries。
+8. 安装 `webcodex-runner` 和 `webcodex-cli` binaries。
 9. 运行 `webcodex-cli client enroll`。
 10. 运行 `webcodex-cli agent install-service`。
 11. 运行 `sudo systemctl daemon-reload`。
-12. 运行 `sudo systemctl enable --now webcodex-agent`。
+12. 运行 `sudo systemctl enable --now webcodex-runner`。
 13. 运行 `webcodex-cli agent status`。
 14. 运行 `webcodex-cli ops status --strict`。
 
-`/etc/webcodex/webcodex.env` 只属于 server 侧。多用户或多个 client 共享一台机器时，client 侧文件应放在 profile 目录下，例如 `/etc/webcodex/clients/workstation/agent.toml`、`/etc/webcodex/clients/workstation/webcodex-user-token`、`/etc/webcodex/clients/workstation/webcodex-agent-token` 和 `/etc/webcodex/clients/workstation/projects.d`。
+`/etc/webcodex/webcodex.env` 只属于 server 侧。多用户或多个 client 共享一台机器时，client 侧文件应放在 profile 目录下，例如 `/etc/webcodex/clients/workstation/agent.toml`、`/etc/webcodex/clients/workstation/webcodex-user-token`、`/etc/webcodex/clients/workstation/webcodex-runner-token` 和 `/etc/webcodex/clients/workstation/projects.d`。
 
 ## 账户凭据开通流程
 
@@ -164,8 +164,8 @@ Client：
 1. 使用 server env file 中的 `WEBCODEX_TOKEN` 启动服务器。它只是 bootstrap/root/admin 凭据。
 2. 管理员运行 `webcodex-cli users create --issue-credential` 创建用户，并把返回的 `wc_acct_xxx` 一次性发给该用户。这个路径的二进制帮助使用 `users create` 和 `--server-url`；`token create-local` 与 `agent-token create-local` 使用 `--server`。
 3. 用户运行 `webcodex-cli token create-local`，使用 `wc_acct_xxx` 在本地生成 `wc_pat_xxx`，服务器只登记其 hash。GPT Actions、MCP 和 runtime API 调用使用这个 PAT。
-4. 用户运行 `webcodex-cli agent-token create-local`，使用 `wc_acct_xxx` 和 `--client-id <client_id>` 在本地生成 `wc_agent_xxx`，服务器只登记其 hash。该 token 只用于 `webcodex-agent`。
-5. 初始化 `webcodex-agent`，添加顶层 agent `projects.d/*.toml` 文件，启动 agent，然后验证 `runtime_status`、`projects/list` 和一个只读 `tools/call`，例如 `git_status`。
+4. 用户运行 `webcodex-cli agent-token create-local`，使用 `wc_acct_xxx` 和 `--client-id <client_id>` 在本地生成 `wc_agent_xxx`，服务器只登记其 hash。该 token 只用于 `webcodex-runner`。
+5. 初始化 `webcodex-runner`，添加顶层 agent `projects.d/*.toml` 文件，启动 agent，然后验证 `runtime_status`、`projects/list` 和一个只读 `tools/call`，例如 `git_status`。
 
 不要把 `wc_acct_xxx` 当作 GPT Action/MCP token，也不要把它写进 `agent.toml`。
 
@@ -200,11 +200,11 @@ webcodex-cli client enroll \
 
 webcodex-cli agent install-service \
   --profile workstation \
-  --bin /opt/webcodex/bin/webcodex-agent \
+  --bin /opt/webcodex/bin/webcodex-runner \
   --overwrite
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now webcodex-agent-workstation
+sudo systemctl enable --now webcodex-runner-workstation
 
 webcodex-cli ops status \
   --server-url https://your-domain.example \
@@ -212,7 +212,7 @@ webcodex-cli ops status \
   --strict
 ```
 
-`client enroll` 是 client/friend 侧操作。GPT Actions 应使用 client 侧的 `webcodex-user-token`；生成的 agent config 使用 client 侧 agent token 连接 `webcodex-agent`。不要在机器之间复制 `WEBCODEX_TOKEN`、`wc_pat_*`、`wc_agent_*`、完整 env files 或完整 `agent.toml` files。每个 friend 都应使用唯一的 `username` 和 `client_id`。
+`client enroll` 是 client/friend 侧操作。GPT Actions 应使用 client 侧的 `webcodex-user-token`；生成的 agent config 使用 client 侧 agent token 连接 `webcodex-runner`。不要在机器之间复制 `WEBCODEX_TOKEN`、`wc_pat_*`、`wc_agent_*`、完整 env files 或完整 `agent.toml` files。每个 friend 都应使用唯一的 `username` 和 `client_id`。
 
 ## Runtime console
 
@@ -292,9 +292,9 @@ server {
 ```bash
 sudo webcodex-cli agent install-service \
   --profile workstation \
-  --bin /opt/webcodex/bin/webcodex-agent
+  --bin /opt/webcodex/bin/webcodex-runner
 sudo systemctl daemon-reload
-sudo systemctl enable --now webcodex-agent-workstation
+sudo systemctl enable --now webcodex-runner-workstation
 webcodex-cli agent status \
   --profile workstation \
   --server-url https://your-domain.example
@@ -303,11 +303,11 @@ webcodex-cli agent status \
 前台测试可直接启动 agent：
 
 ```bash
-webcodex-agent --profile workstation
+webcodex-runner --profile workstation
 ```
 
 高级手工初始化使用 `webcodex-cli agent init`；重复的
-`webcodex-agent init` alias 已删除。
+`webcodex-runner init` alias 已删除。
 
 重要 agent 设置：
 
@@ -341,7 +341,7 @@ max_output_bytes = 262144
 
 `projects_dir` 中的 agent project files 可以设置 `shell_profile = "rust"`，把项目绑定到已配置 profile。
 
-Shell profiles 会为每个 project/profile 准备一次性 environment snapshot；它不是持久 shell，默认不会 source `.bashrc` 或 `.profile`。Rust/Cargo、Python venv、Conda 示例、解析规则和安全边界见 [SHELL_PROFILES.md](SHELL_PROFILES.md)。修改 profile 后需要重启 `webcodex-agent`，当前没有 reload API。
+Shell profiles 会为每个 project/profile 准备一次性 environment snapshot；它不是持久 shell，默认不会 source `.bashrc` 或 `.profile`。Rust/Cargo、Python venv、Conda 示例、解析规则和安全边界见 [SHELL_PROFILES.md](SHELL_PROFILES.md)。修改 profile 后需要重启 `webcodex-runner`，当前没有 reload API。
 
 `runtime_status` 和 `listAgents` 会暴露 redacted policy summary，以及经过清理的 `shell_profiles` 摘要，包括 profile names、`has_init_script`、`env_keys_count`、`program`、`args_count`。`listProjects` 会暴露 `shell_profile`、`resolved_shell_profile` 和 `shell_profile_status`（`configured` / `missing` / `not_configured` / `unknown`）。这些接口不会暴露 tokens、env values、`Authorization` headers、完整 `agent.toml`、完整 env snapshot 或 shell profile `init_script` bodies。
 

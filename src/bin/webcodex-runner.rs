@@ -52,9 +52,9 @@ mod project_overview;
 mod workspace_checkpoint;
 
 #[cfg(test)]
-#[path = "webcodex_agent/job_manager_tests.rs"]
+#[path = "webcodex_runner/job_manager_tests.rs"]
 mod job_manager_tests;
-mod webcodex_agent;
+mod webcodex_runner;
 
 use shell_protocol::{
     AgentPolicySummary, ShellAgentJobUpdateRequest, ShellAgentPollPayload, ShellAgentPollRequest,
@@ -76,9 +76,9 @@ use std::collections::BTreeMap;
 #[cfg(test)]
 use std::net::SocketAddr;
 #[cfg(test)]
-use webcodex_agent::QuicClientConfig;
+use webcodex_runner::QuicClientConfig;
 #[cfg(test)]
-use webcodex_agent::{
+use webcodex_runner::{
     agent_project_summary, auto_transport_plan, build_ws_request, default_quic_alpn,
     default_quic_connect_timeout_secs, default_quic_keepalive_interval_secs,
     default_websocket_connect_timeout_secs, effective_transport, handle_project_op,
@@ -88,7 +88,7 @@ use webcodex_agent::{
     sha256_hex_bytes, validate_project_path_policy, websocket_session, AgentRuntimeState,
     ShellProfileConfig, CLIENT_PROFILE_ERROR, DEFAULT_MAX_CONCURRENT_JOBS, WS_OUTGOING_CAPACITY,
 };
-use webcodex_agent::{
+use webcodex_runner::{
     client_profile_agent_config, configured_prepared_shell_job_command,
     configured_shell_job_command, configured_validation_job_command, cwd_allowed,
     default_config_path, dispatch_request, err_cmd, handle_apply_text_edits_file_request,
@@ -164,7 +164,7 @@ enum AgentCliAction {
 }
 
 fn usage() -> &'static str {
-    "Usage: webcodex-agent [--config PATH] [--once]\n\n\
+    "Usage: webcodex-runner [--config PATH] [--once]\n\n\
      Options:\n\
        -h, --help                 Print help and exit\n\
        -V, --version              Print version and exit\n\
@@ -218,7 +218,7 @@ where
             "--version" | "-V" => {
                 return Ok(AgentCliAction::Exit {
                     code: 0,
-                    stdout: build_info::version_output("webcodex-agent"),
+                    stdout: build_info::version_output("webcodex-runner"),
                     stderr: String::new(),
                 });
             }
@@ -244,7 +244,7 @@ where
             "--version" | "-V" => {
                 return Ok(AgentCliAction::Exit {
                     code: 0,
-                    stdout: build_info::version_output("webcodex-agent"),
+                    stdout: build_info::version_output("webcodex-runner"),
                     stderr: String::new(),
                 });
             }
@@ -682,7 +682,7 @@ fn build_register_request_with_provider_status(
     prepared_cache_count: usize,
 ) -> (
     ShellClientRegisterRequest,
-    Arc<webcodex_agent::external_tools::ExternalToolRouter>,
+    Arc<webcodex_runner::external_tools::ExternalToolRouter>,
     u64,
 ) {
     let hot = runtime.snapshot();
@@ -1106,7 +1106,7 @@ impl JobManager {
             stop_requested.store(true, Ordering::SeqCst);
             if let Some(child) = child {
                 if let Err(e) = kill_child_group(&child) {
-                    eprintln!("webcodex-agent stop_job error: failed to kill job {job_id}: {e}");
+                    eprintln!("webcodex-runner stop_job error: failed to kill job {job_id}: {e}");
                 }
             }
         }
@@ -1682,7 +1682,7 @@ fn handle_one_poll(
     jobs: &JobManager,
     project_cache: &mut AgentProjectCache,
     agent_instance_id: &str,
-    lsp: &webcodex_agent::LspSupervisor,
+    lsp: &webcodex_runner::LspSupervisor,
 ) -> Result<bool, PollError> {
     let metadata_config = runtime.snapshot();
     let provider_update =
@@ -1792,11 +1792,11 @@ fn main() {
     };
     if cfg.token.trim().is_empty() {
         eprintln!(
-            "webcodex-agent warning: agent token is empty; connecting without Authorization; the server must be started with --open"
+            "webcodex-runner warning: agent token is empty; connecting without Authorization; the server must be started with --open"
         );
     }
     if let Err(e) = run_agent(cfg, config_path, once) {
-        eprintln!("webcodex-agent failed: {}", e);
+        eprintln!("webcodex-runner failed: {}", e);
         std::process::exit(1);
     }
 }
@@ -1898,8 +1898,8 @@ tool_providers.claude_code.timeout_secs = 30
         hot_only.policy.max_timeout_secs += 1;
         hot_only.shell.program = "bash".to_string();
         hot_only.tool_providers.strategy =
-            webcodex_agent::config::ToolProviderStrategy::ClaudeCodeThenNative;
-        assert!(webcodex_agent::config::restart_required_fields(&startup, &hot_only).is_empty());
+            webcodex_runner::config::ToolProviderStrategy::ClaudeCodeThenNative;
+        assert!(webcodex_runner::config::restart_required_fields(&startup, &hot_only).is_empty());
 
         let mut changed = hot_only;
         changed.server_url.push_str("/other");
@@ -1916,7 +1916,7 @@ tool_providers.claude_code.timeout_secs = 30
         changed.websocket_connect_timeout_secs += 1;
         changed.quic = Some(quic_client_config());
         assert_eq!(
-            webcodex_agent::config::restart_required_fields(&startup, &changed).join(" "),
+            webcodex_runner::config::restart_required_fields(&startup, &changed).join(" "),
             "capabilities client_id display_name hostname max_concurrent_jobs owner poll_interval_ms projects_dir quic server_url token transport websocket_connect_timeout_secs"
         );
     }
@@ -2238,8 +2238,8 @@ transport = "auto"
                 stderr,
             } => {
                 assert_eq!(code, 0);
-                assert!(stdout.contains("Usage: webcodex-agent"));
-                assert!(!stdout.contains("webcodex-agent init"));
+                assert!(stdout.contains("Usage: webcodex-runner"));
+                assert!(!stdout.contains("webcodex-runner init"));
                 assert!(stderr.is_empty());
             }
             other => panic!("expected help exit, got {other:?}"),
@@ -2252,13 +2252,13 @@ transport = "auto"
             } => {
                 assert_eq!(code, 0);
                 assert!(stdout.starts_with(&format!(
-                    "webcodex-agent {} (commit ",
+                    "webcodex-runner {} (commit ",
                     env!("CARGO_PKG_VERSION")
                 )));
                 assert!(stdout.trim_end().ends_with(')'));
                 assert_ne!(
                     stdout,
-                    format!("webcodex-agent {}\n", env!("CARGO_PKG_VERSION"))
+                    format!("webcodex-runner {}\n", env!("CARGO_PKG_VERSION"))
                 );
                 assert!(stderr.is_empty());
             }
@@ -2282,7 +2282,7 @@ transport = "auto"
             } => {
                 assert_eq!(code, 0);
                 assert!(stdout.contains("commit "));
-                assert!(stdout.starts_with("webcodex-agent "));
+                assert!(stdout.starts_with("webcodex-runner "));
                 assert!(stderr.is_empty());
             }
             other => panic!("expected version exit, got {other:?}"),
@@ -5681,7 +5681,7 @@ shell_profile = "../rust"
         assert_eq!(shell_result.stdout.as_deref(), Some("same"));
 
         let (sink, mut rx) = ws_sink("ws-client");
-        let lsp = webcodex_agent::LspSupervisor::default();
+        let lsp = webcodex_runner::LspSupervisor::default();
         let mut cfg = test_config(projects_dir.clone());
         cfg.shell = shell.clone();
         let hot = runtime_config(&cfg);
@@ -6526,7 +6526,7 @@ shell_profile = "../rust"
             sandbox: None,
         };
         let pdir = projects_dir(&cfg);
-        let lsp = webcodex_agent::LspSupervisor::default();
+        let lsp = webcodex_runner::LspSupervisor::default();
         let hot = runtime_config(&cfg);
         let ran =
             dispatch_request(&sink, &hot.snapshot(), &hot, &jobs, &pdir, &lsp, request).unwrap();
@@ -6598,7 +6598,7 @@ shell_profile = "../rust"
                 &hot,
                 &jobs,
                 &pdir,
-                &webcodex_agent::LspSupervisor::default(),
+                &webcodex_runner::LspSupervisor::default(),
                 request,
             )
             .unwrap();

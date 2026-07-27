@@ -556,7 +556,7 @@ async fn apply_patch_agent_does_not_require_server_local_project_root() {
             capabilities: Some(caps),
             projects: Some(vec![registered_project(
                 "agent-proj",
-                "/definitely/not/on/server/webcodex-agent-only",
+                "/definitely/not/on/server/webcodex-runner-only",
             )]),
             agent_protocol_version: Some("polling-v1".to_string()),
             policy: None,

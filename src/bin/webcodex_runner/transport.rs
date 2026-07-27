@@ -108,7 +108,7 @@ async fn stop_jobs_for_shutdown(jobs: &JobManager, poll_interval_ms: u64) {
         tokio::time::sleep(sleep.min(remaining)).await;
     }
     if jobs.has_work() {
-        eprintln!("webcodex-agent shutdown: active jobs did not stop within 2s; exiting");
+        eprintln!("webcodex-runner shutdown: active jobs did not stop within 2s; exiting");
     }
 }
 
@@ -121,7 +121,7 @@ fn stop_jobs_for_polling_shutdown(jobs: &JobManager, poll_interval_ms: u64) {
         std::thread::sleep(sleep.min(remaining));
     }
     if jobs.has_work() {
-        eprintln!("webcodex-agent shutdown: active jobs did not stop within 2s; exiting");
+        eprintln!("webcodex-runner shutdown: active jobs did not stop within 2s; exiting");
     }
 }
 
@@ -141,7 +141,7 @@ fn install_polling_shutdown_flag() -> Arc<AtomicBool> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let listener_flag = Arc::clone(&shutdown);
     let _ = std::thread::Builder::new()
-        .name("webcodex-agent-shutdown".to_string())
+        .name("webcodex-runner-shutdown".to_string())
         .spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -156,7 +156,7 @@ fn install_polling_shutdown_flag() -> Arc<AtomicBool> {
 }
 
 fn finish_polling_shutdown(jobs: &JobManager, poll_interval_ms: u64) {
-    eprintln!("webcodex-agent received process shutdown signal; exiting");
+    eprintln!("webcodex-runner received process shutdown signal; exiting");
     stop_jobs_for_polling_shutdown(jobs, poll_interval_ms);
 }
 
@@ -296,7 +296,7 @@ fn enabled_projects_count(projects: &[ShellAgentProjectSummary]) -> usize {
 
 fn registered_log_line(cfg: &AgentConfig, actual_transport: &str, projects_count: usize) -> String {
     format!(
-        "webcodex-agent registered client_id={} server={} preferred_transport={} actual_transport={} projects={}",
+        "webcodex-runner registered client_id={} server={} preferred_transport={} actual_transport={} projects={}",
         cfg.client_id,
         server_log_label(&cfg.server_url),
         effective_transport(cfg),
@@ -306,11 +306,11 @@ fn registered_log_line(cfg: &AgentConfig, actual_transport: &str, projects_count
 }
 
 fn auto_quic_not_configured_log_line() -> &'static str {
-    "webcodex-agent transport auto: quic not configured; skipping"
+    "webcodex-runner transport auto: quic not configured; skipping"
 }
 
 fn auto_trying_log_line(transport: &str) -> String {
-    format!("webcodex-agent transport auto: {} trying", transport)
+    format!("webcodex-runner transport auto: {} trying", transport)
 }
 
 #[cfg(unix)]
@@ -348,7 +348,7 @@ fn install_reload_listener(
             .map_err(|_| "failed to install config reload signal listener".to_string())?
     };
     std::thread::Builder::new()
-        .name("webcodex-agent-reload".to_string())
+        .name("webcodex-runner-reload".to_string())
         .spawn(move || {
             signal_runtime.block_on(async move {
                 while !runtime.is_stopping() {
@@ -634,14 +634,14 @@ fn format_delay(delay: Duration) -> String {
 fn schedule_reconnect(transport: &str, backoff: &mut ReconnectBackoff) -> Duration {
     let delay = backoff.next_delay();
     eprintln!(
-        "webcodex-agent reconnect attempt scheduled transport={} delay={}",
+        "webcodex-runner reconnect attempt scheduled transport={} delay={}",
         transport,
         format_delay(delay)
     );
     tracing::debug!(
         transport,
         delay_ms = delay.as_millis() as u64,
-        "webcodex-agent reconnect attempt scheduled"
+        "webcodex-runner reconnect attempt scheduled"
     );
     delay
 }
@@ -675,7 +675,7 @@ fn run_auto_agent(
                         Ok(AgentSessionExit::TransportDisconnected) if once => return Ok(()),
                         Ok(AgentSessionExit::TransportDisconnected) => {
                             reset_backoff_after_stable_session(&mut backoff, session_started);
-                            eprintln!("webcodex-agent quic connection closed; reconnecting");
+                            eprintln!("webcodex-runner quic connection closed; reconnecting");
                             std::thread::sleep(schedule_reconnect(TRANSPORT_QUIC, &mut backoff));
                             continue 'supervisor;
                         }
@@ -686,13 +686,13 @@ fn run_auto_agent(
                             }
                             let log_error = concise_log_error(&e.to_string(), &cfg.token);
                             eprintln!(
-                                "webcodex-agent transport auto: quic unavailable: {}; trying websocket",
+                                "webcodex-runner transport auto: quic unavailable: {}; trying websocket",
                                 log_error
                             );
                             tracing::debug!(
                                 transport = "quic",
                                 error = %log_error,
-                                "webcodex-agent auto transport attempt failed"
+                                "webcodex-runner auto transport attempt failed"
                             );
                         }
                     }
@@ -707,7 +707,7 @@ fn run_auto_agent(
                         Ok(AgentSessionExit::TransportDisconnected) if once => return Ok(()),
                         Ok(AgentSessionExit::TransportDisconnected) => {
                             reset_backoff_after_stable_session(&mut backoff, session_started);
-                            eprintln!("webcodex-agent websocket connection closed; reconnecting");
+                            eprintln!("webcodex-runner websocket connection closed; reconnecting");
                             std::thread::sleep(schedule_reconnect(
                                 TRANSPORT_WEBSOCKET,
                                 &mut backoff,
@@ -724,13 +724,13 @@ fn run_auto_agent(
                             }
                             let log_error = concise_log_error(&e.to_string(), &cfg.token);
                             eprintln!(
-                                "webcodex-agent transport auto: websocket failed: {}; falling back to polling",
+                                "webcodex-runner transport auto: websocket failed: {}; falling back to polling",
                                 log_error
                             );
                             tracing::debug!(
                                 transport = "websocket",
                                 error = %log_error,
-                                "webcodex-agent auto transport attempt failed"
+                                "webcodex-runner auto transport attempt failed"
                             );
                         }
                     }
@@ -830,7 +830,7 @@ fn run_polling_agent_with_shutdown(
                 if terminal || once {
                     return Err(message);
                 }
-                eprintln!("webcodex-agent poll retryable error: {}", message);
+                eprintln!("webcodex-runner poll retryable error: {}", message);
                 if sleep_or_shutdown(
                     Duration::from_millis(cfg.poll_interval_ms),
                     shutdown.as_ref(),
@@ -896,7 +896,7 @@ fn run_quic_agent(
             match quic_session(&cfg, projects, &agent_instance_id, once, &runtime).await {
                 Ok(AgentSessionExit::Shutdown) => {
                     project_cache.invalidate();
-                    eprintln!("webcodex-agent quic shutdown complete");
+                    eprintln!("webcodex-runner quic shutdown complete");
                     return Ok(());
                 }
                 Ok(AgentSessionExit::Completed) => {
@@ -909,7 +909,7 @@ fn run_quic_agent(
                         return Ok(());
                     }
                     reset_backoff_after_stable_session(&mut backoff, session_started);
-                    eprintln!("webcodex-agent quic connection closed; reconnecting");
+                    eprintln!("webcodex-runner quic connection closed; reconnecting");
                     tokio::time::sleep(schedule_reconnect(TRANSPORT_QUIC, &mut backoff)).await;
                 }
                 Err(e) => {
@@ -921,11 +921,11 @@ fn run_quic_agent(
                     if e.is_fatal() {
                         return Err(e.into_message());
                     }
-                    eprintln!("webcodex-agent quic error: {}; reconnecting", e);
+                    eprintln!("webcodex-runner quic error: {}; reconnecting", e);
                     tracing::debug!(
                         transport = "quic",
                         error = %e,
-                        "webcodex-agent quic transient error"
+                        "webcodex-runner quic transient error"
                     );
                     tokio::time::sleep(schedule_reconnect(TRANSPORT_QUIC, &mut backoff)).await;
                 }
@@ -1233,7 +1233,7 @@ async fn quic_session(
     loop {
         tokio::select! {
             _ = &mut shutdown => {
-                eprintln!("webcodex-agent received process shutdown signal; exiting");
+                eprintln!("webcodex-runner received process shutdown signal; exiting");
                 runtime.config.begin_shutdown();
                 shutdown_requested = true;
                 break;
@@ -1244,7 +1244,7 @@ async fn quic_session(
                     Err(QuicFrameError::EmptyStream) => {
                         tracing::debug!(
                             transport = "quic",
-                            "webcodex-agent quic stream closed by peer"
+                            "webcodex-runner quic stream closed by peer"
                         );
                         break;
                     }
@@ -1288,7 +1288,7 @@ async fn quic_session(
                     }
                     other => {
                         eprintln!(
-                            "webcodex-agent quic ignoring unexpected envelope: {}",
+                            "webcodex-runner quic ignoring unexpected envelope: {}",
                             other.kind()
                         );
                     }
@@ -1297,7 +1297,7 @@ async fn quic_session(
             _ = ping_interval.tick() => {
                 tracing::debug!(
                     transport = "quic",
-                    "webcodex-agent quic keepalive ping"
+                    "webcodex-runner quic keepalive ping"
                 );
                 send_provider_metadata(&out_tx, &runtime.config, None);
                 let _ = out_tx.send(AgentEnvelope::Ping {
@@ -1318,7 +1318,7 @@ async fn quic_session(
     } else if jobs.has_work() {
         tracing::warn!(
             transport = "quic",
-            "webcodex-agent quic disconnected with active jobs; reconnecting without waiting"
+            "webcodex-runner quic disconnected with active jobs; reconnecting without waiting"
         );
     }
     drop(sink_handle);
@@ -1421,7 +1421,7 @@ fn run_websocket_agent(
             match websocket_session(&cfg, projects, &agent_instance_id, &runtime).await {
                 Ok(AgentSessionExit::Shutdown) => {
                     project_cache.invalidate();
-                    eprintln!("webcodex-agent websocket shutdown complete");
+                    eprintln!("webcodex-runner websocket shutdown complete");
                     return Ok(());
                 }
                 Ok(AgentSessionExit::Completed) => {
@@ -1434,7 +1434,7 @@ fn run_websocket_agent(
                         return Ok(());
                     }
                     reset_backoff_after_stable_session(&mut backoff, session_started);
-                    eprintln!("webcodex-agent websocket connection closed; reconnecting");
+                    eprintln!("webcodex-runner websocket connection closed; reconnecting");
                     tokio::time::sleep(schedule_reconnect(TRANSPORT_WEBSOCKET, &mut backoff)).await;
                 }
                 Err(e) => {
@@ -1446,11 +1446,11 @@ fn run_websocket_agent(
                     if e.is_fatal() {
                         return Err(e.into_message());
                     }
-                    eprintln!("webcodex-agent websocket error: {}; reconnecting", e);
+                    eprintln!("webcodex-runner websocket error: {}; reconnecting", e);
                     tracing::debug!(
                         transport = "websocket",
                         error = %e,
-                        "webcodex-agent websocket transient error"
+                        "webcodex-runner websocket transient error"
                     );
                     tokio::time::sleep(schedule_reconnect(TRANSPORT_WEBSOCKET, &mut backoff)).await;
                 }
@@ -1618,7 +1618,7 @@ where
             _ = &mut shutdown => {
                 runtime.config.begin_shutdown();
                 quit_after_session = true;
-                eprintln!("webcodex-agent received process shutdown signal; exiting");
+                eprintln!("webcodex-runner received process shutdown signal; exiting");
                 break;
             }
             msg = stream.next() => {
@@ -1628,14 +1628,14 @@ where
                         tracing::debug!(
                             transport = "websocket",
                             error = ?e,
-                            "webcodex-agent websocket read error"
+                            "webcodex-runner websocket read error"
                         );
                         break;
                     }
                     None => {
                         tracing::debug!(
                             transport = "websocket",
-                            "webcodex-agent websocket stream ended"
+                            "webcodex-runner websocket stream ended"
                         );
                         break;
                     }
@@ -1646,12 +1646,12 @@ where
                             transport = "websocket",
                             close_code = ?frame.code,
                             close_reason = %frame.reason,
-                            "webcodex-agent websocket close frame received"
+                            "webcodex-runner websocket close frame received"
                         );
                     } else {
                         tracing::debug!(
                             transport = "websocket",
-                            "webcodex-agent websocket close frame received"
+                            "webcodex-runner websocket close frame received"
                         );
                     }
                     break;
@@ -1663,7 +1663,7 @@ where
                 let env = match AgentEnvelope::from_slice(text.as_bytes()) {
                     Ok(env) => env,
                     Err(e) => {
-                        eprintln!("webcodex-agent websocket malformed envelope: {}", e);
+                        eprintln!("webcodex-runner websocket malformed envelope: {}", e);
                         continue;
                     }
                 };
@@ -1706,7 +1706,7 @@ where
                     }
                     other => {
                         eprintln!(
-                            "webcodex-agent websocket ignoring unexpected envelope: {}",
+                            "webcodex-runner websocket ignoring unexpected envelope: {}",
                             other.kind()
                         );
                     }
@@ -1715,7 +1715,7 @@ where
             _ = ping_interval.tick() => {
                 tracing::debug!(
                     transport = "websocket",
-                    "webcodex-agent websocket keepalive ping"
+                    "webcodex-runner websocket keepalive ping"
                 );
                 send_provider_metadata(&out_tx, &runtime.config, None);
                 let _ = out_tx.send(AgentEnvelope::Ping {
@@ -1736,7 +1736,7 @@ where
     } else if jobs.has_work() {
         tracing::warn!(
             transport = "websocket",
-            "webcodex-agent websocket disconnected with active jobs; reconnecting without waiting"
+            "webcodex-runner websocket disconnected with active jobs; reconnecting without waiting"
         );
     }
 
@@ -1808,7 +1808,7 @@ mod tests {
             },
             transport: Some(TRANSPORT_WEBSOCKET.to_string()),
             websocket_connect_timeout_secs:
-                crate::webcodex_agent::default_websocket_connect_timeout_secs(),
+                crate::webcodex_runner::default_websocket_connect_timeout_secs(),
             quic: None,
             shell: ShellConfig::default(),
             tool_providers: Default::default(),
@@ -2101,15 +2101,15 @@ mod tests {
     fn auto_log_lines_are_concise_and_redacted() {
         assert_eq!(
             auto_quic_not_configured_log_line(),
-            "webcodex-agent transport auto: quic not configured; skipping"
+            "webcodex-runner transport auto: quic not configured; skipping"
         );
         assert_eq!(
             auto_trying_log_line(TRANSPORT_WEBSOCKET),
-            "webcodex-agent transport auto: websocket trying"
+            "webcodex-runner transport auto: websocket trying"
         );
         assert_eq!(
             auto_trying_log_line(TRANSPORT_POLLING),
-            "webcodex-agent transport auto: polling trying"
+            "webcodex-runner transport auto: polling trying"
         );
 
         let token = "DO_NOT_LEAK_THIS_TOKEN";

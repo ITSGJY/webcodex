@@ -44,7 +44,7 @@ TARBALL="$PACK_DIR/$TARBALL"
 echo "[npm-smoke] installing tarball into temporary prefix"
 WEBCODEX_BINARY_DIR="$BIN_DIR" npm install --global --prefix "$PREFIX" "$TARBALL"
 
-for name in webcodex webcodex-cli webcodex-agent; do
+for name in webcodex webcodex-cli webcodex-runner; do
     output="$("$PREFIX/bin/$name" --version)"
     echo "[npm-smoke] $output"
     case "$output" in
@@ -59,6 +59,6 @@ done
 
 "$PREFIX/bin/webcodex" -h >/dev/null
 "$PREFIX/bin/webcodex-cli" -h >/dev/null
-"$PREFIX/bin/webcodex-agent" -h >/dev/null
+"$PREFIX/bin/webcodex-runner" -h >/dev/null
 
 echo "[npm-smoke] local npm package smoke passed for $VERSION"

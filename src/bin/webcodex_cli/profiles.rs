@@ -58,12 +58,12 @@ pub(crate) fn client_profile_user_token_file(profile: &str) -> PathBuf {
 }
 
 pub(crate) fn client_profile_agent_token_file(profile: &str) -> PathBuf {
-    client_profile_dir(profile).join("webcodex-agent-token")
+    client_profile_dir(profile).join("webcodex-runner-token")
 }
 
 pub(crate) fn client_profile_service_file(profile: &str) -> PathBuf {
     PathBuf::from(format!(
-        "/etc/systemd/system/webcodex-agent-{}.service",
+        "/etc/systemd/system/webcodex-runner-{}.service",
         profile
     ))
 }

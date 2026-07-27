@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 "use strict";
 
-const { runNative } = require("./wrapper");
+// Deprecated alias. The binary is `webcodex-runner`; this entry point exists so
+// that an existing install, systemd unit, or script keeps working across the
+// rename instead of failing with "command not found".
+const { deprecatedAlias } = require("./wrapper");
 
-runNative("webcodex-agent");
+deprecatedAlias("webcodex-agent", "webcodex-runner");

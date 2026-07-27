@@ -1183,13 +1183,13 @@ fn parse_agent_install_service(args: &[String]) -> Result<AgentInstallServiceOpt
         profile
             .as_deref()
             .map(client_profile_service_file)
-            .unwrap_or_else(|| PathBuf::from("/etc/systemd/system/webcodex-agent.service"))
+            .unwrap_or_else(|| PathBuf::from("/etc/systemd/system/webcodex-runner.service"))
     });
-    let bin = match bin.or_else(|| discover_named_binary_absolute("webcodex-agent")) {
+    let bin = match bin.or_else(|| discover_named_binary_absolute("webcodex-runner")) {
         Some(path) => path,
         None => {
             return Err(
-                "--bin is required because webcodex-agent was not found in PATH".to_string(),
+                "--bin is required because webcodex-runner was not found in PATH".to_string(),
             )
         }
     };

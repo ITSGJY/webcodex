@@ -74,7 +74,7 @@ fn agent_install_service_generates_expected_unit_without_tokens() {
         "--config",
         config.to_str().unwrap(),
         "--bin",
-        "/opt/webcodex/bin/webcodex-agent",
+        "/opt/webcodex/bin/webcodex-runner",
         "--working-directory",
         "/root",
         "--user",
@@ -87,7 +87,7 @@ fn agent_install_service_generates_expected_unit_without_tokens() {
     let unit = run_agent_install_service(opts).unwrap();
     assert!(unit.contains("[Unit]\nDescription=WebCodex Agent\n"));
     assert!(unit.contains(&format!(
-        "ExecStart=/opt/webcodex/bin/webcodex-agent --config {}\n",
+        "ExecStart=/opt/webcodex/bin/webcodex-runner --config {}\n",
         config.display()
     )));
     assert!(unit.contains("ExecReload=/bin/kill -HUP $MAINPID\n"));
@@ -107,13 +107,13 @@ fn agent_install_service_generates_expected_unit_without_tokens() {
 #[test]
 fn agent_install_service_refuses_overwrite_unless_requested() {
     let tmp = tempfile::tempdir().unwrap();
-    let service_file = tmp.path().join("webcodex-agent.service");
+    let service_file = tmp.path().join("webcodex-runner.service");
     std::fs::write(&service_file, "old").unwrap();
     let opts = parse_agent_install_service(&args(&[
         "--config",
         "/etc/webcodex/agent.toml",
         "--bin",
-        "/opt/webcodex/bin/webcodex-agent",
+        "/opt/webcodex/bin/webcodex-runner",
         "--service-file",
         service_file.to_str().unwrap(),
     ]))
@@ -128,19 +128,19 @@ fn agent_install_service_dry_run_and_output_work_without_systemd() {
         "--config",
         "/etc/webcodex/agent.toml",
         "--bin",
-        "/opt/webcodex/bin/webcodex-agent",
+        "/opt/webcodex/bin/webcodex-runner",
         "--dry-run",
     ]))
     .unwrap();
     assert!(run_agent_install_service(dry)
         .unwrap()
-        .contains("ExecStart=/opt/webcodex/bin/webcodex-agent --config /etc/webcodex/agent.toml"));
+        .contains("ExecStart=/opt/webcodex/bin/webcodex-runner --config /etc/webcodex/agent.toml"));
 
     let out = parse_agent_install_service(&args(&[
         "--config",
         "/etc/webcodex/agent.toml",
         "--bin",
-        "/opt/webcodex/bin/webcodex-agent",
+        "/opt/webcodex/bin/webcodex-runner",
         "--output",
         "-",
         "--json",
@@ -151,7 +151,7 @@ fn agent_install_service_dry_run_and_output_work_without_systemd() {
     assert!(json["unit"]
         .as_str()
         .unwrap()
-        .contains("ExecStart=/opt/webcodex/bin/webcodex-agent --config /etc/webcodex/agent.toml"));
+        .contains("ExecStart=/opt/webcodex/bin/webcodex-runner --config /etc/webcodex/agent.toml"));
 }
 
 #[test]
@@ -250,7 +250,7 @@ transport = "websocket"
     )
     .unwrap();
     let user_token_file = tmp.path().join("webcodex-user-token");
-    let agent_token_file = tmp.path().join("webcodex-agent-token");
+    let agent_token_file = tmp.path().join("webcodex-runner-token");
     std::fs::write(&user_token_file, "pat_online_secret_1234567890\n").unwrap();
     std::fs::write(&agent_token_file, "agent_boundary_secret_1234567890\n").unwrap();
     let opts = parse_agent_status(&args(&[

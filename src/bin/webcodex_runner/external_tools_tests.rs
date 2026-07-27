@@ -38,8 +38,8 @@ fn fake_binary() -> Arc<FakeBinary> {
         "webcodex-claude-mcp-fake{}",
         env::consts::EXE_SUFFIX
     ));
-    let source =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/bin/webcodex_agent/fake_claude_mcp.rs");
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src/bin/webcodex_runner/fake_claude_mcp.rs");
     let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
     let result = Command::new(rustc)
         .arg("--edition=2021")

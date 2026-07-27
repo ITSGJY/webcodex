@@ -259,7 +259,7 @@ pub(crate) fn agent_usage() -> &'static str {
      Client-side agent commands.\n\n\
      Commands:\n\
        init                 Generate an agent.toml config\n\
-       install-service      Generate/install a webcodex-agent systemd unit\n\
+       install-service      Generate/install a webcodex-runner systemd unit\n\
        status               Check systemd status and safe agent metadata\n"
 }
 
@@ -292,8 +292,8 @@ pub(crate) fn agent_install_service_usage() -> &'static str {
      Options:\n\
        --profile NAME             Client config profile for config/service defaults\n\
        --config PATH              Agent config path [default: /etc/webcodex/agent.toml, or profile agent.toml]\n\
-       --bin PATH                 webcodex-agent binary path; defaults to webcodex-agent from PATH when safely discoverable\n\
-       --service-file PATH        systemd unit path [default: /etc/systemd/system/webcodex-agent.service, or webcodex-agent-<profile>.service]\n\
+       --bin PATH                 webcodex-runner binary path; defaults to webcodex-runner from PATH when safely discoverable\n\
+       --service-file PATH        systemd unit path [default: /etc/systemd/system/webcodex-runner.service, or webcodex-runner-<profile>.service]\n\
        --working-directory PATH   WorkingDirectory= [default: /root]\n\
        --user USER                Optional systemd User=\n\
        --group GROUP              Optional systemd Group=\n\
@@ -306,7 +306,7 @@ pub(crate) fn agent_install_service_usage() -> &'static str {
      /etc/webcodex/clients/<profile> for root or\n\
      ~/.config/webcodex/clients/<profile> for non-root users. Explicit path\n\
      flags override profile-derived defaults. The unit runs:\n\
-     webcodex-agent --config <config>. Tokens are never inlined.\n"
+     webcodex-runner --config <config>. Tokens are never inlined.\n"
 }
 
 pub(crate) fn agent_status_usage() -> &'static str {

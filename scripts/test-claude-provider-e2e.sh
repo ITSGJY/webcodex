@@ -202,7 +202,7 @@ start_agent() {
     XDG_CACHE_HOME="$ISOLATED_HOME/.cache" \
     CLAUDE_CONFIG_DIR="$ISOLATED_HOME/.claude-e2e" \
     RUST_LOG=warn \
-        "$ROOT/target/debug/webcodex-agent" --config "$AGENT_CONFIG" \
+        "$ROOT/target/debug/webcodex-runner" --config "$AGENT_CONFIG" \
         >"$AGENT_LOG" 2>&1 &
     AGENT_PID=$!
     wait_for_agent || fail "agent did not register"
@@ -238,7 +238,7 @@ require_command "$CLAUDE_BIN"
 
 cd "$ROOT"
 if [ "${WEBCODEX_E2E_SKIP_BUILD:-0}" != "1" ]; then
-    "$CARGO_BIN" build --quiet --bin webcodex --bin webcodex-agent
+    "$CARGO_BIN" build --quiet --bin webcodex --bin webcodex-runner
 fi
 
 TMP_ROOT="$(mktemp -d -t webcodex-claude-provider-e2e-XXXXXX)"

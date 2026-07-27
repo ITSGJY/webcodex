@@ -95,7 +95,7 @@ For the planned v0.2.0 binary release:
 
 - Rust package metadata should be `0.2.0`.
 - Artifact names and platform coverage should match the release notes.
-- Release artifact smoke should use `webcodex --version`, `webcodex-cli --version`, and `webcodex-agent --version`.
+- Release artifact smoke should use `webcodex --version`, `webcodex-cli --version`, and `webcodex-runner --version`.
 - Confirm whether any npm wrapper installs 0.2.0 before documenting npm as a 0.2.0 install path.
 
 ## 9. Post-Deployment Acceptance Smoke

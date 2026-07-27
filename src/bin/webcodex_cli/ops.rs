@@ -553,7 +553,7 @@ pub(crate) fn ops_status_report(server_url: &str, runtime: &Option<Value>) -> Op
     if online == 0 {
         verdict.fail_reason(
             "no_online_agents",
-            "start a webcodex-agent and rerun ops status",
+            "start a webcodex-runner and rerun ops status",
         );
     } else {
         if stale > 0 {
@@ -630,7 +630,7 @@ pub(crate) fn ops_agents_report(server_url: &str, runtime: &Option<Value>) -> Op
     if online == 0 {
         verdict.fail_reason(
             "no_online_agents",
-            "start a webcodex-agent and rerun ops agents",
+            "start a webcodex-runner and rerun ops agents",
         );
     }
     if stale > 0 {

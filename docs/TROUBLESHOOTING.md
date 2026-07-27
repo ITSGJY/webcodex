@@ -15,7 +15,7 @@ Server:
 
 Client:
 
-- `webcodex-agent --version` prints a version.
+- `webcodex-runner --version` prints a version.
 - `webcodex-cli agent status --profile workstation` can read the local agent config.
 - `webcodex doctor` passes for a canonical project, or advanced
   `webcodex-cli ops status --strict --server-url https://your-domain.example`
@@ -68,15 +68,15 @@ Copy only the `wc_pair_*` code between machines. Do not copy `WEBCODEX_TOKEN`, u
 
 ### Doctor warns `binary webcodex not found in PATH` on a client
 
-That can be acceptable on agent-only client machines. Agent-only clients need `webcodex-agent` and `webcodex-cli`; the server binary `webcodex` is only required on server hosts.
+That can be acceptable on agent-only client machines. Agent-only clients need `webcodex-runner` and `webcodex-cli`; the server binary `webcodex` is only required on server hosts.
 
 ### `client online: no`
 
 Check the agent service and its connection details:
 
 ```bash
-systemctl status webcodex-agent
-journalctl -u webcodex-agent
+systemctl status webcodex-runner
+journalctl -u webcodex-runner
 ```
 
 Also verify the server URL, local token files, and agent `allowed_roots`. Missing or empty `allowed_roots` defaults to `$HOME`; explicit `allowed_roots` replaces that default.
@@ -107,8 +107,8 @@ new service and check `journalctl -u webcodex` for startup or auth errors.
 Run `runtime_status` or `listAgents`, then check the agent host:
 
 ```bash
-systemctl status webcodex-agent
-journalctl -u webcodex-agent
+systemctl status webcodex-runner
+journalctl -u webcodex-runner
 ```
 
 Confirm the agent server URL, token file, service user, and `allowed_roots`.
@@ -116,7 +116,7 @@ Confirm the agent server URL, token file, service user, and `allowed_roots`.
 ### Wrong token type
 
 GPT Actions and MCP should use a managed `wc_pat_*` token or a
-deployment-allowed shared key. `wc_agent_*` is only for `webcodex-agent`.
+deployment-allowed shared key. `wc_agent_*` is only for `webcodex-runner`.
 `WEBCODEX_TOKEN` is bootstrap/admin-oriented and should not be copied into GPT
 Actions, MCP, or agent config.
 

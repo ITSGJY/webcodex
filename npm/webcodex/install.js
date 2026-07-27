@@ -99,7 +99,7 @@ function fetchToFile(url, dest, redirects = 0) {
 
 function copyLocalBinaryDir(srcDir) {
   fs.mkdirSync(VENDOR_BIN, { recursive: true });
-  for (const name of ["webcodex", "webcodex-agent", "webcodex-cli"]) {
+  for (const name of ["webcodex", "webcodex-runner", "webcodex-cli"]) {
     const exe = process.platform === "win32" ? `${name}.exe` : name;
     const src = path.join(srcDir, exe);
     const dest = path.join(VENDOR_BIN, exe);
@@ -132,7 +132,7 @@ function extractTarGz(archive, destDir) {
     offset += Math.ceil(size / 512) * 512;
     if (!name || type === 53) continue;
     const base = path.basename(name);
-    if (!["webcodex", "webcodex-agent", "webcodex-cli", "webcodex.exe", "webcodex-agent.exe", "webcodex-cli.exe"].includes(base)) {
+    if (!["webcodex", "webcodex-runner", "webcodex-cli", "webcodex.exe", "webcodex-runner.exe", "webcodex-cli.exe"].includes(base)) {
       continue;
     }
     const out = path.join(destDir, base);

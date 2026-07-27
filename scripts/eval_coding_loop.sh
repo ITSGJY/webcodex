@@ -1085,7 +1085,7 @@ EOF
     log "server listening on $PORT"
 
     log "starting agent (transport=${TRANSPORT})"
-    "$CARGO_BIN" run --quiet --bin webcodex-agent -- --config "$AGENT_TOML" >"$AGENT_LOG" 2>&1 &
+    "$CARGO_BIN" run --quiet --bin webcodex-runner -- --config "$AGENT_TOML" >"$AGENT_LOG" 2>&1 &
     AGENT_PID=$!
 
     log "waiting for agent registration"

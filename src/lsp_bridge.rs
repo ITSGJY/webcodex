@@ -1,6 +1,6 @@
 //! Typed agent LSP navigation bridge contract.
 //!
-//! Shared by the server runtime and `webcodex-agent`. This module intentionally
+//! Shared by the server runtime and `webcodex-runner`. This module intentionally
 //! exposes only fixed read-only operations — never arbitrary LSP methods,
 //! JSON-RPC passthrough, or absolute project roots.
 
@@ -350,7 +350,7 @@ pub struct AgentLspResultEnvelope {
 }
 
 impl AgentLspResultEnvelope {
-    #[allow(dead_code)] // Constructed by the webcodex-agent production target.
+    #[allow(dead_code)] // Constructed by the webcodex-runner production target.
     pub fn ok(result: impl Serialize) -> Self {
         Self {
             format: AGENT_LSP_RESULT_FORMAT.to_string(),
@@ -360,7 +360,7 @@ impl AgentLspResultEnvelope {
         }
     }
 
-    #[allow(dead_code)] // Constructed by the webcodex-agent production target.
+    #[allow(dead_code)] // Constructed by the webcodex-runner production target.
     pub fn err(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             format: AGENT_LSP_RESULT_FORMAT.to_string(),
@@ -373,7 +373,7 @@ impl AgentLspResultEnvelope {
         }
     }
 
-    #[allow(dead_code)] // Serialized by the webcodex-agent production target.
+    #[allow(dead_code)] // Serialized by the webcodex-runner production target.
     pub fn to_stdout_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|_| {
             r#"{"format":"webcodex.agent_lsp_result.v1","success":false,"error":{"code":"lsp_protocol_error","message":"failed to serialize result"}}"#.to_string()

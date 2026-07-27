@@ -361,7 +361,7 @@ pub(crate) fn render_login_result(
     }
     Ok(format!(
         "Logged in to {server_url} as {username} ({device}).\n\n  \
-         config: {}\n\nStart the agent:\n  webcodex-agent --config {}\n",
+         config: {}\n\nStart the agent:\n  webcodex-runner --config {}\n",
         paths.dir.display(),
         paths.agent_config.display(),
     ))
@@ -760,7 +760,7 @@ mod tests {
         assert!(paths.user_token.is_file());
         assert!(paths.projects_dir.is_dir());
         // The agent token has exactly one home.
-        assert!(!paths.dir.join("webcodex-agent-token").exists());
+        assert!(!paths.dir.join("webcodex-runner-token").exists());
         assert!(std::fs::read_to_string(&paths.agent_config)
             .unwrap()
             .contains(AGENT_TOKEN));

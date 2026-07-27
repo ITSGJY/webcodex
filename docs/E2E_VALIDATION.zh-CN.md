@@ -39,7 +39,7 @@ bash scripts/smoke_artifact_transfer.sh
 
 Smoke project 应是 disposable、agent-backed 的 git repository，例如
 `agent:special:webcodex-smoke`。不要把 `wc_agent_*` 用于 GPT Actions、MCP
-或这个 smoke script；该 token type 只给 `webcodex-agent` 使用。
+或这个 smoke script；该 token type 只给 `webcodex-runner` 使用。
 
 ## Authentication
 
@@ -65,12 +65,12 @@ webcodex-cli server install-service
 webcodex-cli server status
 webcodex-cli pairing create --server-url URL --username alice --client-id alice-laptop
 webcodex-cli client enroll --server-url URL --pairing-code CODE --client-id alice-laptop
-webcodex-cli agent install-service --profile workstation --bin /opt/webcodex/bin/webcodex-agent
+webcodex-cli agent install-service --profile workstation --bin /opt/webcodex/bin/webcodex-runner
 webcodex-cli agent status --profile workstation --server-url URL
 webcodex-cli ops status --strict --server-url URL --token-file PATH
 ```
 
-`pairing create` 是 server/admin-side。`client enroll`、`agent install-service` 和 `agent status` 是运行 `webcodex-agent` 的 client-side 操作。不要把 server tokens 复制到 client；只复制短期 pairing code。
+`pairing create` 是 server/admin-side。`client enroll`、`agent install-service` 和 `agent status` 是运行 `webcodex-runner` 的 client-side 操作。不要把 server tokens 复制到 client；只复制短期 pairing code。
 ## 二进制 help 校验
 
 发布前或大规模修改文档后，应对照实际二进制 help 检查命令示例：
@@ -86,7 +86,7 @@ webcodex-cli agent install-service -h
 webcodex-cli agent status -h
 webcodex doctor -h
 webcodex-cli ops status -h
-webcodex-agent -h
+webcodex-runner -h
 webcodex -h
 ```
 

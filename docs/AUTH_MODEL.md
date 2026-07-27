@@ -13,7 +13,7 @@ WebCodex separates bootstrap administration, account onboarding, runtime API acc
 | shared key | agent + GPT/MCP quick start | shared-key group onboarding | production IAM/admin |
 | `wc_acct_xxx` | user CLI | create local PAT/agent token | GPT/MCP/agent |
 | `wc_pat_xxx` | GPT Action/MCP/API | runtime tools | agent connection |
-| `wc_agent_xxx` | `webcodex-agent` | connect agent to server | GPT/MCP/runtime API |
+| `wc_agent_xxx` | `webcodex-runner` | connect agent to server | GPT/MCP/runtime API |
 
 ## `WEBCODEX_TOKEN`
 
@@ -112,7 +112,7 @@ Scope the PAT to the workflow. For example, a GPT Action that inspects and edits
 
 `wc_agent_xxx` is an agent token generated locally by the user. The server stores only its hash and binds the token to `allowed_client_id`.
 
-Use `wc_agent_xxx` only for `webcodex-agent` connectivity. It cannot call runtime, project, tool, MCP, or account endpoints.
+Use `wc_agent_xxx` only for `webcodex-runner` connectivity. It cannot call runtime, project, tool, MCP, or account endpoints.
 
 ## `client_id`
 

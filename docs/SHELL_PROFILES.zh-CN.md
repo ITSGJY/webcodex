@@ -6,7 +6,7 @@ WebCodex **不会**保持一个持久 shell session。它会为每个 project/pr
 
 本文档说明 shell profiles 的工作方式、配置方法和安全边界。
 
-> 适用于 `webcodex-agent`，即真正执行 shell commands 的 host agent。server 不会读取或保存 shell env values、`init_script` bodies 或 tokens。
+> 适用于 `webcodex-runner`，即真正执行 shell commands 的 host agent。server 不会读取或保存 shell env values、`init_script` bodies 或 tokens。
 
 ## 1. 什么是 prepared shell env snapshot
 
@@ -95,7 +95,7 @@ shell_profile = "conda-ml"
 
 ## 8. 修改配置需要重启 agent
 
-当前没有 reload API。修改 `agent.toml` 或 project TOML 后，需要重启 `webcodex-agent`。重启会丢弃已有 snapshots，并在下一次命令时 lazy re-prepare。
+当前没有 reload API。修改 `agent.toml` 或 project TOML 后，需要重启 `webcodex-runner`。重启会丢弃已有 snapshots，并在下一次命令时 lazy re-prepare。
 
 ## 9. 安全提示
 

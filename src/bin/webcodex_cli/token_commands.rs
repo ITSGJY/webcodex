@@ -122,7 +122,7 @@ pub(crate) async fn run_agent_token_create_local(
     let req = build_admin_request(&cmd)?;
     post_json_with_bearer(&req).await?;
     Ok(format!(
-        "Agent token created locally and registered with server.\n\nClient ID:\n{}\n\nToken:\n{}\n\nUse this token in webcodex-agent config or WEBCODEX_AGENT_TOKEN.\nThis token will not be shown again.\n",
+        "Agent token created locally and registered with server.\n\nClient ID:\n{}\n\nToken:\n{}\n\nUse this token in webcodex-runner config or WEBCODEX_AGENT_TOKEN.\nThis token will not be shown again.\n",
         opts.client_id, token
     ))
 }

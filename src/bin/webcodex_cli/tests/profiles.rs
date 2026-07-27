@@ -302,7 +302,7 @@ fn agent_install_service_profile_derives_config_and_service_file() {
         "--profile",
         "special",
         "--bin",
-        "/opt/webcodex/bin/webcodex-agent",
+        "/opt/webcodex/bin/webcodex-runner",
         "--dry-run",
     ]))
     .unwrap();
@@ -310,7 +310,7 @@ fn agent_install_service_profile_derives_config_and_service_file() {
     assert_eq!(opts.service_file, client_profile_service_file("special"));
     let unit = render_agent_systemd_unit(&opts);
     assert!(unit.contains(
-        "ExecStart=/opt/webcodex/bin/webcodex-agent --config /etc/webcodex/clients/special/agent.toml"
+        "ExecStart=/opt/webcodex/bin/webcodex-runner --config /etc/webcodex/clients/special/agent.toml"
     ));
 }
 
@@ -322,22 +322,22 @@ fn agent_install_service_explicit_paths_win_and_rejects_unsafe_profile() {
         "--config",
         "/tmp/agent.toml",
         "--service-file",
-        "/tmp/webcodex-agent.service",
+        "/tmp/webcodex-runner.service",
         "--bin",
-        "/opt/webcodex/bin/webcodex-agent",
+        "/opt/webcodex/bin/webcodex-runner",
     ]))
     .unwrap();
     assert_eq!(opts.config, PathBuf::from("/tmp/agent.toml"));
     assert_eq!(
         opts.service_file,
-        PathBuf::from("/tmp/webcodex-agent.service")
+        PathBuf::from("/tmp/webcodex-runner.service")
     );
 
     let err = parse_agent_install_service(&args(&[
         "--profile",
         "../x",
         "--bin",
-        "/opt/webcodex/bin/webcodex-agent",
+        "/opt/webcodex/bin/webcodex-runner",
     ]))
     .unwrap_err();
     assert_eq!(err, CLIENT_PROFILE_ERROR);

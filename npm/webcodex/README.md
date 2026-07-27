@@ -3,8 +3,14 @@
 Thin npm installer/wrapper for WebCodex native binaries. It installs command wrappers for:
 
 - `webcodex`
-- `webcodex-agent`
+- `webcodex-runner`
 - `webcodex-cli`
+
+`webcodex-agent` was renamed to `webcodex-runner`: it runs shell commands the
+server sends, it is not an agent loop. The old command still works and forwards
+to the new binary, printing one deprecation line on stderr — stdout is
+untouched, so a script that parses its JSON keeps working. The alias will be
+removed in the next major version.
 
 ## Install
 

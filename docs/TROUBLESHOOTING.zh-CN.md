@@ -15,7 +15,7 @@ Server：
 
 Client：
 
-- `webcodex-agent --version` 能打印版本。
+- `webcodex-runner --version` 能打印版本。
 - `webcodex-cli agent status --profile workstation` 能读取本地 agent config。
 - canonical project 的 `webcodex doctor` 通过；managed deployment 则使用
   `webcodex-cli ops status --strict --server-url https://your-domain.example`。
@@ -67,15 +67,15 @@ sudo ln -s /opt/webcodex/bin/webcodex-cli /usr/local/bin/webcodex-cli
 
 ### Client 上 doctor 警告 `binary webcodex not found in PATH`
 
-这在 agent-only client machines 上可能是正常的。Agent-only client 需要 `webcodex-agent` 和 `webcodex-cli`；server binary `webcodex` 只在 server host 上需要。
+这在 agent-only client machines 上可能是正常的。Agent-only client 需要 `webcodex-runner` 和 `webcodex-cli`；server binary `webcodex` 只在 server host 上需要。
 
 ### `client online: no`
 
 检查 agent service 和连接详情：
 
 ```bash
-systemctl status webcodex-agent
-journalctl -u webcodex-agent
+systemctl status webcodex-runner
+journalctl -u webcodex-runner
 ```
 
 同时确认 server URL、本地 token files 和 agent `allowed_roots`。缺失或为空的 `allowed_roots` 默认使用 `$HOME`；显式 `allowed_roots` 会覆盖该默认值。
@@ -106,8 +106,8 @@ schema；artifact upload tools 应继续作为 runtime-only tools 通过
 先运行 `runtime_status` 或 `listAgents`，再在 agent host 上检查：
 
 ```bash
-systemctl status webcodex-agent
-journalctl -u webcodex-agent
+systemctl status webcodex-runner
+journalctl -u webcodex-runner
 ```
 
 确认 agent server URL、token file、service user 和 `allowed_roots`。
@@ -115,7 +115,7 @@ journalctl -u webcodex-agent
 ### Token type 错误
 
 GPT Actions 和 MCP 应使用 managed `wc_pat_*` token，或部署允许的 shared key。
-`wc_agent_*` 只给 `webcodex-agent` 使用。`WEBCODEX_TOKEN` 面向 bootstrap/admin，
+`wc_agent_*` 只给 `webcodex-runner` 使用。`WEBCODEX_TOKEN` 面向 bootstrap/admin，
 不应复制到 GPT Actions、MCP 或 agent config。
 
 ### 非 git smoke workspace 不能运行 `git_status`

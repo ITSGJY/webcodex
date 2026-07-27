@@ -9,7 +9,7 @@ workflow session, executor reference, or internal config path.
 ## Prerequisites
 
 - All three WebCodex binaries installed (`webcodex`, `webcodex-cli`,
-  `webcodex-agent`).
+  `webcodex-runner`).
 - Git available on `PATH`.
 - A Git project you can safely inspect and edit.
 

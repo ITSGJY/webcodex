@@ -10,7 +10,7 @@ CARGO_BIN="${CARGO_BIN:-cargo}"
 CLIENT_ID="agent-reload-e2e"
 PROJECT_ID="fixture"
 RUNTIME_PROJECT="agent:${CLIENT_ID}:${PROJECT_ID}"
-TOKEN="webcodex-agent-reload-e2e-only"
+TOKEN="webcodex-runner-reload-e2e-only"
 STARTUP_DISPLAY="Agent Reload E2E"
 TMP_ROOT=""
 SERVER_PID=""
@@ -210,11 +210,11 @@ for command in awk curl git mv python3 setsid tail "$CARGO_BIN"; do require_comm
 cd "$ROOT"
 REPO_STATUS_BEFORE="$(git status --short)"
 if [ "${WEBCODEX_E2E_SKIP_BUILD:-0}" != "1" ]; then
-    "$CARGO_BIN" build --quiet --bin webcodex --bin webcodex-agent
+    "$CARGO_BIN" build --quiet --bin webcodex --bin webcodex-runner
 fi
-[ -x target/debug/webcodex ] && [ -x target/debug/webcodex-agent ] \
+[ -x target/debug/webcodex ] && [ -x target/debug/webcodex-runner ] \
     || fail "debug server/agent binaries are unavailable"
-TMP_ROOT="$(mktemp -d -t webcodex-agent-reload-e2e-XXXXXX)"
+TMP_ROOT="$(mktemp -d -t webcodex-runner-reload-e2e-XXXXXX)"
 DATA_DIR="$TMP_ROOT/data"
 PROJECTS_DIR="$TMP_ROOT/projects.d"
 FIXTURE="$TMP_ROOT/fixture"
@@ -259,7 +259,7 @@ setsid env -i PATH="$PATH" LANG=C HOME="$ISOLATED_HOME" \
     XDG_CONFIG_HOME="$ISOLATED_HOME/.config" XDG_DATA_HOME="$ISOLATED_HOME/.local/share" \
     XDG_STATE_HOME="$ISOLATED_HOME/.local/state" XDG_CACHE_HOME="$ISOLATED_HOME/.cache" \
     TMPDIR="$RUNTIME_TMP" WEBCODEX_ENV_FILE="$TMP_ROOT/empty.env" RUST_LOG=warn \
-    target/debug/webcodex-agent --config "$AGENT_CONFIG" >"$AGENT_LOG" 2>&1 &
+    target/debug/webcodex-runner --config "$AGENT_CONFIG" >"$AGENT_LOG" 2>&1 &
 AGENT_PID=$!
 START_AGENT_PID="$AGENT_PID"
 STAGE="generation 1 baseline"

@@ -1,5 +1,5 @@
 //! Deterministic, bounded project-structure inspection shared by the runtime
-//! local-executor parity path and `webcodex-agent`.
+//! local-executor parity path and `webcodex-runner`.
 //!
 //! This module reads directory entries and file types only. It never reads file
 //! contents, follows symlinks, invokes a shell, or consults environment values.

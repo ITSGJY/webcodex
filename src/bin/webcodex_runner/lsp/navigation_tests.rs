@@ -7,7 +7,7 @@ use crate::lsp_bridge::{
     parse_agent_lsp_result_envelope, AgentLspPayload, AgentLspRequest, AGENT_LSP_REQUEST_KIND,
 };
 use crate::shell_protocol::{ShellAgentShellRequest, ShellClientCapabilities};
-use crate::webcodex_agent::config::AgentPolicy;
+use crate::webcodex_runner::config::AgentPolicy;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
@@ -26,8 +26,8 @@ fn fake_server_binary() -> &'static FakeServerBinary {
     BINARY.get_or_init(|| {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fake-lsp-server");
-        let src =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/webcodex_agent/lsp/fake_server.rs");
+        let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/bin/webcodex_runner/lsp/fake_server.rs");
         // The spawned rustc competes with every other test process when the
         // whole suite runs in parallel and can fail transiently; retry once
         // and keep any real failure diagnosable by capturing stderr.
@@ -1240,7 +1240,7 @@ fn real_language_server(env_var: &str, executable: &str) -> Option<PathBuf> {
 /// needs `pyright-langserver` (`npm i -g pyright`) and Node on the host.
 ///
 /// Run with:
-/// `cargo test --bin webcodex-agent real_pyright -- --ignored --nocapture`
+/// `cargo test --bin webcodex-runner real_pyright -- --ignored --nocapture`
 #[test]
 #[ignore = "requires a real pyright-langserver (npm i -g pyright)"]
 fn real_pyright_document_symbols_end_to_end() {
@@ -1356,7 +1356,7 @@ fn real_pyright_document_symbols_end_to_end() {
 /// through the same supervisor path against a real
 /// `typescript-language-server`. Ignored by default (needs the server and
 /// Node). Run with:
-/// `cargo test --bin webcodex-agent real_typescript -- --ignored --nocapture`
+/// `cargo test --bin webcodex-runner real_typescript -- --ignored --nocapture`
 #[test]
 // Needs typescript@5 (classic tsserver.js); typescript@7 native preview lacks it.
 #[ignore = "requires typescript-language-server + typescript@5 (npm i -g typescript-language-server typescript@5)"]

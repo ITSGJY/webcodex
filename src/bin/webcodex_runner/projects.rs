@@ -221,7 +221,7 @@ fn warn_empty_hook_commands(source: &Path, project: &AgentProjectFile) {
         for (idx, command) in commands.iter().enumerate() {
             if command.trim().is_empty() {
                 eprintln!(
-                    "webcodex-agent project warning: {} hook {} command {} is empty",
+                    "webcodex-runner project warning: {} hook {} command {} is empty",
                     source.display(),
                     hook,
                     idx
@@ -237,7 +237,7 @@ pub(crate) fn load_agent_project_summaries_from_dir(dir: &Path) -> Vec<ShellAgen
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
         Err(e) => {
             eprintln!(
-                "webcodex-agent project warning: failed to read {}: {}",
+                "webcodex-runner project warning: failed to read {}: {}",
                 dir.display(),
                 e
             );
@@ -261,7 +261,7 @@ pub(crate) fn load_agent_project_summaries_from_dir(dir: &Path) -> Vec<ShellAgen
             Ok(content) => content,
             Err(e) => {
                 eprintln!(
-                    "webcodex-agent project warning: failed to read {}: {}",
+                    "webcodex-runner project warning: failed to read {}: {}",
                     file.display(),
                     e
                 );
@@ -272,7 +272,7 @@ pub(crate) fn load_agent_project_summaries_from_dir(dir: &Path) -> Vec<ShellAgen
             Ok(project) => project,
             Err(e) => {
                 eprintln!(
-                    "webcodex-agent project warning: skipping {}: {}",
+                    "webcodex-runner project warning: skipping {}: {}",
                     file.display(),
                     e
                 );
@@ -284,7 +284,7 @@ pub(crate) fn load_agent_project_summaries_from_dir(dir: &Path) -> Vec<ShellAgen
         }
         if !seen.insert(project.id.clone()) {
             eprintln!(
-                "webcodex-agent project warning: duplicate project id {} in {}; skipping",
+                "webcodex-runner project warning: duplicate project id {} in {}; skipping",
                 project.id,
                 file.display()
             );

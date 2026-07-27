@@ -669,7 +669,7 @@ impl ProjectMcpClient {
             json!({
                 "protocolVersion": MCP_PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": {"name": "webcodex-agent", "version": env!("CARGO_PKG_VERSION")},
+                "clientInfo": {"name": "webcodex-runner", "version": env!("CARGO_PKG_VERSION")},
             }),
             timeout(),
             WriteState::NotSubmitted,

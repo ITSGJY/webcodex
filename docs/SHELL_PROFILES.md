@@ -7,7 +7,7 @@ environment snapshot **once per project/profile** and then runs each command as
 an independent process with that snapshot. This page describes how shell
 profiles work, how to configure them, and the safety boundaries.
 
-> Applies to `webcodex-agent` (the host agent that executes shell commands).
+> Applies to `webcodex-runner` (the host agent that executes shell commands).
 > The server never reads or stores shell env values, init_script bodies, or
 > tokens.
 
@@ -129,7 +129,7 @@ requires restarting the agent so the in-memory snapshot cache is rebuilt:
 > Changing shell profile config requires restarting the agent so the
 > in-memory snapshot cache is rebuilt.
 
-After editing `agent.toml` or a project TOML, restart the `webcodex-agent`
+After editing `agent.toml` or a project TOML, restart the `webcodex-runner`
 service. Existing snapshots are dropped on restart and re-prepared lazily on
 the next command.
 

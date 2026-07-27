@@ -120,7 +120,7 @@ Each client or user profile gets its own directory under `/etc/webcodex/clients/
 /etc/webcodex/clients/<profile>/agent.toml
 /etc/webcodex/clients/<profile>/projects.d/
 /etc/webcodex/clients/<profile>/webcodex-user-token
-/etc/webcodex/clients/<profile>/webcodex-agent-token
+/etc/webcodex/clients/<profile>/webcodex-runner-token
 ```
 
 Enroll a client with a profile:
@@ -140,11 +140,11 @@ Install a profile-specific agent service:
 ```bash
 "$CLI" agent install-service \
   --profile workstation \
-  --bin /opt/webcodex/bin/webcodex-agent \
+  --bin /opt/webcodex/bin/webcodex-runner \
   --overwrite
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now webcodex-agent-workstation
+sudo systemctl enable --now webcodex-runner-workstation
 ```
 
 ### Legacy flat paths (not recommended)
@@ -155,7 +155,7 @@ Older setups may use flat paths directly under `/etc/webcodex/`:
 /etc/webcodex/agent.toml
 /etc/webcodex/projects.d/
 /etc/webcodex/webcodex-user-token
-/etc/webcodex/webcodex-agent-token
+/etc/webcodex/webcodex-runner-token
 ```
 
 This layout does not support multiple clients on the same machine. Migrate to profile-based config when possible.
@@ -274,7 +274,7 @@ If `allowed_roots` is `/root/git`, then paths outside that root (e.g., `/tmp/...
 - Belongs to an agent instance.
 - Generated locally by `webcodex-cli agent-token create-local`; the server stores only the hash.
 - Bound to a specific `client_id`.
-- Used for: `webcodex-agent` WebSocket/QUIC connections only.
+- Used for: `webcodex-runner` WebSocket/QUIC connections only.
 - Do not use for: GPT Actions, MCP, REST API calls.
 
 ### wc_acct_* (Account Credential)
@@ -904,7 +904,7 @@ sudo cp -a /opt/webcodex/bin/. "$backup_dir/"
 
 ```bash
 sudo install -m 0755 target/release/webcodex /opt/webcodex/bin/webcodex
-sudo install -m 0755 target/release/webcodex-agent /opt/webcodex/bin/webcodex-agent
+sudo install -m 0755 target/release/webcodex-runner /opt/webcodex/bin/webcodex-runner
 sudo install -m 0755 target/release/webcodex-cli /opt/webcodex/bin/webcodex-cli
 ```
 
@@ -912,7 +912,7 @@ sudo install -m 0755 target/release/webcodex-cli /opt/webcodex/bin/webcodex-cli
 
 ```bash
 sudo systemctl restart webcodex
-sudo systemctl restart webcodex-agent
+sudo systemctl restart webcodex-runner
 ```
 
 5. Verify the public schema and operation budget:
@@ -959,14 +959,14 @@ client and run `initialize`, `tools/list`, and a read-only `tools/call` such as
 `runtime_status` or `list_projects`.
 
 GPT Actions and MCP should use a managed `wc_pat_*` token or a
-deployment-allowed shared key. `wc_agent_*` is only for `webcodex-agent`; do not
+deployment-allowed shared key. `wc_agent_*` is only for `webcodex-runner`; do not
 copy it into GPT Actions or MCP configuration.
 
 7. Check service logs:
 
 ```bash
 journalctl -u webcodex --since "15 minutes ago"
-journalctl -u webcodex-agent --since "15 minutes ago"
+journalctl -u webcodex-runner --since "15 minutes ago"
 ```
 
 8. Roll back from the backup if smoke or logs show a deployment regression:
@@ -974,7 +974,7 @@ journalctl -u webcodex-agent --since "15 minutes ago"
 ```bash
 sudo cp -a "$backup_dir"/. /opt/webcodex/bin/
 sudo systemctl restart webcodex
-sudo systemctl restart webcodex-agent
+sudo systemctl restart webcodex-runner
 ```
 
 Do not use production mutation as smoke coverage. Any write-path smoke must stay

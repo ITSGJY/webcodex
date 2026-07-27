@@ -23,7 +23,7 @@
 //! # Credential source of truth
 //!
 //! The agent token is stored **only** inline in `agent.toml`. `login` used to
-//! also drop a `webcodex-agent-token` file, which left two copies that could
+//! also drop a `webcodex-runner-token` file, which left two copies that could
 //! drift with nothing saying which one won. The user token keeps its own file
 //! because a different consumer reads it (GPT Actions / MCP clients), not the
 //! agent.
