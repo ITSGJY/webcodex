@@ -72,6 +72,17 @@ export PATH="$PWD/target/release:$PATH"
 
 See [docs/BUILD_INSTALL.md](docs/BUILD_INSTALL.md) for installation details.
 
+## Choose a Setup Path
+
+| Goal | Recommended path |
+| --- | --- |
+| Try WebCodex with one local project | Use the three project commands below. This path needs no systemd service, database setup, or public port. Add a trusted HTTPS tunnel only when connecting a hosted chat. |
+| Keep WebCodex online or connect another machine | Use the long-running self-hosting path. It adds a Linux service, public HTTPS, and pairing/enrollment; OAuth is optional, not a first-deployment prerequisite. |
+
+The packaged 0.3.0 path currently assumes Linux x64. A production installation
+also assumes systemd, `sudo`, and an HTTPS domain or trusted tunnel; v0.3.0 does
+not include a Docker Compose deployment or managed cloud service.
+
 ## One Project, One Entry
 
 Run the following from the Git project you want to expose:
@@ -123,6 +134,25 @@ Actions → Import from URL), with copy buttons. Authentication stays the
 Project Credential from setup — the console never displays it. Set
 `WEBCODEX_PUBLIC_URL` when the advertised schema should pin a fixed public
 address.
+
+## Long-Running Self-Hosting
+
+For a persistent installation, use this order:
+
+1. Install the three binaries on the Linux server and on every machine that
+   owns repositories.
+2. Initialize the server environment and install the `webcodex` systemd unit.
+3. Put Nginx, Caddy, or another trusted reverse proxy in front of the loopback
+   server, enable HTTPS, and set `WEBCODEX_PUBLIC_URL`.
+4. Create a short-lived pairing code on the server; enroll each repository
+   machine with that code instead of copying long-lived credentials.
+5. Install the `webcodex-runner` service on each repository machine and finish
+   with `webcodex-cli ops status --strict`.
+
+The exact commands and rollback-safe credential rules are in
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). OAuth2 is an optional later step for
+delegated client login; PAT authentication is sufficient for the first
+single-operator deployment.
 
 ## Canonical Coding Path
 

@@ -64,6 +64,16 @@ export PATH="$PWD/target/release:$PATH"
 
 安装细节见 [docs/BUILD_INSTALL.zh-CN.md](docs/BUILD_INSTALL.zh-CN.md)。
 
+## 先选部署方式
+
+| 目标 | 推荐路径 |
+| --- | --- |
+| 先在本机体验一个项目 | 使用下面三条项目命令。不需要 systemd service、数据库初始化或公网端口；只有接入托管聊天窗口时，才增加一个可信 HTTPS 隧道。 |
+| 长期在线，或连接另一台代码机器 | 使用长期自托管路径。它会增加 Linux service、公开 HTTPS 和 pairing/enrollment；OAuth 是可选增强，不是首次部署前置条件。 |
+
+0.3.0 的 package 路径目前只支持 Linux x64。生产安装还要求 systemd、`sudo`
+以及 HTTPS 域名或可信隧道；v0.3.0 暂不提供 Docker Compose 部署或托管云服务。
+
 ## 一个项目，一个入口
 
 在希望开放的 Git 项目中运行：
@@ -111,6 +121,23 @@ cloudflared tunnel --url http://127.0.0.1:8080
 要导入的 schema URL，均带复制按钮。认证始终使用 setup 生成的 Project
 Credential——console 永远不会显示它。需要在 schema 里固定公网地址时设置
 `WEBCODEX_PUBLIC_URL`。
+
+## 长期自托管
+
+长期运行时按下面顺序操作：
+
+1. 在 Linux server 和每台持有代码仓库的机器上安装三个 binaries。
+2. 初始化 server env，并安装 `webcodex` systemd unit。
+3. 用 Nginx、Caddy 或其他可信 reverse proxy 代理 loopback server，启用 HTTPS，
+   并设置 `WEBCODEX_PUBLIC_URL`。
+4. 在 server 上创建短期 pairing code；每台代码机器用该 code enroll，不复制长期
+   credential。
+5. 在每台代码机器上安装 `webcodex-runner` service，最后执行
+   `webcodex-cli ops status --strict`。
+
+完整命令和可回滚的 credential 规则见
+[docs/DEPLOYMENT.zh-CN.md](docs/DEPLOYMENT.zh-CN.md)。OAuth2 是之后可选的委托登录
+能力；首次单 operator 部署使用 PAT 认证即可。
 
 ## Canonical coding path
 

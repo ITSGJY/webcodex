@@ -125,7 +125,7 @@ See [../SECURITY.md](../SECURITY.md), [CONCEPTS.md](CONCEPTS.md), and [READ_ONLY
 
 ## Validation
 
-The release candidate passed the full Rust binary suite (1,750 main tests with 4 ignored, 220 CLI tests, and 402 runner tests with 2 ignored), focused process-group cleanup coverage, source/release checks, frontend typecheck/tests/dist verification, and npm self-tests. WebSocket and polling zero-config E2E each passed 108/108 checks; the coding-loop comparison passed 6/6 cases; 83 Markdown files contained 436 valid local links with no missing targets; and the release-mode npm package smoke installed all three 0.3.0 binaries successfully.
+The release candidate passed the full Rust binary suite (1,750 main tests with 4 ignored, 220 CLI tests, and 402 runner tests with 2 ignored), focused process-group cleanup coverage, source/release checks, frontend typecheck/tests/dist verification, and npm self-tests. WebSocket and polling zero-config E2E each passed 108/108 checks; the coding-loop comparison passed 6/6 cases; 79 tracked Markdown files contained 438 valid local links with no missing targets; and the release-mode npm package smoke installed all three 0.3.0 binaries successfully.
 
 The release-preparation commit intentionally carries a checksum placeholder. The published npm package is not ready until the exact uploaded 0.3.0 Linux x64 artifact checksum is committed after the immutable release tag without moving that tag. Post-deployment acceptance remains a release-operator step after the final binaries are installed.
 

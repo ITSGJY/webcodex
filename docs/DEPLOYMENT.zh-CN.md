@@ -10,6 +10,24 @@
 - `webcodex-runner`：长驻 worker，通过 `auto` transport 连接（先 QUIC，再 WebSocket，再 polling），也可显式指定单一 transport。
 - `webcodex-cli`：推荐的管理 CLI，用于 server bootstrap、pairing/enrollment、status 和 doctor checks。
 
+## 第一次部署先看这里
+
+首次部署不需要先配置 OAuth、QUIC 或 account credential flow。最小生产路径是：
+
+1. 准备一台带 systemd、`sudo` 和公网 HTTPS 域名或可信隧道的 Linux x64 主机。
+2. 安装 `@yyjeqhc/webcodex`，运行 `webcodex-cli server init`，再安装
+   `webcodex` service。
+3. 配置 reverse proxy，并把 `WEBCODEX_PUBLIC_URL` 设为准确的公网 HTTPS origin。
+4. 在 server 上创建短期 pairing code，在持有代码仓库的机器上运行
+   `webcodex-cli client enroll`。
+5. 在该代码机器上安装 `webcodex-runner` service。
+6. 执行 `webcodex-cli ops status --strict`；通过后再导入 GPT Actions schema 或添加
+   MCP connector。
+
+只想在同一台机器试用、不需要长期 service 或公网 ingress 时，请走主 README 的
+project-first 路径。本文后续提供完整生产命令、可选 OAuth、多用户 enrollment 和
+transport 细节。
+
 ## 服务器配置
 
 生产环境通常需要这些配置：

@@ -10,6 +10,28 @@ This guide covers the current WebCodex production shape: server bootstrap, servi
 - `webcodex-runner`: long-lived worker connected by `auto` transport (QUIC first, then WebSocket, then polling) or by an explicitly selected transport.
 - `webcodex-cli`: recommended management CLI for server bootstrap, pairing/enrollment, status, and doctor checks.
 
+## First Deployment: Read This First
+
+A first-time operator does not need OAuth, QUIC, or the account-credential
+workflow. The minimum production path is:
+
+1. Use a Linux x64 host with systemd, `sudo`, and a public HTTPS domain or
+   trusted tunnel.
+2. Install `@yyjeqhc/webcodex`, run `webcodex-cli server init`, and install the
+   `webcodex` service.
+3. Configure the reverse proxy and set `WEBCODEX_PUBLIC_URL` to the exact public
+   HTTPS origin.
+4. Create a short-lived pairing code on the server and run
+   `webcodex-cli client enroll` on the machine that owns the repositories.
+5. Install the `webcodex-runner` service on that repository machine.
+6. Run `webcodex-cli ops status --strict`; only then import the GPT Actions
+   schema or add the MCP connector.
+
+For a same-machine evaluation without a permanent service or public ingress,
+use the project-first flow in the main README instead. The rest of this guide
+contains the exact production commands, optional OAuth, multi-user enrollment,
+and transport details.
+
 ## Server configuration
 
 Required production settings usually include:
