@@ -48,7 +48,7 @@ The documented distribution path uses the npm thin installer/wrapper:
 ```bash
 npm install -g @yyjeqhc/webcodex
 ```
-The v0.2.0 npm wrapper is prepared for `linux-x64` only. `linux-arm64`, `darwin-arm64`, `darwin-x64`, Windows, and other targets are not planned for v0.2.0 unless a later release adds artifacts. Do not publish the npm package until the v0.2.0 GitHub Release artifact exists and `npm/webcodex/manifest.json` contains its real SHA-256 checksum.
+The v0.3.0 npm wrapper is prepared for `linux-x64` only. `linux-arm64`, `darwin-arm64`, `darwin-x64`, Windows, and other targets are not included in v0.3.0 unless matching artifacts are added before release. Do not publish the npm package until the v0.3.0 GitHub Release artifact exists and `npm/webcodex/manifest.json` contains the SHA-256 checksum of that exact uploaded tarball.
 
 The npm package is a thin wrapper around native release artifacts. During install it downloads the matching GitHub Release artifact and verifies the SHA-256 checksum from the manifest. Before publishing, run the local package smoke without publishing:
 

@@ -12,6 +12,11 @@ for (const [platform, artifact] of Object.entries(manifest.artifacts || {})) {
     new RegExp(`v${packageJson.version}/webcodex-v${packageJson.version}-${platform}\\.tar\\.gz$`)
   );
   assert.match(artifact.sha256, /^[a-f0-9]{64}$/);
+  assert.notStrictEqual(
+    artifact.sha256,
+    "0".repeat(64),
+    `manifest checksum for ${platform} must not be an all-zero placeholder`
+  );
 }
 
 console.log(`release manifest is publish-ready for ${packageJson.version}`);

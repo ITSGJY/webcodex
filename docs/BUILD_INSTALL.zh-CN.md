@@ -49,7 +49,7 @@ binary、npm 命令、systemd unit 与 QUIC ALPN（`webcodex-runner/1`）统一�
 npm install -g @yyjeqhc/webcodex
 ```
 
-v0.2.0 npm wrapper 只按 `linux-x64` 准备。除非后续 release 增加 artifacts，否则 v0.2.0 暂不计划包含 `linux-arm64`、`darwin-arm64`、`darwin-x64`、Windows 和其他 targets。不要在 v0.2.0 GitHub Release artifact 存在且 `npm/webcodex/manifest.json` 写入真实 SHA-256 checksum 之前发布 npm package。
+v0.3.0 npm wrapper 只按 `linux-x64` 准备。除非在发布前补齐匹配 artifacts，否则 v0.3.0 不包含 `linux-arm64`、`darwin-arm64`、`darwin-x64`、Windows 和其他 targets。不要在 v0.3.0 GitHub Release artifact 已存在、且 `npm/webcodex/manifest.json` 写入该次实际上传 tarball 的 SHA-256 checksum 之前发布 npm package。
 
 npm package 是 native release artifacts 的 thin wrapper。安装时会下载匹配的 GitHub Release artifact，并使用 manifest 中的 SHA-256 checksum 验证。发布前先运行本地 package smoke；它不会发布：
 

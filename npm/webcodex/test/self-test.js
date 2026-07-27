@@ -10,7 +10,7 @@ const packageJson = require("../package.json");
 const releaseManifest = require("../manifest.json");
 const exampleManifest = require("../manifest.example.json");
 
-assert.strictEqual(packageJson.version, "0.2.0");
+assert.strictEqual(packageJson.version, "0.3.0");
 assert.deepStrictEqual(packageJson.bin, {
   webcodex: "bin/webcodex.js",
   "webcodex-runner": "bin/webcodex-runner.js",

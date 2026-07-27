@@ -17,15 +17,15 @@ npm install -g @yyjeqhc/webcodex
 
 The package does not commit compiled binaries to git. During installation, `install.js` detects the current platform/architecture, reads `manifest.json`, downloads the matching `.tar.gz` artifact from the GitHub Release, verifies its SHA-256 checksum, and installs the native binaries into `vendor/bin`.
 
-## Supported platforms in v0.2.0
+## Supported platforms in v0.3.0
 
 Current release artifacts include:
 
 - `linux-x64`
 
-`linux-arm64`, `darwin-arm64`, `darwin-x64`, Windows, and other platforms are not included in v0.2.0. They are future targets unless a later release adds matching artifacts.
+`linux-arm64`, `darwin-arm64`, `darwin-x64`, Windows, and other platforms are not included in v0.3.0. They remain future targets unless a later release adds matching artifacts.
 
-The published v0.2.0 manifest contains the SHA-256 checksum for the Linux x64 GitHub Release artifact. The `prepublishOnly` check rejects placeholder checksums during future release preparation.
+The release-preparation manifest for v0.3.0 intentionally keeps a checksum placeholder until the Linux x64 GitHub Release artifact has been built and uploaded. Replace it with the checksum of the exact uploaded tarball before npm publication. The `prepublishOnly` check rejects non-hex and all-zero placeholders.
 
 ## Development switches
 

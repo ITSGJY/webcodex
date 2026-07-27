@@ -48,13 +48,14 @@
 - [PRODUCT_DEVELOPMENT_PLAN.zh-CN.md](PRODUCT_DEVELOPMENT_PLAN.zh-CN.md) - 历史产品设计基线；其中旧 connect 命令不是当前使用指南。
 - [PROJECT_FIRST_REFINEMENT_PLAN.zh-CN.md](PROJECT_FIRST_REFINEMENT_PLAN.zh-CN.md) - 当前长期开发基线：Execution Engine、三轮收敛计划、代码/测试预算、时间估算与合并门禁。
 - [CODEX_EXECUTION_ENGINE_REFACTOR_PROMPT.zh-CN.md](CODEX_EXECUTION_ENGINE_REFACTOR_PROMPT.zh-CN.md) - 可直接交给 Codex 的 Iteration 6 大重构执行 prompt。
-23. [RELEASE_NOTES_v0.2.0.md](RELEASE_NOTES_v0.2.0.md) - 面向外部用户的 0.2.0 release notes。
-24. [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) - release readiness 和 acceptance procedure。
-25. [ROADMAP.zh-CN.md](ROADMAP.zh-CN.md) / [ROADMAP.md](ROADMAP.md) - 短 roadmap。
+23. [RELEASE_NOTES_v0.3.0.zh-CN.md](RELEASE_NOTES_v0.3.0.zh-CN.md) / [RELEASE_NOTES_v0.3.0.md](RELEASE_NOTES_v0.3.0.md) - 当前面向外部用户的 0.3.0 release notes。
+24. [RELEASE_NOTES_v0.2.0.md](RELEASE_NOTES_v0.2.0.md) - 上一版 0.2.0 release notes。
+25. [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) - release readiness 和 acceptance procedure。
+26. [ROADMAP.zh-CN.md](ROADMAP.zh-CN.md) / [ROADMAP.md](ROADMAP.md) - 短 roadmap。
 
 ## Developer Maintenance
 
-26. [TESTING.md](TESTING.md) - test lanes、test layout 和 ignored-test inventory。
-27. [E2E_VALIDATION.zh-CN.md](E2E_VALIDATION.zh-CN.md) / [E2E_VALIDATION.md](E2E_VALIDATION.md) - 本地端到端验证脚本和文档扫描建议。
-28. [../AGENTS.md](../AGENTS.md) - Agent 执行契约（安全、编辑、Git、验证、架构必须项）。
-29. [agent/architecture-decisions.md](agent/architecture-decisions.md)、[agent/session-model.md](agent/session-model.md)、[agent/session-correlation.md](agent/session-correlation.md)、[agent/permission-model.md](agent/permission-model.md)、[agent/oauth-bridge-plan.md](agent/oauth-bridge-plan.md)、[agent/openapi-guidelines.md](agent/openapi-guidelines.md)、[agent/release-process.md](agent/release-process.md) - 从 AGENTS.md 迁出的长文设计说明（Session 双模型、可选 Session 关联、权限决策层、OAuth bridge、OpenAPI、release）。
+27. [TESTING.md](TESTING.md) - test lanes、test layout 和 ignored-test inventory。
+28. [E2E_VALIDATION.zh-CN.md](E2E_VALIDATION.zh-CN.md) / [E2E_VALIDATION.md](E2E_VALIDATION.md) - 本地端到端验证脚本和文档扫描建议。
+29. [../AGENTS.md](../AGENTS.md) - Agent 执行契约（安全、编辑、Git、验证、架构必须项）。
+30. [agent/architecture-decisions.md](agent/architecture-decisions.md)、[agent/session-model.md](agent/session-model.md)、[agent/session-correlation.md](agent/session-correlation.md)、[agent/permission-model.md](agent/permission-model.md)、[agent/oauth-bridge-plan.md](agent/oauth-bridge-plan.md)、[agent/openapi-guidelines.md](agent/openapi-guidelines.md)、[agent/release-process.md](agent/release-process.md) - 从 AGENTS.md 迁出的长文设计说明（Session 双模型、可选 Session 关联、权限决策层、OAuth bridge、OpenAPI、release）。

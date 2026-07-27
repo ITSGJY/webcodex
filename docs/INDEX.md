@@ -43,13 +43,14 @@ Start with the README, [QUICK_START.md](QUICK_START.md), and [DEMO.md](DEMO.md).
 
 ## Release And Roadmap
 
-23. [RELEASE_NOTES_v0.2.0.md](RELEASE_NOTES_v0.2.0.md) - external-facing 0.2.0 release notes.
-24. [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) - release readiness and acceptance procedure.
-25. [ROADMAP.md](ROADMAP.md) / [ROADMAP.zh-CN.md](ROADMAP.zh-CN.md) - short roadmap.
+23. [RELEASE_NOTES_v0.3.0.md](RELEASE_NOTES_v0.3.0.md) / [RELEASE_NOTES_v0.3.0.zh-CN.md](RELEASE_NOTES_v0.3.0.zh-CN.md) - current external-facing 0.3.0 release notes.
+24. [RELEASE_NOTES_v0.2.0.md](RELEASE_NOTES_v0.2.0.md) - previous 0.2.0 release notes.
+25. [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) - release readiness and acceptance procedure.
+26. [ROADMAP.md](ROADMAP.md) / [ROADMAP.zh-CN.md](ROADMAP.zh-CN.md) - short roadmap.
 
 ## Developer Maintenance
 
-26. [TESTING.md](TESTING.md) - test lanes, test layout, and ignored-test inventory.
-27. [E2E_VALIDATION.md](E2E_VALIDATION.md) / [E2E_VALIDATION.zh-CN.md](E2E_VALIDATION.zh-CN.md) - local end-to-end validation scripts and documentation scan guidance.
-28. [../AGENTS.md](../AGENTS.md) - agent execution contract (safety, editing, git, validation, architecture musts).
-29. [agent/architecture-decisions.md](agent/architecture-decisions.md), [agent/session-model.md](agent/session-model.md), [agent/session-correlation.md](agent/session-correlation.md), [agent/permission-model.md](agent/permission-model.md), [agent/oauth-bridge-plan.md](agent/oauth-bridge-plan.md), [agent/openapi-guidelines.md](agent/openapi-guidelines.md), [agent/release-process.md](agent/release-process.md) - long-form design moved out of AGENTS.md (session dual model, optional session correlation, permission decision layer, OAuth bridge, OpenAPI, release).
+27. [TESTING.md](TESTING.md) - test lanes, test layout, and ignored-test inventory.
+28. [E2E_VALIDATION.md](E2E_VALIDATION.md) / [E2E_VALIDATION.zh-CN.md](E2E_VALIDATION.zh-CN.md) - local end-to-end validation scripts and documentation scan guidance.
+29. [../AGENTS.md](../AGENTS.md) - agent execution contract (safety, editing, git, validation, architecture musts).
+30. [agent/architecture-decisions.md](agent/architecture-decisions.md), [agent/session-model.md](agent/session-model.md), [agent/session-correlation.md](agent/session-correlation.md), [agent/permission-model.md](agent/permission-model.md), [agent/oauth-bridge-plan.md](agent/oauth-bridge-plan.md), [agent/openapi-guidelines.md](agent/openapi-guidelines.md), [agent/release-process.md](agent/release-process.md) - long-form design moved out of AGENTS.md (session dual model, optional session correlation, permission decision layer, OAuth bridge, OpenAPI, release).
