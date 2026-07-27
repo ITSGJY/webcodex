@@ -5842,6 +5842,77 @@ shell_profile = "../rust"
         assert_eq!(result.stdout.as_deref(), Some("ok"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn prepared_profile_prepare_reaps_background_pipe_holder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("prepare-background-pipe-holder.pid");
+        let init_script = format!(
+            "sleep 60 & background_pid=$!; printf '%s' \"$background_pid\" > {}; export WEBCODEX_TEST_PROFILE=ready",
+            shell_quote_path(&pid_file)
+        );
+        let shell = shell_with_profiles(
+            Some("test"),
+            vec![(
+                "test",
+                ShellProfileConfig {
+                    program: Some("/bin/sh".to_string()),
+                    args: Some(vec!["-c".to_string()]),
+                    init_script: Some(init_script),
+                    ..ShellProfileConfig::default()
+                },
+            )],
+        );
+        let policy = unrestricted_test_policy();
+        let cache = PreparedShellProfileCache::default();
+        let projects_dir = tmp.path().to_path_buf();
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let worker_shell = shell.clone();
+        let worker_policy = policy.clone();
+        let worker_cache = cache.clone();
+        let worker_projects_dir = projects_dir.clone();
+        let worker_cwd = cwd.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = run_shell_with_profiles(
+                1,
+                &worker_policy,
+                &worker_shell,
+                &worker_projects_dir,
+                &worker_cache,
+                Some(&worker_cwd),
+                "printf %s \"$WEBCODEX_TEST_PROFILE\"",
+                None,
+                10,
+                None,
+            );
+            let _ = result_tx.send(result);
+        });
+
+        let received = result_rx.recv_timeout(Duration::from_secs(5));
+        if received.is_err() {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|contents| contents.trim().parse::<u32>().ok())
+            {
+                // SAFETY: the PID was written by this test's background
+                // command. This failure-path cleanup targets only that PID.
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
+            }
+        }
+        worker.join().expect("prepared profile worker panicked");
+        let result = received.unwrap_or_else(|error| {
+            panic!("prepared profile prepare did not return within its bound: {error}")
+        });
+
+        assert_eq!(result.exit_code, Some(0), "{result:?}");
+        assert_eq!(result.stdout.as_deref(), Some("ready"), "{result:?}");
+        assert_eq!(cache.len(), 1, "prepared profile cache was not established");
+        assert_descendant_reaped(&pid_file);
+    }
+
     #[test]
     fn prepared_profile_errors_do_not_leak_init_script_body() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6144,6 +6215,158 @@ shell_profile = "../rust"
             .contains("command timed out after 1 seconds"));
     }
 
+    #[cfg(unix)]
+    fn shell_quote_path(path: &Path) -> String {
+        format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+    }
+
+    #[cfg(unix)]
+    fn long_lived_descendant_command(pid_file: &Path) -> String {
+        format!(
+            "sleep 60 & descendant=$!; printf '%s' \"$descendant\" > {}; wait",
+            shell_quote_path(pid_file)
+        )
+    }
+
+    #[cfg(unix)]
+    fn wait_until(timeout: Duration, predicate: impl Fn() -> bool) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if predicate() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        predicate()
+    }
+
+    #[cfg(unix)]
+    fn descendant_is_gone(pid: u32) -> bool {
+        if pid == 0 {
+            return false;
+        }
+        // SAFETY: signal 0 only probes the PID written by this test command;
+        // it does not deliver a signal to the process.
+        let missing = unsafe { libc::kill(pid as i32, 0) == -1 };
+        missing && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+
+    #[cfg(unix)]
+    struct DescendantCleanup {
+        pid: u32,
+    }
+
+    #[cfg(unix)]
+    impl DescendantCleanup {
+        fn disarm(&mut self) {
+            self.pid = 0;
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for DescendantCleanup {
+        fn drop(&mut self) {
+            if self.pid != 0 {
+                // SAFETY: the PID was created by this test. This is a
+                // best-effort failure-path cleanup and never targets a group.
+                unsafe {
+                    libc::kill(self.pid as i32, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_descendant_reaped(pid_file: &Path) {
+        assert!(
+            wait_until(Duration::from_secs(2), || pid_file.exists()),
+            "descendant pid file was not created: {}",
+            pid_file.display()
+        );
+        let pid = std::fs::read_to_string(pid_file)
+            .expect("read descendant pid file")
+            .trim()
+            .parse::<u32>()
+            .expect("parse descendant pid");
+        let mut cleanup = DescendantCleanup { pid };
+        assert!(
+            wait_until(Duration::from_secs(5), || descendant_is_gone(pid)),
+            "descendant {pid} survived synchronous shell cancellation"
+        );
+        cleanup.disarm();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_job_timeout_reaps_descendant_process_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_config(tmp.path().join("config/projects.d"));
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let pid_file = tmp.path().join("timeout-descendant.pid");
+
+        let result = run_shell(
+            &cfg.policy,
+            &cfg.shell,
+            Some(&cwd),
+            &long_lived_descendant_command(&pid_file),
+            None,
+            1,
+            None,
+        );
+
+        assert_eq!(result.exit_code, Some(-1), "{result:?}");
+        assert_eq!(
+            result.error.as_deref(),
+            Some("command timed out"),
+            "{result:?}"
+        );
+        assert!(
+            result
+                .stderr
+                .as_deref()
+                .unwrap_or_default()
+                .contains("command timed out after 1 seconds"),
+            "{result:?}"
+        );
+        assert_descendant_reaped(&pid_file);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_job_timeout_profile_reaps_descendant_process_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shell =
+            shell_with_profiles(Some("test"), vec![("test", ShellProfileConfig::default())]);
+        let policy = unrestricted_test_policy();
+        let cache = PreparedShellProfileCache::default();
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let pid_file = tmp.path().join("profile-timeout-descendant.pid");
+
+        // Exercise the production request path directly rather than the
+        // test-only `run_shell` wrapper.
+        let result = run_shell_with_profiles(
+            1,
+            &policy,
+            &shell,
+            tmp.path(),
+            &cache,
+            Some(&cwd),
+            &long_lived_descendant_command(&pid_file),
+            None,
+            1,
+            None,
+        );
+
+        assert_eq!(cache.len(), 1, "prepared profile path was not used");
+        assert_eq!(result.exit_code, Some(-1), "{result:?}");
+        assert_eq!(
+            result.error.as_deref(),
+            Some("command timed out"),
+            "{result:?}"
+        );
+        assert_descendant_reaped(&pid_file);
+    }
+
     #[test]
     fn shell_job_stop_flag_is_best_effort() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6167,6 +6390,46 @@ shell_profile = "../rust"
             .as_deref()
             .unwrap_or_default()
             .contains("job stopped by request"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_job_stop_reaps_descendant_process_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_config(tmp.path().join("config/projects.d"));
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let pid_file = tmp.path().join("stop-descendant.pid");
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop_requested);
+        let stop_pid_file = pid_file.clone();
+        let stopper = std::thread::spawn(move || {
+            let created = wait_until(Duration::from_secs(2), || stop_pid_file.exists());
+            stop_flag.store(true, Ordering::SeqCst);
+            created
+        });
+
+        let result = run_shell(
+            &cfg.policy,
+            &cfg.shell,
+            Some(&cwd),
+            &long_lived_descendant_command(&pid_file),
+            None,
+            10,
+            Some(stop_requested.as_ref()),
+        );
+
+        assert!(stopper.join().expect("stopper thread panicked"));
+        assert_eq!(result.exit_code, Some(-1), "{result:?}");
+        assert_eq!(result.error.as_deref(), Some("job stopped"), "{result:?}");
+        assert!(
+            result
+                .stderr
+                .as_deref()
+                .unwrap_or_default()
+                .contains("job stopped by request"),
+            "{result:?}"
+        );
+        assert_descendant_reaped(&pid_file);
     }
 
     #[test]

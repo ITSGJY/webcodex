@@ -6,10 +6,12 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const SHELL_PROFILE_PREPARE_TIMEOUT_SECS: u64 = 30;
+const PROCESS_GROUP_TERMINATION_GRACE: Duration = Duration::from_millis(50);
+const PROFILE_PREPARE_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PreparedShellProfileKey {
@@ -96,6 +98,7 @@ fn configured_shell_command(shell: &ShellConfig, command: &str) -> Result<Comman
         cmd.arg(arg);
     }
     cmd.arg(shell_command_text(shell, command));
+    configure_direct_process_group(&mut cmd);
     apply_shell_environment(&mut cmd, shell)?;
     Ok(cmd)
 }
@@ -109,6 +112,7 @@ fn configured_prepared_shell_command(
         cmd.arg(arg);
     }
     cmd.arg(command);
+    configure_direct_process_group(&mut cmd);
     apply_env_snapshot(&mut cmd, &profile.env_snapshot);
     Ok(cmd)
 }
@@ -225,6 +229,72 @@ fn stderr_tail(bytes: &[u8]) -> String {
     format!("[stderr truncated]\n{}", &text[start..])
 }
 
+struct ProfilePreparePipeReader {
+    stream_name: &'static str,
+    result_rx: mpsc::Receiver<Result<Vec<u8>, String>>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+impl ProfilePreparePipeReader {
+    fn finish(self, timeout: Duration) -> Result<Vec<u8>, String> {
+        match self.result_rx.recv_timeout(timeout) {
+            Ok(result) => {
+                self.handle
+                    .join()
+                    .map_err(|_| format!("profile prepare {} reader panicked", self.stream_name))?;
+                result
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+                "profile prepare {} reader did not finish within {} ms",
+                self.stream_name,
+                timeout.as_millis()
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if self.handle.join().is_err() {
+                    Err(format!(
+                        "profile prepare {} reader panicked",
+                        self.stream_name
+                    ))
+                } else {
+                    Err(format!(
+                        "profile prepare {} reader exited without a result",
+                        self.stream_name
+                    ))
+                }
+            }
+        }
+    }
+}
+
+fn spawn_profile_prepare_pipe_reader(
+    stream_name: &'static str,
+    mut pipe: impl Read + Send + 'static,
+) -> ProfilePreparePipeReader {
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let result = pipe
+            .read_to_end(&mut buf)
+            .map(|_| buf)
+            .map_err(|e| format!("failed to read profile prepare {stream_name}: {e}"));
+        let _ = result_tx.send(result);
+    });
+    ProfilePreparePipeReader {
+        stream_name,
+        result_rx,
+        handle,
+    }
+}
+
+fn collect_profile_prepare_output(
+    stdout: ProfilePreparePipeReader,
+    stderr: ProfilePreparePipeReader,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let stdout = stdout.finish(PROFILE_PREPARE_PIPE_DRAIN_TIMEOUT)?;
+    let stderr = stderr.finish(PROFILE_PREPARE_PIPE_DRAIN_TIMEOUT)?;
+    Ok((stdout, stderr))
+}
+
 fn run_prepare_command(
     mut cmd: Command,
     timeout: Duration,
@@ -234,64 +304,86 @@ fn run_prepare_command(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to spawn profile prepare command: {}", e))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "profile prepare stdout pipe missing".to_string())?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "profile prepare stderr pipe missing".to_string())?;
-    let stdout_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        stdout
-            .read_to_end(&mut buf)
-            .map(|_| buf)
-            .map_err(|e| format!("failed to read profile prepare stdout: {}", e))
-    });
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        stderr
-            .read_to_end(&mut buf)
-            .map(|_| buf)
-            .map_err(|e| format!("failed to read profile prepare stderr: {}", e))
-    });
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let cleanup = terminate_child_without_output(child).err();
+            return Err(with_cleanup_error(
+                "profile prepare stdout pipe missing",
+                cleanup,
+            ));
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            drop(stdout);
+            let cleanup = terminate_child_without_output(child).err();
+            return Err(with_cleanup_error(
+                "profile prepare stderr pipe missing",
+                cleanup,
+            ));
+        }
+    };
+    let stdout_reader = spawn_profile_prepare_pipe_reader("stdout", stdout);
+    let stderr_reader = spawn_profile_prepare_pipe_reader("stderr", stderr);
     let start = Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _stdout = stdout_handle
-                        .join()
-                        .map_err(|_| "profile prepare stdout reader panicked".to_string())??;
-                    let stderr = stderr_handle
-                        .join()
-                        .map_err(|_| "profile prepare stderr reader panicked".to_string())??;
-                    return Err(format!(
-                        "profile prepare timed out after {} seconds; stderr tail: {}",
-                        timeout.as_secs(),
-                        stderr_tail(&stderr)
-                    ));
+                    let cleanup = terminate_child_process_tree(&mut child).err();
+                    return match collect_profile_prepare_output(stdout_reader, stderr_reader) {
+                        Ok((_stdout, stderr)) => Err(format!(
+                            "profile prepare timed out after {} seconds; stderr tail: {}{}",
+                            timeout.as_secs(),
+                            stderr_tail(&stderr),
+                            cleanup
+                                .as_deref()
+                                .map(|error| format!("; cleanup failed: {error}"))
+                                .unwrap_or_default(),
+                        )),
+                        Err(error) => Err(with_cleanup_error(
+                            format!(
+                                "profile prepare timed out after {} seconds; failed to collect output: {}",
+                                timeout.as_secs(),
+                                error
+                            ),
+                            cleanup,
+                        )),
+                    };
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("failed to wait profile prepare command: {}", e));
+                let cleanup = terminate_child_process_tree(&mut child).err();
+                let output = collect_profile_prepare_output(stdout_reader, stderr_reader).err();
+                let base = match output {
+                    Some(error) => {
+                        format!("failed to wait profile prepare command: {}; failed to collect output: {}", e, error)
+                    }
+                    None => format!("failed to wait profile prepare command: {}", e),
+                };
+                return Err(with_cleanup_error(base, cleanup));
             }
         }
     };
-    let stdout = stdout_handle
-        .join()
-        .map_err(|_| "profile prepare stdout reader panicked".to_string())??;
-    let stderr = stderr_handle
-        .join()
-        .map_err(|_| "profile prepare stderr reader panicked".to_string())??;
-    Ok((status, stdout, stderr))
+    // The direct child has already exited, but its private process group can
+    // still contain background descendants that inherited these pipe handles.
+    // Reap that group before waiting on the readers so they see EOF promptly.
+    let cleanup = terminate_child_process_tree(&mut child).err();
+    let output = collect_profile_prepare_output(stdout_reader, stderr_reader);
+    match (cleanup, output) {
+        (None, Ok((stdout, stderr))) => Ok((status, stdout, stderr)),
+        (Some(cleanup), Ok(_)) => Err(format!(
+            "failed to clean up profile prepare command process group: {cleanup}"
+        )),
+        (None, Err(error)) => Err(format!("failed to collect profile prepare output: {error}")),
+        (Some(cleanup), Err(error)) => Err(format!(
+            "failed to clean up profile prepare command process group: {cleanup}; failed to collect output: {error}"
+        )),
+    }
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -364,6 +456,7 @@ fn capture_profile_env_snapshot(
         cmd.arg(arg);
     }
     cmd.arg(prepare_script).current_dir(prepare_cwd).env_clear();
+    configure_direct_process_group(&mut cmd);
     for (key, value) in initial_env {
         cmd.env(key, value);
     }
@@ -567,6 +660,127 @@ fn truncate_bytes(bytes: &[u8], max: usize) -> String {
         max,
         &text[start..]
     )
+}
+
+fn with_cleanup_error(base: impl Into<String>, cleanup: Option<String>) -> String {
+    match cleanup {
+        Some(cleanup) => format!("{}; cleanup failed: {}", base.into(), cleanup),
+        None => base.into(),
+    }
+}
+
+#[cfg(unix)]
+fn signal_process_group(pgid: u32, signal: i32) -> Result<bool, String> {
+    let target = i32::try_from(pgid)
+        .map_err(|_| format!("process-group id {pgid} exceeds the supported range"))?;
+    // SAFETY: callers use only the private session/process group created for
+    // this command by `configure_direct_process_group`. A negative target is
+    // required by POSIX to signal the whole group, not just its leader.
+    if unsafe { libc::kill(-target, signal) } == 0 {
+        Ok(true)
+    } else {
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => Ok(false),
+            Some(libc::EPERM) => Err(format!(
+                "permission denied signaling command process group {pgid} with signal {signal}"
+            )),
+            _ => Err(format!(
+                "failed to signal command process group {pgid} with signal {signal}: {}",
+                std::io::Error::last_os_error()
+            )),
+        }
+    }
+}
+
+/// Terminate a command and all members of its private process group, then
+/// reap the direct child. Callers do this before waiting for output pipes, so
+/// descendants cannot keep them open after a timeout, stop, executor failure,
+/// or direct-child exit.
+fn terminate_child_process_tree(child: &mut std::process::Child) -> Result<(), String> {
+    let mut errors = Vec::new();
+    #[cfg(unix)]
+    {
+        // `configure_direct_process_group` calls `setsid` before exec, making
+        // this pid the private session and process-group leader. Guard zero so
+        // a malformed Child can never turn into a signal for the runner's own
+        // process group.
+        let pgid = child.id();
+        if pgid == 0 {
+            errors.push("command child has invalid process-group id 0".to_string());
+        } else {
+            let sent_sigterm = match signal_process_group(pgid, libc::SIGTERM) {
+                Ok(true) => {
+                    std::thread::sleep(PROCESS_GROUP_TERMINATION_GRACE);
+                    true
+                }
+                // If the group is already gone, do not probe this numeric ID
+                // again: a later probe could observe an unrelated, reused
+                // process-group ID.
+                Ok(false) => false,
+                Err(error) => {
+                    errors.push(error);
+                    false
+                }
+            };
+            if sent_sigterm {
+                match signal_process_group(pgid, 0) {
+                    Ok(true) => {
+                        if let Err(error) = signal_process_group(pgid, libc::SIGKILL) {
+                            errors.push(error);
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => errors.push(error),
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Non-Unix platforms retain the existing direct-child behavior; they
+        // do not have the POSIX process-group signalling used above.
+        if let Err(error) = child.kill() {
+            match child.try_wait() {
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => errors.push(format!("failed to kill command: {error}")),
+            }
+        }
+    }
+    if let Err(error) = child.wait() {
+        errors.push(format!("failed to reap command child: {error}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn terminate_child_without_output(mut child: std::process::Child) -> Result<(), String> {
+    let result = terminate_child_process_tree(&mut child);
+    // The direct child has been reaped above. Closing the local pipe handles
+    // is sufficient on error paths where the response intentionally has no
+    // command output.
+    drop(child.stdout.take());
+    drop(child.stderr.take());
+    result
+}
+
+fn terminate_and_read_pipes(
+    mut child: std::process::Child,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), String> {
+    let cleanup = terminate_child_process_tree(&mut child).err();
+    let output = read_pipes(child);
+    match (cleanup, output) {
+        (None, Ok(output)) => Ok(output),
+        (Some(cleanup), Ok(_)) => Err(format!(
+            "failed to terminate command process tree: {cleanup}"
+        )),
+        (None, Err(error)) => Err(error),
+        (Some(cleanup), Err(error)) => Err(format!(
+            "failed to terminate command process tree: {cleanup}; failed to collect output: {error}"
+        )),
+    }
 }
 
 fn read_pipes(
@@ -783,25 +997,28 @@ fn run_shell_impl(
                     // result, so preserve its exit status and output. Other
                     // write failures still belong to the executor.
                     if e.kind() != std::io::ErrorKind::BrokenPipe {
-                        let _ = child.kill();
+                        let cleanup = terminate_child_without_output(child).err();
                         return CommandResult {
                             exit_code: None,
                             stdout: None,
                             stderr: None,
                             duration_ms: Some(start.elapsed().as_millis() as u64),
-                            error: Some(format!("failed to write command stdin: {}", e)),
+                            error: Some(with_cleanup_error(
+                                format!("failed to write command stdin: {}", e),
+                                cleanup,
+                            )),
                         };
                     }
                 }
             }
             None => {
-                let _ = child.kill();
+                let cleanup = terminate_child_without_output(child).err();
                 return CommandResult {
                     exit_code: None,
                     stdout: None,
                     stderr: None,
                     duration_ms: Some(start.elapsed().as_millis() as u64),
-                    error: Some("stdin pipe missing".to_string()),
+                    error: Some(with_cleanup_error("stdin pipe missing", cleanup)),
                 };
             }
         }
@@ -811,9 +1028,8 @@ fn run_shell_impl(
             .map(|flag| flag.load(Ordering::SeqCst))
             .unwrap_or(false)
         {
-            let _ = child.kill();
             let duration_ms = start.elapsed().as_millis() as u64;
-            return match read_pipes(child) {
+            return match terminate_and_read_pipes(child) {
                 Ok((_status, stdout, stderr)) => CommandResult {
                     exit_code: Some(-1),
                     stdout: Some(truncate_bytes(&stdout, policy.max_output_bytes)),
@@ -838,9 +1054,8 @@ fn run_shell_impl(
             Ok(Some(_)) => break,
             Ok(None) => {
                 if start.elapsed() >= Duration::from_secs(timeout_secs) {
-                    let _ = child.kill();
                     let duration_ms = start.elapsed().as_millis() as u64;
-                    return match read_pipes(child) {
+                    return match terminate_and_read_pipes(child) {
                         Ok((_status, stdout, stderr)) => CommandResult {
                             exit_code: Some(-1),
                             stdout: Some(truncate_bytes(&stdout, policy.max_output_bytes)),
@@ -868,17 +1083,21 @@ fn run_shell_impl(
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
+                let cleanup = terminate_child_without_output(child).err();
                 return CommandResult {
                     exit_code: None,
                     stdout: None,
                     stderr: None,
                     duration_ms: Some(start.elapsed().as_millis() as u64),
-                    error: Some(format!("failed to wait command: {}", e)),
+                    error: Some(with_cleanup_error(
+                        format!("failed to wait command: {}", e),
+                        cleanup,
+                    )),
                 };
             }
         }
     }
-    match read_pipes(child) {
+    match terminate_and_read_pipes(child) {
         Ok((status, stdout, stderr)) => CommandResult {
             exit_code: Some(status.code().unwrap_or(-1)),
             stdout: Some(truncate_bytes(&stdout, policy.max_output_bytes)),
