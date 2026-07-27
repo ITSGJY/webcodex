@@ -85,7 +85,7 @@ fn agent_install_service_generates_expected_unit_without_tokens() {
     ]))
     .unwrap();
     let unit = run_agent_install_service(opts).unwrap();
-    assert!(unit.contains("[Unit]\nDescription=WebCodex Agent\n"));
+    assert!(unit.contains("[Unit]\nDescription=WebCodex Runner\n"));
     assert!(unit.contains(&format!(
         "ExecStart=/opt/webcodex/bin/webcodex-runner --config {}\n",
         config.display()

@@ -11,7 +11,7 @@ use crate::{
 pub(crate) fn render_agent_systemd_unit(opts: &AgentInstallServiceOptions) -> String {
     let mut unit = String::new();
     unit.push_str("[Unit]\n");
-    unit.push_str("Description=WebCodex Agent\n");
+    unit.push_str("Description=WebCodex Runner\n");
     unit.push_str("After=network-online.target\n");
     unit.push_str("Wants=network-online.target\n\n");
     unit.push_str("[Service]\n");
@@ -100,7 +100,7 @@ pub(crate) fn run_agent_install_service(
         return serde_json::to_string_pretty(&summary).map_err(|e| e.to_string());
     }
     let mut out = String::new();
-    out.push_str("Agent service unit installed.\n\n");
+    out.push_str("Runner service unit installed.\n\n");
     out.push_str(&format!(
         "  service file: {}\n",
         opts.service_file.display()

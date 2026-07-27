@@ -69,9 +69,9 @@ Iteration 8.0 只交付第一条垂直切片，不扩展 Hosted 九项 capabilit
   与重复 doctor projection；运维 registry/discovery 工具继续保留。
 - Browser 只提供 readiness surface；完整 Browser IDE 明确 deferred。
 
-## 当前：Iteration 8.1 — Project-Aware Validation Recipes
+## 已完成：Iteration 8.1 — Project-Aware Validation Recipes
 
-Iteration 8.1 的实现候选保持 Hosted 九项 capability，不新增 discovery call：
+Iteration 8.1 保持 Hosted 九项 capability，不新增 discovery call：
 
 - `checks_run` 增加可选 `recipe: rust|node|python|go`；省略即 deterministic auto，
   不提供 `auto` alias。
@@ -95,14 +95,41 @@ Iteration 8.1 的实现候选保持 Hosted 九项 capability，不新增 discove
 - 四类项目由真实 Auth/HTTP/registry/store/structured progress/local accept
   golden fixture 覆盖；task path 仍不需要 discovery/session call。
 
-本轮等待 focused/full suite、LOC 门禁与人工 review；不自行宣布 merge gate
-通过。通过后再继续：
+Iteration 8.1 已完成 focused/full suite、LOC 门禁与人工 review，并随 0.3.0 发布。
 
-- 已完成（Iteration 8.2）：Browser `/console` 的最小 review/cancel/accept UI —
-  工作队列 + review 详情（bounded diff/output tail）+ Accept/Reject/Cancel 复用与
-  CLI 相同的本机授权，不新增第十项 capability，credential 仅在内存中。
-- replay baseline、真实 ChatGPT MCP/OpenAPI acceptance、第二轮删除。
-- production Rust LOC 相对 2026-07-23 基线净减少 20% 以上。
+## 已完成：Iteration 8.2 — Review Console and Cross-Session Continuity
+
+- Browser `/console` 提供工作队列、event timeline、bounded diff/output tail、
+  Accept/Reject/Cancel、guidance、approvals、devices、activity 与 Connect 面板。
+- `task_list` 与 `task_resume` 支持跨聊天窗口续接；reject reason 通过正常 capability
+  response 一次性回传模型。
+- runner、service、npm command 与 QUIC ALPN 从 `webcodex-agent` hard cut 为
+  `webcodex-runner`，不保留旧名称 alias。
+- 真实 ChatGPT MCP/OpenAPI acceptance、release smoke 和 0.3.0 发布门禁已经完成。
+
+## 当前：Iteration 9 — Agent-Aligned Evidence and Task Reporting
+
+本轮不扩大 Hosted capability surface，也不以代码瘦身或旧版本平滑迁移为目标。
+优先修复软件自身在真实 coding 任务中的判断与交互问题，使 WebCodex 更接近本地
+coding agent 的工作方式：
+
+- 专用工具继续负责权限控制、项目边界、事务式文件修改、命令执行、结构化状态和
+  原始证据，但默认报告事实，不替模型给出脱离语境的任务总裁决；
+- `cargo_*`、`run_shell`、`run_job` 与其他执行路径进入统一 evidence ledger，按实际
+  命令、退出状态和调用意图记录验证事实，不因未使用某个专用工具就报告
+  `validation_not_run`；
+- `finish_coding_task`、handoff 和 hygiene 将 hard blocker 限于权限拒绝、冲突、
+  命令或测试失败、敏感路径风险等确定事实；dirty worktree、输出截断、历史失败已被
+  重试修复等作为上下文提示；
+- 本地 Agent 基于完整证据输出最终任务报告，明确说明执行内容、通过和未执行的验证、
+  当前工作树状态、剩余风险，以及是否建议提交、合并或发布；
+- 修正 shell/cwd 合同、重启后的连接状态分层和过大的 startup/read/log 返回体，减少
+  无意义失败、重复轮询与模型上下文消耗；
+- 项目聊天默认面向 project-bound 精简能力，完整 operator runtime 保留给管理入口，
+  但不试图用不断增加专用工具覆盖所有项目情形。
+
+暂缓代码瘦身与 LOC 门禁、旧版本迁移兼容、SSH、PTY、Workflow DSL、更多 Hosted
+capability 和完整 Browser IDE。
 
 ## 时间判断
 

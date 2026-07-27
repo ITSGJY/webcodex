@@ -436,18 +436,19 @@ Iteration 7.2 的 path-based 统计为 production
 `92 files / 58,514 LOC -> 92 files / 59,014 LOC`（`+500`），均在本轮目标内。
 这些数字和最终验证仍属于人工 merge gate 输入，不表示评审已通过。
 
-LOC 的 10% 长期目标尚未达到：相对 Iteration 6 起点仍高 `1,039` 行，距离 `108,896` 还差 `13,138` 行。当前仍有真实调用者的 Session/current-session、ToolRuntime、ShellClientRegistry、JobManager、local jobs、文件/LSP 和本机 CLI 路径不能为追逐数字而删除；下一轮必须在保留这些产品/安全边界的前提下继续做引用驱动的减法。
+LOC 的 10% 长期目标尚未达到：相对 Iteration 6 起点仍高 `1,039` 行，距离 `108,896` 还差 `13,138` 行。该指标保留为长期观察项，但不再作为当前 Iteration 9 的目标或门禁；当前优先修复真实任务中的证据、裁决、shell/cwd、连接状态和上下文效率问题，不为追逐数字删除仍有调用者的路径。
 
 ## 8. Iteration 8：产品精修与受控 validation
 
 预计：2–3 个专注开发周。
 
-状态：Iteration 8.0 已形成正式基线。Iteration 8.1 只实现 Project-Aware
-Validation Recipes。Iteration 8.2 交付 Browser `/console` 的最小
-review/cancel/accept 控制台：它复用与 CLI 相同的本机人类授权（不新增第十项
-model-facing capability），credential 仅在内存中。完整 Browser IDE、真实公网
-acceptance、credential rotation、数据分析平台和 Iteration 8 总体 20% LOC 目标仍
-不在这些切片内。
+状态：Iteration 8.0、8.1 与 8.2 已完成，并随 0.3.0 发布。当前进入
+Iteration 9：Agent-Aligned Evidence and Task Reporting。下一轮继续保持九项
+model-facing capability，不以代码瘦身或旧版本平滑迁移为目标，优先修复统一证据
+记录、过度 deterministic verdict、shell/cwd 语义、重试后历史失败、连接状态分层和
+上下文返回体过大的问题。工具提供安全边界、状态和原始证据；本地 Agent 负责理解
+项目、选择操作并形成最终任务结论。完整 Browser IDE、credential rotation、数据
+分析平台、SSH、PTY 与 Workflow DSL 仍不在当前切片内。
 
 交付：
 
@@ -462,7 +463,7 @@ acceptance、credential rotation、数据分析平台和 Iteration 8 总体 20% 
 
 - 普通 coding golden scenarios 不需要 discovery/ops 工具；
 - 从 task start 到 accepted result 的路径可解释且稳定；
-- production Rust LOC 相对本文基线净减少 20% 以上；
+- specialized validation 与 shell/job 证据可被同一任务报告正确识别，且工具提示不会替代 Agent 的语境判断；
 - 用户可见概念不出现 agent、client id、runtime project id 和 workflow session。
 
 ### 8.1 Iteration 8.0 真实产品路径审计
@@ -770,6 +771,27 @@ silent interval
 
 成功率必须以 terminal execution、Task Result 和 human decision 为口径，不能把 `queued`、HTTP 200 或工具受理统计成任务成功。
 
+### 11.1 当前分层决策：工具事实与 Agent 结论
+
+Iteration 9 采用以下责任边界：
+
+```text
+WebCodex tools/runtime
+  -> 权限、项目边界、事务修改、命令执行、结构化状态、原始证据
+  -> 只对确定事实 hard fail，不尝试覆盖所有项目语境
+
+Local coding Agent
+  -> 理解项目和用户目标、选择命令、解释输出、合并证据
+  -> 输出完整任务报告和提交/合并/发布建议
+```
+
+统一任务报告至少区分：执行了什么、哪些验证通过、哪些未执行、工作树状态、历史失败
+是否已被后续成功消解、剩余风险和下一步建议。`dirty_worktree`、输出截断、未使用专用
+validation 工具等默认是提示；权限拒绝、冲突、命令失败、测试失败和敏感路径风险才是
+确定 hard blocker。专用工具是可靠执行底座，不承担无法预判全部上下文的最终业务判断。
+
+代码瘦身和旧版本平滑迁移均暂缓，待上述功能问题收敛后再重新排序。
+
 ## 12. 还需要多久
 
 这是工程估算，不是发布日期承诺。
@@ -778,19 +800,20 @@ silent interval
 |---|---|
 | Iteration 6：Execution Engine vertical slice | 2–3 个专注开发周 |
 | Iteration 7/7.1/7.2：checks/provenance/atomic finish | 已完成 |
-| Iteration 8：产品精修/validation/onboarding | 8.1 待人工 review |
+| Iteration 8：产品精修/validation/onboarding | 已随 0.3.0 完成并发布 |
+| Iteration 9：Agent 对齐的证据与任务报告 | 当前阶段；优先修复事实记录、裁决语义与交互合同 |
 | 达到第一阶段“精致、小而美” | 约 7–11 个专注开发周 |
 | 单人非全职推进 | 更现实为 3–5 个月 |
 | 后续成熟 SSH/跨设备 Operations Profile | 另需约 4–8 个专注开发周 |
 
 最大不确定性：
 
-- 旧 ToolRuntime/job/agent transport 能否抽取复用而不是复制；
+- shell/job 与专用 validation evidence 能否在不伪造结论的前提下统一；
 - ChatGPT MCP/OpenAPI 对 long-poll、取消和重连的真实行为；
-- 删除旧 session/tool surface 时暴露出的隐式调用者；
-- 当前测试集的运行成本和重复覆盖程度。
+- deterministic closeout 如何区分事实、提示和需要 Agent 解释的语境；
+- 当前工具返回体和测试日志对模型上下文的实际放大程度。
 
-如果每轮继续增加能力但不删除旧路径，时间会无限延长；如果严格执行 hard cut、LOC 预算和非目标约束，三轮足以达到第一阶段精致产品。
+如果继续增加专用能力来覆盖每种项目情形，工具面和语境误判都会持续扩大；当前阶段应先让证据准确、合同清楚，并由 Agent 对完整事实做综合判断。
 
 ## 13. 合并 main 的门禁
 
