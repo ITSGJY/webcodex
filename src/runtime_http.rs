@@ -542,6 +542,8 @@ mod tests {
         let registry = Arc::new(ShellClientRegistry::default());
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "importer".to_string(),
                 agent_instance_id: "inst-import".to_string(),
                 display_name: None,
@@ -773,10 +775,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_start_coding_task_manifest_intent_survives_null_params_wrapper() {
-        // Hold the env lock so a parallel compact-experiment test cannot flip
-        // WEBCODEX_ACTION_COMPACT_RESPONSES and drop tool_manifest from the body.
-        let _compact = ActionCompactEnvGuard::disabled();
+    async fn http_start_coding_task_rejects_removed_flattened_startup_params() {
         let config = test_config(Some("secret"));
         let (_tmp, db) = test_db();
         let tmp_proj = tempfile::tempdir().unwrap();
@@ -799,18 +798,18 @@ mod tests {
             .send(&service)
             .await;
 
-        assert_eq!(effective_status(&resp), StatusCode::OK);
+        assert_eq!(effective_status(&resp), StatusCode::BAD_REQUEST);
         let body: Value = resp.take_json().await.unwrap();
-        assert_eq!(body["success"], true);
-        assert_eq!(body["output"]["tool_manifest"]["intent"], "audit");
-        assert_eq!(body["output"]["tool_manifest"]["filtered"], true);
+        assert_eq!(body["status"], 400);
+        let error = body["error"].as_str().unwrap_or_default();
         assert!(
-            body["output"]["tool_manifest"]["returned_count"]
-                .as_u64()
-                .unwrap()
-                < body["output"]["tool_manifest"]["total_count"]
-                    .as_u64()
-                    .unwrap()
+            error.contains("invalid arguments for tool 'start_coding_task'")
+                && error.contains("unknown field(s)"),
+            "removed flattened startup params must fail strict validation: {body}"
+        );
+        assert!(
+            error.contains("tool_manifest_intent"),
+            "rejection should name the removed field: {error}"
         );
     }
 

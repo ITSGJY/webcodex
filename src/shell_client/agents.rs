@@ -38,6 +38,7 @@ impl ShellClientRegistry {
         if let Some(policy) = policy.as_mut() {
             policy.tool_providers = normalize_tool_providers(policy.tool_providers.take());
         }
+        let now = now_ts();
         let record = ShellClientRecord {
             client_id: client_id.clone(),
             agent_instance_id: agent_instance_id.clone(),
@@ -46,7 +47,7 @@ impl ShellClientRegistry {
             hostname: trim_string(body.hostname),
             capabilities: body.capabilities.unwrap_or_default(),
             projects: normalize_project_summaries(body.projects),
-            last_seen: now_ts(),
+            last_seen: now,
             agent_protocol_version: body
                 .agent_protocol_version
                 .map(|v| v.trim().to_string())
@@ -55,6 +56,11 @@ impl ShellClientRegistry {
             transport: TRANSPORT_POLLING.to_string(),
             policy,
             auth_group: auth.and_then(ShellClientAuthGroup::from_auth),
+            registered_at: now,
+            connected_at: now,
+            disconnected_at: None,
+            process_started_at: body.process_started_at,
+            build: body.build,
         };
         let mut inner = self.inner.lock().await;
 
@@ -86,6 +92,16 @@ impl ShellClientRegistry {
             .unwrap_or(false);
         if replaced_instance {
             inner.notifiers.remove(&client_id);
+        }
+
+        // Same-instance re-register is a transport reconnect: keep the
+        // original registration time; `connected_at` reflects the new
+        // connection. A new instance starts a fresh lifecycle.
+        let mut record = record;
+        if let Some(existing) = inner.clients.get(&client_id) {
+            if existing.agent_instance_id == agent_instance_id {
+                record.registered_at = existing.registered_at;
+            }
         }
 
         inner.clients.insert(client_id.clone(), record);
@@ -223,6 +239,7 @@ impl ShellClientRegistry {
         let now = now_ts();
         if let Some(client) = inner.clients.get_mut(client_id) {
             client.last_seen = offline_last_seen(now);
+            client.disconnected_at = Some(now);
         }
         let lost_job_ids: Vec<String> = inner
             .jobs_by_id
@@ -359,6 +376,11 @@ impl ShellClientRegistry {
             agent_protocol_version: client.agent_protocol_version.clone(),
             transport: client.transport.clone(),
             policy: client.policy.clone(),
+            registered_at: client.registered_at,
+            connected_at: client.connected_at,
+            disconnected_at: client.disconnected_at,
+            process_started_at: client.process_started_at,
+            build: client.build.clone(),
         })
     }
 }

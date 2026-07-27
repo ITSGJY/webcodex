@@ -1,6 +1,7 @@
 use super::activity::{ActivityRecorder, NoopActivityRecorder};
 use super::checkpoint;
 use super::local_jobs::{LocalJobKiller, LocalJobRecord, SystemJobKiller};
+use super::observations::RuntimeObservations;
 use super::permissions::PermissionEvaluator;
 use super::runtime_info::RuntimeInfo;
 use super::sessions;
@@ -24,12 +25,16 @@ pub struct ToolRuntime {
     pub(crate) job_killer: Arc<dyn LocalJobKiller>,
     pub(crate) semantic_navigation_probe_timeout: Duration,
     /// Authoritative permission evaluator for this runtime instance.
-    /// Resolved once at construction (`WEBCODEX_PERMISSION_MODE`); dispatch
+    /// Resolved once at construction (`WEBCODEX_AUTHORITY_MODE`); dispatch
     /// evaluates once per tool request before mutation.
     pub(crate) permission_evaluator: PermissionEvaluator,
     /// Sink for the workspace activity ledger (mutating tool executions).
     /// No-op unless the host injects a durable recorder.
     pub(crate) activity: Arc<dyn ActivityRecorder>,
+    /// Cross-surface connection observations (connector endpoint activity,
+    /// last successful meaningful tool call). Shared with the connector
+    /// runtime; never stores payloads or secrets.
+    pub(crate) observations: Arc<RuntimeObservations>,
 }
 
 impl ToolRuntime {
@@ -50,6 +55,7 @@ impl ToolRuntime {
                 super::semantic_navigation::DEFAULT_SEMANTIC_NAVIGATION_PROBE_TIMEOUT,
             permission_evaluator: PermissionEvaluator::from_env(),
             activity: Arc::new(NoopActivityRecorder),
+            observations: Arc::new(RuntimeObservations::default()),
         }
     }
 

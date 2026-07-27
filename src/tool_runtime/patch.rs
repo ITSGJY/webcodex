@@ -487,6 +487,8 @@ mod tests {
         runtime
             .shell_clients
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: client_id.to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,

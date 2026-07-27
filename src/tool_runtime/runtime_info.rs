@@ -192,11 +192,14 @@ impl ToolRuntime {
             "summary": agent_health_summary(&clients, &agent_jobs, now),
         });
         let connection_layers = connection_layers(
-            agent_count,
-            online_count,
+            &clients,
             agent_registered_count,
             agent_registered_online_count,
+            self.observations.as_ref(),
+            auth,
+            now,
         );
+        let version_compatibility = version_compatibility(&clients);
 
         // -- jobs summary -----------------------------------------------------
         // Agent-known jobs come from the registry; local jobs come from the
@@ -269,9 +272,10 @@ impl ToolRuntime {
             "projects": projects,
             "agents": agents,
             "connection_layers": connection_layers,
+            "version_compatibility": version_compatibility,
             "jobs": jobs,
             "tools": tools,
-            "permissions": permissions::permission_profile_payload(),
+            "authority": permissions::authority_profile_payload(),
             "session_store": self.sessions.status(),
         });
         if let Some(quic) = quic {
@@ -346,45 +350,404 @@ pub(crate) fn compact_runtime_status(status: &Value) -> Value {
             "session_binding": {"status": "not_observed"},
             "last_successful_tool_call": {"status": "not_observed"},
         })),
+        "version_compatibility": {
+            "status": status.pointer("/version_compatibility/status").cloned().unwrap_or_else(|| json!("unknown")),
+        },
+        "authority": status.get("authority").cloned().unwrap_or(Value::Null),
     })
 }
 
+/// Stale threshold for runner-derived layers (heartbeat window).
+const RUNNER_STALE_AFTER_SECS: i64 = crate::shell_client::CLIENT_ONLINE_WINDOW_SECS;
+/// Stale threshold for connector/tool-call activity observations.
+const ACTIVITY_STALE_AFTER_SECS: i64 = 600;
+
+/// Supported runner protocol versions for the current server build.
+const SUPPORTED_AGENT_PROTOCOL_VERSIONS: &[&str] = &["polling-v1", "websocket-v1", "quic-v1"];
+
+/// One connection-layer observation with the canonical contract fields:
+/// `status`, `observed_at`, `source`, `age_secs`, `stale_after_secs`,
+/// `reason_code`. Extra layer-specific facts are merged on top.
+fn layer_observation(
+    status: &str,
+    observed_at: Option<i64>,
+    source: &str,
+    stale_after_secs: Option<i64>,
+    reason_code: Option<&str>,
+    now: i64,
+    extra: Value,
+) -> Value {
+    let mut layer = json!({
+        "status": status,
+        "observed_at": observed_at,
+        "source": source,
+        "age_secs": observed_at.map(|at| now.saturating_sub(at)),
+        "stale_after_secs": stale_after_secs,
+        "reason_code": reason_code,
+    });
+    if let (Some(object), Some(extra)) = (layer.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            object.insert(key.clone(), value.clone());
+        }
+    }
+    layer
+}
+
 fn connection_layers(
-    registered_clients: usize,
-    online_clients: usize,
+    clients: &[ShellClientView],
     registered_projects: usize,
     online_projects: usize,
+    observations: &super::observations::RuntimeObservations,
+    auth: Option<&AuthContext>,
+    now: i64,
 ) -> Value {
+    // Freshest client drives single-value observations; counts stay explicit.
+    let freshest = clients.iter().max_by_key(|c| c.last_seen);
+    let online: Vec<&ShellClientView> = clients.iter().filter(|c| c.connected).collect();
+    let freshest_online = online.iter().max_by_key(|c| c.last_seen).copied();
+
+    // -- runner_process: process observation, distinct from transport --------
+    let runner_process = match (freshest_online, freshest) {
+        (Some(client), _) => {
+            let (source, reason) = if client.process_started_at.is_some() {
+                ("runner_process_report", None)
+            } else {
+                // Live transport still proves a running process; the runner
+                // just did not report its start identity.
+                ("transport_liveness", Some("process_start_not_reported"))
+            };
+            layer_observation(
+                "ready",
+                Some(client.last_seen),
+                source,
+                Some(RUNNER_STALE_AFTER_SECS),
+                reason,
+                now,
+                json!({
+                    "client_id": client.client_id,
+                    "agent_instance_id": client.agent_instance_id,
+                    "process_started_at": client.process_started_at,
+                }),
+            )
+        }
+        (None, Some(client)) => layer_observation(
+            "stale",
+            Some(client.last_seen),
+            "server_heartbeat_window",
+            Some(RUNNER_STALE_AFTER_SECS),
+            Some("heartbeat_expired"),
+            now,
+            json!({
+                "client_id": client.client_id,
+                "agent_instance_id": client.agent_instance_id,
+                "process_started_at": client.process_started_at,
+            }),
+        ),
+        (None, None) => layer_observation(
+            "not_observed",
+            None,
+            "server_registry",
+            None,
+            Some("no_runner_registered"),
+            now,
+            json!({}),
+        ),
+    };
+
+    // -- server_transport: real connection lifecycle --------------------------
+    let server_transport = match (freshest_online, freshest) {
+        (Some(client), _) => layer_observation(
+            "connected",
+            Some(client.last_seen),
+            "server_transport_lifecycle",
+            Some(RUNNER_STALE_AFTER_SECS),
+            None,
+            now,
+            json!({
+                "connected_clients": online.len(),
+                "transport": client.transport,
+                "connection_instance": client.agent_instance_id,
+                "connected_at": client.connected_at,
+                "last_heartbeat_at": client.last_seen,
+            }),
+        ),
+        (None, Some(client)) => layer_observation(
+            "disconnected",
+            client.disconnected_at.or(Some(client.last_seen)),
+            "server_transport_lifecycle",
+            None,
+            Some("transport_closed_or_heartbeat_expired"),
+            now,
+            json!({
+                "connected_clients": 0,
+                "transport": client.transport,
+                "connection_instance": client.agent_instance_id,
+                "connected_at": client.connected_at,
+                "disconnected_at": client.disconnected_at,
+            }),
+        ),
+        (None, None) => layer_observation(
+            "not_observed",
+            None,
+            "server_transport_lifecycle",
+            None,
+            Some("no_transport_ever_connected"),
+            now,
+            json!({"connected_clients": 0}),
+        ),
+    };
+
+    // -- server_registration: which instance registered, and is it current ---
+    let server_registration = match (freshest_online, freshest) {
+        (Some(client), _) => layer_observation(
+            "registered",
+            Some(client.registered_at),
+            "runner_registration",
+            None,
+            None,
+            now,
+            json!({
+                "registered_clients": clients.len(),
+                "runner_instance": client.agent_instance_id,
+                "registered_at": client.registered_at,
+                "last_refreshed_at": client.last_seen,
+            }),
+        ),
+        (None, Some(client)) => layer_observation(
+            "stale",
+            Some(client.registered_at),
+            "runner_registration",
+            Some(RUNNER_STALE_AFTER_SECS),
+            Some("registration_instance_disconnected"),
+            now,
+            json!({
+                "registered_clients": clients.len(),
+                "runner_instance": client.agent_instance_id,
+                "registered_at": client.registered_at,
+                "last_refreshed_at": client.last_seen,
+            }),
+        ),
+        (None, None) => layer_observation(
+            "not_observed",
+            None,
+            "runner_registration",
+            None,
+            Some("no_registration"),
+            now,
+            json!({"registered_clients": 0}),
+        ),
+    };
+
+    // -- project_registry ------------------------------------------------------
+    let project_registry = if registered_projects == 0 {
+        layer_observation(
+            "not_configured",
+            None,
+            "runner_project_report",
+            None,
+            Some("no_projects_registered"),
+            now,
+            json!({"registered_projects": 0, "online_projects": 0}),
+        )
+    } else if online_projects > 0 {
+        layer_observation(
+            "registered",
+            freshest_online.map(|c| c.last_seen),
+            "runner_project_report",
+            Some(RUNNER_STALE_AFTER_SECS),
+            None,
+            now,
+            json!({
+                "registered_projects": registered_projects,
+                "online_projects": online_projects,
+                "providing_instance": freshest_online.map(|c| c.agent_instance_id.clone()),
+            }),
+        )
+    } else {
+        // Projects are known but their providing runner connection is gone:
+        // a stale registration must not pretend to be callable.
+        layer_observation(
+            "stale",
+            freshest.map(|c| c.last_seen),
+            "runner_project_report",
+            Some(RUNNER_STALE_AFTER_SECS),
+            Some("providing_runner_disconnected"),
+            now,
+            json!({
+                "registered_projects": registered_projects,
+                "online_projects": 0,
+            }),
+        )
+    };
+
+    // -- connector_endpoint: observed activity, never config inference --------
+    let connector_endpoint = if !observations.connector_configured() {
+        layer_observation(
+            "not_configured",
+            None,
+            "connector_runtime",
+            None,
+            Some("connector_runtime_disabled"),
+            now,
+            json!({}),
+        )
+    } else {
+        match observations.latest_connector_observation() {
+            Some(observation) => {
+                let status = match observation.status.as_str() {
+                    "ready" | "request_succeeded" => "ready",
+                    _ => "unknown",
+                };
+                let reason = (status == "unknown").then_some("last_probe_not_ready");
+                layer_observation(
+                    status,
+                    Some(observation.observed_at),
+                    &observation.source,
+                    Some(ACTIVITY_STALE_AFTER_SECS),
+                    reason,
+                    now,
+                    json!({"last_observation": observation.status}),
+                )
+            }
+            None => layer_observation(
+                "not_observed",
+                None,
+                "connector_runtime",
+                None,
+                Some("no_connector_requests_observed"),
+                now,
+                json!({}),
+            ),
+        }
+    };
+
+    // -- session_binding: process-local by design ------------------------------
+    let session_binding = layer_observation(
+        "not_observed",
+        None,
+        "session_store",
+        None,
+        Some("binding_is_process_local_and_principal_scoped"),
+        now,
+        json!({
+            "process_local": true,
+            "lost_after_restart": true,
+            "durable_resume": "explicit session_id resumes the durable wc_sess_* session",
+        }),
+    );
+
+    // -- last_successful_tool_call: scoped meaningful activity ----------------
+    let principal = super::session_context::current_session_principal(auth).ok();
+    let observation = principal
+        .as_ref()
+        .and_then(|(kind, id)| observations.latest_tool_call_for_principal(kind, id))
+        .map(|obs| (obs, "principal"))
+        .or_else(|| {
+            observations
+                .latest_tool_call()
+                .map(|obs| (obs, "any_principal"))
+        });
+    let last_successful_tool_call = match observation {
+        Some((obs, scope)) => layer_observation(
+            "observed",
+            Some(obs.observed_at),
+            "runtime_observations",
+            Some(ACTIVITY_STALE_AFTER_SECS),
+            None,
+            now,
+            json!({
+                "scope": scope,
+                "principal_kind": obs.principal_kind,
+                "project": obs.project,
+                "surface": obs.surface,
+                "session_id": obs.session_id,
+                "tool": obs.tool,
+            }),
+        ),
+        None => layer_observation(
+            "not_observed",
+            None,
+            "runtime_observations",
+            None,
+            Some("no_meaningful_tool_calls_recorded"),
+            now,
+            json!({}),
+        ),
+    };
+
     json!({
-        "runner_process": {
-            "status": if online_clients > 0 { "observed_running" } else { "not_observed" },
-            "basis": "server_client_lease",
+        "runner_process": runner_process,
+        "server_transport": server_transport,
+        "server_registration": server_registration,
+        "project_registry": project_registry,
+        "connector_endpoint": connector_endpoint,
+        "session_binding": session_binding,
+        "last_successful_tool_call": last_successful_tool_call,
+    })
+}
+
+/// Mixed-version diagnostics: a connected runner is not automatically
+/// capability-compatible. Reports facts about which side to upgrade without
+/// exposing paths or environment.
+fn version_compatibility(clients: &[ShellClientView]) -> Value {
+    let server_version = env!("CARGO_PKG_VERSION");
+    let build = crate::build_info::runtime_build_info();
+    let mut overall = if clients.is_empty() {
+        "no_runners"
+    } else {
+        "compatible"
+    };
+    let runners: Vec<Value> = clients
+        .iter()
+        .map(|client| {
+            let protocol_supported =
+                SUPPORTED_AGENT_PROTOCOL_VERSIONS.contains(&client.agent_protocol_version.as_str());
+            let build_version = client.build.as_ref().and_then(|b| b.version.clone());
+            let build_matches_server = build_version
+                .as_deref()
+                .map(|version| version == server_version);
+            let (status, reason_code, action) = if !protocol_supported {
+                (
+                    "capability_mismatch",
+                    Some("agent_protocol_version_unsupported"),
+                    Some("upgrade the runner to a build announcing a supported protocol version"),
+                )
+            } else if build_matches_server == Some(false) {
+                (
+                    "version_mismatch",
+                    Some("runner_build_differs_from_server"),
+                    Some("align server and runner builds (redeploy the older side)"),
+                )
+            } else {
+                ("compatible", None, None)
+            };
+            match (status, overall) {
+                ("capability_mismatch", _) => overall = "capability_mismatch",
+                ("version_mismatch", o) if o != "capability_mismatch" => {
+                    overall = "version_mismatch"
+                }
+                _ => {}
+            }
+            json!({
+                "client_id": client.client_id,
+                "agent_protocol_version": client.agent_protocol_version,
+                "protocol_supported": protocol_supported,
+                "build_version": build_version,
+                "build_git_commit": client.build.as_ref().and_then(|b| b.git_commit.clone()),
+                "build_matches_server": build_matches_server,
+                "status": status,
+                "reason_code": reason_code,
+                "action": action,
+            })
+        })
+        .collect();
+    json!({
+        "status": overall,
+        "server": {
+            "version": server_version,
+            "build": build,
         },
-        "server_transport": {
-            "status": if online_clients > 0 { "connected" } else { "not_connected" },
-            "connected_clients": online_clients,
-        },
-        "server_registration": {
-            "status": if registered_clients > 0 { "registered" } else { "not_registered" },
-            "registered_clients": registered_clients,
-        },
-        "project_registry": {
-            "status": if registered_projects > 0 { "registered" } else { "empty" },
-            "registered_projects": registered_projects,
-            "online_projects": online_projects,
-        },
-        "connector_endpoint": {
-            "status": "not_observed",
-            "reason": "connector_runtime_is_separate",
-        },
-        "session_binding": {
-            "status": "not_observed",
-            "reason": "binding_is_request_principal_and_transport_scoped",
-        },
-        "last_successful_tool_call": {
-            "status": "not_observed",
-            "reason": "no_connector_call_history_in_runtime_registry",
-        },
+        "runners": runners,
     })
 }
 
@@ -492,6 +855,7 @@ fn sanitized_shell_profiles_summary(
                         "env_keys_count": p.env_keys_count,
                         "program": p.program,
                         "args_count": p.args_count,
+                        "dialect": p.dialect,
                     })
                 })
                 .collect();
@@ -500,6 +864,8 @@ fn sanitized_shell_profiles_summary(
                 "configured_count": s.configured_count,
                 "prepared_cache_count": s.prepared_cache_count,
                 "profiles": profiles,
+                "default_dialect": s.default_dialect,
+                "available_dialects": s.available_dialects,
             })
         }
         None => Value::Null,

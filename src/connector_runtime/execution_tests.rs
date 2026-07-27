@@ -98,6 +98,8 @@ pub(crate) async fn console_fixture() -> ConsoleFixture {
         .registry
         .register_with_auth(
             ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "laptop".into(),
                 agent_instance_id: "instance-b".into(),
                 display_name: None,
@@ -124,9 +126,23 @@ async fn fixture(yield_ms: u64) -> Fixture {
     fixture_configured(yield_ms, |service| service).await
 }
 
+/// Restricted-authority fixture for the lanes that protect the human-approval
+/// machinery; the default fixture runs under trusted_agent like production.
+async fn fixture_restricted(yield_ms: u64) -> Fixture {
+    fixture_built(yield_ms, |service| service, true).await
+}
+
 async fn fixture_configured(
     yield_ms: u64,
     configure: impl FnOnce(execution::ExecutionService) -> execution::ExecutionService,
+) -> Fixture {
+    fixture_built(yield_ms, configure, false).await
+}
+
+async fn fixture_built(
+    yield_ms: u64,
+    configure: impl FnOnce(execution::ExecutionService) -> execution::ExecutionService,
+    restricted: bool,
 ) -> Fixture {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");
@@ -137,6 +153,8 @@ async fn fixture_configured(
     registry
         .register_with_auth(
             ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "hosted".into(),
                 agent_instance_id: "instance".into(),
                 display_name: None,
@@ -161,9 +179,15 @@ async fn fixture_configured(
         .await
         .unwrap();
     let db = Arc::new(Database::open(&temp.path().join("connector.db")).unwrap());
-    let tools = Arc::new(ToolRuntime::new_for_tests_with_shell_clients(
-        registry.clone(),
-    ));
+    let mut tools = ToolRuntime::new_for_tests_with_shell_clients(registry.clone());
+    if restricted {
+        tools = tools.with_permission_evaluator(
+            crate::tool_runtime::permissions::PermissionEvaluator::with_mode(
+                crate::tool_runtime::permissions::AuthorityMode::Restricted,
+            ),
+        );
+    }
+    let tools = Arc::new(tools);
     let mut connector = ConnectorRuntime::new(
         tools,
         db,
@@ -302,31 +326,13 @@ async fn call(
         .await
 }
 
-async fn approve(fixture: &Fixture, operation_id: &str, command: &str) -> Value {
-    let arguments = json!({
+fn command_arguments(fixture: &Fixture, operation_id: &str, command: &str) -> Value {
+    json!({
         "task_id": fixture.task_id,
         "operation_id": operation_id,
         "command": command,
         "timeout_secs": 30
-    });
-    let waiting = fixture.call("commands_run", arguments.clone()).await;
-    assert_eq!(waiting.body["error"]["code"], "approval_required");
-    fixture
-        .connector
-        .db
-        .decide_connector_approval(
-            &fixture.task_id,
-            &fixture.connector.context.project_id,
-            waiting.body["data"]["approval"]["approval_id"]
-                .as_str()
-                .unwrap(),
-            true,
-            "local_cli",
-            None,
-            chrono::Utc::now().timestamp(),
-        )
-        .unwrap();
-    arguments
+    })
 }
 
 fn checks(fixture: &Fixture, operation_id: &str, plan: &[&str]) -> Value {
@@ -527,6 +533,8 @@ async fn connector_readiness_uses_registered_agent_capabilities() {
         .registry
         .register_with_auth(
             ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "hosted".into(),
                 agent_instance_id: "instance".into(),
                 display_name: None,
@@ -574,7 +582,7 @@ async fn connector_readiness_uses_registered_agent_capabilities() {
 #[tokio::test]
 async fn short_command_returns_terminal_and_precise_retry_does_not_spawn() {
     let fixture = fixture(1_000).await;
-    let arguments = approve(&fixture, "short-command-1", "printf short").await;
+    let arguments = command_arguments(&fixture, "short-command-1", "printf short");
     let registry = fixture.registry.clone();
     let responder = tokio::spawn(async move {
         let request = next_request(&registry).await;
@@ -1219,7 +1227,7 @@ async fn active_review_surfaces_applied_paths_without_diff() {
     assert!(edit_call.await.unwrap().ok);
 
     // Start a long command and let it reach running.
-    let arguments = approve(&fixture, "active-review-cmd-1", "sleep 30").await;
+    let arguments = command_arguments(&fixture, "active-review-cmd-1", "sleep 30");
     let connector = fixture.connector.clone();
     let owner = fixture.owner.clone();
     let command_call =
@@ -1273,7 +1281,7 @@ async fn active_review_surfaces_applied_paths_without_diff() {
 #[tokio::test]
 async fn finish_fingerprint_and_result_capture_exclude_a_concurrent_edit() {
     let fixture = fixture(1_000).await;
-    let command_arguments = approve(&fixture, "atomic-finish-command-1", "printf late").await;
+    let command_arguments = command_arguments(&fixture, "atomic-finish-command-1", "printf late");
     let second = fixture
         .connector
         .call(
@@ -1380,7 +1388,7 @@ async fn finish_fingerprint_and_result_capture_exclude_a_concurrent_edit() {
 #[tokio::test]
 async fn command_and_check_reservations_block_finish_before_dispatch_completes() {
     let fixture = fixture(1_000).await;
-    let arguments = approve(&fixture, "reservation-command-1", "printf reserved").await;
+    let arguments = command_arguments(&fixture, "reservation-command-1", "printf reserved");
     let connector = fixture.connector.clone();
     let owner = fixture.owner.clone();
     let command_call =
@@ -1434,7 +1442,7 @@ async fn mutating_command_after_a_passed_check_makes_finish_stale() {
     )
     .await;
     let command = "printf changed > command-after-check.txt";
-    let arguments = approve(&fixture, "mutating-command-1", command).await;
+    let arguments = command_arguments(&fixture, "mutating-command-1", command);
     let registry = fixture.registry.clone();
     let execution_root = task(&fixture).execution_root;
     let responder = tokio::spawn(async move {
@@ -1861,6 +1869,8 @@ async fn old_agent_cannot_receive_a_structured_validation_job() {
         .registry
         .register_with_auth(
             ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "hosted".into(),
                 agent_instance_id: "instance".into(),
                 display_name: None,
@@ -2001,7 +2011,7 @@ async fn same_normalized_test_filter_retries_and_different_filter_conflicts() {
 #[tokio::test]
 async fn operation_id_conflict_is_stable_and_does_not_spawn() {
     let fixture = fixture(1_000).await;
-    let arguments = approve(&fixture, "stable-operation", "printf first").await;
+    let arguments = command_arguments(&fixture, "stable-operation", "printf first");
     let registry = fixture.registry.clone();
     let responder = tokio::spawn(async move {
         let request = next_request(&registry).await;
@@ -2032,7 +2042,7 @@ async fn operation_id_conflict_is_stable_and_does_not_spawn() {
 async fn new_operation_id_reruns_same_command_after_workspace_change() {
     let fixture = fixture(1_000).await;
     let command = "cargo test";
-    let first_arguments = approve(&fixture, "test-attempt-1", command).await;
+    let first_arguments = command_arguments(&fixture, "test-attempt-1", command);
     let first_registry = fixture.registry.clone();
     let first_responder = tokio::spawn(async move {
         let request = next_request(&first_registry).await;
@@ -2058,7 +2068,7 @@ async fn new_operation_id_reruns_same_command_after_workspace_change() {
         "fixed",
     )
     .unwrap();
-    let second_arguments = approve(&fixture, "test-attempt-2", command).await;
+    let second_arguments = command_arguments(&fixture, "test-attempt-2", command);
     let second_registry = fixture.registry.clone();
     let second_responder = tokio::spawn(async move {
         let request = next_request(&second_registry).await;
@@ -2095,7 +2105,7 @@ async fn starting_cancel_late_attach_binds_job_and_dispatches_compensating_stop(
         move |service| service.with_monitor_timing(80, 5).with_attach_gate(gate)
     })
     .await;
-    let arguments = approve(&fixture, "starting-race-1", "sleep 30").await;
+    let arguments = command_arguments(&fixture, "starting-race-1", "sleep 30");
     let connector = fixture.connector.clone();
     let owner = fixture.owner.clone();
     let command_call =
@@ -2190,7 +2200,7 @@ async fn starting_cancel_late_attach_binds_job_and_dispatches_compensating_stop(
 #[tokio::test]
 async fn retry_and_cancel_share_one_execution_monitor() {
     let fixture = fixture_configured(20, |service| service.with_monitor_timing(500, 5)).await;
-    let arguments = approve(&fixture, "one-monitor-1", "sleep 30").await;
+    let arguments = command_arguments(&fixture, "one-monitor-1", "sleep 30");
     let connector = fixture.connector.clone();
     let owner = fixture.owner.clone();
     let first_arguments = arguments.clone();
@@ -2974,6 +2984,8 @@ async fn read_only_commands_run_is_denied_even_when_agent_advertises_sandbox() {
         .registry
         .register_with_auth(
             ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "hosted".into(),
                 agent_instance_id: "instance".into(),
                 display_name: None,
@@ -3082,7 +3094,7 @@ async fn read_only_denial_creates_no_approval_reservation_or_agent_request() {
 /// host-local approval before it runs.
 #[tokio::test]
 async fn normal_commands_run_still_requires_exact_one_time_approval() {
-    let fixture = fixture(20).await;
+    let fixture = fixture_restricted(20).await;
     let arguments = json!({
         "task_id": fixture.task_id,
         "operation_id": "needs-approval",
@@ -3344,6 +3356,8 @@ async fn manifestless_python_unittest_checks_finish_with_clean_result() {
     registry
         .register_with_auth(
             ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "hosted".into(),
                 agent_instance_id: "instance".into(),
                 display_name: None,
@@ -3539,7 +3553,7 @@ async fn guidance_is_delivered_once_inside_the_next_capability_response() {
     let fixture = fixture(20).await;
     // Keep an execution active so task_review stays on the deferred branch
     // (no workspace scan) for both polls.
-    let arguments = approve(&fixture, "guided-review-1", "sleep 30").await;
+    let arguments = command_arguments(&fixture, "guided-review-1", "sleep 30");
     let connector = fixture.connector.clone();
     let owner = fixture.owner.clone();
     let command_call =
@@ -3613,7 +3627,7 @@ async fn guidance_is_delivered_once_inside_the_next_capability_response() {
 #[tokio::test]
 async fn finished_command_response_carries_pending_guidance() {
     let fixture = fixture(1_000).await;
-    let arguments = approve(&fixture, "guided-cmd-1", "printf done").await;
+    let arguments = command_arguments(&fixture, "guided-cmd-1", "printf done");
     let connector = fixture.connector.clone();
     let owner = fixture.owner.clone();
     let command_call =
@@ -3639,7 +3653,7 @@ async fn finished_command_response_carries_pending_guidance() {
 
 #[tokio::test]
 async fn denied_approval_reason_reaches_the_model() {
-    let fixture = fixture(20).await;
+    let fixture = fixture_restricted(20).await;
     let arguments = json!({
         "task_id": fixture.task_id,
         "operation_id": "denied-cmd-1",

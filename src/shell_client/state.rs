@@ -1,7 +1,7 @@
 use super::auth::ShellClientAuthGroup;
 use crate::shell_protocol::{
-    AgentPolicySummary, ShellAgentProjectSummary, ShellAgentShellRequest, ShellClientCapabilities,
-    ShellJobCodexMetadata, ShellJobValidationProgress, ShellRunResponse,
+    AgentBuildInfo, AgentPolicySummary, ShellAgentProjectSummary, ShellAgentShellRequest,
+    ShellClientCapabilities, ShellJobCodexMetadata, ShellJobValidationProgress, ShellRunResponse,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -31,6 +31,19 @@ pub(super) struct ShellClientRecord {
     /// Lightweight quick-start isolation group captured at registration. This
     /// is intentionally not exposed in `ShellClientView`.
     pub(super) auth_group: Option<ShellClientAuthGroup>,
+    /// When the current agent instance first registered under this client_id.
+    /// Preserved across same-instance re-registrations (transport reconnects).
+    pub(super) registered_at: i64,
+    /// When the current transport connection was established (latest register
+    /// for this instance).
+    pub(super) connected_at: i64,
+    /// When the server observed the last transport disconnect for the current
+    /// instance. Cleared on re-register.
+    pub(super) disconnected_at: Option<i64>,
+    /// Runner-reported process start timestamp (register payload).
+    pub(super) process_started_at: Option<i64>,
+    /// Runner-reported build identity (register payload).
+    pub(super) build: Option<AgentBuildInfo>,
 }
 
 #[derive(Debug)]

@@ -17,6 +17,9 @@ tests with different cost profiles sharing the same default lane.
 | local integration | Exercise HTTP handlers, runtime dispatch, sessions, local agent registry, temp dirs, loopback listeners, and database fixtures. | Loopback only, isolated temp dirs, bounded waits, no shared mutable state without a lock. | `cargo test --bin webcodex runtime_http -- --nocapture`; `cargo test --bin webcodex session -- --nocapture` |
 | slow/manual ignored | Valuable coverage that is local but slow, serial, large-input, or global-state-sensitive. | Explicit operator opt-in; often `--ignored` and `--test-threads=1`. | `cargo test --bin webcodex import_http -- --ignored --nocapture --test-threads=1` |
 | e2e/deployment smoke | Prove that binaries, local services, GPT Actions schema, MCP, artifact transfer, and an agent can work together. | Temporary local services and loopback ports; real deployment only when explicitly requested. | `bash scripts/e2e_zero_config_ws.sh`; `bash scripts/smoke_deployment.sh`; `bash scripts/smoke_artifact_transfer.sh` |
+| reconnect continuity | Runner disconnect/reconnect layer independence, stale-not-ready observations, server-restart durable session plus binding loss, lost-job terminal semantics, meaningful-activity scoping, and version-mismatch diagnostics. | In-process fixtures, no external network. | `cargo test --bin webcodex reconnect` |
+| trusted smoke | Disposable git fixture full chain (start → edit → failing shell validation → fix → pass → git review → finish) asserting zero approval interruptions under `trusted_agent` authority, resolved failure evidence, dirty-worktree advisory-only, and bounded payloads; prints baseline counters. | Temp git fixture, no external network. | `cargo test --bin webcodex trusted_smoke` |
+| real-process reconnect harness | Boot a real server plus runner, assert layered connection observations, crash the runner (layers degrade independently; running job goes terminal `lost`), restart the runner (new connection instance, no server restart), restart the server (runner auto-reconnect, durable session resume via explicit session id, binding reported `not_bound`), and print post-deploy smoke facts (server version/commit, authority mode, version compatibility, runner shell dialect). | Local processes and loopback ports. | `bash scripts/e2e_reconnect_ws.sh` |
 | security auth matrix | Cover OAuth, scope policy, shared-key behavior, token classes, read-only session guards, and denied mutations. | No external identity provider by default; use local fixtures and synthetic tokens. | `cargo test --bin webcodex oauth -- --nocapture`; `cargo test --bin webcodex scope -- --nocapture`; `cargo test --bin webcodex metadata -- --nocapture` |
 
 Iteration 9 execution/reporting changes use the existing domain lanes rather
@@ -28,7 +31,8 @@ than a new test suite:
   shell/cwd metadata, bounded job tails, detected summaries, and cursors;
 - `cargo test --bin webcodex tool_runtime::tests::coding_task -- --nocapture`
   and `cargo test --bin webcodex tool_runtime::tests::handoff -- --nocapture`
-  cover facts/advisories/hard blockers and compact startup;
+  cover facts/advisories/hard blockers and the `detail=minimal|standard|full`
+  startup projection (the only startup projection control);
 - `cargo test --bin webcodex read_file -- --nocapture`, `metadata`, `mcp`, and
   `openapi` cover the single read representation, layered readiness, and
   project-bound versus operator surfaces.

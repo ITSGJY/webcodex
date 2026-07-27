@@ -66,8 +66,12 @@ pub enum ToolCall {
     },
 
     /// Create a task session and return deterministic startup context: project
-    /// resolution, optional runtime/git/rules summaries, recommended flow, and
-    /// explicit current-session binding state. Never calls an LLM.
+    /// resolution, runtime/git summaries scaled by `detail`, recommended flow,
+    /// and explicit current-session binding state. Never calls an LLM.
+    ///
+    /// `detail` is the only projection control. The removed legacy startup
+    /// flags (`compact_startup`, `include_*`, `tool_manifest_*`) are rejected
+    /// as unknown fields by strict argument validation.
     StartCodingTask {
         project: String,
         #[serde(default)]
@@ -80,24 +84,6 @@ pub enum ToolCall {
         deny_shell_tools: bool,
         #[serde(default)]
         detail: StartupDetail,
-        #[serde(default)]
-        include_runtime_status: Option<bool>,
-        #[serde(default)]
-        compact_startup: bool,
-        #[serde(default)]
-        include_git: Option<bool>,
-        #[serde(default)]
-        include_recent_commits: Option<bool>,
-        #[serde(default)]
-        include_rules: Option<bool>,
-        #[serde(default)]
-        include_tool_manifest: Option<bool>,
-        #[serde(default)]
-        tool_manifest_intent: Option<String>,
-        #[serde(default)]
-        tool_manifest_categories: Option<Vec<String>>,
-        #[serde(default)]
-        tool_manifest_limit: Option<usize>,
         #[serde(default)]
         bind_current: bool,
     },
@@ -1042,6 +1028,41 @@ pub enum ToolCall {
     },
 }
 
+/// Strict argument validation for `start_coding_task`: the removed legacy
+/// startup flags must fail loudly instead of being silently ignored by serde.
+fn reject_unknown_start_coding_task_fields(arguments: &Value) -> Result<(), String> {
+    const ALLOWED: &[&str] = &[
+        "project",
+        "title",
+        "mode",
+        "deny_write_tools",
+        "deny_shell_tools",
+        "detail",
+        "bind_current",
+        // Wrapper/session metadata that transports may leave in params.
+        "session_id",
+        "recording_session_id",
+        "_session_id",
+    ];
+    let Some(object) = arguments.as_object() else {
+        return Ok(());
+    };
+    let unknown: Vec<&str> = object
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !ALLOWED.contains(key))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "invalid arguments for tool 'start_coding_task': unknown field(s) {}. \
+         Startup projection is controlled solely by detail=minimal|standard|full; \
+         the legacy startup flags were removed.",
+        unknown.join(", ")
+    ))
+}
+
 impl ToolCall {
     pub fn from_tool_name(name: &str, arguments: Value) -> Result<Self, String> {
         Self::from_tool_name_with_recorder_metadata(name, arguments).map(|(call, _)| call)
@@ -1066,6 +1087,11 @@ impl ToolCall {
         })?;
         let recorder_metadata = ToolCallRecorderMetadata::from_arguments(&arguments);
         let arguments = strip_tool_call_expectation_metadata(arguments);
+        if name == "start_coding_task" {
+            if let Err(message) = reject_unknown_start_coding_task_fields(&arguments) {
+                return Err(message);
+            }
+        }
         let mut wrapped = serde_json::Map::new();
         wrapped.insert(
             TOOL_CALL_TOOL_FIELD.to_string(),

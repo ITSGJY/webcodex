@@ -1,6 +1,6 @@
-//! Permission evaluation entry point.
+//! Authority evaluation entry point.
 //!
-//! Authoritative call chain (Phase 2):
+//! Authoritative call chain:
 //!
 //! ```text
 //! request validation / hard session+auth guards
@@ -16,42 +16,42 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::model::PermissionDecision;
-use super::policy::{decide_for_required_tool, EffectivePermissionConfig};
+use super::policy::{decide_for_required_tool, EffectiveAuthorityConfig};
 use super::risk::{classify_tool_risk, tool_requires_permission};
 #[cfg(test)]
-use super::PermissionMode;
+use super::AuthorityMode;
 
 /// Evaluates whether a tool invocation is permission-bearing and, if so, the
 /// mode-specific decision. Does **not** execute tools and does **not** override
 /// hard safety.
 #[derive(Debug, Clone)]
 pub(crate) struct PermissionEvaluator {
-    config: EffectivePermissionConfig,
+    config: EffectiveAuthorityConfig,
     /// Optional counter incremented on every [`Self::evaluate`] (tests).
     eval_count: Option<Arc<AtomicUsize>>,
 }
 
 impl PermissionEvaluator {
-    /// Evaluator using `WEBCODEX_PERMISSION_MODE` (default `dev_auto_approve`).
+    /// Evaluator using `WEBCODEX_AUTHORITY_MODE` (default `trusted_agent`).
     pub(crate) fn from_env() -> Self {
         Self {
-            config: EffectivePermissionConfig::from_env(),
+            config: EffectiveAuthorityConfig::from_env(),
             eval_count: None,
         }
     }
 
     /// Evaluator fixed to a known mode (unit tests / explicit wiring).
     #[cfg(test)]
-    pub(crate) fn with_mode(mode: PermissionMode) -> Self {
+    pub(crate) fn with_mode(mode: AuthorityMode) -> Self {
         Self {
-            config: EffectivePermissionConfig::with_mode(mode),
+            config: EffectiveAuthorityConfig::with_mode(mode),
             eval_count: None,
         }
     }
 
     /// Evaluator from an already-resolved config (including invalid mode).
     #[cfg(test)]
-    pub(crate) fn with_config(config: EffectivePermissionConfig) -> Self {
+    pub(crate) fn with_config(config: EffectiveAuthorityConfig) -> Self {
         Self {
             config,
             eval_count: None,
@@ -65,8 +65,8 @@ impl PermissionEvaluator {
         self
     }
 
-    #[cfg(test)]
-    pub(crate) fn config(&self) -> &EffectivePermissionConfig {
+    /// Construction-time resolved authority configuration for this runtime.
+    pub(crate) fn config(&self) -> &EffectiveAuthorityConfig {
         &self.config
     }
 

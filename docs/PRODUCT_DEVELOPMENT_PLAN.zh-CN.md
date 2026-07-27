@@ -70,7 +70,7 @@ WebCodex 当前最根本的问题不是依赖线上 GPT，而是把某次聊天�
 | workflow session 存 JSON ledger，current session 是进程内 map，HTTP action audit 另存 SQLite | 同一任务存在三个状态面，只能靠 summary 拼接 |
 | SessionRecord 没有可比较的 Git/worktree baseline | dirty workspace 中无法证明哪些变化属于本任务 |
 | finish_coding_task 不关闭 session，close_session 是另一个低层工具 | “完成任务”没有一个原子终态 |
-| require_approval 不是 pending，而是 require_approval_not_implemented 的立即拒绝 | 系统只有自动执行或拒绝，没有真实人工闭环 |
+| runtime authority mode 只有 trusted_agent 自动执行与 restricted 拒绝（旧 WEBCODEX_PERMISSION_MODE 已 hard cut，设置即 fail closed） | runtime 层没有 pending 队列；真实人工闭环只存在于 connector `commands_run` 的一次性审批 |
 | server 没有持久化 Project、Workspace、Device 或 ProjectMembership | 项目只是在线 agent 上报的内存摘要 |
 | runtime project id 是 agent:<client_id>:<project_id> | 逻辑项目身份被某台机器的某个 client 绑定 |
 | client_id 同时用于 token 绑定、连接 lease、请求路由和 project namespace | 一个字段承担四种生命周期 |
@@ -562,7 +562,7 @@ WebCodex 不驱动线上模型，因此 `TaskDriver` 会制造错误抽象。实
 
 CLI/console 是人类控制面，也不是 model driver。代码中不建立 `ModelProvider`、`PromptRunner`、`AgentLoop` 或 provider-neutral completion interface。
 
-Domain event 不包含 recommended_next_tool、compact_startup、flattened_args、tunnel_id 或 public_url 等 client/ingress-specific 字段。每个 adapter 自己投影需要的 payload；若某个平台需要提示下一步，提示属于该 connector preset 的版本化 metadata，不进入任务事实。
+Domain event 不包含 recommended_next_tool、flattened_args、tunnel_id 或 public_url 等 client/ingress-specific 字段。每个 adapter 自己投影需要的 payload；若某个平台需要提示下一步，提示属于该 connector preset 的版本化 metadata，不进入任务事实。
 
 ## 10. 状态存储：一个事件事实源，多个小投影
 
@@ -994,7 +994,7 @@ Golden scenarios：
 
 同时删除：
 
-- require_approval_not_implemented；
+- require_approval_not_implemented（已随 canonical authority mode hard cut 删除）；
 - permission summary 代替真实 gate 的行为；
 - runtime-only console 首页。
 

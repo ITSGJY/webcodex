@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 
 use super::common::{
-    array_schema, nullable_schema, open_object_schema, permission_profile_schema, schema_type,
+    array_schema, authority_profile_schema, nullable_schema, open_object_schema, schema_type,
     wrapped_output_schema,
 };
 
@@ -35,8 +35,8 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ("jobs", open_object_schema("Runtime job counts.")),
             ("tools", open_object_schema("Runtime tool counts and names.")),
             (
-                "permissions",
-                permission_profile_schema("Current permission/approval profile. dev_auto_approve is the self-hosted development default and does not bypass hard safety checks."),
+                "authority",
+                authority_profile_schema("Canonical authority profile. trusted_agent is the self-hosted single-operator default and does not bypass hard safety checks (scopes, project boundary, read-only sessions, path policy)."),
             ),
             (
                 "quic",

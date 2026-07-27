@@ -256,6 +256,9 @@ impl ConnectorRuntime {
             "local-owner".to_string(),
             Path::new(&agent_token_path),
         )?;
+        // The connector endpoint layer distinguishes not_configured from
+        // not_observed; mark the surface as configured for this process.
+        tools.observations.set_connector_configured();
         Ok(ConnectorRuntimeSlot(Some(Arc::new(
             Self::new(tools, db, context, credential)?.with_project_agent_token(agent_token),
         ))))
@@ -284,7 +287,7 @@ impl ConnectorRuntime {
         &self,
         auth: &AuthContext,
     ) -> Option<crate::project_entry::ProjectReadiness> {
-        use crate::project_entry::{runtime_readiness, RemoteProbe};
+        use crate::project_entry::RemoteProbe;
 
         if !self.project_access_allowed(auth) {
             return None;
@@ -295,10 +298,7 @@ impl ConnectorRuntime {
             .strip_prefix("agent:")
             .and_then(|value| value.split_once(':'))
         else {
-            return Some(runtime_readiness(
-                Some(self.context.project_name.clone()),
-                RemoteProbe::ProjectMissing,
-            ));
+            return Some(self.observed_readiness(RemoteProbe::ProjectMissing));
         };
         let Some(agent) = self
             .tools
@@ -306,26 +306,17 @@ impl ConnectorRuntime {
             .get_client_view_for_auth(client_id, Some(auth))
             .await
         else {
-            return Some(runtime_readiness(
-                Some(self.context.project_name.clone()),
-                RemoteProbe::AgentOffline,
-            ));
+            return Some(self.observed_readiness(RemoteProbe::AgentOffline));
         };
         if agent.status != "online" || !agent.connected {
-            return Some(runtime_readiness(
-                Some(self.context.project_name.clone()),
-                RemoteProbe::AgentOffline,
-            ));
+            return Some(self.observed_readiness(RemoteProbe::AgentOffline));
         }
         if !agent
             .projects
             .iter()
             .any(|project| project.id == project_id && !project.disabled)
         {
-            return Some(runtime_readiness(
-                Some(self.context.project_name.clone()),
-                RemoteProbe::ProjectMissing,
-            ));
+            return Some(self.observed_readiness(RemoteProbe::ProjectMissing));
         }
         let capabilities = &agent.capabilities;
         if !(capabilities.shell
@@ -335,21 +326,31 @@ impl ConnectorRuntime {
             && capabilities.async_jobs
             && capabilities.async_shell_jobs)
         {
-            return Some(runtime_readiness(
-                Some(self.context.project_name.clone()),
-                RemoteProbe::RequiredCapabilityMissing,
-            ));
+            return Some(self.observed_readiness(RemoteProbe::RequiredCapabilityMissing));
         }
         if !capabilities.structured_validation_argv {
-            return Some(runtime_readiness(
-                Some(self.context.project_name.clone()),
-                RemoteProbe::StructuredValidationMissing,
-            ));
+            return Some(self.observed_readiness(RemoteProbe::StructuredValidationMissing));
         }
-        Some(runtime_readiness(
-            Some(self.context.project_name.clone()),
-            RemoteProbe::Ready,
-        ))
+        Some(self.observed_readiness(RemoteProbe::Ready))
+    }
+
+    /// Build the readiness projection and record the probe outcome as the
+    /// connector endpoint observation (real activity, not config inference).
+    fn observed_readiness(
+        &self,
+        probe: crate::project_entry::RemoteProbe,
+    ) -> crate::project_entry::ProjectReadiness {
+        let status = if matches!(probe, crate::project_entry::RemoteProbe::Ready) {
+            "ready"
+        } else {
+            "not_ready"
+        };
+        self.tools.observations.record_connector_observation(
+            status,
+            "readiness_probe",
+            chrono::Utc::now().timestamp(),
+        );
+        crate::project_entry::runtime_readiness(Some(self.context.project_name.clone()), probe)
     }
 
     pub(crate) async fn host_review(
@@ -510,7 +511,7 @@ impl ConnectorRuntime {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
-        match capability {
+        let outcome = match capability {
             "task_start" => {
                 self.task_start(arguments, &subject_id, auth, transport, now)
                     .await
@@ -551,7 +552,17 @@ impl ConnectorRuntime {
                     .await
             }
             _ => unreachable!("capability registry checked before dispatch"),
+        };
+        if outcome.ok {
+            // Real endpoint activity backs the connector_endpoint connection
+            // layer; configuration presence alone never implies readiness.
+            self.tools.observations.record_connector_observation(
+                "request_succeeded",
+                "connector_request",
+                chrono::Utc::now().timestamp(),
+            );
         }
+        outcome
     }
 
     fn task_lock(&self, task_id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -1512,22 +1523,46 @@ impl ConnectorRuntime {
                     short_oid(&precondition),
                     crate::shell_client::command_preview(&input.command)
                 );
-                let gate = match self.db.request_or_consume_connector_approval(
-                    &task.task_id,
-                    &self.context.project_id,
-                    subject_id,
-                    "commands_run",
-                    &action_hash,
-                    &action_summary,
-                    now,
-                    now + COMMAND_APPROVAL_TTL_SECS,
-                ) {
-                    Ok(gate) => gate,
-                    Err(error) => return store_error_outcome(error, Some(&task)),
-                };
-                if !matches!(&gate, ConnectorApprovalGate::Authorized(_)) {
-                    let current = self.task(&task.task_id, subject_id).unwrap_or(task);
-                    return approval_gate_outcome(gate, &current);
+                let authority = self.tools.permission_evaluator.config();
+                if authority.auto_authorize() {
+                    // Trusted agent authority: no human approval interruption
+                    // and no pending approval record. The auto-authorization is
+                    // still a durable audit fact on the task event stream.
+                    let _ = self.record_event(
+                        &task,
+                        "authority_auto_authorized",
+                        json!({
+                            "action_kind": "commands_run",
+                            "action_hash": action_hash,
+                            "action_summary": action_summary,
+                            "authority_mode": authority.mode_name(),
+                            "authority_source": authority.source().as_str(),
+                            "resolved_rule":
+                                crate::tool_runtime::permissions::TRUSTED_AGENT_AUTO_REASON,
+                            "risk": "shell",
+                            "principal": subject_id,
+                            "project": self.context.project_id,
+                        }),
+                        now,
+                    );
+                } else {
+                    let gate = match self.db.request_or_consume_connector_approval(
+                        &task.task_id,
+                        &self.context.project_id,
+                        subject_id,
+                        "commands_run",
+                        &action_hash,
+                        &action_summary,
+                        now,
+                        now + COMMAND_APPROVAL_TTL_SECS,
+                    ) {
+                        Ok(gate) => gate,
+                        Err(error) => return store_error_outcome(error, Some(&task)),
+                    };
+                    if !matches!(&gate, ConnectorApprovalGate::Authorized(_)) {
+                        let current = self.task(&task.task_id, subject_id).unwrap_or(task);
+                        return approval_gate_outcome(gate, &current);
+                    }
                 }
                 match self.executions.reserve(
                     &task,
@@ -3786,6 +3821,8 @@ pub(crate) mod tests {
         registry
             .register_with_auth(
                 ShellClientRegisterRequest {
+                    process_started_at: None,
+                    build: None,
                     client_id: "hosted".to_string(),
                     agent_instance_id: "instance".to_string(),
                     display_name: None,

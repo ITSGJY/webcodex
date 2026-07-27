@@ -705,10 +705,46 @@ fn build_register_request_with_provider_status(
                 prepared_cache_count,
                 tool_providers,
             )),
+            process_started_at: Some(process_started_at()),
+            build: Some(runner_build_info()),
         },
         Arc::clone(&hot.external_tools),
         revision,
     )
+}
+
+/// Unix timestamp when this runner process started. Captured on first call;
+/// `run_agent` initializes it at startup so registration payloads report the
+/// real process start, not the first register time after a reconnect.
+fn process_started_at() -> i64 {
+    static STARTED_AT: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *STARTED_AT.get_or_init(|| chrono::Utc::now().timestamp())
+}
+
+/// Non-secret runner build identity for mixed-version diagnostics.
+fn runner_build_info() -> shell_protocol::AgentBuildInfo {
+    shell_protocol::AgentBuildInfo {
+        version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        git_commit: option_env!("WEBCODEX_BUILD_GIT_COMMIT")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+    }
+}
+
+/// Shell dialect derived from a program path basename. Only `sh` and `bash`
+/// map to portable dialects; anything else is `custom` and callers that need
+/// deterministic syntax must select an explicit `shell=sh|bash`.
+fn shell_dialect_for_program(program: &str) -> &'static str {
+    match std::path::Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program)
+    {
+        "sh" => "sh",
+        "bash" => "bash",
+        _ => "custom",
+    }
 }
 
 /// Build the sanitized shell-profiles summary from the active shell config.
@@ -730,20 +766,44 @@ fn build_shell_profiles_summary(
                 .clone()
                 .unwrap_or_else(|| shell.program.clone());
             let args = profile.args.clone().unwrap_or_else(|| shell.args.clone());
+            let dialect = shell_dialect_for_program(&program);
             ShellProfileSummaryEntry {
                 name: name.clone(),
                 has_init_script: profile.init_script.is_some(),
                 env_keys_count: profile.env.len(),
                 program,
                 args_count: args.len(),
+                dialect: Some(dialect.to_string()),
             }
         })
         .collect();
+    // Default execution path when the caller selects no explicit shell:
+    // shell.default_profile if set, otherwise the plain shell program.
+    // (A project-level shell_profile override is reported per project.)
+    let default_program = shell
+        .default_profile
+        .as_deref()
+        .and_then(|name| shell.profiles.get(name))
+        .and_then(|profile| profile.program.clone())
+        .unwrap_or_else(|| shell.program.clone());
+    let default_dialect = shell_dialect_for_program(&default_program).to_string();
+    // Explicit shell=sh|bash always resolves on the runner; configured custom
+    // profiles add the custom dialect.
+    let mut available: Vec<String> = vec!["sh".to_string(), "bash".to_string()];
+    for entry in &profiles {
+        if let Some(dialect) = entry.dialect.as_deref() {
+            if !available.iter().any(|existing| existing == dialect) {
+                available.push(dialect.to_string());
+            }
+        }
+    }
     ShellProfilesSummary {
         default_profile: shell.default_profile.clone(),
         configured_count: shell.profiles.len(),
         prepared_cache_count,
         profiles,
+        default_dialect: Some(default_dialect),
+        available_dialects: Some(available),
     }
 }
 
@@ -1783,6 +1843,9 @@ fn handle_one_poll(
 }
 
 fn main() {
+    // Pin the process start timestamp before any transport work so register
+    // payloads report real process identity even after reconnect loops.
+    let _ = process_started_at();
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let _ = tracing_subscriber::fmt()
         .with_env_filter(

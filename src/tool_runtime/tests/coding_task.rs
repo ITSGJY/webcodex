@@ -60,8 +60,8 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
         start_output["properties"]["output"]["properties"]
             .as_object()
             .unwrap()
-            .contains_key("permissions"),
-        "start_coding_task output schema should include permissions"
+            .contains_key("authority"),
+        "start_coding_task output schema should include authority"
     );
     assert!(
         start_output["properties"]["output"]["properties"]
@@ -187,15 +187,6 @@ async fn start_coding_task_returns_session_and_does_not_bind_current_by_default(
                         detail: crate::tool_runtime::StartupDetail::Full,
                         deny_write_tools: false,
                         deny_shell_tools: false,
-                        include_runtime_status: Some(false),
-                        compact_startup: false,
-                        include_git: Some(true),
-                        include_recent_commits: Some(true),
-                        include_rules: Some(true),
-                        include_tool_manifest: Some(true),
-                        tool_manifest_intent: None,
-                        tool_manifest_categories: None,
-                        tool_manifest_limit: None,
                         bind_current: false,
                     },
                     Some(&auth),
@@ -269,7 +260,7 @@ async fn start_coding_task_returns_session_and_does_not_bind_current_by_default(
     for field in [
         "session",
         "runtime_status",
-        "permissions",
+        "authority",
         "rules",
         "git",
         "semantic_navigation",
@@ -282,12 +273,8 @@ async fn start_coding_task_returns_session_and_does_not_bind_current_by_default(
             "start_coding_task output should include {field}"
         );
     }
-    assert_eq!(result.output["permissions"]["policy"], "dev_auto_approve");
-    assert_eq!(result.output["permissions"]["auto_approve"], true);
-    assert_eq!(
-        result.output["permissions"]["human_approval_required"],
-        false
-    );
+    assert_eq!(result.output["authority"]["mode"], "trusted_agent");
+    assert_eq!(result.output["authority"]["human_approval_required"], false);
 
     let current = runtime
         .dispatch(ToolCall::CurrentSession {
@@ -377,15 +364,6 @@ async fn start_coding_task_can_omit_compact_tool_manifest() {
                 detail: Default::default(),
                 deny_write_tools: false,
                 deny_shell_tools: false,
-                include_runtime_status: Some(false),
-                compact_startup: false,
-                include_git: Some(false),
-                include_recent_commits: Some(false),
-                include_rules: Some(false),
-                include_tool_manifest: Some(false),
-                tool_manifest_intent: Some("coding".to_string()),
-                tool_manifest_categories: None,
-                tool_manifest_limit: None,
                 bind_current: false,
             },
             Some(&auth),
@@ -456,7 +434,7 @@ async fn start_coding_task_minimal_runtime_status_is_compact_and_path_safe() {
         "tool_manifest",
         "rules",
         "recent_commits",
-        "permissions",
+        "authority",
         "recommended_flow",
     ] {
         assert!(
@@ -486,24 +464,13 @@ async fn start_coding_task_compact_startup_returns_sanitized_runtime_summary() {
     let auth = auth_context(None, true);
     let project = "agent:coding-compact-status:demo".to_string();
 
-    let result = runtime
-        .dispatch_with_auth(
-            ToolCall::from_tool_name(
-                "start_coding_task",
-                json!({
-                    "project": project,
-                    "include_runtime_status": true,
-                    "compact_startup": true,
-                    "include_git": false,
-                    "include_recent_commits": false,
-                    "include_rules": false,
-                    "include_tool_manifest": false
-                }),
-            )
-            .unwrap(),
-            Some(&auth),
-        )
-        .await;
+    let result = start_coding_task_serviced(
+        &runtime,
+        "coding-compact-status",
+        json!({ "project": project }),
+        &auth,
+    )
+    .await;
 
     assert!(result.success, "{:?}", result.error);
     let summary = &result.output["runtime_status"];
@@ -557,7 +524,6 @@ async fn start_coding_task_compact_startup_returns_sanitized_runtime_summary() {
     assert_startup_verdict_shape(verdict);
     assert_ne!(verdict["status"], "fail");
     assert_eq!(verdict["blocking"], false);
-    assert_check_reason(verdict, "workspace", "workspace_not_checked");
     assert_check_reason(verdict, "tool_manifest", "tool_manifest_not_requested");
     assert_compact_verdict_safe(verdict, "startup verdict");
 
@@ -591,36 +557,13 @@ async fn start_coding_task_compact_startup_verdict_accepts_clean_workspace() {
         register_agent_project_at_path(&runtime, "coding-start-verdict", "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
-    let task = tokio::spawn({
-        let runtime = runtime.clone();
-        let project = project.clone();
-        let auth = auth.clone();
-        async move {
-            runtime
-                .dispatch_with_auth(
-                    ToolCall::from_tool_name(
-                        "start_coding_task",
-                        json!({
-                            "project": project,
-                            "include_runtime_status": true,
-                            "compact_startup": true,
-                            "include_git": true,
-                            "include_recent_commits": false,
-                            "include_rules": false,
-                            "include_tool_manifest": true
-                        }),
-                    )
-                    .unwrap(),
-                    Some(&auth),
-                )
-                .await
-        }
-    });
-    let req = next_patch_agent_request(&runtime, "coding-start-verdict")
-        .await
-        .expect("start_coding_task should inspect clean workspace");
-    complete_agent_request_by_running_locally(&runtime, "coding-start-verdict", req).await;
-    let result = task.await.unwrap();
+    let result = start_coding_task_serviced(
+        &runtime,
+        "coding-start-verdict",
+        json!({ "project": project, "detail": "full" }),
+        &auth,
+    )
+    .await;
 
     assert!(result.success, "{:?}", result.error);
     let verdict = &result.output["startup_verdict"];
@@ -641,7 +584,6 @@ async fn start_coding_task_with_git_inspection(
     client_id: &str,
     project: &str,
     auth: &AuthContext,
-    compact_startup: bool,
 ) -> ToolResult {
     let task = tokio::spawn({
         let runtime = runtime.clone();
@@ -654,12 +596,6 @@ async fn start_coding_task_with_git_inspection(
                         "start_coding_task",
                         json!({
                             "project": project,
-                            "include_runtime_status": true,
-                            "compact_startup": compact_startup,
-                            "include_git": true,
-                            "include_recent_commits": false,
-                            "include_rules": false,
-                            "include_tool_manifest": true
                         }),
                     )
                     .unwrap(),
@@ -672,6 +608,43 @@ async fn start_coding_task_with_git_inspection(
         .await
         .expect("start_coding_task should inspect workspace git status");
     complete_agent_request_by_running_locally(runtime, client_id, req).await;
+    task.await.unwrap()
+}
+
+/// Shared helper: dispatch start_coding_task and service every startup agent
+/// request (rules read, git status, git log) locally until the call finishes.
+async fn start_coding_task_serviced(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    params: Value,
+    auth: &AuthContext,
+) -> ToolResult {
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::from_tool_name("start_coding_task", params).unwrap(),
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    for _ in 0..200 {
+        if task.is_finished() {
+            break;
+        }
+        if let Some(req) = next_patch_agent_request(runtime, client_id).await {
+            complete_agent_request_by_running_locally(runtime, client_id, req).await;
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+    assert!(
+        task.is_finished(),
+        "start_coding_task did not finish after servicing startup agent requests"
+    );
     task.await.unwrap()
 }
 
@@ -719,8 +692,7 @@ async fn start_coding_task_untracked_only_is_nonblocking_warning() {
     let project = register_agent_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
-    let result =
-        start_coding_task_with_git_inspection(&runtime, client_id, &project, &auth, true).await;
+    let result = start_coding_task_with_git_inspection(&runtime, client_id, &project, &auth).await;
 
     assert_startup_nonblocking_dirty(&result, "workspace_dirty");
     assert_eq!(result.output["git"]["counts"]["untracked"], 1);
@@ -752,8 +724,7 @@ async fn start_coding_task_tracked_modified_is_nonblocking_and_allows_continued_
     let project = register_agent_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
-    let result =
-        start_coding_task_with_git_inspection(&runtime, client_id, &project, &auth, false).await;
+    let result = start_coding_task_with_git_inspection(&runtime, client_id, &project, &auth).await;
 
     assert_startup_nonblocking_dirty(&result, "workspace_dirty");
     assert_eq!(result.output["git"]["counts"]["modified"], 1);
@@ -837,8 +808,7 @@ async fn start_coding_task_staged_changes_are_nonblocking() {
     let project = register_agent_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
-    let result =
-        start_coding_task_with_git_inspection(&runtime, client_id, &project, &auth, true).await;
+    let result = start_coding_task_with_git_inspection(&runtime, client_id, &project, &auth).await;
 
     assert_startup_nonblocking_dirty(&result, "workspace_dirty");
     assert_eq!(result.output["git"]["counts"]["staged"], 1);
@@ -870,8 +840,7 @@ async fn start_coding_task_mixed_dirty_workspace_summarizes_counts_without_block
     let project = register_agent_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
-    let result =
-        start_coding_task_with_git_inspection(&runtime, client_id, &project, &auth, false).await;
+    let result = start_coding_task_with_git_inspection(&runtime, client_id, &project, &auth).await;
 
     assert_startup_nonblocking_dirty(&result, "workspace_dirty");
     assert_eq!(result.output["git"]["counts"]["modified"], 2);
@@ -916,8 +885,7 @@ async fn start_coding_task_conflict_state_is_a_hard_blocker_but_remains_inspecta
     let project = register_agent_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
-    let result =
-        start_coding_task_with_git_inspection(&runtime, client_id, &project, &auth, true).await;
+    let result = start_coding_task_with_git_inspection(&runtime, client_id, &project, &auth).await;
 
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["startup_verdict"]["status"], "fail");
@@ -957,12 +925,7 @@ async fn start_coding_task_unknown_project_still_fails() {
             ToolCall::from_tool_name(
                 "start_coding_task",
                 json!({
-                    "project": "agent:missing:does-not-exist",
-                    "include_runtime_status": false,
-                    "include_git": false,
-                    "include_recent_commits": false,
-                    "include_rules": false,
-                    "include_tool_manifest": false
+                    "project": "agent:missing:does-not-exist"
                 }),
             )
             .unwrap(),
@@ -1018,13 +981,7 @@ async fn start_coding_task_agent_offline_is_still_blocking() {
             ToolCall::from_tool_name(
                 "start_coding_task",
                 json!({
-                    "project": project,
-                    "include_runtime_status": true,
-                    "compact_startup": true,
-                    "include_git": false,
-                    "include_recent_commits": false,
-                    "include_rules": false,
-                    "include_tool_manifest": true
+                    "project": project
                 }),
             )
             .unwrap(),
@@ -1050,347 +1007,31 @@ async fn start_coding_task_agent_offline_is_still_blocking() {
 }
 
 #[tokio::test]
-async fn start_coding_task_filters_compact_tool_manifest_by_categories() {
-    let tmp = tempfile::tempdir().unwrap();
-    init_git_repo(tmp.path());
-    let runtime = test_runtime();
-    let project =
-        register_agent_project_at_path(&runtime, "coding-filter", "demo", tmp.path()).await;
-    let auth = auth_context(None, true);
-
-    let result = runtime
-        .dispatch_with_auth(
-            ToolCall::from_tool_name(
-                "start_coding_task",
-                json!({
-                    "project": project,
-                    "include_runtime_status": false,
-                    "include_git": false,
-                    "include_recent_commits": false,
-                    "include_rules": false,
-                    "include_tool_manifest": true,
-                    "tool_manifest_categories": ["workflow", "session"]
-                }),
-            )
-            .unwrap(),
-            Some(&auth),
-        )
-        .await;
-
-    assert!(result.success, "{:?}", result.error);
-    let manifest = &result.output["tool_manifest"];
-    assert_eq!(manifest["filtered"], true);
-    assert_eq!(
-        manifest["categories_requested"],
-        json!(["workflow", "session"])
-    );
-    assert_eq!(manifest["limit"], Value::Null);
-    assert_eq!(manifest["truncated"], false);
-    let tools = manifest["tools"].as_array().unwrap();
-    assert!(tools.iter().any(|tool| tool["name"] == "start_coding_task"));
-    assert!(tools.iter().any(|tool| tool["name"] == "session_summary"));
-    assert!(tools
-        .iter()
-        .all(|tool| matches!(tool["category"].as_str(), Some("workflow" | "session"))));
-    assert!(tools
-        .iter()
-        .all(|tool| tool.get("inputSchema").is_none() && tool.get("outputSchema").is_none()));
-    assert!(tools
-        .iter()
-        .all(|tool| tool["accepted_flattened_args"].is_array()));
-    let verdict = &result.output["startup_verdict"];
-    assert_startup_verdict_shape(verdict);
-    assert_eq!(verdict["status"], "warn");
-    assert_check_reason(verdict, "runtime_status", "runtime_status_not_requested");
-    assert_check_reason(verdict, "workspace", "workspace_not_checked");
-}
-
-#[tokio::test]
-async fn start_coding_task_manifest_limit_truncates_filtered_entries() {
-    let tmp = tempfile::tempdir().unwrap();
-    init_git_repo(tmp.path());
-    let runtime = test_runtime();
-    let project =
-        register_agent_project_at_path(&runtime, "coding-limit", "demo", tmp.path()).await;
-    let auth = auth_context(None, true);
-
-    let result = runtime
-        .dispatch_with_auth(
-            ToolCall::from_tool_name(
-                "start_coding_task",
-                json!({
-                    "project": project,
-                    "include_runtime_status": false,
-                    "include_git": false,
-                    "include_recent_commits": false,
-                    "include_rules": false,
-                    "include_tool_manifest": true,
-                    "tool_manifest_categories": ["session"],
-                    "tool_manifest_limit": 2
-                }),
-            )
-            .unwrap(),
-            Some(&auth),
-        )
-        .await;
-
-    assert!(result.success, "{:?}", result.error);
-    let manifest = &result.output["tool_manifest"];
-    assert_eq!(manifest["filtered"], true);
-    assert_eq!(manifest["limit"], 2);
-    assert_eq!(manifest["truncated"], true);
-    assert_eq!(manifest["truncation_reason"], "limit");
-    assert_eq!(manifest["limit_applied"], true);
-    assert_eq!(manifest["requested_limit"], 2);
-    assert_eq!(manifest["count"], 2);
-    assert_eq!(manifest["returned_count"], 2);
-    assert!(
-        manifest["total_count"].as_u64().unwrap() >= manifest["filtered_count"].as_u64().unwrap()
-    );
-    assert!(manifest["filtered_count"].as_u64().unwrap() > 2);
-    assert!(!serde_json::to_string(manifest)
-        .unwrap()
-        .contains("ResponseTooLarge"));
-    assert!(manifest["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|tool| tool["category"] == "session"));
-    let verdict = &result.output["startup_verdict"];
-    assert_startup_verdict_shape(verdict);
-    assert_ne!(verdict["status"], "fail");
-    assert_check_reason(verdict, "tool_manifest", "truncated_by_limit");
-}
-
-#[tokio::test]
-async fn start_coding_task_available_manifest_intents_match_direct_tool_manifest() {
-    let tmp = tempfile::tempdir().unwrap();
-    init_git_repo(tmp.path());
-    let runtime = test_runtime();
-    let project =
-        register_agent_project_at_path(&runtime, "coding-intents", "demo", tmp.path()).await;
-    let auth = auth_context(None, true);
-
-    for intent in ["coding", "audit", "exploration", "release", "discovery"] {
-        let direct = runtime
-            .dispatch(ToolCall::ToolManifest {
-                category: None,
-                intent: Some(intent.to_string()),
-                include_recommended_flows: true,
-                include_risk_summary: true,
-            })
-            .await;
-        assert!(direct.success, "direct {intent}: {:?}", direct.error);
-
-        let startup = runtime
-            .dispatch_with_auth(
-                ToolCall::from_tool_name(
-                    "start_coding_task",
-                    json!({
-                        "project": project,
-                        "detail": "full",
-                        "include_runtime_status": false,
-                        "include_git": false,
-                        "include_recent_commits": false,
-                        "include_rules": false,
-                        "tool_manifest_intent": intent,
-                    }),
-                )
-                .unwrap_or_else(|error| panic!("startup {intent} should parse: {error}")),
-                Some(&auth),
-            )
-            .await;
-        assert!(startup.success, "startup {intent}: {:?}", startup.error);
-
-        let manifest = &startup.output["tool_manifest"];
-        assert_eq!(
-            manifest, &direct.output,
-            "startup/direct mismatch for {intent}"
-        );
-        assert_eq!(manifest["intent"], intent);
-        assert_eq!(manifest["filtered"], true);
+async fn start_coding_task_rejects_removed_startup_and_manifest_params() {
+    for (field, value) in [
+        ("include_runtime_status", json!(false)),
+        ("compact_startup", json!(true)),
+        ("include_git", json!(false)),
+        ("include_recent_commits", json!(false)),
+        ("include_rules", json!(false)),
+        ("include_tool_manifest", json!(true)),
+        ("tool_manifest_intent", json!("coding")),
+        ("tool_manifest_categories", json!(["workflow", "session"])),
+        ("tool_manifest_limit", json!(2)),
+    ] {
+        let mut params = json!({ "project": "agent:demo:demo", "detail": "standard" });
+        params[field] = value;
+        let error = ToolCall::from_tool_name("start_coding_task", params)
+            .expect_err("removed startup param must be rejected");
         assert!(
-            manifest["returned_count"].as_u64().unwrap()
-                < manifest["total_count"].as_u64().unwrap()
+            error.starts_with("invalid arguments for tool 'start_coding_task': unknown field(s)"),
+            "unexpected rejection error for removed field {field}: {error}"
         );
-        assert_eq!(startup.output["session"]["mode"], "normal");
-        assert_eq!(
-            startup.output["session"]["guards"]["deny_write_tools"],
-            false
+        assert!(
+            error.contains(field),
+            "rejection must name the unknown field {field}: {error}"
         );
-        assert_eq!(
-            startup.output["session"]["guards"]["deny_shell_tools"],
-            false
-        );
-        assert_eq!(startup.output["permissions"]["policy"], "dev_auto_approve");
-
-        if intent == "audit" {
-            assert_eq!(
-                manifest["risk_summary"]["read_only"],
-                manifest["returned_count"]
-            );
-            for tool in manifest["tools"].as_array().unwrap() {
-                assert_eq!(
-                    tool["risk"], "read_only",
-                    "audit tool must be read-only: {tool:?}"
-                );
-                assert_eq!(
-                    tool["shell_like"], false,
-                    "audit tool must not be shell-like: {tool:?}"
-                );
-                assert_ne!(tool["category"], "project_write");
-                assert_ne!(tool["category"], "job_run");
-                assert_ne!(tool["name"], "run_shell");
-                assert_ne!(tool["name"], "run_job");
-            }
-        }
     }
-}
-
-#[tokio::test]
-async fn start_coding_task_manifest_intent_composes_with_categories_then_limit() {
-    let tmp = tempfile::tempdir().unwrap();
-    init_git_repo(tmp.path());
-    let runtime = test_runtime();
-    let project =
-        register_agent_project_at_path(&runtime, "coding-intent-bounds", "demo", tmp.path()).await;
-    let auth = auth_context(None, true);
-
-    let direct_file = runtime
-        .dispatch(ToolCall::ToolManifest {
-            category: Some("file".to_string()),
-            intent: Some("coding".to_string()),
-            include_recommended_flows: true,
-            include_risk_summary: true,
-        })
-        .await;
-    assert!(direct_file.success, "{:?}", direct_file.error);
-    let startup_file = runtime
-        .dispatch_with_auth(
-            ToolCall::from_tool_name(
-                "start_coding_task",
-                json!({
-                    "project": project,
-                    "detail": "full",
-                    "include_runtime_status": false,
-                    "include_git": false,
-                    "include_recent_commits": false,
-                    "include_rules": false,
-                    "tool_manifest_intent": "coding",
-                    "tool_manifest_categories": ["file"],
-                }),
-            )
-            .unwrap(),
-            Some(&auth),
-        )
-        .await;
-    assert!(startup_file.success, "{:?}", startup_file.error);
-    assert_eq!(startup_file.output["tool_manifest"], direct_file.output);
-    assert!(startup_file.output["tool_manifest"]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|tool| tool["category"] == "file"));
-
-    let direct_coding = runtime
-        .dispatch(ToolCall::ToolManifest {
-            category: None,
-            intent: Some("coding".to_string()),
-            include_recommended_flows: true,
-            include_risk_summary: true,
-        })
-        .await;
-    assert!(direct_coding.success, "{:?}", direct_coding.error);
-    let startup_limited = runtime
-        .dispatch_with_auth(
-            ToolCall::from_tool_name(
-                "start_coding_task",
-                json!({
-                    "project": project,
-                    "detail": "full",
-                    "include_runtime_status": false,
-                    "include_git": false,
-                    "include_recent_commits": false,
-                    "include_rules": false,
-                    "tool_manifest_intent": "coding",
-                    "tool_manifest_limit": 2,
-                }),
-            )
-            .unwrap(),
-            Some(&auth),
-        )
-        .await;
-    assert!(startup_limited.success, "{:?}", startup_limited.error);
-    let manifest = &startup_limited.output["tool_manifest"];
-    assert_eq!(manifest["returned_count"], 2);
-    assert_eq!(
-        manifest["filtered_count"],
-        direct_coding.output["returned_count"]
-    );
-    assert_eq!(manifest["limit_applied"], true);
-    assert_eq!(manifest["requested_limit"], 2);
-    assert_eq!(
-        manifest["tools"],
-        Value::Array(direct_coding.output["tools"].as_array().unwrap()[..2].to_vec()),
-        "limit must apply after intent ordering"
-    );
-}
-
-#[tokio::test]
-async fn start_coding_task_unknown_manifest_intent_precedes_session_creation_and_binding() {
-    let tmp = tempfile::tempdir().unwrap();
-    init_git_repo(tmp.path());
-    let ledger = tmp.path().join("sessions.json");
-    let runtime = test_runtime().with_session_ledger(&ledger);
-    let project =
-        register_agent_project_at_path(&runtime, "coding-bad-intent", "demo", tmp.path()).await;
-    let auth = auth_context(None, true);
-    let sentinel = runtime
-        .dispatch(ToolCall::StartSession {
-            project: None,
-            title: Some("sentinel".to_string()),
-            mode: SessionMode::Normal,
-            deny_write_tools: false,
-            deny_shell_tools: false,
-        })
-        .await;
-    assert!(sentinel.success, "{:?}", sentinel.error);
-    // Persistent ledger writes on a background thread; flush before reading
-    // the file so this assertion is not a race against the writer.
-    runtime.sessions.flush_persistence();
-    let ledger_before = fs::read(&ledger).expect("sentinel session should persist");
-
-    let result = runtime
-        .dispatch_with_auth(
-            ToolCall::from_tool_name(
-                "start_coding_task",
-                json!({
-                    "project": project,
-                    "detail": "full",
-                    "tool_manifest_intent": "not_a_real_intent",
-                    "bind_current": true,
-                }),
-            )
-            .unwrap(),
-            Some(&auth),
-        )
-        .await;
-    assert!(!result.success);
-    assert_eq!(result.output["code"], "unknown_tool_manifest_intent");
-    assert_eq!(result.output["intent"], "not_a_real_intent");
-    assert!(result.output["available_intents"].is_array());
-    runtime.sessions.flush_persistence();
-    assert_eq!(
-        fs::read(&ledger).unwrap(),
-        ledger_before,
-        "invalid intent must return before any session-ledger mutation"
-    );
-
-    let current = runtime
-        .dispatch_with_auth(ToolCall::CurrentSession { project }, Some(&auth))
-        .await;
-    assert!(current.success, "{:?}", current.error);
-    assert_eq!(current.output["found"], false);
 }
 
 #[tokio::test]
@@ -1415,15 +1056,6 @@ async fn finish_coding_task_requires_explicit_session_and_returns_structured_fie
                 detail: Default::default(),
                 deny_write_tools: false,
                 deny_shell_tools: false,
-                include_runtime_status: Some(false),
-                compact_startup: false,
-                include_git: Some(false),
-                include_recent_commits: Some(false),
-                include_rules: Some(false),
-                include_tool_manifest: Some(false),
-                tool_manifest_intent: None,
-                tool_manifest_categories: None,
-                tool_manifest_limit: None,
                 bind_current: false,
             },
             Some(&auth),
@@ -1489,7 +1121,7 @@ async fn finish_coding_task_requires_explicit_session_and_returns_structured_fie
     assert_eq!(validation["source"], "session_ledger");
     assert_eq!(validation["events_total"], 0);
     assert!(validation["events"].as_array().unwrap().is_empty());
-    assert_eq!(result.output["permissions"]["policy"], "dev_auto_approve");
+    assert_eq!(result.output["permissions"]["policy"], "trusted_agent");
     assert_eq!(result.output["permissions"]["required_count"], 0);
     assert_eq!(result.output["permissions"]["auto_approved_count"], 0);
     assert_eq!(result.output["permissions"]["manual_approved_count"], 0);
@@ -2474,15 +2106,6 @@ async fn finish_coding_task_includes_active_jobs_warning_without_logs() {
                 detail: Default::default(),
                 deny_write_tools: false,
                 deny_shell_tools: false,
-                include_runtime_status: Some(false),
-                compact_startup: false,
-                include_git: Some(false),
-                include_recent_commits: Some(false),
-                include_rules: Some(false),
-                include_tool_manifest: Some(false),
-                tool_manifest_intent: None,
-                tool_manifest_categories: None,
-                tool_manifest_limit: None,
                 bind_current: false,
             },
             Some(&auth),
@@ -2607,15 +2230,6 @@ async fn finish_coding_task_treats_stop_requested_jobs_as_nonblocking() {
                 detail: Default::default(),
                 deny_write_tools: false,
                 deny_shell_tools: false,
-                include_runtime_status: Some(false),
-                compact_startup: false,
-                include_git: Some(false),
-                include_recent_commits: Some(false),
-                include_rules: Some(false),
-                include_tool_manifest: Some(false),
-                tool_manifest_intent: None,
-                tool_manifest_categories: None,
-                tool_manifest_limit: None,
                 bind_current: false,
             },
             Some(&auth),
@@ -3026,33 +2640,13 @@ async fn start_coding_task_top_level_recommended_flow_projects_to_visible_manife
         register_agent_project_at_path(&runtime, "coding-flow-proj", "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
-    let result = runtime
-        .dispatch_with_auth(
-            ToolCall::from_tool_name(
-                "start_coding_task",
-                json!({
-                    "project": project,
-                    "detail": "full",
-                    "include_runtime_status": false,
-                    "include_git": false,
-                    "include_recent_commits": false,
-                    "include_rules": false,
-                    "include_tool_manifest": true,
-                    "tool_manifest_intent": "coding",
-                    "tool_manifest_categories": [
-                        "workflow",
-                        "file",
-                        "edit",
-                        "validation",
-                        "git",
-                        "cleanup"
-                    ]
-                }),
-            )
-            .unwrap(),
-            Some(&auth),
-        )
-        .await;
+    let result = start_coding_task_serviced(
+        &runtime,
+        "coding-flow-proj",
+        json!({ "project": project, "detail": "full" }),
+        &auth,
+    )
+    .await;
     assert!(result.success, "{:?}", result.error);
 
     let manifest_tools: std::collections::BTreeSet<&str> = result.output["tool_manifest"]["tools"]
@@ -3061,10 +2655,6 @@ async fn start_coding_task_top_level_recommended_flow_projects_to_visible_manife
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect();
-    assert!(
-        !manifest_tools.contains("apply_patch_checked"),
-        "startup without patch must hide apply_patch_checked"
-    );
     assert!(
         manifest_tools.contains("finish_coding_task"),
         "coding startup should keep finish_coding_task visible"
@@ -3084,10 +2674,6 @@ async fn start_coding_task_top_level_recommended_flow_projects_to_visible_manife
             assert!(
                 manifest_tools.contains(tool),
                 "recommended_flow.{group} references invisible tool {tool}; visible={manifest_tools:?}"
-            );
-            assert_ne!(
-                tool, "apply_patch_checked",
-                "recommended_flow must not project patch tools without patch category"
             );
         }
     }

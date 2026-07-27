@@ -71,7 +71,7 @@ async fn run_shell_session_events_record_exit_without_stdio_bodies() {
     assert!(ok.success, "{:?}", ok.error);
     assert_eq!(ok.output["session_recorded"], true);
     assert_eq!(ok.output["permission"]["required"], true);
-    assert_eq!(ok.output["permission"]["policy"], "dev_auto_approve");
+    assert_eq!(ok.output["permission"]["policy"], "trusted_agent");
     assert_eq!(ok.output["permission"]["status"], "auto_approved");
     assert_eq!(ok.output["permission"]["risk"], "shell");
 
@@ -1479,6 +1479,8 @@ async fn register_job_agent_for_auth(
         .shell_clients
         .register_with_auth(
             ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: client_id.to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,

@@ -349,6 +349,7 @@ impl ToolRuntime {
         }
         let activity_context =
             Self::capture_workspace_activity_context(&call, activity_project.as_deref());
+        let tool_name = call.tool_name();
         let mut result = self.dispatch_authorized_inner(call, auth, transport).await;
         let permission = permission.filter(|_| {
             !permissions::is_hard_denied_output(&result.output, result.error.as_deref())
@@ -392,6 +393,23 @@ impl ToolRuntime {
                 // from whoever holds this client id at read time.
                 scope: super::activity::ActivityScope::from_auth(auth),
             });
+        }
+        if result.success && super::observations::is_meaningful_activity_tool(tool_name) {
+            if let Ok((principal_kind, principal_id)) =
+                super::session_context::current_session_principal(auth)
+            {
+                self.observations.record_successful_tool_call(
+                    super::observations::ToolCallObservation {
+                        principal_kind,
+                        principal_id,
+                        project: activity_project.clone(),
+                        surface: transport.as_str().to_string(),
+                        session_id: session_id.clone(),
+                        tool: tool_name.to_string(),
+                        observed_at: chrono::Utc::now().timestamp(),
+                    },
+                );
+            }
         }
         result
     }

@@ -1,6 +1,6 @@
-//! Permission unit tests: modes, evaluator, execution gate, hard-safety independence.
+//! Authority unit tests: modes, evaluator, execution gate, hard-safety independence.
 
-use super::policy::{self, EffectivePermissionConfig};
+use super::policy::{self, EffectiveAuthorityConfig};
 use super::*;
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,15 +10,15 @@ const WRITE_TOOL: &str = "write_project_file";
 const READ_TOOL: &str = "read_file";
 
 #[test]
-fn default_mode_auto_approves_permission_bearing_tools() {
-    let evaluator = PermissionEvaluator::with_mode(PermissionMode::DevAutoApprove);
+fn trusted_agent_auto_authorizes_permission_bearing_tools() {
+    let evaluator = PermissionEvaluator::with_mode(AuthorityMode::TrustedAgent);
     let decision = evaluator
         .evaluate(WRITE_TOOL, Some("agent:oe:private-drop"))
         .expect("write tools require permission");
     assert!(decision.required);
-    assert_eq!(decision.policy, "dev_auto_approve");
+    assert_eq!(decision.policy, "trusted_agent");
     assert_eq!(decision.status, "auto_approved");
-    assert_eq!(decision.reason, "dev_auto_approve");
+    assert_eq!(decision.reason, TRUSTED_AGENT_AUTO_REASON);
     assert_eq!(decision.risk, "write");
     assert_eq!(decision.tool_name, WRITE_TOOL);
     assert_eq!(decision.project.as_deref(), Some("agent:oe:private-drop"));
@@ -27,19 +27,19 @@ fn default_mode_auto_approves_permission_bearing_tools() {
 }
 
 #[test]
-fn unset_permission_mode_matches_dev_auto_approve_behavior() {
+fn unset_authority_mode_matches_trusted_agent_behavior() {
     // resolve: unset / empty → default
     assert_eq!(
-        resolve_permission_mode(None).unwrap(),
-        PermissionMode::DevAutoApprove
+        resolve_authority_mode(None).unwrap(),
+        AuthorityMode::TrustedAgent
     );
     assert_eq!(
-        resolve_permission_mode(Some("")).unwrap(),
-        PermissionMode::DevAutoApprove
+        resolve_authority_mode(Some("")).unwrap(),
+        AuthorityMode::TrustedAgent
     );
 
-    let from_unset = PermissionEvaluator::with_config(EffectivePermissionConfig::from_raw(None));
-    let from_default = PermissionEvaluator::with_mode(PermissionMode::DEFAULT);
+    let from_unset = PermissionEvaluator::with_config(EffectiveAuthorityConfig::from_raw(None));
+    let from_default = PermissionEvaluator::with_mode(AuthorityMode::DEFAULT);
     let a = from_unset.evaluate(WRITE_TOOL, None).unwrap();
     let b = from_default.evaluate(WRITE_TOOL, None).unwrap();
     assert_eq!(a.policy, b.policy);
@@ -51,27 +51,27 @@ fn unset_permission_mode_matches_dev_auto_approve_behavior() {
 
 #[test]
 fn read_only_tools_do_not_emit_permission_decision() {
-    let evaluator = PermissionEvaluator::with_mode(PermissionMode::DevAutoApprove);
+    let evaluator = PermissionEvaluator::with_mode(AuthorityMode::TrustedAgent);
     assert!(evaluator.evaluate(READ_TOOL, None).is_none());
-    // Even under require_approval, non-permission tools stay not_required.
-    let strict = PermissionEvaluator::with_mode(PermissionMode::RequireApproval);
+    // Even under restricted, non-permission tools stay not_required.
+    let strict = PermissionEvaluator::with_mode(AuthorityMode::Restricted);
     assert!(strict.evaluate(READ_TOOL, None).is_none());
 }
 
 #[test]
-fn illegal_mode_has_explicit_handling_and_does_not_auto_approve() {
-    let err = resolve_permission_mode(Some("totally_bogus")).unwrap_err();
+fn illegal_mode_has_explicit_handling_and_does_not_auto_authorize() {
+    let err = resolve_authority_mode(Some("totally_bogus")).unwrap_err();
     assert_eq!(err.value, "totally_bogus");
     let msg = err.to_string();
-    assert!(msg.contains(PERMISSION_MODE_ENV), "{msg}");
+    assert!(msg.contains(AUTHORITY_MODE_ENV), "{msg}");
     assert!(msg.contains("totally_bogus"), "{msg}");
 
-    let config = EffectivePermissionConfig::from_raw(Some("totally_bogus"));
+    let config = EffectiveAuthorityConfig::from_raw(Some("totally_bogus"));
     assert!(matches!(
         config,
-        EffectivePermissionConfig::InvalidMode { .. }
+        EffectiveAuthorityConfig::InvalidMode { .. }
     ));
-    assert!(!config.auto_approve());
+    assert!(!config.auto_authorize());
     assert!(config.human_approval_required());
 
     let decision = PermissionEvaluator::with_config(config)
@@ -80,42 +80,45 @@ fn illegal_mode_has_explicit_handling_and_does_not_auto_approve() {
     assert_ne!(decision.status, "auto_approved");
     assert_eq!(decision.outcome(), Some(PermissionOutcome::Denied));
     assert!(
-        decision.reason.contains("invalid_permission_mode"),
+        decision.reason.contains("invalid_authority_mode"),
         "{}",
         decision.reason
     );
 }
 
 #[test]
-fn require_approval_does_not_pretend_to_approve() {
-    let evaluator = PermissionEvaluator::with_mode(PermissionMode::RequireApproval);
+fn legacy_permission_mode_names_are_rejected() {
+    // The removed three-mode switch must not silently alias into authority
+    // modes: dev_auto_approve / audit_only / require_approval are invalid.
+    for legacy in ["dev_auto_approve", "audit_only", "require_approval"] {
+        let config = EffectiveAuthorityConfig::from_raw(Some(legacy));
+        assert!(
+            matches!(config, EffectiveAuthorityConfig::InvalidMode { .. }),
+            "{legacy} must not parse as an authority mode"
+        );
+        let decision = PermissionEvaluator::with_config(config)
+            .evaluate(WRITE_TOOL, None)
+            .unwrap();
+        assert!(!decision.allows_execution());
+    }
+}
+
+#[test]
+fn restricted_denies_consequential_tools_without_pretending_to_approve() {
+    let evaluator = PermissionEvaluator::with_mode(AuthorityMode::Restricted);
     let decision = evaluator.evaluate(WRITE_TOOL, None).unwrap();
-    assert_eq!(decision.policy, "require_approval");
+    assert_eq!(decision.policy, "restricted");
     assert_ne!(decision.status, "auto_approved");
     assert_ne!(decision.status, "approved");
     assert_eq!(decision.outcome(), Some(PermissionOutcome::Denied));
-    assert_eq!(decision.reason, "require_approval_not_implemented");
-    assert!(!evaluator.config().auto_approve());
+    assert_eq!(decision.reason, RESTRICTED_DENY_REASON);
+    assert!(!evaluator.config().auto_authorize());
     assert!(evaluator.config().human_approval_required());
 }
 
 #[test]
-fn audit_only_allows_without_claiming_human_approval() {
-    let evaluator = PermissionEvaluator::with_mode(PermissionMode::AuditOnly);
-    let decision = evaluator.evaluate(WRITE_TOOL, None).unwrap();
-    assert_eq!(decision.policy, "audit_only");
-    assert_eq!(decision.status, "audit_only_allowed");
-    assert_eq!(
-        decision.outcome(),
-        Some(PermissionOutcome::AuditOnlyAllowed)
-    );
-    assert!(evaluator.config().auto_approve());
-    assert!(!evaluator.config().human_approval_required());
-}
-
-#[test]
-fn hard_security_rules_are_not_bypassed_by_permission_mode() {
-    // Hard-deny detection is independent of soft permission mode.
+fn hard_security_rules_are_not_bypassed_by_authority_mode() {
+    // Hard-deny detection is independent of soft authority mode.
     let hard_kinds = [
         "policy_rejected",
         "session_guard_denied",
@@ -138,9 +141,9 @@ fn hard_security_rules_are_not_bypassed_by_permission_mode() {
         Some("path cannot contain parent traversal")
     ));
 
-    // Auto-approve decision exists for the tool class, but hard-deny filter
+    // Auto-authorized decision exists for the tool class, but hard-deny filter
     // still drops attachment — mode never overrides hard safety signals.
-    let decision = PermissionEvaluator::with_mode(PermissionMode::DevAutoApprove)
+    let decision = PermissionEvaluator::with_mode(AuthorityMode::TrustedAgent)
         .evaluate(WRITE_TOOL, None)
         .unwrap();
     assert_eq!(decision.status, "auto_approved");
@@ -152,7 +155,7 @@ fn hard_security_rules_are_not_bypassed_by_permission_mode() {
     let filtered = Some(decision).filter(|_| !is_hard_denied_output(&hard, None));
     assert!(
         filtered.is_none(),
-        "hard deny must suppress permission attach even under dev_auto_approve"
+        "hard deny must suppress permission attach even under trusted_agent"
     );
 
     // edit_path helper still produces policy_rejected hard-deny shape.
@@ -165,14 +168,38 @@ fn hard_security_rules_are_not_bypassed_by_permission_mode() {
 }
 
 #[test]
-fn default_profile_payload_matches_dev_auto_approve() {
-    let payload = policy::permission_profile_payload_for(&EffectivePermissionConfig::with_mode(
-        PermissionMode::DevAutoApprove,
+fn authority_profile_payload_projects_canonical_fields() {
+    let trusted = policy::authority_profile_payload_for(&EffectiveAuthorityConfig::with_mode(
+        AuthorityMode::TrustedAgent,
     ));
-    assert_eq!(payload["policy"], "dev_auto_approve");
-    assert_eq!(payload["human_approval_required"], false);
-    assert_eq!(payload["auto_approve"], true);
-    assert_eq!(payload["release_recommended_policy"], "require_approval");
+    assert_eq!(trusted["mode"], "trusted_agent");
+    assert_eq!(trusted["source"], "default");
+    assert_eq!(trusted["project_write"], true);
+    assert_eq!(trusted["shell"], true);
+    assert_eq!(trusted["git"], true);
+    assert_eq!(trusted["network"], true);
+    assert_eq!(trusted["package_install"], true);
+    assert_eq!(trusted["service_control"], true);
+    assert_eq!(trusted["release"], "user_task_scoped");
+    assert_eq!(trusted["human_approval_required"], false);
+
+    let restricted = policy::authority_profile_payload_for(&EffectiveAuthorityConfig::from_raw(
+        Some("restricted"),
+    ));
+    assert_eq!(restricted["mode"], "restricted");
+    assert_eq!(restricted["source"], "env:WEBCODEX_AUTHORITY_MODE");
+    assert_eq!(restricted["project_write"], false);
+    assert_eq!(restricted["shell"], false);
+    assert_eq!(restricted["release"], "human_approval");
+    assert_eq!(restricted["human_approval_required"], true);
+
+    // No token / secret / internal policy dump in the projection.
+    for payload in [&trusted, &restricted] {
+        let text = payload.to_string().to_lowercase();
+        assert!(!text.contains("token"), "{text}");
+        assert!(!text.contains("secret"), "{text}");
+        assert!(!text.contains("authorization"), "{text}");
+    }
 }
 
 #[test]
@@ -180,7 +207,7 @@ fn permission_decision_for_tool_wrapper_uses_evaluator() {
     // When env is unset (typical test process), default equals explicit mode.
     let via_wrapper = permission_decision_for_tool(WRITE_TOOL, None);
     let via_evaluator =
-        PermissionEvaluator::with_mode(PermissionMode::DevAutoApprove).evaluate(WRITE_TOOL, None);
+        PermissionEvaluator::with_mode(AuthorityMode::TrustedAgent).evaluate(WRITE_TOOL, None);
     let a = via_wrapper.expect("wrapper");
     let b = via_evaluator.expect("evaluator");
     assert_eq!(a.policy, b.policy);
@@ -191,28 +218,22 @@ fn permission_decision_for_tool_wrapper_uses_evaluator() {
 #[test]
 fn allows_execution_is_centralized_by_outcome() {
     assert!(PermissionOutcome::AutoApproved.allows_execution());
-    assert!(PermissionOutcome::AuditOnlyAllowed.allows_execution());
     assert!(PermissionOutcome::Approved.allows_execution());
     assert!(!PermissionOutcome::Denied.allows_execution());
     assert!(!PermissionOutcome::Pending.allows_execution());
     assert!(!PermissionOutcome::HardDenied.allows_execution());
 
-    let auto = PermissionEvaluator::with_mode(PermissionMode::DevAutoApprove)
+    let auto = PermissionEvaluator::with_mode(AuthorityMode::TrustedAgent)
         .evaluate(WRITE_TOOL, None)
         .unwrap();
     assert!(auto.allows_execution());
 
-    let audit = PermissionEvaluator::with_mode(PermissionMode::AuditOnly)
+    let restricted = PermissionEvaluator::with_mode(AuthorityMode::Restricted)
         .evaluate(WRITE_TOOL, None)
         .unwrap();
-    assert!(audit.allows_execution());
+    assert!(!restricted.allows_execution());
 
-    let require = PermissionEvaluator::with_mode(PermissionMode::RequireApproval)
-        .evaluate(WRITE_TOOL, None)
-        .unwrap();
-    assert!(!require.allows_execution());
-
-    let invalid = PermissionEvaluator::with_config(EffectivePermissionConfig::from_raw(Some(
+    let invalid = PermissionEvaluator::with_config(EffectiveAuthorityConfig::from_raw(Some(
         "not_a_real_mode",
     )))
     .evaluate(WRITE_TOOL, None)
@@ -227,20 +248,17 @@ fn allows_execution_is_centralized_by_outcome() {
 
 #[test]
 fn permission_execution_denied_result_is_stable_and_non_approving() {
-    let decision = PermissionEvaluator::with_mode(PermissionMode::RequireApproval)
+    let decision = PermissionEvaluator::with_mode(AuthorityMode::Restricted)
         .evaluate(WRITE_TOOL, None)
         .unwrap();
     let result = permission_execution_denied_result(&decision);
     assert!(!result.success);
     assert_eq!(result.output["error_kind"], "permission_denied");
     assert_eq!(result.output["failure_kind"], "permission_denied");
-    assert_eq!(
-        result.output["permission_reason"],
-        "require_approval_not_implemented"
-    );
+    assert_eq!(result.output["permission_reason"], RESTRICTED_DENY_REASON);
     let err = result.error.as_deref().unwrap();
-    assert!(err.contains("require_approval"), "{err}");
-    assert!(err.contains("not implemented"), "{err}");
+    assert!(err.contains("restricted"), "{err}");
+    assert!(err.contains("human authorization"), "{err}");
     // Must not look like hard-deny (permission attach must remain).
     assert!(!is_hard_denied_output(
         &result.output,
@@ -248,23 +266,23 @@ fn permission_execution_denied_result_is_stable_and_non_approving() {
     ));
 
     let invalid =
-        PermissionEvaluator::with_config(EffectivePermissionConfig::from_raw(Some("weird_mode")))
+        PermissionEvaluator::with_config(EffectiveAuthorityConfig::from_raw(Some("weird_mode")))
             .evaluate(WRITE_TOOL, None)
             .unwrap();
     let invalid_result = permission_execution_denied_result(&invalid);
     assert!(!invalid_result.success);
     let msg = invalid_result.error.as_deref().unwrap();
-    assert!(msg.contains(PERMISSION_MODE_ENV), "{msg}");
+    assert!(msg.contains(AUTHORITY_MODE_ENV), "{msg}");
     assert!(
         !msg.contains("auto_approved"),
-        "must not pretend auto-approve: {msg}"
+        "must not pretend auto-authorization: {msg}"
     );
 }
 
 #[test]
 fn evaluate_counter_increments_once_per_call() {
     let counter = Arc::new(AtomicUsize::new(0));
-    let evaluator = PermissionEvaluator::with_mode(PermissionMode::DevAutoApprove)
+    let evaluator = PermissionEvaluator::with_mode(AuthorityMode::TrustedAgent)
         .with_eval_counter(counter.clone());
     let _ = evaluator.evaluate(WRITE_TOOL, None);
     let _ = evaluator.evaluate(READ_TOOL, None);
@@ -273,7 +291,7 @@ fn evaluate_counter_increments_once_per_call() {
 
 #[test]
 fn permission_decision_from_output_roundtrips() {
-    let decision = PermissionEvaluator::with_mode(PermissionMode::DevAutoApprove)
+    let decision = PermissionEvaluator::with_mode(AuthorityMode::TrustedAgent)
         .evaluate(WRITE_TOOL, Some("agent:oe:private-drop"))
         .unwrap();
     let mut result = ToolResult::ok(json!({"ok": true}));

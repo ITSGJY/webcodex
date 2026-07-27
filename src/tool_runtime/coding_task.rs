@@ -13,7 +13,7 @@ use super::handoff::{
     resolved_unexpected_validation_failure_count, review_evidence_summary_for_session,
     unresolved_unexpected_failure_count, validation_has_cargo_test_zero_tests,
 };
-use super::permissions::{permission_profile_payload, permission_summary_from_events};
+use super::permissions::{authority_profile_payload, permission_summary_from_events};
 use super::project_instructions::{ProjectInstructionFile, ProjectInstructionsSnapshot};
 use super::project_resolution::ResolvedProject;
 use super::runtime_info::compact_runtime_status;
@@ -46,32 +46,19 @@ impl ToolRuntime {
         deny_write_tools: bool,
         deny_shell_tools: bool,
         detail: StartupDetail,
-        include_runtime_status: Option<bool>,
-        compact_startup: bool,
-        include_git: Option<bool>,
-        include_recent_commits: Option<bool>,
-        include_rules: Option<bool>,
-        include_tool_manifest: Option<bool>,
-        tool_manifest_intent: Option<String>,
-        tool_manifest_categories: Option<Vec<String>>,
-        tool_manifest_limit: Option<usize>,
         bind_current: bool,
         auth: Option<&AuthContext>,
         transport: SessionTransport,
     ) -> ToolResult {
-        let include_runtime_status = include_runtime_status.unwrap_or(true);
-        let compact_startup = compact_startup || detail != StartupDetail::Full;
-        let include_git = include_git.unwrap_or(true);
-        let include_recent_commits =
-            include_recent_commits.unwrap_or(detail == StartupDetail::Full);
-        let include_rules = include_rules.unwrap_or(detail == StartupDetail::Full);
-        let include_tool_manifest = include_tool_manifest.unwrap_or(detail == StartupDetail::Full);
+        // `detail` is the single startup projection control: full keeps the
+        // complete runtime status, recent commits, rules, and tool manifest;
+        // standard/minimal use the compact projections.
+        let compact_startup = detail != StartupDetail::Full;
+        let include_recent_commits = detail == StartupDetail::Full;
+        let include_rules = detail == StartupDetail::Full;
+        let include_tool_manifest = detail == StartupDetail::Full;
         let tool_manifest = if include_tool_manifest {
-            match self.compact_tool_manifest_payload_bounded(
-                tool_manifest_categories,
-                tool_manifest_intent,
-                tool_manifest_limit,
-            ) {
+            match self.compact_tool_manifest_payload_bounded(None, None, None) {
                 Ok(payload) => Some(payload),
                 Err(result) => return result,
             }
@@ -153,7 +140,7 @@ impl ToolRuntime {
         };
 
         let mut runtime_status_call_failed = false;
-        let runtime_status = if include_runtime_status {
+        let runtime_status = {
             let result = self.runtime_status(auth).await;
             if !result.success {
                 runtime_status_call_failed = true;
@@ -167,8 +154,6 @@ impl ToolRuntime {
             } else {
                 result.output
             }
-        } else {
-            Value::Null
         };
         let mut connection_state = runtime_status
             .get("connection_layers")
@@ -185,30 +170,33 @@ impl ToolRuntime {
                 })
             });
         connection_state["project_registry"]["resolved_project"] = json!(resolved.resolved_id);
+        let bound = current_binding
+            .get("bound")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         connection_state["session_binding"] = json!({
-            "status": if current_binding.get("bound").and_then(Value::as_bool).unwrap_or(false) {
-                "bound"
-            } else {
-                "not_bound"
-            },
+            "status": if bound { "bound" } else { "not_bound" },
+            "observed_at": chrono::Utc::now().timestamp(),
+            "source": "session_store",
+            "age_secs": 0,
+            "stale_after_secs": Value::Null,
+            "reason_code": if bound { Value::Null } else { json!("binding_not_requested_or_unavailable") },
             "process_local_in_memory": true,
+            "lost_after_restart": true,
             "transport": transport.as_str(),
+            "durable_resume": "explicit session_id resumes the durable wc_sess_* session",
         });
 
-        let git = if include_git || include_recent_commits {
-            self.start_coding_task_git_summary(
+        let git = self
+            .start_coding_task_git_summary(
                 &resolved.resolved_id,
-                include_git,
                 include_recent_commits,
                 &mut warnings,
             )
-            .await
-        } else {
-            Value::Null
-        };
+            .await;
         // Surface dirty/conflict worktree state at top-level so compact Action
         // responses that omit full git payloads still keep the warning reason.
-        if include_git && !git.is_null() {
+        if !git.is_null() {
             append_workspace_warnings(&workspace_payload_from_git_summary(&git), &mut warnings);
         }
         let recommended_flow = match &tool_manifest {
@@ -233,7 +221,7 @@ impl ToolRuntime {
             },
             "runtime_status": runtime_status,
             "connection_state": connection_state,
-            "permissions": permission_profile_payload(),
+            "authority": authority_profile_payload(),
             "rules": rules_summary(project_instructions.as_ref()),
             "git": git,
             "semantic_navigation": semantic_navigation,
@@ -255,16 +243,11 @@ impl ToolRuntime {
         }
         if detail == StartupDetail::Minimal {
             if let Some(object) = output.as_object_mut() {
-                object.remove("permissions");
+                object.remove("authority");
             }
         }
-        output["startup_verdict"] = startup_verdict(
-            &output,
-            include_runtime_status,
-            runtime_status_call_failed,
-            include_git,
-            include_tool_manifest,
-        );
+        output["startup_verdict"] =
+            startup_verdict(&output, runtime_status_call_failed, include_tool_manifest);
         ToolResult::ok(output)
     }
 
@@ -528,7 +511,6 @@ impl ToolRuntime {
     async fn start_coding_task_git_summary(
         &self,
         project: &str,
-        include_git: bool,
         include_recent_commits: bool,
         warnings: &mut Vec<Value>,
     ) -> Value {
@@ -543,7 +525,7 @@ impl ToolRuntime {
             "warnings": [],
         });
 
-        if include_git {
+        {
             let result = self
                 .show_changes(project.to_string(), None, Some(false), None, None, None)
                 .await;
@@ -835,9 +817,7 @@ fn compact_finish_output(output: &Value, resolved_unexpected_validation_failures
 
 fn startup_verdict(
     output: &Value,
-    runtime_status_requested: bool,
     runtime_status_call_failed: bool,
-    git_requested: bool,
     tool_manifest_requested: bool,
 ) -> Value {
     let mut checks = Vec::new();
@@ -846,23 +826,11 @@ fn startup_verdict(
     push_startup_check(
         &mut checks,
         "runtime_status",
-        runtime_status_check(output, runtime_status_requested, runtime_status_call_failed),
+        runtime_status_check(output, runtime_status_call_failed),
     );
-    push_startup_check(
-        &mut checks,
-        "workspace",
-        workspace_check(output, git_requested),
-    );
-    push_startup_check(
-        &mut checks,
-        "jobs",
-        startup_jobs_check(output, runtime_status_requested),
-    );
-    push_startup_check(
-        &mut checks,
-        "agent",
-        startup_agent_check(output, runtime_status_requested),
-    );
+    push_startup_check(&mut checks, "workspace", workspace_check(output));
+    push_startup_check(&mut checks, "jobs", startup_jobs_check(output));
+    push_startup_check(&mut checks, "agent", startup_agent_check(output));
     push_startup_check(
         &mut checks,
         "tool_manifest",
@@ -871,15 +839,8 @@ fn startup_verdict(
 
     for check in &checks {
         match check.get("reason").and_then(Value::as_str) {
-            Some("runtime_status_not_requested") => push_unique_action(
-                &mut actions,
-                "rerun startup with include_runtime_status=true and compact_startup=true for sanity",
-            ),
             Some("runtime_status_call_failed") => {
                 push_unique_action(&mut actions, "inspect runtime_status directly")
-            }
-            Some("workspace_not_checked") => {
-                push_unique_action(&mut actions, "run show_changes before editing or finishing")
             }
             Some("workspace_dirty") => push_unique_action(
                 &mut actions,
@@ -924,12 +885,8 @@ fn startup_verdict(
 
 fn runtime_status_check(
     output: &Value,
-    runtime_status_requested: bool,
     runtime_status_call_failed: bool,
 ) -> (&'static str, Option<&'static str>) {
-    if !runtime_status_requested {
-        return ("warn", Some("runtime_status_not_requested"));
-    }
     if runtime_status_call_failed {
         return ("fail", Some("runtime_status_call_failed"));
     }
@@ -947,10 +904,7 @@ fn runtime_status_check(
     }
 }
 
-fn workspace_check(output: &Value, git_requested: bool) -> (&'static str, Option<&'static str>) {
-    if !git_requested {
-        return ("warn", Some("workspace_not_checked"));
-    }
+fn workspace_check(output: &Value) -> (&'static str, Option<&'static str>) {
     let git = output.get("git").unwrap_or(&Value::Null);
     if git.get("available").and_then(Value::as_bool) == Some(false) {
         return ("warn", Some("git_unavailable"));
@@ -972,13 +926,7 @@ fn workspace_check(output: &Value, git_requested: bool) -> (&'static str, Option
     }
 }
 
-fn startup_jobs_check(
-    output: &Value,
-    runtime_status_requested: bool,
-) -> (&'static str, Option<&'static str>) {
-    if !runtime_status_requested {
-        return ("warn", Some("runtime_status_not_requested"));
-    }
+fn startup_jobs_check(output: &Value) -> (&'static str, Option<&'static str>) {
     let jobs = output
         .pointer("/runtime_status/jobs")
         .unwrap_or(&Value::Null);
@@ -997,13 +945,7 @@ fn startup_jobs_check(
     }
 }
 
-fn startup_agent_check(
-    output: &Value,
-    runtime_status_requested: bool,
-) -> (&'static str, Option<&'static str>) {
-    if !runtime_status_requested {
-        return ("warn", Some("runtime_status_not_requested"));
-    }
+fn startup_agent_check(output: &Value) -> (&'static str, Option<&'static str>) {
     let executor = output
         .pointer("/resolved_project/executor")
         .and_then(Value::as_str);

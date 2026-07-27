@@ -23,6 +23,8 @@ pub(in crate::tool_runtime::tests) async fn register_agent_project_at_path(
     runtime
         .shell_clients
         .register(ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
             client_id: client_id.to_string(),
             agent_instance_id: "inst".to_string(),
             display_name: None,
@@ -240,6 +242,8 @@ pub(in crate::tool_runtime::tests) async fn register_agent(
     runtime
         .shell_clients
         .register(ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
             client_id: client_id.to_string(),
             agent_instance_id: "inst".to_string(),
             display_name: None,
@@ -329,6 +333,8 @@ pub(in crate::tool_runtime::tests) async fn register_agent_projects(
     runtime
         .shell_clients
         .register(ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
             client_id: client_id.to_string(),
             agent_instance_id: format!("inst-{}", client_id),
             display_name: None,
@@ -354,6 +360,8 @@ pub(in crate::tool_runtime::tests) async fn register_agent_projects_for_auth(
         .shell_clients
         .register_with_auth(
             ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: client_id.to_string(),
                 agent_instance_id: format!("inst-{}", client_id),
                 display_name: None,
@@ -526,6 +534,8 @@ pub(in crate::tool_runtime::tests) async fn register_agent_with_projects(
     runtime
         .shell_clients
         .register(ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
             client_id: client_id.to_string(),
             agent_instance_id: "inst".to_string(),
             display_name: None,
@@ -552,6 +562,8 @@ pub(in crate::tool_runtime::tests) async fn register_agent_with_shell_profiles(
     runtime
         .shell_clients
         .register(ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
             client_id: client_id.to_string(),
             agent_instance_id: "inst".to_string(),
             display_name: None,
@@ -587,6 +599,7 @@ pub(in crate::tool_runtime::tests) fn profile_summary_entry(
     env_keys_count: usize,
 ) -> ShellProfileSummaryEntry {
     ShellProfileSummaryEntry {
+        dialect: None,
         name: name.to_string(),
         has_init_script,
         env_keys_count,

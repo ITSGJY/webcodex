@@ -504,7 +504,7 @@ fn key_tool_output_schemas_include_expected_fields() {
         "projects",
         "jobs",
         "tools",
-        "permissions",
+        "authority",
         "quic",
     ] {
         assert!(

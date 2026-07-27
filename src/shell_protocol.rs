@@ -231,6 +231,10 @@ pub struct ShellProfileSummaryEntry {
     pub env_keys_count: usize,
     pub program: String,
     pub args_count: usize,
+    /// Shell dialect for this profile derived from the resolved program
+    /// basename: `sh`, `bash`, or `custom`. Older agents omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialect: Option<String>,
 }
 
 /// Sanitized summary of an agent's prepared-shell-profile configuration.
@@ -250,6 +254,16 @@ pub struct ShellProfilesSummary {
     pub configured_count: usize,
     pub prepared_cache_count: usize,
     pub profiles: Vec<ShellProfileSummaryEntry>,
+    /// Dialect of the default execution path when no explicit `shell` is
+    /// selected: `sh`, `bash`, or `custom`. Reported by the runner from its
+    /// actual configuration; the server never guesses. Older agents omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_dialect: Option<String>,
+    /// Dialects an explicit `shell=` selection can resolve to on this runner
+    /// (always includes `sh` and `bash`; configured custom profiles add
+    /// `custom`). Older agents omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_dialects: Option<Vec<String>>,
 }
 
 /// Bounded, non-secret snapshot of the agent's experimental tool providers.
@@ -371,6 +385,24 @@ pub struct ShellClientRegisterRequest {
     /// `null` for the policy so older/minimal payloads stay compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<AgentPolicySummary>,
+    /// Unix timestamp when the agent process started. Reported by the runner
+    /// itself so `runner_process` observations come from the process, not
+    /// from server-side inference. Older agents omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_started_at: Option<i64>,
+    /// Runner build metadata (crate version and optional git commit). Used
+    /// for mixed-version diagnostics; never carries paths or environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<AgentBuildInfo>,
+}
+
+/// Non-secret runner build identity for mixed-version diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentBuildInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -407,6 +439,23 @@ pub struct ShellClientView {
     /// policy. Never contains token/env/init_script.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<AgentPolicySummary>,
+    /// When this client_id first registered its current agent instance.
+    #[serde(default)]
+    pub registered_at: i64,
+    /// When the current transport connection was established (register or
+    /// reconnect). `0` for views that predate connection lifecycle tracking.
+    #[serde(default)]
+    pub connected_at: i64,
+    /// When the server observed the last transport disconnect for the current
+    /// instance, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disconnected_at: Option<i64>,
+    /// Runner-reported process start timestamp, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_started_at: Option<i64>,
+    /// Runner-reported build identity, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<AgentBuildInfo>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1221,6 +1270,8 @@ mod envelope_tests {
 
     fn sample_register() -> ShellClientRegisterRequest {
         ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
             client_id: "ws-1".to_string(),
             agent_instance_id: "11111111-1111-1111-1111-111111111111".to_string(),
             display_name: Some("WS Agent".to_string()),
@@ -1646,6 +1697,8 @@ mod envelope_tests {
         // separately) so its wire format is unchanged.
         let env = AgentEnvelope::Register {
             payload: ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "q-1".to_string(),
                 agent_instance_id: "11111111-1111-1111-1111-111111111111".to_string(),
                 display_name: None,

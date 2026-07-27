@@ -83,36 +83,66 @@ pub(crate) fn evidence_integrity_schema(description: &str) -> Value {
     })
 }
 
-pub(crate) fn permission_profile_schema(description: &str) -> Value {
+pub(crate) fn authority_profile_schema(description: &str) -> Value {
     json!({
         "type": "object",
         "description": description,
         "additionalProperties": false,
         "properties": {
-            "policy": {
+            "mode": {
                 "type": "string",
-                "enum": ["dev_auto_approve", "require_approval", "disabled", "off"],
-                "description": "Current permission policy/profile."
+                "enum": ["trusted_agent", "restricted", "invalid"],
+                "description": "Canonical authority mode. trusted_agent auto-authorizes consequential tools after hard safety checks; restricted requires human authorization; invalid means the configuration failed to resolve (fail closed)."
+            },
+            "source": {
+                "type": "string",
+                "description": "Where the resolved mode came from (default, env:WEBCODEX_AUTHORITY_MODE, rejected_legacy_env:WEBCODEX_PERMISSION_MODE)."
+            },
+            "project_write": {
+                "type": "boolean",
+                "description": "Project file writes execute without human approval."
+            },
+            "shell": {
+                "type": "boolean",
+                "description": "Shell and async jobs execute without human approval."
+            },
+            "git": {
+                "type": "boolean",
+                "description": "Project git operations execute without human approval."
+            },
+            "network": {
+                "type": "boolean",
+                "description": "Network-using project commands execute without human approval."
+            },
+            "package_install": {
+                "type": "boolean",
+                "description": "Dependency installation executes without human approval."
+            },
+            "service_control": {
+                "type": "boolean",
+                "description": "Local service control executes without human approval."
+            },
+            "release": {
+                "type": "string",
+                "enum": ["user_task_scoped", "human_approval"],
+                "description": "External release actions: user_task_scoped executes when the user task explicitly includes the action and target; human_approval requires an operator decision."
             },
             "human_approval_required": {
                 "type": "boolean",
-                "description": "False for the self-hosted development dev_auto_approve profile."
-            },
-            "auto_approve": {
-                "type": "boolean",
-                "description": "True when high-risk tools are automatically approved after hard safety checks pass."
-            },
-            "release_recommended_policy": {
-                "type": "string",
-                "enum": ["require_approval"],
-                "description": "Recommended future release policy."
+                "description": "True when consequential tools require a human authorization step."
             }
         },
         "required": [
-            "policy",
-            "human_approval_required",
-            "auto_approve",
-            "release_recommended_policy"
+            "mode",
+            "source",
+            "project_write",
+            "shell",
+            "git",
+            "network",
+            "package_install",
+            "service_control",
+            "release",
+            "human_approval_required"
         ]
     })
 }

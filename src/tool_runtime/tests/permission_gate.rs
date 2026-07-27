@@ -1,7 +1,7 @@
 //! Phase 2 permission pre-exec gate: single evaluation, mode matrix, mutation side effects.
 
 use super::super::kernel::{ToolCallContext, ToolCallRequest, ToolTransport};
-use super::super::permissions::{EffectivePermissionConfig, PermissionEvaluator, PermissionMode};
+use super::super::permissions::{AuthorityMode, EffectiveAuthorityConfig, PermissionEvaluator};
 use super::super::*;
 use super::support::*;
 use crate::shell_protocol::ShellClientCapabilities;
@@ -26,12 +26,12 @@ fn write_tool_call(
     }
 }
 
-fn runtime_with_mode(client_id: &str, mode: PermissionMode) -> ToolRuntime {
+fn runtime_with_mode(client_id: &str, mode: AuthorityMode) -> ToolRuntime {
     runtime_with_agent_project(client_id)
         .with_permission_evaluator(PermissionEvaluator::with_mode(mode))
 }
 
-fn runtime_with_config(client_id: &str, config: EffectivePermissionConfig) -> ToolRuntime {
+fn runtime_with_config(client_id: &str, config: EffectiveAuthorityConfig) -> ToolRuntime {
     runtime_with_agent_project(client_id)
         .with_permission_evaluator(PermissionEvaluator::with_config(config))
 }
@@ -72,11 +72,11 @@ async fn complete_write_ok(runtime: &ToolRuntime, client_id: &str, path: &str) {
 }
 
 #[tokio::test]
-async fn dev_auto_approve_evaluates_once_executes_and_attaches_same_decision() {
+async fn trusted_agent_evaluates_once_executes_and_attaches_same_decision() {
     let counter = Arc::new(AtomicUsize::new(0));
     let client_id = "perm-auto-once";
     let runtime = runtime_with_agent_project(client_id).with_permission_evaluator(
-        PermissionEvaluator::with_mode(PermissionMode::DevAutoApprove)
+        PermissionEvaluator::with_mode(AuthorityMode::TrustedAgent)
             .with_eval_counter(counter.clone()),
     );
     register_write_agent(&runtime, client_id).await;
@@ -103,8 +103,11 @@ async fn dev_auto_approve_evaluates_once_executes_and_attaches_same_decision() {
     assert!(result.success, "{:?}", result.error);
     assert_eq!(counter.load(Ordering::SeqCst), 1, "evaluator must run once");
     assert_eq!(result.output["permission"]["status"], "auto_approved");
-    assert_eq!(result.output["permission"]["policy"], "dev_auto_approve");
-    assert_eq!(result.output["permission"]["reason"], "dev_auto_approve");
+    assert_eq!(result.output["permission"]["policy"], "trusted_agent");
+    assert_eq!(
+        result.output["permission"]["reason"],
+        "trusted_agent_authority"
+    );
     let request_id = result.output["permission"]["request_id"]
         .as_str()
         .expect("request_id");
@@ -121,38 +124,9 @@ async fn dev_auto_approve_evaluates_once_executes_and_attaches_same_decision() {
 }
 
 #[tokio::test]
-async fn audit_only_allows_mutation_and_attaches_audit_decision() {
-    let client_id = "perm-audit";
-    let runtime = runtime_with_mode(client_id, PermissionMode::AuditOnly);
-    register_write_agent(&runtime, client_id).await;
-    let project = agent_test_project_id(client_id);
-    let bootstrap = auth_context(None, true);
-
-    let task = tokio::spawn({
-        let runtime = runtime.clone();
-        let project = project.clone();
-        async move {
-            runtime
-                .dispatch_with_auth(
-                    write_tool_call(project, "src/audit.txt", "ok\n", None),
-                    Some(&bootstrap),
-                )
-                .await
-        }
-    });
-    complete_write_ok(&runtime, client_id, "src/audit.txt").await;
-    let result = task.await.unwrap();
-
-    assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["permission"]["status"], "audit_only_allowed");
-    assert_eq!(result.output["permission"]["policy"], "audit_only");
-    assert_eq!(result.output["permission"]["risk"], "write");
-}
-
-#[tokio::test]
-async fn require_approval_blocks_mutation_before_agent_enqueue() {
+async fn restricted_blocks_mutation_before_agent_enqueue() {
     let client_id = "perm-require";
-    let runtime = runtime_with_mode(client_id, PermissionMode::RequireApproval);
+    let runtime = runtime_with_mode(client_id, AuthorityMode::Restricted);
     register_write_agent(&runtime, client_id).await;
     let project = agent_test_project_id(client_id);
     let session = runtime.sessions.start_session(Some(project.clone()), None);
@@ -176,18 +150,20 @@ async fn require_approval_blocks_mutation_before_agent_enqueue() {
     assert_eq!(result.output["permission"]["status"], "denied");
     assert_eq!(
         result.output["permission"]["reason"],
-        "require_approval_not_implemented"
+        "restricted_requires_human_authorization"
     );
     assert_ne!(result.output["permission"]["status"], "auto_approved");
     let err = result.error.as_deref().unwrap();
-    assert!(err.contains("require_approval"), "{err}");
-    assert!(err.contains("not implemented"), "{err}");
+    assert!(
+        err.contains("restricted authority mode requires human authorization"),
+        "{err}"
+    );
 
     assert!(
         next_patch_agent_request(&runtime, client_id)
             .await
             .is_none(),
-        "require_approval must not enqueue mutation"
+        "restricted authority must not enqueue mutation"
     );
 
     let summary = runtime
@@ -198,7 +174,7 @@ async fn require_approval_blocks_mutation_before_agent_enqueue() {
     assert_eq!(event.status.as_deref(), Some("failed"));
     let perm = event.permission.as_ref().expect("permission on ledger");
     assert_eq!(perm.status, "denied");
-    assert_eq!(perm.reason, "require_approval_not_implemented");
+    assert_eq!(perm.reason, "restricted_requires_human_authorization");
 }
 
 #[tokio::test]
@@ -206,7 +182,7 @@ async fn invalid_mode_blocks_mutation_and_does_not_auto_approve() {
     let client_id = "perm-invalid";
     let runtime = runtime_with_config(
         client_id,
-        EffectivePermissionConfig::from_raw(Some("totally_bogus_mode")),
+        EffectiveAuthorityConfig::from_raw(Some("totally_bogus_mode")),
     );
     register_write_agent(&runtime, client_id).await;
     let project = agent_test_project_id(client_id);
@@ -227,13 +203,13 @@ async fn invalid_mode_blocks_mutation_and_does_not_auto_approve() {
         result.output["permission"]["reason"]
             .as_str()
             .unwrap()
-            .contains("invalid_permission_mode"),
+            .contains("invalid_authority_mode"),
         "{:?}",
         result.output["permission"]["reason"]
     );
     let err = result.error.as_deref().unwrap();
     assert!(
-        err.contains("WEBCODEX_PERMISSION_MODE") || err.contains("invalid"),
+        err.contains("WEBCODEX_AUTHORITY_MODE") || err.contains("invalid"),
         "{err}"
     );
     assert!(
@@ -247,7 +223,7 @@ async fn invalid_mode_blocks_mutation_and_does_not_auto_approve() {
 #[tokio::test]
 async fn hard_policy_deny_still_suppresses_permission_attach() {
     let client_id = "perm-hard-deny";
-    let runtime = runtime_with_mode(client_id, PermissionMode::DevAutoApprove);
+    let runtime = runtime_with_mode(client_id, AuthorityMode::TrustedAgent);
     register_write_agent(&runtime, client_id).await;
     let project = agent_test_project_id(client_id);
     let session = runtime.sessions.start_session(Some(project.clone()), None);
@@ -295,7 +271,7 @@ async fn hard_policy_deny_still_suppresses_permission_attach() {
 #[tokio::test]
 async fn read_only_tool_skips_permission_decision() {
     let client_id = "perm-readonly";
-    let runtime = runtime_with_mode(client_id, PermissionMode::RequireApproval);
+    let runtime = runtime_with_mode(client_id, AuthorityMode::Restricted);
     register_agent(
         &runtime,
         client_id,
@@ -330,7 +306,7 @@ async fn read_only_tool_skips_permission_decision() {
     });
     let req = next_patch_agent_request(&runtime, client_id)
         .await
-        .expect("read_file should still execute under require_approval");
+        .expect("read_file should still execute under restricted authority");
     complete_patch_agent_request(
         &runtime,
         client_id,
@@ -355,7 +331,7 @@ async fn kernel_path_does_not_double_evaluate_or_duplicate_request_id() {
     let counter = Arc::new(AtomicUsize::new(0));
     let client_id = "perm-kernel-once";
     let runtime = runtime_with_agent_project(client_id).with_permission_evaluator(
-        PermissionEvaluator::with_mode(PermissionMode::DevAutoApprove)
+        PermissionEvaluator::with_mode(AuthorityMode::TrustedAgent)
             .with_eval_counter(counter.clone()),
     );
     register_write_agent(&runtime, client_id).await;

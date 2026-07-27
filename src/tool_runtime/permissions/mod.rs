@@ -1,13 +1,13 @@
-//! Permission decision layer for high-risk tool execution.
+//! Authority decision layer for permission-bearing tool execution.
 //!
 //! Module layout:
-//! - [`model`] — modes, outcomes, [`PermissionDecision`], constants
+//! - [`model`] — canonical authority modes, outcomes, [`PermissionDecision`]
 //! - [`evaluator`] — single evaluation entry ([`PermissionEvaluator`])
-//! - [`policy`] — mode behavior (`dev_auto_approve`, `audit_only`, …)
+//! - [`policy`] — mode behavior (`trusted_agent`, `restricted`)
 //! - [`risk`] — coarse risk classification facade
 //!
 //! Hard safety (session guard, path policy, scopes) lives outside this module
-//! and is never bypassed by permission mode. See
+//! and is never bypassed by authority mode. See
 //! `docs/agent/permission-model.md`.
 
 mod evaluator;
@@ -20,30 +20,37 @@ mod tests;
 
 pub(crate) use evaluator::PermissionEvaluator;
 pub(crate) use model::{PermissionDecision, DEFAULT_PERMISSION_RECENT_LIMIT};
-pub(crate) use policy::EffectivePermissionConfig;
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use policy::authority_profile_payload_for;
+pub(crate) use policy::EffectiveAuthorityConfig;
+
+// Shared with the connector approval gate: one authority contract for both
+// runtime and connector surfaces.
+#[cfg(test)]
+pub(crate) use model::AuthorityMode;
+pub(crate) use policy::TRUSTED_AGENT_AUTO_REASON;
 
 // Test-facing surface: mode parsing, outcomes, constants, compatibility wrapper.
 #[cfg(test)]
 pub(crate) use evaluator::permission_decision_for_tool;
 #[cfg(test)]
-pub(crate) use model::PermissionMode;
-#[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use model::{
-    PermissionModeParseError, PermissionOutcome, DEFAULT_PERMISSION_POLICY, PERMISSION_MODE_ENV,
-    RELEASE_RECOMMENDED_PERMISSION_POLICY,
+    AuthorityModeParseError, PermissionOutcome, AUTHORITY_MODE_ENV, LEGACY_PERMISSION_MODE_ENV,
 };
 #[cfg(test)]
-pub(crate) use policy::resolve_permission_mode;
+#[allow(unused_imports)]
+pub(crate) use policy::{resolve_authority_mode, AuthoritySource, RESTRICTED_DENY_REASON};
 
 use serde_json::{json, Value};
 
 use super::sessions::SessionEvent;
 use super::tool_result::ToolResult;
 
-/// Operator-facing permission profile (runtime_status / coding-task startup).
-pub(crate) fn permission_profile_payload() -> Value {
-    policy::permission_profile_payload_for(&EffectivePermissionConfig::from_env())
+/// Canonical authority profile (runtime_status / coding-task startup).
+pub(crate) fn authority_profile_payload() -> Value {
+    policy::authority_profile_payload_for(&EffectiveAuthorityConfig::from_env())
 }
 
 pub(crate) fn add_permission_to_result(result: &mut ToolResult, permission: &PermissionDecision) {
@@ -62,19 +69,20 @@ pub(crate) fn add_permission_to_result(result: &mut ToolResult, permission: &Per
     result.output = Value::Object(output);
 }
 
-/// Structured denial when the permission layer blocks execution before mutation.
+/// Structured denial when the authority layer blocks execution before mutation.
 ///
 /// Stable, diagnostic messages without tool parameters or sensitive content.
 /// Callers attach the same [`PermissionDecision`] via [`add_permission_to_result`].
 pub(crate) fn permission_execution_denied_result(decision: &PermissionDecision) -> ToolResult {
     let message = match decision.reason.as_str() {
-        "require_approval_not_implemented" => {
-            "permission denied: require_approval is not implemented; tool execution blocked"
+        policy::RESTRICTED_DENY_REASON => {
+            "permission denied: restricted authority mode requires human authorization \
+             for consequential tools"
                 .to_string()
         }
-        reason if reason.starts_with("invalid_permission_mode:") => format!(
+        reason if reason.starts_with("invalid_authority_mode:") => format!(
             "permission denied: invalid {env} configuration; tool execution blocked",
-            env = model::PERMISSION_MODE_ENV
+            env = model::AUTHORITY_MODE_ENV
         ),
         other => format!("permission denied: {other}"),
     };
@@ -100,8 +108,8 @@ pub(crate) fn permission_decision_from_output(output: &Value) -> Option<Permissi
     serde_json::from_value(value.clone()).ok()
 }
 
-/// Detect hard-safety denials on tool output. Independent of permission mode:
-/// auto-approve must never suppress these outcomes.
+/// Detect hard-safety denials on tool output. Independent of authority mode:
+/// auto-authorization must never suppress these outcomes.
 pub(crate) fn is_hard_denied_output(output: &Value, error: Option<&str>) -> bool {
     let structured_hard_deny = [
         "policy_rejected",
@@ -176,10 +184,10 @@ pub(crate) fn permission_summary_from_events(events: &[SessionEvent], limit: usi
 
     let manual_approved_count = approved_count;
     let total_approved_count = manual_approved_count + auto_approved_count;
-    let config = EffectivePermissionConfig::from_env();
+    let config = EffectiveAuthorityConfig::from_env();
 
     json!({
-        "policy": config.policy_name(),
+        "policy": config.mode_name(),
         "events_total": events_total,
         "required_count": required_count,
         "auto_approved_count": auto_approved_count,

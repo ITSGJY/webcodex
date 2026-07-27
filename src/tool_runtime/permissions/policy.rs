@@ -1,33 +1,81 @@
-//! Permission mode policy: how each mode maps to a decision outcome.
+//! Authority mode policy: how each mode maps to a decision outcome.
 //!
 //! Hard safety rules (session guard, path policy, scopes, …) are **not**
 //! implemented here and must never be weakened by mode choice.
 
 use super::model::{
-    PermissionDecision, PermissionMode, PermissionModeParseError, PermissionOutcome,
-    DEFAULT_PERMISSION_POLICY, PERMISSION_MODE_ENV, RELEASE_RECOMMENDED_PERMISSION_POLICY,
+    AuthorityMode, AuthorityModeParseError, PermissionDecision, PermissionOutcome,
+    AUTHORITY_MODE_ENV, LEGACY_PERMISSION_MODE_ENV,
 };
 use serde_json::{json, Value};
 
-/// Effective configuration used by the evaluator.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum EffectivePermissionConfig {
-    /// A known mode (including the default when the env var is unset).
-    Active(PermissionMode),
-    /// Env was set to an unrecognized value — refuse auto-approval.
-    InvalidMode { value: String },
+/// Resolved rule name recorded on auto-authorized decisions.
+pub(crate) const TRUSTED_AGENT_AUTO_REASON: &str = "trusted_agent_authority";
+
+/// Resolved rule name recorded on restricted-mode denials of the runtime
+/// surface (the connector surface routes through one-time human approvals).
+pub(crate) const RESTRICTED_DENY_REASON: &str = "restricted_requires_human_authorization";
+
+/// Where the resolved authority mode came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthoritySource {
+    /// No explicit configuration; product default for self-hosted deployments.
+    Default,
+    /// Explicit `WEBCODEX_AUTHORITY_MODE`.
+    Env,
+    /// The removed legacy `WEBCODEX_PERMISSION_MODE` switch was set. Rejected
+    /// (fail closed), never silently migrated.
+    LegacyEnvRejected,
 }
 
-impl EffectivePermissionConfig {
-    /// Resolve `WEBCODEX_PERMISSION_MODE` from the process environment.
+impl AuthoritySource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Env => concat!("env:", "WEBCODEX_AUTHORITY_MODE"),
+            Self::LegacyEnvRejected => concat!("rejected_legacy_env:", "WEBCODEX_PERMISSION_MODE"),
+        }
+    }
+}
+
+/// Effective configuration used by the evaluator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EffectiveAuthorityConfig {
+    /// A known mode (including the default when the env var is unset).
+    Active {
+        mode: AuthorityMode,
+        source: AuthoritySource,
+    },
+    /// Configuration is invalid — refuse auto-authorization (fail closed).
+    InvalidMode {
+        value: String,
+        source: AuthoritySource,
+    },
+}
+
+impl EffectiveAuthorityConfig {
+    /// Resolve the authority mode from the process environment.
     ///
-    /// Unset or empty → [`PermissionMode::DevAutoApprove`].
-    /// Unknown non-empty value → [`EffectivePermissionConfig::InvalidMode`].
+    /// Unset or empty `WEBCODEX_AUTHORITY_MODE` → [`AuthorityMode::TrustedAgent`]
+    /// with source `default`. Unknown non-empty value → invalid (fail closed).
+    /// A set legacy `WEBCODEX_PERMISSION_MODE` is a hard configuration error.
     pub(crate) fn from_env() -> Self {
-        match std::env::var(PERMISSION_MODE_ENV) {
-            Err(std::env::VarError::NotPresent) => Self::Active(PermissionMode::DEFAULT),
+        if let Ok(raw) = std::env::var(LEGACY_PERMISSION_MODE_ENV) {
+            if !raw.trim().is_empty() {
+                return Self::InvalidMode {
+                    value: format!("{LEGACY_PERMISSION_MODE_ENV} is removed; set {AUTHORITY_MODE_ENV}=trusted_agent|restricted"),
+                    source: AuthoritySource::LegacyEnvRejected,
+                };
+            }
+        }
+        match std::env::var(AUTHORITY_MODE_ENV) {
+            Err(std::env::VarError::NotPresent) => Self::Active {
+                mode: AuthorityMode::DEFAULT,
+                source: AuthoritySource::Default,
+            },
             Err(std::env::VarError::NotUnicode(_)) => Self::InvalidMode {
                 value: "<non-utf8>".to_string(),
+                source: AuthoritySource::Env,
             },
             Ok(raw) => Self::from_raw(Some(raw.as_str())),
         }
@@ -35,35 +83,51 @@ impl EffectivePermissionConfig {
 
     /// Resolve from an optional raw mode string (tests and explicit config).
     pub(crate) fn from_raw(raw: Option<&str>) -> Self {
-        match resolve_permission_mode(raw) {
-            Ok(mode) => Self::Active(mode),
-            Err(err) => Self::InvalidMode { value: err.value },
+        let source = match raw {
+            Some(value) if !value.trim().is_empty() => AuthoritySource::Env,
+            _ => AuthoritySource::Default,
+        };
+        match resolve_authority_mode(raw) {
+            Ok(mode) => Self::Active { mode, source },
+            Err(err) => Self::InvalidMode {
+                value: err.value,
+                source,
+            },
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn with_mode(mode: PermissionMode) -> Self {
-        Self::Active(mode)
+    pub(crate) fn with_mode(mode: AuthorityMode) -> Self {
+        Self::Active {
+            mode,
+            source: AuthoritySource::Default,
+        }
     }
 
-    pub(crate) fn policy_name(&self) -> &str {
+    pub(crate) fn mode_name(&self) -> &str {
         match self {
-            Self::Active(mode) => mode.as_str(),
+            Self::Active { mode, .. } => mode.as_str(),
             Self::InvalidMode { .. } => "invalid",
+        }
+    }
+
+    pub(crate) fn source(&self) -> AuthoritySource {
+        match self {
+            Self::Active { source, .. } | Self::InvalidMode { source, .. } => *source,
         }
     }
 
     pub(crate) fn human_approval_required(&self) -> bool {
         match self {
-            Self::Active(mode) => mode.human_approval_required(),
-            // Fail closed: do not advertise frictionless auto-approve.
+            Self::Active { mode, .. } => mode.human_approval_required(),
+            // Fail closed: do not advertise frictionless auto-authorization.
             Self::InvalidMode { .. } => true,
         }
     }
 
-    pub(crate) fn auto_approve(&self) -> bool {
+    pub(crate) fn auto_authorize(&self) -> bool {
         match self {
-            Self::Active(mode) => mode.auto_approve(),
+            Self::Active { mode, .. } => mode.auto_authorize(),
             Self::InvalidMode { .. } => false,
         }
     }
@@ -71,20 +135,20 @@ impl EffectivePermissionConfig {
 
 /// Resolve a mode from optional raw config.
 ///
-/// - `None` / empty / whitespace → default `dev_auto_approve`
+/// - `None` / empty / whitespace → default `trusted_agent`
 /// - known mode name → `Ok`
 /// - anything else → `Err` with the invalid value
-pub(crate) fn resolve_permission_mode(
+pub(crate) fn resolve_authority_mode(
     raw: Option<&str>,
-) -> Result<PermissionMode, PermissionModeParseError> {
+) -> Result<AuthorityMode, AuthorityModeParseError> {
     match raw {
-        None => Ok(PermissionMode::DEFAULT),
+        None => Ok(AuthorityMode::DEFAULT),
         Some(value) => {
             let trimmed = value.trim();
             if trimmed.is_empty() {
-                Ok(PermissionMode::DEFAULT)
+                Ok(AuthorityMode::DEFAULT)
             } else {
-                PermissionMode::parse(trimmed)
+                AuthorityMode::parse(trimmed)
             }
         }
     }
@@ -94,46 +158,38 @@ pub(crate) fn resolve_permission_mode(
 ///
 /// Caller must already have determined that the tool requires permission.
 pub(crate) fn decide_for_required_tool(
-    config: &EffectivePermissionConfig,
+    config: &EffectiveAuthorityConfig,
     tool_name: &str,
     project: Option<&str>,
     risk: &str,
 ) -> PermissionDecision {
     match config {
-        EffectivePermissionConfig::Active(PermissionMode::DevAutoApprove) => {
-            PermissionDecision::new(
-                PermissionMode::DevAutoApprove.as_str(),
-                PermissionOutcome::AutoApproved,
-                // Wire-compatible reason echo of the policy name.
-                DEFAULT_PERMISSION_POLICY,
-                risk,
-                tool_name,
-                project,
-            )
-        }
-        EffectivePermissionConfig::Active(PermissionMode::AuditOnly) => PermissionDecision::new(
-            PermissionMode::AuditOnly.as_str(),
-            PermissionOutcome::AuditOnlyAllowed,
-            "audit_only",
+        EffectiveAuthorityConfig::Active {
+            mode: AuthorityMode::TrustedAgent,
+            ..
+        } => PermissionDecision::new(
+            AuthorityMode::TrustedAgent.as_str(),
+            PermissionOutcome::AutoApproved,
+            TRUSTED_AGENT_AUTO_REASON,
             risk,
             tool_name,
             project,
         ),
-        EffectivePermissionConfig::Active(PermissionMode::RequireApproval) => {
-            // Real pending/approve is not implemented. Never emit auto_approved.
-            PermissionDecision::new(
-                PermissionMode::RequireApproval.as_str(),
-                PermissionOutcome::Denied,
-                "require_approval_not_implemented",
-                risk,
-                tool_name,
-                project,
-            )
-        }
-        EffectivePermissionConfig::InvalidMode { value } => PermissionDecision::new(
+        EffectiveAuthorityConfig::Active {
+            mode: AuthorityMode::Restricted,
+            ..
+        } => PermissionDecision::new(
+            AuthorityMode::Restricted.as_str(),
+            PermissionOutcome::Denied,
+            RESTRICTED_DENY_REASON,
+            risk,
+            tool_name,
+            project,
+        ),
+        EffectiveAuthorityConfig::InvalidMode { value, .. } => PermissionDecision::new(
             "invalid",
             PermissionOutcome::Denied,
-            format!("invalid_permission_mode:{value}"),
+            format!("invalid_authority_mode:{value}"),
             risk,
             tool_name,
             project,
@@ -141,19 +197,23 @@ pub(crate) fn decide_for_required_tool(
     }
 }
 
-/// Operator-facing permission profile for runtime_status / coding-task startup.
-pub(crate) fn permission_profile_payload_for(config: &EffectivePermissionConfig) -> Value {
+/// Canonical authority profile projection (runtime_status / coding-task
+/// startup / health surfaces). Never exposes tokens or raw policy internals.
+pub(crate) fn authority_profile_payload_for(config: &EffectiveAuthorityConfig) -> Value {
+    let auto = config.auto_authorize();
     json!({
-        "policy": match config {
-            // Profile schema historically lists dev_auto_approve / require_approval /
-            // disabled / off. Keep known public names; surface audit_only and
-            // invalid as their policy strings for honesty without OpenAPI edits.
-            EffectivePermissionConfig::Active(mode) => mode.as_str(),
-            EffectivePermissionConfig::InvalidMode { .. } => "invalid",
-        },
+        "mode": config.mode_name(),
+        "source": config.source().as_str(),
+        "project_write": auto,
+        "shell": auto,
+        "git": auto,
+        "network": auto,
+        "package_install": auto,
+        "service_control": auto,
+        // In trusted_agent mode external release actions execute only when the
+        // user's task explicitly includes that action and target.
+        "release": if auto { "user_task_scoped" } else { "human_approval" },
         "human_approval_required": config.human_approval_required(),
-        "auto_approve": config.auto_approve(),
-        "release_recommended_policy": RELEASE_RECOMMENDED_PERMISSION_POLICY,
     })
 }
 
@@ -162,44 +222,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unset_and_empty_resolve_to_dev_auto_approve() {
+    fn unset_and_empty_resolve_to_trusted_agent() {
         assert_eq!(
-            resolve_permission_mode(None).unwrap(),
-            PermissionMode::DevAutoApprove
+            resolve_authority_mode(None).unwrap(),
+            AuthorityMode::TrustedAgent
         );
         assert_eq!(
-            resolve_permission_mode(Some("")).unwrap(),
-            PermissionMode::DevAutoApprove
+            resolve_authority_mode(Some("")).unwrap(),
+            AuthorityMode::TrustedAgent
         );
         assert_eq!(
-            resolve_permission_mode(Some("   ")).unwrap(),
-            PermissionMode::DevAutoApprove
+            resolve_authority_mode(Some("   ")).unwrap(),
+            AuthorityMode::TrustedAgent
         );
     }
 
     #[test]
     fn known_modes_parse() {
         assert_eq!(
-            resolve_permission_mode(Some("dev_auto_approve")).unwrap(),
-            PermissionMode::DevAutoApprove
+            resolve_authority_mode(Some("trusted_agent")).unwrap(),
+            AuthorityMode::TrustedAgent
         );
         assert_eq!(
-            resolve_permission_mode(Some("audit_only")).unwrap(),
-            PermissionMode::AuditOnly
-        );
-        assert_eq!(
-            resolve_permission_mode(Some("require_approval")).unwrap(),
-            PermissionMode::RequireApproval
+            resolve_authority_mode(Some("restricted")).unwrap(),
+            AuthorityMode::Restricted
         );
     }
 
     #[test]
+    fn legacy_mode_names_are_rejected_not_aliased() {
+        for legacy in ["dev_auto_approve", "audit_only", "require_approval"] {
+            let err = resolve_authority_mode(Some(legacy)).unwrap_err();
+            assert_eq!(err.value, legacy);
+        }
+    }
+
+    #[test]
     fn illegal_mode_is_explicit_error() {
-        let err = resolve_permission_mode(Some("nope")).unwrap_err();
+        let err = resolve_authority_mode(Some("nope")).unwrap_err();
         assert_eq!(err.value, "nope");
         let message = err.to_string();
-        assert!(message.contains(PERMISSION_MODE_ENV), "{message}");
-        assert!(message.contains("dev_auto_approve"), "{message}");
+        assert!(message.contains(AUTHORITY_MODE_ENV), "{message}");
+        assert!(message.contains("trusted_agent"), "{message}");
         assert!(message.contains("nope"), "{message}");
+    }
+
+    #[test]
+    fn source_is_reported_for_default_and_env() {
+        assert_eq!(
+            EffectiveAuthorityConfig::from_raw(None).source(),
+            AuthoritySource::Default
+        );
+        assert_eq!(
+            EffectiveAuthorityConfig::from_raw(Some("restricted")).source(),
+            AuthoritySource::Env
+        );
+        assert_eq!(AuthoritySource::Default.as_str(), "default");
+        assert_eq!(AuthoritySource::Env.as_str(), "env:WEBCODEX_AUTHORITY_MODE");
+        assert_eq!(
+            AuthoritySource::LegacyEnvRejected.as_str(),
+            "rejected_legacy_env:WEBCODEX_PERMISSION_MODE"
+        );
     }
 }

@@ -42,7 +42,7 @@ async fn register_semantic_agent(
     crate::tool_runtime::agent_project_runtime_id(client_id, project_id)
 }
 
-fn start_call(project: String, compact_startup: bool, mode: SessionMode) -> ToolCall {
+fn start_call(project: String, mode: SessionMode) -> ToolCall {
     ToolCall::StartCodingTask {
         project,
         title: Some("semantic navigation startup".to_string()),
@@ -50,15 +50,6 @@ fn start_call(project: String, compact_startup: bool, mode: SessionMode) -> Tool
         detail: Default::default(),
         deny_write_tools: false,
         deny_shell_tools: false,
-        include_runtime_status: Some(false),
-        compact_startup,
-        include_git: Some(false),
-        include_recent_commits: Some(false),
-        include_rules: Some(false),
-        include_tool_manifest: Some(false),
-        tool_manifest_intent: None,
-        tool_manifest_categories: None,
-        tool_manifest_limit: None,
         bind_current: false,
     }
 }
@@ -66,16 +57,12 @@ fn start_call(project: String, compact_startup: bool, mode: SessionMode) -> Tool
 fn spawn_start(
     runtime: &ToolRuntime,
     project: String,
-    compact_startup: bool,
     mode: SessionMode,
 ) -> tokio::task::JoinHandle<ToolResult> {
     let runtime = runtime.clone();
     tokio::spawn(async move {
         runtime
-            .dispatch_with_auth(
-                start_call(project, compact_startup, mode),
-                Some(&auth_context(None, true)),
-            )
+            .dispatch_with_auth(start_call(project, mode), Some(&auth_context(None, true)))
             .await
     })
 }
@@ -150,9 +137,10 @@ async fn start_with_status(
 ) -> ToolResult {
     let runtime = test_runtime();
     let temp = tempfile::tempdir().unwrap();
+    seed_clean_repo(temp.path());
     let project =
         register_semantic_agent(&runtime, "semantic-agent", "demo", temp.path(), true).await;
-    let task = spawn_start(&runtime, project, false, SessionMode::Normal);
+    let task = spawn_start(&runtime, project, SessionMode::Normal);
     let request = next_semantic_status_request(&runtime, "semantic-agent").await;
     complete_status_envelope(
         &runtime,
@@ -161,14 +149,47 @@ async fn start_with_status(
         AgentLspResultEnvelope::ok(status_result("demo", true, status, position_encoding)),
     )
     .await;
+    finish_start_servicing_locally(&runtime, "semantic-agent", task).await
+}
+
+fn seed_clean_repo(root: &std::path::Path) {
+    init_git_repo(root);
+    commit_file(root, "README.md", "# demo\n", "chore: seed fixture");
+}
+
+/// Standard-detail startup inspects git through the agent; service those
+/// remaining requests locally until start_coding_task finishes.
+async fn finish_start_servicing_locally(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    task: tokio::task::JoinHandle<ToolResult>,
+) -> ToolResult {
+    for _ in 0..400 {
+        if task.is_finished() {
+            break;
+        }
+        if let Some(request) = next_patch_agent_request(runtime, client_id).await {
+            complete_agent_request_by_running_locally(runtime, client_id, request).await;
+        } else {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    assert!(
+        task.is_finished(),
+        "start_coding_task did not finish after servicing startup agent requests"
+    );
     task.await.unwrap()
 }
 
 fn assert_optional_sections_disabled(output: &Value) {
-    assert_eq!(output["runtime_status"], Value::Null);
-    assert_eq!(output["git"], Value::Null);
+    // Standard detail keeps the compact runtime status and git summary;
+    // rules, tool_manifest, and recommended_flow stay full-detail only.
+    assert!(output["runtime_status"].is_object());
+    assert!(output["git"].is_object());
+    assert_eq!(output["git"]["available"], true);
     assert_eq!(output["rules"], Value::Null);
     assert!(output.get("tool_manifest").is_none());
+    assert!(output.get("recommended_flow").is_none());
     assert!(output.get("semantic_navigation").is_some());
 }
 
@@ -279,9 +300,10 @@ async fn coding_task_semantic_navigation_unavailable_is_nonblocking() {
 async fn coding_task_semantic_navigation_non_rust_agent_is_not_applicable() {
     let runtime = test_runtime();
     let temp = tempfile::tempdir().unwrap();
+    seed_clean_repo(temp.path());
     let project =
         register_semantic_agent(&runtime, "non-rust-agent", "demo", temp.path(), true).await;
-    let task = spawn_start(&runtime, project, false, SessionMode::Normal);
+    let task = spawn_start(&runtime, project, SessionMode::Normal);
     let request = next_semantic_status_request(&runtime, "non-rust-agent").await;
     complete_status_envelope(
         &runtime,
@@ -295,7 +317,7 @@ async fn coding_task_semantic_navigation_non_rust_agent_is_not_applicable() {
         )),
     )
     .await;
-    let result = task.await.unwrap();
+    let result = finish_start_servicing_locally(&runtime, "non-rust-agent", task).await;
     assert!(result.success, "{result:?}");
     let semantic = &result.output["semantic_navigation"];
     assert_eq!(semantic["supported"], true);
@@ -309,14 +331,25 @@ async fn coding_task_semantic_navigation_non_rust_agent_is_not_applicable() {
 async fn coding_task_semantic_navigation_legacy_agent_is_not_enqueued() {
     let runtime = test_runtime();
     let temp = tempfile::tempdir().unwrap();
+    seed_clean_repo(temp.path());
     let project =
         register_semantic_agent(&runtime, "legacy-agent", "demo", temp.path(), false).await;
-    let result = runtime
-        .dispatch_with_auth(
-            start_call(project, false, SessionMode::Normal),
-            Some(&auth_context(None, true)),
-        )
-        .await;
+    let task = spawn_start(&runtime, project, SessionMode::Normal);
+    for _ in 0..400 {
+        if task.is_finished() {
+            break;
+        }
+        if let Some(request) = next_patch_agent_request(&runtime, "legacy-agent").await {
+            assert_ne!(
+                request.kind, AGENT_LSP_REQUEST_KIND,
+                "legacy agent must not receive an LSP probe"
+            );
+            complete_agent_request_by_running_locally(&runtime, "legacy-agent", request).await;
+        } else {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    let result = task.await.unwrap();
     assert!(result.success, "{result:?}");
     let semantic = &result.output["semantic_navigation"];
     assert_eq!(semantic["supported"], false);
@@ -340,7 +373,7 @@ async fn coding_task_semantic_navigation_disconnected_agent_is_nonblocking() {
         .await;
     let result = runtime
         .dispatch_with_auth(
-            start_call(project, false, SessionMode::Normal),
+            start_call(project, SessionMode::Normal),
             Some(&auth_context(None, true)),
         )
         .await;
@@ -348,8 +381,29 @@ async fn coding_task_semantic_navigation_disconnected_agent_is_nonblocking() {
     let semantic = &result.output["semantic_navigation"];
     assert_eq!(semantic["status"], "agent_unavailable");
     assert_eq!(semantic["reason_code"], "agent_not_connected");
-    assert_eq!(result.output["startup_verdict"]["status"], "warn");
-    assert_eq!(result.output["warnings"], json!([]));
+    // The offline runner is the deterministic blocker; the semantic probe
+    // itself adds no failure of its own.
+    assert_eq!(result.output["startup_verdict"]["status"], "fail");
+    assert_eq!(result.output["startup_verdict"]["blocking"], true);
+    let agent_check = result.output["startup_verdict"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "agent")
+        .expect("agent startup check");
+    assert_eq!(agent_check["status"], "fail");
+    assert_eq!(agent_check["reason"], "agent_offline");
+    // Git inspection cannot reach the offline agent: advisory, not blocking.
+    let warning_kinds: Vec<&str> = result.output["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|warning| warning["kind"].as_str())
+        .collect();
+    assert!(
+        warning_kinds.contains(&"git_unavailable"),
+        "{warning_kinds:?}"
+    );
     assert!(next_patch_agent_request(&runtime, "offline-agent")
         .await
         .is_none());
@@ -359,13 +413,14 @@ async fn coding_task_semantic_navigation_disconnected_agent_is_nonblocking() {
 async fn coding_task_semantic_navigation_timeout_uses_one_budget_and_cancels_waiter() {
     let runtime = test_runtime().with_semantic_navigation_probe_timeout(Duration::from_millis(25));
     let temp = tempfile::tempdir().unwrap();
+    seed_clean_repo(temp.path());
     let project =
         register_semantic_agent(&runtime, "timeout-agent", "demo", temp.path(), true).await;
     let started = Instant::now();
-    let task = spawn_start(&runtime, project, false, SessionMode::Normal);
+    let task = spawn_start(&runtime, project, SessionMode::Normal);
     let request = next_semantic_status_request(&runtime, "timeout-agent").await;
-    let result = task.await.unwrap();
-    assert!(started.elapsed() < Duration::from_millis(500));
+    let result = finish_start_servicing_locally(&runtime, "timeout-agent", task).await;
+    assert!(started.elapsed() < Duration::from_millis(2_000));
     assert!(result.success, "{result:?}");
     let semantic = &result.output["semantic_navigation"];
     assert_eq!(semantic["status"], "probe_timeout");
@@ -403,9 +458,10 @@ async fn coding_task_semantic_navigation_timeout_uses_one_budget_and_cancels_wai
 async fn coding_task_semantic_navigation_malformed_result_is_sanitized() {
     let runtime = test_runtime();
     let temp = tempfile::tempdir().unwrap();
+    seed_clean_repo(temp.path());
     let project =
         register_semantic_agent(&runtime, "malformed-agent", "demo", temp.path(), true).await;
-    let task = spawn_start(&runtime, project, false, SessionMode::Normal);
+    let task = spawn_start(&runtime, project, SessionMode::Normal);
     let request = next_semantic_status_request(&runtime, "malformed-agent").await;
     complete_patch_agent_request(
         &runtime,
@@ -416,7 +472,7 @@ async fn coding_task_semantic_navigation_malformed_result_is_sanitized() {
         "stderr must not leak",
     )
     .await;
-    let result = task.await.unwrap();
+    let result = finish_start_servicing_locally(&runtime, "malformed-agent", task).await;
     assert!(result.success, "{result:?}");
     let semantic = &result.output["semantic_navigation"];
     assert_eq!(semantic["status"], "probe_failed");
@@ -432,9 +488,10 @@ async fn coding_task_semantic_navigation_malformed_result_is_sanitized() {
 async fn coding_task_semantic_navigation_agent_failure_uses_fixed_reason_code() {
     let runtime = test_runtime();
     let temp = tempfile::tempdir().unwrap();
+    seed_clean_repo(temp.path());
     let project =
         register_semantic_agent(&runtime, "failed-agent", "demo", temp.path(), true).await;
-    let task = spawn_start(&runtime, project, false, SessionMode::Normal);
+    let task = spawn_start(&runtime, project, SessionMode::Normal);
     let request = next_semantic_status_request(&runtime, "failed-agent").await;
     complete_status_envelope(
         &runtime,
@@ -443,7 +500,7 @@ async fn coding_task_semantic_navigation_agent_failure_uses_fixed_reason_code() 
         AgentLspResultEnvelope::err("lsp_protocol_error", "private raw failure detail"),
     )
     .await;
-    let result = task.await.unwrap();
+    let result = finish_start_servicing_locally(&runtime, "failed-agent", task).await;
     assert!(result.success, "{result:?}");
     let semantic = &result.output["semantic_navigation"];
     assert_eq!(semantic["status"], "probe_failed");
@@ -456,9 +513,10 @@ async fn coding_task_semantic_navigation_agent_failure_uses_fixed_reason_code() 
 async fn coding_task_semantic_navigation_compact_read_only_keeps_full_shape() {
     let runtime = test_runtime();
     let temp = tempfile::tempdir().unwrap();
+    seed_clean_repo(temp.path());
     let project =
         register_semantic_agent(&runtime, "compact-agent", "demo", temp.path(), true).await;
-    let task = spawn_start(&runtime, project, true, SessionMode::ReadOnly);
+    let task = spawn_start(&runtime, project, SessionMode::ReadOnly);
     let request = next_semantic_status_request(&runtime, "compact-agent").await;
     complete_status_envelope(
         &runtime,
@@ -472,7 +530,7 @@ async fn coding_task_semantic_navigation_compact_read_only_keeps_full_shape() {
         )),
     )
     .await;
-    let result = task.await.unwrap();
+    let result = finish_start_servicing_locally(&runtime, "compact-agent", task).await;
     let semantic = &result.output["semantic_navigation"];
     assert_eq!(semantic.as_object().unwrap().len(), 11);
     assert_eq!(semantic["status"], "available");

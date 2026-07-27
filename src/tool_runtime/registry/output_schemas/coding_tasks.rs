@@ -1,8 +1,8 @@
 use serde_json::{json, Value};
 
 use super::common::{
-    array_schema, evidence_history_schema, evidence_integrity_schema, job_lifecycle_summary_schema,
-    nullable_schema, open_object_schema, permission_profile_schema, permission_summary_schema,
+    array_schema, authority_profile_schema, evidence_history_schema, evidence_integrity_schema,
+    job_lifecycle_summary_schema, nullable_schema, open_object_schema, permission_summary_schema,
     schema_type, task_outcome_schema, wrapped_output_schema,
 };
 
@@ -31,8 +31,8 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 open_object_schema("Layered runner process, server transport/registration, project registry, connector endpoint, session binding, and last successful tool-call observations."),
             ),
             (
-                "permissions",
-                permission_profile_schema("Current permission/approval profile for this task."),
+                "authority",
+                authority_profile_schema("Canonical authority profile for this task."),
             ),
             (
                 "rules",

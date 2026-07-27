@@ -110,6 +110,87 @@ nohup env WEBCODEX_ENV_FILE="$ENV_FILE" "$BIN" > /var/log/webcodex.log 2>&1 &
 
 Manual mode does not provide automatic restart, log rotation, or boot persistence. Use systemd for production.
 
+## Authority Mode
+
+`WEBCODEX_AUTHORITY_MODE` is the canonical authorization switch for
+consequential runtime tools:
+
+| Value | Behavior |
+| --- | --- |
+| unset / empty | `trusted_agent` (product default for self-hosted single-operator deployments); reported source is `default`. |
+| `trusted_agent` | Project read/write, shell, async jobs, git operations, script/build execution, dependency install, and local service control auto-execute after hard safety checks, with no human approval interruptions. Push/tag/publish/release/deploy execute only when the user task explicitly includes that action (`release: "user_task_scoped"`). Every permission-bearing call still records an auditable decision (`policy=trusted_agent`, `status=auto_approved`, `reason=trusted_agent_authority`) on the session ledger. |
+| `restricted` | Consequential runtime tools are denied (`restricted_requires_human_authorization`). The project-bound connector `commands_run` keeps the one-time human approval loop (`wc_approvals`, `task_cli approve/deny`). |
+| anything else | Invalid configuration; consequential tools fail closed with `invalid_authority_mode:...`. |
+
+`WEBCODEX_PERMISSION_MODE` is removed. If it is set to any value, the
+configuration is invalid: consequential tools fail closed with reason
+`invalid_authority_mode:...` and source
+`rejected_legacy_env:WEBCODEX_PERMISSION_MODE`. Delete the variable; there is
+no alias or migration.
+
+Hard boundaries are never relaxed by `trusted_agent`: OAuth scopes, project
+boundary/allowed roots, explicitly read-only sessions (writes and shell
+denied), path and sensitive-path policy, concurrent-overwrite guards,
+credential redaction, job cancel/reclaim semantics, and immutable release
+targets all remain enforced.
+
+`runtime_status` and `start_coding_task` report the resolved state as an
+`authority` object: `{mode, source, project_write, shell, git, network,
+package_install, service_control, release, human_approval_required}`. Under
+`trusted_agent`, connector `commands_run` records a durable
+`authority_auto_authorized` task event (mode, source, resolved rule, action
+hash/summary, risk, principal, project) instead of approval records or
+`approval_required` interruptions.
+
+Full contract: [agent/permission-model.md](agent/permission-model.md).
+
+## Connection Layers and Version Compatibility
+
+`runtime_status.connection_layers` is an observation contract: every layer
+reports `{status, observed_at, source, age_secs, stale_after_secs,
+reason_code}` plus layer-specific facts. Statuses are backed by real
+observations only; configuration presence never implies readiness, and a stale
+layer is never presented as callable.
+
+| Layer | Statuses | Notes |
+| --- | --- | --- |
+| `runner_process` | `ready` \| `stale` \| `not_observed` | `ready` comes from `runner_process_report` (runner-reported `process_started_at`) or `transport_liveness`; `stale` means `heartbeat_expired`; `not_observed` means `no_runner_registered`. Never fakes "running". |
+| `server_transport` | `connected` \| `disconnected` \| `not_observed` | Facts: transport kind, `connection_instance` (agent instance UUID), `connected_at`, `last_heartbeat_at`, `disconnected_at`. |
+| `server_registration` | `registered` \| `stale` \| `not_observed` | `stale` means `registration_instance_disconnected`. Facts: `runner_instance`, `registered_at`, `last_refreshed_at`. |
+| `project_registry` | `registered` \| `stale` \| `not_configured` | `stale` means `providing_runner_disconnected`; `not_configured` means `no_projects_registered`. Counts registered/online projects. |
+| `connector_endpoint` | `not_configured` \| `not_observed` \| `ready` \| `unknown` | `not_configured` when the connector runtime is disabled; `not_observed` (`no_connector_requests_observed`) until a real readiness probe (`/connector/readiness`) or successful connector request is seen. |
+| `session_binding` | `not_observed` (runtime_status) / `bound` \| `not_bound` (start_coding_task) | Bindings are process-local and principal+transport scoped. `runtime_status` reports `not_observed` with reason `binding_is_process_local_and_principal_scoped`, `process_local=true`, `lost_after_restart=true`. |
+| `last_successful_tool_call` | `observed` \| `not_observed` | Scoped by principal/project/surface/session/tool. Only successful meaningful calls are recorded — `runtime_status`, `list_tools`, `list_agents`, `list_projects`, and `tool_manifest` never refresh it. Bounded in-memory store; no arguments, outputs, or secrets. |
+
+After a server restart, session bindings are lost by design. The correct
+recovery is to continue with the explicit durable `wc_sess_*` session id — do
+not restart the runner to "fix" a `not_bound` binding.
+
+`runtime_status` also reports `version_compatibility`:
+
+```json
+{
+  "status": "compatible | version_mismatch | capability_mismatch | no_runners",
+  "server": {"version": "...", "build": "..."},
+  "runners": [{
+    "client_id": "...",
+    "agent_protocol_version": "...",
+    "protocol_supported": true,
+    "build_version": "...",
+    "build_git_commit": "...",
+    "build_matches_server": true,
+    "status": "...",
+    "reason_code": "...",
+    "action": "..."
+  }]
+}
+```
+
+Connected does not mean compatible. The per-runner facts say which side to
+upgrade; there are no compatibility fallback shims. Runners also report
+`process_started_at`, `build {version, git_commit}`, and shell dialect facts
+(see [SHELL_PROFILES.md](SHELL_PROFILES.md)) at registration.
+
 ## Client enrollment
 
 ### Profile-based config (recommended)
@@ -412,10 +493,16 @@ startup projection:
 
 - `minimal`: session id, resolved project, branch/head/workspace state, compact
   runtime/readiness layers, semantic-navigation summary, hard blockers, and
-  advisories;
-- `standard` (default): minimal plus the permission profile;
+  advisories; the `authority` block is omitted;
+- `standard` (default): minimal plus the `authority` block;
 - `full`: explicitly adds full runtime status, recent commits, project rules,
   recommended flow, and the compact tool manifest.
+
+`detail` is the only projection control. The legacy startup flags
+(`compact_startup`, `include_runtime_status`, `include_git`,
+`include_recent_commits`, `include_rules`, `include_tool_manifest`,
+`tool_manifest_intent`, `tool_manifest_categories`, `tool_manifest_limit`) are
+removed; sending any of them returns a strict unknown-field error.
 
 Minimal and standard do not return repeated manifest/rules/recent-commit
 payloads. Use `tool_manifest` directly when focused discovery is needed.
@@ -443,8 +530,12 @@ Startup sanity verdict rules:
 
 `output.connection_state` reports runner process, server transport, server
 registration, project registry, connector endpoint, session binding, and last
-successful tool call separately. `not_observed` means that layer has no evidence;
-it must not be collapsed into an overall offline verdict.
+successful tool call separately (see
+[Connection Layers and Version Compatibility](#connection-layers-and-version-compatibility)).
+`not_observed` means that layer has no evidence; it must not be collapsed into
+an overall offline verdict. `session_binding` here reports `bound` or
+`not_bound`; after a server restart, continue with the explicit durable
+`wc_sess_*` session id instead of restarting the runner.
 
 Console **Connect a chat client** targets the project-bound canonical capability
 surface by default. Its connection projection reports
@@ -452,10 +543,10 @@ surface by default. Its connection projection reports
 operator runtime remains available for management, development, and internal
 execution, but it is not the model-default project chat endpoint.
 
-The response also includes `output.permissions`. The current self-hosted
-development profile is `policy=dev_auto_approve`, `auto_approve=true`, and
-`human_approval_required=false`; future release profiles should prefer
-`require_approval`.
+The response also includes `output.authority` (omitted at `detail=minimal`).
+On a default self-hosted deployment this reports `mode=trusted_agent`,
+`source=default`, `human_approval_required=false`, and
+`release=user_task_scoped`. See [Authority Mode](#authority-mode).
 
 ### 2. Discover and inspect
 
@@ -763,8 +854,9 @@ explicitly requires validation.
 `finish_coding_task.permissions` and `session_handoff_summary.permissions`
 summarize high-risk permission decisions from the session ledger. A high-risk
 tool is one that is not read-only, is destructive, or is shell/job-like according
-to runtime metadata. Under `dev_auto_approve`, those tools record
-`status=auto_approved` after hard safety checks pass. Auto approval does not
+to runtime metadata. Under `trusted_agent` authority, those tools record
+`status=auto_approved` with `reason=trusted_agent_authority` after hard safety
+checks pass. Auto authorization does not
 bypass auth, OAuth scopes, read-only sessions, explicit deny guards,
 cross-project session mismatch denial, path safety, sensitive path denial, or
 agent policy. The permission summaries are bounded metadata only and must not
@@ -808,9 +900,9 @@ Assumes a registered project `agent:workstation:my-repo`.
 
 Confirm service/build, `tools.count`, `jobs.active_count`, agent summary, and
 project effective status. Use full no-arg `runtime_status` only when you need
-deeper details such as `output.permissions.policy`; for development builds this
-is normally `dev_auto_approve`, and release deployments should plan to use
-`require_approval`.
+deeper details such as `output.authority.mode` (normally `trusted_agent` with
+`source=default` on self-hosted deployments), `connection_layers`, or
+`version_compatibility`.
 
 ```json
 {"tool": "list_agents", "params": {}}
@@ -837,6 +929,30 @@ is normally `dev_auto_approve`, and release deployments should plan to use
 ```
 
 ## Post-Deployment Acceptance Smoke
+
+### Post-deploy smoke facts
+
+Fastest full check: run the real-process reconnect harness, which boots a
+server plus runner, asserts layered connection observations, crashes and
+restarts both sides, and prints post-deploy smoke facts:
+
+```bash
+bash scripts/e2e_reconnect_ws.sh
+```
+
+Alternatively, call `POST /api/runtime/status` (or the `runtime_status` tool)
+and verify:
+
+- server `version` and `build.git_commit` match the deployed build;
+- `authority.mode` is the intended mode (`trusted_agent` by default) with the
+  expected `source`;
+- `version_compatibility.status` is `compatible`;
+- `connection_layers`: `runner_process` is `ready`, `server_transport` is
+  `connected`, `server_registration` and `project_registry` are `registered`;
+- `agents.clients[].shell_profiles.default_dialect` reports the expected
+  runner shell dialect (`sh`, `bash`, or `custom`).
+
+### Full acceptance sequence
 
 After deploying a new server, agent, or runtime build:
 

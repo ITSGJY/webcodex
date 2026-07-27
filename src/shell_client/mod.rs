@@ -53,7 +53,7 @@ use validation::{
 };
 
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
-const CLIENT_ONLINE_WINDOW_SECS: i64 = 60;
+pub(crate) const CLIENT_ONLINE_WINDOW_SECS: i64 = 60;
 /// Maximum number of pending requests queued for a single agent client.
 /// Bounds memory when an agent is slow or disconnected: once a client's
 /// queue reaches this depth, new enqueues are rejected with a structured
@@ -1490,6 +1490,8 @@ mod tests {
             registry
                 .register_with_auth(
                     ShellClientRegisterRequest {
+                        process_started_at: None,
+                        build: None,
                         client_id: client_id.to_string(),
                         agent_instance_id: format!("inst-{}", client_id),
                         display_name: None,
@@ -1507,6 +1509,8 @@ mod tests {
         }
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "managed".to_string(),
                 agent_instance_id: "inst-managed".to_string(),
                 display_name: None,
@@ -1620,6 +1624,8 @@ mod tests {
         let grant_b =
             crate::auth::shared_key::project_credential_context("wc_pgrant_bbbbbbbbbbbbbbbb");
         let registration = |hostname: &str, project: &str| ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
             client_id: "same-project-agent".to_string(),
             agent_instance_id: "same-instance-id".to_string(),
             display_name: None,
@@ -1694,6 +1700,8 @@ mod tests {
         let registry = ShellClientRegistry::default();
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "xrh".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: Some("XRH".to_string()),
@@ -1718,6 +1726,8 @@ mod tests {
         let registry = ShellClientRegistry::default();
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -1744,6 +1754,8 @@ mod tests {
         let registry = ShellClientRegistry::default();
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -1780,6 +1792,8 @@ mod tests {
         let registry = ShellClientRegistry::default();
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "alice-client".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -1794,6 +1808,8 @@ mod tests {
             .unwrap();
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "bob-client".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -1881,6 +1897,8 @@ mod tests {
         let registry = ShellClientRegistry::default();
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -1902,6 +1920,8 @@ mod tests {
         let registry = ShellClientRegistry::default();
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "xrh".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -1927,6 +1947,8 @@ mod tests {
         let registry = ShellClientRegistry::default();
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -1952,6 +1974,8 @@ mod tests {
         caps.async_shell_jobs = true;
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -1997,6 +2021,8 @@ mod tests {
         let registry = ShellClientRegistry::default();
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "all".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -2034,6 +2060,8 @@ mod tests {
         let registry = ShellClientRegistry::default();
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "xrh".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -2113,6 +2141,8 @@ mod tests {
     async fn register_quic_v1_client(registry: &ShellClientRegistry, client_id: &str) {
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: client_id.to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -2267,6 +2297,8 @@ mod tests {
         let registry = ShellClientRegistry::default();
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "quic-stop".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -2353,6 +2385,8 @@ mod tests {
         let registry = ShellClientRegistry::default();
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -2459,6 +2493,8 @@ mod tests {
         let registry = ShellClientRegistry::default();
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -2511,6 +2547,8 @@ mod tests {
         let registry = ShellClientRegistry::default();
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -2576,6 +2614,8 @@ mod tests {
         let registry = ShellClientRegistry::default();
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -2631,6 +2671,8 @@ mod tests {
         let registry = ShellClientRegistry::default();
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -2667,6 +2709,8 @@ mod tests {
         let registry = ShellClientRegistry::default();
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "ws-1".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -2950,6 +2994,8 @@ mod tests {
         let registry = ShellClientRegistry::default();
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "full".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -3009,6 +3055,8 @@ mod tests {
         let registry = ShellClientRegistry::default();
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "stale".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -3053,6 +3101,8 @@ mod tests {
         let registry = ShellClientRegistry::default();
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -3106,6 +3156,8 @@ mod tests {
         let registry = ShellClientRegistry::default();
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -3190,6 +3242,8 @@ mod tests {
     ) -> ShellClientView {
         registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: client_id.to_string(),
                 agent_instance_id: instance.to_string(),
                 display_name: None,
@@ -3234,6 +3288,8 @@ mod tests {
         // must be rejected while the first is online.
         let err = registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst-b".to_string(),
                 display_name: None,
@@ -3552,6 +3608,8 @@ mod tests {
         let registry = ShellClientRegistry::default();
         let err = registry
             .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "".to_string(),
                 display_name: None,

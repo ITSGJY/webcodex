@@ -1,103 +1,96 @@
-//! Permission decision types and wire-stable constants.
+//! Authority decision types and wire-stable constants.
 //!
 //! Wire shape of [`PermissionDecision`] is preserved for ledger / handoff
-//! compatibility. Typed enums ([`PermissionMode`], [`PermissionOutcome`]) are
+//! compatibility. Typed enums ([`AuthorityMode`], [`PermissionOutcome`]) are
 //! the internal model; string fields on the decision remain the serialized form.
 
 use serde::{Deserialize, Serialize};
 
-/// Default permission policy / mode name when `WEBCODEX_PERMISSION_MODE` is unset.
-pub(crate) const DEFAULT_PERMISSION_POLICY: &str = "dev_auto_approve";
-
-/// Recommended future release policy (documentation / profile only).
-pub(crate) const RELEASE_RECOMMENDED_PERMISSION_POLICY: &str = "require_approval";
-
 /// Bounded recent permission rows in session handoff summaries.
 pub(crate) const DEFAULT_PERMISSION_RECENT_LIMIT: usize = 20;
 
-/// Environment variable for the active permission mode.
-pub(crate) const PERMISSION_MODE_ENV: &str = "WEBCODEX_PERMISSION_MODE";
+/// Environment variable for the canonical authority mode.
+pub(crate) const AUTHORITY_MODE_ENV: &str = "WEBCODEX_AUTHORITY_MODE";
 
-/// Configurable permission mode (soft policy; never overrides hard safety).
+/// Removed legacy switch. There is exactly one authority field; a set legacy
+/// env is a hard configuration error, never a silent alias.
+pub(crate) const LEGACY_PERMISSION_MODE_ENV: &str = "WEBCODEX_PERMISSION_MODE";
+
+/// Canonical authority mode (soft policy; never overrides hard safety).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PermissionMode {
-    /// Default: auto-approve permission-bearing tools after hard safety.
-    DevAutoApprove,
-    /// Shadow recommendations; execution still allowed after hard safety.
-    AuditOnly,
-    /// Future human gate. Not implemented — must not pretend to approve.
-    RequireApproval,
+pub(crate) enum AuthorityMode {
+    /// Trusted agent: auto-authorize permission-bearing tools after hard
+    /// safety (scopes, project boundary, session guards, path policy).
+    TrustedAgent,
+    /// Restricted: consequential tools require human authorization; runtime
+    /// surface denies them (connector surface routes through one-time
+    /// approvals).
+    Restricted,
 }
 
-impl PermissionMode {
-    pub(crate) const DEFAULT: Self = Self::DevAutoApprove;
+impl AuthorityMode {
+    pub(crate) const DEFAULT: Self = Self::TrustedAgent;
 
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::DevAutoApprove => "dev_auto_approve",
-            Self::AuditOnly => "audit_only",
-            Self::RequireApproval => "require_approval",
+            Self::TrustedAgent => "trusted_agent",
+            Self::Restricted => "restricted",
         }
     }
 
     /// Parse a mode name (case-sensitive, trimmed by caller).
-    pub(crate) fn parse(raw: &str) -> Result<Self, PermissionModeParseError> {
+    pub(crate) fn parse(raw: &str) -> Result<Self, AuthorityModeParseError> {
         match raw {
-            "dev_auto_approve" => Ok(Self::DevAutoApprove),
-            "audit_only" => Ok(Self::AuditOnly),
-            "require_approval" => Ok(Self::RequireApproval),
-            other => Err(PermissionModeParseError {
+            "trusted_agent" => Ok(Self::TrustedAgent),
+            "restricted" => Ok(Self::Restricted),
+            other => Err(AuthorityModeParseError {
                 value: other.to_string(),
             }),
         }
     }
 
     pub(crate) fn human_approval_required(self) -> bool {
-        matches!(self, Self::RequireApproval)
+        matches!(self, Self::Restricted)
     }
 
-    pub(crate) fn auto_approve(self) -> bool {
-        matches!(self, Self::DevAutoApprove | Self::AuditOnly)
+    pub(crate) fn auto_authorize(self) -> bool {
+        matches!(self, Self::TrustedAgent)
     }
 }
 
-impl Default for PermissionMode {
+impl Default for AuthorityMode {
     fn default() -> Self {
         Self::DEFAULT
     }
 }
 
-/// Failed to parse a configured permission mode string.
+/// Failed to parse a configured authority mode string.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PermissionModeParseError {
+pub(crate) struct AuthorityModeParseError {
     pub(crate) value: String,
 }
 
-impl std::fmt::Display for PermissionModeParseError {
+impl std::fmt::Display for AuthorityModeParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "invalid {PERMISSION_MODE_ENV} value {:?}; expected one of: \
-             dev_auto_approve, audit_only, require_approval",
+            "invalid {AUTHORITY_MODE_ENV} value {:?}; expected one of: \
+             trusted_agent, restricted",
             self.value
         )
     }
 }
 
-impl std::error::Error for PermissionModeParseError {}
+impl std::error::Error for AuthorityModeParseError {}
 
-/// Execution-eligibility outcome from the permission decision layer.
+/// Execution-eligibility outcome from the authority decision layer.
 ///
 /// Distinct from HTTP/MCP protocol success. Wire form is stored on
 /// [`PermissionDecision::status`].
-///
-/// Variants beyond the current scaffold (`Approved`, `Pending`, `HardDenied`)
-/// exist so summaries and future modes share one parse table without thrash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Approved / Pending / HardDenied reserved for later phases.
+#[allow(dead_code)] // Approved / Pending / HardDenied reserved for summaries.
 pub(crate) enum PermissionOutcome {
     AutoApproved,
-    AuditOnlyAllowed,
     Approved,
     Denied,
     /// Ledger / summary historical label for pending requests.
@@ -109,7 +102,6 @@ impl PermissionOutcome {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::AutoApproved => "auto_approved",
-            Self::AuditOnlyAllowed => "audit_only_allowed",
             Self::Approved => "approved",
             Self::Denied => "denied",
             // Summary counters historically match `requested` for pending.
@@ -120,20 +112,15 @@ impl PermissionOutcome {
 
     /// Whether this outcome authorizes tool mutation / execution.
     ///
-    /// Centralized so call sites never ad-hoc match outcomes. `audit_only`
-    /// allows execution; denied / pending / hard-denied do not.
+    /// Centralized so call sites never ad-hoc match outcomes.
     pub(crate) fn allows_execution(self) -> bool {
-        matches!(
-            self,
-            Self::AutoApproved | Self::AuditOnlyAllowed | Self::Approved
-        )
+        matches!(self, Self::AutoApproved | Self::Approved)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw {
             "auto_approved" => Some(Self::AutoApproved),
-            "audit_only_allowed" => Some(Self::AuditOnlyAllowed),
             "approved" => Some(Self::Approved),
             "denied" | "expired" => Some(Self::Denied),
             "requested" | "pending" => Some(Self::Pending),
@@ -143,9 +130,12 @@ impl PermissionOutcome {
     }
 }
 
-/// Permission decision attached to high-risk tool results and session ledger events.
+/// Authority decision attached to permission-bearing tool results and session
+/// ledger events.
 ///
 /// Field names and semantics are wire-stable for existing clients and handoffs.
+/// `policy` carries the resolved authority mode; `reason` carries the resolved
+/// rule (for auto-authorization: `trusted_agent_authority`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct PermissionDecision {
     pub(crate) required: bool,

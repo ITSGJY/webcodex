@@ -147,6 +147,41 @@ coding agent 的工作方式：
 - Console chat connection 明确生成 project-bound surface，model 默认不会得到 operator
   runtime；完整 operator runtime 继续用于管理与内部执行。
 
+### 第二阶段已交付 — Trusted Agent Authority and Reconnect Continuity
+
+- canonical 双模式 authority：`WEBCODEX_AUTHORITY_MODE=trusted_agent|restricted`，
+  未设置默认 `trusted_agent`（source 报告为 `default`）。`trusted_agent` 下项目读写、
+  shell、异步 job、git 操作、脚本/构建、依赖安装与本地服务控制在硬安全检查后
+  自动执行，没有人工审批中断，但每个 permission-bearing 调用仍在 session ledger
+  记录可审计决策（`trusted_agent_authority`）；push/tag/publish/release/deploy 只在
+  用户任务显式包含该动作时执行（`user_task_scoped`）。`restricted` 下 consequential
+  runtime 工具被拒绝，project-bound connector `commands_run` 保留一次性人工审批
+  闭环（`wc_approvals`、task_cli approve/deny）。设置旧
+  `WEBCODEX_PERMISSION_MODE` 即为无效配置，fail closed，无 alias、无迁移。
+- authority mode 不放松硬边界：OAuth scopes、项目根/allowed roots、read-only
+  session、路径与敏感路径策略、并发覆盖 guard、凭据脱敏、job cancel/reclaim 与
+  不可变 release 目标全部不变。
+- `runtime_status`/`start_coding_task` 投影 canonical `authority` 对象；旧
+  `permissions` profile 对象已删除。`trusted_agent` 下 connector 自动授权记录
+  durable `authority_auto_authorized` task event，不再生成 approval 记录或
+  `approval_required` 中断。
+- `runtime_status.connection_layers` 成为 observation contract：每层携带
+  status/observed_at/source/age_secs/stale_after_secs/reason_code 与真实事实；
+  配置存在不等于 ready，stale registration 不呈现为可调用，session binding 如实
+  报告 process-local、重启即丢（应继续使用 durable `wc_sess_*` session id 而不是
+  重启 runner），`last_successful_tool_call` 只记录有意义的成功调用。
+- `runtime_status.version_compatibility` 诊断混合版本
+  （compatible/version_mismatch/capability_mismatch/no_runners），给出每个 runner
+  的 build/protocol 事实与升级方向，不做兼容 fallback。runner 注册上报
+  `process_started_at`、build version/commit 与 shell profile dialect
+  （`default_dialect`、`available_dialects`、每个 profile 的 `dialect`）。
+- `start_coding_task` hard cut：旧 startup flag 已从 wire 与内部实现删除；
+  `detail=minimal|standard|full` 是唯一投影控制，未知/旧字段返回严格
+  unknown-field 错误。
+- 新验证 lane：`cargo test --bin webcodex reconnect`、
+  `cargo test --bin webcodex trusted_smoke` 与真实进程 harness
+  `scripts/e2e_reconnect_ws.sh`。
+
 暂缓代码瘦身与 LOC 门禁、旧版本迁移兼容、SSH、PTY、Workflow DSL、更多 Hosted
 capability 和完整 Browser IDE。
 

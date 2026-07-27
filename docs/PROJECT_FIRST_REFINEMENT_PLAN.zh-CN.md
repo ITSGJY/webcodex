@@ -842,6 +842,33 @@ Rust 为 `90 files / 64,811 LOC -> 90 files / 65,287 LOC`（`+476 LOC`）。本�
 `402 passed / 0 failed / 2 ignored`；同时 `cargo fmt --check`、
 `cargo check --all-targets` 与 `git diff --check` 通过。
 
+### 11.3 Iteration 9 第二阶段已交付（Trusted Agent Authority and Reconnect Continuity）
+
+本阶段已实现并通过 focused 与完整验证，要点：
+
+- canonical authority mode：`WEBCODEX_AUTHORITY_MODE=trusted_agent|restricted`，
+  未设置默认 `trusted_agent`；`trusted_agent` 下 consequential 工具在硬安全检查后
+  自动执行且每次调用仍记录可审计决策，release 类动作保持 user_task_scoped；
+  `restricted` 下 runtime 工具拒绝、connector `commands_run` 保留一次性人工审批。
+  旧 `WEBCODEX_PERMISSION_MODE` 一律 fail closed
+  （`rejected_legacy_env:WEBCODEX_PERMISSION_MODE`），无 alias、无迁移；
+- `runtime_status`/`start_coding_task` 投影 `authority` 对象，旧 `permissions`
+  profile 对象删除；connector 自动授权记录 durable `authority_auto_authorized`
+  task event；
+- `connection_layers` 成为 observation contract：每层携带
+  status/observed_at/source/age_secs/stale_after_secs/reason_code；配置存在不推断
+  ready，session binding 如实报告 process-local 且重启即丢（用 durable
+  `wc_sess_*` 续接，不重启 runner），`last_successful_tool_call` 只记录有意义
+  成功调用；新增 `version_compatibility` 混合版本诊断，不做兼容 fallback；
+- runner 注册上报 `process_started_at`、build version/commit 与 shell dialect
+  （`default_dialect`/`available_dialects`/每 profile `dialect`）；
+- `start_coding_task` 旧 startup flag hard cut，`detail=minimal|standard|full`
+  是唯一投影控制，未知/旧字段严格报错；
+- 新验证 lane：`cargo test --bin webcodex reconnect`、
+  `cargo test --bin webcodex trusted_smoke` 与 `scripts/e2e_reconnect_ws.sh`
+  真实进程 harness（含 runner/server 崩溃重启、durable session 续接与
+  post-deploy smoke facts）。
+
 ## 12. 还需要多久
 
 这是工程估算，不是发布日期承诺。

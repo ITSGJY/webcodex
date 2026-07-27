@@ -67,9 +67,12 @@ async fn write_project_file_with_session_id_records_changed_path_without_content
 
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["permission"]["required"], true);
-    assert_eq!(result.output["permission"]["policy"], "dev_auto_approve");
+    assert_eq!(result.output["permission"]["policy"], "trusted_agent");
     assert_eq!(result.output["permission"]["status"], "auto_approved");
-    assert_eq!(result.output["permission"]["reason"], "dev_auto_approve");
+    assert_eq!(
+        result.output["permission"]["reason"],
+        "trusted_agent_authority"
+    );
     assert_eq!(result.output["permission"]["risk"], "write");
     let summary = runtime
         .sessions
@@ -81,7 +84,7 @@ async fn write_project_file_with_session_id_records_changed_path_without_content
     assert_eq!(event.changed_paths, vec!["src/new.txt".to_string()]);
     let permission = event.permission.as_ref().expect("permission metadata");
     assert!(permission.required);
-    assert_eq!(permission.policy, "dev_auto_approve");
+    assert_eq!(permission.policy, "trusted_agent");
     assert_eq!(permission.status, "auto_approved");
     assert_eq!(permission.tool_name, "write_project_file");
     assert_eq!(permission.risk, "write");

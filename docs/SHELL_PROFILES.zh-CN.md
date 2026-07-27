@@ -93,20 +93,35 @@ shell_profile = "conda-ml"
 
 `listProjects` 会暴露 `shell_profile`、`resolved_shell_profile` 和 `shell_profile_status`（`configured` / `missing` / `not_configured` / `unknown`）。
 
-## 8. 修改配置需要重启 agent
+## 8. Dialect 上报
+
+runner 注册时会上报 shell dialect 事实，server 与 agent 永远不需要猜测远端 shell：
+
+- shell profiles summary 携带 `default_dialect`（`sh` | `bash` | `custom`，即
+  runner 默认 shell program 的 dialect）和 `available_dialects`（始终包含 `sh`
+  和 `bash`；存在 custom profile 时额外包含 `custom`）。
+- 每个 profile 条目携带自己的 `dialect`。
+- program 无法映射到 sh/bash 的 custom profile 上报 `custom`；需要确定性命令
+  语法的 agent 必须显式选择 shell，而不是依赖 profile dialect。
+- `run_shell`/`run_job` 上的显式 `shell=sh|bash` 始终覆盖默认值；server 不会
+  猜测远端 shell。
+- Dialect 上报只是 metadata：不会向 server 发送任何 PATH、env values 或
+  `init_script` 内容。
+
+## 9. 修改配置需要重启 agent
 
 当前没有 reload API。修改 `agent.toml` 或 project TOML 后，需要重启 `webcodex-runner`。重启会丢弃已有 snapshots，并在下一次命令时 lazy re-prepare。
 
-## 9. 安全提示
+## 10. 安全提示
 
 - **不要**在 `init_script` 中放 tokens。
 - **不要**在 `init_script` 中 `echo`/`printf` secrets。
-- `runtime_status`、`listAgents` 和 `listProjects` 只暴露 sanitized metadata：profile name、`has_init_script`、`env_keys_count`、`program`、`args_count`。
+- `runtime_status`、`listAgents` 和 `listProjects` 只暴露 sanitized metadata：profile name、`has_init_script`、`env_keys_count`、`program`、`args_count`、每个 profile 的 `dialect`，以及 summary 的 `default_dialect` / `available_dialects`。
 - 它们不会暴露 `init_script` bodies、env values、tokens、Authorization header、完整 `agent.toml` 或完整 env snapshot。
 - Agent token 相关环境变量会从 child process environment 中剥离。
 - `prepare` 使用 `env_clear` 和显式 inherited keys allowlist；profiles 必须声明所需 env。
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 canonical project 使用共享只读 readiness：
 

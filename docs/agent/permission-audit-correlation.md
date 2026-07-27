@@ -13,7 +13,7 @@ OpenAPI, MCP, or migration ships with this file.
 |---|---|
 | Workflow Session lifecycle | Implemented / designed (`session-lifecycle.md`) |
 | Session correlation (audit → `wc_sess_*`) | Design only (`session-correlation.md`) |
-| Permission System Phase 1/2 | **Implemented** (types, env mode, single pre-exec gate) |
+| Permission System | **Implemented** (authority mode, single pre-exec gate) |
 | MCP / API lifecycle trace | Implemented, default **off** (`tool_request_trace`) |
 | Action Audit Session boundary | Clarified dual model (`session-model.md`) |
 
@@ -23,7 +23,7 @@ OpenAPI, MCP, or migration ships with this file.
 
 | Doc | Relationship |
 |---|---|
-| [`permission-model.md`](permission-model.md) | Decision layer, modes, wire shape, Phase 1/2 status |
+| [`permission-model.md`](permission-model.md) | Authority decision layer, modes, wire shape |
 | [`session-model.md`](session-model.md) | Workflow Session vs Action Audit Session |
 | [`session-correlation.md`](session-correlation.md) | Optional audit → `workflow_session_id` |
 | [`session-lifecycle.md`](session-lifecycle.md) | Lifecycle independence; Permission never owns sessions |
@@ -83,7 +83,7 @@ Do **not** treat the following as requirements for this design:
 | Wire `PermissionDecision` (`status`, `policy`, `reason`, `risk`, …) | Action Audit create / close / idle reuse |
 | One `wc_perm_*` request id per decision that reaches the gate | Workflow Session create / close / mode / guards |
 | Optional attach to tool output and Workflow ledger tool-call events | Authoritative “list of audit events for this decision” |
-| Mode config (`WEBCODEX_PERMISSION_MODE`) | Trace enablement or OTel exporters |
+| Mode config (`WEBCODEX_AUTHORITY_MODE`) | Trace enablement or OTel exporters |
 
 **Invariants (must):**
 
@@ -91,7 +91,7 @@ Do **not** treat the following as requirements for this design:
    (kernel reuses; does not re-evaluate).
 2. **Permission never creates, switches, or closes** a Workflow Session.
 3. **Permission never creates or closes** an Action Audit Session.
-4. **Hard safety remains independent** of soft permission mode.
+4. **Hard safety remains independent** of the authority mode.
 
 ### 2.2 Action Audit owns
 
@@ -285,9 +285,8 @@ enough that:
 | Soft permission outcome (wire `status`) | Tool executes? | Emit `PermissionDecision`? | Action Audit may still record HTTP fact? | Put `permission_request_id` on audit when available? |
 |---|---|---|---|---|
 | *(no decision — not permission-bearing)* | Yes (hard safety still applies) | **No** | **Yes** | **No** (nothing to join) |
-| `auto_approved` | Yes | Yes | Yes | **Yes** |
-| `audit_only_allowed` | Yes | Yes | Yes | **Yes** |
-| `denied` (e.g. `require_approval_not_implemented`, invalid mode) | **No** | Yes | **Yes** (failed / non-success envelope) | **Yes** — denial is high value for triage |
+| `auto_approved` (`trusted_agent_authority`) | Yes | Yes | Yes | **Yes** |
+| `denied` (e.g. `restricted_requires_human_authorization`, `invalid_authority_mode:…`) | **No** | Yes | **Yes** (failed / non-success envelope) | **Yes** — denial is high value for triage |
 | Future `approved` / `requested` | Yes / No | Yes | Yes | **Yes** |
 | Hard safety deny **before** soft evaluate | No | Usually **no** soft object | Yes | **No** soft permission id |
 | Hard-denied tool output **after** soft allow | Ran then hard-denied | Soft decision may be **suppressed** on attach | Yes | Prefer **yes if id already known at request end**; do not claim soft success semantics in audit thin fields |
@@ -295,12 +294,12 @@ enough that:
 ### 5.2 Rules
 
 1. **Denied soft decisions are first-class correlation targets.**  
-   Operators need “this API call was blocked by permission mode” without
+   Operators need “this API call was blocked by the authority mode” without
    hunting only in the ledger.
 
-2. **`auto_approved` / `audit_only_allowed` also correlate.**  
-   Frictionless mode is not “invisible.” Correlation still helps policy and
-   incident work; it must not add client friction.
+2. **`auto_approved` decisions also correlate.** Frictionless trusted-agent
+   mode is not “invisible.” Correlation still helps policy and incident work;
+   it must not add client friction.
 
 3. **Non-permission tools:** no fake `wc_perm_*`, no empty decision object, no
    synthetic audit permission field.
@@ -320,7 +319,7 @@ enough that:
 | Failure | Effect on the other system |
 |---|---|
 | Permission evaluate fails closed (deny) | Tool does not run; audit may still record the denial response |
-| Audit write fails | Default / audit_only modes: **do not** block execution; log warn |
+| Audit write fails | `trusted_agent` mode: **do not** block execution; log warn |
 | Ledger permission attach fails | Prefer not to block execution in default modes |
 | Trace disabled / missing | Correlation via audit ↔ permission ids still valid without trace |
 
@@ -347,7 +346,7 @@ enough that:
 | New SQLite table / migration for permissions in early phases? | **No** |
 | Authoritative durable home for full decision? | Tool response + **Workflow ledger attach when session exists**; not audit |
 | Decision without Workflow Session? | Still valid in-process and on tool output; may have **no** long-lived full copy — correlation id on audit (when present) still helps join logs |
-| Pending approval durability? | **Out of scope** until real approval (permission-model Phase 5); would need its own store design |
+| Pending approval durability? | **Out of scope** — the only human approval loop is the connector `commands_run` path under `restricted` mode; runtime pending approval would need its own store design |
 
 ### 6.3 Retention semantics
 
@@ -401,7 +400,7 @@ replace that design; it only states that **permission join is a separate key**.
 ### 8.2 Correlation rules
 
 1. **Trace never owns approval state** (pending, approved, denied policy).
-2. **Enabling permission modes does not require enabling trace.**
+2. **Selecting an authority mode does not require enabling trace.**
 3. **Enabling trace does not require permission correlation.**
 4. When both are active on the same handler, emitters **may** include:
 
@@ -574,7 +573,7 @@ HTTP tools/call (or MCP equivalent with audit)
 |---|---|
 | Joinable | Given an Action Audit event from a permission-bearing call, `ids.permission_request_id` matches `output.permission.request_id` |
 | Denied visible | Soft-denied calls still produce audit rows with the id when the route audits |
-| No friction | Default `dev_auto_approve` behavior and client contracts unchanged |
+| No friction | Default `trusted_agent` behavior and client contracts unchanged |
 | No migration | Schema version / SQL migrations untouched |
 | No control inversion | Audit contents never feed back into `allows_execution` |
 
@@ -592,7 +591,7 @@ HTTP tools/call (or MCP equivalent with audit)
 | 2 | Align MCP + API + ledger + optional trace emission; same-request workflow id if session-correlation Phase 2 is ready |
 | 3 | Operator query helpers; optional response fields after product review |
 | 4 | Optional SQLite column / index if `ids_json` scans hurt; still no full decision blob |
-| 5+ | Real approval durability remains a **separate** design (permission-model); correlation keys stay id-only |
+| 5+ | Runtime pending-approval durability, if ever needed, remains a **separate** design; correlation keys stay id-only |
 
 ---
 
@@ -616,8 +615,9 @@ This design explicitly does **not**:
     current Action Audit Session
 13. **Accept client-supplied `permission_request_id`** as an authority that
     changes policy outcomes
-14. **Pretend `require_approval` is a working human gate** (remains honest deny
-    until a dedicated approval design ships)
+14. **Pretend `restricted` mode has a runtime approval queue** (runtime tools
+    deny honestly; the only human approval loop is the connector
+    `commands_run` path)
 15. **Ship code with this document** — Phase 0 is docs only
 
 ---
@@ -659,7 +659,7 @@ This design explicitly does **not**:
 
 | Doc | Update expectation after acceptance |
 |---|---|
-| [`permission-model.md`](permission-model.md) | Phase 4 “audit correlation” points here for detail; modes/status remain authoritative there |
+| [`permission-model.md`](permission-model.md) | Authority modes / decision status remain authoritative there; this file only adds correlation detail |
 | [`session-correlation.md`](session-correlation.md) | Unchanged authority for `workflow_session_id`; this file adds a **sibling** key |
 | [`session-model.md`](session-model.md) / [`session-lifecycle.md`](session-lifecycle.md) | Dual model + “Permission never owns lifecycle” remain standing |
 | [`architecture-decisions.md`](architecture-decisions.md) | Optional short pointer later; not required for Phase 0 |

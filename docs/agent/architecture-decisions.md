@@ -61,31 +61,31 @@ Full design, validation table, and phased rollout:
 [`session-correlation.md`](session-correlation.md). Dual-model detail:
 [`session-model.md`](session-model.md).
 
-### Permission decision layer (standing)
+### Authority decision layer (standing)
 
-Permission is a **decision layer** for whether a tool invocation may proceed
-under the active mode. It is **not** a Workflow Session manager, not Action
-Audit, and not lifecycle tracing.
+Authority is a **decision layer** for whether a consequential tool invocation
+may proceed under the active mode. It is **not** a Workflow Session manager,
+not Action Audit, and not lifecycle tracing.
 
 | Layer | Owns |
 |---|---|
-| Permission | allow / deny / pending / auto-approve outcomes (configurable) |
+| Authority | auto-authorize / deny outcomes (`trusted_agent` \| `restricted`) |
 | Workflow Session | task context and bounded evidence (`wc_sess_*`) |
 | Action Audit | HTTP/operator action facts (SQLite) |
 | Lifecycle trace | optional request-path observation |
 
-**Default mode is frictionless** (`dev_auto_approve`): no human wait, no client
-changes, no blocking for approval UX. Hard safety (path, secrets, session
+**Default mode is `trusted_agent`** (self-hosted single-operator product
+default): no human wait, no approval interruptions, every permission-bearing
+call still records an auditable decision. Hard safety (path, secrets, session
 guards, scopes, agent policy) remains independent and **not overridable** by
-permission mode.
+authority mode.
 
-**Implementation (Phase 1/2):** module under `src/tool_runtime/permissions/`;
+**Implementation:** module under `src/tool_runtime/permissions/`;
 authoritative single evaluation at ToolRuntime **dispatch** before mutation;
 kernel reuses the attached decision and does not re-evaluate. Modes:
-`dev_auto_approve` / `audit_only` allow; `require_approval` and invalid
-`WEBCODEX_PERMISSION_MODE` fail closed (deny; approval workflow not
-implemented). Full design, **Implementation Status**, mode matrix, and later
-phases: [`permission-model.md`](permission-model.md).
+`trusted_agent` auto-authorizes after hard safety; `restricted` denies runtime
+tools; unknown values and any set legacy `WEBCODEX_PERMISSION_MODE` fail
+closed (see §6). Full contract: [`permission-model.md`](permission-model.md).
 
 ---
 
@@ -178,3 +178,74 @@ sensitive-path risks, and consistency errors are deterministic blockers.
 - Do not preserve obsolete compatibility layers by default (see §2).
 - Structural refactors that reduce coupling or clarify ownership are allowed
   when scoped to the task; unrelated broad rewrites are not.
+
+---
+
+## 6. Canonical two-mode authority with fail-closed legacy env rejection
+
+The permission-mode system (`WEBCODEX_PERMISSION_MODE` with
+`dev_auto_approve` / `audit_only` / `require_approval`) is replaced by one
+canonical authority mode.
+
+| Decision | Choice |
+|---|---|
+| Env var | `WEBCODEX_AUTHORITY_MODE` = `trusted_agent` \| `restricted` |
+| Default (unset/empty) | `trusted_agent`; source reported as `default` |
+| `trusted_agent` | Consequential runtime tools auto-execute after hard safety with no approval interruptions; external release actions remain user-task-scoped; every permission-bearing call records an auditable ledger decision (`policy=trusted_agent`, `status=auto_approved`, `reason=trusted_agent_authority`) |
+| `restricted` | Runtime tools deny (`restricted_requires_human_authorization`); connector `commands_run` keeps the one-time human approval loop |
+| Legacy env set | Invalid configuration; consequential tools fail closed with `invalid_authority_mode:...` and source `rejected_legacy_env:WEBCODEX_PERMISSION_MODE`. No alias, no migration |
+| Shared surfaces | Both modes share the same tool implementations, schemas, session model, evidence, and audit records |
+| Projection | `runtime_status` / `start_coding_task` report one canonical `authority` object; the old `permissions` profile object is deleted |
+| Connector | Under `trusted_agent`, `commands_run` records a durable `authority_auto_authorized` task event instead of approval records or `approval_required` interruptions |
+
+Hard boundaries are never relaxed by authority mode: OAuth scopes, project
+boundary/allowed roots, explicitly read-only sessions, path and sensitive-path
+policy, concurrent-overwrite guards, credential redaction, job cancel/reclaim,
+and immutable release targets. Full contract:
+[`permission-model.md`](permission-model.md).
+
+---
+
+## 7. Connection layers are an observation contract
+
+`runtime_status.connection_layers` reports facts that were actually observed;
+it never infers readiness from configuration.
+
+| Decision | Choice |
+|---|---|
+| Layer envelope | Every layer carries `{status, observed_at, source, age_secs, stale_after_secs, reason_code}` plus layer facts |
+| No config-inferred readiness | `connector_endpoint` readiness comes only from readiness probes or successful connector requests; configuration presence never implies `ready`. `runner_process` never fakes "running"; a stale registration is never presented as callable |
+| Process-local binding honesty | Session bindings are process-local, principal+transport scoped. `runtime_status` reports `not_observed` with `binding_is_process_local_and_principal_scoped`, `process_local=true`, `lost_after_restart=true`; `start_coding_task` reports `bound`/`not_bound`. After a server restart, the correct action is to continue with the explicit durable `wc_sess_*` session id, not to restart the runner |
+| Meaningful-activity rule | `last_successful_tool_call` records only successful meaningful calls, scoped by principal/project/surface/session/tool. `runtime_status`, `list_tools`, `list_agents`, `list_projects`, and `tool_manifest` never refresh it. Bounded in-memory store; no arguments, outputs, or secrets |
+| Independence | Layers degrade independently; `not_observed` on one layer must not be collapsed into a global offline verdict |
+
+---
+
+## 8. Startup projection is detail-only (hard cut)
+
+`start_coding_task` accepts exactly one projection control:
+`detail=minimal|standard|full`.
+
+| Decision | Choice |
+|---|---|
+| Removed | `compact_startup`, `include_runtime_status`, `include_git`, `include_recent_commits`, `include_rules`, `include_tool_manifest`, `tool_manifest_intent`, `tool_manifest_categories`, `tool_manifest_limit` — removed from the wire and internals |
+| `full` | Full runtime status + recent commits + rules + tool manifest + recommended flow |
+| `minimal` | Additionally omits the `authority` block |
+| Unknown/legacy fields | Strict unknown-field error; no silent acceptance |
+
+No alias or dual shape is kept for the removed flags (consistent with §2).
+
+---
+
+## 9. Mixed-version diagnostics without compatibility fallback
+
+Runner registration reports `process_started_at` and
+`build {version, git_commit}`; `runtime_status` projects
+`version_compatibility`.
+
+| Decision | Choice |
+|---|---|
+| Shape | `{status: compatible \| version_mismatch \| capability_mismatch \| no_runners, server: {version, build}, runners: [{client_id, agent_protocol_version, protocol_supported, build_version, build_git_commit, build_matches_server, status, reason_code, action}]}` |
+| Connected ≠ compatible | Transport liveness never implies protocol/build compatibility |
+| Direction | Per-runner facts say which side to upgrade (`action`); no fallback shims or version-translation layers |
+| Shell dialects | `ShellProfilesSummary` reports `default_dialect` (`sh` \| `bash` \| `custom`) and `available_dialects`; each profile entry reports `dialect`. The server never guesses the remote shell; custom profiles that do not map to sh/bash report `custom`, and agents needing deterministic syntax must pass an explicit `shell=sh\|bash`. No PATH/env/init-script contents are ever sent |

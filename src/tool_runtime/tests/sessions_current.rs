@@ -285,6 +285,8 @@ async fn open_anonymous_can_bind_current_session_and_record_project_read() {
         .shell_clients
         .register_with_auth(
             ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: "open-current".to_string(),
                 agent_instance_id: "inst-open-current".to_string(),
                 display_name: None,

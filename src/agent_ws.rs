@@ -462,6 +462,8 @@ mod tests {
     fn register_envelope_with_instance(client_id: &str, instance_id: &str) -> AgentEnvelope {
         AgentEnvelope::Register {
             payload: ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: client_id.to_string(),
                 agent_instance_id: instance_id.to_string(),
                 display_name: Some("ws-test".to_string()),

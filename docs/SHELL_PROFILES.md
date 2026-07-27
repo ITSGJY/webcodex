@@ -121,7 +121,25 @@ Notes:
   `shell_profile_status` (`configured` / `missing` / `not_configured` /
   `unknown`).
 
-## 8. Changing config requires restarting the agent
+## 8. Dialect reporting
+
+Runner registration reports shell dialect facts so the server and agents never
+have to guess the remote shell:
+
+- The shell profiles summary carries `default_dialect` (`sh` | `bash` |
+  `custom`) — the dialect of the runner's default shell program — and
+  `available_dialects`, which always contains `sh` and `bash`, plus `custom`
+  when custom profiles exist.
+- Each profile entry carries its own `dialect`.
+- A custom profile whose program does not map to sh or bash reports
+  `custom`. Agents that need deterministic command syntax must select an
+  explicit shell instead of relying on the profile dialect.
+- An explicit `shell=sh|bash` on `run_shell` / `run_job` always overrides the
+  default; the server never guesses the remote shell.
+- Dialect reporting is metadata only: no PATH, env values, or `init_script`
+  contents are ever sent to the server.
+
+## 9. Changing config requires restarting the agent
 
 There is **no reload API** in this phase. Changing a shell profile config
 requires restarting the agent so the in-memory snapshot cache is rebuilt:
@@ -133,14 +151,15 @@ After editing `agent.toml` or a project TOML, restart the `webcodex-runner`
 service. Existing snapshots are dropped on restart and re-prepared lazily on
 the next command.
 
-## 9. Security notes
+## 10. Security notes
 
 - **Never** put tokens in `init_script`.
 - **Never** `echo`/`printf` secrets in `init_script` — anything the script
   writes to stdout is parsed as part of the env snapshot capture.
 - Status / `runtime_status` / `listAgents` / `listProjects` expose **only**
   sanitized metadata: profile name, `has_init_script` (boolean),
-  `env_keys_count` (count), `program`, and `args_count`. They never expose
+  `env_keys_count` (count), `program`, `args_count`, per-profile `dialect`,
+  and the summary `default_dialect` / `available_dialects`. They never expose
   `init_script` bodies, env values, tokens, the Authorization header, the full
   `agent.toml`, or the full env snapshot.
 - A prepare failure may surface a **safe** error summary (e.g. "failed to
@@ -152,7 +171,7 @@ the next command.
 - `prepare` runs with `env_clear` + an explicit allowlist of inherited keys;
   profiles must declare the env they need.
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 For a canonical project, run the shared read-only readiness checks:
 

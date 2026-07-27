@@ -162,6 +162,8 @@ async fn authenticated_project_fixture_for(recipe: &str) -> AuthenticatedProject
     registry
         .register_with_auth(
             ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: config.executor_client_id.clone(),
                 agent_instance_id: "project-agent-instance".to_string(),
                 display_name: Some("configured project Agent".to_string()),
@@ -664,28 +666,6 @@ async fn run_authenticated_golden_path(recipe: &str) -> GoldenPathEvidence {
         "command": "printf golden-command",
         "timeout_secs": 30
     });
-    let (status, waiting) = post_connector(
-        &fixture,
-        "/api/connector/commands/run",
-        &fixture.credential,
-        command.clone(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(waiting["error"]["code"], "approval_required");
-    let approval_id = waiting["data"]["approval"]["approval_id"].as_str().unwrap();
-    let approval = crate::task_cli::parse(&[
-        "approve".to_string(),
-        task_id.clone(),
-        approval_id.to_string(),
-        "--root".to_string(),
-        fixture.root.to_string_lossy().into_owned(),
-        "--state-dir".to_string(),
-        fixture.state.to_string_lossy().into_owned(),
-    ])
-    .unwrap();
-    assert!(crate::task_cli::run(approval).unwrap().contains("Approved"));
-
     let registry = fixture.registry.clone();
     let client_id = fixture.client_id.clone();
     let recorder = agent_requests.clone();
@@ -827,9 +807,7 @@ async fn configured_project_credential_can_complete_connector_golden_path() {
         "files_read",
         "files_search",
         "edits_apply",
-        "approval_requested",
-        "approval_granted",
-        "approval_consumed",
+        "authority_auto_authorized",
         "execution_succeeded",
         "task_finished",
         "workspace_release",
@@ -870,7 +848,6 @@ async fn authenticated_golden_path_emits_no_discovery_or_session_calls() {
             "/api/connector/files/search",
             "/api/connector/edits/apply",
             "/api/connector/commands/run",
-            "/api/connector/commands/run",
             "/api/connector/checks/run",
             "/api/connector/task/finish",
             "/api/connector/task/review",
@@ -882,8 +859,8 @@ async fn authenticated_golden_path_emits_no_discovery_or_session_calls() {
             .iter()
             .filter(|path| path.as_str() == "/api/connector/commands/run")
             .count(),
-        2,
-        "the authenticated recorder must include approval request and exact approved retry"
+        1,
+        "trusted_agent authority must run the command in one call without an approval retry"
     );
     for forbidden in [
         "list_projects",

@@ -96,6 +96,8 @@ async fn register_agent_projects_for_auth(
         .shell_clients
         .register_with_auth(
             ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: client_id.to_string(),
                 agent_instance_id: format!("inst-{}", client_id),
                 display_name: None,
@@ -484,6 +486,8 @@ async fn list_projects_shows_shell_profile_resolution() {
     use crate::shell_protocol::{AgentPolicySummary, ShellProfilesSummary};
     let runtime = test_runtime();
     let summary = ShellProfilesSummary {
+        default_dialect: None,
+        available_dialects: None,
         default_profile: Some("rust".to_string()),
         configured_count: 1,
         prepared_cache_count: 0,
@@ -566,10 +570,13 @@ async fn runtime_status_shell_profiles_summary_is_sanitized() {
     let secret_env_value = "DO_NOT_LEAK_THIS_ENV_VALUE";
     let secret_script = "DO_NOT_LEAK_THIS_INIT_SCRIPT_BODY";
     let summary = ShellProfilesSummary {
+        default_dialect: None,
+        available_dialects: None,
         default_profile: Some("rust".to_string()),
         configured_count: 1,
         prepared_cache_count: 0,
         profiles: vec![ShellProfileSummaryEntry {
+            dialect: None,
             name: "rust".to_string(),
             has_init_script: true,
             env_keys_count: 3,
@@ -583,6 +590,8 @@ async fn runtime_status_shell_profiles_summary_is_sanitized() {
     let _ = (secret_env_value, secret_script);
     registry
         .register(crate::shell_protocol::ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
             client_id: "profile-agent".to_string(),
             agent_instance_id: "inst".to_string(),
             display_name: None,
@@ -1403,13 +1412,8 @@ async fn runtime_status_with_no_projects_returns_configured_false() {
     assert!(out["build"].get("built_at").is_some());
     assert!(out["server_time"].is_i64());
     assert!(out["pid"].is_i64());
-    assert_eq!(out["permissions"]["policy"], "dev_auto_approve");
-    assert_eq!(out["permissions"]["auto_approve"], true);
-    assert_eq!(out["permissions"]["human_approval_required"], false);
-    assert_eq!(
-        out["permissions"]["release_recommended_policy"],
-        "require_approval"
-    );
+    assert_eq!(out["authority"]["mode"], "trusted_agent");
+    assert_eq!(out["authority"]["human_approval_required"], false);
     assert_eq!(out["projects"]["mode"], "agent_registered");
     assert_eq!(out["projects"]["count"], 0);
     assert!(out["projects"].get("configured").is_none());
@@ -1480,6 +1484,8 @@ async fn runtime_status_compact_and_summary_only_return_sanitized_summary() {
             "/tmp/runtime-compact-allowed-root-never-emit",
         )],
         shell_profiles: Some(ShellProfilesSummary {
+            default_dialect: None,
+            available_dialects: None,
             default_profile: Some("rust".to_string()),
             configured_count: 1,
             prepared_cache_count: 0,
@@ -1743,6 +1749,8 @@ async fn runtime_status_agent_summary_includes_protocol_version() {
     let registry = Arc::new(ShellClientRegistry::default());
     registry
         .register(ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
             client_id: "agent-1".to_string(),
             agent_instance_id: "inst".to_string(),
             display_name: Some("Workstation".to_string()),
@@ -1806,6 +1814,8 @@ async fn runtime_status_includes_sanitized_policy_summary() {
     let registry = Arc::new(ShellClientRegistry::default());
     registry
         .register(ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
             client_id: "policy-agent".to_string(),
             agent_instance_id: "inst-p".to_string(),
             display_name: None,
@@ -1941,6 +1951,8 @@ async fn external_provider_discovery_cannot_change_public_tool_or_openapi_surfac
     let registry = Arc::new(ShellClientRegistry::default());
     registry
         .register(ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
             client_id: "provider-surface".to_string(),
             agent_instance_id: "inst-surface".to_string(),
             display_name: None,
@@ -2022,6 +2034,8 @@ async fn runtime_status_policy_summary_is_null_for_older_agents() {
     // Older agent: no policy field (None).
     registry
         .register(ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
             client_id: "legacy-agent".to_string(),
             agent_instance_id: "inst-l".to_string(),
             display_name: None,
@@ -2052,6 +2066,8 @@ async fn list_agents_includes_sanitized_policy_summary() {
     let registry = Arc::new(ShellClientRegistry::default());
     registry
         .register(ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
             client_id: "list-policy-agent".to_string(),
             agent_instance_id: "inst-lp".to_string(),
             display_name: None,
@@ -2112,6 +2128,8 @@ async fn runtime_status_distinguishes_stale_registration_from_transport_connecti
     let registry = Arc::new(ShellClientRegistry::default());
     registry
         .register(ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
             client_id: "ws-stale".to_string(),
             agent_instance_id: "inst".to_string(),
             display_name: Some("Stale WS".to_string()),
@@ -2151,11 +2169,20 @@ async fn runtime_status_distinguishes_stale_registration_from_transport_connecti
     assert_eq!(entry["connected"], false);
     assert_eq!(entry["last_seen"], stale_ts);
     let layers = &result.output["connection_layers"];
-    assert_eq!(layers["runner_process"]["status"], "not_observed");
-    assert_eq!(layers["server_transport"]["status"], "not_connected");
-    assert_eq!(layers["server_registration"]["status"], "registered");
-    assert_eq!(layers["project_registry"]["status"], "empty");
-    assert_eq!(layers["connector_endpoint"]["status"], "not_observed");
+    assert_eq!(layers["runner_process"]["status"], "stale");
+    assert_eq!(layers["runner_process"]["reason_code"], "heartbeat_expired");
+    assert_eq!(layers["server_transport"]["status"], "disconnected");
+    assert_eq!(layers["server_registration"]["status"], "stale");
+    assert_eq!(
+        layers["server_registration"]["reason_code"],
+        "registration_instance_disconnected"
+    );
+    assert_eq!(layers["project_registry"]["status"], "not_configured");
+    assert_eq!(layers["connector_endpoint"]["status"], "not_configured");
+    assert_eq!(
+        layers["connector_endpoint"]["reason_code"],
+        "connector_runtime_disabled"
+    );
     assert_eq!(layers["session_binding"]["status"], "not_observed");
 }
 
@@ -2169,6 +2196,8 @@ async fn runtime_status_reflects_websocket_transport_label() {
     );
     registry
         .register(ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
             client_id: "ws-agent".to_string(),
             agent_instance_id: "inst".to_string(),
             display_name: None,

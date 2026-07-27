@@ -658,6 +658,8 @@ mod tests {
     ) -> AgentEnvelope {
         AgentEnvelope::Register {
             payload: ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
                 client_id: client_id.to_string(),
                 agent_instance_id: instance.to_string(),
                 display_name: Some("quic-test".to_string()),

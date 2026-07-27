@@ -32,6 +32,16 @@ Keep the hosted capability surface stable. Do not make code-size reduction or sm
 - `start_coding_task(detail=minimal|standard|full)` replaces startup flag combinations, `read_file` returns one text representation, and readiness is split across runner process, server transport/registration, project registry, connector endpoint, session binding, and last successful call.
 - Console chat connection data names the project-bound surface explicitly and does not expose the operator runtime as the model default; the full operator runtime remains available for management and internal execution.
 
+### Stage 2 delivered — Trusted Agent Authority and Reconnect Continuity
+
+- Canonical two-mode authority: `WEBCODEX_AUTHORITY_MODE=trusted_agent|restricted` (default `trusted_agent`). Under `trusted_agent`, consequential runtime tools auto-execute after hard safety checks with no approval interruptions while still recording auditable decisions (`trusted_agent_authority`); external release actions stay user-task-scoped. Under `restricted`, runtime tools are denied and the connector `commands_run` keeps the one-time human approval loop. A set `WEBCODEX_PERMISSION_MODE` is rejected fail-closed with no alias or migration.
+- Hard boundaries unchanged by authority mode: OAuth scopes, project roots, read-only sessions, path/sensitive-path policy, concurrent-overwrite guards, credential redaction, job cancel/reclaim, and immutable release targets.
+- `runtime_status`/`start_coding_task` project a canonical `authority` object; the old `permissions` profile object is gone. Connector auto-authorization records a durable `authority_auto_authorized` task event instead of approval records.
+- `runtime_status.connection_layers` became an observation contract: every layer carries status/observed_at/source/age/staleness/reason_code plus real facts; configuration never implies readiness, stale registrations are never callable, session bindings are honestly reported as process-local and lost after restart (continue with the durable `wc_sess_*` id), and `last_successful_tool_call` counts only meaningful successful calls.
+- `runtime_status.version_compatibility` diagnoses mixed server/runner versions (compatible / version_mismatch / capability_mismatch / no_runners) with per-runner build and protocol facts and no fallback shims. Runners report `process_started_at`, build version/commit, and shell profile dialects (`default_dialect`, `available_dialects`, per-profile `dialect`).
+- `start_coding_task` hard cut: the legacy startup flags are removed from the wire and internals; `detail=minimal|standard|full` is the only projection control and unknown fields error strictly.
+- New validation lanes: `cargo test --bin webcodex reconnect`, `cargo test --bin webcodex trusted_smoke`, and the real-process harness `scripts/e2e_reconnect_ws.sh`.
+
 ## Deferred
 
 - Code-size reduction and LOC gates.
