@@ -109,21 +109,23 @@ pub(crate) fn glob_matches(pattern: &str, path: &str) -> bool {
 /// Backtracking glob matcher over bytes.
 ///
 /// Iterative rather than recursive so a hostile pattern like `**a**a**a**`
-/// cannot blow the stack; the saved-state pair is the standard linear-space
-/// backtrack used for single-wildcard globs, extended to treat `**` as a
-/// wildcard that may also consume `/`.
+/// cannot blow the call stack. Every encountered star keeps one bounded
+/// backtrack frame: a later single `*` may get stuck at `/`, in which case the
+/// matcher must still be able to widen an earlier `**` (for example `**/*`
+/// against `a/b/c`).
 fn glob_match_segment(pattern: &[u8], text: &[u8]) -> bool {
     let (mut p, mut t) = (0usize, 0usize);
-    // Saved backtrack point: (pattern index just after the star, text index to
-    // resume from, whether that star may cross `/`).
-    let mut star: Option<(usize, usize, bool)> = None;
+    // (pattern index just after the star, next text index consumed by that
+    // star, whether the star may cross `/`). The number of frames is bounded
+    // by the pattern length (itself capped by the public input contract).
+    let mut stars: Vec<(usize, usize, bool)> = Vec::new();
     while t < text.len() {
         if p < pattern.len() {
             match pattern[p] {
                 b'*' => {
                     let crosses_slash = pattern.get(p + 1) == Some(&b'*');
                     p += if crosses_slash { 2 } else { 1 };
-                    star = Some((p, t, crosses_slash));
+                    stars.push((p, t, crosses_slash));
                     continue;
                 }
                 b'?' if text[t] != b'/' => {
@@ -139,16 +141,20 @@ fn glob_match_segment(pattern: &[u8], text: &[u8]) -> bool {
                 _ => {}
             }
         }
-        match star {
-            // Resume the most recent star, letting it consume one more byte.
-            Some((resume_p, resume_t, crosses_slash))
-                if crosses_slash || text[resume_t] != b'/' =>
-            {
-                p = resume_p;
-                t = resume_t + 1;
-                star = Some((resume_p, t, crosses_slash));
+
+        let mut resumed = false;
+        while let Some((resume_p, resume_t, crosses_slash)) = stars.last_mut() {
+            if *resume_t < text.len() && (*crosses_slash || text[*resume_t] != b'/') {
+                *resume_t += 1;
+                p = *resume_p;
+                t = *resume_t;
+                resumed = true;
+                break;
             }
-            _ => return false,
+            stars.pop();
+        }
+        if !resumed {
+            return false;
         }
     }
     while pattern.get(p) == Some(&b'*') {
@@ -371,6 +377,13 @@ mod tests {
         assert!(glob_matches("src/**", "src/db/main.rs"));
         assert!(glob_matches("?.rs", "a.rs"));
         assert!(!glob_matches("?.rs", "ab.rs"));
+    }
+
+    #[test]
+    fn an_earlier_double_star_can_widen_after_a_later_single_star_hits_a_slash() {
+        assert!(glob_matches("**/*", "a/b/c"));
+        assert!(glob_matches("src/**/*", "src/a/b/c.rs"));
+        assert!(!glob_matches("src/*/*", "src/a/b/c.rs"));
     }
 
     #[test]

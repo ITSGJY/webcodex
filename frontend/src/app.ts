@@ -620,9 +620,13 @@ function openConfirmUi(action: string) {
       addLine(body, "Effect", "The active execution is stopped.");
     }
   }
-  // Cancel and reject carry an optional reason; a rejection reason is
-  // delivered to the model as guidance on its next capability call.
-  show("confirm-reason-row", action === "cancel" || action === "reject");
+  // A stable-result rejection can carry guidance for the model's next call.
+  // An interrupted task without a result has no such delivery channel, so its
+  // reject dialog must not claim that a reason can be sent.
+  const reasonAvailable =
+    action === "cancel" ||
+    (action === "reject" && !!pending.snapshot && !!pending.snapshot.resultId);
+  show("confirm-reason-row", reasonAvailable);
   const reason = el("confirm-reason");
   if (reason) {
     (reason as HTMLInputElement).value = "";
@@ -656,7 +660,11 @@ async function performAction() {
   const req = actionRequest(pending);
   // Cancel and reject may carry an optional human reason; identity still comes
   // only from the bound snapshot, never the live selection.
-  if (req && (req.path === "task/cancel" || req.path === "result/reject")) {
+  if (
+    req &&
+    (req.path === "task/cancel" ||
+      (req.path === "result/reject" && !!pending.snapshot.resultId))
+  ) {
     const reason = inputValue("confirm-reason").trim();
     if (reason) {
       req.body.reason = reason;

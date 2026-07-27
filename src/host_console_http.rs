@@ -313,6 +313,7 @@ async fn decide(req: &mut Request, depot: &Depot, res: &mut Response, accept: bo
         || (accept && input.result_id.is_none())
         || reason.is_some_and(|reason| reason.len() > 500)
         || (accept && reason.is_some())
+        || (!accept && input.result_id.is_none() && reason.is_some())
     {
         return invalid(res, "invalid decision input");
     }
@@ -605,6 +606,13 @@ mod tests {
                     "result_id": "wc_result_0123456789abcdef",
                     "reason": "looks good"
                 }),
+            ),
+            // An interrupted task without a stable result has no future model
+            // call to receive decision guidance, so reject the reason instead
+            // of claiming it was delivered.
+            (
+                "reject",
+                serde_json::json!({ "task_id": task_id, "reason": "why" }),
             ),
         ];
         for (action, body) in cases {

@@ -472,6 +472,12 @@ fn decide_result(
         .local_connector_task_result(task_id, &state.logical_project_id)
         .map_err(store_error)?
         .map(|result| result.result_id);
+    if !accept && expected_result_id.is_none() && reason.is_some() {
+        return Err(
+            "an interrupted task without a stable result cannot deliver a rejection reason; retry without REASON"
+                .to_string(),
+        );
+    }
     let decision = if accept {
         LocalResultDecision::Accept
     } else {
@@ -498,14 +504,10 @@ fn decide_result(
             state.root.display()
         )
     } else if expected_result_id.is_none() {
-        let mut line = format!(
+        format!(
             "Rejected interrupted {}; its uncaptured workspace changes were discarded.",
             task_id
-        );
-        if reason.is_some() {
-            line.push_str(" The task had no stable result, so the reason was discarded with it.");
-        }
-        line
+        )
     } else {
         let mut line = format!(
             "Rejected {}; its stable result was discarded and the reusable workspace is available.",
@@ -856,6 +858,27 @@ mod tests {
         db.reconcile_connector_executions(&context.project_id, 5)
             .unwrap();
         drop(db);
+
+        let error = run(TaskCliCommand::Reject {
+            location: TaskLocationOptions {
+                root: root.clone(),
+                state_dir: Some(state_dir.clone()),
+                profile: "personal".to_string(),
+            },
+            task_id: abandoned_task_id.to_string(),
+            reason: Some("please explain".to_string()),
+        })
+        .unwrap_err();
+        assert!(
+            error.contains("cannot deliver a rejection reason"),
+            "{error}"
+        );
+        assert!(
+            Path::new(&interrupted.execution_root)
+                .join("discard-me.txt")
+                .exists(),
+            "a rejected reason must not discard the interrupted workspace"
+        );
 
         let output = run(TaskCliCommand::Reject {
             location: TaskLocationOptions {
