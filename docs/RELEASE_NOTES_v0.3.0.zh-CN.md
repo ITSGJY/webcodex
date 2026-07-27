@@ -125,7 +125,7 @@ npm package 仍是 thin installer。0.3.0 只按 `linux-x64` 准备；在把 Git
 
 ## 验证
 
-当前 release candidate 已通过完整 Rust binary suite（main 1,750 passed / 4 ignored，CLI 220 passed，runner 402 passed / 2 ignored）、focused process-group cleanup tests、源码与 release checks、前端 typecheck/test/dist 检查以及 npm self-test。WebSocket 与 polling zero-config E2E 均为 108/108，coding-loop compare 为 6/6；83 个 Markdown 文件中的 438 个本地链接全部有效；release-mode npm package smoke 也成功临时安装并运行三个 0.3.0 binaries。
+当前 release candidate 已通过完整 Rust binary suite（main 1,750 passed / 4 ignored，CLI 220 passed，runner 402 passed / 2 ignored）、focused process-group cleanup tests、源码与 release checks、前端 typecheck/test/dist 检查以及 npm self-test。WebSocket 与 polling zero-config E2E 均为 108/108，coding-loop compare 为 6/6；83 个 Markdown 文件中的 436 个本地链接全部有效；release-mode npm package smoke 也成功临时安装并运行三个 0.3.0 binaries。
 
 Release-preparation commit 会故意保留 checksum placeholder。只有在 immutable release tag 之后，把实际上传的 0.3.0 Linux x64 artifact checksum 提交到 manifest，且不移动 tag，npm package 才具备发布条件。最终 binaries 安装完成后，仍需由 release operator 执行 post-deployment acceptance。
 
