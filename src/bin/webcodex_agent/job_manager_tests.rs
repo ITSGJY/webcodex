@@ -88,9 +88,64 @@ fn process_group_signal_errors_distinguish_gone_permission_and_other_failures() 
     assert!(other.contains("Invalid argument"));
 }
 
+/// One run of the fail-fast plan, plus the side effect the plan must not have.
 #[cfg(unix)]
-#[test]
-fn validation_job_progress_is_executor_owned_and_fail_fast() {
+struct FailFastAttempt {
+    updates: Vec<ShellAgentJobUpdateRequest>,
+    test_step_ran: bool,
+}
+
+/// Drain job updates until the job reports `finished`, or the deadline passes.
+///
+/// The deadline is wall-clock rather than a sleep count: under a loaded machine
+/// a 10ms sleep is not 10ms, so a counting loop silently shortens its own
+/// patience exactly when the job needs more of it.
+#[cfg(unix)]
+fn collect_job_updates(
+    rx: &mut tokio::sync::mpsc::Receiver<AgentEnvelope>,
+    deadline: Duration,
+) -> Vec<ShellAgentJobUpdateRequest> {
+    let started = Instant::now();
+    let mut updates: Vec<ShellAgentJobUpdateRequest> = Vec::new();
+    while started.elapsed() < deadline {
+        while let Ok(envelope) = rx.try_recv() {
+            if let AgentEnvelope::JobUpdate { payload } = envelope {
+                updates.push(payload);
+            }
+        }
+        if updates.last().is_some_and(|update| update.finished) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    updates
+}
+
+/// The outcome the executor emits when a step could not be spawned at all.
+///
+/// This is a modeled result, not a bug — `validation_spawn_failure_is_
+/// infrastructure_without_failed_assertion` pins it, and the connector treats
+/// it as infrastructure rather than as a failed assertion. Recognising it here
+/// keeps a machine-level spawn failure from being read as a fail-fast
+/// regression.
+#[cfg(unix)]
+fn is_validation_spawn_failure(update: &ShellAgentJobUpdateRequest) -> bool {
+    update.finished
+        && update.status == "failed"
+        && update.exit_code.is_none()
+        && update.error.as_deref() == Some(VALIDATION_STEP_SPAWN_FAILED_CODE)
+}
+
+#[cfg(unix)]
+fn describe_update(update: &ShellAgentJobUpdateRequest) -> String {
+    format!(
+        "status={:?} finished={} exit_code={:?} error={:?} progress={:?}",
+        update.status, update.finished, update.exit_code, update.error, update.validation_progress
+    )
+}
+
+#[cfg(unix)]
+fn run_fail_fast_validation_job(attempt: usize) -> FailFastAttempt {
     use std::os::unix::fs::PermissionsExt;
 
     let temp = tempfile::tempdir().unwrap();
@@ -144,55 +199,108 @@ fn validation_job_progress_is_executor_owned_and_fail_fast() {
         shell,
         temp.path().join("projects.d"),
         serde_json::from_value(json!({
-            "request_id": "validation-request",
+            "request_id": format!("validation-request-{attempt}"),
             "client_id": "validation-agent",
             "kind": "start_validation_job",
-            "job_id": "validation-job",
+            "job_id": format!("validation-job-{attempt}"),
             "cwd": temp.path(),
             "command": serde_json::to_string(&steps).unwrap(),
-            "timeout_secs": 10,
+            // Two `sh` one-liners. A timeout here would mean a hang, not a busy
+            // machine, which is the point of the gap between this and the
+            // collector deadline below.
+            "timeout_secs": 60,
             "requested_by": "test",
             "created_at": 1
         }))
         .unwrap(),
     );
-    let mut updates = Vec::new();
-    for _ in 0..500 {
-        while let Ok(envelope) = rx.try_recv() {
-            if let AgentEnvelope::JobUpdate { payload } = envelope {
-                let finished = payload.finished;
-                updates.push(payload);
-                if finished {
-                    break;
-                }
-            }
-        }
-        if updates.last().is_some_and(|update| update.finished) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
+    let updates = collect_job_updates(&mut rx, Duration::from_secs(120));
+    FailFastAttempt {
+        test_step_ran: temp.path().join("should-not-run").exists(),
+        updates,
     }
-    let final_update = updates.last().expect("validation job emitted updates");
-    assert!(final_update.finished);
-    assert_eq!(final_update.status, "failed");
-    assert_eq!(final_update.exit_code, Some(7));
-    assert_eq!(
-        final_update.validation_progress,
-        Some(ShellJobValidationProgress {
-            completed: 1,
-            current_step: None,
-            failed_step: Some("check".into()),
-        })
-    );
-    assert!(updates.iter().any(|update| {
-        update.validation_progress
-            == Some(ShellJobValidationProgress {
+}
+
+#[cfg(unix)]
+#[test]
+fn validation_job_progress_is_executor_owned_and_fail_fast() {
+    // Spawning a step can fail for reasons that belong to the machine rather
+    // than to the state machine — `fork` returning EAGAIN under a loaded test
+    // suite, or ETXTBSY on a script written moments earlier. The executor
+    // reports that as `validation_step_spawn_failed` with no exit code, which
+    // is the correct answer to a question this test is not asking. Retrying
+    // those attempts is what keeps a busy machine from deciding whether the
+    // fail-fast contract holds; asserting on the first attempt is not.
+    const ATTEMPTS: usize = 3;
+    let mut spawn_failures = Vec::new();
+
+    for attempt in 0..ATTEMPTS {
+        let FailFastAttempt {
+            updates,
+            test_step_ran,
+        } = run_fail_fast_validation_job(attempt);
+        let final_update = updates.last().unwrap_or_else(|| {
+            panic!("attempt {attempt}: validation job emitted no updates before the deadline")
+        });
+        assert!(
+            final_update.finished,
+            "attempt {attempt}: job never finished; last update was {}",
+            describe_update(final_update)
+        );
+        if is_validation_spawn_failure(final_update) {
+            spawn_failures.push(format!(
+                "attempt {attempt}: {}",
+                describe_update(final_update)
+            ));
+            continue;
+        }
+
+        assert_eq!(
+            final_update.status,
+            "failed",
+            "attempt {attempt}: {}",
+            describe_update(final_update)
+        );
+        assert_eq!(
+            final_update.exit_code,
+            Some(7),
+            "attempt {attempt}: the failing step's exit code must reach the final update: {}",
+            describe_update(final_update)
+        );
+        assert_eq!(
+            final_update.validation_progress,
+            Some(ShellJobValidationProgress {
                 completed: 1,
-                current_step: Some("check".into()),
-                failed_step: None,
-            })
-    }));
-    assert!(!temp.path().join("should-not-run").exists());
+                current_step: None,
+                failed_step: Some("check".into()),
+            }),
+            "attempt {attempt}: {}",
+            describe_update(final_update)
+        );
+        assert!(
+            updates.iter().any(|update| {
+                update.validation_progress
+                    == Some(ShellJobValidationProgress {
+                        completed: 1,
+                        current_step: Some("check".into()),
+                        failed_step: None,
+                    })
+            }),
+            "attempt {attempt}: no update announced 'check' as the running step; saw {:?}",
+            updates.iter().map(describe_update).collect::<Vec<_>>()
+        );
+        assert!(
+            !test_step_ran,
+            "attempt {attempt}: the plan ran 'test' after 'check' failed"
+        );
+        return;
+    }
+
+    panic!(
+        "every attempt failed to spawn a validation step, so the fail-fast path \
+         was never exercised:\n{}",
+        spawn_failures.join("\n")
+    );
 }
 
 #[cfg(unix)]
