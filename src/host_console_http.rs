@@ -570,18 +570,21 @@ mod tests {
             .send(&service)
             .await;
         let body: serde_json::Value = response.take_json().await.unwrap();
-        assert_eq!(body["mcp_path"], "/mcp", "{body}");
-        assert_eq!(body["actions_schema_path"], "/openapi.json");
+        let public_url = body
+            .get("public_url")
+            .cloned()
+            .expect("connect projection includes public_url");
         assert_eq!(
-            body["oauth_discovery_path"],
-            "/.well-known/oauth-authorization-server"
-        );
-        // The panel must be safe to screenshot: no credential material, ever.
-        let serialized = serde_json::to_string(&body).unwrap();
-        assert!(!serialized.contains("webcodex_"), "{serialized}");
-        assert!(
-            !serialized.to_lowercase().contains("bearer"),
-            "{serialized}"
+            body,
+            serde_json::json!({
+                "project": "project",
+                "profile": "personal",
+                "public_url": public_url,
+                "mcp_path": "/mcp",
+                "actions_schema_path": "/openapi.json",
+                "oauth_discovery_path": "/.well-known/oauth-authorization-server",
+            }),
+            "the screenshot-safe response must not grow credential-bearing fields"
         );
     }
 

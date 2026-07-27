@@ -187,7 +187,7 @@ Shared contract: `src/validation_bridge.rs`
   `BridgeDiagnostics` (project-relative paths only). **No raw Pyright JSON,
   no absolute paths, no unbounded stdout/stderr.**
 
-Agent modules: `src/bin/webcodex_agent/validation/`
+Runner modules: `src/bin/webcodex_runner/validation/`
 
 | Concern | Location |
 |---|---|

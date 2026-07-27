@@ -44,14 +44,4 @@ function runNative(name) {
   });
 }
 
-// A renamed command keeps working under its old name for one major version.
-// The notice goes to stderr, never stdout, so a script that parses the JSON
-// output of `webcodex-agent ...` keeps parsing it.
-function deprecatedAlias(oldName, newName) {
-  console.error(
-    `${oldName} has been renamed to ${newName}; the old name will be removed in the next major version.`
-  );
-  runNative(newName);
-}
-
-module.exports = { exeName, nativePath, runNative, deprecatedAlias };
+module.exports = { exeName, nativePath, runNative };

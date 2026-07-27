@@ -11,6 +11,12 @@ const releaseManifest = require("../manifest.json");
 const exampleManifest = require("../manifest.example.json");
 
 assert.strictEqual(packageJson.version, "0.2.0");
+assert.deepStrictEqual(packageJson.bin, {
+  webcodex: "bin/webcodex.js",
+  "webcodex-runner": "bin/webcodex-runner.js",
+  "webcodex-cli": "bin/webcodex-cli.js"
+});
+assert.strictEqual(wrapper.deprecatedAlias, undefined);
 assert.strictEqual(releaseManifest.version, packageJson.version);
 assert.strictEqual(exampleManifest.version, packageJson.version);
 for (const manifest of [releaseManifest, exampleManifest]) {

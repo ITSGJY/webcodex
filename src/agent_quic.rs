@@ -598,12 +598,12 @@ mod tests {
     use crate::shell_protocol::{
         ShellAgentJobUpdateRequest, ShellAgentResultRequest, ShellClientCapabilities,
         ShellClientRegisterRequest, ShellJobOpRequest, ShellRunRequest,
-        AGENT_PROTOCOL_VERSION_QUIC_V1, AGENT_PROTOCOL_VERSION_WEBSOCKET_V1,
+        AGENT_PROTOCOL_VERSION_QUIC_V1, AGENT_PROTOCOL_VERSION_WEBSOCKET_V1, AGENT_QUIC_ALPN_V1,
     };
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
     /// ALPN used by the QUIC integration tests.
-    const TEST_ALPN: &str = "webcodex-agent/1";
+    const TEST_ALPN: &str = AGENT_QUIC_ALPN_V1;
 
     /// Generate a self-signed cert/key for `localhost` using rcgen, returned as
     /// DER types directly consumable by rustls. Avoids PEM parsing in tests.

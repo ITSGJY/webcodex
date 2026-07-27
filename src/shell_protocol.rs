@@ -46,6 +46,30 @@ fn default_transport_polling() -> String {
 pub const AGENT_PROTOCOL_VERSION_POLLING_V1: &str = "polling-v1";
 pub const VALIDATION_STEP_SPAWN_FAILED_CODE: &str = "validation_step_spawn_failed";
 pub const VALIDATION_TOOL_UNAVAILABLE_CODE: &str = "validation_tool_unavailable";
+/// The step ran, but the executor lost the ability to reap it — `waitpid`
+/// answered with an error rather than a status. Distinct from a spawn
+/// failure because the process did start, and distinct from a step failure
+/// because nothing is known about how the step would have ended. Without its
+/// own code it is indistinguishable from "the check failed", which blames the
+/// project for the host's problem.
+pub const VALIDATION_STEP_WAIT_FAILED_CODE: &str = "validation_step_wait_failed";
+
+/// Return the canonical code when a validation result describes executor
+/// infrastructure rather than a failed project check.
+///
+/// The runner uses this to avoid naming a failed check, the server protocol
+/// validator uses it to accept that shape, and the connector uses it to
+/// attribute the failure to the executor. Keeping the set here prevents those
+/// three decisions from drifting apart.
+pub fn validation_infrastructure_failure_code(error: &str) -> Option<&'static str> {
+    match error {
+        VALIDATION_STEP_SPAWN_FAILED_CODE => Some(VALIDATION_STEP_SPAWN_FAILED_CODE),
+        VALIDATION_TOOL_UNAVAILABLE_CODE => Some(VALIDATION_TOOL_UNAVAILABLE_CODE),
+        VALIDATION_STEP_WAIT_FAILED_CODE => Some(VALIDATION_STEP_WAIT_FAILED_CODE),
+        _ => None,
+    }
+}
+
 /// Maximum byte length of the single argv value that may follow `cargo test`.
 pub const RUST_TEST_FILTER_MAX_BYTES: usize = 200;
 
@@ -65,6 +89,7 @@ pub const AGENT_PROTOCOL_VERSION_WEBSOCKET_V1: &str = "websocket-v1";
 /// `TRANSPORT_QUIC`).
 #[allow(dead_code)]
 pub const AGENT_PROTOCOL_VERSION_QUIC_V1: &str = "quic-v1";
+pub const AGENT_QUIC_ALPN_V1: &str = "webcodex-runner/1";
 
 pub const SHELL_CLIENT_CAPABILITY_SHELL: &str = "shell";
 pub const SHELL_CLIENT_CAPABILITY_FILE_READ: &str = "file_read";

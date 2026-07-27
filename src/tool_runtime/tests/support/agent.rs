@@ -62,12 +62,18 @@ pub(in crate::tool_runtime::tests) fn run_agent_shell_request_locally(
         .expect("spawn agent shell request");
     if let Some(stdin) = req.stdin.as_deref() {
         use std::io::Write;
-        child
+        let write_result = child
             .stdin
             .take()
             .expect("agent shell request stdin")
-            .write_all(stdin.as_bytes())
-            .unwrap();
+            .write_all(stdin.as_bytes());
+        if let Err(error) = write_result {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe,
+                "agent shell request stdin write failed: {error}"
+            );
+        }
     }
     let output = child.wait_with_output().unwrap();
     (

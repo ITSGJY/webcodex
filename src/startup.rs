@@ -43,7 +43,7 @@ Default off; only safe on localhost/trusted LAN/temporary demos.\n\
   WEBCODEX_QUIC_LISTEN   QUIC UDP listen addr, default 0.0.0.0:8443\n\
   WEBCODEX_QUIC_CERT     PEM cert path for the QUIC listener\n\
   WEBCODEX_QUIC_KEY      PEM key path for the QUIC listener\n\
-  WEBCODEX_QUIC_ALPN     QUIC ALPN, default webcodex-agent/1\n",
+  WEBCODEX_QUIC_ALPN     QUIC ALPN, default webcodex-runner/1\n",
         project_entry::usage(),
         admin_cli::usage()
     )

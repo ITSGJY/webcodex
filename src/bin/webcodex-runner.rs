@@ -57,11 +57,12 @@ mod job_manager_tests;
 mod webcodex_runner;
 
 use shell_protocol::{
-    AgentPolicySummary, ShellAgentJobUpdateRequest, ShellAgentPollPayload, ShellAgentPollRequest,
-    ShellAgentPollResponse, ShellAgentProjectSummary, ShellAgentShellRequest,
-    ShellClientCapabilities, ShellClientRegisterRequest, ShellClientRegisterResponse,
-    ShellJobValidationProgress, ShellJobValidationStep, ShellProfileSummaryEntry,
-    ShellProfilesSummary, AGENT_PROTOCOL_VERSION_POLLING_V1, VALIDATION_STEP_SPAWN_FAILED_CODE,
+    validation_infrastructure_failure_code, AgentPolicySummary, ShellAgentJobUpdateRequest,
+    ShellAgentPollPayload, ShellAgentPollRequest, ShellAgentPollResponse, ShellAgentProjectSummary,
+    ShellAgentShellRequest, ShellClientCapabilities, ShellClientRegisterRequest,
+    ShellClientRegisterResponse, ShellJobValidationProgress, ShellJobValidationStep,
+    ShellProfileSummaryEntry, ShellProfilesSummary, AGENT_PROTOCOL_VERSION_POLLING_V1,
+    VALIDATION_STEP_SPAWN_FAILED_CODE, VALIDATION_STEP_WAIT_FAILED_CODE,
     VALIDATION_TOOL_UNAVAILABLE_CODE,
 };
 
@@ -966,6 +967,22 @@ fn send_validation_executor_failure(
     );
 }
 
+fn wait_failure_error(validation: bool, error: &std::io::Error) -> String {
+    if validation {
+        VALIDATION_STEP_WAIT_FAILED_CODE.to_string()
+    } else {
+        format!("failed to wait job: {error}")
+    }
+}
+
+fn validation_failed_step(status: &str, error: Option<&str>, step_name: &str) -> Option<String> {
+    (status == "failed"
+        && error
+            .and_then(validation_infrastructure_failure_code)
+            .is_none())
+    .then(|| step_name.to_string())
+}
+
 fn send_job_start_failure(
     sink: &AgentSink,
     request: ShellAgentShellRequest,
@@ -1497,10 +1514,17 @@ impl JobManager {
                             }
                         }
                         Err(e) => {
+                            // The host lost track of a process it started.
+                            // For a validation job that must arrive as a
+                            // machine-readable infrastructure code: the step
+                            // did not fail, its outcome is simply unknown,
+                            // and saying "check failed" would blame the
+                            // project for the executor's problem.
+                            eprintln!("webcodex-runner failed to wait job {job_id}: {e}");
                             break (
                                 "failed".to_string(),
                                 None,
-                                Some(format!("failed to wait job: {}", e)),
+                                Some(wait_failure_error(validation, &e)),
                             );
                         }
                     }
@@ -1595,8 +1619,14 @@ impl JobManager {
                         step_index
                     },
                     current_step: None,
-                    failed_step: (step_status.0 == "failed")
-                        .then(|| steps[step_index].name.clone()),
+                    // An infrastructure code names no failed step: the
+                    // connector reads `failed_step` as "this check rejected
+                    // the work", which is exactly what did not happen.
+                    failed_step: validation_failed_step(
+                        &step_status.0,
+                        step_status.2.as_deref(),
+                        &steps[step_index].name,
+                    ),
                 });
                 break (step_status, out, err, progress);
             };
@@ -2121,7 +2151,7 @@ server_name = "v4.example.test"
         assert_eq!(quic.server_addr, "v4.example.test:8443");
         assert_eq!(quic.server_name, "v4.example.test");
         // Defaults applied.
-        assert_eq!(quic.alpn, "webcodex-agent/1");
+        assert_eq!(quic.alpn, "webcodex-runner/1");
         assert_eq!(quic.connect_timeout_secs, 10);
         assert_eq!(quic.keepalive_interval_secs, 20);
     }
@@ -6034,6 +6064,31 @@ shell_profile = "../rust"
         assert_eq!(result.exit_code, Some(0));
         assert_eq!(result.stdout.as_deref(), Some("stdin payload\n"));
         assert!(result.error.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_job_preserves_result_when_child_closes_stdin_early() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_config(tmp.path().join("config/projects.d"));
+        let cwd = tmp.path().to_string_lossy().to_string();
+        // Larger than a pipe buffer, so write_all observes the closed reader
+        // instead of winning the race by buffering the whole payload.
+        let input = "unused payload\n".repeat(128 * 1024);
+
+        let result = run_shell(
+            &cfg.policy,
+            &cfg.shell,
+            Some(&cwd),
+            "exec 0<&-; printf capability-unavailable; exit 23",
+            Some(&input),
+            10,
+            None,
+        );
+
+        assert_eq!(result.exit_code, Some(23), "{result:?}");
+        assert_eq!(result.stdout.as_deref(), Some("capability-unavailable"));
+        assert!(result.error.is_none(), "{result:?}");
     }
 
     #[cfg(unix)]

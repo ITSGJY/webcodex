@@ -14,17 +14,9 @@ webcodex-runner
 webcodex-cli
 ```
 
-`webcodex-agent` 已更名为 `webcodex-runner`——它执行服务端下发的 shell 命令，
-并不是一个 agent 循环。有两处**刻意没有**跟着改：
-
-- QUIC ALPN 仍是 `webcodex-agent/1`。它是 wire identifier，改掉会让更名后的
-  runner 无法与任何既有 server 通信。
-- 已安装的 systemd unit 保持安装时的名字。`webcodex-cli agent status` 先读
-  `webcodex-runner.service`，找不到再回退到 `webcodex-agent.service`，并如实
-  报告用的是哪一个，同时提示重跑 `webcodex-cli agent install-service` 迁移。
-
-npm 命令 `webcodex-agent` 仍然可用，会转发到新二进制并在 stderr 打一行弃用
-提示；下个大版本移除。
+`webcodex-runner` 执行服务端下发的 shell 命令，并不是一个 agent 循环。
+binary、npm 命令、systemd unit 与 QUIC ALPN（`webcodex-runner/1`）统一使用
+这个名称，不保留旧名称 alias。
 
 不要运行 unauthenticated production deployments。
 

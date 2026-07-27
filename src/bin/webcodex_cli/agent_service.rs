@@ -3,7 +3,6 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 use super::http::{fetch_runtime_status, http_post_json_status, HttpStatusSummary};
-use crate::webcodex_cli::system::SystemdStatus;
 use crate::{
     is_systemd_platform, query_systemd_service_status, read_optional_token, write_text_file,
     AgentInstallServiceOptions, AgentStatusOptions,
@@ -43,10 +42,20 @@ pub(crate) fn render_agent_systemd_unit(opts: &AgentInstallServiceOptions) -> St
     unit
 }
 
+fn service_unit_name(service_file: &Path) -> String {
+    service_file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(AGENT_SERVICE_UNIT)
+        .to_string()
+}
+
 pub(crate) fn run_agent_install_service(
     opts: AgentInstallServiceOptions,
 ) -> Result<String, String> {
     let unit = render_agent_systemd_unit(&opts);
+    let service_unit = service_unit_name(&opts.service_file);
     let writes_file = !opts.dry_run && !opts.output_stdout;
     if writes_file {
         if opts.service_file.exists() && !opts.overwrite {
@@ -84,8 +93,8 @@ pub(crate) fn run_agent_install_service(
             "wrote_service_file": true,
             "next_steps": [
                 "sudo systemctl daemon-reload",
-                "sudo systemctl enable --now webcodex-runner",
-                "sudo systemctl status webcodex-runner"
+                format!("sudo systemctl enable --now {service_unit}"),
+                format!("sudo systemctl status {service_unit}")
             ],
         });
         return serde_json::to_string_pretty(&summary).map_err(|e| e.to_string());
@@ -100,8 +109,8 @@ pub(crate) fn run_agent_install_service(
     out.push_str(&format!("  binary:       {}\n", opts.bin.display()));
     out.push_str("\nNext steps:\n");
     out.push_str("  - sudo systemctl daemon-reload\n");
-    out.push_str("  - sudo systemctl enable --now webcodex-runner\n");
-    out.push_str("  - sudo systemctl status webcodex-runner\n");
+    out.push_str(&format!("  - sudo systemctl enable --now {service_unit}\n"));
+    out.push_str(&format!("  - sudo systemctl status {service_unit}\n"));
     Ok(out)
 }
 
@@ -198,55 +207,9 @@ fn runtime_client_online(output: &Value, client_id: &str) -> Option<bool> {
 /// The unit `agent install-service` writes today.
 pub(crate) const AGENT_SERVICE_UNIT: &str = "webcodex-runner.service";
 
-/// The unit installs from before the `webcodex-agent` → `webcodex-runner`
-/// rename are still running under. systemd does not rename a unit when a
-/// binary is renamed, so an existing deployment keeps this name until its
-/// owner reinstalls the service.
-pub(crate) const LEGACY_AGENT_SERVICE_UNIT: &str = "webcodex-agent.service";
-
-/// Status of the agent's systemd unit, plus the unit it was actually read
-/// from.
-///
-/// Asking only about the new name would report `inactive` for a service that
-/// is running perfectly well under the old one — a rename turning into a
-/// false outage report. The legacy unit is consulted only when the current
-/// one is absent, so a host mid-migration (both units present) is described
-/// by the one that is supposed to win.
-fn query_agent_service_status() -> (SystemdStatus, &'static str) {
-    choose_agent_service_status(query_systemd_service_status(AGENT_SERVICE_UNIT), || {
-        query_systemd_service_status(LEGACY_AGENT_SERVICE_UNIT)
-    })
-}
-
-/// A unit systemd knows about answers `is-enabled` with a real word; one it
-/// has never heard of answers nothing, which this module reads back as
-/// `unknown`. `active` alone is not enough to conclude presence, but it is
-/// enough to conclude *not absent*, so a running-but-not-enabled unit still
-/// counts.
-fn unit_exists(status: &SystemdStatus) -> bool {
-    status.enabled != "unknown" || status.active == "active"
-}
-
-/// Split out from the systemd call so the migration rule is testable on a
-/// host with no systemd at all.
-fn choose_agent_service_status(
-    current: SystemdStatus,
-    legacy: impl FnOnce() -> SystemdStatus,
-) -> (SystemdStatus, &'static str) {
-    if unit_exists(&current) {
-        return (current, AGENT_SERVICE_UNIT);
-    }
-    let legacy = legacy();
-    if unit_exists(&legacy) {
-        return (legacy, LEGACY_AGENT_SERVICE_UNIT);
-    }
-    // Neither exists: describe the unit an install would create, not the one
-    // it would not.
-    (current, AGENT_SERVICE_UNIT)
-}
-
 pub(crate) async fn run_agent_status(opts: AgentStatusOptions) -> Result<String, String> {
-    let (systemd, service_unit) = query_agent_service_status();
+    let service_unit = service_unit_name(&opts.service_file);
+    let systemd = query_systemd_service_status(&service_unit);
     let metadata = read_agent_config_metadata(&opts.config)?;
     let effective_server_url = opts.server_url.clone().or_else(|| {
         let url = metadata.server_url.trim().to_string();
@@ -304,7 +267,6 @@ pub(crate) async fn run_agent_status(opts: AgentStatusOptions) -> Result<String,
         let summary = json!({
             "service": {
                 "unit": service_unit,
-                "legacy_unit": service_unit == LEGACY_AGENT_SERVICE_UNIT,
                 "active": systemd.active,
                 "enabled": systemd.enabled,
             },
@@ -347,16 +309,9 @@ pub(crate) async fn run_agent_status(opts: AgentStatusOptions) -> Result<String,
 
     let mut out = String::new();
     out.push_str("Agent status:\n\n");
-    out.push_str(&format!("  service unit:         {}\n", service_unit));
+    out.push_str(&format!("  service unit:         {service_unit}\n"));
     out.push_str(&format!("  service active:       {}\n", systemd.active));
     out.push_str(&format!("  service enabled:      {}\n", systemd.enabled));
-    if service_unit == LEGACY_AGENT_SERVICE_UNIT {
-        out.push_str(
-            "  note:                 this unit predates the webcodex-runner rename; \
-             rerun `webcodex-cli agent install-service` to move to \
-             webcodex-runner.service\n",
-        );
-    }
     out.push_str(&format!(
         "  config:               {}\n",
         metadata.path.display()
@@ -441,63 +396,20 @@ pub(crate) async fn run_agent_status(opts: AgentStatusOptions) -> Result<String,
 }
 
 #[cfg(test)]
-mod service_unit_tests {
-    use super::{choose_agent_service_status, AGENT_SERVICE_UNIT, LEGACY_AGENT_SERVICE_UNIT};
-    use crate::webcodex_cli::system::SystemdStatus;
-
-    fn status(active: &str, enabled: &str) -> SystemdStatus {
-        SystemdStatus {
-            active: active.to_string(),
-            enabled: enabled.to_string(),
-        }
-    }
-
-    /// A unit systemd has never heard of. `is-enabled` writes nothing, which
-    /// the query layer reports as `unknown`.
-    fn absent() -> SystemdStatus {
-        status("inactive", "unknown")
-    }
+mod tests {
+    use super::*;
 
     #[test]
-    fn a_current_unit_is_reported_without_consulting_the_legacy_one() {
-        let (chosen, unit) = choose_agent_service_status(status("active", "enabled"), || {
-            panic!("legacy unit must not be queried when the current one exists")
-        });
-        assert_eq!(unit, AGENT_SERVICE_UNIT);
-        assert_eq!(chosen.active, "active");
-    }
-
-    #[test]
-    fn an_install_predating_the_rename_is_not_reported_as_a_dead_service() {
-        // The failure this prevents: renaming the binary makes `agent status`
-        // announce `inactive` about an agent that is running fine under
-        // webcodex-agent.service.
-        let (chosen, unit) = choose_agent_service_status(absent(), || status("active", "enabled"));
-        assert_eq!(unit, LEGACY_AGENT_SERVICE_UNIT);
-        assert_eq!(chosen.active, "active");
-        assert_eq!(chosen.enabled, "enabled");
-    }
-
-    #[test]
-    fn a_legacy_unit_left_running_but_disabled_still_counts_as_present() {
-        let (chosen, unit) = choose_agent_service_status(absent(), || status("active", "unknown"));
-        assert_eq!(unit, LEGACY_AGENT_SERVICE_UNIT);
-        assert_eq!(chosen.active, "active");
-    }
-
-    #[test]
-    fn a_host_mid_migration_is_described_by_the_unit_that_wins() {
-        let (chosen, unit) = choose_agent_service_status(status("inactive", "disabled"), || {
-            panic!("an installed current unit decides, even when stopped")
-        });
-        assert_eq!(unit, AGENT_SERVICE_UNIT);
-        assert_eq!(chosen.active, "inactive");
-    }
-
-    #[test]
-    fn with_neither_unit_installed_the_report_names_the_unit_an_install_creates() {
-        let (chosen, unit) = choose_agent_service_status(absent(), absent);
-        assert_eq!(unit, AGENT_SERVICE_UNIT);
-        assert_eq!(chosen.enabled, "unknown");
+    fn service_unit_name_tracks_the_selected_profile_unit() {
+        assert_eq!(
+            service_unit_name(Path::new(
+                "/etc/systemd/system/webcodex-runner-workstation.service"
+            )),
+            "webcodex-runner-workstation.service"
+        );
+        assert_eq!(
+            service_unit_name(Path::new("/etc/systemd/system/webcodex-runner.service")),
+            AGENT_SERVICE_UNIT
+        );
     }
 }

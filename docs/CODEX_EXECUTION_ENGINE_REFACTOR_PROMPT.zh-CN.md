@@ -72,7 +72,7 @@
 - src/tool_runtime/job_tools.rs
 - src/shell_client/jobs.rs
 - src/shell_client/job_updates.rs
-- src/bin/webcodex-agent.rs 中的 JobManager
+- src/bin/webcodex-runner.rs 中的 JobManager
 - 现有 process-group termination、output files/buffers、timeout、approval、workspace policy 和 agent dispatch
 
 必须复用或抽取这些能力。禁止再实现第二套 scheduler、第二套 process manager、第二套 output store 或 Connector 私有 job system。

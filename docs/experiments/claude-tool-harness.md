@@ -29,7 +29,7 @@ capability adapter.
 | `claude_describe_tool` | Return live tool description + `inputSchema` + `schema_hash` |
 | `claude_tool_call` | Validate arguments against live schema, call `tools/call`, return bounded raw result |
 
-These are **agent request kinds** handled by `webcodex-agent` external tools
+These are **runner request kinds** handled by `webcodex-runner` external tools
 routing before production strategy/provider selection. They are **not**
 dynamically expanded when Claude adds tools, and they are **not** published as
 individual MCP tools for every Claude name.
@@ -273,19 +273,19 @@ See `docs/agent/claude-code-mcp-provider.md` for the reload operator flow and
 ## 11. Fake tests (default suite)
 
 ```bash
-cargo test --bin webcodex-agent experimental_ -- --nocapture
-cargo test --bin webcodex-agent external_tools -- --nocapture
+cargo test --bin webcodex-runner experimental_ -- --nocapture
+cargo test --bin webcodex-runner external_tools -- --nocapture
 ```
 
 Uses the standalone fake stdio MCP binary compiled from
-`src/bin/webcodex_agent/fake_claude_mcp.rs`. Coverage includes the generation
+`src/bin/webcodex_runner/fake_claude_mcp.rs`. Coverage includes the generation
 retirement path (`experimental_raw_edit_survives_generation_router_retirement`).
 
 ## 12. Opt-in real Claude tests
 
 ```bash
 WEBCODEX_EXPERIMENTAL_CLAUDE_TOOLS=1 \
-cargo test --bin webcodex-agent opt_in_experimental_real_claude_tools_smoke -- --nocapture
+cargo test --bin webcodex-runner opt_in_experimental_real_claude_tools_smoke -- --nocapture
 ```
 
 Requires a logged-in local `claude` that supports `claude mcp serve`. The
@@ -296,8 +296,8 @@ tools.
 Related existing opt-ins (production provider path):
 
 ```bash
-WEBCODEX_PROBE_CLAUDE_PROVIDER=1 cargo test --bin webcodex-agent opt_in_real_claude_mcp_probe -- --nocapture
-WEBCODEX_TEST_CLAUDE_MCP=1 cargo test --bin webcodex-agent opt_in_real_claude_mcp_smoke -- --nocapture
+WEBCODEX_PROBE_CLAUDE_PROVIDER=1 cargo test --bin webcodex-runner opt_in_real_claude_mcp_probe -- --nocapture
+WEBCODEX_TEST_CLAUDE_MCP=1 cargo test --bin webcodex-runner opt_in_real_claude_mcp_smoke -- --nocapture
 ```
 
 ## 13. Bounds and timeouts

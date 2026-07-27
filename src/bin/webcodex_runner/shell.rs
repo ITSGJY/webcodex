@@ -777,14 +777,21 @@ fn run_shell_impl(
         match child.stdin.take() {
             Some(mut child_stdin) => {
                 if let Err(e) = child_stdin.write_all(input.as_bytes()) {
-                    let _ = child.kill();
-                    return CommandResult {
-                        exit_code: None,
-                        stdout: None,
-                        stderr: None,
-                        duration_ms: Some(start.elapsed().as_millis() as u64),
-                        error: Some(format!("failed to write command stdin: {}", e)),
-                    };
+                    // A command may reject a request or report a missing
+                    // capability before consuming its payload. Once it closes
+                    // stdin, BrokenPipe says nothing about the command's own
+                    // result, so preserve its exit status and output. Other
+                    // write failures still belong to the executor.
+                    if e.kind() != std::io::ErrorKind::BrokenPipe {
+                        let _ = child.kill();
+                        return CommandResult {
+                            exit_code: None,
+                            stdout: None,
+                            stderr: None,
+                            duration_ms: Some(start.elapsed().as_millis() as u64),
+                            error: Some(format!("failed to write command stdin: {}", e)),
+                        };
+                    }
                 }
             }
             None => {

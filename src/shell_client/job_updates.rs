@@ -11,9 +11,8 @@ use super::state::ShellJobRecord;
 use super::validation::{validate_agent_instance_id, validate_id, validate_run_request};
 use super::{now_ts, ShellClientRegistry};
 use crate::shell_protocol::{
-    ShellAgentJobUpdateRequest, ShellAgentShellRequest, ShellJobInfo, ShellJobOpRequest,
-    ShellJobValidationStep, ShellRunRequest, VALIDATION_STEP_SPAWN_FAILED_CODE,
-    VALIDATION_TOOL_UNAVAILABLE_CODE,
+    validation_infrastructure_failure_code, ShellAgentJobUpdateRequest, ShellAgentShellRequest,
+    ShellJobInfo, ShellJobOpRequest, ShellJobValidationStep, ShellRunRequest,
 };
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -70,10 +69,11 @@ fn validate_validation_progress(
     let infrastructure_failure = status == "failed"
         && update.finished
         && update.exit_code.is_none()
-        && matches!(
-            update.error.as_deref(),
-            Some(VALIDATION_STEP_SPAWN_FAILED_CODE | VALIDATION_TOOL_UNAVAILABLE_CODE)
-        );
+        && update
+            .error
+            .as_deref()
+            .and_then(validation_infrastructure_failure_code)
+            .is_some();
     let valid = if cancelling {
         no_active_step
     } else if infrastructure_failure {

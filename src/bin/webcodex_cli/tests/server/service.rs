@@ -194,6 +194,8 @@ allowed_roots = ["/srv/projects"]
     }
     assert!(!output.contains(secret));
     let json: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(json["service"]["unit"], "webcodex-runner.service");
+    assert!(json["service"].get("legacy_unit").is_none());
     assert_eq!(json["service"]["active"], "unknown");
     assert_eq!(json["service"]["enabled"], "unknown");
     assert_eq!(json["config"]["client_id"], "alice-laptop");

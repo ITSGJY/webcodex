@@ -14,20 +14,9 @@ webcodex-runner
 webcodex-cli
 ```
 
-`webcodex-agent` was renamed to `webcodex-runner`, because it runs shell
-commands the server sends rather than an agent loop. Two things did *not*
-change with it, on purpose:
-
-- The QUIC ALPN stays `webcodex-agent/1`. It is a wire identifier, and
-  changing it would stop a renamed runner from talking to any existing server.
-- An installed systemd unit keeps whatever name it was installed under.
-  `webcodex-cli agent status` reads `webcodex-runner.service` and falls back to
-  `webcodex-agent.service`, reports which unit it used, and tells you to rerun
-  `webcodex-cli agent install-service` to migrate.
-
-The npm command `webcodex-agent` still works and forwards to the new binary
-with a deprecation line on stderr. It will be removed in the next major
-version.
+`webcodex-runner` runs shell commands the server sends rather than an agent
+loop. The binary, npm command, systemd unit, and QUIC ALPN
+(`webcodex-runner/1`) use that name without old-name aliases.
 
 Do not run unauthenticated production deployments.
 

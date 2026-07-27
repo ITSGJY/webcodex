@@ -1604,7 +1604,7 @@ async fn runtime_status_quic_disabled_is_non_sensitive() {
     assert!(result.success);
     assert_eq!(result.output["quic"]["enabled"], false);
     assert_eq!(result.output["quic"]["listen"], "0.0.0.0:8443");
-    assert_eq!(result.output["quic"]["alpn"], "webcodex-agent/1");
+    assert_eq!(result.output["quic"]["alpn"], "webcodex-runner/1");
     assert_eq!(result.output["quic"]["listener_started"], false);
     assert!(result.output["quic"]["last_error"].is_null());
     let serialized = serde_json::to_string(&result.output).unwrap();
@@ -1620,7 +1620,7 @@ async fn runtime_status_quic_enabled_error_is_sanitized() {
         listen: "0.0.0.0:8443".to_string(),
         cert: PathBuf::from("/secret/certs/fullchain.pem"),
         key: PathBuf::from("/secret/certs/privkey.pem"),
-        alpn: "webcodex-agent/1".to_string(),
+        alpn: "webcodex-runner/1".to_string(),
     };
     let status = Arc::new(std::sync::Mutex::new(quic_cfg.runtime_status()));
     status
@@ -1652,7 +1652,7 @@ async fn runtime_status_quic_started_reports_listen_and_alpn() {
         listen: "127.0.0.1:9443".to_string(),
         cert: PathBuf::from("/hidden/cert.pem"),
         key: PathBuf::from("/hidden/key.pem"),
-        alpn: "webcodex-agent/1".to_string(),
+        alpn: "webcodex-runner/1".to_string(),
     };
     let status = Arc::new(std::sync::Mutex::new(quic_cfg.runtime_status()));
     status.lock().unwrap().mark_started();
@@ -1665,7 +1665,7 @@ async fn runtime_status_quic_started_reports_listen_and_alpn() {
     assert!(result.success);
     assert_eq!(result.output["quic"]["enabled"], true);
     assert_eq!(result.output["quic"]["listen"], "127.0.0.1:9443");
-    assert_eq!(result.output["quic"]["alpn"], "webcodex-agent/1");
+    assert_eq!(result.output["quic"]["alpn"], "webcodex-runner/1");
     assert_eq!(result.output["quic"]["listener_started"], true);
     assert!(result.output["quic"]["last_error"].is_null());
     let serialized = serde_json::to_string(&result.output).unwrap();

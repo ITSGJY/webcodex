@@ -120,7 +120,7 @@ pub(crate) struct QuicClientConfig {
 }
 
 pub(crate) fn default_quic_alpn() -> String {
-    "webcodex-agent/1".to_string()
+    crate::shell_protocol::AGENT_QUIC_ALPN_V1.to_string()
 }
 pub(crate) fn default_quic_connect_timeout_secs() -> u64 {
     10

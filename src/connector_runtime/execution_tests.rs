@@ -5,7 +5,7 @@ use crate::shell_protocol::{
     ShellAgentJobUpdateRequest, ShellAgentPollRequest, ShellAgentProjectSummary,
     ShellAgentResultRequest, ShellAgentShellRequest, ShellClientCapabilities,
     ShellClientRegisterRequest, ShellJobOpRequest, ShellJobValidationProgress,
-    ShellJobValidationStep,
+    ShellJobValidationStep, VALIDATION_STEP_WAIT_FAILED_CODE,
 };
 use std::time::{Duration, Instant};
 
@@ -952,6 +952,38 @@ async fn validation_tool_unavailable_is_executor_failure_not_assertion_failure()
     assert_eq!(execution["failure_code"], "validation_tool_unavailable");
     assert!(execution["assertion_evidence"].is_null());
     assert!(execution["checks"][0]["status"] != "failed");
+}
+
+#[tokio::test]
+async fn validation_step_wait_failure_is_executor_failure_without_assertion_evidence() {
+    let fixture = fixture(1_000).await;
+    let registry = fixture.registry.clone();
+    let responder = tokio::spawn(async move {
+        let request = next_request(&registry).await;
+        let mut failed = validation_job_update(
+            request.job_id.as_deref().unwrap(),
+            "failed",
+            check_progress(0, None, None),
+        );
+        failed.error = Some(VALIDATION_STEP_WAIT_FAILED_CODE.to_string());
+        let updated = registry.update_job(failed).await.unwrap();
+        assert_eq!(updated.status, "failed");
+        assert!(updated
+            .validation_progress
+            .is_some_and(|progress| progress.failed_step.is_none()));
+    });
+    let outcome = fixture
+        .call("checks_run", checks(&fixture, "wait-failure", &["check"]))
+        .await;
+    responder.await.unwrap();
+    assert!(outcome.ok, "{}", outcome.body);
+    let execution = &outcome.body["data"]["execution"];
+    assert_eq!(execution["execution_status"], "failed");
+    assert_eq!(execution["failure_source"], "executor");
+    assert_eq!(execution["failure_code"], VALIDATION_STEP_WAIT_FAILED_CODE);
+    assert_ne!(execution["assertion_status"], "failed");
+    assert!(execution["assertion_evidence"].is_null());
+    assert_ne!(execution["checks"][0]["status"], "failed");
 }
 
 #[tokio::test]

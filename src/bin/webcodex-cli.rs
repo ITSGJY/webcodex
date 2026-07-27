@@ -225,6 +225,7 @@ struct ServerUpOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AgentStatusOptions {
     config: PathBuf,
+    service_file: PathBuf,
     server_url: Option<String>,
     user_token_file: Option<PathBuf>,
     agent_token_file: Option<PathBuf>,
@@ -1224,6 +1225,7 @@ fn parse_agent_status(args: &[String]) -> Result<AgentStatusOptions, String> {
     let mut config: Option<PathBuf> = None;
     let mut opts = AgentStatusOptions {
         config: PathBuf::new(),
+        service_file: PathBuf::from("/etc/systemd/system/webcodex-runner.service"),
         server_url: None,
         user_token_file: None,
         agent_token_file: None,
@@ -1251,6 +1253,7 @@ fn parse_agent_status(args: &[String]) -> Result<AgentStatusOptions, String> {
         .transpose()?
     {
         opts.config = config.unwrap_or_else(|| client_profile_agent_config(&profile));
+        opts.service_file = client_profile_service_file(&profile);
         opts.user_token_file = opts
             .user_token_file
             .or_else(|| Some(client_profile_user_token_file(&profile)));

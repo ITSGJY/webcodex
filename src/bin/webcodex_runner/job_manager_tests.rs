@@ -1,6 +1,24 @@
 use super::*;
 use serde_json::json;
 
+#[test]
+fn validation_wait_failure_is_executor_owned_without_a_failed_check() {
+    let error = std::io::Error::other("synthetic wait failure");
+    let encoded = wait_failure_error(true, &error);
+    assert_eq!(encoded, VALIDATION_STEP_WAIT_FAILED_CODE);
+    assert_eq!(
+        validation_failed_step("failed", Some(&encoded), "check"),
+        None
+    );
+
+    let ordinary = wait_failure_error(false, &error);
+    assert_eq!(ordinary, "failed to wait job: synthetic wait failure");
+    assert_eq!(
+        validation_failed_step("failed", Some("check exited non-zero"), "check"),
+        Some("check".to_string())
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn job_manager_stop_terminates_the_process_group() {

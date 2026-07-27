@@ -59,7 +59,7 @@ impl QuicServerConfig {
                 .map(PathBuf::from)
                 .unwrap_or_default(),
             alpn: std::env::var("WEBCODEX_QUIC_ALPN")
-                .unwrap_or_else(|_| "webcodex-agent/1".to_string()),
+                .unwrap_or_else(|_| crate::shell_protocol::AGENT_QUIC_ALPN_V1.to_string()),
         }
     }
 
@@ -171,7 +171,7 @@ impl Default for QuicServerConfig {
             listen: "0.0.0.0:8443".to_string(),
             cert: PathBuf::new(),
             key: PathBuf::new(),
-            alpn: "webcodex-agent/1".to_string(),
+            alpn: crate::shell_protocol::AGENT_QUIC_ALPN_V1.to_string(),
         }
     }
 }
@@ -545,7 +545,7 @@ mod tests {
         let cfg = QuicServerConfig::default();
         assert!(!cfg.enabled);
         assert_eq!(cfg.listen, "0.0.0.0:8443");
-        assert_eq!(cfg.alpn, "webcodex-agent/1");
+        assert_eq!(cfg.alpn, "webcodex-runner/1");
         // A disabled config is always valid (no cert/key required).
         assert!(cfg.validate().is_ok());
     }
@@ -558,7 +558,7 @@ mod tests {
             listen: "0.0.0.0:8443".to_string(),
             cert: PathBuf::new(),
             key: PathBuf::from("/tmp/key.pem"),
-            alpn: "webcodex-agent/1".to_string(),
+            alpn: "webcodex-runner/1".to_string(),
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("WEBCODEX_QUIC_CERT"), "err was: {err}");
@@ -569,7 +569,7 @@ mod tests {
             listen: "0.0.0.0:8443".to_string(),
             cert: PathBuf::from("/tmp/cert.pem"),
             key: PathBuf::new(),
-            alpn: "webcodex-agent/1".to_string(),
+            alpn: "webcodex-runner/1".to_string(),
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("WEBCODEX_QUIC_KEY"), "err was: {err}");
@@ -582,7 +582,7 @@ mod tests {
             listen: "0.0.0.0:8443".to_string(),
             cert: PathBuf::from("/definitely/does/not/exist/cert.pem"),
             key: PathBuf::from("/definitely/does/not/exist/key.pem"),
-            alpn: "webcodex-agent/1".to_string(),
+            alpn: "webcodex-runner/1".to_string(),
         };
         let err = cfg.validate().unwrap_err();
         // Names the missing path without dumping file contents.
@@ -617,7 +617,7 @@ mod tests {
         let cfg = QuicServerConfig::from_env();
         assert!(!cfg.enabled);
         assert_eq!(cfg.listen, "0.0.0.0:8443");
-        assert_eq!(cfg.alpn, "webcodex-agent/1");
+        assert_eq!(cfg.alpn, "webcodex-runner/1");
     }
 
     #[test]

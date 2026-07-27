@@ -260,6 +260,7 @@ fn agent_init_rejects_unsafe_profile() {
 fn agent_status_profile_derives_config_and_token_paths() {
     let opts = parse_agent_status(&args(&["--profile", "special"])).unwrap();
     assert_eq!(opts.config, client_profile_agent_config("special"));
+    assert_eq!(opts.service_file, client_profile_service_file("special"));
     assert_eq!(
         opts.user_token_file,
         Some(client_profile_user_token_file("special"))
@@ -292,6 +293,10 @@ fn agent_status_explicit_paths_win_and_no_profile_keeps_legacy_default() {
 
     let legacy = parse_agent_status(&args(&[])).unwrap();
     assert_eq!(legacy.config, PathBuf::from("/etc/webcodex/agent.toml"));
+    assert_eq!(
+        legacy.service_file,
+        PathBuf::from("/etc/systemd/system/webcodex-runner.service")
+    );
     assert_eq!(legacy.user_token_file, None);
     assert_eq!(legacy.agent_token_file, None);
 }

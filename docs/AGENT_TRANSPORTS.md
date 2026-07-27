@@ -44,7 +44,7 @@ WEBCODEX_QUIC_ENABLED=true
 WEBCODEX_QUIC_LISTEN=0.0.0.0:8443
 WEBCODEX_QUIC_CERT=/etc/letsencrypt/live/<host>/fullchain.pem
 WEBCODEX_QUIC_KEY=/etc/letsencrypt/live/<host>/privkey.pem
-WEBCODEX_QUIC_ALPN=webcodex-agent/1
+WEBCODEX_QUIC_ALPN=webcodex-runner/1
 ```
 
 The certificate SAN must match the `server_name` configured on the agent. You may reuse the same Let's Encrypt certificate used by your HTTPS reverse proxy, or use a separate certificate.
@@ -69,7 +69,7 @@ websocket_connect_timeout_secs = 5
 [quic]
 server_addr = "your-domain.example:8443"
 server_name = "your-domain.example"
-alpn = "webcodex-agent/1"
+alpn = "webcodex-runner/1"
 connect_timeout_secs = 10
 keepalive_interval_secs = 20
 ```
@@ -84,7 +84,7 @@ transport = "quic"
 [quic]
 server_addr = "your-domain.example:8443"
 server_name = "your-domain.example"
-alpn = "webcodex-agent/1"
+alpn = "webcodex-runner/1"
 ```
 
 Notes:
@@ -108,7 +108,7 @@ either direction: Ping       { ts }
 either direction: Pong       { ts }
 ```
 
-- ALPN: `webcodex-agent/1`
+- ALPN: `webcodex-runner/1`
 - Transport label reported in `runtime_status` / `listAgents`: `quic`, `websocket`, or `polling`.
 - QUIC agents report `agent_protocol_version=quic-v1`.
 

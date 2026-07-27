@@ -6,8 +6,7 @@
   "bin": {
     "webcodex": "bin/webcodex.js",
     "webcodex-runner": "bin/webcodex-runner.js",
-    "webcodex-cli": "bin/webcodex-cli.js",
-    "webcodex-agent": "bin/webcodex-agent.js"
+    "webcodex-cli": "bin/webcodex-cli.js"
   },
   "scripts": {
     "postinstall": "node install.js",

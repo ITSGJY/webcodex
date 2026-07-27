@@ -206,6 +206,12 @@ pub(crate) fn build_listing(
     let limit = limit.max(1);
     let mut matched: Vec<&str> = paths
         .iter()
+        // Use the shared policy: sensitive paths stay hidden like they do for
+        // reads, writes, and edits, while bulk trees stay hidden like they do
+        // for `files_search`. A tracked `.env` is a real thing: without this
+        // the listing advertises a path that `files_read` then refuses, which
+        // costs a round trip and gives the model a contradictory signal.
+        .filter(|path| !crate::sensitive_paths::is_bulk_skipped_path(path))
         .filter(|path| scope.is_empty() || path.starts_with(scope))
         .filter(|path| {
             globs.is_empty() || globs.iter().any(|glob| glob_matches(glob, path.as_str()))
@@ -338,6 +344,61 @@ mod tests {
 
     fn paths(entries: &[&str]) -> Vec<String> {
         entries.iter().map(|entry| (*entry).to_string()).collect()
+    }
+
+    #[test]
+    fn credentials_and_bulk_trees_never_reach_the_model() {
+        // Git tracks whatever it was told to track, including secrets. The
+        // listing must not be the one file tool that hands them over.
+        let tracked = paths(&[
+            "src/main.rs",
+            ".env",
+            ".env.production",
+            "deploy/agent.toml",
+            "certs/server.pem",
+            "certs/server.key",
+            "secrets/db.txt",
+            "projects.d/one.toml",
+            "node_modules/left-pad/index.js",
+            "target/debug/build.rs",
+        ]);
+        let listing = build_listing(&tracked, "", &[], None, 100, 0);
+        let shown: Vec<&str> = listing
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        assert_eq!(shown, vec!["src/main.rs"], "leaked: {shown:?}");
+        // The count is what survived the filter, not what git printed —
+        // otherwise `total_files` silently advertises hidden paths.
+        assert_eq!(listing.total_files, 1);
+    }
+
+    #[test]
+    fn an_explicit_glob_does_not_reopen_the_filtered_paths() {
+        // Asking for the secret by name is still asking for the secret.
+        let tracked = paths(&["src/main.rs", ".env", "certs/server.key"]);
+        let listing = build_listing(
+            &tracked,
+            "",
+            &[".env".to_string(), "**/*.key".to_string()],
+            None,
+            100,
+            0,
+        );
+        assert!(listing.entries.is_empty(), "{:?}", listing.entries);
+        assert_eq!(listing.total_files, 0);
+    }
+
+    #[test]
+    fn a_rolled_up_directory_does_not_count_files_it_hides() {
+        // file_count is a claim about what a caller would find by descending.
+        // Counting filtered paths would make that claim false.
+        let tracked = paths(&["app/main.rs", "app/util.rs", "app/.env", "app/id.pem"]);
+        let listing = build_listing(&tracked, "", &[], Some(1), 100, 0);
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].path, "app/");
+        assert_eq!(listing.entries[0].file_count, Some(2));
     }
 
     #[test]

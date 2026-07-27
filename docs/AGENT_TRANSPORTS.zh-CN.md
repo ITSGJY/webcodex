@@ -41,7 +41,7 @@ WEBCODEX_QUIC_ENABLED=true
 WEBCODEX_QUIC_LISTEN=0.0.0.0:8443
 WEBCODEX_QUIC_CERT=/etc/letsencrypt/live/<host>/fullchain.pem
 WEBCODEX_QUIC_KEY=/etc/letsencrypt/live/<host>/privkey.pem
-WEBCODEX_QUIC_ALPN=webcodex-agent/1
+WEBCODEX_QUIC_ALPN=webcodex-runner/1
 ```
 
 Certificate SAN 必须匹配 agent 配置的 `server_name`。可以复用 HTTPS reverse proxy 使用的 Let's Encrypt certificate，也可以使用单独 certificate。
@@ -65,7 +65,7 @@ transport = "auto"
 [quic]
 server_addr = "your-domain.example:8443"
 server_name = "your-domain.example"
-alpn = "webcodex-agent/1"
+alpn = "webcodex-runner/1"
 connect_timeout_secs = 10
 keepalive_interval_secs = 20
 ```
@@ -80,7 +80,7 @@ transport = "quic"
 [quic]
 server_addr = "your-domain.example:8443"
 server_name = "your-domain.example"
-alpn = "webcodex-agent/1"
+alpn = "webcodex-runner/1"
 ```
 
 注意：
@@ -104,7 +104,7 @@ either direction: Ping       { ts }
 either direction: Pong       { ts }
 ```
 
-- ALPN：`webcodex-agent/1`
+- ALPN：`webcodex-runner/1`
 - `runtime_status` / `listAgents` 报告的 transport label：`quic`、`websocket` 或 `polling`。
 - QUIC agents 报告 `agent_protocol_version=quic-v1`。
 

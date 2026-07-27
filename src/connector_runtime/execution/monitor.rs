@@ -389,13 +389,6 @@ fn validation_protocol_failure_code(error: &str) -> Option<&'static str> {
 }
 
 fn executor_failure_code(error: &str) -> Option<&'static str> {
-    match error {
-        crate::shell_protocol::VALIDATION_STEP_SPAWN_FAILED_CODE => {
-            Some(crate::shell_protocol::VALIDATION_STEP_SPAWN_FAILED_CODE)
-        }
-        crate::shell_protocol::VALIDATION_TOOL_UNAVAILABLE_CODE => {
-            Some(crate::shell_protocol::VALIDATION_TOOL_UNAVAILABLE_CODE)
-        }
-        _ => validation_protocol_failure_code(error),
-    }
+    crate::shell_protocol::validation_infrastructure_failure_code(error)
+        .or_else(|| validation_protocol_failure_code(error))
 }
