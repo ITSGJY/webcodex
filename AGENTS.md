@@ -1,6 +1,6 @@
-# AGENTS.md — WebCodex Agent Execution Contract
+# AGENTS.md — WebCodex Trusted Agent Contract
 
-Executable rules for autonomous agents working in this repository.
+Executable rules for autonomous coding agents working in this repository.
 Long-form design context lives under [`docs/agent/`](docs/agent/).
 
 ---
@@ -10,268 +10,208 @@ Long-form design context lives under [`docs/agent/`](docs/agent/).
 - **Project:** WebCodex
 - **Default managed project id:** `agent:oe:private-drop`
 - **Repository path:** `/root/git/private-drop` (deployment location may vary)
-- Inspect `git status` and `git log` before editing; do not assume `main`.
-- Do not infer repository identity from the directory name alone; confirm the
-  project id and active repository when needed.
-- Do not modify unrelated projects, repos, or worktrees outside the requested
-  task scope.
+- Confirm the resolved project, active repository, branch, worktree state, and
+  recent commits before changing files.
+- Do not modify unrelated repositories, worktrees, hosts, or deployment targets.
 
 ---
 
-## 2. Safety Rules
+## 2. Operating Model
 
-| Rule | Enforcement |
-|---|---|
-| No tag by default | Create git tags only under the Release Exception below |
-| No push by default | Push only under the Release Exception |
-| No npm publish by default | `npm publish` only under the Release Exception |
-| No GitHub Release by default | Create releases only under the Release Exception |
-| No deploy by default | Do not deploy or publish production artifacts unless explicitly requested under the Release Exception |
-| No history rewrite | No `rebase`, `filter-branch`, or `commit --amend` unless explicitly requested; no destructive resets on others' work |
-| No rebase/squash unless asked | Preserve merge topology |
-| No secrets | Skip `.env`, `.env.*`, credential files, and any file containing tokens |
-| No credential output | Never echo, log, or include tokens/secrets in output |
-| No release-doc edits unless asked | Leave release checklists, changelogs, version docs, packaging/release files untouched unless the task is explicitly about them |
-| No approval bypass | Do not skip, weaken, or circumvent human approval, release gates, guard checks, or policy enforcement to "make progress" |
+This repository uses a **trusted-agent** workflow.
 
-These defaults apply to every ordinary task. User prompts need not restate them.
-When a user prompt conflicts with this file, **the stricter, safer constraint
-wins**.
+- Platform, system, and user instructions define the authorization boundary.
+  Do not create a second approval system inside the coding workflow.
+- Once the user assigns a task, autonomously perform the inspection, edits,
+  shell commands, tests, builds, local service operations, Git operations, and
+  recovery steps reasonably required to complete it.
+- Use project tools as a reliable execution and evidence layer, not as a
+  substitute for contextual engineering judgment.
+- Tool verdicts are facts or signals. The Agent owns the final task conclusion.
+- Do not interrupt merely because the worktree is dirty, a generic shell/job
+  tool was used, output was truncated, a retry was needed, or a previous attempt
+  failed and was later corrected.
+- Ask the user only when a required credential or external target is missing,
+  the requested outcome is materially ambiguous, instructions conflict, or
+  unknown overlapping work may be destroyed.
+- For a large task, form and update a plan while continuing execution. Do not
+  stop solely because the task spans many files or subsystems.
 
-### Release Exception (compressed)
-
-Release operations (tag, push, npm publish, GitHub Release, deploy) are allowed
-**only when all** of the following hold:
-
-1. The user **explicitly** requests that release action.
-2. The request names version, package, repository, and release target.
-3. Worktree is clean at release start (except release files created for the task).
-4. Remote tag / GitHub Release / npm version do not already exist.
-5. No force-push, tag overwrite, published-commit amend, or release replacement.
-6. Release gates run; stop on first failure; never print secrets.
-7. Post-tag manifest/checksum commits are reported and must not move the tag.
-
-**Who confirms:** the human requester of the named release task.
-**What to record:** targets, gates, outcomes, deferred checks.
-Detailed procedure: [`docs/agent/release-process.md`](docs/agent/release-process.md)
-and [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md).
+The target interaction is: the user gives an outcome, the Agent completes the
+work, validates it, and returns one evidence-based report.
 
 ---
 
-## 3. Editing Rules
+## 3. Hard Boundaries
 
-- **Inspect before edit:** read relevant code/docs and existing diffs first.
-- **Minimal change:** keep edits scoped to the requested task.
-- **Prefer structured edit tools** when available (`apply_text_edits` for
-  precise local edits, `apply_patch_checked` for multi-file patches,
-  `write_project_file` only for create/intentional full rewrite; line/pattern
-  tools remain compatibility paths).
-- **Do not** use shell `sed` / `perl` / `python` as the primary editing mechanism.
-- Shell is for **inspection, tests, and bounded diagnostics only**.
-- Do not weaken, delete, or skip critical assertions, security checks, schema
-  required fields, session guards, or consistency coverage **just to make tests
-  pass**. Fix product code or add honest tests; do not hollow out the suite.
-- Do not preserve obsolete compatibility layers by default; keep backward
-  compatibility only for a named external contract, release artifact, or
-  explicitly requested migration (see
-  [`docs/agent/architecture-decisions.md`](docs/agent/architecture-decisions.md)).
-- Necessary structural refactors that reduce coupling or clarify ownership are
-  allowed when in scope; do not mix silent behavior changes with mechanical
-  moves—report any semantic change.
+These are execution-correctness and privacy boundaries, not a second layer of
+product judgment.
 
-Test layout guidance (soft limits, domain folders):
-[`docs/agent/architecture-decisions.md`](docs/agent/architecture-decisions.md).
+- Never print, commit, or expose reusable credentials, authorization headers,
+  private keys, token values, or secret file contents.
+- Stay inside the resolved project and explicitly authorized deployment roots.
+- Inspect and preserve existing user work. Stop only when ownership is unclear,
+  changes overlap, or proceeding could lose work.
+- Do not silently overwrite concurrent file changes; use guarded or
+  transactional edits when available.
+- Do not weaken security checks, required schema fields, permission enforcement,
+  or meaningful tests merely to obtain a green result.
+- Do not bypass platform policy, valid session guards, or an explicit user
+  restriction.
+- Do not force-push, overwrite tags/releases, rewrite published history, or
+  destructively reset other work unless the user explicitly requests that exact
+  destructive operation and its target.
+- Redact sensitive command output. Prefer bounded summaries and retrieve full
+  logs only when needed for diagnosis.
 
-### Project-first refinement work
+---
 
-For broad Project-first refinement work, read
+## 4. Editing and Execution
+
+- Inspect relevant code, documentation, and existing diffs before editing.
+- Keep changes aligned with the requested outcome, but make all necessary
+  cross-cutting fixes rather than leaving knowingly inconsistent surfaces.
+- Choose the most effective execution path:
+  - use `apply_text_edits` for guarded transactional text changes;
+  - use `apply_patch_checked` for complex unified diffs;
+  - use `write_project_file` for creates or intentional full rewrites;
+  - use shell, scripts, or repository-native tools whenever they are the clearer
+    or more complete way to perform project work.
+- Shell is a first-class execution path. It may be used for inspection, editing,
+  tests, builds, package management, Git, service control, release work, and
+  diagnostics within the authorized task scope.
+- Specialized tools are preferred only when they improve transactional safety,
+  structured evidence, or efficiency. Their absence does not make an operation
+  invalid.
+- Do not preserve compatibility aliases, dual response shapes, or obsolete
+  paths for hypothetical consumers. Add compatibility only for a named current
+  contract or an explicitly requested migration.
+- Code-size reduction and legacy migration are not current iteration goals.
+  Perform them only when directly required by the task or when deletion is the
+  clearest fix for the behavior being changed.
+
+For current product direction, read
 [`docs/PROJECT_FIRST_REFINEMENT_PLAN.zh-CN.md`](docs/PROJECT_FIRST_REFINEMENT_PLAN.zh-CN.md)
-before editing. The historical `refactor/project-first-experience` branch has
-been merged into `main`; do not assume that branch is still the active base.
-
-- Record production/test LOC and largest files before and after the iteration.
-- A new abstraction must replace an existing responsibility; report the old
-  path deleted in the same iteration or explicitly reduce scope.
-- Do not expand the Hosted model surface beyond nine single-intent capabilities
-  without replay or acceptance evidence and an explicit design change.
-- New tests must protect a real contract, state transition, recovery invariant,
-  or observed failure class. Prefer table-driven/state-machine coverage and
-  delete tests that only served removed compatibility paths.
-- A large refactor is not complete without a deletion list, before/after
-  metrics, focused validation, and a precise remaining-risk handoff.
+and [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ---
 
-## 4. Git and Commit Rules
+## 5. Git, Commit, Release, and Deployment
 
-- Always check `git status` and recent `git log` before editing.
-- **Dirty workspace:** inspect existing changes and protect them. Continue only
-  when those changes are understood, unrelated to your task, and will not be
-  overwritten. **Stop only when ownership is unclear, changes overlap the
-  requested work, or existing work may be lost.** Do not require a globally
-  clean tree for ordinary development (release tasks have their own clean-tree
-  rule under Release Exception).
-- Create a local commit **only when explicitly requested**.
-- Commit message prefixes: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`.
-- Prefer small, incremental commits when commits are requested; separate pure
-  docs from behavior when practical.
-- If a single turn would need roughly **30+ distinct modification actions** or
-  span multiple subsystems, stop and present a plan first.
+- Check `git status` and recent `git log` before editing and before commit.
+- A dirty worktree is context, not automatic failure. Understand and preserve
+  it; ordinary development does not require a globally clean tree.
+- Create commits when the user requests a commit or when the assigned task
+  explicitly includes completing the repository change as a committed unit.
+- Commit prefixes: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`.
+- Prefer coherent commits. Do not split changes mechanically when one behavior
+  requires code, tests, and documentation together.
+- Push, tag, publish, create a GitHub Release, or deploy when the user's task
+  explicitly includes that action and identifies the target sufficiently to
+  execute safely.
+- Before an external release action, verify the actual repository, branch,
+  version/tag/package, remote target, relevant validation, and immutable-target
+  state. Never print credentials or move an existing published tag.
+- Report post-tag checksum/manifest commits without moving the tag.
+
+Expanded release mechanics:
+[`docs/agent/release-process.md`](docs/agent/release-process.md) and
+[`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md).
 
 ---
 
-## 5. Validation Rules
+## 6. Validation and Evidence
 
-- **Code changes must be validated** before claiming done. Prefer repository
-  structured checks (`cargo fmt`, `cargo check`, focused `cargo test`, and
-  domain tools) over ad-hoc scripts.
-- **Docs-only** changes: `git diff --check` and `git status --short` (and link
-  checks when relevant). Do not run the full Rust suite for pure docs unless
-  asked.
-- Report **current validation failures** distinctly from **historical ledger
-  failures** or pre-existing known failures; do not claim a green tree by
-  ignoring real new breakages, and do not "fix" history by deleting evidence
-  or weakening tests.
+The Agent chooses validation proportional to the change and owns the final
+interpretation.
 
-### Always (code changes)
+- Code changes require relevant validation before claiming completion.
+- Any successfully recorded execution path may provide validation evidence:
+  `cargo_*`, `run_shell`, `run_job`, repository scripts, or other native tools.
+- Prefer structured tools when they reduce parsing or preserve better evidence,
+  but never report `validation_not_run` solely because validation used shell or
+  a generic job path.
+- Record what ran, the resolved cwd/shell when relevant, exit status, detected
+  test/build summary, truncation, and skipped checks.
+- Distinguish current failures, historical failures, resolved retries, and
+  pre-existing failures. A later successful retry should mark the earlier
+  failure as resolved without deleting its evidence.
+- Dirty worktree, optional LSP unavailability, output truncation, or absence of
+  a full suite are advisory facts unless the current task makes them blocking.
+- Deterministic hard blockers are limited to facts such as permission denial,
+  unresolved conflict, command/test failure, sensitive-path risk, lost
+  execution state, or an explicitly required check not completed.
 
-```
+Typical Rust baseline, adjusted to the touched domain:
+
+```text
 cargo fmt --check
 cargo check --all-targets
+focused cargo test lanes
 git diff --check
 git status --short
 ```
 
-### Domain add-ons (run the lanes you touched)
+Run `cargo test --bin webcodex` for broad core changes, release/merge readiness,
+or when the Agent judges focused lanes insufficient. Do not run it mechanically
+for pure documentation changes.
 
-| Change domain | Minimum extra tests |
-|---|---|
-| Session / current-session / guard | `cargo test --bin webcodex session -- --nocapture` and `metadata` |
-| Runtime HTTP / REST | `runtime_http` and `openapi` |
-| MCP | `mcp` |
-| OpenAPI / registry / metadata | `openapi` and `metadata` |
-| Auth / OAuth / scope | `oauth`, `scope`, and `metadata` |
-
-### Full suite
-
-```
-cargo test --bin webcodex
-```
-
-Required only before merging to `main`, after broad core changes, or when
-explicitly requested. Existing ignored `import_http` tests may stay ignored
-unless the task targets them. Broader lanes:
-[`docs/TESTING.md`](docs/TESTING.md).
+Broader lanes: [`docs/TESTING.md`](docs/TESTING.md).
 
 ---
 
-## 6. Architecture Invariants
+## 7. Architecture Invariants
 
-### Runtime tool surface
+### Runtime and hosted surfaces
 
-Tool metadata, registry, OAuth scope policy, MCP `tools/list`, and OpenAPI
-`callRuntimeTool` names **must stay synchronized**. Adding or renaming a
-runtime tool requires updating parser/`KNOWN_TOOL_NAMES`, metadata, registry,
-OAuth policy, OpenAPI, MCP schema tests, and consistency tests in the same
-change.
+- Runtime tool metadata, registry, OAuth scope policy, MCP `tools/list`, and
+  OpenAPI names must stay synchronized when a tool is added or renamed.
+- The project-bound model surface remains the canonical minimal coding surface.
+  The full operator runtime is for administration and internal execution.
+- Do not add dedicated tools merely to predict every project situation. Prefer
+  general execution plus reliable evidence and Agent reasoning.
+- GPT Actions must stay below the 30-operation limit and must not expose legacy
+  `/api/codex`, token-management, or pairing endpoints.
 
-### OpenAPI / GPT Actions (must)
+### Sessions
 
-- Do **not** expose legacy `/api/codex` routes or agent token management /
-  pairing endpoints in GPT Action OpenAPI.
-- Stay below the **30-operation** GPT Actions limit; **verify via generation or
-  tests** — never hard-code a live operation count in this file.
-- Prefer flattened top-level Action fields; use `session_id` for tool business
-  input and `recording_session_id` for wrapper recorder metadata.
-- Do not loosen `additionalProperties` to hide missing flattened fields.
+- Workflow session IDs retain the `wc_sess_*` format.
+- Explicit `session_id` wins over current-session binding.
+- Unknown explicit IDs fail as `unknown_session_id`; never silently fall back.
+- Explicitly read-only sessions deny writes and shell/jobs.
+- Session denial occurs before mutation or agent enqueue and is recorded when
+  the session is valid.
+- Current-session bindings remain isolated by principal, transport, and project.
 
-Product detail (consequential labels, discovery, artifacts, smoke paths):
+### Compatibility
+
+- One canonical field per concept.
+- No alias/dual shape without a named migration.
+- No compatibility code for hypothetical consumers.
+
+Detailed architecture:
+[`docs/agent/architecture-decisions.md`](docs/agent/architecture-decisions.md),
+[`docs/agent/session-model.md`](docs/agent/session-model.md), and
 [`docs/agent/openapi-guidelines.md`](docs/agent/openapi-guidelines.md).
 
-### Session (must)
-
-- **Workflow session IDs** use the `wc_sess_*` form; do not change ID format,
-  ledger event schema, or lifecycle semantics without an explicit design task.
-- **Explicit `session_id` always wins** over current session.
-- **Unknown explicit `session_id`** → `unknown_session_id` (never silent
-  fallback to current session).
-- **`read_only` sessions** deny write-like and shell/job-like tools.
-- **Guard denial before** mutation or agent enqueue; record a failed session
-  event when the session id is valid.
-- `session_summary`'s required `session_id` is business input; do not replace it
-  with current session.
-- Current-session bindings are in-memory and isolated by principal, transport,
-  and resolved project.
-
-Architecture note — two different "session" concepts (workflow ledger vs
-HTTP action audit), responsibilities, and non-goals:
-[`docs/agent/session-model.md`](docs/agent/session-model.md) (detail) and
-[`docs/agent/architecture-decisions.md`](docs/agent/architecture-decisions.md)
-(summary).
-
-### Compatibility (must)
-
-- Do not retain compatibility fields for hypothetical consumers.
-- Do not emit both a canonical field and an alias for the same concept.
-- Do not add deprecated aliases / dual shapes without a named migration.
-- Background and examples:
-  [`docs/agent/architecture-decisions.md`](docs/agent/architecture-decisions.md).
-
-### OAuth bridge design (pointer only)
-
-v1 subject model, scope non-goals, and implementation order:
-[`docs/agent/oauth-bridge-plan.md`](docs/agent/oauth-bridge-plan.md) and
-[`docs/OAUTH2_BRIDGE_THREAT_MODEL.md`](docs/OAUTH2_BRIDGE_THREAT_MODEL.md).
-
 ---
 
-## 7. Security and Privacy Rules
+## 8. Final Agent Report
 
-- Do not read, copy, or commit secrets, tokens, private keys, or `.env` contents.
-- Do not print credentials, authorization headers, shared keys, or token hashes
-  that could be reused.
-- Stay inside the resolved project / allowed roots for the task; do not widen
-  access or register unrelated project paths without request.
-- Treat shell/job execution, raw writes, patches, delete/restore/discard, and
-  imports as **consequential**; do not bypass policy, session guards, or
-  approval flows.
-- Redact sensitive validation/tool output in reports; prefer structured
-  summaries over full stdout/stderr dumps.
+For code, documentation, operations, release, or deployment tasks, return one
+complete contextual report containing:
 
----
+- outcome and behavior changed;
+- files or external resources changed;
+- commands and validation performed;
+- validations passed, failed, skipped, or resolved by retry;
+- current worktree and commit state;
+- remaining risks or limitations;
+- whether commit, merge, push, release, or deployment is recommended or already
+  completed.
 
-## 8. Final Report Requirements
+Do not copy a tool's aggregate verdict as the task conclusion. Explain what the
+recorded facts mean for the user's requested outcome.
 
-### Development / code or docs change tasks
-
-Must report:
-
-- **Files changed** — modified / added / deleted paths
-- **Behavior changes** — runtime differences, if any
-- **Validation run** — commands and outcomes
-- **Full suite yes/no** — whether `cargo test --bin webcodex` was run
-- **Commit status** — commit hash if created; otherwise exactly:
-
-  ```
-  no commit created
-  ```
-
-- **Known limitations** — skipped checks, ignored tests, deferred work
-
-### Review-only or analysis tasks
-
-May use a shorter report (findings and recommendations). Full development
-fields are not required when no tree changes were made.
-
----
-
-## Design docs index
-
-| Doc | Contents |
-|---|---|
-| [`docs/agent/architecture-decisions.md`](docs/agent/architecture-decisions.md) | Session dual model, API evolution, test layout, validation evidence |
-| [`docs/PROJECT_FIRST_REFINEMENT_PLAN.zh-CN.md`](docs/PROJECT_FIRST_REFINEMENT_PLAN.zh-CN.md) | Current Project-first execution, simplification, LOC/test budgets, and merge gates |
-| [`docs/CODEX_EXECUTION_ENGINE_REFACTOR_PROMPT.zh-CN.md`](docs/CODEX_EXECUTION_ENGINE_REFACTOR_PROMPT.zh-CN.md) | Ready-to-run Codex goal for the next Execution Engine vertical slice |
-| [`docs/agent/oauth-bridge-plan.md`](docs/agent/oauth-bridge-plan.md) | Shared-key OAuth bridge decisions and phase order |
-| [`docs/agent/openapi-guidelines.md`](docs/agent/openapi-guidelines.md) | GPT Action / OpenAPI product rules |
-| [`docs/agent/release-process.md`](docs/agent/release-process.md) | Expanded release exception procedure |
+For review-only tasks, report findings, evidence, and recommendations without
+inventing changes or validation.
