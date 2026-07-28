@@ -103,6 +103,8 @@ pub const SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV: &str = "structured
 /// older agents and defaults to `false` so the server never dispatches typed
 /// LSP requests to agents that cannot handle them.
 pub const SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION: &str = "lsp_read_only_navigation";
+/// Linux Landlock ABI v3 inspect-command write sandbox.
+pub const SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS: &str = "sandbox_inspect_commands";
 #[cfg(test)]
 pub const SHELL_CLIENT_CAPABILITY_NAMES: &[&str] = &[
     SHELL_CLIENT_CAPABILITY_SHELL,
@@ -114,6 +116,7 @@ pub const SHELL_CLIENT_CAPABILITY_NAMES: &[&str] = &[
     SHELL_CLIENT_CAPABILITY_ASYNC_SHELL_JOBS,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV,
     SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
+    SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,11 +143,10 @@ pub struct ShellClientCapabilities {
     /// false for wire compatibility with older agents.
     #[serde(default)]
     pub lsp_read_only_navigation: bool,
-    /// Reserved wire capability for a future kernel command sandbox. Current
-    /// agents always advertise false and the server keeps commands_run disabled
-    /// for every read_only task; the field remains only for wire compatibility.
+    /// The runner can fail-closed enforce the Linux Landlock ABI v3 write
+    /// sandbox used by inspect commands.
     #[serde(default)]
-    pub sandbox_read_only_commands: bool,
+    pub sandbox_inspect_commands: bool,
 }
 
 /// Bounded, non-secret status for the agent's active configuration generation.
@@ -183,7 +185,7 @@ impl Default for ShellClientCapabilities {
             async_shell_jobs: false,
             structured_validation_argv: false,
             lsp_read_only_navigation: false,
-            sandbox_read_only_commands: false,
+            sandbox_inspect_commands: false,
         }
     }
 }
@@ -605,9 +607,8 @@ pub struct ShellAgentShellRequest {
     /// Defaults to `None` so older request bodies continue to deserialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lsp: Option<crate::lsp_bridge::AgentLspPayload>,
-    /// Reserved kernel sandbox mode for a future request ("read_only"). The
-    /// current server never sets it, but agents still fail closed if a request
-    /// arrives: unsupported, partial, or unknown modes must not run unconfined.
+    /// Optional kernel sandbox mode (`"inspect"`). Agents fail closed for
+    /// unsupported, partial, or unknown modes and never run them unconfined.
     /// Absent on the wire when unset so older agents continue to deserialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<String>,
@@ -1287,7 +1288,7 @@ mod envelope_tests {
                 async_shell_jobs: true,
                 structured_validation_argv: true,
                 lsp_read_only_navigation: false,
-                sandbox_read_only_commands: false,
+                sandbox_inspect_commands: false,
             }),
             projects: None,
             agent_protocol_version: Some(AGENT_PROTOCOL_VERSION_WEBSOCKET_V1.to_string()),

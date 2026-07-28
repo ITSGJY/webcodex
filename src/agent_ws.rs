@@ -479,7 +479,7 @@ mod tests {
                     async_shell_jobs: true,
                     structured_validation_argv: true,
                     lsp_read_only_navigation: false,
-                    sandbox_read_only_commands: false,
+                    sandbox_inspect_commands: false,
                 }),
                 projects: None,
                 agent_protocol_version: Some(

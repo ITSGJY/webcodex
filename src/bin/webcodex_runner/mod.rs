@@ -47,10 +47,12 @@ pub(crate) use projects::{
 pub(crate) use projects::{handle_project_op, AgentProjectCache};
 #[cfg(test)]
 pub(crate) use shell::run_shell;
+#[cfg(test)]
+pub(crate) use shell::run_shell_with_profiles;
 pub(crate) use shell::{
     configured_prepared_shell_job_command, configured_shell_job_command,
     configured_validation_job_command, cwd_allowed, resolve_prepared_shell_profile,
-    run_shell_with_profiles, PreparedShellProfile, PreparedShellProfileCache,
+    run_shell_with_profiles_in_sandbox, PreparedShellProfile, PreparedShellProfileCache,
 };
 #[cfg(test)]
 pub(crate) use transport::{

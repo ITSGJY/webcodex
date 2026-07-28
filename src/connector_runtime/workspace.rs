@@ -151,7 +151,7 @@ impl WorkspaceManager {
         context: &ConnectorContext,
         task_id: &str,
         run_id: &str,
-        read_only: bool,
+        non_writable: bool,
     ) -> Result<PreparedWorkspace, String> {
         let (client_id, _) = parse_agent_executor_ref(&context.executor_project)?;
         let baseline_commit = git_text(
@@ -166,7 +166,7 @@ impl WorkspaceManager {
             )
             .ok()
         });
-        if read_only {
+        if non_writable {
             let (project_overview, git_dirty, git_conflict_count) =
                 project_brief_evidence(Path::new(&context.executor_root));
             return Ok(PreparedWorkspace {
@@ -273,7 +273,9 @@ impl WorkspaceManager {
                 patch_sha256: None,
                 patch_bytes: 0,
                 changed_paths: Vec::new(),
-                warnings: vec!["read_only task has no isolated writable result patch".to_string()],
+                warnings: vec![
+                    "non-writable task has no isolated writable result patch".to_string()
+                ],
             });
         }
         let execution_root = Path::new(&task.execution_root);

@@ -5,7 +5,7 @@ use super::common::object_schema;
 pub(crate) fn session_mode_schema(description: &str) -> Value {
     json!({
         "type": "string",
-        "enum": ["normal", "read_only"],
+        "enum": ["normal", "inspect", "read_only"],
         "description": description,
     })
 }
@@ -267,7 +267,7 @@ pub(crate) fn start_session_input_schema() -> Value {
                 "type": "string",
                 "description": "Optional human-readable task title."
             },
-            "mode": session_mode_schema("Optional session mode. Defaults to normal. read_only automatically blocks write-like and shell/job-like tools."),
+            "mode": session_mode_schema("Optional session mode. Defaults to normal. inspect blocks structured write tools and runs shell/job-like tools in the Linux Landlock inspect sandbox; read_only blocks both write-like and shell/job-like tools."),
             "deny_write_tools": {
                 "type": "boolean",
                 "description": "Optional task guard. When true, write-like tools such as apply_patch, write_project_file, replace_line_range, insert_at_line, and delete_line_range are blocked before execution."

@@ -298,15 +298,16 @@ impl Database {
                     "normal tasks require an isolated execution root and Git baseline".to_string(),
                 ));
             }
-            "read_only" if task.isolated || task.execution_root != task.target_root => {
+            "inspect" | "read_only" if task.isolated || task.execution_root != task.target_root => {
                 return Err(ConnectorTaskStoreError::InvalidState(
-                    "read_only tasks must use the target workspace without isolation".to_string(),
+                    "inspect and read_only tasks must use the target workspace without isolation"
+                        .to_string(),
                 ));
             }
-            "normal" | "read_only" => {}
+            "normal" | "inspect" | "read_only" => {}
             _ => {
                 return Err(ConnectorTaskStoreError::InvalidState(
-                    "task mode must be normal or read_only".to_string(),
+                    "task mode must be normal, inspect, or read_only".to_string(),
                 ))
             }
         }
@@ -2108,6 +2109,41 @@ mod tests {
             events.iter().map(|e| e.sequence).collect::<Vec<_>>(),
             vec![1, 2]
         );
+    }
+
+    #[test]
+    fn inspect_task_is_persisted_without_an_isolated_workspace() {
+        let (_temp, db) = database();
+        bind(&db, "user:one");
+        let task_id = new_id("wc_task");
+        let run_id = new_id("wc_run");
+        let task = db
+            .start_connector_task(NewConnectorTask {
+                task_id: &task_id,
+                run_id: &run_id,
+                project_id: "wc_proj_demo",
+                workspace_id: "wc_ws_demo",
+                subject_id: "user:one",
+                goal: "inspect the parser",
+                mode: "inspect",
+                target_executor_ref: "agent:hosted:demo",
+                execution_executor_ref: "agent:hosted:demo",
+                target_root: "/workspace/demo",
+                execution_root: "/workspace/demo",
+                baseline_commit: None,
+                baseline_tree: None,
+                isolated: false,
+                now: 101,
+            })
+            .unwrap();
+
+        assert_eq!(task.mode, "inspect");
+        let restored = db
+            .connector_task(&task.task_id, "wc_proj_demo", "user:one")
+            .unwrap();
+        assert_eq!(restored.mode, "inspect");
+        assert!(!restored.isolated);
+        assert_eq!(restored.execution_root, restored.target_root);
     }
 
     #[test]

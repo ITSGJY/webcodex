@@ -82,8 +82,9 @@ These are also summarized in `AGENTS.md` §6:
 2. **Explicit wins:** An explicit `session_id` always wins over current session.
 3. **Unknown rejects:** Unknown explicit `session_id` → `unknown_session_id`.
    Never silently fall back to current session.
-4. **Read-only mode:** `read_only` sessions deny write-like and shell/job-like
-   tools.
+4. **Mode guards:** `inspect` denies structured write-like tools and permits
+   shell/job-like tools only through the fail-closed Landlock inspect sandbox;
+   `read_only` denies both write-like and shell/job-like tools.
 5. **Guards first:** Guard denial happens before mutation or agent enqueue;
    record a failed session event when the session id is valid.
 6. **Business vs recorder:** `session_summary` (and similar) required
@@ -238,7 +239,7 @@ renamed without an explicit compatibility migration:
 - Audit session records (`session_id`, `status`, counters, timestamps, …)
 - Audit event views and stats aggregates
 - Workflow tool fields: `session_id`, `recording_session_id`, session mode
-  values such as `normal` / `read_only`
+  values such as `normal` / `inspect` / `read_only`
 - Error kinds such as `unknown_session_id`
 
 ### OpenAPI / MCP / runtime tool surface

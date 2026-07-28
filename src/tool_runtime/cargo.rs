@@ -112,12 +112,25 @@ fn looks_like_command_infrastructure_failure(stderr: &str) -> bool {
 }
 
 impl ToolRuntime {
+    #[cfg(test)]
     pub(crate) async fn cargo_fmt(
         &self,
         project: String,
         cwd: Option<String>,
         check: Option<bool>,
         timeout_secs: Option<u64>,
+    ) -> ToolResult {
+        self.cargo_fmt_in_sandbox(project, cwd, check, timeout_secs, None)
+            .await
+    }
+
+    pub(crate) async fn cargo_fmt_in_sandbox(
+        &self,
+        project: String,
+        cwd: Option<String>,
+        check: Option<bool>,
+        timeout_secs: Option<u64>,
+        sandbox: Option<&str>,
     ) -> ToolResult {
         let timeout = match resolve_sync_timeout_secs(timeout_secs, DEFAULT_CARGO_TIMEOUT_SECS) {
             Ok(timeout) => timeout,
@@ -142,10 +155,11 @@ impl ToolRuntime {
                 ..ValidationCommandOptions::default()
             })
             .expect("cargo_fmt command builder is infallible");
-        self.run_cargo_command(project, cwd, command, timeout, adapter)
+        self.run_cargo_command(project, cwd, command, timeout, adapter, sandbox)
             .await
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn cargo_check(
         &self,
@@ -157,6 +171,33 @@ impl ToolRuntime {
         features: Option<String>,
         package: Option<String>,
         timeout_secs: Option<u64>,
+    ) -> ToolResult {
+        self.cargo_check_in_sandbox(
+            project,
+            cwd,
+            all_targets,
+            all_features,
+            no_default_features,
+            features,
+            package,
+            timeout_secs,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn cargo_check_in_sandbox(
+        &self,
+        project: String,
+        cwd: Option<String>,
+        all_targets: Option<bool>,
+        all_features: Option<bool>,
+        no_default_features: Option<bool>,
+        features: Option<String>,
+        package: Option<String>,
+        timeout_secs: Option<u64>,
+        sandbox: Option<&str>,
     ) -> ToolResult {
         let timeout = match resolve_sync_timeout_secs(timeout_secs, DEFAULT_CARGO_TIMEOUT_SECS) {
             Ok(timeout) => timeout,
@@ -191,10 +232,11 @@ impl ToolRuntime {
                 ))
             }
         };
-        self.run_cargo_command(project, cwd, command, timeout, adapter)
+        self.run_cargo_command(project, cwd, command, timeout, adapter, sandbox)
             .await
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn cargo_test(
         &self,
@@ -208,6 +250,37 @@ impl ToolRuntime {
         package: Option<String>,
         no_run: Option<bool>,
         timeout_secs: Option<u64>,
+    ) -> ToolResult {
+        self.cargo_test_in_sandbox(
+            project,
+            cwd,
+            filter,
+            all_targets,
+            all_features,
+            no_default_features,
+            features,
+            package,
+            no_run,
+            timeout_secs,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn cargo_test_in_sandbox(
+        &self,
+        project: String,
+        cwd: Option<String>,
+        filter: Option<String>,
+        all_targets: Option<bool>,
+        all_features: Option<bool>,
+        no_default_features: Option<bool>,
+        features: Option<String>,
+        package: Option<String>,
+        no_run: Option<bool>,
+        timeout_secs: Option<u64>,
+        sandbox: Option<&str>,
     ) -> ToolResult {
         let timeout = match resolve_sync_timeout_secs(timeout_secs, DEFAULT_CARGO_TIMEOUT_SECS) {
             Ok(timeout) => timeout,
@@ -244,7 +317,7 @@ impl ToolRuntime {
                 ))
             }
         };
-        self.run_cargo_command(project, cwd, command, timeout, adapter)
+        self.run_cargo_command(project, cwd, command, timeout, adapter, sandbox)
             .await
     }
 
@@ -255,9 +328,16 @@ impl ToolRuntime {
         command: String,
         timeout_secs: u64,
         adapter: &'static dyn ValidationAdapter,
+        sandbox: Option<&str>,
     ) -> ToolResult {
         let output = match self
-            .run_project_command_capture(&project, command.clone(), timeout_secs, cwd.clone())
+            .run_project_command_capture_with_sandbox(
+                &project,
+                command.clone(),
+                timeout_secs,
+                cwd.clone(),
+                sandbox,
+            )
             .await
         {
             Ok(output) => output,

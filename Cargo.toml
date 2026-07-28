@@ -44,8 +44,8 @@ webpki-roots = "0.26"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# Kernel command sandbox for read_only tasks: governs write access classes
-# only, so no read-path enumeration is ever needed. Linux >= 5.13.
+# Linux Landlock ABI v3 write sandbox for inspect commands. Reads, network,
+# inherited environment, and external services remain deliberately unrestricted.
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 

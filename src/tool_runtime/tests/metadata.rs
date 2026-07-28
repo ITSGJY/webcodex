@@ -113,7 +113,7 @@ async fn register_agent_projects_for_auth(
                     async_shell_jobs: true,
                     structured_validation_argv: true,
                     lsp_read_only_navigation: false,
-                    sandbox_read_only_commands: false,
+                    sandbox_inspect_commands: false,
                 }),
                 projects: Some(vec![registered_project(
                     project_id,
@@ -2258,10 +2258,7 @@ async fn runtime_status_counts_local_jobs() {
     .unwrap();
     runtime.local_jobs.lock().await.insert(
         "job-active".to_string(),
-        LocalJobRecord {
-            project: "demo".to_string(),
-            dir: job_dir,
-        },
+        LocalJobRecord::new("demo".to_string(), job_dir),
     );
     // Also write a completed job to verify it's not counted as active.
     let done_dir = root.join(".codex/jobs/job-done");
@@ -2285,10 +2282,7 @@ async fn runtime_status_counts_local_jobs() {
     .unwrap();
     runtime.local_jobs.lock().await.insert(
         "job-done".to_string(),
-        LocalJobRecord {
-            project: "demo".to_string(),
-            dir: done_dir,
-        },
+        LocalJobRecord::new("demo".to_string(), done_dir),
     );
 
     let result = runtime.dispatch(runtime_status_call()).await;

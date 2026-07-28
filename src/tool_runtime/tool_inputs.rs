@@ -100,6 +100,7 @@ pub(crate) fn is_checkpoint_validation_status(value: &str) -> bool {
 #[serde(rename_all = "snake_case")]
 pub enum SessionMode {
     Normal,
+    Inspect,
     ReadOnly,
 }
 
@@ -113,6 +114,7 @@ impl SessionMode {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Normal => "normal",
+            Self::Inspect => "inspect",
             Self::ReadOnly => "read_only",
         }
     }

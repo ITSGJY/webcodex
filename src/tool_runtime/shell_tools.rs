@@ -3,7 +3,11 @@
 use super::{ToolCall, ToolResult, ToolRuntime};
 
 impl ToolRuntime {
-    pub(crate) async fn dispatch_shell_tool(&self, call: ToolCall) -> ToolResult {
+    pub(crate) async fn dispatch_shell_tool(
+        &self,
+        call: ToolCall,
+        sandbox: Option<&str>,
+    ) -> ToolResult {
         match call {
             ToolCall::RunShell {
                 project,
@@ -14,8 +18,16 @@ impl ToolRuntime {
                 purpose,
                 shell,
             } => {
-                self.run_shell_with_contract(project, command, timeout_secs, cwd, purpose, shell)
-                    .await
+                self.run_shell_with_contract_in_sandbox(
+                    project,
+                    command,
+                    timeout_secs,
+                    cwd,
+                    purpose,
+                    shell,
+                    sandbox,
+                )
+                .await
             }
             _ => unreachable!("non-shell tool routed to shell dispatcher"),
         }

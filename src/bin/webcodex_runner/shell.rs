@@ -837,9 +837,11 @@ pub(crate) fn run_shell(
         stdin,
         timeout_secs,
         stop_requested,
+        None,
     )
 }
 
+#[cfg(test)]
 pub(crate) fn run_shell_with_profiles(
     generation: u64,
     policy: &AgentPolicy,
@@ -852,6 +854,35 @@ pub(crate) fn run_shell_with_profiles(
     timeout_secs: u64,
     stop_requested: Option<&AtomicBool>,
 ) -> CommandResult {
+    run_shell_with_profiles_in_sandbox(
+        generation,
+        policy,
+        shell,
+        projects_dir,
+        cache,
+        cwd,
+        command,
+        stdin,
+        timeout_secs,
+        stop_requested,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_shell_with_profiles_in_sandbox(
+    generation: u64,
+    policy: &AgentPolicy,
+    shell: &ShellConfig,
+    projects_dir: &Path,
+    cache: &PreparedShellProfileCache,
+    cwd: Option<&str>,
+    command: &str,
+    stdin: Option<&str>,
+    timeout_secs: u64,
+    stop_requested: Option<&AtomicBool>,
+    sandbox: Option<&str>,
+) -> CommandResult {
     run_shell_impl(
         policy,
         shell,
@@ -861,6 +892,7 @@ pub(crate) fn run_shell_with_profiles(
         stdin,
         timeout_secs,
         stop_requested,
+        sandbox,
     )
 }
 
@@ -873,6 +905,7 @@ fn run_shell_impl(
     stdin: Option<&str>,
     timeout_secs: u64,
     stop_requested: Option<&AtomicBool>,
+    sandbox: Option<&str>,
 ) -> CommandResult {
     if !policy.allow_raw_shell {
         return CommandResult {
@@ -897,8 +930,37 @@ fn run_shell_impl(
     }
     let timeout_secs = timeout_secs.min(policy.max_timeout_secs).max(1);
     let start = Instant::now();
+    let inspect_scratch = match sandbox {
+        None => None,
+        Some(crate::command_sandbox::INSPECT_SANDBOX_MODE) => {
+            match crate::command_sandbox::InspectScratch::create() {
+                Ok(scratch) => Some(scratch),
+                Err(error) => {
+                    return CommandResult {
+                        exit_code: None,
+                        stdout: None,
+                        stderr: None,
+                        duration_ms: Some(start.elapsed().as_millis() as u64),
+                        error: Some(format!("inspect sandbox unavailable: {error}")),
+                    }
+                }
+            }
+        }
+        Some(other) => {
+            return CommandResult {
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+                duration_ms: Some(start.elapsed().as_millis() as u64),
+                error: Some(format!("unknown sandbox mode '{other}'")),
+            }
+        }
+    };
     let mut prepared_profile_name = None;
-    let mut cmd = match profiles {
+    // Preparing a profile executes its init script. In inspect mode that
+    // preparation must not happen outside Landlock, so use the base configured
+    // shell and run its optional init script as part of the sandboxed command.
+    let mut cmd = match profiles.filter(|_| inspect_scratch.is_none()) {
         Some((generation, projects_dir, cache)) => {
             match resolve_prepared_shell_profile(
                 generation,
@@ -967,6 +1029,17 @@ fn run_shell_impl(
         .stderr(Stdio::piped());
     if stdin.is_some() {
         cmd.stdin(Stdio::piped());
+    }
+    if let Some(scratch) = inspect_scratch.as_ref() {
+        if let Err(error) = crate::command_sandbox::sandbox_command_inspect(&mut cmd, scratch) {
+            return CommandResult {
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+                duration_ms: Some(start.elapsed().as_millis() as u64),
+                error: Some(format!("inspect sandbox unavailable: {error}")),
+            };
+        }
     }
     let spawn = cmd.spawn();
     let mut child = match spawn {

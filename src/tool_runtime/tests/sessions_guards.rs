@@ -526,6 +526,202 @@ async fn start_session_read_only_enables_write_and_shell_guards() {
 }
 
 #[tokio::test]
+async fn start_session_inspect_enables_write_guard_but_keeps_shell_enabled() {
+    let runtime = test_runtime();
+    let result = runtime
+        .dispatch(
+            ToolCall::from_tool_name(
+                "start_session",
+                json!({
+                    "mode": "inspect",
+                    "deny_write_tools": false,
+                    "deny_shell_tools": true
+                }),
+            )
+            .unwrap(),
+        )
+        .await;
+
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["mode"], "inspect");
+    assert_eq!(result.output["guards"]["deny_write_tools"], true);
+    assert_eq!(result.output["guards"]["deny_shell_tools"], false);
+    let session_id = result.output["session_id"].as_str().unwrap();
+    let summary = runtime.sessions.summary(session_id, None).unwrap();
+    assert_eq!(summary.mode, SessionMode::Inspect);
+    assert!(summary.guards.deny_write_tools);
+    assert!(!summary.guards.deny_shell_tools);
+}
+
+#[tokio::test]
+async fn inspect_session_blocks_structured_write_and_landlocks_run_shell() {
+    let runtime = runtime_with_agent_project("guard-inspect");
+    register_agent(
+        &runtime,
+        "guard-inspect",
+        None,
+        ShellClientCapabilities {
+            shell: true,
+            file_write: true,
+            sandbox_inspect_commands: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id("guard-inspect");
+    let session = runtime.sessions.start_session_with_guards(
+        Some(project.clone()),
+        Some("inspect".to_string()),
+        SessionMode::Inspect,
+        sessions::SessionGuards::default(),
+    );
+    let bootstrap = auth_context(None, true);
+
+    let denied = runtime
+        .dispatch_with_auth(
+            ToolCall::WriteProjectFile {
+                project: project.clone(),
+                path: "blocked.txt".to_string(),
+                content: "nope".to_string(),
+                session_id: Some(session.session_id.clone()),
+                overwrite: None,
+                expected_sha256: None,
+                expected_content_prefix: None,
+            },
+            Some(&bootstrap),
+        )
+        .await;
+    assert!(!denied.success);
+    assert_eq!(denied.output["guard"], "deny_write_tools");
+    assert_eq!(denied.output["mode"], "inspect");
+
+    let shell_task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        let session_id = session.session_id.clone();
+        async move {
+            let bootstrap = auth_context(None, true);
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::RunShell {
+                        project,
+                        command: "rg inspect .".to_string(),
+                        session_id: Some(session_id),
+                        timeout_secs: Some(30),
+                        cwd: None,
+                        purpose: None,
+                        shell: None,
+                    },
+                    Some(&bootstrap),
+                )
+                .await
+        }
+    });
+    let request = next_patch_agent_request(&runtime, "guard-inspect")
+        .await
+        .expect("inspect run_shell should be enqueued");
+    assert_eq!(
+        request.sandbox.as_deref(),
+        Some(crate::command_sandbox::INSPECT_SANDBOX_MODE)
+    );
+    complete_patch_agent_request(&runtime, "guard-inspect", &request.request_id, 0, "", "").await;
+    assert!(shell_task.await.unwrap().success);
+}
+
+#[tokio::test]
+async fn inspect_session_landlocks_cargo_and_async_job_entry_points() {
+    let runtime = runtime_with_agent_project("guard-inspect-all-shell");
+    register_agent(
+        &runtime,
+        "guard-inspect-all-shell",
+        None,
+        ShellClientCapabilities {
+            shell: true,
+            jobs: true,
+            async_jobs: true,
+            async_shell_jobs: true,
+            sandbox_inspect_commands: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id("guard-inspect-all-shell");
+    let session = runtime.sessions.start_session_with_guards(
+        Some(project.clone()),
+        Some("inspect all shell".to_string()),
+        SessionMode::Inspect,
+        sessions::SessionGuards::default(),
+    );
+
+    let cargo_task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        let session_id = session.session_id.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::CargoCheck {
+                        project,
+                        session_id: Some(session_id),
+                        cwd: None,
+                        all_targets: None,
+                        all_features: None,
+                        no_default_features: None,
+                        features: None,
+                        package: None,
+                        timeout_secs: Some(30),
+                    },
+                    Some(&auth_context(None, true)),
+                )
+                .await
+        }
+    });
+    let cargo_request =
+        next_agent_request_for_instance(&runtime, "guard-inspect-all-shell", "inst")
+            .await
+            .expect("inspect cargo_check should enqueue");
+    assert_eq!(cargo_request.kind, "run_shell");
+    assert_eq!(
+        cargo_request.sandbox.as_deref(),
+        Some(crate::command_sandbox::INSPECT_SANDBOX_MODE)
+    );
+    complete_patch_agent_request(
+        &runtime,
+        "guard-inspect-all-shell",
+        &cargo_request.request_id,
+        0,
+        "",
+        "",
+    )
+    .await;
+    assert!(cargo_task.await.unwrap().success);
+
+    let job = runtime
+        .dispatch_with_auth(
+            ToolCall::RunJob {
+                project,
+                command: "cargo test".to_string(),
+                session_id: Some(session.session_id),
+                timeout_secs: Some(30),
+                cwd: None,
+                purpose: None,
+                shell: None,
+            },
+            Some(&auth_context(None, true)),
+        )
+        .await;
+    assert!(job.success, "{:?}", job.error);
+    let job_request = next_agent_request_for_instance(&runtime, "guard-inspect-all-shell", "inst")
+        .await
+        .expect("inspect run_job should enqueue");
+    assert_eq!(job_request.kind, "start_job");
+    assert_eq!(
+        job_request.sandbox.as_deref(),
+        Some(crate::command_sandbox::INSPECT_SANDBOX_MODE)
+    );
+}
+
+#[tokio::test]
 async fn read_only_session_allows_read_file_and_records_success() {
     let runtime = runtime_with_agent_project("guard-read");
     register_agent(
@@ -1047,7 +1243,7 @@ fn project_tool_schemas_include_optional_session_id() {
     let start_session = spec_named(&specs, "start_session");
     assert_eq!(
         start_session.input_schema["properties"]["mode"]["enum"],
-        json!(["normal", "read_only"])
+        json!(["normal", "inspect", "read_only"])
     );
     assert!(start_session.input_schema["properties"]
         .get("deny_write_tools")

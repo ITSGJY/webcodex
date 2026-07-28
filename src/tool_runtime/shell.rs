@@ -4,10 +4,10 @@ use std::time::Duration;
 use super::helpers::{
     bounded_tail, command_failed_message, command_rejected_message, command_timeout_message,
     looks_like_command_timeout, project_relative_agent_cwd, project_relative_cwd,
-    resolve_agent_cwd, resolve_local_cwd, resolve_sync_timeout_secs, run_command_sync_bounded,
-    run_command_sync_bounded_with_shell, shell_escape_simple, sync_timeout_out_of_range_result,
-    LocalRunFailure, COMMAND_STDIO_TAIL_CHARS, DEFAULT_RUN_SHELL_TIMEOUT_SECS,
-    MAX_SYNC_TIMEOUT_SECS, MIN_SYNC_TIMEOUT_SECS,
+    resolve_agent_cwd, resolve_local_cwd, resolve_sync_timeout_secs,
+    run_command_sync_bounded_with_shell_and_sandbox, shell_escape_simple,
+    sync_timeout_out_of_range_result, LocalRunFailure, COMMAND_STDIO_TAIL_CHARS,
+    DEFAULT_RUN_SHELL_TIMEOUT_SECS, MAX_SYNC_TIMEOUT_SECS, MIN_SYNC_TIMEOUT_SECS,
 };
 use super::tool_result::ToolResult;
 use super::{ExecutionPurpose, ExecutionShell, ToolRuntime};
@@ -135,6 +135,18 @@ impl ToolRuntime {
         timeout_secs: u64,
         cwd: Option<String>,
     ) -> Result<ProjectCommandOutput, String> {
+        self.run_project_command_capture_with_sandbox(project, command, timeout_secs, cwd, None)
+            .await
+    }
+
+    pub(crate) async fn run_project_command_capture_with_sandbox(
+        &self,
+        project: &str,
+        command: String,
+        timeout_secs: u64,
+        cwd: Option<String>,
+        sandbox: Option<&str>,
+    ) -> Result<ProjectCommandOutput, String> {
         let proj = self.resolve_project(project).await?;
         // Shared root of the sync agent-wait contract: wait_timeout_secs and
         // command timeout must both stay within 1..=120 before enqueue so
@@ -152,7 +164,7 @@ impl ToolRuntime {
             let wait_timeout = timeout;
             let (request_id, rx) = self
                 .shell_clients
-                .enqueue_run(
+                .enqueue_run_with_sandbox(
                     ShellRunRequest {
                         client_id,
                         cwd: effective_cwd,
@@ -162,6 +174,7 @@ impl ToolRuntime {
                         wait_timeout_secs: wait_timeout,
                     },
                     "tool_runtime".to_string(),
+                    sandbox.map(str::to_string),
                 )
                 .await?;
             match tokio::time::timeout(Duration::from_secs(wait_timeout + 2), rx).await {
@@ -200,7 +213,13 @@ impl ToolRuntime {
             }
         } else {
             let cwd_path = resolve_local_cwd(&proj, cwd.as_deref())?;
-            let result = run_command_sync_bounded(command, cwd_path, timeout)
+            let result = run_command_sync_bounded_with_shell_and_sandbox(
+                command,
+                cwd_path,
+                timeout,
+                "sh".to_string(),
+                sandbox.map(str::to_string),
+            )
                 .await
                 .map_err(|failure| match failure {
                     LocalRunFailure::HardTimeout { bound_secs } => format!(
@@ -241,6 +260,29 @@ impl ToolRuntime {
         cwd: Option<String>,
         purpose: Option<ExecutionPurpose>,
         shell: Option<ExecutionShell>,
+    ) -> ToolResult {
+        self.run_shell_with_contract_in_sandbox(
+            project,
+            command,
+            timeout_secs,
+            cwd,
+            purpose,
+            shell,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_shell_with_contract_in_sandbox(
+        &self,
+        project: String,
+        command: String,
+        timeout_secs: Option<u64>,
+        cwd: Option<String>,
+        purpose: Option<ExecutionPurpose>,
+        shell: Option<ExecutionShell>,
+        sandbox: Option<&str>,
     ) -> ToolResult {
         let timeout = match resolve_sync_timeout_secs(timeout_secs, DEFAULT_RUN_SHELL_TIMEOUT_SECS)
         {
@@ -311,7 +353,7 @@ impl ToolRuntime {
             let wait_timeout = timeout;
             let (request_id, rx) = match self
                 .shell_clients
-                .enqueue_run(
+                .enqueue_run_with_sandbox(
                     ShellRunRequest {
                         client_id,
                         cwd: Some(effective_cwd),
@@ -321,6 +363,7 @@ impl ToolRuntime {
                         wait_timeout_secs: wait_timeout,
                     },
                     "tool_runtime".to_string(),
+                    sandbox.map(str::to_string),
                 )
                 .await
             {
@@ -417,11 +460,12 @@ impl ToolRuntime {
             let resolved_cwd =
                 project_relative_cwd(&proj, &cwd_path).unwrap_or_else(|_| ".".to_string());
             let actual_shell = shell.map(ExecutionShell::as_str).unwrap_or("sh");
-            let result = match run_command_sync_bounded_with_shell(
+            let result = match run_command_sync_bounded_with_shell_and_sandbox(
                 command,
                 cwd_path,
                 timeout,
                 actual_shell.to_string(),
+                sandbox.map(str::to_string),
             )
             .await
             {

@@ -62,7 +62,9 @@ The ToolRuntime is the protocol-independent execution layer. MCP, GPT Actions, a
 Common tool groups:
 
 - Discovery: `runtime_status`, `list_projects`, `list_agents`, `tool_manifest`.
-- Inspect: `list_project_files`, `search_project_text`, `read_file`, `git_status`, `git_diff_hunks`.
+- Inspect: `read_file`, then `run_shell` with `rg` or `git grep` for code
+  search, plus `git_status` / `git_diff_hunks` for worktree review.
+  `search_project_text` remains available as a compatibility path.
 - Edit: `apply_text_edits` (guarded transactional file changes), `apply_patch_checked` (complex checked unified diff), `write_project_file` (intentional full rewrite). Line/pattern tools remain compatibility paths.
 - Validate: `validate_patch`, `cargo_fmt`, `cargo_check`, `cargo_test`.
 - Review: `show_changes`, `workspace_hygiene_check`.
@@ -115,14 +117,19 @@ Review tools show what changed before the user accepts it. Use `show_changes` fo
 
 ### `run_shell` As Escape Hatch
 
-`run_shell` can run bounded project commands through the agent. It is useful for project-specific checks that do not have a structured helper yet.
+`run_shell` can run bounded project commands through the agent. It is the
+preferred code-search and inspection path with `rg` or `git grep`, and is also
+useful for project-specific checks that do not have a structured helper yet.
 
-It is not the default editing path, not the first validation choice, and not a way to bypass project policy. Treat shell/job tools as powerful operations that require trusted configuration and human review.
+It is not the default editing path and not a way to bypass project policy.
+Treat shell/job tools as powerful operations that require trusted
+configuration and human review.
 
 ## Default Coding Loop
 
 1. `start_coding_task`
-2. Inspect with `list_project_files`, `search_project_text`, and `read_file`.
+2. Inspect with `read_file` and `run_shell` using `rg` or `git grep`
+   (`search_project_text` remains compatible).
 3. Edit with structured edit or patch tools.
 4. Validate with structured validation tools.
 5. Review with `show_changes`, `git_diff_hunks`, and `workspace_hygiene_check`.

@@ -8,6 +8,7 @@ use crate::lsp_bridge::{AgentLspPayload, AGENT_LSP_REQUEST_KIND};
 use crate::shell_protocol::{
     ShellAgentShellRequest, ShellFileOpRequest, ShellRunRequest, ShellRunResponse,
     SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
+    SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS,
 };
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -175,6 +176,16 @@ impl ShellClientRegistry {
         body: ShellRunRequest,
         requested_by: String,
     ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+        self.enqueue_run_with_sandbox(body, requested_by, None)
+            .await
+    }
+
+    pub(crate) async fn enqueue_run_with_sandbox(
+        &self,
+        body: ShellRunRequest,
+        requested_by: String,
+        sandbox: Option<String>,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
         validate_run_request(&body)?;
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
@@ -202,9 +213,23 @@ impl ShellClientRegistry {
             created_at: now_ts(),
             validation: None,
             lsp: None,
-            sandbox: None,
+            sandbox: sandbox.clone(),
         };
         let mut inner = self.inner.lock().await;
+        if let Some(mode) = sandbox.as_deref() {
+            if mode != crate::command_sandbox::INSPECT_SANDBOX_MODE {
+                return Err(format!("unknown sandbox mode '{mode}'"));
+            }
+            let Some(client) = inner.clients.get(&body.client_id) else {
+                return Err(format!("unknown shell client: {}", body.client_id));
+            };
+            if !client.capabilities.sandbox_inspect_commands {
+                return Err(format!(
+                    "{}: agent client {} cannot enforce the inspect sandbox",
+                    SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS, body.client_id
+                ));
+            }
+        }
         enqueue_pending_request_locked(
             &mut inner,
             &body.client_id,

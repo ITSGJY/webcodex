@@ -14,7 +14,7 @@ pub(crate) fn start_coding_task_input_schema() -> Value {
                 "type": "string",
                 "description": "Optional human-readable task title for the created session."
             },
-            "mode": session_mode_schema("Optional session mode. Defaults to normal. read_only automatically blocks write-like and shell/job-like tools in the created session."),
+            "mode": session_mode_schema("Optional session mode. Defaults to normal. inspect blocks structured write tools and runs shell/job-like tools in the Linux Landlock inspect sandbox; read_only blocks both write-like and shell/job-like tools."),
             "deny_write_tools": {
                 "type": "boolean",
                 "description": "Optional task guard for the created session. Defaults to false unless mode=read_only."

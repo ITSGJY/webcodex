@@ -139,6 +139,58 @@ fn collect_job_updates(
     updates
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn inspect_job_manager_path_landlocks_commands_and_descendants() {
+    if crate::command_sandbox::inspect_sandbox_available().is_err() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let tracked = project.join("tracked.txt");
+    std::fs::write(&tracked, "original\n").unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let sink = AgentSink::WebSocket {
+        tx,
+        client_id: "inspect-agent".into(),
+        agent_instance_id: "inspect-instance".into(),
+    };
+    let manager = JobManager::new(1);
+    manager.enqueue(
+        sink,
+        1,
+        AgentPolicy {
+            allow_cwd_anywhere: true,
+            ..AgentPolicy::default()
+        },
+        ShellConfig::default(),
+        temp.path().join("projects.d"),
+        serde_json::from_value(json!({
+            "request_id": "inspect-job-request",
+            "client_id": "inspect-agent",
+            "kind": "start_job",
+            "job_id": "inspect-job",
+            "cwd": project,
+            "command": "set -eu; cat tracked.txt; printf ok > \"$TMPDIR/proof\"; test \"$(cat \"$TMPDIR/proof\")\" = ok; ! touch created.txt; ! truncate -s 0 tracked.txt; ! sh -c 'printf child > child.txt'",
+            "timeout_secs": 30,
+            "requested_by": "test",
+            "created_at": 1,
+            "sandbox": crate::command_sandbox::INSPECT_SANDBOX_MODE
+        }))
+        .unwrap(),
+    );
+
+    let updates = collect_job_updates(&mut rx, Duration::from_secs(30));
+    let final_update = updates.last().expect("inspect job should finish");
+    assert!(final_update.finished, "{final_update:?}");
+    assert_eq!(final_update.status, "completed", "{final_update:?}");
+    assert_eq!(final_update.exit_code, Some(0), "{final_update:?}");
+    assert_eq!(std::fs::read_to_string(&tracked).unwrap(), "original\n");
+    assert!(!project.join("created.txt").exists());
+    assert!(!project.join("child.txt").exists());
+}
+
 /// The outcome the executor emits when a step could not be spawned at all.
 ///
 /// This is a modeled result, not a bug — `validation_spawn_failure_is_
@@ -431,10 +483,25 @@ fn python_module_probe_reports_tool_unavailable_without_running_recipe() {
         &shell,
         None,
         temp.path(),
-        &step
+        &step,
+        None,
     ));
-    assert_eq!(std::fs::read_to_string(probe_output).unwrap(), "unittest");
+    assert_eq!(std::fs::read_to_string(&probe_output).unwrap(), "unittest");
     assert!(!temp.path().join("recipe-ran").exists());
+
+    std::fs::remove_file(&probe_output).unwrap();
+    let scratch = crate::command_sandbox::InspectScratch::create().unwrap();
+    assert!(!validation_module_available(
+        &shell,
+        None,
+        temp.path(),
+        &step,
+        Some(&scratch),
+    ));
+    assert!(
+        !probe_output.exists(),
+        "the inspect validation probe must not write outside scratch"
+    );
 }
 
 #[cfg(target_os = "linux")]

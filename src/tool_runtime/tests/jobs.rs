@@ -17,10 +17,7 @@ async fn seed_local_job(
 ) {
     runtime.local_jobs.lock().await.insert(
         job_id.to_string(),
-        LocalJobRecord {
-            project: project.to_string(),
-            dir,
-        },
+        LocalJobRecord::new(project.to_string(), dir),
     );
 }
 
@@ -1752,10 +1749,7 @@ async fn lightweight_auth_cannot_enumerate_unrelated_local_jobs() {
     );
     runtime.local_jobs.lock().await.insert(
         "job-local".to_string(),
-        LocalJobRecord {
-            project: "demo".to_string(),
-            dir,
-        },
+        LocalJobRecord::new("demo".to_string(), dir),
     );
     let shared = shared_key_auth_context("hash-local");
     let bridge = oauth_bridge_auth_context("hash-local", &[crate::auth::SCOPE_JOB_RUN]);
@@ -1895,10 +1889,7 @@ async fn list_jobs_returns_bounded_summaries_without_stdout_stderr() {
     );
     runtime.local_jobs.lock().await.insert(
         "job-secret".to_string(),
-        LocalJobRecord {
-            project: "demo".to_string(),
-            dir,
-        },
+        LocalJobRecord::new("demo".to_string(), dir),
     );
     let result = runtime
         .dispatch(ToolCall::ListJobs {
@@ -1954,10 +1945,7 @@ async fn list_jobs_respects_limit_bound() {
         );
         runtime.local_jobs.lock().await.insert(
             format!("job-{}", i),
-            LocalJobRecord {
-                project: "demo".to_string(),
-                dir,
-            },
+            LocalJobRecord::new("demo".to_string(), dir),
         );
     }
     let result = runtime

@@ -82,6 +82,11 @@ task_start
 `files_list` answers "what is in this project" from the Git index, so ignored
 directories never appear. Call it before guessing paths for `files_read` —
 especially in a `read_only` task, which has no shell to list files with.
+For trusted command-based inspection, use Workflow Session `inspect` with
+`run_shell`, or connector `task_start(mode=inspect)` with `commands_run`, and
+prefer `rg` or `git grep`. Inspect shell/jobs are Landlock-restricted against
+ordinary local filesystem writes but retain reads, environment, network, and
+possible external side effects.
 
 Use `commands_run` only as an approved escape hatch. Use `task_cancel` for a
 queued/running execution that should stop.

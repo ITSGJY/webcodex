@@ -184,6 +184,10 @@ impl SessionGuards {
     pub(crate) fn effective(mode: SessionMode, guards: Self) -> Self {
         match mode {
             SessionMode::Normal => guards,
+            SessionMode::Inspect => Self {
+                deny_write_tools: true,
+                deny_shell_tools: false,
+            },
             SessionMode::ReadOnly => Self {
                 deny_write_tools: true,
                 deny_shell_tools: true,

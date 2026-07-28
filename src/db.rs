@@ -138,6 +138,74 @@ mod tests {
     }
 
     #[test]
+    fn open_migrates_connector_task_mode_constraint_to_inspect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pre-inspect.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE wc_projects (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE wc_tasks (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    owner_subject_id TEXT NOT NULL,
+                    goal TEXT NOT NULL,
+                    mode TEXT NOT NULL CHECK(mode IN ('normal', 'read_only')),
+                    status TEXT NOT NULL
+                        CHECK(status IN ('active', 'ready_for_review', 'accepted', 'rejected')),
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    FOREIGN KEY(project_id) REFERENCES wc_projects(id)
+                );
+                INSERT INTO wc_projects VALUES ('project', 'Project', 1, 1);
+                INSERT INTO wc_tasks
+                    (id, project_id, owner_subject_id, goal, mode, status, created_at, updated_at)
+                VALUES ('task', 'project', 'owner', 'keep me', 'read_only', 'active', 1, 1);
+                ",
+            )
+            .unwrap();
+        }
+
+        let db = Database::open(&path).unwrap();
+        let conn = db.conn_for_tests();
+        let schema: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'wc_tasks'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(schema.contains("'inspect'"), "{schema}");
+        assert_eq!(
+            conn.query_row("SELECT mode FROM wc_tasks WHERE id = 'task'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "read_only"
+        );
+        conn.execute(
+            "INSERT INTO wc_tasks
+                (id, project_id, owner_subject_id, goal, mode, status,
+                 created_at, updated_at, guidance_seen_seq)
+             VALUES ('inspect-task', 'project', 'owner', 'inspect', 'inspect',
+                     'active', 2, 2, 0)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn execution_provenance_columns_are_fresh_additive_and_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let upgrade = tmp.path().join("iteration-7.db");

@@ -24,10 +24,9 @@ mod shell_protocol;
 #[path = "../apply_edits_shared.rs"]
 mod apply_edits_shared;
 
-// The agent does not run glob-based search, so part of the shared policy
-// is unused here.
-// The agent enforces the sandbox but no longer probes for it: the capability is
-// never advertised, so the probe side of the module is unused here.
+// The agent does not run glob-based search, so part of the shared policy is
+// unused here. The shared sandbox module is also compiled into the server for
+// local-executor inspect commands and readiness reporting.
 #[allow(dead_code)]
 #[path = "../command_sandbox.rs"]
 mod command_sandbox;
@@ -85,9 +84,10 @@ use webcodex_runner::{
     default_websocket_connect_timeout_secs, effective_transport, handle_project_op,
     load_agent_project_summaries_from_dir, max_concurrent_jobs, non_empty_token,
     parse_agent_project_toml, quic_client_bind_addr_for, resolve_quic_config,
-    resolve_quic_server_addrs, run_shell, run_shell_with_profiles, server_url_to_ws,
-    sha256_hex_bytes, validate_project_path_policy, websocket_session, AgentRuntimeState,
-    ShellProfileConfig, CLIENT_PROFILE_ERROR, DEFAULT_MAX_CONCURRENT_JOBS, WS_OUTGOING_CAPACITY,
+    resolve_quic_server_addrs, run_shell, run_shell_with_profiles,
+    run_shell_with_profiles_in_sandbox, server_url_to_ws, sha256_hex_bytes,
+    validate_project_path_policy, websocket_session, AgentRuntimeState, ShellProfileConfig,
+    CLIENT_PROFILE_ERROR, DEFAULT_MAX_CONCURRENT_JOBS, WS_OUTGOING_CAPACITY,
 };
 use webcodex_runner::{
     client_profile_agent_config, configured_prepared_shell_job_command,
@@ -644,13 +644,11 @@ fn agent_register_capabilities(cfg: &AgentConfig) -> ShellClientCapabilities {
     // New agents always advertise read-only LSP navigation. Older agents omit
     // the field and deserialize as false on the server.
     capabilities.lsp_read_only_navigation = true;
-    // Never advertised. The wire field stays so re-enabling later does not need
-    // a second protocol migration, but a write-denying Landlock ruleset is not
-    // a non-consequential execution boundary: a command under it still reads
-    // anything this user can read, inherits the environment, and reaches the
-    // network. See docs/READ_ONLY_COMMAND_SANDBOX.md for what has to be true
-    // before this may become dynamic again.
-    capabilities.sandbox_read_only_commands = false;
+    // Advertise only after a real child-process enforcement probe proves Linux
+    // Landlock ABI v3 (including TRUNCATE) works on this host. Every request
+    // still applies the policy again in pre_exec and fails closed on error.
+    capabilities.sandbox_inspect_commands =
+        crate::command_sandbox::inspect_sandbox_available().is_ok();
     capabilities
 }
 
@@ -1074,6 +1072,7 @@ fn validation_module_available(
     profile: Option<&PreparedShellProfile>,
     cwd: &Path,
     step: &ShellJobValidationStep,
+    inspect_scratch: Option<&crate::command_sandbox::InspectScratch>,
 ) -> bool {
     if step.program != "python" {
         return true;
@@ -1095,9 +1094,11 @@ fn validation_module_available(
                 .current_dir(cwd)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map_err(|error| error.to_string())
+                .stderr(Stdio::null());
+            if let Some(scratch) = inspect_scratch {
+                crate::command_sandbox::sandbox_command_inspect(&mut command, scratch)?;
+            }
+            command.status().map_err(|error| error.to_string())
         })
         .is_ok_and(|status| status.success())
 }
@@ -1336,23 +1337,56 @@ impl JobManager {
         } else {
             Vec::new()
         };
-        let prepared_profile = match resolve_prepared_shell_profile(
-            generation,
-            &shell,
-            &projects_dir,
-            &cwd_path,
-            request.cwd.is_some(),
-            &self.prepared_profiles,
-        ) {
-            Ok(profile) => profile,
-            Err(e) => {
-                send_start_failure(&sink, request, e);
+        let sandbox_mode = request.sandbox.clone();
+        let inspect_scratch = match sandbox_mode.as_deref() {
+            None => None,
+            Some(crate::command_sandbox::INSPECT_SANDBOX_MODE) => {
+                match crate::command_sandbox::InspectScratch::create() {
+                    Ok(scratch) => Some(scratch),
+                    Err(error) => {
+                        send_start_failure(
+                            &sink,
+                            request,
+                            format!("inspect sandbox unavailable: {error}"),
+                        );
+                        return;
+                    }
+                }
+            }
+            Some(other) => {
+                send_start_failure(&sink, request, format!("unknown sandbox mode '{other}'"));
                 return;
             }
         };
+        // Profile preparation runs an init script. Inspect execution bypasses
+        // that unsandboxed preparation and uses the base shell environment;
+        // the actual command (and global init script, if any) is sandboxed.
+        let prepared_profile = match inspect_scratch.as_ref() {
+            Some(_) => None,
+            None => match resolve_prepared_shell_profile(
+                generation,
+                &shell,
+                &projects_dir,
+                &cwd_path,
+                request.cwd.is_some(),
+                &self.prepared_profiles,
+            ) {
+                Ok(profile) => profile,
+                Err(e) => {
+                    send_start_failure(&sink, request, e);
+                    return;
+                }
+            },
+        };
         if validation
             && steps.iter().any(|step| {
-                !validation_module_available(&shell, prepared_profile.as_deref(), &cwd_path, step)
+                !validation_module_available(
+                    &shell,
+                    prepared_profile.as_deref(),
+                    &cwd_path,
+                    step,
+                    inspect_scratch.as_ref(),
+                )
             })
         {
             send_validation_executor_failure(&sink, request, 0, VALIDATION_TOOL_UNAVAILABLE_CODE);
@@ -1391,37 +1425,15 @@ impl JobManager {
                         .map(|(key, value)| (key.as_str(), value.as_str())),
                 );
             }
-            let sandbox_mode = request.sandbox.clone();
-            match sandbox_mode.as_deref() {
-                None => {}
-                Some("read_only") => {
-                    // Kernel write sandbox: the command may write only into a
-                    // request-private scratch directory. pre_exec fails the
-                    // spawn if the kernel cannot fully enforce the policy.
-                    let scratch =
-                        std::env::temp_dir().join(format!("webcodex-ro-{}", request.request_id));
-                    if let Err(error) = std::fs::create_dir_all(&scratch) {
-                        send_start_failure(
-                            &sink,
-                            request,
-                            format!("could not create sandbox scratch dir: {error}"),
-                        );
-                        return;
-                    }
-                    command.env("TMPDIR", &scratch);
-                    // A host that cannot sandbox must refuse the request, not
-                    // run the command unconfined.
-                    if let Err(error) = crate::command_sandbox::sandbox_command_read_only(
-                        &mut command,
-                        vec![scratch],
-                    ) {
-                        send_start_failure(&sink, request, format!("sandbox unavailable: {error}"));
-                        return;
-                    }
-                }
-                Some(other) => {
-                    // Unknown mode: refuse rather than run unsandboxed.
-                    send_start_failure(&sink, request, format!("unknown sandbox mode '{other}'"));
+            if let Some(scratch) = inspect_scratch.as_ref() {
+                if let Err(error) =
+                    crate::command_sandbox::sandbox_command_inspect(&mut command, scratch)
+                {
+                    send_start_failure(
+                        &sink,
+                        request,
+                        format!("inspect sandbox unavailable: {error}"),
+                    );
                     return;
                 }
             }
@@ -1498,7 +1510,11 @@ impl JobManager {
         let queued = self.queued.clone();
         let prepared_profiles = self.prepared_profiles.clone();
         let max_concurrent = self.max_concurrent;
+        let inspect_scratch_guard = inspect_scratch;
         std::thread::spawn(move || {
+            // Keep the private writable directory alive for every process in
+            // the job, then clean it when the terminal update has been sent.
+            let _inspect_scratch_guard = inspect_scratch_guard;
             let timeout_secs = request.timeout_secs.min(policy.max_timeout_secs).max(1);
             let mut step_index = 0;
             let (final_status, out, err, final_progress) = loop {
@@ -2769,6 +2785,104 @@ shell_profile = "../rust"
         );
         assert_eq!(result.exit_code, Some(0));
         assert_eq!(result.stdout.as_deref(), Some("default-ok"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inspect_shell_real_smoke_reads_checks_and_blocks_project_writes() {
+        if crate::command_sandbox::inspect_sandbox_available().is_err() {
+            // The fail-closed unavailable path has a dedicated sandbox test.
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let projects_dir = tmp.path().join("projects.d");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let manifest =
+            "[package]\nname = \"inspect-runner-smoke\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        let lockfile = "# This file is automatically @generated by Cargo.\n\
+                        # It is not intended for manual editing.\n\
+                        version = 3\n\n\
+                        [[package]]\n\
+                        name = \"inspect-runner-smoke\"\n\
+                        version = \"0.1.0\"\n";
+        std::fs::write(project.join("Cargo.toml"), manifest).unwrap();
+        std::fs::write(project.join("Cargo.lock"), lockfile).unwrap();
+        std::fs::write(project.join("src/lib.rs"), "pub fn answer() -> u8 { 42 }\n").unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&project)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "inspect@example.invalid"]);
+        git(&["config", "user.name", "Inspect Smoke"]);
+        git(&["add", "."]);
+        git(&["commit", "-qm", "seed"]);
+
+        let run_inspect = |command: &str| {
+            run_shell_with_profiles_in_sandbox(
+                1,
+                &unrestricted_test_policy(),
+                &ShellConfig::default(),
+                &projects_dir,
+                &PreparedShellProfileCache::default(),
+                Some(project.to_string_lossy().as_ref()),
+                command,
+                None,
+                60,
+                None,
+                Some(crate::command_sandbox::INSPECT_SANDBOX_MODE),
+            )
+        };
+
+        let inspection = run_inspect(
+            "rg 'inspect-runner-smoke' Cargo.toml \
+             && git status --short \
+             && cargo check --offline \
+             && printf scratch-ok > \"$TMPDIR/proof\" \
+             && test \"$(cat \"$TMPDIR/proof\")\" = scratch-ok",
+        );
+        assert_eq!(inspection.exit_code, Some(0), "{inspection:?}");
+        assert!(!project.join("target").exists());
+
+        for command in [
+            "printf created > created.txt",
+            "printf changed > Cargo.toml",
+            "truncate -s 0 Cargo.toml",
+            "rm Cargo.toml",
+            "mv Cargo.toml renamed.toml",
+            "sh -c 'printf child > child.txt'",
+        ] {
+            let denied = run_inspect(command);
+            assert_ne!(denied.exit_code, Some(0), "{command}: {denied:?}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+            manifest
+        );
+        assert!(!project.join("created.txt").exists());
+        assert!(!project.join("child.txt").exists());
+        assert!(!project.join("renamed.toml").exists());
+
+        let normal = run_shell(
+            &unrestricted_test_policy(),
+            &ShellConfig::default(),
+            Some(project.to_string_lossy().as_ref()),
+            "printf normal-ok > normal.txt",
+            None,
+            10,
+            None,
+        );
+        assert_eq!(normal.exit_code, Some(0), "{normal:?}");
+        assert_eq!(
+            std::fs::read_to_string(project.join("normal.txt")).unwrap(),
+            "normal-ok"
+        );
     }
 
     #[test]
@@ -6524,10 +6638,10 @@ shell_profile = "../rust"
     fn register_request_announces_correct_protocol_version() {
         let tmp = tempfile::tempdir().unwrap();
         let mut cfg = test_config(tmp.path().join("config/projects.d"));
-        // Even a stale or hand-edited config cannot re-enable the disabled
-        // read_only shell capability at registration time.
+        // A stale or hand-edited config cannot force capability advertisement:
+        // registration replaces it with the result of the real host probe.
         cfg.capabilities = Some(ShellClientCapabilities {
-            sandbox_read_only_commands: true,
+            sandbox_inspect_commands: true,
             ..Default::default()
         });
         for (version, expected_str) in [
@@ -6560,7 +6674,10 @@ shell_profile = "../rust"
         assert!(caps.async_shell_jobs);
         assert!(caps.structured_validation_argv);
         assert!(caps.lsp_read_only_navigation);
-        assert!(!caps.sandbox_read_only_commands);
+        assert_eq!(
+            caps.sandbox_inspect_commands,
+            crate::command_sandbox::inspect_sandbox_available().is_ok()
+        );
     }
 
     #[test]

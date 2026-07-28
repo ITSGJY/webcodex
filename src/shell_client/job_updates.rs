@@ -221,6 +221,18 @@ impl ShellClientRegistry {
                 client_id
             ));
         }
+        if let Some(mode) = request.sandbox.as_deref() {
+            if mode != crate::command_sandbox::INSPECT_SANDBOX_MODE {
+                return Err(format!("unknown sandbox mode '{mode}'"));
+            }
+            if !client.capabilities.sandbox_inspect_commands {
+                return Err(format!(
+                    "{}: agent client {} cannot enforce the inspect sandbox",
+                    crate::shell_protocol::SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS,
+                    client_id
+                ));
+            }
+        }
         if !validation_steps.is_empty() && !client.capabilities.structured_validation_argv {
             return Err(format!(
                 "structured_validation_unavailable: agent client {} does not support structured argv validation jobs",

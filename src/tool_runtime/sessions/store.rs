@@ -429,6 +429,11 @@ impl SessionStore {
         inner.contains_session(session_id)
     }
 
+    pub(crate) fn session_mode(&self, session_id: &str) -> Option<SessionMode> {
+        let inner = self.inner.lock().expect("session store mutex poisoned");
+        inner.guard_state(session_id).map(|(mode, _)| mode)
+    }
+
     pub(crate) fn session_project(&self, session_id: &str) -> Option<Option<String>> {
         let inner = self.inner.lock().expect("session store mutex poisoned");
         inner.session_project(session_id)

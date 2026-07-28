@@ -5,7 +5,8 @@ use crate::shell_protocol::{
     ShellAgentProjectSummary, ShellClientCapabilities, SHELL_CLIENT_CAPABILITY_ASYNC_JOBS,
     SHELL_CLIENT_CAPABILITY_ASYNC_SHELL_JOBS, SHELL_CLIENT_CAPABILITY_FILE_READ,
     SHELL_CLIENT_CAPABILITY_FILE_WRITE, SHELL_CLIENT_CAPABILITY_GIT, SHELL_CLIENT_CAPABILITY_JOBS,
-    SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION, SHELL_CLIENT_CAPABILITY_SHELL,
+    SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
+    SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS, SHELL_CLIENT_CAPABILITY_SHELL,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV,
 };
 
@@ -20,6 +21,7 @@ fn capability_enabled(caps: &ShellClientCapabilities, capability: &str) -> bool 
         SHELL_CLIENT_CAPABILITY_ASYNC_SHELL_JOBS => caps.async_shell_jobs,
         SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV => caps.structured_validation_argv,
         SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION => caps.lsp_read_only_navigation,
+        SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS => caps.sandbox_inspect_commands,
         _ => false,
     }
 }
@@ -57,7 +59,8 @@ impl ShellClientRegistry {
     /// Recognized capability names: `shell`, `file_read`, `file_write`,
     /// `git`, `jobs`, `async_jobs`, `async_shell_jobs`,
     /// `structured_validation_argv`,
-    /// `lsp_read_only_navigation`. Unknown capability names return `false`.
+    /// `lsp_read_only_navigation`, `sandbox_inspect_commands`. Unknown
+    /// capability names return `false`.
     pub async fn client_supports(&self, client_id: &str, capability: &str) -> Result<bool, String> {
         let caps = self.get_client_capabilities(client_id).await?;
         Ok(capability_enabled(&caps, capability))

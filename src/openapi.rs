@@ -1990,6 +1990,15 @@ mod tests {
         fields
     }
 
+    #[test]
+    fn openapi_flattened_session_mode_includes_inspect() {
+        let spec = build_openapi_spec();
+        assert_eq!(
+            spec["components"]["schemas"]["ToolCallRequest"]["properties"]["mode"]["enum"],
+            json!(["normal", "inspect", "read_only"])
+        );
+    }
+
     /// Recursively collect every `$ref` string found anywhere in a JSON value.
     fn collect_refs(value: &Value, out: &mut Vec<String>) {
         match value {

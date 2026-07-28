@@ -2,7 +2,8 @@ use super::external_tools::ExternalRoute;
 use super::lsp::{handle_lsp_request, is_lsp_request_kind, LspSupervisor};
 use super::validation::{handle_validation_request, is_validation_request_kind};
 use super::{
-    handle_project_op, run_shell_with_profiles, AgentSink, HotAgentConfig, ReloadableAgentConfig,
+    handle_project_op, run_shell_with_profiles_in_sandbox, AgentSink, HotAgentConfig,
+    ReloadableAgentConfig,
 };
 use crate::shell_protocol::ShellAgentShellRequest;
 use crate::{handle_file_request, is_file_request_kind, JobManager};
@@ -24,7 +25,15 @@ pub(crate) fn dispatch_request(
     let policy = &config.policy;
     let shell = &config.shell;
     let external_tools = &config.external_tools;
-    match external_tools.route(policy, &request) {
+    // Inspect requests must stay on the native execution path where Landlock
+    // is applied in pre_exec. External providers are not an equivalent local
+    // filesystem write boundary.
+    let external_route = if request.sandbox.is_some() {
+        ExternalRoute::Native
+    } else {
+        external_tools.route(policy, &request)
+    };
+    match external_route {
         ExternalRoute::Handled(result) => {
             return sink.submit_result_with_metadata(request.request_id, result, config, runtime);
         }
@@ -33,7 +42,7 @@ pub(crate) fn dispatch_request(
             let result = if is_file_request_kind(&request.kind) {
                 handle_file_request(policy, &request)
             } else {
-                run_shell_with_profiles(
+                run_shell_with_profiles_in_sandbox(
                     config.generation,
                     policy,
                     shell,
@@ -44,6 +53,7 @@ pub(crate) fn dispatch_request(
                     request.stdin.as_deref(),
                     request.timeout_secs,
                     None,
+                    request.sandbox.as_deref(),
                 )
             };
             external_tools.complete_native_fallback(fallback, &result);
@@ -95,7 +105,7 @@ pub(crate) fn dispatch_request(
         }
         _ => {
             let request_id = request.request_id.clone();
-            let result = run_shell_with_profiles(
+            let result = run_shell_with_profiles_in_sandbox(
                 config.generation,
                 policy,
                 shell,
@@ -106,6 +116,7 @@ pub(crate) fn dispatch_request(
                 request.stdin.as_deref(),
                 request.timeout_secs,
                 None,
+                request.sandbox.as_deref(),
             );
             sink.submit_result_with_metadata(request_id, result, config, runtime)
         }

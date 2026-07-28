@@ -296,7 +296,7 @@ impl Database {
                 project_id TEXT NOT NULL,
                 owner_subject_id TEXT NOT NULL,
                 goal TEXT NOT NULL,
-                mode TEXT NOT NULL CHECK(mode IN ('normal', 'read_only')),
+                mode TEXT NOT NULL CHECK(mode IN ('normal', 'inspect', 'read_only')),
                 status TEXT NOT NULL
                     CHECK(status IN ('active', 'ready_for_review', 'accepted', 'rejected')),
                 created_at INTEGER NOT NULL,
@@ -506,6 +506,7 @@ impl Database {
         Self::ensure_users_and_api_key_columns(&conn)?;
         Self::ensure_connector_execution_columns(&conn)?;
         Self::ensure_connector_task_columns(&conn)?;
+        Self::ensure_connector_task_modes(&conn)?;
         Self::ensure_activity_scope_columns(&conn)?;
         Ok(())
     }
@@ -623,6 +624,66 @@ impl Database {
             )?;
         }
         Ok(())
+    }
+
+    /// Expand the connector task-mode constraint on databases created before
+    /// `inspect` became a persisted mode. SQLite cannot alter a CHECK
+    /// constraint in place, so rebuild only this table while preserving rows
+    /// and the stable table name referenced by child tables.
+    fn ensure_connector_task_modes(conn: &Connection) -> anyhow::Result<()> {
+        let table_sql: String = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'wc_tasks'",
+            [],
+            |row| row.get(0),
+        )?;
+        if table_sql.contains("'inspect'") {
+            return Ok(());
+        }
+
+        conn.execute_batch("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;")?;
+        let migration = conn.execute_batch(
+            "
+            CREATE TABLE wc_tasks_inspect_migration (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                owner_subject_id TEXT NOT NULL,
+                goal TEXT NOT NULL,
+                mode TEXT NOT NULL CHECK(mode IN ('normal', 'inspect', 'read_only')),
+                status TEXT NOT NULL
+                    CHECK(status IN ('active', 'ready_for_review', 'accepted', 'rejected')),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                guidance_seen_seq INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(project_id) REFERENCES wc_projects(id)
+            );
+            INSERT INTO wc_tasks_inspect_migration
+                (id, project_id, owner_subject_id, goal, mode, status,
+                 created_at, updated_at, guidance_seen_seq)
+            SELECT id, project_id, owner_subject_id, goal, mode, status,
+                   created_at, updated_at, guidance_seen_seq
+            FROM wc_tasks;
+            DROP TABLE wc_tasks;
+            ALTER TABLE wc_tasks_inspect_migration RENAME TO wc_tasks;
+            CREATE INDEX idx_wc_tasks_owner_project
+                ON wc_tasks(owner_subject_id, project_id, updated_at DESC);
+            ",
+        );
+        match migration {
+            Ok(()) => {
+                conn.execute_batch("COMMIT;")?;
+                let foreign_key_error = conn.prepare("PRAGMA foreign_key_check")?.exists([])?;
+                conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+                if foreign_key_error {
+                    anyhow::bail!("connector task mode migration broke a foreign key");
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                let _ = conn.execute_batch("PRAGMA foreign_keys = ON;");
+                Err(error.into())
+            }
+        }
     }
 
     fn ensure_connector_execution_columns(conn: &Connection) -> anyhow::Result<()> {

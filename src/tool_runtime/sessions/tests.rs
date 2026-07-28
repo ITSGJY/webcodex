@@ -967,6 +967,15 @@ fn read_only_guards_block_write_and_shell_classifications() {
         SessionMode::ReadOnly,
         SessionGuards::default(),
     );
+    let inspect = store.start_session_with_guards(
+        None,
+        None,
+        SessionMode::Inspect,
+        SessionGuards {
+            deny_write_tools: false,
+            deny_shell_tools: true,
+        },
+    );
 
     assert!(store
         .guard_denial(&normal.session_id, "write_project_file")
@@ -990,6 +999,16 @@ fn read_only_guards_block_write_and_shell_classifications() {
     assert!(store
         .guard_denial(&read_only.session_id, "read_file")
         .is_none());
+    assert_eq!(
+        store
+            .guard_denial(&inspect.session_id, "write_project_file")
+            .expect("inspect write denied")
+            .guard,
+        "deny_write_tools"
+    );
+    assert!(store
+        .guard_denial(&inspect.session_id, "run_shell")
+        .is_none());
 }
 
 #[test]
@@ -997,7 +1016,12 @@ fn ledger_round_trip_preserves_session_events_and_messages() {
     let dir = tempfile::tempdir().unwrap();
     let ledger = dir.path().join("sessions.json");
     let store = SessionStore::with_persistence(&ledger, 10, 50);
-    let session = store.start_session(Some("proj".to_string()), Some("persist".to_string()));
+    let session = store.start_session_with_guards(
+        Some("proj".to_string()),
+        Some("persist".to_string()),
+        SessionMode::Inspect,
+        SessionGuards::default(),
+    );
     let start = store
         .record_tool_call_started(
             Some(&session.session_id),
@@ -1019,6 +1043,9 @@ fn ledger_round_trip_preserves_session_events_and_messages() {
     let summary = restored.summary(&session.session_id, Some(20)).unwrap();
     assert_eq!(summary.project.as_deref(), Some("proj"));
     assert_eq!(summary.title.as_deref(), Some("persist"));
+    assert_eq!(summary.mode, SessionMode::Inspect);
+    assert!(summary.guards.deny_write_tools);
+    assert!(!summary.guards.deny_shell_tools);
     assert_eq!(summary.lifecycle, SessionLifecycle::Active);
     assert_eq!(summary.counts.tool_calls, 1);
     assert!(summary

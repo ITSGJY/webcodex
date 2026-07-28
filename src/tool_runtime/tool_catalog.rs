@@ -27,6 +27,7 @@ pub(crate) const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "project_overview",
             "list_project_tracked_files",
             "read_file",
+            "run_shell",
             "search_project_text",
             "document_symbols",
             "document_diagnostics",
@@ -190,21 +191,28 @@ pub(crate) const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
 pub(crate) const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
     ToolRecommendedFlow {
         name: "discovery",
-        summary: "Discovery: list_projects, project_overview, read_file, then search_project_text for an unfamiliar project.",
+        summary: "Discovery: list_projects, project_overview, and read_file; prefer run_shell with rg or git grep for code search. search_project_text remains a compatibility path.",
         manifest_purpose:
-            "Resolve the project, inspect bounded structure, then load targeted rules/context.",
+            "Resolve the project, inspect bounded structure, then search code with run_shell and rg or git grep.",
         tools: &[
             "list_projects",
             "project_overview",
             "read_file",
+            "run_shell",
             "search_project_text",
         ],
     },
     ToolRecommendedFlow {
         name: "inspect",
-        summary: "Inspect: use read_file, search_project_text, and show_changes before editing.",
-        manifest_purpose: "Use the default inspect tools before editing.",
-        tools: &["read_file", "search_project_text", "show_changes"],
+        summary: "Inspect: use read_file and run_shell with rg or git grep before editing; search_project_text remains compatible, and show_changes reviews the worktree.",
+        manifest_purpose:
+            "Prefer run_shell with rg or git grep for code inspection, then review the worktree.",
+        tools: &[
+            "read_file",
+            "run_shell",
+            "search_project_text",
+            "show_changes",
+        ],
     },
     ToolRecommendedFlow {
         name: "edit",

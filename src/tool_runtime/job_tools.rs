@@ -8,6 +8,7 @@ impl ToolRuntime {
         &self,
         call: ToolCall,
         auth: Option<&AuthContext>,
+        sandbox: Option<&str>,
     ) -> ToolResult {
         match call {
             ToolCall::RunJob {
@@ -26,7 +27,7 @@ impl ToolRuntime {
                     timeout_secs,
                     cwd,
                     Vec::new(),
-                    None,
+                    sandbox.map(str::to_string),
                     auth,
                     purpose,
                     shell,

@@ -3,7 +3,11 @@
 use super::{ToolCall, ToolResult, ToolRuntime};
 
 impl ToolRuntime {
-    pub(crate) async fn dispatch_cargo_tool(&self, call: ToolCall) -> ToolResult {
+    pub(crate) async fn dispatch_cargo_tool(
+        &self,
+        call: ToolCall,
+        sandbox: Option<&str>,
+    ) -> ToolResult {
         match call {
             ToolCall::CargoFmt {
                 project,
@@ -11,7 +15,10 @@ impl ToolRuntime {
                 cwd,
                 check,
                 timeout_secs,
-            } => self.cargo_fmt(project, cwd, check, timeout_secs).await,
+            } => {
+                self.cargo_fmt_in_sandbox(project, cwd, check, timeout_secs, sandbox)
+                    .await
+            }
             ToolCall::CargoCheck {
                 project,
                 session_id: _,
@@ -23,7 +30,7 @@ impl ToolRuntime {
                 package,
                 timeout_secs,
             } => {
-                self.cargo_check(
+                self.cargo_check_in_sandbox(
                     project,
                     cwd,
                     all_targets,
@@ -32,6 +39,7 @@ impl ToolRuntime {
                     features,
                     package,
                     timeout_secs,
+                    sandbox,
                 )
                 .await
             }
@@ -48,7 +56,7 @@ impl ToolRuntime {
                 no_run,
                 timeout_secs,
             } => {
-                self.cargo_test(
+                self.cargo_test_in_sandbox(
                     project,
                     cwd,
                     filter,
@@ -59,6 +67,7 @@ impl ToolRuntime {
                     package,
                     no_run,
                     timeout_secs,
+                    sandbox,
                 )
                 .await
             }

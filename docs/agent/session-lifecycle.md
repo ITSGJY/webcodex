@@ -38,7 +38,7 @@ This section describes **what the code does today**. It is not the target model.
 |---|---|
 | `session_id` | `wc_sess_*` identity |
 | `project`, `title` | Optional association / label |
-| `mode` | `normal` \| `read_only` (mutation policy, **not** lifecycle) |
+| `mode` | `normal` \| `inspect` \| `read_only` (mutation policy, **not** lifecycle) |
 | `guards` | Effective write/shell denials |
 | `created_at`, `updated_at` | Timestamps |
 | `events` | Bounded tool-call ledger (`VecDeque`) |
@@ -96,7 +96,7 @@ Future lifecycle implementation should keep retention/eviction policy separate f
 
 | Concept | Values / behavior | Is lifecycle? |
 |---|---|---|
-| `SessionMode` | `normal`, `read_only` | **No** — policy for write/shell tools |
+| `SessionMode` | `normal`, `inspect`, `read_only` | **No** — policy for write/shell tools |
 | `SessionGuards` | `deny_write_tools`, `deny_shell_tools` | **No** — effective policy |
 | Message `status` | `open` / `resolved` | **No** — per-message board state |
 | Tool event `status` | `succeeded` / `failed` (on finished events) | **No** — per-call outcome |
@@ -170,7 +170,7 @@ When a field is added (Phase 1+), prefer a single field:
 lifecycle: "created" | "active" | "closed" | "archived"
 ```
 
-Do **not** overload `mode` (`normal` / `read_only`) with lifecycle values.
+Do **not** overload `mode` (`normal` / `inspect` / `read_only`) with lifecycle values.
 
 ---
 

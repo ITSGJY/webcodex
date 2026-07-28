@@ -87,6 +87,29 @@ impl ToolRuntime {
         allow_cross_project_session: bool,
         recorder_metadata: sessions::ToolCallRecorderMetadata,
     ) -> ToolResult {
+        self.dispatch_with_auth_transport_options_and_metadata_with_sandbox(
+            call,
+            auth,
+            transport,
+            use_current_session,
+            allow_cross_project_session,
+            recorder_metadata,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn dispatch_with_auth_transport_options_and_metadata_with_sandbox(
+        &self,
+        call: ToolCall,
+        auth: Option<&AuthContext>,
+        transport: sessions::SessionTransport,
+        use_current_session: bool,
+        allow_cross_project_session: bool,
+        recorder_metadata: sessions::ToolCallRecorderMetadata,
+        inherited_sandbox: Option<&'static str>,
+    ) -> ToolResult {
         // Phase-1 edit usage telemetry: argument-free structured log only.
         // Does not alter execution, session ledger, Action Audit, or schemas.
         let mut edit_usage = edit_tool_telemetry::start_edit_tool_usage(call.tool_name());
@@ -98,6 +121,7 @@ impl ToolRuntime {
                 use_current_session,
                 allow_cross_project_session,
                 recorder_metadata,
+                inherited_sandbox,
             )
             .await;
         if let Some(guard) = edit_usage.as_mut() {
@@ -139,6 +163,7 @@ impl ToolRuntime {
         use_current_session: bool,
         allow_cross_project_session: bool,
         recorder_metadata: sessions::ToolCallRecorderMetadata,
+        inherited_sandbox: Option<&'static str>,
     ) -> ToolResult {
         let mut resolved_project = match call.project() {
             Some(project) => self
@@ -172,6 +197,13 @@ impl ToolRuntime {
                 return unknown_session_result(session_id);
             }
         }
+        let execution_sandbox = inherited_sandbox.or_else(|| {
+            session_id
+                .as_deref()
+                .and_then(|session_id| self.sessions.session_mode(session_id))
+                .filter(|mode| matches!(mode, super::SessionMode::Inspect))
+                .map(|_| crate::command_sandbox::INSPECT_SANDBOX_MODE)
+        });
         let session_project_mismatch = session_id.as_deref().and_then(|session_id| {
             match (
                 self.sessions.session_project(session_id),
@@ -350,7 +382,9 @@ impl ToolRuntime {
         let activity_context =
             Self::capture_workspace_activity_context(&call, activity_project.as_deref());
         let tool_name = call.tool_name();
-        let mut result = self.dispatch_authorized_inner(call, auth, transport).await;
+        let mut result = self
+            .dispatch_authorized_inner(call, auth, transport, execution_sandbox)
+            .await;
         let permission = permission.filter(|_| {
             !permissions::is_hard_denied_output(&result.output, result.error.as_deref())
         });
@@ -419,6 +453,7 @@ impl ToolRuntime {
         call: ToolCall,
         auth: Option<&AuthContext>,
         transport: sessions::SessionTransport,
+        execution_sandbox: Option<&'static str>,
     ) -> ToolResult {
         match call {
             call @ (ToolCall::ListTools { .. }
@@ -460,7 +495,9 @@ impl ToolRuntime {
             | ToolCall::RegisterProject { .. }
             | ToolCall::CreateProject { .. }) => self.dispatch_project_tool(call, auth).await,
 
-            call @ ToolCall::RunShell { .. } => self.dispatch_shell_tool(call).await,
+            call @ ToolCall::RunShell { .. } => {
+                self.dispatch_shell_tool(call, execution_sandbox).await
+            }
 
             call @ (ToolCall::ApplyPatch { .. }
             | ToolCall::ApplyPatchChecked { .. }
@@ -500,14 +537,18 @@ impl ToolRuntime {
 
             call @ (ToolCall::CargoFmt { .. }
             | ToolCall::CargoCheck { .. }
-            | ToolCall::CargoTest { .. }) => self.dispatch_cargo_tool(call).await,
+            | ToolCall::CargoTest { .. }) => {
+                self.dispatch_cargo_tool(call, execution_sandbox).await
+            }
 
             call @ (ToolCall::RunJob { .. }
             | ToolCall::StopJob { .. }
             | ToolCall::JobStatus { .. }
             | ToolCall::JobLog { .. }
             | ToolCall::ListJobs { .. }
-            | ToolCall::JobTail { .. }) => self.dispatch_job_tool(call, auth).await,
+            | ToolCall::JobTail { .. }) => {
+                self.dispatch_job_tool(call, auth, execution_sandbox).await
+            }
 
             call @ ToolCall::WorkspaceHygieneCheck { .. } => self.dispatch_hygiene_tool(call).await,
 

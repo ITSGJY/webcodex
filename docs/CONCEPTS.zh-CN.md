@@ -62,7 +62,9 @@ ToolRuntime 是与协议无关的执行层。MCP、GPT Actions 和 REST wrapper 
 常见工具组：
 
 - Discovery：`runtime_status`、`list_projects`、`list_agents`、`tool_manifest`。
-- Inspect：`list_project_files`、`search_project_text`、`read_file`、`git_status`、`git_diff_hunks`。
+- Inspect：先用 `read_file`，代码搜索优先使用 `run_shell` 配合 `rg` 或
+  `git grep`，并用 `git_status` / `git_diff_hunks` 检查工作区。
+  `search_project_text` 暂时保留为兼容路径。
 - Edit：`apply_text_edits`（带 guard 的事务式文件变更）、`apply_patch_checked`（复杂 checked unified diff）、`write_project_file`（有意的整文件重写）。行/模式类工具仍为兼容路径。
 - Validate：`validate_patch`、`cargo_fmt`、`cargo_check`、`cargo_test`。
 - Review：`show_changes`、`workspace_hygiene_check`。
@@ -115,14 +117,18 @@ review tools 在用户接受结果前展示变更。`show_changes` 用于查看�
 
 ### `run_shell` 作为 Escape Hatch
 
-`run_shell` 可以通过 agent 运行受限项目命令。它适合尚无结构化 helper 的项目特定检查。
+`run_shell` 可以通过 agent 运行受限项目命令。它是配合 `rg` 或
+`git grep` 进行代码搜索和检查的优先路径，也适合尚无结构化 helper
+的项目特定检查。
 
-它不是默认编辑路径，不是第一验证选择，也不是绕过项目策略的方式。shell/job tools 很强，需要可信配置和人工 review。
+它不是默认编辑路径，也不是绕过项目策略的方式。shell/job tools 很强，
+需要可信配置和人工 review。
 
 ## 默认 Coding Loop
 
 1. `start_coding_task`
-2. 用 `list_project_files`、`search_project_text` 和 `read_file` inspect。
+2. 用 `read_file` 和 `run_shell` 配合 `rg` 或 `git grep` inspect
+   （`search_project_text` 保留兼容）。
 3. 用结构化 edit 或 patch tools 修改。
 4. 用结构化 validation tools 验证。
 5. 用 `show_changes`、`git_diff_hunks` 和 `workspace_hygiene_check` review。

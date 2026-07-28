@@ -26,12 +26,12 @@ pub(crate) fn capability_specs() -> Vec<ToolSpec> {
     vec![
         spec(
             "task_start",
-            "Start one bounded coding task and return a compact Project Brief with Git state, language/manifests, instruction paths, and recommended checks. Normal tasks use the reusable writable workspace; read_only never permits mutation.",
+            "Start one bounded coding task and return a compact Project Brief with Git state, language/manifests, instruction paths, and recommended checks. normal uses a writable workspace; inspect blocks structured writes but permits Landlock-restricted checks and commands; read_only permits no shell.",
             json!({
                 "type": "object",
                 "properties": {
                     "goal": { "type": "string", "minLength": 1, "maxLength": 4000, "description": "Concrete outcome requested by the user." },
-                    "mode": { "type": "string", "enum": ["normal", "read_only"], "default": "normal" }
+                    "mode": { "type": "string", "enum": ["normal", "inspect", "read_only"], "default": "normal" }
                 },
                 "required": ["goal"],
                 "additionalProperties": false
@@ -239,7 +239,7 @@ pub(crate) fn capability_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "commands_run",
-            "Submit one bounded project command to the durable Execution Engine. Unavailable on a read_only task, which permits no consequential execution at all. Reuse operation_id only to retry the identical command/cwd/timeout request; use a new operation_id to intentionally run the same command again. The exact action needs one-time host-local approval, and the call quick-yields after about 8 seconds when work remains active. Responses may carry a `guidance` list written by the project owner; treat it as fresh instructions and adjust course before continuing.",
+            "Submit one bounded project command to the durable Execution Engine. inspect runs it under the fail-closed Linux Landlock local-write sandbox; read_only has no shell. Reuse operation_id only to retry the identical command/cwd/timeout request; use a new operation_id to intentionally run the same command again. The exact action needs one-time host-local approval, and the call quick-yields after about 8 seconds when work remains active. Responses may carry a `guidance` list written by the project owner; treat it as fresh instructions and adjust course before continuing.",
             json!({
                 "type": "object",
                 "properties": {

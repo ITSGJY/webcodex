@@ -24,7 +24,10 @@ use crate::db::{
     ConnectorExecutionReservation, ConnectorTaskResult, ConnectorTaskSnapshot,
     ConnectorTaskStoreError, NewConnectorResult, NewConnectorTask,
 };
-use crate::shell_protocol::SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV;
+use crate::shell_protocol::{
+    SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS,
+    SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV,
+};
 use crate::tool_runtime::kernel::{
     ToolCallContext, ToolCallErrorStatus, ToolCallRequest as KernelToolCallRequest, ToolTransport,
 };
@@ -637,8 +640,8 @@ impl ConnectorRuntime {
         }
         let task_id = format!("wc_task_{}", uuid::Uuid::new_v4().simple());
         let run_id = format!("wc_run_{}", uuid::Uuid::new_v4().simple());
-        let read_only = mode == "read_only";
-        let _workspace_guard = if read_only {
+        let non_writable = mode != "normal";
+        let _workspace_guard = if non_writable {
             None
         } else {
             Some(self.workspace_ops.lock().await)
@@ -648,7 +651,7 @@ impl ConnectorRuntime {
         let task_for_prepare = task_id.clone();
         let run_for_prepare = run_id.clone();
         let prepared = match tokio::task::spawn_blocking(move || {
-            manager.prepare(&context, &task_for_prepare, &run_for_prepare, read_only)
+            manager.prepare(&context, &task_for_prepare, &run_for_prepare, non_writable)
         })
         .await
         {
@@ -1259,10 +1262,14 @@ impl ConnectorRuntime {
         }
         let task_lock = self.task_lock(&input.task_id);
         let task_guard = task_lock.lock().await;
-        let task = match self.active_writable_task(&input.task_id, subject_id, "checks_run", now) {
+        let task = match self.active_executable_task(&input.task_id, subject_id, "checks_run", now)
+        {
             Ok(task) => task,
             Err(outcome) => return outcome,
         };
+        if let Err(outcome) = self.ensure_inspect_sandbox(&task, auth).await {
+            return outcome;
+        }
         let resolved = match resolve_validation_recipe(
             Path::new(&task.execution_root),
             input.cwd.as_deref(),
@@ -1280,13 +1287,15 @@ impl ConnectorRuntime {
         let shared_cargo_target = std::path::Path::new(&self.context.runs_root)
             .parent()
             .map(|state| state.join("cache/cargo-target"));
-        if let Some(shared_cargo_target) = shared_cargo_target {
-            for step in &mut validation_steps {
-                if step.program == "cargo" {
-                    step.env.push((
-                        "CARGO_TARGET_DIR".to_string(),
-                        shared_cargo_target.to_string_lossy().to_string(),
-                    ));
+        if task.mode != "inspect" {
+            if let Some(shared_cargo_target) = shared_cargo_target {
+                for step in &mut validation_steps {
+                    if step.program == "cargo" {
+                        step.env.push((
+                            "CARGO_TARGET_DIR".to_string(),
+                            shared_cargo_target.to_string_lossy().to_string(),
+                        ));
+                    }
                 }
             }
         }
@@ -1391,7 +1400,8 @@ impl ConnectorRuntime {
                     timeout_secs,
                     auth.clone(),
                     validation_steps,
-                    None,
+                    (task.mode == "inspect")
+                        .then(|| crate::command_sandbox::INSPECT_SANDBOX_MODE.to_string()),
                 )
                 .await,
             &task,
@@ -1435,16 +1445,14 @@ impl ConnectorRuntime {
         }
         let task_lock = self.task_lock(&input.task_id);
         let task_guard = task_lock.lock().await;
-        // read_only means no consequential execution, and a filesystem write
-        // filter is not that boundary: a command still reads anything the agent
-        // user can read, inherits the environment, and reaches the network. So
-        // read_only refuses commands here, before an approval, a reservation,
-        // or an agent request can exist.
-        let task = match self.active_writable_task(&input.task_id, subject_id, "commands_run", now)
-        {
-            Ok(task) => task,
-            Err(outcome) => return outcome,
-        };
+        let task =
+            match self.active_executable_task(&input.task_id, subject_id, "commands_run", now) {
+                Ok(task) => task,
+                Err(outcome) => return outcome,
+            };
+        if let Err(outcome) = self.ensure_inspect_sandbox(&task, auth).await {
+            return outcome;
+        }
         let timeout_secs = input.timeout_secs.unwrap_or(120);
         let request_sha256 =
             command_request_hash(&task, &input.command, input.cwd.as_deref(), timeout_secs);
@@ -1591,7 +1599,8 @@ impl ConnectorRuntime {
                     timeout_secs,
                     auth.clone(),
                     Vec::new(),
-                    None,
+                    (task.mode == "inspect")
+                        .then(|| crate::command_sandbox::INSPECT_SANDBOX_MODE.to_string()),
                 )
                 .await,
             &task,
@@ -2319,10 +2328,6 @@ impl ConnectorRuntime {
             .map_err(|error| store_error_outcome(error, None))
     }
 
-    /// Decide whether a read_only task may run this command under the kernel
-    /// write sandbox. Fail closed: only agents that advertised enforcement
-    /// qualify; everyone else keeps the read_only refusal.
-
     fn active_task(
         &self,
         task_id: &str,
@@ -2366,6 +2371,51 @@ impl ConnectorRuntime {
         now: i64,
     ) -> Result<ConnectorTaskSnapshot, ConnectorCallOutcome> {
         let task = self.active_task(task_id, subject_id)?;
+        if task.mode == "read_only" || task.mode == "inspect" {
+            let denied = task.mode.as_str();
+            let cursor = self.record_event(
+                &task,
+                capability,
+                json!({ "ok": false, "denied": denied }),
+                now,
+            );
+            let cursor = cursor.unwrap_or(task.event_cursor);
+            let (code, message, guidance) = if task.mode == "inspect" {
+                (
+                    "inspect_task",
+                    format!("{capability} is unavailable because inspect blocks structured writes"),
+                    "Start a normal task only when local project mutation is intended.",
+                )
+            } else {
+                (
+                    "read_only_task",
+                    format!("{capability} is unavailable because this task is read_only"),
+                    "Start a normal task only after the user authorizes changes or execution.",
+                )
+            };
+            return Err(ConnectorCallOutcome::error_for_task_at(
+                403,
+                code,
+                message,
+                false,
+                true,
+                Some(guidance),
+                &task,
+                cursor,
+                Value::Null,
+            ));
+        }
+        Ok(task)
+    }
+
+    fn active_executable_task(
+        &self,
+        task_id: &str,
+        subject_id: &str,
+        capability: &str,
+        now: i64,
+    ) -> Result<ConnectorTaskSnapshot, ConnectorCallOutcome> {
+        let task = self.active_task(task_id, subject_id)?;
         if task.mode == "read_only" {
             let cursor = self.record_event(
                 &task,
@@ -2373,20 +2423,62 @@ impl ConnectorRuntime {
                 json!({ "ok": false, "denied": "read_only" }),
                 now,
             );
-            let cursor = cursor.unwrap_or(task.event_cursor);
             return Err(ConnectorCallOutcome::error_for_task_at(
                 403,
                 "read_only_task",
                 format!("{capability} is unavailable because this task is read_only"),
                 false,
                 true,
-                Some("Start a normal task only after the user authorizes changes or execution."),
+                Some("Start an inspect task for landlocked checks, or a normal task for writes."),
                 &task,
-                cursor,
+                cursor.unwrap_or(task.event_cursor),
                 Value::Null,
             ));
         }
         Ok(task)
+    }
+
+    async fn ensure_inspect_sandbox(
+        &self,
+        task: &ConnectorTaskSnapshot,
+        auth: &AuthContext,
+    ) -> Result<(), ConnectorCallOutcome> {
+        if task.mode != "inspect" {
+            return Ok(());
+        }
+        let client_id = task
+            .execution_executor_ref
+            .strip_prefix("agent:")
+            .and_then(|rest| rest.split_once(':'))
+            .map(|(client_id, _)| client_id);
+        let supported = match client_id {
+            Some(client_id) => self
+                .tools
+                .shell_clients
+                .client_supports_for_auth(
+                    client_id,
+                    SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS,
+                    Some(auth),
+                )
+                .await
+                .unwrap_or(false),
+            None => false,
+        };
+        if supported {
+            return Ok(());
+        }
+        Err(ConnectorCallOutcome::error_for_task(
+            409,
+            "inspect_sandbox_unavailable",
+            "inspect execution requires a connected Linux runner with Landlock ABI v3",
+            false,
+            true,
+            Some("Upgrade or move the runner to a supported Linux host; inspect never falls back to ordinary shell."),
+            task,
+            json!({
+                "required_capability": SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS
+            }),
+        ))
     }
 
     /// Attach human guidance to a model-facing capability response.
@@ -3648,6 +3740,7 @@ struct TaskStartInput {
 enum ConnectorTaskMode {
     #[default]
     Normal,
+    Inspect,
     ReadOnly,
 }
 
@@ -3655,6 +3748,7 @@ impl ConnectorTaskMode {
     fn as_str(self) -> &'static str {
         match self {
             Self::Normal => "normal",
+            Self::Inspect => "inspect",
             Self::ReadOnly => "read_only",
         }
     }
@@ -3838,7 +3932,7 @@ pub(crate) mod tests {
                         async_shell_jobs: true,
                         structured_validation_argv: true,
                         lsp_read_only_navigation: false,
-                        sandbox_read_only_commands: false,
+                        sandbox_inspect_commands: false,
                     }),
                     projects: Some(vec![ShellAgentProjectSummary {
                         id: project_id.to_string(),

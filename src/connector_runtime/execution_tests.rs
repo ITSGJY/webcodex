@@ -2993,10 +2993,13 @@ async fn read_only_commands_run_is_denied_even_when_agent_advertises_sandbox() {
                 hostname: None,
                 capabilities: Some(ShellClientCapabilities {
                     shell: true,
-                    sandbox_read_only_commands: true,
+                    sandbox_inspect_commands: true,
                     ..Default::default()
                 }),
-                projects: None,
+                projects: Some(vec![project_summary(
+                    "project",
+                    Path::new(&fixture.connector.context.executor_root),
+                )]),
                 agent_protocol_version: Some("test".into()),
                 policy: None,
             },
@@ -3027,6 +3030,179 @@ async fn read_only_commands_run_is_denied_even_when_agent_advertises_sandbox() {
     assert!(!outcome.ok, "{}", outcome.body);
     assert_eq!(outcome.http_status, 403);
     assert_eq!(outcome.body["error"]["code"], "read_only_task");
+}
+
+async fn enable_inspect_sandbox(fixture: &Fixture) {
+    fixture
+        .registry
+        .register_with_auth(
+            ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
+                client_id: "hosted".into(),
+                agent_instance_id: "instance".into(),
+                display_name: None,
+                owner: Some("owner".into()),
+                hostname: None,
+                capabilities: Some(ShellClientCapabilities {
+                    shell: true,
+                    file_read: true,
+                    file_write: true,
+                    jobs: true,
+                    async_jobs: true,
+                    async_shell_jobs: true,
+                    structured_validation_argv: true,
+                    sandbox_inspect_commands: true,
+                    ..Default::default()
+                }),
+                projects: Some(vec![project_summary(
+                    "project",
+                    Path::new(&fixture.connector.context.executor_root),
+                )]),
+                agent_protocol_version: Some("test".into()),
+                policy: None,
+            },
+            Some(&fixture.owner),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn inspect_blocks_structured_edits_but_landlocks_commands_run() {
+    let fixture = fixture(20).await;
+    enable_inspect_sandbox(&fixture).await;
+    let started = fixture
+        .call(
+            "task_start",
+            json!({ "goal": "inspect safely", "mode": "inspect" }),
+        )
+        .await;
+    assert!(started.ok, "{}", started.body);
+    assert_eq!(started.body["data"]["mode"], "inspect");
+    let task_id = started.body["task_id"].as_str().unwrap().to_string();
+
+    let denied = fixture
+        .call(
+            "edits_apply",
+            json!({
+                "task_id": task_id,
+                "operation_id": "inspect-write",
+                "changes": [{
+                    "kind": "create",
+                    "path": "blocked.txt",
+                    "content": "blocked"
+                }]
+            }),
+        )
+        .await;
+    assert_eq!(denied.http_status, 403);
+    assert_eq!(denied.body["error"]["code"], "inspect_task");
+
+    let outcome = fixture
+        .call(
+            "commands_run",
+            json!({
+                "task_id": task_id,
+                "operation_id": "inspect-command",
+                "command": "rg inspect .",
+                "timeout_secs": 30
+            }),
+        )
+        .await;
+    assert!(outcome.ok, "{}", outcome.body);
+    let request = next_request(&fixture.registry).await;
+    assert_eq!(request.kind, "start_job");
+    assert_eq!(
+        request.sandbox.as_deref(),
+        Some(crate::command_sandbox::INSPECT_SANDBOX_MODE)
+    );
+    update_job(
+        &fixture.registry,
+        request.job_id.as_deref().unwrap(),
+        "completed",
+        None,
+        Some(0),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn inspect_checks_run_uses_the_same_landlock_job_path() {
+    let fixture = fixture(20).await;
+    enable_inspect_sandbox(&fixture).await;
+    let started = fixture
+        .call(
+            "task_start",
+            json!({ "goal": "check safely", "mode": "inspect" }),
+        )
+        .await;
+    let task_id = started.body["task_id"].as_str().unwrap().to_string();
+    let outcome = fixture
+        .call(
+            "checks_run",
+            json!({
+                "task_id": task_id,
+                "operation_id": "inspect-check",
+                "checks": ["check"],
+                "recipe": "rust",
+                "timeout_secs": 30
+            }),
+        )
+        .await;
+    assert!(outcome.ok, "{}", outcome.body);
+    let request = next_request(&fixture.registry).await;
+    assert_eq!(request.kind, "start_validation_job");
+    assert_eq!(
+        request.sandbox.as_deref(),
+        Some(crate::command_sandbox::INSPECT_SANDBOX_MODE)
+    );
+    update_validation_job(
+        &fixture.registry,
+        request.job_id.as_deref().unwrap(),
+        "completed",
+        None,
+        Some(0),
+        check_progress(1, None, None),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn inspect_fails_closed_before_reservation_when_runner_lacks_landlock() {
+    let fixture = fixture(20).await;
+    let started = fixture
+        .call(
+            "task_start",
+            json!({ "goal": "inspect safely", "mode": "inspect" }),
+        )
+        .await;
+    let task_id = started.body["task_id"].as_str().unwrap().to_string();
+    let outcome = fixture
+        .call(
+            "commands_run",
+            json!({
+                "task_id": task_id,
+                "operation_id": "inspect-unavailable",
+                "command": "git status",
+                "timeout_secs": 30
+            }),
+        )
+        .await;
+    assert_eq!(outcome.http_status, 409);
+    assert_eq!(outcome.body["error"]["code"], "inspect_sandbox_unavailable");
+    assert!(poll(&fixture.registry).await.is_none());
+    let execution = fixture
+        .connector
+        .db
+        .latest_connector_execution(
+            &task_id,
+            &fixture.connector.context.project_id,
+            &super::stable_subject_id(&fixture.owner).unwrap(),
+            Some("inspect-unavailable"),
+        )
+        .unwrap();
+    assert!(execution.is_none());
 }
 
 /// The denial has to happen before anything is created — an approval, a

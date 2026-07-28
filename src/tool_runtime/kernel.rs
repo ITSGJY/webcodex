@@ -361,14 +361,20 @@ impl ToolRuntime {
         // Permission is evaluated once inside dispatch (pre-exec gate). Kernel
         // only reuses the attached decision for the outer recording session —
         // never re-evaluate (no second request id / inconsistent outcome).
+        let inherited_sandbox = context
+            .session_id
+            .and_then(|session_id| self.sessions.session_mode(session_id))
+            .filter(|mode| matches!(mode, crate::tool_runtime::SessionMode::Inspect))
+            .map(|_| crate::command_sandbox::INSPECT_SANDBOX_MODE);
         let mut result = self
-            .dispatch_with_auth_transport_options_and_metadata(
+            .dispatch_with_auth_transport_options_and_metadata_with_sandbox(
                 call,
                 context.auth,
                 context.transport.into(),
                 context.session_id.is_none(),
                 allow_cross_project_session,
                 recorder_metadata,
+                inherited_sandbox,
             )
             .await;
         if let Some(start) = session_event.as_mut() {

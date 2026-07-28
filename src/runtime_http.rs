@@ -2277,7 +2277,7 @@ mod tests {
             .expect("missing start_session");
         assert_eq!(
             start_session["inputSchema"]["properties"]["mode"]["enum"],
-            json!(["normal", "read_only"])
+            json!(["normal", "inspect", "read_only"])
         );
         assert!(start_session["inputSchema"]["properties"]
             .get("deny_write_tools")

@@ -3,11 +3,12 @@ use std::path::Path;
 
 use super::helpers::{
     command_rejected_message, is_safe_job_id, normalize_local_status, project_relative_agent_cwd,
-    project_relative_cwd, read_json, read_lines_from, read_trim, resolve_agent_cwd,
-    resolve_local_cwd, shell_escape_simple,
+    project_relative_cwd, read_lines_from_text, resolve_agent_cwd, resolve_local_cwd,
+    shell_escape_simple,
 };
 use super::local_jobs::{
-    LocalJobKiller, LocalJobRecord, TerminateOutcome, ACTIVE_JOB_STATUSES, ACTIVE_LOCAL_STATUSES,
+    retain_inspect_job_until_terminal, LocalJobKiller, LocalJobRecord, TerminateOutcome,
+    ACTIVE_JOB_STATUSES, ACTIVE_LOCAL_STATUSES,
 };
 use super::tool_result::ToolResult;
 use super::{ExecutionPurpose, ExecutionShell, ToolRuntime};
@@ -116,6 +117,26 @@ fn job_id_for_log(path: &Path) -> String {
         .to_string()
 }
 
+fn local_read_trim(record: &LocalJobRecord, name: &str) -> Option<String> {
+    record
+        .read_text(name)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn local_read_lines(
+    record: &LocalJobRecord,
+    name: &str,
+    offset: Option<usize>,
+    tail_lines: Option<usize>,
+) -> (String, usize, usize, bool) {
+    read_lines_from_text(
+        record.read_text(name).as_deref().unwrap_or_default(),
+        offset,
+        tail_lines,
+    )
+}
+
 /// Build a bounded job summary `Value` for an agent-known job. Never includes
 /// stdout/stderr bodies.
 pub(crate) fn agent_job_summary_value(job: &ShellJobInfo) -> Value {
@@ -143,21 +164,21 @@ pub(crate) fn local_job_summary_value(
     record: &LocalJobRecord,
     status_filter: &Option<String>,
 ) -> Option<Value> {
-    let meta = read_json(record.dir.join("metadata.json"));
-    let raw_status = read_trim(record.dir.join("status")).unwrap_or_default();
+    let meta = record.read_json("metadata.json");
+    let raw_status = local_read_trim(record, "status").unwrap_or_default();
     let status = normalize_local_status(&raw_status);
     if let Some(filter) = status_filter {
         if &status != filter {
             return None;
         }
     }
-    let exit_code = read_trim(record.dir.join("exit_code")).and_then(|v| v.parse::<i32>().ok());
+    let exit_code = local_read_trim(record, "exit_code").and_then(|v| v.parse::<i32>().ok());
     let created_at = meta
         .get("created_at")
         .and_then(Value::as_i64)
         .unwrap_or_default();
     let started_at = meta.get("started_at").and_then(Value::as_i64);
-    let ended_at = read_trim(record.dir.join("finished_at")).and_then(|v| v.parse::<i64>().ok());
+    let ended_at = local_read_trim(record, "finished_at").and_then(|v| v.parse::<i64>().ok());
     let kind = meta
         .get("kind")
         .and_then(Value::as_str)
@@ -186,16 +207,16 @@ pub(crate) fn local_job_status(
     // `lost` status (and terminates the process group) so callers see a
     // consistent terminal state and we don't leak processes.
     let timeout_note = enforce_local_job_timeout(record, killer);
-    let meta = read_json(record.dir.join("metadata.json"));
-    let raw_status = read_trim(record.dir.join("status")).unwrap_or_default();
+    let meta = record.read_json("metadata.json");
+    let raw_status = local_read_trim(record, "status").unwrap_or_default();
     let status = normalize_local_status(&raw_status);
-    let exit_code = read_trim(record.dir.join("exit_code")).and_then(|v| v.parse::<i32>().ok());
+    let exit_code = local_read_trim(record, "exit_code").and_then(|v| v.parse::<i32>().ok());
     let created_at = meta
         .get("created_at")
         .and_then(Value::as_i64)
         .unwrap_or_default();
     let started_at = meta.get("started_at").and_then(Value::as_i64);
-    let finished_at = read_trim(record.dir.join("finished_at")).and_then(|v| v.parse::<i64>().ok());
+    let finished_at = local_read_trim(record, "finished_at").and_then(|v| v.parse::<i64>().ok());
     let max_runtime_secs = meta.get("max_runtime_secs").and_then(Value::as_i64);
     let elapsed_secs = started_at.map(|started| {
         finished_at
@@ -238,12 +259,12 @@ pub(crate) fn local_job_log(
     // A log query on an overtime job also reclaims it so the reported status
     // is terminal and the process group is not leaked.
     let timeout_note = enforce_local_job_timeout(record, killer);
-    let stdout = read_lines_from(record.dir.join("stdout.log"), offset, tail_lines);
-    let stderr = read_lines_from(record.dir.join("stderr.log"), offset, tail_lines);
-    let raw_status = read_trim(record.dir.join("status")).unwrap_or_default();
+    let stdout = local_read_lines(record, "stdout.log", offset, tail_lines);
+    let stderr = local_read_lines(record, "stderr.log", offset, tail_lines);
+    let raw_status = local_read_trim(record, "status").unwrap_or_default();
     let status = normalize_local_status(&raw_status);
-    let exit_code = read_trim(record.dir.join("exit_code")).and_then(|v| v.parse::<i32>().ok());
-    let meta = read_json(record.dir.join("metadata.json"));
+    let exit_code = local_read_trim(record, "exit_code").and_then(|v| v.parse::<i32>().ok());
+    let meta = record.read_json("metadata.json");
     let purpose = meta
         .get("purpose")
         .and_then(Value::as_str)
@@ -296,7 +317,7 @@ pub(crate) fn local_job_log(
 pub(crate) fn resolve_job_pgid(meta: &Value, record: &LocalJobRecord) -> Option<i64> {
     meta.get("process_group_id")
         .and_then(Value::as_i64)
-        .or_else(|| read_trim(record.dir.join("pid")).and_then(|s| s.parse::<i64>().ok()))
+        .or_else(|| local_read_trim(record, "pid").and_then(|s| s.parse::<i64>().ok()))
 }
 
 /// If a local job is still `running` but has exceeded `max_runtime_secs`,
@@ -312,8 +333,8 @@ pub(crate) fn enforce_local_job_timeout(
     record: &LocalJobRecord,
     killer: &dyn LocalJobKiller,
 ) -> Option<String> {
-    let meta = read_json(record.dir.join("metadata.json"));
-    let raw_status = read_trim(record.dir.join("status")).unwrap_or_default();
+    let meta = record.read_json("metadata.json");
+    let raw_status = local_read_trim(record, "status").unwrap_or_default();
     if normalize_local_status(&raw_status) != "running" {
         return None;
     }
@@ -321,7 +342,7 @@ pub(crate) fn enforce_local_job_timeout(
     let max_runtime_secs = meta.get("max_runtime_secs").and_then(Value::as_i64)?;
     // The wrapper writes `finished_at` before `status`. If it exists, the job
     // just finished (or was already reclaimed) — do not double-reclaim.
-    if read_trim(record.dir.join("finished_at")).is_some() {
+    if local_read_trim(record, "finished_at").is_some() {
         return None;
     }
     let now = chrono::Utc::now().timestamp();
@@ -332,7 +353,7 @@ pub(crate) fn enforce_local_job_timeout(
     let pgid = resolve_job_pgid(&meta, record);
     let note = match pgid {
         Some(pgid) => {
-            let pid = read_trim(record.dir.join("pid"))
+            let pid = local_read_trim(record, "pid")
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(pgid);
             let outcome = killer.terminate_group(pid, pgid);
@@ -365,18 +386,18 @@ pub(crate) fn enforce_local_job_timeout(
     // Persist terminal state so subsequent reads are consistent and we don't
     // repeatedly attempt to kill. The wrapper shell was part of the group and
     // is now gone, so it will not write its own status/finished_at.
-    if let Err(e) = std::fs::write(record.dir.join("status"), "lost") {
-        tracing::warn!(
-            job_id = %job_id_for_log(&record.dir),
-            error = %e,
-            "failed to write timed-out local job status"
-        );
-    }
     if let Err(e) = std::fs::write(record.dir.join("finished_at"), now.to_string()) {
         tracing::warn!(
             job_id = %job_id_for_log(&record.dir),
             error = %e,
             "failed to write timed-out local job finished_at"
+        );
+    }
+    if let Err(e) = std::fs::write(record.dir.join("status"), "lost") {
+        tracing::warn!(
+            job_id = %job_id_for_log(&record.dir),
+            error = %e,
+            "failed to write timed-out local job status"
         );
     }
     Some(note)
@@ -392,8 +413,8 @@ pub(crate) fn stop_local_job(
     record: &LocalJobRecord,
     killer: &dyn LocalJobKiller,
 ) -> ToolResult {
-    let meta = read_json(record.dir.join("metadata.json"));
-    let raw_status = read_trim(record.dir.join("status")).unwrap_or_default();
+    let meta = record.read_json("metadata.json");
+    let raw_status = local_read_trim(record, "status").unwrap_or_default();
     let status = normalize_local_status(&raw_status);
     if !ACTIVE_LOCAL_STATUSES.contains(&status.as_str()) {
         return ToolResult::ok(json!({
@@ -406,7 +427,7 @@ pub(crate) fn stop_local_job(
     let now = chrono::Utc::now().timestamp();
     let note = match resolve_job_pgid(&meta, record) {
         Some(pgid) => {
-            let pid = read_trim(record.dir.join("pid"))
+            let pid = local_read_trim(record, "pid")
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(pgid);
             let outcome = killer.terminate_group(pid, pgid);
@@ -429,18 +450,18 @@ pub(crate) fn stop_local_job(
         }
         None => "stopped; no pid/process_group_id on record; marked stopped".to_string(),
     };
-    if let Err(e) = std::fs::write(record.dir.join("status"), "stopped") {
-        tracing::warn!(
-            job_id,
-            error = %e,
-            "failed to write stopped local job status"
-        );
-    }
     if let Err(e) = std::fs::write(record.dir.join("finished_at"), now.to_string()) {
         tracing::warn!(
             job_id,
             error = %e,
             "failed to write stopped local job finished_at"
+        );
+    }
+    if let Err(e) = std::fs::write(record.dir.join("status"), "stopped") {
+        tracing::warn!(
+            job_id,
+            error = %e,
+            "failed to write stopped local job status"
         );
     }
     ToolResult::ok(json!({
@@ -452,12 +473,13 @@ pub(crate) fn stop_local_job(
 }
 
 fn local_job_status_string(record: &LocalJobRecord) -> String {
-    let raw_status = read_trim(record.dir.join("status")).unwrap_or_default();
+    let raw_status = local_read_trim(record, "status").unwrap_or_default();
     normalize_local_status(&raw_status)
 }
 
 fn local_job_session_id(record: &LocalJobRecord) -> Option<String> {
-    read_json(record.dir.join("metadata.json"))
+    record
+        .read_json("metadata.json")
         .get("session_id")
         .and_then(Value::as_str)
         .map(str::trim)
@@ -829,7 +851,22 @@ impl ToolRuntime {
             // when omitted; explicit sh/bash selects the requested language.
             let actual_shell = shell.map(ExecutionShell::as_str).unwrap_or("bash");
             let job_id = uuid::Uuid::new_v4().to_string();
-            let dir = root.join(format!(".codex/jobs/{}", job_id));
+            let inspect_scratch = match sandbox.as_deref() {
+                None => None,
+                Some(crate::command_sandbox::INSPECT_SANDBOX_MODE) => {
+                    match crate::command_sandbox::InspectScratch::create() {
+                        Ok(scratch) => Some(scratch),
+                        Err(error) => {
+                            return ToolResult::err(format!("inspect sandbox unavailable: {error}"))
+                        }
+                    }
+                }
+                Some(other) => return ToolResult::err(format!("unknown sandbox mode '{other}'")),
+            };
+            let dir = inspect_scratch
+                .as_ref()
+                .map(|scratch| scratch.path().join("job"))
+                .unwrap_or_else(|| root.join(format!(".codex/jobs/{}", job_id)));
             if let Err(e) = std::fs::create_dir_all(&dir) {
                 return ToolResult::err(format!("Failed to create job dir: {}", e));
             }
@@ -875,16 +912,23 @@ impl ToolRuntime {
                 shell_escape_simple(&dir_s),
                 actual_shell,
             );
-            match std::process::Command::new("setsid")
+            let mut job_command = std::process::Command::new("setsid");
+            job_command
                 .arg("sh")
                 .arg("-c")
                 .arg(wrapper)
                 .current_dir(&cwd_path)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            {
+                .stderr(std::process::Stdio::null());
+            if let Some(scratch) = inspect_scratch.as_ref() {
+                if let Err(error) =
+                    crate::command_sandbox::sandbox_command_inspect(&mut job_command, scratch)
+                {
+                    return ToolResult::err(format!("inspect sandbox unavailable: {error}"));
+                }
+            }
+            match job_command.spawn() {
                 Ok(child) => {
                     // `setsid` makes the child a session + process-group
                     // leader, so child.id() is both the leader pid and the
@@ -909,13 +953,12 @@ impl ToolRuntime {
                             "failed to update local job metadata with process group"
                         );
                     }
-                    self.local_jobs.lock().await.insert(
-                        job_id.clone(),
-                        LocalJobRecord {
-                            project: project_id.clone(),
-                            dir,
-                        },
-                    );
+                    let record = LocalJobRecord::new(project_id.clone(), dir.clone());
+                    let terminal_snapshot = record.terminal_snapshot_handle();
+                    self.local_jobs.lock().await.insert(job_id.clone(), record);
+                    if let Some(scratch) = inspect_scratch {
+                        retain_inspect_job_until_terminal(dir, terminal_snapshot, scratch, child);
+                    }
                     ToolResult::ok(json!({
                         "job_id": job_id,
                         "kind": "shell",

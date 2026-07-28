@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -11,11 +11,22 @@ pub(crate) fn run_command_sync(
     run_command_sync_with_shell(cmd, cwd, timeout_secs, "sh")
 }
 
+#[cfg(test)]
 pub(crate) fn run_command_sync_with_shell(
     cmd: &str,
     cwd: &Path,
     timeout_secs: u64,
     shell: &str,
+) -> (i32, String, String, u64) {
+    run_command_sync_with_shell_and_sandbox(cmd, cwd, timeout_secs, shell, None)
+}
+
+pub(crate) fn run_command_sync_with_shell_and_sandbox(
+    cmd: &str,
+    cwd: &Path,
+    timeout_secs: u64,
+    shell: &str,
+    sandbox: Option<&str>,
 ) -> (i32, String, String, u64) {
     let start = Instant::now();
     let mut command = std::process::Command::new(shell);
@@ -36,6 +47,41 @@ pub(crate) fn run_command_sync_with_shell(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
+    let _scratch = match sandbox {
+        None => None,
+        Some(crate::command_sandbox::INSPECT_SANDBOX_MODE) => {
+            let scratch = match crate::command_sandbox::InspectScratch::create() {
+                Ok(scratch) => scratch,
+                Err(error) => {
+                    return (
+                        -1,
+                        String::new(),
+                        format!("Failed to configure inspect sandbox: {error}"),
+                        start.elapsed().as_millis() as u64,
+                    )
+                }
+            };
+            if let Err(error) =
+                crate::command_sandbox::sandbox_command_inspect(&mut command, &scratch)
+            {
+                return (
+                    -1,
+                    String::new(),
+                    format!("Failed to configure inspect sandbox: {error}"),
+                    start.elapsed().as_millis() as u64,
+                );
+            }
+            Some(scratch)
+        }
+        Some(other) => {
+            return (
+                -1,
+                String::new(),
+                format!("Failed to configure inspect sandbox: unknown sandbox mode '{other}'"),
+                start.elapsed().as_millis() as u64,
+            )
+        }
+    };
     let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -182,9 +228,25 @@ pub(crate) async fn run_command_sync_bounded_with_shell(
     timeout_secs: u64,
     shell: String,
 ) -> Result<(i32, String, String, u64), LocalRunFailure> {
+    run_command_sync_bounded_with_shell_and_sandbox(cmd, cwd, timeout_secs, shell, None).await
+}
+
+pub(crate) async fn run_command_sync_bounded_with_shell_and_sandbox(
+    cmd: String,
+    cwd: PathBuf,
+    timeout_secs: u64,
+    shell: String,
+    sandbox: Option<String>,
+) -> Result<(i32, String, String, u64), LocalRunFailure> {
     let bound_secs = timeout_secs.saturating_add(LOCAL_RUN_HARD_GRACE_SECS);
     let task = tokio::task::spawn_blocking(move || {
-        run_command_sync_with_shell(&cmd, &cwd, timeout_secs, &shell)
+        run_command_sync_with_shell_and_sandbox(
+            &cmd,
+            &cwd,
+            timeout_secs,
+            &shell,
+            sandbox.as_deref(),
+        )
     });
     match tokio::time::timeout(Duration::from_secs(bound_secs), task).await {
         Ok(Ok(result)) => Ok(result),
@@ -494,13 +556,7 @@ pub(crate) fn normalize_local_status(raw: &str) -> String {
     }
 }
 
-pub(crate) fn read_json(path: PathBuf) -> Value {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({}))
-}
-
+#[cfg(test)]
 pub(crate) fn read_trim(path: PathBuf) -> Option<String> {
     std::fs::read_to_string(path)
         .ok()
@@ -511,12 +567,21 @@ pub(crate) fn read_trim(path: PathBuf) -> Option<String> {
 pub(crate) const MAX_LOCAL_LOG_LINES: usize = 500;
 pub(crate) const DEFAULT_JOB_LOG_TAIL_LINES: usize = 200;
 
+#[cfg(test)]
 pub(crate) fn read_lines_from(
     path: PathBuf,
     offset: Option<usize>,
     tail_lines: Option<usize>,
 ) -> (String, usize, usize, bool) {
     let content = std::fs::read_to_string(path).unwrap_or_default();
+    read_lines_from_text(&content, offset, tail_lines)
+}
+
+pub(crate) fn read_lines_from_text(
+    content: &str,
+    offset: Option<usize>,
+    tail_lines: Option<usize>,
+) -> (String, usize, usize, bool) {
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
     // `offset` is a 1-based line cursor (matching agent `since_stdout_line`).

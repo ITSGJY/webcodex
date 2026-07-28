@@ -281,6 +281,7 @@ fn allowed_tool_definition_categories_for_discovery_group(group: &str) -> &'stat
             "checkpoint",
             "file",
             "git",
+            "job",
             "lsp",
             "project",
             "runtime",
@@ -316,6 +317,7 @@ fn expected_cross_listed_discovery_groups(tool: &str) -> Option<&'static [&'stat
         "list_projects" => Some(&["inspect", "projects", "runtime"]),
         "list_tools" => Some(&["inspect", "runtime"]),
         "run_job" => Some(&["jobs", "shell"]),
+        "run_shell" => Some(&["inspect", "shell"]),
         "runtime_status" => Some(&["inspect", "runtime"]),
         "show_changes" => Some(&["git", "inspect", "review"]),
         "start_coding_task" => Some(&["inspect", "runtime"]),
@@ -943,7 +945,12 @@ fn tool_categories_and_recommended_flows_are_well_formed() {
     assert!(review.iter().any(|v| v == "workspace_hygiene_check"));
     assert!(review.iter().any(|v| v == "git_log"));
     let inspect = categories[TOOL_DISCOVERY_GROUP_INSPECT].as_array().unwrap();
-    for name in ["read_file", "search_project_text", "show_changes"] {
+    for name in [
+        "read_file",
+        "run_shell",
+        "search_project_text",
+        "show_changes",
+    ] {
         assert!(
             inspect.iter().any(|v| v == name),
             "inspect category should include default inspect tool {name}"
@@ -974,7 +981,10 @@ fn tool_categories_and_recommended_flows_are_well_formed() {
     }
     let joined_flows = flows.join("\n").to_lowercase();
     for phrase in [
-        "inspect: use read_file, search_project_text, and show_changes before editing",
+        "prefer run_shell with rg or git grep for code search",
+        "search_project_text remains a compatibility path",
+        "inspect: use read_file and run_shell with rg or git grep before editing",
+        "search_project_text remains compatible",
         "edit: prefer apply_text_edits for transactional guarded file changes",
         "apply_patch_checked for complex unified diffs",
         "write_project_file only for intentional full rewrites",

@@ -24,7 +24,7 @@ Full naming, lifecycle, compatibility, and non-goals:
 | Purpose | Coding-task workflow: start/finish coding task, tool events, validation evidence, handoff |
 | Storage | In-memory ledger with durable JSON-oriented session records (product surface for MCP / runtime tools) |
 | Identity rules | Explicit `session_id` always wins; unknown id → `unknown_session_id`; no silent current-session fallback |
-| Mutation policy | `read_only` denies write-like and shell/job-like tools; guard denial before mutation |
+| Mutation policy | `inspect` denies structured writes and Landlocks shell/jobs; `read_only` denies write-like and shell/job-like tools; guard denial before mutation |
 
 Do **not** change `wc_sess_*` ID format, ledger event shape, or lifecycle
 semantics casually. Session / guard / current-session work must preserve the
