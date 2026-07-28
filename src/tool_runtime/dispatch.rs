@@ -487,7 +487,7 @@ impl ToolRuntime {
             | ToolCall::ReplaceLineRange { .. }
             | ToolCall::InsertAtLine { .. }
             | ToolCall::DeleteLineRange { .. }
-            | ToolCall::ApplyTextEdits { .. }) => self.dispatch_file_tool(call).await,
+            | ToolCall::ApplyTextEdits { .. }) => self.dispatch_file_tool(call, transport).await,
 
             call @ (ToolCall::GitRestorePaths { .. }
             | ToolCall::DiscardUntracked { .. }

@@ -2,6 +2,7 @@ use super::files::sha256_hex_bytes;
 use super::output::{line_edit_stdout, CommandResult};
 use crate::artifact_policy::{
     has_safe_octet_stream_artifact_extension, octet_stream_safe_extension_error,
+    MAX_MCP_IMAGE_BYTES,
 };
 use crate::shell_protocol::ShellAgentShellRequest;
 use base64::{engine::general_purpose, Engine as _};
@@ -1351,18 +1352,39 @@ fn handle_read_project_artifact(
         Ok(value) => value,
         Err(e) => return line_edit_stdout(read_error(Some(path), e), start),
     };
-    let length = match parse_usize_field(&payload, "length", DEFAULT_ARTIFACT_READ_LENGTH) {
+    let mcp_image = match parse_bool_field(&payload, "mcp_image") {
         Ok(value) => value,
         Err(e) => return line_edit_stdout(read_error(Some(path), e), start),
+    };
+    if mcp_image && offset != 0 {
+        return line_edit_stdout(
+            read_error(Some(path), "MCP image reads must start at offset 0"),
+            start,
+        );
+    }
+    let requested_length = match parse_usize_field(&payload, "length", DEFAULT_ARTIFACT_READ_LENGTH)
+    {
+        Ok(value) => value,
+        Err(e) => return line_edit_stdout(read_error(Some(path), e), start),
+    };
+    let length = if mcp_image {
+        MAX_MCP_IMAGE_BYTES
+    } else {
+        requested_length
     };
     if length < 1 {
         return line_edit_stdout(read_error(Some(path), "length must be >= 1"), start);
     }
-    let max_file_bytes =
+    let requested_max_file_bytes =
         match parse_usize_field(&payload, "max_file_bytes", DEFAULT_MAX_ARTIFACT_BYTES) {
             Ok(value) => value,
             Err(e) => return line_edit_stdout(read_error(Some(path), e), start),
         };
+    let max_file_bytes = if mcp_image {
+        requested_max_file_bytes.min(MAX_MCP_IMAGE_BYTES)
+    } else {
+        requested_max_file_bytes
+    };
     if max_file_bytes < 1 {
         return line_edit_stdout(read_error(Some(path), "max_file_bytes must be >= 1"), start);
     }
@@ -1373,19 +1395,48 @@ fn handle_read_project_artifact(
         }
     };
     if file_bytes > max_file_bytes as u64 {
-        return line_edit_stdout(
-            read_error(
-                Some(path),
-                "artifact too large to read; use metadata or a smaller artifact",
-            ),
-            start,
-        );
+        let message = if mcp_image {
+            format!(
+                "MCP image too large; maximum is {} bytes",
+                MAX_MCP_IMAGE_BYTES
+            )
+        } else {
+            "artifact too large to read; use metadata or a smaller artifact".to_string()
+        };
+        return line_edit_stdout(read_error(Some(path), message), start);
     }
     let data = match std::fs::read(resolved) {
         Ok(data) => data,
         Err(e) => {
             return line_edit_stdout(read_error(Some(path), format!("read failed: {e}")), start)
         }
+    };
+    let mime_type = if mcp_image {
+        match magic_mime(&data) {
+            Some(mime @ ("image/png" | "image/jpeg" | "image/webp")) => Some(mime.to_string()),
+            Some(mime) => {
+                return line_edit_stdout(
+                    read_error(
+                        Some(path),
+                        format!(
+                            "unsupported MCP image MIME type '{mime}'; supported types are image/png, image/jpeg, and image/webp"
+                        ),
+                    ),
+                    start,
+                )
+            }
+            None => {
+                return line_edit_stdout(
+                    read_error(
+                        Some(path),
+                        "artifact content is not a supported PNG, JPEG, or WebP image",
+                    ),
+                    start,
+                )
+            }
+        }
+    } else {
+        artifact_mime(path, &data, true)
     };
     let file_bytes = data.len();
     let (segment, next_offset, truncated) = if offset >= file_bytes {
@@ -1401,7 +1452,7 @@ fn handle_read_project_artifact(
     line_edit_stdout(
         json!({
             "path": path,
-            "mime_type": artifact_mime(path, &data, true),
+            "mime_type": mime_type,
             "file_bytes": file_bytes,
             "sha256": sha256_hex_bytes(&data),
             "offset": offset,
@@ -1548,6 +1599,114 @@ mod tests {
         assert_eq!(metadata["missing"], false);
         assert_eq!(metadata["bytes"], 5);
         assert_eq!(metadata["sha256"], sha256_hex_bytes(b"hello"));
+    }
+
+    #[test]
+    fn read_project_artifact_mcp_image_returns_complete_supported_formats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cases: [(&str, &[u8], &str); 3] = [
+            (
+                "docs/images/sample.png",
+                b"\x89PNG\r\n\x1a\npng-body",
+                "image/png",
+            ),
+            (
+                "docs/images/sample.jpg",
+                b"\xff\xd8\xff\xe0jpeg-body\xff\xd9",
+                "image/jpeg",
+            ),
+            (
+                "docs/images/sample.webp",
+                b"RIFF\x08\x00\x00\x00WEBPwebp-body",
+                "image/webp",
+            ),
+        ];
+
+        for (path, bytes, expected_mime) in cases {
+            let resolved = tmp.path().join(path);
+            std::fs::create_dir_all(resolved.parent().unwrap()).unwrap();
+            std::fs::write(&resolved, bytes).unwrap();
+            let output = run_artifact_request(
+                tmp.path(),
+                "file_read_project_artifact",
+                path,
+                json!({
+                    "path": path,
+                    "offset": 0,
+                    "length": MAX_MCP_IMAGE_BYTES,
+                    "max_file_bytes": MAX_MCP_IMAGE_BYTES,
+                    "mcp_image": true,
+                }),
+            );
+
+            assert_eq!(output["mime_type"], expected_mime);
+            assert_eq!(output["file_bytes"], bytes.len());
+            assert_eq!(output["bytes_returned"], bytes.len());
+            assert_eq!(
+                output["content_base64"],
+                general_purpose::STANDARD.encode(bytes)
+            );
+            assert_eq!(output["offset"], 0);
+            assert_eq!(output["next_offset"], bytes.len());
+            assert_eq!(output["truncated"], false);
+            assert_eq!(output["eof"], true);
+        }
+    }
+
+    #[test]
+    fn read_project_artifact_mcp_image_fails_safely() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unsupported_path = "docs/images/not-an-image.png";
+        let unsupported = tmp.path().join(unsupported_path);
+        std::fs::create_dir_all(unsupported.parent().unwrap()).unwrap();
+        std::fs::write(&unsupported, b"%PDF-1.7\n").unwrap();
+        let unsupported_output = run_artifact_request(
+            tmp.path(),
+            "file_read_project_artifact",
+            unsupported_path,
+            json!({
+                "path": unsupported_path,
+                "mcp_image": true,
+            }),
+        );
+        assert!(unsupported_output["error"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported MCP image MIME type 'application/pdf'"));
+
+        let too_large_path = "docs/images/too-large.png";
+        let too_large = tmp.path().join(too_large_path);
+        let mut oversized_bytes = vec![0u8; MAX_MCP_IMAGE_BYTES + 1];
+        oversized_bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        std::fs::write(&too_large, oversized_bytes).unwrap();
+        let too_large_output = run_artifact_request(
+            tmp.path(),
+            "file_read_project_artifact",
+            too_large_path,
+            json!({
+                "path": too_large_path,
+                "max_file_bytes": MAX_MCP_IMAGE_BYTES * 2,
+                "mcp_image": true,
+            }),
+        );
+        let too_large_error = too_large_output["error"].as_str().unwrap();
+        assert!(too_large_error.contains("MCP image too large"));
+        assert!(too_large_error.contains(&MAX_MCP_IMAGE_BYTES.to_string()));
+
+        let missing_path = "docs/images/missing.png";
+        let missing_output = run_artifact_request(
+            tmp.path(),
+            "file_read_project_artifact",
+            missing_path,
+            json!({
+                "path": missing_path,
+                "mcp_image": true,
+            }),
+        );
+        assert!(missing_output["error"]
+            .as_str()
+            .unwrap()
+            .contains("stat failed"));
     }
 
     #[test]

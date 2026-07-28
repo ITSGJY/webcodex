@@ -574,6 +574,7 @@ impl ToolCall {
                 offset,
                 length,
                 max_bytes,
+                as_image,
                 ..
             } => serde_json::json!({
                 "project": project,
@@ -582,6 +583,7 @@ impl ToolCall {
                 "offset": offset,
                 "length": length,
                 "max_bytes": max_bytes,
+                "as_image": as_image,
             }),
             Self::ArtifactUploadBegin {
                 project,

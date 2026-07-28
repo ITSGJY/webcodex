@@ -8,7 +8,7 @@ use crate::tool_request_trace::{
 use crate::tool_runtime::kernel::{
     ToolCallContext, ToolCallErrorStatus, ToolCallRequest as KernelToolCallRequest, ToolTransport,
 };
-use crate::tool_runtime::{registered_tool_specs, ToolRuntime, ToolSpec};
+use crate::tool_runtime::{registered_tool_specs, ToolResult, ToolRuntime, ToolSpec};
 use salvo::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -92,7 +92,21 @@ fn mcp_tools_list_payload_for_connector(connector_enabled: bool) -> Value {
     json!({ "tools": tools })
 }
 
-fn mcp_tool_spec_json(spec: ToolSpec, compact: bool) -> Value {
+fn mcp_tool_spec_json(mut spec: ToolSpec, compact: bool) -> Value {
+    if spec.name == "read_project_artifact" {
+        if let Some(properties) = spec.input_schema["properties"].as_object_mut() {
+            properties.insert(
+                "as_image".to_string(),
+                json!({
+                    "type": "boolean",
+                    "description": "MCP-only. When true, read one complete PNG, JPEG, or WebP up to 1 MiB and return it as native image content. Cannot be combined with offset, length, or max_bytes."
+                }),
+            );
+        }
+        spec.description.push_str(
+            " Over MCP, set as_image=true to return one complete PNG, JPEG, or WebP as native image content; ordinary calls keep the existing chunked base64 response.",
+        );
+    }
     if compact {
         json!({
             "name": spec.name,
@@ -104,6 +118,109 @@ fn mcp_tool_spec_json(spec: ToolSpec, compact: bool) -> Value {
         // Match ToolSpec's camelCase serde so default behavior is unchanged.
         serde_json::to_value(spec).unwrap_or_else(|_| json!({}))
     }
+}
+
+fn mcp_runtime_tool_result(
+    tool_name: &str,
+    as_image_requested: bool,
+    mut result: ToolResult,
+) -> Value {
+    if tool_name == "read_project_artifact" && as_image_requested && result.success {
+        match mcp_native_image_tool_result(&mut result) {
+            Ok(value) => return value,
+            Err(error) => {
+                result = ToolResult::err(format!(
+                    "cannot frame read_project_artifact as MCP image content: {error}"
+                ));
+            }
+        }
+    }
+
+    let text = serde_json::to_string(&json!({
+        "success": result.success,
+        "output": result.output.clone(),
+        "error": result.error.clone(),
+    }))
+    .unwrap_or_else(|_| "{}".to_string());
+    json!({
+        "content": [
+            {
+                "type": "text",
+                "text": text
+            }
+        ],
+        "structuredContent": {
+            "success": result.success,
+            "output": result.output,
+            "error": result.error,
+        },
+        "isError": !result.success
+    })
+}
+
+fn mcp_native_image_tool_result(result: &mut ToolResult) -> Result<Value, String> {
+    let data = result
+        .output
+        .get("content_base64")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing content_base64".to_string())?
+        .to_string();
+    let mime_type = result
+        .output
+        .get("mime_type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing mime_type".to_string())?
+        .to_string();
+    if !matches!(
+        mime_type.as_str(),
+        "image/png" | "image/jpeg" | "image/webp"
+    ) {
+        return Err(format!("unsupported MIME type '{mime_type}'"));
+    }
+    let path = result
+        .output
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("project image");
+    let file_bytes = result
+        .output
+        .get("file_bytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "missing file_bytes".to_string())?;
+    let sha256 = result
+        .output
+        .get("sha256")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let metadata_text = format!("Image {path}: {mime_type}, {file_bytes} bytes, sha256 {sha256}.");
+
+    let output = result
+        .output
+        .as_object_mut()
+        .ok_or_else(|| "tool output is not an object".to_string())?;
+    output.remove("content_base64");
+    output.insert("content_delivery".to_string(), json!("mcp_image"));
+    let structured_output = result.output.clone();
+
+    Ok(json!({
+        "content": [
+            {
+                "type": "text",
+                "text": metadata_text
+            },
+            {
+                "type": "image",
+                "data": data,
+                "mimeType": mime_type
+            }
+        ],
+        "structuredContent": {
+            "success": true,
+            "output": structured_output,
+            "error": Value::Null,
+        },
+        "isError": false
+    }))
 }
 
 /// Outcome of handling a single MCP JSON-RPC request.
@@ -477,6 +594,8 @@ async fn handle_mcp_request_with_lifecycle(
                 ));
             }
             let session_id = strip_reserved_session_id(&mut params.arguments);
+            let as_image_requested = params.name == "read_project_artifact"
+                && params.arguments.get("as_image").and_then(Value::as_bool) == Some(true);
             let outcome = runtime
                 .call_tool_with_context(
                     KernelToolCallRequest {
@@ -528,28 +647,9 @@ async fn handle_mcp_request_with_lifecycle(
                     lc.dispatch_finished(true, Some(false), category);
                 }
             }
-            let text = serde_json::to_string(&json!({
-                "success": result.success,
-                "output": result.output.clone(),
-                "error": result.error.clone(),
-            }))
-            .unwrap_or_else(|_| "{}".to_string());
             rpc_result(
                 id,
-                json!({
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": text
-                        }
-                    ],
-                    "structuredContent": {
-                        "success": result.success,
-                        "output": result.output,
-                        "error": result.error,
-                    },
-                    "isError": !result.success
-                }),
+                mcp_runtime_tool_result(&params.name, as_image_requested, result),
             )
         }
         "notifications/initialized" => rpc_result(id, json!({})),
@@ -616,6 +716,12 @@ fn rpc_error(id: Option<Value>, code: i64, message: impl Into<String>) -> Value 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell_protocol::{
+        ShellAgentPollRequest, ShellAgentProjectSummary, ShellAgentResultRequest,
+        ShellClientCapabilities, ShellClientRegisterRequest,
+    };
+    use base64::{engine::general_purpose, Engine as _};
+    use sha2::{Digest, Sha256};
 
     fn test_runtime() -> ToolRuntime {
         ToolRuntime::new_for_tests()
@@ -756,6 +862,232 @@ mod tests {
             }
         }
         std::env::remove_var("WEBCODEX_MCP_COMPACT_SCHEMAS");
+    }
+
+    #[test]
+    fn mcp_tools_list_adds_image_mode_without_changing_generic_artifact_schema() {
+        let payload = mcp_tools_list_payload();
+        let mcp_tool = payload["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "read_project_artifact")
+            .expect("MCP read_project_artifact");
+        assert_eq!(
+            mcp_tool["inputSchema"]["properties"]["as_image"]["type"],
+            "boolean"
+        );
+        assert!(mcp_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("as_image=true"));
+
+        let generic_tool = registered_tool_specs()
+            .into_iter()
+            .find(|tool| tool.name == "read_project_artifact")
+            .expect("generic read_project_artifact");
+        assert!(
+            generic_tool.input_schema["properties"]
+                .get("as_image")
+                .is_none(),
+            "MCP image presentation must not change the generic REST/GPT Actions schema"
+        );
+    }
+
+    #[test]
+    fn ordinary_artifact_result_keeps_existing_text_and_structured_base64_shape() {
+        let value = mcp_runtime_tool_result(
+            "read_project_artifact",
+            false,
+            ToolResult::ok(json!({
+                "path": "sample.pdf",
+                "mime_type": "application/pdf",
+                "file_bytes": 100_000,
+                "sha256": "a".repeat(64),
+                "offset": 0,
+                "bytes_returned": 32_768,
+                "content_base64": "JVBERg==",
+                "next_offset": 32_768,
+                "truncated": true,
+                "eof": false,
+            })),
+        );
+        assert_eq!(value["content"].as_array().unwrap().len(), 1);
+        assert_eq!(value["content"][0]["type"], "text");
+        assert_eq!(
+            value["structuredContent"]["output"]["content_base64"],
+            "JVBERg=="
+        );
+        assert_eq!(
+            value["structuredContent"]["output"]["truncated"], true,
+            "ordinary artifact reads must retain chunk continuation metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_image_call_returns_native_image_for_remote_agent_project() {
+        let runtime = test_runtime();
+        let client_id = "mcp-vision-agent";
+        let agent_instance_id = "inst-mcp-vision";
+        let project_name = "remote-images";
+        runtime
+            .shell_clients
+            .register(ShellClientRegisterRequest {
+                client_id: client_id.to_string(),
+                agent_instance_id: agent_instance_id.to_string(),
+                display_name: None,
+                owner: None,
+                hostname: None,
+                capabilities: Some(ShellClientCapabilities {
+                    file_read: true,
+                    ..Default::default()
+                }),
+                projects: Some(vec![ShellAgentProjectSummary {
+                    id: project_name.to_string(),
+                    name: Some(project_name.to_string()),
+                    path: "/remote/session-atlas".to_string(),
+                    allow_patch: true,
+                    kind: Some("repo".to_string()),
+                    description: None,
+                    hooks: Vec::new(),
+                    disabled: false,
+                    git_branch: None,
+                    git_head: None,
+                    git_dirty: None,
+                    updated_at: 1,
+                    shell_profile: None,
+                }]),
+                agent_protocol_version: Some("polling-v1".to_string()),
+                policy: None,
+                process_started_at: None,
+                build: None,
+            })
+            .await
+            .unwrap();
+        let project = crate::tool_runtime::agent_project_runtime_id(client_id, project_name);
+        let mut auth = crate::auth::AuthContext::new(crate::auth::AuthKind::Bootstrap);
+        auth.is_bootstrap = true;
+
+        // Larger than the ordinary 256 KiB runner stdout cap: this proves the
+        // narrowly widened MCP image result path carries a real screenshot-sized
+        // response without silently tail-truncating its JSON/base64.
+        let mut image_bytes = vec![0u8; 300 * 1024];
+        image_bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        let image_base64 = general_purpose::STANDARD.encode(&image_bytes);
+        let sha256 = format!("{:x}", Sha256::digest(&image_bytes));
+        let path = "docs/images/console-overview-dark.png";
+
+        let call = tokio::spawn({
+            let runtime = runtime.clone();
+            let project = project.clone();
+            let auth = auth.clone();
+            async move {
+                handle_mcp_request(
+                    &runtime,
+                    rpc(
+                        "tools/call",
+                        Some(json!(77)),
+                        json!({
+                            "name": "read_project_artifact",
+                            "arguments": {
+                                "project": project,
+                                "path": path,
+                                "as_image": true
+                            }
+                        }),
+                    ),
+                    Some(&auth),
+                )
+                .await
+            }
+        });
+
+        let mut request = None;
+        for _ in 0..200 {
+            request = runtime
+                .shell_clients
+                .poll(ShellAgentPollRequest {
+                    client_id: client_id.to_string(),
+                    agent_instance_id: agent_instance_id.to_string(),
+                    projects: None,
+                })
+                .await
+                .unwrap();
+            if request.is_some() || call.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let request = match request {
+            Some(request) => request,
+            None => {
+                let outcome = call.await.unwrap();
+                panic!("MCP image call should enqueue a remote artifact read, got {outcome:?}");
+            }
+        };
+        assert_eq!(request.kind, "file_read_project_artifact");
+        assert_eq!(request.cwd.as_deref(), Some("/remote/session-atlas"));
+        let payload: Value = serde_json::from_str(request.content.as_deref().unwrap()).unwrap();
+        assert_eq!(payload["path"], path);
+        assert_eq!(payload["offset"], 0);
+        assert_eq!(
+            payload["length"],
+            crate::artifact_policy::MAX_MCP_IMAGE_BYTES
+        );
+        assert_eq!(
+            payload["max_file_bytes"],
+            crate::artifact_policy::MAX_MCP_IMAGE_BYTES
+        );
+        assert_eq!(payload["mcp_image"], true);
+
+        let stdout = json!({
+            "path": path,
+            "mime_type": "image/png",
+            "file_bytes": image_bytes.len(),
+            "sha256": sha256,
+            "offset": 0,
+            "bytes_returned": image_bytes.len(),
+            "content_base64": &image_base64,
+            "next_offset": image_bytes.len(),
+            "truncated": false,
+            "eof": true,
+        })
+        .to_string();
+        assert!(stdout.len() > 256 * 1024);
+        runtime
+            .shell_clients
+            .complete(ShellAgentResultRequest {
+                client_id: client_id.to_string(),
+                agent_instance_id: agent_instance_id.to_string(),
+                request_id: request.request_id,
+                exit_code: Some(0),
+                stdout: Some(stdout),
+                stderr: Some(String::new()),
+                duration_ms: Some(1),
+                error: None,
+            })
+            .await
+            .unwrap();
+
+        let outcome = call.await.unwrap();
+        let McpOutcome::Ok(value) = outcome else {
+            panic!("expected MCP tool result, got {outcome:?}");
+        };
+        assert_eq!(value["result"]["isError"], false);
+        let content = value["result"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert!(content[0]["text"].as_str().unwrap().len() < 256);
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["mimeType"], "image/png");
+        assert_eq!(content[1]["data"], image_base64);
+        let structured = &value["result"]["structuredContent"];
+        assert_eq!(structured["success"], true);
+        assert_eq!(structured["output"]["content_delivery"], "mcp_image");
+        assert!(
+            structured["output"].get("content_base64").is_none(),
+            "structuredContent must not duplicate the image base64"
+        );
     }
 
     #[test]

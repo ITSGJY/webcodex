@@ -1,6 +1,7 @@
 //! Agent-native artifact file-op routing tests.
 
 use super::super::files::*;
+use super::super::sessions::SessionTransport;
 use super::super::ToolCall;
 use super::support::*;
 use crate::shell_protocol::ShellClientCapabilities;
@@ -202,6 +203,7 @@ async fn read_project_artifact_routes_to_agent_file_op() {
                     Some(5),
                     Some(7),
                     None,
+                    None,
                 )
                 .await
         }
@@ -235,6 +237,177 @@ async fn read_project_artifact_routes_to_agent_file_op() {
     assert_eq!(result.output["bytes_returned"], 7);
     assert_eq!(result.output["content_base64"], "ZmdoaWprbA==");
     assert_eq!(result.output["eof"], true);
+}
+
+#[tokio::test]
+async fn read_project_artifact_mcp_image_routes_complete_bounded_remote_read() {
+    let runtime = runtime_with_agent_project("artifact-image");
+    register_agent(
+        &runtime,
+        "artifact-image",
+        None,
+        ShellClientCapabilities {
+            file_read: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id("artifact-image");
+    let bytes = b"\x89PNG\r\n\x1a\nremote-image";
+    let content_base64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+    let sha256 = sha256_hex_bytes(bytes);
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        async move {
+            runtime
+                .read_project_artifact(
+                    project,
+                    "docs/images/remote.png".to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(true),
+                )
+                .await
+        }
+    });
+
+    let req = next_patch_agent_request(&runtime, "artifact-image")
+        .await
+        .expect("MCP image read should enqueue an artifact file-op");
+    assert_eq!(req.kind, "file_read_project_artifact");
+    let payload: serde_json::Value =
+        serde_json::from_str(req.content.as_deref().expect("artifact payload")).unwrap();
+    assert_eq!(
+        payload,
+        json!({
+            "path": "docs/images/remote.png",
+            "offset": 0,
+            "length": crate::artifact_policy::MAX_MCP_IMAGE_BYTES,
+            "max_file_bytes": crate::artifact_policy::MAX_MCP_IMAGE_BYTES,
+            "mcp_image": true,
+        })
+    );
+
+    let stdout = json!({
+        "path": "docs/images/remote.png",
+        "mime_type": "image/png",
+        "file_bytes": bytes.len(),
+        "sha256": sha256,
+        "offset": 0,
+        "bytes_returned": bytes.len(),
+        "content_base64": &content_base64,
+        "next_offset": bytes.len(),
+        "truncated": false,
+        "eof": true,
+    })
+    .to_string();
+    complete_patch_agent_request(&runtime, "artifact-image", &req.request_id, 0, &stdout, "").await;
+
+    let result = task.await.unwrap();
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["mime_type"], "image/png");
+    assert_eq!(result.output["content_base64"], content_base64);
+    assert_eq!(result.output["eof"], true);
+}
+
+#[tokio::test]
+async fn read_project_artifact_mcp_image_rejects_untrusted_remote_mime() {
+    let runtime = runtime_with_agent_project("artifact-image-mime");
+    register_agent(
+        &runtime,
+        "artifact-image-mime",
+        None,
+        ShellClientCapabilities {
+            file_read: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id("artifact-image-mime");
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .read_project_artifact(
+                    project,
+                    "docs/images/spoofed.png".to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(true),
+                )
+                .await
+        }
+    });
+    let req = next_patch_agent_request(&runtime, "artifact-image-mime")
+        .await
+        .expect("MCP image read should enqueue an artifact file-op");
+    let pdf = b"%PDF-1.7\n";
+    let stdout = json!({
+        "path": "docs/images/spoofed.png",
+        "mime_type": "image/png",
+        "file_bytes": pdf.len(),
+        "sha256": sha256_hex_bytes(pdf),
+        "offset": 0,
+        "bytes_returned": pdf.len(),
+        "content_base64": base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            pdf
+        ),
+        "next_offset": pdf.len(),
+        "truncated": false,
+        "eof": true,
+    })
+    .to_string();
+    complete_patch_agent_request(
+        &runtime,
+        "artifact-image-mime",
+        &req.request_id,
+        0,
+        &stdout,
+        "",
+    )
+    .await;
+
+    let result = task.await.unwrap();
+    assert!(!result.success);
+    assert!(result
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("not a supported PNG, JPEG, or WebP"));
+    assert_eq!(result.output["error_kind"], "invalid_mcp_image_artifact");
+}
+
+#[tokio::test]
+async fn read_project_artifact_image_mode_is_rejected_outside_mcp() {
+    let result = test_runtime()
+        .dispatch_file_tool(
+            ToolCall::ReadProjectArtifact {
+                project: "agent:missing:missing".to_string(),
+                path: "docs/images/sample.png".to_string(),
+                session_id: None,
+                encoding: None,
+                offset: None,
+                length: None,
+                max_bytes: None,
+                as_image: Some(true),
+            },
+            SessionTransport::Api,
+        )
+        .await;
+    assert!(!result.success);
+    assert!(result
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("only supported over MCP"));
 }
 
 #[tokio::test]
@@ -465,6 +638,7 @@ async fn project_artifact_tools_require_file_capabilities() {
                 offset: None,
                 length: None,
                 max_bytes: None,
+                as_image: None,
             },
             Some(&bootstrap),
         )

@@ -19,6 +19,7 @@ use super::tool_result::ToolResult;
 use super::{SearchResultMode, ToolRuntime};
 use crate::artifact_policy::{
     has_safe_octet_stream_artifact_extension, octet_stream_safe_extension_error,
+    MAX_MCP_IMAGE_BYTES,
 };
 use crate::project_overview::{
     effective_project_overview_limit, effective_project_overview_max_depth,
@@ -1468,6 +1469,80 @@ pub(crate) const MAX_PROJECT_ARTIFACT_BASE64_BYTES: usize = 14 * 1024 * 1024; //
 /// Hard cap for a base64-encoded chunk plus JSON overhead.
 pub(crate) const MAX_PROJECT_ARTIFACT_UPLOAD_CHUNK_BASE64_BYTES: usize = 96 * 1024;
 
+fn sniff_supported_mcp_image_mime(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if data.starts_with(b"\xff\xd8") {
+        Some("image/jpeg")
+    } else if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+fn validate_mcp_image_artifact_output(output: &Value) -> Result<(), String> {
+    let mime_type = output
+        .get("mime_type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            "MCP image read requires a detected image/png, image/jpeg, or image/webp MIME type"
+                .to_string()
+        })?;
+    if !matches!(mime_type, "image/png" | "image/jpeg" | "image/webp") {
+        return Err(format!(
+            "unsupported MCP image MIME type '{mime_type}'; supported types are image/png, image/jpeg, and image/webp"
+        ));
+    }
+    let encoded = output
+        .get("content_base64")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "MCP image read did not return complete base64 content".to_string())?;
+    let decoded = general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| format!("MCP image read returned invalid base64: {error}"))?;
+    if decoded.len() > MAX_MCP_IMAGE_BYTES {
+        return Err(format!(
+            "MCP image is too large; maximum is {} bytes",
+            MAX_MCP_IMAGE_BYTES
+        ));
+    }
+    let detected = sniff_supported_mcp_image_mime(&decoded).ok_or_else(|| {
+        "artifact content is not a supported PNG, JPEG, or WebP image".to_string()
+    })?;
+    if detected != mime_type {
+        return Err(format!(
+            "artifact MIME mismatch: runner reported '{mime_type}' but content is '{detected}'"
+        ));
+    }
+    let file_bytes = output
+        .get("file_bytes")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| "MCP image read did not report file_bytes".to_string())?;
+    let bytes_returned = output
+        .get("bytes_returned")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| "MCP image read did not report bytes_returned".to_string())?;
+    let complete = output.get("offset").and_then(Value::as_u64) == Some(0)
+        && output.get("truncated").and_then(Value::as_bool) == Some(false)
+        && output.get("eof").and_then(Value::as_bool) == Some(true)
+        && file_bytes == decoded.len()
+        && bytes_returned == decoded.len();
+    if !complete {
+        return Err("MCP image read returned an incomplete artifact".to_string());
+    }
+    let reported_sha256 = output
+        .get("sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "MCP image read did not report sha256".to_string())?;
+    if sha256_hex_bytes(&decoded) != reported_sha256 {
+        return Err("MCP image read returned content that does not match its sha256".to_string());
+    }
+    Ok(())
+}
+
 /// Validate a project-relative file path for the Phase 4 structured edit
 /// tools (`replace_in_file`, `write_project_file`). Unlike the patch preflight
 /// path validator, this HARD-rejects sensitive path components (the task spec
@@ -2577,6 +2652,7 @@ impl ToolRuntime {
         offset: Option<usize>,
         length: Option<usize>,
         max_bytes: Option<usize>,
+        as_image: Option<bool>,
     ) -> ToolResult {
         if let Err(e) = validate_artifact_file_path(&path) {
             return artifact_policy_rejected_result(&path, e);
@@ -2585,9 +2661,18 @@ impl ToolRuntime {
         if encoding != "base64" {
             return ToolResult::err("unsupported encoding; only 'base64' is currently supported");
         }
+        let as_image = as_image.unwrap_or(false);
+        if as_image && (offset.is_some() || length.is_some() || max_bytes.is_some()) {
+            return ToolResult::err(
+                "as_image cannot be combined with offset, length, or max_bytes; the MCP image path always reads one complete bounded image",
+            );
+        }
         let offset = offset.unwrap_or(0);
-        let mut length =
-            length.unwrap_or_else(|| max_bytes.unwrap_or(DEFAULT_READ_PROJECT_ARTIFACT_LENGTH));
+        let mut length = if as_image {
+            MAX_MCP_IMAGE_BYTES
+        } else {
+            length.unwrap_or_else(|| max_bytes.unwrap_or(DEFAULT_READ_PROJECT_ARTIFACT_LENGTH))
+        };
         if let Some(max_bytes) = max_bytes {
             if max_bytes == 0 {
                 return ToolResult::err("max_bytes must be at least 1");
@@ -2597,7 +2682,7 @@ impl ToolRuntime {
         if length == 0 {
             return ToolResult::err("length must be at least 1");
         }
-        if length > MAX_READ_PROJECT_ARTIFACT_LENGTH {
+        if !as_image && length > MAX_READ_PROJECT_ARTIFACT_LENGTH {
             return ToolResult::err(format!(
                 "length too large; maximum is {} bytes",
                 MAX_READ_PROJECT_ARTIFACT_LENGTH
@@ -2614,12 +2699,19 @@ impl ToolRuntime {
             Ok(id) => id.to_string(),
             Err(e) => return ToolResult::err(e),
         };
-        let payload = json!({
+        let mut payload = json!({
             "path": path.clone(),
             "offset": offset,
             "length": length,
-            "max_file_bytes": MAX_PROJECT_ARTIFACT_BYTES,
+            "max_file_bytes": if as_image {
+                MAX_MCP_IMAGE_BYTES
+            } else {
+                MAX_PROJECT_ARTIFACT_BYTES
+            },
         });
+        if as_image {
+            payload["mcp_image"] = json!(true);
+        }
         let obj = match self
             .run_agent_json_file_op(
                 client_id,
@@ -2644,6 +2736,17 @@ impl ToolRuntime {
                 output: obj,
                 error: Some(err),
             };
+        }
+        if as_image {
+            if let Err(error) = validate_mcp_image_artifact_output(&obj) {
+                return ToolResult::err_with_output(
+                    error,
+                    json!({
+                        "path": path,
+                        "error_kind": "invalid_mcp_image_artifact",
+                    }),
+                );
+            }
         }
         ToolResult::ok(obj)
     }

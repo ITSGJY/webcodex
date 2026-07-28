@@ -723,6 +723,9 @@ pub enum ToolCall {
 
     /// Read one bounded binary content segment for a project artifact. Returns
     /// base64 for the requested chunk plus full-file sha256 and MIME metadata.
+    /// MCP callers may request one complete, size-limited PNG/JPEG/WebP for
+    /// native image content framing; that transport-only option is deliberately
+    /// not part of the generic REST/GPT Actions schema.
     ReadProjectArtifact {
         project: String,
         path: String,
@@ -736,6 +739,8 @@ pub enum ToolCall {
         length: Option<usize>,
         #[serde(default)]
         max_bytes: Option<usize>,
+        #[serde(default)]
+        as_image: Option<bool>,
     },
 
     /// Begin a bounded chunked binary artifact upload. The agent creates a

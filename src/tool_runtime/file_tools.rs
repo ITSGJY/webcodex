@@ -1,9 +1,13 @@
 //! Runtime dispatch adapters for file, artifact, and text-edit tool calls.
 
-use super::{ToolCall, ToolResult, ToolRuntime};
+use super::{sessions::SessionTransport, ToolCall, ToolResult, ToolRuntime};
 
 impl ToolRuntime {
-    pub(crate) async fn dispatch_file_tool(&self, call: ToolCall) -> ToolResult {
+    pub(crate) async fn dispatch_file_tool(
+        &self,
+        call: ToolCall,
+        transport: SessionTransport,
+    ) -> ToolResult {
         match call {
             ToolCall::DeleteProjectFiles {
                 project,
@@ -170,9 +174,18 @@ impl ToolRuntime {
                 offset,
                 length,
                 max_bytes,
+                as_image,
             } => {
-                self.read_project_artifact(project, path, encoding, offset, length, max_bytes)
+                if as_image == Some(true) && !matches!(transport, SessionTransport::Mcp) {
+                    ToolResult::err(
+                        "as_image is only supported over MCP; omit it to use the existing chunked artifact response",
+                    )
+                } else {
+                    self.read_project_artifact(
+                        project, path, encoding, offset, length, max_bytes, as_image,
+                    )
                     .await
+                }
             }
             ToolCall::ArtifactUploadBegin {
                 project,

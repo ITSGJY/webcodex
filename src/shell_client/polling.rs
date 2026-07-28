@@ -1,4 +1,6 @@
-use super::jobs::{assert_active_instance_locked, command_preview, truncate_output};
+use super::jobs::{
+    assert_active_instance_locked, command_preview, truncate_output, truncate_output_to,
+};
 use super::requests::take_pending_request_locked;
 use super::validation::{normalize_project_summaries, validate_agent_instance_id, validate_id};
 use super::{now_ts, ShellClientRegistry};
@@ -85,7 +87,14 @@ impl ShellClientRegistry {
         let request_id = body.request_id.clone();
         let client_id = body.client_id.clone();
         let error = body.error.clone();
-        let stdout = truncate_output(body.stdout);
+        let stdout = if is_mcp_image_artifact_request(&pending.request) {
+            truncate_output_to(
+                body.stdout,
+                crate::artifact_policy::MAX_MCP_IMAGE_RESPONSE_BYTES,
+            )
+        } else {
+            truncate_output(body.stdout)
+        };
         let stderr = truncate_output(body.stderr);
         if let Some(job_id) = pending.job_id.clone() {
             inner.request_to_job.remove(&request_id);
@@ -120,4 +129,14 @@ impl ShellClientRegistry {
         }
         Ok(())
     }
+}
+
+fn is_mcp_image_artifact_request(request: &ShellAgentShellRequest) -> bool {
+    request.kind == "file_read_project_artifact"
+        && request
+            .content
+            .as_deref()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok())
+            .and_then(|payload| payload.get("mcp_image").and_then(|value| value.as_bool()))
+            .unwrap_or(false)
 }

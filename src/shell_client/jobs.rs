@@ -109,17 +109,21 @@ mod select_lines_tests {
 }
 
 pub(super) fn truncate_output(value: Option<String>) -> Option<String> {
+    truncate_output_to(value, MAX_OUTPUT_BYTES)
+}
+
+pub(super) fn truncate_output_to(value: Option<String>, max_bytes: usize) -> Option<String> {
     value.map(|s| {
-        if s.len() <= MAX_OUTPUT_BYTES {
+        if s.len() <= max_bytes {
             s
         } else {
-            let mut start = s.len() - MAX_OUTPUT_BYTES;
+            let mut start = s.len() - max_bytes;
             while start < s.len() && !s.is_char_boundary(start) {
                 start += 1;
             }
             format!(
                 "[output truncated to last {} bytes]\n{}",
-                MAX_OUTPUT_BYTES,
+                max_bytes,
                 &s[start..]
             )
         }

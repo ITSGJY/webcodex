@@ -3023,6 +3023,7 @@ async fn read_project_artifact_rejects_sensitive_path_before_resolving_project()
             None,
             None,
             None,
+            None,
         )
         .await;
     assert!(!out.success);
@@ -3038,6 +3039,7 @@ async fn read_project_artifact_rejects_invalid_length_before_resolving_project()
             None,
             None,
             Some(crate::tool_runtime::files::MAX_READ_PROJECT_ARTIFACT_LENGTH + 1),
+            None,
             None,
         )
         .await;
