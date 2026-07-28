@@ -8,6 +8,7 @@ use super::{
 use crate::shell_protocol::ShellAgentShellRequest;
 use crate::{handle_file_request, is_file_request_kind, JobManager};
 use std::path::Path;
+use std::sync::atomic::Ordering;
 
 /// Execute a single agent request (shell/file/job/lsp/validation) and send the
 /// result over the active transport. This is the shared dispatch path used by
@@ -22,6 +23,9 @@ pub(crate) fn dispatch_request(
     lsp: &LspSupervisor,
     request: ShellAgentShellRequest,
 ) -> Result<bool, SubmitResultError> {
+    if runtime.shutdown_flag().load(Ordering::SeqCst) {
+        return Ok(false);
+    }
     let policy = &config.policy;
     let shell = &config.shell;
     let external_tools = &config.external_tools;
@@ -31,7 +35,7 @@ pub(crate) fn dispatch_request(
     let external_route = if request.sandbox.is_some() {
         ExternalRoute::Native
     } else {
-        external_tools.route(policy, &request)
+        external_tools.route_with_shutdown(policy, &request, Some(runtime.shutdown_flag()))
     };
     match external_route {
         ExternalRoute::Handled(result) => {
@@ -54,7 +58,7 @@ pub(crate) fn dispatch_request(
                     &request.command,
                     request.stdin.as_deref(),
                     request.timeout_secs,
-                    None,
+                    Some(runtime.shutdown_flag()),
                     request.sandbox.as_deref(),
                 )
             };
@@ -107,7 +111,12 @@ pub(crate) fn dispatch_request(
         kind if is_validation_request_kind(kind) => {
             // Explicit validation bridge branch — never fall through to shell.
             let request_id = request.request_id.clone();
-            let result = handle_validation_request(policy, projects_dir, &request);
+            let result = handle_validation_request(
+                policy,
+                projects_dir,
+                &request,
+                Some(runtime.shutdown_flag()),
+            );
             sink.submit_result_with_metadata(request_id, result, config, runtime)
                 .map(|_| true)
         }
@@ -123,7 +132,7 @@ pub(crate) fn dispatch_request(
                 &request.command,
                 request.stdin.as_deref(),
                 request.timeout_secs,
-                None,
+                Some(runtime.shutdown_flag()),
                 request.sandbox.as_deref(),
             );
             sink.submit_result_with_metadata(request_id, result, config, runtime)

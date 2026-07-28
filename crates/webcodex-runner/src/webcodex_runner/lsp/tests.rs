@@ -3,7 +3,8 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Barrier, OnceLock, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Barrier, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -1251,6 +1252,134 @@ fn lsp_shutdown_uses_single_deadline_against_hanging_server() {
         ),
         "pending request should be woken: {pending_result:?}"
     );
+}
+
+#[test]
+fn lsp_multiple_hanging_servers_share_one_supervisor_deadline() {
+    let shutdown_timeout = Duration::from_millis(200);
+    let fixture = Fixture::with_config(
+        "shutdown_hang",
+        4,
+        Duration::from_secs(60),
+        shutdown_timeout,
+        false,
+    );
+    let parent = fixture.root.parent().unwrap();
+    let roots = [
+        fixture.root.clone(),
+        parent.join("project-two"),
+        parent.join("project-three"),
+    ];
+    for root in roots.iter().skip(1) {
+        fs::create_dir(root).unwrap();
+    }
+    let servers = roots
+        .iter()
+        .map(|root| {
+            fixture
+                .supervisor
+                .server_for_test(root, LspServerKind::RustAnalyzer)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let pids = servers
+        .iter()
+        .map(|server| server.process_id())
+        .collect::<Vec<_>>();
+    assert_eq!(pids.len(), 3);
+
+    let started = Instant::now();
+    let outcome = fixture
+        .supervisor
+        .shutdown_until(Instant::now() + shutdown_timeout);
+    let elapsed = started.elapsed();
+    assert_eq!(outcome.servers, 3);
+    assert!(
+        elapsed < Duration::from_millis(450),
+        "three slots stacked independent shutdown budgets: {elapsed:?}"
+    );
+    for pid in pids {
+        assert!(
+            wait_until(Duration::from_secs(1), || !process_exists(pid)),
+            "LSP child {pid} survived shared-deadline shutdown"
+        );
+    }
+
+    let drop_started = Instant::now();
+    drop(servers);
+    assert!(
+        drop_started.elapsed() < Duration::from_millis(100),
+        "explicit shutdown was followed by a second Drop wait"
+    );
+    let Fixture {
+        supervisor,
+        _fake,
+        _temp,
+        root: _,
+        marker: _,
+        exit_marker: _,
+    } = fixture;
+    let supervisor_drop_started = Instant::now();
+    drop(supervisor);
+    assert!(
+        supervisor_drop_started.elapsed() < Duration::from_millis(100),
+        "supervisor Drop re-armed the configured shutdown timeout"
+    );
+    drop(_fake);
+    drop(_temp);
+}
+
+#[test]
+fn lsp_reaper_timeout_does_not_rearm_supervisor_drop_budget() {
+    let fixture = Fixture::with_config(
+        "normal",
+        4,
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        true,
+    );
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let exited = Arc::new(AtomicBool::new(false));
+    let exited_in_thread = Arc::clone(&exited);
+    let handle = std::thread::spawn(move || {
+        ready_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(2));
+        exited_in_thread.store(true, Ordering::SeqCst);
+    });
+    fixture
+        .supervisor
+        .inner
+        .reaper_started
+        .store(true, Ordering::SeqCst);
+    *lock_unpoison(&fixture.supervisor.inner.reaper_thread) = Some(handle);
+    ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    let outcome = fixture
+        .supervisor
+        .shutdown_until(Instant::now() + Duration::from_millis(20));
+    assert!(outcome.reaper_timed_out);
+
+    let Fixture {
+        supervisor,
+        _fake,
+        _temp,
+        root: _,
+        marker: _,
+        exit_marker: _,
+    } = fixture;
+    let drop_started = Instant::now();
+    drop(supervisor);
+    assert!(
+        drop_started.elapsed() < Duration::from_millis(150),
+        "SupervisorInner::drop re-armed the configured shutdown timeout: {:?}",
+        drop_started.elapsed()
+    );
+
+    release_tx.send(()).unwrap();
+    assert!(wait_until(Duration::from_secs(1), || exited.load(Ordering::SeqCst)));
+    drop(_fake);
+    drop(_temp);
 }
 
 #[test]

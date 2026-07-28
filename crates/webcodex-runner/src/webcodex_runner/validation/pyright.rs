@@ -14,6 +14,7 @@ use crate::validation_bridge::{
 use serde_json::Value;
 use std::cmp::Ordering;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 const ADAPTER_ID: &str = "pyright";
 
@@ -21,6 +22,7 @@ pub(crate) fn run_pyright(
     project_root: &Path,
     request: &ValidationBridgeRequest,
     max_timeout_secs: u64,
+    shutdown: Option<&AtomicBool>,
 ) -> ValidationBridgeResponse {
     let meta = registry::lookup_adapter(ADAPTER_ID).expect("pyright adapter registered");
     let timeout = request.timeout_secs.min(max_timeout_secs).max(1);
@@ -67,7 +69,7 @@ pub(crate) fn run_pyright(
         }
     }
 
-    let captured = run_bounded(&program, &args, &cwd, timeout);
+    let captured = run_bounded(&program, &args, &cwd, timeout, shutdown);
     let mut response = base_response(request, true);
     response.command_started = captured.spawn_error.is_none();
     response.duration_ms = captured.duration_ms;

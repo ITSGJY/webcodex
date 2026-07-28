@@ -187,13 +187,20 @@ impl LspCommand {
     }
 
     fn spawn(&self, project_root: &Path) -> Result<Child, LspError> {
-        Command::new(&self.program)
+        let mut command = Command::new(&self.program);
+        command
             .args(&self.args)
             .envs(self.env.iter().cloned())
             .current_dir(project_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        command
             .spawn()
             .map_err(|error| LspError::SpawnFailed(error.to_string()))
     }
@@ -275,8 +282,21 @@ enum SlotState {
 struct SupervisorInner {
     config: LspSupervisorConfig,
     servers: Mutex<HashMap<ProcessKey, Arc<ServerSlot>>>,
-    shutting_down: AtomicBool,
+    shutting_down: Arc<AtomicBool>,
+    shutdown_deadline: Arc<Mutex<Option<Instant>>>,
+    shutdown_started: AtomicBool,
+    shutdown_result: Mutex<Option<LspShutdownOutcome>>,
+    shutdown_changed: Condvar,
     reaper_started: AtomicBool,
+    reaper_thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LspShutdownOutcome {
+    pub(crate) servers: usize,
+    pub(crate) timed_out: usize,
+    pub(crate) failures: usize,
+    pub(crate) reaper_timed_out: bool,
 }
 
 #[derive(Clone)]
@@ -296,8 +316,13 @@ impl LspSupervisor {
             inner: Arc::new(SupervisorInner {
                 config,
                 servers: Mutex::new(HashMap::new()),
-                shutting_down: AtomicBool::new(false),
+                shutting_down: Arc::new(AtomicBool::new(false)),
+                shutdown_deadline: Arc::new(Mutex::new(None)),
+                shutdown_started: AtomicBool::new(false),
+                shutdown_result: Mutex::new(None),
+                shutdown_changed: Condvar::new(),
                 reaper_started: AtomicBool::new(false),
+                reaper_thread: Mutex::new(None),
             }),
         }
     }
@@ -663,19 +688,79 @@ impl LspSupervisor {
         }
         let count = removed.len();
         // Never perform slow shutdown while holding the supervisor map lock.
-        shutdown_slots(removed, self.inner.config.shutdown_timeout);
+        shutdown_slots(removed, Instant::now() + self.inner.config.shutdown_timeout);
         count
     }
 
+    #[cfg(test)]
     pub(crate) fn shutdown(&self) {
-        if self.inner.shutting_down.swap(true, Ordering::SeqCst) {
-            return;
+        let _ = self.shutdown_until(Instant::now() + self.inner.config.shutdown_timeout);
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        self.inner.shutting_down.store(true, Ordering::SeqCst);
+        if let Some(reaper) = lock_unpoison(&self.inner.reaper_thread).as_ref() {
+            reaper.thread().unpark();
+        }
+    }
+
+    pub(crate) fn begin_shutdown_until(&self, deadline: Instant) {
+        {
+            let mut stored = lock_unpoison(&self.inner.shutdown_deadline);
+            *stored = Some(stored.map_or(deadline, |current| current.min(deadline)));
+        }
+        self.begin_shutdown();
+    }
+
+    pub(crate) fn shutdown_until(&self, deadline: Instant) -> LspShutdownOutcome {
+        self.begin_shutdown_until(deadline);
+        if self.inner.shutdown_started.swap(true, Ordering::SeqCst) {
+            let mut result = lock_unpoison(&self.inner.shutdown_result);
+            while result.is_none() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return LspShutdownOutcome {
+                        timed_out: 1,
+                        ..LspShutdownOutcome::default()
+                    };
+                }
+                let (next, _) = self
+                    .inner
+                    .shutdown_changed
+                    .wait_timeout(result, remaining.min(Duration::from_millis(25)))
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                result = next;
+            }
+            return result.unwrap_or_default();
         }
         let slots = {
             let mut servers = lock_unpoison(&self.inner.servers);
             servers.drain().map(|(_, slot)| slot).collect::<Vec<_>>()
         };
-        shutdown_slots(slots, self.inner.config.shutdown_timeout);
+        let mut outcome = shutdown_slots(slots, deadline);
+        outcome.reaper_timed_out = !self.stop_reaper_until(deadline);
+        let mut result = lock_unpoison(&self.inner.shutdown_result);
+        *result = Some(outcome);
+        self.inner.shutdown_changed.notify_all();
+        outcome
+    }
+
+    fn stop_reaper_until(&self, deadline: Instant) -> bool {
+        let mut handle = lock_unpoison(&self.inner.reaper_thread).take();
+        let Some(handle) = handle.take() else {
+            return true;
+        };
+        handle.thread().unpark();
+        while !handle.is_finished() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                *lock_unpoison(&self.inner.reaper_thread) = Some(handle);
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5).min(remaining));
+        }
+        let _ = handle.join();
+        true
     }
 
     /// Start the background idle reaper once, on the first server demand.
@@ -695,7 +780,7 @@ impl LspSupervisor {
         let spawned = thread::Builder::new()
             .name("webcodex-lsp-reaper".to_string())
             .spawn(move || loop {
-                thread::sleep(interval);
+                thread::park_timeout(interval);
                 let Some(inner) = weak.upgrade() else {
                     return;
                 };
@@ -706,10 +791,19 @@ impl LspSupervisor {
                 // concurrent drop is delayed by at most one pass.
                 LspSupervisor { inner }.cleanup_idle();
             });
-        if let Err(error) = spawned {
-            // Degraded mode: capacity recovery falls back to explicit
-            // eviction on failed requests, exactly as before the reaper.
-            tracing::debug!(error = %error, "LSP idle reaper thread failed to start");
+        match spawned {
+            Ok(handle) => {
+                let mut stored = lock_unpoison(&self.inner.reaper_thread);
+                if self.inner.shutting_down.load(Ordering::SeqCst) {
+                    handle.thread().unpark();
+                }
+                *stored = Some(handle);
+            }
+            Err(error) => {
+                // Degraded mode: capacity recovery falls back to explicit
+                // eviction on failed requests, exactly as before the reaper.
+                tracing::debug!(error = %error, "LSP idle reaper thread failed to start");
+            }
         }
     }
 
@@ -785,12 +879,15 @@ impl LspSupervisor {
             if let Some(server) = stale_server {
                 // Reap the stale instance outside the slot lock. Even when the
                 // child is still alive after a reader crash, kill/wait it.
-                let _ = server.shutdown(self.inner.config.shutdown_timeout);
+                let _ = server.shutdown_until(Instant::now() + self.inner.config.shutdown_timeout);
             }
             let result = self.start_server(key);
             if self.inner.shutting_down.load(Ordering::SeqCst) {
                 if let Ok(server) = &result {
-                    let _ = server.shutdown(self.inner.config.shutdown_timeout);
+                    let _ = server.shutdown_until(
+                        lock_unpoison(&self.inner.shutdown_deadline)
+                            .unwrap_or_else(|| Instant::now() + self.inner.config.shutdown_timeout),
+                    );
                 }
                 let mut state = lock_unpoison(&slot.state);
                 *state = SlotState::Failed(LspError::ServerUnavailable);
@@ -841,6 +938,8 @@ impl LspSupervisor {
             command,
             self.inner.config.initialize_timeout,
             self.inner.config.shutdown_timeout,
+            Arc::clone(&self.inner.shutting_down),
+            Arc::clone(&self.inner.shutdown_deadline),
         )
     }
 
@@ -862,7 +961,10 @@ impl LspSupervisor {
             }
         };
         if let Some(slot) = slot {
-            shutdown_slots(vec![slot], self.inner.config.shutdown_timeout);
+            shutdown_slots(
+                vec![slot],
+                Instant::now() + self.inner.config.shutdown_timeout,
+            );
         }
     }
 
@@ -940,6 +1042,11 @@ impl LspSupervisor {
 impl Drop for SupervisorInner {
     fn drop(&mut self) {
         self.shutting_down.store(true, Ordering::SeqCst);
+        if let Ok(reaper) = self.reaper_thread.get_mut() {
+            if let Some(reaper) = reaper.as_ref() {
+                reaper.thread().unpark();
+            }
+        }
         let slots = match self.servers.get_mut() {
             Ok(servers) => servers.drain().map(|(_, slot)| slot).collect::<Vec<_>>(),
             Err(poisoned) => poisoned
@@ -948,25 +1055,47 @@ impl Drop for SupervisorInner {
                 .map(|(_, slot)| slot)
                 .collect::<Vec<_>>(),
         };
-        shutdown_slots(slots, self.config.shutdown_timeout);
+        let deadline = lock_unpoison(&self.shutdown_deadline)
+            .unwrap_or_else(|| Instant::now() + self.config.shutdown_timeout);
+        shutdown_slots(slots, deadline);
+        let handle = match self.reaper_thread.get_mut() {
+            Ok(handle) => handle.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(handle) = handle {
+            join_owned_thread_until(handle, deadline);
+        }
     }
 }
 
-fn shutdown_slots(slots: Vec<Arc<ServerSlot>>, timeout: Duration) {
+fn shutdown_slots(slots: Vec<Arc<ServerSlot>>, deadline: Instant) -> LspShutdownOutcome {
+    let mut outcome = LspShutdownOutcome::default();
     for slot in slots {
         let server = {
-            let state = lock_unpoison(&slot.state);
+            let mut state = lock_unpoison(&slot.state);
             match &*state {
                 SlotState::Running(server) => Some(Arc::clone(server)),
-                SlotState::Starting | SlotState::Failed(_) => None,
+                SlotState::Starting => {
+                    *state = SlotState::Failed(LspError::ServerUnavailable);
+                    slot.ready.notify_all();
+                    None
+                }
+                SlotState::Failed(_) => None,
             }
         };
         if let Some(server) = server {
-            if let Err(error) = server.shutdown(timeout) {
+            outcome.servers += 1;
+            let result = server.shutdown_until(deadline);
+            if result.timed_out {
+                outcome.timed_out += 1;
+            }
+            if let Some(error) = result.error {
+                outcome.failures += 1;
                 tracing::debug!(error = %error, "LSP server shutdown was not graceful");
             }
         }
     }
+    outcome
 }
 
 fn canonical_project_root(root: &Path) -> Result<PathBuf, LspError> {
@@ -1490,6 +1619,7 @@ fn synchronize_document_state(
 struct ServerInstance {
     key: ProcessKey,
     child: Mutex<Child>,
+    process_group_id: u32,
     writer: Arc<Mutex<ChildStdin>>,
     connection: Arc<ConnectionState>,
     next_id: AtomicU64,
@@ -1502,6 +1632,14 @@ struct ServerInstance {
     reader_thread: Mutex<Option<JoinHandle<()>>>,
     stderr_thread: Mutex<Option<JoinHandle<()>>>,
     shutdown_started: AtomicBool,
+    supervisor_shutdown: Arc<AtomicBool>,
+    global_shutdown_deadline: Arc<Mutex<Option<Instant>>>,
+}
+
+#[derive(Debug)]
+struct ServerShutdownResult {
+    timed_out: bool,
+    error: Option<String>,
 }
 
 impl ServerInstance {
@@ -1510,22 +1648,29 @@ impl ServerInstance {
         command: LspCommand,
         initialize_timeout: Duration,
         shutdown_timeout: Duration,
+        supervisor_shutdown: Arc<AtomicBool>,
+        global_shutdown_deadline: Arc<Mutex<Option<Instant>>>,
     ) -> Result<Arc<Self>, LspError> {
+        let cleanup_deadline = || {
+            lock_unpoison(&global_shutdown_deadline)
+                .unwrap_or_else(|| Instant::now() + shutdown_timeout)
+        };
         let mut child = command.spawn(&key.project_root)?;
+        let process_group_id = child.id();
         let Some(stdin) = child.stdin.take() else {
-            terminate_child(&mut child);
+            terminate_child_until(&mut child, process_group_id, cleanup_deadline());
             return Err(LspError::SpawnFailed(
                 "stdin pipe was unavailable".to_string(),
             ));
         };
         let Some(stdout) = child.stdout.take() else {
-            terminate_child(&mut child);
+            terminate_child_until(&mut child, process_group_id, cleanup_deadline());
             return Err(LspError::SpawnFailed(
                 "stdout pipe was unavailable".to_string(),
             ));
         };
         let Some(stderr) = child.stderr.take() else {
-            terminate_child(&mut child);
+            terminate_child_until(&mut child, process_group_id, cleanup_deadline());
             return Err(LspError::SpawnFailed(
                 "stderr pipe was unavailable".to_string(),
             ));
@@ -1550,7 +1695,7 @@ impl ServerInstance {
             }) {
             Ok(thread) => thread,
             Err(error) => {
-                terminate_child(&mut child);
+                terminate_child_until(&mut child, process_group_id, cleanup_deadline());
                 return Err(LspError::SpawnFailed(error.to_string()));
             }
         };
@@ -1570,7 +1715,7 @@ impl ServerInstance {
             }) {
             Ok(thread) => thread,
             Err(error) => {
-                terminate_child(&mut child);
+                terminate_child_until(&mut child, process_group_id, cleanup_deadline());
                 if reader_thread.is_finished() {
                     let _ = reader_thread.join();
                 }
@@ -1581,6 +1726,7 @@ impl ServerInstance {
         let server = Arc::new(Self {
             key,
             child: Mutex::new(child),
+            process_group_id,
             writer,
             connection,
             next_id: AtomicU64::new(1),
@@ -1592,13 +1738,17 @@ impl ServerInstance {
             reader_thread: Mutex::new(Some(reader_thread)),
             stderr_thread: Mutex::new(Some(stderr_thread)),
             shutdown_started: AtomicBool::new(false),
+            supervisor_shutdown,
+            global_shutdown_deadline,
         });
 
         if let Err(error) = server.initialize(initialize_timeout) {
             // Use the configured shutdown budget, never a fixed default.
             // Shutdown also joins the stderr drain thread so the bounded capture
             // is complete before we classify the failure.
-            let _ = server.shutdown(shutdown_timeout);
+            let deadline = lock_unpoison(&server.global_shutdown_deadline)
+                .unwrap_or_else(|| Instant::now() + shutdown_timeout);
+            let _ = server.shutdown_until(deadline);
             let stderr_summary = server.startup_stderr_summary();
             return Err(LspError::InitializeFailed(combine_initialize_failure(
                 &error,
@@ -1652,6 +1802,7 @@ impl ServerInstance {
                 }
             }),
             timeout,
+            true,
         )?;
         *lock_unpoison(&self.position_encoding) = PositionEncoding::from_initialize_result(&result);
         self.notify("initialized", json!({}))?;
@@ -1673,7 +1824,7 @@ impl ServerInstance {
         if !self.is_usable() {
             return Err(LspError::ServerExited);
         }
-        match self.request_raw(method, params, timeout) {
+        match self.request_raw(method, params, timeout, true) {
             Err(LspError::RequestTimeout { method, timeout })
                 if !self.is_alive() || self.connection.status() == LspServerStatus::Crashed =>
             {
@@ -1696,7 +1847,11 @@ impl ServerInstance {
         method: &str,
         params: Value,
         timeout: Duration,
+        observe_supervisor_shutdown: bool,
     ) -> Result<Value, LspError> {
+        if observe_supervisor_shutdown && self.supervisor_shutdown.load(Ordering::SeqCst) {
+            return Err(LspError::ServerExited);
+        }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (sender, receiver) = mpsc::channel();
         lock_unpoison(&self.connection.pending).insert(id, sender);
@@ -1714,19 +1869,30 @@ impl ServerInstance {
             self.touch_last_used();
             return Err(error);
         }
-        let result = match receiver.recv_timeout(timeout) {
-            Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+        let deadline = Instant::now() + timeout;
+        let result = loop {
+            if observe_supervisor_shutdown && self.supervisor_shutdown.load(Ordering::SeqCst) {
+                lock_unpoison(&self.connection.pending).remove(&id);
+                break Err(LspError::ServerExited);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 // Remove before cancellation so a late response is ignored and
                 // cannot re-wake this wait or panic on a dropped sender.
                 lock_unpoison(&self.connection.pending).remove(&id);
                 self.send_cancel_request(id);
-                Err(LspError::RequestTimeout {
+                break Err(LspError::RequestTimeout {
                     method: method.to_string(),
                     timeout,
-                })
+                });
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(LspError::ServerExited),
+            match receiver.recv_timeout(remaining.min(Duration::from_millis(25))) {
+                Ok(result) => break result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break Err(LspError::ServerExited);
+                }
+            }
         };
         // Reflect request completion, failure, or timeout.
         self.touch_last_used();
@@ -1829,12 +1995,14 @@ impl ServerInstance {
         lock_unpoison(&self.connection.pending).len()
     }
 
-    fn shutdown(&self, timeout: Duration) -> Result<(), LspError> {
+    fn shutdown_until(&self, deadline: Instant) -> ServerShutdownResult {
         if self.shutdown_started.swap(true, Ordering::SeqCst) {
-            return Ok(());
+            return ServerShutdownResult {
+                timed_out: !self.process_reaped_and_group_gone(),
+                error: None,
+            };
         }
-        // One shared deadline for the entire shutdown path (no stacked waits).
-        let deadline = Instant::now() + timeout;
+        const KILL_REAP_RESERVE: Duration = Duration::from_millis(150);
         let mut graceful_error = None;
 
         let status = self.connection.status();
@@ -1842,27 +2010,28 @@ impl ServerInstance {
 
         if can_attempt_graceful {
             // Healthy Running connection: request shutdown, then exit, then wait
-            // for natural exit under the remaining budget before kill/wait.
-            let remaining = remaining_until(deadline);
+            // for natural exit while reserving a bounded kill/reap tail.
+            let graceful_deadline = deadline
+                .checked_sub(KILL_REAP_RESERVE)
+                .unwrap_or_else(Instant::now);
+            let remaining = remaining_until(graceful_deadline);
             if !remaining.is_zero() {
-                if let Err(error) = self.request_raw("shutdown", Value::Null, remaining) {
-                    // Do not keep spending budget on a hung shutdown request
-                    // beyond the shared deadline (request_raw already waited).
+                if let Err(error) = self.request_raw("shutdown", Value::Null, remaining, false) {
                     graceful_error = Some(error.to_string());
                 } else {
                     let _ = self.notify("exit", Value::Null);
                 }
             }
-            if !self.reap_child(deadline) {
-                if let Err(error) = self.kill_and_wait_child() {
+            if !self.reap_child(graceful_deadline) {
+                if let Err(error) = self.kill_and_reap_child(deadline) {
                     graceful_error = Some(error);
                 }
             }
         } else {
             // Crashed, initializing-failure, writer-failure, or other unusable
             // state: never wait the full deadline for a natural exit. Kill
-            // immediately, wait to reap (no zombies), then join threads below.
-            if let Err(error) = self.kill_and_wait_child() {
+            // immediately and use only the caller's shared deadline to reap.
+            if let Err(error) = self.kill_and_reap_child(deadline) {
                 graceful_error = Some(error);
             }
         }
@@ -1872,22 +2041,35 @@ impl ServerInstance {
         join_thread_until(&self.reader_thread, deadline);
         join_thread_until(&self.stderr_thread, deadline);
 
-        if let Some(error) = graceful_error {
-            return Err(LspError::ShutdownFailed(error));
+        let timed_out = !self.process_reaped_and_group_gone()
+            || lock_unpoison(&self.reader_thread).is_some()
+            || lock_unpoison(&self.stderr_thread).is_some();
+        ServerShutdownResult {
+            timed_out,
+            error: graceful_error,
         }
-        Ok(())
     }
 
-    /// Kill the child if still running and always wait so no zombie remains.
-    fn kill_and_wait_child(&self) -> Result<(), String> {
-        let mut child = lock_unpoison(&self.child);
-        match child.try_wait() {
-            Ok(Some(_)) => Ok(()),
-            Ok(None) => {
-                let _ = child.kill();
-                child.wait().map(|_| ()).map_err(|error| error.to_string())
+    fn kill_and_reap_child(&self, deadline: Instant) -> Result<(), String> {
+        let mut errors = Vec::new();
+        #[cfg(unix)]
+        if signal_lsp_process_group(self.process_group_id, libc::SIGKILL).is_err() {
+            errors.push("process_group_kill_failed".to_string());
+        }
+        #[cfg(not(unix))]
+        {
+            let mut child = lock_unpoison(&self.child);
+            if child.try_wait().is_ok_and(|status| status.is_none()) && child.kill().is_err() {
+                errors.push("child_kill_failed".to_string());
             }
-            Err(error) => Err(error.to_string()),
+        }
+        if !self.reap_child(deadline) {
+            errors.push("child_reap_timed_out".to_string());
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join(","))
         }
     }
 
@@ -1895,7 +2077,11 @@ impl ServerInstance {
     /// the process has been reaped (exited before the deadline).
     fn reap_child(&self, deadline: Instant) -> bool {
         while Instant::now() < deadline {
-            match lock_unpoison(&self.child).try_wait() {
+            let wait_result = {
+                let mut child = lock_unpoison(&self.child);
+                child.try_wait()
+            };
+            match wait_result {
                 Ok(Some(_)) => return true,
                 Ok(None) => {
                     let remaining = remaining_until(deadline);
@@ -1908,6 +2094,15 @@ impl ServerInstance {
             }
         }
         matches!(lock_unpoison(&self.child).try_wait(), Ok(Some(_)) | Err(_))
+    }
+
+    fn process_reaped_and_group_gone(&self) -> bool {
+        let child_reaped = matches!(lock_unpoison(&self.child).try_wait(), Ok(Some(_)) | Err(_));
+        #[cfg(unix)]
+        let group_gone = !lsp_process_group_exists(self.process_group_id);
+        #[cfg(not(unix))]
+        let group_gone = true;
+        child_reaped && group_gone
     }
 
     #[cfg(test)]
@@ -1929,7 +2124,7 @@ impl ServerInstance {
 impl Drop for ServerInstance {
     fn drop(&mut self) {
         // Must never panic. Uses the same single-deadline shutdown path.
-        let _ = self.shutdown(DEFAULT_SHUTDOWN_TIMEOUT);
+        let _ = self.shutdown_until(Instant::now() + DEFAULT_SHUTDOWN_TIMEOUT);
     }
 }
 
@@ -2056,9 +2251,54 @@ fn join_thread_until(thread: &Mutex<Option<JoinHandle<()>>>, deadline: Instant) 
     }
 }
 
-fn terminate_child(child: &mut Child) {
+fn join_owned_thread_until(handle: JoinHandle<()>, deadline: Instant) {
+    let handle = handle;
+    while !handle.is_finished() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(5).min(remaining));
+    }
+    let _ = handle.join();
+}
+
+#[cfg(unix)]
+fn signal_lsp_process_group(process_group_id: u32, signal: i32) -> Result<bool, ()> {
+    if process_group_id == 0 {
+        return Err(());
+    }
+    let process_group_id = i32::try_from(process_group_id).map_err(|_| ())?;
+    // SAFETY: every LSP child is placed in its own private process group.
+    if unsafe { libc::kill(-process_group_id, signal) } == 0 {
+        Ok(true)
+    } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        Ok(false)
+    } else {
+        Err(())
+    }
+}
+
+#[cfg(unix)]
+fn lsp_process_group_exists(process_group_id: u32) -> bool {
+    signal_lsp_process_group(process_group_id, 0).unwrap_or(true)
+}
+
+fn terminate_child_until(child: &mut Child, process_group_id: u32, deadline: Instant) {
+    #[cfg(unix)]
+    let _ = signal_lsp_process_group(process_group_id, libc::SIGKILL);
+    #[cfg(not(unix))]
     let _ = child.kill();
-    let _ = child.wait();
+    loop {
+        if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10).min(remaining));
+    }
 }
 
 fn lock_unpoison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

@@ -25,6 +25,7 @@ use crate::validation_bridge::{
     VALIDATION_BRIDGE_PROTOCOL_VERSION,
 };
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 pub(crate) fn is_validation_request_kind(kind: &str) -> bool {
@@ -35,6 +36,7 @@ pub(crate) fn handle_validation_request(
     policy: &AgentPolicy,
     projects_dir: &Path,
     request: &ShellAgentShellRequest,
+    shutdown: Option<&AtomicBool>,
 ) -> CommandResult {
     let start = Instant::now();
     let Some(payload) = request.validation.as_ref() else {
@@ -44,7 +46,7 @@ pub(crate) fn handle_validation_request(
             "validation request missing typed payload",
         );
     };
-    match execute_validation(policy, projects_dir, payload) {
+    match execute_validation_with_shutdown(policy, projects_dir, payload, shutdown) {
         Ok(response) => {
             let envelope = ValidationBridgeResultEnvelope::ok(response);
             CommandResult {
@@ -65,12 +67,11 @@ pub(crate) fn handle_validation_request(
     }
 }
 
-/// Internal entry used by tests and dispatch. Runs a typed validation request
-/// against a resolved agent project.
-pub(crate) fn execute_validation(
+fn execute_validation_with_shutdown(
     policy: &AgentPolicy,
     projects_dir: &Path,
     request: &ValidationBridgeRequest,
+    shutdown: Option<&AtomicBool>,
 ) -> Result<ValidationBridgeResponse, ValidationBridgeResultEnvelope> {
     if let Err(message) = validate_bridge_request(request) {
         return Err(ValidationBridgeResultEnvelope::err(
@@ -113,6 +114,7 @@ pub(crate) fn execute_validation(
             &project_root,
             request,
             policy.max_timeout_secs,
+            shutdown,
         )),
         other => Err(ValidationBridgeResultEnvelope::err(
             failure_kinds::ADAPTER_NOT_FOUND,
@@ -151,6 +153,7 @@ pub(crate) fn execute_validation_at_root(
             project_root,
             request,
             max_timeout_secs,
+            None,
         )),
         other => Err(ValidationBridgeResultEnvelope::err(
             failure_kinds::ADAPTER_NOT_FOUND,

@@ -122,12 +122,15 @@ pub(crate) fn configured_shell_job_command(
     command: &str,
 ) -> Result<Command, String> {
     validate_shell_config(shell)?;
-    let mut cmd = Command::new("setsid");
-    cmd.arg(&shell.program);
+    let mut cmd = Command::new(&shell.program);
     for arg in &shell.args {
         cmd.arg(arg);
     }
     cmd.arg(shell_command_text(shell, command));
+    // Establish the private group before `Command::spawn` returns. Executing
+    // an external `setsid` wrapper left a race where shutdown could signal a
+    // group that the wrapper had not created yet, then lose the group id.
+    configure_direct_process_group(&mut cmd);
     apply_shell_environment(&mut cmd, shell)?;
     Ok(cmd)
 }
@@ -136,12 +139,12 @@ pub(crate) fn configured_prepared_shell_job_command(
     profile: &PreparedShellProfile,
     command: &str,
 ) -> Result<Command, String> {
-    let mut cmd = Command::new("setsid");
-    cmd.arg(&profile.program);
+    let mut cmd = Command::new(&profile.program);
     for arg in &profile.args {
         cmd.arg(arg);
     }
     cmd.arg(command);
+    configure_direct_process_group(&mut cmd);
     apply_env_snapshot(&mut cmd, &profile.env_snapshot);
     Ok(cmd)
 }
@@ -236,34 +239,45 @@ struct ProfilePreparePipeReader {
 }
 
 impl ProfilePreparePipeReader {
-    fn finish(self, timeout: Duration) -> Result<Vec<u8>, String> {
-        match self.result_rx.recv_timeout(timeout) {
+    fn finish_until(self, deadline: Instant) -> Result<Vec<u8>, String> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match self.result_rx.recv_timeout(remaining) {
             Ok(result) => {
-                self.handle
-                    .join()
-                    .map_err(|_| format!("profile prepare {} reader panicked", self.stream_name))?;
+                join_profile_prepare_reader_until(self.handle, deadline, self.stream_name)?;
                 result
             }
             Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
-                "profile prepare {} reader did not finish within {} ms",
-                self.stream_name,
-                timeout.as_millis()
+                "profile prepare {} reader did not finish before the cleanup deadline",
+                self.stream_name
             )),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                if self.handle.join().is_err() {
-                    Err(format!(
-                        "profile prepare {} reader panicked",
-                        self.stream_name
-                    ))
-                } else {
-                    Err(format!(
-                        "profile prepare {} reader exited without a result",
-                        self.stream_name
-                    ))
-                }
+                join_profile_prepare_reader_until(self.handle, deadline, self.stream_name)?;
+                Err(format!(
+                    "profile prepare {} reader exited without a result",
+                    self.stream_name
+                ))
             }
         }
     }
+}
+
+fn join_profile_prepare_reader_until(
+    handle: std::thread::JoinHandle<()>,
+    deadline: Instant,
+    stream_name: &'static str,
+) -> Result<(), String> {
+    while !handle.is_finished() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "profile prepare {stream_name} reader did not join before the cleanup deadline"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(5).min(remaining));
+    }
+    handle
+        .join()
+        .map_err(|_| format!("profile prepare {stream_name} reader panicked"))
 }
 
 fn spawn_profile_prepare_pipe_reader(
@@ -290,15 +304,20 @@ fn collect_profile_prepare_output(
     stdout: ProfilePreparePipeReader,
     stderr: ProfilePreparePipeReader,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let stdout = stdout.finish(PROFILE_PREPARE_PIPE_DRAIN_TIMEOUT)?;
-    let stderr = stderr.finish(PROFILE_PREPARE_PIPE_DRAIN_TIMEOUT)?;
+    let deadline = Instant::now() + PROFILE_PREPARE_PIPE_DRAIN_TIMEOUT;
+    let stdout = stdout.finish_until(deadline)?;
+    let stderr = stderr.finish_until(deadline)?;
     Ok((stdout, stderr))
 }
 
 fn run_prepare_command(
     mut cmd: Command,
     timeout: Duration,
+    stop_requested: Option<&AtomicBool>,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), String> {
+    if stop_requested.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        return Err("profile prepare stopped during runner shutdown".to_string());
+    }
     let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -332,6 +351,21 @@ fn run_prepare_command(
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
+                if stop_requested.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+                    let cleanup = terminate_child_process_tree(&mut child).err();
+                    let output = collect_profile_prepare_output(stdout_reader, stderr_reader).err();
+                    return Err(with_cleanup_error(
+                        output.map_or_else(
+                            || "profile prepare stopped during runner shutdown".to_string(),
+                            |error| {
+                                format!(
+                                    "profile prepare stopped during runner shutdown; failed to collect output: {error}"
+                                )
+                            },
+                        ),
+                        cleanup,
+                    ));
+                }
                 if start.elapsed() >= timeout {
                     let cleanup = terminate_child_process_tree(&mut child).err();
                     return match collect_profile_prepare_output(stdout_reader, stderr_reader) {
@@ -442,6 +476,7 @@ fn capture_profile_env_snapshot(
     args: &[String],
     prepare_cwd: &Path,
     initial_env: HashMap<String, String>,
+    stop_requested: Option<&AtomicBool>,
 ) -> Result<HashMap<String, String>, String> {
     let Some(init_script) = profile.init_script.as_deref() else {
         return Ok(initial_env);
@@ -460,17 +495,19 @@ fn capture_profile_env_snapshot(
     for (key, value) in initial_env {
         cmd.env(key, value);
     }
-    let (status, stdout, stderr) =
-        run_prepare_command(cmd, Duration::from_secs(SHELL_PROFILE_PREPARE_TIMEOUT_SECS)).map_err(
-            |e| {
-                format!(
-                    "failed to prepare shell profile '{}' at {}: {}",
-                    profile_name,
-                    prepare_cwd.display(),
-                    e
-                )
-            },
-        )?;
+    let (status, stdout, stderr) = run_prepare_command(
+        cmd,
+        Duration::from_secs(SHELL_PROFILE_PREPARE_TIMEOUT_SECS),
+        stop_requested,
+    )
+    .map_err(|e| {
+        format!(
+            "failed to prepare shell profile '{}' at {}: {}",
+            profile_name,
+            prepare_cwd.display(),
+            e
+        )
+    })?;
     if !status.success() {
         return Err(format!(
             "failed to prepare shell profile '{}' at {}: exit code {}; stderr tail: {}",
@@ -520,6 +557,7 @@ impl PreparedShellProfileCache {
         profile_name: &str,
         project_key: String,
         prepare_cwd: &Path,
+        stop_requested: Option<&AtomicBool>,
     ) -> Result<Arc<PreparedShellProfile>, String> {
         let key = PreparedShellProfileKey {
             generation,
@@ -551,6 +589,7 @@ impl PreparedShellProfileCache {
             &args,
             prepare_cwd,
             initial_env,
+            stop_requested,
         )?;
         let prepared = Arc::new(PreparedShellProfile {
             profile_name: profile_name.to_string(),
@@ -590,6 +629,7 @@ pub(crate) fn resolve_prepared_shell_profile(
     cwd_path: &Path,
     request_has_cwd: bool,
     cache: &PreparedShellProfileCache,
+    stop_requested: Option<&AtomicBool>,
 ) -> Result<Option<Arc<PreparedShellProfile>>, String> {
     let project = request_has_cwd
         .then(|| find_project_shell_context(projects_dir, cwd_path))
@@ -620,7 +660,14 @@ pub(crate) fn resolve_prepared_shell_profile(
         &prepare_cwd,
     );
     cache
-        .get_or_prepare(generation, shell, profile_name, project_key, &prepare_cwd)
+        .get_or_prepare(
+            generation,
+            shell,
+            profile_name,
+            project_key,
+            &prepare_cwd,
+            stop_requested,
+        )
         .map(Some)
 }
 
@@ -697,6 +744,13 @@ fn signal_process_group(pgid: u32, signal: i32) -> Result<bool, String> {
 /// descendants cannot keep them open after a timeout, stop, executor failure,
 /// or direct-child exit.
 fn terminate_child_process_tree(child: &mut std::process::Child) -> Result<(), String> {
+    terminate_child_process_tree_until(child, Instant::now() + Duration::from_secs(1))
+}
+
+fn terminate_child_process_tree_until(
+    child: &mut std::process::Child,
+    deadline: Instant,
+) -> Result<(), String> {
     let mut errors = Vec::new();
     #[cfg(unix)]
     {
@@ -710,7 +764,22 @@ fn terminate_child_process_tree(child: &mut std::process::Child) -> Result<(), S
         } else {
             let sent_sigterm = match signal_process_group(pgid, libc::SIGTERM) {
                 Ok(true) => {
-                    std::thread::sleep(PROCESS_GROUP_TERMINATION_GRACE);
+                    let grace_deadline =
+                        deadline.min(Instant::now() + PROCESS_GROUP_TERMINATION_GRACE);
+                    while Instant::now() < grace_deadline {
+                        match signal_process_group(pgid, 0) {
+                            Ok(false) => break,
+                            Ok(true) => {}
+                            Err(error) => {
+                                errors.push(error);
+                                break;
+                            }
+                        }
+                        std::thread::sleep(
+                            Duration::from_millis(10)
+                                .min(grace_deadline.saturating_duration_since(Instant::now())),
+                        );
+                    }
                     true
                 }
                 // If the group is already gone, do not probe this numeric ID
@@ -746,8 +815,22 @@ fn terminate_child_process_tree(child: &mut std::process::Child) -> Result<(), S
             }
         }
     }
-    if let Err(error) = child.wait() {
-        errors.push(format!("failed to reap command child: {error}"));
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    errors.push("command child reap timed out".to_string());
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10).min(remaining));
+            }
+            Err(error) => {
+                errors.push(format!("failed to reap command child: {error}"));
+                break;
+            }
+        }
     }
     if errors.is_empty() {
         Ok(())
@@ -768,9 +851,11 @@ fn terminate_child_without_output(mut child: std::process::Child) -> Result<(), 
 
 fn terminate_and_read_pipes(
     mut child: std::process::Child,
+    max_output_bytes: usize,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), String> {
-    let cleanup = terminate_child_process_tree(&mut child).err();
-    let output = read_pipes(child);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let cleanup = terminate_child_process_tree_until(&mut child, deadline).err();
+    let output = read_pipes_until(child, max_output_bytes, deadline);
     match (cleanup, output) {
         (None, Ok(output)) => Ok(output),
         (Some(cleanup), Ok(_)) => Err(format!(
@@ -783,37 +868,78 @@ fn terminate_and_read_pipes(
     }
 }
 
-fn read_pipes(
+fn read_pipes_until(
     mut child: std::process::Child,
+    max_output_bytes: usize,
+    deadline: Instant,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), String> {
-    let mut stdout = child
+    let stdout = child
         .stdout
         .take()
         .ok_or_else(|| "stdout pipe missing".to_string())?;
-    let mut stderr = child
+    let stderr = child
         .stderr
         .take()
         .ok_or_else(|| "stderr pipe missing".to_string())?;
+    let (stdout_tx, stdout_rx) = mpsc::sync_channel(1);
     let stdout_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let result = stdout.read_to_end(&mut buf).map(|_| buf);
-        result.map_err(|e| format!("failed to read stdout: {}", e))
+        let _ = stdout_tx.send(read_bounded_pipe_tail(stdout, max_output_bytes, "stdout"));
     });
+    let (stderr_tx, stderr_rx) = mpsc::sync_channel(1);
     let stderr_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let result = stderr.read_to_end(&mut buf).map(|_| buf);
-        result.map_err(|e| format!("failed to read stderr: {}", e))
+        let _ = stderr_tx.send(read_bounded_pipe_tail(stderr, max_output_bytes, "stderr"));
     });
-    let status = child
-        .wait()
-        .map_err(|e| format!("failed to wait command: {}", e))?;
-    let stdout = stdout_handle
-        .join()
-        .map_err(|_| "stdout reader panicked".to_string())??;
-    let stderr = stderr_handle
-        .join()
-        .map_err(|_| "stderr reader panicked".to_string())??;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err("command child wait timed out".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(10).min(remaining));
+            }
+            Err(error) => return Err(format!("failed to wait command: {error}")),
+        }
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let stdout = stdout_rx
+        .recv_timeout(remaining)
+        .map_err(|_| "stdout reader did not finish before cleanup deadline".to_string())??;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let stderr = stderr_rx
+        .recv_timeout(remaining)
+        .map_err(|_| "stderr reader did not finish before cleanup deadline".to_string())??;
+    if stdout_handle.is_finished() {
+        let _ = stdout_handle.join();
+    }
+    if stderr_handle.is_finished() {
+        let _ = stderr_handle.join();
+    }
     Ok((status, stdout, stderr))
+}
+
+fn read_bounded_pipe_tail(
+    mut pipe: impl Read,
+    max_bytes: usize,
+    stream_name: &'static str,
+) -> Result<Vec<u8>, String> {
+    let retained_limit = max_bytes.saturating_add(1);
+    let mut output = Vec::with_capacity(retained_limit.min(64 * 1024));
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = pipe
+            .read(&mut chunk)
+            .map_err(|error| format!("failed to read {stream_name}: {error}"))?;
+        if read == 0 {
+            return Ok(output);
+        }
+        output.extend_from_slice(&chunk[..read]);
+        if output.len() > retained_limit {
+            let discard = output.len() - retained_limit;
+            output.drain(..discard);
+        }
+    }
 }
 
 // Test-only wrapper for callers that do not need prepared shell profiles; the
@@ -969,6 +1095,7 @@ fn run_shell_impl(
                 &cwd_path,
                 cwd.is_some(),
                 cache,
+                stop_requested,
             ) {
                 Ok(Some(profile)) => match configured_prepared_shell_command(&profile, command) {
                     Ok(cmd) => {
@@ -1102,7 +1229,7 @@ fn run_shell_impl(
             .unwrap_or(false)
         {
             let duration_ms = start.elapsed().as_millis() as u64;
-            return match terminate_and_read_pipes(child) {
+            return match terminate_and_read_pipes(child, policy.max_output_bytes) {
                 Ok((_status, stdout, stderr)) => CommandResult {
                     exit_code: Some(-1),
                     stdout: Some(truncate_bytes(&stdout, policy.max_output_bytes)),
@@ -1128,7 +1255,7 @@ fn run_shell_impl(
             Ok(None) => {
                 if start.elapsed() >= Duration::from_secs(timeout_secs) {
                     let duration_ms = start.elapsed().as_millis() as u64;
-                    return match terminate_and_read_pipes(child) {
+                    return match terminate_and_read_pipes(child, policy.max_output_bytes) {
                         Ok((_status, stdout, stderr)) => CommandResult {
                             exit_code: Some(-1),
                             stdout: Some(truncate_bytes(&stdout, policy.max_output_bytes)),
@@ -1170,7 +1297,7 @@ fn run_shell_impl(
             }
         }
     }
-    match terminate_and_read_pipes(child) {
+    match terminate_and_read_pipes(child, policy.max_output_bytes) {
         Ok((status, stdout, stderr)) => CommandResult {
             exit_code: Some(status.code().unwrap_or(-1)),
             stdout: Some(truncate_bytes(&stdout, policy.max_output_bytes)),

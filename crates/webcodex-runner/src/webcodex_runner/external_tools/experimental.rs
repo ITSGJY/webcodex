@@ -14,6 +14,7 @@ use super::{
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 /// Experimental raw Claude harness bounds (experiment-local; not production API).
@@ -119,9 +120,10 @@ impl ExternalToolRouter {
         &self,
         policy: &AgentPolicy,
         request: &ShellAgentShellRequest,
+        shutdown: Option<&AtomicBool>,
     ) -> super::CommandResult {
         let started = Instant::now();
-        match self.claude.experimental_dispatch(policy, request) {
+        match self.claude.experimental_dispatch(policy, request, shutdown) {
             Ok(outcome) => command_result(outcome.value.to_string(), started),
             Err(error) => {
                 // Cover preflight path/payload errors that exit before record_call.
@@ -175,6 +177,7 @@ impl ClaudeCodeMcpProvider {
         &self,
         policy: &AgentPolicy,
         request: &ShellAgentShellRequest,
+        shutdown: Option<&AtomicBool>,
     ) -> Result<ExperimentalDispatchOutcome, ProviderError> {
         let root = request.cwd.as_deref().ok_or_else(path_error)?;
         let root = Path::new(root).canonicalize().map_err(|_| path_error())?;
@@ -217,7 +220,7 @@ impl ClaudeCodeMcpProvider {
             .unwrap()
             .get(&root)
             .is_some_and(|client| client.connection.is_alive());
-        let client = match self.project_client(&root, deadline) {
+        let client = match self.project_client_with_shutdown(&root, deadline, shutdown) {
             Ok(client) => client,
             Err(error) => {
                 self.record_experimental_failure(&request.kind, &error, None);
@@ -253,6 +256,7 @@ impl ClaudeCodeMcpProvider {
                     arguments,
                     process_reused,
                     deadline,
+                    shutdown,
                 )
             }
             _ => Err(request_error()),
@@ -414,6 +418,7 @@ impl ProjectMcpClient {
         arguments: Value,
         process_reused: bool,
         deadline: Instant,
+        shutdown: Option<&AtomicBool>,
     ) -> Result<ExperimentalDispatchOutcome, ProviderError> {
         let tool = self
             .tools
@@ -437,11 +442,12 @@ impl ProjectMcpClient {
         // tools/call has not been written yet; post-send failure_state applies only after send.
         let failure_state = kind.post_send_failure_state();
         let started = Instant::now();
-        let result = self.connection.request(
+        let result = self.connection.request_with_shutdown(
             "tools/call",
             json!({"name": tool_name, "arguments": arguments}),
             timeout,
             failure_state,
+            shutdown,
         )?;
         let is_error = result
             .get("isError")

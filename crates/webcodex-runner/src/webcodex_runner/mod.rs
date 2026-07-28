@@ -9,6 +9,7 @@ pub(crate) mod output;
 pub(crate) mod patches;
 pub(crate) mod projects;
 pub(crate) mod shell;
+pub(crate) mod shutdown;
 pub(crate) mod transport;
 pub(crate) mod validation;
 

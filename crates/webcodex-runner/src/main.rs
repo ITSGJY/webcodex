@@ -1,13 +1,14 @@
 use reqwest::blocking::Client;
 use std::collections::{HashMap, VecDeque};
 use std::error::Error as StdError;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing_subscriber::EnvFilter;
+use webcodex_runner::shutdown::{lock_unpoison, ActivityTracker};
 
 #[cfg(test)]
 #[path = "webcodex_runner/job_manager_tests.rs"]
@@ -95,6 +96,9 @@ struct JobManager {
         >,
     >,
     prepared_profiles: PreparedShellProfileCache,
+    lifecycle: Arc<Mutex<()>>,
+    shutting_down: Arc<AtomicBool>,
+    workers: ActivityTracker,
 }
 
 impl JobManager {
@@ -104,6 +108,9 @@ impl JobManager {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             queued: Arc::new(Mutex::new(VecDeque::new())),
             prepared_profiles: PreparedShellProfileCache::default(),
+            lifecycle: Arc::new(Mutex::new(())),
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            workers: ActivityTracker::default(),
         }
     }
 }
@@ -112,6 +119,7 @@ impl JobManager {
 struct RunningJob {
     client_id: String,
     child: Option<Arc<Mutex<Child>>>,
+    process_group_id: Option<u32>,
     stop_requested: Arc<AtomicBool>,
 }
 
@@ -1314,10 +1322,11 @@ fn register(
     cfg: &AgentConfig,
     runtime: &ReloadableAgentConfig,
     project_cache: &mut AgentProjectCache,
+    shutdown: Option<&AtomicBool>,
     agent_instance_id: &str,
     prepared_cache_count: usize,
 ) -> Result<usize, RegisterError> {
-    let projects = project_cache.get(cfg);
+    let projects = project_cache.get_with_shutdown(cfg, shutdown);
     let projects_count = projects.iter().filter(|project| !project.disabled).count();
     let (body, provider, provider_revision) = build_register_request_with_provider_status(
         cfg,
@@ -1457,18 +1466,20 @@ fn write_created_file(
 }
 
 fn spawn_reader<R: Read + Send + 'static>(
-    reader: R,
-    tx: mpsc::Sender<OutputChunk>,
+    mut reader: R,
+    tx: mpsc::SyncSender<OutputChunk>,
     stdout: bool,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let mut reader = BufReader::new(reader);
+        // A bounded channel plus fixed-size reads prevents a fast child (or
+        // one enormous line) from retaining unbounded output in the runner
+        // while a transport send is slow.
+        let mut buf = [0_u8; 8 * 1024];
         loop {
-            let mut buf = Vec::new();
-            match reader.read_until(b'\n', &mut buf) {
+            match reader.read(&mut buf) {
                 Ok(0) => break,
-                Ok(_) => {
-                    let text = String::from_utf8_lossy(&buf).to_string();
+                Ok(read) => {
+                    let text = String::from_utf8_lossy(&buf[..read]).to_string();
                     let _ = if stdout {
                         tx.send(OutputChunk::Stdout(text))
                     } else {
@@ -1479,6 +1490,31 @@ fn spawn_reader<R: Read + Send + 'static>(
             }
         }
     })
+}
+
+fn join_reader_threads_until(mut readers: Vec<std::thread::JoinHandle<()>>, deadline: Instant) {
+    loop {
+        let mut index = 0;
+        while index < readers.len() {
+            if readers[index].is_finished() {
+                let reader = readers.swap_remove(index);
+                let _ = reader.join();
+            } else {
+                index += 1;
+            }
+        }
+        if readers.is_empty() {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            // Dropping a JoinHandle detaches it. The output channel is bounded,
+            // so an abnormal pipe holder cannot retain unbounded runner memory
+            // or block process shutdown.
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10).min(remaining));
+    }
 }
 
 /// Report a job-start failure over the active transport. Used by
@@ -1554,6 +1590,7 @@ fn validation_module_available(
     cwd: &Path,
     step: &ShellJobValidationStep,
     inspect_scratch: Option<&crate::command_sandbox::InspectScratch>,
+    shutdown: Option<&AtomicBool>,
 ) -> bool {
     if step.program != "python" {
         return true;
@@ -1569,19 +1606,51 @@ fn validation_module_available(
     const PROBE: &str =
         "import importlib.util,sys;sys.exit(0 if importlib.util.find_spec(sys.argv[1]) else 42)";
     let args = ["-I", "-c", PROBE, module].map(str::to_string);
-    configured_validation_job_command(shell, profile, &step.program, &args)
-        .and_then(|mut command| {
-            command
-                .current_dir(cwd)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            if let Some(scratch) = inspect_scratch {
-                crate::command_sandbox::sandbox_command_inspect(&mut command, scratch)?;
+    let Ok(mut command) = configured_validation_job_command(shell, profile, &step.program, &args)
+    else {
+        return false;
+    };
+    command
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(scratch) = inspect_scratch {
+        if crate::command_sandbox::sandbox_command_inspect(&mut command, scratch).is_err() {
+            return false;
+        }
+    }
+    let Ok(child) = command.spawn() else {
+        return false;
+    };
+    let child = Arc::new(Mutex::new(child));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let wait_result = {
+            let mut child = lock_unpoison(&child);
+            child.try_wait()
+        };
+        match wait_result {
+            Ok(Some(status)) => {
+                let success = status.success();
+                let _ = kill_child_group(&child);
+                return success;
             }
-            command.status().map_err(|error| error.to_string())
-        })
-        .is_ok_and(|status| status.success())
+            Ok(None) => {
+                if shutdown.is_some_and(|flag| flag.load(Ordering::SeqCst))
+                    || Instant::now() >= deadline
+                {
+                    let _ = kill_child_group(&child);
+                    return false;
+                }
+            }
+            Err(_) => {
+                let _ = kill_child_group(&child);
+                return false;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[cfg(unix)]
@@ -1603,6 +1672,9 @@ fn classify_process_group_signal_error(
 
 #[cfg(unix)]
 fn signal_process_group(pgid: u32, signal: i32) -> Result<bool, String> {
+    if pgid == 0 {
+        return Err("process-group id 0 is invalid".to_string());
+    }
     let target = i32::try_from(pgid).map_err(|_| format!("process-group id {pgid} exceeds i32"))?;
     // SAFETY: callers only pass the private process-group id of a child that
     // this JobManager launched through `setsid`.
@@ -1614,10 +1686,7 @@ fn signal_process_group(pgid: u32, signal: i32) -> Result<bool, String> {
 }
 
 fn kill_child_group(child: &Arc<Mutex<Child>>) -> Result<(), String> {
-    let pid = child
-        .lock()
-        .map_err(|_| "job child lock poisoned".to_string())?
-        .id();
+    let pid = lock_unpoison(child).id();
     #[cfg(unix)]
     {
         if pid == 0 {
@@ -1634,50 +1703,226 @@ fn kill_child_group(child: &Arc<Mutex<Child>>) -> Result<(), String> {
         }
     }
     #[cfg(not(unix))]
-    child
-        .lock()
-        .map_err(|_| "job child lock poisoned".to_string())?
+    lock_unpoison(child)
         .kill()
         .map_err(|error| error.to_string())?;
-    Ok(())
+    if reap_job_child_until(child, Instant::now() + Duration::from_secs(1))? {
+        Ok(())
+    } else {
+        Err("job child did not reap within the bounded stop deadline".to_string())
+    }
+}
+
+fn try_reap_job_child(child: &Arc<Mutex<Child>>) -> Result<bool, String> {
+    let mut child = match child.try_lock() {
+        Ok(child) => child,
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+    };
+    match child.try_wait() {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn reap_job_child_until(child: &Arc<Mutex<Child>>, deadline: Instant) -> Result<bool, String> {
+    loop {
+        if try_reap_job_child(child)? {
+            return Ok(true);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(10).min(remaining));
+    }
+}
+
+#[derive(Clone)]
+struct JobShutdownTarget {
+    child: Arc<Mutex<Child>>,
+    process_group_id: Option<u32>,
+}
+
+struct JobShutdownBatch {
+    targets: Vec<JobShutdownTarget>,
+    running: usize,
+    failures: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JobShutdownOutcome {
+    resources: usize,
+    timed_out: usize,
+    failures: usize,
+}
+
+fn shutdown_target_running(target: &mut JobShutdownTarget) -> bool {
+    let child_running = !matches!(try_reap_job_child(&target.child), Ok(true));
+    #[cfg(unix)]
+    let group_running = match target.process_group_id {
+        Some(process_group_id) => match signal_process_group(process_group_id, 0) {
+            Ok(true) => true,
+            Ok(false) => {
+                target.process_group_id = None;
+                false
+            }
+            Err(_) => true,
+        },
+        None => false,
+    };
+    #[cfg(not(unix))]
+    let group_running = false;
+    child_running || group_running
 }
 
 impl JobManager {
     fn has_work(&self) -> bool {
-        !self.jobs.lock().unwrap().is_empty() || !self.queued.lock().unwrap().is_empty()
+        !lock_unpoison(&self.jobs).is_empty() || !lock_unpoison(&self.queued).is_empty()
     }
 
-    fn stop_all(&self) {
-        self.queued.lock().unwrap().clear();
+    fn stop_accepting_work(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+    }
+
+    fn cancel_queued_for_shutdown(&self) -> usize {
+        let _lifecycle = lock_unpoison(&self.lifecycle);
+        self.shutting_down.store(true, Ordering::SeqCst);
+        let mut queued = lock_unpoison(&self.queued);
+        let cancelled = queued.len();
+        queued.clear();
+        cancelled
+    }
+
+    fn signal_all_for_shutdown(&self) -> JobShutdownBatch {
         let running = {
-            let jobs = self.jobs.lock().unwrap();
+            let jobs = lock_unpoison(&self.jobs);
             jobs.iter()
-                .map(|(job_id, job)| {
+                .map(|(_, job)| {
                     (
-                        job_id.clone(),
                         job.child.clone(),
-                        job.stop_requested.clone(),
+                        job.process_group_id,
+                        Arc::clone(&job.stop_requested),
                     )
                 })
                 .collect::<Vec<_>>()
         };
-        for (job_id, child, stop_requested) in running {
+        let running_count = running.len();
+        let mut targets = Vec::with_capacity(running.len());
+        let mut failures = 0;
+        for (child, process_group_id, stop_requested) in running {
             stop_requested.store(true, Ordering::SeqCst);
-            if let Some(child) = child {
-                if let Err(e) = kill_child_group(&child) {
-                    eprintln!("webcodex-runner stop_job error: failed to kill job {job_id}: {e}");
+            let Some(child) = child else {
+                continue;
+            };
+            #[cfg(unix)]
+            if let Some(process_group_id) = process_group_id {
+                if signal_process_group(process_group_id, libc::SIGTERM).is_err() {
+                    failures += 1;
                 }
             }
+            #[cfg(not(unix))]
+            if lock_unpoison(&child).kill().is_err() {
+                failures += 1;
+            }
+            targets.push(JobShutdownTarget {
+                child,
+                process_group_id,
+            });
+        }
+        JobShutdownBatch {
+            running: running_count,
+            targets,
+            failures,
         }
     }
 
+    fn drain_shutdown(&self, mut batch: JobShutdownBatch, deadline: Instant) -> JobShutdownOutcome {
+        const TERM_GRACE: Duration = Duration::from_millis(500);
+        let resources = batch.targets.len();
+        let grace_deadline = deadline.min(Instant::now() + TERM_GRACE);
+        while Instant::now() < grace_deadline {
+            if batch
+                .targets
+                .iter_mut()
+                .all(|target| !shutdown_target_running(target))
+            {
+                break;
+            }
+            let remaining = grace_deadline.saturating_duration_since(Instant::now());
+            std::thread::sleep(Duration::from_millis(10).min(remaining));
+        }
+
+        for target in &mut batch.targets {
+            if !shutdown_target_running(target) {
+                continue;
+            }
+            #[cfg(unix)]
+            if let Some(process_group_id) = target.process_group_id {
+                if signal_process_group(process_group_id, libc::SIGKILL).is_err() {
+                    batch.failures += 1;
+                }
+            }
+            #[cfg(not(unix))]
+            if lock_unpoison(&target.child).kill().is_err() {
+                batch.failures += 1;
+            }
+        }
+
+        while Instant::now() < deadline {
+            if batch
+                .targets
+                .iter_mut()
+                .all(|target| !shutdown_target_running(target))
+            {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            std::thread::sleep(Duration::from_millis(10).min(remaining));
+        }
+        let mut timed_out = 0;
+        for target in &mut batch.targets {
+            timed_out += usize::from(shutdown_target_running(target));
+        }
+        JobShutdownOutcome {
+            resources,
+            timed_out,
+            failures: batch.failures,
+        }
+    }
+
+    #[cfg(test)]
+    fn stop_all(&self) {
+        self.stop_accepting_work();
+        self.cancel_queued_for_shutdown();
+        let batch = self.signal_all_for_shutdown();
+        let outcome = self.drain_shutdown(batch, Instant::now() + Duration::from_secs(2));
+        if outcome.timed_out > 0 || outcome.failures > 0 {
+            eprintln!(
+                "webcodex-runner shutdown job cleanup incomplete resources={} timed_out={} failures={}",
+                outcome.resources, outcome.timed_out, outcome.failures
+            );
+        }
+    }
+
+    fn wait_for_workers(&self, deadline: Instant) -> bool {
+        self.workers.wait_until(deadline)
+    }
+
+    fn worker_count(&self) -> usize {
+        self.workers.active()
+    }
+
     fn active_job_count(&self, client_id: &str) -> usize {
-        self.jobs
-            .lock()
-            .unwrap()
+        lock_unpoison(&self.jobs)
             .values()
             .filter(|job| job.client_id == client_id)
             .count()
+    }
+
+    fn shutdown_rejection(&self, sink: &AgentSink, request: ShellAgentShellRequest) {
+        send_job_start_failure(sink, request, "runner is shutting down".to_string(), None);
     }
 
     fn enqueue(
@@ -1692,10 +1937,14 @@ impl JobManager {
         let Some(job_id) = request.job_id.clone() else {
             return;
         };
+        if self.shutting_down.load(Ordering::SeqCst) {
+            self.shutdown_rejection(&sink, request);
+            return;
+        }
         let client_id = sink.client_id().to_string();
         let active = self.active_job_count(&client_id);
         if active >= self.max_concurrent {
-            let _ = sink.send_job_update(&ShellAgentJobUpdateRequest {
+            let queued_update = ShellAgentJobUpdateRequest {
                 client_id: client_id.clone(),
                 agent_instance_id: sink.agent_instance_id().to_string(),
                 job_id: job_id.clone(),
@@ -1710,8 +1959,15 @@ impl JobManager {
                 error: None,
                 validation_progress: None,
                 finished: false,
-            });
-            self.queued.lock().unwrap().push_back((
+            };
+            let lifecycle = lock_unpoison(&self.lifecycle);
+            if self.shutting_down.load(Ordering::SeqCst) {
+                drop(lifecycle);
+                self.shutdown_rejection(&sink, request);
+                return;
+            }
+            let update_sink = sink.clone();
+            lock_unpoison(&self.queued).push_back((
                 sink,
                 generation,
                 policy,
@@ -1719,6 +1975,8 @@ impl JobManager {
                 projects_dir,
                 request,
             ));
+            drop(lifecycle);
+            let _ = update_sink.send_job_update(&queued_update);
             return;
         }
         self.start_now(sink, generation, policy, shell, projects_dir, request);
@@ -1733,14 +1991,27 @@ impl JobManager {
         projects_dir: PathBuf,
         request: ShellAgentShellRequest,
     ) {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            self.shutdown_rejection(&sink, request);
+            return;
+        }
         self.start_shell_job(sink, generation, policy, shell, projects_dir, request);
     }
 
     fn start_available_queued(&self) {
         loop {
+            if self.shutting_down.load(Ordering::SeqCst) {
+                lock_unpoison(&self.queued).clear();
+                return;
+            }
             let next = {
-                let jobs = self.jobs.lock().unwrap();
-                let mut queued = self.queued.lock().unwrap();
+                let _lifecycle = lock_unpoison(&self.lifecycle);
+                if self.shutting_down.load(Ordering::SeqCst) {
+                    lock_unpoison(&self.queued).clear();
+                    return;
+                }
+                let jobs = lock_unpoison(&self.jobs);
+                let mut queued = lock_unpoison(&self.queued);
                 let mut selected = None;
                 for (idx, (_, _, _policy, _shell, _projects_dir, request)) in
                     queued.iter().enumerate()
@@ -1851,6 +2122,7 @@ impl JobManager {
                 &cwd_path,
                 request.cwd.is_some(),
                 &self.prepared_profiles,
+                Some(self.shutting_down.as_ref()),
             ) {
                 Ok(profile) => profile,
                 Err(e) => {
@@ -1867,6 +2139,7 @@ impl JobManager {
                     &cwd_path,
                     step,
                     inspect_scratch.as_ref(),
+                    Some(self.shutting_down.as_ref()),
                 )
             })
         {
@@ -1924,6 +2197,27 @@ impl JobManager {
                 .stderr(Stdio::piped());
             commands.push_back(command);
         }
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let client_id = sink.client_id().to_string();
+        {
+            let _lifecycle = lock_unpoison(&self.lifecycle);
+            if self.shutting_down.load(Ordering::SeqCst) {
+                self.shutdown_rejection(&sink, request);
+                return;
+            }
+            // Reserve the job before spawning outside the lifecycle mutex.
+            // Shutdown can then set this stop flag even while Command::spawn
+            // is waiting for a child-side pre-exec hook.
+            lock_unpoison(&self.jobs).insert(
+                job_id.clone(),
+                RunningJob {
+                    client_id: client_id.clone(),
+                    child: None,
+                    process_group_id: None,
+                    stop_requested: Arc::clone(&stop_requested),
+                },
+            );
+        }
         let start = Instant::now();
         let spawn = commands
             .pop_front()
@@ -1932,6 +2226,7 @@ impl JobManager {
         let mut child = match spawn {
             Ok(c) => c,
             Err(e) => {
+                lock_unpoison(&self.jobs).remove(&job_id);
                 if validation {
                     send_validation_executor_failure(
                         &sink,
@@ -1954,19 +2249,28 @@ impl JobManager {
                 return;
             }
         };
+        let process_group_id = child.id();
         let mut stdout = child.stdout.take();
         let mut stderr = child.stderr.take();
         let mut child = Arc::new(Mutex::new(child));
-        let stop_requested = Arc::new(AtomicBool::new(false));
-        let client_id = sink.client_id().to_string();
-        self.jobs.lock().unwrap().insert(
-            job_id.clone(),
-            RunningJob {
-                client_id: client_id.clone(),
-                child: Some(child.clone()),
-                stop_requested: stop_requested.clone(),
-            },
-        );
+        let reject_for_shutdown = {
+            let _lifecycle = lock_unpoison(&self.lifecycle);
+            if self.shutting_down.load(Ordering::SeqCst) || stop_requested.load(Ordering::SeqCst) {
+                lock_unpoison(&self.jobs).remove(&job_id);
+                true
+            } else if let Some(job) = lock_unpoison(&self.jobs).get_mut(&job_id) {
+                job.child = Some(child.clone());
+                job.process_group_id = Some(process_group_id);
+                false
+            } else {
+                true
+            }
+        };
+        if reject_for_shutdown {
+            let _ = kill_child_group(&child);
+            self.shutdown_rejection(&sink, request);
+            return;
+        }
         let _ = sink.send_job_update(&ShellAgentJobUpdateRequest {
             client_id: client_id.clone(),
             agent_instance_id: sink.agent_instance_id().to_string(),
@@ -1990,16 +2294,22 @@ impl JobManager {
         let jobs = self.jobs.clone();
         let queued = self.queued.clone();
         let prepared_profiles = self.prepared_profiles.clone();
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let shutting_down = Arc::clone(&self.shutting_down);
+        let workers = self.workers.clone();
         let max_concurrent = self.max_concurrent;
         let inspect_scratch_guard = inspect_scratch;
+        let worker_guard = self.workers.enter();
         std::thread::spawn(move || {
+            let _worker_guard = worker_guard;
             // Keep the private writable directory alive for every process in
             // the job, then clean it when the terminal update has been sent.
             let _inspect_scratch_guard = inspect_scratch_guard;
             let timeout_secs = request.timeout_secs.min(policy.max_timeout_secs).max(1);
             let mut step_index = 0;
             let (final_status, out, err, final_progress) = loop {
-                let (tx, rx) = mpsc::channel::<OutputChunk>();
+                const OUTPUT_CHANNEL_CAPACITY: usize = 64;
+                let (tx, rx) = mpsc::sync_channel::<OutputChunk>(OUTPUT_CHANNEL_CAPACITY);
                 let mut readers = Vec::new();
                 if let Some(stdout) = stdout {
                     readers.push(spawn_reader(stdout, tx.clone(), true));
@@ -2039,7 +2349,11 @@ impl JobManager {
                             finished: false,
                         });
                     }
-                    match child.lock().unwrap().try_wait() {
+                    let wait_result = {
+                        let mut child = lock_unpoison(&child);
+                        child.try_wait()
+                    };
+                    match wait_result {
                         Ok(Some(status)) => {
                             let stopped = stop_requested.load(Ordering::SeqCst);
                             break (
@@ -2060,6 +2374,14 @@ impl JobManager {
                             );
                         }
                         Ok(None) => {
+                            if stop_requested.load(Ordering::SeqCst) {
+                                let _ = kill_child_group(&child);
+                                break (
+                                    "stopped".to_string(),
+                                    Some(-1),
+                                    Some("job stopped by request".to_string()),
+                                );
+                            }
                             if start.elapsed() >= Duration::from_secs(timeout_secs) {
                                 stop_requested.store(true, Ordering::SeqCst);
                                 let _ = kill_child_group(&child);
@@ -2087,9 +2409,11 @@ impl JobManager {
                     }
                     std::thread::sleep(Duration::from_millis(JOB_UPDATE_INTERVAL_MS));
                 };
-                for reader in readers {
-                    let _ = reader.join();
-                }
+                // A direct child can exit while a background descendant keeps
+                // stdout/stderr open. Terminate the private group before the
+                // bounded reader join so cleanup cannot wait forever on EOF.
+                let _ = kill_child_group(&child);
+                join_reader_threads_until(readers, Instant::now() + Duration::from_secs(1));
                 let mut out = String::new();
                 let mut err = String::new();
                 while let Ok(chunk) = rx.try_recv() {
@@ -2116,6 +2440,27 @@ impl JobManager {
                             }),
                         );
                     }
+                    {
+                        let _lifecycle_guard = lock_unpoison(&lifecycle);
+                        if shutting_down.load(Ordering::SeqCst)
+                            || stop_requested.load(Ordering::SeqCst)
+                        {
+                            break (
+                                (
+                                    "stopped".to_string(),
+                                    Some(-1),
+                                    Some("job stopped by request".to_string()),
+                                ),
+                                out,
+                                err,
+                                validation.then(|| ShellJobValidationProgress {
+                                    completed: step_index,
+                                    current_step: None,
+                                    failed_step: None,
+                                }),
+                            );
+                        }
+                    }
                     let spawn = commands
                         .pop_front()
                         .expect("one command per validation step")
@@ -2141,10 +2486,40 @@ impl JobManager {
                     };
                     let next_stdout = next.stdout.take();
                     let next_stderr = next.stderr.take();
-                    child = Arc::new(Mutex::new(next));
-                    if let Some(job) = jobs.lock().unwrap().get_mut(&job_id) {
-                        job.child = Some(child.clone());
+                    let process_group_id = next.id();
+                    let next = Arc::new(Mutex::new(next));
+                    let reject_for_shutdown = {
+                        let _lifecycle_guard = lock_unpoison(&lifecycle);
+                        if shutting_down.load(Ordering::SeqCst)
+                            || stop_requested.load(Ordering::SeqCst)
+                        {
+                            true
+                        } else if let Some(job) = lock_unpoison(&jobs).get_mut(&job_id) {
+                            job.child = Some(Arc::clone(&next));
+                            job.process_group_id = Some(process_group_id);
+                            false
+                        } else {
+                            true
+                        }
+                    };
+                    if reject_for_shutdown {
+                        let _ = kill_child_group(&next);
+                        break (
+                            (
+                                "stopped".to_string(),
+                                Some(-1),
+                                Some("job stopped by request".to_string()),
+                            ),
+                            out,
+                            err,
+                            validation.then(|| ShellJobValidationProgress {
+                                completed: step_index,
+                                current_step: None,
+                                failed_step: None,
+                            }),
+                        );
                     }
+                    child = next;
                     let _ = sink.send_job_update(&ShellAgentJobUpdateRequest {
                         client_id: sink.client_id().to_string(),
                         agent_instance_id: sink.agent_instance_id().to_string(),
@@ -2203,12 +2578,15 @@ impl JobManager {
                 validation_progress: final_progress,
                 finished: true,
             });
-            jobs.lock().unwrap().remove(&job_id);
+            lock_unpoison(&jobs).remove(&job_id);
             let manager = JobManager {
                 max_concurrent,
                 jobs: jobs.clone(),
                 queued: queued.clone(),
                 prepared_profiles,
+                lifecycle,
+                shutting_down,
+                workers,
             };
             manager.start_available_queued();
         });
@@ -2216,7 +2594,7 @@ impl JobManager {
 
     fn stop(&self, job_id: &str) -> Result<(), String> {
         let queued_job = {
-            let mut queued = self.queued.lock().unwrap();
+            let mut queued = lock_unpoison(&self.queued);
             if let Some(pos) = queued
                 .iter()
                 .position(|(_, _, _, _, _, request)| request.job_id.as_deref() == Some(job_id))
@@ -2248,7 +2626,7 @@ impl JobManager {
             return Ok(());
         }
         let (child, stop_requested) = {
-            let jobs = self.jobs.lock().unwrap();
+            let jobs = lock_unpoison(&self.jobs);
             let Some(job) = jobs.get(job_id) else {
                 return Err(format!("unknown local job: {}", job_id));
             };
@@ -2265,12 +2643,13 @@ impl JobManager {
 fn handle_one_poll(
     client: &Client,
     cfg: &AgentConfig,
-    runtime: &ReloadableAgentConfig,
+    runtime: &Arc<ReloadableAgentConfig>,
     jobs: &JobManager,
     project_cache: &mut AgentProjectCache,
     agent_instance_id: &str,
     lsp: &webcodex_runner::LspSupervisor,
     shutdown: &Arc<AtomicBool>,
+    dispatches: &ActivityTracker,
 ) -> Result<bool, PollError> {
     let metadata_config = runtime.snapshot();
     let provider_update =
@@ -2289,7 +2668,7 @@ fn handle_one_poll(
         request: ShellAgentPollRequest {
             client_id: cfg.client_id.clone(),
             agent_instance_id: agent_instance_id.to_string(),
-            projects: Some(project_cache.get(cfg)),
+            projects: Some(project_cache.get_with_shutdown(cfg, Some(shutdown.as_ref()))),
         },
         tool_providers: provider_update
             .as_ref()
@@ -2329,15 +2708,34 @@ fn handle_one_poll(
         shutdown: Arc::clone(shutdown),
     });
     let hot = runtime.snapshot();
-    let result = dispatch_request(
-        &sink,
-        &hot,
-        runtime,
-        jobs,
-        &projects_dir(&cfg),
-        lsp,
-        request,
-    );
+    let runtime = Arc::clone(runtime);
+    let jobs = jobs.clone();
+    let projects_dir = projects_dir(cfg);
+    let lsp = lsp.clone();
+    let dispatch_guard = dispatches.enter();
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _dispatch_guard = dispatch_guard;
+        let result = dispatch_request(&sink, &hot, &runtime, &jobs, &projects_dir, &lsp, request);
+        let _ = result_tx.send(result);
+    });
+    let result = loop {
+        match result_rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(result) => break result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if shutdown.load(Ordering::SeqCst) {
+                    return Err(PollError::from_submit(SubmitResultError::Shutdown(
+                        "process shutdown".to_string(),
+                    )));
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(PollError::from_submit(SubmitResultError::TransportClosed(
+                    "polling dispatch worker closed".to_string(),
+                )));
+            }
+        }
+    };
     if project_op && result.is_ok() {
         project_cache.invalidate();
     }
@@ -7630,17 +8028,30 @@ shell_profile = "../rust"
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = test_config(tmp.path().join("config/projects.d"));
         let jobs = JobManager::new(1);
         let stop_requested = Arc::new(AtomicBool::new(false));
+        let mut running_command =
+            configured_shell_job_command(&ShellConfig::default(), "sleep 60").unwrap();
+        let running_child = Arc::new(Mutex::new(
+            running_command
+                .current_dir(tmp.path())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        ));
+        let running_pid = lock_unpoison(&running_child).id();
         jobs.jobs.lock().unwrap().insert(
             "running-job".to_string(),
             RunningJob {
                 client_id: "ws-client".to_string(),
-                child: None,
+                child: Some(Arc::clone(&running_child)),
+                process_group_id: Some(running_pid),
                 stop_requested: stop_requested.clone(),
             },
         );
@@ -7662,7 +8073,7 @@ shell_profile = "../rust"
             end_line: None,
             line: None,
             create_dirs: false,
-            command: "sleep 60".to_string(),
+            command: ": > queued-started".to_string(),
             stdin: None,
             timeout_secs: 60,
             requested_by: "tester".to_string(),
@@ -7671,6 +8082,9 @@ shell_profile = "../rust"
             lsp: None,
             sandbox: None,
         };
+        let mut rejected_request = request.clone();
+        rejected_request.request_id = "req-after-shutdown".to_string();
+        rejected_request.job_id = Some("job-after-shutdown".to_string());
 
         jobs.enqueue(
             sink,
@@ -7693,6 +8107,32 @@ shell_profile = "../rust"
 
         assert!(stop_requested.load(Ordering::SeqCst));
         assert!(jobs.queued.lock().unwrap().is_empty());
+        assert!(lock_unpoison(&running_child).try_wait().unwrap().is_some());
+        assert_eq!(signal_process_group(running_pid, 0), Ok(false));
+        assert!(
+            !tmp.path().join("queued-started").exists(),
+            "queued job started during shutdown"
+        );
+
+        let (rejected_sink, mut rejected_rx) = ws_sink("ws-client");
+        jobs.enqueue(
+            rejected_sink,
+            1,
+            cfg.policy.clone(),
+            cfg.shell.clone(),
+            projects_dir(&cfg),
+            rejected_request,
+        );
+        assert!(jobs.queued.lock().unwrap().is_empty());
+        match rejected_rx.try_recv().expect("shutdown rejection was sent") {
+            AgentEnvelope::JobUpdate { payload } => {
+                assert_eq!(payload.job_id, "job-after-shutdown");
+                assert_eq!(payload.status, "failed");
+                assert!(payload.finished);
+                assert_eq!(payload.error.as_deref(), Some("runner is shutting down"));
+            }
+            other => panic!("expected job_update, got {:?}", other.kind()),
+        }
     }
 
     #[test]
@@ -8425,6 +8865,7 @@ shell_profile = "../rust"
             &cfg,
             &runtime,
             &mut project_cache,
+            None,
             "inst-empty-token",
             0,
         )

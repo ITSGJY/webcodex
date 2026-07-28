@@ -59,6 +59,7 @@ fn job_manager_stop_terminates_the_process_group() {
         RunningJob {
             client_id: "test-agent".into(),
             child: Some(child.clone()),
+            process_group_id: Some(leader_pid),
             stop_requested: stop_requested.clone(),
         },
     );
@@ -77,6 +78,126 @@ fn job_manager_stop_terminates_the_process_group() {
         !process_running(descendant_pid),
         "descendant {descendant_pid} survived process-group cancellation"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn job_shutdown_reaps_a_sigterm_responsive_child() {
+    let temp = tempfile::tempdir().unwrap();
+    let ready = temp.path().join("ready");
+    let mut command = configured_shell_job_command(
+        &ShellConfig::default(),
+        "trap 'exit 0' TERM; : > ready; while :; do sleep 1; done",
+    )
+    .unwrap();
+    let child = Arc::new(Mutex::new(
+        command
+            .current_dir(temp.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    ));
+    let leader_pid = child.lock().unwrap().id();
+    assert!(wait_until(Duration::from_secs(1), || ready.exists()));
+    let manager = JobManager::new(1);
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    lock_unpoison(&manager.jobs).insert(
+        "term-responsive".into(),
+        RunningJob {
+            client_id: "test-agent".into(),
+            child: Some(Arc::clone(&child)),
+            process_group_id: Some(leader_pid),
+            stop_requested: Arc::clone(&stop_requested),
+        },
+    );
+
+    manager.stop_accepting_work();
+    let batch = manager.signal_all_for_shutdown();
+    let outcome = manager.drain_shutdown(batch, Instant::now() + Duration::from_millis(800));
+    assert_eq!(outcome.resources, 1);
+    assert_eq!(outcome.timed_out, 0);
+    assert!(stop_requested.load(Ordering::SeqCst));
+    assert!(child.lock().unwrap().try_wait().unwrap().is_some());
+    assert!(!process_running(leader_pid));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn job_shutdown_escalates_ignored_sigterm_for_parent_and_descendant() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut command = configured_shell_job_command(
+        &ShellConfig::default(),
+        "trap '' TERM; sleep 60 & echo $! > descendant.pid; wait",
+    )
+    .unwrap();
+    let child = Arc::new(Mutex::new(
+        command
+            .current_dir(temp.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    ));
+    let leader_pid = child.lock().unwrap().id();
+    let pid_file = temp.path().join("descendant.pid");
+    assert!(wait_until(Duration::from_secs(2), || pid_file.exists()));
+    let descendant_pid = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    assert!(process_running(leader_pid));
+    assert!(process_running(descendant_pid));
+
+    let manager = JobManager::new(1);
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    lock_unpoison(&manager.jobs).insert(
+        "term-ignoring".into(),
+        RunningJob {
+            client_id: "test-agent".into(),
+            child: Some(Arc::clone(&child)),
+            process_group_id: Some(leader_pid),
+            stop_requested: Arc::clone(&stop_requested),
+        },
+    );
+    let started = Instant::now();
+    manager.stop_accepting_work();
+    let batch = manager.signal_all_for_shutdown();
+    let outcome = manager.drain_shutdown(batch, Instant::now() + Duration::from_millis(900));
+    let elapsed = started.elapsed();
+
+    assert_eq!(outcome.resources, 1);
+    assert_eq!(outcome.timed_out, 0);
+    assert!(stop_requested.load(Ordering::SeqCst));
+    assert!(
+        elapsed < Duration::from_millis(1100),
+        "job shutdown exceeded its absolute deadline: {elapsed:?}"
+    );
+    assert!(child.lock().unwrap().try_wait().unwrap().is_some());
+    assert!(!process_running(leader_pid));
+    assert!(
+        wait_until(Duration::from_secs(1), || !process_running(descendant_pid)),
+        "descendant survived process-group SIGKILL"
+    );
+}
+
+#[test]
+fn poisoned_job_mutex_does_not_panic_shutdown() {
+    let manager = JobManager::new(1);
+    let jobs = Arc::clone(&manager.jobs);
+    let poisoned = std::thread::spawn(move || {
+        let _guard = jobs.lock().unwrap();
+        panic!("poison jobs mutex");
+    });
+    assert!(poisoned.join().is_err());
+
+    manager.stop_accepting_work();
+    assert_eq!(manager.cancel_queued_for_shutdown(), 0);
+    let batch = manager.signal_all_for_shutdown();
+    let outcome = manager.drain_shutdown(batch, Instant::now() + Duration::from_millis(50));
+    assert_eq!(outcome.resources, 0);
+    assert_eq!(outcome.timed_out, 0);
 }
 
 #[cfg(unix)]
@@ -485,6 +606,7 @@ fn python_module_probe_reports_tool_unavailable_without_running_recipe() {
         temp.path(),
         &step,
         None,
+        None,
     ));
     assert_eq!(std::fs::read_to_string(&probe_output).unwrap(), "unittest");
     assert!(!temp.path().join("recipe-ran").exists());
@@ -497,6 +619,7 @@ fn python_module_probe_reports_tool_unavailable_without_running_recipe() {
         temp.path(),
         &step,
         Some(&scratch),
+        None,
     ));
     assert!(
         !probe_output.exists(),
@@ -512,4 +635,15 @@ fn process_running(pid: u32) -> bool {
     stat.rsplit_once(") ")
         .and_then(|(_, rest)| rest.chars().next())
         .is_some_and(|state| state != 'Z')
+}
+
+fn wait_until(timeout: Duration, condition: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    condition()
 }

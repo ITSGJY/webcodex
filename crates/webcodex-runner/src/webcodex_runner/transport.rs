@@ -4,6 +4,11 @@ use super::config::{
 };
 use super::lsp::LspSupervisor;
 use super::projects::AgentProjectCache;
+use super::shutdown::{
+    ActivityTracker, BackgroundThreads, ShutdownCoordinator, ShutdownDeadline, ShutdownPhaseResult,
+    ShutdownReport, BACKGROUND_JOIN_BUDGET, DEFAULT_SHUTDOWN_BUDGET, JOB_DRAIN_BUDGET,
+    LSP_SHUTDOWN_BUDGET, PROVIDER_SHUTDOWN_BUDGET,
+};
 use crate::agent_init::{TRANSPORT_AUTO, TRANSPORT_POLLING, TRANSPORT_QUIC, TRANSPORT_WEBSOCKET};
 use crate::shell_protocol::{
     read_quic_frame, write_quic_frame, AgentEnvelope, QuicFrameError, ShellAgentJobUpdateRequest,
@@ -48,10 +53,17 @@ const RECONNECT_STABLE_RESET_AFTER: Duration = Duration::from_secs(60);
 /// guarantees `websocket_session` (and therefore the reconnect loop) always
 /// makes progress instead of stalling forever after a disconnect.
 const WS_WRITER_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
-/// Bounded wait for local agent jobs to acknowledge a process shutdown.
-const JOB_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Process-shutdown control frames are best effort, but enqueueing them must
+/// never wait behind a permanently full transport channel.
+const TRANSPORT_CONTROL_SEND_TIMEOUT: Duration = Duration::from_millis(250);
 /// Bounded wait for Tokio blocking tasks when the transport runtime exits.
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+/// A blocking polling request must return early enough to leave useful time
+/// for the process-wide cleanup budget.
+const POLLING_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Reload listener polls its stop flag every 100ms, so one second is ample
+/// while still preserving most of the global budget for child processes.
+const CONFIG_RELOAD_JOIN_BUDGET: Duration = Duration::from_secs(1);
 /// Granularity for signal-aware sleeps in the blocking polling loop.
 const POLLING_SHUTDOWN_SLEEP_SLICE: Duration = Duration::from_millis(50);
 /// Polling session recovery is persistent but capped: after reaching 10s,
@@ -110,44 +122,235 @@ fn send_provider_metadata(
 pub(crate) struct AgentRuntimeState {
     lsp: LspSupervisor,
     config: Arc<ReloadableAgentConfig>,
+    jobs: JobManager,
+    coordinator: Arc<ShutdownCoordinator>,
+    reload_threads: Arc<BackgroundThreads>,
+    background_threads: Arc<BackgroundThreads>,
+    dispatches: ActivityTracker,
 }
 
 impl AgentRuntimeState {
     pub(crate) fn new(cfg: &AgentConfig, path: PathBuf) -> Self {
+        Self::with_shutdown_budget(cfg, path, DEFAULT_SHUTDOWN_BUDGET)
+    }
+
+    fn with_shutdown_budget(cfg: &AgentConfig, path: PathBuf, budget: Duration) -> Self {
         Self {
             lsp: LspSupervisor::default(),
             config: Arc::new(ReloadableAgentConfig::new(cfg.clone(), path)),
+            jobs: JobManager::new(max_concurrent_jobs(cfg)),
+            coordinator: Arc::new(ShutdownCoordinator::new(budget)),
+            reload_threads: Arc::new(BackgroundThreads::default()),
+            background_threads: Arc::new(BackgroundThreads::default()),
+            dispatches: ActivityTracker::default(),
         }
     }
 
-    fn shutdown(&self) {
-        self.lsp.shutdown();
+    fn request_shutdown_signal(&self) {
+        self.coordinator.request_signal();
+        let deadline = self.coordinator.deadline().instant();
+        self.config.begin_shutdown();
+        self.jobs.stop_accepting_work();
+        self.lsp.begin_shutdown_until(deadline);
+    }
+
+    fn shutdown_flag(&self) -> Arc<AtomicBool> {
+        self.coordinator.requested_flag()
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        self.coordinator.is_requested()
+    }
+
+    fn project_summaries(
+        &self,
+        cache: &mut AgentProjectCache,
+        cfg: &AgentConfig,
+    ) -> Vec<ShellAgentProjectSummary> {
+        let shutdown = self.shutdown_flag();
+        cache.get_with_shutdown(cfg, Some(shutdown.as_ref()))
+    }
+
+    fn transport_runtime_shutdown_timeout(&self) -> Duration {
+        if self.shutdown_requested() {
+            RUNTIME_SHUTDOWN_TIMEOUT.min(
+                self.coordinator
+                    .deadline()
+                    .instant()
+                    .saturating_duration_since(Instant::now()),
+            )
+        } else {
+            RUNTIME_SHUTDOWN_TIMEOUT
+        }
+    }
+
+    async fn wait_for_shutdown(&self) {
+        while !self.shutdown_requested() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    fn register_reload_thread(&self, handle: std::thread::JoinHandle<()>) {
+        self.reload_threads.register(handle);
+    }
+
+    fn register_background_thread(&self, handle: std::thread::JoinHandle<()>) {
+        self.background_threads.register(handle);
+    }
+
+    fn shutdown(&self) -> ShutdownReport {
+        self.coordinator.run_once(|deadline| self.cleanup(deadline))
+    }
+
+    fn cleanup(&self, deadline: ShutdownDeadline) -> Vec<ShutdownPhaseResult> {
+        let mut phases = Vec::with_capacity(10);
+
+        let started = Instant::now();
+        phases.push(if self.coordinator.signal_received() {
+            ShutdownPhaseResult::completed("signal_received", started, 0)
+        } else {
+            ShutdownPhaseResult::skipped("signal_received", started)
+        });
+
+        let started = Instant::now();
+        self.config.begin_shutdown();
+        self.jobs.stop_accepting_work();
+        self.lsp.begin_shutdown_until(deadline.instant());
+        phases.push(ShutdownPhaseResult::completed(
+            "stop_accepting_work",
+            started,
+            0,
+        ));
+
+        let started = Instant::now();
+        let reload_resources = self.reload_threads.pending();
+        let reload = self
+            .reload_threads
+            .join_until(deadline.phase_deadline(CONFIG_RELOAD_JOIN_BUDGET));
+        phases.push(shutdown_phase(
+            "config_reload_stop",
+            started,
+            reload_resources,
+            reload.timed_out,
+            reload.panicked,
+            "reload_thread_panicked",
+        ));
+
+        let started = Instant::now();
+        let cancelled = self.jobs.cancel_queued_for_shutdown();
+        phases.push(if cancelled == 0 {
+            ShutdownPhaseResult::skipped("queued_jobs_cancel", started)
+        } else {
+            ShutdownPhaseResult::completed("queued_jobs_cancel", started, cancelled)
+        });
+
+        let started = Instant::now();
+        let job_batch = self.jobs.signal_all_for_shutdown();
+        let active_jobs = job_batch.running;
+        let signal_failures = job_batch.failures;
+        phases.push(shutdown_phase(
+            "active_jobs_signal",
+            started,
+            active_jobs,
+            0,
+            signal_failures,
+            "job_signal_failed",
+        ));
+
+        let started = Instant::now();
+        let jobs = self
+            .jobs
+            .drain_shutdown(job_batch, deadline.phase_deadline(JOB_DRAIN_BUDGET));
+        phases.push(shutdown_phase(
+            "active_jobs_drain",
+            started,
+            jobs.resources,
+            jobs.timed_out,
+            jobs.failures.saturating_sub(signal_failures),
+            "job_reap_failed",
+        ));
+
+        let started = Instant::now();
+        let provider_deadline = deadline.phase_deadline(PROVIDER_SHUTDOWN_BUDGET);
+        let mut provider_connections = 0usize;
+        let mut provider_timeouts = 0usize;
+        let mut provider_failures = 0usize;
+        for router in self.config.external_routers() {
+            let outcome = router.shutdown_until(provider_deadline);
+            provider_connections = provider_connections.saturating_add(outcome.connections);
+            provider_timeouts = provider_timeouts.saturating_add(outcome.timed_out);
+            provider_failures = provider_failures.saturating_add(outcome.failures);
+        }
+        phases.push(shutdown_phase(
+            "external_providers_stop",
+            started,
+            provider_connections,
+            provider_timeouts,
+            provider_failures,
+            "provider_shutdown_failed",
+        ));
+
+        let started = Instant::now();
+        let lsp = self
+            .lsp
+            .shutdown_until(deadline.phase_deadline(LSP_SHUTDOWN_BUDGET));
+        phases.push(shutdown_phase(
+            "lsp_servers_stop",
+            started,
+            lsp.servers,
+            lsp.timed_out + usize::from(lsp.reaper_timed_out),
+            lsp.failures,
+            "lsp_shutdown_failed",
+        ));
+
+        let started = Instant::now();
+        let background_deadline = deadline.phase_deadline(BACKGROUND_JOIN_BUDGET);
+        let background_resources = self.reload_threads.pending()
+            + self.background_threads.pending()
+            + self.jobs.worker_count()
+            + self.dispatches.active();
+        let reload_retry = self.reload_threads.join_until(background_deadline);
+        let joined = self.background_threads.join_until(background_deadline);
+        let workers_done = self.jobs.wait_for_workers(background_deadline);
+        let dispatches_done = self.dispatches.wait_until(background_deadline);
+        let background_timeouts = reload_retry.timed_out
+            + joined.timed_out
+            + usize::from(!workers_done)
+            + usize::from(!dispatches_done);
+        phases.push(shutdown_phase(
+            "background_threads_join",
+            started,
+            background_resources,
+            background_timeouts,
+            reload_retry.panicked + joined.panicked,
+            "background_thread_panicked",
+        ));
+
+        phases.push(ShutdownPhaseResult::completed(
+            "shutdown_complete",
+            Instant::now(),
+            0,
+        ));
+        phases
     }
 }
 
-async fn stop_jobs_for_shutdown(jobs: &JobManager, poll_interval_ms: u64) {
-    jobs.stop_all();
-    let start = std::time::Instant::now();
-    let sleep = Duration::from_millis(poll_interval_ms.clamp(50, 250));
-    while jobs.has_work() && start.elapsed() < JOB_SHUTDOWN_DRAIN_TIMEOUT {
-        let remaining = JOB_SHUTDOWN_DRAIN_TIMEOUT.saturating_sub(start.elapsed());
-        tokio::time::sleep(sleep.min(remaining)).await;
-    }
-    if jobs.has_work() {
-        eprintln!("webcodex-runner shutdown: active jobs did not stop within 2s; exiting");
-    }
-}
-
-fn stop_jobs_for_polling_shutdown(jobs: &JobManager, poll_interval_ms: u64) {
-    jobs.stop_all();
-    let start = Instant::now();
-    let sleep = Duration::from_millis(poll_interval_ms.clamp(50, 250));
-    while jobs.has_work() && start.elapsed() < JOB_SHUTDOWN_DRAIN_TIMEOUT {
-        let remaining = JOB_SHUTDOWN_DRAIN_TIMEOUT.saturating_sub(start.elapsed());
-        std::thread::sleep(sleep.min(remaining));
-    }
-    if jobs.has_work() {
-        eprintln!("webcodex-runner shutdown: active jobs did not stop within 2s; exiting");
+fn shutdown_phase(
+    phase: &'static str,
+    started: Instant,
+    resources: usize,
+    timed_out: usize,
+    failures: usize,
+    failure_code: &'static str,
+) -> ShutdownPhaseResult {
+    if timed_out > 0 {
+        ShutdownPhaseResult::timed_out(phase, started, resources)
+    } else if failures > 0 {
+        ShutdownPhaseResult::failed(phase, started, resources, failure_code)
+    } else if resources == 0 {
+        ShutdownPhaseResult::skipped(phase, started)
+    } else {
+        ShutdownPhaseResult::completed(phase, started, resources)
     }
 }
 
@@ -163,10 +366,27 @@ fn sleep_or_shutdown(delay: Duration, shutdown: &AtomicBool) -> bool {
     shutdown.load(Ordering::SeqCst)
 }
 
-fn install_polling_shutdown_flag() -> Arc<AtomicBool> {
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let listener_flag = Arc::clone(&shutdown);
-    let _ = std::thread::Builder::new()
+async fn async_sleep_or_shutdown(delay: Duration, runtime: &AgentRuntimeState) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => false,
+        _ = runtime.wait_for_shutdown() => true,
+    }
+}
+
+async fn future_or_shutdown<F>(future: F, runtime: &AgentRuntimeState) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::select! {
+        result = future => Some(result),
+        _ = runtime.wait_for_shutdown() => None,
+    }
+}
+
+fn install_shutdown_listener(
+    runtime: AgentRuntimeState,
+) -> Result<std::thread::JoinHandle<()>, String> {
+    std::thread::Builder::new()
         .name("webcodex-runner-shutdown".to_string())
         .spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -175,24 +395,19 @@ fn install_polling_shutdown_flag() -> Arc<AtomicBool> {
             else {
                 return;
             };
-            rt.block_on(shutdown_signal());
-            listener_flag.store(true, Ordering::SeqCst);
-        });
-    shutdown
+            rt.block_on(async {
+                tokio::select! {
+                    _ = shutdown_signal() => runtime.request_shutdown_signal(),
+                    _ = runtime.wait_for_shutdown() => {}
+                }
+            });
+        })
+        .map_err(|_| "failed to start process shutdown signal listener".to_string())
 }
 
-fn finish_polling_shutdown(jobs: &JobManager, poll_interval_ms: u64) {
-    eprintln!("webcodex-runner received process shutdown signal; exiting");
-    stop_jobs_for_polling_shutdown(jobs, poll_interval_ms);
-}
-
-fn complete_polling_shutdown(
-    runtime: &AgentRuntimeState,
-    jobs: &JobManager,
-    poll_interval_ms: u64,
-) -> Result<(), String> {
-    runtime.config.begin_shutdown();
-    finish_polling_shutdown(jobs, poll_interval_ms);
+fn complete_polling_shutdown(runtime: &AgentRuntimeState) -> Result<(), String> {
+    runtime.request_shutdown_signal();
+    runtime.shutdown();
     Ok(())
 }
 
@@ -796,17 +1011,22 @@ pub(crate) fn run_agent(cfg: AgentConfig, config_path: PathBuf, once: bool) -> R
     // The LSP supervisor belongs to the agent process rather than any server
     // transport session and is shared across reconnects.
     let runtime = AgentRuntimeState::new(&cfg, config_path);
+    let shutdown_listener = install_shutdown_listener(runtime.clone())?;
+    runtime.register_background_thread(shutdown_listener);
     #[cfg(unix)]
-    let reload_listener = install_reload_listener(Arc::clone(&runtime.config))?;
+    match install_reload_listener(Arc::clone(&runtime.config)) {
+        Ok(reload_listener) => runtime.register_reload_thread(reload_listener),
+        Err(error) => {
+            runtime.shutdown();
+            return Err(error);
+        }
+    }
     let result = match transport.as_str() {
         TRANSPORT_WEBSOCKET => run_websocket_agent(cfg, once, &agent_instance_id, &runtime),
         TRANSPORT_QUIC => run_quic_agent(cfg, once, &agent_instance_id, &runtime),
         TRANSPORT_AUTO => run_auto_agent(cfg, once, &agent_instance_id, &runtime),
         _ => run_polling_agent(cfg, once, &agent_instance_id, &runtime),
     };
-    runtime.config.begin_shutdown();
-    #[cfg(unix)]
-    let _ = reload_listener.join();
     runtime.shutdown();
     result
 }
@@ -952,7 +1172,12 @@ fn run_auto_agent(
                         Ok(AgentSessionExit::TransportDisconnected) => {
                             reset_backoff_after_stable_session(&mut backoff, session_started);
                             eprintln!("webcodex-runner quic connection closed; reconnecting");
-                            std::thread::sleep(schedule_reconnect(TRANSPORT_QUIC, &mut backoff));
+                            let delay = schedule_reconnect(TRANSPORT_QUIC, &mut backoff);
+                            let shutdown = runtime.shutdown_flag();
+                            if sleep_or_shutdown(delay, shutdown.as_ref()) {
+                                runtime.shutdown();
+                                return Ok(());
+                            }
                             continue 'supervisor;
                         }
                         Err(e) => {
@@ -984,10 +1209,12 @@ fn run_auto_agent(
                         Ok(AgentSessionExit::TransportDisconnected) => {
                             reset_backoff_after_stable_session(&mut backoff, session_started);
                             eprintln!("webcodex-runner websocket connection closed; reconnecting");
-                            std::thread::sleep(schedule_reconnect(
-                                TRANSPORT_WEBSOCKET,
-                                &mut backoff,
-                            ));
+                            let delay = schedule_reconnect(TRANSPORT_WEBSOCKET, &mut backoff);
+                            let shutdown = runtime.shutdown_flag();
+                            if sleep_or_shutdown(delay, shutdown.as_ref()) {
+                                runtime.shutdown();
+                                return Ok(());
+                            }
                             continue 'supervisor;
                         }
                         Err(e) => {
@@ -1027,7 +1254,7 @@ fn run_polling_agent(
     agent_instance_id: &str,
     runtime: &AgentRuntimeState,
 ) -> Result<(), String> {
-    let shutdown = install_polling_shutdown_flag();
+    let shutdown = runtime.shutdown_flag();
     run_polling_agent_with_shutdown(cfg, once, agent_instance_id, shutdown, runtime)
 }
 
@@ -1039,10 +1266,10 @@ fn run_polling_agent_with_shutdown(
     runtime: &AgentRuntimeState,
 ) -> Result<(), String> {
     let client = Client::builder()
-        .timeout(Duration::from_secs(30))
+        .timeout(POLLING_HTTP_TIMEOUT)
         .build()
         .map_err(|e| format!("failed to create http client: {}", e))?;
-    let jobs = JobManager::new(max_concurrent_jobs(&cfg));
+    let jobs = runtime.jobs.clone();
     let mut project_cache = AgentProjectCache::default();
     let mut registered = false;
     let mut recovering = false;
@@ -1051,7 +1278,7 @@ fn run_polling_agent_with_shutdown(
     let mut lease_conflict_started: Option<Instant> = None;
     loop {
         if shutdown.load(Ordering::SeqCst) {
-            return complete_polling_shutdown(runtime, &jobs, cfg.poll_interval_ms);
+            return complete_polling_shutdown(runtime);
         }
         if !registered {
             match register(
@@ -1059,6 +1286,7 @@ fn run_polling_agent_with_shutdown(
                 &cfg,
                 &runtime.config,
                 &mut project_cache,
+                Some(shutdown.as_ref()),
                 agent_instance_id,
                 jobs.prepared_profiles.len(),
             ) {
@@ -1089,7 +1317,7 @@ fn run_polling_agent_with_shutdown(
                             concise_log_error(&error.to_string(), &cfg.token)
                         );
                         if sleep_or_shutdown(delay, shutdown.as_ref()) {
-                            return complete_polling_shutdown(runtime, &jobs, cfg.poll_interval_ms);
+                            return complete_polling_shutdown(runtime);
                         }
                     }
                     RegisterRecoveryAction::WaitForLease => {
@@ -1110,7 +1338,7 @@ fn run_polling_agent_with_shutdown(
                             format_delay(delay)
                         );
                         if sleep_or_shutdown(delay, shutdown.as_ref()) {
-                            return complete_polling_shutdown(runtime, &jobs, cfg.poll_interval_ms);
+                            return complete_polling_shutdown(runtime);
                         }
                     }
                 },
@@ -1126,6 +1354,7 @@ fn run_polling_agent_with_shutdown(
             agent_instance_id,
             &runtime.lsp,
             &shutdown,
+            &runtime.dispatches,
         ) {
             Ok(ran_request) => {
                 recovery_backoff.reset();
@@ -1144,7 +1373,7 @@ fn run_polling_agent_with_shutdown(
                             Duration::from_millis(cfg.poll_interval_ms),
                             shutdown.as_ref(),
                         ) {
-                            return complete_polling_shutdown(runtime, &jobs, cfg.poll_interval_ms);
+                            return complete_polling_shutdown(runtime);
                         }
                     }
                     return Ok(());
@@ -1154,14 +1383,14 @@ fn run_polling_agent_with_shutdown(
                         Duration::from_millis(cfg.poll_interval_ms),
                         shutdown.as_ref(),
                     ) {
-                        return complete_polling_shutdown(runtime, &jobs, cfg.poll_interval_ms);
+                        return complete_polling_shutdown(runtime);
                     }
                 }
             }
             Err(e) => {
                 match e.recovery_action() {
                     PollingRecoveryAction::Shutdown => {
-                        return complete_polling_shutdown(runtime, &jobs, cfg.poll_interval_ms);
+                        return complete_polling_shutdown(runtime);
                     }
                     PollingRecoveryAction::Fatal => return Err(e.into_message()),
                     PollingRecoveryAction::RetryPoll => {
@@ -1180,7 +1409,7 @@ fn run_polling_agent_with_shutdown(
                             concise_log_error(&e.to_string(), &cfg.token)
                         );
                         if sleep_or_shutdown(delay, shutdown.as_ref()) {
-                            return complete_polling_shutdown(runtime, &jobs, cfg.poll_interval_ms);
+                            return complete_polling_shutdown(runtime);
                         }
                     }
                     PollingRecoveryAction::ReRegister => {
@@ -1194,7 +1423,7 @@ fn run_polling_agent_with_shutdown(
                             concise_log_error(&e.to_string(), &cfg.token)
                         );
                         if sleep_or_shutdown(delay, shutdown.as_ref()) {
-                            return complete_polling_shutdown(runtime, &jobs, cfg.poll_interval_ms);
+                            return complete_polling_shutdown(runtime);
                         }
                     }
                 }
@@ -1233,6 +1462,7 @@ fn run_quic_agent(
     runtime: &AgentRuntimeState,
 ) -> Result<(), String> {
     let agent_instance_id = agent_instance_id.to_string();
+    let runtime_for_shutdown = runtime.clone();
     let runtime = runtime.clone();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1242,12 +1472,12 @@ fn run_quic_agent(
         let mut project_cache = AgentProjectCache::default();
         let mut backoff = ReconnectBackoff::new();
         loop {
-            let projects = project_cache.get(&cfg);
+            let projects = runtime.project_summaries(&mut project_cache, &cfg);
             let session_started = Instant::now();
             match quic_session(&cfg, projects, &agent_instance_id, once, &runtime).await {
                 Ok(AgentSessionExit::Shutdown) => {
                     project_cache.invalidate();
-                    eprintln!("webcodex-runner quic shutdown complete");
+                    runtime.shutdown();
                     return Ok(());
                 }
                 Ok(AgentSessionExit::Completed) => {
@@ -1261,7 +1491,11 @@ fn run_quic_agent(
                     }
                     reset_backoff_after_stable_session(&mut backoff, session_started);
                     eprintln!("webcodex-runner quic connection closed; reconnecting");
-                    tokio::time::sleep(schedule_reconnect(TRANSPORT_QUIC, &mut backoff)).await;
+                    let delay = schedule_reconnect(TRANSPORT_QUIC, &mut backoff);
+                    if async_sleep_or_shutdown(delay, &runtime).await {
+                        runtime.shutdown();
+                        return Ok(());
+                    }
                 }
                 Err(e) => {
                     let e = classify_session_error(e);
@@ -1278,12 +1512,16 @@ fn run_quic_agent(
                         error = %e,
                         "webcodex-runner quic transient error"
                     );
-                    tokio::time::sleep(schedule_reconnect(TRANSPORT_QUIC, &mut backoff)).await;
+                    let delay = schedule_reconnect(TRANSPORT_QUIC, &mut backoff);
+                    if async_sleep_or_shutdown(delay, &runtime).await {
+                        runtime.shutdown();
+                        return Ok(());
+                    }
                 }
             }
         }
     });
-    rt.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    rt.shutdown_timeout(runtime_for_shutdown.transport_runtime_shutdown_timeout());
     result
 }
 
@@ -1293,6 +1531,7 @@ fn run_quic_agent_single_session(
     agent_instance_id: &str,
     runtime: &AgentRuntimeState,
 ) -> Result<AgentSessionExit, String> {
+    let runtime_for_shutdown = runtime.clone();
     let runtime = runtime.clone();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1300,10 +1539,10 @@ fn run_quic_agent_single_session(
         .map_err(|e| format!("failed to create tokio runtime: {}", e))?;
     let result = rt.block_on(async move {
         let mut project_cache = AgentProjectCache::default();
-        let projects = project_cache.get(cfg);
+        let projects = runtime.project_summaries(&mut project_cache, cfg);
         quic_session(cfg, projects, agent_instance_id, once, &runtime).await
     });
-    rt.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    rt.shutdown_timeout(runtime_for_shutdown.transport_runtime_shutdown_timeout());
     result
 }
 
@@ -1419,6 +1658,9 @@ async fn quic_session(
     let mut client_endpoint = None;
     let mut conn = None;
     for server_addr in server_addrs {
+        if runtime.shutdown_requested() {
+            return Ok(AgentSessionExit::Shutdown);
+        }
         let endpoint = match quinn::Endpoint::client(quic_client_bind_addr_for(server_addr)) {
             Ok(endpoint) => endpoint,
             Err(e) => {
@@ -1440,7 +1682,15 @@ async fn quic_session(
                     continue;
                 }
             };
-        match tokio::time::timeout(Duration::from_secs(quic.connect_timeout_secs), connect).await {
+        let Some(connect_result) = future_or_shutdown(
+            tokio::time::timeout(Duration::from_secs(quic.connect_timeout_secs), connect),
+            runtime,
+        )
+        .await
+        else {
+            return Ok(AgentSessionExit::Shutdown);
+        };
+        match connect_result {
             Ok(Ok(connection)) => {
                 client_endpoint = Some(endpoint);
                 conn = Some(connection);
@@ -1461,7 +1711,7 @@ async fn quic_session(
             }
         }
     }
-    let _client_endpoint = client_endpoint.ok_or_else(|| {
+    let client_endpoint = client_endpoint.ok_or_else(|| {
         format!(
             "quic connect to {} failed for all resolved addresses: {}",
             quic.server_addr,
@@ -1475,10 +1725,13 @@ async fn quic_session(
     // mismatch fails the handshake (surfaced as the connect error above).
 
     // Open a single bidirectional stream for register/ack/keepalive.
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| format!("failed to open quic bidirectional stream: {}", e))?;
+    let Some(open_result) = future_or_shutdown(conn.open_bi(), runtime).await else {
+        conn.close(quinn::VarInt::from_u32(0), b"process shutdown");
+        client_endpoint.close(quinn::VarInt::from_u32(0), b"process shutdown");
+        return Ok(AgentSessionExit::Shutdown);
+    };
+    let (mut send, mut recv) =
+        open_result.map_err(|e| format!("failed to open quic bidirectional stream: {}", e))?;
 
     // Register. The token is carried in `auth_token`; the server authenticates
     // it exactly like the websocket/polling paths. It is never logged.
@@ -1496,13 +1749,27 @@ async fn quic_session(
         payload: register_payload,
         auth_token: non_empty_token(&cfg.token),
     };
-    write_quic_frame(&mut send, &reg_env)
-        .await
-        .map_err(|e| format!("failed to send quic register: {}", e))?;
+    let Some(register_write) =
+        future_or_shutdown(write_quic_frame(&mut send, &reg_env), runtime).await
+    else {
+        conn.close(quinn::VarInt::from_u32(0), b"process shutdown");
+        client_endpoint.close(quinn::VarInt::from_u32(0), b"process shutdown");
+        return Ok(AgentSessionExit::Shutdown);
+    };
+    register_write.map_err(|e| format!("failed to send quic register: {}", e))?;
 
     // Wait for the Registered ack.
-    let ack = tokio::time::timeout(Duration::from_secs(15), read_quic_frame(&mut recv))
-        .await
+    let Some(ack_result) = future_or_shutdown(
+        tokio::time::timeout(Duration::from_secs(10), read_quic_frame(&mut recv)),
+        runtime,
+    )
+    .await
+    else {
+        conn.close(quinn::VarInt::from_u32(0), b"process shutdown");
+        client_endpoint.close(quinn::VarInt::from_u32(0), b"process shutdown");
+        return Ok(AgentSessionExit::Shutdown);
+    };
+    let ack = ack_result
         .map_err(|_| "quic register ack timed out".to_string())?
         .map_err(|e| format!("failed to read quic register ack: {}", e))?;
     match ack {
@@ -1534,11 +1801,25 @@ async fn quic_session(
         let ping = AgentEnvelope::Ping {
             ts: chrono::Utc::now().timestamp(),
         };
-        write_quic_frame(&mut send, &ping)
-            .await
-            .map_err(|e| format!("quic once ping send failed: {}", e))?;
-        let resp = tokio::time::timeout(Duration::from_secs(10), read_quic_frame(&mut recv))
-            .await
+        let Some(ping_write) =
+            future_or_shutdown(write_quic_frame(&mut send, &ping), runtime).await
+        else {
+            conn.close(quinn::VarInt::from_u32(0), b"process shutdown");
+            client_endpoint.close(quinn::VarInt::from_u32(0), b"process shutdown");
+            return Ok(AgentSessionExit::Shutdown);
+        };
+        ping_write.map_err(|e| format!("quic once ping send failed: {}", e))?;
+        let Some(pong_result) = future_or_shutdown(
+            tokio::time::timeout(Duration::from_secs(10), read_quic_frame(&mut recv)),
+            runtime,
+        )
+        .await
+        else {
+            conn.close(quinn::VarInt::from_u32(0), b"process shutdown");
+            client_endpoint.close(quinn::VarInt::from_u32(0), b"process shutdown");
+            return Ok(AgentSessionExit::Shutdown);
+        };
+        let resp = pong_result
             .map_err(|_| "quic once pong timed out".to_string())?
             .map_err(|e| format!("quic once pong read failed: {}", e))?;
         match resp {
@@ -1574,18 +1855,16 @@ async fn quic_session(
         client_id: cfg.client_id.clone(),
         agent_instance_id: agent_instance_id.to_string(),
     };
-    let jobs = JobManager::new(max_concurrent_jobs(cfg));
+    let jobs = runtime.jobs.clone();
     let mut ping_interval = tokio::time::interval(QUIC_PING_INTERVAL);
     ping_interval.tick().await; // skip immediate first tick
-    let mut shutdown = Box::pin(shutdown_signal());
+    let mut shutdown = Box::pin(runtime.wait_for_shutdown());
     let mut shutdown_requested = false;
     let mut session_error: Option<String> = None;
 
     loop {
         tokio::select! {
             _ = &mut shutdown => {
-                eprintln!("webcodex-runner received process shutdown signal; exiting");
-                runtime.config.begin_shutdown();
                 shutdown_requested = true;
                 break;
             }
@@ -1612,7 +1891,9 @@ async fn quic_session(
                         let jobs = jobs.clone();
                         let projects_dir = projects_dir(cfg);
                         let lsp = runtime.lsp.clone();
+                        let dispatch_guard = runtime.dispatches.enter();
                         tokio::task::spawn_blocking(move || {
+                            let _dispatch_guard = dispatch_guard;
                             let _ = dispatch_request(
                                 &sink_handle,
                                 &hot,
@@ -1625,7 +1906,7 @@ async fn quic_session(
                         });
                     }
                     AgentEnvelope::Ping { ts } => {
-                        let _ = out_tx.send(AgentEnvelope::Pong { ts }).await;
+                        let _ = out_tx.try_send(AgentEnvelope::Pong { ts });
                     }
                     AgentEnvelope::Pong { .. } => {
                         // Normal keepalive response.
@@ -1651,26 +1932,31 @@ async fn quic_session(
                     "webcodex-runner quic keepalive ping"
                 );
                 send_provider_metadata(&out_tx, &runtime.config, None);
-                let _ = out_tx.send(AgentEnvelope::Ping {
+                let _ = out_tx.try_send(AgentEnvelope::Ping {
                     ts: chrono::Utc::now().timestamp(),
-                }).await;
+                });
             }
         }
     }
 
     let graceful_writer_shutdown = shutdown_requested;
     if shutdown_requested {
-        stop_jobs_for_shutdown(&jobs, cfg.poll_interval_ms).await;
-        let _ = out_tx
-            .send(AgentEnvelope::Goodbye {
+        let _ = tokio::time::timeout(
+            TRANSPORT_CONTROL_SEND_TIMEOUT,
+            out_tx.send(AgentEnvelope::Goodbye {
                 reason: Some("process shutdown".to_string()),
-            })
-            .await;
+            }),
+        )
+        .await;
     } else if jobs.has_work() {
         tracing::warn!(
             transport = "quic",
             "webcodex-runner quic disconnected with active jobs; reconnecting without waiting"
         );
+    }
+    if shutdown_requested {
+        conn.close(quinn::VarInt::from_u32(0), b"process shutdown");
+        client_endpoint.close(quinn::VarInt::from_u32(0), b"process shutdown");
     }
     drop(sink_handle);
     drop(out_tx);
@@ -1758,6 +2044,7 @@ fn run_websocket_agent(
     runtime: &AgentRuntimeState,
 ) -> Result<(), String> {
     let agent_instance_id = agent_instance_id.to_string();
+    let runtime_for_shutdown = runtime.clone();
     let runtime = runtime.clone();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1767,12 +2054,12 @@ fn run_websocket_agent(
         let mut project_cache = AgentProjectCache::default();
         let mut backoff = ReconnectBackoff::new();
         loop {
-            let projects = project_cache.get(&cfg);
+            let projects = runtime.project_summaries(&mut project_cache, &cfg);
             let session_started = Instant::now();
             match websocket_session(&cfg, projects, &agent_instance_id, &runtime).await {
                 Ok(AgentSessionExit::Shutdown) => {
                     project_cache.invalidate();
-                    eprintln!("webcodex-runner websocket shutdown complete");
+                    runtime.shutdown();
                     return Ok(());
                 }
                 Ok(AgentSessionExit::Completed) => {
@@ -1786,7 +2073,11 @@ fn run_websocket_agent(
                     }
                     reset_backoff_after_stable_session(&mut backoff, session_started);
                     eprintln!("webcodex-runner websocket connection closed; reconnecting");
-                    tokio::time::sleep(schedule_reconnect(TRANSPORT_WEBSOCKET, &mut backoff)).await;
+                    let delay = schedule_reconnect(TRANSPORT_WEBSOCKET, &mut backoff);
+                    if async_sleep_or_shutdown(delay, &runtime).await {
+                        runtime.shutdown();
+                        return Ok(());
+                    }
                 }
                 Err(e) => {
                     let e = classify_session_error(e);
@@ -1803,12 +2094,16 @@ fn run_websocket_agent(
                         error = %e,
                         "webcodex-runner websocket transient error"
                     );
-                    tokio::time::sleep(schedule_reconnect(TRANSPORT_WEBSOCKET, &mut backoff)).await;
+                    let delay = schedule_reconnect(TRANSPORT_WEBSOCKET, &mut backoff);
+                    if async_sleep_or_shutdown(delay, &runtime).await {
+                        runtime.shutdown();
+                        return Ok(());
+                    }
                 }
             }
         }
     });
-    rt.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    rt.shutdown_timeout(runtime_for_shutdown.transport_runtime_shutdown_timeout());
     result
 }
 
@@ -1817,6 +2112,7 @@ fn run_websocket_agent_single_session(
     agent_instance_id: &str,
     runtime: &AgentRuntimeState,
 ) -> Result<AgentSessionExit, String> {
+    let runtime_for_shutdown = runtime.clone();
     let runtime = runtime.clone();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1824,10 +2120,10 @@ fn run_websocket_agent_single_session(
         .map_err(|e| format!("failed to create tokio runtime: {}", e))?;
     let result = rt.block_on(async move {
         let mut project_cache = AgentProjectCache::default();
-        let projects = project_cache.get(cfg);
+        let projects = runtime.project_summaries(&mut project_cache, cfg);
         websocket_session(cfg, projects, agent_instance_id, &runtime).await
     });
-    rt.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    rt.shutdown_timeout(runtime_for_shutdown.transport_runtime_shutdown_timeout());
     result
 }
 
@@ -1839,8 +2135,14 @@ pub(crate) async fn websocket_session(
     agent_instance_id: &str,
     runtime: &AgentRuntimeState,
 ) -> Result<AgentSessionExit, String> {
-    websocket_session_with_shutdown(cfg, projects, agent_instance_id, runtime, shutdown_signal())
-        .await
+    websocket_session_with_shutdown(
+        cfg,
+        projects,
+        agent_instance_id,
+        runtime,
+        runtime.wait_for_shutdown(),
+    )
+    .await
 }
 
 async fn websocket_session_with_shutdown<F>(
@@ -1856,20 +2158,27 @@ where
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+    let mut shutdown = Box::pin(shutdown);
     let ws_url = server_url_to_ws(&cfg.server_url, "/api/agents/ws")?;
     let request = build_ws_request(&ws_url, &cfg.token)?;
-    let (mut ws_stream, _resp) = tokio::time::timeout(
-        Duration::from_secs(cfg.websocket_connect_timeout_secs),
-        tokio_tungstenite::connect_async(request),
-    )
-    .await
-    .map_err(|_| {
-        format!(
-            "websocket connect timed out after {}s",
-            cfg.websocket_connect_timeout_secs
-        )
-    })?
-    .map_err(|e| format!("websocket connect failed: {}", e))?;
+    let connect = tokio::select! {
+        result = tokio::time::timeout(
+            Duration::from_secs(cfg.websocket_connect_timeout_secs),
+            tokio_tungstenite::connect_async(request),
+        ) => result,
+        _ = &mut shutdown => {
+            runtime.request_shutdown_signal();
+            return Ok(AgentSessionExit::Shutdown);
+        }
+    };
+    let (mut ws_stream, _resp) = connect
+        .map_err(|_| {
+            format!(
+                "websocket connect timed out after {}s",
+                cfg.websocket_connect_timeout_secs
+            )
+        })?
+        .map_err(|e| format!("websocket connect failed: {}", e))?;
 
     // Register over the socket. The prepared-profile cache is empty at
     // registration time (snapshots are prepared lazily on first use), so
@@ -1890,17 +2199,27 @@ where
     };
     let reg_json =
         serde_json::to_string(&reg_env).map_err(|e| format!("failed to encode register: {}", e))?;
-    ws_stream
-        .send(WsMessage::Text(reg_json.into()))
-        .await
-        .map_err(|e| format!("failed to send register: {}", e))?;
+    tokio::select! {
+        result = ws_stream.send(WsMessage::Text(reg_json.into())) => result,
+        _ = &mut shutdown => {
+            runtime.request_shutdown_signal();
+            return Ok(AgentSessionExit::Shutdown);
+        }
+    }
+    .map_err(|e| format!("failed to send register: {}", e))?;
 
     // Wait for Registered ack.
-    let ack_msg = ws_stream
-        .next()
-        .await
-        .ok_or_else(|| "server closed before register ack".to_string())?
-        .map_err(|e| format!("failed to read register ack: {}", e))?;
+    let ack_msg = tokio::select! {
+        result = tokio::time::timeout(Duration::from_secs(10), ws_stream.next()) => {
+            result.map_err(|_| "websocket register ack timed out".to_string())?
+        }
+        _ = &mut shutdown => {
+            runtime.request_shutdown_signal();
+            return Ok(AgentSessionExit::Shutdown);
+        }
+    }
+    .ok_or_else(|| "server closed before register ack".to_string())?
+    .map_err(|e| format!("failed to read register ack: {}", e))?;
     let ack_text = ack_msg
         .into_text()
         .map_err(|_| "register ack was not text".to_string())?;
@@ -1933,7 +2252,9 @@ where
     let (mut sink, mut stream) = ws_stream.split();
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<AgentEnvelope>(WS_OUTGOING_CAPACITY);
     let writer_task = tokio::spawn(async move {
+        let mut graceful_close = false;
         while let Some(env) = out_rx.recv().await {
+            let is_goodbye = matches!(env, AgentEnvelope::Goodbye { .. });
             match serde_json::to_string(&env) {
                 Ok(json) => {
                     if sink.send(WsMessage::Text(json.into())).await.is_err() {
@@ -1942,14 +2263,17 @@ where
                 }
                 Err(_) => break,
             }
+            if is_goodbye {
+                graceful_close = true;
+                break;
+            }
         }
-        // The sink is dropped here. We intentionally do NOT call
-        // `sink.close()`: on a split WebSocket sink the close handshake is
-        // delivered through the read half, which is no longer polled once
-        // the read loop breaks, so an unbounded `close().await` can hang and
-        // block the reconnect loop. Dropping the sink lets the OS tear down
-        // the socket; the server reconciles via its disconnect path either
-        // way.
+        if graceful_close {
+            // The session loop continues polling the split read half while
+            // awaiting this task, allowing tungstenite's close handshake to
+            // progress without turning this into an unbounded wait.
+            let _ = sink.close().await;
+        }
     });
 
     let sink_handle = AgentSink::WebSocket {
@@ -1957,19 +2281,17 @@ where
         client_id: cfg.client_id.clone(),
         agent_instance_id: agent_instance_id.to_string(),
     };
-    let jobs = JobManager::new(max_concurrent_jobs(cfg));
+    let jobs = runtime.jobs.clone();
     let mut ping_interval = tokio::time::interval(WS_PING_INTERVAL);
     ping_interval.tick().await; // skip immediate first tick
-    let mut shutdown = Box::pin(shutdown);
     let mut quit_after_session = false;
     let mut session_error: Option<String> = None;
 
     loop {
         tokio::select! {
             _ = &mut shutdown => {
-                runtime.config.begin_shutdown();
+                runtime.request_shutdown_signal();
                 quit_after_session = true;
-                eprintln!("webcodex-runner received process shutdown signal; exiting");
                 break;
             }
             msg = stream.next() => {
@@ -2026,10 +2348,12 @@ where
                         let jobs = jobs.clone();
                         let projects_dir = projects_dir(&cfg);
                         let lsp = runtime.lsp.clone();
+                        let dispatch_guard = runtime.dispatches.enter();
                         // Execution is blocking (shell/file/jobs/lsp); run it off
                         // the async runtime thread. dispatch_request sends
                         // results/updates via the shared AgentSink.
                         tokio::task::spawn_blocking(move || {
+                            let _dispatch_guard = dispatch_guard;
                             let _ = dispatch_request(
                                 &sink_handle,
                                 &hot,
@@ -2042,7 +2366,7 @@ where
                         });
                     }
                     AgentEnvelope::Ping { ts } => {
-                        let _ = out_tx.send(AgentEnvelope::Pong { ts }).await;
+                        let _ = out_tx.try_send(AgentEnvelope::Pong { ts });
                     }
                     AgentEnvelope::Pong { .. } => {
                         // Normal keepalive response from the server to our
@@ -2069,21 +2393,22 @@ where
                     "webcodex-runner websocket keepalive ping"
                 );
                 send_provider_metadata(&out_tx, &runtime.config, None);
-                let _ = out_tx.send(AgentEnvelope::Ping {
+                let _ = out_tx.try_send(AgentEnvelope::Ping {
                     ts: chrono::Utc::now().timestamp(),
-                }).await;
+                });
             }
         }
     }
 
     let graceful_writer_shutdown = quit_after_session;
     if quit_after_session {
-        stop_jobs_for_shutdown(&jobs, cfg.poll_interval_ms).await;
-        let _ = out_tx
-            .send(AgentEnvelope::Goodbye {
+        let _ = tokio::time::timeout(
+            TRANSPORT_CONTROL_SEND_TIMEOUT,
+            out_tx.send(AgentEnvelope::Goodbye {
                 reason: Some("process shutdown".to_string()),
-            })
-            .await;
+            }),
+        )
+        .await;
     } else if jobs.has_work() {
         tracing::warn!(
             transport = "websocket",
@@ -2097,18 +2422,49 @@ where
     // job sender clones cannot delay reconnect.
     drop(sink_handle);
     drop(out_tx);
-    drop(stream);
     let mut writer_task = writer_task;
     if graceful_writer_shutdown {
-        if tokio::time::timeout(WS_WRITER_CLOSE_TIMEOUT, &mut writer_task)
-            .await
-            .is_err()
-        {
-            writer_task.abort();
+        // Keep polling the read half while the writer flushes Goodbye and a
+        // WebSocket close frame. The single absolute timeout keeps a peer
+        // that never acknowledges close from extending process shutdown.
+        let close_deadline = tokio::time::Instant::now() + WS_WRITER_CLOSE_TIMEOUT;
+        let mut stream_open = true;
+        let mut writer_finished = false;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(close_deadline) => {
+                    writer_task.abort();
+                    break;
+                }
+                _ = &mut writer_task => {
+                    writer_finished = true;
+                    break;
+                }
+                message = stream.next(), if stream_open => {
+                    if !matches!(message, Some(Ok(_))) {
+                        stream_open = false;
+                    }
+                }
+            }
+        }
+        // `SinkExt::send` has flushed Goodbye, but immediately dropping the
+        // read half can still reset a split TCP socket before the peer
+        // consumes those bytes. Observe peer close/EOF using the remainder of
+        // the same deadline; no second per-component grace period is added.
+        while writer_finished && stream_open {
+            tokio::select! {
+                _ = tokio::time::sleep_until(close_deadline) => break,
+                message = stream.next() => {
+                    if !matches!(message, Some(Ok(message)) if !message.is_close()) {
+                        stream_open = false;
+                    }
+                }
+            }
         }
     } else {
         writer_task.abort();
     }
+    drop(stream);
     if let Some(error) = session_error {
         return Err(error);
     }
@@ -2176,6 +2532,146 @@ mod tests {
 
     fn test_runtime(cfg: &AgentConfig) -> AgentRuntimeState {
         AgentRuntimeState::new(cfg, PathBuf::new())
+    }
+
+    #[test]
+    fn runtime_shutdown_is_fast_ordered_and_runs_once_without_resources() {
+        let cfg = test_agent_config("http://127.0.0.1:1".to_string());
+        let runtime = AgentRuntimeState::with_shutdown_budget(
+            &cfg,
+            PathBuf::new(),
+            Duration::from_millis(300),
+        );
+        let started = Instant::now();
+        let first = runtime.shutdown();
+        let second = runtime.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "empty shutdown was not fast"
+        );
+        assert_eq!(runtime.coordinator.run_count(), 1);
+        assert_eq!(first.phases, second.phases);
+        assert_eq!(
+            first
+                .phases
+                .iter()
+                .map(|phase| phase.phase)
+                .collect::<Vec<_>>(),
+            vec![
+                "signal_received",
+                "stop_accepting_work",
+                "config_reload_stop",
+                "queued_jobs_cancel",
+                "active_jobs_signal",
+                "active_jobs_drain",
+                "external_providers_stop",
+                "lsp_servers_stop",
+                "background_threads_join",
+                "shutdown_complete",
+            ]
+        );
+        let lines = first.log_lines();
+        assert_eq!(lines.len(), 1, "idle shutdown should stay concise");
+        assert!(lines[0].starts_with("webcodex-runner shutdown complete "));
+    }
+
+    #[test]
+    fn runtime_completion_log_follows_bounded_background_cleanup() {
+        let cfg = test_agent_config("http://127.0.0.1:1".to_string());
+        let runtime = AgentRuntimeState::with_shutdown_budget(
+            &cfg,
+            PathBuf::new(),
+            Duration::from_millis(500),
+        );
+        runtime.register_background_thread(thread::spawn(|| {
+            thread::sleep(Duration::from_millis(60));
+        }));
+
+        let report = runtime.shutdown();
+        let background = report
+            .phases
+            .iter()
+            .find(|phase| phase.phase == "background_threads_join")
+            .unwrap();
+        assert_eq!(
+            background.status,
+            super::super::shutdown::ShutdownPhaseStatus::Completed
+        );
+        assert!(
+            report.elapsed_ms >= 40,
+            "completion was recorded before background cleanup"
+        );
+        let lines = report.log_lines();
+        assert!(
+            lines
+                .last()
+                .unwrap()
+                .starts_with("webcodex-runner shutdown complete "),
+            "completion log was not last"
+        );
+    }
+
+    #[test]
+    fn runtime_shutdown_global_budget_bounds_unjoinable_background_thread() {
+        let cfg = test_agent_config("http://127.0.0.1:1".to_string());
+        let budget = Duration::from_millis(80);
+        let runtime = AgentRuntimeState::with_shutdown_budget(&cfg, PathBuf::new(), budget);
+        runtime.register_background_thread(thread::spawn(|| {
+            thread::sleep(Duration::from_millis(400));
+        }));
+
+        let started = Instant::now();
+        let report = runtime.shutdown();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(50) && elapsed < Duration::from_millis(250),
+            "global shutdown budget was not enforced: {elapsed:?}"
+        );
+        let background = report
+            .phases
+            .iter()
+            .find(|phase| phase.phase == "background_threads_join")
+            .unwrap();
+        assert_eq!(
+            background.status,
+            super::super::shutdown::ShutdownPhaseStatus::TimedOut
+        );
+        assert_eq!(runtime.coordinator.run_count(), 1);
+        assert!(
+            report
+                .log_lines()
+                .last()
+                .unwrap()
+                .starts_with("webcodex-runner shutdown complete "),
+            "completion must be emitted after the timed-out cleanup attempt"
+        );
+    }
+
+    #[test]
+    fn runtime_shutdown_wakes_and_joins_reload_listener() {
+        let cfg = test_agent_config("http://127.0.0.1:1".to_string());
+        let runtime = AgentRuntimeState::with_shutdown_budget(
+            &cfg,
+            PathBuf::new(),
+            Duration::from_millis(500),
+        );
+        let config = Arc::clone(&runtime.config);
+        runtime.register_reload_thread(thread::spawn(move || {
+            while !config.is_stopping() {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }));
+        let report = runtime.shutdown();
+        let reload = report
+            .phases
+            .iter()
+            .find(|phase| phase.phase == "config_reload_stop")
+            .unwrap();
+        assert_eq!(
+            reload.status,
+            super::super::shutdown::ShutdownPhaseStatus::Completed
+        );
+        assert_eq!(reload.resources, 1);
     }
 
     fn test_project(id: &str) -> ShellAgentProjectSummary {
@@ -3201,6 +3697,35 @@ mod tests {
             vec!["/api/shell/agent/register", "/api/shell/agent/poll"],
             "shutdown must not leak a re-register request"
         );
+    }
+
+    #[test]
+    fn polling_shutdown_uses_the_process_coordinator_once() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Register,
+            ScriptStep::PollResponse {
+                status: "502 Bad Gateway",
+                body: "bad gateway",
+            },
+        ]);
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = polling_agent_config(server.server_url.clone(), temp.path().join("projects.d"));
+        let runtime = AgentRuntimeState::with_shutdown_budget(
+            &cfg,
+            PathBuf::new(),
+            Duration::from_millis(500),
+        );
+        run_polling_agent_with_shutdown(
+            cfg,
+            false,
+            "inst-coordinator",
+            Arc::clone(&server.shutdown),
+            &runtime,
+        )
+        .unwrap();
+        server.handle.join().unwrap();
+        runtime.shutdown();
+        assert_eq!(runtime.coordinator.run_count(), 1);
     }
 
     #[test]
@@ -4231,6 +4756,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_reconnect_backoff_is_interrupted_by_process_shutdown() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (closed_tx, closed_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _register = read_register(&mut ws).await;
+            send_registered_ack(&mut ws).await;
+            ws.send(WsMessage::Close(None)).await.unwrap();
+            closed_tx.send(()).unwrap();
+        });
+
+        let cfg = test_agent_config(format!("http://{}", addr));
+        let runtime = AgentRuntimeState::with_shutdown_budget(
+            &cfg,
+            PathBuf::new(),
+            Duration::from_millis(500),
+        );
+        let runner_runtime = runtime.clone();
+        let runner = tokio::task::spawn_blocking(move || {
+            run_websocket_agent(cfg, false, "inst-backoff-shutdown", &runner_runtime)
+        });
+        closed_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let started = Instant::now();
+        runtime.request_shutdown_signal();
+        tokio::time::timeout(Duration::from_secs(2), runner)
+            .await
+            .expect("websocket reconnect backoff ignored shutdown")
+            .unwrap()
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "websocket reconnect shutdown was delayed"
+        );
+        assert_eq!(runtime.coordinator.run_count(), 1);
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn quic_connect_or_reconnect_wait_is_interrupted_by_process_shutdown() {
+        let mut cfg = test_agent_config("https://localhost".to_string());
+        cfg.transport = Some(TRANSPORT_QUIC.to_string());
+        cfg.quic = Some(QuicClientConfig {
+            server_addr: "127.0.0.1:9".to_string(),
+            server_name: "localhost".to_string(),
+            alpn: crate::webcodex_runner::default_quic_alpn(),
+            connect_timeout_secs: 10,
+            keepalive_interval_secs: 20,
+        });
+        let runtime = AgentRuntimeState::with_shutdown_budget(
+            &cfg,
+            PathBuf::new(),
+            Duration::from_millis(500),
+        );
+        let trigger_runtime = runtime.clone();
+        let trigger = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(75));
+            trigger_runtime.request_shutdown_signal();
+        });
+        let started = Instant::now();
+        run_quic_agent(cfg, false, "inst-quic-shutdown", &runtime)
+            .expect("QUIC process shutdown should be a normal exit");
+        trigger.join().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "QUIC connect/reconnect wait ignored shutdown"
+        );
+        assert_eq!(runtime.coordinator.run_count(), 1);
+    }
+
+    #[tokio::test]
     async fn websocket_process_shutdown_exits_gracefully() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4241,6 +4839,22 @@ mod tests {
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
             let _register = read_register(&mut ws).await;
             send_registered_ack(&mut ws).await;
+            ws.send(WsMessage::Text(
+                serde_json::to_string(&AgentEnvelope::Ping { ts: 1 })
+                    .unwrap()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            let pong = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("agent did not enter the registered session")
+                .expect("stream open")
+                .expect("pong message ok");
+            assert!(matches!(
+                AgentEnvelope::from_slice(pong.into_text().unwrap().as_bytes()).unwrap(),
+                AgentEnvelope::Pong { ts: 1 }
+            ));
             registered_tx.send(()).unwrap();
             let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
                 .await
@@ -4255,13 +4869,14 @@ mod tests {
 
         let cfg = test_agent_config(format!("http://{}", addr));
         let runtime = test_runtime(&cfg);
+        let session_runtime = runtime.clone();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let session = tokio::spawn(async move {
             websocket_session_with_shutdown(
                 &cfg,
                 vec![test_project("shutdown-test")],
                 "inst-shutdown",
-                &runtime,
+                &session_runtime,
                 async {
                     let _ = shutdown_rx.await;
                 },
@@ -4282,5 +4897,8 @@ mod tests {
             Some("process shutdown")
         );
         server.await.unwrap();
+        runtime.shutdown();
+        runtime.shutdown();
+        assert_eq!(runtime.coordinator.run_count(), 1);
     }
 }

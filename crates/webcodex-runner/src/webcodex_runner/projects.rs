@@ -7,12 +7,18 @@ use crate::{err_cmd, ok_cmd, write_created_file};
 use crate::{CommandResult, CreatedProjectPaths};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 const PROJECT_SCAN_CACHE_MS: u64 = 5000;
+const PROJECT_GIT_TIMEOUT: Duration = Duration::from_secs(2);
+const PROJECT_GIT_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
+const PROJECT_GIT_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AgentProjectFile {
@@ -169,31 +175,216 @@ pub(crate) fn find_project_shell_context(
         .map(|(_, project)| project)
 }
 
-fn run_git_capture(path: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
+struct BoundedGitOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_capped: bool,
+    stderr_capped: bool,
+}
+
+fn spawn_bounded_git_reader(
+    mut pipe: impl Read + Send + 'static,
+) -> (mpsc::Receiver<(Vec<u8>, bool)>, thread::JoinHandle<()>) {
+    let (tx, rx) = mpsc::sync_channel(1);
+    let handle = thread::spawn(move || {
+        let mut retained = Vec::with_capacity(PROJECT_GIT_OUTPUT_MAX_BYTES.min(8192));
+        let mut chunk = [0_u8; 8192];
+        let mut capped = false;
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => {
+                    let remaining = PROJECT_GIT_OUTPUT_MAX_BYTES.saturating_sub(retained.len());
+                    let keep = remaining.min(read);
+                    retained.extend_from_slice(&chunk[..keep]);
+                    capped |= keep < read;
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = tx.send((retained, capped));
+    });
+    (rx, handle)
+}
+
+#[cfg(unix)]
+fn signal_project_git_group(process_group_id: u32, signal: i32) -> bool {
+    let Ok(process_group_id) = i32::try_from(process_group_id) else {
+        return false;
+    };
+    if process_group_id == 0 {
+        return false;
+    }
+    // SAFETY: each helper below places Git in a private process group.
+    (unsafe { libc::kill(-process_group_id, signal) }) == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+fn terminate_project_git_child(
+    child: &mut std::process::Child,
+    process_group_id: u32,
+    deadline: Instant,
+) {
+    #[cfg(unix)]
+    {
+        let _ = signal_project_git_group(process_group_id, libc::SIGTERM);
+        let grace = deadline.min(Instant::now() + Duration::from_millis(50));
+        while Instant::now() < grace {
+            if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
+                break;
+            }
+            thread::sleep(
+                Duration::from_millis(10).min(grace.saturating_duration_since(Instant::now())),
+            );
+        }
+        let _ = signal_project_git_group(process_group_id, libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
+            return;
+        }
+        thread::sleep(
+            Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
+fn run_git_bounded(
+    path: &Path,
+    args: &[&str],
+    timeout: Duration,
+    shutdown: Option<&AtomicBool>,
+) -> Result<BoundedGitOutput, String> {
+    if shutdown.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        return Err("git stopped during runner shutdown".to_string());
+    }
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(path)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to spawn git: {error}"))?;
+    let process_group_id = child.id();
+    let Some(stdout) = child.stdout.take() else {
+        terminate_project_git_child(
+            &mut child,
+            process_group_id,
+            Instant::now() + PROJECT_GIT_CLEANUP_TIMEOUT,
+        );
+        return Err("git stdout pipe was unavailable".to_string());
+    };
+    let Some(stderr) = child.stderr.take() else {
+        drop(stdout);
+        terminate_project_git_child(
+            &mut child,
+            process_group_id,
+            Instant::now() + PROJECT_GIT_CLEANUP_TIMEOUT,
+        );
+        return Err("git stderr pipe was unavailable".to_string());
+    };
+    let (stdout_rx, stdout_reader) = spawn_bounded_git_reader(stdout);
+    let (stderr_rx, stderr_reader) = spawn_bounded_git_reader(stderr);
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                let stopping = shutdown.is_some_and(|flag| flag.load(Ordering::SeqCst));
+                if stopping || Instant::now() >= deadline {
+                    terminate_project_git_child(
+                        &mut child,
+                        process_group_id,
+                        Instant::now() + PROJECT_GIT_CLEANUP_TIMEOUT,
+                    );
+                    return Err(if stopping {
+                        "git stopped during runner shutdown".to_string()
+                    } else {
+                        "git command timed out".to_string()
+                    });
+                }
+                thread::sleep(
+                    Duration::from_millis(10)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            Err(error) => {
+                terminate_project_git_child(
+                    &mut child,
+                    process_group_id,
+                    Instant::now() + PROJECT_GIT_CLEANUP_TIMEOUT,
+                );
+                return Err(format!("failed to wait for git: {error}"));
+            }
+        }
+    };
+
+    // A helper descendant must not keep either pipe open after Git itself
+    // exits. The private group makes this cleanup local to this command.
+    #[cfg(unix)]
+    let _ = signal_project_git_group(process_group_id, libc::SIGKILL);
+    let drain_deadline = Instant::now() + PROJECT_GIT_CLEANUP_TIMEOUT;
+    let stdout = stdout_rx
+        .recv_timeout(drain_deadline.saturating_duration_since(Instant::now()))
+        .map_err(|_| "git stdout reader timed out".to_string())?;
+    let stderr = stderr_rx
+        .recv_timeout(drain_deadline.saturating_duration_since(Instant::now()))
+        .map_err(|_| "git stderr reader timed out".to_string())?;
+    if stdout_reader.is_finished() {
+        let _ = stdout_reader.join();
+    }
+    if stderr_reader.is_finished() {
+        let _ = stderr_reader.join();
+    }
+    Ok(BoundedGitOutput {
+        status,
+        stdout: stdout.0,
+        stderr: stderr.0,
+        stdout_capped: stdout.1,
+        stderr_capped: stderr.1,
+    })
+}
+
+fn run_git_capture(path: &str, args: &[&str], shutdown: Option<&AtomicBool>) -> Option<String> {
+    let output = run_git_bounded(Path::new(path), args, PROJECT_GIT_TIMEOUT, shutdown).ok()?;
+    if !output.status.success() || output.stdout_capped {
         return None;
     }
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-pub(crate) fn agent_project_summary(
+fn agent_project_summary_with_shutdown(
     project: &AgentProjectFile,
     updated_at: i64,
     include_git: bool,
+    shutdown: Option<&AtomicBool>,
 ) -> ShellAgentProjectSummary {
     let mut hooks = project.hooks.keys().cloned().collect::<Vec<_>>();
     hooks.sort();
     let (git_branch, git_head, git_dirty) = if include_git {
-        let branch = run_git_capture(&project.path, &["rev-parse", "--abbrev-ref", "HEAD"]);
-        let head = run_git_capture(&project.path, &["log", "-1", "--pretty=format:%h"]);
-        let dirty = run_git_capture(&project.path, &["status", "--short"])
+        let branch = run_git_capture(
+            &project.path,
+            &["rev-parse", "--abbrev-ref", "HEAD"],
+            shutdown,
+        );
+        let head = run_git_capture(
+            &project.path,
+            &["log", "-1", "--pretty=format:%h"],
+            shutdown,
+        );
+        let dirty = run_git_capture(&project.path, &["status", "--short"], shutdown)
             .map(|status| !status.trim().is_empty());
         (branch, head, dirty)
     } else {
@@ -216,6 +407,15 @@ pub(crate) fn agent_project_summary(
     }
 }
 
+#[cfg(test)]
+pub(crate) fn agent_project_summary(
+    project: &AgentProjectFile,
+    updated_at: i64,
+    include_git: bool,
+) -> ShellAgentProjectSummary {
+    agent_project_summary_with_shutdown(project, updated_at, include_git, None)
+}
+
 fn warn_empty_hook_commands(source: &Path, project: &AgentProjectFile) {
     for (hook, commands) in &project.hooks {
         for (idx, command) in commands.iter().enumerate() {
@@ -231,7 +431,10 @@ fn warn_empty_hook_commands(source: &Path, project: &AgentProjectFile) {
     }
 }
 
-pub(crate) fn load_agent_project_summaries_from_dir(dir: &Path) -> Vec<ShellAgentProjectSummary> {
+fn load_agent_project_summaries_from_dir_with_shutdown(
+    dir: &Path,
+    shutdown: Option<&AtomicBool>,
+) -> Vec<ShellAgentProjectSummary> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
@@ -257,6 +460,9 @@ pub(crate) fn load_agent_project_summaries_from_dir(dir: &Path) -> Vec<ShellAgen
     let mut seen = HashSet::new();
     let mut projects = Vec::new();
     for file in files {
+        if shutdown.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            break;
+        }
         let content = match std::fs::read_to_string(&file) {
             Ok(content) => content,
             Err(e) => {
@@ -291,24 +497,42 @@ pub(crate) fn load_agent_project_summaries_from_dir(dir: &Path) -> Vec<ShellAgen
             continue;
         }
         warn_empty_hook_commands(&file, &project);
-        projects.push(agent_project_summary(&project, updated_at, true));
+        projects.push(agent_project_summary_with_shutdown(
+            &project, updated_at, true, shutdown,
+        ));
     }
     projects.sort_by(|a, b| a.id.cmp(&b.id));
     projects
 }
 
-fn load_agent_project_summaries(cfg: &AgentConfig) -> Vec<ShellAgentProjectSummary> {
-    load_agent_project_summaries_from_dir(&projects_dir(cfg))
+pub(crate) fn load_agent_project_summaries_from_dir(dir: &Path) -> Vec<ShellAgentProjectSummary> {
+    load_agent_project_summaries_from_dir_with_shutdown(dir, None)
+}
+
+fn load_agent_project_summaries(
+    cfg: &AgentConfig,
+    shutdown: Option<&AtomicBool>,
+) -> Vec<ShellAgentProjectSummary> {
+    load_agent_project_summaries_from_dir_with_shutdown(&projects_dir(cfg), shutdown)
 }
 
 impl AgentProjectCache {
+    #[cfg(test)]
     pub(crate) fn get(&mut self, cfg: &AgentConfig) -> Vec<ShellAgentProjectSummary> {
+        self.get_with_shutdown(cfg, None)
+    }
+
+    pub(crate) fn get_with_shutdown(
+        &mut self,
+        cfg: &AgentConfig,
+        shutdown: Option<&AtomicBool>,
+    ) -> Vec<ShellAgentProjectSummary> {
         if self.refreshed_at.is_some_and(|refreshed_at| {
             refreshed_at.elapsed() < Duration::from_millis(PROJECT_SCAN_CACHE_MS)
         }) {
             return self.projects.clone();
         }
-        self.projects = load_agent_project_summaries(cfg);
+        self.projects = load_agent_project_summaries(cfg, shutdown);
         self.refreshed_at = Some(Instant::now());
         self.projects.clone()
     }
@@ -791,13 +1015,7 @@ pub(crate) fn handle_project_op(
     // git init.
     let mut git_initialized = false;
     if git_init {
-        match Command::new("git")
-            .arg("init")
-            .current_dir(&path_buf)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-        {
+        match run_git_bounded(&path_buf, &["init"], Duration::from_secs(5), None) {
             Ok(output) if output.status.success() => {
                 git_initialized = true;
                 created_paths.track(path_buf.join(".git"));
@@ -805,7 +1023,15 @@ pub(crate) fn handle_project_op(
             Ok(output) => {
                 created_paths.cleanup();
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                return err_cmd(start, format!("git init failed: {}", stderr.trim()));
+                let suffix = if output.stderr_capped {
+                    " [stderr truncated]"
+                } else {
+                    ""
+                };
+                return err_cmd(
+                    start,
+                    format!("git init failed: {}{}", stderr.trim(), suffix),
+                );
             }
             Err(e) => {
                 created_paths.cleanup();
@@ -839,4 +1065,86 @@ pub(crate) fn handle_project_op(
         "git_initialized": git_initialized,
     });
     ok_cmd(start, result)
+}
+
+#[cfg(all(test, unix))]
+mod shutdown_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+
+    fn process_exists(pid: i32) -> bool {
+        // SAFETY: signal 0 only probes a test child pid read from our fixture.
+        (unsafe { libc::kill(pid, 0) }) == 0
+            || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    #[test]
+    fn project_git_scan_shutdown_kills_hanging_process_group_and_returns_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let status = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let pid_path = root.path().join("fsmonitor.pid");
+        let hook = root.path().join("hanging-fsmonitor");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\ntrap '' TERM\nprintf '%s' \"$$\" > '{}'\nwhile :; do sleep 1; done\n",
+                pid_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let status = Command::new("git")
+            .args(["config", "core.fsmonitor", hook.to_string_lossy().as_ref()])
+            .current_dir(root.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let project = root.path().to_path_buf();
+        let started = Instant::now();
+        let worker = thread::spawn(move || {
+            run_git_bounded(
+                &project,
+                &["status", "--short"],
+                Duration::from_secs(5),
+                Some(worker_shutdown.as_ref()),
+            )
+        });
+        let ready_deadline = Instant::now() + Duration::from_secs(1);
+        while !pid_path.exists() && Instant::now() < ready_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let hook_started = pid_path.exists();
+        shutdown.store(true, Ordering::SeqCst);
+        let result = worker.join().unwrap();
+        assert!(hook_started, "Git did not start the hanging fixture hook");
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "project Git scan ignored the shutdown flag"
+        );
+
+        let hook_pid = std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        let gone_deadline = Instant::now() + Duration::from_secs(1);
+        while process_exists(hook_pid) && Instant::now() < gone_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !process_exists(hook_pid),
+            "hanging Git descendant survived process-group cleanup"
+        );
+    }
 }

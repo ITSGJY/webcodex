@@ -723,6 +723,130 @@ fn timeout_removes_pending_and_uncertain_edit_never_falls_back() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn provider_shutdown_reaps_a_normally_terminating_process_once() {
+    let fixture = Fixture::new("normal");
+    let client = fixture
+        .provider
+        .project_client(&fixture.root, Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    let process_group = client.connection.process_group_id;
+
+    let outcome = fixture
+        .provider
+        .shutdown_until(Instant::now() + Duration::from_millis(500));
+    assert_eq!(outcome.connections, 1);
+    assert_eq!(outcome.timed_out, 0);
+    assert!(
+        wait_until(Duration::from_secs(1), || !process_group_exists(
+            process_group
+        )),
+        "provider process group remained after shutdown"
+    );
+
+    let repeated = Instant::now();
+    let second = fixture
+        .provider
+        .shutdown_until(Instant::now() + Duration::from_millis(500));
+    assert_eq!(second.connections, 0);
+    assert!(
+        repeated.elapsed() < Duration::from_millis(100),
+        "idempotent provider shutdown re-armed a wait"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unresponsive_provider_is_killed_reaped_and_wakes_pending_request() {
+    let fixture = Fixture::with_timeout("ignore_term", 5);
+    let client = fixture
+        .provider
+        .project_client(&fixture.root, Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    let connection = Arc::clone(&client.connection);
+    let process_group = connection.process_group_id;
+    let request_connection = Arc::clone(&connection);
+    let request = std::thread::spawn(move || {
+        request_connection.request(
+            "tools/call",
+            json!({"name":"fake_search","arguments":{}}),
+            Duration::from_secs(5),
+            WriteState::NotSubmitted,
+        )
+    });
+    assert!(wait_until(Duration::from_secs(1), || {
+        lock_unpoison(&connection.pending).len() == 1
+    }));
+
+    let started = Instant::now();
+    let outcome = fixture
+        .provider
+        .shutdown_until(Instant::now() + Duration::from_millis(600));
+    let elapsed = started.elapsed();
+    assert_eq!(outcome.connections, 1);
+    assert!(
+        elapsed < Duration::from_millis(900),
+        "provider shutdown exceeded its shared deadline: {elapsed:?}"
+    );
+    let error = request.join().unwrap().unwrap_err();
+    assert_eq!(error.code, "mcp_connection_closed");
+    assert_eq!(lock_unpoison(&connection.pending).len(), 0);
+    assert!(
+        wait_until(Duration::from_secs(1), || !process_group_exists(
+            process_group
+        )),
+        "SIGTERM-ignoring provider process group survived SIGKILL"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_request_timeout_racing_shutdown_is_idempotent() {
+    let fixture = Fixture::with_timeout("ignore_term", 1);
+    let client = fixture
+        .provider
+        .project_client(&fixture.root, Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    let connection = Arc::clone(&client.connection);
+    let process_group = connection.process_group_id;
+    let request_connection = Arc::clone(&connection);
+    let request = std::thread::spawn(move || {
+        request_connection.request(
+            "tools/call",
+            json!({"name":"fake_search","arguments":{}}),
+            Duration::from_millis(100),
+            WriteState::NotSubmitted,
+        )
+    });
+    assert!(wait_until(Duration::from_secs(1), || {
+        lock_unpoison(&connection.pending).len() == 1
+    }));
+    std::thread::sleep(Duration::from_millis(80));
+
+    let outcome = fixture
+        .provider
+        .shutdown_until(Instant::now() + Duration::from_millis(600));
+    assert_eq!(outcome.connections, 1);
+    let error = request.join().unwrap().unwrap_err();
+    assert!(
+        matches!(error.code, "mcp_request_timeout" | "mcp_connection_closed"),
+        "{}",
+        error.code
+    );
+    assert!(
+        wait_until(Duration::from_secs(1), || !process_group_exists(
+            process_group
+        )),
+        "provider process survived concurrent timeout and shutdown"
+    );
+    let repeated = Instant::now();
+    fixture
+        .provider
+        .shutdown_until(Instant::now() + Duration::from_millis(600));
+    assert!(repeated.elapsed() < Duration::from_millis(100));
+}
+
 #[test]
 fn native_strategy_does_not_start_claude() {
     let fixture = Fixture::new("normal");

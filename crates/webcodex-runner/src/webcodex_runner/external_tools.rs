@@ -8,6 +8,7 @@ use super::files::sha256_hex_bytes;
 use super::output::CommandResult;
 use super::patches::validate_line_edit_agent_path;
 use super::shell::cwd_allowed;
+use super::shutdown::{lock_unpoison, SHUTDOWN_POLL_INTERVAL};
 use super::AgentPolicy;
 use crate::shell_protocol::{
     ClaudeCodeProviderStatus, ProviderCallSummary, ShellAgentShellRequest, ToolProvidersStatus,
@@ -18,8 +19,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 mod experimental;
@@ -30,6 +32,20 @@ const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const MAX_MCP_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_MCP_OUTPUT_BYTES: usize = 512 * 1024;
 const MAX_PENDING_REQUESTS: usize = 32;
+const MCP_TERMINATION_GRACE: Duration = Duration::from_millis(250);
+const MCP_FALLBACK_SHUTDOWN_BUDGET: Duration = Duration::from_secs(1);
+
+const MCP_RUNNING: usize = 0;
+const MCP_TERM_SENT: usize = 1;
+const MCP_KILL_SENT: usize = 2;
+const MCP_REAPED: usize = 3;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ExternalShutdownOutcome {
+    pub(crate) connections: usize,
+    pub(crate) timed_out: usize,
+    pub(crate) failures: usize,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ProviderCapability {
@@ -112,8 +128,13 @@ impl ExternalToolRouter {
         }
     }
 
+    pub(crate) fn shutdown_until(&self, deadline: Instant) -> ExternalShutdownOutcome {
+        self.claude.shutdown_until(deadline)
+    }
+
+    #[cfg(test)]
     pub(crate) fn shutdown(&self) {
-        self.claude.shutdown();
+        let _ = self.shutdown_until(Instant::now() + MCP_FALLBACK_SHUTDOWN_BUDGET);
     }
 
     #[cfg(test)]
@@ -192,14 +213,24 @@ impl ExternalToolRouter {
         self.status_with_revision()
     }
 
+    #[cfg(test)]
     pub(crate) fn route(
         &self,
         policy: &AgentPolicy,
         request: &ShellAgentShellRequest,
     ) -> ExternalRoute {
+        self.route_with_shutdown(policy, request, None)
+    }
+
+    pub(crate) fn route_with_shutdown(
+        &self,
+        policy: &AgentPolicy,
+        request: &ShellAgentShellRequest,
+        shutdown: Option<&AtomicBool>,
+    ) -> ExternalRoute {
         // Fixed experimental harness surface — independent of production strategy.
         if experimental::is_experimental_claude_kind(&request.kind) {
-            return ExternalRoute::Handled(self.handle_experimental(policy, request));
+            return ExternalRoute::Handled(self.handle_experimental(policy, request, shutdown));
         }
         if self.strategy == ToolProviderStrategy::Native {
             return ExternalRoute::Native;
@@ -257,7 +288,10 @@ impl ExternalToolRouter {
                 .min(MAX_MCP_OUTPUT_BYTES),
             timeout_secs: request.timeout_secs.max(1).min(policy.max_timeout_secs),
         };
-        match self.claude.call(capability, payload, context) {
+        match self
+            .claude
+            .call_with_shutdown(capability, payload, context, shutdown)
+        {
             Ok(output) => {
                 self.claude.record_call(
                     call_summary(
@@ -293,6 +327,10 @@ impl ExternalToolRouter {
         if self.strategy == ToolProviderStrategy::ClaudeCodeThenNative
             && (capability != ProviderCapability::EditFile
                 || error.write_state == WriteState::NotSubmitted)
+            && !matches!(
+                error.code,
+                "mcp_connection_closed" | "claude_code_unavailable"
+            )
         {
             ExternalRoute::NativeFallback(NativeFallback {
                 capability,
@@ -344,7 +382,7 @@ impl ExternalToolRouter {
 
 impl Drop for ExternalToolRouter {
     fn drop(&mut self) {
-        self.shutdown();
+        let _ = self.shutdown_until(Instant::now() + MCP_FALLBACK_SHUTDOWN_BUDGET);
     }
 }
 
@@ -494,7 +532,7 @@ impl ProviderState {
     }
 
     fn update(&self, update: impl FnOnce(&mut ClaudeCodeProviderStatus)) {
-        let mut status = self.status.lock().unwrap();
+        let mut status = lock_unpoison(&self.status);
         let previous = status.clone();
         update(&mut status);
         if *status != previous {
@@ -503,7 +541,7 @@ impl ProviderState {
     }
 
     fn snapshot_with_revision(&self) -> (ClaudeCodeProviderStatus, u64) {
-        let status = self.status.lock().unwrap();
+        let status = lock_unpoison(&self.status);
         (status.clone(), self.revision.load(Ordering::SeqCst))
     }
 
@@ -522,6 +560,7 @@ struct ClaudeCodeMcpProvider {
     config: ClaudeCodeMcpConfig,
     projects: Mutex<HashMap<PathBuf, Arc<ProjectMcpClient>>>,
     state: Arc<ProviderState>,
+    shutting_down: AtomicBool,
 }
 
 impl ClaudeCodeMcpProvider {
@@ -531,21 +570,42 @@ impl ClaudeCodeMcpProvider {
             config,
             projects: Mutex::new(HashMap::new()),
             state,
+            shutting_down: AtomicBool::new(false),
         }
     }
 
-    fn shutdown(&self) {
+    fn shutdown_until(&self, deadline: Instant) -> ExternalShutdownOutcome {
+        self.shutting_down.store(true, Ordering::SeqCst);
         let clients = self
             .projects
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .drain()
             .map(|(_, client)| client)
             .collect::<Vec<_>>();
-        for client in clients {
-            client.connection.shutdown();
+        let connections = clients
+            .iter()
+            .map(|client| Arc::clone(&client.connection))
+            .collect::<Vec<_>>();
+        for connection in &connections {
+            connection.signal_shutdown();
+        }
+        let mut outcome = ExternalShutdownOutcome {
+            connections: connections.len(),
+            ..ExternalShutdownOutcome::default()
+        };
+        for connection in connections {
+            let result = connection.finish_shutdown(deadline);
+            outcome.timed_out += usize::from(!result.reaped || !result.reader_joined);
+            outcome.failures += result.failures;
         }
         self.state.stopped(None);
+        outcome
+    }
+
+    #[cfg(test)]
+    fn shutdown(&self) {
+        let _ = self.shutdown_until(Instant::now() + MCP_FALLBACK_SHUTDOWN_BUDGET);
     }
 
     fn record_error(&self, error: &ProviderError) {
@@ -585,23 +645,40 @@ impl ClaudeCodeMcpProvider {
         self.state.snapshot_with_revision()
     }
 
+    #[cfg(test)]
     fn project_client(
         &self,
         root: &Path,
         deadline: Instant,
     ) -> Result<Arc<ProjectMcpClient>, ProviderError> {
-        if !self.config.enabled {
+        self.project_client_with_shutdown(root, deadline, None)
+    }
+
+    fn project_client_with_shutdown(
+        &self,
+        root: &Path,
+        deadline: Instant,
+        shutdown: Option<&AtomicBool>,
+    ) -> Result<Arc<ProjectMcpClient>, ProviderError> {
+        if !self.config.enabled
+            || self.shutting_down.load(Ordering::SeqCst)
+            || shutdown.is_some_and(|flag| flag.load(Ordering::SeqCst))
+        {
             let error = ProviderError::new("claude_code_unavailable");
             self.record_error(&error);
             return Err(error);
         }
-        let mut projects = self.projects.lock().unwrap();
-        if let Some(client) = projects.get(root) {
-            if client.connection.is_alive() {
-                return Ok(Arc::clone(client));
+        let stale = {
+            let mut projects = lock_unpoison(&self.projects);
+            if let Some(client) = projects.get(root) {
+                if client.connection.is_alive() {
+                    return Ok(Arc::clone(client));
+                }
             }
-            client.connection.shutdown();
-            projects.remove(root);
+            projects.remove(root)
+        };
+        if let Some(stale) = stale {
+            let _ = stale.connection.finish_shutdown(deadline);
         }
         self.state.update(|status| {
             status.available = false;
@@ -611,31 +688,87 @@ impl ClaudeCodeMcpProvider {
             status.capabilities = unmapped_capabilities();
             status.last_error_code = None;
         });
-        let client =
-            match ProjectMcpClient::start(root, &self.config, deadline, Arc::clone(&self.state)) {
-                Ok(client) => Arc::new(client),
-                Err(error) => {
-                    self.state.stopped(Some(error.code));
-                    self.record_error(&error);
-                    return Err(error);
-                }
-            };
-        projects.insert(root.to_path_buf(), Arc::clone(&client));
-        Ok(client)
+        let client = match ProjectMcpClient::start(
+            root,
+            &self.config,
+            deadline,
+            Arc::clone(&self.state),
+            shutdown,
+        ) {
+            Ok(client) => Arc::new(client),
+            Err(error) => {
+                self.state.stopped(Some(error.code));
+                self.record_error(&error);
+                return Err(error);
+            }
+        };
+        enum PublishClient {
+            Inserted,
+            Existing(Arc<ProjectMcpClient>),
+            ShuttingDown,
+        }
+        let published = {
+            let mut projects = lock_unpoison(&self.projects);
+            if self.shutting_down.load(Ordering::SeqCst)
+                || shutdown.is_some_and(|flag| flag.load(Ordering::SeqCst))
+            {
+                PublishClient::ShuttingDown
+            } else if let Some(existing) = projects
+                .get(root)
+                .filter(|existing| existing.connection.is_alive())
+                .cloned()
+            {
+                PublishClient::Existing(existing)
+            } else {
+                projects.insert(root.to_path_buf(), Arc::clone(&client));
+                PublishClient::Inserted
+            }
+        };
+        match published {
+            PublishClient::Inserted => Ok(client),
+            PublishClient::Existing(existing) => {
+                client.connection.signal_shutdown();
+                let _ = client.connection.finish_shutdown(deadline);
+                Ok(existing)
+            }
+            PublishClient::ShuttingDown => {
+                client.connection.signal_shutdown();
+                let _ = client.connection.finish_shutdown(deadline);
+                Err(ProviderError::new("mcp_connection_closed"))
+            }
+        }
     }
 
+    #[cfg(test)]
     fn call(
         &self,
         capability: ProviderCapability,
         request: Value,
         context: ToolExecutionContext<'_>,
     ) -> Result<Value, ProviderError> {
+        self.call_with_shutdown(capability, request, context, None)
+    }
+
+    fn call_with_shutdown(
+        &self,
+        capability: ProviderCapability,
+        request: Value,
+        context: ToolExecutionContext<'_>,
+        shutdown: Option<&AtomicBool>,
+    ) -> Result<Value, ProviderError> {
         let budget = self.config.timeout_secs.min(context.timeout_secs);
         let deadline = Instant::now() + Duration::from_secs(budget);
-        let client = self.project_client(context.project_root, deadline)?;
-        let result = client.call(capability, request, &context, &self.config, deadline);
+        let client = self.project_client_with_shutdown(context.project_root, deadline, shutdown)?;
+        let result = client.call_with_shutdown(
+            capability,
+            request,
+            &context,
+            &self.config,
+            deadline,
+            shutdown,
+        );
         if !client.connection.is_alive() {
-            self.projects.lock().unwrap().remove(context.project_root);
+            lock_unpoison(&self.projects).remove(context.project_root);
         }
         if let Err(error) = &result {
             self.record_error(error);
@@ -657,6 +790,7 @@ impl ProjectMcpClient {
         config: &ClaudeCodeMcpConfig,
         deadline: Instant,
         state: Arc<ProviderState>,
+        shutdown: Option<&AtomicBool>,
     ) -> Result<Self, ProviderError> {
         let connection = McpConnection::spawn(root, config, Arc::clone(&state))?;
         let timeout = || {
@@ -664,7 +798,7 @@ impl ProjectMcpClient {
                 .saturating_duration_since(Instant::now())
                 .min(Duration::from_secs(10))
         };
-        let initialized = connection.request(
+        let initialized = connection.request_with_shutdown(
             "initialize",
             json!({
                 "protocolVersion": MCP_PROTOCOL_VERSION,
@@ -673,6 +807,7 @@ impl ProjectMcpClient {
             }),
             timeout(),
             WriteState::NotSubmitted,
+            shutdown,
         )?;
         let version = initialized
             .pointer("/serverInfo/version")
@@ -686,8 +821,13 @@ impl ProjectMcpClient {
         connection.write_json(
             &json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
         )?;
-        let listed =
-            connection.request("tools/list", json!({}), timeout(), WriteState::NotSubmitted)?;
+        let listed = connection.request_with_shutdown(
+            "tools/list",
+            json!({}),
+            timeout(),
+            WriteState::NotSubmitted,
+            shutdown,
+        )?;
         let mut tools = BTreeMap::new();
         let mut tools_truncated = false;
         for tool in listed
@@ -790,6 +930,7 @@ impl ProjectMcpClient {
         }
     }
 
+    #[cfg(test)]
     fn call(
         &self,
         capability: ProviderCapability,
@@ -797,6 +938,18 @@ impl ProjectMcpClient {
         context: &ToolExecutionContext<'_>,
         config: &ClaudeCodeMcpConfig,
         deadline: Instant,
+    ) -> Result<Value, ProviderError> {
+        self.call_with_shutdown(capability, request, context, config, deadline, None)
+    }
+
+    fn call_with_shutdown(
+        &self,
+        capability: ProviderCapability,
+        request: Value,
+        context: &ToolExecutionContext<'_>,
+        config: &ClaudeCodeMcpConfig,
+        deadline: Instant,
+        shutdown: Option<&AtomicBool>,
     ) -> Result<Value, ProviderError> {
         let tool = self.tool_for(capability, config)?;
         let (arguments, expected_after) = build_arguments(capability, &request, context)?;
@@ -809,11 +962,12 @@ impl ProjectMcpClient {
         if timeout.is_zero() {
             return Err(ProviderError::new("mcp_request_timeout"));
         }
-        let result = self.connection.request(
+        let result = self.connection.request_with_shutdown(
             "tools/call",
             json!({"name": tool, "arguments": arguments}),
             timeout,
             failure_state,
+            shutdown,
         )?;
         if result
             .get("isError")
@@ -997,18 +1151,33 @@ type PendingSender = mpsc::Sender<Result<Value, ProviderError>>;
 
 struct McpConnection {
     child: Mutex<Child>,
+    process_group_id: u32,
     stdin: Arc<Mutex<ChildStdin>>,
     pending: Arc<Mutex<HashMap<u64, PendingSender>>>,
     next_id: AtomicU64,
     alive: Arc<AtomicBool>,
-    shutdown_started: Arc<AtomicBool>,
+    shutdown_state: Arc<AtomicUsize>,
+    shutdown_started_at: Mutex<Option<Instant>>,
+    shutdown_deadline: Mutex<Option<Instant>>,
+    shutdown_failures: AtomicUsize,
+    reader_thread: Mutex<Option<JoinHandle<()>>>,
     state: Arc<ProviderState>,
 }
 
 impl Drop for McpConnection {
     fn drop(&mut self) {
-        self.shutdown();
+        self.signal_shutdown();
+        let deadline = lock_unpoison(&self.shutdown_deadline)
+            .unwrap_or_else(|| Instant::now() + MCP_FALLBACK_SHUTDOWN_BUDGET);
+        let _ = self.finish_shutdown(deadline);
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct McpShutdownResult {
+    reaped: bool,
+    reader_joined: bool,
+    failures: usize,
 }
 
 impl McpConnection {
@@ -1033,24 +1202,51 @@ impl McpConnection {
         let mut child = command
             .spawn()
             .map_err(|_| ProviderError::new("claude_code_spawn_failed"))?;
-        let stdin = Arc::new(Mutex::new(child.stdin.take().ok_or_else(protocol_error)?));
-        let stdout = child.stdout.take().ok_or_else(protocol_error)?;
+        let process_group_id = child.id();
+        let stdin = match child.stdin.take() {
+            Some(stdin) => Arc::new(Mutex::new(stdin)),
+            None => {
+                terminate_unowned_mcp_child(
+                    &mut child,
+                    process_group_id,
+                    Instant::now() + MCP_FALLBACK_SHUTDOWN_BUDGET,
+                );
+                return Err(protocol_error());
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                terminate_unowned_mcp_child(
+                    &mut child,
+                    process_group_id,
+                    Instant::now() + MCP_FALLBACK_SHUTDOWN_BUDGET,
+                );
+                return Err(protocol_error());
+            }
+        };
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
-        let shutdown_started = Arc::new(AtomicBool::new(false));
+        let shutdown_state = Arc::new(AtomicUsize::new(MCP_RUNNING));
         state.update(|status| {
             status.process_state = "initializing".to_string();
         });
         let connection = Arc::new(Self {
             child: Mutex::new(child),
+            process_group_id,
             stdin: Arc::clone(&stdin),
             pending: Arc::clone(&pending),
             next_id: AtomicU64::new(1),
             alive: Arc::clone(&alive),
-            shutdown_started: Arc::clone(&shutdown_started),
+            shutdown_state: Arc::clone(&shutdown_state),
+            shutdown_started_at: Mutex::new(None),
+            shutdown_deadline: Mutex::new(None),
+            shutdown_failures: AtomicUsize::new(0),
+            reader_thread: Mutex::new(None),
             state: Arc::clone(&state),
         });
-        spawn_stdout_reader(stdout, stdin, pending, alive, shutdown_started, state);
+        let reader = spawn_stdout_reader(stdout, stdin, pending, alive, shutdown_state, state);
+        *lock_unpoison(&connection.reader_thread) = Some(reader);
         Ok(connection)
     }
 
@@ -1058,6 +1254,7 @@ impl McpConnection {
         self.alive.load(Ordering::SeqCst)
     }
 
+    #[cfg(test)]
     fn request(
         &self,
         method: &str,
@@ -1065,14 +1262,31 @@ impl McpConnection {
         timeout: Duration,
         failure_state: WriteState,
     ) -> Result<Value, ProviderError> {
+        self.request_with_shutdown(method, params, timeout, failure_state, None)
+    }
+
+    fn request_with_shutdown(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        failure_state: WriteState,
+        shutdown: Option<&AtomicBool>,
+    ) -> Result<Value, ProviderError> {
         // Pre-send failures keep default NotSubmitted (do not apply failure_state).
+        if shutdown.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            return Err(ProviderError::new("mcp_connection_closed"));
+        }
         if !self.is_alive() {
             return Err(protocol_error());
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
         {
-            let mut pending = self.pending.lock().unwrap();
+            let mut pending = lock_unpoison(&self.pending);
+            if !self.is_alive() {
+                return Err(protocol_error());
+            }
             if pending.len() >= MAX_PENDING_REQUESTS {
                 return Err(ProviderError::new("mcp_pending_limit"));
             }
@@ -1084,25 +1298,39 @@ impl McpConnection {
         let encoded = match encode_mcp_message(&message) {
             Ok(bytes) => bytes,
             Err(error) => {
-                self.pending.lock().unwrap().remove(&id);
+                lock_unpoison(&self.pending).remove(&id);
                 return Err(error);
             }
         };
         // Write/flush may partially deliver bytes; treat as post-send.
         if let Err(error) = write_mcp_message(&self.stdin, &encoded) {
-            self.pending.lock().unwrap().remove(&id);
+            lock_unpoison(&self.pending).remove(&id);
             return Err(error.with_state(failure_state));
         }
-        match rx.recv_timeout(timeout) {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(error)) => Err(error.with_state(failure_state)),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                self.pending.lock().unwrap().remove(&id);
-                self.shutdown();
-                Err(ProviderError::new("mcp_request_timeout").with_state(failure_state))
+        let deadline = Instant::now() + timeout;
+        loop {
+            if shutdown.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+                lock_unpoison(&self.pending).remove(&id);
+                self.signal_shutdown();
+                let _ = self.finish_shutdown(Instant::now() + MCP_FALLBACK_SHUTDOWN_BUDGET);
+                return Err(ProviderError::new("mcp_connection_closed").with_state(failure_state));
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err(ProviderError::new("mcp_connection_closed").with_state(failure_state))
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                lock_unpoison(&self.pending).remove(&id);
+                self.signal_shutdown();
+                let _ = self.finish_shutdown(Instant::now() + MCP_FALLBACK_SHUTDOWN_BUDGET);
+                return Err(ProviderError::new("mcp_request_timeout").with_state(failure_state));
+            }
+            match rx.recv_timeout(remaining.min(Duration::from_millis(25))) {
+                Ok(Ok(value)) => return Ok(value),
+                Ok(Err(error)) => return Err(error.with_state(failure_state)),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(
+                        ProviderError::new("mcp_connection_closed").with_state(failure_state)
+                    );
+                }
             }
         }
     }
@@ -1111,25 +1339,171 @@ impl McpConnection {
         write_json(&self.stdin, value)
     }
 
-    fn shutdown(&self) {
-        if self.shutdown_started.swap(true, Ordering::SeqCst) {
+    fn signal_shutdown(&self) {
+        if self
+            .shutdown_state
+            .compare_exchange(
+                MCP_RUNNING,
+                MCP_TERM_SENT,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
             return;
         }
         self.alive.store(false, Ordering::SeqCst);
         self.state.stopped(None);
-        let mut child = self.child.lock().unwrap();
+        *lock_unpoison(&self.shutdown_started_at) = Some(Instant::now());
+        fail_pending(&self.pending, ProviderError::new("mcp_connection_closed"));
         #[cfg(unix)]
-        if child.id() != 0 {
-            // SAFETY: this is the private process group created at spawn.
-            unsafe {
-                libc::kill(-(child.id() as i32), libc::SIGKILL);
+        {
+            if self.process_group_id == 0
+                || signal_mcp_process_group(self.process_group_id, libc::SIGTERM).is_err()
+            {
+                self.shutdown_failures.fetch_add(1, Ordering::SeqCst);
             }
         }
         #[cfg(not(unix))]
-        let _ = child.kill();
-        let _ = child.wait();
-        drop(child);
-        fail_pending(&self.pending, ProviderError::new("mcp_connection_closed"));
+        if lock_unpoison(&self.child).kill().is_err() {
+            self.shutdown_failures.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn finish_shutdown(&self, deadline: Instant) -> McpShutdownResult {
+        let deadline = {
+            let mut recorded = lock_unpoison(&self.shutdown_deadline);
+            let deadline = recorded.map_or(deadline, |existing| existing.min(deadline));
+            *recorded = Some(deadline);
+            deadline
+        };
+        self.signal_shutdown();
+        let started_at = lock_unpoison(&self.shutdown_started_at).unwrap_or_else(Instant::now);
+        let grace_deadline = deadline.min(started_at + MCP_TERMINATION_GRACE);
+        while Instant::now() < grace_deadline && !self.process_reaped_and_group_gone() {
+            let remaining = grace_deadline.saturating_duration_since(Instant::now());
+            std::thread::sleep(SHUTDOWN_POLL_INTERVAL.min(remaining));
+        }
+
+        if !self.process_reaped_and_group_gone()
+            && self
+                .shutdown_state
+                .compare_exchange(
+                    MCP_TERM_SENT,
+                    MCP_KILL_SENT,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+        {
+            #[cfg(unix)]
+            if signal_mcp_process_group(self.process_group_id, libc::SIGKILL).is_err() {
+                self.shutdown_failures.fetch_add(1, Ordering::SeqCst);
+            }
+            #[cfg(not(unix))]
+            if lock_unpoison(&self.child).kill().is_err() {
+                self.shutdown_failures.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        while Instant::now() < deadline && !self.process_reaped_and_group_gone() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            std::thread::sleep(SHUTDOWN_POLL_INTERVAL.min(remaining));
+        }
+        let reaped = self.process_reaped_and_group_gone();
+        if reaped {
+            self.shutdown_state.store(MCP_REAPED, Ordering::SeqCst);
+        }
+        let reader_joined = join_mcp_reader_until(&self.reader_thread, deadline);
+        McpShutdownResult {
+            reaped,
+            reader_joined,
+            failures: self.shutdown_failures.load(Ordering::SeqCst),
+        }
+    }
+
+    fn process_reaped_and_group_gone(&self) -> bool {
+        let child_reaped = match self.child.try_lock() {
+            Ok(mut child) => matches!(child.try_wait(), Ok(Some(_)) | Err(_)),
+            Err(std::sync::TryLockError::WouldBlock) => false,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let mut child = poisoned.into_inner();
+                matches!(child.try_wait(), Ok(Some(_)) | Err(_))
+            }
+        };
+        #[cfg(unix)]
+        let group_gone = !mcp_process_group_exists(self.process_group_id);
+        #[cfg(not(unix))]
+        let group_gone = true;
+        child_reaped && group_gone
+    }
+}
+
+fn terminate_unowned_mcp_child(child: &mut Child, process_group_id: u32, deadline: Instant) {
+    #[cfg(unix)]
+    {
+        let _ = signal_mcp_process_group(process_group_id, libc::SIGTERM);
+        let grace = deadline.min(Instant::now() + MCP_TERMINATION_GRACE);
+        while Instant::now() < grace && mcp_process_group_exists(process_group_id) {
+            let remaining = grace.saturating_duration_since(Instant::now());
+            std::thread::sleep(SHUTDOWN_POLL_INTERVAL.min(remaining));
+        }
+        if mcp_process_group_exists(process_group_id) {
+            let _ = signal_mcp_process_group(process_group_id, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(SHUTDOWN_POLL_INTERVAL.min(remaining));
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_mcp_process_group(process_group_id: u32, signal: i32) -> Result<bool, ()> {
+    if process_group_id == 0 {
+        return Err(());
+    }
+    let process_group_id = i32::try_from(process_group_id).map_err(|_| ())?;
+    // SAFETY: the child is placed in a private process group at spawn.
+    if unsafe { libc::kill(-process_group_id, signal) } == 0 {
+        Ok(true)
+    } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        Ok(false)
+    } else {
+        Err(())
+    }
+}
+
+#[cfg(unix)]
+fn mcp_process_group_exists(process_group_id: u32) -> bool {
+    signal_mcp_process_group(process_group_id, 0).unwrap_or(true)
+}
+
+fn join_mcp_reader_until(reader: &Mutex<Option<JoinHandle<()>>>, deadline: Instant) -> bool {
+    loop {
+        let finished = lock_unpoison(reader)
+            .as_ref()
+            .map(JoinHandle::is_finished)
+            .unwrap_or(true);
+        if finished {
+            let handle = lock_unpoison(reader).take();
+            if let Some(handle) = handle {
+                let _ = handle.join();
+            }
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        std::thread::sleep(SHUTDOWN_POLL_INTERVAL.min(remaining));
     }
 }
 
@@ -1145,7 +1519,7 @@ fn encode_mcp_message(value: &Value) -> Result<Vec<u8>, ProviderError> {
 
 /// Write a previously encoded MCP line to stdin (may partially write).
 fn write_mcp_message(stdin: &Mutex<ChildStdin>, bytes: &[u8]) -> Result<(), ProviderError> {
-    let mut writer = stdin.lock().unwrap();
+    let mut writer = lock_unpoison(stdin);
     writer.write_all(bytes).map_err(|_| protocol_error())?;
     writer.flush().map_err(|_| protocol_error())
 }
@@ -1160,9 +1534,9 @@ fn spawn_stdout_reader(
     stdin: Arc<Mutex<ChildStdin>>,
     pending: Arc<Mutex<HashMap<u64, PendingSender>>>,
     alive: Arc<AtomicBool>,
-    shutdown_started: Arc<AtomicBool>,
+    shutdown_state: Arc<AtomicUsize>,
     state: Arc<ProviderState>,
-) {
+) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         let mut terminal_error = ProviderError::new("mcp_connection_closed");
@@ -1202,7 +1576,7 @@ fn spawn_stdout_reader(
             let Some(id) = id.and_then(Value::as_u64) else {
                 continue;
             };
-            let Some(sender) = pending.lock().unwrap().remove(&id) else {
+            let Some(sender) = lock_unpoison(&pending).remove(&id) else {
                 continue;
             };
             let response = if value.get("error").is_some() {
@@ -1213,11 +1587,11 @@ fn spawn_stdout_reader(
             let _ = sender.send(response);
         }
         alive.store(false, Ordering::SeqCst);
-        if !shutdown_started.load(Ordering::SeqCst) {
+        if shutdown_state.load(Ordering::SeqCst) == MCP_RUNNING {
             state.stopped(Some(terminal_error.code));
         }
         fail_pending(&pending, terminal_error);
-    });
+    })
 }
 
 fn read_bounded_line(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>, ProviderError> {
@@ -1243,7 +1617,11 @@ fn read_bounded_line(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>, Provi
 }
 
 fn fail_pending(pending: &Mutex<HashMap<u64, PendingSender>>, error: ProviderError) {
-    for (_, sender) in pending.lock().unwrap().drain() {
+    let senders = lock_unpoison(pending)
+        .drain()
+        .map(|(_, sender)| sender)
+        .collect::<Vec<_>>();
+    for sender in senders {
         let _ = sender.send(Err(error.clone()));
     }
 }

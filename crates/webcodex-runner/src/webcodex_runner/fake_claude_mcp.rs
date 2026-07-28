@@ -11,6 +11,12 @@ use std::time::Duration;
 fn main() -> io::Result<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     let scenario = args.first().map(String::as_str).unwrap_or("normal");
+    #[cfg(unix)]
+    if scenario == "ignore_term" {
+        unsafe {
+            signal(SIGTERM, SIG_IGN);
+        }
+    }
     let marker = args.get(1).map(Path::new);
     append(marker, "start\n")?;
     let mut reader = BufReader::new(io::stdin().lock());
@@ -40,7 +46,7 @@ fn main() -> io::Result<()> {
             }
             Some("tools/call") => match scenario {
                 "invalid_json" => send(&mut writer, "{invalid")?,
-                "timeout" => thread::sleep(Duration::from_secs(5)),
+                "timeout" | "ignore_term" => thread::sleep(Duration::from_secs(5)),
                 "oversized" => {
                     let text = "x".repeat(1024 * 1024 + 100);
                     send(&mut writer, &tool_result(id, &text, false))?;
@@ -124,6 +130,15 @@ fn main() -> io::Result<()> {
             _ => {}
         }
     }
+}
+
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
+#[cfg(unix)]
+const SIG_IGN: usize = 1;
+#[cfg(unix)]
+unsafe extern "C" {
+    fn signal(signal: i32, handler: usize) -> usize;
 }
 
 fn dispatch_tool(body: &str) -> io::Result<(String, bool)> {

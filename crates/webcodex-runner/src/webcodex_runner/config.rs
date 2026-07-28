@@ -1,4 +1,5 @@
 use super::external_tools::ExternalToolRouter;
+use super::shutdown::lock_unpoison;
 use crate::agent_init::{
     effective_allowed_roots, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_MAX_TIMEOUT_SECS,
     DEFAULT_POLL_INTERVAL_MS, TRANSPORT_AUTO, TRANSPORT_POLLING, TRANSPORT_QUIC,
@@ -9,7 +10,7 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/webcodex/agent.toml";
 pub(crate) const CLIENT_PROFILE_ERROR: &str =
@@ -235,6 +236,7 @@ pub(crate) struct ReloadableAgentConfig {
     startup: AgentConfig,
     path: PathBuf,
     current: RwLock<Arc<HotAgentConfig>>,
+    external_routers: Mutex<Vec<Weak<ExternalToolRouter>>>,
     stopping: AtomicBool,
 }
 
@@ -246,10 +248,12 @@ impl ReloadableAgentConfig {
             status.last_reload_error_code = Some("reload_unsupported".to_string());
         }
         let current = Arc::new(HotAgentConfig::new(1, &startup, status));
+        let external_routers = vec![Arc::downgrade(&current.external_tools)];
         Self {
             startup,
             path,
             current: RwLock::new(current),
+            external_routers: Mutex::new(external_routers),
             stopping: AtomicBool::new(false),
         }
     }
@@ -266,8 +270,19 @@ impl ReloadableAgentConfig {
         self.stopping.store(true, Ordering::SeqCst);
     }
 
+    pub(crate) fn shutdown_flag(&self) -> &AtomicBool {
+        &self.stopping
+    }
+
     pub(crate) fn is_stopping(&self) -> bool {
         self.stopping.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn external_routers(&self) -> Vec<Arc<ExternalToolRouter>> {
+        let mut routers = lock_unpoison(&self.external_routers);
+        let live = routers.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
+        routers.retain(|router| router.strong_count() > 0);
+        live
     }
 
     pub(crate) fn reload(&self) -> AgentConfigReloadStatus {
@@ -306,6 +321,11 @@ impl ReloadableAgentConfig {
             restart_required_fields,
         };
         let next = Arc::new(HotAgentConfig::new(generation, &candidate, status.clone()));
+        {
+            let mut routers = lock_unpoison(&self.external_routers);
+            routers.retain(|router| router.strong_count() > 0);
+            routers.push(Arc::downgrade(&next.external_tools));
+        }
         let mut current = self.current.write().unwrap();
         if self.is_stopping() {
             return current.reload_status();
