@@ -19,7 +19,7 @@ function display(value) {
     }
     return String(value);
 }
-function capabilityLabels(value) {
+export function capabilityLabels(value) {
     if (Array.isArray(value)) {
         return value.filter((item) => typeof item === "string");
     }
@@ -72,7 +72,7 @@ function setVisible(doc, id, visible) {
     if (node)
         node.hidden = !visible;
 }
-function renderAdminDashboard(doc, raw) {
+export function renderAdminDashboard(doc, raw) {
     const data = record(raw);
     sectionError(doc, "overview", data);
     if (sectionOk(data, "overview")) {
@@ -155,97 +155,3 @@ function renderAdminDashboard(doc, raw) {
         setVisible(doc, "activity-empty", rows.length === 0);
     }
 }
-
-const ADMIN_BASE = "/api/admin/";
-const REFRESH_MS = 10000;
-let adminToken = "";
-let timer = 0;
-const byId = (id) => document.getElementById(id);
-function text(id, value) {
-    const node = byId(id);
-    if (node)
-        node.textContent = value == null || value === "" ? "—" : String(value);
-}
-function visible(id, yes) {
-    const node = byId(id);
-    if (node)
-        node.hidden = !yes;
-}
-function stopAuto() {
-    if (timer)
-        window.clearInterval(timer);
-    timer = 0;
-}
-function startAuto() {
-    stopAuto();
-    const auto = byId("auto");
-    if (auto?.checked && adminToken)
-        timer = window.setInterval(refresh, REFRESH_MS);
-}
-function lock(message = "") {
-    adminToken = "";
-    stopAuto();
-    visible("gate", true);
-    visible("dashboard", false);
-    visible("controls", false);
-    text("gate-error", message);
-    const input = byId("token");
-    if (input)
-        input.value = "";
-}
-async function api() {
-    const response = await fetch(ADMIN_BASE + "dashboard", {
-        method: "POST",
-        headers: {
-            Authorization: "Bearer " + adminToken,
-            "Content-Type": "application/json",
-        },
-        body: "{}",
-    });
-    let data = null;
-    try {
-        data = await response.json();
-    }
-    catch {
-        // The status code below remains the safe fallback.
-    }
-    if (!response.ok) {
-        throw new Error(data?.error?.message || data?.message || `Request failed (${response.status})`);
-    }
-    return data;
-}
-async function refresh() {
-    if (!adminToken)
-        return;
-    visible("error", false);
-    text("status", "Loading…");
-    try {
-        const data = await api();
-        renderAdminDashboard(document, data);
-        visible("gate", false);
-        visible("dashboard", true);
-        visible("controls", true);
-        text("status", `Updated ${new Date().toLocaleTimeString()}`);
-    }
-    catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        text("error", message);
-        visible("error", true);
-        text("status", "Refresh failed; showing last successful data.");
-        if (/auth|token|admin|unauthorized|forbidden/i.test(message))
-            lock(message);
-    }
-}
-byId("token-form")?.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const input = byId("token");
-    adminToken = input?.value.trim() || "";
-    if (input)
-        input.value = "";
-    await refresh();
-    startAuto();
-});
-byId("refresh")?.addEventListener("click", refresh);
-byId("lock")?.addEventListener("click", () => lock("Locked."));
-byId("auto")?.addEventListener("change", startAuto);
-lock();

@@ -384,6 +384,9 @@ mod tests {
             .push(Router::with_path("console").get(console_html))
             .push(Router::with_path("console/app.js").get(console_app_js))
             .push(Router::with_path("console/styles.css").get(console_styles_css))
+            .push(Router::with_path("admin").get(admin_html))
+            .push(Router::with_path("admin/app.js").get(admin_app_js))
+            .push(Router::with_path("admin/styles.css").get(admin_styles_css))
             .push(
                 Router::with_path("api")
                     .hoop(crate::AuthMiddleware)
@@ -531,6 +534,106 @@ mod tests {
         let body = missing.take_string().await.unwrap();
         assert_eq!(body, DEVELOPMENT_ERROR_BODY);
         assert!(!body.contains("performAction"));
+    }
+
+    #[tokio::test]
+    async fn admin_assets_cover_embedded_and_filesystem_modes() {
+        let embedded = embedded_service();
+        for (url, expected, mime) in [
+            ("http://localhost/admin", ADMIN_HTML, "text/html"),
+            (
+                "http://localhost/admin/app.js",
+                ADMIN_APP_JS,
+                "application/javascript",
+            ),
+            (
+                "http://localhost/admin/styles.css",
+                ADMIN_STYLES_CSS,
+                "text/css",
+            ),
+        ] {
+            let mut response = TestClient::get(url).send(&embedded).await;
+            assert_eq!(response.status_code, Some(StatusCode::OK));
+            assert!(header(&response, "content-type").contains(mime));
+            assert_eq!(
+                header(&response, "cache-control"),
+                "no-cache, must-revalidate"
+            );
+            assert_eq!(response.take_string().await.unwrap(), expected);
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        write_development_assets(temp.path());
+        fs::write(temp.path().join("admin.html"), "<html>admin one</html>\n").unwrap();
+        fs::write(temp.path().join("admin.js"), "globalThis.admin = 1;\n").unwrap();
+        fs::write(temp.path().join("admin.css"), ".admin { color: blue; }\n").unwrap();
+        let development = development_service(temp.path());
+        for (url, expected, mime) in [
+            (
+                "http://localhost/admin",
+                "<html>admin one</html>\n",
+                "text/html",
+            ),
+            (
+                "http://localhost/admin/app.js",
+                "globalThis.admin = 1;\n",
+                "application/javascript",
+            ),
+            (
+                "http://localhost/admin/styles.css",
+                ".admin { color: blue; }\n",
+                "text/css",
+            ),
+        ] {
+            let mut response = TestClient::get(url).send(&development).await;
+            assert_eq!(response.status_code, Some(StatusCode::OK));
+            assert!(header(&response, "content-type").contains(mime));
+            assert_eq!(header(&response, "cache-control"), "no-store");
+            assert_eq!(header(&response, "pragma"), "no-cache");
+            assert_eq!(response.take_string().await.unwrap(), expected);
+        }
+
+        fs::write(temp.path().join("admin.html"), "<html>admin two</html>\n").unwrap();
+        let mut updated = TestClient::get("http://localhost/admin")
+            .send(&development)
+            .await;
+        assert_eq!(
+            updated.take_string().await.unwrap(),
+            "<html>admin two</html>\n"
+        );
+        fs::remove_file(temp.path().join("admin.html")).unwrap();
+        let mut missing = TestClient::get("http://localhost/admin")
+            .send(&development)
+            .await;
+        assert_eq!(missing.status_code, Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(header(&missing, "cache-control"), "no-store");
+        assert_eq!(missing.take_string().await.unwrap(), DEVELOPMENT_ERROR_BODY);
+
+        let mut console = TestClient::get("http://localhost/console")
+            .send(&development)
+            .await;
+        assert_eq!(console.status_code, Some(StatusCode::OK));
+        assert_eq!(
+            console.take_string().await.unwrap(),
+            "<html>filesystem html</html>\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn console_only_development_directory_keeps_console_available() {
+        let temp = tempfile::tempdir().unwrap();
+        write_development_assets(temp.path());
+        let service = development_service(temp.path());
+        let console = TestClient::get("http://localhost/console")
+            .send(&service)
+            .await;
+        assert_eq!(console.status_code, Some(StatusCode::OK));
+        let mut admin = TestClient::get("http://localhost/admin")
+            .send(&service)
+            .await;
+        assert_eq!(admin.status_code, Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(header(&admin, "cache-control"), "no-store");
+        assert_eq!(admin.take_string().await.unwrap(), DEVELOPMENT_ERROR_BODY);
     }
 
     #[test]

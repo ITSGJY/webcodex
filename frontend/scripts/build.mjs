@@ -20,6 +20,7 @@ const watchedSources = new Set([
   "styles.css",
   "console.html",
   "admin.ts",
+  "admin_view.ts",
   "admin.css",
   "admin.html",
 ]);
@@ -113,11 +114,26 @@ export function createOutputs(
   );
   const appInlined = buildJs(reviewStateClassic + "\n" + appScript);
   assertClassicScript(resolve(outputDirectory, "app.js"), appInlined);
-  const adminScript = buildJs(transpileTypeScript(sourceDirectory, "admin.ts"));
+  const adminViewModule = buildJs(
+    transpileTypeScript(sourceDirectory, "admin_view.ts")
+  );
+  const adminViewClassic = stripModuleExports(adminViewModule);
+  const adminModule = transpileTypeScript(sourceDirectory, "admin.ts");
+  const adminScript = buildJs(
+    adminViewClassic +
+      "\n" +
+      stripModuleExports(
+        adminModule.replace(
+          /^import\s*\{[\s\S]*?\}\s*from\s*["']\.\/admin_view(?:\.js)?["'];?\s*\n/m,
+          ""
+        )
+      )
+  );
   assertClassicScript(resolve(outputDirectory, "admin.js"), adminScript);
 
   return new Map([
     ["review_state.js", reviewStateModule],
+    ["admin_view.js", adminViewModule],
     ["app.js", appInlined],
     ["styles.css", minifyCss(readSource(sourceDirectory, "styles.css"))],
     ["admin.js", adminScript],
