@@ -248,6 +248,7 @@ profile 和 operator observability 继续通过管理文档和 `webcodex-cli` �
 
 ## 文档
 
+- 完整文档索引：[docs/INDEX.zh-CN.md](docs/INDEX.zh-CN.md)
 - 快速开始：[docs/QUICK_START.zh-CN.md](docs/QUICK_START.zh-CN.md)
 - 构建安装：[docs/BUILD_INSTALL.zh-CN.md](docs/BUILD_INSTALL.zh-CN.md)
 - 概念：[docs/CONCEPTS.zh-CN.md](docs/CONCEPTS.zh-CN.md)

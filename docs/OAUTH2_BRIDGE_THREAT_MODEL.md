@@ -181,14 +181,6 @@ Do not use synthetic managed users. Do not overload `user_id`. Managed-user
 OAuth remains supported for formal managed-account delegation, but the bridge
 path uses the explicit `shared_key` subject model.
 
-Suggested staged roadmap:
-
-1. Phase A: document the threat model and endpoint contract.
-2. Phase B: implement OAuth subject substrate and verifier dispatch for
-   `managed_user` and `shared_key`.
-3. Phase C: implement public shared-key bridge authorize route/UI behind an
-   explicit config flag and strict scope policy.
-
 ## Endpoint Contract
 
 Implemented route shape:
@@ -308,11 +300,13 @@ The public bridge implementation covers:
 - Current-session behavior remains OAuth-token/user/client based unless a
   future design intentionally changes it.
 
-## Open Questions
+## Remaining considerations
 
-1. Is pure shared-key OAuth onboarding a product requirement, or is a
-   managed-account-bound bridge enough?
-2. Should shared-key bridge support `project:write` or `job:run` by default?
-3. Should bridge tokens be revocable by shared-key hash?
-4. Should changing or rotating a shared key revoke bridge-issued OAuth tokens?
-5. Does the server need a bridge-specific client registration mode?
+The current bridge contract is complete without the following optional
+enhancements:
+
+- Administrative revocation of bridge-issued tokens by `shared_key_hash`.
+- Automatic revocation of existing bridge-issued OAuth tokens when a shared key
+  is rotated.
+- A bridge-specific OAuth client registration policy beyond the current client
+  allowlist and scope controls.

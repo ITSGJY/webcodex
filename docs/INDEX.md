@@ -2,55 +2,54 @@
 
 [English](INDEX.md) | [简体中文](INDEX.zh-CN.md)
 
-Start with the README, [QUICK_START.md](QUICK_START.md), and [DEMO.md](DEMO.md). This index is the compact map for setup, client integration, security, release, and maintenance docs.
+## Getting Started
 
-## Start Here
+- [README](../README.md) / [中文 README](../README.zh-CN.md)
+- [Quick Start](QUICK_START.md) / [快速开始](QUICK_START.zh-CN.md)
+- [Build and Install](BUILD_INSTALL.md) / [构建与安装](BUILD_INSTALL.zh-CN.md)
+- [Demo](DEMO.md) / [演示](DEMO.zh-CN.md)
+- [Concepts](CONCEPTS.md) / [概念](CONCEPTS.zh-CN.md)
+- [MCP](MCP.md) / [中文](MCP.zh-CN.md)
+- [GPT Actions](GPT_ACTIONS.md) / [中文](GPT_ACTIONS.zh-CN.md)
 
-1. [../README.md](../README.md) / [../README.zh-CN.md](../README.zh-CN.md) - product overview and positioning.
-2. [QUICK_START.md](QUICK_START.md) / [QUICK_START.zh-CN.md](QUICK_START.zh-CN.md) - local-first setup for one server, one agent, one project, and one client.
-3. [DEMO.md](DEMO.md) / [DEMO.zh-CN.md](DEMO.zh-CN.md) - expected safe coding workflow.
-4. [CONCEPTS.md](CONCEPTS.md) / [CONCEPTS.zh-CN.md](CONCEPTS.zh-CN.md) - vocabulary and mental model.
-5. [ARCHITECTURE.md](ARCHITECTURE.md) - product architecture and Rust module map.
+## Operations
 
-## Client Integration
+- [Deployment](DEPLOYMENT.md) / [部署](DEPLOYMENT.zh-CN.md)
+- [Operations](OPERATIONS.md)
+- [Troubleshooting](TROUBLESHOOTING.md) / [故障排查](TROUBLESHOOTING.zh-CN.md)
+- [Authentication Model](AUTH_MODEL.md) / [中文](AUTH_MODEL.zh-CN.md)
+- [Agent Projects](AGENT_PROJECTS.md) / [中文](AGENT_PROJECTS.zh-CN.md)
+- [Agent Transports](AGENT_TRANSPORTS.md) / [中文](AGENT_TRANSPORTS.zh-CN.md)
+- [Agent Protocol](AGENT_PROTOCOL.md) / [中文](AGENT_PROTOCOL.zh-CN.md)
+- [Shell Profiles](SHELL_PROFILES.md) / [中文](SHELL_PROFILES.zh-CN.md)
 
-6. [MCP.md](MCP.md) / [MCP.zh-CN.md](MCP.zh-CN.md) - remote MCP endpoint, authentication, default coding loop, read-only LSP and validation intelligence, and common MCP errors.
-7. [GPT_ACTIONS.md](GPT_ACTIONS.md) / [GPT_ACTIONS.zh-CN.md](GPT_ACTIONS.zh-CN.md) - Custom GPT setup, OpenAPI import, authentication, generic validation-summary access, and workflow guidance.
-8. [assets/README.md](assets/README.md) / [assets/README.zh-CN.md](assets/README.zh-CN.md) - screenshots used by MCP and GPT Actions guides.
+## Architecture and Contributors
 
-## Setup And Operation
+- [Architecture](ARCHITECTURE.md)
+- [Testing](TESTING.md)
+- [End-to-End Validation](E2E_VALIDATION.md) / [中文](E2E_VALIDATION.zh-CN.md)
+- [Console Development](CONSOLE_DEVELOPMENT.md)
+- [LSP Navigation](LSP_NAVIGATION.md)
+- [Multi-Language Validation](MULTI_LANGUAGE_VALIDATION.md)
+- [Read-Only Command Sandbox](READ_ONLY_COMMAND_SANDBOX.md) / [中文](READ_ONLY_COMMAND_SANDBOX.zh-CN.md)
+- [Roadmap](ROADMAP.md) / [中文](ROADMAP.zh-CN.md)
+- [Contributor Agent Contract](../AGENTS.md)
+- [Architecture Decisions](agent/architecture-decisions.md)
+- [Session Model](agent/session-model.md)
+- [Permission Model](agent/permission-model.md)
+- [OpenAPI Guidelines](agent/openapi-guidelines.md)
+- [Claude Code MCP Provider](agent/claude-code-mcp-provider.md)
 
-9. [BUILD_INSTALL.md](BUILD_INSTALL.md) / [BUILD_INSTALL.zh-CN.md](BUILD_INSTALL.zh-CN.md) - build/install command reference and artifact details.
-10. [DEPLOYMENT.md](DEPLOYMENT.md) / [DEPLOYMENT.zh-CN.md](DEPLOYMENT.zh-CN.md) - production server bootstrap, HTTPS, systemd, OAuth, QUIC, and smoke checks.
-11. [OPERATIONS.md](OPERATIONS.md) - day-to-day operations, token model, project registration, session workflow, and smoke testing.
-12. [TROUBLESHOOTING.md](TROUBLESHOOTING.md) / [TROUBLESHOOTING.zh-CN.md](TROUBLESHOOTING.zh-CN.md) - common deployment and integration failures.
+## Security
 
-## Security And Auth
+- [Security Policy and Model](../SECURITY.md)
+- [OAuth2 Internals](OAUTH2_INTERNALS.md)
+- [OAuth2 Smoke Test](OAUTH2_SMOKE_TEST.md)
+- [OAuth2 Bridge Threat Model](OAUTH2_BRIDGE_THREAT_MODEL.md)
 
-13. [../SECURITY.md](../SECURITY.md) - security model, model capabilities, project boundary, shell/job risk, token handling, audit evidence, revocation, and vulnerability reporting.
-14. [AUTH_MODEL.md](AUTH_MODEL.md) / [AUTH_MODEL.zh-CN.md](AUTH_MODEL.zh-CN.md) - shared key, bootstrap token, account credential, PAT, OAuth token, agent token, and hash storage.
-15. [OAUTH2_INTERNALS.md](OAUTH2_INTERNALS.md) - OAuth2 storage, client management, authorize flow, token exchange, revocation, and delegated scope enforcement.
-16. [OAUTH2_SMOKE_TEST.md](OAUTH2_SMOKE_TEST.md) - manual end-to-end OAuth2 validation.
-17. [OAUTH2_BRIDGE_THREAT_MODEL.md](OAUTH2_BRIDGE_THREAT_MODEL.md) - shared-key OAuth bridge threat model and subject model constraints.
+## Release History
 
-## Agent And Runtime
-
-18. [AGENT_PROJECTS.md](AGENT_PROJECTS.md) / [AGENT_PROJECTS.zh-CN.md](AGENT_PROJECTS.zh-CN.md) - agent project registry format and runtime project ids.
-19. [AGENT_TRANSPORTS.md](AGENT_TRANSPORTS.md) / [AGENT_TRANSPORTS.zh-CN.md](AGENT_TRANSPORTS.zh-CN.md) - QUIC, WebSocket, polling, fallback, and transport validation.
-20. [AGENT_PROTOCOL.md](AGENT_PROTOCOL.md) / [AGENT_PROTOCOL.zh-CN.md](AGENT_PROTOCOL.zh-CN.md) - agent auth, identity, typed read-only LSP bridge, protocol, and redacted policy summaries.
-21. [SHELL_PROFILES.md](SHELL_PROFILES.md) / [SHELL_PROFILES.zh-CN.md](SHELL_PROFILES.zh-CN.md) - prepared shell environment snapshots and safety boundaries.
-22. [LSP_NAVIGATION.md](LSP_NAVIGATION.md) - read-only Rust LSP navigation tools, startup capability summary, boundaries, limits, and error codes.
-
-## Release And Roadmap
-
-23. [RELEASE_NOTES_v0.3.0.md](RELEASE_NOTES_v0.3.0.md) / [RELEASE_NOTES_v0.3.0.zh-CN.md](RELEASE_NOTES_v0.3.0.zh-CN.md) - current external-facing 0.3.0 release notes.
-24. [RELEASE_NOTES_v0.2.0.md](RELEASE_NOTES_v0.2.0.md) - previous 0.2.0 release notes.
-25. [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) - release readiness and acceptance procedure.
-26. [ROADMAP.md](ROADMAP.md) / [ROADMAP.zh-CN.md](ROADMAP.zh-CN.md) - short roadmap.
-
-## Developer Maintenance
-
-27. [TESTING.md](TESTING.md) - test lanes, test layout, and ignored-test inventory.
-28. [E2E_VALIDATION.md](E2E_VALIDATION.md) / [E2E_VALIDATION.zh-CN.md](E2E_VALIDATION.zh-CN.md) - local end-to-end validation scripts and documentation scan guidance.
-29. [../AGENTS.md](../AGENTS.md) - agent execution contract (safety, editing, git, validation, architecture musts).
-30. [agent/architecture-decisions.md](agent/architecture-decisions.md), [agent/session-model.md](agent/session-model.md), [agent/session-correlation.md](agent/session-correlation.md), [agent/permission-model.md](agent/permission-model.md), [agent/oauth-bridge-plan.md](agent/oauth-bridge-plan.md), [agent/openapi-guidelines.md](agent/openapi-guidelines.md), [agent/release-process.md](agent/release-process.md) - long-form design moved out of AGENTS.md (session dual model, optional session correlation, authority decision layer, OAuth bridge, OpenAPI, release).
+- [Release Checklist](RELEASE_CHECKLIST.md)
+- [Release Process](agent/release-process.md)
+- [v0.3.0 Release Notes](RELEASE_NOTES_v0.3.0.md) / [中文](RELEASE_NOTES_v0.3.0.zh-CN.md)
+- [v0.2.0 Release Notes](RELEASE_NOTES_v0.2.0.md)

@@ -15,7 +15,6 @@ runtime facts. **When design text and code disagree, code wins.**
 | [`AGENTS.md`](../../AGENTS.md) | Executable trusted-agent contract and hard boundaries |
 | [`SECURITY.md`](../../SECURITY.md) | Security model and redaction expectations |
 | [`session-model.md`](session-model.md) | Workflow Session vs Action Audit Session |
-| [`session-correlation.md`](session-correlation.md) | Optional one-way audit → `wc_sess_*` link |
 | [`architecture-decisions.md`](architecture-decisions.md) | Standing authority / observation / API-evolution decisions |
 | [`OPERATIONS.md`](../OPERATIONS.md) | Operator-facing authority configuration and smoke checks |
 | [`AUTH_MODEL.md`](../AUTH_MODEL.md) | Authn / tokens / scopes (orthogonal to this decision layer) |

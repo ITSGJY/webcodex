@@ -69,12 +69,13 @@ them visible to an external WebCodex client. Public names and input schemas,
 including `replace_in_file`, are identical with the provider disabled or
 enabled.
 
-Separately from the two mapped production capabilities, the agent also carries
-three experimental agent-internal request kinds (`claude_list_tools`,
-`claude_describe_tool`, `claude_tool_call`) that observe the raw Claude tool
-surface and call only `Read`/`Edit`/`Write`/`Bash`. They share this provider's
-process, bounds, and generation Router lifecycle, and are likewise absent from
-public MCP/OpenAPI. See `docs/experiments/claude-tool-harness.md`.
+The agent also carries three internal diagnostic request kinds
+(`claude_list_tools`, `claude_describe_tool`, `claude_tool_call`). They remain
+absent from public MCP/OpenAPI. Raw calls are fixed to the `Read`, `Edit`,
+`Write`, and `Bash` allowlist; orchestration, workflow, network, and other
+discovered tools are never callable. Mutating calls are never automatically
+retried after an uncertain result because the provider may already have
+applied the write.
 
 The bounded version reported by MCP `initialize.serverInfo` is exposed in
 provider status after a successful start. A version is retained only when it

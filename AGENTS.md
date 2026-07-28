@@ -9,8 +9,6 @@ Long-form design context lives under [`docs/agent/`](docs/agent/).
 
 - **Project:** WebCodex
 - **Canonical repository:** `https://github.com/yyjeqhc/webcodex.git`
-- **Default managed project id:** `agent:special:webcodex`
-- **Canonical checkout path:** `/root/git/webcodex`
 - Other registered checkouts or deployment paths may exist. Treat them as
   independent worktrees and verify their branch, HEAD, remote, and dirty state
   before using them.
@@ -94,9 +92,8 @@ product judgment.
   Perform them only when directly required by the task or when deletion is the
   clearest fix for the behavior being changed.
 
-For current product direction, read
-[`docs/PROJECT_FIRST_REFINEMENT_PLAN.zh-CN.md`](docs/PROJECT_FIRST_REFINEMENT_PLAN.zh-CN.md)
-and [`docs/ROADMAP.md`](docs/ROADMAP.md).
+For current product direction, read [`docs/ROADMAP.md`](docs/ROADMAP.md) and
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ---
 
@@ -190,6 +187,8 @@ Broader lanes: [`docs/TESTING.md`](docs/TESTING.md).
 - Workflow session IDs retain the `wc_sess_*` format.
 - Explicit `session_id` wins over current-session binding.
 - Unknown explicit IDs fail as `unknown_session_id`; never silently fall back.
+- Explicit `close_session` moves `active` sessions to `closed`;
+  `finish_coding_task` and summary tools do not close them.
 - Explicitly read-only sessions deny writes and shell/jobs.
 - Session denial occurs before mutation or agent enqueue and is recorded when
   the session is valid.

@@ -57,9 +57,8 @@ correlation only:
 | Missing field | Keep unlinked behavior |
 | Bad format | Parameter error; never silent remap |
 
-Full design, validation table, and phased rollout:
-[`session-correlation.md`](session-correlation.md). Dual-model detail:
-[`session-model.md`](session-model.md).
+The optional correlation contract is summarized above; dual-model lifecycle and
+identity rules live in [`session-model.md`](session-model.md).
 
 ### Authority decision layer (standing)
 

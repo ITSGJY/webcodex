@@ -5,7 +5,7 @@ casual vocabulary only. They must not be merged, cross-wired, or inferred from
 each other.
 
 Executable constraints that agents must obey live in
-[`AGENTS.md`](../../AGENTS.md) §6 (Session). Standing architecture summary:
+[`AGENTS.md`](../../AGENTS.md) §7, **Sessions**. Standing architecture summary:
 [`architecture-decisions.md`](architecture-decisions.md) §1.
 
 ---
@@ -56,25 +56,32 @@ handoff, and finish can reason about the same unit of work.
 | Durability | JSON-oriented session ledger (bounded events/messages per session) |
 | Current-session map | In-memory bindings isolated by principal, transport, and resolved project |
 
-### Lifecycle (sketch)
+### Current lifecycle contract
 
-Typical product path:
-
-1. `start_coding_task` / `start_session` creates a Workflow Session and returns
-   `wc_sess_*`.
-2. Subsequent tool calls may pass explicit `session_id` or, where allowed, fall
-   back to a current-session binding.
-3. Guards, validation, messages, and checkpoints accumulate evidence on that
-   ledger.
-4. `finish_coding_task` or handoff tools close out or summarize the task.
+- New Workflow Sessions are `active`; older ledgers without a lifecycle field
+  are also read as `active`.
+- `close_session` is the only explicit `active → closed` transition. It requires
+  an explicit `session_id`, never uses current-session fallback, and returns
+  `unknown_session_id` for malformed or unknown IDs without creating a session.
+- Re-closing a closed session is idempotent. Only a real transition records one
+  `session_closed` event.
+- Closed sessions still allow queries and pure reads. They reject write-like
+  tools, shell/job tools, session-message mutation, and session-scoped
+  checkpoint create/restore/delete with `session_closed`.
+- `finish_coding_task`, `session_handoff_summary`, and other summary/query tools
+  produce closeout information but do not close the session.
+- `archived` is a reserved wire state that current code does not produce. LRU
+  eviction is capacity management, not a lifecycle transition.
+- Session modes (`normal`, `inspect`, `read_only`) are execution policy, not
+  lifecycle state.
 
 This is **not** the same state machine as Action Audit Sessions. Lifecycle
-tools and error kinds (`unknown_session_id`, `read_only` denials, guard
-failures) apply only to Workflow Sessions.
+tools and error kinds (`unknown_session_id`, `session_closed`, mode denials,
+guard failures) apply only to Workflow Sessions.
 
 ### Invariants (must)
 
-These are also summarized in `AGENTS.md` §6:
+These are also summarized in `AGENTS.md` §7, **Sessions**:
 
 1. **ID format:** Workflow Session IDs use `wc_sess_*`. Do not change the
    prefix, ledger event schema, or lifecycle semantics without an explicit
@@ -184,9 +191,7 @@ identity rules, and blur security/guard boundaries. Keep two implementations.
 
 ## 5. Future association (explicit only)
 
-Full design: [`session-correlation.md`](session-correlation.md).
-
-Summary only (do not implement from this section alone):
+The standing optional-correlation contract is:
 
 - **Direction:** Action Audit side holds optional `workflow_session_id`
   (`wc_sess_*`); prefer **event/record** level first.
@@ -273,7 +278,7 @@ Renaming tables, routes, or serialized field names does.
 | Wrapper field `recording_session_id`? | Workflow Session (recorder metadata only) |
 | Header `x-action-session-id`? | Action Audit Session |
 | Should these share one store or state machine? | **No** |
-| Need a link later? | Optional explicit `workflow_session_id` — see [`session-correlation.md`](session-correlation.md) |
+| Need a link later? | Optional explicit `workflow_session_id`; never infer it from transport or current bindings |
 
 ---
 
@@ -281,8 +286,6 @@ Renaming tables, routes, or serialized field names does.
 
 - [`AGENTS.md`](../../AGENTS.md) — executable Session invariants
 - [`architecture-decisions.md`](architecture-decisions.md) — dual-model summary
-- [`session-correlation.md`](session-correlation.md) — optional one-way
-  Action Audit → Workflow Session correlation design
 - [`openapi-guidelines.md`](openapi-guidelines.md) — `session_id` vs
   `recording_session_id` on GPT Actions
 - [`../CONCEPTS.md`](../CONCEPTS.md) — product vocabulary (Workflow Session in

@@ -281,6 +281,7 @@ project entry above.
 
 ## Documentation
 
+- Full documentation index: [docs/INDEX.md](docs/INDEX.md)
 - Getting started: [docs/QUICK_START.md](docs/QUICK_START.md)
 - Build/install: [docs/BUILD_INSTALL.md](docs/BUILD_INSTALL.md)
 - Concepts: [docs/CONCEPTS.md](docs/CONCEPTS.md)

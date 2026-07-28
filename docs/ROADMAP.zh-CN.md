@@ -1,234 +1,32 @@
 # Roadmap
 
-这份 roadmap 故意保持很短。长期边界、LOC/test 预算、验收门禁和时间估算见 [PROJECT_FIRST_REFINEMENT_PLAN.zh-CN.md](PROJECT_FIRST_REFINEMENT_PLAN.zh-CN.md)。
+WebCodex 是面向 coding assistant 的远程、可审计、有界执行层。它不是内置模型、自主 agent loop，也不是完整浏览器 IDE。
 
-## 已完成：Iteration 6/6.1 — Command Execution Engine
+## 当前已交付基线
 
-- 建立持久化 `wc_exec_*` Execution 生命周期。
-- `commands_run` 采用约 8 秒 quick-yield：短命令直接完成，长命令返回 durable running。
-- `task_review` 提供状态、queue/silent metadata、output cursor 和有界 wait。
-- 增加单意图 `task_cancel`，完成 executor/process-group 取消闭环。
-- runtime restart 后将未完成 execution 标为 interrupted/unknown。
-- active/unknown execution 存在时，`task_finish` fail closed。
-- 复用现有 job/process 资产，删除 Connector direct synchronous command path。
+- project-bound MCP 与 OpenAPI 暴露精简的 canonical capability surface。
+- Task、Execution、Event、Result、Approval、续接 review 和有界输出均可持久化。
+- server、CLI 和 runner 通过 workspace library crates 共享代码，并由 package boundary 检查约束。
+- 认证、project grant、allowed roots、路径策略、authority mode 和审计证据保持显式边界。
+- structured validation 支持 Rust、Node、Python 和 Go recipe，不安装依赖，也不运行联网 setup hook。
+- review console、重连续接、只读 LSP 导航、shell profile 和 transport fallback 已可用。
 
-## 已完成：Iteration 7 — Durable Validation Provenance
+## 下一阶段优先级
 
-- `checks_run` 已迁移到同一 Execution Engine，一个 ordered fail-fast plan 对应一个 `kind=check` Execution。
-- check 复用 quick-yield、review、cancel、monitor、restart reconciliation 和 finish blocker。
-- `operation_id` 支持精确重试、payload conflict 与新 key 有意重跑。
-- assertion failure 与 submission/transport/execution failure 分层。
-- Hosted credential 停止访问 legacy 76-tool/session/admin surface。
-- 删除同步 checks adapter、重复 projection、无调用者 Principal 抽象和两条专用写文件 REST 兼容路由。
-- MCP、OpenAPI、HTTP 与 OAuth 保持 canonical 9-capability 合同。
-- production Rust 相对 Iteration 7 起点净减 594 行；10% 长期减幅尚未达到。
-- 成功 check 独立持久化 workspace provenance；后续 mutation 使
-  `task_finish` 返回 `checks_stale`，不改变 operation exact-retry identity。
-- stdout marker 控制路径已删除；agent JobManager 拥有 structured validation
-  progress，项目输出不能伪造 completed/failed step。
-- failed check 持久化最大 16 KiB 的 sanitized assertion evidence；旧数据库 additive
-  upgrade，历史成功 check 缺 provenance 时要求重跑。
-- `edits_apply`、command/check reservation、cancel 和 `task_finish` 使用同一
-  per-task coordination domain；Result capture 与 provenance comparison 原子，
-  不同 Task 仍可并发。
-- structured validation terminal success 必须有完整 plan-aligned progress；
-  malformed progress 显式成为 executor protocol failure，DB 不再按 plan 文本推断
-  completed steps。
-- Agent 通过 structured validation capability 明确协商；旧 Agent 收到
-  `structured_validation_unavailable`，没有 marker、普通 shell 或 stdout fallback。
-- Iteration 7 已完成人工 review、完整测试与最终 squash，正式基线为
-  `a1547bba3b93669e8bdf6d0fec2388e0ae2b138e`。
+1. 改善任务续接和 operator 可见性，同时避免无必要扩大公开 capability surface。
+2. 完善自托管安装、升级、回滚和混合版本诊断。
+3. 在保持协议兼容的前提下继续减少重复 projection 和过大返回体。
+4. 扩展认证、transport 恢复、validation provenance 和进程清理的端到端覆盖。
+5. 只在能够保持 project、permission、timeout 和 audit 边界时评估更多 provider 集成。
 
-## 已完成：Iteration 8.0/8.0.1 — Product Entry, Credential Boundary and Golden Path
+## 完成标准
 
-Iteration 8.0 只交付第一条垂直切片，不扩展 Hosted 九项 capability：
+Roadmap 项目只有在公开合同已文档化、聚焦与回归验证通过、失败行为明确，并且涉及运维时具备部署或回滚说明后才算完成。
 
-- 唯一普通用户入口 `webcodex setup`，后续显式
-  `webcodex doctor` → `webcodex agent start` → `webcodex status`。
-- setup 生成一个由 Connector 与 Agent 共用的精确 Project Credential；两者映射到
-  同一非秘密 project grant，普通 arbitrary shared-key fallback 在 project mode
-  关闭，loopback 不免除认证。
-- readiness、file read/search/edit、command/check、monitor/log 与 cancel 都按请求
-  principal 验证 Agent grant；跨 grant 调用在 Task/Execution/pending request 等
-  副作用前 fail closed。
-- 新 setup client ID 包含非秘密 grant suffix；旧同名 lease 的跨组注册不能覆盖原
-  group。
-- application-level Project readiness facts 同时投影给 CLI、Connector API 和
-  Browser；不再读取 runtime registry 自行拼三套状态。
-- malformed/conflicting registration、invalid credential、workspace unavailable、
-  server unreachable、credential rejected 与 agent offline 使用不同 stable code；
-  doctor/status 保持只读。
-- project-bound Connector happy path 从 `task_start` 直接开始，不要求
-  `list_projects`、`runtime_status`、`tool_manifest` 或 workflow session。
-- golden path 由真实 Auth middleware、Connector HTTP adapter、Agent registry、
-  durable Task/Execution/event store 与本机 accept 覆盖；真实 recorder 证明没有
-  discovery/ops/session call，手工 calls vector 已删除。
-- normal task 在 `task_finish` 前必须运行 structured checks；check spawn failure
-  属于 executor infrastructure failure，不生成 assertion evidence/provenance。
-- 删除旧 `webcodex connect` process/tunnel orchestration、`webcodex-cli connect`
-  与重复 doctor projection；运维 registry/discovery 工具继续保留。
-- Browser 只提供 readiness surface；完整 Browser IDE 明确 deferred。
+## 明确非目标
 
-## 已完成：Iteration 8.1 — Project-Aware Validation Recipes
-
-Iteration 8.1 保持 Hosted 九项 capability，不新增 discovery call：
-
-- `checks_run` 增加可选 `recipe: rust|node|python|go`；省略即 deterministic auto，
-  不提供 `auto` alias。
-- resolver 在 Task execution workspace 内从相对 `cwd` 向 root 查找最近 marker，
-  不扫描 sibling；同 root 多 marker 自动模式 fail closed，显式 recipe 必须匹配；
-  唯一例外是显式 Python test 在没有选中 `pyproject.toml` 时从 `cwd` 运行固定
-  unittest plan。
-- Rust 保持 `format/check/test`；Node 只运行 allowlisted 非修改型 script，并从
-  `packageManager` 或单一 lockfile 确定 manager；Python 的 Ruff/Black、
-  Ruff/Mypy、pytest 只由 `pyproject.toml` 证明，manifestless Python 只支持
-  `python -B -m unittest discover -v`；Go 支持 `check/test`，`format` 明确
-  unavailable。
-- 所有 invocation 都是 canonical `program + argv`；recipe 不安装依赖、不运行
-  install hook、不修改 lockfile、不联网。旧 command-string Agent 通过
-  `structured_validation_argv` capability fail closed。
-- recipe ID/version、相对 root、semantic checks、tool identity 和
-  invocation/manifest digest 持久化并进入 request hash；manifest、lockfile 或
-  workspace 变化使 provenance stale。
-- planner failure 不创建 Execution；tool unavailable/spawn failure 属于 executor
-  failure；只有已启动 validator 的 non-zero verdict 属于 assertion failure。
-- 四类项目由真实 Auth/HTTP/registry/store/structured progress/local accept
-  golden fixture 覆盖；task path 仍不需要 discovery/session call。
-
-Iteration 8.1 已完成 focused/full suite、LOC 门禁与人工 review，并随 0.3.0 发布。
-
-## 已完成：Iteration 8.2 — Review Console and Cross-Session Continuity
-
-- Browser `/console` 提供工作队列、event timeline、bounded diff/output tail、
-  Accept/Reject/Cancel、guidance、approvals、devices、activity 与 Connect 面板。
-- `task_list` 与 `task_resume` 支持跨聊天窗口续接；reject reason 通过正常 capability
-  response 一次性回传模型。
-- runner、service、npm command 与 QUIC ALPN 从 `webcodex-agent` hard cut 为
-  `webcodex-runner`，不保留旧名称 alias。
-- 真实 ChatGPT MCP/OpenAPI acceptance、release smoke 和 0.3.0 发布门禁已经完成。
-
-## 已完成：Iteration 9 — Agent-Aligned Evidence and Task Reporting
-
-本轮不扩大 Hosted capability surface，也不以代码瘦身或旧版本平滑迁移为目标。
-优先修复软件自身在真实 coding 任务中的判断与交互问题，使 WebCodex 更接近本地
-coding agent 的工作方式：
-
-- 专用工具继续负责权限控制、项目边界、事务式文件修改、命令执行、结构化状态和
-  原始证据，但默认报告事实，不替模型给出脱离语境的任务总裁决；
-- `cargo_*`、`run_shell`、`run_job` 与其他执行路径进入统一 evidence ledger，按实际
-  命令、退出状态和调用意图记录验证事实，不因未使用某个专用工具就报告
-  `validation_not_run`；
-- `finish_coding_task`、handoff 和 hygiene 将 hard blocker 限于权限拒绝、冲突、
-  命令或测试失败、敏感路径风险等确定事实；dirty worktree、输出截断、历史失败已被
-  重试修复等作为上下文提示；
-- 本地 Agent 基于完整证据输出最终任务报告，明确说明执行内容、通过和未执行的验证、
-  当前工作树状态、剩余风险，以及是否建议提交、合并或发布；
-- 修正 shell/cwd 合同、重启后的连接状态分层和过大的 startup/read/log 返回体，减少
-  无意义失败、重复轮询与模型上下文消耗；
-- 项目聊天默认面向 project-bound 精简能力，完整 operator runtime 保留给管理入口，
-  但不试图用不断增加专用工具覆盖所有项目情形。
-
-### 第一阶段已实现
-
-- `cargo_fmt`、`cargo_check`、`cargo_test`、显式声明 purpose 的 `run_shell`，以及进入
-  terminal 的 `run_job` 复用同一 bounded execution evidence 投影。稳定 assertion/
-  command identity 保留 `historical_failures`，并明确拆分 `resolved_failures` 与
-  `unresolved_failures`。
-- `validation_summary`、`session_handoff_summary` 与 `finish_coding_task` 直接复用该
-  投影；closeout 以 `facts`、`hard_blockers`、`advisories` 为主。普通 dirty worktree
-  和任务可选 validation 未运行是 advisory；未解决冲突、命令/测试失败、blocking
-  active job 与敏感路径风险是 blocker。
-- `run_shell`/`run_job` 接受 `purpose` 和 `shell=sh|bash`；cwd 省略、空字符串或 `.`
-  都解析为项目根，并返回 project-relative cwd、executor 和 shell 事实。job log
-  默认只返回 bounded tail、总行数、截断、detected summary 和 continuation cursor。
-- `start_coding_task(detail=minimal|standard|full)` 替代启动 flag 组合；`read_file`
-  只返回一种文本表示；readiness 拆为 runner process、server transport/registration、
-  project registry、connector endpoint、session binding 与 last successful call。
-- Console chat connection 明确生成 project-bound surface，model 默认不会得到 operator
-  runtime；完整 operator runtime 继续用于管理与内部执行。
-
-### 第二阶段已交付 — Trusted Agent Authority and Reconnect Continuity
-
-- canonical 双模式 authority：`WEBCODEX_AUTHORITY_MODE=trusted_agent|restricted`，
-  未设置默认 `trusted_agent`（source 报告为 `default`）。`trusted_agent` 下项目读写、
-  shell、异步 job、git 操作、脚本/构建、依赖安装与本地服务控制在硬安全检查后
-  自动执行，没有人工审批中断，但每个 permission-bearing 调用仍在 session ledger
-  记录可审计决策（`trusted_agent_authority`）；push/tag/publish/release/deploy 只在
-  用户任务显式包含该动作时执行（`user_task_scoped`）。`restricted` 下 consequential
-  runtime 工具被拒绝，project-bound connector `commands_run` 保留一次性人工审批
-  闭环（`wc_approvals`、task_cli approve/deny）。设置旧
-  `WEBCODEX_PERMISSION_MODE` 即为无效配置，fail closed，无 alias、无迁移。
-- authority mode 不放松硬边界：OAuth scopes、项目根/allowed roots、read-only
-  session、路径与敏感路径策略、并发覆盖 guard、凭据脱敏、job cancel/reclaim 与
-  不可变 release 目标全部不变。
-- `runtime_status`/`start_coding_task` 投影 canonical `authority` 对象；旧
-  `permissions` profile 对象已删除。`trusted_agent` 下 connector 自动授权记录
-  durable `authority_auto_authorized` task event，不再生成 approval 记录或
-  `approval_required` 中断。
-- `runtime_status.connection_layers` 成为 observation contract：每层携带
-  status/observed_at/source/age_secs/stale_after_secs/reason_code 与真实事实；
-  配置存在不等于 ready，stale registration 不呈现为可调用，session binding 如实
-  报告 process-local、重启即丢（应继续使用 durable `wc_sess_*` session id 而不是
-  重启 runner），`last_successful_tool_call` 只记录有意义的成功调用。
-- `runtime_status.version_compatibility` 诊断混合版本
-  （compatible/version_mismatch/capability_mismatch/no_runners），给出每个 runner
-  的 build/protocol 事实与升级方向，不做兼容 fallback。runner 注册上报
-  `process_started_at`、build version/commit 与 shell profile dialect
-  （`default_dialect`、`available_dialects`、每个 profile 的 `dialect`）。
-- `start_coding_task` hard cut：旧 startup flag 已从 wire 与内部实现删除；
-  `detail=minimal|standard|full` 是唯一投影控制，未知/旧字段返回严格
-  unknown-field 错误。
-- 新验证 lane：`cargo test -p webcodex --bin webcodex reconnect`、
-  `cargo test -p webcodex --bin webcodex trusted_smoke` 与真实进程 harness
-  `scripts/e2e_reconnect_ws.sh`。
-
-### 第三阶段已交付 — Final Acceptance and Release Readiness
-
-- 真实 project-bound MCP acceptance（JSON-RPC，对接 connector 配置下的 `webcodex`
-  与 `webcodex-runner`）：`initialize`、`tools/list` 只暴露 12 项 canonical 能力、
-  不暴露 operator runtime；`task_start → files_read → edits_apply →
-  commands_run（先失败、修复、再通过）→ checks_run → task_review → task_finish`
-  在 `trusted_agent` 下零审批中断完成。connector surface 拒绝 operator-only 工具名，
-  `files_read` 只返回一种文本表示，`task_review` 事件 cursor 有界且不重复，新客户端
-  经 `task_resume` 继续 durable 任务。
-- 真实 OpenAPI/HTTP acceptance：`/openapi.json` 投影同一 12 项 canonical operation，
-  与 MCP 业务合同 schema 一致；project credential 被拒绝调用 operator-only 路由
-  （`/api/tools/*` → 403），未知字段严格拒绝且无 alias；`restricted` 下 `commands_run`
-  需一次性审批，`trusted_agent` 自动授权；durable 任务在 server/runner 重启后仍可继续。
-- 记录 `start_coding_task`（minimal/standard/full）、`read_file`（普通/numbered）、
-  `job_log`（默认页与 follow cursor）、`finish_coding_task summary_only` 与 project-bound
-  `tools/list` 的返回体字节基线；新增 `select_lines` 有界/不重复回归测试，守护 job log
-  payload 大小与 cursor 前进，且不建立任何遥测系统。
-- 临时安装与回滚 smoke：release binaries 安装到临时目录，server/runner/CLI 从中启动并
-  报告部署 version/commit，服务停止后无孤儿进程，文档化的 `cp -a` 回滚可恢复可运行
-  binary——全程不触碰 `/opt/webcodex` 或生产服务。
-- 修复 reconnect harness fixture 遗漏 `allowed_roots` 的问题：该遗漏使 runner 默认回退到
-  `$HOME` 并拒绝 `/tmp` 测试仓库，导致 running-job 变 `lost` 与 read 恢复断言依赖宿主
-  环境；现在在 `TMPDIR` 位于 `$HOME` 之外的宿主上也能通过。
-
-暂缓代码瘦身与 LOC 门禁、旧版本迁移兼容、SSH、PTY、Workflow DSL、更多 Hosted
-capability 和完整 Browser IDE。
-
-## 时间判断
-
-- 三轮合计约 7–11 个专注开发周。
-- 单人非全职推进更现实为 3–5 个月。
-- SSH/跨设备 Operations Profile 在 Coding Profile 收敛后另行规划，不阻塞当前主线。
-
-## 已完成基础
-
-- project-bound Connector 与当前 9 项 capability。
-- SQLite Task/Run/Event/Result/Approval。
-- 隔离执行工作区与本机 accept/reject。
-- 事务式多文件 edit/create/delete/rename。
-- LSP Phase 1–3 read-only 能力。
-- Validation Intelligence MVP。
-
-## Non-Goals
-
-- 内置模型或 agent loop。
-- 完整 IDE replacement。
-- 默认 autonomous DevOps。
-- 在 Execution Engine 稳定前扩展 SSH、Android、Kubernetes 或 workflow DSL。
-- 为假想消费者保留 aliases、dual shapes 或旧 Hosted tool surface。
-- 以测试数量、工具数量或 LOC 增长作为完成度。
+- 内置模型选择、prompt loop、context compaction 或 token budget。
+- 完整 IDE replacement 或任意 computer use。
+- 默认自主部署或生产环境变更。
+- 为假想消费者保留 compatibility alias。
+- 把工具数、测试数或 LOC 当作产品进度。
