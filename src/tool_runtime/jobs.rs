@@ -3,8 +3,7 @@ use std::path::Path;
 
 use super::helpers::{
     command_rejected_message, is_safe_job_id, normalize_local_status, project_relative_agent_cwd,
-    project_relative_cwd, read_lines_from_text, resolve_agent_cwd, resolve_local_cwd,
-    shell_escape_simple,
+    project_relative_cwd, resolve_agent_cwd, resolve_local_cwd, shell_escape_simple,
 };
 use super::local_jobs::{
     retain_inspect_job_until_terminal, LocalJobKiller, LocalJobRecord, TerminateOutcome,
@@ -130,11 +129,7 @@ fn local_read_lines(
     offset: Option<usize>,
     tail_lines: Option<usize>,
 ) -> (String, usize, usize, bool) {
-    read_lines_from_text(
-        record.read_text(name).as_deref().unwrap_or_default(),
-        offset,
-        tail_lines,
-    )
+    record.read_log_lines(name, offset, tail_lines)
 }
 
 /// Build a bounded job summary `Value` for an agent-known job. Never includes

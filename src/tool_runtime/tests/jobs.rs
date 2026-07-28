@@ -1464,6 +1464,105 @@ async fn job_log_paginates_with_offset_for_in_memory_local_job() {
     assert_eq!(second.output["cursor"]["stdout"], 601);
 }
 
+#[tokio::test]
+async fn inspect_job_log_and_tail_use_terminal_snapshot_global_cursors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime = runtime_with_project(tmp.path(), "demo");
+    let scratch = crate::command_sandbox::InspectScratch::create().unwrap();
+    let scratch_path = scratch.path().to_path_buf();
+    let dir = scratch.path().join("job");
+    fs::create_dir(&dir).unwrap();
+    let stdout = (1..=700)
+        .map(|line| format!("stdout {line}\n"))
+        .collect::<String>();
+    let stderr = (1..=700)
+        .map(|line| format!("stderr {line}\n"))
+        .collect::<String>();
+    fs::write(
+        dir.join("metadata.json"),
+        serde_json::to_string(&json!({
+            "command": "echo test",
+            "cwd": ".",
+            "shell": "bash",
+            "purpose": "other"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(dir.join("status"), "completed").unwrap();
+    fs::write(dir.join("exit_code"), "0").unwrap();
+    fs::write(dir.join("finished_at"), "100").unwrap();
+    fs::write(dir.join("stdout.log"), stdout).unwrap();
+    fs::write(dir.join("stderr.log"), stderr).unwrap();
+
+    let job_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let record = LocalJobRecord::new("demo".to_string(), dir.clone());
+    let snapshot = record.terminal_snapshot_handle();
+    runtime
+        .local_jobs
+        .lock()
+        .await
+        .insert(job_id.to_string(), record);
+    let child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("exit 0")
+        .spawn()
+        .unwrap();
+    super::super::local_jobs::retain_inspect_job_until_terminal(dir, snapshot, scratch, child);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while scratch_path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "inspect scratch cleanup timed out"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let from_start = runtime.job_log(job_id.to_string(), Some(1), None).await;
+    assert!(from_start.success, "{:?}", from_start.error);
+    assert_eq!(from_start.output["stdout_lines"], 700);
+    assert_eq!(from_start.output["stderr_lines"], 700);
+    assert_eq!(from_start.output["stdout_truncated"], true);
+    assert_eq!(from_start.output["stderr_truncated"], true);
+    assert_eq!(from_start.output["cursor"]["stdout"], 701);
+    assert_eq!(from_start.output["cursor"]["stderr"], 701);
+    assert_eq!(
+        from_start.output["stdout_tail"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .next(),
+        Some("stdout 201")
+    );
+    assert_eq!(
+        from_start.output["stderr_tail"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .next(),
+        Some("stderr 201")
+    );
+
+    let tail = runtime.job_tail(job_id.to_string(), Some(5)).await;
+    assert!(tail.success, "{:?}", tail.error);
+    assert_eq!(tail.output["stdout_lines"], 700);
+    assert_eq!(tail.output["stderr_lines"], 700);
+    assert_eq!(tail.output["stdout_truncated"], true);
+    assert_eq!(tail.output["stderr_truncated"], true);
+    assert_eq!(tail.output["cursor"]["stdout"], 701);
+    assert_eq!(tail.output["cursor"]["stderr"], 701);
+    assert_eq!(
+        tail.output["stdout_tail"].as_str().unwrap(),
+        "stdout 696\nstdout 697\nstdout 698\nstdout 699\nstdout 700"
+    );
+    assert_eq!(
+        tail.output["stderr_tail"].as_str().unwrap(),
+        "stderr 696\nstderr 697\nstderr 698\nstderr 699\nstderr 700"
+    );
+    assert!(!scratch_path.exists());
+}
+
 async fn register_job_agent_for_auth(
     runtime: &ToolRuntime,
     client_id: &str,

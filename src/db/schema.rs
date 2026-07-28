@@ -1,4 +1,5 @@
 use super::Database;
+use anyhow::Context;
 use rusqlite::Connection;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -640,49 +641,86 @@ impl Database {
             return Ok(());
         }
 
-        conn.execute_batch("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;")?;
-        let migration = conn.execute_batch(
-            "
-            CREATE TABLE wc_tasks_inspect_migration (
-                id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL,
-                owner_subject_id TEXT NOT NULL,
-                goal TEXT NOT NULL,
-                mode TEXT NOT NULL CHECK(mode IN ('normal', 'inspect', 'read_only')),
-                status TEXT NOT NULL
-                    CHECK(status IN ('active', 'ready_for_review', 'accepted', 'rejected')),
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                guidance_seen_seq INTEGER NOT NULL DEFAULT 0,
-                FOREIGN KEY(project_id) REFERENCES wc_projects(id)
-            );
-            INSERT INTO wc_tasks_inspect_migration
-                (id, project_id, owner_subject_id, goal, mode, status,
-                 created_at, updated_at, guidance_seen_seq)
-            SELECT id, project_id, owner_subject_id, goal, mode, status,
-                   created_at, updated_at, guidance_seen_seq
-            FROM wc_tasks;
-            DROP TABLE wc_tasks;
-            ALTER TABLE wc_tasks_inspect_migration RENAME TO wc_tasks;
-            CREATE INDEX idx_wc_tasks_owner_project
-                ON wc_tasks(owner_subject_id, project_id, updated_at DESC);
-            ",
-        );
-        match migration {
-            Ok(()) => {
-                conn.execute_batch("COMMIT;")?;
-                let foreign_key_error = conn.prepare("PRAGMA foreign_key_check")?.exists([])?;
-                conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        let migration = match conn.execute_batch("PRAGMA foreign_keys = OFF;") {
+            Ok(()) => (|| -> anyhow::Result<()> {
+                conn.execute_batch("BEGIN IMMEDIATE;")
+                    .context("begin connector task mode migration")?;
+                conn.execute_batch(
+                    "
+                    CREATE TABLE wc_tasks_inspect_migration (
+                        id TEXT PRIMARY KEY,
+                        project_id TEXT NOT NULL,
+                        owner_subject_id TEXT NOT NULL,
+                        goal TEXT NOT NULL,
+                        mode TEXT NOT NULL CHECK(mode IN ('normal', 'inspect', 'read_only')),
+                        status TEXT NOT NULL
+                            CHECK(status IN ('active', 'ready_for_review', 'accepted', 'rejected')),
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        guidance_seen_seq INTEGER NOT NULL DEFAULT 0,
+                        FOREIGN KEY(project_id) REFERENCES wc_projects(id)
+                    );
+                    INSERT INTO wc_tasks_inspect_migration
+                        (id, project_id, owner_subject_id, goal, mode, status,
+                         created_at, updated_at, guidance_seen_seq)
+                    SELECT id, project_id, owner_subject_id, goal, mode, status,
+                           created_at, updated_at, guidance_seen_seq
+                    FROM wc_tasks;
+                    DROP TABLE wc_tasks;
+                    ALTER TABLE wc_tasks_inspect_migration RENAME TO wc_tasks;
+                    CREATE INDEX idx_wc_tasks_owner_project
+                        ON wc_tasks(owner_subject_id, project_id, updated_at DESC);
+                    ",
+                )
+                .context("rebuild wc_tasks for inspect task mode")?;
+
+                let foreign_key_error = {
+                    let mut statement = conn
+                        .prepare("PRAGMA foreign_key_check")
+                        .context("prepare connector task mode foreign key check")?;
+                    statement
+                        .exists([])
+                        .context("query connector task mode foreign key check")?
+                };
                 if foreign_key_error {
-                    anyhow::bail!("connector task mode migration broke a foreign key");
+                    anyhow::bail!(
+                        "connector task mode migration foreign_key_check found a violation"
+                    );
                 }
+                conn.execute_batch("COMMIT;")
+                    .context("commit connector task mode migration")?;
                 Ok(())
-            }
+            })(),
+            Err(error) => Err(anyhow::Error::new(error)
+                .context("disable foreign keys for connector task mode migration")),
+        };
+
+        let migration = match migration {
+            Ok(()) => Ok(()),
             Err(error) => {
-                let _ = conn.execute_batch("ROLLBACK;");
-                let _ = conn.execute_batch("PRAGMA foreign_keys = ON;");
-                Err(error.into())
+                let rollback = conn.execute_batch("ROLLBACK;");
+                if let Err(rollback_error) = rollback {
+                    if !conn.is_autocommit() {
+                        Err(error.context(format!(
+                            "connector task mode rollback also failed: {rollback_error}"
+                        )))
+                    } else {
+                        Err(error)
+                    }
+                } else {
+                    Err(error)
+                }
             }
+        };
+        let restore = restore_foreign_keys(conn);
+        match (migration, restore) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(restore_error)) => Err(restore_error),
+            (Err(error), Err(restore_error)) => Err(error.context(format!(
+                "restoring foreign_keys after connector task mode migration also failed: \
+                 {restore_error:#}"
+            ))),
         }
     }
 
@@ -716,4 +754,155 @@ fn table_columns(conn: &Connection, table: &str) -> anyhow::Result<Vec<String>> 
         cols.push(row?);
     }
     Ok(cols)
+}
+
+fn restore_foreign_keys(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys = ON;")
+        .context("restore foreign_keys after connector task mode migration")?;
+    let enabled: i64 = conn
+        .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+        .context("verify foreign_keys after connector task mode migration")?;
+    if enabled != 1 {
+        anyhow::bail!(
+            "foreign_keys remained disabled after connector task mode migration (value {enabled})"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod connector_task_mode_tests {
+    use super::*;
+
+    #[test]
+    fn connector_task_mode_migration_rolls_back_foreign_key_failure() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA foreign_keys = OFF;
+            CREATE TABLE wc_projects (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE wc_tasks (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                owner_subject_id TEXT NOT NULL,
+                goal TEXT NOT NULL,
+                mode TEXT NOT NULL CHECK(mode IN ('normal', 'read_only')),
+                status TEXT NOT NULL
+                    CHECK(status IN ('active', 'ready_for_review', 'accepted', 'rejected')),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                guidance_seen_seq INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(project_id) REFERENCES wc_projects(id)
+            );
+            CREATE INDEX idx_wc_tasks_owner_project
+                ON wc_tasks(owner_subject_id, project_id, updated_at DESC);
+            INSERT INTO wc_tasks
+                (id, project_id, owner_subject_id, goal, mode, status,
+                 created_at, updated_at, guidance_seen_seq)
+            VALUES ('task', 'missing-project', 'owner', 'keep me', 'read_only',
+                    'active', 1, 1, 9);
+            PRAGMA foreign_keys = ON;
+            ",
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+
+        let error = Database::ensure_connector_task_modes(&conn).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("foreign_key_check"),
+            "{error:#}"
+        );
+        let schema: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'wc_tasks'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!schema.contains("'inspect'"), "{schema}");
+        assert_eq!(
+            conn.query_row(
+                "SELECT project_id, goal, guidance_seen_seq FROM wc_tasks WHERE id = 'task'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap(),
+            ("missing-project".to_string(), "keep me".to_string(), 9)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'wc_tasks_inspect_migration'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_wc_tasks_owner_project'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+
+        conn.execute(
+            "INSERT INTO wc_projects VALUES ('missing-project', 'Project', 1, 1)",
+            [],
+        )
+        .unwrap();
+        Database::ensure_connector_task_modes(&conn).unwrap();
+        let schema: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'wc_tasks'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(schema.contains("'inspect'"), "{schema}");
+        assert_eq!(
+            conn.query_row(
+                "SELECT mode, goal, guidance_seen_seq FROM wc_tasks WHERE id = 'task'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap(),
+            ("read_only".to_string(), "keep me".to_string(), 9)
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
 }
