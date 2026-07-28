@@ -609,7 +609,7 @@ Specialized Cargo tools automatically declare purpose and parser metadata.
 General execution is equally valid evidence when its intent is explicit:
 
 ```json
-{"tool": "run_shell", "params": {"project": "agent:workstation:my-repo", "session_id": "wc_sess_example", "purpose": "test", "shell": "bash", "cwd": ".", "command": "cargo test --bin webcodex focused"}}
+{"tool": "run_shell", "params": {"project": "agent:workstation:my-repo", "session_id": "wc_sess_example", "purpose": "test", "shell": "bash", "cwd": ".", "command": "cargo test -p webcodex --bin webcodex focused"}}
 {"tool": "run_job", "params": {"project": "agent:workstation:my-repo", "session_id": "wc_sess_example", "purpose": "validation", "shell": "sh", "command": "make check"}}
 ```
 

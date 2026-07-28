@@ -3,6 +3,10 @@
 一次针对最近提交与项目整体的评审记录。范围：`main` 分支 `fbe2e3e` 及之前
 约 13 次 LSP 相关提交，加上仓库整体结构、构建、发布与代码健康度。
 这是一份时点快照，不是持续维护的产品文档；条目落地后可删改。
+下文出现的 `src/bin/webcodex-agent.rs`、`src/bin/webcodex_agent/*` 等路径均为
+workspace 拆分前的历史位置；当前 runner 实现位于
+`crates/webcodex-runner/src/webcodex_runner/*`，共享配置位于
+`crates/webcodex-agent-config/src/lib.rs`。
 
 ## 最近提交评审结论
 

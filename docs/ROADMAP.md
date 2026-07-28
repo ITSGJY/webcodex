@@ -40,7 +40,7 @@ Keep the hosted capability surface stable. Do not make code-size reduction or sm
 - `runtime_status.connection_layers` became an observation contract: every layer carries status/observed_at/source/age/staleness/reason_code plus real facts; configuration never implies readiness, stale registrations are never callable, session bindings are honestly reported as process-local and lost after restart (continue with the durable `wc_sess_*` id), and `last_successful_tool_call` counts only meaningful successful calls.
 - `runtime_status.version_compatibility` diagnoses mixed server/runner versions (compatible / version_mismatch / capability_mismatch / no_runners) with per-runner build and protocol facts and no fallback shims. Runners report `process_started_at`, build version/commit, and shell profile dialects (`default_dialect`, `available_dialects`, per-profile `dialect`).
 - `start_coding_task` hard cut: the legacy startup flags are removed from the wire and internals; `detail=minimal|standard|full` is the only projection control and unknown fields error strictly.
-- New validation lanes: `cargo test --bin webcodex reconnect`, `cargo test --bin webcodex trusted_smoke`, and the real-process harness `scripts/e2e_reconnect_ws.sh`.
+- New validation lanes: `cargo test -p webcodex --bin webcodex reconnect`, `cargo test -p webcodex --bin webcodex trusted_smoke`, and the real-process harness `scripts/e2e_reconnect_ws.sh`.
 
 ### Stage 3 delivered — Final Acceptance and Release Readiness
 

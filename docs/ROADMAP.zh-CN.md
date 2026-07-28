@@ -178,8 +178,8 @@ coding agent 的工作方式：
 - `start_coding_task` hard cut：旧 startup flag 已从 wire 与内部实现删除；
   `detail=minimal|standard|full` 是唯一投影控制，未知/旧字段返回严格
   unknown-field 错误。
-- 新验证 lane：`cargo test --bin webcodex reconnect`、
-  `cargo test --bin webcodex trusted_smoke` 与真实进程 harness
+- 新验证 lane：`cargo test -p webcodex --bin webcodex reconnect`、
+  `cargo test -p webcodex --bin webcodex trusted_smoke` 与真实进程 harness
   `scripts/e2e_reconnect_ws.sh`。
 
 ### 第三阶段已交付 — Final Acceptance and Release Readiness

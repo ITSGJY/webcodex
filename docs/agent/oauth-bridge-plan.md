@@ -89,9 +89,9 @@ validation matrix):
 ```
 cargo fmt --check
 cargo check --all-targets
-cargo test --bin webcodex oauth -- --nocapture
-cargo test --bin webcodex scope -- --nocapture
-cargo test --bin webcodex metadata -- --nocapture
+cargo test -p webcodex --bin webcodex oauth -- --nocapture
+cargo test -p webcodex --bin webcodex scope -- --nocapture
+cargo test -p webcodex --bin webcodex metadata -- --nocapture
 git diff --check
 git status --short --branch
 ```

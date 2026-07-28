@@ -16,6 +16,43 @@ flowchart LR
 
 The online client calls WebCodex over MCP or GPT Actions. The server authenticates the caller and dispatches runtime tool calls. The agent owns the local project boundary and performs approved file, Git, validation, shell, and job work.
 
+## Workspace Crates and Build Reuse
+
+The three binaries share project code through real library crates rather than
+cross-package `#[path]` inclusions. The current direct dependency shape is:
+
+```text
+webcodex
+  -> webcodex-admin
+  -> webcodex-agent-config
+  -> webcodex-core
+  -> webcodex-sandbox
+  -> webcodex-workspace
+
+webcodex-cli
+  -> webcodex-admin
+  -> webcodex-agent-config
+  -> webcodex-core
+
+webcodex-runner
+  -> webcodex-agent-config
+  -> webcodex-core
+  -> webcodex-sandbox
+  -> webcodex-workspace
+```
+
+For the same target, profile, and feature combination, Cargo compiles a shared
+crate once and reuses that artifact for dependents. A runner-only implementation
+change therefore normally rebuilds the runner package and the affected shared
+crates, while the server, CLI, and runner binaries are still compiled and linked
+separately. Different profiles, targets, feature sets, or third-party dependency
+versions can still produce multiple artifacts; this structure does not imply
+that every dependency in the workspace is always compiled only once.
+
+The workspace boundary check guarantees that cross-parent, cross-package
+`#[path]` source sharing is absent. Same-crate `#[path]` uses for tests or module
+organization remain allowed.
+
 ## 2. Security Boundary
 
 ```mermaid

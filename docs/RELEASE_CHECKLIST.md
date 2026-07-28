@@ -23,13 +23,13 @@ For documentation-only release readiness work, the full test suite may be deferr
 Run focused lanes when touching runtime metadata, schemas, OpenAPI, MCP, session, handoff, validation, or coding-task behavior:
 
 ```bash
-cargo test --bin webcodex metadata -- --nocapture
-cargo test --bin webcodex schema -- --nocapture
-cargo test --bin webcodex openapi -- --nocapture
-cargo test --bin webcodex mcp -- --nocapture
-cargo test --bin webcodex validation -- --nocapture
-cargo test --bin webcodex handoff -- --nocapture
-cargo test --bin webcodex coding_task -- --nocapture
+cargo test -p webcodex --bin webcodex metadata -- --nocapture
+cargo test -p webcodex --bin webcodex schema -- --nocapture
+cargo test -p webcodex --bin webcodex openapi -- --nocapture
+cargo test -p webcodex --bin webcodex mcp -- --nocapture
+cargo test -p webcodex --bin webcodex validation -- --nocapture
+cargo test -p webcodex --bin webcodex handoff -- --nocapture
+cargo test -p webcodex --bin webcodex coding_task -- --nocapture
 ```
 
 ## 3. Product Documentation Check

@@ -453,7 +453,7 @@ Exit criteria:
 
 - Matrix tests: Active vs Closed × read/write tools × unknown id.
 - No regression on `unknown_session_id` and `read_only` guards.
-- Domain tests: `cargo test --bin webcodex session` (and related) green.
+- Domain tests: `cargo test -p webcodex --bin webcodex session` (and related) green.
 
 ### Phase 3 — Archive / retention (future)
 

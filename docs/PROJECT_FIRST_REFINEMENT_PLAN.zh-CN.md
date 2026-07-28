@@ -468,6 +468,13 @@ model-facing capability，不以代码瘦身或旧版本平滑迁移为目标，
 
 ### 8.1 Iteration 8.0 真实产品路径审计
 
+> 历史快照说明：以下审计输入和删除清单记录 workspace 拆分前的 Iteration 8
+> 基线，旧路径按当时事实保留。当前 CLI 位于 `crates/webcodex-cli/src/main.rs`
+> 及 `crates/webcodex-cli/src/webcodex_cli/*`；共享 agent 配置位于
+> `crates/webcodex-agent-config/src/lib.rs`。旧 `hosted_connect` 已删除，当前
+> onboarding/连接入口由 CLI 的 setup/login/agent 子命令及现有 server/agent
+> runtime 路径承担，不存在可一一替换的同名文件。
+
 审计基于 `src/startup.rs`、`src/hosted_connect.rs`、`src/bin/webcodex-cli.rs`、
 `src/bin/webcodex_cli/{connect,doctor,doctor_support}.rs`、
 `src/bin/webcodex-agent.rs`、`src/bin/webcodex_agent/{config,projects}.rs`、
@@ -828,6 +835,12 @@ validation 工具等默认是提示；权限拒绝、冲突、命令失败、测
 fail、`read_file` 双份全文、job log 默认全量正文，以及 startup flag 组合。没有保留
 canonical schema alias 或 dual response shape。
 
+> 历史快照说明：下列路径、测试命令、测试数量和 LOC 是 Iteration 9 当时的
+> 验证记录，不改写为拆分后路径。当前等价验证命令应使用
+> `cargo test -p webcodex --bin webcodex`、
+> `cargo test -p webcodex-cli --bin webcodex-cli` 和
+> `cargo test -p webcodex-runner --bin webcodex-runner`。
+
 按本计划既有 path-based 口径记录，本阶段 production Rust 为
 `267 files / 135,436 LOC -> 267 files / 136,779 LOC`（`+1,343 LOC`），test-path
 Rust 为 `90 files / 64,811 LOC -> 90 files / 65,287 LOC`（`+476 LOC`）。本轮明确
@@ -864,8 +877,9 @@ Rust 为 `90 files / 64,811 LOC -> 90 files / 65,287 LOC`（`+476 LOC`）。本�
   （`default_dialect`/`available_dialects`/每 profile `dialect`）；
 - `start_coding_task` 旧 startup flag hard cut，`detail=minimal|standard|full`
   是唯一投影控制，未知/旧字段严格报错；
-- 新验证 lane：`cargo test --bin webcodex reconnect`、
-  `cargo test --bin webcodex trusted_smoke` 与 `scripts/e2e_reconnect_ws.sh`
+- 新验证 lane：`cargo test -p webcodex --bin webcodex reconnect`、
+  `cargo test -p webcodex --bin webcodex trusted_smoke` 与
+  `scripts/e2e_reconnect_ws.sh`
   真实进程 harness（含 runner/server 崩溃重启、durable session 续接与
   post-deploy smoke facts）。
 
