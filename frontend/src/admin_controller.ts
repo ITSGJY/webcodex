@@ -18,6 +18,7 @@ type ControllerDependencies<T> = {
   setStatus(message: string): void;
   showError(message: string): void;
   clearError(): void;
+  onUnauthorized?(): void;
   setInterval?(callback: () => void, milliseconds: number): TimerHandle;
   clearInterval?(handle: TimerHandle): void;
 };
@@ -63,6 +64,16 @@ export class AdminRefreshController<T> {
   }
 
   refresh(): Promise<void> {
+    return this.refreshInternal();
+  }
+
+  invalidateAndRefresh(): Promise<void> {
+    if (!this.token) return Promise.resolve();
+    this.invalidateRequests();
+    return this.refreshInternal();
+  }
+
+  private refreshInternal(): Promise<void> {
     if (!this.token) return Promise.resolve();
     if (
       this.active &&
@@ -88,7 +99,8 @@ export class AdminRefreshController<T> {
       .catch((error: unknown) => {
         if (!this.isCurrent(generation, token, id) || isAbortError(error)) return;
         if (error instanceof AdminHttpError && (error.status === 401 || error.status === 403)) {
-          this.lock("Administrator authentication required.");
+          if (this.dependencies.onUnauthorized) this.dependencies.onUnauthorized();
+          else this.lock("Administrator authentication required.");
           return;
         }
         this.dependencies.showError("Dashboard refresh failed");

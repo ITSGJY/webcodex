@@ -228,3 +228,32 @@ test("dispose models pagehide by aborting request and stopping timer", async () 
   assert.deepEqual(state.rendered, [{ sequence: 1 }]);
   assert.deepEqual(state.errors, []);
 });
+
+test("invalidateAndRefresh aborts old request and only renders forced result", async () => {
+  const h = harness();
+  const first = h.controller.beginSession("token");
+  assert.equal(h.requests.length, 1);
+  const forced = h.controller.invalidateAndRefresh();
+  assert.equal(h.requests.length, 2);
+  assert.equal(h.requests[0].signal.aborted, true);
+  h.requests[0].task.resolve({ value: "old" });
+  await first;
+  assert.deepEqual(h.state.rendered, []);
+  h.requests[1].task.resolve({ value: "new" });
+  await forced;
+  assert.deepEqual(h.state.rendered, [{ value: "new" }]);
+});
+
+test("current unauthorized delegates to unified lock callback", async () => {
+  let unauthorized = 0;
+  const requests = [];
+  const controller = new AdminRefreshController({
+    request(token, signal) { const task = deferred(); requests.push({ token, signal, task }); return task.promise; },
+    render() {}, showAuthenticated() {}, showLocked() {}, setStatus() {}, showError() {}, clearError() {},
+    onUnauthorized() { unauthorized += 1; },
+  });
+  const run = controller.beginSession("token");
+  requests[0].task.reject(new AdminHttpError(401, "unauthorized"));
+  await run;
+  assert.equal(unauthorized, 1);
+});

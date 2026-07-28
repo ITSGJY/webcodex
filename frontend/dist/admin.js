@@ -32,6 +32,15 @@ class AdminRefreshController {
         this.dependencies.showLocked(message);
     }
     refresh() {
+        return this.refreshInternal();
+    }
+    invalidateAndRefresh() {
+        if (!this.token)
+            return Promise.resolve();
+        this.invalidateRequests();
+        return this.refreshInternal();
+    }
+    refreshInternal() {
         if (!this.token)
             return Promise.resolve();
         if (this.active &&
@@ -57,7 +66,10 @@ class AdminRefreshController {
             if (!this.isCurrent(generation, token, id) || isAbortError(error))
                 return;
             if (error instanceof AdminHttpError && (error.status === 401 || error.status === 403)) {
-                this.lock("Administrator authentication required.");
+                if (this.dependencies.onUnauthorized)
+                    this.dependencies.onUnauthorized();
+                else
+                    this.lock("Administrator authentication required.");
                 return;
             }
             this.dependencies.showError("Dashboard refresh failed");
@@ -144,6 +156,8 @@ class AdminMutationController {
         if (!context?.pending)
             this.contexts.delete(target);
     }
+    has(target) { return this.contexts.has(target); }
+    isPending(target) { return this.contexts.get(target)?.pending === true; }
     async submit(context) {
         if (!this.current(context) || context.pending)
             return;
@@ -175,7 +189,7 @@ class AdminMutationController {
                 this.contexts.delete(context.target);
         }
         finally {
-            if (this.current(context)) {
+            if (this.generation === context.generation && this.token === context.token) {
                 context.pending = false;
                 this.deps.pending(context.target, false);
             }
@@ -189,6 +203,66 @@ class AdminMutationController {
         for (const context of this.contexts.values())
             context.controller.abort();
         this.contexts.clear();
+    }
+}
+
+class AdminMutationDialogCoordinator {
+    constructor(mutation, adapter) {
+        this.mutation = mutation;
+        this.adapter = adapter;
+        this.target = "";
+        this.context = null;
+        this.bodyFingerprint = "";
+        this.cleaning = false;
+    }
+    open(target, context = null, body) {
+        this.cleanup(false);
+        this.target = target;
+        this.context = context;
+        this.bodyFingerprint = body ? JSON.stringify(body) : "";
+    }
+    async submit(kind, body) {
+        const fingerprint = JSON.stringify(body);
+        if (this.context && fingerprint === this.bodyFingerprint && this.mutation.has(this.target)) {
+            await this.mutation.retry(this.target);
+            return;
+        }
+        if (this.context || this.mutation.has(this.target))
+            this.mutation.cancel(this.target);
+        this.context = this.mutation.start(kind, this.target, body);
+        this.bodyFingerprint = fingerprint;
+        if (this.context)
+            await this.mutation.submit(this.context);
+    }
+    setPendingContext(context, body) {
+        this.context = context;
+        this.bodyFingerprint = JSON.stringify(body);
+    }
+    cancel() { this.cleanup(true); }
+    handleCancel(event) {
+        event.preventDefault();
+        if (this.target && this.mutation.isPending(this.target))
+            return;
+        this.cleanup(true);
+    }
+    handleClose() { this.cleanup(true); }
+    closeForSessionEnd() { this.cleanup(true); }
+    currentTarget() { return this.target; }
+    cleanup(closeDialog) {
+        if (this.cleaning || (!this.target && !this.context && !this.bodyFingerprint))
+            return;
+        this.cleaning = true;
+        const target = this.target;
+        this.target = "";
+        this.context = null;
+        this.bodyFingerprint = "";
+        if (target)
+            this.mutation.cancel(target);
+        this.adapter.clearSensitive();
+        if (closeDialog && this.adapter.isOpen())
+            this.adapter.close();
+        this.adapter.restoreFocus();
+        this.cleaning = false;
     }
 }
 
@@ -300,9 +374,9 @@ const text = (id, value) => { const node = byId(id); if (node)
 const visible = (id, yes) => { const node = byId(id); if (node)
     node.hidden = !yes; };
 let adminToken = "";
-let dialogTarget = "";
-let dialogContext = null;
 let dialogTrigger = null;
+let mutation;
+let dialogFlow;
 async function parseResponse(response) { try {
     return await response.json();
 }
@@ -330,20 +404,26 @@ async function requestMutation(kind, token, body, signal) {
         throw classify(response.status, data);
     return data;
 }
+function unifiedLock(message = "Locked.") {
+    dialogFlow?.closeForSessionEnd();
+    mutation?.lock();
+    refresh.lock(message);
+    adminToken = "";
+}
 const refresh = new AdminRefreshController({
-    request: requestDashboard,
-    render: (data) => renderAdminDashboard(document, data),
+    request: requestDashboard, render: (data) => renderAdminDashboard(document, data),
     showAuthenticated: () => { visible("gate", false); visible("dashboard", true); visible("controls", true); },
     showLocked: (message) => { visible("gate", true); visible("dashboard", false); visible("controls", false); text("gate-error", message); const input = byId("token"); if (input)
         input.value = ""; },
     setStatus: (message) => text("status", message), showError: (message) => { text("error", message); visible("error", true); }, clearError: () => visible("error", false),
+    onUnauthorized: () => unifiedLock("Administrator authentication required."),
 });
 const errorMessage = {
     invalid_request: "The request is invalid. Review the fields and try again.", revision_conflict: "Project state changed. The dashboard was refreshed; confirm again using the latest revision.", active_jobs_conflict: "The project has active jobs. No jobs were stopped; refresh and retry after they finish.", idempotency_conflict: "This retry no longer matches its original operation. Start a new operation.", unsupported_runner_version: "The Agent does not support project lifecycle operations.", agent_unavailable: "The Agent is unavailable. Current dashboard data is preserved; retry this same operation later.", operation_indeterminate: "The Agent may have completed the operation. Refresh state first, then retry this same operation context rather than creating a new mutation.", operation_failed: "The operation failed safely. Internal details were not displayed.", network_error: "Network failure. Current data is preserved; retry this same operation.", unauthorized: "Administrator authentication required."
 };
-const mutation = new AdminMutationController({
-    request: requestMutation, keyFactory: () => crypto.randomUUID(), refresh: () => refresh.refresh(),
-    outcome: (message) => { text("status", message); closeDialog(true); },
+mutation = new AdminMutationController({
+    request: requestMutation, keyFactory: () => crypto.randomUUID(), refresh: () => refresh.invalidateAndRefresh(),
+    outcome: (message) => { text("status", message); dialogFlow.cancel(); },
     error: (code) => { text("dialog-error", errorMessage[code]); visible("dialog-error", true); },
     pending: (_target, value) => { const submit = byId("dialog-submit"); const cancel = byId("dialog-cancel"); if (submit) {
         submit.disabled = value;
@@ -351,9 +431,15 @@ const mutation = new AdminMutationController({
         submit.textContent = value ? "Working…" : "Continue";
     } if (cancel)
         cancel.disabled = value; },
-    lock: (message) => lock(message),
+    lock: (message) => unifiedLock(message),
 });
-function lock(message = "Locked.") { mutation.lock(); refresh.lock(message); adminToken = ""; closeDialog(false); }
+dialogFlow = new AdminMutationDialogCoordinator(mutation, {
+    close: () => byId("project-dialog")?.close(),
+    isOpen: () => byId("project-dialog")?.open === true,
+    clearSensitive: () => { const path = document.querySelector('input[name="path"]'); if (path)
+        path.value = ""; },
+    restoreFocus: () => { const trigger = dialogTrigger; dialogTrigger = null; trigger?.focus(); },
+});
 function configureAutoRefresh() { const auto = byId("auto"); if (auto?.checked)
     refresh.startAutoRefresh(REFRESH_MS);
 else
@@ -362,28 +448,29 @@ function field(name, label, type = "text", checked = false) { const wrap = docum
     input.checked = checked; input.required = !["description", "template"].includes(name) && type !== "checkbox"; wrap.appendChild(input); return wrap; }
 function paragraph(value) { const p = document.createElement("p"); p.textContent = value; return p; }
 function openCreate(kind, trigger) {
+    const target = `${kind}:${crypto.randomUUID()}`;
+    dialogFlow.open(target);
     dialogTrigger = trigger;
-    dialogTarget = `${kind}:${Date.now()}`;
-    const title = kind === "register" ? "Register existing project" : "Create project";
-    text("dialog-title", title);
+    text("dialog-title", kind === "register" ? "Register existing project" : "Create project");
     text("dialog-description", kind === "create" ? "Create may create a directory and Git repository. Existing non-empty directories are never overwritten, and no directory deletion is offered." : "Register an existing directory. The path remains only in this form and page memory.");
     const fields = byId("dialog-fields");
     fields.replaceChildren(field("client_id", "Client ID"), field("project_id", "Project ID"), field("name", "Name"), field("description", "Description"), field("path", "Path"), field("allow_patch", "Allow patch", "checkbox", true));
     if (kind === "create")
         fields.append(field("git_init", "Initialize Git repository", "checkbox"), field("template", "Template"), field("allow_existing_empty", "Allow existing empty directory", "checkbox"));
-    dialogContext = null;
     visible("dialog-error", false);
+    byId("project-form").dataset.kind = kind;
     byId("project-dialog").showModal();
     fields.querySelector("input")?.focus();
-    byId("project-form").dataset.kind = kind;
 }
 function openAction(kind, project, trigger) {
+    const target = String(project.id || "");
+    const body = { project: target, expected_revision: String(project.revision || ""), confirm: true };
+    const context = mutation.start(kind, target, body);
+    dialogFlow.open(target, context, body);
     dialogTrigger = trigger;
-    dialogTarget = String(project.id || "");
     text("dialog-title", `${kind[0].toUpperCase()}${kind.slice(1)} project`);
     const fields = byId("dialog-fields");
-    fields.replaceChildren();
-    fields.append(paragraph(`Project: ${dialogTarget}`), paragraph(`Revision: ${String(project.revision || "")}`), paragraph(`Active jobs: ${String(project.active_jobs ?? 0)}`));
+    fields.replaceChildren(paragraph(`Project: ${target}`), paragraph(`Revision: ${String(project.revision || "")}`), paragraph(`Active jobs: ${String(project.active_jobs ?? 0)}`));
     if (kind === "disable")
         fields.append(paragraph("Already-started jobs will not be stopped. Project configuration and source directory are retained."));
     if (kind === "enable")
@@ -392,45 +479,45 @@ function openAction(kind, project, trigger) {
         fields.append(paragraph("Only the Agent registry record is removed. The source directory and .git are not deleted. Active jobs cause rejection."));
         fields.append(field("confirm_project", "Type the full runtime project ID to confirm"));
     }
-    dialogContext = mutation.start(kind, dialogTarget, { project: dialogTarget, expected_revision: String(project.revision || ""), confirm: true });
     byId("project-form").dataset.kind = kind;
     visible("dialog-error", false);
     byId("project-dialog").showModal();
     fields.querySelector("input")?.focus();
 }
-function closeDialog(reset) { const dialog = byId("project-dialog"); if (dialog?.open)
-    dialog.close(); if (reset && dialogTarget)
-    mutation.cancel(dialogTarget); const path = document.querySelector('input[name="path"]'); if (path)
-    path.value = ""; dialogContext = null; dialogTarget = ""; dialogTrigger?.focus(); dialogTrigger = null; }
 byId("token-form")?.addEventListener("submit", async (event) => { event.preventDefault(); const input = byId("token"); const token = input?.value.trim() || ""; if (input)
     input.value = ""; if (!token)
-    return; adminToken = token; mutation.beginSession(token); await refresh.beginSession(token); configureAutoRefresh(); });
+    return; dialogFlow.closeForSessionEnd(); adminToken = token; mutation.beginSession(token); await refresh.beginSession(token); configureAutoRefresh(); });
 byId("refresh")?.addEventListener("click", () => void refresh.refresh());
-byId("lock")?.addEventListener("click", () => lock());
+byId("lock")?.addEventListener("click", () => unifiedLock());
 byId("auto")?.addEventListener("change", configureAutoRefresh);
 byId("register-project")?.addEventListener("click", (e) => openCreate("register", e.currentTarget));
 byId("create-project")?.addEventListener("click", (e) => openCreate("create", e.currentTarget));
 document.addEventListener("admin-project-action", (event) => { const detail = event.detail; openAction(detail.kind, detail.project, document.querySelector(`[data-project-action="${detail.kind}"][data-project-id="${CSS.escape(String(detail.project.id))}"]`)); });
-byId("dialog-cancel")?.addEventListener("click", () => { if (dialogTarget)
-    mutation.cancel(dialogTarget); closeDialog(true); });
+byId("dialog-cancel")?.addEventListener("click", () => dialogFlow.cancel());
+byId("project-dialog")?.addEventListener("cancel", (event) => dialogFlow.handleCancel(event));
+byId("project-dialog")?.addEventListener("close", () => dialogFlow.handleClose());
 byId("project-form")?.addEventListener("submit", (event) => {
     event.preventDefault();
     const form = event.currentTarget;
     const kind = form.dataset.kind;
     const data = new FormData(form);
+    const target = dialogFlow.currentTarget();
+    let body = { project: target, expected_revision: "", confirm: true };
     if (kind === "register" || kind === "create") {
-        const body = { client_id: String(data.get("client_id") || "").trim(), project_id: String(data.get("project_id") || "").trim(), name: String(data.get("name") || "").trim(), description: String(data.get("description") || "").trim() || null, path: String(data.get("path") || "").trim(), allow_patch: data.get("allow_patch") === "on" };
+        body = { client_id: String(data.get("client_id") || "").trim(), project_id: String(data.get("project_id") || "").trim(), name: String(data.get("name") || "").trim(), description: String(data.get("description") || "").trim() || null, path: String(data.get("path") || "").trim(), allow_patch: data.get("allow_patch") === "on" };
         if (kind === "create")
             Object.assign(body, { git_init: data.get("git_init") === "on", template: String(data.get("template") || "").trim() || null, allow_existing_empty: data.get("allow_existing_empty") === "on" });
-        dialogContext = mutation.start(kind, dialogTarget, body);
     }
-    if (kind === "unregister" && String(data.get("confirm_project") || "") !== dialogTarget) {
+    else {
+        const revisionText = byId("dialog-fields")?.children[1]?.textContent || "";
+        body = { project: target, expected_revision: revisionText.replace(/^Revision:\s*/, ""), confirm: true };
+    }
+    if (kind === "unregister" && String(data.get("confirm_project") || "") !== target) {
         text("dialog-error", "Type the full runtime project ID to confirm.");
         visible("dialog-error", true);
         return;
     }
-    if (dialogContext)
-        void mutation.submit(dialogContext);
+    void dialogFlow.submit(kind, body);
 });
-window.addEventListener("pagehide", () => { mutation.dispose(); refresh.dispose(); adminToken = ""; });
+window.addEventListener("pagehide", () => { dialogFlow.closeForSessionEnd(); mutation.dispose(); refresh.dispose(); adminToken = ""; });
 refresh.lock();

@@ -22,6 +22,7 @@ const watchedSources = new Set([
   "admin.ts",
   "admin_controller.ts",
   "admin_mutation_controller.ts",
+  "admin_mutation_view.ts",
   "admin_view.ts",
   "admin.css",
   "admin.html",
@@ -124,6 +125,10 @@ export function createOutputs(
     transpileTypeScript(sourceDirectory, "admin_mutation_controller.ts")
   );
   const adminMutationControllerClassic = stripModuleExports(adminMutationControllerModule);
+  const adminMutationViewModule = buildJs(
+    transpileTypeScript(sourceDirectory, "admin_mutation_view.ts")
+  );
+  const adminMutationViewClassic = stripModuleExports(adminMutationViewModule);
   const adminViewModule = buildJs(
     transpileTypeScript(sourceDirectory, "admin_view.ts")
   );
@@ -133,6 +138,8 @@ export function createOutputs(
     adminControllerClassic +
       "\n" +
       adminMutationControllerClassic +
+      "\n" +
+      adminMutationViewClassic +
       "\n" +
       adminViewClassic +
       "\n" +
@@ -147,6 +154,10 @@ export function createOutputs(
             ""
           )
           .replace(
+            /^import\s*\{[\s\S]*?\}\s*from\s*["']\.\/admin_mutation_view(?:\.js)?["'];?\s*\n/m,
+            ""
+          )
+          .replace(
             /^import\s*\{[\s\S]*?\}\s*from\s*["']\.\/admin_view(?:\.js)?["'];?\s*\n/m,
             ""
           )
@@ -158,6 +169,7 @@ export function createOutputs(
     ["review_state.js", reviewStateModule],
     ["admin_controller.js", adminControllerModule],
     ["admin_mutation_controller.js", adminMutationControllerModule],
+    ["admin_mutation_view.js", adminMutationViewModule],
     ["admin_view.js", adminViewModule],
     ["app.js", appInlined],
     ["styles.css", minifyCss(readSource(sourceDirectory, "styles.css"))],

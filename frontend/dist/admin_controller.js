@@ -32,6 +32,15 @@ export class AdminRefreshController {
         this.dependencies.showLocked(message);
     }
     refresh() {
+        return this.refreshInternal();
+    }
+    invalidateAndRefresh() {
+        if (!this.token)
+            return Promise.resolve();
+        this.invalidateRequests();
+        return this.refreshInternal();
+    }
+    refreshInternal() {
         if (!this.token)
             return Promise.resolve();
         if (this.active &&
@@ -57,7 +66,10 @@ export class AdminRefreshController {
             if (!this.isCurrent(generation, token, id) || isAbortError(error))
                 return;
             if (error instanceof AdminHttpError && (error.status === 401 || error.status === 403)) {
-                this.lock("Administrator authentication required.");
+                if (this.dependencies.onUnauthorized)
+                    this.dependencies.onUnauthorized();
+                else
+                    this.lock("Administrator authentication required.");
                 return;
             }
             this.dependencies.showError("Dashboard refresh failed");

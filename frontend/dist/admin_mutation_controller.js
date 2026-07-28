@@ -40,6 +40,8 @@ export class AdminMutationController {
         if (!context?.pending)
             this.contexts.delete(target);
     }
+    has(target) { return this.contexts.has(target); }
+    isPending(target) { return this.contexts.get(target)?.pending === true; }
     async submit(context) {
         if (!this.current(context) || context.pending)
             return;
@@ -71,7 +73,7 @@ export class AdminMutationController {
                 this.contexts.delete(context.target);
         }
         finally {
-            if (this.current(context)) {
+            if (this.generation === context.generation && this.token === context.token) {
                 context.pending = false;
                 this.deps.pending(context.target, false);
             }
