@@ -149,16 +149,24 @@ interpretation.
 Typical Rust baseline, adjusted to the touched domain:
 
 ```text
-cargo fmt --check
-cargo check --all-targets
+cargo fmt --all -- --check
+cargo check --workspace --all-targets
 focused cargo test lanes
 git diff --check
 git status --short
 ```
 
-Run `cargo test --bin webcodex` for broad core changes, release/merge readiness,
-or when the Agent judges focused lanes insufficient. Do not run it mechanically
-for pure documentation changes.
+Use an explicit package for binary-focused tests:
+
+```text
+cargo test -p webcodex --bin webcodex
+cargo test -p webcodex-cli --bin webcodex-cli
+cargo test -p webcodex-runner --bin webcodex-runner
+```
+
+Run `cargo test -p webcodex --bin webcodex` for broad server changes,
+release/merge readiness, or when the Agent judges focused lanes insufficient.
+Do not run it mechanically for pure documentation changes.
 
 Broader lanes: [`docs/TESTING.md`](docs/TESTING.md).
 

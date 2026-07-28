@@ -9,6 +9,24 @@ use crate::shell_protocol::{
     SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS, SHELL_CLIENT_CAPABILITY_SHELL,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV,
 };
+use std::fmt;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ShellClientLookupError {
+    UnknownClient { client_id: String },
+}
+
+impl fmt::Display for ShellClientLookupError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownClient { client_id } => {
+                write!(formatter, "unknown shell client: {client_id}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ShellClientLookupError {}
 
 fn capability_enabled(caps: &ShellClientCapabilities, capability: &str) -> bool {
     match capability {
@@ -41,27 +59,32 @@ fn upsert_project_summary(
 
 impl ShellClientRegistry {
     /// Return the capabilities advertised by a registered agent client.
-    /// Errors with a structured `unknown shell client` message when the
-    /// client is not registered.
-    pub async fn get_client_capabilities(
+    /// Returns a typed lookup error when the client is not registered.
+    pub(crate) async fn get_client_capabilities(
         &self,
         client_id: &str,
-    ) -> Result<ShellClientCapabilities, String> {
+    ) -> Result<ShellClientCapabilities, ShellClientLookupError> {
         let inner = self.inner.lock().await;
-        let client = inner
-            .clients
-            .get(client_id)
-            .ok_or_else(|| format!("unknown shell client: {}", client_id))?;
+        let client =
+            inner
+                .clients
+                .get(client_id)
+                .ok_or_else(|| ShellClientLookupError::UnknownClient {
+                    client_id: client_id.to_string(),
+                })?;
         Ok(client.capabilities.clone())
     }
 
     /// Check whether a registered agent client supports a named capability.
     /// Recognized capability names: `shell`, `file_read`, `file_write`,
     /// `git`, `jobs`, `async_jobs`, `async_shell_jobs`,
-    /// `structured_validation_argv`,
-    /// `lsp_read_only_navigation`, `sandbox_inspect_commands`. Unknown
-    /// capability names return `false`.
-    pub async fn client_supports(&self, client_id: &str, capability: &str) -> Result<bool, String> {
+    /// `structured_validation_argv`, `lsp_read_only_navigation`,
+    /// `sandbox_inspect_commands`. Unknown capability names return `false`.
+    pub(crate) async fn client_supports(
+        &self,
+        client_id: &str,
+        capability: &str,
+    ) -> Result<bool, ShellClientLookupError> {
         let caps = self.get_client_capabilities(client_id).await?;
         Ok(capability_enabled(&caps, capability))
     }

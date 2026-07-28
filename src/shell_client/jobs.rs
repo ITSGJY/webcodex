@@ -2,8 +2,41 @@ use super::state::{ShellClientRegistryInner, ShellJobRecord};
 use super::{now_ts, CLIENT_ONLINE_WINDOW_SECS, MAX_OUTPUT_BYTES, MAX_QUEUED_REQUESTS_PER_CLIENT};
 use crate::shell_protocol::{ShellAgentJobResult, ShellAgentShellJobResult, ShellJobInfo};
 use std::collections::VecDeque;
+use std::fmt;
 
 pub(crate) const COMMAND_PREVIEW_MAX_CHARS: usize = 120;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PendingRequestEnqueueError {
+    UnknownClient { client_id: String },
+    ClientOffline { client_id: String },
+    QueueFull { client_id: String, limit: usize },
+}
+
+impl fmt::Display for PendingRequestEnqueueError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownClient { client_id } => {
+                write!(formatter, "unknown shell client: {client_id}")
+            }
+            Self::ClientOffline { client_id } => write!(
+                formatter,
+                "shell client {client_id} is offline (no keepalive within \
+                 {CLIENT_ONLINE_WINDOW_SECS}s); reconnect the agent before retrying"
+            ),
+            Self::QueueFull { client_id, limit } => write!(
+                formatter,
+                "too many pending requests for shell client {client_id} (limit {limit})"
+            ),
+        }
+    }
+}
+
+impl From<PendingRequestEnqueueError> for String {
+    fn from(error: PendingRequestEnqueueError) -> Self {
+        error.to_string()
+    }
+}
 
 pub(crate) fn command_preview(command: &str) -> String {
     let first_line = command.lines().next().unwrap_or_default().trim();
@@ -279,17 +312,17 @@ pub(super) fn assert_active_instance_locked(
 pub(super) fn ensure_queue_capacity_locked(
     inner: &ShellClientRegistryInner,
     client_id: &str,
-) -> Result<(), String> {
+) -> Result<(), PendingRequestEnqueueError> {
     let len = inner
         .queues_by_client
         .get(client_id)
         .map(VecDeque::len)
         .unwrap_or(0);
     if len >= MAX_QUEUED_REQUESTS_PER_CLIENT {
-        return Err(format!(
-            "too many pending requests for shell client {} (limit {})",
-            client_id, MAX_QUEUED_REQUESTS_PER_CLIENT
-        ));
+        return Err(PendingRequestEnqueueError::QueueFull {
+            client_id: client_id.to_string(),
+            limit: MAX_QUEUED_REQUESTS_PER_CLIENT,
+        });
     }
     Ok(())
 }
@@ -305,15 +338,16 @@ pub(super) fn ensure_queue_capacity_locked(
 pub(super) fn ensure_dispatch_supported_locked(
     inner: &ShellClientRegistryInner,
     client_id: &str,
-) -> Result<(), String> {
+) -> Result<(), PendingRequestEnqueueError> {
     if !inner.clients.contains_key(client_id) {
-        return Err(format!("unknown shell client: {}", client_id));
+        return Err(PendingRequestEnqueueError::UnknownClient {
+            client_id: client_id.to_string(),
+        });
     }
     if !client_is_connected_locked(inner, client_id) {
-        return Err(format!(
-            "shell client {} is offline (no keepalive within {}s); reconnect the agent before retrying",
-            client_id, CLIENT_ONLINE_WINDOW_SECS
-        ));
+        return Err(PendingRequestEnqueueError::ClientOffline {
+            client_id: client_id.to_string(),
+        });
     }
     Ok(())
 }

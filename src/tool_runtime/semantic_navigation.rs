@@ -11,6 +11,7 @@ use crate::lsp_bridge::{
     parse_agent_lsp_result_envelope, AgentLspPayload, AgentLspRequest, LspAvailabilityStatus,
     LspStatusResult,
 };
+use crate::shell_client::EnqueueLspError;
 use serde::Serialize;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -140,6 +141,27 @@ impl SemanticNavigationStartupSummary {
             preferred_flow: Vec::new(),
             limitations: SEMANTIC_NAVIGATION_LIMITATIONS.to_vec(),
             reason_code: Some(SemanticNavigationReasonCode::RustNotDetected),
+        }
+    }
+
+    fn from_enqueue_error(error: &EnqueueLspError) -> Self {
+        match error {
+            EnqueueLspError::UnknownClient { .. } | EnqueueLspError::ClientOffline { .. } => {
+                Self::unsupported(
+                    SemanticNavigationStartupStatus::AgentUnavailable,
+                    SemanticNavigationReasonCode::AgentNotConnected,
+                )
+            }
+            EnqueueLspError::UnsupportedCapability { .. } => Self::unsupported(
+                SemanticNavigationStartupStatus::AgentCapabilityUnavailable,
+                SemanticNavigationReasonCode::LspCapabilityNotAdvertised,
+            ),
+            EnqueueLspError::InvalidRequest { .. } | EnqueueLspError::QueueFull { .. } => {
+                Self::supported_failure(
+                    SemanticNavigationStartupStatus::ProbeFailed,
+                    SemanticNavigationReasonCode::StatusProbeFailed,
+                )
+            }
         }
     }
 
@@ -302,25 +324,7 @@ impl ToolRuntime {
                     SemanticNavigationReasonCode::StatusProbeTimedOut,
                 )
             }
-            Ok(Err(error)) => {
-                let lower = error.to_ascii_lowercase();
-                if lower.contains("unknown shell client") || lower.contains("not connected") {
-                    return SemanticNavigationStartupSummary::unsupported(
-                        SemanticNavigationStartupStatus::AgentUnavailable,
-                        SemanticNavigationReasonCode::AgentNotConnected,
-                    );
-                }
-                if lower.contains("does not support") {
-                    return SemanticNavigationStartupSummary::unsupported(
-                        SemanticNavigationStartupStatus::AgentCapabilityUnavailable,
-                        SemanticNavigationReasonCode::LspCapabilityNotAdvertised,
-                    );
-                }
-                return SemanticNavigationStartupSummary::supported_failure(
-                    SemanticNavigationStartupStatus::ProbeFailed,
-                    SemanticNavigationReasonCode::StatusProbeFailed,
-                );
-            }
+            Ok(Err(error)) => return SemanticNavigationStartupSummary::from_enqueue_error(&error),
             Ok(Ok(request)) => request,
         };
 
@@ -449,5 +453,40 @@ mod tests {
         assert_eq!(value["tools"], serde_json::json!([]));
         assert_eq!(value["preferred_flow"], serde_json::json!([]));
         assert_eq!(value["limitations"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn enqueue_error_classification_uses_variants_not_display_text() {
+        let cases = [
+            (
+                EnqueueLspError::UnknownClient {
+                    client_id: "agent does not support navigation".to_string(),
+                },
+                SemanticNavigationStartupStatus::AgentUnavailable,
+                SemanticNavigationReasonCode::AgentNotConnected,
+            ),
+            (
+                EnqueueLspError::UnsupportedCapability {
+                    client_id: "unknown shell client wording".to_string(),
+                },
+                SemanticNavigationStartupStatus::AgentCapabilityUnavailable,
+                SemanticNavigationReasonCode::LspCapabilityNotAdvertised,
+            ),
+            (
+                EnqueueLspError::QueueFull {
+                    client_id: "does not support".to_string(),
+                    limit: 256,
+                },
+                SemanticNavigationStartupStatus::ProbeFailed,
+                SemanticNavigationReasonCode::StatusProbeFailed,
+            ),
+        ];
+
+        for (error, expected_status, expected_reason) in cases {
+            let displayed = error.to_string();
+            let summary = SemanticNavigationStartupSummary::from_enqueue_error(&error);
+            assert_eq!(summary.status, expected_status, "{displayed}");
+            assert_eq!(summary.reason_code, Some(expected_reason), "{displayed}");
+        }
     }
 }
