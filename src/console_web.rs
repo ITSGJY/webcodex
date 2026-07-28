@@ -189,9 +189,10 @@ impl ConsoleAssetSource {
         };
         let candidate = directory.canonical_root.join(asset.file_name());
 
-        // Files are fixed by the server, never by URL input. Rejecting file
-        // symlinks both at startup and per request prevents a later replacement
-        // from turning this into an escape from the canonical directory.
+        // Files are fixed by the server, never by URL input. Re-checking the
+        // symlink and canonical-path constraints rejects persistent path
+        // substitution. A process with concurrent write access to this directory
+        // is already trusted to control the development bundle itself.
         let link_metadata = fs::symlink_metadata(&candidate).map_err(|_| {
             ConsoleAssetConfigError::new(format!(
                 "console development asset {} is unavailable",

@@ -1,7 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import {
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,6 +44,30 @@ async function assertRequiredAssets(outputDirectory) {
   await exec(process.execPath, ["--check", resolve(outputDirectory, "app.js")]);
 }
 
+async function copySources(sourceDirectory) {
+  await mkdir(sourceDirectory, { recursive: true });
+  for (const source of [
+    "app.ts",
+    "review_state.ts",
+    "styles.css",
+    "console.html",
+  ]) {
+    await copyFile(
+      resolve(frontendRoot, "src", source),
+      resolve(sourceDirectory, source)
+    );
+  }
+}
+
+async function waitFor(predicate, diagnostic, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+  }
+  throw new Error(diagnostic());
+}
+
 test("custom development build creates parseable fixed console assets", async () => {
   const outputDirectory = await mkdtemp(resolve(tmpdir(), "webcodex-assets-"));
   try {
@@ -52,13 +84,23 @@ test("custom development build creates parseable fixed console assets", async ()
 });
 
 test(
-  "watch mode performs its initial development build",
-  { timeout: 15_000 },
+  "watch mode rebuilds changed sources and preserves the last good bundle",
+  { timeout: 20_000 },
   async () => {
-    const outputDirectory = await mkdtemp(resolve(tmpdir(), "webcodex-watch-"));
+    const workspace = await mkdtemp(resolve(tmpdir(), "webcodex-watch-"));
+    const sourceDirectory = resolve(workspace, "src");
+    const outputDirectory = resolve(workspace, "out");
+    await copySources(sourceDirectory);
     const child = spawn(
       process.execPath,
-      [buildScript, "--out-dir", outputDirectory, "--watch"],
+      [
+        buildScript,
+        "--source-dir",
+        sourceDirectory,
+        "--out-dir",
+        outputDirectory,
+        "--watch",
+      ],
       { stdio: ["ignore", "pipe", "pipe"] }
     );
     let stdout = "";
@@ -72,30 +114,37 @@ test(
       stderr += chunk;
     });
     try {
-      await new Promise((resolvePromise, reject) => {
-        const deadline = setTimeout(
-          () => reject(new Error(`watcher did not start: ${stdout}\n${stderr}`)),
-          10_000
-        );
-        const inspect = () => {
-          if (stdout.includes("[console] watching")) {
-            clearTimeout(deadline);
-            resolvePromise();
-          }
-        };
-        child.stdout.on("data", inspect);
-        child.once("exit", (code) => {
-          clearTimeout(deadline);
-          reject(new Error(`watcher exited early (${code}): ${stderr}`));
-        });
-        inspect();
-      });
-      assert.match(stdout, /\[console\] built/);
+      await waitFor(
+        () => stdout.includes("[console] watching"),
+        () => `watcher did not start: ${stdout}\n${stderr}`
+      );
       await assertRequiredAssets(outputDirectory);
+
+      const changedCss = "body { color: rgb(1, 2, 3); }\n";
+      await writeFile(resolve(sourceDirectory, "styles.css"), changedCss);
+      await waitFor(
+        async () =>
+          (await readFile(resolve(outputDirectory, "styles.css"), "utf8")).includes(
+            "rgb(1,2,3)"
+          ),
+        () => `watcher did not rebuild CSS: ${stdout}\n${stderr}`
+      );
+
+      const lastGoodApp = await readFile(resolve(outputDirectory, "app.js"), "utf8");
+      await writeFile(resolve(sourceDirectory, "app.ts"), "const broken: = 1;\n");
+      await waitFor(
+        () => stderr.includes("[console] build failed:"),
+        () => `watcher did not report the failed build: ${stdout}\n${stderr}`
+      );
+      assert.equal(
+        await readFile(resolve(outputDirectory, "app.js"), "utf8"),
+        lastGoodApp
+      );
+      await exec(process.execPath, ["--check", resolve(outputDirectory, "app.js")]);
     } finally {
       child.kill("SIGTERM");
       await new Promise((resolvePromise) => child.once("exit", resolvePromise));
-      await rm(outputDirectory, { recursive: true, force: true });
+      await rm(workspace, { recursive: true, force: true });
     }
   }
 );

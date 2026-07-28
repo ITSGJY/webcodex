@@ -21,8 +21,8 @@ const watchedSources = new Set([
   "console.html",
 ]);
 
-function read(relPath) {
-  return readFileSync(resolve(root, relPath), "utf8");
+function readSource(sourceDirectory, fileName) {
+  return readFileSync(resolve(sourceDirectory, fileName), "utf8");
 }
 
 function normalizeNewline(content) {
@@ -35,8 +35,9 @@ const diagnosticHost = {
   getNewLine: () => "\n",
 };
 
-function transpileTypeScript(relPath) {
-  const result = ts.transpileModule(read(relPath), {
+function transpileTypeScript(sourceDirectory, fileName) {
+  const sourcePath = resolve(sourceDirectory, fileName);
+  const result = ts.transpileModule(readSource(sourceDirectory, fileName), {
     compilerOptions: {
       target: ts.ScriptTarget.ES2020,
       module: ts.ModuleKind.ES2020,
@@ -45,7 +46,7 @@ function transpileTypeScript(relPath) {
       sourceMap: false,
       inlineSourceMap: false,
     },
-    fileName: relPath,
+    fileName: sourcePath,
     reportDiagnostics: true,
   });
   const errors = (result.diagnostics || []).filter(
@@ -92,10 +93,15 @@ function stripModuleExports(js) {
     .replace(/^export\s+(function|const|let|class)\b/gm, "$1");
 }
 
-export function createOutputs(outputDirectory) {
-  const reviewStateModule = buildJs(transpileTypeScript("src/review_state.ts"));
+export function createOutputs(
+  outputDirectory,
+  sourceDirectory = resolve(root, "src")
+) {
+  const reviewStateModule = buildJs(
+    transpileTypeScript(sourceDirectory, "review_state.ts")
+  );
   const reviewStateClassic = stripModuleExports(reviewStateModule);
-  const appModule = transpileTypeScript("src/app.ts");
+  const appModule = transpileTypeScript(sourceDirectory, "app.ts");
   const appScript = stripModuleExports(
     appModule.replace(
       /^import\s*\{[\s\S]*?\}\s*from\s*["']\.\/review_state(?:\.js)?["'];?\s*\n/m,
@@ -108,8 +114,11 @@ export function createOutputs(outputDirectory) {
   return new Map([
     ["review_state.js", reviewStateModule],
     ["app.js", appInlined],
-    ["styles.css", minifyCss(read("src/styles.css"))],
-    ["console.html", normalizeNewline(read("src/console.html"))],
+    ["styles.css", minifyCss(readSource(sourceDirectory, "styles.css"))],
+    [
+      "console.html",
+      normalizeNewline(readSource(sourceDirectory, "console.html")),
+    ],
   ]);
 }
 
@@ -153,11 +162,15 @@ function checkOutputs(outputDirectory, outputs) {
   }
 }
 
-export function runBuild({ outputDirectory, checkOnly = false }) {
+export function runBuild({
+  outputDirectory,
+  sourceDirectory = resolve(root, "src"),
+  checkOnly = false,
+}) {
   const startedAt = Date.now();
   // Generate and validate every output before touching any final file. A
   // TypeScript or JS parse failure therefore preserves the previous build.
-  const outputs = createOutputs(outputDirectory);
+  const outputs = createOutputs(outputDirectory, sourceDirectory);
   if (checkOnly) {
     checkOutputs(outputDirectory, outputs);
   } else {
@@ -174,6 +187,7 @@ export function runBuild({ outputDirectory, checkOnly = false }) {
 
 function parseArguments(argv) {
   let outputDirectory = resolve(root, "dist");
+  let sourceDirectory = resolve(root, "src");
   let checkOnly = false;
   let watchMode = false;
   for (let index = 0; index < argv.length; index += 1) {
@@ -193,6 +207,15 @@ function parseArguments(argv) {
         index += 1;
         break;
       }
+      case "--source-dir": {
+        const value = argv[index + 1];
+        if (!value || value.startsWith("--")) {
+          throw new Error("--source-dir requires a path");
+        }
+        sourceDirectory = resolve(root, value);
+        index += 1;
+        break;
+      }
       default:
         throw new Error(`unknown option: ${argv[index]}`);
     }
@@ -200,17 +223,17 @@ function parseArguments(argv) {
   if (checkOnly && watchMode) {
     throw new Error("--check and --watch cannot be used together");
   }
-  return { outputDirectory, checkOnly, watchMode };
+  return { outputDirectory, sourceDirectory, checkOnly, watchMode };
 }
 
-function startWatcher(outputDirectory) {
+function startWatcher(outputDirectory, sourceDirectory) {
   let debounceTimer;
   let closed = false;
 
   const rebuild = () => {
     debounceTimer = undefined;
     try {
-      runBuild({ outputDirectory });
+      runBuild({ outputDirectory, sourceDirectory });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.error(`[console] build failed: ${message}`);
@@ -221,13 +244,15 @@ function startWatcher(outputDirectory) {
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(rebuild, 100);
   };
-  const sourceWatcher = watch(resolve(root, "src"), (_event, fileName) => {
+  const sourceWatcher = watch(sourceDirectory, (_event, fileName) => {
     const name = fileName === null ? null : fileName.toString();
     if (name === null || watchedSources.has(name)) schedule();
   });
+  const displaySourceDirectory =
+    relative(root, sourceDirectory) || basename(sourceDirectory);
   const watched = [...watchedSources]
     .sort()
-    .map((name) => `src/${name}`)
+    .map((name) => `${displaySourceDirectory}/${name}`)
     .join(", ");
   console.log(`[console] watching ${watched}`);
 
@@ -250,7 +275,9 @@ function main() {
     if (!options.watchMode) throw error;
     console.error(`[console] initial build failed: ${message}`);
   }
-  if (options.watchMode) startWatcher(options.outputDirectory);
+  if (options.watchMode) {
+    startWatcher(options.outputDirectory, options.sourceDirectory);
+  }
 }
 
 const invokedPath = process.argv[1] ? resolve(process.argv[1]) : "";
