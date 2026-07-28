@@ -70,11 +70,9 @@ impl LocalJobRecord {
                 .map(|log| log.read_lines(offset, tail_lines))
                 .unwrap_or_else(|| (String::new(), 1, 0, false));
         }
-        super::helpers::read_lines_from_text(
-            &std::fs::read_to_string(self.dir.join(name)).unwrap_or_default(),
-            offset,
-            tail_lines,
-        )
+        read_bounded_log(&self.dir.join(name), offset)
+            .map(|log| log.read_lines(offset, tail_lines))
+            .unwrap_or_else(|_| (String::new(), 1, 0, false))
     }
 
     pub(crate) fn read_json(&self, name: &str) -> Value {
@@ -169,7 +167,7 @@ pub(crate) fn retain_inspect_job_until_terminal(
             .map(|name| {
                 (
                     name.to_string(),
-                    read_bounded_log(&dir.join(name)).unwrap_or_default(),
+                    read_bounded_log(&dir.join(name), None).unwrap_or_default(),
                 )
             })
             .collect();
@@ -182,12 +180,20 @@ fn read_file(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-fn read_bounded_log(path: &Path) -> std::io::Result<LocalJobLogSnapshot> {
-    let mut file = File::open(path)?;
+fn read_bounded_log(path: &Path, offset: Option<usize>) -> std::io::Result<LocalJobLogSnapshot> {
+    let file = File::open(path)?;
+    // Freeze this call at the length observed immediately after opening. A job
+    // may continue appending, but this reader must not chase a growing file.
+    let snapshot_len = file.metadata()?.len();
+    let mut file = file.take(snapshot_len);
     let mut retained = VecDeque::with_capacity(MAX_LOCAL_LOG_BYTES_PER_STREAM);
     let mut buffer = [0_u8; LOCAL_LOG_READ_CHUNK_BYTES];
     let mut total_newlines = 0_usize;
     let mut last_byte = None;
+    let requested_line = offset.map(|line| line.max(1));
+    let mut current_line = 1_usize;
+    let mut retained_complete_lines = 0_usize;
+    let mut first_retained_line = requested_line.unwrap_or(1);
     let mut truncated = false;
 
     loop {
@@ -198,23 +204,42 @@ fn read_bounded_log(path: &Path) -> std::io::Result<LocalJobLogSnapshot> {
         for &byte in &buffer[..read] {
             total_newlines = total_newlines.saturating_add(usize::from(byte == b'\n'));
             last_byte = Some(byte);
-            if retained.len() == MAX_LOCAL_LOG_BYTES_PER_STREAM {
-                retained.pop_front();
-                truncated = true;
+
+            let retain_byte = match requested_line {
+                Some(requested) => {
+                    current_line >= requested && retained_complete_lines < MAX_LOCAL_LOG_LINES
+                }
+                None => true,
+            };
+            if retain_byte {
+                if retained.len() == MAX_LOCAL_LOG_BYTES_PER_STREAM {
+                    if retained.pop_front() == Some(b'\n') {
+                        first_retained_line = first_retained_line.saturating_add(1);
+                    }
+                    truncated = true;
+                }
+                retained.push_back(byte);
+                if byte == b'\n' {
+                    retained_complete_lines = retained_complete_lines.saturating_add(1);
+                }
             }
-            retained.push_back(byte);
+            if byte == b'\n' {
+                current_line = current_line.saturating_add(1);
+            }
         }
     }
 
     let total_lines =
         total_newlines.saturating_add(usize::from(last_byte.is_some_and(|byte| byte != b'\n')));
     let mut retained: Vec<u8> = retained.into_iter().collect();
-    let retained_lines = byte_line_count(&retained);
-    if retained_lines > MAX_LOCAL_LOG_LINES {
-        let lines_to_drop = retained_lines - MAX_LOCAL_LOG_LINES;
-        if let Some(end) = nth_newline(&retained, lines_to_drop) {
-            retained.drain(..=end);
-            truncated = true;
+    if requested_line.is_none() {
+        let retained_lines = byte_line_count(&retained);
+        if retained_lines > MAX_LOCAL_LOG_LINES {
+            let lines_to_drop = retained_lines - MAX_LOCAL_LOG_LINES;
+            if let Some(end) = nth_newline(&retained, lines_to_drop) {
+                retained.drain(..=end);
+                truncated = true;
+            }
         }
     }
 
@@ -228,11 +253,13 @@ fn read_bounded_log(path: &Path) -> std::io::Result<LocalJobLogSnapshot> {
         truncated = true;
     }
     let retained_lines = retained_text.lines().count();
-    let first_retained_line = if retained_lines == 0 {
-        total_lines.saturating_add(1)
-    } else {
-        total_lines.saturating_sub(retained_lines).saturating_add(1)
-    };
+    if retained_lines == 0 {
+        first_retained_line = total_lines.saturating_add(1);
+    } else if requested_line.is_none() {
+        first_retained_line = total_lines.saturating_sub(retained_lines).saturating_add(1);
+    }
+    let retained_end = first_retained_line.saturating_add(retained_lines.saturating_sub(1));
+    truncated |= first_retained_line > 1 || retained_end < total_lines;
 
     Ok(LocalJobLogSnapshot {
         retained_text,
@@ -427,6 +454,125 @@ mod tests {
         }
         assert_eq!(record.read_text("exit_code").as_deref(), Some("7"));
         assert!(record.read_text("finished_at").is_some());
+    }
+
+    #[test]
+    fn active_job_logs_are_bounded_and_keep_global_line_cursors() {
+        let scratch = crate::command_sandbox::InspectScratch::create().unwrap();
+        let dir = scratch.path().join("job");
+        std::fs::create_dir(&dir).unwrap();
+        let total_lines = 20_000;
+        let stdout = (1..=total_lines)
+            .map(|line| format!("{line:05}:{}\n", "x".repeat(120)))
+            .collect::<String>();
+        let stderr = (1..=total_lines)
+            .map(|line| format!("err-{line:05}:{}\n", "y".repeat(120)))
+            .collect::<String>();
+        assert!(stdout.len() > 2 * MAX_LOCAL_LOG_BYTES_PER_STREAM);
+        assert!(stderr.len() > 2 * MAX_LOCAL_LOG_BYTES_PER_STREAM);
+        std::fs::write(dir.join("stdout.log"), stdout).unwrap();
+        std::fs::write(dir.join("stderr.log"), stderr).unwrap();
+        let record = LocalJobRecord::new("project".to_string(), dir);
+
+        for name in ["stdout.log", "stderr.log"] {
+            let (tail, cursor, observed_lines, truncated) =
+                record.read_log_lines(name, None, Some(MAX_LOCAL_LOG_LINES));
+            assert!(tail.len() <= MAX_LOCAL_LOG_BYTES_PER_STREAM);
+            assert_eq!(tail.lines().count(), MAX_LOCAL_LOG_LINES);
+            assert_eq!(observed_lines, total_lines);
+            assert_eq!(cursor, total_lines + 1);
+            assert!(truncated);
+            assert!(tail.contains(&format!("{total_lines:05}:")));
+            assert!(!tail.contains("00001:"));
+
+            let (first_page, cursor, observed_lines, truncated) =
+                record.read_log_lines(name, Some(1), None);
+            assert_eq!(first_page.lines().count(), MAX_LOCAL_LOG_LINES);
+            assert_eq!(cursor, MAX_LOCAL_LOG_LINES + 1);
+            assert_eq!(observed_lines, total_lines);
+            assert!(truncated);
+            assert!(first_page.contains("00001:"));
+            assert!(!first_page.contains("00501:"));
+
+            let (page, cursor, observed_lines, truncated) =
+                record.read_log_lines(name, Some(total_lines - 9), None);
+            assert_eq!(page.lines().count(), 10);
+            assert_eq!(cursor, total_lines + 1);
+            assert_eq!(observed_lines, total_lines);
+            assert!(truncated);
+
+            let (past_eof, cursor, observed_lines, truncated) =
+                record.read_log_lines(name, Some(total_lines + 10), None);
+            assert!(past_eof.is_empty());
+            assert_eq!(cursor, total_lines + 1);
+            assert_eq!(observed_lines, total_lines);
+            assert!(truncated);
+        }
+    }
+
+    #[test]
+    fn active_job_log_bounds_long_lossy_line_and_preserves_small_logs() {
+        let scratch = crate::command_sandbox::InspectScratch::create().unwrap();
+        let dir = scratch.path().join("job");
+        std::fs::create_dir(&dir).unwrap();
+        let mut long_line = vec![b'x'; 2 * MAX_LOCAL_LOG_BYTES_PER_STREAM];
+        long_line.extend_from_slice(&[0xff, 0xfe]);
+        long_line.extend_from_slice(b"THE-END");
+        std::fs::write(dir.join("stdout.log"), long_line).unwrap();
+        std::fs::write(dir.join("stderr.log"), b"one\ntwo\nthree\n").unwrap();
+        let record = LocalJobRecord::new("project".to_string(), dir);
+
+        let (stdout, cursor, total_lines, truncated) =
+            record.read_log_lines("stdout.log", None, None);
+        assert!(stdout.len() <= MAX_LOCAL_LOG_BYTES_PER_STREAM);
+        assert!(stdout.ends_with("THE-END"));
+        assert!(stdout.contains('\u{fffd}'));
+        assert_eq!(cursor, 2);
+        assert_eq!(total_lines, 1);
+        assert!(truncated);
+
+        let (stderr, cursor, total_lines, truncated) =
+            record.read_log_lines("stderr.log", None, None);
+        assert_eq!(stderr, "one\ntwo\nthree");
+        assert_eq!(cursor, 4);
+        assert_eq!(total_lines, 3);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn active_job_log_read_does_not_chase_appends() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let scratch = crate::command_sandbox::InspectScratch::create().unwrap();
+        let dir = scratch.path().join("job");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("stdout.log");
+        std::fs::write(&path, "start\n").unwrap();
+        let record = LocalJobRecord::new("project".to_string(), dir);
+        let keep_writing = Arc::new(AtomicBool::new(true));
+        let writer_flag = keep_writing.clone();
+        let writer = std::thread::spawn(move || {
+            let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+            let chunk = vec![b'z'; LOCAL_LOG_READ_CHUNK_BYTES];
+            while writer_flag.load(Ordering::Relaxed) {
+                file.write_all(&chunk).unwrap();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        std::thread::sleep(Duration::from_millis(20));
+        let started = Instant::now();
+        let (text, cursor, total_lines, truncated) =
+            record.read_log_lines("stdout.log", None, Some(10));
+        let elapsed = started.elapsed();
+        keep_writing.store(false, Ordering::Relaxed);
+        writer.join().unwrap();
+
+        assert!(elapsed < Duration::from_secs(2), "read took {elapsed:?}");
+        assert!(text.len() <= MAX_LOCAL_LOG_BYTES_PER_STREAM);
+        assert!(cursor <= total_lines.saturating_add(1));
+        assert!(truncated);
     }
 
     #[test]

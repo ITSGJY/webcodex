@@ -577,6 +577,7 @@ pub(crate) fn read_lines_from(
     read_lines_from_text(&content, offset, tail_lines)
 }
 
+#[cfg(test)]
 pub(crate) fn read_lines_from_text(
     content: &str,
     offset: Option<usize>,
