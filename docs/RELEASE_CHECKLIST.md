@@ -10,8 +10,8 @@ Run:
 
 ```bash
 cargo fmt --check
-cargo check --all-targets
-cargo test --bin webcodex -- --nocapture
+cargo check --workspace --all-targets
+cargo test --workspace -- --nocapture
 git diff --check
 git status --short --branch
 ```

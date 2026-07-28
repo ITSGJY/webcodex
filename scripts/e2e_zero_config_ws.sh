@@ -341,14 +341,14 @@ log "runtime project id: $RUNTIME_PROJECT_ID"
 # 3. Start the server
 # ----------------------------------------------------------------------------
 
-log "starting server (cargo run --bin webcodex)"
+log "starting server (cargo run -p webcodex --bin webcodex)"
 WEBCODEX_ADDR="127.0.0.1:${PORT}" \
 WEBCODEX_DATA="$DATA_DIR" \
 WEBCODEX_TOKEN="$TOKEN" \
 CODEX_DEFAULT_TIMEOUT_SECS="30" \
 CODEX_APPROVAL_MODE="full-auto" \
 RUST_LOG="info" \
-"$CARGO_BIN" run --quiet --bin webcodex >"$SERVER_LOG" 2>&1 &
+"$CARGO_BIN" run --quiet -p webcodex --bin webcodex >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
 if ! wait_for_port "$PORT" 40; then
@@ -362,8 +362,8 @@ pass "server listening on $PORT"
 # 4. Start the agent
 # ----------------------------------------------------------------------------
 
-log "starting agent (cargo run --bin webcodex-runner, transport=$TRANSPORT)"
-"$CARGO_BIN" run --quiet --bin webcodex-runner -- --config "$AGENT_TOML" >"$AGENT_LOG" 2>&1 &
+log "starting agent (cargo run -p webcodex-runner --bin webcodex-runner, transport=$TRANSPORT)"
+"$CARGO_BIN" run --quiet -p webcodex-runner --bin webcodex-runner -- --config "$AGENT_TOML" >"$AGENT_LOG" 2>&1 &
 AGENT_PID=$!
 
 # Wait for the agent to register by polling runtime_status for the client.

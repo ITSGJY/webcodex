@@ -1,10 +1,32 @@
-[package]
-name = "webcodex"
+[workspace]
+members = [
+    "crates/webcodex-admin",
+    "crates/webcodex-agent-config",
+    "crates/webcodex-cli",
+    "crates/webcodex-core",
+    "crates/webcodex-runner",
+    "crates/webcodex-sandbox",
+    "crates/webcodex-workspace",
+]
+resolver = "2"
+
+[workspace.package]
 version = "0.3.0"
 license = "Apache-2.0"
 edition = "2021"
 
+[package]
+name = "webcodex"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+
 [dependencies]
+webcodex-admin = { path = "crates/webcodex-admin" }
+webcodex-agent-config = { path = "crates/webcodex-agent-config" }
+webcodex-core = { path = "crates/webcodex-core" }
+webcodex-sandbox = { path = "crates/webcodex-sandbox" }
+webcodex-workspace = { path = "crates/webcodex-workspace" }
 salvo = { version = "0.93", features = ["oapi", "cors", "affix-state", "websocket", "timeout"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.29", features = ["connect", "rustls-tls-webpki-roots"] }
@@ -31,11 +53,6 @@ sha2 = "0.10"
 quinn = "0.11"
 rustls = "0.23"
 rustls-pemfile = "2"
-# Mozilla root store for the agent's QUIC client cert verification. Reuses the
-# 0.26 line already pulled transitively by tokio-tungstenite's
-# `rustls-tls-webpki-roots` feature, so it does not add a new major version.
-webpki-roots = "0.26"
-
 # Unix process-group reap for synchronous local commands (`run_command_sync`).
 # A direct `kill(-pgid, SIGKILL)` reliably reaps background grandchildren that
 # inherit the stdout/stderr pipes — otherwise `wait_with_output` blocks on pipe
@@ -43,11 +60,6 @@ webpki-roots = "0.26"
 # Already present transitively; pinned to the resolved 0.2 line.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
-# Linux Landlock ABI v3 write sandbox for inspect commands. Reads, network,
-# inherited environment, and external services remain deliberately unrestricted.
-[target.'cfg(target_os = "linux")'.dependencies]
-landlock = "0.4"
 
 # Release binaries ship via the npm wrapper; optimize for size without
 # changing runtime behavior (panic unwinding stays enabled).

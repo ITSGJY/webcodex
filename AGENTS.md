@@ -8,8 +8,12 @@ Long-form design context lives under [`docs/agent/`](docs/agent/).
 ## 1. Project Identity
 
 - **Project:** WebCodex
-- **Default managed project id:** `agent:oe:private-drop`
-- **Repository path:** `/root/git/private-drop` (deployment location may vary)
+- **Canonical repository:** `https://github.com/yyjeqhc/webcodex.git`
+- **Default managed project id:** `agent:special:webcodex`
+- **Canonical checkout path:** `/root/git/webcodex`
+- Other registered checkouts or deployment paths may exist. Treat them as
+  independent worktrees and verify their branch, HEAD, remote, and dirty state
+  before using them.
 - Confirm the resolved project, active repository, branch, worktree state, and
   recent commits before changing files.
 - Do not modify unrelated repositories, worktrees, hosts, or deployment targets.

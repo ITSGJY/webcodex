@@ -3527,7 +3527,6 @@ dependencies = [
  "base64",
  "chrono",
  "futures-util",
- "landlock",
  "libc",
  "quinn",
  "rcgen",
@@ -3549,7 +3548,107 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "webcodex-admin",
+ "webcodex-agent-config",
+ "webcodex-core",
+ "webcodex-sandbox",
+ "webcodex-workspace",
+]
+
+[[package]]
+name = "webcodex-admin"
+version = "0.3.0"
+dependencies = [
+ "reqwest 0.12.28",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "webcodex-agent-config"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "toml",
+ "webcodex-core",
+]
+
+[[package]]
+name = "webcodex-cli"
+version = "0.3.0"
+dependencies = [
+ "chrono",
+ "reqwest 0.12.28",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "toml",
+ "url",
+ "uuid",
+ "webcodex-admin",
+ "webcodex-agent-config",
+ "webcodex-core",
+]
+
+[[package]]
+name = "webcodex-core"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "webcodex-runner"
+version = "0.3.0"
+dependencies = [
+ "base64",
+ "chrono",
+ "futures-util",
+ "libc",
+ "quinn",
+ "reqwest 0.12.28",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "webcodex-agent-config",
+ "webcodex-core",
+ "webcodex-sandbox",
+ "webcodex-workspace",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "webcodex-sandbox"
+version = "0.3.0"
+dependencies = [
+ "landlock",
+ "tempfile",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "webcodex-workspace"
+version = "0.3.0"
+dependencies = [
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

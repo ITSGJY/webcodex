@@ -17,30 +17,11 @@
 
 use std::path::PathBuf;
 
-#[allow(dead_code)]
-#[path = "../lsp_bridge.rs"]
-mod lsp_bridge;
-
-#[allow(dead_code)]
-#[path = "../validation_bridge.rs"]
-mod validation_bridge;
-
-#[allow(dead_code)]
-#[path = "../shell_protocol.rs"]
-mod shell_protocol;
-
-#[allow(dead_code)]
-#[path = "../admin_cli.rs"]
-mod admin_cli;
-
-#[allow(dead_code)]
-#[path = "../agent_init.rs"]
-mod agent_init;
-
-#[path = "../build_info.rs"]
-mod build_info;
-
 mod webcodex_cli;
+
+use webcodex_admin as admin_cli;
+use webcodex_agent_config as agent_init;
+use webcodex_core::build_info;
 
 use admin_cli::{parse_admin_cli, run_admin_command, AdminCliCommand, AdminOptions};
 use agent_init::{

@@ -26,13 +26,13 @@ struct UntrackedCheckpointFile {
     content: String,
 }
 
-pub(crate) fn create_workspace_checkpoint(root: &Path, include_untracked: bool) -> Value {
+pub fn create_workspace_checkpoint(root: &Path, include_untracked: bool) -> Value {
     match create_workspace_checkpoint_inner(root, include_untracked) {
         Ok(value) | Err(value) => value,
     }
 }
 
-pub(crate) fn restore_workspace_checkpoint(root: &Path, checkpoint: &Value) -> Value {
+pub fn restore_workspace_checkpoint(root: &Path, checkpoint: &Value) -> Value {
     match restore_workspace_checkpoint_inner(root, checkpoint) {
         Ok(value) | Err(value) => value,
     }
@@ -818,7 +818,7 @@ fn invalid_rel_path(path: &str) -> bool {
     path.replace('\\', "/").split('/').any(|part| part == "..")
 }
 
-pub(crate) fn sensitive_path(path: &str) -> bool {
+pub fn sensitive_path(path: &str) -> bool {
     let parts = path
         .replace('\\', "/")
         .split('/')

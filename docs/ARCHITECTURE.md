@@ -52,8 +52,8 @@ The protocol adapters translate incoming requests into runtime tool calls. The T
 ## Agent Bridge
 
 - `shell_client` is the server-side agent registry and transport bridge. It tracks connected agents, project registrations, request/response flow, job updates, and agent policy summaries.
-- `src/bin/webcodex_runner/*` owns the runner binary behavior: config loading, transport fallback, project registry parsing, file/patch/artifact/checkpoint handling, shell execution, and response shaping.
-- `src/bin/webcodex_runner/lsp/*` owns the LSP process supervisor and read-only navigation handlers. Supported languages live in one registry (`lsp/language.rs`): each `LanguageProfile` pairs a server with its extensions/`languageId`s, project markers, executable resolution, and constrained read-only `initialize` profile, so the supervisor and handlers carry no per-language branches. Rust (`rust-analyzer`), Python (`pyright`), and TypeScript/JavaScript (`typescript-language-server`) ship today. Results use project-relative paths, 1-based Unicode scalar columns, bounded truncation, and omit external (registry/sysroot/stdlib) locations.
+- `crates/webcodex-runner/src/webcodex_runner/*` owns the runner binary behavior: config loading, transport fallback, project registry parsing, file/patch/artifact/checkpoint handling, shell execution, and response shaping.
+- `crates/webcodex-runner/src/webcodex_runner/lsp/*` owns the LSP process supervisor and read-only navigation handlers. Supported languages live in one registry (`lsp/language.rs`): each `LanguageProfile` pairs a server with its extensions/`languageId`s, project markers, executable resolution, and constrained read-only `initialize` profile, so the supervisor and handlers carry no per-language branches. Rust (`rust-analyzer`), Python (`pyright`), and TypeScript/JavaScript (`typescript-language-server`) ship today. Results use project-relative paths, 1-based Unicode scalar columns, bounded truncation, and omit external (registry/sysroot/stdlib) locations.
 - `tool_runtime::semantic_navigation` builds the always-present compact `start_coding_task.semantic_navigation` capability summary. It sends only typed `AgentLspRequest::Status` under one two-second deadline and parses the versioned result contract directly, without recursively dispatching the public `lsp_status` ToolCall or recording a nested session event. Agent status resolution may inspect Cargo workspace presence, executable availability, and an existing supervisor slot, but it never starts a language server, runs Cargo or shell commands, or retrieves symbol/location data. This startup summary is currently Rust-focused (a Rust readiness hint); the seven runtime tools themselves are multi-language. The summary is read-only, workspace-only, dependency-limited by `cargo.noDeps=true`, and marked `full_text_sync_only`: validated workspace `.rs` files refresh open LSP documents from current disk content, without editor-style incremental synchronization. Probe failure or unavailability remains optional acceleration metadata and does not affect the coding startup verdict or warnings.
 
 The agent is where private repository paths are interpreted. The server routes by runtime project id, such as `agent:<client_id>:<project_id>`.
@@ -105,7 +105,7 @@ The parser is deterministic and fail-closed. It consumes only the bounded, sanit
 
 ## CLI And Operations
 
-- `src/bin/webcodex_cli/*` owns setup and operations commands such as server bootstrap, connect, pairing, token creation, doctor checks, service installation, and profile handling.
+- `crates/webcodex-cli/src/webcodex_cli/*` owns setup and operations commands such as server bootstrap, connect, pairing, token creation, doctor checks, service installation, and profile handling.
 - Deployment docs should use the CLI for management tasks rather than exposing management endpoints to GPT Actions or MCP.
 
 ## Frontend

@@ -21,7 +21,7 @@ fn fake_server_binary() -> Arc<FakeServerBinary> {
         return binary;
     }
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let source = manifest.join("src/bin/webcodex_runner/lsp/fake_server.rs");
+    let source = manifest.join("src/webcodex_runner/lsp/fake_server.rs");
     let temp = tempfile::tempdir().unwrap();
     let output = temp
         .path()

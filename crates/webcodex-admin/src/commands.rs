@@ -51,14 +51,14 @@ impl FlagParser {
     }
 }
 
-pub(crate) fn is_admin_group(arg: &str) -> bool {
+pub fn is_admin_group(arg: &str) -> bool {
     matches!(
         arg,
         "user" | "users" | "token" | "tokens" | "agent-token" | "agent-tokens"
     )
 }
 
-pub(crate) fn usage() -> &'static str {
+pub fn usage() -> &'static str {
     "Admin commands:\n\
       webcodex users create --server-url URL [--token TOKEN|--token-file PATH] --username USER [--display-name NAME] [--role ROLE] [--issue-credential]\n\
       webcodex users list --server-url URL [--token TOKEN|--token-file PATH]\n\
@@ -76,7 +76,7 @@ pub(crate) fn usage() -> &'static str {
     Output: JSON\n"
 }
 
-pub(crate) fn parse_admin_cli(args: &[String]) -> Result<AdminCliCommand, String> {
+pub fn parse_admin_cli(args: &[String]) -> Result<AdminCliCommand, String> {
     if args.len() < 2 {
         return Err(format!("missing admin subcommand\n{}", usage()));
     }
@@ -380,7 +380,7 @@ fn require_non_empty(flag: &str, value: &str) -> Result<(), String> {
     }
 }
 
-pub(crate) fn build_admin_request(cmd: &AdminCliCommand) -> Result<AdminCliRequest, String> {
+pub fn build_admin_request(cmd: &AdminCliCommand) -> Result<AdminCliRequest, String> {
     let (opts, path, body) = match cmd {
         AdminCliCommand::UsersCreate(opts, user) => {
             let mut body = json!({
@@ -540,7 +540,7 @@ fn resolve_token(opts: &AdminOptions, env_key: &str) -> Result<String, String> {
     Ok(token)
 }
 
-pub(crate) async fn run_admin_command(cmd: AdminCliCommand) -> Result<String, String> {
+pub async fn run_admin_command(cmd: AdminCliCommand) -> Result<String, String> {
     let req = build_admin_request(&cmd)?;
     let url = format!("{}{}", req.server_url, req.path);
     let client = reqwest::Client::builder()

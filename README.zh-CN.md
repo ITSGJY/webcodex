@@ -58,7 +58,7 @@ npm install -g @yyjeqhc/webcodex
 也可以从源码构建全部 binaries：
 
 ```bash
-cargo build --release --bins
+cargo build --release --workspace --bins
 export PATH="$PWD/target/release:$PATH"
 ```
 

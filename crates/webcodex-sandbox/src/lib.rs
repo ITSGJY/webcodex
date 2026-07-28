@@ -9,7 +9,7 @@
 //! it adds `TRUNCATE`; unsupported kernels, partial enforcement, invalid
 //! scratch directories, and non-Linux hosts reject inspect execution.
 
-pub(crate) const INSPECT_SANDBOX_MODE: &str = "inspect";
+pub const INSPECT_SANDBOX_MODE: &str = "inspect";
 
 /// Why the sandbox cannot be used, when it cannot.
 ///
@@ -18,7 +18,7 @@ pub(crate) const INSPECT_SANDBOX_MODE: &str = "inspect";
 /// partial ruleset is a bug in the policy, and a failed probe is a host
 /// problem. All of them deny.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SandboxUnavailable {
+pub enum SandboxUnavailable {
     /// No Landlock on this build target or kernel.
     Unsupported(String),
     /// The kernel applied only part of the ruleset. Treated as failure: a
@@ -56,12 +56,12 @@ struct ProbeDir {
 /// real directory rather than a symlink, and dropping the final owner removes
 /// the directory recursively after the command subtree has ended.
 #[derive(Debug)]
-pub(crate) struct InspectScratch {
+pub struct InspectScratch {
     path: std::path::PathBuf,
 }
 
 impl InspectScratch {
-    pub(crate) fn create() -> Result<Self, SandboxUnavailable> {
+    pub fn create() -> Result<Self, SandboxUnavailable> {
         let path = std::env::temp_dir().join(format!(
             "webcodex-inspect-{}",
             uuid::Uuid::new_v4().simple()
@@ -108,7 +108,7 @@ impl InspectScratch {
         Ok(scratch)
     }
 
-    pub(crate) fn path(&self) -> &std::path::Path {
+    pub fn path(&self) -> &std::path::Path {
         &self.path
     }
 }
@@ -155,7 +155,7 @@ impl Drop for ProbeDir {
 /// descriptor — which is all this used to do — proves only that the syscall
 /// exists, not that the policy takes effect.
 #[cfg(target_os = "linux")]
-pub(crate) fn inspect_sandbox_available() -> Result<(), SandboxUnavailable> {
+pub fn inspect_sandbox_available() -> Result<(), SandboxUnavailable> {
     use std::io::Write;
 
     let probe = ProbeDir::create()?;
@@ -220,7 +220,7 @@ pub(crate) fn inspect_sandbox_available() -> Result<(), SandboxUnavailable> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn inspect_sandbox_available() -> Result<(), SandboxUnavailable> {
+pub fn inspect_sandbox_available() -> Result<(), SandboxUnavailable> {
     Err(SandboxUnavailable::Unsupported(
         "inspect command sandboxing requires Linux with Landlock ABI v3".to_string(),
     ))
@@ -241,9 +241,7 @@ fn shell_quote(path: &std::path::Path) -> String {
 /// case a `BestEffort` ruleset hides — so the compatibility level is a hard
 /// requirement and anything short of full enforcement denies.
 #[cfg(target_os = "linux")]
-pub(crate) fn restrict_writes_to(
-    writable: &[std::path::PathBuf],
-) -> Result<(), SandboxUnavailable> {
+pub fn restrict_writes_to(writable: &[std::path::PathBuf]) -> Result<(), SandboxUnavailable> {
     use landlock::{
         AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
         RulesetCreatedAttr, RulesetStatus, ABI,
@@ -308,7 +306,7 @@ pub(crate) fn restrict_writes_to(
 /// command unconfined. The policy itself is applied between fork and exec, and
 /// a failure there aborts the exec.
 #[cfg(target_os = "linux")]
-pub(crate) fn sandbox_command_inspect(
+pub fn sandbox_command_inspect(
     command: &mut std::process::Command,
     scratch: &InspectScratch,
 ) -> Result<(), String> {
@@ -329,7 +327,7 @@ pub(crate) fn sandbox_command_inspect(
 /// Non-Linux hosts cannot sandbox, and silently running the command anyway
 /// would turn a sandbox request into an unconfined execution. Fails instead.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn sandbox_command_inspect(
+pub fn sandbox_command_inspect(
     _command: &mut std::process::Command,
     _scratch: &InspectScratch,
 ) -> Result<(), String> {

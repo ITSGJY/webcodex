@@ -22,7 +22,7 @@ npm install -g @yyjeqhc/webcodex
 Or build from this checkout:
 
 ```bash
-cargo build --release --bins
+cargo build --release --workspace --bins
 export PATH="$PWD/target/release:$PATH"
 ```
 

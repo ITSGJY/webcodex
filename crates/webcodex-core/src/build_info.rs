@@ -8,7 +8,6 @@ pub struct BuildInfo {
     pub built_at: Option<&'static str>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RuntimeBuildInfo {
     pub git_commit: Option<&'static str>,
@@ -25,7 +24,6 @@ pub fn current() -> BuildInfo {
     }
 }
 
-#[allow(dead_code)]
 pub fn runtime_build_info() -> RuntimeBuildInfo {
     let info = current();
     RuntimeBuildInfo {

@@ -191,14 +191,14 @@ start a model conversation:
 
 ```bash
 WEBCODEX_PROBE_CLAUDE_PROVIDER=1 \
-cargo test --bin webcodex-runner opt_in_real_claude_mcp_probe -- --nocapture
+cargo test -p webcodex-runner --bin webcodex-runner opt_in_real_claude_mcp_probe -- --nocapture
 ```
 
 The default test suite uses a standalone fake stdio MCP server. A real local
 smoke check is opt-in:
 
 ```bash
-WEBCODEX_TEST_CLAUDE_MCP=1 cargo test --bin webcodex-runner opt_in_real_claude_mcp_smoke -- --nocapture
+WEBCODEX_TEST_CLAUDE_MCP=1 cargo test -p webcodex-runner --bin webcodex-runner opt_in_real_claude_mcp_smoke -- --nocapture
 ```
 
 This smoke test prints a bounded tool/schema inventory, resolves configured or

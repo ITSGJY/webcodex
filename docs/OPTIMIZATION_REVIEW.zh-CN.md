@@ -101,21 +101,25 @@ jobs:
 清零后在 `Cargo.toml` 加 `[lints.clippy]` 或在 CI 用 `-D warnings`
 防止回潮。
 
-### P1：用 workspace 拆分替代 `#[path]` 模块共享
+### P1（已完成）：用 workspace 拆分替代 `#[path]` 模块共享
 
-三个二进制通过 `#[path = "../x.rs"] #[allow(dead_code)] mod x;` 共享
-`lsp_bridge`、`shell_protocol`、`admin_cli`、`agent_init` 等模块，全仓
-共约 90 处 `allow(dead_code)`，多数是这个模式的症状。建议拆成
-workspace：`webcodex-core`（共享协议/类型）+ `webcodex-server` +
-`webcodex-agent` + `webcodex-cli`。收益：
+仓库现已拆为根 server package 与七个内部 crate：`webcodex-core`、
+`webcodex-runner`、`webcodex-cli`、`webcodex-admin`、
+`webcodex-agent-config`、`webcodex-sandbox`、`webcodex-workspace`。
+三个最终 binary 名称保持不变。
 
-- dead_code 抑制大幅减少，真正的死代码重新可见；
-- agent/cli 不再重复编译 server 依赖面（salvo 等），增量构建和
-  `cargo check` 更快；
-- 每个二进制的依赖边界显式化（agent 理论上不需要 salvo/rusqlite）。
+迁移结果：
 
-这是结构性工程，建议单独立项、分阶段迁移（先抽 `shell_protocol` +
-`lsp_bridge` 这两个纯类型模块）。
+- 跨父目录的 17 处 `#[path = "../..."]` 已清零；
+- `#[allow(dead_code)]` 从 66 处降至 41 处；
+- runner 不再依赖 `salvo`、`rusqlite`；
+- CLI 不再依赖 `salvo`、`rusqlite`、`quinn`、`landlock`；
+- runner 实现文件的小改动只重新编译 runner package，不再带动 server
+  或 CLI 重新编译。
+
+共享协议、build info 和纯 helper 位于 `crates/webcodex-core`；执行、
+管理、配置、沙箱与工作区实现按真实调用边界拆入对应 crate。旧源码副本和
+binary 间 `#[path]` fallback 均未保留。
 
 ### P2：生产路径的 `unwrap()` 收敛
 

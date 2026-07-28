@@ -238,7 +238,7 @@ require_command "$CLAUDE_BIN"
 
 cd "$ROOT"
 if [ "${WEBCODEX_E2E_SKIP_BUILD:-0}" != "1" ]; then
-    "$CARGO_BIN" build --quiet --bin webcodex --bin webcodex-runner
+    "$CARGO_BIN" build --quiet -p webcodex -p webcodex-runner --bins
 fi
 
 TMP_ROOT="$(mktemp -d -t webcodex-claude-provider-e2e-XXXXXX)"
