@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 mod action_audit;
 mod action_audit_sessions;
+mod admin_http;
 mod agent_quic;
 mod agent_tokens_http;
 mod agent_ws;
@@ -308,10 +309,12 @@ only for local/trusted-network demos."
         }
     }
 
+    let _admin_route_allowlist = admin_http::ADMIN_ROUTES;
     let authed_api_router = Router::new()
         .hoop(AuthMiddleware)
         .push(connector_runtime::http::routes())
         .push(host_console_http::routes())
+        .push(admin_http::routes())
         .push(Router::with_path("tools/list").post(runtime_http::tools_list))
         .push(Router::with_path("tools/call").post(runtime_http::tools_call))
         .push(
@@ -420,6 +423,11 @@ only for local/trusted-network demos."
         .push(Router::with_path("app.js").get(console_web::console_app_js))
         .push(Router::with_path("styles.css").get(console_web::console_styles_css));
 
+    let admin_router = Router::with_path("admin")
+        .get(console_web::admin_html)
+        .push(Router::with_path("app.js").get(console_web::admin_app_js))
+        .push(Router::with_path("styles.css").get(console_web::admin_styles_css));
+
     let mut router = Router::new()
         // Whole-service backstop: no handler may hold an HTTP request open
         // forever. Sized well above every legitimate request — sync agent
@@ -442,6 +450,7 @@ only for local/trusted-network demos."
         .push(api_router)
         .push(openapi_router)
         .push(console_router)
+        .push(admin_router)
         // OAuth2 token, revocation, and discovery endpoints — public, no
         // AuthMiddleware. Token/revoke clients authenticate via
         // client_id + client_secret in the form body.

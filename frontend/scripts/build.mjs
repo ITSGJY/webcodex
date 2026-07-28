@@ -19,6 +19,9 @@ const watchedSources = new Set([
   "review_state.ts",
   "styles.css",
   "console.html",
+  "admin.ts",
+  "admin.css",
+  "admin.html",
 ]);
 
 function readSource(sourceDirectory, fileName) {
@@ -110,15 +113,17 @@ export function createOutputs(
   );
   const appInlined = buildJs(reviewStateClassic + "\n" + appScript);
   assertClassicScript(resolve(outputDirectory, "app.js"), appInlined);
+  const adminScript = buildJs(transpileTypeScript(sourceDirectory, "admin.ts"));
+  assertClassicScript(resolve(outputDirectory, "admin.js"), adminScript);
 
   return new Map([
     ["review_state.js", reviewStateModule],
     ["app.js", appInlined],
     ["styles.css", minifyCss(readSource(sourceDirectory, "styles.css"))],
-    [
-      "console.html",
-      normalizeNewline(readSource(sourceDirectory, "console.html")),
-    ],
+    ["admin.js", adminScript],
+    ["admin.css", minifyCss(readSource(sourceDirectory, "admin.css"))],
+    ["console.html", normalizeNewline(readSource(sourceDirectory, "console.html"))],
+    ["admin.html", normalizeNewline(readSource(sourceDirectory, "admin.html"))],
   ]);
 }
 

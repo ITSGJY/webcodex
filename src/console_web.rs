@@ -29,12 +29,18 @@ const DEVELOPMENT_ERROR_BODY: &str = "Console development asset is unavailable.\
 const CONSOLE_HTML: &str = include_str!("../frontend/dist/console.html");
 const CONSOLE_APP_JS: &str = include_str!("../frontend/dist/app.js");
 const CONSOLE_STYLES_CSS: &str = include_str!("../frontend/dist/styles.css");
+const ADMIN_HTML: &str = include_str!("../frontend/dist/admin.html");
+const ADMIN_APP_JS: &str = include_str!("../frontend/dist/admin.js");
+const ADMIN_STYLES_CSS: &str = include_str!("../frontend/dist/admin.css");
 
 #[derive(Debug, Clone, Copy)]
 enum ConsoleAsset {
     Html,
     JavaScript,
     Css,
+    AdminHtml,
+    AdminJavaScript,
+    AdminCss,
 }
 
 impl ConsoleAsset {
@@ -43,6 +49,9 @@ impl ConsoleAsset {
             Self::Html => "console.html",
             Self::JavaScript => "app.js",
             Self::Css => "styles.css",
+            Self::AdminHtml => "admin.html",
+            Self::AdminJavaScript => "admin.js",
+            Self::AdminCss => "admin.css",
         }
     }
 
@@ -50,7 +59,9 @@ impl ConsoleAsset {
         match self {
             Self::Html => "text/html; charset=utf-8",
             Self::JavaScript => "application/javascript; charset=utf-8",
-            Self::Css => "text/css; charset=utf-8",
+            Self::Css | Self::AdminCss => "text/css; charset=utf-8",
+            Self::AdminHtml => "text/html; charset=utf-8",
+            Self::AdminJavaScript => "application/javascript; charset=utf-8",
         }
     }
 
@@ -59,6 +70,9 @@ impl ConsoleAsset {
             Self::Html => CONSOLE_HTML,
             Self::JavaScript => CONSOLE_APP_JS,
             Self::Css => CONSOLE_STYLES_CSS,
+            Self::AdminHtml => ADMIN_HTML,
+            Self::AdminJavaScript => ADMIN_APP_JS,
+            Self::AdminCss => ADMIN_STYLES_CSS,
         }
     }
 }
@@ -322,6 +336,22 @@ pub async fn console_app_js(depot: &Depot, res: &mut Response) {
 #[handler]
 pub async fn console_styles_css(depot: &Depot, res: &mut Response) {
     serve_asset(depot, res, ConsoleAsset::Css).await;
+}
+
+/// Public admin shell; all data remains protected by `/api/admin/*`.
+#[handler]
+pub async fn admin_html(depot: &Depot, res: &mut Response) {
+    serve_asset(depot, res, ConsoleAsset::AdminHtml).await;
+}
+
+#[handler]
+pub async fn admin_app_js(depot: &Depot, res: &mut Response) {
+    serve_asset(depot, res, ConsoleAsset::AdminJavaScript).await;
+}
+
+#[handler]
+pub async fn admin_styles_css(depot: &Depot, res: &mut Response) {
+    serve_asset(depot, res, ConsoleAsset::AdminCss).await;
 }
 
 #[cfg(test)]

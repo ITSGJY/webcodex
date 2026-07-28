@@ -17,7 +17,14 @@ import { fileURLToPath } from "node:url";
 const frontendRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryRoot = resolve(frontendRoot, "..");
 const buildScript = resolve(frontendRoot, "scripts/build.mjs");
-const requiredAssets = ["console.html", "app.js", "styles.css"];
+const requiredAssets = [
+  "console.html",
+  "app.js",
+  "styles.css",
+  "admin.html",
+  "admin.js",
+  "admin.css",
+];
 
 function exec(command, args, options = {}) {
   return new Promise((resolvePromise, reject) => {
@@ -42,6 +49,11 @@ async function assertRequiredAssets(outputDirectory) {
   const app = await readFile(resolve(outputDirectory, "app.js"), "utf8");
   assert.equal(app.includes("interface Review"), false);
   await exec(process.execPath, ["--check", resolve(outputDirectory, "app.js")]);
+  const admin = await readFile(resolve(outputDirectory, "admin.js"), "utf8");
+  await exec(process.execPath, ["--check", resolve(outputDirectory, "admin.js")]);
+  assert.equal(/localStorage|sessionStorage|document\.cookie/.test(admin), false);
+  assert.equal(/innerHTML/.test(admin), false);
+  assert.match(admin, /textContent/);
 }
 
 async function copySources(sourceDirectory) {
@@ -51,6 +63,9 @@ async function copySources(sourceDirectory) {
     "review_state.ts",
     "styles.css",
     "console.html",
+    "admin.ts",
+    "admin.css",
+    "admin.html",
   ]) {
     await copyFile(
       resolve(frontendRoot, "src", source),
