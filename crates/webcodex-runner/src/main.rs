@@ -73,6 +73,10 @@ use webcodex_runner::{
 const JOB_UPDATE_INTERVAL_MS: u64 = 250;
 const AGENT_REGISTER_PATH: &str = "/api/shell/agent/register";
 const AGENT_POLL_PATH: &str = "/api/shell/agent/poll";
+/// Polling HTTP responses can carry the current largest 15 MiB request
+/// payloads plus their JSON envelope, but must never be loaded without a
+/// finite bound.
+const AGENT_HTTP_RESPONSE_BODY_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct JobManager {
@@ -137,7 +141,7 @@ fn usage() -> &'static str {
        -V, --version              Print version and exit\n\
        -c, --config PATH          Agent config path for normal runtime\n\
        --profile NAME             Client config profile for default config path\n\
-       --once                     Poll once, then exit (polling transport)\n\n\
+       --once                     Complete one successful poll, then exit (polling transport)\n\n\
      With --profile, the default config path is derived under\n\
      /etc/webcodex/clients/<profile> for root or\n\
      ~/.config/webcodex/clients/<profile> for non-root users. Explicit\n\
@@ -244,11 +248,13 @@ where
     Ok(AgentCliAction::Run { config_path, once })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentHttpErrorKind {
     ServerUnavailable,
     Auth,
     NotFound,
+    /// A local URL/TLS configuration failure that retrying cannot repair.
+    Config,
     /// 4xx (other than auth/endpoint kinds): the server understood the
     /// exchange and rejected this exact request. Resending the identical
     /// payload cannot succeed.
@@ -256,7 +262,12 @@ enum AgentHttpErrorKind {
     Status,
     RequestTimeout,
     Request,
-    Decode,
+    /// The response was incomplete or was recognizably produced by a
+    /// temporary proxy/upstream failure.
+    DecodeTransient,
+    /// The response was complete enough to prove that it does not implement
+    /// the expected server protocol.
+    ProtocolDecode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,6 +275,9 @@ struct AgentHttpError {
     kind: AgentHttpErrorKind,
     path: String,
     summary: String,
+    /// Bounded structured server error, when the response contract supplied
+    /// one. Recovery classifiers use this instead of parsing display strings.
+    server_error: Option<String>,
 }
 
 impl AgentHttpError {
@@ -273,27 +287,31 @@ impl AgentHttpError {
             404 => AgentHttpErrorKind::NotFound,
             // Explicitly retryable request-level statuses.
             408 | 429 => AgentHttpErrorKind::Status,
-            502 | 503 | 504 => AgentHttpErrorKind::ServerUnavailable,
+            code if (500..600).contains(&code) => AgentHttpErrorKind::ServerUnavailable,
             code if (400..500).contains(&code) => AgentHttpErrorKind::ClientRejected,
             _ if looks_like_proxy_html_error(body) => AgentHttpErrorKind::ServerUnavailable,
             _ => AgentHttpErrorKind::Status,
         };
+        let server_error = structured_body_error(body);
         let mut summary = http_status_summary(status);
         if kind == AgentHttpErrorKind::ClientRejected {
-            if let Some(detail) = structured_body_error(body) {
+            if let Some(detail) = server_error.as_deref() {
                 summary = format!("{}: {}", summary, detail);
             }
         }
         Self {
             kind,
-            path: path.to_string(),
+            path: bounded_endpoint_path(path),
             summary,
+            server_error,
         }
     }
 
     fn request(path: &str, error: reqwest::Error) -> Self {
         let chain = error_chain_text(&error);
-        let kind = if looks_like_server_down_request(&error, &chain) {
+        let kind = if error.is_builder() || looks_like_fatal_tls_request(&chain) {
+            AgentHttpErrorKind::Config
+        } else if looks_like_server_down_request(&error, &chain) {
             AgentHttpErrorKind::ServerUnavailable
         } else if error.is_timeout() {
             AgentHttpErrorKind::RequestTimeout
@@ -302,19 +320,27 @@ impl AgentHttpError {
         };
         Self {
             kind,
-            path: path.to_string(),
+            path: bounded_endpoint_path(path),
             summary: request_error_summary(error, &chain),
+            server_error: None,
         }
     }
 
-    fn decode(path: &str, error: serde_json::Error) -> Self {
+    fn decode_transient(path: &str, summary: String) -> Self {
         Self {
-            kind: AgentHttpErrorKind::Decode,
-            path: path.to_string(),
-            summary: format!(
-                "invalid JSON response: {}",
-                bounded_single_line(&error.to_string())
-            ),
+            kind: AgentHttpErrorKind::DecodeTransient,
+            path: bounded_endpoint_path(path),
+            summary,
+            server_error: None,
+        }
+    }
+
+    fn protocol_decode(path: &str, summary: String) -> Self {
+        Self {
+            kind: AgentHttpErrorKind::ProtocolDecode,
+            path: bounded_endpoint_path(path),
+            summary,
+            server_error: None,
         }
     }
 }
@@ -335,86 +361,240 @@ impl std::fmt::Display for AgentHttpError {
                 "endpoint missing or incompatible server for {}: {}",
                 self.path, self.summary
             ),
+            AgentHttpErrorKind::Config => {
+                write!(
+                    f,
+                    "HTTP/TLS configuration failed for {}: {}",
+                    self.path, self.summary
+                )
+            }
             AgentHttpErrorKind::ClientRejected => {
                 write!(f, "server rejected {} request: {}", self.path, self.summary)
             }
             AgentHttpErrorKind::Status
             | AgentHttpErrorKind::RequestTimeout
-            | AgentHttpErrorKind::Request
-            | AgentHttpErrorKind::Decode => {
+            | AgentHttpErrorKind::Request => {
                 write!(f, "{} request failed: {}", self.path, self.summary)
             }
+            AgentHttpErrorKind::DecodeTransient => {
+                write!(
+                    f,
+                    "transient response corruption for {}: {}",
+                    self.path, self.summary
+                )
+            }
+            AgentHttpErrorKind::ProtocolDecode => write!(
+                f,
+                "response from {} incompatible with server protocol: {}",
+                self.path, self.summary
+            ),
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegisterRecoveryAction {
+    Retry,
+    WaitForLease,
+    Fatal,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum PollErrorKind {
-    ServerUnavailable,
+enum RegisterErrorKind {
+    Transient,
+    LeaseConflict,
     Auth,
     EndpointMissing,
-    Retryable,
+    Rejected,
+    Config,
+    Protocol,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegisterError {
+    kind: RegisterErrorKind,
+    message: String,
+}
+
+impl RegisterError {
+    fn from_http(error: AgentHttpError, client_id: &str) -> Self {
+        let kind = match error.kind {
+            AgentHttpErrorKind::ServerUnavailable
+            | AgentHttpErrorKind::Status
+            | AgentHttpErrorKind::RequestTimeout
+            | AgentHttpErrorKind::Request
+            | AgentHttpErrorKind::DecodeTransient => RegisterErrorKind::Transient,
+            AgentHttpErrorKind::Auth => RegisterErrorKind::Auth,
+            AgentHttpErrorKind::NotFound => RegisterErrorKind::EndpointMissing,
+            AgentHttpErrorKind::Config => RegisterErrorKind::Config,
+            AgentHttpErrorKind::ProtocolDecode => RegisterErrorKind::Protocol,
+            AgentHttpErrorKind::ClientRejected
+                if is_active_instance_lease_conflict(client_id, error.server_error.as_deref()) =>
+            {
+                RegisterErrorKind::LeaseConflict
+            }
+            AgentHttpErrorKind::ClientRejected => RegisterErrorKind::Rejected,
+        };
+        let message = if error.kind == AgentHttpErrorKind::ProtocolDecode {
+            format!(
+                "register response incompatible with server protocol: endpoint={} {}",
+                error.path, error.summary
+            )
+        } else {
+            error.to_string()
+        };
+        Self { kind, message }
+    }
+
+    fn from_response_error(client_id: &str, error: Option<String>) -> Self {
+        let summary =
+            bounded_single_line(error.as_deref().unwrap_or("register failed without error"));
+        let kind = if is_active_instance_lease_conflict(client_id, Some(&summary)) {
+            RegisterErrorKind::LeaseConflict
+        } else if looks_like_auth_failure_message(&summary) {
+            RegisterErrorKind::Auth
+        } else {
+            RegisterErrorKind::Rejected
+        };
+        Self {
+            kind,
+            message: format!("register rejected by server: {summary}"),
+        }
+    }
+
+    fn recovery_action(&self) -> RegisterRecoveryAction {
+        match self.kind {
+            RegisterErrorKind::Transient => RegisterRecoveryAction::Retry,
+            RegisterErrorKind::LeaseConflict => RegisterRecoveryAction::WaitForLease,
+            RegisterErrorKind::Auth
+            | RegisterErrorKind::EndpointMissing
+            | RegisterErrorKind::Rejected
+            | RegisterErrorKind::Config
+            | RegisterErrorKind::Protocol => RegisterRecoveryAction::Fatal,
+        }
+    }
+
+    fn into_message(self) -> String {
+        self.message
+    }
+}
+
+impl std::fmt::Display for RegisterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollingRecoveryAction {
+    RetryPoll,
+    ReRegister,
+    Fatal,
+    Shutdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PollErrorKind {
+    Transient,
+    SessionLost,
+    Auth,
+    EndpointMissing,
+    Rejected,
+    Config,
+    Protocol,
     Shutdown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PollError {
     kind: PollErrorKind,
-    terminal: bool,
     message: String,
 }
 
 impl PollError {
-    fn terminal(kind: PollErrorKind, message: impl Into<String>) -> Self {
+    fn new(kind: PollErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
-            terminal: true,
             message: message.into(),
         }
     }
 
-    fn retryable(message: impl Into<String>) -> Self {
-        Self {
-            kind: PollErrorKind::Retryable,
-            terminal: false,
-            message: message.into(),
-        }
-    }
-
-    fn from_http(error: AgentHttpError) -> Self {
+    fn from_http(error: AgentHttpError, client_id: &str) -> Self {
         match error.kind {
-            AgentHttpErrorKind::ServerUnavailable => Self::terminal(
-                PollErrorKind::ServerUnavailable,
+            AgentHttpErrorKind::ServerUnavailable => Self::new(
+                PollErrorKind::Transient,
                 format!(
                     "server unavailable while polling {}: {}",
                     error.path, error.summary
                 ),
             ),
-            AgentHttpErrorKind::Auth => Self::terminal(
+            AgentHttpErrorKind::Auth => Self::new(
                 PollErrorKind::Auth,
                 format!(
                     "authentication failed while polling {}: {}; check agent token/config",
                     error.path, error.summary
                 ),
             ),
-            AgentHttpErrorKind::NotFound => Self::terminal(
+            AgentHttpErrorKind::NotFound => Self::new(
                 PollErrorKind::EndpointMissing,
                 format!(
                     "poll endpoint missing or incompatible server while polling {}: {}",
                     error.path, error.summary
                 ),
             ),
-            AgentHttpErrorKind::RequestTimeout => Self::retryable(format!(
-                "poll request timed out while polling {}: {}",
-                error.path, error.summary
-            )),
+            AgentHttpErrorKind::Config => Self::new(
+                PollErrorKind::Config,
+                format!(
+                    "HTTP/TLS configuration failed while polling {}: {}",
+                    error.path, error.summary
+                ),
+            ),
+            AgentHttpErrorKind::RequestTimeout => Self::new(
+                PollErrorKind::Transient,
+                format!(
+                    "poll request timed out while polling {}: {}",
+                    error.path, error.summary
+                ),
+            ),
             AgentHttpErrorKind::ClientRejected
-            | AgentHttpErrorKind::Status
-            | AgentHttpErrorKind::Request
-            | AgentHttpErrorKind::Decode => Self::retryable(format!(
-                "poll request failed while polling {}: {}",
-                error.path, error.summary
-            )),
+                if is_unknown_polling_session(client_id, error.server_error.as_deref()) =>
+            {
+                Self::new(
+                    PollErrorKind::SessionLost,
+                    format!(
+                        "polling session is not registered for client_id={}",
+                        bounded_single_line(client_id)
+                    ),
+                )
+            }
+            AgentHttpErrorKind::ClientRejected => Self::new(
+                PollErrorKind::Rejected,
+                format!(
+                    "server permanently rejected polling {}: {}",
+                    error.path, error.summary
+                ),
+            ),
+            AgentHttpErrorKind::Status | AgentHttpErrorKind::Request => Self::new(
+                PollErrorKind::Transient,
+                format!(
+                    "poll request failed while polling {}: {}",
+                    error.path, error.summary
+                ),
+            ),
+            AgentHttpErrorKind::DecodeTransient => Self::new(
+                PollErrorKind::Transient,
+                format!(
+                    "transient poll response corruption: endpoint={} {}",
+                    error.path, error.summary
+                ),
+            ),
+            AgentHttpErrorKind::ProtocolDecode => Self::new(
+                PollErrorKind::Protocol,
+                format!(
+                    "poll response incompatible with server protocol: endpoint={} {}",
+                    error.path, error.summary
+                ),
+            ),
         }
     }
 
@@ -424,39 +604,64 @@ impl PollError {
     /// neither can trigger polling sleep/re-registration recovery here.
     fn from_submit(error: SubmitResultError) -> Self {
         match error {
-            SubmitResultError::FatalAuth(message) => Self::terminal(PollErrorKind::Auth, message),
+            SubmitResultError::FatalAuth(message) => Self::new(PollErrorKind::Auth, message),
             SubmitResultError::FatalProtocol(message) => {
-                Self::terminal(PollErrorKind::EndpointMissing, message)
+                Self::new(PollErrorKind::EndpointMissing, message)
             }
+            SubmitResultError::FatalConfig(message) => Self::new(PollErrorKind::Config, message),
             SubmitResultError::TransportClosed(message) => {
-                Self::terminal(PollErrorKind::ServerUnavailable, message)
+                Self::new(PollErrorKind::Rejected, message)
             }
-            SubmitResultError::Shutdown(message) => {
-                Self::terminal(PollErrorKind::Shutdown, message)
-            }
+            SubmitResultError::Shutdown(message) => Self::new(PollErrorKind::Shutdown, message),
         }
     }
 
-    fn from_response_error(error: Option<String>) -> Self {
+    fn from_response_error(client_id: &str, error: Option<String>) -> Self {
         let message = error.unwrap_or_else(|| "poll failed without error".to_string());
         let summary = bounded_single_line(&message);
         if looks_like_auth_failure_message(&summary) {
-            Self::terminal(
+            Self::new(
                 PollErrorKind::Auth,
                 format!(
                     "authentication failed while polling {}: {}; check agent token/config",
                     AGENT_POLL_PATH, summary
                 ),
             )
+        } else if is_unknown_polling_session(client_id, Some(&summary)) {
+            Self::new(
+                PollErrorKind::SessionLost,
+                format!(
+                    "polling session is not registered for client_id={}",
+                    bounded_single_line(client_id)
+                ),
+            )
         } else {
-            Self::retryable(summary)
+            Self::new(
+                PollErrorKind::Rejected,
+                format!("server permanently rejected polling response: {summary}"),
+            )
         }
     }
 
-    fn is_terminal(&self) -> bool {
-        self.terminal
+    fn recovery_action(&self) -> PollingRecoveryAction {
+        match self.kind {
+            PollErrorKind::Transient => PollingRecoveryAction::RetryPoll,
+            PollErrorKind::SessionLost => PollingRecoveryAction::ReRegister,
+            PollErrorKind::Auth
+            | PollErrorKind::EndpointMissing
+            | PollErrorKind::Rejected
+            | PollErrorKind::Config
+            | PollErrorKind::Protocol => PollingRecoveryAction::Fatal,
+            PollErrorKind::Shutdown => PollingRecoveryAction::Shutdown,
+        }
     }
 
+    #[cfg(test)]
+    fn is_terminal(&self) -> bool {
+        self.recovery_action() == PollingRecoveryAction::Fatal
+    }
+
+    #[cfg(test)]
     fn is_shutdown(&self) -> bool {
         self.kind == PollErrorKind::Shutdown
     }
@@ -518,6 +723,23 @@ fn looks_like_server_down_request(error: &reqwest::Error, chain: &str) -> bool {
     )
 }
 
+fn looks_like_fatal_tls_request(chain: &str) -> bool {
+    let lower = chain.to_ascii_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "certificate verify failed",
+            "invalid peer certificate",
+            "unknownissuer",
+            "notvalidforname",
+            "certificateunknown",
+            "invalid certificate",
+            "no application protocol",
+            "alpn mismatch",
+        ],
+    )
+}
+
 fn looks_like_auth_failure_message(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     contains_any(
@@ -531,6 +753,19 @@ fn looks_like_auth_failure_message(message: &str) -> bool {
             "authentication",
         ],
     )
+}
+
+fn is_active_instance_lease_conflict(client_id: &str, error: Option<&str>) -> bool {
+    let expected = format!(
+        "agent client {} is already online with a different instance",
+        client_id
+    );
+    error == Some(expected.as_str())
+}
+
+fn is_unknown_polling_session(client_id: &str, error: Option<&str>) -> bool {
+    let expected = format!("unknown shell client: {}", client_id);
+    error == Some(expected.as_str())
 }
 
 fn error_chain_text(error: &reqwest::Error) -> String {
@@ -599,6 +834,11 @@ fn bounded_single_line(text: &str) -> String {
     out.trim().to_string()
 }
 
+fn bounded_endpoint_path(path: &str) -> String {
+    let without_query = path.split_once('?').map_or(path, |(path, _)| path);
+    bounded_single_line(without_query)
+}
+
 /// Extract the structured `error` field from a JSON error response body, if
 /// present. Non-JSON bodies (proxy HTML, truncated payloads) yield `None` so
 /// raw response bytes never leak into diagnostics.
@@ -615,6 +855,185 @@ fn structured_body_error(body: &str) -> Option<String> {
     } else {
         Some(error)
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BoundedResponseBody {
+    bytes: Vec<u8>,
+    exceeded_limit: bool,
+}
+
+fn read_bounded_response_body<R: Read>(
+    reader: &mut R,
+    content_length: Option<u64>,
+    max_bytes: usize,
+) -> std::io::Result<BoundedResponseBody> {
+    let read_limit = (max_bytes as u64).saturating_add(1);
+    let initial_capacity = content_length
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default()
+        .min(max_bytes.saturating_add(1));
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    reader.take(read_limit).read_to_end(&mut bytes)?;
+    let exceeded_limit = bytes.len() > max_bytes;
+    if exceeded_limit {
+        bytes.truncate(max_bytes);
+    }
+    Ok(BoundedResponseBody {
+        bytes,
+        exceeded_limit,
+    })
+}
+
+fn bounded_response_content_type(
+    value: Option<&reqwest::header::HeaderValue>,
+    token: &str,
+) -> String {
+    match value {
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|value| {
+                let media_type = value.split(';').next()?.trim();
+                let lower = media_type.to_ascii_lowercase();
+                let token = token.trim();
+                if media_type.is_empty()
+                    || lower.contains("authorization")
+                    || lower.contains("bearer")
+                    || (!token.is_empty() && media_type.contains(token))
+                    || !media_type.chars().all(|ch| {
+                        ch.is_ascii_alphanumeric()
+                            || matches!(
+                                ch,
+                                '/' | '!' | '#' | '$' | '&' | '^' | '_' | '.' | '+' | '-'
+                            )
+                    })
+                {
+                    None
+                } else {
+                    Some(bounded_single_line(media_type))
+                }
+            })
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "<redacted-or-invalid>".to_string()),
+        None => "<missing>".to_string(),
+    }
+}
+
+fn response_decode_summary(
+    status: reqwest::StatusCode,
+    content_type: &str,
+    detail: impl AsRef<str>,
+) -> String {
+    format!(
+        "status={} content_type={} {}",
+        http_status_summary(status),
+        content_type,
+        detail.as_ref()
+    )
+}
+
+fn looks_like_transient_proxy_response(content_type: &str, body: &[u8]) -> bool {
+    const MAX_INSPECT_BYTES: usize = 8 * 1024;
+    let inspected = &body[..body.len().min(MAX_INSPECT_BYTES)];
+    let text = String::from_utf8_lossy(inspected);
+    let lower = text.to_ascii_lowercase();
+    let has_temporary_gateway_marker = contains_any(
+        &lower,
+        &[
+            "bad gateway",
+            "service unavailable",
+            "gateway timeout",
+            "upstream connect error",
+            "upstream connection error",
+            "upstream unavailable",
+            "proxy error",
+            "temporarily unavailable",
+        ],
+    );
+    let looks_html = content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/html"))
+        || lower.contains("<html")
+        || lower.contains("<!doctype html");
+    if looks_html && has_temporary_gateway_marker {
+        return true;
+    }
+    let plain = lower.trim();
+    body.len() <= MAX_INSPECT_BYTES
+        && (matches!(
+            plain,
+            "bad gateway"
+                | "service unavailable"
+                | "gateway timeout"
+                | "upstream unavailable"
+                | "temporarily unavailable"
+        ) || plain.starts_with("upstream connect error")
+            || plain.starts_with("upstream connection error"))
+}
+
+fn serde_json_category_name(error: &serde_json::Error) -> &'static str {
+    match error.classify() {
+        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "data",
+        serde_json::error::Category::Eof => "eof",
+    }
+}
+
+fn decode_json_response<R>(
+    path: &str,
+    status: reqwest::StatusCode,
+    content_type: &str,
+    body: BoundedResponseBody,
+) -> Result<R, AgentHttpError>
+where
+    R: serde::de::DeserializeOwned,
+{
+    if body.bytes.iter().all(u8::is_ascii_whitespace) {
+        return Err(AgentHttpError::decode_transient(
+            path,
+            response_decode_summary(status, content_type, "empty response body"),
+        ));
+    }
+    if looks_like_transient_proxy_response(content_type, &body.bytes) {
+        return Err(AgentHttpError::decode_transient(
+            path,
+            response_decode_summary(
+                status,
+                content_type,
+                "recognized temporary proxy/upstream response",
+            ),
+        ));
+    }
+    if body.exceeded_limit {
+        return Err(AgentHttpError::protocol_decode(
+            path,
+            response_decode_summary(
+                status,
+                content_type,
+                format!(
+                    "response body exceeds limit_bytes={}",
+                    AGENT_HTTP_RESPONSE_BODY_MAX_BYTES
+                ),
+            ),
+        ));
+    }
+    serde_json::from_slice(&body.bytes).map_err(|error| {
+        let detail = format!(
+            "serde_category={} line={} column={}",
+            serde_json_category_name(&error),
+            error.line(),
+            error.column()
+        );
+        let summary = response_decode_summary(status, content_type, detail);
+        if error.is_eof() {
+            AgentHttpError::decode_transient(path, summary)
+        } else {
+            AgentHttpError::protocol_decode(path, summary)
+        }
+    })
 }
 
 fn post_json<T, R>(
@@ -651,11 +1070,49 @@ where
         .send()
         .map_err(|e| AgentHttpError::request(path, e))?;
     let status = resp.status();
-    let text = resp.text().map_err(|e| AgentHttpError::request(path, e))?;
+    let content_type =
+        bounded_response_content_type(resp.headers().get(reqwest::header::CONTENT_TYPE), token);
+    let content_length = resp.content_length();
+    if content_length.is_some_and(|length| length > AGENT_HTTP_RESPONSE_BODY_MAX_BYTES as u64) {
+        if !status.is_success() {
+            return Err(AgentHttpError::status(path, status, ""));
+        }
+        return Err(AgentHttpError::protocol_decode(
+            path,
+            response_decode_summary(
+                status,
+                &content_type,
+                format!(
+                    "declared response body exceeds limit_bytes={}",
+                    AGENT_HTTP_RESPONSE_BODY_MAX_BYTES
+                ),
+            ),
+        ));
+    }
+    let mut resp = resp;
+    let body = match read_bounded_response_body(
+        &mut resp,
+        content_length,
+        AGENT_HTTP_RESPONSE_BODY_MAX_BYTES,
+    ) {
+        Ok(body) => body,
+        Err(error) if status.is_success() => {
+            return Err(AgentHttpError::decode_transient(
+                path,
+                response_decode_summary(
+                    status,
+                    &content_type,
+                    format!("response body read interrupted io_kind={:?}", error.kind()),
+                ),
+            ));
+        }
+        Err(_) => return Err(AgentHttpError::status(path, status, "")),
+    };
     if !status.is_success() {
+        let text = String::from_utf8_lossy(&body.bytes);
         return Err(AgentHttpError::status(path, status, &text));
     }
-    serde_json::from_str(&text).map_err(|e| AgentHttpError::decode(path, e))
+    decode_json_response(path, status, &content_type, body)
 }
 
 fn agent_register_capabilities(cfg: &AgentConfig) -> ShellClientCapabilities {
@@ -859,7 +1316,7 @@ fn register(
     project_cache: &mut AgentProjectCache,
     agent_instance_id: &str,
     prepared_cache_count: usize,
-) -> Result<usize, String> {
+) -> Result<usize, RegisterError> {
     let projects = project_cache.get(cfg);
     let projects_count = projects.iter().filter(|project| !project.disabled).count();
     let (body, provider, provider_revision) = build_register_request_with_provider_status(
@@ -870,15 +1327,16 @@ fn register(
         agent_instance_id,
         prepared_cache_count,
     );
-    let response: ShellClientRegisterResponse =
-        post_json(client, cfg, AGENT_REGISTER_PATH, &body).map_err(|e| e.to_string())?;
+    let response: ShellClientRegisterResponse = post_json(client, cfg, AGENT_REGISTER_PATH, &body)
+        .map_err(|error| RegisterError::from_http(error, &cfg.client_id))?;
     if response.success {
         provider.mark_status_reported(provider_revision);
         Ok(projects_count)
     } else {
-        Err(response
-            .error
-            .unwrap_or_else(|| "register failed without error".to_string()))
+        Err(RegisterError::from_response_error(
+            &cfg.client_id,
+            response.error,
+        ))
     }
 }
 
@@ -1843,14 +2301,17 @@ fn handle_one_poll(
             if let Some((_, provider, revision)) = provider_update {
                 provider.release_status_update(revision);
             }
-            return Err(PollError::from_http(error));
+            return Err(PollError::from_http(error, &cfg.client_id));
         }
     };
     if !response.success {
         if let Some((_, provider, revision)) = provider_update {
             provider.release_status_update(revision);
         }
-        return Err(PollError::from_response_error(response.error));
+        return Err(PollError::from_response_error(
+            &cfg.client_id,
+            response.error,
+        ));
     }
     if let Some((_, provider, revision)) = provider_update {
         provider.mark_status_reported(revision);
@@ -1978,6 +2439,78 @@ mod tests {
     }
 
     #[test]
+    fn bounded_response_body_reader_stops_after_limit_plus_one() {
+        let mut reader = std::io::Cursor::new(vec![b'x'; 66]);
+        let body = read_bounded_response_body(&mut reader, None, 64).unwrap();
+        assert!(body.exceeded_limit);
+        assert_eq!(body.bytes.len(), 64);
+        assert_eq!(
+            reader.position(),
+            65,
+            "the bounded reader must not consume the unbounded remainder"
+        );
+    }
+
+    #[test]
+    fn response_decode_distinguishes_empty_eof_and_complete_syntax_errors() {
+        for bytes in [b"".as_slice(), br#"{"success":true,"request":"#.as_slice()] {
+            let error = decode_json_response::<ShellAgentPollResponse>(
+                AGENT_POLL_PATH,
+                reqwest::StatusCode::OK,
+                "application/json",
+                BoundedResponseBody {
+                    bytes: bytes.to_vec(),
+                    exceeded_limit: false,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.kind, AgentHttpErrorKind::DecodeTransient);
+        }
+
+        let error = decode_json_response::<ShellAgentPollResponse>(
+            AGENT_POLL_PATH,
+            reqwest::StatusCode::OK,
+            "application/json",
+            BoundedResponseBody {
+                bytes: b"{not-json".to_vec(),
+                exceeded_limit: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, AgentHttpErrorKind::ProtocolDecode);
+        assert!(error.summary.contains("serde_category=syntax"));
+        assert!(!error.to_string().contains("{not-json"));
+    }
+
+    #[test]
+    fn protocol_decode_diagnostics_omit_queries_credentials_and_response_values() {
+        let content_type = reqwest::header::HeaderValue::from_static(
+            "application/json; authorization=Bearer SECRET-TOKEN",
+        );
+        let content_type = bounded_response_content_type(Some(&content_type), "SECRET-TOKEN");
+        let error = decode_json_response::<ShellAgentPollResponse>(
+            "/api/shell/agent/poll?token=SECRET-TOKEN",
+            reqwest::StatusCode::OK,
+            &content_type,
+            BoundedResponseBody {
+                bytes: br#"{"success":"SECRET-TOKEN","request":null,"error":null}"#.to_vec(),
+                exceeded_limit: false,
+            },
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert_eq!(error.kind, AgentHttpErrorKind::ProtocolDecode);
+        assert!(
+            message.contains("content_type=application/json"),
+            "{message}"
+        );
+        assert!(!message.contains('?'), "{message}");
+        assert!(!message.contains("SECRET-TOKEN"), "{message}");
+        assert!(!message.contains("authorization"), "{message}");
+        assert!(!message.contains('\n'), "{message}");
+    }
+
+    #[test]
     fn result_400_is_classified_permanent_with_bounded_structured_reason() {
         let error = AgentHttpError::status(
             "/api/shell/agent/result",
@@ -2049,7 +2582,7 @@ mod tests {
             ),
             (
                 reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                AgentHttpErrorKind::Status,
+                AgentHttpErrorKind::ServerUnavailable,
             ),
             (
                 reqwest::StatusCode::BAD_GATEWAY,
@@ -2071,19 +2604,104 @@ mod tests {
     }
 
     #[test]
+    fn register_recovery_classification_is_strict_about_lease_conflicts() {
+        let lease = AgentHttpError::status(
+            AGENT_REGISTER_PATH,
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"success":false,"error":"agent client oe is already online with a different instance"}"#,
+        );
+        let lease = RegisterError::from_http(lease, "oe");
+        assert_eq!(
+            lease.recovery_action(),
+            RegisterRecoveryAction::WaitForLease
+        );
+
+        for body in [
+            r#"{"success":false,"error":"agent client identity is unavailable"}"#,
+            r#"{"success":false,"error":"agent token owner is 'alice'; cannot register owner 'bob'"}"#,
+            r#"{"success":false,"error":"agent client oe is already online"}"#,
+        ] {
+            let rejected =
+                AgentHttpError::status(AGENT_REGISTER_PATH, reqwest::StatusCode::BAD_REQUEST, body);
+            let rejected = RegisterError::from_http(rejected, "oe");
+            assert_eq!(
+                rejected.recovery_action(),
+                RegisterRecoveryAction::Fatal,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn poll_recovery_actions_separate_transport_session_and_fatal_errors() {
+        let transient = PollError::from_http(
+            AgentHttpError::status(
+                AGENT_POLL_PATH,
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                "{}",
+            ),
+            "oe",
+        );
+        assert_eq!(
+            transient.recovery_action(),
+            PollingRecoveryAction::RetryPoll
+        );
+
+        let missing_session = PollError::from_http(
+            AgentHttpError::status(
+                AGENT_POLL_PATH,
+                reqwest::StatusCode::BAD_REQUEST,
+                r#"{"success":false,"error":"unknown shell client: oe"}"#,
+            ),
+            "oe",
+        );
+        assert_eq!(
+            missing_session.recovery_action(),
+            PollingRecoveryAction::ReRegister
+        );
+
+        let ordinary_400 = PollError::from_http(
+            AgentHttpError::status(
+                AGENT_POLL_PATH,
+                reqwest::StatusCode::BAD_REQUEST,
+                r#"{"success":false,"error":"invalid poll payload"}"#,
+            ),
+            "oe",
+        );
+        assert_eq!(ordinary_400.recovery_action(), PollingRecoveryAction::Fatal);
+    }
+
+    #[test]
+    fn tls_configuration_markers_are_fatal_but_dns_and_eof_are_not() {
+        assert!(looks_like_fatal_tls_request(
+            "error: invalid peer certificate: UnknownIssuer"
+        ));
+        assert!(looks_like_fatal_tls_request(
+            "tls error: no application protocol; ALPN mismatch"
+        ));
+        assert!(!looks_like_fatal_tls_request(
+            "dns error: temporary failure in name resolution"
+        ));
+        assert!(!looks_like_fatal_tls_request(
+            "connection closed: unexpected EOF"
+        ));
+    }
+
+    #[test]
     fn submit_fatal_error_classes_map_to_terminal_poll_contract() {
         assert!(PollError::from_submit(SubmitResultError::FatalAuth("auth".into())).is_terminal());
         assert!(
             PollError::from_submit(SubmitResultError::FatalProtocol("missing".into()))
                 .is_terminal()
         );
+        assert!(PollError::from_submit(SubmitResultError::FatalConfig("tls".into())).is_terminal());
         assert!(
             PollError::from_submit(SubmitResultError::TransportClosed("closed".into()))
                 .is_terminal()
         );
         let shutdown =
             PollError::from_submit(SubmitResultError::Shutdown("process shutdown".into()));
-        assert!(shutdown.is_terminal());
+        assert!(!shutdown.is_terminal());
         assert!(shutdown.is_shutdown());
     }
 
