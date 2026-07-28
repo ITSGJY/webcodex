@@ -45,6 +45,9 @@ pub use handlers::{
 };
 pub(crate) use job_updates::ShellJobStartMetadata;
 pub(crate) use jobs::{command_preview, COMMAND_PREVIEW_MAX_CHARS};
+#[cfg(test)]
+pub(crate) use projects::ShellClientLookupError;
+pub(crate) use requests::EnqueueLspError;
 use state::ShellClientRegistryInner;
 use validation::sha256_hex;
 #[cfg(test)]
@@ -1250,6 +1253,7 @@ pub async fn shell_jobs_list(req: &mut Request, depot: &mut Depot, res: &mut Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lsp_bridge::{AgentLspPayload, AgentLspRequest};
     use crate::shell_protocol::AGENT_PROTOCOL_VERSION_QUIC_V1;
 
     fn auth_context(username: Option<&str>, is_bootstrap: bool) -> crate::auth::AuthContext {
@@ -2011,9 +2015,19 @@ mod tests {
             .client_supports("ghost", SHELL_CLIENT_CAPABILITY_SHELL)
             .await
             .unwrap_err();
-        assert!(err.contains("unknown shell client"));
+        assert_eq!(
+            err,
+            ShellClientLookupError::UnknownClient {
+                client_id: "ghost".to_string()
+            }
+        );
         let err = registry.get_client_capabilities("ghost").await.unwrap_err();
-        assert!(err.contains("unknown shell client"));
+        assert_eq!(
+            err,
+            ShellClientLookupError::UnknownClient {
+                client_id: "ghost".to_string()
+            }
+        );
     }
 
     #[tokio::test]
@@ -2136,6 +2150,144 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("unknown shell client"));
+    }
+
+    fn lsp_status_payload() -> AgentLspPayload {
+        AgentLspPayload {
+            project_id: "demo".to_string(),
+            request: AgentLspRequest::Status,
+        }
+    }
+
+    async fn register_lsp_test_client(
+        registry: &ShellClientRegistry,
+        client_id: &str,
+        lsp_capable: bool,
+    ) {
+        registry
+            .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
+                client_id: client_id.to_string(),
+                agent_instance_id: "inst".to_string(),
+                display_name: None,
+                owner: None,
+                hostname: None,
+                capabilities: Some(ShellClientCapabilities {
+                    lsp_read_only_navigation: lsp_capable,
+                    ..Default::default()
+                }),
+                projects: None,
+                agent_protocol_version: None,
+                policy: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn enqueue_lsp_returns_structured_unknown_client_error() {
+        let registry = ShellClientRegistry::default();
+        let error = registry
+            .enqueue_lsp(
+                "missing".to_string(),
+                lsp_status_payload(),
+                "test".to_string(),
+                5,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            EnqueueLspError::UnknownClient {
+                client_id: "missing".to_string()
+            }
+        );
+        assert_eq!(error.to_string(), "unknown shell client: missing");
+    }
+
+    #[tokio::test]
+    async fn enqueue_lsp_returns_structured_unsupported_capability_error() {
+        let registry = ShellClientRegistry::default();
+        register_lsp_test_client(&registry, "legacy", false).await;
+        let error = registry
+            .enqueue_lsp(
+                "legacy".to_string(),
+                lsp_status_payload(),
+                "test".to_string(),
+                5,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            EnqueueLspError::UnsupportedCapability {
+                client_id: "legacy".to_string()
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "agent client legacy does not support lsp_read_only_navigation"
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_lsp_returns_structured_offline_client_error() {
+        let registry = ShellClientRegistry::default();
+        register_lsp_test_client(&registry, "stale-lsp", true).await;
+        registry
+            .set_last_seen_for_test("stale-lsp", now_ts() - CLIENT_ONLINE_WINDOW_SECS - 1)
+            .await;
+        let error = registry
+            .enqueue_lsp(
+                "stale-lsp".to_string(),
+                lsp_status_payload(),
+                "test".to_string(),
+                5,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            EnqueueLspError::ClientOffline {
+                client_id: "stale-lsp".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_lsp_returns_structured_queue_full_error() {
+        let registry = ShellClientRegistry::default();
+        register_lsp_test_client(&registry, "full-lsp", true).await;
+        {
+            let mut inner = registry.inner.lock().await;
+            inner.queues_by_client.insert(
+                "full-lsp".to_string(),
+                (0..MAX_QUEUED_REQUESTS_PER_CLIENT)
+                    .map(|index| format!("queued-{index}"))
+                    .collect(),
+            );
+        }
+        let error = registry
+            .enqueue_lsp(
+                "full-lsp".to_string(),
+                lsp_status_payload(),
+                "test".to_string(),
+                5,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            EnqueueLspError::QueueFull {
+                client_id: "full-lsp".to_string(),
+                limit: MAX_QUEUED_REQUESTS_PER_CLIENT,
+            }
+        );
     }
 
     async fn register_quic_v1_client(registry: &ShellClientRegistry, client_id: &str) {

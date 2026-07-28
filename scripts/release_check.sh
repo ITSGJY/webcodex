@@ -10,15 +10,16 @@ set -euo pipefail
 # secrets, agent.toml, webcodex.env, or .env files.
 #
 # Stages:
-#   1. cargo fmt --check
-#   2. cargo check --workspace --all-targets
-#   3. cargo test -p webcodex --bin webcodex metadata -- --nocapture
-#   4. cargo test -p webcodex --bin webcodex schema -- --nocapture
-#   5. cargo test -p webcodex --bin webcodex openapi -- --nocapture
-#   6. cargo test -p webcodex --bin webcodex mcp -- --nocapture
-#   7. bash syntax checks for scripts/*.sh
-#   8. static: no python runtime helper regressions
-#   9. static: no sensitive files tracked or staged by git
+#   1. workspace boundary check
+#   2. cargo fmt --all -- --check
+#   3. cargo check --workspace --all-targets
+#   4. cargo test -p webcodex --bin webcodex metadata -- --nocapture
+#   5. cargo test -p webcodex --bin webcodex schema -- --nocapture
+#   6. cargo test -p webcodex --bin webcodex openapi -- --nocapture
+#   7. cargo test -p webcodex --bin webcodex mcp -- --nocapture
+#   8. bash syntax checks for scripts/*.sh
+#   9. static: no python runtime helper regressions
+#  10. static: no sensitive files tracked or staged by git
 #
 # Manual final acceptance steps live in docs/RELEASE_CHECKLIST.md:
 #   - cargo test --workspace -- --nocapture
@@ -69,17 +70,27 @@ fi
 log "project: $PROJECT_DIR"
 
 # ----------------------------------------------------------------------------
-# Stage 1: cargo fmt --check
+# Stage 1: workspace boundary check
 # ----------------------------------------------------------------------------
-stage_start "cargo fmt --check"
-if cargo fmt --check; then
-    ok "cargo fmt --check"
+stage_start "workspace boundary check"
+if bash scripts/workspace_boundary_check.sh; then
+    ok "workspace boundary check"
 else
-    die "cargo fmt --check"
+    die "workspace boundary check"
 fi
 
 # ----------------------------------------------------------------------------
-# Stage 2: cargo check --workspace --all-targets
+# Stage 2: cargo fmt --all -- --check
+# ----------------------------------------------------------------------------
+stage_start "cargo fmt --all -- --check"
+if cargo fmt --all -- --check; then
+    ok "cargo fmt --all -- --check"
+else
+    die "cargo fmt --all -- --check"
+fi
+
+# ----------------------------------------------------------------------------
+# Stage 3: cargo check --workspace --all-targets
 # ----------------------------------------------------------------------------
 stage_start "cargo check --workspace --all-targets"
 if cargo check --workspace --all-targets; then
@@ -89,7 +100,7 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# Stage 3: focused metadata tests
+# Stage 4: focused metadata tests
 # ----------------------------------------------------------------------------
 stage_start "cargo test -p webcodex --bin webcodex metadata -- --nocapture"
 if cargo test -p webcodex --bin webcodex metadata -- --nocapture; then
@@ -99,7 +110,7 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# Stage 4: focused schema tests
+# Stage 5: focused schema tests
 # ----------------------------------------------------------------------------
 stage_start "cargo test -p webcodex --bin webcodex schema -- --nocapture"
 if cargo test -p webcodex --bin webcodex schema -- --nocapture; then
@@ -109,7 +120,7 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# Stage 5: focused OpenAPI tests
+# Stage 6: focused OpenAPI tests
 # ----------------------------------------------------------------------------
 stage_start "cargo test -p webcodex --bin webcodex openapi -- --nocapture"
 if cargo test -p webcodex --bin webcodex openapi -- --nocapture; then
@@ -119,7 +130,7 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# Stage 6: focused MCP tests
+# Stage 7: focused MCP tests
 # ----------------------------------------------------------------------------
 stage_start "cargo test -p webcodex --bin webcodex mcp -- --nocapture"
 if cargo test -p webcodex --bin webcodex mcp -- --nocapture; then
@@ -129,7 +140,7 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# Stage 7: bash syntax checks
+# Stage 8: bash syntax checks
 # ----------------------------------------------------------------------------
 stage_start "bash syntax checks"
 for script in scripts/*.sh; do
@@ -141,7 +152,7 @@ for script in scripts/*.sh; do
 done
 
 # ----------------------------------------------------------------------------
-# Stage 8: static — no python runtime helper regressions
+# Stage 9: static — no python runtime helper regressions
 # ----------------------------------------------------------------------------
 stage_start "static: no python runtime helper regressions"
 if grep -R "python3 -c" -n src/tool_runtime src/shell_client crates/webcodex-runner/src; then
@@ -156,7 +167,7 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# Stage 9: static — no sensitive files tracked or staged by git
+# Stage 10: static — no sensitive files tracked or staged by git
 # ----------------------------------------------------------------------------
 stage_start "static: no sensitive files tracked/staged"
 # These are git-ignored deployment files that must NEVER be committed. We check
@@ -201,7 +212,7 @@ fi
 # Summary
 # ----------------------------------------------------------------------------
 printf '\n[release] ===== all stages passed =====\n'
-ok "fmt, check --all-targets, focused metadata/schema/openapi/mcp tests, bash syntax, static checks"
+ok "workspace boundaries, fmt, check --all-targets, focused metadata/schema/openapi/mcp tests, bash syntax, static checks"
 log "manual final acceptance: full suite, E2E websocket/polling, and eval compare (see docs/RELEASE_CHECKLIST.md)"
 log "release readiness gate PASSED"
 exit 0

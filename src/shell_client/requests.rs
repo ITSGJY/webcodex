@@ -1,16 +1,81 @@
 use super::jobs::{
     command_preview, ensure_dispatch_supported_locked, ensure_queue_capacity_locked,
+    PendingRequestEnqueueError,
 };
+use super::projects::ShellClientLookupError;
 use super::state::{PendingShellRequest, ShellClientRegistryInner};
 use super::validation::{validate_file_request, validate_id, validate_run_request};
-use super::{now_ts, ShellClientRegistry};
+use super::{now_ts, ShellClientRegistry, CLIENT_ONLINE_WINDOW_SECS};
 use crate::lsp_bridge::{AgentLspPayload, AGENT_LSP_REQUEST_KIND};
 use crate::shell_protocol::{
     ShellAgentShellRequest, ShellFileOpRequest, ShellRunRequest, ShellRunResponse,
     SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
 };
+use std::fmt;
 use tokio::sync::oneshot;
 use uuid::Uuid;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EnqueueLspError {
+    InvalidRequest { message: String },
+    UnknownClient { client_id: String },
+    ClientOffline { client_id: String },
+    UnsupportedCapability { client_id: String },
+    QueueFull { client_id: String, limit: usize },
+}
+
+impl fmt::Display for EnqueueLspError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRequest { message } => formatter.write_str(message),
+            Self::UnknownClient { client_id } => {
+                write!(formatter, "unknown shell client: {client_id}")
+            }
+            Self::ClientOffline { client_id } => write!(
+                formatter,
+                "shell client {client_id} is offline (no keepalive within \
+                 {CLIENT_ONLINE_WINDOW_SECS}s); reconnect the agent before retrying"
+            ),
+            Self::UnsupportedCapability { client_id } => write!(
+                formatter,
+                "agent client {client_id} does not support \
+                 {SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION}"
+            ),
+            Self::QueueFull { client_id, limit } => write!(
+                formatter,
+                "too many pending requests for shell client {client_id} (limit {limit})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EnqueueLspError {}
+
+impl From<PendingRequestEnqueueError> for EnqueueLspError {
+    fn from(error: PendingRequestEnqueueError) -> Self {
+        match error {
+            PendingRequestEnqueueError::UnknownClient { client_id } => {
+                Self::UnknownClient { client_id }
+            }
+            PendingRequestEnqueueError::ClientOffline { client_id } => {
+                Self::ClientOffline { client_id }
+            }
+            PendingRequestEnqueueError::QueueFull { client_id, limit } => {
+                Self::QueueFull { client_id, limit }
+            }
+        }
+    }
+}
+
+impl From<ShellClientLookupError> for EnqueueLspError {
+    fn from(error: ShellClientLookupError) -> Self {
+        match error {
+            ShellClientLookupError::UnknownClient { client_id } => {
+                Self::UnknownClient { client_id }
+            }
+        }
+    }
+}
 
 pub(super) fn next_request_id() -> String {
     Uuid::new_v4().to_string()
@@ -29,7 +94,7 @@ pub(super) fn enqueue_pending_request_locked(
     request: ShellAgentShellRequest,
     waiter: Option<oneshot::Sender<ShellRunResponse>>,
     job_id: Option<String>,
-) -> Result<(), String> {
+) -> Result<(), PendingRequestEnqueueError> {
     ensure_dispatch_supported_locked(inner, client_id)?;
     ensure_queue_capacity_locked(inner, client_id)?;
     inner
@@ -296,18 +361,17 @@ impl ShellClientRegistry {
         payload: AgentLspPayload,
         requested_by: String,
         timeout_secs: u64,
-    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
-        validate_id(&client_id, "client_id")?;
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), EnqueueLspError> {
+        validate_id(&client_id, "client_id")
+            .map_err(|message| EnqueueLspError::InvalidRequest { message })?;
         // Capability gate before enqueue so old agents never receive unknown
         // LSP kinds that could fall into shell fallback.
         if !self
             .client_supports(&client_id, SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION)
-            .await?
+            .await
+            .map_err(EnqueueLspError::from)?
         {
-            return Err(format!(
-                "agent client {} does not support {}",
-                client_id, SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION
-            ));
+            return Err(EnqueueLspError::UnsupportedCapability { client_id });
         }
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
@@ -345,7 +409,8 @@ impl ShellClientRegistry {
             request,
             Some(tx),
             None,
-        )?;
+        )
+        .map_err(EnqueueLspError::from)?;
         notify_client_locked(&inner, &client_id);
         Ok((request_id, rx))
     }

@@ -121,6 +121,12 @@ jobs:
 管理、配置、沙箱与工作区实现按真实调用边界拆入对应 crate。旧源码副本和
 binary 间 `#[path]` fallback 均未保留。
 
+`scripts/workspace_boundary_check.sh` 已将这些边界固化为 CI 和 release
+readiness gate：通过 `cargo metadata` 校验 8 个既有 package 与
+core/runner/CLI 的直接依赖，并扫描生产及测试 Rust 源码，阻止跨父目录
+`#[path]` 共享源码回潮。检查逻辑带隔离 fixture 自测试，不修改真实
+manifest。
+
 ### P2：生产路径的 `unwrap()` 收敛
 
 非测试目录下约 1,652 处 `unwrap()`（含 inline `#[cfg(test)]`，实际生产
@@ -133,13 +139,13 @@ agent 是长驻进程，panic 即掉线。建议：
   `expect("原因")`，I/O、解析、协议路径换错误传播；
 - LSP 模块已有 `lock_unpoison` 模式，可推广到其他模块。
 
-### P2：`semantic_navigation.rs` 错误分类去字符串化
+### P2（已完成）：`semantic_navigation.rs` 错误分类去字符串化
 
-`src/tool_runtime/semantic_navigation.rs:306` 依赖
-`error.contains("unknown shell client")` / `contains("does not support")`
-对 `enqueue_lsp` 的 `String` 错误分类。上游改一个字，startup 概要
-的 `reason_code` 就会静默退化为 `probe_failed`。建议 `enqueue_lsp`
-返回带枚举的错误类型（或在错误上带稳定 code），字符串匹配只留作兜底。
+`enqueue_lsp` 现返回窄范围的 `EnqueueLspError`，稳定区分输入无效、
+未知 client、client 离线、能力不支持与队列满；shell client lookup
+及共享入队检查也在各自边界返回类型化错误。semantic navigation startup
+probe 与公开 LSP 调度调用方均按枚举变体匹配，不再解析展示文案，原有
+错误文本、startup summary、JSON/schema 和 agent wire format 保持不变。
 
 ### P2：多平台 npm 分发
 

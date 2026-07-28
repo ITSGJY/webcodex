@@ -8,6 +8,7 @@ use crate::lsp_bridge::{
     DocumentDiagnosticsResult, DocumentDiagnosticsStatus, DocumentSymbolsResult, HoverResult,
     LocationsResult, LspStatusResult, WorkspaceSymbolsResult,
 };
+use crate::shell_client::EnqueueLspError;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -207,16 +208,14 @@ impl ToolRuntime {
             .await
         {
             Ok(pair) => pair,
-            Err(e) => {
-                if e.contains("does not support") {
-                    return ToolResult::err(format!(
-                        "{}: {}",
-                        error_codes::AGENT_CAPABILITY_UNAVAILABLE,
-                        e
-                    ));
-                }
-                return ToolResult::err(e);
+            Err(error @ EnqueueLspError::UnsupportedCapability { .. }) => {
+                return ToolResult::err(format!(
+                    "{}: {}",
+                    error_codes::AGENT_CAPABILITY_UNAVAILABLE,
+                    error
+                ));
             }
+            Err(error) => return ToolResult::err(error.to_string()),
         };
         match tokio::time::timeout(Duration::from_secs(wait_timeout + 2), rx).await {
             Ok(Ok(resp)) => {
