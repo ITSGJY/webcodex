@@ -56,17 +56,17 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
         ),
         tool_spec(
             "bind_current_session",
-            "Bind an existing project-scoped session as the current session for this caller, transport, and project. This is process-local in-memory control metadata, not the durable session ledger, and may be lost on restart. Read-only; never modifies project files.",
+            "Bind an existing project-scoped session as current for this client window, caller, transport, and project. This is process-local in-memory control metadata, not the durable session ledger, and may be lost on restart. Read-only; never modifies project files.",
             current_session_input_schema(true),
         ),
         tool_spec(
             "current_session",
-            "Return the process-local in-memory current-session binding for this caller, transport, and project, if a live binding exists. This is convenience control metadata, not the durable session ledger, and may be lost on restart.",
+            "Return the process-local in-memory current-session binding for this client window, caller, transport, and project, if a live binding exists. This is convenience control metadata, not the durable session ledger, and may be lost on restart.",
             current_session_input_schema(false),
         ),
         tool_spec(
             "unbind_current_session",
-            "Remove the process-local in-memory current-session binding for this caller, transport, and project. This only clears convenience control metadata, not the durable session ledger. Idempotent and read-only.",
+            "Remove the process-local in-memory current-session binding for this client window, caller, transport, and project. This only clears convenience control metadata, not the durable session ledger. Idempotent and read-only.",
             current_session_input_schema(false),
         ),
     ]

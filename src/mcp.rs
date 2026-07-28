@@ -308,6 +308,7 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
     };
     guard.set_tool_name(tool_name.clone());
     guard.parsed("ok");
+    let window = crate::client_window::mcp_window(req, request.method == "initialize");
 
     // Chat-window MCP tool calls must land in the action audit exactly like
     // the REST surface (they were previously invisible there). Summary-level
@@ -348,6 +349,7 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
             connector.as_deref(),
             request,
             auth.as_ref(),
+            window.identity.as_ref(),
             Some(&mut guard),
         ),
     )
@@ -376,6 +378,12 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
             return;
         }
     };
+
+    if matches!(outcome, McpOutcome::Ok(_)) {
+        if let Some(session_id) = window.issued_session_id.as_deref() {
+            crate::client_window::set_mcp_session_header(res, session_id);
+        }
+    }
 
     match outcome {
         McpOutcome::Ok(body) => {
@@ -459,7 +467,7 @@ async fn handle_mcp_request(
     request: JsonRpcRequest,
     auth: Option<&AuthContext>,
 ) -> McpOutcome {
-    handle_mcp_request_with_lifecycle(runtime, None, request, auth, None).await
+    handle_mcp_request_with_lifecycle(runtime, None, request, auth, None, None).await
 }
 
 async fn handle_mcp_request_with_lifecycle(
@@ -467,6 +475,7 @@ async fn handle_mcp_request_with_lifecycle(
     connector: Option<&ConnectorRuntime>,
     request: JsonRpcRequest,
     auth: Option<&AuthContext>,
+    window: Option<&crate::client_window::ClientWindow>,
     mut lifecycle: Option<&mut ToolRequestLifecycle>,
 ) -> McpOutcome {
     let is_oauth2 = auth.is_some_and(|ctx| ctx.is_oauth_token());
@@ -544,12 +553,24 @@ async fn handle_mcp_request_with_lifecycle(
                 lc.dispatch_started();
             }
             if let Some(connector) = connector {
+                if params.name == "task_start" && window.is_none() {
+                    if let Some(lc) = lifecycle.as_deref() {
+                        lc.dispatch_failed("window_identity_unavailable");
+                        lc.dispatch_finished(false, Some(false), "window_identity_unavailable");
+                    }
+                    return McpOutcome::BadRequest(rpc_error(
+                        id,
+                        -32600,
+                        "MCP session identity is unavailable; initialize the connection before starting or continuing project work",
+                    ));
+                }
                 let outcome = connector
-                    .call(
+                    .call_for_window(
                         &params.name,
                         params.arguments,
                         auth,
                         ConnectorTransport::Mcp,
+                        window,
                     )
                     .await;
                 if let Some(required_scope) = outcome.required_scope {
@@ -606,6 +627,7 @@ async fn handle_mcp_request_with_lifecycle(
                         transport: ToolTransport::Mcp,
                         session_id: session_id.as_deref(),
                         auth,
+                        window,
                         record_oauth_scope_denials: false,
                     },
                 )
@@ -1883,10 +1905,15 @@ mod tests {
         config: Arc<crate::Config>,
         db: Arc<crate::Database>,
         runtime: Arc<ToolRuntime>,
+        project_root: &std::path::Path,
     ) -> Router {
         const PROJECT_GRANT_ID: &str = "wc_pgrant_3333333333333333";
         const PROJECT_CREDENTIAL: &str =
             "webcodex_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let state_root = project_root
+            .parent()
+            .expect("connector test project parent")
+            .join("connector-state");
         let connector = crate::connector_runtime::ConnectorRuntime::new(
             runtime.clone(),
             db.clone(),
@@ -1895,10 +1922,13 @@ mod tests {
                 project_name: "demo".to_string(),
                 workspace_id: "wc_ws_1234567890".to_string(),
                 executor_project: "agent:hosted:demo".to_string(),
-                executor_root: "/workspace/demo".to_string(),
-                runs_root: "/tmp/webcodex-mcp-connector-tests/runs".to_string(),
-                results_root: "/tmp/webcodex-mcp-connector-tests/results".to_string(),
-                projects_dir: "/tmp/webcodex-mcp-connector-tests/agent/projects.d".to_string(),
+                executor_root: project_root.to_string_lossy().to_string(),
+                runs_root: state_root.join("runs").to_string_lossy().to_string(),
+                results_root: state_root.join("results").to_string_lossy().to_string(),
+                projects_dir: state_root
+                    .join("agent/projects.d")
+                    .to_string_lossy()
+                    .to_string(),
                 profile: "personal".to_string(),
                 project_grant_id: PROJECT_GRANT_ID.to_string(),
             },
@@ -1954,6 +1984,12 @@ mod tests {
             .send(&service)
             .await;
         assert_eq!(effective_status(&resp), StatusCode::OK);
+        let session_id = resp
+            .headers
+            .get(crate::client_window::MCP_SESSION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("initialize must mint an MCP session id");
+        assert!(session_id.starts_with("wc_mcp_"));
         let body: Value = resp.take_json().await.unwrap();
         assert_eq!(body["jsonrpc"], "2.0");
         assert_eq!(body["id"], 1);
@@ -2006,11 +2042,13 @@ mod tests {
     #[tokio::test]
     async fn http_project_connector_lists_and_dispatches_only_canonical_capabilities() {
         let config = test_config(Some("secret"));
-        let (_tmp, db) = test_db();
+        let (tmp, db) = test_db();
+        let project = tmp.path().join("connector-project");
+        crate::connector_runtime::tests::init_repo(&project);
         let user_token =
             "webcodex_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let runtime = Arc::new(test_runtime());
-        let service = Service::new(build_connector_test_router(config, db, runtime));
+        let service = Service::new(build_connector_test_router(config, db, runtime, &project));
 
         let mut schema = TestClient::get("http://localhost/openapi.json")
             .send(&service)
@@ -2054,6 +2092,45 @@ mod tests {
             .clone();
         assert_eq!(mcp_checks_schema, action_checks_schema);
 
+        let mut missing_window = TestClient::post("http://localhost/mcp")
+            .bearer_auth(user_token)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 18,
+                "method": "tools/call",
+                "params": {
+                    "name": "task_start",
+                    "arguments": { "goal": "must not create an anonymous context" }
+                }
+            }))
+            .send(&service)
+            .await;
+        assert_eq!(effective_status(&missing_window), StatusCode::BAD_REQUEST);
+        let missing_window_body: Value = missing_window.take_json().await.unwrap();
+        assert_eq!(missing_window_body["error"]["code"], -32600);
+        assert!(missing_window_body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("initialize"));
+
+        let initialized = TestClient::post("http://localhost/mcp")
+            .bearer_auth(user_token)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 19,
+                "method": "initialize",
+                "params": {}
+            }))
+            .send(&service)
+            .await;
+        assert_eq!(effective_status(&initialized), StatusCode::OK);
+        let mcp_session_id = initialized
+            .headers
+            .get(crate::client_window::MCP_SESSION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("connector initialize session id")
+            .to_string();
+
         let mut action_started = TestClient::post("http://localhost/api/connector/task/start")
             .bearer_auth(user_token)
             .json(&json!({
@@ -2063,6 +2140,15 @@ mod tests {
             .send(&service)
             .await;
         assert_eq!(effective_status(&action_started), StatusCode::OK);
+        let window_cookie = action_started
+            .headers
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find(|value| value.starts_with("webcodex_window="))
+            .and_then(|value| value.split(';').next())
+            .expect("first connector call must mint a window cookie")
+            .to_string();
         let action_body: Value = action_started.take_json().await.unwrap();
         assert_eq!(action_body["ok"], true);
         assert!(action_body["task_id"]
@@ -2070,6 +2156,54 @@ mod tests {
             .unwrap()
             .starts_with("wc_task_"));
         assert!(action_body.get("success").is_none());
+
+        let mut action_continued = TestClient::post("http://localhost/api/connector/task/start")
+            .bearer_auth(user_token)
+            .add_header("cookie", &window_cookie, true)
+            .json(&json!({
+                "goal": "continue the Actions inspection",
+                "mode": "read_only"
+            }))
+            .send(&service)
+            .await;
+        assert_eq!(effective_status(&action_continued), StatusCode::OK);
+        let continued_body: Value = action_continued.take_json().await.unwrap();
+        assert_eq!(continued_body["task_id"], action_body["task_id"]);
+        assert_eq!(continued_body["data"]["continuation"], "continued");
+
+        let action_conversation_request = |conversation_id: &'static str, goal: &'static str| {
+            TestClient::post("http://localhost/api/connector/task/start")
+                .bearer_auth(user_token)
+                .add_header("openai-conversation-id", conversation_id, true)
+                .json(&json!({"goal": goal, "mode": "read_only"}))
+        };
+        let mut conversation_a =
+            action_conversation_request("conversation-a", "conversation A work")
+                .send(&service)
+                .await;
+        let conversation_a_body: Value = conversation_a.take_json().await.unwrap();
+        let mut conversation_b =
+            action_conversation_request("conversation-b", "conversation B work")
+                .send(&service)
+                .await;
+        let conversation_b_body: Value = conversation_b.take_json().await.unwrap();
+        assert_ne!(
+            conversation_a_body["task_id"], conversation_b_body["task_id"],
+            "one credential must not merge two hosted conversations"
+        );
+        let mut conversation_a_again =
+            action_conversation_request("conversation-a", "conversation A follow-up")
+                .send(&service)
+                .await;
+        let conversation_a_again_body: Value = conversation_a_again.take_json().await.unwrap();
+        assert_eq!(
+            conversation_a_again_body["task_id"],
+            conversation_a_body["task_id"]
+        );
+        assert_eq!(
+            conversation_a_again_body["data"]["continuation"],
+            "continued"
+        );
 
         let mut legacy = TestClient::post("http://localhost/api/tools/call")
             .bearer_auth(user_token)
@@ -2085,6 +2219,11 @@ mod tests {
 
         let mut started = TestClient::post("http://localhost/mcp")
             .bearer_auth(user_token)
+            .add_header(
+                crate::client_window::MCP_SESSION_HEADER,
+                &mcp_session_id,
+                true,
+            )
             .json(&json!({
                 "jsonrpc": "2.0",
                 "id": 21,
@@ -2106,6 +2245,38 @@ mod tests {
         assert!(started_body["result"]["structuredContent"]
             .get("success")
             .is_none());
+
+        let mut continued = TestClient::post("http://localhost/mcp")
+            .bearer_auth(user_token)
+            .add_header(
+                crate::client_window::MCP_SESSION_HEADER,
+                &mcp_session_id,
+                true,
+            )
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 211,
+                "method": "tools/call",
+                "params": {
+                    "name": "task_start",
+                    "arguments": {
+                        "goal": "continue inspecting the project",
+                        "mode": "read_only"
+                    }
+                }
+            }))
+            .send(&service)
+            .await;
+        assert_eq!(effective_status(&continued), StatusCode::OK);
+        let continued_body: Value = continued.take_json().await.unwrap();
+        assert_eq!(
+            continued_body["result"]["structuredContent"]["task_id"],
+            started_body["result"]["structuredContent"]["task_id"]
+        );
+        assert_eq!(
+            continued_body["result"]["structuredContent"]["data"]["continuation"],
+            "continued"
+        );
 
         let mut hidden = TestClient::post("http://localhost/mcp")
             .bearer_auth(user_token)

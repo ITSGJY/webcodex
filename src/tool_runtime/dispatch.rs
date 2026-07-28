@@ -95,6 +95,7 @@ impl ToolRuntime {
             allow_cross_project_session,
             recorder_metadata,
             None,
+            None,
         )
         .await
     }
@@ -109,6 +110,7 @@ impl ToolRuntime {
         allow_cross_project_session: bool,
         recorder_metadata: sessions::ToolCallRecorderMetadata,
         inherited_sandbox: Option<&'static str>,
+        window: Option<&crate::client_window::ClientWindow>,
     ) -> ToolResult {
         // Phase-1 edit usage telemetry: argument-free structured log only.
         // Does not alter execution, session ledger, Action Audit, or schemas.
@@ -122,6 +124,7 @@ impl ToolRuntime {
                 allow_cross_project_session,
                 recorder_metadata,
                 inherited_sandbox,
+                window,
             )
             .await;
         if let Some(guard) = edit_usage.as_mut() {
@@ -164,6 +167,7 @@ impl ToolRuntime {
         allow_cross_project_session: bool,
         recorder_metadata: sessions::ToolCallRecorderMetadata,
         inherited_sandbox: Option<&'static str>,
+        window: Option<&crate::client_window::ClientWindow>,
     ) -> ToolResult {
         let mut resolved_project = match call.project() {
             Some(project) => self
@@ -180,8 +184,8 @@ impl ToolRuntime {
             .map(|resolved| resolved.resolved_id.clone());
         if use_current_session && call.session_id().is_none() && is_current_session_eligible(&call)
         {
-            if let Some(resolved) = resolved_project.as_ref() {
-                match current_session_key(auth, transport, &resolved.resolved_id) {
+            if let (Some(resolved), Some(window)) = (resolved_project.as_ref(), window) {
+                match current_session_key(auth, transport, &resolved.resolved_id, Some(window)) {
                     Ok(key) => {
                         if let Some(session_id) = self.sessions.current_session_id(&key) {
                             call = call.with_effective_session_id(session_id);
@@ -383,7 +387,7 @@ impl ToolRuntime {
             Self::capture_workspace_activity_context(&call, activity_project.as_deref());
         let tool_name = call.tool_name();
         let mut result = self
-            .dispatch_authorized_inner(call, auth, transport, execution_sandbox)
+            .dispatch_authorized_inner(call, auth, transport, execution_sandbox, window)
             .await;
         let permission = permission.filter(|_| {
             !permissions::is_hard_denied_output(&result.output, result.error.as_deref())
@@ -454,6 +458,7 @@ impl ToolRuntime {
         auth: Option<&AuthContext>,
         transport: sessions::SessionTransport,
         execution_sandbox: Option<&'static str>,
+        window: Option<&crate::client_window::ClientWindow>,
     ) -> ToolResult {
         match call {
             call @ (ToolCall::ListTools { .. }
@@ -472,11 +477,13 @@ impl ToolRuntime {
             | ToolCall::BindCurrentSession { .. }
             | ToolCall::CurrentSession { .. }
             | ToolCall::UnbindCurrentSession { .. }) => {
-                self.dispatch_session_tool(call, auth, transport).await
+                self.dispatch_session_tool(call, auth, transport, window)
+                    .await
             }
 
             call @ (ToolCall::StartCodingTask { .. } | ToolCall::FinishCodingTask { .. }) => {
-                self.dispatch_coding_task_tool(call, auth, transport).await
+                self.dispatch_coding_task_tool(call, auth, transport, window)
+                    .await
             }
 
             call @ ToolCall::SessionHandoffSummary { .. } => {

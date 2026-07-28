@@ -47,16 +47,22 @@ task_cancel
 task_finish
 ```
 
-聊天会话会过期，任务在服务端是持久的。新会话先用 `task_list` 发现未完成的
-工作，再用 `task_resume` 拿到紧凑 bootstrap——目标、状态、已应用路径、结果
-决定，以及尚未投递的人工 guidance（包括拒绝理由）。
+同一个聊天窗口会自动继续已配置仓库的工作。`task_start` 会为该窗口和项目解析
+唯一上下文，不创建无意义的重复任务；每条后续指令都会追加到当前持久任务。
+切换仓库连接时各仓库历史保持隔离，切回此前连接时恢复原任务。兼容的 MCP
+client 会自动保留协议 session，用户不需要在 prompt 中传入它。
 
 Connector context 已绑定项目。直接从 `task_start` 开始；不要调用
 `list_projects`、`runtime_status`、`tool_manifest`、`start_session` 或
 `current_session`，也不要向用户索取 Agent client ID、runtime project ID、
 executor reference 或 workflow session。
 
-保留的 durable ID 都有明确产品用途：
+复用前，WebCodex 会比较仓库实际路径、分支与 HEAD、工作区、适用的仓库规则及
+项目 manifest。未变化的上下文直接复用，只把变化部分标为已刷新。`task_list`
+和 `task_resume` 只用于 client 丢失 MCP transport session 后的显式恢复，不是
+普通工作流的前置步骤。
+
+这些 durable ID 用于模型工具与 host review 之间的稳定关联，普通用户无需管理：
 
 - `task_id`：继续/review 一个 bounded task；
 - `operation_id`：mutation/execution 的 exact retry identity；

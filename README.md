@@ -170,10 +170,13 @@ task_start
 → task_cancel (when needed)
 ```
 
-Chat sessions expire; tasks do not. A new session starts with `task_list` to
-find durable work, then `task_resume` for a compact bootstrap of one task —
-goal, state, applied paths, and any guidance the reviewer left, including a
-rejection reason.
+The same chat window continues its current repository work automatically.
+Switching to another configured repository changes the active project without
+closing the first task; returning to the first repository restores its prior
+context. Each follow-up instruction is appended to the durable task history,
+and WebCodex selectively refreshes Git, worktree, manifest, and repository-rule
+state before reuse. `task_list` and `task_resume` remain recovery tools for a
+lost transport identity, not ordinary setup steps.
 
 The configured Connector context resolves the project deterministically.
 Ordinary coding does not need `list_projects`, `runtime_status`,
@@ -197,9 +200,10 @@ that same authority. Hosted Chat can propose work but can never accept it; the
 server re-verifies the target checkout and the result before applying, so a
 Browser click cannot bypass the durable preconditions.
 
-Task, operation, execution, and result IDs remain visible because they provide
-exact retry, progress, review, and acceptance identity. Executor routing and
-queue IDs stay internal.
+Task, operation, execution, and result IDs still provide exact retry, progress,
+review, and acceptance identity between tools and the host, but ordinary users
+do not need to choose or manage them. Executor routing and queue IDs stay
+internal.
 
 ### Project-aware validation
 

@@ -18,11 +18,19 @@ use crate::auth::{
     AuthContext, AuthKind, ProjectAgentTokenVerifier, ProjectCredentialVerifier, SCOPE_JOB_RUN,
     SCOPE_PROJECT_READ, SCOPE_PROJECT_WRITE, SCOPE_RUNTIME_READ,
 };
-use crate::connector_runtime::workspace::{LocalResultDecision, WorkspaceManager};
+use crate::client_window::ClientWindow;
+use crate::connector_runtime::workspace::{
+    LocalResultDecision, PreparedWorkspace, WorkspaceManager,
+};
 use crate::db::{
     ConnectorApproval, ConnectorApprovalGate, ConnectorBinding, ConnectorEditOperationGate,
-    ConnectorExecutionReservation, ConnectorTaskResult, ConnectorTaskSnapshot,
-    ConnectorTaskStoreError, NewConnectorResult, NewConnectorTask,
+    ConnectorExecutionReservation, ConnectorTaskContinuation, ConnectorTaskResult,
+    ConnectorTaskSnapshot, ConnectorTaskStoreError, ConnectorWorkspaceTransition,
+    NewConnectorResult, NewConnectorTask,
+};
+use crate::project_context::{
+    capture_project_context, compare_project_context, ContextRefreshSummary,
+    ProjectContextFingerprint,
 };
 use crate::shell_protocol::{
     SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS,
@@ -148,6 +156,7 @@ pub(crate) struct ConnectorRuntime {
     project_agent_token: Option<ProjectAgentTokenVerifier>,
     workspace_ops: tokio::sync::Mutex<()>,
     task_locks: StdMutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    context_locks: StdMutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     #[cfg(test)]
     finish_after_fingerprint: StdMutex<Option<FinishTestHook>>,
     #[cfg(test)]
@@ -228,6 +237,7 @@ impl ConnectorRuntime {
             project_agent_token: None,
             workspace_ops: tokio::sync::Mutex::new(()),
             task_locks: StdMutex::new(HashMap::new()),
+            context_locks: StdMutex::new(HashMap::new()),
             #[cfg(test)]
             finish_after_fingerprint: StdMutex::new(None),
             #[cfg(test)]
@@ -420,12 +430,25 @@ impl ConnectorRuntime {
         )
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn call(
         &self,
         capability: &str,
         arguments: Value,
         auth: Option<&AuthContext>,
         transport: ConnectorTransport,
+    ) -> ConnectorCallOutcome {
+        self.call_for_window(capability, arguments, auth, transport, None)
+            .await
+    }
+
+    pub(crate) async fn call_for_window(
+        &self,
+        capability: &str,
+        arguments: Value,
+        auth: Option<&AuthContext>,
+        transport: ConnectorTransport,
+        window: Option<&ClientWindow>,
     ) -> ConnectorCallOutcome {
         if surface::capability_spec(capability).is_none() {
             return ConnectorCallOutcome::error(
@@ -516,11 +539,11 @@ impl ConnectorRuntime {
         };
         let outcome = match capability {
             "task_start" => {
-                self.task_start(arguments, &subject_id, auth, transport, now)
+                self.task_start(arguments, &subject_id, auth, transport, window, now)
                     .await
             }
             "task_list" => self.task_list(arguments, &subject_id).await,
-            "task_resume" => self.task_resume(arguments, &subject_id, now).await,
+            "task_resume" => self.task_resume(arguments, &subject_id, window, now).await,
             "files_list" => {
                 self.files_list(arguments, &subject_id, auth, transport, now)
                     .await
@@ -579,6 +602,18 @@ impl ConnectorRuntime {
         lock
     }
 
+    fn context_lock(&self, subject_id: &str, window_key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let key = format!("{subject_id}:{window_key}");
+        let mut locks = self.context_locks.lock().unwrap();
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
+    }
+
     async fn workspace_fingerprint(
         &self,
         task: &ConnectorTaskSnapshot,
@@ -624,6 +659,7 @@ impl ConnectorRuntime {
         subject_id: &str,
         auth: &AuthContext,
         _transport: ConnectorTransport,
+        window: Option<&ClientWindow>,
         now: i64,
     ) -> ConnectorCallOutcome {
         let input: TaskStartInput = match parse_input("task_start", arguments) {
@@ -638,9 +674,244 @@ impl ConnectorRuntime {
         if mode == "normal" && !auth.has_scope(SCOPE_PROJECT_WRITE) {
             return ConnectorCallOutcome::scope_denied(SCOPE_PROJECT_WRITE);
         }
+
+        let normalized_target = match crate::project_overview::normalize_project_overview_path(
+            input.target_path.as_deref().unwrap_or(""),
+        ) {
+            Ok(path) => path,
+            Err(message) => return invalid_input("task_start", message),
+        };
+        let fingerprint = match self
+            .capture_connector_context(normalized_target.clone())
+            .await
+        {
+            Ok(fingerprint) => fingerprint,
+            Err(outcome) => return outcome,
+        };
+
+        // Serialize get-or-create for one stable window/project. Without this,
+        // two simultaneous first turns could both observe no mapping and
+        // create duplicate durable tasks.
+        let context_lock = window.map(|window| self.context_lock(subject_id, window.key()));
+        let _context_guard = match context_lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        let project_identity = format!(
+            "{}:{}",
+            self.context.project_id, fingerprint.project_root_sha256
+        );
+        let navigation = window.map(|window| {
+            self.db
+                .activate_window_project(subject_id, window.key(), &project_identity)
+        });
+
+        let existing_context = if let Some(window) = window {
+            match self.db.connector_window_context(
+                window.key(),
+                &self.context.project_id,
+                subject_id,
+                &fingerprint.project_root_sha256,
+            ) {
+                Ok(context) => context,
+                Err(error) => return store_error_outcome(error, None),
+            }
+        } else {
+            None
+        };
+
+        if let Some(existing_context) = existing_context.as_ref() {
+            let existing = match self.db.connector_task(
+                &existing_context.task_id,
+                &self.context.project_id,
+                subject_id,
+            ) {
+                Ok(task) => Some(task),
+                Err(ConnectorTaskStoreError::NotFound) => None,
+                Err(error) => return store_error_outcome(error, None),
+            };
+            if let Some(task) = existing {
+                let refresh =
+                    compare_project_context(Some(&existing_context.fingerprint), &fingerprint);
+                if task.task_status == "active" && task.run_status == "running" {
+                    return self
+                        .continue_window_task(
+                            task,
+                            goal,
+                            mode,
+                            auth,
+                            window.expect("existing window context has a window"),
+                            &fingerprint,
+                            &refresh,
+                            navigation.as_ref(),
+                            now,
+                        )
+                        .await;
+                }
+                if task.run_status == "interrupted" && task.task_status == "needs_attention" {
+                    let cursor = match self.db.append_interrupted_connector_instruction(
+                        &task.task_id,
+                        &self.context.project_id,
+                        subject_id,
+                        goal,
+                        mode,
+                        now,
+                    ) {
+                        Ok(cursor) => cursor,
+                        Err(error) => return store_error_outcome(error, Some(&task)),
+                    };
+                    if let Err(error) = self.persist_window_context(
+                        window.expect("existing window context has a window"),
+                        subject_id,
+                        &task.task_id,
+                        &fingerprint,
+                        now,
+                    ) {
+                        return store_error_outcome(error, Some(&task));
+                    }
+                    return ConnectorCallOutcome::error_for_task_at(
+                        409,
+                        "task_interrupted",
+                        "the previous project context was recovered, but its execution was interrupted and cannot be resumed by a chat request",
+                        false,
+                        true,
+                        Some("Review the task, then resume or reject it from the WebCodex host."),
+                        &task,
+                        cursor,
+                        json!({
+                            "continuation": "recovered",
+                            "instruction_appended": true,
+                            "context": context_refresh_payload(&refresh),
+                            "project_switch": navigation_payload(navigation.as_ref(), true),
+                            "local_command": format!("webcodex task resume {}", task.task_id)
+                        }),
+                    );
+                }
+                // A reviewed/closed task remains durable history. The mapping
+                // may advance to a new task without deleting the old row.
+            }
+        }
+
         let task_id = format!("wc_task_{}", uuid::Uuid::new_v4().simple());
         let run_id = format!("wc_run_{}", uuid::Uuid::new_v4().simple());
         let non_writable = mode != "normal";
+        let prepared = match self
+            .prepare_connector_workspace(&task_id, &run_id, non_writable, auth)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(outcome) => return outcome,
+        };
+        let task = match self.db.start_connector_task(NewConnectorTask {
+            task_id: &task_id,
+            run_id: &run_id,
+            project_id: &self.context.project_id,
+            workspace_id: &self.context.workspace_id,
+            subject_id,
+            goal,
+            mode,
+            target_executor_ref: &self.context.executor_project,
+            execution_executor_ref: &prepared.execution_executor_ref,
+            target_root: &self.context.executor_root,
+            execution_root: &prepared.execution_root,
+            baseline_commit: prepared.baseline_commit.as_deref(),
+            baseline_tree: prepared.baseline_tree.as_deref(),
+            isolated: prepared.isolated,
+            now,
+        }) {
+            Ok(task) => task,
+            Err(error) => {
+                if let Some(cleanup) = self
+                    .workspace
+                    .discard_prepared(&self.context.executor_root, &prepared)
+                {
+                    tracing::warn!(cleanup = %cleanup, "failed to fully clean unpersisted workspace");
+                }
+                return store_error_outcome(error, None);
+            }
+        };
+        if let Some(window) = window {
+            if let Err(error) =
+                self.persist_window_context(window, subject_id, &task.task_id, &fingerprint, now)
+            {
+                return store_error_outcome(error, Some(&task));
+            }
+        }
+        let brief = project_brief(
+            &task,
+            prepared.project_overview.as_ref(),
+            prepared.git_dirty,
+            prepared.git_conflict_count,
+        );
+        ConnectorCallOutcome::success(
+            &task,
+            json!({
+                "project": {
+                    "id": self.context.project_id,
+                    "name": self.context.project_name
+                },
+                "goal": goal,
+                "mode": mode,
+                "status": task.task_status,
+                "continuation": "created",
+                "instruction_appended": true,
+                "history": {
+                    "preserved": true,
+                    "event_cursor_before": 0,
+                    "event_cursor_after": task.event_cursor
+                },
+                "context": context_refresh_payload(&compare_project_context(None, &fingerprint)),
+                "project_switch": navigation_payload(navigation.as_ref(), false),
+                "brief": brief,
+                "next": "Use the brief to choose the first targeted read; edit with returned sha256 guards, validate, review, and finish."
+            }),
+        )
+    }
+
+    async fn capture_connector_context(
+        &self,
+        target_path: String,
+    ) -> Result<ProjectContextFingerprint, ConnectorCallOutcome> {
+        let root = self.context.executor_root.clone();
+        match tokio::task::spawn_blocking(move || {
+            capture_project_context(Path::new(&root), Some(&target_path))
+        })
+        .await
+        {
+            Ok(Ok(fingerprint)) => Ok(fingerprint),
+            Ok(Err(message)) => Err(ConnectorCallOutcome::error(
+                409,
+                "project_context_unavailable",
+                self.sanitize_executor_string(&message),
+                false,
+                true,
+                Some("Resolve the repository path or Git state, then retry the instruction."),
+                None,
+                false,
+            )),
+            Err(error) => {
+                tracing::error!(error = %error, "connector context fingerprint task failed");
+                Err(ConnectorCallOutcome::error(
+                    500,
+                    "project_context_unavailable",
+                    "connector could not fingerprint the project context",
+                    false,
+                    true,
+                    Some("Inspect server logs before retrying the instruction."),
+                    None,
+                    false,
+                ))
+            }
+        }
+    }
+
+    async fn prepare_connector_workspace(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        non_writable: bool,
+        auth: &AuthContext,
+    ) -> Result<PreparedWorkspace, ConnectorCallOutcome> {
         let _workspace_guard = if non_writable {
             None
         } else {
@@ -648,8 +919,8 @@ impl ConnectorRuntime {
         };
         let manager = self.workspace.clone();
         let context = self.context.clone();
-        let task_for_prepare = task_id.clone();
-        let run_for_prepare = run_id.clone();
+        let task_for_prepare = task_id.to_string();
+        let run_for_prepare = run_id.to_string();
         let prepared = match tokio::task::spawn_blocking(move || {
             manager.prepare(&context, &task_for_prepare, &run_for_prepare, non_writable)
         })
@@ -658,11 +929,11 @@ impl ConnectorRuntime {
             Ok(Ok(prepared)) => prepared,
             Ok(Err(message)) => {
                 let guidance = if message.contains("workspace slot is occupied") {
-                    "Run 'webcodex task list', then finish, resume, or reject the task occupying the writable slot."
+                    "Finish, resume, or reject the task occupying the writable slot."
                 } else {
-                    "Resolve the Git/workspace issue, then start a new task."
+                    "Resolve the Git/workspace issue, then retry the instruction."
                 };
-                return ConnectorCallOutcome::error(
+                return Err(ConnectorCallOutcome::error(
                     409,
                     "workspace_preparation_failed",
                     self.sanitize_executor_string(&message),
@@ -671,20 +942,20 @@ impl ConnectorRuntime {
                     Some(guidance),
                     None,
                     false,
-                );
+                ));
             }
             Err(error) => {
                 tracing::error!(error = %error, "connector workspace preparation task failed");
-                return ConnectorCallOutcome::error(
+                return Err(ConnectorCallOutcome::error(
                     500,
                     "workspace_preparation_failed",
                     "connector could not prepare the isolated execution workspace",
                     false,
                     true,
-                    Some("Inspect server logs, then start a new task."),
+                    Some("Inspect server logs, then retry the instruction."),
                     None,
                     false,
-                );
+                ));
             }
         };
         if prepared.isolated {
@@ -715,65 +986,150 @@ impl ConnectorRuntime {
                 if let Some(cleanup) = cleanup {
                     tracing::warn!(cleanup = %cleanup, "failed to fully clean rejected workspace preparation");
                 }
-                return ConnectorCallOutcome::error(
+                return Err(ConnectorCallOutcome::error(
                     400,
                     "workspace_registration_failed",
                     message,
                     false,
                     true,
-                    Some("Inspect the executor policy and retry task_start."),
+                    Some("Inspect the executor policy and retry the instruction."),
                     None,
                     false,
-                );
+                ));
             }
         }
-        let task = match self.db.start_connector_task(NewConnectorTask {
-            task_id: &task_id,
-            run_id: &run_id,
-            project_id: &self.context.project_id,
-            workspace_id: &self.context.workspace_id,
-            subject_id,
-            goal,
-            mode,
-            target_executor_ref: &self.context.executor_project,
-            execution_executor_ref: &prepared.execution_executor_ref,
-            target_root: &self.context.executor_root,
-            execution_root: &prepared.execution_root,
-            baseline_commit: prepared.baseline_commit.as_deref(),
-            baseline_tree: prepared.baseline_tree.as_deref(),
-            isolated: prepared.isolated,
-            now,
-        }) {
-            Ok(task) => task,
+        Ok(prepared)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn continue_window_task(
+        &self,
+        task: ConnectorTaskSnapshot,
+        instruction: &str,
+        mode: &str,
+        auth: &AuthContext,
+        window: &ClientWindow,
+        fingerprint: &ProjectContextFingerprint,
+        refresh: &ContextRefreshSummary,
+        navigation: Option<&crate::db::WindowProjectActivation>,
+        now: i64,
+    ) -> ConnectorCallOutcome {
+        let event_cursor_before = task.event_cursor;
+        let prepared = if mode == "normal" && !task.isolated {
+            match self
+                .prepare_connector_workspace(&task.task_id, &task.run_id, false, auth)
+                .await
+            {
+                Ok(prepared) => Some(prepared),
+                Err(outcome) => return outcome,
+            }
+        } else {
+            None
+        };
+        let workspace = prepared
+            .as_ref()
+            .map(|prepared| ConnectorWorkspaceTransition {
+                target_executor_ref: &self.context.executor_project,
+                execution_executor_ref: &prepared.execution_executor_ref,
+                target_root: &self.context.executor_root,
+                execution_root: &prepared.execution_root,
+                baseline_commit: prepared.baseline_commit.as_deref().unwrap_or_default(),
+                baseline_tree: prepared.baseline_tree.as_deref().unwrap_or_default(),
+            });
+        let (continued, cursor, previous_mode) = match self.db.continue_connector_task(
+            ConnectorTaskContinuation {
+                task_id: &task.task_id,
+                project_id: &self.context.project_id,
+                subject_id: &task.owner_subject_id,
+                instruction,
+                mode,
+                workspace,
+                now,
+            },
+        ) {
+            Ok(continued) => continued,
             Err(error) => {
-                if let Some(cleanup) = self
-                    .workspace
-                    .discard_prepared(&self.context.executor_root, &prepared)
-                {
-                    tracing::warn!(cleanup = %cleanup, "failed to fully clean unpersisted workspace");
+                if let Some(prepared) = prepared.as_ref() {
+                    if let Some(cleanup) = self
+                        .workspace
+                        .discard_prepared(&self.context.executor_root, prepared)
+                    {
+                        tracing::warn!(cleanup = %cleanup, "failed to fully clean rejected workspace upgrade");
+                    }
                 }
-                return store_error_outcome(error, None);
+                return store_error_outcome(error, Some(&task));
             }
         };
-        let brief = project_brief(
-            &task,
-            prepared.project_overview.as_ref(),
-            prepared.git_dirty,
-            prepared.git_conflict_count,
-        );
-        ConnectorCallOutcome::success(
-            &task,
+        if let Err(error) = self.persist_window_context(
+            window,
+            &continued.owner_subject_id,
+            &continued.task_id,
+            fingerprint,
+            now,
+        ) {
+            return store_error_outcome(error, Some(&continued));
+        }
+        let brief = match prepared.as_ref() {
+            Some(prepared) => project_brief(
+                &continued,
+                prepared.project_overview.as_ref(),
+                prepared.git_dirty,
+                prepared.git_conflict_count,
+            ),
+            None => project_brief_from_fingerprint(&continued, fingerprint),
+        };
+        ConnectorCallOutcome::success_at(
+            &continued,
+            cursor,
             json!({
                 "project": {
                     "id": self.context.project_id,
                     "name": self.context.project_name
                 },
-                "goal": goal,
-                "mode": mode,
-                "status": task.task_status,
+                "goal": continued.goal,
+                "instruction": instruction,
+                "mode": continued.mode,
+                "status": continued.task_status,
+                "continuation": "continued",
+                "instruction_appended": true,
+                "history": {
+                    "preserved": true,
+                    "event_cursor_before": event_cursor_before,
+                    "event_cursor_after": cursor
+                },
+                "capability": {
+                    "changed": previous_mode != continued.mode,
+                    "previous_mode": previous_mode,
+                    "mode": continued.mode,
+                    "write_scope_verified": mode == "normal",
+                    "workspace_upgraded": prepared.is_some()
+                },
+                "context": context_refresh_payload(refresh),
+                "project_switch": navigation_payload(navigation, true),
                 "brief": brief,
-                "next": "Use the brief to choose the first targeted read; edit with returned sha256 guards, validate, review, and finish."
+                "next": "Continue from the preserved history; read only context reported as refreshed before editing or validating."
             }),
+        )
+    }
+
+    fn persist_window_context(
+        &self,
+        window: &ClientWindow,
+        subject_id: &str,
+        task_id: &str,
+        fingerprint: &ProjectContextFingerprint,
+        now: i64,
+    ) -> Result<(), ConnectorTaskStoreError> {
+        self.db.bind_connector_window_context(
+            window.key(),
+            window.source(),
+            &self.context.project_id,
+            subject_id,
+            &fingerprint.project_root_sha256,
+            task_id,
+            &fingerprint.target_directory,
+            fingerprint,
+            now,
         )
     }
 
@@ -1865,9 +2221,9 @@ impl ConnectorRuntime {
         ConnectorCallOutcome::success_blocking_at(&task, task.event_cursor, data, blocking)
     }
 
-    /// A new chat session's entry point: the durable tasks this credential
-    /// may continue, most actionable first. Project-scoped on purpose — no
-    /// task binding exists yet, so the response carries no task_id.
+    /// Recovery/diagnostic listing for durable tasks this credential may
+    /// continue, most actionable first. Ordinary same-window continuation is
+    /// resolved by task_start without duplicating the durable context.
     async fn task_list(&self, arguments: Value, subject_id: &str) -> ConnectorCallOutcome {
         let input: TaskListInput = match parse_input("task_list", arguments) {
             Ok(input) => input,
@@ -1902,17 +2258,18 @@ impl ConnectorRuntime {
         ConnectorCallOutcome::success_project(json!({
             "tasks": items,
             "count": items.len(),
-            "note": "Continue one task with task_resume, or start new work with task_start."
+            "note": "Ordinary work starts or continues with task_start. Use task_resume only to recover a specific durable task after window identity was lost."
         }))
     }
 
-    /// Rebind a fresh chat session to an existing task: one compact, durable
-    /// bootstrap instead of guesses recalled from an expired context window.
-    /// Claims pending human guidance exactly like task_review does.
+    /// Explicit recovery for a task whose automatic window binding is no
+    /// longer available. Claims pending human guidance exactly like
+    /// task_review does.
     async fn task_resume(
         &self,
         arguments: Value,
         subject_id: &str,
+        window: Option<&ClientWindow>,
         now: i64,
     ) -> ConnectorCallOutcome {
         let input: TaskResumeInput = match parse_input("task_resume", arguments) {
@@ -1922,6 +2279,11 @@ impl ConnectorRuntime {
         let task = match self.task(&input.task_id, subject_id) {
             Ok(task) => task,
             Err(outcome) => return outcome,
+        };
+        let context_lock = window.map(|window| self.context_lock(subject_id, window.key()));
+        let _context_guard = match context_lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
         };
         let result =
             match self
@@ -1996,6 +2358,65 @@ impl ConnectorRuntime {
                 })
             })
             .unwrap_or(Value::Null);
+        let continuity = if let Some(window) = window {
+            let previous = match self.db.connector_window_context_for_task(
+                &task.task_id,
+                &self.context.project_id,
+                subject_id,
+            ) {
+                Ok(previous) => previous,
+                Err(error) => return store_error_outcome(error, Some(&task)),
+            };
+            let target_path = previous
+                .as_ref()
+                .map(|context| context.target_path.clone())
+                .unwrap_or_default();
+            let fingerprint = match self.capture_connector_context(target_path).await {
+                Ok(fingerprint) => fingerprint,
+                Err(outcome) => return outcome,
+            };
+            if previous.as_ref().is_some_and(|context| {
+                context.fingerprint.project_root_sha256 != fingerprint.project_root_sha256
+            }) {
+                return ConnectorCallOutcome::error_for_task(
+                    409,
+                    "project_context_mismatch",
+                    "the durable task repository identity no longer matches the configured path",
+                    false,
+                    true,
+                    Some("Recover the task only after restoring its original repository identity."),
+                    &task,
+                    json!({ "window_rebound": false }),
+                );
+            }
+            let refresh = compare_project_context(
+                previous.as_ref().map(|context| &context.fingerprint),
+                &fingerprint,
+            );
+            let navigation = self.db.activate_window_project(
+                subject_id,
+                window.key(),
+                &format!(
+                    "{}:{}",
+                    self.context.project_id, fingerprint.project_root_sha256
+                ),
+            );
+            if let Err(error) =
+                self.persist_window_context(window, subject_id, &task.task_id, &fingerprint, now)
+            {
+                return store_error_outcome(error, Some(&task));
+            }
+            json!({
+                "window_rebound": true,
+                "context": context_refresh_payload(&refresh),
+                "project_switch": navigation_payload(Some(&navigation), true)
+            })
+        } else {
+            json!({
+                "window_rebound": false,
+                "recovery_boundary": "no stable transport window identity was available"
+            })
+        };
         let mut data = json!({
             "goal": task.goal,
             "mode": task.mode,
@@ -2010,7 +2431,8 @@ impl ConnectorRuntime {
             "applied_paths_complete": applied.complete,
             "recent_execution": execution_value.unwrap_or(Value::Null),
             "next_action": next_action,
-            "resume_note": "This session is now the task's continuation. Trust this bootstrap over assumptions from earlier sessions, and apply any guidance below before acting."
+            "continuity": continuity,
+            "resume_note": "This window is now the task's continuation when a stable transport identity was available. Trust this bootstrap over assumptions from earlier windows, and apply any guidance below before acting."
         });
         self.attach_pending_guidance(&task, &mut data);
         // Timeline visibility for the console; terminal tasks skip the
@@ -2020,7 +2442,7 @@ impl ConnectorRuntime {
             match self.record_event(
                 &task,
                 "task_resume",
-                json!({ "session_rebound": true }),
+                json!({ "window_rebound": window.is_some() }),
                 now,
             ) {
                 Ok(cursor) => cursor,
@@ -2323,9 +2745,36 @@ impl ConnectorRuntime {
         subject_id: &str,
     ) -> Result<ConnectorTaskSnapshot, ConnectorCallOutcome> {
         validate_task_id(task_id).map_err(|message| invalid_input("task", message))?;
-        self.db
+        let task = self
+            .db
             .connector_task(task_id, &self.context.project_id, subject_id)
-            .map_err(|error| store_error_outcome(error, None))
+            .map_err(|error| store_error_outcome(error, None))?;
+        match (
+            Path::new(&task.target_root).canonicalize(),
+            Path::new(&self.context.executor_root).canonicalize(),
+        ) {
+            (Ok(recorded), Ok(configured)) if recorded == configured => Ok(task),
+            (Ok(_), Ok(_)) => Err(ConnectorCallOutcome::error_for_task(
+                409,
+                "project_context_mismatch",
+                "the durable task belongs to a different repository path",
+                false,
+                true,
+                Some("Use the Connector configured for the task's original repository."),
+                &task,
+                json!({ "window_rebound": false }),
+            )),
+            _ => Err(ConnectorCallOutcome::error_for_task(
+                409,
+                "project_context_unavailable",
+                "the durable task repository identity cannot be verified",
+                false,
+                true,
+                Some("Restore the configured repository path before continuing this task."),
+                &task,
+                json!({ "window_rebound": false }),
+            )),
+        }
     }
 
     fn active_task(
@@ -2636,6 +3085,7 @@ impl ConnectorRuntime {
                     transport: transport.into(),
                     session_id: None,
                     auth: Some(auth),
+                    window: None,
                     record_oauth_scope_denials: false,
                 },
             )
@@ -3519,6 +3969,85 @@ fn project_brief(
     })
 }
 
+fn project_brief_from_fingerprint(
+    task: &ConnectorTaskSnapshot,
+    fingerprint: &ProjectContextFingerprint,
+) -> Value {
+    let mut language_kinds = Vec::new();
+    for manifest in &fingerprint.manifests {
+        let kind = match manifest.path.rsplit('/').next().unwrap_or_default() {
+            "Cargo.toml" => Some("rust"),
+            "package.json" => Some("node"),
+            "pyproject.toml" | "setup.py" | "setup.cfg" | "requirements.txt" | "Pipfile" => {
+                Some("python")
+            }
+            "go.mod" => Some("go"),
+            "pom.xml" | "build.gradle" | "build.gradle.kts" => Some("jvm"),
+            "Gemfile" => Some("ruby"),
+            "composer.json" => Some("php"),
+            "CMakeLists.txt" | "meson.build" => Some("cpp"),
+            name if name.ends_with(".sln") || name.ends_with(".csproj") => Some("dotnet"),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            if !language_kinds.contains(&kind) {
+                language_kinds.push(kind);
+            }
+        }
+    }
+    let overview = json!({
+        "project_types": language_kinds
+            .into_iter()
+            .map(|kind| json!({"kind": kind}))
+            .collect::<Vec<_>>(),
+        "manifests": fingerprint
+            .manifests
+            .iter()
+            .map(|manifest| json!({"path": manifest.path}))
+            .collect::<Vec<_>>(),
+        "key_files": fingerprint
+            .rules
+            .iter()
+            .map(|rule| json!({"path": rule.path, "kind": "agent_instructions"}))
+            .collect::<Vec<_>>()
+    });
+    project_brief(task, Some(&overview), fingerprint.git.dirty, None)
+}
+
+fn context_refresh_payload(refresh: &ContextRefreshSummary) -> Value {
+    json!({
+        "reused": refresh.reused,
+        "refreshed": refresh.refreshed,
+        "rules": {
+            "reused": refresh.rules.reused,
+            "refreshed": refresh.rules.refreshed,
+            "removed": refresh.rules.removed
+        },
+        "manifests": {
+            "reused_count": refresh.manifests.reused.len(),
+            "refreshed": refresh.manifests.refreshed,
+            "removed": refresh.manifests.removed
+        }
+    })
+}
+
+fn navigation_payload(
+    activation: Option<&crate::db::WindowProjectActivation>,
+    reused_context: bool,
+) -> Value {
+    let restored_previous_context = reused_context
+        && match activation {
+            Some(activation) => {
+                activation.previous_project.as_deref() != Some(activation.current_project.as_str())
+            }
+            None => true,
+        };
+    json!({
+        "switched": activation.is_some_and(|activation| activation.switched),
+        "restored_previous_context": restored_previous_context
+    })
+}
+
 fn validation_projection(execution: Option<&crate::db::ConnectorExecution>) -> Value {
     let Some(execution) = execution else {
         return json!({ "status": "not_run", "execution_id": null, "checks": [] });
@@ -3733,6 +4262,10 @@ struct TaskStartInput {
     goal: String,
     #[serde(default)]
     mode: ConnectorTaskMode,
+    /// Optional project-relative directory whose nested repository rules apply
+    /// to the current instruction.
+    #[serde(default)]
+    target_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -3960,7 +4493,7 @@ pub(crate) mod tests {
             .unwrap();
     }
 
-    pub(super) fn init_repo(project: &Path) {
+    pub(crate) fn init_repo(project: &Path) {
         std::fs::create_dir(project).unwrap();
         let run = |args: &[&str]| {
             let output = std::process::Command::new("git")
@@ -4044,6 +4577,692 @@ pub(crate) mod tests {
         )
         .unwrap();
         (temp, connector)
+    }
+
+    #[tokio::test]
+    async fn same_window_reuses_task_and_appends_instruction_history() {
+        let (_temp, connector) = connector();
+        let owner = auth("u1");
+        let window = ClientWindow::for_test("window-a");
+        let first = connector
+            .call_for_window(
+                "task_start",
+                json!({"goal": "inspect the parser", "mode": "read_only"}),
+                Some(&owner),
+                ConnectorTransport::Mcp,
+                Some(&window),
+            )
+            .await;
+        assert!(first.ok, "{}", first.body);
+        assert_eq!(first.body["data"]["continuation"], "created");
+        let task_id = first.body["task_id"].as_str().unwrap().to_string();
+        let first_task = connector
+            .db
+            .connector_task(&task_id, &connector.context.project_id, PROJECT_SUBJECT_ID)
+            .unwrap();
+        connector
+            .record_event(
+                &first_task,
+                "analysis_finding",
+                json!({"summary": "the parser keeps the original error context"}),
+                chrono::Utc::now().timestamp(),
+            )
+            .unwrap();
+
+        let second = connector
+            .call_for_window(
+                "task_start",
+                json!({"goal": "check the error path too", "mode": "read_only"}),
+                Some(&owner),
+                ConnectorTransport::Mcp,
+                Some(&window),
+            )
+            .await;
+        assert!(second.ok, "{}", second.body);
+        assert_eq!(second.body["task_id"], task_id);
+        assert_eq!(second.body["data"]["continuation"], "continued");
+        assert_eq!(
+            second.body["data"]["project_switch"]["restored_previous_context"],
+            false
+        );
+        assert_eq!(second.body["data"]["history"]["preserved"], true);
+        assert!(
+            second.body["data"]["history"]["event_cursor_after"]
+                .as_i64()
+                .unwrap()
+                > second.body["data"]["history"]["event_cursor_before"]
+                    .as_i64()
+                    .unwrap()
+        );
+
+        let tasks = connector
+            .db
+            .connector_tasks_for_subject(&connector.context.project_id, PROJECT_SUBJECT_ID, 10)
+            .unwrap();
+        assert_eq!(
+            tasks.len(),
+            1,
+            "same window/project must not duplicate tasks"
+        );
+        let events = connector
+            .db
+            .connector_task_events(
+                &task_id,
+                &connector.context.project_id,
+                PROJECT_SUBJECT_ID,
+                20,
+            )
+            .unwrap();
+        assert_eq!(events[0].kind, "task_started");
+        let appended = events
+            .iter()
+            .find(|event| event.kind == "task_instruction")
+            .expect("follow-up instruction event");
+        assert_eq!(appended.payload["instruction"], "check the error path too");
+        assert!(events.iter().any(|event| {
+            event.kind == "analysis_finding"
+                && event.payload["summary"] == "the parser keeps the original error context"
+        }));
+        assert_eq!(
+            connector
+                .db
+                .connector_task(&task_id, &connector.context.project_id, PROJECT_SUBJECT_ID)
+                .unwrap()
+                .goal,
+            "inspect the parser",
+            "the first goal remains the durable task root"
+        );
+        let stored_window_key: String = connector
+            .db
+            .conn_for_tests()
+            .query_row(
+                "SELECT window_key FROM wc_window_project_contexts WHERE task_id = ?1",
+                [&task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_window_key.len(), 64);
+        assert_ne!(stored_window_key, "window-a");
+        let fingerprint_json: String = connector
+            .db
+            .conn_for_tests()
+            .query_row(
+                "SELECT fingerprint_json FROM wc_window_project_contexts WHERE task_id = ?1",
+                [&task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!fingerprint_json.contains(&connector.context.executor_root));
+    }
+
+    #[tokio::test]
+    async fn simultaneous_first_turns_create_one_window_project_context() {
+        let (_temp, connector) = connector();
+        let owner = auth("u1");
+        let window = ClientWindow::for_test("concurrent-window");
+        let first = connector.call_for_window(
+            "task_start",
+            json!({"goal": "inspect parser branch one", "mode": "read_only"}),
+            Some(&owner),
+            ConnectorTransport::Mcp,
+            Some(&window),
+        );
+        let second = connector.call_for_window(
+            "task_start",
+            json!({"goal": "inspect parser branch two", "mode": "read_only"}),
+            Some(&owner),
+            ConnectorTransport::Mcp,
+            Some(&window),
+        );
+        let (first, second) = tokio::join!(first, second);
+        assert!(first.ok && second.ok);
+        assert_eq!(first.body["task_id"], second.body["task_id"]);
+        let continuations = [
+            first.body["data"]["continuation"].as_str().unwrap(),
+            second.body["data"]["continuation"].as_str().unwrap(),
+        ];
+        assert!(continuations.contains(&"created"));
+        assert!(continuations.contains(&"continued"));
+        let tasks = connector
+            .db
+            .connector_tasks_for_subject(&connector.context.project_id, PROJECT_SUBJECT_ID, 10)
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn different_windows_on_one_project_keep_independent_contexts() {
+        let (_temp, connector) = connector();
+        let owner = auth("u1");
+        let first_window = ClientWindow::for_test("window-one");
+        let second_window = ClientWindow::for_test("window-two");
+        let first = connector
+            .call_for_window(
+                "task_start",
+                json!({"goal": "window one work", "mode": "read_only"}),
+                Some(&owner),
+                ConnectorTransport::Mcp,
+                Some(&first_window),
+            )
+            .await;
+        let second = connector
+            .call_for_window(
+                "task_start",
+                json!({"goal": "window two work", "mode": "read_only"}),
+                Some(&owner),
+                ConnectorTransport::Mcp,
+                Some(&second_window),
+            )
+            .await;
+        assert!(first.ok && second.ok);
+        assert_ne!(first.body["task_id"], second.body["task_id"]);
+
+        let first_again = connector
+            .call_for_window(
+                "task_start",
+                json!({"goal": "window one follow-up", "mode": "read_only"}),
+                Some(&owner),
+                ConnectorTransport::Mcp,
+                Some(&first_window),
+            )
+            .await;
+        assert_eq!(first_again.body["task_id"], first.body["task_id"]);
+        assert_ne!(first_again.body["task_id"], second.body["task_id"]);
+    }
+
+    #[tokio::test]
+    async fn explicit_recovery_moves_context_without_sharing_it_between_windows() {
+        let (_temp, connector) = connector();
+        let owner = auth("u1");
+        let original_window = ClientWindow::for_test("recovery-original");
+        let recovered_window = ClientWindow::for_test("recovery-new");
+        let started = connector
+            .call_for_window(
+                "task_start",
+                json!({"goal": "inspect before reconnect", "mode": "read_only"}),
+                Some(&owner),
+                ConnectorTransport::Mcp,
+                Some(&original_window),
+            )
+            .await;
+        assert!(started.ok, "{}", started.body);
+        let task_id = started.body["task_id"].as_str().unwrap().to_string();
+
+        let resumed = connector
+            .call_for_window(
+                "task_resume",
+                json!({"task_id": task_id}),
+                Some(&owner),
+                ConnectorTransport::Mcp,
+                Some(&recovered_window),
+            )
+            .await;
+        assert!(resumed.ok, "{}", resumed.body);
+        assert_eq!(resumed.body["data"]["continuity"]["window_rebound"], true);
+
+        let recovered_follow_up = connector
+            .call_for_window(
+                "task_start",
+                json!({"goal": "continue in the rebuilt connection", "mode": "read_only"}),
+                Some(&owner),
+                ConnectorTransport::Mcp,
+                Some(&recovered_window),
+            )
+            .await;
+        assert!(recovered_follow_up.ok, "{}", recovered_follow_up.body);
+        assert_eq!(recovered_follow_up.body["task_id"], task_id);
+
+        let original_follow_up = connector
+            .call_for_window(
+                "task_start",
+                json!({"goal": "independent work in the old window", "mode": "read_only"}),
+                Some(&owner),
+                ConnectorTransport::Mcp,
+                Some(&original_window),
+            )
+            .await;
+        assert!(original_follow_up.ok, "{}", original_follow_up.body);
+        assert_ne!(original_follow_up.body["task_id"], task_id);
+        let tasks = connector
+            .db
+            .connector_tasks_for_subject(&connector.context.project_id, PROJECT_SUBJECT_ID, 10)
+            .unwrap();
+        assert_eq!(tasks.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn one_window_switches_projects_and_restores_each_task() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_a = temp.path().join("same-name-a");
+        let project_b = temp.path().join("same-name-b");
+        init_repo(&project_a);
+        init_repo(&project_b);
+        let db = Arc::new(Database::open(&temp.path().join("connector.db")).unwrap());
+        let runtime = Arc::new(ToolRuntime::new_for_tests());
+        let make = |project_id: &str, workspace_id: &str, name: &str, root: &Path, state: &str| {
+            ConnectorRuntime::new(
+                runtime.clone(),
+                db.clone(),
+                ConnectorContext {
+                    project_id: project_id.to_string(),
+                    project_name: name.to_string(),
+                    workspace_id: workspace_id.to_string(),
+                    executor_project: format!("agent:hosted:{name}"),
+                    executor_root: root.to_string_lossy().to_string(),
+                    runs_root: temp
+                        .path()
+                        .join(format!("{state}/runs"))
+                        .to_string_lossy()
+                        .to_string(),
+                    results_root: temp
+                        .path()
+                        .join(format!("{state}/results"))
+                        .to_string_lossy()
+                        .to_string(),
+                    projects_dir: temp
+                        .path()
+                        .join(format!("{state}/projects.d"))
+                        .to_string_lossy()
+                        .to_string(),
+                    profile: "personal".to_string(),
+                    project_grant_id: PROJECT_GRANT_ID.to_string(),
+                },
+                credential(),
+            )
+            .unwrap()
+        };
+        let connector_a = make(
+            "wc_proj_aaaaaaaaaaaaaaaa",
+            "wc_ws_aaaaaaaaaaaaaaaa",
+            "same-name",
+            &project_a,
+            "state-a",
+        );
+        let connector_b = make(
+            "wc_proj_aaaaaaaaaaaaaaaa",
+            "wc_ws_bbbbbbbbbbbbbbbb",
+            "same-name",
+            &project_b,
+            "state-b",
+        );
+        let owner = auth("u1");
+        let window = ClientWindow::for_test("switching-window");
+        let a_first = connector_a
+            .call_for_window(
+                "task_start",
+                json!({"goal": "inspect A", "mode": "read_only"}),
+                Some(&owner),
+                ConnectorTransport::Mcp,
+                Some(&window),
+            )
+            .await;
+        let b = connector_b
+            .call_for_window(
+                "task_start",
+                json!({"goal": "inspect B", "mode": "read_only"}),
+                Some(&owner),
+                ConnectorTransport::Mcp,
+                Some(&window),
+            )
+            .await;
+        let cross_root_resume = connector_b
+            .call_for_window(
+                "task_resume",
+                json!({"task_id": a_first.body["task_id"]}),
+                Some(&owner),
+                ConnectorTransport::Mcp,
+                Some(&window),
+            )
+            .await;
+        let a_again = connector_a
+            .call_for_window(
+                "task_start",
+                json!({"goal": "continue A", "mode": "read_only"}),
+                Some(&owner),
+                ConnectorTransport::Mcp,
+                Some(&window),
+            )
+            .await;
+        assert!(a_first.ok && b.ok && a_again.ok);
+        assert!(!cross_root_resume.ok);
+        assert_eq!(
+            cross_root_resume.body["error"]["code"],
+            "project_context_mismatch"
+        );
+        assert_ne!(a_first.body["task_id"], b.body["task_id"]);
+        assert_eq!(a_again.body["task_id"], a_first.body["task_id"]);
+        assert_eq!(a_again.body["data"]["continuation"], "continued");
+        assert_eq!(
+            a_again.body["data"]["project_switch"]["restored_previous_context"],
+            true
+        );
+        assert_eq!(b.body["data"]["project_switch"]["switched"], true);
+        assert_eq!(a_again.body["data"]["project_switch"]["switched"], true);
+        assert_eq!(
+            connector_a
+                .db
+                .connector_task(
+                    a_first.body["task_id"].as_str().unwrap(),
+                    &connector_a.context.project_id,
+                    PROJECT_SUBJECT_ID,
+                )
+                .unwrap()
+                .task_status,
+            "active"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_refresh_reports_only_changed_rules_and_worktree() {
+        let (_temp, connector) = connector();
+        let root = Path::new(&connector.context.executor_root);
+        std::fs::create_dir_all(root.join("src/nested")).unwrap();
+        let owner = auth("u1");
+        let window = ClientWindow::for_test("refresh-window");
+        let first = connector
+            .call_for_window(
+                "task_start",
+                json!({
+                    "goal": "inspect nested code",
+                    "mode": "read_only",
+                    "target_path": "src/nested"
+                }),
+                Some(&owner),
+                ConnectorTransport::Mcp,
+                Some(&window),
+            )
+            .await;
+        assert!(first.ok, "{}", first.body);
+        std::fs::write(root.join("src/AGENTS.md"), "nested rules\n").unwrap();
+        let second = connector
+            .call_for_window(
+                "task_start",
+                json!({
+                    "goal": "continue under the new rule",
+                    "mode": "read_only",
+                    "target_path": "src/nested"
+                }),
+                Some(&owner),
+                ConnectorTransport::Mcp,
+                Some(&window),
+            )
+            .await;
+        assert!(second.ok, "{}", second.body);
+        assert_eq!(
+            second.body["data"]["context"]["rules"]["refreshed"],
+            json!(["src/AGENTS.md"])
+        );
+        assert!(second.body["data"]["context"]["refreshed"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("worktree")));
+        assert!(second.body["data"]["context"]["manifests"]["refreshed"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            second.body["data"]["context"]["manifests"]["reused_count"],
+            1
+        );
+        assert!(second.body["data"]["context"]["manifests"]
+            .get("reused")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn inspect_to_write_keeps_task_and_rechecks_write_authority() {
+        use crate::shell_protocol::{ShellAgentPollRequest, ShellAgentResultRequest};
+
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        init_repo(&project);
+        let registry = Arc::new(ShellClientRegistry::default());
+        register_agent(&registry, "project", &project.to_string_lossy()).await;
+        let db = Arc::new(Database::open(&temp.path().join("connector.db")).unwrap());
+        let connector = ConnectorRuntime::new(
+            Arc::new(ToolRuntime::new_for_tests_with_shell_clients(
+                registry.clone(),
+            )),
+            db,
+            ConnectorContext {
+                project_id: "wc_proj_upgrade123456".to_string(),
+                project_name: "upgrade".to_string(),
+                workspace_id: "wc_ws_upgrade123456".to_string(),
+                executor_project: "agent:hosted:project".to_string(),
+                executor_root: project.to_string_lossy().to_string(),
+                runs_root: temp.path().join("state/runs").to_string_lossy().to_string(),
+                results_root: temp
+                    .path()
+                    .join("state/results")
+                    .to_string_lossy()
+                    .to_string(),
+                projects_dir: temp
+                    .path()
+                    .join("state/projects.d")
+                    .to_string_lossy()
+                    .to_string(),
+                profile: "personal".to_string(),
+                project_grant_id: PROJECT_GRANT_ID.to_string(),
+            },
+            credential(),
+        )
+        .unwrap();
+        let owner = auth("u1");
+        let window = ClientWindow::for_test("upgrade-window");
+        let inspected = connector
+            .call_for_window(
+                "task_start",
+                json!({"goal": "inspect first", "mode": "read_only"}),
+                Some(&owner),
+                ConnectorTransport::Mcp,
+                Some(&window),
+            )
+            .await;
+        assert!(inspected.ok, "{}", inspected.body);
+        let task_id = inspected.body["task_id"].as_str().unwrap().to_string();
+
+        let mut read_only_credential = owner.clone();
+        read_only_credential
+            .scopes
+            .retain(|scope| scope != SCOPE_PROJECT_WRITE);
+        let denied = connector
+            .call_for_window(
+                "task_start",
+                json!({"goal": "now fix it", "mode": "normal"}),
+                Some(&read_only_credential),
+                ConnectorTransport::Mcp,
+                Some(&window),
+            )
+            .await;
+        assert!(!denied.ok);
+        assert_eq!(denied.body["error"]["code"], "insufficient_scope");
+        let still_read_only = connector
+            .db
+            .connector_task(&task_id, &connector.context.project_id, PROJECT_SUBJECT_ID)
+            .unwrap();
+        assert_eq!(still_read_only.mode, "read_only");
+        assert!(!still_read_only.isolated);
+
+        let responder_registry = registry.clone();
+        let responder = tokio::spawn(async move {
+            for _ in 0..1_000 {
+                if let Some(request) = responder_registry
+                    .poll(ShellAgentPollRequest {
+                        client_id: "hosted".to_string(),
+                        agent_instance_id: "instance".to_string(),
+                        projects: None,
+                    })
+                    .await
+                    .unwrap()
+                {
+                    assert_eq!(request.kind, "register_project");
+                    let payload: Value =
+                        serde_json::from_str(request.stdin.as_deref().unwrap()).unwrap();
+                    responder_registry
+                        .complete(ShellAgentResultRequest {
+                            client_id: "hosted".to_string(),
+                            agent_instance_id: "instance".to_string(),
+                            request_id: request.request_id,
+                            exit_code: Some(0),
+                            stdout: Some(
+                                json!({
+                                    "agent_project_id": payload["id"],
+                                    "client_id": "hosted",
+                                    "name": payload["name"],
+                                    "path": payload["path"],
+                                    "allow_patch": true
+                                })
+                                .to_string(),
+                            ),
+                            stderr: Some(String::new()),
+                            duration_ms: Some(1),
+                            error: None,
+                        })
+                        .await
+                        .unwrap();
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            panic!("workspace upgrade did not register the isolated project");
+        });
+        let upgraded = connector
+            .call_for_window(
+                "task_start",
+                json!({"goal": "now fix it", "mode": "normal"}),
+                Some(&owner),
+                ConnectorTransport::Mcp,
+                Some(&window),
+            )
+            .await;
+        responder.await.unwrap();
+        assert!(upgraded.ok, "{}", upgraded.body);
+        assert_eq!(upgraded.body["task_id"], task_id);
+        assert_eq!(upgraded.body["data"]["continuation"], "continued");
+        assert_eq!(
+            upgraded.body["data"]["capability"]["previous_mode"],
+            "read_only"
+        );
+        assert_eq!(upgraded.body["data"]["capability"]["mode"], "normal");
+        assert_eq!(
+            upgraded.body["data"]["capability"]["write_scope_verified"],
+            true
+        );
+        assert_eq!(
+            upgraded.body["data"]["capability"]["workspace_upgraded"],
+            true
+        );
+        let task = connector
+            .db
+            .connector_task(&task_id, &connector.context.project_id, PROJECT_SUBJECT_ID)
+            .unwrap();
+        assert_eq!(task.mode, "normal");
+        assert!(task.isolated);
+        assert_ne!(task.execution_root, task.target_root);
+        let events = connector
+            .db
+            .connector_task_events(
+                &task_id,
+                &connector.context.project_id,
+                PROJECT_SUBJECT_ID,
+                20,
+            )
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "task_instruction"
+                && event.payload["instruction"] == "now fix it"
+                && event.payload["workspace_upgraded"] == true
+        }));
+    }
+
+    #[tokio::test]
+    async fn restart_recovers_history_without_guessing_execution_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        init_repo(&project);
+        let db_path = temp.path().join("connector.db");
+        let context = ConnectorContext {
+            project_id: "wc_proj_restart123456".to_string(),
+            project_name: "restart".to_string(),
+            workspace_id: "wc_ws_restart123456".to_string(),
+            executor_project: "agent:hosted:restart".to_string(),
+            executor_root: project.to_string_lossy().to_string(),
+            runs_root: temp.path().join("runs").to_string_lossy().to_string(),
+            results_root: temp.path().join("results").to_string_lossy().to_string(),
+            projects_dir: temp.path().join("projects.d").to_string_lossy().to_string(),
+            profile: "personal".to_string(),
+            project_grant_id: PROJECT_GRANT_ID.to_string(),
+        };
+        let owner = auth("u1");
+        let window = ClientWindow::for_test("restart-window");
+        let task_id = {
+            let db = Arc::new(Database::open(&db_path).unwrap());
+            let connector = ConnectorRuntime::new(
+                Arc::new(ToolRuntime::new_for_tests()),
+                db,
+                context.clone(),
+                credential(),
+            )
+            .unwrap();
+            let started = connector
+                .call_for_window(
+                    "task_start",
+                    json!({"goal": "persistent inspection", "mode": "read_only"}),
+                    Some(&owner),
+                    ConnectorTransport::Mcp,
+                    Some(&window),
+                )
+                .await;
+            assert!(started.ok, "{}", started.body);
+            started.body["task_id"].as_str().unwrap().to_string()
+        };
+
+        let db = Arc::new(Database::open(&db_path).unwrap());
+        let connector = ConnectorRuntime::new(
+            Arc::new(ToolRuntime::new_for_tests()),
+            db,
+            context,
+            credential(),
+        )
+        .unwrap();
+        let recovered = connector
+            .call_for_window(
+                "task_start",
+                json!({"goal": "continue after reconnect", "mode": "read_only"}),
+                Some(&owner),
+                ConnectorTransport::Mcp,
+                Some(&window),
+            )
+            .await;
+        assert!(!recovered.ok);
+        assert_eq!(recovered.body["task_id"], task_id);
+        assert_eq!(recovered.body["error"]["code"], "task_interrupted");
+        assert_eq!(recovered.body["data"]["continuation"], "recovered");
+        assert_eq!(recovered.body["data"]["instruction_appended"], true);
+        assert_eq!(
+            recovered.body["data"]["project_switch"]["restored_previous_context"],
+            true
+        );
+        let tasks = connector
+            .db
+            .connector_tasks_for_subject(&connector.context.project_id, PROJECT_SUBJECT_ID, 10)
+            .unwrap();
+        assert_eq!(tasks.len(), 1, "restart must not duplicate the context");
+        let events = connector
+            .db
+            .connector_task_events(
+                &task_id,
+                &connector.context.project_id,
+                PROJECT_SUBJECT_ID,
+                20,
+            )
+            .unwrap();
+        assert!(events.iter().any(|event| event.kind == "task_started"));
+        assert!(events.iter().any(|event| {
+            event.kind == "task_instruction"
+                && event.payload["instruction"] == "continue after reconnect"
+                && event.payload["blocked_by"] == "task_interrupted"
+        }));
     }
 
     #[tokio::test]
@@ -4316,9 +5535,11 @@ pub(crate) mod tests {
         use crate::shell_protocol::{ShellAgentPollRequest, ShellAgentResultRequest};
 
         let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        init_repo(&project);
         let db = Arc::new(Database::open(&temp.path().join("connector.db")).unwrap());
         let registry = Arc::new(ShellClientRegistry::default());
-        register_agent(&registry, "demo", "/workspace/demo").await;
+        register_agent(&registry, "demo", &project.to_string_lossy()).await;
         let tool_runtime = Arc::new(ToolRuntime::new_for_tests_with_shell_clients(
             registry.clone(),
         ));
@@ -4330,7 +5551,7 @@ pub(crate) mod tests {
                 project_name: "demo".to_string(),
                 workspace_id: "wc_ws_1234567890".to_string(),
                 executor_project: "agent:hosted:demo".to_string(),
-                executor_root: "/workspace/demo".to_string(),
+                executor_root: project.to_string_lossy().to_string(),
                 runs_root: temp.path().join("runs").to_string_lossy().to_string(),
                 results_root: temp.path().join("results").to_string_lossy().to_string(),
                 projects_dir: temp
@@ -4409,8 +5630,14 @@ pub(crate) mod tests {
                 ConnectorTransport::Mcp,
             )
             .await;
+        if !outcome.ok {
+            responder.abort();
+            panic!(
+                "files_read failed before executor dispatch: {}",
+                outcome.body
+            );
+        }
         responder.await.unwrap();
-        assert!(outcome.ok, "{}", outcome.body);
         assert_eq!(outcome.body["event_cursor"], 2);
         assert!(outcome.body["data"]["files"][0]["text"]
             .as_str()

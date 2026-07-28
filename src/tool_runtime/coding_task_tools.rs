@@ -9,6 +9,7 @@ impl ToolRuntime {
         call: ToolCall,
         auth: Option<&AuthContext>,
         transport: sessions::SessionTransport,
+        window: Option<&crate::client_window::ClientWindow>,
     ) -> ToolResult {
         match call {
             ToolCall::StartCodingTask {
@@ -30,6 +31,7 @@ impl ToolRuntime {
                     bind_current,
                     auth,
                     transport,
+                    window,
                 )
                 .await
             }

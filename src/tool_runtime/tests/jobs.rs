@@ -1361,6 +1361,7 @@ async fn model_facing_stop_job_session_project_mismatch_beats_auto_approve() {
                 transport: ToolTransport::Api,
                 session_id: None,
                 auth: Some(&auth),
+                window: None,
                 record_oauth_scope_denials: true,
             },
         )

@@ -43,6 +43,22 @@ When docs or code say "session", identify which kind is meant. Cross-wiring
 workflow ledger APIs to audit UUIDs (or the reverse) is a design change, not a
 drive-by fix.
 
+### Project Connector continuity (standing)
+
+The canonical project-bound path reuses the existing SQLite Connector Task,
+run, and event model. It adds only a lightweight durable exact mapping:
+
+```text
+hashed client window + authenticated subject + connector project + root hash
+→ current durable connector task
+```
+
+`task_start` owns duplicate-free context create/continue, instruction append,
+project switch/restore, read-only-to-write workspace upgrade after scope
+checks, and selective context-fingerprint refresh. This mapping is neither a Workflow
+Session nor an Action Audit Session, and it must not dual-write either ledger.
+Raw transport identifiers are never persisted or exposed as tool fields.
+
 ### Correlation decision (standing)
 
 If the two systems are linked later, use **optional, explicit, one-way**
@@ -214,7 +230,7 @@ it never infers readiness from configuration.
 |---|---|
 | Layer envelope | Every layer carries `{status, observed_at, source, age_secs, stale_after_secs, reason_code}` plus layer facts |
 | No config-inferred readiness | `connector_endpoint` readiness comes only from readiness probes or successful connector requests; configuration presence never implies `ready`. `runner_process` never fakes "running"; a stale registration is never presented as callable |
-| Process-local binding honesty | Session bindings are process-local, principal+transport scoped. `runtime_status` reports `not_observed` with `binding_is_process_local_and_principal_scoped`, `process_local=true`, `lost_after_restart=true`; `start_coding_task` reports `bound`/`not_bound`. After a server restart, the correct action is to continue with the explicit durable `wc_sess_*` session id, not to restart the runner |
+| Process-local binding honesty | Full-runtime current-session bindings are process-local and window+principal+transport+project scoped. `runtime_status` reports `not_observed` with `binding_is_process_local_and_principal_scoped`, `process_local=true`, `lost_after_restart=true`; `start_coding_task` reports `bound`/`not_bound`. This is separate from the durable Connector window/project/task map. After a server restart, the full-runtime recovery path still uses an explicit durable `wc_sess_*` id; the ordinary Connector restores from its exact transport identity or uses task recovery when that identity is lost |
 | Meaningful-activity rule | `last_successful_tool_call` records only successful meaningful calls, scoped by principal/project/surface/session/tool. `runtime_status`, `list_tools`, `list_agents`, `list_projects`, and `tool_manifest` never refresh it. Bounded in-memory store; no arguments, outputs, or secrets |
 | Independence | Layers degrade independently; `not_observed` on one layer must not be collapsed into a global offline verdict |
 

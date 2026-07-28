@@ -22,6 +22,45 @@ statement is true for only one kind, name that kind explicitly.
 
 ---
 
+## Project Connector continuity is not a third session type
+
+The ordinary project-bound product path uses existing durable Connector Tasks
+and task events. A lightweight SQLite map associates the hashed client-window
+identity, authenticated subject, exact Connector project, and canonical-root
+hash with one current durable task. It does not create another event ledger and
+must never be cross-wired to either session system below.
+
+`task_start` resolves get-or-create/continue context without duplication:
+
+- no mapping creates a durable Connector Task;
+- an active exact mapping appends a `task_instruction` event to that task;
+- changing repository activates a separate mapping without closing the first;
+- returning to the repository restores its mapping;
+- a read-only-to-write transition rechecks project-write authority and upgrades
+  the same task's execution workspace;
+- a terminal task advances that repository mapping to a new task while keeping
+  old history.
+
+Raw window identifiers are neither tool arguments nor stored data. MCP uses the
+server-minted `Mcp-Session-Id` from initialize; hosted Actions use their
+conversation-scoped request header; other HTTP clients use a server-minted
+HttpOnly cookie and one cookie jar per logical window. Only a domain-separated
+SHA-256 key is stored. Every lookup is also scoped by authenticated subject,
+Connector project id, and canonical-root hash. The process-local
+current-project navigation map is intentionally separate from the durable
+per-repository task mapping.
+
+Restart recovery has a strict boundary: task history and the durable exact
+mapping survive; current navigation does not. A retained MCP header or HTTP
+cookie can recover the exact repository. Missing identity never falls back to a
+user, credential, project name, or repository path. MCP rejects anonymous
+`task_start`; HTTP clients that discard cookies require explicit task recovery.
+When `task_resume` has a new stable window identity, it moves the lightweight
+binding to that window without copying history or sharing one active task
+between two windows.
+
+---
+
 ## 1. Workflow Session
 
 ### Purpose
@@ -54,7 +93,7 @@ handoff, and finish can reason about the same unit of work.
 | Module | `tool_runtime::sessions` (model, store, events, JSON persistence) |
 | Primary store | In-memory session store |
 | Durability | JSON-oriented session ledger (bounded events/messages per session) |
-| Current-session map | In-memory bindings isolated by principal, transport, and resolved project |
+| Current-session map | In-memory bindings isolated by client window, principal, transport, and resolved project |
 
 ### Current lifecycle contract
 
@@ -99,6 +138,10 @@ These are also summarized in `AGENTS.md` §7, **Sessions**:
    with `recording_session_id`.
 7. **No inference from HTTP audit:** Never derive a `wc_sess_*` id from an
    Action Audit Session id (or from `x-action-session-id` / audit SQLite rows).
+8. **Window isolation:** Current-session lookup and mutation require a stable
+   transport window identity. Missing identity skips generic fallback and
+   fails explicit current-binding operations; it never falls back to a
+   credential-wide binding.
 
 ---
 

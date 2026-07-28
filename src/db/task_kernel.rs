@@ -5,6 +5,7 @@
 //! one executor attempt; events are its bounded, ordered audit trail.
 
 use super::Database;
+use crate::project_context::ProjectContextFingerprint;
 use rusqlite::types::Type;
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde::Serialize;
@@ -38,6 +39,41 @@ pub(crate) struct NewConnectorTask<'a> {
     pub baseline_tree: Option<&'a str>,
     pub isolated: bool,
     pub now: i64,
+}
+
+pub(crate) struct ConnectorTaskContinuation<'a> {
+    pub task_id: &'a str,
+    pub project_id: &'a str,
+    pub subject_id: &'a str,
+    pub instruction: &'a str,
+    pub mode: &'a str,
+    pub workspace: Option<ConnectorWorkspaceTransition<'a>>,
+    pub now: i64,
+}
+
+pub(crate) struct ConnectorWorkspaceTransition<'a> {
+    pub target_executor_ref: &'a str,
+    pub execution_executor_ref: &'a str,
+    pub target_root: &'a str,
+    pub execution_root: &'a str,
+    pub baseline_commit: &'a str,
+    pub baseline_tree: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConnectorWindowContext {
+    pub task_id: String,
+    pub target_path: String,
+    pub fingerprint: ProjectContextFingerprint,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WindowProjectActivation {
+    pub previous_project: Option<String>,
+    pub current_project: String,
+    pub switched: bool,
 }
 
 pub(crate) struct NewConnectorResult<'a> {
@@ -237,6 +273,190 @@ impl From<serde_json::Error> for ConnectorTaskStoreError {
 }
 
 impl Database {
+    /// Process-local navigation state. The durable window/project context map
+    /// below is deliberately separate, so a restart cannot invent a current
+    /// project but can still recover exact prior work when the next request
+    /// names that project.
+    pub(crate) fn activate_window_project(
+        &self,
+        subject_id: &str,
+        window_key: &str,
+        project_identity: &str,
+    ) -> WindowProjectActivation {
+        let key = (subject_id.to_string(), window_key.to_string());
+        let mut bindings = self.window_projects.lock().unwrap();
+        let previous_project = bindings.insert(key, project_identity.to_string());
+        let switched = previous_project
+            .as_deref()
+            .is_some_and(|previous| previous != project_identity);
+        WindowProjectActivation {
+            previous_project,
+            current_project: project_identity.to_string(),
+            switched,
+        }
+    }
+
+    pub(crate) fn connector_window_context(
+        &self,
+        window_key: &str,
+        project_id: &str,
+        subject_id: &str,
+        project_root_sha256: &str,
+    ) -> Result<Option<ConnectorWindowContext>, ConnectorTaskStoreError> {
+        let conn = self.conn.lock().unwrap();
+        let stored = conn
+            .query_row(
+                "SELECT task_id, target_path, fingerprint_json, created_at, updated_at
+                 FROM wc_window_project_contexts
+                 WHERE window_key = ?1 AND project_id = ?2 AND owner_subject_id = ?3
+                   AND project_root_sha256 = ?4",
+                params![window_key, project_id, subject_id, project_root_sha256],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((task_id, target_path, fingerprint_json, created_at, updated_at)) = stored else {
+            return Ok(None);
+        };
+        let fingerprint = serde_json::from_str(&fingerprint_json)?;
+        Ok(Some(ConnectorWindowContext {
+            task_id,
+            target_path,
+            fingerprint,
+            created_at,
+            updated_at,
+        }))
+    }
+
+    pub(crate) fn connector_window_context_for_task(
+        &self,
+        task_id: &str,
+        project_id: &str,
+        subject_id: &str,
+    ) -> Result<Option<ConnectorWindowContext>, ConnectorTaskStoreError> {
+        let conn = self.conn.lock().unwrap();
+        let stored = conn
+            .query_row(
+                "SELECT task_id, target_path, fingerprint_json, created_at, updated_at
+                 FROM wc_window_project_contexts
+                 WHERE task_id = ?1 AND project_id = ?2 AND owner_subject_id = ?3",
+                params![task_id, project_id, subject_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((task_id, target_path, fingerprint_json, created_at, updated_at)) = stored else {
+            return Ok(None);
+        };
+        let fingerprint = serde_json::from_str(&fingerprint_json)?;
+        Ok(Some(ConnectorWindowContext {
+            task_id,
+            target_path,
+            fingerprint,
+            created_at,
+            updated_at,
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bind_connector_window_context(
+        &self,
+        window_key: &str,
+        window_source: &str,
+        project_id: &str,
+        subject_id: &str,
+        project_root_sha256: &str,
+        task_id: &str,
+        target_path: &str,
+        fingerprint: &ProjectContextFingerprint,
+        now: i64,
+    ) -> Result<(), ConnectorTaskStoreError> {
+        if fingerprint.project_root_sha256 != project_root_sha256 {
+            return Err(ConnectorTaskStoreError::InvalidState(
+                "window context root identity does not match its fingerprint".to_string(),
+            ));
+        }
+        let fingerprint_json = serde_json::to_string(fingerprint)?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let owns_task = tx
+            .query_row(
+                "SELECT 1 FROM wc_tasks
+                 WHERE id = ?1 AND project_id = ?2 AND owner_subject_id = ?3",
+                params![task_id, project_id, subject_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !owns_task {
+            return Err(ConnectorTaskStoreError::NotFound);
+        }
+        // A task has one controlling window. Explicit recovery therefore
+        // moves this lightweight binding instead of letting two windows
+        // concurrently inherit one active context. Durable task history is
+        // untouched.
+        tx.execute(
+            "DELETE FROM wc_window_project_contexts
+             WHERE task_id = ?1
+               AND NOT (
+                    window_key = ?2 AND project_id = ?3
+                    AND owner_subject_id = ?4 AND project_root_sha256 = ?5
+               )",
+            params![
+                task_id,
+                window_key,
+                project_id,
+                subject_id,
+                project_root_sha256
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO wc_window_project_contexts
+                (window_key, window_source, project_id, owner_subject_id,
+                 project_root_sha256, task_id, target_path, fingerprint_json,
+                 created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+             ON CONFLICT(
+                window_key,
+                project_id,
+                owner_subject_id,
+                project_root_sha256
+             ) DO UPDATE SET
+                window_source = excluded.window_source,
+                task_id = excluded.task_id,
+                target_path = excluded.target_path,
+                fingerprint_json = excluded.fingerprint_json,
+                updated_at = excluded.updated_at",
+            params![
+                window_key,
+                window_source,
+                project_id,
+                subject_id,
+                project_root_sha256,
+                task_id,
+                target_path,
+                fingerprint_json,
+                now
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn ensure_connector_binding(
         &self,
         binding: ConnectorBinding<'_>,
@@ -398,6 +618,137 @@ impl Database {
             created_at: task.now,
             updated_at: task.now,
         })
+    }
+
+    pub(crate) fn continue_connector_task(
+        &self,
+        continuation: ConnectorTaskContinuation<'_>,
+    ) -> Result<(ConnectorTaskSnapshot, i64, String), ConnectorTaskStoreError> {
+        if !matches!(continuation.mode, "normal" | "inspect" | "read_only") {
+            return Err(ConnectorTaskStoreError::InvalidState(
+                "task mode must be normal, inspect, or read_only".to_string(),
+            ));
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let task = load_task(
+            &tx,
+            continuation.task_id,
+            continuation.project_id,
+            continuation.subject_id,
+        )?
+        .ok_or(ConnectorTaskStoreError::NotFound)?;
+        require_running(&task)?;
+        if task.task_status != "active" {
+            return Err(ConnectorTaskStoreError::InvalidState(
+                "only an active task can continue".to_string(),
+            ));
+        }
+        if continuation.mode == "normal" && !task.isolated && continuation.workspace.is_none() {
+            return Err(ConnectorTaskStoreError::InvalidState(
+                "read-only workspace must be upgraded before enabling writes".to_string(),
+            ));
+        }
+        let previous_mode = task.mode.clone();
+        let workspace_upgraded = continuation.workspace.is_some();
+        if let Some(workspace) = continuation.workspace {
+            if continuation.mode != "normal"
+                || workspace.execution_root == workspace.target_root
+                || workspace.baseline_commit.is_empty()
+                || workspace.baseline_tree.is_empty()
+            {
+                return Err(ConnectorTaskStoreError::InvalidState(
+                    "writable transition requires an isolated workspace and Git baseline"
+                        .to_string(),
+                ));
+            }
+            tx.execute(
+                "UPDATE wc_run_contexts
+                 SET target_executor_ref = ?1, execution_executor_ref = ?2,
+                     target_root = ?3, execution_root = ?4,
+                     baseline_commit = ?5, baseline_tree = ?6, isolated = 1
+                 WHERE run_id = ?7",
+                params![
+                    workspace.target_executor_ref,
+                    workspace.execution_executor_ref,
+                    workspace.target_root,
+                    workspace.execution_root,
+                    workspace.baseline_commit,
+                    workspace.baseline_tree,
+                    task.run_id
+                ],
+            )?;
+        }
+        tx.execute(
+            "UPDATE wc_tasks SET mode = ?1, updated_at = ?2 WHERE id = ?3",
+            params![continuation.mode, continuation.now, continuation.task_id],
+        )?;
+        let sequence = task.event_cursor + 1;
+        insert_event(
+            &tx,
+            &task.task_id,
+            &task.run_id,
+            sequence,
+            "task_instruction",
+            &serde_json::json!({
+                "instruction": continuation.instruction,
+                "previous_mode": previous_mode,
+                "mode": continuation.mode,
+                "capability_changed": previous_mode != continuation.mode,
+                "workspace_upgraded": workspace_upgraded
+            }),
+            continuation.now,
+        )?;
+        tx.commit()?;
+        let task = load_task(
+            &conn,
+            continuation.task_id,
+            continuation.project_id,
+            continuation.subject_id,
+        )?
+        .ok_or(ConnectorTaskStoreError::NotFound)?;
+        Ok((task, sequence, previous_mode))
+    }
+
+    /// Record a follow-up instruction without pretending an interrupted run
+    /// resumed. This is metadata-only and intentionally does not change mode,
+    /// run status, or workspace ownership.
+    pub(crate) fn append_interrupted_connector_instruction(
+        &self,
+        task_id: &str,
+        project_id: &str,
+        subject_id: &str,
+        instruction: &str,
+        requested_mode: &str,
+        now: i64,
+    ) -> Result<i64, ConnectorTaskStoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let task = load_task(&tx, task_id, project_id, subject_id)?
+            .ok_or(ConnectorTaskStoreError::NotFound)?;
+        if task.run_status != "interrupted" || task.task_status != "needs_attention" {
+            return Err(ConnectorTaskStoreError::InvalidState(
+                "only an interrupted task accepts a blocked continuation instruction".to_string(),
+            ));
+        }
+        let sequence = task.event_cursor + 1;
+        insert_event(
+            &tx,
+            task_id,
+            &task.run_id,
+            sequence,
+            "task_instruction",
+            &serde_json::json!({
+                "instruction": instruction,
+                "mode": requested_mode,
+                "applied": false,
+                "blocked_by": "task_interrupted"
+            }),
+            now,
+        )?;
+        touch_task(&tx, task_id, now)?;
+        tx.commit()?;
+        Ok(sequence)
     }
 
     pub(crate) fn connector_task(

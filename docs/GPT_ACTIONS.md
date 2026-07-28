@@ -49,13 +49,20 @@ not call `listProjects`, `runtime_status`, `tool_manifest`, `start_session`, or
 Agent listing before normal coding, and the prompt must not contain an Agent
 client ID or runtime project ID.
 
+Within one retained chat-window identity, `task_start` automatically continues
+the repository's active durable context and appends the new instruction.
+Changing to another configured repository keeps the two histories isolated;
+returning restores the first repository. WebCodex refreshes only Git, worktree,
+repository-rule, target-directory, and manifest state that changed.
+
 ## Suggested GPT Instructions
 
 ```text
 Use the configured WebCodex project.
-Start each bounded request with task_start.
-In a fresh chat session, call task_list first and continue durable work
-with task_resume before starting anything new.
+Start or continue each user instruction with task_start.
+Let task_start reuse the current project context; do not ask the user for IDs.
+Use task_list and task_resume only after WebCodex reports that automatic
+transport-window recovery is unavailable.
 Use files_list to see what the project contains before guessing paths.
 Use files_read/files_search before edits_apply.
 Use a stable operation_id for exact retry.
@@ -63,8 +70,8 @@ Run checks_run before task_finish.
 Use task_review for execution progress and result review.
 Use commands_run only when structured capabilities are insufficient and
 approval is available.
-Never ask the user for internal routing, Agent, transport, queue, or workflow
-session identifiers.
+Never ask the user for task, session, current-binding, Agent, transport, queue,
+or workflow identifiers.
 ```
 
 ## Validation recipe contract

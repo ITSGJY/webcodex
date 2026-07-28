@@ -99,12 +99,14 @@ async fn dispatch(
         }
     };
     let auth = depot.obtain::<AuthContext>().ok().cloned();
+    let window = crate::client_window::api_window(req, res);
     let outcome = runtime
-        .call(
+        .call_for_window(
             capability,
             arguments,
             auth.as_ref(),
             ConnectorTransport::Api,
+            Some(&window),
         )
         .await;
     render(res, outcome);

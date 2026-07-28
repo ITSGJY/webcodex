@@ -188,6 +188,7 @@ pub async fn tools_call(req: &mut Request, depot: &mut Depot, res: &mut Response
 
     let session_id = extract_recording_session_id(&body);
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
+    let window = crate::client_window::api_window(req, res);
     let outcome = runtime
         .call_tool_with_context(
             KernelToolCallRequest {
@@ -198,6 +199,7 @@ pub async fn tools_call(req: &mut Request, depot: &mut Depot, res: &mut Response
                 transport: ToolTransport::Api,
                 session_id: session_id.as_deref(),
                 auth: auth.as_ref(),
+                window: Some(&window),
                 record_oauth_scope_denials: true,
             },
         )

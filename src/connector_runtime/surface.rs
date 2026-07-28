@@ -26,12 +26,16 @@ pub(crate) fn capability_specs() -> Vec<ToolSpec> {
     vec![
         spec(
             "task_start",
-            "Start one bounded coding task and return a compact Project Brief with Git state, language/manifests, instruction paths, and recommended checks. normal uses a writable workspace; inspect blocks structured writes but permits Landlock-restricted checks and commands; read_only permits no shell.",
+            "Start or continue this chat window's work in the configured project. A follow-up goal is appended to the existing active task after selective Git, worktree, manifest, and repository-rule refresh; switching away and back restores that project's task. normal uses a writable workspace; inspect blocks structured writes but permits Landlock-restricted checks and commands; read_only permits no shell.",
             json!({
                 "type": "object",
                 "properties": {
                     "goal": { "type": "string", "minLength": 1, "maxLength": 4000, "description": "Concrete outcome requested by the user." },
-                    "mode": { "type": "string", "enum": ["normal", "inspect", "read_only"], "default": "normal" }
+                    "mode": { "type": "string", "enum": ["normal", "inspect", "read_only"], "default": "normal" },
+                    "target_path": {
+                        "type": "string",
+                        "description": "Optional project-relative file or directory relevant to this instruction. WebCodex uses it to apply nested repository rules."
+                    }
                 },
                 "required": ["goal"],
                 "additionalProperties": false
@@ -41,7 +45,7 @@ pub(crate) fn capability_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "task_list",
-            "Chat sessions do not persist, but tasks do. In a new session, call this before task_start to find this project's recent tasks — status, goal, and the recommended next step — then continue one with task_resume or start fresh with task_start.",
+            "List this project's durable tasks for recovery or operator diagnosis. Ordinary same-window work lets task_start resolve the existing context without duplicating it; use this list only when the transport window identity was lost or a specific older task must be inspected.",
             json!({
                 "type": "object",
                 "properties": {
@@ -58,7 +62,7 @@ pub(crate) fn capability_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "task_resume",
-            "Rebind this chat session to an existing task and return a compact bootstrap: goal, status, applied paths, the result and its local decision, the latest execution, undelivered human guidance (including a rejection reason), and the recommended next step. Guidance is claimed on delivery — treat it as fresh instructions.",
+            "Explicitly recover one durable task when automatic same-window continuation is unavailable. Returns a compact bootstrap: goal, status, applied paths, result decision, latest execution, undelivered human guidance, and recommended next step. This recovery operation is not part of the ordinary coding path.",
             json!({
                 "type": "object",
                 "properties": {
@@ -530,6 +534,13 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(operations, expected);
         assert_eq!(spec["paths"].as_object().unwrap().len(), 12);
+        let start = &spec["paths"]["/api/connector/task/start"]["post"]["requestBody"]["content"]
+            ["application/json"]["schema"];
+        assert_eq!(start["properties"]["target_path"]["type"], "string");
+        assert!(!start["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("target_path")));
         let commands = &spec["paths"]["/api/connector/commands/run"]["post"]["requestBody"]
             ["content"]["application/json"]["schema"];
         assert!(commands["required"]

@@ -46,13 +46,18 @@ Connector 已拥有确定性 project binding。Custom GPT 普通 coding 前不�
 `listProjects`、`runtime_status`、`tool_manifest`、`start_session` 或 Agent listing，
 prompt 也不包含 Agent client ID 或 runtime project ID。
 
+在同一个可保留的聊天窗口身份内，`task_start` 会自动继续该仓库的持久上下文并
+追加新指令。切换到另一份已配置仓库时两边历史严格隔离，切回时恢复原仓库。
+WebCodex 只刷新发生变化的 Git、工作区、仓库规则、目标目录和 manifest 状态。
+
 ## 建议 GPT Instructions
 
 ```text
 Use the configured WebCodex project.
-Start each bounded request with task_start.
-In a fresh chat session, call task_list first and continue durable work
-with task_resume before starting anything new.
+Start or continue each user instruction with task_start.
+Let task_start reuse the current project context; do not ask the user for IDs.
+Use task_list and task_resume only after WebCodex reports that automatic
+transport-window recovery is unavailable.
 Use files_list to see what the project contains before guessing paths.
 Use files_read/files_search before edits_apply.
 Use a stable operation_id for exact retry.
@@ -60,8 +65,8 @@ Run checks_run before task_finish.
 Use task_review for execution progress and result review.
 Use commands_run only when structured capabilities are insufficient and
 approval is available.
-Never ask the user for internal routing, Agent, transport, queue, or workflow
-session identifiers.
+Never ask the user for task, session, current-binding, Agent, transport, queue,
+or workflow identifiers.
 ```
 
 ## Validation recipe contract

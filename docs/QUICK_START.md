@@ -119,9 +119,11 @@ task_start
 
 It does not need to call `list_projects`, `runtime_status`, `tool_manifest`,
 `start_session`, or `current_session`, and it does not put an
-`agent:<client>:<project>` value in the prompt. A returning chat session
-begins with `task_list` instead and rebinds to durable work with
-`task_resume`.
+`agent:<client>:<project>` value in the prompt. The same chat window continues
+the current repository automatically. Switching to another configured
+repository switches project context, and returning restores that repository's
+prior work. `task_list` and `task_resume` are only needed for explicit recovery
+when the client can no longer present its transport window identity.
 
 Hosted ChatGPT cannot reach a loopback address. An operator must provide an
 approved HTTPS endpoint and authentication without changing the project

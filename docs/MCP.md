@@ -48,17 +48,27 @@ task_cancel
 task_finish
 ```
 
-Chat sessions expire; tasks are durable on the server. A new session starts
-with `task_list` to discover unfinished work, then `task_resume` for a compact
-bootstrap — goal, state, applied paths, the result decision, and undelivered
-human guidance (including a rejection reason).
+The same chat window continues the configured repository automatically.
+`task_start` resolves one context for that window and project without
+duplicating it; each follow-up instruction is appended to the active durable
+task.
+Switching repository connections keeps their histories isolated, and returning
+to a previous connection restores its prior task. Compatible MCP clients retain
+the protocol session automatically; users do not pass it in prompts.
 
 The Connector context already binds the project. Start with `task_start`; do
 not call `list_projects`, `runtime_status`, `tool_manifest`, `start_session`,
 or `current_session`, and do not ask the user for an Agent client ID, runtime
 project ID, executor reference, or workflow session.
 
-The stable visible IDs have product purposes:
+Before reuse, WebCodex compares the repository path, branch and HEAD, worktree,
+applicable repository rules, and project manifests. Unchanged context is
+reused; only changed slices are reported as refreshed. `task_list` and
+`task_resume` are explicit recovery tools for a client that lost its MCP
+transport session, not steps in the ordinary loop.
+
+The stable IDs have product purposes between model tools and host review, but
+ordinary users do not manage them:
 
 - `task_id`: continue/review one bounded task;
 - `operation_id`: exact retry identity for a mutation or execution;

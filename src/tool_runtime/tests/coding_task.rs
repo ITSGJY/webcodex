@@ -1,5 +1,6 @@
 use super::support::*;
 use crate::auth::AuthContext;
+use crate::client_window::ClientWindow;
 use crate::shell_protocol::{AgentPolicySummary, ShellClientCapabilities};
 use crate::tool_runtime::metadata::lookup_tool_metadata;
 use crate::tool_runtime::sessions::SessionTransport;
@@ -276,10 +277,20 @@ async fn start_coding_task_returns_session_and_does_not_bind_current_by_default(
     assert_eq!(result.output["authority"]["mode"], "trusted_agent");
     assert_eq!(result.output["authority"]["human_approval_required"], false);
 
+    let window = ClientWindow::for_test("coding-task-window");
     let current = runtime
-        .dispatch(ToolCall::CurrentSession {
-            project: project.clone(),
-        })
+        .dispatch_with_auth_transport_options_and_metadata_with_sandbox(
+            ToolCall::CurrentSession {
+                project: project.clone(),
+            },
+            None,
+            SessionTransport::Api,
+            true,
+            false,
+            Default::default(),
+            None,
+            Some(&window),
+        )
         .await;
     assert!(current.success, "{:?}", current.error);
     assert_eq!(current.output["found"], false);

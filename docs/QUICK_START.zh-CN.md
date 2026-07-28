@@ -111,8 +111,10 @@ task_start
 ```
 
 它不需要 `list_projects`、`runtime_status`、`tool_manifest`、`start_session` 或
-`current_session`，prompt 中也不需要 `agent:<client>:<project>`。回访的聊天
-会话则从 `task_list` 开始，用 `task_resume` 重新接上持久的任务。
+`current_session`，prompt 中也不需要 `agent:<client>:<project>`。同一个聊天窗口
+会自动继续当前仓库的工作；切换到另一份已配置仓库时会自动切换项目上下文，
+之后切回会恢复该仓库之前的工作。只有 client 无法继续提供 transport 窗口身份
+时，才需要用 `task_list` 和 `task_resume` 做显式恢复。
 
 ChatGPT hosted client 无法访问 loopback address。operator 必须提供批准的 HTTPS
 endpoint 和认证，同时保持 project binding 不变。见

@@ -4,6 +4,7 @@
 //! diagnostics.
 
 use super::support::*;
+use crate::client_window::ClientWindow;
 use crate::shell_protocol::{
     AgentBuildInfo, ShellClientCapabilities, ShellClientRegisterRequest, ShellJobOpRequest,
 };
@@ -583,7 +584,19 @@ pub(in crate::tool_runtime::tests) async fn dispatch_start_coding_task_with_loca
         let runtime = runtime.clone();
         async move {
             let bootstrap = auth_context(None, true);
-            runtime.dispatch_with_auth(call, Some(&bootstrap)).await
+            let window = ClientWindow::for_test("reconnect-window");
+            runtime
+                .dispatch_with_auth_transport_options_and_metadata_with_sandbox(
+                    call,
+                    Some(&bootstrap),
+                    crate::tool_runtime::sessions::SessionTransport::Api,
+                    true,
+                    false,
+                    Default::default(),
+                    None,
+                    Some(&window),
+                )
+                .await
         }
     });
     while !task.is_finished() {

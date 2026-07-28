@@ -1,9 +1,50 @@
 //! Current-session binding tests: bind, unbind, isolation, stale eviction.
 
-use super::super::{current_session_principal, kernel, sessions, ToolCall, ToolRuntime};
+use super::super::{
+    current_session_principal, kernel, sessions, ToolCall, ToolResult, ToolRuntime,
+};
 use super::support::*;
+use crate::auth::AuthContext;
+use crate::client_window::ClientWindow;
 use crate::shell_protocol::{ShellClientCapabilities, ShellClientRegisterRequest};
 use serde_json::json;
+
+async fn dispatch_in_window(
+    runtime: &ToolRuntime,
+    call: ToolCall,
+    auth: Option<&AuthContext>,
+) -> ToolResult {
+    dispatch_in_window_transport(
+        runtime,
+        call,
+        auth,
+        sessions::SessionTransport::Api,
+        "current-window",
+    )
+    .await
+}
+
+async fn dispatch_in_window_transport(
+    runtime: &ToolRuntime,
+    call: ToolCall,
+    auth: Option<&AuthContext>,
+    transport: sessions::SessionTransport,
+    window_id: &str,
+) -> ToolResult {
+    let window = ClientWindow::for_test(window_id);
+    runtime
+        .dispatch_with_auth_transport_options_and_metadata_with_sandbox(
+            call,
+            auth,
+            transport,
+            true,
+            false,
+            sessions::ToolCallRecorderMetadata::default(),
+            None,
+            Some(&window),
+        )
+        .await
+}
 
 fn post_store_message(
     runtime: &ToolRuntime,
@@ -52,40 +93,40 @@ async fn bind_current_session_success_and_lookup() {
     .await;
     let project = agent_test_project_id("current-bind");
     let bootstrap = auth_context(None, true);
-    let started = runtime
-        .dispatch_with_auth(
-            ToolCall::from_tool_name(
-                "start_session",
-                json!({"project": project, "title": "current"}),
-            )
-            .unwrap(),
-            Some(&bootstrap),
+    let started = dispatch_in_window(
+        &runtime,
+        ToolCall::from_tool_name(
+            "start_session",
+            json!({"project": project, "title": "current"}),
         )
-        .await;
+        .unwrap(),
+        Some(&bootstrap),
+    )
+    .await;
     assert!(started.success, "{:?}", started.error);
     let session_id = started.output["session_id"].as_str().unwrap().to_string();
 
-    let bound = runtime
-        .dispatch_with_auth(
-            ToolCall::from_tool_name(
-                "bind_current_session",
-                json!({"project": project, "session_id": session_id}),
-            )
-            .unwrap(),
-            Some(&bootstrap),
+    let bound = dispatch_in_window(
+        &runtime,
+        ToolCall::from_tool_name(
+            "bind_current_session",
+            json!({"project": project, "session_id": session_id}),
         )
-        .await;
+        .unwrap(),
+        Some(&bootstrap),
+    )
+    .await;
     assert!(bound.success, "{:?}", bound.error);
     assert_eq!(bound.output["bound"], true);
     assert_eq!(bound.output["session_id"], session_id);
     assert_eq!(bound.output["resolved_project"], project);
 
-    let current = runtime
-        .dispatch_with_auth(
-            ToolCall::from_tool_name("current_session", json!({"project": project})).unwrap(),
-            Some(&bootstrap),
-        )
-        .await;
+    let current = dispatch_in_window(
+        &runtime,
+        ToolCall::from_tool_name("current_session", json!({"project": project})).unwrap(),
+        Some(&bootstrap),
+    )
+    .await;
     assert!(current.success, "{:?}", current.error);
     assert_eq!(current.output["found"], true);
     assert_eq!(current.output["session_id"], session_id);
@@ -102,15 +143,16 @@ async fn bind_current_session_rejects_unknown_session() {
     )
     .await;
     let project = agent_test_project_id("current-unknown");
-    let result = runtime
-        .dispatch(
-            ToolCall::from_tool_name(
-                "bind_current_session",
-                json!({"project": project, "session_id": "wc_sess_missing"}),
-            )
-            .unwrap(),
+    let result = dispatch_in_window(
+        &runtime,
+        ToolCall::from_tool_name(
+            "bind_current_session",
+            json!({"project": project, "session_id": "wc_sess_missing"}),
         )
-        .await;
+        .unwrap(),
+        None,
+    )
+    .await;
     assert!(!result.success);
     assert_eq!(result.output["error_kind"], "unknown_session_id");
 }
@@ -123,15 +165,16 @@ async fn bind_current_session_rejects_project_mismatch() {
     let session = runtime
         .sessions
         .start_session(Some(project_a.to_string()), Some("a".to_string()));
-    let result = runtime
-        .dispatch(
-            ToolCall::from_tool_name(
-                "bind_current_session",
-                json!({"project": project_b, "session_id": session.session_id}),
-            )
-            .unwrap(),
+    let result = dispatch_in_window(
+        &runtime,
+        ToolCall::from_tool_name(
+            "bind_current_session",
+            json!({"project": project_b, "session_id": session.session_id}),
         )
-        .await;
+        .unwrap(),
+        None,
+    )
+    .await;
     assert!(!result.success);
     assert_eq!(result.output["error_kind"], "session_project_mismatch");
     assert_eq!(result.output["session_project"], project_a);
@@ -152,39 +195,43 @@ async fn unbind_current_session_removes_binding_and_is_idempotent() {
     let session = runtime
         .sessions
         .start_session(Some(project.clone()), Some("unbind".to_string()));
-    let bind = runtime
-        .dispatch(
-            ToolCall::from_tool_name(
-                "bind_current_session",
-                json!({"project": project, "session_id": session.session_id}),
-            )
-            .unwrap(),
+    let bind = dispatch_in_window(
+        &runtime,
+        ToolCall::from_tool_name(
+            "bind_current_session",
+            json!({"project": project, "session_id": session.session_id}),
         )
-        .await;
+        .unwrap(),
+        None,
+    )
+    .await;
     assert!(bind.success, "{:?}", bind.error);
 
-    let first = runtime
-        .dispatch(
-            ToolCall::from_tool_name("unbind_current_session", json!({"project": project}))
-                .unwrap(),
-        )
-        .await;
+    let first = dispatch_in_window(
+        &runtime,
+        ToolCall::from_tool_name("unbind_current_session", json!({"project": project})).unwrap(),
+        None,
+    )
+    .await;
     assert!(first.success, "{:?}", first.error);
     assert_eq!(first.output["unbound"], true);
     assert_eq!(first.output["had_binding"], true);
 
-    let current = runtime
-        .dispatch(ToolCall::from_tool_name("current_session", json!({"project": project})).unwrap())
-        .await;
+    let current = dispatch_in_window(
+        &runtime,
+        ToolCall::from_tool_name("current_session", json!({"project": project})).unwrap(),
+        None,
+    )
+    .await;
     assert!(current.success, "{:?}", current.error);
     assert_eq!(current.output["found"], false);
 
-    let second = runtime
-        .dispatch(
-            ToolCall::from_tool_name("unbind_current_session", json!({"project": project}))
-                .unwrap(),
-        )
-        .await;
+    let second = dispatch_in_window(
+        &runtime,
+        ToolCall::from_tool_name("unbind_current_session", json!({"project": project})).unwrap(),
+        None,
+    )
+    .await;
     assert!(second.success, "{:?}", second.error);
     assert_eq!(second.output["had_binding"], false);
 }
@@ -207,16 +254,16 @@ async fn bound_current_session_records_project_tool_without_session_id() {
     let session = runtime
         .sessions
         .start_session(Some(project.clone()), Some("current read".to_string()));
-    let bind = runtime
-        .dispatch_with_auth(
-            ToolCall::from_tool_name(
-                "bind_current_session",
-                json!({"project": project, "session_id": session.session_id}),
-            )
-            .unwrap(),
-            Some(&bootstrap),
+    let bind = dispatch_in_window(
+        &runtime,
+        ToolCall::from_tool_name(
+            "bind_current_session",
+            json!({"project": project, "session_id": session.session_id}),
         )
-        .await;
+        .unwrap(),
+        Some(&bootstrap),
+    )
+    .await;
     assert!(bind.success, "{:?}", bind.error);
     post_store_message(
         &runtime,
@@ -231,19 +278,19 @@ async fn bound_current_session_records_project_tool_without_session_id() {
         let project = project.clone();
         let bootstrap = bootstrap.clone();
         async move {
-            runtime
-                .dispatch_with_auth(
-                    ToolCall::ReadFile {
-                        project,
-                        path: "README.md".to_string(),
-                        session_id: None,
-                        start_line: None,
-                        limit: Some(1),
-                        with_line_numbers: None,
-                    },
-                    Some(&bootstrap),
-                )
-                .await
+            dispatch_in_window(
+                &runtime,
+                ToolCall::ReadFile {
+                    project,
+                    path: "README.md".to_string(),
+                    session_id: None,
+                    start_line: None,
+                    limit: Some(1),
+                    with_line_numbers: None,
+                },
+                Some(&bootstrap),
+            )
+            .await
         }
     });
     let req = next_agent_request_for_instance(&runtime, "current-read", "inst")
@@ -306,38 +353,38 @@ async fn open_anonymous_can_bind_current_session_and_record_project_read() {
         .unwrap();
     let project = agent_test_project_id("open-current");
 
-    let started = runtime
-        .dispatch_with_auth(
-            ToolCall::from_tool_name(
-                "start_session",
-                json!({"project": project, "title": "open current"}),
-            )
-            .unwrap(),
-            Some(&open),
+    let started = dispatch_in_window(
+        &runtime,
+        ToolCall::from_tool_name(
+            "start_session",
+            json!({"project": project, "title": "open current"}),
         )
-        .await;
+        .unwrap(),
+        Some(&open),
+    )
+    .await;
     assert!(started.success, "{:?}", started.error);
     let session_id = started.output["session_id"].as_str().unwrap().to_string();
 
-    let bound = runtime
-        .dispatch_with_auth(
-            ToolCall::from_tool_name(
-                "bind_current_session",
-                json!({"project": project, "session_id": session_id}),
-            )
-            .unwrap(),
-            Some(&open),
+    let bound = dispatch_in_window(
+        &runtime,
+        ToolCall::from_tool_name(
+            "bind_current_session",
+            json!({"project": project, "session_id": session_id}),
         )
-        .await;
+        .unwrap(),
+        Some(&open),
+    )
+    .await;
     assert!(bound.success, "{:?}", bound.error);
     assert_eq!(bound.output["bound"], true);
 
-    let current = runtime
-        .dispatch_with_auth(
-            ToolCall::from_tool_name("current_session", json!({"project": project})).unwrap(),
-            Some(&open),
-        )
-        .await;
+    let current = dispatch_in_window(
+        &runtime,
+        ToolCall::from_tool_name("current_session", json!({"project": project})).unwrap(),
+        Some(&open),
+    )
+    .await;
     assert!(current.success, "{:?}", current.error);
     assert_eq!(current.output["found"], true);
     assert_eq!(current.output["session_id"], session_id);
@@ -347,19 +394,19 @@ async fn open_anonymous_can_bind_current_session_and_record_project_read() {
         let project = project.clone();
         let open = open.clone();
         async move {
-            runtime
-                .dispatch_with_auth(
-                    ToolCall::ReadFile {
-                        project,
-                        path: "README.md".to_string(),
-                        session_id: None,
-                        start_line: None,
-                        limit: Some(1),
-                        with_line_numbers: None,
-                    },
-                    Some(&open),
-                )
-                .await
+            dispatch_in_window(
+                &runtime,
+                ToolCall::ReadFile {
+                    project,
+                    path: "README.md".to_string(),
+                    session_id: None,
+                    start_line: None,
+                    limit: Some(1),
+                    with_line_numbers: None,
+                },
+                Some(&open),
+            )
+            .await
         }
     });
     let req = next_agent_request_for_instance(&runtime, "open-current", "inst-open-current")
@@ -399,16 +446,16 @@ async fn generic_tool_call_uses_bound_current_session_without_session_id() {
     let session = runtime
         .sessions
         .start_session(Some(project.clone()), Some("generic current".to_string()));
-    let bind = runtime
-        .dispatch_with_auth(
-            ToolCall::from_tool_name(
-                "bind_current_session",
-                json!({"project": project, "session_id": session.session_id}),
-            )
-            .unwrap(),
-            Some(&bootstrap),
+    let bind = dispatch_in_window(
+        &runtime,
+        ToolCall::from_tool_name(
+            "bind_current_session",
+            json!({"project": project, "session_id": session.session_id}),
         )
-        .await;
+        .unwrap(),
+        Some(&bootstrap),
+    )
+    .await;
     assert!(bind.success, "{:?}", bind.error);
 
     let task = tokio::spawn({
@@ -430,6 +477,7 @@ async fn generic_tool_call_uses_bound_current_session_without_session_id() {
                         transport: kernel::ToolTransport::Api,
                         session_id: None,
                         auth: Some(&bootstrap),
+                        window: Some(&ClientWindow::for_test("current-window")),
                         record_oauth_scope_denials: true,
                     },
                 )
@@ -485,16 +533,16 @@ async fn explicit_session_id_wins_over_current_session() {
     let explicit = runtime
         .sessions
         .start_session(Some(project.clone()), Some("explicit".to_string()));
-    let bind = runtime
-        .dispatch_with_auth(
-            ToolCall::from_tool_name(
-                "bind_current_session",
-                json!({"project": project, "session_id": current.session_id}),
-            )
-            .unwrap(),
-            Some(&bootstrap),
+    let bind = dispatch_in_window(
+        &runtime,
+        ToolCall::from_tool_name(
+            "bind_current_session",
+            json!({"project": project, "session_id": current.session_id}),
         )
-        .await;
+        .unwrap(),
+        Some(&bootstrap),
+    )
+    .await;
     assert!(bind.success, "{:?}", bind.error);
     post_store_message(
         &runtime,
@@ -588,16 +636,16 @@ async fn unknown_explicit_session_id_does_not_fallback_to_current_session() {
     let current = runtime
         .sessions
         .start_session(Some(project.clone()), Some("current".to_string()));
-    let bind = runtime
-        .dispatch_with_auth(
-            ToolCall::from_tool_name(
-                "bind_current_session",
-                json!({"project": project, "session_id": current.session_id}),
-            )
-            .unwrap(),
-            Some(&bootstrap),
+    let bind = dispatch_in_window(
+        &runtime,
+        ToolCall::from_tool_name(
+            "bind_current_session",
+            json!({"project": project, "session_id": current.session_id}),
         )
-        .await;
+        .unwrap(),
+        Some(&bootstrap),
+    )
+    .await;
     assert!(bind.success, "{:?}", bind.error);
     post_store_message(
         &runtime,
@@ -660,16 +708,16 @@ async fn stale_current_session_is_cleared_and_project_tool_runs_without_session(
     let stale = runtime
         .sessions
         .start_session(Some(project.clone()), Some("stale".to_string()));
-    let bind = runtime
-        .dispatch_with_auth(
-            ToolCall::from_tool_name(
-                "bind_current_session",
-                json!({"project": project, "session_id": stale.session_id}),
-            )
-            .unwrap(),
-            Some(&bootstrap),
+    let bind = dispatch_in_window(
+        &runtime,
+        ToolCall::from_tool_name(
+            "bind_current_session",
+            json!({"project": project, "session_id": stale.session_id}),
         )
-        .await;
+        .unwrap(),
+        Some(&bootstrap),
+    )
+    .await;
     assert!(bind.success, "{:?}", bind.error);
     for idx in 0..101 {
         runtime
@@ -678,12 +726,12 @@ async fn stale_current_session_is_cleared_and_project_tool_runs_without_session(
     }
     assert!(runtime.sessions.summary(&stale.session_id, None).is_none());
 
-    let current = runtime
-        .dispatch_with_auth(
-            ToolCall::from_tool_name("current_session", json!({"project": project})).unwrap(),
-            Some(&bootstrap),
-        )
-        .await;
+    let current = dispatch_in_window(
+        &runtime,
+        ToolCall::from_tool_name("current_session", json!({"project": project})).unwrap(),
+        Some(&bootstrap),
+    )
+    .await;
     assert!(current.success, "{:?}", current.error);
     assert_eq!(current.output["found"], false);
 
@@ -692,19 +740,19 @@ async fn stale_current_session_is_cleared_and_project_tool_runs_without_session(
         let project = project.clone();
         let bootstrap = bootstrap.clone();
         async move {
-            runtime
-                .dispatch_with_auth(
-                    ToolCall::ReadFile {
-                        project,
-                        path: "README.md".to_string(),
-                        session_id: None,
-                        start_line: None,
-                        limit: Some(1),
-                        with_line_numbers: None,
-                    },
-                    Some(&bootstrap),
-                )
-                .await
+            dispatch_in_window(
+                &runtime,
+                ToolCall::ReadFile {
+                    project,
+                    path: "README.md".to_string(),
+                    session_id: None,
+                    start_line: None,
+                    limit: Some(1),
+                    with_line_numbers: None,
+                },
+                Some(&bootstrap),
+            )
+            .await
         }
     });
     let req = next_agent_request_for_instance(&runtime, "current-stale", "inst")
@@ -725,7 +773,7 @@ async fn stale_current_session_is_cleared_and_project_tool_runs_without_session(
 }
 
 #[tokio::test]
-async fn current_session_binding_is_principal_and_transport_isolated() {
+async fn current_session_binding_is_window_principal_and_transport_isolated() {
     let runtime = runtime_with_agent_project("current-isolation");
     register_agent(
         &runtime,
@@ -740,43 +788,57 @@ async fn current_session_binding_is_principal_and_transport_isolated() {
         .start_session(Some(project.clone()), Some("isolated".to_string()));
     let alice = auth_context(Some("alice"), false);
     let bob = auth_context(Some("bob"), false);
-    let bind = runtime
-        .dispatch_with_auth_transport(
-            ToolCall::from_tool_name(
-                "bind_current_session",
-                json!({"project": project, "session_id": session.session_id}),
-            )
-            .unwrap(),
-            Some(&alice),
-            sessions::SessionTransport::Api,
+    let bind = dispatch_in_window_transport(
+        &runtime,
+        ToolCall::from_tool_name(
+            "bind_current_session",
+            json!({"project": project, "session_id": session.session_id}),
         )
-        .await;
+        .unwrap(),
+        Some(&alice),
+        sessions::SessionTransport::Api,
+        "alice-window-a",
+    )
+    .await;
     assert!(bind.success, "{:?}", bind.error);
 
-    let alice_api = runtime
-        .dispatch_with_auth_transport(
-            ToolCall::from_tool_name("current_session", json!({"project": project})).unwrap(),
-            Some(&alice),
-            sessions::SessionTransport::Api,
-        )
-        .await;
+    let alice_api = dispatch_in_window_transport(
+        &runtime,
+        ToolCall::from_tool_name("current_session", json!({"project": project})).unwrap(),
+        Some(&alice),
+        sessions::SessionTransport::Api,
+        "alice-window-a",
+    )
+    .await;
     assert_eq!(alice_api.output["found"], true);
 
-    let bob_api = runtime
-        .dispatch_with_auth_transport(
-            ToolCall::from_tool_name("current_session", json!({"project": project})).unwrap(),
-            Some(&bob),
-            sessions::SessionTransport::Api,
-        )
-        .await;
+    let alice_other_window = dispatch_in_window_transport(
+        &runtime,
+        ToolCall::from_tool_name("current_session", json!({"project": project})).unwrap(),
+        Some(&alice),
+        sessions::SessionTransport::Api,
+        "alice-window-b",
+    )
+    .await;
+    assert_eq!(alice_other_window.output["found"], false);
+
+    let bob_api = dispatch_in_window_transport(
+        &runtime,
+        ToolCall::from_tool_name("current_session", json!({"project": project})).unwrap(),
+        Some(&bob),
+        sessions::SessionTransport::Api,
+        "alice-window-a",
+    )
+    .await;
     assert_eq!(bob_api.output["found"], false);
 
-    let alice_mcp = runtime
-        .dispatch_with_auth_transport(
-            ToolCall::from_tool_name("current_session", json!({"project": project})).unwrap(),
-            Some(&alice),
-            sessions::SessionTransport::Mcp,
-        )
-        .await;
+    let alice_mcp = dispatch_in_window_transport(
+        &runtime,
+        ToolCall::from_tool_name("current_session", json!({"project": project})).unwrap(),
+        Some(&alice),
+        sessions::SessionTransport::Mcp,
+        "alice-window-a",
+    )
+    .await;
     assert_eq!(alice_mcp.output["found"], false);
 }

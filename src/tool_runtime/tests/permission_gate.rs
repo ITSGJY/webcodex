@@ -360,6 +360,7 @@ async fn kernel_path_does_not_double_evaluate_or_duplicate_request_id() {
                         transport: ToolTransport::Api,
                         session_id: Some(&recording_id),
                         auth: Some(&bootstrap),
+                        window: None,
                         record_oauth_scope_denials: true,
                     },
                 )

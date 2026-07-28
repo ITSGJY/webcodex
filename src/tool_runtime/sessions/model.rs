@@ -51,6 +51,7 @@ pub(crate) struct CurrentSessionKey {
     pub(crate) principal_kind: String,
     pub(crate) principal_id: String,
     pub(crate) transport: String,
+    pub(crate) window_key: String,
     pub(crate) resolved_project: String,
 }
 

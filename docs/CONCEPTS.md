@@ -53,7 +53,9 @@ Runtime project ids use this shape:
 agent:<client_id>:<project_id>
 ```
 
-`client_id` identifies the agent connection profile. `project_id` is the project id registered by that agent. Put the full runtime project id in prompts and tool calls so the model does not choose the wrong repository.
+`client_id` identifies the agent connection profile. `project_id` is the
+project id registered by that agent. A project-bound Connector resolves this
+internally; ordinary users do not put the runtime project id in prompts.
 
 ### Tool Runtime
 
@@ -89,11 +91,29 @@ GPT Actions import the WebCodex OpenAPI schema:
 https://your-domain.example/openapi.json
 ```
 
-Use GPT Actions if you are building a Custom GPT. GPT Actions exposes a focused REST operation surface and a generic `callRuntimeTool` path for runtime tools. It shares the same WebCodex ToolRuntime as MCP.
+Use GPT Actions if you are building a Custom GPT. A project-bound Connector
+exposes the same focused twelve-capability surface as MCP and shares its
+authorization and execution boundaries.
+
+### Project Work Context
+
+The same chat window continues its current repository work. WebCodex keeps
+durable history separately for each exact repository, switches context when
+the window changes repository, and restores the previous context when it
+returns. Follow-up instructions append to that history.
+
+Before reuse, WebCodex checks the repository path, branch and HEAD, worktree,
+applicable repository rules, target directory, and project manifests. It reuses
+unchanged context and refreshes changed slices. Task IDs and window bindings
+remain implementation details in the ordinary Connector path.
 
 ### Session
 
-A session is a bounded task record. `start_coding_task` creates the recommended coding session and returns an explicit `session_id`. Keep that id and pass it to later review, validation, handoff, or finish calls when the tool accepts it.
+A Workflow Session is the full operator runtime's bounded evidence ledger.
+Those tools retain explicit `wc_sess_*` contracts for administration and
+specialized workflows, but project-bound Connector users do not create, bind,
+upgrade, or pass Workflow Session IDs. Their normal continuity comes from the
+project work context above.
 
 Dirty workspace is an expected development state and does not prevent starting a coding task. Existing worktree changes (tracked modified, staged, untracked, renamed, deleted, or conflicted) must be inspected and preserved. They are not automatically reverted, stashed, cleaned, or overwritten. Startup blocking is reserved for conditions that make the project inaccessible or the requested work unsafe or impossible (missing project path, resolution failure, agent offline when required, permission denial, or path safety failures). Review and finish tools may still treat a dirty closeout as non-pass evidence.
 
@@ -127,13 +147,15 @@ configuration and human review.
 
 ## Default Coding Loop
 
-1. `start_coding_task`
-2. Inspect with `read_file` and `run_shell` using `rg` or `git grep`
-   (`search_project_text` remains compatible).
-3. Edit with structured edit or patch tools.
-4. Validate with structured validation tools.
-5. Review with `show_changes`, `git_diff_hunks`, and `workspace_hygiene_check`.
-6. Finish with `finish_coding_task` or hand off with `session_handoff_summary`.
+1. Start or continue the instruction with `task_start`.
+2. Inspect with `files_list`, `files_read`, and `files_search`.
+3. Edit with `edits_apply`.
+4. Validate with `checks_run`.
+5. Finish with `task_finish` and review with `task_review`.
+
+The model passes durable tool IDs between these calls; the user does not manage
+them. `task_list` and `task_resume` are recovery operations when automatic
+transport-window continuity is unavailable.
 
 ## Where To Go Next
 

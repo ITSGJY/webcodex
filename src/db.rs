@@ -5,6 +5,7 @@ use crate::models::{
     OAuthRefreshTokenRecord, UserRecord,
 };
 use rusqlite::Connection;
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 mod accounts;
@@ -27,12 +28,18 @@ pub use self::oauth::RotateResult;
 #[allow(unused_imports)]
 pub(crate) use self::task_kernel::{
     ConnectorApproval, ConnectorApprovalGate, ConnectorBinding, ConnectorEditOperationGate,
-    ConnectorPreservedWorkspace, ConnectorTaskEvent, ConnectorTaskResult, ConnectorTaskSnapshot,
-    ConnectorTaskStoreError, LocalReviewableTask, NewConnectorResult, NewConnectorTask,
+    ConnectorPreservedWorkspace, ConnectorTaskContinuation, ConnectorTaskEvent,
+    ConnectorTaskResult, ConnectorTaskSnapshot, ConnectorTaskStoreError, ConnectorWindowContext,
+    ConnectorWorkspaceTransition, LocalReviewableTask, NewConnectorResult, NewConnectorTask,
+    WindowProjectActivation,
 };
 
 pub struct Database {
     conn: Mutex<Connection>,
+    /// Ephemeral navigation only. Durable work stays in wc_tasks and
+    /// wc_window_project_contexts; restarting never guesses a window's current
+    /// project.
+    window_projects: Mutex<HashMap<(String, String), String>>,
 }
 
 #[derive(Debug, Clone)]

@@ -18,6 +18,7 @@ mod agent_tokens_http;
 mod agent_ws;
 mod audit_http;
 mod auth;
+mod client_window;
 mod config;
 mod connector_runtime;
 mod console_web;
@@ -47,7 +48,7 @@ pub(crate) use webcodex_core::{
     validation_bridge,
 };
 pub(crate) use webcodex_sandbox as command_sandbox;
-pub(crate) use webcodex_workspace::{project_overview, workspace_checkpoint};
+pub(crate) use webcodex_workspace::{project_context, project_overview, workspace_checkpoint};
 
 pub(crate) use auth::{get_db, json_error, AuthMiddleware};
 pub(crate) use config::load_startup_env_files;

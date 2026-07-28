@@ -20,6 +20,7 @@ impl Database {
         )?;
         let db = Self {
             conn: Mutex::new(conn),
+            window_projects: Mutex::new(std::collections::HashMap::new()),
         };
         db.init_tables()?;
         // Personal-use instance: reclaim dead auth rows on every open rather
@@ -477,6 +478,27 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_wc_task_events_task_sequence
                 ON wc_task_events(task_id, sequence);
+
+            CREATE TABLE IF NOT EXISTS wc_window_project_contexts (
+                window_key TEXT NOT NULL,
+                window_source TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                owner_subject_id TEXT NOT NULL,
+                project_root_sha256 TEXT NOT NULL,
+                task_id TEXT NOT NULL UNIQUE,
+                target_path TEXT NOT NULL DEFAULT '',
+                fingerprint_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(
+                    window_key,
+                    project_id,
+                    owner_subject_id,
+                    project_root_sha256
+                ),
+                FOREIGN KEY(project_id) REFERENCES wc_projects(id),
+                FOREIGN KEY(task_id) REFERENCES wc_tasks(id)
+            );
 
             CREATE TABLE IF NOT EXISTS admin_project_lifecycle_audit (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

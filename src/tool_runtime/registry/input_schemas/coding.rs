@@ -31,7 +31,7 @@ pub(crate) fn start_coding_task_input_schema() -> Value {
             },
             "bind_current": {
                 "type": "boolean",
-                "description": "If true, bind the new session as the caller/transport/project current session. Defaults to false. Binding is process-local in-memory control metadata."
+                "description": "If true, bind the new session as the window/caller/transport/project current session. Defaults to false. Binding is process-local in-memory control metadata."
             }
         },
         "required": ["project"],

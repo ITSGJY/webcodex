@@ -265,12 +265,19 @@ pub(crate) fn current_session_key(
     auth: Option<&AuthContext>,
     transport: sessions::SessionTransport,
     resolved_project: &str,
+    window: Option<&crate::client_window::ClientWindow>,
 ) -> Result<sessions::CurrentSessionKey, String> {
     let (principal_kind, principal_id) = current_session_principal(auth)?;
+    let Some(window) = window else {
+        return Err(
+            "current_session_unavailable: caller has no stable chat-window identity".to_string(),
+        );
+    };
     Ok(sessions::CurrentSessionKey {
         principal_kind,
         principal_id,
         transport: transport.as_str().to_string(),
+        window_key: window.key().to_string(),
         resolved_project: resolved_project.to_string(),
     })
 }

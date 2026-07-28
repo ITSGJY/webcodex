@@ -15,6 +15,7 @@ impl ToolRuntime {
         call: ToolCall,
         auth: Option<&AuthContext>,
         transport: sessions::SessionTransport,
+        window: Option<&crate::client_window::ClientWindow>,
     ) -> ToolResult {
         match call {
             ToolCall::StartSession {
@@ -74,14 +75,15 @@ impl ToolRuntime {
                 project,
                 session_id,
             } => {
-                self.bind_current_session_tool(project, session_id, auth, transport)
+                self.bind_current_session_tool(project, session_id, auth, transport, window)
                     .await
             }
             ToolCall::CurrentSession { project } => {
-                self.current_session_tool(project, auth, transport).await
+                self.current_session_tool(project, auth, transport, window)
+                    .await
             }
             ToolCall::UnbindCurrentSession { project } => {
-                self.unbind_current_session_tool(project, auth, transport)
+                self.unbind_current_session_tool(project, auth, transport, window)
                     .await
             }
             _ => unreachable!("non-session tool routed to session dispatcher"),
@@ -273,6 +275,7 @@ impl ToolRuntime {
         session_id: String,
         auth: Option<&AuthContext>,
         transport: sessions::SessionTransport,
+        window: Option<&crate::client_window::ClientWindow>,
     ) -> ToolResult {
         let resolved = match self.resolve_project_input_for_auth(&project, auth).await {
             Ok(resolved) => resolved,
@@ -306,7 +309,7 @@ impl ToolRuntime {
                 }),
             );
         }
-        let key = match current_session_key(auth, transport, &resolved.resolved_id) {
+        let key = match current_session_key(auth, transport, &resolved.resolved_id, window) {
             Ok(key) => key,
             Err(message) => return current_session_unavailable_result(message),
         };
@@ -328,12 +331,13 @@ impl ToolRuntime {
         project: String,
         auth: Option<&AuthContext>,
         transport: sessions::SessionTransport,
+        window: Option<&crate::client_window::ClientWindow>,
     ) -> ToolResult {
         let resolved = match self.resolve_project_input_for_auth(&project, auth).await {
             Ok(resolved) => resolved,
             Err(err) => return err.into_tool_result(),
         };
-        let key = match current_session_key(auth, transport, &resolved.resolved_id) {
+        let key = match current_session_key(auth, transport, &resolved.resolved_id, window) {
             Ok(key) => key,
             Err(message) => return current_session_unavailable_result(message),
         };
@@ -359,12 +363,13 @@ impl ToolRuntime {
         project: String,
         auth: Option<&AuthContext>,
         transport: sessions::SessionTransport,
+        window: Option<&crate::client_window::ClientWindow>,
     ) -> ToolResult {
         let resolved = match self.resolve_project_input_for_auth(&project, auth).await {
             Ok(resolved) => resolved,
             Err(err) => return err.into_tool_result(),
         };
-        let key = match current_session_key(auth, transport, &resolved.resolved_id) {
+        let key = match current_session_key(auth, transport, &resolved.resolved_id, window) {
             Ok(key) => key,
             Err(message) => return current_session_unavailable_result(message),
         };

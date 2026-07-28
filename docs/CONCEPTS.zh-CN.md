@@ -53,7 +53,9 @@ runtime project id 使用这种形状：
 agent:<client_id>:<project_id>
 ```
 
-`client_id` 标识 agent connection profile。`project_id` 是该 agent 注册的项目 id。prompt 和 tool call 中应写完整 runtime project id，避免模型选错仓库。
+`client_id` 标识 agent connection profile。`project_id` 是该 agent 注册的项目
+id。project-bound Connector 会在内部解析它；普通用户不需要在 prompt 中填写
+runtime project id。
 
 ### Tool Runtime
 
@@ -89,11 +91,24 @@ GPT Actions 导入 WebCodex OpenAPI schema：
 https://your-domain.example/openapi.json
 ```
 
-如果你在构建 Custom GPT，使用 GPT Actions。GPT Actions 暴露精简 REST operation surface，并通过 generic `callRuntimeTool` 调用 runtime tools。它和 MCP 共享同一个 WebCodex ToolRuntime。
+如果你在构建 Custom GPT，使用 GPT Actions。project-bound Connector 与 MCP
+暴露同一份精简的十二项 capability surface，并共享相同的授权和执行边界。
+
+### 项目工作上下文
+
+同一个聊天窗口会继续当前仓库的工作。WebCodex 按仓库实际身份分别保存持久历史；
+窗口切换仓库时自动切换上下文，之后切回会恢复原上下文。后续指令追加到既有历史。
+
+复用前，WebCodex 会检查仓库路径、分支与 HEAD、工作区、适用的仓库规则、目标
+目录和项目 manifest。未变化的上下文直接复用，只刷新变化部分。普通 Connector
+路径中，Task ID 与窗口绑定都属于内部实现，用户无需管理。
 
 ### Session
 
-session 是有界任务记录。`start_coding_task` 创建推荐的 coding session，并返回显式 `session_id`。保存该 id，并在后续 review、validation、handoff 或 finish tool 支持时传入。
+Workflow Session 是完整 operator runtime 的有界 evidence ledger。这套工具为管理
+和特殊 workflow 保留显式 `wc_sess_*` contract；project-bound Connector 的普通
+用户不创建、绑定、升级或传入 Workflow Session ID，其连续性由上面的项目工作
+上下文自动提供。
 
 脏工作区是预期中的开发状态，**不会**阻止启动 coding task。已有的 worktree 改动（tracked modified、staged、untracked、renamed、deleted 或 conflicted）必须先检查并保留；不得自动 revert、stash、clean 或覆盖。Startup blocking 仅保留给项目不可访问、或请求的工作不安全/不可能的情况（路径不存在、解析失败、所需 agent 离线、权限拒绝、路径安全失败等）。review/finish 工具在收口时仍可将 dirty closeout 作为非 pass 证据。
 
@@ -126,13 +141,14 @@ review tools 在用户接受结果前展示变更。`show_changes` 用于查看�
 
 ## 默认 Coding Loop
 
-1. `start_coding_task`
-2. 用 `read_file` 和 `run_shell` 配合 `rg` 或 `git grep` inspect
-   （`search_project_text` 保留兼容）。
-3. 用结构化 edit 或 patch tools 修改。
-4. 用结构化 validation tools 验证。
-5. 用 `show_changes`、`git_diff_hunks` 和 `workspace_hygiene_check` review。
-6. 用 `finish_coding_task` 收口，或用 `session_handoff_summary` 交接。
+1. 用 `task_start` 开始或继续当前指令。
+2. 用 `files_list`、`files_read` 和 `files_search` inspect。
+3. 用 `edits_apply` 修改。
+4. 用 `checks_run` 验证。
+5. 用 `task_finish` 收口，并用 `task_review` review。
+
+模型会在这些调用之间传递持久 tool ID，用户无需管理。只有自动 transport-window
+连续性不可用时，才使用 `task_list` 和 `task_resume` 恢复。
 
 ## 下一步
 

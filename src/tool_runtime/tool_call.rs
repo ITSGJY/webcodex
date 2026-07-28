@@ -197,22 +197,21 @@ pub enum ToolCall {
         limit: Option<usize>,
     },
 
-    /// Explicitly bind an existing project-scoped session as the caller's
-    /// process-local in-memory current session for later project tool calls on
-    /// this transport.
+    /// Explicitly bind an existing project-scoped session as current for the
+    /// client window, caller, transport, and project.
     BindCurrentSession {
         project: String,
         session_id: String,
     },
 
-    /// Return the caller's process-local current session binding for a project,
-    /// if any.
+    /// Return this window/caller/transport's process-local current session
+    /// binding for a project, if any.
     CurrentSession {
         project: String,
     },
 
-    /// Remove the caller's process-local current session binding for a project.
-    /// Idempotent.
+    /// Remove this window/caller/transport's process-local current session
+    /// binding for a project. Idempotent.
     UnbindCurrentSession {
         project: String,
     },

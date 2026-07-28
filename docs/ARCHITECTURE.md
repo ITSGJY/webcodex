@@ -84,7 +84,62 @@ The protocol adapters translate incoming requests into runtime tool calls. The T
 - `runtime_http` exposes REST runtime routes, including generic runtime tool calls and dedicated project/file wrappers.
 - `mcp` exposes the remote MCP endpoint backed by the same ToolRuntime.
 - `openapi` builds the GPT Actions schema for the focused public operation surface.
+- `connector_runtime` owns the canonical project-bound coding path. It maps one
+  transport window and exact repository identity to an existing durable
+  Connector Task before invoking the ToolRuntime execution primitives.
 - `tool_runtime` owns protocol-independent tool parsing, dispatch, project resolution, registry metadata, sessions, handoff, hygiene, files, Git, patches, Cargo validation, shell, jobs, artifacts, and checkpoints.
+
+## Project-Bound Continuity
+
+```mermaid
+flowchart LR
+  W[Chat window] --> I[Hashed transport identity]
+  I --> C[ConnectorRuntime]
+  C --> N[Current-project navigation]
+  C --> M[(Window + project context map)]
+  M --> T[(Tasks + runs + events)]
+  C --> F[Repository fingerprint]
+  C --> TR[ToolRuntime execution]
+```
+
+`task_start` is the single start-or-continue entry point. Under a per-window
+lock it resolves context without duplication by comparing the authenticated
+subject, Connector project id, and hash of the canonical repository path. An
+active mapped task is reused and every accepted new instruction becomes an
+ordered `task_instruction` event; a terminal task causes a new task without
+deleting history. The process-local current-project map reports navigation
+only. Durable task history and the per-repository window map live in SQLite, so
+switching projects neither closes nor deletes the previous task.
+
+Window identity is transport-owned and never accepted as a normal tool field.
+MCP initialize mints `Mcp-Session-Id`, which a conforming client echoes on later
+requests. Hosted Actions use their conversation-scoped request header when
+present. Other HTTP clients use a server-generated `HttpOnly`, `SameSite=Lax`
+cookie and must keep separate cookie jars for separate logical windows.
+WebCodex stores only a domain-separated SHA-256 key, always scoped again by
+authenticated subject and exact project/root identity. Full-runtime current-
+session bindings include the same window key, preventing two windows with one
+credential from overwriting each other.
+
+The continuity fingerprint contains hashes and identities, not repository file
+contents: canonical root, branch, HEAD, porcelain worktree state, applicable
+root/nested instruction files, target directory, and supported manifests.
+Comparison reports unchanged slices as reused and changed, added, or removed
+files as refreshed. Repository rules are content-hashed so unchanged rules need
+not be reintroduced into the model context.
+
+After a server restart, SQLite task/event history and exact window/project
+mappings remain. Process-local “currently viewed project” state is deliberately
+discarded. A client that retains its MCP session header, hosted conversation
+header, or HTTP cookie restores the matching repository on its next
+`task_start`; a lost transport identity is never guessed from user, credential,
+project name, or path. MCP refuses an anonymous `task_start`, while generic
+HTTP clients that discard cookies cannot receive automatic cross-request
+continuity and must use explicit durable-task recovery. `task_resume` moves the
+lightweight task binding to the new stable window; it does not copy the task or
+let both windows inherit one active context. Existing running Connector
+executions continue to follow the pre-existing fail-safe restart rule and
+become interrupted rather than being silently resumed.
 
 ## Agent Bridge
 

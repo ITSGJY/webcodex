@@ -30,6 +30,7 @@ pub(crate) struct ToolCallContext<'a> {
     pub(crate) transport: ToolTransport,
     pub(crate) session_id: Option<&'a str>,
     pub(crate) auth: Option<&'a AuthContext>,
+    pub(crate) window: Option<&'a crate::client_window::ClientWindow>,
     /// REST already recorded OAuth scope denials with session metadata before
     /// this facade existed. MCP rejected scope denials before `_session_id`
     /// became recorder metadata. Keep both adapter-visible behaviors stable.
@@ -375,6 +376,7 @@ impl ToolRuntime {
                 allow_cross_project_session,
                 recorder_metadata,
                 inherited_sandbox,
+                context.window,
             )
             .await;
         if let Some(start) = session_event.as_mut() {
@@ -495,6 +497,7 @@ mod tests {
                     transport: ToolTransport::Api,
                     session_id: Some(&session.session_id),
                     auth: None,
+                    window: None,
                     record_oauth_scope_denials: true,
                 },
             )
@@ -527,6 +530,7 @@ mod tests {
                     transport: ToolTransport::Mcp,
                     session_id: Some(&session.session_id),
                     auth: None,
+                    window: None,
                     record_oauth_scope_denials: false,
                 },
             )
@@ -572,6 +576,7 @@ mod tests {
                     transport: ToolTransport::Api,
                     session_id: Some(&session.session_id),
                     auth: None,
+                    window: None,
                     record_oauth_scope_denials: true,
                 },
             )
@@ -603,6 +608,7 @@ mod tests {
                     transport: ToolTransport::Api,
                     session_id: None,
                     auth: Some(&auth),
+                    window: None,
                     record_oauth_scope_denials: true,
                 },
             )
@@ -632,6 +638,7 @@ mod tests {
                     transport: ToolTransport::Mcp,
                     session_id: None,
                     auth: Some(&auth),
+                    window: None,
                     record_oauth_scope_denials: false,
                 },
             )
@@ -656,6 +663,7 @@ mod tests {
                     transport: ToolTransport::Api,
                     session_id: None,
                     auth: None,
+                    window: None,
                     record_oauth_scope_denials: true,
                 },
             )

@@ -49,6 +49,7 @@ impl ToolRuntime {
         bind_current: bool,
         auth: Option<&AuthContext>,
         transport: SessionTransport,
+        window: Option<&crate::client_window::ClientWindow>,
     ) -> ToolResult {
         // `detail` is the single startup projection control: full keeps the
         // complete runtime status, recent commits, rules, and tool manifest;
@@ -94,7 +95,7 @@ impl ToolRuntime {
 
         let mut warnings = Vec::new();
         let current_binding = if bind_current {
-            match current_session_key(auth, transport, &resolved.resolved_id) {
+            match current_session_key(auth, transport, &resolved.resolved_id, window) {
                 Ok(key) => match self
                     .sessions
                     .bind_current_session(key, &session_summary.session_id)

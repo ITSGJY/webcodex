@@ -2991,6 +2991,7 @@ async fn call_recorded_tool(
                 transport: ToolTransport::Api,
                 session_id: Some(session_id),
                 auth,
+                window: None,
                 record_oauth_scope_denials: true,
             },
         )
@@ -3054,6 +3055,7 @@ async fn call_kernel_tool(
                 transport: ToolTransport::Api,
                 session_id: recording_session_id,
                 auth,
+                window: None,
                 record_oauth_scope_denials: true,
             },
         )

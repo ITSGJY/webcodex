@@ -2,6 +2,7 @@
 
 use super::super::*;
 use super::support::*;
+use crate::client_window::ClientWindow;
 use crate::shell_protocol::ShellClientCapabilities;
 use crate::tool_runtime::kernel::{ToolCallContext, ToolCallRequest, ToolTransport};
 use serde_json::json;
@@ -348,6 +349,7 @@ async fn recording_session_id_obeys_project_boundary() {
                 transport: ToolTransport::Api,
                 session_id: Some(&session.session_id),
                 auth: Some(&auth),
+                window: None,
                 record_oauth_scope_denials: true,
             },
         )
@@ -438,6 +440,7 @@ async fn current_session_binding_cannot_cross_project_boundary() {
 #[tokio::test]
 async fn read_only_current_session_guard_blocks_write_before_enqueue() {
     let runtime = runtime_with_agent_project("current-guard");
+    let window = ClientWindow::for_test("current-guard-window");
     let mut caps = ShellClientCapabilities::default();
     caps.shell = true;
     caps.file_write = true;
@@ -450,26 +453,42 @@ async fn read_only_current_session_guard_blocks_write_before_enqueue() {
         sessions::SessionGuards::default(),
     );
     let bind = runtime
-        .dispatch(
+        .dispatch_with_auth_transport_options_and_metadata_with_sandbox(
             ToolCall::from_tool_name(
                 "bind_current_session",
                 json!({"project": project, "session_id": session.session_id}),
             )
             .unwrap(),
+            None,
+            sessions::SessionTransport::Api,
+            true,
+            false,
+            Default::default(),
+            None,
+            Some(&window),
         )
         .await;
     assert!(bind.success, "{:?}", bind.error);
 
     let result = runtime
-        .dispatch(ToolCall::WriteProjectFile {
-            project: project.clone(),
-            path: "blocked.txt".to_string(),
-            content: "nope".to_string(),
-            session_id: None,
-            overwrite: None,
-            expected_sha256: None,
-            expected_content_prefix: None,
-        })
+        .dispatch_with_auth_transport_options_and_metadata_with_sandbox(
+            ToolCall::WriteProjectFile {
+                project: project.clone(),
+                path: "blocked.txt".to_string(),
+                content: "nope".to_string(),
+                session_id: None,
+                overwrite: None,
+                expected_sha256: None,
+                expected_content_prefix: None,
+            },
+            None,
+            sessions::SessionTransport::Api,
+            true,
+            false,
+            Default::default(),
+            None,
+            Some(&window),
+        )
         .await;
     assert!(!result.success);
     assert_eq!(result.output["error_kind"], "session_guard_denied");

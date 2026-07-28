@@ -730,6 +730,7 @@ fn test_binding_key(project: &str) -> CurrentSessionKey {
         principal_kind: "test".to_string(),
         principal_id: "principal-1".to_string(),
         transport: SessionTransport::Api.as_str().to_string(),
+        window_key: "window-1".to_string(),
         resolved_project: project.to_string(),
     }
 }
