@@ -1,7 +1,9 @@
 #!/usr/bin/env node
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { Script } from "node:vm";
+import ts from "typescript";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const checkOnly = process.argv.includes("--check");
@@ -20,34 +22,48 @@ function normalizeNewline(content) {
   return content.replace(/\r\n/g, "\n").trim() + "\n";
 }
 
-function stripTypeScript(source) {
-  let js = source;
-  js = js.replace(/^type\s+RequestOptions\s*=.*?;\n\n/s, "");
-  js = js.replace(/^declare\s+global\s*\{[\s\S]*?^\}\n\n/m, "");
-  js = js.replace(/^export\s*\{\};\s*\n?/gm, "");
-  js = js.replace(/: RequestOptions(?=\s*[=,)])/g, "");
-  js = js.replace(/: (string|number|unknown|boolean|any)(?=\s*[=,)])/g, "");
-  // DOM event-handler parameter types (single identifiers). Safe because the
-  // only JS context where `: <Word>` appears before `=`, `,`, or `)` is a TS
-  // type annotation; object-literal values like `{ key: Event, }` are avoided
-  // in the source by contract.
-  js = js.replace(/: (Event|SubmitEvent|MouseEvent|KeyboardEvent|ChangeEvent)(?=\s*[=,)])/g, "");
-  // `as <Identifier>` type assertions (e.g. `node as HTMLInputElement`).
-  // `as` is not a JS operator, so stripping `as <Word>` is safe; generic
-  // casts like `as Array<T>` are intentionally not used in the source.
-  js = js.replace(/\bas\s+[A-Za-z_]\w*/g, "");
-  js = js.replace(/: Promise<Response \| null>(?=\s*\{)/g, "");
-  js = js.replace(/: Promise<void>(?=\s*\{)/g, "");
-  js = js.replace(/: Promise<any>(?=\s*\{)/g, "");
-  js = js.replace(/: (boolean|string|void|number|any)(?=\s*\{)/g, "");
-  return js;
+const diagnosticHost = {
+  getCanonicalFileName: (fileName) => fileName,
+  getCurrentDirectory: () => root,
+  getNewLine: () => "\n",
+};
+
+function transpileTypeScript(relPath) {
+  const result = ts.transpileModule(read(relPath), {
+    compilerOptions: {
+      target: ts.ScriptTarget.ES2020,
+      module: ts.ModuleKind.ES2020,
+      newLine: ts.NewLineKind.LineFeed,
+      removeComments: false,
+      sourceMap: false,
+      inlineSourceMap: false,
+    },
+    fileName: relPath,
+    reportDiagnostics: true,
+  });
+  const errors = (result.diagnostics || []).filter(
+    (diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error
+  );
+  if (errors.length) {
+    throw new Error(ts.formatDiagnostics(errors, diagnosticHost).trim());
+  }
+  return normalizeNewline(result.outputText);
 }
 
 function buildJs(source) {
   // Keep generated JS readable and avoid whitespace-sensitive rewrites inside
-  // template literals. CSS is safe to minify below; JS only needs deterministic
-  // TypeScript stripping for the current no-bundler frontend.
+  // template literals. TypeScript owns syntax erasure; this step only makes the
+  // committed output deterministic.
   return normalizeNewline(source);
+}
+
+function assertClassicScript(relPath, source) {
+  try {
+    new Script(source, { filename: relPath });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${relPath} is not valid browser JavaScript: ${message}`);
+  }
 }
 
 function minifyCss(source) {
@@ -68,17 +84,25 @@ function stripModuleExports(js) {
     .replace(/^export\s+(function|const|let|class)\b/gm, "$1");
 }
 
-// The pure review-identity state machine. Emitted as an ESM module so the Node
-// test runner can import it, and inlined into app.js for the no-bundler browser.
-const reviewStateModule = buildJs(stripTypeScript(read("src/review_state.ts")));
+// The pure review-identity state machine stays as ESM for Node tests and is also
+// converted to classic-script declarations for the browser bundle.
+const reviewStateModule = buildJs(transpileTypeScript("src/review_state.ts"));
+const reviewStateClassic = stripModuleExports(reviewStateModule);
 
-// app.js is a single classic script: inline the state module and drop its ESM
-// import so the browser needs no bundler and no extra fetch.
-const appStripped = stripTypeScript(read("src/app.ts")).replace(
-  /^import\s*\{[\s\S]*?\}\s*from\s*["']\.\/review_state(?:\.js)?["'];\s*\n/m,
-  ""
+// app.js is one classic script: TypeScript emits valid ES2020 first, then the
+// local ESM import is removed because review_state is inlined immediately above.
+const appModule = transpileTypeScript("src/app.ts");
+const appScript = stripModuleExports(
+  appModule.replace(
+    /^import\s*\{[\s\S]*?\}\s*from\s*["']\.\/review_state(?:\.js)?["'];?\s*\n/m,
+    ""
+  )
 );
-const appInlined = buildJs(stripModuleExports(reviewStateModule) + "\n" + appStripped);
+const appInlined = buildJs(reviewStateClassic + "\n" + appScript);
+
+// Rust embeds this file as an opaque string, so validate the browser grammar
+// here rather than relying on Rust compilation or TypeScript source checking.
+assertClassicScript("dist/app.js", appInlined);
 
 const outputs = new Map([
   ["dist/review_state.js", reviewStateModule],
