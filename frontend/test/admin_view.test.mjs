@@ -9,11 +9,14 @@ class Node {
     this.hidden = false;
     this.className = "";
     this.children = [];
+    this.attributes = {};
   }
   get firstChild() { return this.children[0] || null; }
   appendChild(child) { this.children.push(child); return child; }
   append(...children) { this.children.push(...children); }
   removeChild(child) { this.children.splice(this.children.indexOf(child), 1); return child; }
+  setAttribute(name, value) { this.attributes[name] = value; }
+  addEventListener() {}
 }
 
 class FakeDocument {
@@ -49,8 +52,8 @@ function populated() {
       { client_id: "c", capabilities: 42, compatibility: "unknown" },
     ],
     projects: [
-      { id: "agent:a:p", client_id: "a", compatibility: "compatible" },
-      { id: "agent:b:p", client_id: "b", compatibility: "version_mismatch" },
+      { id: "agent:a:p", client_id: "a", compatibility: "compatible", actions: { enable: false, disable: true, unregister: true } },
+      { id: "agent:b:p", client_id: "b", compatibility: "version_mismatch", actions: { enable: true, disable: false, unregister: false } },
     ],
     activity: [{ kind: "run_shell", status: "ok" }],
   };
@@ -67,8 +70,8 @@ test("admin renderer handles populated agents and mixed compatibility", () => {
   assert.equal(rowText(devices.children[0])[9], "compatible");
   assert.equal(rowText(devices.children[1])[9], "version_mismatch");
   const projects = doc.getElementById("projects");
-  assert.equal(rowText(projects.children[0])[8], "compatible");
-  assert.equal(rowText(projects.children[1])[8], "version_mismatch");
+  assert.equal(rowText(projects.children[0])[9], "compatible");
+  assert.equal(rowText(projects.children[1])[9], "version_mismatch");
 });
 
 test("section error preserves prior successful DOM and other sections render", () => {

@@ -102,80 +102,130 @@ class AdminRefreshController {
     }
 }
 
-function record(value) {
-    return value && typeof value === "object" && !Array.isArray(value)
-        ? value
-        : {};
+class AdminMutationError extends Error {
+    constructor(status, code, activeJobs) {
+        super(code);
+        this.status = status;
+        this.code = code;
+        this.activeJobs = activeJobs;
+        this.name = "AdminMutationError";
+    }
 }
-function list(value) {
-    return Array.isArray(value) ? value : [];
+function aborted(error) {
+    return Boolean(error && typeof error === "object" && "name" in error && error.name === "AbortError");
 }
-function display(value) {
-    if (value === null || value === undefined || value === "")
-        return "—";
-    if (typeof value === "object") {
+class AdminMutationController {
+    constructor(deps) {
+        this.deps = deps;
+        this.generation = 0;
+        this.token = "";
+        this.contexts = new Map();
+    }
+    beginSession(token) { this.invalidate(); this.token = token; }
+    lock() { this.invalidate(); this.token = ""; }
+    dispose() { this.invalidate(); this.token = ""; }
+    start(kind, target, body) {
+        const existing = this.contexts.get(target);
+        if (!this.token || existing)
+            return null;
+        const context = {
+            kind, target, body: { ...body }, key: this.deps.keyFactory(), generation: this.generation,
+            token: this.token, controller: new AbortController(), pending: false,
+        };
+        this.contexts.set(target, context);
+        return context;
+    }
+    retry(target) {
+        const context = this.contexts.get(target);
+        return context ? this.submit(context) : Promise.resolve();
+    }
+    cancel(target) {
+        const context = this.contexts.get(target);
+        if (!context?.pending)
+            this.contexts.delete(target);
+    }
+    async submit(context) {
+        if (!this.current(context) || context.pending)
+            return;
+        context.pending = true;
+        this.deps.pending(context.target, true);
         try {
-            return JSON.stringify(value);
+            await this.deps.request(context.kind, context.token, { ...context.body, idempotency_key: context.key }, context.controller.signal);
+            if (!this.current(context))
+                return;
+            this.deps.outcome(`${context.kind[0].toUpperCase()}${context.kind.slice(1)} completed.`);
+            this.contexts.delete(context.target);
+            await this.deps.refresh();
         }
-        catch {
-            return "—";
+        catch (error) {
+            if (!this.current(context) || aborted(error))
+                return;
+            const classified = error instanceof AdminMutationError
+                ? error
+                : new AdminMutationError(0, "network_error");
+            if (classified.code === "unauthorized") {
+                this.deps.lock("Administrator authentication required.");
+                return;
+            }
+            this.deps.error(classified.code, context);
+            if (classified.code === "revision_conflict" || classified.code === "active_jobs_conflict") {
+                await this.deps.refresh();
+            }
+            if (classified.code === "revision_conflict")
+                this.contexts.delete(context.target);
+        }
+        finally {
+            if (this.current(context)) {
+                context.pending = false;
+                this.deps.pending(context.target, false);
+            }
         }
     }
-    return String(value);
-}
-function capabilityLabels(value) {
-    if (Array.isArray(value)) {
-        return value.filter((item) => typeof item === "string");
+    current(context) {
+        return this.generation === context.generation && this.token === context.token && this.contexts.get(context.target) === context;
     }
-    if (value && typeof value === "object") {
-        return Object.entries(value)
-            .filter(([, enabled]) => enabled === true)
-            .map(([name]) => name)
-            .sort();
+    invalidate() {
+        this.generation += 1;
+        for (const context of this.contexts.values())
+            context.controller.abort();
+        this.contexts.clear();
     }
-    return [];
 }
-function statusFor(data, section) {
-    return record(record(data.section_status)[section]);
-}
-function sectionOk(data, section) {
-    return statusFor(data, section).status !== "error";
-}
-function sectionError(doc, section, data) {
-    const node = doc.getElementById(`${section}-error`);
-    if (!node)
-        return;
-    const status = statusFor(data, section);
-    const failed = status.status === "error";
-    node.hidden = !failed;
-    node.textContent = failed ? display(status.error || `${section} unavailable`) : "";
-}
-function clear(node) {
-    while (node?.firstChild)
-        node.removeChild(node.firstChild);
-}
-function cell(doc, row, value, code = false) {
-    const td = doc.createElement("td");
-    const child = doc.createElement(code ? "code" : "span");
-    child.textContent = display(value);
-    td.appendChild(child);
-    row.appendChild(td);
-}
-function card(doc, label, value) {
-    const box = doc.createElement("article");
-    box.className = "card";
-    const name = doc.createElement("span");
-    name.textContent = label;
-    const content = doc.createElement("strong");
-    content.textContent = display(value);
-    box.append(name, content);
-    return box;
-}
-function setVisible(doc, id, visible) {
-    const node = doc.getElementById(id);
-    if (node)
-        node.hidden = !visible;
-}
+
+function record(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
+function list(value) { return Array.isArray(value) ? value : []; }
+function display(value) { if (value == null || value === "")
+    return "—"; if (typeof value === "object") {
+    try {
+        return JSON.stringify(value);
+    }
+    catch {
+        return "—";
+    }
+} return String(value); }
+function capabilityLabels(value) { if (Array.isArray(value))
+    return value.filter((item) => typeof item === "string"); if (value && typeof value === "object")
+    return Object.entries(value).filter(([, enabled]) => enabled === true).map(([name]) => name).sort(); return []; }
+function statusFor(data, section) { return record(record(data.section_status)[section]); }
+function sectionOk(data, section) { return statusFor(data, section).status !== "error"; }
+function sectionError(doc, section, data) { const node = doc.getElementById(`${section}-error`); if (!node)
+    return; const status = statusFor(data, section); const failed = status.status === "error"; node.hidden = !failed; node.textContent = failed ? display(status.error || `${section} unavailable`) : ""; }
+function clear(node) { while (node?.firstChild)
+    node.removeChild(node.firstChild); }
+function cell(doc, row, value, code = false) { const td = doc.createElement("td"); const child = doc.createElement(code ? "code" : "span"); child.textContent = display(value); td.appendChild(child); row.appendChild(td); }
+function card(doc, label, value) { const box = doc.createElement("article"); box.className = "card"; const name = doc.createElement("span"); name.textContent = label; const content = doc.createElement("strong"); content.textContent = display(value); box.append(name, content); return box; }
+function setVisible(doc, id, visible) { const node = doc.getElementById(id); if (node)
+    node.hidden = !visible; }
+function actionCell(doc, row, project) { const td = doc.createElement("td"); const group = doc.createElement("div"); group.className = "project-actions"; const actions = record(project.actions); for (const kind of ["enable", "disable", "unregister"]) {
+    const button = doc.createElement("button");
+    button.type = "button";
+    button.textContent = kind[0].toUpperCase() + kind.slice(1);
+    button.disabled = actions[kind] !== true;
+    button.setAttribute("data-project-action", kind);
+    button.setAttribute("data-project-id", String(project.id || ""));
+    button.addEventListener("click", () => doc.dispatchEvent(new CustomEvent("admin-project-action", { detail: { kind, project: { ...project } } })));
+    group.appendChild(button);
+} td.appendChild(group); row.appendChild(td); }
 function renderAdminDashboard(doc, raw) {
     const data = record(raw);
     sectionError(doc, "overview", data);
@@ -183,14 +233,7 @@ function renderAdminDashboard(doc, raw) {
         const overview = doc.getElementById("overview");
         clear(overview);
         const value = record(data.overview);
-        const cards = [
-            ["Server", `${display(value.version)} · ${display(value.build_commit)}`],
-            ["Authority", value.authority_mode],
-            ["Agents", `${display(value.agents_online || 0)} / ${display(value.agents_total || 0)} online`],
-            ["Projects", `${display(value.projects_online || 0)} / ${display(value.projects_total || 0)} online`],
-            ["Active jobs", value.active_jobs || 0],
-            ["Compatibility", value.version_compatibility || "unknown"],
-        ];
+        const cards = [["Server", `${display(value.version)} · ${display(value.build_commit)}`], ["Authority", value.authority_mode], ["Agents", `${display(value.agents_online || 0)} / ${display(value.agents_total || 0)} online`], ["Projects", `${display(value.projects_online || 0)} / ${display(value.projects_total || 0)} online`], ["Active jobs", value.active_jobs || 0], ["Compatibility", value.version_compatibility || "unknown"]];
         for (const [label, content] of cards)
             overview?.appendChild(card(doc, label, content));
         const diagnostics = doc.getElementById("diagnostics");
@@ -211,12 +254,7 @@ function renderAdminDashboard(doc, raw) {
         for (const item of rows) {
             const device = record(item);
             const row = doc.createElement("tr");
-            const values = [
-                [device.display_name], [device.client_id, true], [device.status],
-                [device.transport], [device.hostname], [device.last_seen],
-                [capabilityLabels(device.capabilities).join(", ")], [device.project_count],
-                [device.active_jobs], [device.compatibility],
-            ];
+            const values = [[device.display_name], [device.client_id, true], [device.status], [device.transport], [device.hostname], [device.last_seen], [capabilityLabels(device.capabilities).join(", ")], [device.project_count], [device.active_jobs], [device.compatibility]];
             for (const [value, code] of values)
                 cell(doc, row, value, Boolean(code));
             devices?.appendChild(row);
@@ -231,13 +269,10 @@ function renderAdminDashboard(doc, raw) {
         for (const item of rows) {
             const project = record(item);
             const row = doc.createElement("tr");
-            const values = [
-                [project.id, true], [project.name], [project.client_id], [project.path],
-                [project.readiness], [project.git_available], [project.allow_patch],
-                [project.shell_profile_status], [project.compatibility], [project.console_hint],
-            ];
+            const values = [[project.id, true], [project.name], [project.client_id], [project.path], [project.lifecycle_status || project.readiness], [project.active_jobs], [project.git_available], [project.allow_patch], [project.shell_profile_status], [project.compatibility], [project.console_hint]];
             for (const [value, code] of values)
                 cell(doc, row, value, Boolean(code));
+            actionCell(doc, row, project);
             projects?.appendChild(row);
         }
         setVisible(doc, "projects-empty", rows.length === 0);
@@ -250,10 +285,7 @@ function renderAdminDashboard(doc, raw) {
         for (const item of rows) {
             const entry = record(item);
             const li = doc.createElement("li");
-            li.textContent = [entry.created_at, entry.kind, entry.project_id, entry.status]
-                .filter(Boolean)
-                .map(String)
-                .join(" · ");
+            li.textContent = [entry.created_at, entry.kind, entry.project_id, entry.status].filter(Boolean).map(String).join(" · ");
             activity?.appendChild(li);
         }
         setVisible(doc, "activity-empty", rows.length === 0);
@@ -263,84 +295,142 @@ function renderAdminDashboard(doc, raw) {
 const ADMIN_BASE = "/api/admin/";
 const REFRESH_MS = 10000;
 const byId = (id) => document.getElementById(id);
-function text(id, value) {
-    const node = byId(id);
-    if (node)
-        node.textContent = value == null || value === "" ? "—" : String(value);
+const text = (id, value) => { const node = byId(id); if (node)
+    node.textContent = value == null || value === "" ? "—" : String(value); };
+const visible = (id, yes) => { const node = byId(id); if (node)
+    node.hidden = !yes; };
+let adminToken = "";
+let dialogTarget = "";
+let dialogContext = null;
+let dialogTrigger = null;
+async function parseResponse(response) { try {
+    return await response.json();
 }
-function visible(id, yes) {
-    const node = byId(id);
-    if (node)
-        node.hidden = !yes;
-}
+catch {
+    return null;
+} }
 async function requestDashboard(token, signal) {
-    const response = await fetch(ADMIN_BASE + "dashboard", {
-        method: "POST",
-        headers: {
-            Authorization: "Bearer " + token,
-            "Content-Type": "application/json",
-        },
-        body: "{}",
-        signal,
-    });
-    let data = null;
-    try {
-        data = await response.json();
-    }
-    catch {
-        // The status code below remains the safe fallback.
-    }
-    if (!response.ok) {
-        throw new AdminHttpError(response.status, data?.error?.message || data?.message || `Request failed (${response.status})`);
-    }
+    const response = await fetch(ADMIN_BASE + "dashboard", { method: "POST", headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" }, body: "{}", signal });
+    const data = await parseResponse(response);
+    if (!response.ok)
+        throw new AdminHttpError(response.status, "dashboard_failed");
     return data;
 }
-const controller = new AdminRefreshController({
+function classify(status, data) {
+    if (status === 401 || status === 403)
+        return new AdminMutationError(status, "unauthorized");
+    const code = data?.error?.code;
+    const allowed = new Set(["invalid_request", "revision_conflict", "active_jobs_conflict", "idempotency_conflict", "unsupported_runner_version", "agent_unavailable", "operation_indeterminate", "operation_failed"]);
+    return new AdminMutationError(status, allowed.has(code) ? code : "operation_failed", typeof data?.active_jobs === "number" ? data.active_jobs : undefined);
+}
+async function requestMutation(kind, token, body, signal) {
+    const response = await fetch(`${ADMIN_BASE}projects/${kind}`, { method: "POST", headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" }, body: JSON.stringify(body), signal });
+    const data = await parseResponse(response);
+    if (!response.ok)
+        throw classify(response.status, data);
+    return data;
+}
+const refresh = new AdminRefreshController({
     request: requestDashboard,
     render: (data) => renderAdminDashboard(document, data),
-    showAuthenticated: () => {
-        visible("gate", false);
-        visible("dashboard", true);
-        visible("controls", true);
-    },
-    showLocked: (message) => {
-        visible("gate", true);
-        visible("dashboard", false);
-        visible("controls", false);
-        text("gate-error", message);
-        const input = byId("token");
-        if (input)
-            input.value = "";
-    },
-    setStatus: (message) => text("status", message),
-    showError: (message) => {
-        text("error", message);
-        visible("error", true);
-    },
-    clearError: () => visible("error", false),
+    showAuthenticated: () => { visible("gate", false); visible("dashboard", true); visible("controls", true); },
+    showLocked: (message) => { visible("gate", true); visible("dashboard", false); visible("controls", false); text("gate-error", message); const input = byId("token"); if (input)
+        input.value = ""; },
+    setStatus: (message) => text("status", message), showError: (message) => { text("error", message); visible("error", true); }, clearError: () => visible("error", false),
 });
-function configureAutoRefresh() {
-    const auto = byId("auto");
-    if (auto?.checked)
-        controller.startAutoRefresh(REFRESH_MS);
-    else
-        controller.stopAutoRefresh();
+const errorMessage = {
+    invalid_request: "The request is invalid. Review the fields and try again.", revision_conflict: "Project state changed. The dashboard was refreshed; confirm again using the latest revision.", active_jobs_conflict: "The project has active jobs. No jobs were stopped; refresh and retry after they finish.", idempotency_conflict: "This retry no longer matches its original operation. Start a new operation.", unsupported_runner_version: "The Agent does not support project lifecycle operations.", agent_unavailable: "The Agent is unavailable. Current dashboard data is preserved; retry this same operation later.", operation_indeterminate: "The Agent may have completed the operation. Refresh state first, then retry this same operation context rather than creating a new mutation.", operation_failed: "The operation failed safely. Internal details were not displayed.", network_error: "Network failure. Current data is preserved; retry this same operation.", unauthorized: "Administrator authentication required."
+};
+const mutation = new AdminMutationController({
+    request: requestMutation, keyFactory: () => crypto.randomUUID(), refresh: () => refresh.refresh(),
+    outcome: (message) => { text("status", message); closeDialog(true); },
+    error: (code) => { text("dialog-error", errorMessage[code]); visible("dialog-error", true); },
+    pending: (_target, value) => { const submit = byId("dialog-submit"); const cancel = byId("dialog-cancel"); if (submit) {
+        submit.disabled = value;
+        submit.setAttribute("aria-busy", String(value));
+        submit.textContent = value ? "Working…" : "Continue";
+    } if (cancel)
+        cancel.disabled = value; },
+    lock: (message) => lock(message),
+});
+function lock(message = "Locked.") { mutation.lock(); refresh.lock(message); adminToken = ""; closeDialog(false); }
+function configureAutoRefresh() { const auto = byId("auto"); if (auto?.checked)
+    refresh.startAutoRefresh(REFRESH_MS);
+else
+    refresh.stopAutoRefresh(); }
+function field(name, label, type = "text", checked = false) { const wrap = document.createElement("label"); wrap.textContent = label; const input = document.createElement("input"); input.name = name; input.type = type; input.autocomplete = "off"; if (type === "checkbox")
+    input.checked = checked; input.required = !["description", "template"].includes(name) && type !== "checkbox"; wrap.appendChild(input); return wrap; }
+function paragraph(value) { const p = document.createElement("p"); p.textContent = value; return p; }
+function openCreate(kind, trigger) {
+    dialogTrigger = trigger;
+    dialogTarget = `${kind}:${Date.now()}`;
+    const title = kind === "register" ? "Register existing project" : "Create project";
+    text("dialog-title", title);
+    text("dialog-description", kind === "create" ? "Create may create a directory and Git repository. Existing non-empty directories are never overwritten, and no directory deletion is offered." : "Register an existing directory. The path remains only in this form and page memory.");
+    const fields = byId("dialog-fields");
+    fields.replaceChildren(field("client_id", "Client ID"), field("project_id", "Project ID"), field("name", "Name"), field("description", "Description"), field("path", "Path"), field("allow_patch", "Allow patch", "checkbox", true));
+    if (kind === "create")
+        fields.append(field("git_init", "Initialize Git repository", "checkbox"), field("template", "Template"), field("allow_existing_empty", "Allow existing empty directory", "checkbox"));
+    dialogContext = null;
+    visible("dialog-error", false);
+    byId("project-dialog").showModal();
+    fields.querySelector("input")?.focus();
+    byId("project-form").dataset.kind = kind;
 }
-byId("token-form")?.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const input = byId("token");
-    const token = input?.value.trim() || "";
-    if (input)
-        input.value = "";
-    if (!token)
-        return;
-    await controller.beginSession(token);
-    configureAutoRefresh();
-});
-byId("refresh")?.addEventListener("click", () => {
-    void controller.refresh();
-});
-byId("lock")?.addEventListener("click", () => controller.lock("Locked."));
+function openAction(kind, project, trigger) {
+    dialogTrigger = trigger;
+    dialogTarget = String(project.id || "");
+    text("dialog-title", `${kind[0].toUpperCase()}${kind.slice(1)} project`);
+    const fields = byId("dialog-fields");
+    fields.replaceChildren();
+    fields.append(paragraph(`Project: ${dialogTarget}`), paragraph(`Revision: ${String(project.revision || "")}`), paragraph(`Active jobs: ${String(project.active_jobs ?? 0)}`));
+    if (kind === "disable")
+        fields.append(paragraph("Already-started jobs will not be stopped. Project configuration and source directory are retained."));
+    if (kind === "enable")
+        fields.append(paragraph("This only re-enables a registered project. It does not create a missing directory; the Agent revalidates path policy."));
+    if (kind === "unregister") {
+        fields.append(paragraph("Only the Agent registry record is removed. The source directory and .git are not deleted. Active jobs cause rejection."));
+        fields.append(field("confirm_project", "Type the full runtime project ID to confirm"));
+    }
+    dialogContext = mutation.start(kind, dialogTarget, { project: dialogTarget, expected_revision: String(project.revision || ""), confirm: true });
+    byId("project-form").dataset.kind = kind;
+    visible("dialog-error", false);
+    byId("project-dialog").showModal();
+    fields.querySelector("input")?.focus();
+}
+function closeDialog(reset) { const dialog = byId("project-dialog"); if (dialog?.open)
+    dialog.close(); if (reset && dialogTarget)
+    mutation.cancel(dialogTarget); const path = document.querySelector('input[name="path"]'); if (path)
+    path.value = ""; dialogContext = null; dialogTarget = ""; dialogTrigger?.focus(); dialogTrigger = null; }
+byId("token-form")?.addEventListener("submit", async (event) => { event.preventDefault(); const input = byId("token"); const token = input?.value.trim() || ""; if (input)
+    input.value = ""; if (!token)
+    return; adminToken = token; mutation.beginSession(token); await refresh.beginSession(token); configureAutoRefresh(); });
+byId("refresh")?.addEventListener("click", () => void refresh.refresh());
+byId("lock")?.addEventListener("click", () => lock());
 byId("auto")?.addEventListener("change", configureAutoRefresh);
-window.addEventListener("pagehide", () => controller.dispose());
-controller.lock();
+byId("register-project")?.addEventListener("click", (e) => openCreate("register", e.currentTarget));
+byId("create-project")?.addEventListener("click", (e) => openCreate("create", e.currentTarget));
+document.addEventListener("admin-project-action", (event) => { const detail = event.detail; openAction(detail.kind, detail.project, document.querySelector(`[data-project-action="${detail.kind}"][data-project-id="${CSS.escape(String(detail.project.id))}"]`)); });
+byId("dialog-cancel")?.addEventListener("click", () => { if (dialogTarget)
+    mutation.cancel(dialogTarget); closeDialog(true); });
+byId("project-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const kind = form.dataset.kind;
+    const data = new FormData(form);
+    if (kind === "register" || kind === "create") {
+        const body = { client_id: String(data.get("client_id") || "").trim(), project_id: String(data.get("project_id") || "").trim(), name: String(data.get("name") || "").trim(), description: String(data.get("description") || "").trim() || null, path: String(data.get("path") || "").trim(), allow_patch: data.get("allow_patch") === "on" };
+        if (kind === "create")
+            Object.assign(body, { git_init: data.get("git_init") === "on", template: String(data.get("template") || "").trim() || null, allow_existing_empty: data.get("allow_existing_empty") === "on" });
+        dialogContext = mutation.start(kind, dialogTarget, body);
+    }
+    if (kind === "unregister" && String(data.get("confirm_project") || "") !== dialogTarget) {
+        text("dialog-error", "Type the full runtime project ID to confirm.");
+        visible("dialog-error", true);
+        return;
+    }
+    if (dialogContext)
+        void mutation.submit(dialogContext);
+});
+window.addEventListener("pagehide", () => { mutation.dispose(); refresh.dispose(); adminToken = ""; });
+refresh.lock();
