@@ -157,7 +157,7 @@ fi
 
 # Build once so restarts are fast and both restarts run the same binaries.
 log "building webcodex + webcodex-runner (release of the current tree, debug profile)"
-"$CARGO_BIN" build --quiet --bin webcodex --bin webcodex-runner
+"$CARGO_BIN" build --quiet -p webcodex -p webcodex-runner --bins
 SERVER_BIN="$PROJECT_DIR/target/debug/webcodex"
 AGENT_BIN="$PROJECT_DIR/target/debug/webcodex-runner"
 

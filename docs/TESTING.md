@@ -171,7 +171,8 @@ Recent structure work moved large test groups out of production roots:
 
 - OAuth HTTP endpoint tests are rooted at `src/oauth_http/tests.rs` and grouped
   by endpoint/domain under `src/oauth_http/tests/*`.
-- CLI tests are grouped under `src/bin/webcodex_cli/tests/*`.
+- CLI tests are grouped under
+  `crates/webcodex-cli/src/webcodex_cli/tests/*`.
 - CLI help smoke coverage lives with the CLI test modules and covers common
   help entry points, so new command help should extend that smoke coverage.
 - Runtime HTTP tests live under `src/runtime_http/tests/*`; the only currently

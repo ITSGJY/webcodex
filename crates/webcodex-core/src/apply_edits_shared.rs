@@ -1,8 +1,6 @@
 //! Types, limits, and the sensitive-path guard shared by the `apply_text_edits`
-//! host write path (`tool_runtime::files`) and the agent-side wire boundary
-//! (`bin/webcodex_runner/patches`). This file is compiled into the main binary
-//! as `crate::apply_edits_shared` and `#[path]`-included by the agent binary,
-//! so both sides share one definition instead of maintaining parallel copies.
+//! host write path (`tool_runtime::files`) and the agent-side wire boundary.
+//! Both sides consume this module from `webcodex-core`.
 //!
 //! It must stay dependency-light: only `serde` and `std`, which both binaries
 //! have. Do not add main-crate-only imports here.

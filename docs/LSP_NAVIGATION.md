@@ -34,7 +34,8 @@ agent.
 
 ## Supported Languages
 
-The runner registry (`src/bin/webcodex_runner/lsp/language.rs`) is the single
+The runner registry
+(`crates/webcodex-runner/src/webcodex_runner/lsp/language.rs`) is the single
 source of truth. Each entry pairs a language server with the file extensions,
 project markers, and constrained read-only profile it owns.
 
@@ -244,7 +245,8 @@ ignored test shows how to smoke-test a real server end to end.
 ## Related Docs
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — module map, including
-  `src/bin/webcodex_runner/lsp/*` and `tool_runtime::semantic_navigation`.
+  `crates/webcodex-runner/src/webcodex_runner/lsp/*` and
+  `tool_runtime::semantic_navigation`.
 - [../SECURITY.md](../SECURITY.md) — overall boundary model.
 - [AGENT_PROTOCOL.md](AGENT_PROTOCOL.md) — agent transport and request kinds.
 - [ROADMAP.md](ROADMAP.md) — planned LSP follow-ups.

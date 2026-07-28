@@ -1007,7 +1007,7 @@ operator's shell or secret manager rather than in commands, logs, or docs.
 1. Build the release binaries:
 
 ```bash
-cargo build --release --bins
+cargo build --release --workspace --bins
 ```
 
 2. Back up the current install directory:

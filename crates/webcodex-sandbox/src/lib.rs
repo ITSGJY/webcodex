@@ -21,7 +21,7 @@
 /// partial ruleset is a bug in the policy, and a failed probe is a host
 /// problem. All of them deny.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SandboxUnavailable {
+pub enum SandboxUnavailable {
     /// No Landlock on this build target or kernel.
     Unsupported(String),
     /// The kernel applied only part of the ruleset. Treated as failure: a
@@ -81,7 +81,7 @@ impl Drop for ProbeDir {
 /// descriptor — which is all this used to do — proves only that the syscall
 /// exists, not that the policy takes effect.
 #[cfg(target_os = "linux")]
-pub(crate) fn read_only_sandbox_available() -> Result<(), SandboxUnavailable> {
+pub fn read_only_sandbox_available() -> Result<(), SandboxUnavailable> {
     use std::io::Write;
 
     let probe = ProbeDir::create()?;
@@ -146,7 +146,7 @@ pub(crate) fn read_only_sandbox_available() -> Result<(), SandboxUnavailable> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn read_only_sandbox_available() -> Result<(), SandboxUnavailable> {
+pub fn read_only_sandbox_available() -> Result<(), SandboxUnavailable> {
     Err(SandboxUnavailable::Unsupported(
         "command sandboxing requires Linux with Landlock (kernel >= 5.13)".to_string(),
     ))
@@ -165,9 +165,7 @@ fn shell_quote(path: &std::path::Path) -> String {
 /// case a `BestEffort` ruleset hides — so the compatibility level is a hard
 /// requirement and anything short of full enforcement denies.
 #[cfg(target_os = "linux")]
-pub(crate) fn restrict_writes_to(
-    writable: &[std::path::PathBuf],
-) -> Result<(), SandboxUnavailable> {
+pub fn restrict_writes_to(writable: &[std::path::PathBuf]) -> Result<(), SandboxUnavailable> {
     use landlock::{
         path_beneath_rules, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr,
         RulesetCreatedAttr, RulesetStatus, ABI,
@@ -203,7 +201,7 @@ pub(crate) fn restrict_writes_to(
 /// command unconfined. The policy itself is applied between fork and exec, and
 /// a failure there aborts the exec.
 #[cfg(target_os = "linux")]
-pub(crate) fn sandbox_command_read_only(
+pub fn sandbox_command_read_only(
     command: &mut std::process::Command,
     writable: Vec<std::path::PathBuf>,
 ) -> Result<(), String> {
@@ -220,7 +218,7 @@ pub(crate) fn sandbox_command_read_only(
 /// Non-Linux hosts cannot sandbox, and silently running the command anyway
 /// would turn a sandbox request into an unconfined execution. Fails instead.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn sandbox_command_read_only(
+pub fn sandbox_command_read_only(
     _command: &mut std::process::Command,
     _writable: Vec<std::path::PathBuf>,
 ) -> Result<(), String> {

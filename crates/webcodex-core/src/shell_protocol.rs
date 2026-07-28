@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-pub(crate) const EXTERNAL_SEARCH_REQUEST_PREFIX: &str = "# webcodex:search_project_text:v1";
+pub const EXTERNAL_SEARCH_REQUEST_PREFIX: &str = "# webcodex:search_project_text:v1";
 
 fn default_shell_true() -> bool {
     true
@@ -39,10 +39,7 @@ fn default_transport_polling() -> String {
     "polling".to_string()
 }
 
-/// Protocol version announced by current `webcodex-runner` builds. Used by
-/// the `webcodex-runner` binary target; allowed dead-code here because the
-/// main server binary does not reference it directly.
-#[allow(dead_code)]
+/// Protocol version announced by current `webcodex-runner` polling builds.
 pub const AGENT_PROTOCOL_VERSION_POLLING_V1: &str = "polling-v1";
 pub const VALIDATION_STEP_SPAWN_FAILED_CODE: &str = "validation_step_spawn_failed";
 pub const VALIDATION_TOOL_UNAVAILABLE_CODE: &str = "validation_tool_unavailable";
@@ -76,7 +73,6 @@ pub const RUST_TEST_FILTER_MAX_BYTES: usize = 200;
 /// Protocol version announced by `webcodex-runner` builds that connect over
 /// WebSocket. Kept in the shared protocol module so both the server and the
 /// agent binary reference the same literal.
-#[allow(dead_code)]
 pub const AGENT_PROTOCOL_VERSION_WEBSOCKET_V1: &str = "websocket-v1";
 
 /// Protocol version announced by `webcodex-runner` builds that connect over the
@@ -87,7 +83,6 @@ pub const AGENT_PROTOCOL_VERSION_WEBSOCKET_V1: &str = "websocket-v1";
 /// same `AgentEnvelope` model for registration, keepalive, request dispatch,
 /// results, and job updates. The transport label remains `"quic"` (see
 /// `TRANSPORT_QUIC`).
-#[allow(dead_code)]
 pub const AGENT_PROTOCOL_VERSION_QUIC_V1: &str = "quic-v1";
 pub const AGENT_QUIC_ALPN_V1: &str = "webcodex-runner/1";
 
@@ -103,7 +98,6 @@ pub const SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV: &str = "structured
 /// older agents and defaults to `false` so the server never dispatches typed
 /// LSP requests to agents that cannot handle them.
 pub const SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION: &str = "lsp_read_only_navigation";
-#[cfg(test)]
 pub const SHELL_CLIENT_CAPABILITY_NAMES: &[&str] = &[
     SHELL_CLIENT_CAPABILITY_SHELL,
     SHELL_CLIENT_CAPABILITY_FILE_READ,
@@ -1120,7 +1114,6 @@ pub enum AgentEnvelope {
 impl AgentEnvelope {
     /// Short discriminator string for a variant, e.g. `"register"`. Useful
     /// for logging and tests.
-    #[allow(dead_code)]
     pub fn kind(&self) -> &'static str {
         match self {
             AgentEnvelope::Register { .. } => "register",

@@ -1074,7 +1074,7 @@ EOF
     CODEX_DEFAULT_TIMEOUT_SECS="30" \
     CODEX_APPROVAL_MODE="full-auto" \
     RUST_LOG="info" \
-    "$CARGO_BIN" run --quiet --bin webcodex >"$SERVER_LOG" 2>&1 &
+    "$CARGO_BIN" run --quiet -p webcodex --bin webcodex >"$SERVER_LOG" 2>&1 &
     SERVER_PID=$!
 
     if ! wait_for_port "$PORT" 90; then
@@ -1085,7 +1085,7 @@ EOF
     log "server listening on $PORT"
 
     log "starting agent (transport=${TRANSPORT})"
-    "$CARGO_BIN" run --quiet --bin webcodex-runner -- --config "$AGENT_TOML" >"$AGENT_LOG" 2>&1 &
+    "$CARGO_BIN" run --quiet -p webcodex-runner --bin webcodex-runner -- --config "$AGENT_TOML" >"$AGENT_LOG" 2>&1 &
     AGENT_PID=$!
 
     log "waiting for agent registration"

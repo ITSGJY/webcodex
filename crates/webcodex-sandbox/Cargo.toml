@@ -1,0 +1,14 @@
+[package]
+name = "webcodex-sandbox"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+
+[dependencies]
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

@@ -8,12 +8,12 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
 
-pub(crate) const PROJECT_OVERVIEW_DEFAULT_MAX_DEPTH: usize = 2;
-pub(crate) const PROJECT_OVERVIEW_MIN_MAX_DEPTH: usize = 1;
-pub(crate) const PROJECT_OVERVIEW_MAX_MAX_DEPTH: usize = 4;
-pub(crate) const PROJECT_OVERVIEW_DEFAULT_LIMIT: usize = 200;
-pub(crate) const PROJECT_OVERVIEW_MIN_LIMIT: usize = 20;
-pub(crate) const PROJECT_OVERVIEW_MAX_LIMIT: usize = 500;
+pub const PROJECT_OVERVIEW_DEFAULT_MAX_DEPTH: usize = 2;
+pub const PROJECT_OVERVIEW_MIN_MAX_DEPTH: usize = 1;
+pub const PROJECT_OVERVIEW_MAX_MAX_DEPTH: usize = 4;
+pub const PROJECT_OVERVIEW_DEFAULT_LIMIT: usize = 200;
+pub const PROJECT_OVERVIEW_MIN_LIMIT: usize = 20;
+pub const PROJECT_OVERVIEW_MAX_LIMIT: usize = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntryKind {
@@ -47,7 +47,7 @@ struct KeyFile {
 
 /// Normalize a caller-supplied project-relative directory path. The returned
 /// string is empty for the project root and otherwise uses `/` separators.
-pub(crate) fn normalize_project_overview_path(path: &str) -> Result<String, String> {
+pub fn normalize_project_overview_path(path: &str) -> Result<String, String> {
     if path.contains('\0') {
         return Err("path cannot contain NUL bytes".to_string());
     }
@@ -82,14 +82,14 @@ pub(crate) fn normalize_project_overview_path(path: &str) -> Result<String, Stri
     Ok(normalized)
 }
 
-pub(crate) fn effective_project_overview_max_depth(value: Option<usize>) -> usize {
+pub fn effective_project_overview_max_depth(value: Option<usize>) -> usize {
     value.unwrap_or(PROJECT_OVERVIEW_DEFAULT_MAX_DEPTH).clamp(
         PROJECT_OVERVIEW_MIN_MAX_DEPTH,
         PROJECT_OVERVIEW_MAX_MAX_DEPTH,
     )
 }
 
-pub(crate) fn effective_project_overview_limit(value: Option<usize>) -> usize {
+pub fn effective_project_overview_limit(value: Option<usize>) -> usize {
     value
         .unwrap_or(PROJECT_OVERVIEW_DEFAULT_LIMIT)
         .clamp(PROJECT_OVERVIEW_MIN_LIMIT, PROJECT_OVERVIEW_MAX_LIMIT)
@@ -97,7 +97,7 @@ pub(crate) fn effective_project_overview_limit(value: Option<usize>) -> usize {
 
 /// Scan `requested_path` under `project_root` and build the agent-owned
 /// project-overview payload. The runtime adds the opaque runtime project id.
-pub(crate) fn build_project_overview(
+pub fn build_project_overview(
     project_root: &Path,
     requested_path: &str,
     max_depth: Option<usize>,

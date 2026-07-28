@@ -210,7 +210,7 @@ for command in awk curl git mv python3 setsid tail "$CARGO_BIN"; do require_comm
 cd "$ROOT"
 REPO_STATUS_BEFORE="$(git status --short)"
 if [ "${WEBCODEX_E2E_SKIP_BUILD:-0}" != "1" ]; then
-    "$CARGO_BIN" build --quiet --bin webcodex --bin webcodex-runner
+    "$CARGO_BIN" build --quiet -p webcodex -p webcodex-runner --bins
 fi
 [ -x target/debug/webcodex ] && [ -x target/debug/webcodex-runner ] \
     || fail "debug server/agent binaries are unavailable"

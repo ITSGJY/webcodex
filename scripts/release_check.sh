@@ -11,17 +11,17 @@ set -euo pipefail
 #
 # Stages:
 #   1. cargo fmt --check
-#   2. cargo check --all-targets
-#   3. cargo test --bin webcodex metadata -- --nocapture
-#   4. cargo test --bin webcodex schema -- --nocapture
-#   5. cargo test --bin webcodex openapi -- --nocapture
-#   6. cargo test --bin webcodex mcp -- --nocapture
+#   2. cargo check --workspace --all-targets
+#   3. cargo test -p webcodex --bin webcodex metadata -- --nocapture
+#   4. cargo test -p webcodex --bin webcodex schema -- --nocapture
+#   5. cargo test -p webcodex --bin webcodex openapi -- --nocapture
+#   6. cargo test -p webcodex --bin webcodex mcp -- --nocapture
 #   7. bash syntax checks for scripts/*.sh
 #   8. static: no python runtime helper regressions
 #   9. static: no sensitive files tracked or staged by git
 #
 # Manual final acceptance steps live in docs/RELEASE_CHECKLIST.md:
-#   - cargo test --bin webcodex -- --nocapture
+#   - cargo test --workspace -- --nocapture
 #   - bash scripts/e2e_zero_config_ws.sh
 #   - E2E_TRANSPORT=polling bash scripts/e2e_zero_config_ws.sh
 #   - EVAL_MODE=compare bash scripts/eval_coding_loop.sh
@@ -79,20 +79,20 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# Stage 2: cargo check --all-targets
+# Stage 2: cargo check --workspace --all-targets
 # ----------------------------------------------------------------------------
-stage_start "cargo check --all-targets"
-if cargo check --all-targets; then
-    ok "cargo check --all-targets"
+stage_start "cargo check --workspace --all-targets"
+if cargo check --workspace --all-targets; then
+    ok "cargo check --workspace --all-targets"
 else
-    die "cargo check --all-targets"
+    die "cargo check --workspace --all-targets"
 fi
 
 # ----------------------------------------------------------------------------
 # Stage 3: focused metadata tests
 # ----------------------------------------------------------------------------
-stage_start "cargo test --bin webcodex metadata -- --nocapture"
-if cargo test --bin webcodex metadata -- --nocapture; then
+stage_start "cargo test -p webcodex --bin webcodex metadata -- --nocapture"
+if cargo test -p webcodex --bin webcodex metadata -- --nocapture; then
     ok "metadata tests"
 else
     die "metadata tests"
@@ -101,8 +101,8 @@ fi
 # ----------------------------------------------------------------------------
 # Stage 4: focused schema tests
 # ----------------------------------------------------------------------------
-stage_start "cargo test --bin webcodex schema -- --nocapture"
-if cargo test --bin webcodex schema -- --nocapture; then
+stage_start "cargo test -p webcodex --bin webcodex schema -- --nocapture"
+if cargo test -p webcodex --bin webcodex schema -- --nocapture; then
     ok "schema tests"
 else
     die "schema tests"
@@ -111,8 +111,8 @@ fi
 # ----------------------------------------------------------------------------
 # Stage 5: focused OpenAPI tests
 # ----------------------------------------------------------------------------
-stage_start "cargo test --bin webcodex openapi -- --nocapture"
-if cargo test --bin webcodex openapi -- --nocapture; then
+stage_start "cargo test -p webcodex --bin webcodex openapi -- --nocapture"
+if cargo test -p webcodex --bin webcodex openapi -- --nocapture; then
     ok "openapi tests"
 else
     die "openapi tests"
@@ -121,8 +121,8 @@ fi
 # ----------------------------------------------------------------------------
 # Stage 6: focused MCP tests
 # ----------------------------------------------------------------------------
-stage_start "cargo test --bin webcodex mcp -- --nocapture"
-if cargo test --bin webcodex mcp -- --nocapture; then
+stage_start "cargo test -p webcodex --bin webcodex mcp -- --nocapture"
+if cargo test -p webcodex --bin webcodex mcp -- --nocapture; then
     ok "mcp tests"
 else
     die "mcp tests"
@@ -144,12 +144,12 @@ done
 # Stage 8: static — no python runtime helper regressions
 # ----------------------------------------------------------------------------
 stage_start "static: no python runtime helper regressions"
-if grep -R "python3 -c" -n src/tool_runtime src/bin src/shell_client; then
+if grep -R "python3 -c" -n src/tool_runtime src/shell_client crates/webcodex-runner/src; then
     die "python3 -c in runtime paths"
 else
     ok "no python3 -c in runtime paths"
 fi
-if grep -R "run_agent_helper" -n src/tool_runtime src/bin src/shell_client; then
+if grep -R "run_agent_helper" -n src/tool_runtime src/shell_client crates/webcodex-runner/src; then
     die "run_agent_helper in runtime paths"
 else
     ok "no run_agent_helper in runtime paths"

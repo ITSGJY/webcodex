@@ -1,12 +1,9 @@
-//! Shared agent-config initialization logic used by both the `webcodex-runner`
-//! binary (`agent init`) and the `webcodex-cli` binary (`agent init`).
+//! Shared agent-config initialization logic used by the server,
+//! `webcodex-runner`, and `webcodex-cli`.
 //!
-//! This module is included via `#[path]` from each binary and depends only on
-//! the `shell_protocol` module (also inlined by each binary). It owns the
-//! `AgentInitOptions` type, validation, token resolution, TOML generation, and
-//! atomic 0600 file writing. Each binary keeps its own small flag parser and
-//! help text; the large generation/writing code lives here to avoid
-//! duplication.
+//! It owns the `AgentInitOptions` type, validation, token resolution, TOML
+//! generation, and atomic 0600 file writing. Each binary keeps its own small
+//! flag parser and help text.
 //!
 //! Default policy: when `allowed_roots` is not explicitly configured, it
 //! defaults to `$HOME` (see `effective_allowed_roots`).
@@ -16,7 +13,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 
-use crate::shell_protocol::ShellClientCapabilities;
+use webcodex_core::shell_protocol::ShellClientCapabilities;
 
 /// Default projects directory written into generated agent configs.
 pub const DEFAULT_INIT_PROJECTS_DIR: &str = "/etc/webcodex/projects.d";
@@ -274,11 +271,9 @@ pub fn run_agent_init(opts: AgentInitOptions) -> Result<String, String> {
     Ok(format!("wrote {}\n", opts.output.display()))
 }
 
-/// Test-only mutex serializing tests that mutate process-wide environment
-/// variables (`HOME`, `WEBCODEX_AGENT_TOKEN`). Declared at module level so
-/// both `agent_init::tests` and tests in binaries that inline this module can
-/// acquire the same lock via `agent_init::TEST_ENV_LOCK`.
-#[cfg(test)]
+/// Mutex serializing tests that mutate process-wide environment variables.
+/// It stays exported because integration tests in each consuming package share
+/// the same dependency instance.
 pub static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn parse_bool(value: &str) -> Result<bool, String> {

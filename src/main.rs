@@ -11,19 +11,11 @@ use uuid::Uuid;
 
 mod action_audit;
 mod action_audit_sessions;
-mod admin_cli;
-#[allow(dead_code)]
-mod agent_init;
 mod agent_quic;
 mod agent_tokens_http;
 mod agent_ws;
-mod apply_edits_shared;
-mod artifact_policy;
 mod audit_http;
 mod auth;
-mod build_info;
-#[allow(dead_code)]
-mod command_sandbox;
 mod config;
 mod connector_runtime;
 mod console_web;
@@ -34,17 +26,10 @@ mod models;
 mod oauth_http;
 mod openapi;
 mod pairing_http;
-mod sensitive_paths;
-// The server uses only normalization/bounds helpers; the same module's
-// filesystem scanner is compiled for and invoked by webcodex-runner.
-mod lsp_bridge;
 mod project_entry;
-#[allow(dead_code)]
-mod project_overview;
 mod projects;
 mod runtime_http;
 mod shell_client;
-mod shell_protocol;
 mod startup;
 mod task_cli;
 #[cfg(test)]
@@ -52,9 +37,15 @@ mod test_support;
 mod tool_request_trace;
 mod tool_runtime;
 mod users_http;
-#[allow(dead_code)]
-mod validation_bridge;
-mod workspace_checkpoint;
+
+pub(crate) use webcodex_admin as admin_cli;
+pub(crate) use webcodex_agent_config as agent_init;
+pub(crate) use webcodex_core::{
+    apply_edits_shared, artifact_policy, build_info, lsp_bridge, sensitive_paths, shell_protocol,
+    validation_bridge,
+};
+pub(crate) use webcodex_sandbox as command_sandbox;
+pub(crate) use webcodex_workspace::{project_overview, workspace_checkpoint};
 
 pub(crate) use auth::{get_db, json_error, AuthMiddleware};
 pub(crate) use config::load_startup_env_files;

@@ -7,7 +7,7 @@
 **未启用。** `read_only` 任务拒绝 `commands_run`。Agent 从不广告
 `sandbox_read_only_commands`，服务器也不读取该字段。
 
-`src/command_sandbox.rs` 里有一份可用的 Linux Landlock 基础实现。保留它是因为
+`crates/webcodex-sandbox/src/lib.rs` 里有一份可用的 Linux Landlock 基础实现。保留它是因为
 形状是对的，丢掉等于将来重做；但**基础不等于边界**，本文就是它保持关闭的理由。
 
 ## `read_only` 应当意味着什么
@@ -26,7 +26,7 @@
 
 ## 它覆盖不了什么
 
-以下都是当前基础的实际缺口，不是推测。第一条由 `src/command_sandbox.rs` 里一个
+以下都是当前基础的实际缺口，不是推测。第一条由 `crates/webcodex-sandbox/src/lib.rs` 里一个
 断言"读取会成功"的测试钉住。
 
 1. **读取不受限。** 命令可以读取 agent 用户能读的任何文件，包括 checkout 之外的

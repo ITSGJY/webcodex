@@ -9,52 +9,17 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing_subscriber::EnvFilter;
 
-#[allow(dead_code)]
-#[path = "../lsp_bridge.rs"]
-mod lsp_bridge;
-
-#[allow(dead_code)]
-#[path = "../validation_bridge.rs"]
-mod validation_bridge;
-
-#[allow(dead_code)]
-#[path = "../shell_protocol.rs"]
-mod shell_protocol;
-
-#[path = "../apply_edits_shared.rs"]
-mod apply_edits_shared;
-
-// The agent does not run glob-based search, so part of the shared policy
-// is unused here.
-// The agent enforces the sandbox but no longer probes for it: the capability is
-// never advertised, so the probe side of the module is unused here.
-#[allow(dead_code)]
-#[path = "../command_sandbox.rs"]
-mod command_sandbox;
-#[allow(dead_code)]
-#[path = "../sensitive_paths.rs"]
-mod sensitive_paths;
-
-#[allow(dead_code)]
-#[path = "../agent_init.rs"]
-mod agent_init;
-
-#[path = "../artifact_policy.rs"]
-mod artifact_policy;
-
-#[path = "../build_info.rs"]
-mod build_info;
-
-#[path = "../project_overview.rs"]
-mod project_overview;
-
-#[path = "../workspace_checkpoint.rs"]
-mod workspace_checkpoint;
-
 #[cfg(test)]
 #[path = "webcodex_runner/job_manager_tests.rs"]
 mod job_manager_tests;
 mod webcodex_runner;
+
+use webcodex_agent_config as agent_init;
+use webcodex_core::{
+    apply_edits_shared, artifact_policy, build_info, lsp_bridge, shell_protocol, validation_bridge,
+};
+use webcodex_sandbox as command_sandbox;
+use webcodex_workspace::{project_overview, workspace_checkpoint};
 
 use shell_protocol::{
     validation_infrastructure_failure_code, AgentPolicySummary, ShellAgentJobUpdateRequest,
@@ -723,12 +688,10 @@ fn process_started_at() -> i64 {
 
 /// Non-secret runner build identity for mixed-version diagnostics.
 fn runner_build_info() -> shell_protocol::AgentBuildInfo {
+    let info = build_info::current();
     shell_protocol::AgentBuildInfo {
-        version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        git_commit: option_env!("WEBCODEX_BUILD_GIT_COMMIT")
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
+        version: Some(info.version.to_string()),
+        git_commit: info.git_commit.map(str::to_string),
     }
 }
 

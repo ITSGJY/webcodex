@@ -7,7 +7,7 @@
 **Not enabled.** A `read_only` task refuses `commands_run`. The agent never
 advertises `sandbox_read_only_commands`, and the server does not consult it.
 
-`src/command_sandbox.rs` holds a working Linux Landlock foundation. It is kept
+`crates/webcodex-sandbox/src/lib.rs` holds a working Linux Landlock foundation. It is kept
 because the shape is right and throwing it away would mean rebuilding it, but a
 foundation is not a boundary, and this document is the reason it stays switched
 off.
@@ -31,7 +31,7 @@ That is a real property, and it is one access class out of several.
 ## What it does not cover
 
 These are gaps in the current foundation, not speculation. The first is pinned
-by a test in `src/command_sandbox.rs` that asserts the read succeeds.
+by a test in `crates/webcodex-sandbox/src/lib.rs` that asserts the read succeeds.
 
 1. **Reads are unrestricted.** A command can read any file the agent's user can
    read, including everything outside the checkout: `~/.ssh`, `~/.aws`, other

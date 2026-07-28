@@ -1,17 +1,27 @@
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
+    let repo_root = repository_root();
     println!("cargo:rerun-if-env-changed=WEBCODEX_GIT_COMMIT");
     println!("cargo:rerun-if-env-changed=WEBCODEX_GIT_DIRTY");
     println!("cargo:rerun-if-env-changed=WEBCODEX_BUILT_AT");
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    if let Some(head_ref) = current_head_ref() {
-        println!("cargo:rerun-if-changed=.git/{head_ref}");
+    println!(
+        "cargo:rerun-if-changed={}",
+        repo_root.join(".git/HEAD").display()
+    );
+    if let Some(head_ref) = current_head_ref(&repo_root) {
+        println!(
+            "cargo:rerun-if-changed={}",
+            repo_root.join(".git").join(head_ref).display()
+        );
     }
 
-    let git_commit = env_value("WEBCODEX_GIT_COMMIT").unwrap_or_else(git_commit_from_git);
-    let git_dirty = env_value("WEBCODEX_GIT_DIRTY").unwrap_or_else(git_dirty_from_git);
+    let git_commit =
+        env_value("WEBCODEX_GIT_COMMIT").unwrap_or_else(|| git_commit_from_git(&repo_root));
+    let git_dirty =
+        env_value("WEBCODEX_GIT_DIRTY").unwrap_or_else(|| git_dirty_from_git(&repo_root));
     let built_at = env_value("WEBCODEX_BUILT_AT").unwrap_or_else(current_unix_timestamp);
 
     println!("cargo:rustc-env=WEBCODEX_BUILD_GIT_COMMIT={git_commit}");
@@ -26,12 +36,20 @@ fn env_value(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn git_commit_from_git() -> String {
-    command_stdout(["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".to_string())
+fn repository_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
 }
 
-fn current_head_ref() -> Option<String> {
-    let head = std::fs::read_to_string(".git/HEAD").ok()?;
+fn git_commit_from_git(repo_root: &Path) -> String {
+    command_stdout(repo_root, ["rev-parse", "--short=12", "HEAD"])
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn current_head_ref(repo_root: &Path) -> Option<String> {
+    let head = std::fs::read_to_string(repo_root.join(".git/HEAD")).ok()?;
     let head = head.trim();
     head.strip_prefix("ref: ")
         .filter(|value| !value.contains(".."))
@@ -39,8 +57,9 @@ fn current_head_ref() -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn git_dirty_from_git() -> String {
+fn git_dirty_from_git(repo_root: &Path) -> String {
     match Command::new("git")
+        .current_dir(repo_root)
         .args(["diff-index", "--quiet", "HEAD", "--"])
         .status()
     {
@@ -50,8 +69,12 @@ fn git_dirty_from_git() -> String {
     }
 }
 
-fn command_stdout<const N: usize>(args: [&str; N]) -> Option<String> {
-    let output = Command::new("git").args(args).output().ok()?;
+fn command_stdout<const N: usize>(repo_root: &Path, args: [&str; N]) -> Option<String> {
+    let output = Command::new("git")
+        .current_dir(repo_root)
+        .args(args)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }

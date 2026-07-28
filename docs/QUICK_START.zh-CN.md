@@ -22,7 +22,7 @@ npm install -g @yyjeqhc/webcodex
 或从本仓库构建：
 
 ```bash
-cargo build --release --bins
+cargo build --release --workspace --bins
 export PATH="$PWD/target/release:$PATH"
 ```
 

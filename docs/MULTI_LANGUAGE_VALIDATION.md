@@ -174,7 +174,7 @@ Design notes:
 
 ### 3.1 Agent-side validation bridge (implemented)
 
-Shared contract: `src/validation_bridge.rs`
+Shared contract: `crates/webcodex-core/src/validation_bridge.rs`
 
 - **Protocol version:** `VALIDATION_BRIDGE_PROTOCOL_VERSION = 1`
 - **Result format:** `webcodex.validation_bridge_result.v1`
@@ -187,7 +187,7 @@ Shared contract: `src/validation_bridge.rs`
   `BridgeDiagnostics` (project-relative paths only). **No raw Pyright JSON,
   no absolute paths, no unbounded stdout/stderr.**
 
-Runner modules: `src/bin/webcodex_runner/validation/`
+Runner modules: `crates/webcodex-runner/src/webcodex_runner/validation/`
 
 | Concern | Location |
 |---|---|
