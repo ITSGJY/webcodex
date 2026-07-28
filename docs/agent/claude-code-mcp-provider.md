@@ -4,8 +4,10 @@
 capabilities while WebCodex remains the online MCP/API, authorization, session,
 project, permission, timeout, and audit boundary.
 
-The provider is disabled by default. Add this to the agent configuration (not
-the server configuration):
+This provider is experimental, disabled by default, and not recommended for
+ordinary deployments. Native execution is the default strategy. Enable the
+provider only through an explicit agent configuration (not the server
+configuration):
 
 ```toml
 [tool_providers]
