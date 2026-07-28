@@ -6,12 +6,14 @@ use crate::shell_protocol::{ShellAgentProjectSummary, ShellAgentShellRequest};
 use crate::{err_cmd, ok_cmd, write_created_file};
 use crate::{CommandResult, CreatedProjectPaths};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -19,6 +21,11 @@ const PROJECT_SCAN_CACHE_MS: u64 = 5000;
 const PROJECT_GIT_TIMEOUT: Duration = Duration::from_secs(2);
 const PROJECT_GIT_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
 const PROJECT_GIT_OUTPUT_MAX_BYTES: usize = 64 * 1024;
+static PROJECT_REGISTRY_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn project_registry_write_lock() -> &'static Mutex<()> {
+    PROJECT_REGISTRY_WRITE_LOCK.get_or_init(|| Mutex::new(()))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AgentProjectFile {
@@ -365,6 +372,11 @@ fn run_git_capture(path: &str, args: &[&str], shutdown: Option<&AtomicBool>) -> 
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+fn project_revision(project: &AgentProjectFile) -> String {
+    let normalized = toml::to_string(project).unwrap_or_default();
+    format!("sha256:{:x}", Sha256::digest(normalized.as_bytes()))
+}
+
 fn agent_project_summary_with_shutdown(
     project: &AgentProjectFile,
     updated_at: i64,
@@ -399,6 +411,7 @@ fn agent_project_summary_with_shutdown(
         description: project.description.clone(),
         hooks,
         disabled: project.disabled,
+        revision: Some(project_revision(project)),
         git_branch,
         git_head,
         git_dirty,
@@ -485,9 +498,6 @@ fn load_agent_project_summaries_from_dir_with_shutdown(
                 continue;
             }
         };
-        if project.disabled {
-            continue;
-        }
         if !seen.insert(project.id.clone()) {
             eprintln!(
                 "webcodex-runner project warning: duplicate project id {} in {}; skipping",
@@ -743,6 +753,163 @@ fn write_project_toml_atomic(
     })
 }
 
+fn lifecycle_config_path(projects_dir: &Path, id: &str) -> Result<PathBuf, String> {
+    validate_project_op_id(id)?;
+    let canonical_dir = canonicalize_existing(projects_dir)?;
+    let path = canonical_dir.join(format!("{id}.toml"));
+    if !path.starts_with(&canonical_dir) {
+        return Err("project config path would escape projects_dir".to_string());
+    }
+    Ok(path)
+}
+
+fn write_existing_project_atomic(path: &Path, content: &str) -> Result<(), String> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| "project config has no parent".to_string())?;
+    let temp = dir.join(format!(
+        ".{}.tmp",
+        path.file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("project.toml")
+    ));
+    {
+        let mut file = std::fs::File::create(&temp)
+            .map_err(|e| format!("failed to create lifecycle temp file: {e}"))?;
+        file.write_all(content.as_bytes())
+            .map_err(|e| format!("failed to write lifecycle temp file: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("failed to sync lifecycle temp file: {e}"))?;
+    }
+    std::fs::rename(&temp, path)
+        .map_err(|e| format!("failed to atomically replace project config: {e}"))
+}
+
+/// Structured, non-shell project lifecycle mutation. Unregister only removes
+/// the registry TOML and never touches the project path or Git data.
+pub(crate) fn handle_project_lifecycle_op(
+    policy: &AgentPolicy,
+    projects_dir: &Path,
+    request: &ShellAgentShellRequest,
+) -> CommandResult {
+    let _registry_guard = match project_registry_write_lock().lock() {
+        Ok(guard) => guard,
+        Err(_) => return err_cmd(Instant::now(), "operation_failed".to_string()),
+    };
+    let start = Instant::now();
+    let action = request
+        .kind
+        .strip_prefix("project_lifecycle_")
+        .unwrap_or("");
+    if !matches!(action, "enable" | "disable" | "unregister") {
+        return err_cmd(start, "unsupported project lifecycle action".to_string());
+    }
+    let payload: serde_json::Value = match request
+        .stdin
+        .as_deref()
+        .and_then(|v| serde_json::from_str(v).ok())
+    {
+        Some(v) => v,
+        None => return err_cmd(start, "invalid project lifecycle payload".to_string()),
+    };
+    let id = match payload.get("project_id").and_then(|v| v.as_str()) {
+        Some(v) => v,
+        None => return err_cmd(start, "missing project_id".to_string()),
+    };
+    let expected_revision = match payload.get("expected_revision").and_then(|v| v.as_str()) {
+        Some(v) => v,
+        None => return err_cmd(start, "missing expected_revision".to_string()),
+    };
+    let config_path = match lifecycle_config_path(projects_dir, id) {
+        Ok(v) => v,
+        Err(e) => return err_cmd(start, e),
+    };
+    if !config_path.exists() {
+        if action == "unregister" {
+            return ok_cmd(
+                start,
+                serde_json::json!({
+                    "operation": action, "agent_project_id": id,
+                    "outcome": "already_unregistered", "changed": false,
+                    "revision": serde_json::Value::Null
+                }),
+            );
+        }
+        return err_cmd(start, "project_not_found".to_string());
+    }
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(v) => v,
+        Err(_) => return err_cmd(start, "operation_failed".to_string()),
+    };
+    let mut project = match parse_agent_project_toml(&content) {
+        Ok(v) => v,
+        Err(_) => return err_cmd(start, "operation_failed".to_string()),
+    };
+    let current_revision = project_revision(&project);
+    if expected_revision != current_revision {
+        return err_cmd(start, "revision_conflict".to_string());
+    }
+    if action == "unregister" {
+        let tombstone = config_path.with_extension("toml.unregistering");
+        if std::fs::rename(&config_path, &tombstone).is_err()
+            || std::fs::remove_file(&tombstone).is_err()
+        {
+            return err_cmd(start, "operation_failed".to_string());
+        }
+        return ok_cmd(
+            start,
+            serde_json::json!({
+                "operation": action, "agent_project_id": id,
+                "outcome": "unregistered", "changed": true,
+                "revision": serde_json::Value::Null
+            }),
+        );
+    }
+    let desired_disabled = action == "disable";
+    if project.disabled == desired_disabled {
+        return ok_cmd(
+            start,
+            serde_json::json!({
+                "operation": action, "agent_project_id": id,
+                "outcome": if desired_disabled {"already_disabled"} else {"already_enabled"},
+                "changed": false, "revision": current_revision,
+                "disabled": project.disabled, "path": project.path,
+                "name": project.name, "description": project.description,
+                "allow_patch": project.allow_patch
+            }),
+        );
+    }
+    if !desired_disabled {
+        let canonical = match canonicalize_existing(Path::new(&project.path)) {
+            Ok(v) if v.is_dir() => v,
+            _ => return err_cmd(start, "project_not_found".to_string()),
+        };
+        if let Err(_) = validate_project_path_policy(policy, &canonical) {
+            return err_cmd(start, "path_outside_allowed_roots".to_string());
+        }
+    }
+    project.disabled = desired_disabled;
+    let serialized = match toml::to_string_pretty(&project) {
+        Ok(v) => v,
+        Err(_) => return err_cmd(start, "operation_failed".to_string()),
+    };
+    if write_existing_project_atomic(&config_path, &serialized).is_err() {
+        return err_cmd(start, "operation_failed".to_string());
+    }
+    let revision = project_revision(&project);
+    ok_cmd(
+        start,
+        serde_json::json!({
+            "operation": action, "agent_project_id": id,
+            "outcome": if desired_disabled {"disabled"} else {"enabled"},
+            "changed": true, "revision": revision,
+            "disabled": project.disabled, "path": project.path,
+            "name": project.name, "description": project.description,
+            "allow_patch": project.allow_patch
+        }),
+    )
+}
+
 /// Handle `register_project` / `create_project` agent requests. Parses the
 /// JSON payload from `request.stdin`, validates fields and path against
 /// policy, writes `projects_dir/<id>.toml` atomically (and for
@@ -753,6 +920,10 @@ pub(crate) fn handle_project_op(
     projects_dir: &Path,
     request: &ShellAgentShellRequest,
 ) -> CommandResult {
+    let _registry_guard = match project_registry_write_lock().lock() {
+        Ok(guard) => guard,
+        Err(_) => return err_cmd(Instant::now(), "operation_failed".to_string()),
+    };
     let start = Instant::now();
     let kind = request.kind.as_str();
     let payload = match request.stdin.as_deref() {
@@ -867,6 +1038,7 @@ pub(crate) fn handle_project_op(
             "created_config": write_result.created_config,
             "overwritten": write_result.overwritten,
             "allow_patch": allow_patch,
+            "revision": project_revision(&parse_agent_project_toml(&toml_content).expect("generated project TOML must parse")),
         });
         return ok_cmd(start, result);
     }
@@ -1062,6 +1234,7 @@ pub(crate) fn handle_project_op(
         "overwritten": write_result.overwritten,
         "allow_patch": allow_patch,
         "template": template,
+        "revision": project_revision(&parse_agent_project_toml(&toml_content).expect("generated project TOML must parse")),
         "git_initialized": git_initialized,
     });
     ok_cmd(start, result)

@@ -1,3 +1,7 @@
+use crate::admin_project_lifecycle::{
+    AdminProjectLifecycleService, CreateProjectRequest, ProjectMutationRequest,
+    RegisterProjectRequest, ServiceResponse,
+};
 use crate::auth::{AuthContext, AuthKind};
 use crate::tool_runtime::activity::ActivityVisibility;
 use crate::tool_runtime::{ToolResult, ToolRuntime};
@@ -7,11 +11,28 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub(crate) const ADMIN_ROUTES: &[&str] = &["/api/admin/dashboard"];
+pub(crate) const ADMIN_ROUTES: &[&str] = &[
+    "/api/admin/dashboard",
+    "/api/admin/projects/register",
+    "/api/admin/projects/create",
+    "/api/admin/projects/enable",
+    "/api/admin/projects/disable",
+    "/api/admin/projects/unregister",
+];
 const ACTIVITY_LIMIT: usize = 50;
+const ADMIN_BODY_MAX_BYTES: usize = 16 * 1024;
 
 pub(crate) fn routes() -> Router {
-    Router::with_path("admin").push(Router::with_path("dashboard").post(dashboard))
+    Router::with_path("admin")
+        .push(Router::with_path("dashboard").post(dashboard))
+        .push(
+            Router::with_path("projects")
+                .push(Router::with_path("register").post(register_project))
+                .push(Router::with_path("create").post(create_project))
+                .push(Router::with_path("enable").post(enable_project))
+                .push(Router::with_path("disable").post(disable_project))
+                .push(Router::with_path("unregister").post(unregister_project)),
+        )
 }
 
 fn error(res: &mut Response, status: StatusCode, message: &str) {
@@ -147,15 +168,26 @@ fn project_dashboard(
                     .get("capabilities")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
+                let enabled = project.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+                let active_jobs = project.get("active_jobs").and_then(Value::as_u64).unwrap_or(0);
                 json!({
                     "id": text(project.get("id")),
                     "name": text(project.get("name")),
-                    "description": Value::Null,
+                    "description": project.get("description").cloned().unwrap_or(Value::Null),
                     "client_id": if client_id.is_empty() { Value::Null } else { json!(client_id) },
                     "path": if bootstrap { project.get("path").cloned().unwrap_or(Value::Null) } else { json!("hidden for non-bootstrap admin") },
                     "readiness": if connected {"online"} else {"offline"},
                     "git_available": capabilities.get("git_available").cloned().unwrap_or(Value::Null),
                     "allow_patch": project.get("allow_patch").cloned().unwrap_or(Value::Null),
+                    "enabled": enabled,
+                    "lifecycle_status": if enabled {"enabled"} else {"disabled"},
+                    "revision": project.get("revision").cloned().unwrap_or(Value::Null),
+                    "active_jobs": active_jobs,
+                    "actions": {
+                        "enable": !enabled,
+                        "disable": enabled,
+                        "unregister": active_jobs == 0
+                    },
                     "shell_profile_status": project.get("shell_profile_status").cloned().unwrap_or(Value::Null),
                     "compatibility": compatibility.get(client_id).map(String::as_str).unwrap_or("unknown"),
                     "console_hint": "Use /console with that project's credential; credentials never belong in URLs.",
@@ -215,6 +247,137 @@ fn project_dashboard(
         "activity": activity,
         "limits": {"activity": ACTIVITY_LIMIT}
     })
+}
+
+fn require_admin<'a>(depot: &'a Depot) -> Result<AuthContext, (StatusCode, &'static str)> {
+    let auth = depot
+        .obtain::<AuthContext>()
+        .cloned()
+        .map_err(|_| (StatusCode::UNAUTHORIZED, "authentication required"))?;
+    if !auth.is_admin()
+        || matches!(
+            auth.kind,
+            AuthKind::AgentToken
+                | AuthKind::ProjectCredential
+                | AuthKind::SharedKey
+                | AuthKind::OpenAnonymous
+                | AuthKind::AccountCredential
+        )
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "bootstrap or admin-scoped token required",
+        ));
+    }
+    Ok(auth)
+}
+
+async fn parse_admin_json<T: serde::de::DeserializeOwned>(
+    req: &mut Request,
+) -> Result<T, ServiceResponse> {
+    let bytes = req
+        .payload_with_max_size(ADMIN_BODY_MAX_BYTES)
+        .await
+        .map_err(|_| ServiceResponse {
+            status: StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+            body: json!({"error":{"code":"invalid_request"}}),
+        })?;
+    serde_json::from_slice(bytes).map_err(|_| ServiceResponse {
+        status: StatusCode::BAD_REQUEST.as_u16(),
+        body: json!({"error":{"code":"invalid_request"}}),
+    })
+}
+
+fn render_service_response(res: &mut Response, response: ServiceResponse) {
+    res.status_code(
+        StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+    );
+    res.render(Json(response.body));
+}
+
+async fn lifecycle_context(
+    req: &mut Request,
+    depot: &Depot,
+) -> Result<(AuthContext, AdminProjectLifecycleService), ServiceResponse> {
+    crate::auth::require_json_same_origin(req).map_err(|(status, _, _)| ServiceResponse {
+        status,
+        body: json!({"error":{"code":"invalid_request"}}),
+    })?;
+    let auth = require_admin(depot).map_err(|(status, _)| ServiceResponse {
+        status: status.as_u16(),
+        body: json!({"error":{"code": if status == StatusCode::UNAUTHORIZED {"unauthorized"} else {"forbidden"}}}),
+    })?;
+    let runtime = depot
+        .obtain::<Arc<ToolRuntime>>()
+        .cloned()
+        .map_err(|_| ServiceResponse {
+            status: 500,
+            body: json!({"error":{"code":"operation_failed"}}),
+        })?;
+    let db = depot
+        .obtain::<Arc<Database>>()
+        .cloned()
+        .map_err(|_| ServiceResponse {
+            status: 500,
+            body: json!({"error":{"code":"operation_failed"}}),
+        })?;
+    Ok((auth, AdminProjectLifecycleService::new(runtime, db)))
+}
+
+#[handler]
+async fn register_project(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let (auth, service) = match lifecycle_context(req, depot).await {
+        Ok(value) => value,
+        Err(response) => return render_service_response(res, response),
+    };
+    let body = match parse_admin_json::<RegisterProjectRequest>(req).await {
+        Ok(value) => value,
+        Err(response) => return render_service_response(res, response),
+    };
+    render_service_response(res, service.register(&auth, body).await);
+}
+
+#[handler]
+async fn create_project(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let (auth, service) = match lifecycle_context(req, depot).await {
+        Ok(value) => value,
+        Err(response) => return render_service_response(res, response),
+    };
+    let body = match parse_admin_json::<CreateProjectRequest>(req).await {
+        Ok(value) => value,
+        Err(response) => return render_service_response(res, response),
+    };
+    render_service_response(res, service.create(&auth, body).await);
+}
+
+async fn mutate_project(
+    action: &'static str,
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) {
+    let (auth, service) = match lifecycle_context(req, depot).await {
+        Ok(value) => value,
+        Err(response) => return render_service_response(res, response),
+    };
+    let body = match parse_admin_json::<ProjectMutationRequest>(req).await {
+        Ok(value) => value,
+        Err(response) => return render_service_response(res, response),
+    };
+    render_service_response(res, service.mutate(&auth, action, body).await);
+}
+
+#[handler]
+async fn enable_project(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    mutate_project("enable", req, depot, res).await;
+}
+#[handler]
+async fn disable_project(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    mutate_project("disable", req, depot, res).await;
+}
+#[handler]
+async fn unregister_project(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    mutate_project("unregister", req, depot, res).await;
 }
 
 #[handler]
@@ -473,6 +636,77 @@ mod tests {
         ] {
             assert!(!serialized.contains(forbidden));
         }
+    }
+
+    async fn lifecycle_call(
+        auth: Option<AuthContext>,
+        body: &str,
+        origin: bool,
+    ) -> (StatusCode, Value) {
+        let mut request = TestClient::post("http://127.0.0.1/admin/projects/register")
+            .add_header("host", "127.0.0.1", true)
+            .add_header("content-type", "application/json", true)
+            .body(body.to_string());
+        request = request.add_header(
+            "origin",
+            if origin {
+                "http://127.0.0.1"
+            } else {
+                "http://evil.invalid"
+            },
+            true,
+        );
+        let mut response = request.send(&service(auth)).await;
+        let status = response.status_code.unwrap();
+        let body = response.take_json::<Value>().await.unwrap();
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn lifecycle_routes_enforce_admin_same_origin_and_strict_json() {
+        let valid = r#"{
+            "client_id":"oe","project_id":"demo","name":"Demo",
+            "path":"/tmp/demo","allow_patch":true,"idempotency_key":"req-1"
+        }"#;
+        assert_eq!(
+            lifecycle_call(None, valid, true).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        for kind in [AuthKind::ProjectCredential, AuthKind::AgentToken] {
+            assert_eq!(
+                lifecycle_call(Some(AuthContext::new(kind)), valid, true)
+                    .await
+                    .0,
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            lifecycle_call(Some(AuthContext::new(AuthKind::ApiToken)), valid, true)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        let mut admin = AuthContext::new(AuthKind::ApiToken);
+        admin.scopes.push(SCOPE_ADMIN.to_string());
+        assert_eq!(
+            lifecycle_call(Some(admin.clone()), valid, false).await.0,
+            StatusCode::FORBIDDEN
+        );
+        let unknown = valid.replace("\n        }", ",\"unknown\":true\n        }");
+        assert_eq!(
+            lifecycle_call(Some(admin), &unknown, true).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn dashboard_projection_exposes_lifecycle_actions() {
+        let body = populated_projection(true);
+        let project = &body["projects"][0];
+        assert_eq!(project["enabled"], true);
+        assert_eq!(project["actions"]["disable"], true);
+        assert_eq!(project["actions"]["enable"], false);
+        assert_eq!(project["actions"]["unregister"], true);
     }
 
     #[test]

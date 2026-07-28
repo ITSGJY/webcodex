@@ -30,6 +30,7 @@ const PROJECT_OP_WAIT_SECS: u64 = 32;
 impl ToolRuntime {
     pub(crate) async fn list_projects(&self, auth: Option<&AuthContext>) -> ToolResult {
         let mut list: Vec<Value> = Vec::new();
+        let jobs = self.shell_clients.list_jobs_for_auth(auth, Some(100)).await;
         for client in self.shell_clients.list_clients_for_auth(auth).await {
             // Sanitized shell-profiles summary for this agent (carried inside
             // the registration policy). Used to resolve which profile a project
@@ -39,18 +40,31 @@ impl ToolRuntime {
                 .policy
                 .as_ref()
                 .and_then(|p| p.shell_profiles.as_ref());
-            for project in client.projects.iter().filter(|p| !p.disabled) {
+            for project in &client.projects {
                 let (resolved_shell_profile, shell_profile_status) =
                     resolve_project_shell_profile(project.shell_profile.as_deref(), shell_profiles);
                 let capabilities = smoke_project_capabilities(&client, project);
+                let runtime_id = agent_project_runtime_id(&client.client_id, &project.id);
+                let active_jobs = jobs
+                    .iter()
+                    .filter(|job| {
+                        job.project_id.as_deref() == Some(runtime_id.as_str())
+                            && super::ACTIVE_JOB_STATUSES.contains(&job.status.as_str())
+                    })
+                    .count();
                 list.push(json!({
-                    "id": agent_project_runtime_id(&client.client_id, &project.id),
+                    "id": runtime_id,
                     "agent_project_id": project.id,
                     "name": project.name,
                     "path": project.path,
                     "executor": "agent",
                     "client_id": client.client_id,
                     "allow_patch": project.allow_patch,
+                    "description": project.description,
+                    "enabled": !project.disabled,
+                    "disabled": project.disabled,
+                    "revision": project.revision,
+                    "active_jobs": active_jobs,
                     "source": "agent_registered",
                     "agent_status": client.status,
                     "connected": client.connected,
@@ -504,7 +518,14 @@ fn parse_project_summary_from_result(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         hooks: Vec::new(),
-        disabled: false,
+        disabled: result
+            .get("disabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        revision: result
+            .get("revision")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         git_branch: None,
         git_head: None,
         git_dirty: None,

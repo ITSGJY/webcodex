@@ -507,6 +507,7 @@ mod tests {
                     description: None,
                     hooks: Vec::new(),
                     disabled: false,
+                    revision: None,
                     git_branch: None,
                     git_head: None,
                     git_dirty: None,

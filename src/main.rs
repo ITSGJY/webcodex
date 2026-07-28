@@ -12,6 +12,7 @@ use uuid::Uuid;
 mod action_audit;
 mod action_audit_sessions;
 mod admin_http;
+mod admin_project_lifecycle;
 mod agent_quic;
 mod agent_tokens_http;
 mod agent_ws;

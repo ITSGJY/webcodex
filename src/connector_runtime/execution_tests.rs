@@ -267,6 +267,7 @@ fn project_summary(id: &str, path: &Path) -> ShellAgentProjectSummary {
         description: None,
         hooks: Vec::new(),
         disabled: false,
+        revision: None,
         git_branch: Some("main".into()),
         git_head: None,
         git_dirty: Some(false),
@@ -2994,6 +2995,7 @@ async fn read_only_commands_run_is_denied_even_when_agent_advertises_sandbox() {
                 capabilities: Some(ShellClientCapabilities {
                     shell: true,
                     sandbox_inspect_commands: true,
+                    project_lifecycle: false,
                     ..Default::default()
                 }),
                 projects: Some(vec![project_summary(
@@ -3053,6 +3055,7 @@ async fn enable_inspect_sandbox(fixture: &Fixture) {
                     async_shell_jobs: true,
                     structured_validation_argv: true,
                     sandbox_inspect_commands: true,
+                    project_lifecycle: false,
                     ..Default::default()
                 }),
                 projects: Some(vec![project_summary(

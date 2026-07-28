@@ -9,6 +9,7 @@ use std::sync::Mutex;
 
 mod accounts;
 mod activity;
+mod admin_project_lifecycle;
 mod audit;
 mod execution_model;
 mod executions;
@@ -17,6 +18,7 @@ mod schema;
 mod task_kernel;
 
 pub use self::activity::WorkspaceActivityStore;
+pub(crate) use self::admin_project_lifecycle::AdminProjectAudit;
 pub(crate) use self::execution_model::{
     ConnectorExecution, ConnectorExecutionFailure, ConnectorExecutionObservation,
     ConnectorExecutionReservation, MAX_ASSERTION_EVIDENCE_BYTES,

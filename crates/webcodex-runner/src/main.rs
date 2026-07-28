@@ -1131,6 +1131,7 @@ fn agent_register_capabilities(cfg: &AgentConfig) -> ShellClientCapabilities {
     capabilities.async_jobs = true;
     capabilities.async_shell_jobs = true;
     capabilities.structured_validation_argv = true;
+    capabilities.project_lifecycle = true;
     // New agents always advertise read-only LSP navigation. Older agents omit
     // the field and deserialize as false on the server.
     capabilities.lsp_read_only_navigation = true;
@@ -2797,6 +2798,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::webcodex_runner::handle_project_lifecycle_op;
     static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Policy for tests that exercise shell/profile behavior inside a temp dir
@@ -7793,6 +7795,7 @@ shell_profile = "../rust"
         // registration replaces it with the result of the real host probe.
         cfg.capabilities = Some(ShellClientCapabilities {
             sandbox_inspect_commands: true,
+            project_lifecycle: false,
             ..Default::default()
         });
         for (version, expected_str) in [
@@ -8394,6 +8397,90 @@ shell_profile = "../rust"
         assert_eq!(parsed.name.as_deref(), Some("Demo"));
         assert_eq!(parsed.path, project_dir.to_string_lossy());
         assert!(!parsed.allow_patch);
+    }
+
+    #[test]
+    fn project_lifecycle_persists_state_and_unregister_preserves_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("repo");
+        let projects_dir = tmp.path().join("projects.d");
+        std::fs::create_dir(&project_dir).unwrap();
+        std::fs::create_dir(project_dir.join(".git")).unwrap();
+        std::fs::write(project_dir.join("keep.txt"), "keep").unwrap();
+        let policy = project_policy(tmp.path());
+        let registered = project_ok(handle_project_op(
+            &policy,
+            &projects_dir,
+            &project_request(
+                "register_project",
+                serde_json::json!({
+                    "id": "demo",
+                    "name": "Demo",
+                    "path": project_dir.to_string_lossy()
+                }),
+            ),
+        ));
+        let revision = registered["revision"].as_str().unwrap().to_string();
+
+        let disabled = project_ok(handle_project_lifecycle_op(
+            &policy,
+            &projects_dir,
+            &project_request(
+                "project_lifecycle_disable",
+                serde_json::json!({"project_id":"demo","expected_revision":revision}),
+            ),
+        ));
+        assert_eq!(disabled["outcome"], "disabled");
+        let disabled_revision = disabled["revision"].as_str().unwrap().to_string();
+        let summaries = load_agent_project_summaries_from_dir(&projects_dir);
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].disabled);
+
+        let stale = project_err(handle_project_lifecycle_op(
+            &policy,
+            &projects_dir,
+            &project_request(
+                "project_lifecycle_enable",
+                serde_json::json!({"project_id":"demo","expected_revision":registered["revision"]}),
+            ),
+        ));
+        assert_eq!(stale, "revision_conflict");
+
+        let enabled = project_ok(handle_project_lifecycle_op(
+            &policy,
+            &projects_dir,
+            &project_request(
+                "project_lifecycle_enable",
+                serde_json::json!({"project_id":"demo","expected_revision":disabled_revision}),
+            ),
+        ));
+        assert_eq!(enabled["outcome"], "enabled");
+
+        let unregistered = project_ok(handle_project_lifecycle_op(
+            &policy,
+            &projects_dir,
+            &project_request(
+                "project_lifecycle_unregister",
+                serde_json::json!({
+                    "project_id":"demo",
+                    "expected_revision":enabled["revision"]
+                }),
+            ),
+        ));
+        assert_eq!(unregistered["outcome"], "unregistered");
+        assert!(!projects_dir.join("demo.toml").exists());
+        assert!(project_dir.join("keep.txt").exists());
+        assert!(project_dir.join(".git").is_dir());
+
+        let repeated = project_ok(handle_project_lifecycle_op(
+            &policy,
+            &projects_dir,
+            &project_request(
+                "project_lifecycle_unregister",
+                serde_json::json!({"project_id":"demo","expected_revision":enabled["revision"]}),
+            ),
+        ));
+        assert_eq!(repeated["outcome"], "already_unregistered");
     }
 
     #[test]

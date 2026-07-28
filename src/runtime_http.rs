@@ -559,6 +559,7 @@ mod tests {
                     description: None,
                     hooks: vec![],
                     disabled: false,
+                    revision: None,
                     git_branch: None,
                     git_head: None,
                     git_dirty: None,

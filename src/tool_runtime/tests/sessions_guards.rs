@@ -564,6 +564,7 @@ async fn inspect_session_blocks_structured_write_and_landlocks_run_shell() {
             shell: true,
             file_write: true,
             sandbox_inspect_commands: true,
+            project_lifecycle: false,
             ..Default::default()
         },
     )
@@ -641,6 +642,7 @@ async fn inspect_session_landlocks_cargo_and_async_job_entry_points() {
             async_jobs: true,
             async_shell_jobs: true,
             sandbox_inspect_commands: true,
+            project_lifecycle: false,
             ..Default::default()
         },
     )

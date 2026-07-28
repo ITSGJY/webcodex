@@ -100,6 +100,7 @@ pub const SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV: &str = "structured
 pub const SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION: &str = "lsp_read_only_navigation";
 /// Linux Landlock ABI v3 inspect-command write sandbox.
 pub const SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS: &str = "sandbox_inspect_commands";
+pub const SHELL_CLIENT_CAPABILITY_PROJECT_LIFECYCLE: &str = "project_lifecycle";
 pub const SHELL_CLIENT_CAPABILITY_NAMES: &[&str] = &[
     SHELL_CLIENT_CAPABILITY_SHELL,
     SHELL_CLIENT_CAPABILITY_FILE_READ,
@@ -111,6 +112,7 @@ pub const SHELL_CLIENT_CAPABILITY_NAMES: &[&str] = &[
     SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV,
     SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
     SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS,
+    SHELL_CLIENT_CAPABILITY_PROJECT_LIFECYCLE,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,6 +143,10 @@ pub struct ShellClientCapabilities {
     /// sandbox used by inspect commands.
     #[serde(default)]
     pub sandbox_inspect_commands: bool,
+    /// Structured project enable/disable/unregister requests. Missing on older
+    /// runners and therefore fail-closed.
+    #[serde(default)]
+    pub project_lifecycle: bool,
 }
 
 /// Bounded, non-secret status for the agent's active configuration generation.
@@ -180,6 +186,7 @@ impl Default for ShellClientCapabilities {
             structured_validation_argv: false,
             lsp_read_only_navigation: false,
             sandbox_inspect_commands: false,
+            project_lifecycle: false,
         }
     }
 }
@@ -200,6 +207,9 @@ pub struct ShellAgentProjectSummary {
     pub hooks: Vec<String>,
     #[serde(default)]
     pub disabled: bool,
+    /// Stable SHA-256 revision of the persisted projects.d TOML content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
     #[serde(default)]
     pub git_branch: Option<String>,
     #[serde(default)]
@@ -1282,6 +1292,7 @@ mod envelope_tests {
                 structured_validation_argv: true,
                 lsp_read_only_navigation: false,
                 sandbox_inspect_commands: false,
+                project_lifecycle: false,
             }),
             projects: None,
             agent_protocol_version: Some(AGENT_PROTOCOL_VERSION_WEBSOCKET_V1.to_string()),

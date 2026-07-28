@@ -138,4 +138,18 @@ impl ShellClientRegistry {
         upsert_project_summary(&mut client.projects, project);
         Ok(())
     }
+
+    pub async fn remove_client_project(
+        &self,
+        client_id: &str,
+        project_id: &str,
+    ) -> Result<bool, String> {
+        let mut inner = self.inner.lock().await;
+        let Some(client) = inner.clients.get_mut(client_id) else {
+            return Err(format!("unknown shell client: {}", client_id));
+        };
+        let before = client.projects.len();
+        client.projects.retain(|project| project.id != project_id);
+        Ok(client.projects.len() != before)
+    }
 }

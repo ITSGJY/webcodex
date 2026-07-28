@@ -3933,6 +3933,7 @@ pub(crate) mod tests {
                         structured_validation_argv: true,
                         lsp_read_only_navigation: false,
                         sandbox_inspect_commands: false,
+                        project_lifecycle: false,
                     }),
                     projects: Some(vec![ShellAgentProjectSummary {
                         id: project_id.to_string(),
@@ -3943,6 +3944,7 @@ pub(crate) mod tests {
                         description: None,
                         hooks: Vec::new(),
                         disabled: false,
+                        revision: None,
                         git_branch: Some("main".to_string()),
                         git_head: None,
                         git_dirty: Some(false),

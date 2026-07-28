@@ -2,8 +2,8 @@ use super::external_tools::ExternalRoute;
 use super::lsp::{handle_lsp_request, is_lsp_request_kind, LspSupervisor};
 use super::validation::{handle_validation_request, is_validation_request_kind};
 use super::{
-    handle_project_op, run_shell_with_profiles_in_sandbox, AgentSink, HotAgentConfig,
-    ReloadableAgentConfig, SubmitResultError,
+    handle_project_lifecycle_op, handle_project_op, run_shell_with_profiles_in_sandbox, AgentSink,
+    HotAgentConfig, ReloadableAgentConfig, SubmitResultError,
 };
 use crate::shell_protocol::ShellAgentShellRequest;
 use crate::{handle_file_request, is_file_request_kind, JobManager};
@@ -101,6 +101,14 @@ pub(crate) fn dispatch_request(
             sink.submit_result_with_metadata(request_id, result, config, runtime)
                 .map(|_| true)
         }
+        "project_lifecycle_enable"
+        | "project_lifecycle_disable"
+        | "project_lifecycle_unregister" => {
+            let request_id = request.request_id.clone();
+            let result = handle_project_lifecycle_op(policy, projects_dir, &request);
+            sink.submit_result_with_metadata(request_id, result, config, runtime)
+                .map(|_| true)
+        }
         kind if is_lsp_request_kind(kind) => {
             // Explicit LSP branch — must never fall through to shell execution.
             let request_id = request.request_id.clone();
@@ -142,5 +150,12 @@ pub(crate) fn dispatch_request(
 }
 
 pub(crate) fn is_project_op(kind: &str) -> bool {
-    kind == "register_project" || kind == "create_project"
+    matches!(
+        kind,
+        "register_project"
+            | "create_project"
+            | "project_lifecycle_enable"
+            | "project_lifecycle_disable"
+            | "project_lifecycle_unregister"
+    )
 }

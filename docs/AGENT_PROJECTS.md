@@ -99,3 +99,13 @@ If a new project does not appear in `listProjects`, verify the agent is online a
 For a canonical project, run `webcodex doctor`. For an advanced enrolled
 profile, use `webcodex-cli agent status --profile workstation` and see
 [SHELL_PROFILES.md](SHELL_PROFILES.md).
+
+## Admin project lifecycle API (source capability)
+
+The source tree exposes an admin-only HTTP allowlist under `/api/admin/projects/*` for registering, creating, enabling, disabling, and unregistering agent projects. These endpoints require bootstrap authentication or an admin-scoped PAT, same-origin JSON, bounded strict request bodies, an explicit idempotency key, and (for enable/disable/unregister) the current project revision. They are intentionally absent from GPT Actions, MCP, the runtime tool registry, and the project console.
+
+Lifecycle state remains authoritative in the selected agent's `projects.d/*.toml` registry. Disable persists `disabled = true`, leaves the source directory untouched, and prevents new runtime resolution while allowing already-started jobs to finish. Enable only reactivates an existing disabled registration after the agent revalidates its canonical path and policy. Unregister removes only the registry entry: it never deletes the source directory, `.git`, or project files, and it fails closed while active jobs exist.
+
+Completed idempotent responses are stored in the existing server SQLite database with bounded retention using only request/key digests and safe response projections. Project revisions are stable SHA-256 values derived from persisted registry content; stale revisions return a conflict rather than overwriting another mutation. Offline agents are not queued for later replay. Runners that do not advertise the structured lifecycle capability receive an explicit version/capability error.
+
+The read-only admin dashboard projection includes lifecycle status, revision, active job count, and server-computed allowed actions. The corresponding `/admin` write UI is not implemented in this source version.

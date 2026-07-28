@@ -480,6 +480,7 @@ mod tests {
                     structured_validation_argv: true,
                     lsp_read_only_navigation: false,
                     sandbox_inspect_commands: false,
+                    project_lifecycle: false,
                 }),
                 projects: None,
                 agent_protocol_version: Some(

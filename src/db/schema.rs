@@ -478,6 +478,37 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_wc_task_events_task_sequence
                 ON wc_task_events(task_id, sequence);
 
+            CREATE TABLE IF NOT EXISTS admin_project_lifecycle_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at INTEGER NOT NULL,
+                correlation_id TEXT NOT NULL,
+                subject_type TEXT NOT NULL,
+                subject_id TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                project TEXT NOT NULL,
+                client_id TEXT,
+                outcome TEXT NOT NULL,
+                changed INTEGER NOT NULL,
+                reason_code TEXT,
+                idempotency_digest TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_admin_project_lifecycle_audit_created
+                ON admin_project_lifecycle_audit(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS admin_project_idempotency (
+                subject TEXT NOT NULL,
+                action TEXT NOT NULL,
+                target TEXT NOT NULL,
+                key_hash TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                http_status INTEGER NOT NULL,
+                response_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY(subject, action, target, key_hash)
+            );
+            CREATE INDEX IF NOT EXISTS idx_admin_project_idempotency_created
+                ON admin_project_idempotency(created_at DESC);
+
             CREATE TABLE IF NOT EXISTS workspace_activity (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at INTEGER NOT NULL,

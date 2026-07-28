@@ -114,6 +114,7 @@ async fn register_agent_projects_for_auth(
                     structured_validation_argv: true,
                     lsp_read_only_navigation: false,
                     sandbox_inspect_commands: false,
+                    project_lifecycle: false,
                 }),
                 projects: Some(vec![registered_project(
                     project_id,

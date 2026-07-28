@@ -235,6 +235,7 @@ async fn authenticated_project_fixture_for(recipe: &str) -> AuthenticatedProject
                     description: None,
                     hooks: Vec::new(),
                     disabled: false,
+                    revision: None,
                     git_branch: Some("main".to_string()),
                     git_head: None,
                     git_dirty: Some(false),

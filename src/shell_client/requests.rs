@@ -330,7 +330,14 @@ impl ShellClientRegistry {
         requested_by: String,
     ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
         validate_id(&client_id, "client_id")?;
-        if kind != "register_project" && kind != "create_project" {
+        if !matches!(
+            kind,
+            "register_project"
+                | "create_project"
+                | "project_lifecycle_enable"
+                | "project_lifecycle_disable"
+                | "project_lifecycle_unregister"
+        ) {
             return Err(format!("unsupported project op kind: {}", kind));
         }
         if payload.contains('\0') {

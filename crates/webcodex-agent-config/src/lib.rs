@@ -202,6 +202,7 @@ pub fn generated_agent_config_toml(opts: &AgentInitOptions) -> Result<String, St
             structured_validation_argv: true,
             lsp_read_only_navigation: true,
             sandbox_inspect_commands: false,
+            project_lifecycle: false,
         },
         policy: GeneratedAgentPolicy {
             allow_raw_shell: true,
