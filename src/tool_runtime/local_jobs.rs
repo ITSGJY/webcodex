@@ -238,6 +238,7 @@ fn read_bounded_log(path: &Path, offset: Option<usize>) -> std::io::Result<Local
             let lines_to_drop = retained_lines - MAX_LOCAL_LOG_LINES;
             if let Some(end) = nth_newline(&retained, lines_to_drop) {
                 retained.drain(..=end);
+                first_retained_line = first_retained_line.saturating_add(lines_to_drop);
                 truncated = true;
             }
         }
@@ -249,14 +250,33 @@ fn read_bounded_log(path: &Path, offset: Option<usize>) -> std::io::Result<Local
         while !retained_text.is_char_boundary(start) {
             start += 1;
         }
+        // Prefer a complete first line after lossy UTF-8 expansion. If the
+        // byte limit lands inside a line and another line follows, discard
+        // the partial line through its newline. A single remaining long line
+        // has no later boundary, so keep its suffix and its original line
+        // number instead of returning an empty log.
+        if retained_text.as_bytes()[start - 1] != b'\n' {
+            if let Some(next_newline) = retained_text.as_bytes()[start..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+            {
+                let next_line_start = start + next_newline + 1;
+                if next_line_start < retained_text.len() {
+                    start = next_line_start;
+                }
+            }
+        }
+        let removed_newlines = retained_text.as_bytes()[..start]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count();
+        first_retained_line = first_retained_line.saturating_add(removed_newlines);
         retained_text = retained_text[start..].to_string();
         truncated = true;
     }
     let retained_lines = retained_text.lines().count();
     if retained_lines == 0 {
         first_retained_line = total_lines.saturating_add(1);
-    } else if requested_line.is_none() {
-        first_retained_line = total_lines.saturating_sub(retained_lines).saturating_add(1);
     }
     let retained_end = first_retained_line.saturating_add(retained_lines.saturating_sub(1));
     truncated |= first_retained_line > 1 || retained_end < total_lines;
@@ -426,6 +446,30 @@ impl LocalJobKiller for SystemJobKiller {
 mod tests {
     use super::*;
 
+    const LOSSY_TEST_INVALID_BYTES_PER_LINE: usize = 3 * 1024;
+
+    fn numbered_lossy_log(total_lines: usize) -> Vec<u8> {
+        let mut log = Vec::with_capacity(total_lines * (LOSSY_TEST_INVALID_BYTES_PER_LINE + 16));
+        for line in 1..=total_lines {
+            log.extend_from_slice(format!("line-{line:04}:").as_bytes());
+            log.resize(log.len() + LOSSY_TEST_INVALID_BYTES_PER_LINE, 0xff);
+            log.push(b'\n');
+        }
+        log
+    }
+
+    fn numbered_line_ids(text: &str) -> Vec<usize> {
+        text.lines()
+            .map(|line| {
+                let (number, _) = line
+                    .strip_prefix("line-")
+                    .and_then(|line| line.split_once(':'))
+                    .expect("retained line did not start at a numbered line boundary");
+                number.parse().unwrap()
+            })
+            .collect()
+    }
+
     #[test]
     fn inspect_job_child_exit_publishes_fallback_and_cleans_scratch() {
         let scratch = crate::command_sandbox::InspectScratch::create().unwrap();
@@ -511,12 +555,128 @@ mod tests {
     }
 
     #[test]
+    fn active_job_log_lossy_truncation_keeps_offset_cursor() {
+        let scratch = crate::command_sandbox::InspectScratch::create().unwrap();
+        let dir = scratch.path().join("job");
+        std::fs::create_dir(&dir).unwrap();
+        let total_lines = 540;
+        std::fs::write(dir.join("stdout.log"), numbered_lossy_log(total_lines)).unwrap();
+        let record = LocalJobRecord::new("project".to_string(), dir);
+
+        let (page, next_line, observed_lines, truncated) =
+            record.read_log_lines("stdout.log", Some(1), None);
+        let returned_lines = numbered_line_ids(&page);
+
+        assert!(page.len() <= MAX_LOCAL_LOG_BYTES_PER_STREAM);
+        assert!(page.contains('\u{fffd}'));
+        assert_eq!(observed_lines, total_lines);
+        assert!(truncated);
+        assert!(!returned_lines.is_empty());
+        assert!(returned_lines[0] > 1);
+        assert_eq!(returned_lines.last().copied(), Some(MAX_LOCAL_LOG_LINES));
+        assert_eq!(next_line, MAX_LOCAL_LOG_LINES + 1);
+        assert_eq!(next_line, returned_lines.last().unwrap() + 1);
+        assert_eq!(
+            next_line,
+            returned_lines[0] + returned_lines.len(),
+            "cursor must be based on the final retained prefix"
+        );
+
+        let (later_page, later_cursor, observed_lines, truncated) =
+            record.read_log_lines("stdout.log", Some(21), None);
+        let later_lines = numbered_line_ids(&later_page);
+        assert_eq!(observed_lines, total_lines);
+        assert!(truncated);
+        assert!(later_lines[0] > 21);
+        assert_eq!(later_lines.last().copied(), Some(520));
+        assert_eq!(later_cursor, 521);
+        assert_eq!(later_cursor, later_lines[0] + later_lines.len());
+
+        let (tail, tail_cursor, observed_lines, truncated) =
+            record.read_log_lines("stdout.log", None, Some(20));
+        assert_eq!(
+            numbered_line_ids(&tail),
+            (total_lines - 19..=total_lines).collect::<Vec<_>>()
+        );
+        assert_eq!(tail_cursor, total_lines + 1);
+        assert_eq!(observed_lines, total_lines);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn active_job_log_lossy_cursor_fetches_next_page_without_repeat() {
+        let scratch = crate::command_sandbox::InspectScratch::create().unwrap();
+        let dir = scratch.path().join("job");
+        std::fs::create_dir(&dir).unwrap();
+        let total_lines = 540;
+        std::fs::write(dir.join("stdout.log"), numbered_lossy_log(total_lines)).unwrap();
+        let record = LocalJobRecord::new("project".to_string(), dir);
+
+        let (first_page, next_line, observed_lines, truncated) =
+            record.read_log_lines("stdout.log", Some(1), None);
+        let first_page_lines = numbered_line_ids(&first_page);
+        assert_eq!(observed_lines, total_lines);
+        assert!(truncated);
+
+        let (second_page, final_cursor, observed_lines, truncated) =
+            record.read_log_lines("stdout.log", Some(next_line), None);
+        let second_page_lines = numbered_line_ids(&second_page);
+        assert_eq!(observed_lines, total_lines);
+        assert!(truncated);
+        assert_eq!(second_page_lines.first().copied(), Some(next_line));
+        assert!(
+            second_page_lines[0] > *first_page_lines.last().unwrap(),
+            "the follow-up page repeated the prior page"
+        );
+        assert_eq!(second_page_lines.last().copied(), Some(total_lines));
+        assert_eq!(final_cursor, total_lines + 1);
+        assert!(final_cursor > next_line);
+
+        let (past_eof, eof_cursor, observed_lines, truncated) =
+            record.read_log_lines("stdout.log", Some(final_cursor), None);
+        assert!(past_eof.is_empty());
+        assert_eq!(eof_cursor, total_lines + 1);
+        assert_eq!(observed_lines, total_lines);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn active_job_log_lossy_truncation_discards_partial_first_line() {
+        let scratch = crate::command_sandbox::InspectScratch::create().unwrap();
+        let dir = scratch.path().join("job");
+        std::fs::create_dir(&dir).unwrap();
+        let mut stdout = vec![0xff; MAX_LOCAL_LOG_BYTES_PER_STREAM + 64 * 1024];
+        stdout.extend_from_slice(
+            b"\nline-0002:two\nline-0003:three\nline-0004:four\nline-0005:THE-END",
+        );
+        std::fs::write(dir.join("stdout.log"), stdout).unwrap();
+        let record = LocalJobRecord::new("project".to_string(), dir);
+
+        let (page, next_line, total_lines, truncated) =
+            record.read_log_lines("stdout.log", Some(1), None);
+        assert_eq!(
+            page,
+            "line-0002:two\nline-0003:three\nline-0004:four\nline-0005:THE-END"
+        );
+        assert_eq!(numbered_line_ids(&page), vec![2, 3, 4, 5]);
+        assert_eq!(next_line, 6);
+        assert_eq!(total_lines, 5);
+        assert!(truncated);
+
+        let (past_eof, eof_cursor, total_lines, truncated) =
+            record.read_log_lines("stdout.log", Some(next_line), None);
+        assert!(past_eof.is_empty());
+        assert_eq!(eof_cursor, 6);
+        assert_eq!(total_lines, 5);
+        assert!(truncated);
+    }
+
+    #[test]
     fn active_job_log_bounds_long_lossy_line_and_preserves_small_logs() {
         let scratch = crate::command_sandbox::InspectScratch::create().unwrap();
         let dir = scratch.path().join("job");
         std::fs::create_dir(&dir).unwrap();
-        let mut long_line = vec![b'x'; 2 * MAX_LOCAL_LOG_BYTES_PER_STREAM];
-        long_line.extend_from_slice(&[0xff, 0xfe]);
+        let mut long_line = vec![0xff; 2 * MAX_LOCAL_LOG_BYTES_PER_STREAM];
         long_line.extend_from_slice(b"THE-END");
         std::fs::write(dir.join("stdout.log"), long_line).unwrap();
         std::fs::write(dir.join("stderr.log"), b"one\ntwo\nthree\n").unwrap();
@@ -537,6 +697,13 @@ mod tests {
         assert_eq!(cursor, 4);
         assert_eq!(total_lines, 3);
         assert!(!truncated);
+
+        let (stderr_tail, cursor, total_lines, truncated) =
+            record.read_log_lines("stderr.log", None, Some(2));
+        assert_eq!(stderr_tail, "two\nthree");
+        assert_eq!(cursor, 4);
+        assert_eq!(total_lines, 3);
+        assert!(truncated);
     }
 
     #[test]
@@ -650,6 +817,71 @@ mod tests {
         assert!(stderr_tail.ends_with("THE-END"));
         assert_eq!(cursor, 2);
         assert_eq!(total, 1);
+        assert!(truncated);
+        assert!(!scratch_path.exists());
+    }
+
+    #[test]
+    fn inspect_job_terminal_snapshot_preserves_lossy_log_cursors() {
+        let scratch = crate::command_sandbox::InspectScratch::create().unwrap();
+        let scratch_path = scratch.path().to_path_buf();
+        let dir = scratch.path().join("job");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("status"), "completed").unwrap();
+        std::fs::write(dir.join("finished_at"), "100").unwrap();
+        std::fs::write(dir.join("exit_code"), "0").unwrap();
+        std::fs::write(dir.join("metadata.json"), "{}").unwrap();
+        let total_lines = 540;
+        std::fs::write(dir.join("stdout.log"), numbered_lossy_log(total_lines)).unwrap();
+        std::fs::write(dir.join("stderr.log"), b"done\n").unwrap();
+
+        let record = LocalJobRecord::new("project".to_string(), dir.clone());
+        let snapshot = record.terminal_snapshot_handle();
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .unwrap();
+        retain_inspect_job_until_terminal(dir, snapshot.clone(), scratch, child);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while snapshot.lock().unwrap().is_none() || scratch_path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "terminal snapshot or scratch cleanup timed out"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        {
+            let snapshot = snapshot.lock().unwrap();
+            let stdout = snapshot.as_ref().unwrap().logs.get("stdout.log").unwrap();
+            let retained_lines = numbered_line_ids(&stdout.retained_text);
+            assert!(stdout.retained_text.len() <= MAX_LOCAL_LOG_BYTES_PER_STREAM);
+            assert!(stdout.retained_text.contains('\u{fffd}'));
+            assert_eq!(stdout.total_lines, total_lines);
+            assert_eq!(
+                stdout.first_retained_line,
+                retained_lines.first().copied().unwrap()
+            );
+            assert_eq!(retained_lines.last().copied(), Some(total_lines));
+            assert!(stdout.truncated);
+        }
+
+        let (page, next_line, observed_lines, truncated) =
+            record.read_log_lines("stdout.log", Some(1), None);
+        let returned_lines = numbered_line_ids(&page);
+        assert!(page.len() <= MAX_LOCAL_LOG_BYTES_PER_STREAM);
+        assert_eq!(observed_lines, total_lines);
+        assert!(truncated);
+        assert_eq!(next_line, returned_lines.last().unwrap() + 1);
+        assert_eq!(next_line, total_lines + 1);
+
+        let (past_eof, eof_cursor, observed_lines, truncated) =
+            record.read_log_lines("stdout.log", Some(next_line), None);
+        assert!(past_eof.is_empty());
+        assert_eq!(eof_cursor, total_lines + 1);
+        assert_eq!(observed_lines, total_lines);
         assert!(truncated);
         assert!(!scratch_path.exists());
     }
