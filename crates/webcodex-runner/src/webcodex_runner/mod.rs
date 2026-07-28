@@ -58,6 +58,6 @@ pub(crate) use shell::{
 pub(crate) use transport::{
     auto_transport_plan, build_ws_request, effective_transport, non_empty_token,
     quic_client_bind_addr_for, resolve_quic_config, resolve_quic_server_addrs, server_url_to_ws,
-    websocket_session, AgentRuntimeState, WS_OUTGOING_CAPACITY,
+    websocket_session, AgentRuntimeState, ResultSubmission, WS_OUTGOING_CAPACITY,
 };
-pub(crate) use transport::{run_agent, AgentSink, HttpSendConfig};
+pub(crate) use transport::{run_agent, AgentSink, HttpSendConfig, SubmitResultError};

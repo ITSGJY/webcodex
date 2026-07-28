@@ -12,7 +12,7 @@ use crate::shell_protocol::{
 };
 use crate::{
     build_register_request_with_provider_status, dispatch_request, handle_one_poll, register,
-    CommandResult, JobManager,
+    AgentHttpError, AgentHttpErrorKind, CommandResult, JobManager,
 };
 use reqwest::blocking::Client;
 use std::fmt;
@@ -53,6 +53,17 @@ const JOB_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Granularity for signal-aware sleeps in the blocking polling loop.
 const POLLING_SHUTDOWN_SLEEP_SLICE: Duration = Duration::from_millis(50);
+/// Result submission endpoint used by the polling transport sink.
+const AGENT_RESULT_PATH: &str = "/api/shell/agent/result";
+/// Bounded same-payload retry backoff for transient result submission
+/// failures over the polling transport. After the last step the payload is
+/// released with an explicit dropped outcome, so a single result can never
+/// monopolize the polling loop or trigger outer re-registration recovery.
+const RESULT_SUBMIT_RETRY_BACKOFF: [Duration; 3] = [
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+];
 
 fn send_provider_metadata(
     tx: &tokio::sync::mpsc::Sender<AgentEnvelope>,
@@ -249,8 +260,38 @@ fn classify_session_error(message: impl Into<String>) -> AgentTransportError {
     }
 }
 
+fn redact_url_queries(message: &str) -> String {
+    let mut remaining = message;
+    let mut redacted = String::with_capacity(message.len());
+    loop {
+        let http = remaining.find("http://");
+        let https = remaining.find("https://");
+        let url_start = match (http, https) {
+            (Some(http), Some(https)) => http.min(https),
+            (Some(http), None) => http,
+            (None, Some(https)) => https,
+            (None, None) => {
+                redacted.push_str(remaining);
+                break;
+            }
+        };
+        redacted.push_str(&remaining[..url_start]);
+        let url = &remaining[url_start..];
+        let url_end = url.find(char::is_whitespace).unwrap_or(url.len());
+        let segment = &url[..url_end];
+        if let Some(query_start) = segment.find('?') {
+            redacted.push_str(&segment[..query_start]);
+            redacted.push_str("?[redacted]");
+        } else {
+            redacted.push_str(segment);
+        }
+        remaining = &url[url_end..];
+    }
+    redacted
+}
+
 fn concise_log_error(message: &str, token: &str) -> String {
-    let mut sanitized = message.replace(['\r', '\n'], " ");
+    let mut sanitized = redact_url_queries(message).replace(['\r', '\n'], " ");
     let token = token.trim();
     if !token.is_empty() {
         sanitized = sanitized.replace(token, "[redacted]");
@@ -375,6 +416,7 @@ pub(crate) struct HttpSendConfig {
     pub(crate) token: String,
     pub(crate) client_id: String,
     pub(crate) agent_instance_id: String,
+    pub(crate) shutdown: Arc<AtomicBool>,
 }
 
 /// Transport-neutral outgoing channel for an agent. Both the polling loop and
@@ -399,6 +441,170 @@ pub(crate) enum AgentSink {
         client_id: String,
         agent_instance_id: String,
     },
+}
+
+/// Outcome of a result submission that no longer needs the payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResultSubmission {
+    /// The server accepted the result.
+    Accepted,
+    /// The server permanently rejected this exact payload (e.g. the request
+    /// expired, was cancelled, or this instance lost the lease). The payload
+    /// has been logged once (bounded, redacted) and released; the caller must
+    /// keep polling instead of retrying it.
+    RejectedPermanent,
+    /// A transient HTTP failure persisted through every bounded retry. The
+    /// payload has been logged once (bounded, redacted) and released so the
+    /// polling runner remains live without retrying forever or entering the
+    /// unrelated re-registration recovery path.
+    DroppedAfterRetryExhaustion,
+}
+
+/// Structured result failures that require the current agent/session to stop.
+/// Polling HTTP transients never reach this type: they are retried in place
+/// and become `DroppedAfterRetryExhaustion` if the bounded budget is exhausted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SubmitResultError {
+    /// 401/403: credentials are wrong or revoked. Never retried.
+    FatalAuth(String),
+    /// 404: endpoint missing or incompatible server. Never retried.
+    FatalProtocol(String),
+    /// A WebSocket/QUIC outgoing channel closed before the result could be
+    /// queued. This is a transport-session failure, not an HTTP retry outcome.
+    TransportClosed(String),
+    /// Process shutdown interrupted an HTTP retry backoff. The polling loop
+    /// handles this as a clean shutdown rather than an operational failure.
+    Shutdown(String),
+}
+
+impl fmt::Display for SubmitResultError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FatalAuth(message)
+            | Self::FatalProtocol(message)
+            | Self::TransportClosed(message)
+            | Self::Shutdown(message) => f.write_str(message),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResultHttpErrorDisposition {
+    RetryTransient,
+    RejectPermanent,
+    FatalAuth,
+    FatalProtocol,
+}
+
+fn result_http_error_disposition(kind: &AgentHttpErrorKind) -> ResultHttpErrorDisposition {
+    match kind {
+        AgentHttpErrorKind::ServerUnavailable
+        | AgentHttpErrorKind::Status
+        | AgentHttpErrorKind::RequestTimeout
+        | AgentHttpErrorKind::Request
+        | AgentHttpErrorKind::Decode => ResultHttpErrorDisposition::RetryTransient,
+        AgentHttpErrorKind::ClientRejected => ResultHttpErrorDisposition::RejectPermanent,
+        AgentHttpErrorKind::Auth => ResultHttpErrorDisposition::FatalAuth,
+        AgentHttpErrorKind::NotFound => ResultHttpErrorDisposition::FatalProtocol,
+    }
+}
+
+/// One bounded, redacted diagnostic line for a permanently rejected result.
+/// Emitted exactly once per payload: permanent rejections are never retried,
+/// so this cannot repeat for the same result.
+fn permanent_result_rejection_log_line(request_id: &str, error: &str, token: &str) -> String {
+    format!(
+        "webcodex-runner result permanently rejected request_id={} error={}; dropping this result and continuing to poll",
+        concise_log_error(request_id, token),
+        concise_log_error(error, token)
+    )
+}
+
+/// One bounded, redacted warning after all transient submission attempts have
+/// failed. It makes the possible result loss explicit without exposing raw
+/// response bodies, credentials, or multiline request errors.
+fn dropped_result_log_line(request_id: &str, attempts: usize, error: &str, token: &str) -> String {
+    format!(
+        "webcodex-runner result submission retries exhausted request_id={} attempts={} error={}; dropping this result and continuing to poll",
+        concise_log_error(request_id, token),
+        attempts,
+        concise_log_error(error, token)
+    )
+}
+
+/// Submit one result over the polling HTTP transport. Transient failures are
+/// retried in place with bounded backoff; permanent rejections release the
+/// payload after a single bounded log line; exhausted transient failures also
+/// release it with an explicit dropped outcome; only auth/protocol failures
+/// surface as errors that terminate the polling agent.
+fn submit_result_http(
+    h: &HttpSendConfig,
+    body: &ShellAgentResultRequest,
+) -> Result<ResultSubmission, SubmitResultError> {
+    let mut attempt = 0usize;
+    loop {
+        let error = match post_json_raw::<_, ShellAgentResultResponse>(
+            &h.client,
+            &h.server_url,
+            &h.token,
+            AGENT_RESULT_PATH,
+            body,
+        ) {
+            Ok(resp) if resp.success => return Ok(ResultSubmission::Accepted),
+            Ok(resp) => {
+                // A structured `success: false` answer is an explicit server
+                // decision about this payload; resending it cannot succeed.
+                let reason = resp
+                    .error
+                    .unwrap_or_else(|| "result submission failed without error".to_string());
+                eprintln!(
+                    "{}",
+                    permanent_result_rejection_log_line(&body.request_id, &reason, &h.token)
+                );
+                return Ok(ResultSubmission::RejectedPermanent);
+            }
+            Err(error) => error,
+        };
+        match result_http_error_disposition(&error.kind) {
+            ResultHttpErrorDisposition::RejectPermanent => {
+                eprintln!(
+                    "{}",
+                    permanent_result_rejection_log_line(
+                        &body.request_id,
+                        &error.to_string(),
+                        &h.token
+                    )
+                );
+                return Ok(ResultSubmission::RejectedPermanent);
+            }
+            ResultHttpErrorDisposition::FatalAuth => {
+                return Err(SubmitResultError::FatalAuth(error.to_string()));
+            }
+            ResultHttpErrorDisposition::FatalProtocol => {
+                return Err(SubmitResultError::FatalProtocol(error.to_string()));
+            }
+            ResultHttpErrorDisposition::RetryTransient => {
+                let Some(delay) = RESULT_SUBMIT_RETRY_BACKOFF.get(attempt).copied() else {
+                    eprintln!(
+                        "{}",
+                        dropped_result_log_line(
+                            &body.request_id,
+                            attempt + 1,
+                            &error.to_string(),
+                            &h.token
+                        )
+                    );
+                    return Ok(ResultSubmission::DroppedAfterRetryExhaustion);
+                };
+                attempt += 1;
+                if sleep_or_shutdown(delay, h.shutdown.as_ref()) {
+                    return Err(SubmitResultError::Shutdown(
+                        "result submission retry interrupted by process shutdown".to_string(),
+                    ));
+                }
+            }
+        }
+    }
 }
 
 impl AgentSink {
@@ -430,7 +636,7 @@ impl AgentSink {
         &self,
         request_id: String,
         result: CommandResult,
-    ) -> Result<bool, String> {
+    ) -> Result<ResultSubmission, SubmitResultError> {
         let body = ShellAgentResultRequest {
             client_id: self.client_id().to_string(),
             agent_instance_id: self.agent_instance_id().to_string(),
@@ -441,31 +647,18 @@ impl AgentSink {
             duration_ms: result.duration_ms,
             error: result.error,
         };
-        let submitted = match self {
-            AgentSink::Http(h) => {
-                let resp: ShellAgentResultResponse = post_json_raw(
-                    &h.client,
-                    &h.server_url,
-                    &h.token,
-                    "/api/shell/agent/result",
-                    &body,
-                )?;
-                if resp.success {
-                    Ok(true)
-                } else {
-                    Err(resp
-                        .error
-                        .unwrap_or_else(|| "result submission failed without error".to_string()))
-                }
-            }
+        match self {
+            AgentSink::Http(h) => submit_result_http(h, &body),
             AgentSink::WebSocket { tx, .. } | AgentSink::Quic { tx, .. } => {
                 let env = AgentEnvelope::Result { payload: body };
-                tx.blocking_send(env)
-                    .map_err(|_| "agent transport send failed".to_string())?;
-                Ok(true)
+                tx.blocking_send(env).map_err(|_| {
+                    SubmitResultError::TransportClosed(
+                        "agent transport result channel closed".to_string(),
+                    )
+                })?;
+                Ok(ResultSubmission::Accepted)
             }
-        };
-        submitted
+        }
     }
 
     pub(crate) fn submit_result_with_metadata(
@@ -474,9 +667,12 @@ impl AgentSink {
         result: CommandResult,
         config: &HotAgentConfig,
         runtime: &ReloadableAgentConfig,
-    ) -> Result<bool, String> {
+    ) -> Result<ResultSubmission, SubmitResultError> {
         let submitted = self.submit_result(request_id, result);
-        if submitted.is_ok() {
+        // Provider metadata is a best-effort follow-up on push transports, not
+        // proof that a rejected or dropped result was accepted. Send it only
+        // after the result reached the transport successfully.
+        if matches!(&submitted, Ok(ResultSubmission::Accepted)) {
             self.send_provider_metadata_best_effort(config.generation, runtime);
         }
         submitted
@@ -490,7 +686,8 @@ impl AgentSink {
     }
 
     /// Push an incremental/final job update. Mirrors the old `send_job_update`
-    /// free function.
+    /// free function. Job updates stay best-effort: callers ignore failures
+    /// and the terminal state is still resolved by the final result path.
     pub(crate) fn send_job_update(&self, body: &ShellAgentJobUpdateRequest) -> Result<(), String> {
         match self {
             AgentSink::Http(h) => {
@@ -500,7 +697,8 @@ impl AgentSink {
                     &h.token,
                     "/api/shell/agent/job_update",
                     body,
-                )?;
+                )
+                .map_err(|e| e.to_string())?;
                 if resp.success {
                     Ok(())
                 } else {
@@ -522,19 +720,20 @@ impl AgentSink {
 
 /// Send a JSON POST to the server and decode the response. Same wire behavior
 /// as `post_json` but takes the raw connection bits so it can be used from
-/// `AgentSink::Http` without an `AgentConfig`.
+/// `AgentSink::Http` without an `AgentConfig`. Preserves the structured
+/// `AgentHttpError` classification for callers that must act on it.
 fn post_json_raw<T, R>(
     client: &Client,
     server_url: &str,
     token: &str,
     path: &str,
     body: &T,
-) -> Result<R, String>
+) -> Result<R, AgentHttpError>
 where
     T: serde::Serialize + ?Sized,
     R: serde::de::DeserializeOwned,
 {
-    crate::post_json_with_auth(client, server_url, token, path, body).map_err(|e| e.to_string())
+    crate::post_json_with_auth(client, server_url, token, path, body)
 }
 
 pub(crate) fn non_empty_token(token: &str) -> Option<String> {
@@ -798,6 +997,7 @@ fn run_polling_agent_with_shutdown(
             &mut project_cache,
             agent_instance_id,
             &runtime.lsp,
+            &shutdown,
         ) {
             Ok(ran_request) => {
                 if once {
@@ -825,6 +1025,11 @@ fn run_polling_agent_with_shutdown(
                 }
             }
             Err(e) => {
+                if e.is_shutdown() {
+                    runtime.config.begin_shutdown();
+                    finish_polling_shutdown(&jobs, cfg.poll_interval_ms);
+                    return Ok(());
+                }
                 let terminal = e.is_terminal();
                 let message = e.into_message();
                 if terminal || once {
@@ -1780,6 +1985,7 @@ mod tests {
     use std::net::{TcpListener as StdTcpListener, TcpStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
     use std::thread;
     use tokio::net::TcpListener;
     use tokio::sync::{mpsc, oneshot};
@@ -1999,6 +2205,667 @@ mod tests {
             run_polling_agent_with_shutdown(cfg, once, "inst-poll-test", shutdown, &runtime);
         server.join().unwrap();
         (result, poll_count.load(Ordering::SeqCst))
+    }
+
+    /// Scripted step for the sequential fake agent HTTP server. Each step
+    /// asserts the endpoint the runner is expected to call next, which is
+    /// what distinguishes "kept polling" from "re-registered or resubmitted".
+    enum ScriptStep {
+        Register,
+        PollDeliver(&'static str),
+        PollEmpty,
+        Result {
+            status: &'static str,
+            body: &'static str,
+        },
+    }
+
+    struct ScriptedServer {
+        server_url: String,
+        requests: Arc<Mutex<Vec<(String, String)>>>,
+        handle: thread::JoinHandle<()>,
+    }
+
+    fn sync_file_request(request_id: &str) -> ShellAgentShellRequest {
+        ShellAgentShellRequest {
+            request_id: request_id.to_string(),
+            client_id: "oe".to_string(),
+            kind: "file_read".to_string(),
+            job_id: None,
+            cwd: None,
+            path: None,
+            content: None,
+            max_bytes: None,
+            old_text: None,
+            pattern: None,
+            expected_sha256: None,
+            expected_prefix: None,
+            start_line: None,
+            end_line: None,
+            line: None,
+            create_dirs: false,
+            command: String::new(),
+            stdin: None,
+            timeout_secs: 5,
+            requested_by: "tester".to_string(),
+            created_at: 0,
+            validation: None,
+            lsp: None,
+            sandbox: None,
+        }
+    }
+
+    fn accept_with_deadline(listener: &StdTcpListener, deadline: Duration) -> TcpStream {
+        let start = Instant::now();
+        listener.set_nonblocking(true).unwrap();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    listener.set_nonblocking(false).unwrap();
+                    return stream;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        start.elapsed() < deadline,
+                        "scripted server timed out waiting for the next agent request"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("scripted server accept failed: {e}"),
+            }
+        }
+    }
+
+    fn start_scripted_agent_server(steps: Vec<ScriptStep>) -> ScriptedServer {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let handle = thread::spawn(move || {
+            for step in steps {
+                let mut stream = accept_with_deadline(&listener, Duration::from_secs(8));
+                let request = read_http_request(&mut stream);
+                let path = request_path(&request).to_string();
+                let body = request
+                    .find("\r\n\r\n")
+                    .map(|index| request[index + 4..].to_string())
+                    .unwrap_or_default();
+                recorded.lock().unwrap().push((path.clone(), body));
+                match step {
+                    ScriptStep::Register => {
+                        assert_eq!(path, "/api/shell/agent/register");
+                        write_http_response(
+                            &mut stream,
+                            "200 OK",
+                            "application/json",
+                            r#"{"success":true,"client":null,"error":null}"#,
+                        );
+                    }
+                    ScriptStep::PollDeliver(request_id) => {
+                        assert_eq!(path, "/api/shell/agent/poll", "expected poll, got {path}");
+                        let request_json =
+                            serde_json::to_string(&sync_file_request(request_id)).unwrap();
+                        let body = format!(
+                            r#"{{"success":true,"request":{},"error":null}}"#,
+                            request_json
+                        );
+                        write_http_response(&mut stream, "200 OK", "application/json", &body);
+                    }
+                    ScriptStep::PollEmpty => {
+                        assert_eq!(path, "/api/shell/agent/poll", "expected poll, got {path}");
+                        write_http_response(
+                            &mut stream,
+                            "200 OK",
+                            "application/json",
+                            r#"{"success":true,"request":null,"error":null}"#,
+                        );
+                    }
+                    ScriptStep::Result { status, body } => {
+                        assert_eq!(
+                            path, "/api/shell/agent/result",
+                            "expected result submission, got {path}"
+                        );
+                        write_http_response(&mut stream, status, "application/json", body);
+                    }
+                }
+            }
+            // The listener drops here; the runner's next poll fails with the
+            // terminal server-unavailable classification and stops the test.
+        });
+        ScriptedServer {
+            server_url: format!("http://{}", addr),
+            requests,
+            handle,
+        }
+    }
+
+    fn run_polling_agent_against_scripted_server(server_url: String) -> Result<(), String> {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let runner_shutdown = Arc::clone(&shutdown);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let tmp = tempfile::tempdir().unwrap();
+            let cfg = polling_agent_config(server_url, tmp.path().join("projects.d"));
+            let runtime = test_runtime(&cfg);
+            let result = run_polling_agent_with_shutdown(
+                cfg,
+                false,
+                "inst-script",
+                runner_shutdown,
+                &runtime,
+            );
+            let _ = result_tx.send(result);
+        });
+        match result_rx.recv_timeout(Duration::from_secs(12)) {
+            Ok(result) => result,
+            Err(error) => {
+                shutdown.store(true, Ordering::SeqCst);
+                panic!("scripted polling runner exceeded hard timeout: {error}");
+            }
+        }
+    }
+
+    fn recorded_result_bodies(requests: &Mutex<Vec<(String, String)>>) -> Vec<String> {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path == "/api/shell/agent/result")
+            .map(|(_, body)| body.clone())
+            .collect()
+    }
+
+    #[test]
+    fn polling_result_permanent_400_is_dropped_once_and_polling_continues() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Register,
+            ScriptStep::PollDeliver("req-expired"),
+            ScriptStep::Result {
+                status: "400 Bad Request",
+                body: r#"{"success":false,"error":"unknown or expired shell request: req-expired"}"#,
+            },
+            // The old path treated this as general retryable recovery, adding
+            // a sleep and re-register before the next poll. The next call must
+            // now be a poll, with neither recovery churn nor resubmission.
+            ScriptStep::PollDeliver("req-next"),
+            ScriptStep::Result {
+                status: "200 OK",
+                body: r#"{"success":true}"#,
+            },
+            ScriptStep::PollEmpty,
+        ]);
+        let error = run_polling_agent_against_scripted_server(server.server_url.clone())
+            .expect_err("runner stops when the scripted server goes away");
+        server.handle.join().unwrap();
+
+        let result_bodies = recorded_result_bodies(&server.requests);
+        assert_eq!(
+            result_bodies.len(),
+            2,
+            "the permanently rejected request result must be submitted once"
+        );
+        assert!(
+            result_bodies[0].contains("req-expired"),
+            "{result_bodies:?}"
+        );
+        assert!(result_bodies[1].contains("req-next"), "{result_bodies:?}");
+        let paths: Vec<String> = server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+                "/api/shell/agent/result",
+                "/api/shell/agent/poll",
+                "/api/shell/agent/result",
+                "/api/shell/agent/poll",
+            ],
+        );
+        assert!(
+            error.contains("server unavailable while polling /api/shell/agent/poll"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn polling_result_transient_500_retries_same_payload_then_succeeds() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Register,
+            ScriptStep::PollDeliver("req-transient"),
+            ScriptStep::Result {
+                status: "500 Internal Server Error",
+                body: r#"{"success":false,"error":"temporary backend failure"}"#,
+            },
+            ScriptStep::Result {
+                status: "200 OK",
+                body: r#"{"success":true}"#,
+            },
+            ScriptStep::PollEmpty,
+        ]);
+        let error = run_polling_agent_against_scripted_server(server.server_url.clone())
+            .expect_err("runner stops when the scripted server goes away");
+        server.handle.join().unwrap();
+
+        let result_bodies = recorded_result_bodies(&server.requests);
+        assert_eq!(
+            result_bodies.len(),
+            2,
+            "a transient failure must retry the same result payload"
+        );
+        assert!(
+            result_bodies[0].contains("req-transient"),
+            "{result_bodies:?}"
+        );
+        assert!(
+            result_bodies[1].contains("req-transient"),
+            "{result_bodies:?}"
+        );
+        assert!(
+            error.contains("server unavailable while polling /api/shell/agent/poll"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn polling_result_503_retries_same_payload_then_continues() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Register,
+            ScriptStep::PollDeliver("req-503"),
+            ScriptStep::Result {
+                status: "503 Service Unavailable",
+                body: r#"{"success":false,"error":"temporary gateway failure"}"#,
+            },
+            ScriptStep::Result {
+                status: "200 OK",
+                body: r#"{"success":true}"#,
+            },
+            ScriptStep::PollEmpty,
+        ]);
+        let error = run_polling_agent_against_scripted_server(server.server_url.clone())
+            .expect_err("runner stops only after the completed script drops the poll listener");
+        server.handle.join().unwrap();
+
+        let result_bodies = recorded_result_bodies(&server.requests);
+        assert_eq!(result_bodies.len(), 2);
+        assert_eq!(
+            result_bodies[0], result_bodies[1],
+            "503 must retry the exact result body"
+        );
+        assert!(result_bodies[0].contains("req-503"), "{result_bodies:?}");
+        let paths: Vec<String> = server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+                "/api/shell/agent/result",
+                "/api/shell/agent/result",
+                "/api/shell/agent/poll",
+            ],
+            "503 recovery must neither re-register nor stop polling"
+        );
+        assert!(
+            error.contains("server unavailable while polling /api/shell/agent/poll"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn polling_result_server_unavailable_retry_exhaustion_drops_then_continues() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Register,
+            ScriptStep::PollDeliver("req-exhausted"),
+            ScriptStep::Result {
+                status: "503 Service Unavailable",
+                body: r#"{"success":false,"error":"temporary gateway failure"}"#,
+            },
+            ScriptStep::Result {
+                status: "503 Service Unavailable",
+                body: r#"{"success":false,"error":"temporary gateway failure"}"#,
+            },
+            ScriptStep::Result {
+                status: "503 Service Unavailable",
+                body: r#"{"success":false,"error":"temporary gateway failure"}"#,
+            },
+            ScriptStep::Result {
+                status: "503 Service Unavailable",
+                body: r#"{"success":false,"error":"temporary gateway failure"}"#,
+            },
+            ScriptStep::PollEmpty,
+        ]);
+        let error = run_polling_agent_against_scripted_server(server.server_url.clone())
+            .expect_err("runner stops only after the completed script drops the poll listener");
+        server.handle.join().unwrap();
+
+        let result_bodies = recorded_result_bodies(&server.requests);
+        assert_eq!(
+            result_bodies.len(),
+            RESULT_SUBMIT_RETRY_BACKOFF.len() + 1,
+            "retry exhaustion must stop after the fixed total attempt count"
+        );
+        assert!(
+            result_bodies.iter().all(|body| body == &result_bodies[0]),
+            "every bounded retry must use the exact original payload"
+        );
+        let paths: Vec<String> = server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+                "/api/shell/agent/result",
+                "/api/shell/agent/result",
+                "/api/shell/agent/result",
+                "/api/shell/agent/result",
+                "/api/shell/agent/poll",
+            ],
+            "exhaustion must release the result and poll without re-registering"
+        );
+        assert!(
+            error.contains("server unavailable while polling /api/shell/agent/poll"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn submit_result_503_retry_exhaustion_returns_dropped_outcome() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Result {
+                status: "503 Service Unavailable",
+                body: r#"{"success":false,"error":"temporary gateway failure"}"#,
+            },
+            ScriptStep::Result {
+                status: "503 Service Unavailable",
+                body: r#"{"success":false,"error":"temporary gateway failure"}"#,
+            },
+            ScriptStep::Result {
+                status: "503 Service Unavailable",
+                body: r#"{"success":false,"error":"temporary gateway failure"}"#,
+            },
+            ScriptStep::Result {
+                status: "503 Service Unavailable",
+                body: r#"{"success":false,"error":"temporary gateway failure"}"#,
+            },
+        ]);
+        let sink = AgentSink::Http(HttpSendConfig {
+            client: Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap(),
+            server_url: server.server_url.clone(),
+            token: "test-token".to_string(),
+            client_id: "oe".to_string(),
+            agent_instance_id: "inst-exhausted".to_string(),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        });
+        let outcome = sink
+            .submit_result(
+                "req-exhausted-outcome".to_string(),
+                CommandResult {
+                    exit_code: Some(0),
+                    stdout: Some("done".to_string()),
+                    stderr: None,
+                    duration_ms: Some(1),
+                    error: None,
+                },
+            )
+            .unwrap();
+        server.handle.join().unwrap();
+
+        assert_eq!(outcome, ResultSubmission::DroppedAfterRetryExhaustion);
+        assert_eq!(
+            recorded_result_bodies(&server.requests).len(),
+            RESULT_SUBMIT_RETRY_BACKOFF.len() + 1
+        );
+    }
+
+    #[test]
+    fn submit_result_retry_backoff_is_shutdown_aware() {
+        let server = start_scripted_agent_server(vec![ScriptStep::Result {
+            status: "503 Service Unavailable",
+            body: r#"{"success":false,"error":"temporary gateway failure"}"#,
+        }]);
+        let sink = AgentSink::Http(HttpSendConfig {
+            client: Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap(),
+            server_url: server.server_url.clone(),
+            token: "test-token".to_string(),
+            client_id: "oe".to_string(),
+            agent_instance_id: "inst-shutdown".to_string(),
+            shutdown: Arc::new(AtomicBool::new(true)),
+        });
+        let started = Instant::now();
+        let error = sink
+            .submit_result(
+                "req-shutdown".to_string(),
+                CommandResult {
+                    exit_code: Some(0),
+                    stdout: Some("done".to_string()),
+                    stderr: None,
+                    duration_ms: Some(1),
+                    error: None,
+                },
+            )
+            .expect_err("shutdown must interrupt the retry backoff");
+        server.handle.join().unwrap();
+
+        assert!(matches!(error, SubmitResultError::Shutdown(_)), "{error:?}");
+        assert_eq!(recorded_result_bodies(&server.requests).len(), 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "shutdown-aware result backoff did not return promptly"
+        );
+    }
+
+    #[test]
+    fn result_submission_gateway_and_connection_classes_are_transient() {
+        for status in [
+            reqwest::StatusCode::BAD_GATEWAY,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            reqwest::StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            let error = AgentHttpError::status(AGENT_RESULT_PATH, status, "{}");
+            assert_eq!(error.kind, AgentHttpErrorKind::ServerUnavailable);
+            assert_eq!(
+                result_http_error_disposition(&error.kind),
+                ResultHttpErrorDisposition::RetryTransient,
+                "status {status} must enter bounded result retry"
+            );
+        }
+        assert_eq!(
+            result_http_error_disposition(&AgentHttpErrorKind::ServerUnavailable),
+            ResultHttpErrorDisposition::RetryTransient,
+            "connection-refused/reset/closed classification must enter bounded retry"
+        );
+        for kind in [
+            AgentHttpErrorKind::Status,
+            AgentHttpErrorKind::RequestTimeout,
+            AgentHttpErrorKind::Request,
+            AgentHttpErrorKind::Decode,
+        ] {
+            assert_eq!(
+                result_http_error_disposition(&kind),
+                ResultHttpErrorDisposition::RetryTransient,
+                "{kind:?} must enter bounded result retry"
+            );
+        }
+        assert_eq!(
+            result_http_error_disposition(&AgentHttpErrorKind::ClientRejected),
+            ResultHttpErrorDisposition::RejectPermanent
+        );
+        assert_eq!(
+            result_http_error_disposition(&AgentHttpErrorKind::Auth),
+            ResultHttpErrorDisposition::FatalAuth
+        );
+        assert_eq!(
+            result_http_error_disposition(&AgentHttpErrorKind::NotFound),
+            ResultHttpErrorDisposition::FatalProtocol
+        );
+    }
+
+    #[test]
+    fn polling_result_401_and_403_are_terminal_auth_errors_without_credentials() {
+        for status in ["401 Unauthorized", "403 Forbidden"] {
+            let server = start_scripted_agent_server(vec![
+                ScriptStep::Register,
+                ScriptStep::PollDeliver("req-auth"),
+                ScriptStep::Result {
+                    status,
+                    body: r#"{"success":false,"error":"unauthorized token=SECRET-BODY-TOKEN"}"#,
+                },
+            ]);
+            let error = run_polling_agent_against_scripted_server(server.server_url.clone())
+                .expect_err("auth rejection on result submission must stop the agent");
+            server.handle.join().unwrap();
+
+            assert_eq!(
+                recorded_result_bodies(&server.requests).len(),
+                1,
+                "an auth failure must not retry the result"
+            );
+            assert!(
+                error.contains("authentication failed for /api/shell/agent/result"),
+                "{error}"
+            );
+            assert!(error.contains("check agent token/config"), "{error}");
+            assert!(!error.contains("test-token"), "{error}");
+            assert!(!error.contains("SECRET-BODY-TOKEN"), "{error}");
+        }
+    }
+
+    #[test]
+    fn polling_result_404_is_terminal_protocol_error_without_retry() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Register,
+            ScriptStep::PollDeliver("req-missing-endpoint"),
+            ScriptStep::Result {
+                status: "404 Not Found",
+                body: r#"{"success":false,"error":"token=SECRET-BODY-TOKEN"}"#,
+            },
+        ]);
+        let error = run_polling_agent_against_scripted_server(server.server_url.clone())
+            .expect_err("missing result endpoint must stop the polling agent");
+        server.handle.join().unwrap();
+
+        assert_eq!(
+            recorded_result_bodies(&server.requests).len(),
+            1,
+            "404 must not retry the result"
+        );
+        assert!(
+            error.contains("endpoint missing or incompatible server for /api/shell/agent/result"),
+            "{error}"
+        );
+        assert!(!error.contains("test-token"), "{error}");
+        assert!(!error.contains("SECRET-BODY-TOKEN"), "{error}");
+    }
+
+    #[test]
+    fn polling_result_success_submits_once_and_continues() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Register,
+            ScriptStep::PollDeliver("req-success"),
+            ScriptStep::Result {
+                status: "200 OK",
+                body: r#"{"success":true}"#,
+            },
+            ScriptStep::PollEmpty,
+        ]);
+        let error = run_polling_agent_against_scripted_server(server.server_url.clone())
+            .expect_err("runner stops only after the completed script drops the poll listener");
+        server.handle.join().unwrap();
+
+        let result_bodies = recorded_result_bodies(&server.requests);
+        assert_eq!(result_bodies.len(), 1);
+        assert!(
+            result_bodies[0].contains("req-success"),
+            "{result_bodies:?}"
+        );
+        let paths: Vec<String> = server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+                "/api/shell/agent/result",
+                "/api/shell/agent/poll",
+            ]
+        );
+        assert!(
+            error.contains("server unavailable while polling /api/shell/agent/poll"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn permanent_rejection_log_line_is_bounded_and_redacted() {
+        let token = "DO_NOT_LEAK_THIS_TOKEN";
+        let noisy_error = format!(
+            "server rejected /api/shell/agent/result request: HTTP 400 Bad Request: token={} url=https://host/path?token={}\n{}",
+            token,
+            token,
+            "<html><body>huge proxy page</body></html>".repeat(200)
+        );
+        let line = permanent_result_rejection_log_line("req-noisy", &noisy_error, token);
+        assert!(line.contains("request_id=req-noisy"), "{line}");
+        assert!(!line.contains(token), "{line}");
+        assert!(!line.contains("?token="), "{line}");
+        assert!(!line.contains('\n'), "{line}");
+        assert!(
+            line.chars().count() < 320,
+            "log line not bounded: {} chars",
+            line.chars().count()
+        );
+    }
+
+    #[test]
+    fn dropped_result_log_line_is_bounded_and_redacted() {
+        let token = "DO_NOT_LEAK_THIS_TOKEN";
+        let line = dropped_result_log_line(
+            &format!("req-\n{}{}", token, "x".repeat(500)),
+            RESULT_SUBMIT_RETRY_BACKOFF.len() + 1,
+            &format!(
+                "server unavailable token={} {}",
+                token,
+                "<html>proxy response</html>".repeat(200)
+            ),
+            token,
+        );
+        assert!(line.contains("attempts=4"), "{line}");
+        assert!(!line.contains(token), "{line}");
+        assert!(!line.contains('\n'), "{line}");
+        assert!(
+            line.chars().count() < 520,
+            "log line not bounded: {} chars",
+            line.chars().count()
+        );
     }
 
     async fn read_register(

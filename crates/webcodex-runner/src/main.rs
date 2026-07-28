@@ -67,7 +67,7 @@ use webcodex_runner::{
     resolve_requested_path, run_agent, validate_client_profile, validate_line_edit_agent_path,
     AgentConfig, AgentPolicy, AgentProjectCache, AgentSink, CommandResult, HotAgentConfig,
     HttpSendConfig, PreparedShellProfile, PreparedShellProfileCache, ReloadableAgentConfig,
-    ShellConfig,
+    ShellConfig, SubmitResultError,
 };
 
 const JOB_UPDATE_INTERVAL_MS: u64 = 250;
@@ -249,6 +249,10 @@ enum AgentHttpErrorKind {
     ServerUnavailable,
     Auth,
     NotFound,
+    /// 4xx (other than auth/endpoint kinds): the server understood the
+    /// exchange and rejected this exact request. Resending the identical
+    /// payload cannot succeed.
+    ClientRejected,
     Status,
     RequestTimeout,
     Request,
@@ -267,14 +271,23 @@ impl AgentHttpError {
         let kind = match status.as_u16() {
             401 | 403 => AgentHttpErrorKind::Auth,
             404 => AgentHttpErrorKind::NotFound,
+            // Explicitly retryable request-level statuses.
+            408 | 429 => AgentHttpErrorKind::Status,
             502 | 503 | 504 => AgentHttpErrorKind::ServerUnavailable,
+            code if (400..500).contains(&code) => AgentHttpErrorKind::ClientRejected,
             _ if looks_like_proxy_html_error(body) => AgentHttpErrorKind::ServerUnavailable,
             _ => AgentHttpErrorKind::Status,
         };
+        let mut summary = http_status_summary(status);
+        if kind == AgentHttpErrorKind::ClientRejected {
+            if let Some(detail) = structured_body_error(body) {
+                summary = format!("{}: {}", summary, detail);
+            }
+        }
         Self {
             kind,
             path: path.to_string(),
-            summary: http_status_summary(status),
+            summary,
         }
     }
 
@@ -322,6 +335,9 @@ impl std::fmt::Display for AgentHttpError {
                 "endpoint missing or incompatible server for {}: {}",
                 self.path, self.summary
             ),
+            AgentHttpErrorKind::ClientRejected => {
+                write!(f, "server rejected {} request: {}", self.path, self.summary)
+            }
             AgentHttpErrorKind::Status
             | AgentHttpErrorKind::RequestTimeout
             | AgentHttpErrorKind::Request
@@ -338,6 +354,7 @@ enum PollErrorKind {
     Auth,
     EndpointMissing,
     Retryable,
+    Shutdown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -391,12 +408,32 @@ impl PollError {
                 "poll request timed out while polling {}: {}",
                 error.path, error.summary
             )),
-            AgentHttpErrorKind::Status
+            AgentHttpErrorKind::ClientRejected
+            | AgentHttpErrorKind::Status
             | AgentHttpErrorKind::Request
             | AgentHttpErrorKind::Decode => Self::retryable(format!(
                 "poll request failed while polling {}: {}",
                 error.path, error.summary
             )),
+        }
+    }
+
+    /// Classify a fatal result submission failure surfaced by
+    /// `dispatch_request`. Permanent rejection and exhausted transient retries
+    /// are resolved as payload-lifecycle outcomes inside the HTTP sink, so
+    /// neither can trigger polling sleep/re-registration recovery here.
+    fn from_submit(error: SubmitResultError) -> Self {
+        match error {
+            SubmitResultError::FatalAuth(message) => Self::terminal(PollErrorKind::Auth, message),
+            SubmitResultError::FatalProtocol(message) => {
+                Self::terminal(PollErrorKind::EndpointMissing, message)
+            }
+            SubmitResultError::TransportClosed(message) => {
+                Self::terminal(PollErrorKind::ServerUnavailable, message)
+            }
+            SubmitResultError::Shutdown(message) => {
+                Self::terminal(PollErrorKind::Shutdown, message)
+            }
         }
     }
 
@@ -418,6 +455,10 @@ impl PollError {
 
     fn is_terminal(&self) -> bool {
         self.terminal
+    }
+
+    fn is_shutdown(&self) -> bool {
+        self.kind == PollErrorKind::Shutdown
     }
 
     fn into_message(self) -> String {
@@ -556,6 +597,24 @@ fn bounded_single_line(text: &str) -> String {
         }
     }
     out.trim().to_string()
+}
+
+/// Extract the structured `error` field from a JSON error response body, if
+/// present. Non-JSON bodies (proxy HTML, truncated payloads) yield `None` so
+/// raw response bytes never leak into diagnostics.
+fn structured_body_error(body: &str) -> Option<String> {
+    const MAX_PARSE_BYTES: usize = 64 * 1024;
+    if body.len() > MAX_PARSE_BYTES {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error")?.as_str()?;
+    let error = bounded_single_line(error);
+    if error.is_empty() {
+        None
+    } else {
+        Some(error)
+    }
 }
 
 fn post_json<T, R>(
@@ -1753,6 +1812,7 @@ fn handle_one_poll(
     project_cache: &mut AgentProjectCache,
     agent_instance_id: &str,
     lsp: &webcodex_runner::LspSupervisor,
+    shutdown: &Arc<AtomicBool>,
 ) -> Result<bool, PollError> {
     let metadata_config = runtime.snapshot();
     let provider_update =
@@ -1805,6 +1865,7 @@ fn handle_one_poll(
         token: cfg.token.clone(),
         client_id: cfg.client_id.clone(),
         agent_instance_id: agent_instance_id.to_string(),
+        shutdown: Arc::clone(shutdown),
     });
     let hot = runtime.snapshot();
     let result = dispatch_request(
@@ -1819,7 +1880,7 @@ fn handle_one_poll(
     if project_op && result.is_ok() {
         project_cache.invalidate();
     }
-    result.map_err(PollError::retryable)
+    result.map_err(PollError::from_submit)
 }
 
 fn main() {
@@ -1914,6 +1975,116 @@ mod tests {
 
     fn runtime_config(cfg: &AgentConfig) -> Arc<ReloadableAgentConfig> {
         Arc::new(ReloadableAgentConfig::new(cfg.clone(), PathBuf::new()))
+    }
+
+    #[test]
+    fn result_400_is_classified_permanent_with_bounded_structured_reason() {
+        let error = AgentHttpError::status(
+            "/api/shell/agent/result",
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"success":false,"error":"unknown or expired shell request: req-1"}"#,
+        );
+        assert_eq!(error.kind, AgentHttpErrorKind::ClientRejected);
+        let message = error.to_string();
+        assert!(
+            message.contains("server rejected /api/shell/agent/result request"),
+            "{message}"
+        );
+        assert!(message.contains("HTTP 400 Bad Request"), "{message}");
+        assert!(
+            message.contains("unknown or expired shell request: req-1"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn result_4xx_html_bodies_stay_permanent_and_never_leak_markup() {
+        let bad_request = AgentHttpError::status(
+            "/api/shell/agent/result",
+            reqwest::StatusCode::BAD_REQUEST,
+            "<html>\n<body><h1>400 Bad Request</h1><center>nginx</center></body>\n</html>",
+        );
+        assert_eq!(bad_request.kind, AgentHttpErrorKind::ClientRejected);
+        assert!(!bad_request.to_string().contains("<html"), "{bad_request}");
+
+        let too_large = AgentHttpError::status(
+            "/api/shell/agent/result",
+            reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+            "<html><center>nginx</center><center>413 Request Entity Too Large</center></html>",
+        );
+        assert_eq!(too_large.kind, AgentHttpErrorKind::ClientRejected);
+        assert!(!too_large.to_string().contains("nginx"), "{too_large}");
+    }
+
+    #[test]
+    fn result_400_structured_reason_is_bounded_for_large_json_bodies() {
+        let huge = format!(r#"{{"success":false,"error":"{}"}}"#, "x".repeat(10_000));
+        let error = AgentHttpError::status(
+            "/api/shell/agent/result",
+            reqwest::StatusCode::BAD_REQUEST,
+            &huge,
+        );
+        assert_eq!(error.kind, AgentHttpErrorKind::ClientRejected);
+        let message = error.to_string();
+        assert!(
+            message.chars().count() < 300,
+            "unbounded message: {} chars",
+            message.chars().count()
+        );
+    }
+
+    #[test]
+    fn http_status_classification_keeps_retryable_auth_and_gateway_kinds() {
+        let cases = [
+            (reqwest::StatusCode::UNAUTHORIZED, AgentHttpErrorKind::Auth),
+            (reqwest::StatusCode::FORBIDDEN, AgentHttpErrorKind::Auth),
+            (reqwest::StatusCode::NOT_FOUND, AgentHttpErrorKind::NotFound),
+            (
+                reqwest::StatusCode::REQUEST_TIMEOUT,
+                AgentHttpErrorKind::Status,
+            ),
+            (
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                AgentHttpErrorKind::Status,
+            ),
+            (
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                AgentHttpErrorKind::Status,
+            ),
+            (
+                reqwest::StatusCode::BAD_GATEWAY,
+                AgentHttpErrorKind::ServerUnavailable,
+            ),
+            (
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                AgentHttpErrorKind::ServerUnavailable,
+            ),
+            (
+                reqwest::StatusCode::GATEWAY_TIMEOUT,
+                AgentHttpErrorKind::ServerUnavailable,
+            ),
+        ];
+        for (status, expected) in cases {
+            let error = AgentHttpError::status("/api/shell/agent/result", status, "{}");
+            assert_eq!(error.kind, expected, "status {status}");
+        }
+    }
+
+    #[test]
+    fn submit_fatal_error_classes_map_to_terminal_poll_contract() {
+        assert!(PollError::from_submit(SubmitResultError::FatalAuth("auth".into())).is_terminal());
+        assert!(
+            PollError::from_submit(SubmitResultError::FatalProtocol("missing".into()))
+                .is_terminal()
+        );
+        assert!(
+            PollError::from_submit(SubmitResultError::TransportClosed("closed".into()))
+                .is_terminal()
+        );
+        let shutdown =
+            PollError::from_submit(SubmitResultError::Shutdown("process shutdown".into()));
+        assert!(shutdown.is_terminal());
+        assert!(shutdown.is_shutdown());
     }
 
     fn reload_toml(
@@ -6775,8 +6946,9 @@ shell_profile = "../rust"
                 duration_ms: Some(3),
                 error: None,
             };
-            assert!(
+            assert_eq!(
                 sink.submit_result("req-9".to_string(), result).unwrap(),
+                webcodex_runner::ResultSubmission::Accepted,
                 "{label}"
             );
             let env = rx.try_recv().expect("envelope was sent");
@@ -7562,6 +7734,7 @@ shell_profile = "../rust"
             token: cfg.token.clone(),
             client_id: cfg.client_id.clone(),
             agent_instance_id: "inst-1".to_string(),
+            shutdown: Arc::new(AtomicBool::new(false)),
         });
         assert_eq!(sink.client_id(), "oe");
         assert_eq!(sink.agent_instance_id(), "inst-1");

@@ -3,7 +3,7 @@ use super::lsp::{handle_lsp_request, is_lsp_request_kind, LspSupervisor};
 use super::validation::{handle_validation_request, is_validation_request_kind};
 use super::{
     handle_project_op, run_shell_with_profiles_in_sandbox, AgentSink, HotAgentConfig,
-    ReloadableAgentConfig,
+    ReloadableAgentConfig, SubmitResultError,
 };
 use crate::shell_protocol::ShellAgentShellRequest;
 use crate::{handle_file_request, is_file_request_kind, JobManager};
@@ -21,7 +21,7 @@ pub(crate) fn dispatch_request(
     projects_dir: &Path,
     lsp: &LspSupervisor,
     request: ShellAgentShellRequest,
-) -> Result<bool, String> {
+) -> Result<bool, SubmitResultError> {
     let policy = &config.policy;
     let shell = &config.shell;
     let external_tools = &config.external_tools;
@@ -35,7 +35,9 @@ pub(crate) fn dispatch_request(
     };
     match external_route {
         ExternalRoute::Handled(result) => {
-            return sink.submit_result_with_metadata(request.request_id, result, config, runtime);
+            return sink
+                .submit_result_with_metadata(request.request_id, result, config, runtime)
+                .map(|_| true);
         }
         ExternalRoute::NativeFallback(fallback) => {
             let request_id = request.request_id.clone();
@@ -57,7 +59,9 @@ pub(crate) fn dispatch_request(
                 )
             };
             external_tools.complete_native_fallback(fallback, &result);
-            return sink.submit_result_with_metadata(request_id, result, config, runtime);
+            return sink
+                .submit_result_with_metadata(request_id, result, config, runtime)
+                .map(|_| true);
         }
         ExternalRoute::Native => {}
     }
@@ -85,23 +89,27 @@ pub(crate) fn dispatch_request(
             let request_id = request.request_id.clone();
             let result = handle_file_request(policy, &request);
             sink.submit_result_with_metadata(request_id, result, config, runtime)
+                .map(|_| true)
         }
         "register_project" | "create_project" => {
             let request_id = request.request_id.clone();
             let result = handle_project_op(policy, projects_dir, &request);
             sink.submit_result_with_metadata(request_id, result, config, runtime)
+                .map(|_| true)
         }
         kind if is_lsp_request_kind(kind) => {
             // Explicit LSP branch — must never fall through to shell execution.
             let request_id = request.request_id.clone();
             let result = handle_lsp_request(policy, projects_dir, lsp, &request);
             sink.submit_result_with_metadata(request_id, result, config, runtime)
+                .map(|_| true)
         }
         kind if is_validation_request_kind(kind) => {
             // Explicit validation bridge branch — never fall through to shell.
             let request_id = request.request_id.clone();
             let result = handle_validation_request(policy, projects_dir, &request);
             sink.submit_result_with_metadata(request_id, result, config, runtime)
+                .map(|_| true)
         }
         _ => {
             let request_id = request.request_id.clone();
@@ -119,6 +127,7 @@ pub(crate) fn dispatch_request(
                 request.sandbox.as_deref(),
             );
             sink.submit_result_with_metadata(request_id, result, config, runtime)
+                .map(|_| true)
         }
     }
 }
