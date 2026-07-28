@@ -239,6 +239,13 @@ impl ShellClientRegistry {
                 client_id
             ));
         }
+        if metadata
+            .project_id
+            .as_deref()
+            .is_some_and(|project| inner.unregistering_projects.contains(project))
+        {
+            return Err("project_unregister_in_progress".to_string());
+        }
         enqueue_pending_request_locked(
             &mut inner,
             &client_id,
@@ -337,6 +344,63 @@ impl ShellClientRegistry {
             .take(limit.unwrap_or(20).clamp(1, 100))
             .map(|job| job_view(&job))
             .collect()
+    }
+
+    /// Count active jobs for one exact runtime project without applying the
+    /// display-list pagination limit. Local-only jobs do not carry an agent
+    /// runtime project id and are intentionally excluded.
+    pub(crate) async fn count_active_jobs_for_project(
+        &self,
+        auth: Option<&crate::auth::AuthContext>,
+        runtime_project_id: &str,
+    ) -> usize {
+        let mut inner = self.inner.lock().await;
+        let job_ids = inner.jobs_by_id.keys().cloned().collect::<Vec<_>>();
+        for job_id in job_ids {
+            refresh_job_status_locked(&mut inner, &job_id);
+        }
+        inner
+            .jobs_by_id
+            .values()
+            .filter(|job| shell_job_visible_to_auth(auth, &inner, &job.client_id))
+            .filter(|job| job.project_id.as_deref() == Some(runtime_project_id))
+            .filter(|job| crate::tool_runtime::ACTIVE_JOB_STATUSES.contains(&job.status.as_str()))
+            .count()
+    }
+
+    /// Atomically fence new job starts and count all currently active jobs for
+    /// a runtime project. The fence remains until `end_project_unregister`.
+    pub(crate) async fn begin_project_unregister(
+        &self,
+        auth: Option<&crate::auth::AuthContext>,
+        runtime_project_id: &str,
+    ) -> Result<usize, String> {
+        let mut inner = self.inner.lock().await;
+        let job_ids = inner.jobs_by_id.keys().cloned().collect::<Vec<_>>();
+        for job_id in job_ids {
+            refresh_job_status_locked(&mut inner, &job_id);
+        }
+        let active = inner
+            .jobs_by_id
+            .values()
+            .filter(|job| shell_job_visible_to_auth(auth, &inner, &job.client_id))
+            .filter(|job| job.project_id.as_deref() == Some(runtime_project_id))
+            .filter(|job| crate::tool_runtime::ACTIVE_JOB_STATUSES.contains(&job.status.as_str()))
+            .count();
+        if active == 0 {
+            inner
+                .unregistering_projects
+                .insert(runtime_project_id.to_string());
+        }
+        Ok(active)
+    }
+
+    pub(crate) async fn end_project_unregister(&self, runtime_project_id: &str) {
+        self.inner
+            .lock()
+            .await
+            .unregistering_projects
+            .remove(runtime_project_id);
     }
 
     pub async fn list_jobs_for_client(

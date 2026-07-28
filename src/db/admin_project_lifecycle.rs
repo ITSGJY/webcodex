@@ -80,6 +80,22 @@ impl Database {
         }))
     }
 
+    pub(crate) fn delete_admin_project_idempotency(
+        &self,
+        subject: &str,
+        action: &str,
+        target: &str,
+        key_hash: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM admin_project_idempotency
+             WHERE subject = ?1 AND action = ?2 AND target = ?3 AND key_hash = ?4",
+            params![subject, action, target, key_hash],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn insert_admin_project_idempotency(
         &self,
         subject: &str,
@@ -187,5 +203,26 @@ mod tests {
             "admin_pat:key-id-1:unregister:active_jobs_conflict:sha256:digest"
         );
         assert!(!row.contains("Bearer "));
+    }
+    #[test]
+    fn transient_idempotency_rows_can_be_removed_for_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(&tmp.path().join("state.db")).unwrap();
+        db.insert_admin_project_idempotency(
+            "admin-1",
+            "disable",
+            "agent:oe:demo",
+            "sha256:key",
+            "sha256:request",
+            503,
+            "{\"error\":{\"code\":\"agent_unavailable\"}}",
+        )
+        .unwrap();
+        db.delete_admin_project_idempotency("admin-1", "disable", "agent:oe:demo", "sha256:key")
+            .unwrap();
+        assert!(db
+            .get_admin_project_idempotency("admin-1", "disable", "agent:oe:demo", "sha256:key")
+            .unwrap()
+            .is_none());
     }
 }

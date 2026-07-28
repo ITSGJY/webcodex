@@ -1,7 +1,8 @@
 use crate::auth::AuthContext;
 use crate::db::AdminProjectAudit;
+use crate::shell_client::ShellClientRegistry;
 use crate::shell_protocol::ShellAgentProjectSummary;
-use crate::tool_runtime::{ToolResult, ToolRuntime, ACTIVE_JOB_STATUSES};
+use crate::tool_runtime::{ToolResult, ToolRuntime};
 use crate::Database;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -71,6 +72,21 @@ fn default_true() -> bool {
 pub(crate) struct ServiceResponse {
     pub status: u16,
     pub body: Value,
+}
+
+struct ProjectUnregisterFence {
+    registry: Arc<ShellClientRegistry>,
+    project: String,
+}
+
+impl Drop for ProjectUnregisterFence {
+    fn drop(&mut self) {
+        let registry = self.registry.clone();
+        let project = self.project.clone();
+        tokio::spawn(async move {
+            registry.end_project_unregister(&project).await;
+        });
+    }
 }
 
 #[derive(Clone)]
@@ -195,14 +211,32 @@ impl AdminProjectLifecycleService {
             if action != "unregister" && project.is_none() {
                 return Err(api_error(404, "project_not_found"));
             }
-            let active_jobs = self.runtime.shell_clients.list_jobs_for_auth(Some(auth), Some(100)).await
-                .into_iter()
-                .filter(|job| job.project_id.as_deref() == Some(request.project.as_str())
-                    && ACTIVE_JOB_STATUSES.contains(&job.status.as_str()))
-                .count();
-            if action == "unregister" && active_jobs > 0 {
-                return Err(ServiceResponse { status: 409, body: json!({"error":{"code":"active_jobs_conflict"},"active_jobs":active_jobs}) });
-            }
+            let (active_jobs, _unregister_fence) = if action == "unregister" {
+                let active = self
+                    .runtime
+                    .shell_clients
+                    .begin_project_unregister(Some(auth), &request.project)
+                    .await
+                    .map_err(|_| api_error(500, "operation_failed"))?;
+                if active > 0 {
+                    return Err(ServiceResponse { status: 409, body: json!({"error":{"code":"active_jobs_conflict"},"active_jobs":active}) });
+                }
+                (
+                    active,
+                    Some(ProjectUnregisterFence {
+                        registry: self.runtime.shell_clients.clone(),
+                        project: request.project.clone(),
+                    }),
+                )
+            } else {
+                (
+                    self.runtime
+                        .shell_clients
+                        .count_active_jobs_for_project(Some(auth), &request.project)
+                        .await,
+                    None,
+                )
+            };
             let payload = serde_json::to_string(&json!({
                 "project_id": project_id,
                 "expected_revision": request.expected_revision,
@@ -213,9 +247,13 @@ impl AdminProjectLifecycleService {
             ).await.map_err(|_| api_error(503, "agent_unavailable"))?;
             let response = match tokio::time::timeout(Duration::from_secs(WAIT_SECS), receiver).await {
                 Ok(Ok(value)) => value,
-                _ => {
+                Ok(Err(_)) => {
                     self.runtime.shell_clients.cancel_request(&request_id).await;
-                    return Err(api_error(503, "agent_unavailable"));
+                    return Err(api_error(503, "operation_indeterminate"));
+                }
+                Err(_) => {
+                    self.runtime.shell_clients.cancel_request(&request_id).await;
+                    return Err(api_error(503, "operation_indeterminate"));
                 }
             };
             if let Some(error) = response.error.as_deref() {
@@ -223,6 +261,12 @@ impl AdminProjectLifecycleService {
             }
             let output: Value = serde_json::from_str(response.stdout.as_deref().unwrap_or(""))
                 .map_err(|_| api_error(502, "operation_failed"))?;
+            if let Some(code) = output.get("error_code").and_then(Value::as_str) {
+                return Err(map_agent_error(code));
+            }
+            if response.exit_code != Some(0) {
+                return Err(api_error(500, "operation_failed"));
+            }
             let outcome = output.get("outcome").and_then(Value::as_str).ok_or_else(|| api_error(502, "operation_failed"))?;
             let changed = output.get("changed").and_then(Value::as_bool).unwrap_or(false);
             let revision = output.get("revision").cloned().unwrap_or(Value::Null);
@@ -278,14 +322,26 @@ impl AdminProjectLifecycleService {
             .db
             .get_admin_project_idempotency(&subject, action, target, &key_hash)
         {
-            Ok(Some(stored)) if stored.request_hash == request_hash => {
-                return ServiceResponse {
+            Ok(Some(stored)) => {
+                let stored_response = ServiceResponse {
                     status: stored.http_status as u16,
                     body: serde_json::from_str(&stored.response_json)
                         .unwrap_or_else(|_| json!({"error":{"code":"operation_failed"}})),
+                };
+                if !is_persistable_terminal(&stored_response) {
+                    if self
+                        .db
+                        .delete_admin_project_idempotency(&subject, action, target, &key_hash)
+                        .is_err()
+                    {
+                        return api_error(500, "operation_failed");
+                    }
+                } else if stored.request_hash == request_hash {
+                    return stored_response;
+                } else {
+                    return api_error(409, "idempotency_conflict");
                 }
             }
-            Ok(Some(_)) => return api_error(409, "idempotency_conflict"),
             Err(_) => return api_error(500, "operation_failed"),
             Ok(None) => {}
         }
@@ -324,6 +380,9 @@ impl AdminProjectLifecycleService {
                 reason_code,
                 idempotency_digest: &key_hash,
             });
+        if !is_persistable_terminal(&response) {
+            return response;
+        }
         let response_json = serde_json::to_string(&response.body)
             .unwrap_or_else(|_| "{\"error\":{\"code\":\"operation_failed\"}}".to_string());
         match self.db.insert_admin_project_idempotency(
@@ -346,9 +405,28 @@ impl AdminProjectLifecycleService {
                 },
                 _ => api_error(409, "idempotency_conflict"),
             },
-            Err(_) => api_error(500, "operation_failed"),
+            Err(_) => api_error(503, "operation_indeterminate"),
         }
     }
+}
+
+fn is_persistable_terminal(response: &ServiceResponse) -> bool {
+    if !(200..300).contains(&response.status) {
+        return false;
+    }
+    matches!(
+        response.body.get("outcome").and_then(Value::as_str),
+        Some(
+            "registered"
+                | "created"
+                | "enabled"
+                | "disabled"
+                | "unregistered"
+                | "already_enabled"
+                | "already_disabled"
+                | "already_unregistered"
+        )
+    )
 }
 
 async fn require_online_client(
@@ -374,9 +452,13 @@ fn map_create_result(
     result: ToolResult,
 ) -> Result<ServiceResponse, ServiceResponse> {
     if !result.success {
-        return Err(map_agent_error(
-            result.error.as_deref().unwrap_or("operation_failed"),
-        ));
+        let code = result
+            .output
+            .get("error_code")
+            .and_then(Value::as_str)
+            .or(result.error.as_deref())
+            .unwrap_or("operation_failed");
+        return Err(map_agent_error(code));
     }
     Ok(ServiceResponse {
         status: 200,
@@ -508,30 +590,17 @@ fn api_error(status: u16, code: &str) -> ServiceResponse {
     }
 }
 fn map_agent_error(error: &str) -> ServiceResponse {
-    let lower = error.to_ascii_lowercase();
-    let (status, code) = if lower.contains("revision_conflict") {
-        (409, "revision_conflict")
-    } else if lower.contains("already exists") {
-        (409, "project_already_exists")
-    } else if lower.contains("outside allowed_roots")
-        || lower.contains("path_outside_allowed_roots")
-    {
-        (400, "path_outside_allowed_roots")
-    } else if lower.contains("not empty") {
-        (409, "path_not_empty")
-    } else if lower.contains("project_not_found") {
-        (404, "project_not_found")
-    } else if lower.contains("offline")
-        || lower.contains("unknown shell client")
-        || lower.contains("unknown client")
-        || lower.contains("not connected")
-        || lower.contains("unsupported")
-    {
-        (503, "agent_unavailable")
-    } else {
-        (500, "operation_failed")
-    };
-    api_error(status, code)
+    match error {
+        "revision_conflict" => api_error(409, "revision_conflict"),
+        "project_not_found" => api_error(404, "project_not_found"),
+        "path_outside_allowed_roots" => api_error(400, "path_outside_allowed_roots"),
+        "path_not_empty" => api_error(409, "path_not_empty"),
+        "project_already_exists" => api_error(409, "project_already_exists"),
+        "unsupported_runner_version" => api_error(409, "unsupported_runner_version"),
+        "agent_unavailable" => api_error(503, "agent_unavailable"),
+        "operation_indeterminate" => api_error(503, "operation_indeterminate"),
+        _ => api_error(500, "operation_failed"),
+    }
 }
 
 #[cfg(test)]
@@ -540,13 +609,32 @@ mod tests {
 
     #[test]
     fn project_lifecycle_error_mapping_is_stable_and_safe() {
-        assert_eq!(map_agent_error("unknown client_id: smoke").status, 503);
+        assert_eq!(map_agent_error("agent_unavailable").status, 503);
         assert_eq!(map_agent_error("revision_conflict").status, 409);
         assert_eq!(map_agent_error("secret internal backtrace").status, 500);
         assert_eq!(
             map_agent_error("secret internal backtrace").body["error"]["code"],
             "operation_failed"
         );
+    }
+
+    #[test]
+    fn transient_and_conflict_results_are_not_persisted() {
+        for code in [
+            "agent_unavailable",
+            "operation_indeterminate",
+            "active_jobs_conflict",
+        ] {
+            assert!(!is_persistable_terminal(&api_error(503, code)));
+        }
+        assert!(!is_persistable_terminal(&ServiceResponse {
+            status: 409,
+            body: json!({"error":{"code":"active_jobs_conflict"}}),
+        }));
+        assert!(is_persistable_terminal(&ServiceResponse {
+            status: 200,
+            body: json!({"outcome":"already_disabled"}),
+        }));
     }
 
     #[test]

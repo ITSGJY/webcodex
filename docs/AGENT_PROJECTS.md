@@ -109,3 +109,32 @@ Lifecycle state remains authoritative in the selected agent's `projects.d/*.toml
 Completed idempotent responses are stored in the existing server SQLite database with bounded retention using only request/key digests and safe response projections. Project revisions are stable SHA-256 values derived from persisted registry content; stale revisions return a conflict rather than overwriting another mutation. Offline agents are not queued for later replay. Runners that do not advertise the structured lifecycle capability receive an explicit version/capability error.
 
 The read-only admin dashboard projection includes lifecycle status, revision, active job count, and server-computed allowed actions. The corresponding `/admin` write UI is not implemented in this source version.
+
+### Lifecycle consistency and retry semantics
+
+Admin lifecycle idempotency records only deterministic terminal outcomes. Agent
+unavailability, active-job conflicts, transport enqueue failures, response
+timeouts, receiver loss, and other transient or indeterminate results are
+audited but are not stored as completed responses. A retry with the same key and
+payload may therefore execute again after the dependency recovers. A timeout or
+lost response is reported as `operation_indeterminate`; the Runner converges a
+retry against its authoritative registry state: enable/disable return the
+current already-achieved state even when the request carries the prior revision,
+unregister returns `already_unregistered` when the registry entry is absent, and
+register/create return the completed result only when the existing registry
+entry and requested project side effects match exactly. Mismatched existing
+projects fail closed.
+
+Active-job checks use the complete internal job registry for the exact runtime
+project id rather than the paginated job-list API. Unregister installs a
+short-lived project fence under the same registry lock used by job enqueue, so a
+new project job cannot start between the zero-active-jobs check and the Agent
+registry mutation. Disable continues to allow existing jobs and reports their
+exact count.
+
+All `projects.d` mutations write unique temporary files in the registry
+directory, sync file contents, atomically rename, and then sync the parent
+directory. Unregister uses a unique hidden tombstone, syncs the rename, removes
+the tombstone, and syncs the removal. Registry loading ignores these non-`.toml`
+tombstones; a later unregister retry safely removes a crash-left tombstone and
+never touches the source directory or Git metadata.

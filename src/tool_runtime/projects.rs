@@ -30,7 +30,6 @@ const PROJECT_OP_WAIT_SECS: u64 = 32;
 impl ToolRuntime {
     pub(crate) async fn list_projects(&self, auth: Option<&AuthContext>) -> ToolResult {
         let mut list: Vec<Value> = Vec::new();
-        let jobs = self.shell_clients.list_jobs_for_auth(auth, Some(100)).await;
         for client in self.shell_clients.list_clients_for_auth(auth).await {
             // Sanitized shell-profiles summary for this agent (carried inside
             // the registration policy). Used to resolve which profile a project
@@ -45,13 +44,10 @@ impl ToolRuntime {
                     resolve_project_shell_profile(project.shell_profile.as_deref(), shell_profiles);
                 let capabilities = smoke_project_capabilities(&client, project);
                 let runtime_id = agent_project_runtime_id(&client.client_id, &project.id);
-                let active_jobs = jobs
-                    .iter()
-                    .filter(|job| {
-                        job.project_id.as_deref() == Some(runtime_id.as_str())
-                            && super::ACTIVE_JOB_STATUSES.contains(&job.status.as_str())
-                    })
-                    .count();
+                let active_jobs = self
+                    .shell_clients
+                    .count_active_jobs_for_project(auth, &runtime_id)
+                    .await;
                 list.push(json!({
                     "id": runtime_id,
                     "agent_project_id": project.id,
@@ -256,21 +252,22 @@ impl ToolRuntime {
             .await
         {
             Ok(result) => result,
-            Err(e) => return ToolResult::err(e),
+            Err(_) => {
+                return ToolResult::err_with_output(
+                    "agent_unavailable",
+                    json!({"error_code":"agent_unavailable"}),
+                )
+            }
         };
         let response =
             match tokio::time::timeout(Duration::from_secs(PROJECT_OP_WAIT_SECS), rx).await {
                 Ok(Ok(response)) => response,
-                Ok(Err(_)) => {
+                Ok(Err(_)) | Err(_) => {
                     self.shell_clients.cancel_request(&request_id).await;
-                    return ToolResult::err("project op request waiter was dropped");
-                }
-                Err(_) => {
-                    self.shell_clients.cancel_request(&request_id).await;
-                    return ToolResult::err(format!(
-                        "timed out waiting {} seconds for agent project op result",
-                        PROJECT_OP_WAIT_SECS
-                    ));
+                    return ToolResult::err_with_output(
+                        "operation_indeterminate",
+                        json!({"error_code":"operation_indeterminate"}),
+                    );
                 }
             };
 
@@ -281,25 +278,27 @@ impl ToolRuntime {
             return ToolResult::err(err.clone());
         }
         let stdout = response.stdout.as_deref().unwrap_or("");
-        let result: Value = if stdout.is_empty() {
+        if stdout.is_empty() {
             return ToolResult::err("agent returned empty project op result");
-        } else if response.exit_code != Some(0) {
-            return ToolResult::err(format!(
-                "agent project op failed with exit_code {:?}: {}",
-                response.exit_code, stdout
-            ));
-        } else {
-            match serde_json::from_str::<Value>(stdout) {
-                Ok(v) => v,
-                Err(e) => {
-                    return ToolResult::err(format!(
-                        "failed to parse agent project op response: {} (stdout: {})",
-                        e,
-                        truncate_for_error(stdout)
-                    ))
-                }
+        }
+        let result: Value = match serde_json::from_str::<Value>(stdout) {
+            Ok(value) => value,
+            Err(error) => {
+                return ToolResult::err(format!(
+                    "failed to parse agent project op response: {} (stdout: {})",
+                    error,
+                    truncate_for_error(stdout)
+                ))
             }
         };
+        if response.exit_code != Some(0) {
+            let code = result
+                .get("error_code")
+                .and_then(Value::as_str)
+                .unwrap_or("operation_failed")
+                .to_string();
+            return ToolResult::err_with_output(code, result);
+        }
 
         // -- refresh server-side project cache --------------------------------
         // After a successful operation the agent reports the new/updated

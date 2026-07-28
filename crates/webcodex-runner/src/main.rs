@@ -8361,12 +8361,20 @@ shell_profile = "../rust"
     }
 
     fn project_err(result: CommandResult) -> String {
-        assert!(
-            result.exit_code.is_none(),
+        if let Some(error) = result.error {
+            return error;
+        }
+        assert_ne!(
+            result.exit_code,
+            Some(0),
             "unexpected success: {:?}",
             result
         );
-        result.error.expect("error")
+        serde_json::from_str::<serde_json::Value>(result.stdout.as_deref().expect("error json"))
+            .unwrap()["error_code"]
+            .as_str()
+            .expect("error_code")
+            .to_string()
     }
 
     #[test]
@@ -8397,6 +8405,62 @@ shell_profile = "../rust"
         assert_eq!(parsed.name.as_deref(), Some("Demo"));
         assert_eq!(parsed.path, project_dir.to_string_lossy());
         assert!(!parsed.allow_patch);
+    }
+
+    #[test]
+    fn register_and_create_retries_converge_without_duplicate_side_effects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects_dir = tmp.path().join("projects.d");
+        let register_dir = tmp.path().join("existing");
+        std::fs::create_dir(&register_dir).unwrap();
+        let policy = project_policy(tmp.path());
+        let register = project_request(
+            "register_project",
+            serde_json::json!({
+                "id":"registered", "name":"Registered",
+                "path":register_dir.to_string_lossy(), "allow_patch":true
+            }),
+        );
+        let first = project_ok(handle_project_op(&policy, &projects_dir, &register));
+        let retry = project_ok(handle_project_op(&policy, &projects_dir, &register));
+        assert_eq!(retry["recovered"], true);
+        assert_eq!(retry["changed"], false);
+        assert_eq!(retry["revision"], first["revision"]);
+
+        let create_dir = tmp.path().join("created");
+        let create = project_request(
+            "create_project",
+            serde_json::json!({
+                "id":"created", "name":"Created", "description":"Fixture",
+                "path":create_dir.to_string_lossy(), "allow_patch":true,
+                "template":"basic", "git_init":true,
+                "allow_existing_empty":false
+            }),
+        );
+        let created = project_ok(handle_project_op(&policy, &projects_dir, &create));
+        let readme_before = std::fs::read(create_dir.join("README.md")).unwrap();
+        let recovered = project_ok(handle_project_op(&policy, &projects_dir, &create));
+        assert_eq!(recovered["recovered"], true);
+        assert_eq!(recovered["changed"], false);
+        assert_eq!(recovered["revision"], created["revision"]);
+        assert_eq!(
+            std::fs::read(create_dir.join("README.md")).unwrap(),
+            readme_before
+        );
+        assert!(create_dir.join(".git").is_dir());
+
+        let mismatch = project_err(handle_project_op(
+            &policy,
+            &projects_dir,
+            &project_request(
+                "register_project",
+                serde_json::json!({
+                    "id":"registered", "name":"Different",
+                    "path":register_dir.to_string_lossy(), "allow_patch":true
+                }),
+            ),
+        ));
+        assert_eq!(mismatch, "project_already_exists");
     }
 
     #[test]
@@ -8431,6 +8495,15 @@ shell_profile = "../rust"
             ),
         ));
         assert_eq!(disabled["outcome"], "disabled");
+        let retry_disabled = project_ok(handle_project_lifecycle_op(
+            &policy,
+            &projects_dir,
+            &project_request(
+                "project_lifecycle_disable",
+                serde_json::json!({"project_id":"demo","expected_revision":registered["revision"]}),
+            ),
+        ));
+        assert_eq!(retry_disabled["outcome"], "already_disabled");
         let disabled_revision = disabled["revision"].as_str().unwrap().to_string();
         let summaries = load_agent_project_summaries_from_dir(&projects_dir);
         assert_eq!(summaries.len(), 1);
@@ -8455,6 +8528,15 @@ shell_profile = "../rust"
             ),
         ));
         assert_eq!(enabled["outcome"], "enabled");
+        let retry_enabled = project_ok(handle_project_lifecycle_op(
+            &policy,
+            &projects_dir,
+            &project_request(
+                "project_lifecycle_enable",
+                serde_json::json!({"project_id":"demo","expected_revision":disabled["revision"]}),
+            ),
+        ));
+        assert_eq!(retry_enabled["outcome"], "already_enabled");
 
         let unregistered = project_ok(handle_project_lifecycle_op(
             &policy,
@@ -8481,6 +8563,20 @@ shell_profile = "../rust"
             ),
         ));
         assert_eq!(repeated["outcome"], "already_unregistered");
+
+        let stale_tombstone = projects_dir.join(".demo.crash.toml.unregistering");
+        std::fs::write(&stale_tombstone, "stale").unwrap();
+        assert!(load_agent_project_summaries_from_dir(&projects_dir).is_empty());
+        let recovered = project_ok(handle_project_lifecycle_op(
+            &policy,
+            &projects_dir,
+            &project_request(
+                "project_lifecycle_unregister",
+                serde_json::json!({"project_id":"demo","expected_revision":enabled["revision"]}),
+            ),
+        ));
+        assert_eq!(recovered["outcome"], "already_unregistered");
+        assert!(!stale_tombstone.exists());
     }
 
     #[test]
@@ -8499,7 +8595,7 @@ shell_profile = "../rust"
         );
 
         let err = project_err(handle_project_op(&policy, &projects_dir, &req));
-        assert!(err.contains("outside allowed_roots"), "{err}");
+        assert_eq!(err, "path_outside_allowed_roots");
         assert!(!projects_dir.join("outside.toml").exists());
     }
 
@@ -8661,12 +8757,13 @@ shell_profile = "../rust"
         assert_eq!(first["created_config"], true);
         assert_eq!(first["overwritten"], false);
 
-        let err = project_err(handle_project_op(
+        let retry = project_ok(handle_project_op(
             &policy,
             &projects_dir,
             &project_request("register_project", payload(false)),
         ));
-        assert!(err.contains("already exists"), "{err}");
+        assert_eq!(retry["recovered"], true);
+        assert_eq!(retry["changed"], false);
 
         let overwritten = project_ok(handle_project_op(
             &policy,
@@ -8724,7 +8821,7 @@ shell_profile = "../rust"
         );
 
         let err = project_err(handle_project_op(&policy, &projects_dir, &req));
-        assert!(err.contains("not empty"), "{err}");
+        assert_eq!(err, "path_not_empty");
         assert_eq!(std::fs::read_to_string(keep).unwrap(), "keep");
     }
 
@@ -8745,7 +8842,7 @@ shell_profile = "../rust"
         );
 
         let err = project_err(handle_project_op(&policy, &projects_dir, &req));
-        assert!(err.contains("unknown template"), "{err}");
+        assert_eq!(err, "invalid_request");
         assert!(!project_dir.exists());
     }
 
@@ -8805,7 +8902,7 @@ shell_profile = "../rust"
         );
 
         let err = project_err(handle_project_op(&policy, &projects_dir_file, &req));
-        assert!(err.contains("projects_dir"), "{err}");
+        assert_eq!(err, "operation_failed");
         assert!(project_dir.exists());
         assert!(!project_dir.join("README.md").exists());
         assert!(!project_dir.join(".gitignore").exists());
@@ -8833,7 +8930,7 @@ shell_profile = "../rust"
         );
 
         let err = project_err(handle_project_op(&policy, &projects_dir_file, &req));
-        assert!(err.contains("not empty"), "{err}");
+        assert_eq!(err, "path_not_empty");
         assert_eq!(std::fs::read_to_string(pre_existing).unwrap(), "original");
     }
 
