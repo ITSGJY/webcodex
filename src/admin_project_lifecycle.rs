@@ -328,18 +328,24 @@ impl AdminProjectLifecycleService {
                     body: serde_json::from_str(&stored.response_json)
                         .unwrap_or_else(|_| json!({"error":{"code":"operation_failed"}})),
                 };
-                if !is_persistable_terminal(&stored_response) {
-                    if self
-                        .db
-                        .delete_admin_project_idempotency(&subject, action, target, &key_hash)
-                        .is_err()
-                    {
-                        return api_error(500, "operation_failed");
+                match stored_idempotency_action(
+                    &stored.request_hash,
+                    &request_hash,
+                    &stored_response,
+                ) {
+                    StoredIdempotencyAction::Conflict => {
+                        return api_error(409, "idempotency_conflict");
                     }
-                } else if stored.request_hash == request_hash {
-                    return stored_response;
-                } else {
-                    return api_error(409, "idempotency_conflict");
+                    StoredIdempotencyAction::DeleteAndRetry => {
+                        if self
+                            .db
+                            .delete_admin_project_idempotency(&subject, action, target, &key_hash)
+                            .is_err()
+                        {
+                            return api_error(500, "operation_failed");
+                        }
+                    }
+                    StoredIdempotencyAction::Replay => return stored_response,
                 }
             }
             Err(_) => return api_error(500, "operation_failed"),
@@ -410,6 +416,27 @@ impl AdminProjectLifecycleService {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum StoredIdempotencyAction {
+    Conflict,
+    DeleteAndRetry,
+    Replay,
+}
+
+fn stored_idempotency_action(
+    stored_hash: &str,
+    request_hash: &str,
+    response: &ServiceResponse,
+) -> StoredIdempotencyAction {
+    if stored_hash != request_hash {
+        StoredIdempotencyAction::Conflict
+    } else if is_persistable_terminal(response) {
+        StoredIdempotencyAction::Replay
+    } else {
+        StoredIdempotencyAction::DeleteAndRetry
+    }
+}
+
 fn is_persistable_terminal(response: &ServiceResponse) -> bool {
     if !(200..300).contains(&response.status) {
         return false;
@@ -460,12 +487,35 @@ fn map_create_result(
             .unwrap_or("operation_failed");
         return Err(map_agent_error(code));
     }
+    let actual_outcome = result
+        .output
+        .get("outcome")
+        .and_then(Value::as_str)
+        .ok_or_else(|| api_error(502, "operation_failed"))?;
+    if actual_outcome != outcome {
+        return Err(api_error(502, "operation_failed"));
+    }
+    let changed = result
+        .output
+        .get("changed")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| api_error(502, "operation_failed"))?;
+    let recovered = result
+        .output
+        .get("recovered")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let revision = result
+        .output
+        .get("revision")
+        .cloned()
+        .filter(|v| v.as_str().is_some())
+        .ok_or_else(|| api_error(502, "operation_failed"))?;
     Ok(ServiceResponse {
         status: 200,
         body: json!({
-            "operation": operation, "project": project, "outcome": outcome,
-            "changed": true, "revision": result.output.get("revision").cloned().unwrap_or(Value::Null),
-            "warnings": []
+            "operation": operation, "project": project, "outcome": actual_outcome,
+            "changed": changed, "recovered": recovered, "revision": revision, "warnings": []
         }),
     })
 }
@@ -637,6 +687,38 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn old_transient_with_different_payload_is_conflict_before_delete() {
+        let transient = api_error(503, "agent_unavailable");
+        assert_eq!(
+            stored_idempotency_action("sha256:old", "sha256:new", &transient),
+            StoredIdempotencyAction::Conflict
+        );
+        assert_eq!(
+            stored_idempotency_action("sha256:same", "sha256:same", &transient),
+            StoredIdempotencyAction::DeleteAndRetry
+        );
+    }
+
+    #[test]
+    fn create_result_preserves_recovery_metadata() {
+        let result = ToolResult::ok(json!({
+            "outcome":"created", "changed":false, "recovered":true,
+            "revision":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }));
+        let response = map_create_result("create", "created", "agent:oe:demo", result).unwrap();
+        assert_eq!(response.body["changed"], false);
+        assert_eq!(response.body["recovered"], true);
+        let invalid = ToolResult::ok(json!({
+            "outcome":"registered", "changed":true, "revision":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }));
+        assert_eq!(
+            map_create_result("create", "created", "agent:oe:demo", invalid)
+                .unwrap_err()
+                .status,
+            502
+        );
+    }
     #[test]
     fn project_lifecycle_idempotency_keys_are_bounded() {
         assert!(valid_idempotency_key("req-1:retry_2"));

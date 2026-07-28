@@ -3,7 +3,7 @@ use crate::shell_protocol::{
     AgentBuildInfo, AgentPolicySummary, ShellAgentProjectSummary, ShellAgentShellRequest,
     ShellClientCapabilities, ShellJobCodexMetadata, ShellJobValidationProgress, ShellRunResponse,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{oneshot, Notify};
 
@@ -91,7 +91,7 @@ pub(super) struct ShellClientRegistryInner {
     /// Runtime project ids temporarily fenced while unregister validates and
     /// removes the Agent registry entry. Job enqueue checks this set while
     /// holding the same registry mutex, closing the check/start TOCTOU window.
-    pub(super) unregistering_projects: HashSet<String>,
+    pub(super) unregistering_projects: HashMap<String, usize>,
     /// Optional push notifiers for agents connected over a long-lived
     /// transport (WebSocket). When a request is enqueued for a client that
     /// has a registered notifier, the server pumps the request immediately

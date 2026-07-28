@@ -712,6 +712,30 @@ struct ProjectTomlWriteResult {
     overwritten: bool,
 }
 
+#[derive(Debug)]
+enum ProjectTomlWriteError {
+    BeforeRename,
+    AfterRename,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_PARENT_SYNC_AFTER_PROJECT_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_project_parent_sync_after_rename() {
+    FAIL_PARENT_SYNC_AFTER_PROJECT_RENAME.set(true);
+}
+
+fn sync_project_parent_after_rename(path: &Path) -> Result<(), String> {
+    #[cfg(test)]
+    if FAIL_PARENT_SYNC_AFTER_PROJECT_RENAME.replace(false) {
+        return Err("injected parent directory sync failure".to_string());
+    }
+    sync_parent_dir(path)
+}
+
 /// Write a project TOML file atomically into `projects_dir`. Creates
 /// `projects_dir` if missing. Returns write metadata on success.
 /// The temp file is written and fsynced, then renamed to `<id>.toml`.
@@ -733,50 +757,33 @@ fn write_project_toml_atomic(
     id: &str,
     toml_content: &str,
     overwrite: bool,
-) -> Result<ProjectTomlWriteResult, String> {
-    // Ensure projects_dir exists.
-    std::fs::create_dir_all(projects_dir).map_err(|e| {
-        format!(
-            "failed to create projects_dir {}: {}",
-            projects_dir.display(),
-            e
-        )
-    })?;
-    let canonical_dir = canonicalize_existing(projects_dir)?;
-    let config_path = canonical_dir.join(format!("{}.toml", id));
-    // Guard against path escape: the final config path must be inside the
-    // canonical projects_dir. The id validation already rejects slashes and
-    // dot-dot, but this is a defense-in-depth check.
+) -> Result<ProjectTomlWriteResult, ProjectTomlWriteError> {
+    std::fs::create_dir_all(projects_dir).map_err(|_| ProjectTomlWriteError::BeforeRename)?;
+    let canonical_dir =
+        canonicalize_existing(projects_dir).map_err(|_| ProjectTomlWriteError::BeforeRename)?;
+    let config_path = canonical_dir.join(format!("{id}.toml"));
     if !config_path.starts_with(&canonical_dir) {
-        return Err("project config path would escape projects_dir".to_string());
+        return Err(ProjectTomlWriteError::BeforeRename);
     }
     let existed_before = config_path.exists();
     if existed_before && !overwrite {
-        return Err(format!(
-            "project config already exists at {}; set overwrite=true to replace",
-            config_path.display()
-        ));
+        return Err(ProjectTomlWriteError::BeforeRename);
     }
     let temp_path = unique_registry_temp(&canonical_dir, id, "toml.tmp");
-    {
-        let mut file = std::fs::File::create(&temp_path)
-            .map_err(|e| format!("failed to create temp file {}: {}", temp_path.display(), e))?;
+    let before = (|| -> Result<(), String> {
+        let mut file = std::fs::File::create(&temp_path).map_err(|e| e.to_string())?;
         file.write_all(toml_content.as_bytes())
-            .map_err(|e| format!("failed to write temp file {}: {}", temp_path.display(), e))?;
-        file.sync_all().map_err(|e| {
-            let _ = std::fs::remove_file(&temp_path);
-            format!("failed to sync temp project config: {e}")
-        })?;
-    }
-    if let Err(e) = std::fs::rename(&temp_path, &config_path) {
+            .map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        std::fs::rename(&temp_path, &config_path).map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    if before.is_err() {
         let _ = std::fs::remove_file(&temp_path);
-        return Err(format!(
-            "failed to rename temp file to {}: {}",
-            config_path.display(),
-            e
-        ));
+        return Err(ProjectTomlWriteError::BeforeRename);
     }
-    sync_parent_dir(&config_path)?;
+    sync_project_parent_after_rename(&config_path)
+        .map_err(|_| ProjectTomlWriteError::AfterRename)?;
     Ok(ProjectTomlWriteResult {
         config_path,
         created_config: !existed_before,
@@ -1213,7 +1220,12 @@ pub(crate) fn handle_project_op(
         let write_result =
             match write_project_toml_atomic(projects_dir, &id, &toml_content, overwrite) {
                 Ok(p) => p,
-                Err(_) => return project_error_cmd(start, "operation_failed"),
+                Err(ProjectTomlWriteError::BeforeRename) => {
+                    return project_error_cmd(start, "operation_failed")
+                }
+                Err(ProjectTomlWriteError::AfterRename) => {
+                    return project_error_cmd(start, "operation_indeterminate")
+                }
             };
         let result = serde_json::json!({
             "id": runtime_id,
@@ -1227,6 +1239,7 @@ pub(crate) fn handle_project_op(
             "overwritten": write_result.overwritten,
             "allow_patch": allow_patch,
             "revision": project_revision(&parse_agent_project_toml(&toml_content).expect("generated project TOML must parse")),
+            "operation": "register", "outcome": "registered", "changed": true, "recovered": false,
         });
         return ok_cmd(start, result);
     }
@@ -1409,9 +1422,12 @@ pub(crate) fn handle_project_op(
     let write_result = match write_project_toml_atomic(projects_dir, &id, &toml_content, overwrite)
     {
         Ok(p) => p,
-        Err(_) => {
+        Err(ProjectTomlWriteError::BeforeRename) => {
             created_paths.cleanup();
             return project_error_cmd(start, "operation_failed");
+        }
+        Err(ProjectTomlWriteError::AfterRename) => {
+            return project_error_cmd(start, "operation_indeterminate");
         }
     };
     let result = serde_json::json!({
@@ -1429,6 +1445,7 @@ pub(crate) fn handle_project_op(
         "template": template,
         "revision": project_revision(&parse_agent_project_toml(&toml_content).expect("generated project TOML must parse")),
         "git_initialized": git_initialized,
+        "operation": "create", "outcome": "created", "changed": true, "recovered": false,
     });
     ok_cmd(start, result)
 }

@@ -242,7 +242,7 @@ impl ShellClientRegistry {
         if metadata
             .project_id
             .as_deref()
-            .is_some_and(|project| inner.unregistering_projects.contains(project))
+            .is_some_and(|project| inner.unregistering_projects.contains_key(project))
         {
             return Err("project_unregister_in_progress".to_string());
         }
@@ -388,19 +388,22 @@ impl ShellClientRegistry {
             .filter(|job| crate::tool_runtime::ACTIVE_JOB_STATUSES.contains(&job.status.as_str()))
             .count();
         if active == 0 {
-            inner
+            *inner
                 .unregistering_projects
-                .insert(runtime_project_id.to_string());
+                .entry(runtime_project_id.to_string())
+                .or_insert(0) += 1;
         }
         Ok(active)
     }
 
     pub(crate) async fn end_project_unregister(&self, runtime_project_id: &str) {
-        self.inner
-            .lock()
-            .await
-            .unregistering_projects
-            .remove(runtime_project_id);
+        let mut inner = self.inner.lock().await;
+        if let Some(count) = inner.unregistering_projects.get_mut(runtime_project_id) {
+            *count -= 1;
+            if *count == 0 {
+                inner.unregistering_projects.remove(runtime_project_id);
+            }
+        }
     }
 
     pub async fn list_jobs_for_client(

@@ -3854,6 +3854,14 @@ mod tests {
                 .unwrap(),
             0
         );
+        assert_eq!(
+            registry
+                .begin_project_unregister(None, target)
+                .await
+                .unwrap(),
+            0
+        );
+        registry.end_project_unregister(target).await;
         let blocked = registry
             .start_job_with_metadata(
                 request("echo blocked"),

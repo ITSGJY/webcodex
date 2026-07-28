@@ -8408,6 +8408,32 @@ shell_profile = "../rust"
     }
 
     #[test]
+    fn create_post_rename_sync_failure_preserves_source_and_registry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects_dir = tmp.path().join("projects.d");
+        let create_dir = tmp.path().join("created-after-rename");
+        let policy = project_policy(tmp.path());
+        webcodex_runner::projects::fail_next_project_parent_sync_after_rename();
+        let error = project_err(handle_project_op(
+            &policy,
+            &projects_dir,
+            &project_request(
+                "create_project",
+                serde_json::json!({
+                    "id":"indeterminate", "name":"Indeterminate",
+                    "description":"Preserve me", "path":create_dir.to_string_lossy(),
+                    "allow_patch":true, "template":"basic", "git_init":true
+                }),
+            ),
+        ));
+        assert_eq!(error, "operation_indeterminate");
+        assert!(projects_dir.join("indeterminate.toml").is_file());
+        assert!(create_dir.join("README.md").is_file());
+        assert!(create_dir.join(".gitignore").is_file());
+        assert!(create_dir.join(".git").is_dir());
+    }
+
+    #[test]
     fn register_and_create_retries_converge_without_duplicate_side_effects() {
         let tmp = tempfile::tempdir().unwrap();
         let projects_dir = tmp.path().join("projects.d");
