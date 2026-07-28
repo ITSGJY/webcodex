@@ -28,3 +28,9 @@ data*
 
 # Local-only documentation archive for notes intentionally removed from git.
 /docs-local-archive/
+
+# Local scratch material and reports that must not be committed.
+/ignore/
+
+# Watched frontend development output.
+/frontend/.dev-dist/

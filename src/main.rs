@@ -202,6 +202,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let config = Config::from_env();
+    let console_asset_source = Arc::new(
+        console_web::ConsoleAssetSource::from_env(&config.addr).map_err(std::io::Error::other)?,
+    );
     if !config.is_auth_enabled() {
         tracing::warn!(
             "WEBCODEX_TOKEN is not set! Running in development mode without authentication. \
@@ -219,6 +222,10 @@ only for local/trusted-network demos."
     tracing::info!("Data directory: {:?}", config.data_dir);
     let addr = config.addr.clone();
     tracing::info!("Listening on: {}", addr);
+    tracing::info!("Console assets: {}", console_asset_source.mode_label());
+    if let Some(directory) = console_asset_source.directory() {
+        tracing::info!("Console assets directory: {}", directory.display());
+    }
     std::fs::create_dir_all(config.uploads_dir())?;
     let db = Database::open(&config.db_path())?;
     tracing::info!("Database initialized at {:?}", config.db_path());
@@ -439,6 +446,7 @@ only for local/trusted-network demos."
         .hoop(affix_state::inject(shell_registry.clone()))
         .hoop(affix_state::inject(tool_runtime.clone()))
         .hoop(affix_state::inject(connector_runtime.clone()))
+        .hoop(affix_state::inject(console_asset_source))
         .hoop(cors.into_handler())
         .push(api_router)
         .push(openapi_router)

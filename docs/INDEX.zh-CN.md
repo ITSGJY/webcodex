@@ -47,6 +47,7 @@
 
 - [PRODUCT_DEVELOPMENT_PLAN.zh-CN.md](PRODUCT_DEVELOPMENT_PLAN.zh-CN.md) - 历史产品设计基线；其中旧 connect 命令不是当前使用指南。
 - [PROJECT_FIRST_REFINEMENT_PLAN.zh-CN.md](PROJECT_FIRST_REFINEMENT_PLAN.zh-CN.md) - 当前长期开发基线：Execution Engine、三轮收敛计划、代码/测试预算、时间估算与合并门禁。
+- [CONSOLE_DEVELOPMENT.md](CONSOLE_DEVELOPMENT.md) - `/console` 前端的 loopback-only 本地资源构建与刷新流程。
 - [CODEX_EXECUTION_ENGINE_REFACTOR_PROMPT.zh-CN.md](CODEX_EXECUTION_ENGINE_REFACTOR_PROMPT.zh-CN.md) - 可直接交给 Codex 的 Iteration 6 大重构执行 prompt。
 23. [RELEASE_NOTES_v0.3.0.zh-CN.md](RELEASE_NOTES_v0.3.0.zh-CN.md) / [RELEASE_NOTES_v0.3.0.md](RELEASE_NOTES_v0.3.0.md) - 当前面向外部用户的 0.3.0 release notes。
 24. [RELEASE_NOTES_v0.2.0.md](RELEASE_NOTES_v0.2.0.md) - 上一版 0.2.0 release notes。

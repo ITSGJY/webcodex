@@ -57,7 +57,54 @@ fn options(root: PathBuf, state: PathBuf) -> ProjectCommandOptions {
         profile: "personal".to_string(),
         state_dir: Some(state),
         json: false,
+        console_assets_dir: None,
     }
+}
+
+fn write_console_assets(directory: &Path) {
+    fs::create_dir_all(directory).unwrap();
+    fs::write(directory.join("console.html"), "<html></html>\n").unwrap();
+    fs::write(directory.join("app.js"), "globalThis.consoleDev = true;\n").unwrap();
+    fs::write(directory.join("styles.css"), "body { color: black; }\n").unwrap();
+}
+
+#[test]
+fn console_assets_are_validated_and_passed_only_to_the_serve_child() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path().join("assets");
+    write_console_assets(&directory);
+    let mut start_options = options(
+        temp.path().join("project"),
+        temp.path().join("project-state"),
+    );
+    start_options.console_assets_dir = Some(directory.clone());
+
+    let canonical = resolve_console_assets_directory(&start_options)
+        .unwrap()
+        .unwrap();
+    assert_eq!(canonical, fs::canonicalize(&directory).unwrap());
+
+    let mut command = tokio::process::Command::new("webcodex");
+    configure_console_assets_environment(&mut command, Some(&canonical));
+    let configured = command
+        .as_std()
+        .get_envs()
+        .find(|(key, _)| *key == crate::console_web::CONSOLE_ASSETS_DIR_ENV)
+        .and_then(|(_, value)| value)
+        .map(PathBuf::from);
+    assert_eq!(configured, Some(canonical));
+
+    let mut embedded_command = tokio::process::Command::new("webcodex");
+    configure_console_assets_environment(&mut embedded_command, None);
+    assert!(embedded_command
+        .as_std()
+        .get_envs()
+        .any(|(key, value)| key == crate::console_web::CONSOLE_ASSETS_DIR_ENV && value.is_none()));
+
+    fs::remove_file(directory.join("styles.css")).unwrap();
+    let error = resolve_console_assets_directory(&start_options).unwrap_err();
+    assert_eq!(error.code, "console_assets_invalid");
+    assert!(error.message.contains("styles.css"));
 }
 
 fn fact<'a>(readiness: &'a ProjectReadiness, code: &str) -> &'a ReadinessFact {

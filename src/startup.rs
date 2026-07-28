@@ -37,6 +37,8 @@ Environment:\n\
   WEBCODEX_ADDR          Listen address, default 0.0.0.0:8080\n\
   WEBCODEX_DATA          Data directory, default ./data\n\
   WEBCODEX_PUBLIC_URL    Public URL reported to clients\n\
+  WEBCODEX_CONSOLE_ASSETS_DIR  Advanced `serve`-only development override; \
+prefer `agent start --console-assets-dir`\n\
   WEBCODEX_ALLOW_ANONYMOUS  Allow anonymous GPT/MCP and client access (--open). \
 Default off; only safe on localhost/trusted LAN/temporary demos.\n\
   WEBCODEX_QUIC_ENABLED  Enable QUIC agent transport (default off)\n\
@@ -85,7 +87,11 @@ where
         };
     }
     if args[0] == "agent" {
-        if args.len() == 2 && matches!(args[1].as_str(), "--help" | "-h") {
+        if (args.len() == 2 && matches!(args[1].as_str(), "--help" | "-h"))
+            || (args.len() == 3
+                && args[1] == "start"
+                && matches!(args[2].as_str(), "--help" | "-h"))
+        {
             return ServerCliAction::Exit {
                 code: 0,
                 stdout: project_entry::usage().to_string(),
@@ -210,6 +216,7 @@ mod tests {
             "WEBCODEX_ADDR",
             "WEBCODEX_DATA",
             "WEBCODEX_PUBLIC_URL",
+            "WEBCODEX_CONSOLE_ASSETS_DIR",
             "WEBCODEX_ALLOW_ANONYMOUS",
             "WEBCODEX_QUIC_ENABLED",
             "WEBCODEX_QUIC_LISTEN",
@@ -242,6 +249,10 @@ mod tests {
             .unwrap()
             .unwrap()
             .contains("task <COMMAND>"));
+        let agent_help = server_cli_output(["agent", "start", "--help"])
+            .unwrap()
+            .unwrap();
+        assert!(agent_help.contains("--console-assets-dir"));
     }
 
     #[test]
@@ -276,6 +287,34 @@ mod tests {
     }
 
     #[test]
+    fn console_assets_directory_is_only_accepted_by_agent_start() {
+        let absolute = "/tmp/webcodex-console-assets";
+        match server_cli_action(["agent", "start", "--console-assets-dir", absolute]) {
+            ServerCliAction::AgentStart(options) => {
+                assert_eq!(
+                    options.console_assets_dir,
+                    Some(std::path::PathBuf::from(absolute))
+                );
+            }
+            other => panic!("console asset option unexpectedly rejected: {other:?}"),
+        }
+        for command in ["setup", "doctor", "status"] {
+            match server_cli_action([command, "--console-assets-dir", absolute]) {
+                ServerCliAction::Exit {
+                    code: 2, stderr, ..
+                } => assert!(stderr.contains("unknown")),
+                other => panic!("{command} unexpectedly accepted console assets: {other:?}"),
+            }
+        }
+        match server_cli_action(["agent", "start", "--console-assets-dir", "relative"]) {
+            ServerCliAction::Exit {
+                code: 2, stderr, ..
+            } => assert!(stderr.contains("absolute")),
+            other => panic!("relative console assets unexpectedly accepted: {other:?}"),
+        }
+    }
+
+    #[test]
     fn server_help_mentions_expected_env_vars() {
         let action = server_cli_action(["--help"]);
         let ServerCliAction::Exit {
@@ -295,6 +334,7 @@ mod tests {
             "WEBCODEX_ADDR",
             "WEBCODEX_DATA",
             "WEBCODEX_PUBLIC_URL",
+            "WEBCODEX_CONSOLE_ASSETS_DIR",
             "WEBCODEX_ALLOW_ANONYMOUS",
             "WEBCODEX_QUIC_ENABLED",
             "WEBCODEX_QUIC_LISTEN",

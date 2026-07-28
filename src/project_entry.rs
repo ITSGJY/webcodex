@@ -32,6 +32,7 @@ pub(crate) struct ProjectCommandOptions {
     pub profile: String,
     pub state_dir: Option<PathBuf>,
     pub json: bool,
+    pub console_assets_dir: Option<PathBuf>,
 }
 
 impl ProjectCommandOptions {
@@ -41,6 +42,7 @@ impl ProjectCommandOptions {
             profile: DEFAULT_PROFILE.to_string(),
             state_dir: None,
             json: false,
+            console_assets_dir: None,
         })
     }
 }
@@ -176,6 +178,15 @@ pub(crate) fn parse_options(
             "--profile" => options.profile = value(&mut index)?,
             "--state-dir" => options.state_dir = Some(PathBuf::from(value(&mut index)?)),
             "--json" if command != "agent start" => options.json = true,
+            "--console-assets-dir" if command == "agent start" => {
+                let directory = PathBuf::from(value(&mut index)?);
+                if !directory.is_absolute() {
+                    return Err(
+                        "--console-assets-dir requires an absolute directory path".to_string()
+                    );
+                }
+                options.console_assets_dir = Some(directory);
+            }
             "--help" | "-h" => return Err("help requested".to_string()),
             _ => return Err(format!("unknown {command} option '{flag}'")),
         }
@@ -189,10 +200,12 @@ pub(crate) fn usage() -> &'static str {
     "Usage: webcodex setup [--root PATH] [--profile NAME] [--state-dir PATH] [--json]\n\
        webcodex doctor [--root PATH] [--profile NAME] [--state-dir PATH] [--json]\n\
        webcodex status [--root PATH] [--profile NAME] [--state-dir PATH] [--json]\n\
-       webcodex agent start [--root PATH] [--profile NAME] [--state-dir PATH]\n\n\
+       webcodex agent start [--root PATH] [--profile NAME] [--state-dir PATH]\n\
+                              [--console-assets-dir ABSOLUTE_PATH]\n\n\
 Run setup in a local Git project. It writes private WebCodex state outside the\n\
 checkout and never starts services, modifies Git content, or opens a network\n\
-port. `agent start` is the explicit foreground runtime step.\n"
+port. `agent start` is the explicit foreground runtime step. Its optional\n\
+`--console-assets-dir` enables loopback-only development assets for that run.\n"
 }
 
 pub(crate) fn readiness_with_probe(
@@ -575,6 +588,7 @@ pub(crate) fn render_error(error: &ProductError, json: bool) -> String {
 }
 
 pub(crate) async fn start_agent(options: &ProjectCommandOptions) -> Result<(), ProductError> {
+    let console_assets_dir = resolve_console_assets_directory(options)?;
     let readiness = readiness_with_probe(options, RemoteProbe::Unreachable);
     if readiness
         .findings
@@ -660,6 +674,7 @@ pub(crate) async fn start_agent(options: &ProjectCommandOptions) -> Result<(), P
         .stdout(Stdio::from(server_log))
         .stderr(Stdio::from(server_error))
         .kill_on_drop(true);
+    configure_console_assets_environment(&mut server_command, console_assets_dir.as_deref());
     let mut server = server_command.spawn().map_err(|_| {
         ProductError::new(
             "server_unreachable",
@@ -689,11 +704,22 @@ pub(crate) async fn start_agent(options: &ProjectCommandOptions) -> Result<(), P
             )
         })?;
     wait_for_ready(&mut server, &mut agent, options).await?;
-    println!(
-        "Project: {}\nConnection: connected at {}\nAgent: online\nCoding access: ready\n\nPress Ctrl-C to stop.",
+    let mut started = format!(
+        "Project: {}\nConnection: connected at {}\nConsole: {}/console\nConsole assets: {}",
         config.project_name,
-        config.server_url()
+        config.server_url(),
+        config.server_url(),
+        if console_assets_dir.is_some() {
+            "local development"
+        } else {
+            "embedded"
+        }
     );
+    if let Some(directory) = &console_assets_dir {
+        started.push_str(&format!("\nAssets directory: {}", directory.display()));
+    }
+    started.push_str("\nAgent: online\nCoding access: ready\n\nPress Ctrl-C to stop.");
+    println!("{started}");
     tokio::select! {
         _ = tokio::signal::ctrl_c() => Ok(()),
         status = server.wait() => Err(ProductError::new(
@@ -706,6 +732,30 @@ pub(crate) async fn start_agent(options: &ProjectCommandOptions) -> Result<(), P
             format!("the local Agent stopped unexpectedly ({:?})", status.ok()),
             Some("Run webcodex doctor."),
         )),
+    }
+}
+
+fn resolve_console_assets_directory(
+    options: &ProjectCommandOptions,
+) -> Result<Option<PathBuf>, ProductError> {
+    let Some(directory) = options.console_assets_dir.as_deref() else {
+        return Ok(None);
+    };
+    let source =
+        crate::console_web::ConsoleAssetSource::from_directory(directory).map_err(|error| {
+            ProductError::new(
+                "console_assets_invalid",
+                error.to_string(),
+                Some("Fix the development build directory, then retry."),
+            )
+        })?;
+    Ok(source.directory().map(Path::to_path_buf))
+}
+
+fn configure_console_assets_environment(command: &mut Command, directory: Option<&Path>) {
+    command.env_remove(crate::console_web::CONSOLE_ASSETS_DIR_ENV);
+    if let Some(directory) = directory {
+        command.env(crate::console_web::CONSOLE_ASSETS_DIR_ENV, directory);
     }
 }
 

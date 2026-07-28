@@ -208,6 +208,7 @@ pub(crate) fn resolve_local_task_state(
         profile: profile.to_string(),
         state_dir: state_dir.map(Path::to_path_buf),
         json: false,
+        console_assets_dir: None,
     };
     let (config, paths) = ProjectConfig::resolve(&options).map_err(|error| error.message)?;
     Ok(LocalTaskState {
