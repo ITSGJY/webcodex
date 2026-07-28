@@ -112,6 +112,9 @@ mod tests {
         assert!(!CONSOLE_APP_JS.contains("sessionStorage"));
         assert!(!CONSOLE_APP_JS.contains(".innerHTML"));
         assert!(CONSOLE_APP_JS.contains("performAction"));
+        // Author display declarations must not override HTML's hidden state;
+        // otherwise the confirmation overlay blocks the console on first load.
+        assert!(CONSOLE_STYLES_CSS.contains("[hidden]{display:none !important}"));
         assert!(CONSOLE_HTML.contains("type=\"password\""));
         assert!(!CONSOLE_HTML.contains("Transport"));
     }

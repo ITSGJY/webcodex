@@ -2,6 +2,12 @@
   box-sizing: border-box;
 }
 
+/* Author-level display rules such as .overlay { display: flex } must never
+   override the semantic hidden state controlled by the console script. */
+[hidden] {
+  display: none !important;
+}
+
 :root {
   --bg: #f5f7f8;
   --panel: #ffffff;
