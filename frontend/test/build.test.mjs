@@ -24,6 +24,7 @@ const requiredAssets = [
   "admin.html",
   "admin.js",
   "admin.css",
+  "admin_controller.js",
   "admin_view.js",
 ];
 
@@ -65,6 +66,7 @@ async function copySources(sourceDirectory) {
     "styles.css",
     "console.html",
     "admin.ts",
+    "admin_controller.ts",
     "admin_view.ts",
     "admin.css",
     "admin.html",

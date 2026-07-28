@@ -20,6 +20,7 @@ const watchedSources = new Set([
   "styles.css",
   "console.html",
   "admin.ts",
+  "admin_controller.ts",
   "admin_view.ts",
   "admin.css",
   "admin.html",
@@ -114,25 +115,37 @@ export function createOutputs(
   );
   const appInlined = buildJs(reviewStateClassic + "\n" + appScript);
   assertClassicScript(resolve(outputDirectory, "app.js"), appInlined);
+  const adminControllerModule = buildJs(
+    transpileTypeScript(sourceDirectory, "admin_controller.ts")
+  );
+  const adminControllerClassic = stripModuleExports(adminControllerModule);
   const adminViewModule = buildJs(
     transpileTypeScript(sourceDirectory, "admin_view.ts")
   );
   const adminViewClassic = stripModuleExports(adminViewModule);
   const adminModule = transpileTypeScript(sourceDirectory, "admin.ts");
   const adminScript = buildJs(
-    adminViewClassic +
+    adminControllerClassic +
+      "\n" +
+      adminViewClassic +
       "\n" +
       stripModuleExports(
-        adminModule.replace(
-          /^import\s*\{[\s\S]*?\}\s*from\s*["']\.\/admin_view(?:\.js)?["'];?\s*\n/m,
-          ""
-        )
+        adminModule
+          .replace(
+            /^import\s*\{[\s\S]*?\}\s*from\s*["']\.\/admin_controller(?:\.js)?["'];?\s*\n/m,
+            ""
+          )
+          .replace(
+            /^import\s*\{[\s\S]*?\}\s*from\s*["']\.\/admin_view(?:\.js)?["'];?\s*\n/m,
+            ""
+          )
       )
   );
   assertClassicScript(resolve(outputDirectory, "admin.js"), adminScript);
 
   return new Map([
     ["review_state.js", reviewStateModule],
+    ["admin_controller.js", adminControllerModule],
     ["admin_view.js", adminViewModule],
     ["app.js", appInlined],
     ["styles.css", minifyCss(readSource(sourceDirectory, "styles.css"))],

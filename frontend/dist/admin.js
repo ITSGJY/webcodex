@@ -1,3 +1,107 @@
+class AdminHttpError extends Error {
+    constructor(status, message) {
+        super(message);
+        this.name = "AdminHttpError";
+        this.status = status;
+    }
+}
+function isAbortError(error) {
+    return error instanceof DOMException
+        ? error.name === "AbortError"
+        : Boolean(error && typeof error === "object" && "name" in error && error.name === "AbortError");
+}
+class AdminRefreshController {
+    constructor(dependencies) {
+        this.generation = 0;
+        this.requestId = 0;
+        this.token = "";
+        this.active = null;
+        this.timer = null;
+        this.dependencies = dependencies;
+    }
+    beginSession(token) {
+        this.invalidateRequests();
+        this.token = token;
+        this.dependencies.clearError();
+        return this.refresh();
+    }
+    lock(message = "") {
+        this.invalidateRequests();
+        this.token = "";
+        this.stopAutoRefresh();
+        this.dependencies.showLocked(message);
+    }
+    refresh() {
+        if (!this.token)
+            return Promise.resolve();
+        if (this.active &&
+            this.active.generation === this.generation &&
+            this.active.token === this.token) {
+            return this.active.promise;
+        }
+        const generation = this.generation;
+        const token = this.token;
+        const id = ++this.requestId;
+        const controller = new AbortController();
+        this.dependencies.clearError();
+        const promise = this.dependencies
+            .request(token, controller.signal)
+            .then((data) => {
+            if (!this.isCurrent(generation, token, id))
+                return;
+            this.dependencies.render(data);
+            this.dependencies.showAuthenticated();
+            this.dependencies.setStatus(`Updated ${new Date().toLocaleTimeString()}`);
+        })
+            .catch((error) => {
+            if (!this.isCurrent(generation, token, id) || isAbortError(error))
+                return;
+            if (error instanceof AdminHttpError && (error.status === 401 || error.status === 403)) {
+                this.lock("Administrator authentication required.");
+                return;
+            }
+            this.dependencies.showError("Dashboard refresh failed");
+            this.dependencies.setStatus("Refresh failed; showing last successful data.");
+        })
+            .finally(() => {
+            if (this.active?.id === id)
+                this.active = null;
+        });
+        this.active = { generation, id, token, controller, promise };
+        return promise;
+    }
+    startAutoRefresh(milliseconds) {
+        this.stopAutoRefresh();
+        if (!this.token)
+            return;
+        const schedule = this.dependencies.setInterval || setInterval;
+        this.timer = schedule(() => {
+            void this.refresh();
+        }, milliseconds);
+    }
+    stopAutoRefresh() {
+        if (this.timer === null)
+            return;
+        const cancel = this.dependencies.clearInterval || clearInterval;
+        cancel(this.timer);
+        this.timer = null;
+    }
+    dispose() {
+        this.invalidateRequests();
+        this.stopAutoRefresh();
+    }
+    invalidateRequests() {
+        this.generation += 1;
+        this.active?.controller.abort();
+        this.active = null;
+    }
+    isCurrent(generation, token, id) {
+        return (this.generation === generation &&
+            this.token === token &&
+            this.active?.id === id);
+    }
+}
+
 function record(value) {
     return value && typeof value === "object" && !Array.isArray(value)
         ? value
@@ -158,8 +262,6 @@ function renderAdminDashboard(doc, raw) {
 
 const ADMIN_BASE = "/api/admin/";
 const REFRESH_MS = 10000;
-let adminToken = "";
-let timer = 0;
 const byId = (id) => document.getElementById(id);
 function text(id, value) {
     const node = byId(id);
@@ -171,36 +273,15 @@ function visible(id, yes) {
     if (node)
         node.hidden = !yes;
 }
-function stopAuto() {
-    if (timer)
-        window.clearInterval(timer);
-    timer = 0;
-}
-function startAuto() {
-    stopAuto();
-    const auto = byId("auto");
-    if (auto?.checked && adminToken)
-        timer = window.setInterval(refresh, REFRESH_MS);
-}
-function lock(message = "") {
-    adminToken = "";
-    stopAuto();
-    visible("gate", true);
-    visible("dashboard", false);
-    visible("controls", false);
-    text("gate-error", message);
-    const input = byId("token");
-    if (input)
-        input.value = "";
-}
-async function api() {
+async function requestDashboard(token, signal) {
     const response = await fetch(ADMIN_BASE + "dashboard", {
         method: "POST",
         headers: {
-            Authorization: "Bearer " + adminToken,
+            Authorization: "Bearer " + token,
             "Content-Type": "application/json",
         },
         body: "{}",
+        signal,
     });
     let data = null;
     try {
@@ -210,42 +291,56 @@ async function api() {
         // The status code below remains the safe fallback.
     }
     if (!response.ok) {
-        throw new Error(data?.error?.message || data?.message || `Request failed (${response.status})`);
+        throw new AdminHttpError(response.status, data?.error?.message || data?.message || `Request failed (${response.status})`);
     }
     return data;
 }
-async function refresh() {
-    if (!adminToken)
-        return;
-    visible("error", false);
-    text("status", "Loading…");
-    try {
-        const data = await api();
-        renderAdminDashboard(document, data);
+const controller = new AdminRefreshController({
+    request: requestDashboard,
+    render: (data) => renderAdminDashboard(document, data),
+    showAuthenticated: () => {
         visible("gate", false);
         visible("dashboard", true);
         visible("controls", true);
-        text("status", `Updated ${new Date().toLocaleTimeString()}`);
-    }
-    catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+    },
+    showLocked: (message) => {
+        visible("gate", true);
+        visible("dashboard", false);
+        visible("controls", false);
+        text("gate-error", message);
+        const input = byId("token");
+        if (input)
+            input.value = "";
+    },
+    setStatus: (message) => text("status", message),
+    showError: (message) => {
         text("error", message);
         visible("error", true);
-        text("status", "Refresh failed; showing last successful data.");
-        if (/auth|token|admin|unauthorized|forbidden/i.test(message))
-            lock(message);
-    }
+    },
+    clearError: () => visible("error", false),
+});
+function configureAutoRefresh() {
+    const auto = byId("auto");
+    if (auto?.checked)
+        controller.startAutoRefresh(REFRESH_MS);
+    else
+        controller.stopAutoRefresh();
 }
 byId("token-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const input = byId("token");
-    adminToken = input?.value.trim() || "";
+    const token = input?.value.trim() || "";
     if (input)
         input.value = "";
-    await refresh();
-    startAuto();
+    if (!token)
+        return;
+    await controller.beginSession(token);
+    configureAutoRefresh();
 });
-byId("refresh")?.addEventListener("click", refresh);
-byId("lock")?.addEventListener("click", () => lock("Locked."));
-byId("auto")?.addEventListener("change", startAuto);
-lock();
+byId("refresh")?.addEventListener("click", () => {
+    void controller.refresh();
+});
+byId("lock")?.addEventListener("click", () => controller.lock("Locked."));
+byId("auto")?.addEventListener("change", configureAutoRefresh);
+window.addEventListener("pagehide", () => controller.dispose());
+controller.lock();
