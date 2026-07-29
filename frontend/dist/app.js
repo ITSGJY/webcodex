@@ -11,10 +11,16 @@ function initialState() {
 function reviewSnapshot(review) {
     const result = review && review.result ? review.result : null;
     const cursor = review && typeof review.event_cursor === "number" ? review.event_cursor : 0;
+    const guidanceSeen = review && typeof review.guidance_seen_seq === "number" ? review.guidance_seen_seq : null;
+    const unreadGuidance = review && typeof review.unread_guidance_seq === "number"
+        ? review.unread_guidance_seq
+        : null;
     return {
         taskId: review && review.task_id ? String(review.task_id) : "",
         resultId: result && result.result_id ? String(result.result_id) : null,
         eventCursor: cursor,
+        guidanceSeenSeq: guidanceSeen,
+        unreadGuidanceSeq: unreadGuidance,
         review: review,
     };
 }
@@ -134,6 +140,12 @@ function createReviewController(options) {
             execution.stdout_cursor,
             execution.stderr_cursor,
             execution.assertion_status,
+            review && typeof review.guidance_seen_seq === "number"
+                ? review.guidance_seen_seq
+                : null,
+            review && typeof review.unread_guidance_seq === "number"
+                ? review.unread_guidance_seq
+                : null,
         ]);
     }
     async function request(full) {
@@ -380,6 +392,7 @@ reviewLoop = createReviewController({
     unauthorized: () => lock("Credential rejected. Re-enter it."),
     error: (data) => showError(errorMessage(data)),
     render: (review) => {
+        const previousTask = state.snapshot ? state.snapshot.taskId : null;
         const previousResult = state.snapshot ? state.snapshot.resultId : null;
         if (!adoptReview(state, String(review.task_id), state.reviewSeq, review)) {
             return;
@@ -389,7 +402,7 @@ reviewLoop = createReviewController({
             hideActionButtons();
         }
         hideError();
-        renderDetail(review);
+        renderDetail(review, previousTask === String(review.task_id));
         renderSelection();
     },
 });
@@ -473,6 +486,18 @@ function renderTaskList(tasks) {
         const goal = document.createElement("div");
         goal.className = "task-goal";
         goal.textContent = task.goal || id;
+        const unread = typeof task.unread_guidance === "number" ? task.unread_guidance : 0;
+        if (unread > 0) {
+            // Flag a task whose guidance the model has not yet read, so a reviewer
+            // scanning the queue sees which conversations still have an unread
+            // course correction outstanding.
+            const badge = document.createElement("span");
+            badge.className = "guidance-badge";
+            badge.textContent = unread + " unread guidance";
+            badge.title = "Guidance the model has not yet seen on a capability response";
+            goal.appendChild(badge);
+            item.classList.add("task-guidance-pending");
+        }
         const meta = document.createElement("div");
         meta.className = "task-meta muted small";
         const status = document.createElement("span");
@@ -513,6 +538,13 @@ function selectTaskUi(taskId) {
     renderSelection();
     showDetailLoading();
     reviewLoop.select(taskId);
+    // Focus the guidance box so a reviewer can type a course correction
+    // immediately after selecting a task, without an extra click. The detail
+    // panel is now visible, so the input is in the document.
+    const guide = el("guide-input");
+    if (guide) {
+        guide.focus();
+    }
 }
 function renderSelection() {
     const list = el("task-list");
@@ -541,9 +573,23 @@ function hideActionButtons() {
     show("reject-btn", false);
     show("cancel-btn", false);
 }
-function renderDetail(d) {
+function renderDetail(d, preserveScroll) {
     show("detail-empty", false);
     show("detail", true);
+    // The review long-poll re-renders the same task every few seconds. Preserve
+    // independently scrollable panes only for that same-task refresh; selecting
+    // a different task must start its detail at the top instead of inheriting
+    // the previous task's diff/output/timeline position.
+    const scrollIds = ["detail", "detail-diff", "detail-output", "detail-timeline"];
+    const scrollTop = {};
+    if (preserveScroll) {
+        for (const id of scrollIds) {
+            const node = el(id);
+            if (node) {
+                scrollTop[id] = node.scrollTop;
+            }
+        }
+    }
     setText("detail-goal", d.goal);
     setText("detail-task-status", d.status);
     setText("detail-run-status", "run: " + (d.run_status || "not available"));
@@ -575,6 +621,13 @@ function renderDetail(d) {
     renderTimeline(d);
     renderActions(d);
     setText("detail-next", "Next: " + (d.next_action || "not available"));
+    for (const id of scrollIds) {
+        const node = el(id);
+        if (node) {
+            node.scrollTop =
+                preserveScroll && scrollTop[id] !== undefined ? scrollTop[id] : 0;
+        }
+    }
 }
 function timeLabel(value) {
     return typeof value === "number" && value > 0
@@ -690,6 +743,10 @@ function renderTimeline(d) {
         node.appendChild(item);
         return;
     }
+    // Watermark the model has claimed up to. Guidance with a sequence above this
+    // is still pending — unread — and is rendered distinctly so the reviewer can
+    // tell whether their guidance has reached the model yet.
+    const guidanceSeen = typeof d.guidance_seen_seq === "number" ? d.guidance_seen_seq : null;
     for (const event of [...events].reverse()) {
         const item = document.createElement("li");
         item.className = "timeline-event";
@@ -710,6 +767,16 @@ function renderTimeline(d) {
             : "";
         if (guidance) {
             item.classList.add("timeline-guidance");
+            // Only label read/unread when the host projection supplied a valid
+            // watermark. A missing auxiliary read-state must not be misrepresented
+            // as proof that every historical guidance event is unread.
+            if (guidanceSeen !== null && typeof event.sequence === "number") {
+                const unread = event.sequence > guidanceSeen;
+                item.classList.add(unread ? "timeline-guidance-unread" : "timeline-guidance-read");
+                meta.textContent = [seq, unread ? "unread" : "read", eventTime(event)]
+                    .filter((value) => !!value)
+                    .join(" · ");
+            }
         }
         const summary = guidance || eventSummary(event ? event.payload : null);
         if (summary) {
@@ -1305,6 +1372,15 @@ function init() {
     });
     el("guide-btn")?.addEventListener("click", () => {
         void sendGuidance();
+    });
+    // Ctrl/Cmd+Enter sends guidance so a reviewer can fire off short course
+    // corrections from the keyboard without tabbing to the button. Plain Enter
+    // stays a newline-free submit guard for a single-line text input.
+    el("guide-input")?.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+            event.preventDefault();
+            void sendGuidance();
+        }
     });
     el("accept-btn")?.addEventListener("click", () => {
         openConfirmUi("accept");

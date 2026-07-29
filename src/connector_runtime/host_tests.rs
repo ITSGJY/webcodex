@@ -767,6 +767,7 @@ fn connector_tasks_for_subject_scopes_to_the_owner() {
     assert_eq!(mine[0].task_id, TASK_ID);
     assert_eq!(mine[0].task_status, "ready_for_review");
     assert_eq!(mine[0].next_action, "review_and_accept");
+    assert_eq!(mine[0].unread_guidance, 0, "no guidance recorded yet");
 
     // Ownership is the visibility boundary: another subject sees nothing,
     // not a filtered view of someone else's history.
@@ -775,4 +776,62 @@ fn connector_tasks_for_subject_scopes_to_the_owner() {
         .connector_tasks_for_subject(&fixture.context.project_id, "user:someone_else", 10)
         .unwrap();
     assert!(strangers.is_empty());
+}
+
+#[test]
+fn reviewable_tasks_report_unread_guidance_until_the_model_claims_it() {
+    use serde_json::json;
+    let fixture = fixture(true);
+
+    // Guidance is durable state in the event log; write the row directly so
+    // this test is independent of the task-state guard that `append` enforces
+    // for in-progress capability calls. A fresh guidance event sits above the
+    // zero watermark, so the work queue flags it as unread.
+    let conn = fixture.db.conn_for_tests();
+    let next_sequence: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM wc_task_events WHERE task_id = ?1",
+            [TASK_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "INSERT INTO wc_task_events (id, task_id, run_id, sequence, kind, payload_json, created_at)
+         VALUES (?1, ?2, ?3, ?4, 'human_guidance', ?5, 200)",
+        rusqlite::params![
+            "wc_evt_unread_test",
+            TASK_ID,
+            "wc_run_f123456789abcdef0123456789abcdef",
+            next_sequence,
+            json!({ "message": "look at the lexer", "source": "host" }).to_string(),
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let listed = fixture
+        .db
+        .local_reviewable_tasks(&fixture.context.project_id, false, 20)
+        .unwrap();
+    let mine = fixture
+        .db
+        .connector_tasks_for_subject(&fixture.context.project_id, SUBJECT, 10)
+        .unwrap();
+    assert_eq!(listed[0].unread_guidance, 1);
+    assert_eq!(mine[0].unread_guidance, 1);
+
+    // Once the model claims it, the watermark advances and the queue no longer
+    // flags the task — the same read-state the timeline renders with.
+    fixture
+        .db
+        .claim_pending_connector_guidance(TASK_ID, &fixture.context.project_id, SUBJECT, 16)
+        .unwrap();
+    let listed = fixture
+        .db
+        .local_reviewable_tasks(&fixture.context.project_id, false, 20)
+        .unwrap();
+    assert_eq!(
+        listed[0].unread_guidance, 0,
+        "claimed guidance is no longer unread"
+    );
 }

@@ -3893,6 +3893,13 @@ async fn guidance_is_delivered_once_inside_the_next_capability_response() {
     assert!(host.ok, "{}", host.body);
     assert!(host.body["guidance"].is_null());
 
+    // The host review surfaces the guidance read-state for the console
+    // timeline — the watermark the model has claimed and the newest
+    // still-pending guidance — without advancing the watermark itself.
+    assert_eq!(host.body["guidance_seen_seq"].as_i64(), Some(0));
+    let unread_seq = host.body["unread_guidance_seq"].as_i64();
+    assert!(unread_seq.is_some() && unread_seq.unwrap() > 0);
+
     // The next model-facing capability response carries the guidance…
     let review = fixture
         .call("task_review", json!({"task_id": fixture.task_id}))

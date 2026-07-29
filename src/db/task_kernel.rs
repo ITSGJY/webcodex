@@ -144,6 +144,10 @@ pub(crate) struct LocalReviewableTask {
     pub execution_status: Option<String>,
     pub validation_status: Option<String>,
     pub next_action: String,
+    /// Count of `human_guidance` events the model has not yet claimed (above
+    /// the task's `guidance_seen_seq` watermark). Lets the work queue flag a
+    /// task with pending, unread guidance without an extra per-task review.
+    pub unread_guidance: i64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -227,6 +231,15 @@ pub(crate) struct ConnectorTaskEvent {
     pub kind: String,
     pub payload: Value,
     pub created_at: i64,
+}
+
+/// Read-state of a task's `human_guidance` events, as seen by the host review
+/// console. `seen_seq` is the watermark the model has claimed up to;
+/// `last_pending_seq` is the newest guidance still unread, or `None`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GuidanceReadState {
+    pub seen_seq: i64,
+    pub last_pending_seq: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -1197,6 +1210,52 @@ impl Database {
         Ok(claimed)
     }
 
+    /// Read-only guidance read-state for a host review console: the watermark
+    /// the model has claimed up to, and the most recent `human_guidance`
+    /// sequence still pending (above the watermark). Unlike
+    /// [`claim_pending_connector_guidance`], this never advances the watermark
+    /// — a host opening the review page must not consume guidance the model
+    /// has not yet read. Returns `None` when the task does not exist.
+    pub(crate) fn connector_guidance_read_state(
+        &self,
+        task_id: &str,
+        project_id: &str,
+    ) -> Result<Option<GuidanceReadState>, ConnectorTaskStoreError> {
+        let conn = self.conn.lock().unwrap();
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM wc_tasks WHERE id = ?1 AND project_id = ?2",
+                params![task_id, project_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+        let seen: i64 = conn
+            .query_row(
+                "SELECT guidance_seen_seq FROM wc_tasks WHERE id = ?1 AND project_id = ?2",
+                params![task_id, project_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| ConnectorTaskStoreError::Storage(error.into()))?;
+        let last_pending: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(sequence) FROM wc_task_events
+                 WHERE task_id = ?1 AND kind = 'human_guidance' AND sequence > ?2",
+                params![task_id, seen],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| ConnectorTaskStoreError::Storage(error.into()))?
+            .flatten();
+        Ok(Some(GuidanceReadState {
+            seen_seq: seen,
+            last_pending_seq: last_pending,
+        }))
+    }
+
     /// Every path this task has actually applied, in first-seen order.
     ///
     /// Scoped to `edits_apply` in SQL rather than filtered out of the recent
@@ -1524,7 +1583,8 @@ impl Database {
                         WHEN q.task_status = 'ready_for_review' AND q.result_id IS NOT NULL THEN 'review_and_accept'
                         WHEN q.task_status = 'active' THEN 'in_progress'
                         ELSE 'review'
-                    END
+                    END,
+                    q.unread_guidance
              FROM (
                 SELECT t.id AS task_id, t.goal, t.updated_at,
                     CASE
@@ -1537,7 +1597,10 @@ impl Database {
                     END AS task_status,
                     r.status AS run_status, res.id AS result_id, res.validation_json,
                     (SELECT ex.state FROM wc_executions ex WHERE ex.task_id = t.id
-                     ORDER BY ex.submitted_at DESC, ex.rowid DESC LIMIT 1) AS execution_status
+                     ORDER BY ex.submitted_at DESC, ex.rowid DESC LIMIT 1) AS execution_status,
+                    (SELECT COUNT(*) FROM wc_task_events g
+                     WHERE g.task_id = t.id AND g.kind = 'human_guidance'
+                       AND g.sequence > t.guidance_seen_seq) AS unread_guidance
                 FROM wc_tasks t
                 JOIN wc_runs r ON r.task_id = t.id
                     AND r.started_at = (SELECT MAX(started_at) FROM wc_runs WHERE task_id = t.id)
@@ -1567,6 +1630,7 @@ impl Database {
                     execution_status: row.get(4)?,
                     validation_status: row.get(5)?,
                     next_action: row.get(6)?,
+                    unread_guidance: row.get(7)?,
                 })
             },
         )?;
@@ -1593,7 +1657,8 @@ impl Database {
                         WHEN q.task_status = 'ready_for_review' AND q.result_id IS NOT NULL THEN 'review_and_accept'
                         WHEN q.task_status = 'active' THEN 'in_progress'
                         ELSE 'review'
-                    END
+                    END,
+                    q.unread_guidance
              FROM (
                 SELECT t.id AS task_id, t.goal, t.updated_at,
                     CASE
@@ -1606,7 +1671,10 @@ impl Database {
                     END AS task_status,
                     r.status AS run_status, res.id AS result_id, res.validation_json,
                     (SELECT ex.state FROM wc_executions ex WHERE ex.task_id = t.id
-                     ORDER BY ex.submitted_at DESC, ex.rowid DESC LIMIT 1) AS execution_status
+                     ORDER BY ex.submitted_at DESC, ex.rowid DESC LIMIT 1) AS execution_status,
+                    (SELECT COUNT(*) FROM wc_task_events g
+                     WHERE g.task_id = t.id AND g.kind = 'human_guidance'
+                       AND g.sequence > t.guidance_seen_seq) AS unread_guidance
                 FROM wc_tasks t
                 JOIN wc_runs r ON r.task_id = t.id
                     AND r.started_at = (SELECT MAX(started_at) FROM wc_runs WHERE task_id = t.id)
@@ -1635,6 +1703,7 @@ impl Database {
                     execution_status: row.get(4)?,
                     validation_status: row.get(5)?,
                     next_action: row.get(6)?,
+                    unread_guidance: row.get(7)?,
                 })
             },
         )?;
@@ -3298,6 +3367,68 @@ mod tests {
         assert!(claim(&db, &task).is_empty());
         guide(&db, &task, "arrived later");
         assert_eq!(claim(&db, &task).len(), 1);
+    }
+
+    #[test]
+    fn read_state_reports_pending_and_claimed_guidance_without_consuming() {
+        let (_temp, db) = database();
+        bind(&db, "user:one");
+        let task = start(&db, "user:one", "fix the parser");
+
+        // No guidance yet: the watermark is zero and nothing is pending.
+        let state = db
+            .connector_guidance_read_state(&task.task_id, "wc_proj_demo")
+            .unwrap()
+            .expect("task exists");
+        assert_eq!(state.seen_seq, 0);
+        assert_eq!(state.last_pending_seq, None);
+
+        let first = guide(&db, &task, "first");
+        let second = guide(&db, &task, "second");
+
+        // Both pending: the newest pending sequence is reported while the
+        // watermark stays at zero.
+        let state = db
+            .connector_guidance_read_state(&task.task_id, "wc_proj_demo")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.seen_seq, 0);
+        assert_eq!(state.last_pending_seq, Some(second));
+
+        // The read-only query did not advance the watermark: a real claim
+        // still sees both messages.
+        let claimed = claim(&db, &task);
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(claimed[0].sequence, first);
+        assert_eq!(claimed[1].sequence, second);
+
+        // After the claim the watermark catches up and nothing is pending.
+        let state = db
+            .connector_guidance_read_state(&task.task_id, "wc_proj_demo")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.seen_seq, second);
+        assert_eq!(state.last_pending_seq, None);
+
+        // A guidance that arrives later is reported as pending above the
+        // advanced watermark, while the claimed one stays read.
+        let third = guide(&db, &task, "third");
+        let state = db
+            .connector_guidance_read_state(&task.task_id, "wc_proj_demo")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.seen_seq, second);
+        assert_eq!(state.last_pending_seq, Some(third));
+    }
+
+    #[test]
+    fn read_state_returns_none_for_missing_task() {
+        let (_temp, db) = database();
+        bind(&db, "user:one");
+        assert!(db
+            .connector_guidance_read_state("wc_task_missing", "wc_proj_demo")
+            .unwrap()
+            .is_none());
     }
 
     // -----------------------------------------------------------------------
