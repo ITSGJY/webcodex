@@ -5,7 +5,7 @@ pub(crate) enum ProjectCliAction {
     Setup(project_entry::ProjectCommandOptions),
     Doctor(project_entry::ProjectCommandOptions),
     Status(project_entry::ProjectCommandOptions),
-    AgentStart(project_entry::ProjectCommandOptions),
+    Run(project_entry::ProjectCommandOptions),
     Task(task_cli::TaskCliCommand),
     Exit {
         code: i32,
@@ -41,8 +41,7 @@ impl CliCommandOutput {
 
 pub fn is_project_command(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
-        Some("setup" | "doctor" | "status" | "task") => true,
-        Some("agent") => args.get(1).is_some_and(|arg| arg == "start"),
+        Some("setup" | "doctor" | "status" | "run" | "task") => true,
         _ => false,
     }
 }
@@ -64,7 +63,7 @@ where
         };
     };
 
-    if matches!(command, "setup" | "doctor" | "status") {
+    if matches!(command, "setup" | "doctor" | "status" | "run") {
         if args.len() == 2 && matches!(args[1].as_str(), "--help" | "-h") {
             return ProjectCliAction::Exit {
                 code: 0,
@@ -77,40 +76,9 @@ where
                 "setup" => ProjectCliAction::Setup(options),
                 "doctor" => ProjectCliAction::Doctor(options),
                 "status" => ProjectCliAction::Status(options),
+                "run" => ProjectCliAction::Run(options),
                 _ => unreachable!(),
             },
-            Err(error) => ProjectCliAction::Exit {
-                code: 2,
-                stdout: String::new(),
-                stderr: format!("{error}\n\n{}", project_entry::usage()),
-            },
-        };
-    }
-
-    if command == "agent" {
-        if (args.len() == 2 && matches!(args[1].as_str(), "--help" | "-h"))
-            || (args.len() == 3
-                && args[1] == "start"
-                && matches!(args[2].as_str(), "--help" | "-h"))
-        {
-            return ProjectCliAction::Exit {
-                code: 0,
-                stdout: project_entry::usage().to_string(),
-                stderr: String::new(),
-            };
-        }
-        if args.get(1).map(String::as_str) != Some("start") {
-            return ProjectCliAction::Exit {
-                code: 2,
-                stdout: String::new(),
-                stderr: format!(
-                    "expected `webcodex agent start`\n\n{}",
-                    project_entry::usage()
-                ),
-            };
-        }
-        return match project_entry::parse_options(&args[2..], "agent start") {
-            Ok(options) => ProjectCliAction::AgentStart(options),
             Err(error) => ProjectCliAction::Exit {
                 code: 2,
                 stdout: String::new(),
@@ -209,7 +177,7 @@ pub async fn run_project_command(args: Vec<String>) -> CliCommandOutput {
                 stderr: String::new(),
             }
         }
-        ProjectCliAction::AgentStart(options) => match project_entry::start_agent(&options).await {
+        ProjectCliAction::Run(options) => match project_entry::start_agent(&options).await {
             Ok(()) => CliCommandOutput::success(String::new()),
             Err(error) => CliCommandOutput::failure(
                 1,
@@ -251,8 +219,8 @@ mod tests {
             ProjectCliAction::Status(_)
         ));
         assert!(matches!(
-            project_cli_action(["agent", "start", "--root", "."]),
-            ProjectCliAction::AgentStart(_)
+            project_cli_action(["run", "--root", "."]),
+            ProjectCliAction::Run(_)
         ));
     }
 

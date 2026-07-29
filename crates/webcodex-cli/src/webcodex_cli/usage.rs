@@ -1,49 +1,36 @@
 pub(crate) fn usage() -> &'static str {
     "Usage: webcodex <COMMAND>\n\n\
-     Unified command-line interface for WebCodex.\n\n\
-     Commands:\n\n\
-     Project coding:\n\
-     \x20\x20setup                         Configure the current Git project\n\
-     \x20\x20doctor                        Diagnose project readiness\n\
-     \x20\x20status                        Show concise project coding readiness\n\
-     \x20\x20agent start                   Start the project runtime and local Agent\n\
-     \x20\x20task                          Review tasks and make host-local decisions\n\n\
-     Authentication:\n\
-     \x20\x20login <server-url> --code CODE Log this device into a server\n\
-     \x20\x20logout <server-url>           Remove this device's credentials for a server\n\
-     \x20\x20auth status                   Show which servers this device is logged in to\n\n\
-     Run the server:\n\
-     \x20\x20server up                     Bootstrap server env with an auto-generated admin key\n\
-     \x20\x20server init                   Create the server env bootstrap file\n\
-     \x20\x20server install-service        Generate and install a systemd unit\n\
-     \x20\x20server status                 Check service and runtime status\n\n\
-     Connect a machine:\n\
-     \x20\x20pairing create                Create a short-lived pairing code (run on the server)\n\
-     \x20\x20client enroll                 Enroll this machine using that code\n\
-     \x20\x20agent init|install-service|status\n\
-     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20Manage this machine's agent config and service\n\n\
-     Accounts and credentials:\n\
-     \x20\x20users create|list             Manage users\n\
-     \x20\x20tokens create|create-local|generate|register-hash|list|revoke\n\
-     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20Personal API tokens (wc_pat_*)\n\
-     \x20\x20agent-tokens create|create-local|register-hash|list|revoke\n\
-     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20Agent tokens (wc_agent_*)\n\n\
-     Diagnostics:\n\
-     \x20\x20ops status|agents|projects|smoke-preflight\n\
-     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20Read-only operator workflow checks\n\n\
-     Quick start:\n\
-     \x20\x20setup single-user             Create a user, GPT client, and agent token in one step\n\n\
-     Options:\n\
-     \x20\x20-h, --help                    Print help and exit\n\
-     \x20\x20-V, --version                 Print version and exit\n\n\
-     Common flags (users / tokens / agent-tokens / setup):\n\
-     \x20\x20--server-url URL              WebCodex server URL (required)\n\
-     \x20\x20--token TOKEN                 Bootstrap, admin, or self bearer token\n\
-     \x20\x20--token-file PATH             Read the bearer token from a file\n\
-     \x20\x20Token fallback: WEBCODEX_TOKEN\n\n\
-     `generate` and `create-local` run locally; every other token action calls\n\
-     the server. Singular spellings (user, token, agent-token) are accepted.\n\
-     Output: JSON unless noted otherwise.\n"
+Unified command-line interface for WebCodex.\n\n\
+Project:\n\
+  setup                         Configure the current Git project\n\
+  doctor                        Diagnose project readiness\n\
+  status                        Show concise project coding readiness\n\
+  run                           Run the current project runtime and local Agent\n\n\
+Account:\n\
+  login                         Log this device into a server\n\
+  logout                        Remove this device's credentials\n\
+  auth status                   Show login status\n\n\
+Server:\n\
+  server init|install|run|start|stop|restart|status|logs|uninstall\n\
+                                Configure and manage the Server service\n\n\
+Agent:\n\
+  agent init|install|run|start|stop|restart|status|logs|uninstall\n\
+                                Configure and manage the standalone Agent service\n\n\
+Operations:\n\
+  task                          Review tasks and make host-local decisions\n\
+  ops status|agents|projects|smoke-preflight\n\
+                                Read-only operator workflow checks\n\
+  pairing create                Create a client enrollment code\n\
+  client enroll                 Enroll this machine\n\
+  users create|list             Manage users\n\
+  tokens create|create-local|generate|register-hash|list|revoke\n\
+                                Manage personal API tokens\n\
+  agent-tokens create|create-local|register-hash|list|revoke\n\
+                                Manage Agent tokens\n\
+  setup single-user             Run the existing single-user bootstrap flow\n\n\
+Options:\n\
+  -h, --help                    Print help and exit\n\
+  -V, --version                 Print version and exit\n"
 }
 
 pub(crate) fn pairing_usage() -> &'static str {
@@ -81,25 +68,6 @@ pub(crate) fn client_usage() -> &'static str {
     "Usage: webcodex client <COMMAND>\n\n\
      Commands:\n\
        enroll       Enroll this client using a temporary pairing code\n"
-}
-
-pub(crate) fn server_up_usage() -> &'static str {
-    "Usage: webcodex server up [OPTIONS]\n\n\
-     Quick-start server bootstrap. Generates a local bootstrap/admin key when no\n\
-     WEBCODEX_TOKEN is configured, writes a user-writable env file, and prints\n\
-     next steps. Anonymous access is rejected by default; pass --open only for\n\
-     local/trusted-network demos.\n\n\
-     Options:\n\
-       --public-url URL     Public URL reported to clients\n\
-       --listen ADDR        Listen address [default: 0.0.0.0:8080]\n\
-       --open               Allow anonymous GPT/MCP and client access\n\
-       --data-dir DIR       Data directory [default: user/state dependent]\n\
-       --env-file PATH      Env file path [default: user/config dependent]\n\
-       --json               Print machine-readable output\n\
-       -h, --help           Print help and exit\n\n\
-     Default (no --open): anonymous denied, shared-key clients allowed,\n\
-     managed tokens allowed, bootstrap/admin key enabled.\n\
-     With --open: anonymous GPT/MCP and clients allowed (demo/test only).\n"
 }
 
 pub(crate) fn client_enroll_usage() -> &'static str {
@@ -204,47 +172,48 @@ pub(crate) fn ops_smoke_preflight_usage() -> &'static str {
 
 pub(crate) fn server_usage() -> &'static str {
     "Usage: webcodex server <COMMAND>\n\n\
-     Server bootstrap commands.\n\n\
-     Commands:\n\
-       up                   Quick-start: auto-generate admin key + env, optional --open\n\
-       init                 Create WEBCODEX_TOKEN env bootstrap file\n\
-       install-service      Generate/install a systemd unit\n\
-       status               Check systemd and /api/runtime/status\n\n\
-     Notes:\n\
-       server init only creates the server bootstrap/admin WEBCODEX_TOKEN.\n\
-       It does not create user API tokens or agent tokens.\n"
+Commands:\n\
+  init        Initialize or update Server configuration\n\
+  install     Install, enable, and start the systemd service\n\
+  run         Run webcodex-server directly in the foreground\n\
+  start       Start the installed service\n\
+  stop        Stop the installed service\n\
+  restart     Restart and verify the installed service\n\
+  status      Check systemd, HTTP reachability, and build revisions\n\
+  logs        Read bounded journal logs or explicitly follow them\n\
+  uninstall   Remove only the systemd unit; requires --confirm\n"
 }
 
 pub(crate) fn server_init_usage() -> &'static str {
     "Usage: webcodex server init [OPTIONS]\n\n\
-     Options:\n\
-       --listen ADDR          Listen address [default: 127.0.0.1:8080]\n\
-       --data-dir PATH        Data directory [root: /var/lib/webcodex; user: ~/.local/share/webcodex]\n\
-       --env-file PATH        Env file [root: /etc/webcodex/webcodex.env; user: ~/.config/webcodex/webcodex.env]\n\
-       --public-url URL       Optional public URL to report from runtime status\n\
-       --overwrite            Replace an existing env file\n\
-       --output -             Also print env contents to stdout, including the full WEBCODEX_TOKEN\n\
-       --json                 Print a machine-readable summary without the full token\n\
-       -h, --help             Print help and exit\n\n\
-     server init writes only WEBCODEX_TOKEN. It does not create wc_pat_* user\n\
-     tokens or wc_agent_* agent tokens.\n"
+Options:\n\
+  --listen ADDR          Listen address [default: 127.0.0.1:8080]\n\
+  --data-dir PATH        Data directory\n\
+  --env-file PATH        Server env file\n\
+  --public-url URL       Optional public URL\n\
+  --open                 Allow anonymous access for trusted demos\n\
+  --overwrite            Update an existing env file while preserving its token\n\
+  --json                 Print a summary without the full token\n\
+  -h, --help             Print help and exit\n\n\
+Shared-key mode is enabled. The full bootstrap token is saved only in the env file.\n"
 }
 
 pub(crate) fn server_install_service_usage() -> &'static str {
-    "Usage: webcodex server install-service [OPTIONS]\n\n\
-     Options:\n\
-       --env-file PATH             Env file [default: /etc/webcodex/webcodex.env]\n\
-       --bin PATH                  webcodex-server path; defaults to a sibling binary, then absolute PATH discovery\n\
-       --service-file PATH         systemd unit path [default: /etc/systemd/system/webcodex.service]\n\
-       --user USER                 Optional systemd User=\n\
-       --group GROUP               Optional systemd Group=\n\
-       --working-directory PATH    WorkingDirectory= [default: /var/lib/webcodex]\n\
-       --overwrite                 Replace an existing service file\n\
-       --dry-run                   Print the unit instead of writing it\n\
-       --output -                  Print the unit instead of writing it\n\
-       --json                      Print a machine-readable summary\n\
-       -h, --help                  Print help and exit\n\n\
-     Tokens are never inlined in the unit; it uses EnvironmentFile=.\n"
+    "Usage: webcodex server install [OPTIONS]\n\n\
+Options:\n\
+  --env-file PATH             EnvironmentFile= path\n\
+  --bin PATH                  webcodex-server path; sibling then absolute PATH by default\n\
+  --service-file PATH         Unit path [default: /etc/systemd/system/webcodex.service]\n\
+  --user USER                 Optional systemd User=\n\
+  --group GROUP               Optional systemd Group=\n\
+  --working-directory PATH    WorkingDirectory=\n\
+  --overwrite                 Replace an existing unit\n\
+  --no-start                  Enable without starting immediately\n\
+  --dry-run                   Render only; never call systemctl\n\
+  --output -                  Render only; never call systemctl\n\
+  --json                      Print machine-readable output\n\
+  -h, --help                  Print help and exit\n\n\
+Normal execution runs daemon-reload, enable --now (or enable with --no-start), and verifies state. Tokens are never inlined.\n"
 }
 
 pub(crate) fn server_status_usage() -> &'static str {
@@ -261,13 +230,18 @@ pub(crate) fn server_status_usage() -> &'static str {
 
 pub(crate) fn agent_usage() -> &'static str {
     "Usage: webcodex agent <COMMAND>\n\n\
-     Client-side agent commands.\n\n\
-     Commands:\n\
-       init                 Generate an agent.toml config\n\
-       install-service      Generate/install a webcodex-runner systemd unit\n\
-       status               Check systemd status and safe agent metadata\n"
+Commands:\n\
+  init        Generate an agent.toml config\n\
+  install     Install, enable, and start the webcodex-runner service\n\
+  run         Run webcodex-runner directly in the foreground\n\
+  start       Start the installed profile service\n\
+  stop        Stop the installed profile service\n\
+  restart     Restart and verify the installed profile service\n\
+  status      Check systemd, safe config metadata, and Server connectivity\n\
+  logs        Read bounded journal logs or explicitly follow them\n\
+  uninstall   Remove only the systemd unit; requires --confirm\n\n\
+`webcodex run` is the current-project runtime coordinator. `webcodex agent run` directly executes the standalone Runner.\n"
 }
-
 pub(crate) fn agent_init_usage() -> &'static str {
     "Usage: webcodex agent init --server-url URL [--token TOKEN|--token-file PATH] --client-id ID --owner USER [OPTIONS]\n\n\
      Options:\n\
@@ -293,27 +267,23 @@ pub(crate) fn agent_init_usage() -> &'static str {
 }
 
 pub(crate) fn agent_install_service_usage() -> &'static str {
-    "Usage: webcodex agent install-service [--config PATH] [--bin PATH] [OPTIONS]\n\n\
-     Options:\n\
-       --profile NAME             Client config profile for config/service defaults\n\
-       --config PATH              Agent config path [default: /etc/webcodex/agent.toml, or profile agent.toml]\n\
-       --bin PATH                 webcodex-runner binary path; defaults to webcodex-runner from PATH when safely discoverable\n\
-       --service-file PATH        systemd unit path [default: /etc/systemd/system/webcodex-runner.service, or webcodex-runner-<profile>.service]\n\
-       --working-directory PATH   WorkingDirectory= [default: /root]\n\
-       --user USER                Optional systemd User=\n\
-       --group GROUP              Optional systemd Group=\n\
-       --overwrite                Replace an existing service file\n\
-       --dry-run                  Print the unit instead of writing it\n\
-       --output -                 Print the unit instead of writing it\n\
-       --json                     Print a machine-readable summary\n\
-       -h, --help                 Print help and exit\n\n\
-     With --profile, missing config/service paths are derived under\n\
-     /etc/webcodex/clients/<profile> for root or\n\
-     ~/.config/webcodex/clients/<profile> for non-root users. Explicit path\n\
-     flags override profile-derived defaults. The unit runs:\n\
-     webcodex-runner --config <config>. Tokens are never inlined.\n"
+    "Usage: webcodex agent install [--profile NAME] [--config PATH] [OPTIONS]\n\n\
+Options:\n\
+  --profile NAME             Profile for config and unit defaults\n\
+  --config PATH              Agent config path\n\
+  --bin PATH                 webcodex-runner path; sibling then absolute PATH by default\n\
+  --service-file PATH        Unit path [default: webcodex-runner[-<profile>].service]\n\
+  --working-directory PATH   WorkingDirectory=\n\
+  --user USER                Optional systemd User=\n\
+  --group GROUP              Optional systemd Group=\n\
+  --overwrite                Replace an existing unit\n\
+  --no-start                 Enable without starting immediately\n\
+  --dry-run                  Render only; never call systemctl\n\
+  --output -                 Render only; never call systemctl\n\
+  --json                     Print machine-readable output\n\
+  -h, --help                 Print help and exit\n\n\
+The unit runs webcodex-runner --config <config>. Tokens are never inlined.\n"
 }
-
 pub(crate) fn agent_status_usage() -> &'static str {
     "Usage: webcodex agent status [OPTIONS]\n\n\
      Options:\n\

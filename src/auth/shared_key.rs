@@ -17,7 +17,7 @@ pub(crate) fn allow_anonymous_enabled() -> bool {
 /// unknown bearer tokens that do not look like WebCodex managed credentials
 /// (`wc_*`) are accepted as lightweight shared keys instead of being rejected.
 /// Default false — the server rejects unknown tokens unless the operator
-/// explicitly enables quick-start mode (e.g. via `server up`).
+/// explicitly enables quick-start mode (e.g. via `server init`).
 pub(crate) fn shared_key_enabled() -> bool {
     crate::config::env_flag("WEBCODEX_SHARED_KEY_ENABLED").unwrap_or(false)
 }

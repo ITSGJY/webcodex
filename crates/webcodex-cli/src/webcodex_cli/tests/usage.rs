@@ -74,7 +74,9 @@ fn webcodex_cli_help_mentions_management_commands() {
             }
             assert!(stdout.contains("tokens create|"));
             assert!(stdout.contains("agent-tokens create|"));
-            assert!(stdout.contains("agent init|install-service|status"));
+            assert!(
+                stdout.contains("agent init|install|run|start|stop|restart|status|logs|uninstall")
+            );
         }
         other => panic!("expected help exit, got {other:?}"),
     }
@@ -87,8 +89,8 @@ fn common_help_entrypoints_smoke() {
             &["--help"],
             &[
                 "Usage: webcodex <COMMAND>",
-                "Commands:",
-                "server up",
+                "Project:",
+                "server init|install|run|start|stop|restart|status|logs|uninstall",
                 "setup single-user",
             ],
         ),
@@ -97,10 +99,10 @@ fn common_help_entrypoints_smoke() {
             &[
                 "Usage: webcodex server <COMMAND>",
                 "Commands:",
-                "up",
                 "init",
-                "install-service",
-                "status",
+                "install",
+                "run",
+                "uninstall",
             ],
         ),
     ];
@@ -124,7 +126,7 @@ fn unified_project_and_auth_commands_dispatch() {
         &["status", "--help"][..],
         &["doctor", "--help"][..],
         &["task", "--help"][..],
-        &["agent", "start", "--help"][..],
+        &["run", "--help"][..],
     ] {
         assert!(matches!(
             cli_action(args.iter().copied()),
@@ -145,13 +147,27 @@ fn webcodex_cli_agent_help_mentions_new_subcommands() {
     match cli_action(["agent", "--help"]) {
         CliAction::Exit { code, stdout, .. } => {
             assert_eq!(code, 0);
-            assert!(stdout.contains("install-service"));
-            assert!(stdout.contains("status"));
-            assert!(stdout.contains("init"));
+            for command in [
+                "init",
+                "install",
+                "run",
+                "start",
+                "stop",
+                "restart",
+                "status",
+                "logs",
+                "uninstall",
+            ] {
+                assert!(
+                    stdout.contains(command),
+                    "agent help missing {command}: {stdout}"
+                );
+            }
+            assert!(stdout.contains("webcodex run"));
         }
         other => panic!("expected help exit, got {other:?}"),
     }
-    match cli_action(["agent", "install-service", "--help"]) {
+    match cli_action(["agent", "install", "--help"]) {
         CliAction::Exit { code, stdout, .. } => {
             assert_eq!(code, 0);
             assert!(stdout.contains("--config PATH"));

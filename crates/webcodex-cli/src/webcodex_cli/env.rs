@@ -56,6 +56,10 @@ pub(crate) fn render_server_env(opts: &ServerInitOptions, token: &str) -> String
             public_url.trim().trim_end_matches('/')
         ));
     }
+    content.push_str("WEBCODEX_SHARED_KEY_ENABLED=true\n");
+    if opts.open {
+        content.push_str("WEBCODEX_ALLOW_ANONYMOUS=true\n");
+    }
     content
 }
 

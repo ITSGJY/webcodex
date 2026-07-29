@@ -313,9 +313,9 @@ fn agent_install_service_profile_derives_config_and_service_file() {
     .unwrap();
     assert_eq!(opts.config, client_profile_agent_config("special"));
     assert_eq!(opts.service_file, client_profile_service_file("special"));
-    let unit = render_agent_systemd_unit(&opts);
+    let unit = render_agent_systemd_unit(&opts).unwrap();
     assert!(unit.contains(
-        "ExecStart=/opt/webcodex/bin/webcodex-runner --config /etc/webcodex/clients/special/agent.toml"
+        "ExecStart=\"/opt/webcodex/bin/webcodex-runner\" \"--config\" \"/etc/webcodex/clients/special/agent.toml\""
     ));
 }
 

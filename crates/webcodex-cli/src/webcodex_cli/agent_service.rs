@@ -3,12 +3,30 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 use super::http::{fetch_runtime_status, http_post_json_status, HttpStatusSummary};
+use super::{
+    control_service, encode_exec_argument, encode_exec_path_argument, encode_exec_program,
+    encode_unit_path_value, install_unit, query_systemd_service_status, read_optional_token,
+    run_logs, service_unit_name, uninstall_unit, validate_systemd_identity, AGENT_SERVICE_UNIT,
+};
 use crate::{
-    is_systemd_platform, query_systemd_service_status, read_optional_token, write_text_file,
-    AgentInstallServiceOptions, AgentStatusOptions,
+    AgentInstallServiceOptions, AgentStatusOptions, ServiceActionKind, ServiceActionOptions,
 };
 
-pub(crate) fn render_agent_systemd_unit(opts: &AgentInstallServiceOptions) -> String {
+pub(crate) fn render_agent_systemd_unit(
+    opts: &AgentInstallServiceOptions,
+) -> Result<String, String> {
+    let binary = encode_exec_program("ExecStart", &opts.bin)?;
+    let config_flag = encode_exec_argument("ExecStart option", "--config")?;
+    let config = encode_exec_path_argument("ExecStart --config", &opts.config)?;
+    let exec_start = format!("{binary} {config_flag} {config}");
+    let working_directory = encode_unit_path_value("WorkingDirectory", &opts.working_directory)?;
+    if let Some(user) = &opts.user {
+        validate_systemd_identity("User", user)?;
+    }
+    if let Some(group) = &opts.group {
+        validate_systemd_identity("Group", group)?;
+    }
+
     let mut unit = String::new();
     unit.push_str("[Unit]\n");
     unit.push_str("Description=WebCodex Runner\n");
@@ -16,102 +34,99 @@ pub(crate) fn render_agent_systemd_unit(opts: &AgentInstallServiceOptions) -> St
     unit.push_str("Wants=network-online.target\n\n");
     unit.push_str("[Service]\n");
     unit.push_str("Type=simple\n");
-    unit.push_str(&format!(
-        "ExecStart={} --config {}\n",
-        opts.bin.display(),
-        opts.config.display()
-    ));
+    unit.push_str(&format!("ExecStart={exec_start}\n"));
     unit.push_str("ExecReload=/bin/kill -HUP $MAINPID\n");
     unit.push_str("Restart=always\n");
     unit.push_str("RestartSec=5s\n");
     unit.push_str("StandardOutput=journal\n");
     unit.push_str("StandardError=journal\n");
     unit.push_str("Environment=RUST_LOG=info\n");
-    unit.push_str(&format!(
-        "WorkingDirectory={}\n",
-        opts.working_directory.display()
-    ));
+    unit.push_str(&format!("WorkingDirectory={working_directory}\n"));
     if let Some(user) = &opts.user {
-        unit.push_str(&format!("User={}\n", user));
+        unit.push_str(&format!("User={user}\n"));
     }
     if let Some(group) = &opts.group {
-        unit.push_str(&format!("Group={}\n", group));
+        unit.push_str(&format!("Group={group}\n"));
     }
     unit.push_str("\n[Install]\n");
     unit.push_str("WantedBy=multi-user.target\n");
-    unit
-}
-
-fn service_unit_name(service_file: &Path) -> String {
-    service_file
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or(AGENT_SERVICE_UNIT)
-        .to_string()
+    Ok(unit)
 }
 
 pub(crate) fn run_agent_install_service(
     opts: AgentInstallServiceOptions,
 ) -> Result<String, String> {
-    let unit = render_agent_systemd_unit(&opts);
-    let service_unit = service_unit_name(&opts.service_file);
-    let writes_file = !opts.dry_run && !opts.output_stdout;
-    if writes_file {
-        if opts.service_file.exists() && !opts.overwrite {
-            return Err(format!(
-                "{} already exists; pass --overwrite to replace it",
-                opts.service_file.display()
-            ));
-        }
-        if !is_systemd_platform() {
-            return Err(
-                "systemd was not detected; use --dry-run or --output - to render the unit"
-                    .to_string(),
-            );
-        }
-        write_text_file(&opts.service_file, &unit, opts.overwrite, false)?;
-    }
+    let rendered = render_agent_systemd_unit(&opts)?;
+    let unit = service_unit_name(&opts.service_file, AGENT_SERVICE_UNIT);
     if opts.output_stdout || opts.dry_run {
         if opts.json {
-            let summary = json!({
+            return serde_json::to_string_pretty(&json!({
                 "service_file": opts.service_file.to_string_lossy(),
                 "config": opts.config.to_string_lossy(),
                 "bin": opts.bin.to_string_lossy(),
+                "unit_name": unit,
                 "dry_run": true,
-                "unit": unit,
-            });
-            return serde_json::to_string_pretty(&summary).map_err(|e| e.to_string());
+                "systemd_called": false,
+                "unit": rendered,
+            }))
+            .map_err(|e| e.to_string());
         }
-        return Ok(unit);
+        return Ok(rendered);
     }
+    let result = install_unit(
+        &opts.service_file,
+        &unit,
+        &rendered,
+        opts.overwrite,
+        opts.no_start,
+    )?;
     if opts.json {
-        let summary = json!({
+        return serde_json::to_string_pretty(&json!({
             "service_file": opts.service_file.to_string_lossy(),
             "config": opts.config.to_string_lossy(),
             "bin": opts.bin.to_string_lossy(),
-            "wrote_service_file": true,
-            "next_steps": [
-                "sudo systemctl daemon-reload",
-                format!("sudo systemctl enable --now {service_unit}"),
-                format!("sudo systemctl status {service_unit}")
-            ],
-        });
-        return serde_json::to_string_pretty(&summary).map_err(|e| e.to_string());
+            "unit": result.unit,
+            "enabled": true,
+            "started": result.started,
+        }))
+        .map_err(|e| e.to_string());
     }
-    let mut out = String::new();
-    out.push_str("Runner service unit installed.\n\n");
-    out.push_str(&format!(
-        "  service file: {}\n",
-        opts.service_file.display()
-    ));
-    out.push_str(&format!("  config:       {}\n", opts.config.display()));
-    out.push_str(&format!("  binary:       {}\n", opts.bin.display()));
-    out.push_str("\nNext steps:\n");
-    out.push_str("  - sudo systemctl daemon-reload\n");
-    out.push_str(&format!("  - sudo systemctl enable --now {service_unit}\n"));
-    out.push_str(&format!("  - sudo systemctl status {service_unit}\n"));
-    Ok(out)
+    Ok(format!(
+        "Agent service installed.\n\n  service file: {}\n  unit:         {}\n  config:       {}\n  binary:       {}\n  enabled:      yes\n  started:      {}\n",
+        opts.service_file.display(),
+        result.unit,
+        opts.config.display(),
+        opts.bin.display(),
+        if result.started { "yes" } else { "no (--no-start)" }
+    ))
+}
+
+pub(crate) fn run_agent_service(opts: ServiceActionOptions) -> Result<String, String> {
+    match opts.kind {
+        ServiceActionKind::Control(control) => {
+            control_service(&opts.unit, control)?;
+            Ok(format!(
+                "Agent service {} completed for {}.\n",
+                control.as_str(),
+                opts.unit
+            ))
+        }
+        ServiceActionKind::Logs {
+            lines,
+            since,
+            follow,
+        } => run_logs(&opts.unit, lines, since.as_deref(), follow),
+        ServiceActionKind::Uninstall { confirm } => {
+            if !confirm {
+                return Err("agent uninstall requires --confirm; no changes were made".to_string());
+            }
+            let result = uninstall_unit(&opts.service_file, &opts.unit)?;
+            Ok(format!(
+                "Agent service {}. Agent config, tokens, profile data and binaries were not deleted.\n",
+                if result.removed { "uninstalled" } else { "was already absent" }
+            ))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -204,11 +219,8 @@ fn runtime_client_online(output: &Value, client_id: &str) -> Option<bool> {
     })
 }
 
-/// The unit `agent install-service` writes today.
-pub(crate) const AGENT_SERVICE_UNIT: &str = "webcodex-runner.service";
-
 pub(crate) async fn run_agent_status(opts: AgentStatusOptions) -> Result<String, String> {
-    let service_unit = service_unit_name(&opts.service_file);
+    let service_unit = service_unit_name(&opts.service_file, AGENT_SERVICE_UNIT);
     let systemd = query_systemd_service_status(&service_unit);
     let metadata = read_agent_config_metadata(&opts.config)?;
     let effective_server_url = opts.server_url.clone().or_else(|| {
@@ -402,13 +414,17 @@ mod tests {
     #[test]
     fn service_unit_name_tracks_the_selected_profile_unit() {
         assert_eq!(
-            service_unit_name(Path::new(
-                "/etc/systemd/system/webcodex-runner-workstation.service"
-            )),
+            service_unit_name(
+                Path::new("/etc/systemd/system/webcodex-runner-workstation.service"),
+                AGENT_SERVICE_UNIT,
+            ),
             "webcodex-runner-workstation.service"
         );
         assert_eq!(
-            service_unit_name(Path::new("/etc/systemd/system/webcodex-runner.service")),
+            service_unit_name(
+                Path::new("/etc/systemd/system/webcodex-runner.service"),
+                AGENT_SERVICE_UNIT,
+            ),
             AGENT_SERVICE_UNIT
         );
     }

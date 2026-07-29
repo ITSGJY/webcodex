@@ -177,8 +177,8 @@ pub(crate) fn parse_options(
             "--root" => options.root = PathBuf::from(value(&mut index)?),
             "--profile" => options.profile = value(&mut index)?,
             "--state-dir" => options.state_dir = Some(PathBuf::from(value(&mut index)?)),
-            "--json" if command != "agent start" => options.json = true,
-            "--console-assets-dir" if command == "agent start" => {
+            "--json" if command != "run" => options.json = true,
+            "--console-assets-dir" if command == "run" => {
                 let directory = PathBuf::from(value(&mut index)?);
                 if !directory.is_absolute() {
                     return Err(
@@ -200,11 +200,11 @@ pub(crate) fn usage() -> &'static str {
     "Usage: webcodex setup [--root PATH] [--profile NAME] [--state-dir PATH] [--json]\n\
        webcodex doctor [--root PATH] [--profile NAME] [--state-dir PATH] [--json]\n\
        webcodex status [--root PATH] [--profile NAME] [--state-dir PATH] [--json]\n\
-       webcodex agent start [--root PATH] [--profile NAME] [--state-dir PATH]\n\
+       webcodex run [--root PATH] [--profile NAME] [--state-dir PATH]\n\
                               [--console-assets-dir ABSOLUTE_PATH]\n\n\
 Run setup in a local Git project. It writes private WebCodex state outside the\n\
 checkout and never starts services, modifies Git content, or opens a network\n\
-port. `agent start` is the explicit foreground runtime step. Its optional\n\
+port. `run` is the explicit foreground runtime step. Its optional\n\
 `--console-assets-dir` enables loopback-only development assets for that run.\n"
 }
 
@@ -287,7 +287,7 @@ pub(crate) fn readiness_with_probe(
             .iter()
             .find(|finding| finding.status == ReadinessStatus::Fail)
             .and_then(|finding| finding.next_action.clone())
-            .or_else(|| Some("webcodex agent start".to_string()))
+            .or_else(|| Some("webcodex run".to_string()))
     };
     ProjectReadiness {
         project,
@@ -312,7 +312,7 @@ pub(crate) fn runtime_readiness(project: Option<String>, probe: RemoteProbe) -> 
                 "Connection",
                 "server_unreachable",
                 "WebCodex is not reachable.",
-                "Run webcodex agent start, then retry.",
+                "Run webcodex run, then retry.",
             );
             ("unreachable", "unknown", "not_ready")
         }
@@ -330,7 +330,7 @@ pub(crate) fn runtime_readiness(project: Option<String>, probe: RemoteProbe) -> 
                 "Agent",
                 "agent_offline",
                 "The local Agent is offline.",
-                "Run webcodex agent start.",
+                "Run webcodex run.",
             ));
             ("connected", "offline", "not_ready")
         }
@@ -613,7 +613,7 @@ pub(crate) async fn start_agent(options: &ProjectCommandOptions) -> Result<(), P
         return Err(ProductError::new(
             "server_unreachable",
             "the configured loopback port is already in use",
-            Some("Stop the conflicting process, then run webcodex agent start."),
+            Some("Stop the conflicting process, then run webcodex run."),
         ));
     }
     let agent_binary = locate_agent_binary().ok_or_else(|| {

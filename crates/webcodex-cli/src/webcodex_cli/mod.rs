@@ -8,6 +8,7 @@ pub(crate) mod output;
 pub(crate) mod pairing;
 pub(crate) mod profiles;
 pub(crate) mod server;
+pub(crate) mod service;
 pub(crate) mod setup;
 pub(crate) mod system;
 #[cfg(test)]
@@ -18,7 +19,7 @@ pub(crate) mod usage;
 
 #[cfg(test)]
 pub(crate) use agent_service::render_agent_systemd_unit;
-pub(crate) use agent_service::{run_agent_install_service, run_agent_status};
+pub(crate) use agent_service::{run_agent_install_service, run_agent_service, run_agent_status};
 #[cfg(test)]
 pub(crate) use env::is_effective_root;
 #[cfg(test)]
@@ -54,13 +55,19 @@ pub(crate) use profiles::{
     default_client_output_dir_for_profile, validate_client_profile,
 };
 pub(crate) use server::{
-    run_server_init, run_server_install_service, run_server_status, run_server_up,
+    run_server_init, run_server_install_service, run_server_service, run_server_status,
     ServerStatusOptions,
+};
+pub(crate) use service::{
+    control_service, encode_exec_argument, encode_exec_path_argument, encode_exec_program,
+    encode_unit_path_value, install_unit, query_systemd_service_status, query_systemd_status,
+    run_internal_binary, run_logs, service_unit_name, uninstall_unit, validate_systemd_identity,
+    ServiceControl, AGENT_SERVICE_FILE, AGENT_SERVICE_UNIT, DEFAULT_LOG_LINES, SERVER_SERVICE_FILE,
+    SERVER_SERVICE_UNIT,
 };
 pub(crate) use setup::run_setup_single_user;
 pub(crate) use system::{
-    discover_internal_binary, is_systemd_platform, query_systemd_service_status,
-    query_systemd_status, read_optional_token, write_secret_file, write_text_file,
+    discover_internal_binary, read_optional_token, write_secret_file, write_text_file,
 };
 #[cfg(test)]
 pub(crate) use token_commands::resolve_account_credential;
@@ -74,5 +81,5 @@ pub(crate) use usage::{
     client_enroll_usage, client_usage, login_usage, logout_usage, ops_agents_usage,
     ops_projects_usage, ops_smoke_preflight_usage, ops_status_usage, ops_usage,
     pairing_create_usage, pairing_usage, server_init_usage, server_install_service_usage,
-    server_status_usage, server_up_usage, server_usage, status_usage, usage,
+    server_status_usage, server_usage, status_usage, usage,
 };

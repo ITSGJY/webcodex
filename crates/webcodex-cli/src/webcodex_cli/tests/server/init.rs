@@ -280,7 +280,8 @@ fn server_init_refuses_overwrite_unless_requested() {
     run_server_init(opts).unwrap();
     let content = std::fs::read_to_string(&env_file).unwrap();
     assert!(content.contains("WEBCODEX_ADDR="));
-    assert!(!content.contains("WEBCODEX_TOKEN=old"));
+    assert!(content.contains("WEBCODEX_TOKEN=old"));
+    assert!(content.contains("WEBCODEX_SHARED_KEY_ENABLED=true"));
 }
 
 #[test]
@@ -309,24 +310,10 @@ fn server_init_json_output_does_not_include_full_token() {
 }
 
 #[test]
-fn server_init_output_stdout_explicitly_prints_env_contents_with_token() {
-    let tmp = tempfile::tempdir().unwrap();
-    let env_file = tmp.path().join("webcodex.env");
-    let opts = parse_server_init(&args(&[
-        "--env-file",
-        env_file.to_str().unwrap(),
-        "--data-dir",
-        tmp.path().to_str().unwrap(),
-        "--output",
-        "-",
-    ]))
-    .unwrap();
-    let output = run_server_init(opts).unwrap();
-    let content = std::fs::read_to_string(&env_file).unwrap();
-    let token = parse_env_content_value(&content, "WEBCODEX_TOKEN").unwrap();
-    assert_eq!(output, content);
-    assert!(output.contains(&format!("WEBCODEX_TOKEN={}", token)));
-    assert!(server_init_usage().contains("including the full WEBCODEX_TOKEN"));
+fn server_init_rejects_legacy_full_token_stdout_mode() {
+    let result = parse_server_init(&args(&["--output", "-"]));
+    assert_eq!(result.unwrap_err(), "unknown server init flag: --output");
+    assert!(!server_init_usage().contains("full WEBCODEX_TOKEN"));
 }
 
 /// Fake server: respond to a sequence of (path -> response body) entries.

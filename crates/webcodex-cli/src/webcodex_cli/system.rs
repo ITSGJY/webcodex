@@ -104,17 +104,6 @@ pub(crate) fn discover_named_binary_absolute(name: &str) -> Option<PathBuf> {
     None
 }
 
-fn systemctl_available() -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| dir.join("systemctl").is_file())
-}
-
-pub(crate) fn is_systemd_platform() -> bool {
-    cfg!(target_os = "linux") && systemctl_available()
-}
-
 /// Write `content` to `path` with 0600 permissions on Unix, creating parent
 /// directories as needed. Used for one-time plaintext token files.
 pub(crate) fn write_secret_file(path: &Path, content: &str) -> Result<(), String> {
@@ -164,41 +153,4 @@ pub(crate) fn read_optional_token(
         return Err(format!("{} {} is empty", label, path.display()));
     }
     Ok(Some(token))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SystemdStatus {
-    pub(crate) active: String,
-    pub(crate) enabled: String,
-}
-
-pub(crate) fn query_systemd_service_status(service_name: &str) -> SystemdStatus {
-    fn run_status(args: &[&str]) -> String {
-        let output = std::process::Command::new("systemctl").args(args).output();
-        match output {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if stdout.is_empty() {
-                    "unknown".to_string()
-                } else {
-                    stdout
-                }
-            }
-            Err(_) => "unknown".to_string(),
-        }
-    }
-    if !systemctl_available() {
-        return SystemdStatus {
-            active: "unknown".to_string(),
-            enabled: "unknown".to_string(),
-        };
-    }
-    SystemdStatus {
-        active: run_status(&["is-active", service_name]),
-        enabled: run_status(&["is-enabled", service_name]),
-    }
-}
-
-pub(crate) fn query_systemd_status() -> SystemdStatus {
-    query_systemd_service_status("webcodex.service")
 }

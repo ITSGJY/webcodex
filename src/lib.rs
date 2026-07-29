@@ -145,7 +145,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     if !config.is_auth_enabled() {
         tracing::warn!(
             "WEBCODEX_TOKEN is not set! Running in development mode without authentication. \
-Use `webcodex server up` to generate a bootstrap/admin key, or set WEBCODEX_ALLOW_ANONYMOUS=true \
+Use `webcodex server init` to generate a bootstrap/admin key, or set WEBCODEX_ALLOW_ANONYMOUS=true \
 only for local/trusted-network demos."
         );
         tracing::warn!("Anonymous API access is rejected by default in production mode.");

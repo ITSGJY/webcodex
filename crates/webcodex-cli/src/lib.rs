@@ -8,12 +8,13 @@
 //!
 //! This binary intentionally does NOT start a server and does NOT print real
 //! tokens, Authorization headers, or full agent.toml contents with secrets
-//! (except explicit stdout materialization paths such as `agent init --output -`
-//! and `server init --output -`, which the user requests deliberately).
+//! (except explicit stdout materialization paths such as `agent init --output -`,
+//! which the user requests deliberately). Server initialization never prints the
+//! full bootstrap token.
 //!
-//! The existing `webcodex` server binary keeps its `webcodex users/tokens/...`
-//! admin commands as compatibility wrappers; this binary is the new home for
-//! management tooling.
+//! This package implements the single public `webcodex` CLI; background runtime
+//! execution remains in the separate `webcodex-server` and `webcodex-runner`
+//! binaries.
 
 use std::path::PathBuf;
 
@@ -34,17 +35,18 @@ use webcodex_cli::{
     base_dir_or_default, client_enroll_usage, client_profile_agent_config,
     client_profile_agent_token_file, client_profile_projects_dir, client_profile_service_file,
     client_profile_user_token_file, client_usage, default_client_output_dir_for_profile,
-    default_device_name, default_server_paths, discover_internal_binary, is_systemd_platform,
-    login_usage, logout_usage, ops_agents_usage, ops_projects_usage, ops_smoke_preflight_usage,
-    ops_status_usage, ops_usage, pairing_create_usage, pairing_usage, query_systemd_service_status,
-    read_optional_token, render_token_generate, run_agent_install_service, run_agent_status,
-    run_agent_token_create_local, run_client_enroll, run_login, run_logout, run_ops_command,
-    run_pairing_create, run_server_init, run_server_install_service, run_server_status,
-    run_server_up, run_setup_single_user, run_status, run_token_create_local, server_init_usage,
-    server_install_service_usage, server_status_usage, server_up_usage, server_usage, status_usage,
-    usage, validate_client_profile, write_secret_file, write_text_file, LoginOptions,
-    LogoutOptions, OpsCommand, OpsCommonOptions, OpsSmokePreflightOptions, ServerStatusOptions,
-    StatusOptions,
+    default_device_name, default_server_paths, discover_internal_binary, login_usage, logout_usage,
+    ops_agents_usage, ops_projects_usage, ops_smoke_preflight_usage, ops_status_usage, ops_usage,
+    pairing_create_usage, pairing_usage, render_token_generate, run_agent_install_service,
+    run_agent_service, run_agent_status, run_agent_token_create_local, run_client_enroll,
+    run_internal_binary, run_login, run_logout, run_ops_command, run_pairing_create,
+    run_server_init, run_server_install_service, run_server_service, run_server_status,
+    run_setup_single_user, run_status, run_token_create_local, server_init_usage,
+    server_install_service_usage, server_status_usage, server_usage, status_usage, usage,
+    validate_client_profile, write_secret_file, write_text_file, LoginOptions, LogoutOptions,
+    OpsCommand, OpsCommonOptions, OpsSmokePreflightOptions, ServerStatusOptions, ServiceControl,
+    StatusOptions, AGENT_SERVICE_FILE, AGENT_SERVICE_UNIT, DEFAULT_LOG_LINES, SERVER_SERVICE_FILE,
+    SERVER_SERVICE_UNIT,
 };
 const SETUP_GPT_SCOPES: &[&str] = &["runtime:read", "project:read", "project:write", "job:run"];
 const SETUP_AGENT_SCOPES: &[&str] = &[
@@ -69,12 +71,15 @@ enum CliAction {
     Logout(LogoutOptions),
     Status(StatusOptions),
     Ops(OpsCommand),
-    AgentInstallService(AgentInstallServiceOptions),
+    AgentInstall(AgentInstallServiceOptions),
     AgentStatus(AgentStatusOptions),
+    AgentRun(InternalRunOptions),
+    AgentService(ServiceActionOptions),
     ServerInit(ServerInitOptions),
-    ServerInstallService(ServerInstallServiceOptions),
+    ServerInstall(ServerInstallServiceOptions),
     ServerStatus(ServerStatusOptions),
-    ServerUp(ServerUpOptions),
+    ServerRun(InternalRunOptions),
+    ServerService(ServiceActionOptions),
     Exit {
         code: i32,
         stdout: String,
@@ -159,8 +164,8 @@ struct ServerInitOptions {
     data_dir: PathBuf,
     env_file: PathBuf,
     public_url: Option<String>,
+    open: bool,
     overwrite: bool,
-    output_stdout: bool,
     json: bool,
 }
 
@@ -175,6 +180,7 @@ struct ServerInstallServiceOptions {
     overwrite: bool,
     dry_run: bool,
     output_stdout: bool,
+    no_start: bool,
     json: bool,
 }
 
@@ -189,18 +195,34 @@ struct AgentInstallServiceOptions {
     overwrite: bool,
     dry_run: bool,
     output_stdout: bool,
+    no_start: bool,
     json: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ServerUpOptions {
-    public_url: Option<String>,
-    listen: Option<String>,
-    open: bool,
-    data_dir: Option<PathBuf>,
-    env_file: Option<PathBuf>,
-    foreground: bool,
-    json: bool,
+struct InternalRunOptions {
+    bin: PathBuf,
+    args: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ServiceActionKind {
+    Control(ServiceControl),
+    Logs {
+        lines: u32,
+        since: Option<String>,
+        follow: bool,
+    },
+    Uninstall {
+        confirm: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServiceActionOptions {
+    service_file: PathBuf,
+    unit: String,
+    kind: ServiceActionKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,11 +259,10 @@ where
             stdout: build_info::version_output("webcodex"),
             stderr: String::new(),
         },
-        "status" | "doctor" | "task" => CliAction::Project(args),
+        "status" | "doctor" | "run" | "task" => CliAction::Project(args),
         "setup" if args.get(1).map(String::as_str) != Some("single-user") => {
             CliAction::Project(args)
         }
-        "agent" if args.get(1).map(String::as_str) == Some("start") => CliAction::Project(args),
         "server" => parse_server_subcommand(&args[1..]),
         "pairing" => parse_pairing_subcommand(&args[1..]),
         "client" => parse_client_subcommand(&args[1..]),
@@ -662,76 +683,75 @@ impl SimpleFlagParser {
     }
 }
 
-fn parse_agent_subcommand(args: &[String]) -> CliAction {
-    if args.is_empty() {
-        return CliAction::Exit {
-            code: 2,
-            stdout: String::new(),
-            stderr: format!("{}\n", agent_usage()),
-        };
+fn exit_help(text: &str) -> CliAction {
+    CliAction::Exit {
+        code: 0,
+        stdout: text.to_string(),
+        stderr: String::new(),
     }
-    match args[0].as_str() {
-        "init" => {
-            if args.get(1).is_some_and(|a| a == "--help" || a == "-h") {
-                return CliAction::Exit {
-                    code: 0,
-                    stdout: agent_init_usage().to_string(),
-                    stderr: String::new(),
-                };
-            }
-            match parse_cli_agent_init(&args[1..]) {
-                Ok(opts) => CliAction::AgentInit(opts),
-                Err(e) => CliAction::Exit {
-                    code: 2,
-                    stdout: String::new(),
-                    stderr: format!("{}\n", e),
-                },
-            }
-        }
-        "install-service" => {
-            if args.get(1).is_some_and(|a| a == "--help" || a == "-h") {
-                return CliAction::Exit {
-                    code: 0,
-                    stdout: agent_install_service_usage().to_string(),
-                    stderr: String::new(),
-                };
-            }
-            match parse_agent_install_service(&args[1..]) {
-                Ok(opts) => CliAction::AgentInstallService(opts),
-                Err(e) => CliAction::Exit {
-                    code: 2,
-                    stdout: String::new(),
-                    stderr: format!("{}\n", e),
-                },
-            }
-        }
-        "status" => {
-            if args.get(1).is_some_and(|a| a == "--help" || a == "-h") {
-                return CliAction::Exit {
-                    code: 0,
-                    stdout: agent_status_usage().to_string(),
-                    stderr: String::new(),
-                };
-            }
-            match parse_agent_status(&args[1..]) {
-                Ok(opts) => CliAction::AgentStatus(opts),
-                Err(e) => CliAction::Exit {
-                    code: 2,
-                    stdout: String::new(),
-                    stderr: format!("{}\n", e),
-                },
-            }
-        }
-        "--help" | "-h" => CliAction::Exit {
-            code: 0,
-            stdout: agent_usage().to_string(),
-            stderr: String::new(),
-        },
-        other => CliAction::Exit {
-            code: 2,
-            stdout: String::new(),
-            stderr: format!("unknown agent subcommand: {}\n", other),
-        },
+}
+
+fn exit_error(text: &str) -> CliAction {
+    CliAction::Exit {
+        code: 2,
+        stdout: String::new(),
+        stderr: text.to_string(),
+    }
+}
+
+fn result_action<T>(result: Result<T, String>, action: impl FnOnce(T) -> CliAction) -> CliAction {
+    match result {
+        Ok(value) => action(value),
+        Err(error) => exit_error(&format!("{error}\n")),
+    }
+}
+
+fn parse_agent_subcommand(args: &[String]) -> CliAction {
+    let Some(command) = args.first().map(String::as_str) else {
+        return exit_error(agent_usage());
+    };
+    if matches!(command, "--help" | "-h") {
+        return exit_help(agent_usage());
+    }
+    if command == "run" && args.len() == 2 && matches!(args[1].as_str(), "--version" | "-V") {
+        return exit_help(&build_info::version_output("webcodex-runner"));
+    }
+    if args
+        .get(1)
+        .is_some_and(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        let help = match command {
+            "init" => agent_init_usage(),
+            "install" => agent_install_service_usage(),
+            "run" => "Usage: webcodex agent run [--profile NAME|--config PATH]\n\nRun webcodex-runner directly in the foreground.\n",
+            "start" | "stop" | "restart" => "Usage: webcodex agent <start|stop|restart> [--profile NAME]\n",
+            "status" => agent_status_usage(),
+            "logs" => "Usage: webcodex agent logs [--profile NAME] [--lines N] [--since VALUE] [--follow]\n",
+            "uninstall" => "Usage: webcodex agent uninstall [--profile NAME] --confirm\n",
+            "install-service" => "`webcodex agent install-service` was removed; use `webcodex agent install`.\n",
+            _ => agent_usage(),
+        };
+        return exit_help(help);
+    }
+    match command {
+        "init" => result_action(parse_cli_agent_init(&args[1..]), CliAction::AgentInit),
+        "install" => result_action(
+            parse_agent_install_service(&args[1..]),
+            CliAction::AgentInstall,
+        ),
+        "run" => result_action(parse_agent_run(&args[1..]), CliAction::AgentRun),
+        "status" => result_action(parse_agent_status(&args[1..]), CliAction::AgentStatus),
+        "start" | "stop" | "restart" | "logs" | "uninstall" => result_action(
+            parse_agent_service_action(command, &args[1..]),
+            CliAction::AgentService,
+        ),
+        "install-service" => exit_error(
+            "`webcodex agent install-service` was removed; use `webcodex agent install`.\n",
+        ),
+        other => exit_error(&format!(
+            "unknown agent subcommand: {other}\n\n{}",
+            agent_usage()
+        )),
     }
 }
 
@@ -969,93 +989,208 @@ fn parse_ops_smoke_preflight(args: &[String]) -> Result<OpsSmokePreflightOptions
 }
 
 fn parse_server_subcommand(args: &[String]) -> CliAction {
-    if args.is_empty() {
-        return CliAction::Exit {
-            code: 2,
-            stdout: String::new(),
-            stderr: format!("{}\n", server_usage()),
+    let Some(command) = args.first().map(String::as_str) else {
+        return exit_error(server_usage());
+    };
+    if matches!(command, "--help" | "-h") {
+        return exit_help(server_usage());
+    }
+    if command == "run" && args.len() == 2 && matches!(args[1].as_str(), "--version" | "-V") {
+        return exit_help(&build_info::version_output("webcodex-server"));
+    }
+    if args
+        .get(1)
+        .is_some_and(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        let help = match command {
+            "init" => server_init_usage(),
+            "install" => server_install_service_usage(),
+            "run" => "Usage: webcodex server run [--help|--version]\n\nRun webcodex-server directly in the foreground.\n",
+            "start" | "stop" | "restart" => "Usage: webcodex server <start|stop|restart>\n",
+            "status" => server_status_usage(),
+            "logs" => "Usage: webcodex server logs [--lines N] [--since VALUE] [--follow]\n",
+            "uninstall" => "Usage: webcodex server uninstall --confirm\n",
+            "up" => "`webcodex server up` was removed; use `webcodex server init`.\n",
+            "install-service" => "`webcodex server install-service` was removed; use `webcodex server install`.\n",
+            _ => server_usage(),
         };
+        return exit_help(help);
     }
-    match args[0].as_str() {
-        "--help" | "-h" => CliAction::Exit {
-            code: 0,
-            stdout: server_usage().to_string(),
-            stderr: String::new(),
-        },
-        "init" => {
-            if args.get(1).is_some_and(|a| a == "--help" || a == "-h") {
-                return CliAction::Exit {
-                    code: 0,
-                    stdout: server_init_usage().to_string(),
-                    stderr: String::new(),
-                };
-            }
-            match parse_server_init(&args[1..]) {
-                Ok(opts) => CliAction::ServerInit(opts),
-                Err(e) => CliAction::Exit {
-                    code: 2,
-                    stdout: String::new(),
-                    stderr: format!("{}\n", e),
-                },
-            }
-        }
-        "install-service" => {
-            if args.get(1).is_some_and(|a| a == "--help" || a == "-h") {
-                return CliAction::Exit {
-                    code: 0,
-                    stdout: server_install_service_usage().to_string(),
-                    stderr: String::new(),
-                };
-            }
-            match parse_server_install_service(&args[1..]) {
-                Ok(opts) => CliAction::ServerInstallService(opts),
-                Err(e) => CliAction::Exit {
-                    code: 2,
-                    stdout: String::new(),
-                    stderr: format!("{}\n", e),
-                },
-            }
-        }
-        "status" => {
-            if args.get(1).is_some_and(|a| a == "--help" || a == "-h") {
-                return CliAction::Exit {
-                    code: 0,
-                    stdout: server_status_usage().to_string(),
-                    stderr: String::new(),
-                };
-            }
-            match parse_server_status(&args[1..]) {
-                Ok(opts) => CliAction::ServerStatus(opts),
-                Err(e) => CliAction::Exit {
-                    code: 2,
-                    stdout: String::new(),
-                    stderr: format!("{}\n", e),
-                },
-            }
-        }
-        "up" => {
-            if args.get(1).is_some_and(|a| a == "--help" || a == "-h") {
-                return CliAction::Exit {
-                    code: 0,
-                    stdout: server_up_usage().to_string(),
-                    stderr: String::new(),
-                };
-            }
-            match parse_server_up(&args[1..]) {
-                Ok(opts) => CliAction::ServerUp(opts),
-                Err(e) => CliAction::Exit {
-                    code: 2,
-                    stdout: String::new(),
-                    stderr: format!("{}\n", e),
-                },
-            }
-        }
-        other => CliAction::Exit {
-            code: 2,
-            stdout: String::new(),
-            stderr: format!("unknown server subcommand: {}\n", other),
-        },
+    match command {
+        "init" => result_action(parse_server_init(&args[1..]), CliAction::ServerInit),
+        "install" => result_action(
+            parse_server_install_service(&args[1..]),
+            CliAction::ServerInstall,
+        ),
+        "run" => result_action(parse_server_run(&args[1..]), CliAction::ServerRun),
+        "status" => result_action(parse_server_status(&args[1..]), CliAction::ServerStatus),
+        "start" | "stop" | "restart" | "logs" | "uninstall" => result_action(
+            parse_server_service_action(command, &args[1..]),
+            CliAction::ServerService,
+        ),
+        "up" => exit_error("`webcodex server up` was removed; use `webcodex server init`.\n"),
+        "install-service" => exit_error(
+            "`webcodex server install-service` was removed; use `webcodex server install`.\n",
+        ),
+        other => exit_error(&format!(
+            "unknown server subcommand: {other}\n\n{}",
+            server_usage()
+        )),
     }
+}
+
+fn parse_server_run(args: &[String]) -> Result<InternalRunOptions, String> {
+    if !args.is_empty() {
+        return Err(format!("unknown server run option: {}", args[0]));
+    }
+    let bin = discover_internal_binary("webcodex-server").ok_or_else(|| {
+        "webcodex-server was not found beside webcodex or in an absolute PATH entry".to_string()
+    })?;
+    Ok(InternalRunOptions {
+        bin,
+        args: Vec::new(),
+    })
+}
+
+fn parse_agent_run(args: &[String]) -> Result<InternalRunOptions, String> {
+    let mut profile: Option<String> = None;
+    let mut config: Option<PathBuf> = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--profile" => profile = Some(next_value(&mut iter, arg)?),
+            "--config" => config = Some(PathBuf::from(next_value(&mut iter, arg)?)),
+            other => return Err(format!("unknown agent run option: {other}")),
+        }
+    }
+    let profile = profile
+        .as_deref()
+        .map(validate_client_profile)
+        .transpose()?;
+    let config = config.unwrap_or_else(|| {
+        profile
+            .as_deref()
+            .map(client_profile_agent_config)
+            .unwrap_or_else(|| PathBuf::from("/etc/webcodex/agent.toml"))
+    });
+    let bin = discover_internal_binary("webcodex-runner").ok_or_else(|| {
+        "webcodex-runner was not found beside webcodex or in an absolute PATH entry".to_string()
+    })?;
+    Ok(InternalRunOptions {
+        bin,
+        args: vec!["--config".to_string(), config.display().to_string()],
+    })
+}
+
+fn service_control(command: &str) -> Result<ServiceControl, String> {
+    match command {
+        "start" => Ok(ServiceControl::Start),
+        "stop" => Ok(ServiceControl::Stop),
+        "restart" => Ok(ServiceControl::Restart),
+        _ => Err(format!("unsupported service action: {command}")),
+    }
+}
+
+fn parse_service_kind(command: &str, args: &[String]) -> Result<ServiceActionKind, String> {
+    if matches!(command, "start" | "stop" | "restart") {
+        if let Some(flag) = args.first() {
+            if flag == "--root" || flag == "--state-dir" || flag == "--console-assets-dir" {
+                return Err(format!(
+                    "`webcodex agent {command}` manages the installed service; use `webcodex run` for project runtime options"
+                ));
+            }
+            return Err(format!("unknown {command} option: {flag}"));
+        }
+        return Ok(ServiceActionKind::Control(service_control(command)?));
+    }
+    if command == "logs" {
+        let mut lines = DEFAULT_LOG_LINES;
+        let mut since = None;
+        let mut follow = false;
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "--lines" => {
+                    lines = next_value(&mut iter, arg)?
+                        .parse::<u32>()
+                        .map_err(|_| "--lines must be a positive integer".to_string())?;
+                    if lines == 0 {
+                        return Err("--lines must be greater than zero".to_string());
+                    }
+                }
+                "--since" => {
+                    let value = next_value(&mut iter, arg)?;
+                    if value.trim().is_empty() {
+                        return Err("--since cannot be empty".to_string());
+                    }
+                    since = Some(value);
+                }
+                "--follow" => follow = true,
+                other => return Err(format!("unknown logs option: {other}")),
+            }
+        }
+        return Ok(ServiceActionKind::Logs {
+            lines,
+            since,
+            follow,
+        });
+    }
+    if command == "uninstall" {
+        let mut confirm = false;
+        for arg in args {
+            match arg.as_str() {
+                "--confirm" => confirm = true,
+                other => return Err(format!("unknown uninstall option: {other}")),
+            }
+        }
+        return Ok(ServiceActionKind::Uninstall { confirm });
+    }
+    Err(format!("unsupported service action: {command}"))
+}
+
+fn parse_server_service_action(
+    command: &str,
+    args: &[String],
+) -> Result<ServiceActionOptions, String> {
+    Ok(ServiceActionOptions {
+        service_file: PathBuf::from(SERVER_SERVICE_FILE),
+        unit: SERVER_SERVICE_UNIT.to_string(),
+        kind: parse_service_kind(command, args)?,
+    })
+}
+
+fn parse_agent_service_action(
+    command: &str,
+    args: &[String],
+) -> Result<ServiceActionOptions, String> {
+    let mut profile: Option<String> = None;
+    let mut remaining = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--profile" {
+            profile = Some(next_value(&mut iter, arg)?);
+        } else {
+            remaining.push(arg.clone());
+        }
+    }
+    let profile = profile
+        .as_deref()
+        .map(validate_client_profile)
+        .transpose()?;
+    let service_file = profile
+        .as_deref()
+        .map(client_profile_service_file)
+        .unwrap_or_else(|| PathBuf::from(AGENT_SERVICE_FILE));
+    let unit = service_file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(AGENT_SERVICE_UNIT)
+        .to_string();
+    Ok(ServiceActionOptions {
+        service_file,
+        unit,
+        kind: parse_service_kind(command, &remaining)?,
+    })
 }
 
 fn parse_server_init(args: &[String]) -> Result<ServerInitOptions, String> {
@@ -1065,8 +1200,8 @@ fn parse_server_init(args: &[String]) -> Result<ServerInitOptions, String> {
         data_dir: defaults.data_dir,
         env_file: defaults.env_file,
         public_url: None,
+        open: false,
         overwrite: false,
-        output_stdout: false,
         json: false,
     };
     let mut iter = args.iter();
@@ -1076,14 +1211,8 @@ fn parse_server_init(args: &[String]) -> Result<ServerInitOptions, String> {
             "--data-dir" => opts.data_dir = PathBuf::from(next_value(&mut iter, arg)?),
             "--env-file" => opts.env_file = PathBuf::from(next_value(&mut iter, arg)?),
             "--public-url" => opts.public_url = Some(next_value(&mut iter, arg)?),
+            "--open" => opts.open = true,
             "--overwrite" => opts.overwrite = true,
-            "--output" => {
-                let value = next_value(&mut iter, arg)?;
-                if value != "-" {
-                    return Err("--output only supports '-' for stdout".to_string());
-                }
-                opts.output_stdout = true;
-            }
             "--json" => opts.json = true,
             _ => return Err(format!("unknown server init flag: {}", arg)),
         }
@@ -1105,43 +1234,6 @@ fn parse_server_init(args: &[String]) -> Result<ServerInitOptions, String> {
     Ok(opts)
 }
 
-fn parse_server_up(args: &[String]) -> Result<ServerUpOptions, String> {
-    let mut opts = ServerUpOptions {
-        public_url: None,
-        listen: None,
-        open: false,
-        data_dir: None,
-        env_file: None,
-        foreground: false,
-        json: false,
-    };
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--public-url" => opts.public_url = Some(next_value(&mut iter, arg)?),
-            "--listen" => opts.listen = Some(next_value(&mut iter, arg)?),
-            "--open" => opts.open = true,
-            "--data-dir" => opts.data_dir = Some(PathBuf::from(next_value(&mut iter, arg)?)),
-            "--env-file" => opts.env_file = Some(PathBuf::from(next_value(&mut iter, arg)?)),
-            "--foreground" => {
-                return Err(
-                    "--foreground is not implemented yet; load the printed env command and run webcodex"
-                        .to_string(),
-                )
-            }
-            "--json" => opts.json = true,
-            "-h" | "--help" => return Err(server_up_usage().to_string()),
-            other => return Err(format!("unknown server up flag: {}", other)),
-        }
-    }
-    if let Some(url) = &opts.public_url {
-        if url.trim().is_empty() {
-            return Err("--public-url cannot be empty".to_string());
-        }
-    }
-    Ok(opts)
-}
-
 fn parse_agent_install_service(args: &[String]) -> Result<AgentInstallServiceOptions, String> {
     let mut profile: Option<String> = None;
     let mut config: Option<PathBuf> = None;
@@ -1153,6 +1245,7 @@ fn parse_agent_install_service(args: &[String]) -> Result<AgentInstallServiceOpt
     let mut overwrite = false;
     let mut dry_run = false;
     let mut output_stdout = false;
+    let mut no_start = false;
     let mut json = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -1166,6 +1259,7 @@ fn parse_agent_install_service(args: &[String]) -> Result<AgentInstallServiceOpt
             "--group" => group = Some(next_value(&mut iter, arg)?),
             "--overwrite" => overwrite = true,
             "--dry-run" => dry_run = true,
+            "--no-start" => no_start = true,
             "--output" => {
                 let value = next_value(&mut iter, arg)?;
                 if value != "-" {
@@ -1174,7 +1268,7 @@ fn parse_agent_install_service(args: &[String]) -> Result<AgentInstallServiceOpt
                 output_stdout = true;
             }
             "--json" => json = true,
-            _ => return Err(format!("unknown agent install-service flag: {}", arg)),
+            _ => return Err(format!("unknown agent install flag: {}", arg)),
         }
     }
     let profile = profile
@@ -1223,6 +1317,7 @@ fn parse_agent_install_service(args: &[String]) -> Result<AgentInstallServiceOpt
         overwrite,
         dry_run,
         output_stdout,
+        no_start,
         json,
     })
 }
@@ -1293,6 +1388,7 @@ fn parse_server_install_service(args: &[String]) -> Result<ServerInstallServiceO
     let mut overwrite = false;
     let mut dry_run = false;
     let mut output_stdout = false;
+    let mut no_start = false;
     let mut json = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -1305,6 +1401,7 @@ fn parse_server_install_service(args: &[String]) -> Result<ServerInstallServiceO
             "--working-directory" => working_directory = PathBuf::from(next_value(&mut iter, arg)?),
             "--overwrite" => overwrite = true,
             "--dry-run" => dry_run = true,
+            "--no-start" => no_start = true,
             "--output" => {
                 let value = next_value(&mut iter, arg)?;
                 if value != "-" {
@@ -1313,7 +1410,7 @@ fn parse_server_install_service(args: &[String]) -> Result<ServerInstallServiceO
                 output_stdout = true;
             }
             "--json" => json = true,
-            _ => return Err(format!("unknown server install-service flag: {}", arg)),
+            _ => return Err(format!("unknown server install flag: {}", arg)),
         }
     }
     let bin = match bin.or_else(|| discover_internal_binary("webcodex-server")) {
@@ -1342,6 +1439,7 @@ fn parse_server_install_service(args: &[String]) -> Result<ServerInstallServiceO
         overwrite,
         dry_run,
         output_stdout,
+        no_start,
         json,
     })
 }
@@ -1825,7 +1923,29 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        CliAction::AgentInstallService(opts) => match run_agent_install_service(opts) {
+        CliAction::AgentInstall(opts) => match run_agent_install_service(opts) {
+            Ok(stdout) => {
+                print!("{}", stdout);
+                if !stdout.ends_with('\n') {
+                    println!();
+                }
+                std::process::exit(0);
+            }
+            Err(stderr) => {
+                eprintln!("{}", stderr);
+                std::process::exit(1);
+            }
+        },
+        CliAction::AgentRun(opts) | CliAction::ServerRun(opts) => {
+            match run_internal_binary(&opts.bin, &opts.args) {
+                Ok(code) => std::process::exit(code),
+                Err(stderr) => {
+                    eprintln!("{}", stderr);
+                    std::process::exit(1);
+                }
+            }
+        }
+        CliAction::AgentService(opts) => match run_agent_service(opts) {
             Ok(stdout) => {
                 print!("{}", stdout);
                 if !stdout.ends_with('\n') {
@@ -1864,7 +1984,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
         },
-        CliAction::ServerUp(opts) => match run_server_up(opts) {
+        CliAction::ServerInstall(opts) => match run_server_install_service(opts) {
             Ok(stdout) => {
                 print!("{}", stdout);
                 if !stdout.ends_with('\n') {
@@ -1877,7 +1997,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
         },
-        CliAction::ServerInstallService(opts) => match run_server_install_service(opts) {
+        CliAction::ServerService(opts) => match run_server_service(opts) {
             Ok(stdout) => {
                 print!("{}", stdout);
                 if !stdout.ends_with('\n') {

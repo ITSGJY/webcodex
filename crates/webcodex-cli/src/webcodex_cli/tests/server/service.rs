@@ -19,7 +19,7 @@ fn install_service_generates_expected_unit_without_tokens() {
     let unit = run_server_install_service(opts).unwrap();
     assert!(unit.contains("[Unit]\nDescription=WebCodex Runtime\n"));
     assert!(unit.contains("EnvironmentFile=/etc/webcodex/webcodex.env\n"));
-    assert!(unit.contains("ExecStart=/usr/local/bin/webcodex-server\n"));
+    assert!(unit.contains("ExecStart=\"/usr/local/bin/webcodex-server\"\n"));
     assert!(unit.contains("WorkingDirectory=/var/lib/webcodex\n"));
     assert!(unit.contains("User=webcodex\n"));
     assert!(unit.contains("Group=webcodex\n"));
@@ -53,7 +53,7 @@ fn install_service_dry_run_and_output_work_without_systemd() {
     .unwrap();
     assert!(run_server_install_service(dry)
         .unwrap()
-        .contains("ExecStart=/usr/local/bin/webcodex-server"));
+        .contains("ExecStart=\"/usr/local/bin/webcodex-server\""));
 
     let out = parse_server_install_service(&args(&[
         "--bin",
@@ -90,7 +90,7 @@ fn agent_install_service_generates_expected_unit_without_tokens() {
     let unit = run_agent_install_service(opts).unwrap();
     assert!(unit.contains("[Unit]\nDescription=WebCodex Runner\n"));
     assert!(unit.contains(&format!(
-        "ExecStart=/opt/webcodex/bin/webcodex-runner --config {}\n",
+        "ExecStart=\"/opt/webcodex/bin/webcodex-runner\" \"--config\" \"{}\"\n",
         config.display()
     )));
     assert!(unit.contains("ExecReload=/bin/kill -HUP $MAINPID\n"));
@@ -135,9 +135,9 @@ fn agent_install_service_dry_run_and_output_work_without_systemd() {
         "--dry-run",
     ]))
     .unwrap();
-    assert!(run_agent_install_service(dry)
-        .unwrap()
-        .contains("ExecStart=/opt/webcodex/bin/webcodex-runner --config /etc/webcodex/agent.toml"));
+    assert!(run_agent_install_service(dry).unwrap().contains(
+        "ExecStart=\"/opt/webcodex/bin/webcodex-runner\" \"--config\" \"/etc/webcodex/agent.toml\""
+    ));
 
     let out = parse_agent_install_service(&args(&[
         "--config",
@@ -151,10 +151,213 @@ fn agent_install_service_dry_run_and_output_work_without_systemd() {
     .unwrap();
     let json: Value = serde_json::from_str(&run_agent_install_service(out).unwrap()).unwrap();
     assert_eq!(json["dry_run"], true);
-    assert!(json["unit"]
-        .as_str()
-        .unwrap()
-        .contains("ExecStart=/opt/webcodex/bin/webcodex-runner --config /etc/webcodex/agent.toml"));
+    assert!(json["unit"].as_str().unwrap().contains(
+        "ExecStart=\"/opt/webcodex/bin/webcodex-runner\" \"--config\" \"/etc/webcodex/agent.toml\""
+    ));
+}
+
+#[test]
+fn systemd_unit_rendering_quotes_paths_and_rejects_invalid_fields_in_dry_run() {
+    let server = parse_server_install_service(&args(&[
+        "--env-file",
+        "/etc/webcodex/env files/web\"codex\\main.env",
+        "--bin",
+        "/opt/web codex/bin/webcodex-server%p",
+        "--working-directory",
+        "/var/lib/web codex\\work",
+        "--user",
+        "web_codex-1.service",
+        "--group",
+        "web.group-1",
+        "--dry-run",
+    ]))
+    .unwrap();
+    let unit = run_server_install_service(server).unwrap();
+    assert!(unit.contains("EnvironmentFile=/etc/webcodex/env\\x20files/web\\x22codex\\x5cmain.env"));
+    assert!(unit.contains("ExecStart=\"/opt/web codex/bin/webcodex-server%%p\""));
+    assert!(unit.contains("WorkingDirectory=/var/lib/web\\x20codex\\x5cwork"));
+    assert!(unit.contains("User=web_codex-1.service"));
+    assert!(unit.contains("Group=web.group-1"));
+
+    for (flag, value, field) in [
+        ("--user", "bad user", "User"),
+        ("--group", "bad/group", "Group"),
+        (
+            "--bin",
+            "/opt/webcodex/bin/server\nInjected=yes",
+            "ExecStart",
+        ),
+        ("--env-file", "/etc/webcodex/a\rb", "EnvironmentFile"),
+        (
+            "--working-directory",
+            "/var/lib/web\0codex",
+            "WorkingDirectory",
+        ),
+    ] {
+        let opts = parse_server_install_service(&args(&[
+            "--bin",
+            "/usr/local/bin/webcodex-server",
+            flag,
+            value,
+            "--dry-run",
+        ]))
+        .unwrap();
+        let error = run_server_install_service(opts).unwrap_err();
+        assert!(error.contains(field), "{error}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_systemd_unit(unit: &str, name: &str) {
+    let available = std::process::Command::new("systemd-analyze")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if !available {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join(name);
+    std::fs::write(&path, unit).unwrap();
+    let output = std::process::Command::new("systemd-analyze")
+        .arg("verify")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "systemd-analyze verify failed for {name}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn make_executable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn generated_server_and_agent_units_pass_systemd_analyze_verify() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server_bin = tmp.path().join("webcodex-server");
+    let runner_bin = tmp.path().join("webcodex-runner");
+    make_executable(&server_bin);
+    make_executable(&runner_bin);
+
+    let server = parse_server_install_service(&args(&[
+        "--bin",
+        server_bin.to_str().unwrap(),
+        "--env-file",
+        "/etc/webcodex/webcodex.env",
+        "--working-directory",
+        "/var/lib/webcodex",
+        "--dry-run",
+    ]))
+    .unwrap();
+    let server_unit = run_server_install_service(server).unwrap();
+    assert!(server_unit.contains("EnvironmentFile=/etc/webcodex/webcodex.env\n"));
+    assert!(server_unit.contains("WorkingDirectory=/var/lib/webcodex\n"));
+    assert!(server_unit.contains("webcodex-server"));
+    verify_systemd_unit(&server_unit, "webcodex-default.service");
+
+    let config = tmp.path().join("agent.toml");
+    std::fs::write(&config, "server_url = \"http://127.0.0.1\"\n").unwrap();
+    let agent = parse_agent_install_service(&args(&[
+        "--bin",
+        runner_bin.to_str().unwrap(),
+        "--config",
+        config.to_str().unwrap(),
+        "--working-directory",
+        "/var/lib/webcodex",
+        "--dry-run",
+    ]))
+    .unwrap();
+    let agent_unit = run_agent_install_service(agent).unwrap();
+    assert!(agent_unit.contains("webcodex-runner\" \"--config\""));
+    assert!(agent_unit.contains("WorkingDirectory=/var/lib/webcodex\n"));
+    verify_systemd_unit(&agent_unit, "webcodex-runner-default.service");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn special_supported_paths_pass_systemd_analyze_verify() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server_bin = tmp.path().join("webcodex server%p");
+    let runner_bin = tmp.path().join("webcodex runner%p");
+    make_executable(&server_bin);
+    make_executable(&runner_bin);
+
+    let working = tmp.path().join("work space\"slash\\percent%p");
+    std::fs::create_dir(&working).unwrap();
+    let env_file = tmp.path().join("env space\"slash\\percent%p.env");
+    std::fs::write(&env_file, "WEBCODEX_LISTEN=127.0.0.1:0\n").unwrap();
+    let config = tmp.path().join("config space\"slash\\percent%p.toml");
+    std::fs::write(&config, "server_url = \"http://127.0.0.1\"\n").unwrap();
+
+    let server = parse_server_install_service(&args(&[
+        "--bin",
+        server_bin.to_str().unwrap(),
+        "--env-file",
+        env_file.to_str().unwrap(),
+        "--working-directory",
+        working.to_str().unwrap(),
+        "--dry-run",
+    ]))
+    .unwrap();
+    let server_unit = run_server_install_service(server).unwrap();
+    assert!(server_unit.contains("\\x20"));
+    assert!(server_unit.contains("\\x22"));
+    assert!(server_unit.contains("\\x5c"));
+    assert!(server_unit.contains("%%p"));
+    verify_systemd_unit(&server_unit, "webcodex-special.service");
+
+    let agent = parse_agent_install_service(&args(&[
+        "--bin",
+        runner_bin.to_str().unwrap(),
+        "--config",
+        config.to_str().unwrap(),
+        "--working-directory",
+        working.to_str().unwrap(),
+        "--dry-run",
+    ]))
+    .unwrap();
+    let agent_unit = run_agent_install_service(agent).unwrap();
+    assert!(agent_unit.contains("\\\"slash\\\\percent%%p.toml"));
+    verify_systemd_unit(&agent_unit, "webcodex-runner-special.service");
+}
+
+#[test]
+fn executable_program_rejects_quote_and_backslash_in_dry_run() {
+    for path in [
+        "/opt/webcodex/web\"codex-server",
+        "/opt/webcodex/web\\codex-server",
+    ] {
+        let opts = parse_server_install_service(&args(&["--bin", path, "--dry-run"])).unwrap();
+        let error = run_server_install_service(opts).unwrap_err();
+        assert!(error.contains("executable path"), "{error}");
+    }
+}
+
+#[test]
+fn agent_output_mode_rejects_invalid_unit_fields() {
+    let opts = parse_agent_install_service(&args(&[
+        "--config",
+        "/etc/webcodex/agent.toml\nEnvironment=BAD=1",
+        "--bin",
+        "/opt/webcodex/bin/webcodex-runner",
+        "--output",
+        "-",
+    ]))
+    .unwrap();
+    let error = run_agent_install_service(opts).unwrap_err();
+    assert!(error.contains("ExecStart --config"));
+    assert!(!error.contains("Environment=BAD=1"));
 }
 
 #[test]

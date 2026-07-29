@@ -74,7 +74,7 @@ async fn dispatch(
                 "message": "this project has not been configured",
                 "retryable": false,
                 "user_action_required": true,
-                "suggested_action": "Run webcodex setup, then webcodex agent start."
+                "suggested_action": "Run webcodex setup, then webcodex run."
             }
         })));
         return;
