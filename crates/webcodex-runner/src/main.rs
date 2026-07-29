@@ -73,6 +73,7 @@ use webcodex_runner::{
     HttpSendConfig, PreparedShellProfile, PreparedShellProfileCache, ReloadableAgentConfig,
     ShellConfig, SubmitResultError,
 };
+use webcodex_runner::contains_any;
 
 const JOB_UPDATE_INTERVAL_MS: u64 = 250;
 const AGENT_REGISTER_PATH: &str = "/api/shell/agent/register";
@@ -741,10 +742,6 @@ fn http_status_summary(status: reqwest::StatusCode) -> String {
         Some(reason) => format!("HTTP {} {}", status.as_u16(), reason),
         None => format!("HTTP {}", status.as_u16()),
     }
-}
-
-fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| haystack.contains(needle))
 }
 
 fn looks_like_proxy_html_error(body: &str) -> bool {

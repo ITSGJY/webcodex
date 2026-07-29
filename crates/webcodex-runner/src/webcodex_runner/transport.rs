@@ -4,6 +4,7 @@ use super::config::{
 };
 use super::lsp::LspSupervisor;
 use super::projects::AgentProjectCache;
+use super::util::contains_any;
 use super::shutdown::{
     ActivityTracker, BackgroundThreads, ShutdownCoordinator, ShutdownDeadline, ShutdownPhaseResult,
     ShutdownReport, BACKGROUND_JOIN_BUDGET, DEFAULT_SHUTDOWN_BUDGET, JOB_DRAIN_BUDGET,
@@ -443,10 +444,6 @@ impl fmt::Display for AgentTransportError {
             Self::Transient(message) | Self::Fatal(message) => f.write_str(message),
         }
     }
-}
-
-fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| haystack.contains(needle))
 }
 
 fn is_fatal_auth_or_register_error(message: &str) -> bool {

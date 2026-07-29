@@ -11,6 +11,7 @@ pub(crate) mod projects;
 pub(crate) mod shell;
 pub(crate) mod shutdown;
 pub(crate) mod transport;
+pub(crate) mod util;
 pub(crate) mod validation;
 
 pub(crate) use artifacts::{handle_artifact_file_request, is_artifact_request_kind};
@@ -62,3 +63,4 @@ pub(crate) use transport::{
     websocket_session, AgentRuntimeState, ResultSubmission, WS_OUTGOING_CAPACITY,
 };
 pub(crate) use transport::{run_agent, AgentSink, HttpSendConfig, SubmitResultError};
+pub(crate) use util::contains_any;
