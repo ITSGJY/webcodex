@@ -4,13 +4,11 @@
   "description": "Thin npm installer/wrapper for WebCodex native binaries.",
   "license": "Apache-2.0",
   "bin": {
-    "webcodex": "bin/webcodex.js",
-    "webcodex-runner": "bin/webcodex-runner.js",
-    "webcodex-cli": "bin/webcodex-cli.js"
+    "webcodex": "bin/webcodex.js"
   },
   "scripts": {
     "postinstall": "node install.js",
-    "test": "node test/self-test.js",
+    "test": "node test/self-test.js && node test/release-manifest-check-self-test.js",
     "pack:dry-run": "npm pack --dry-run",
     "smoke:local": "bash ../../scripts/npm_package_smoke.sh",
     "prepublishOnly": "node test/release-manifest-check.js"
@@ -20,9 +18,7 @@
     "install.js",
     "manifest.json",
     "manifest.example.json",
-    "README.md",
-    "test",
-    "vendor/.gitkeep"
+    "README.md"
   ],
   "engines": {
     "node": ">=18"

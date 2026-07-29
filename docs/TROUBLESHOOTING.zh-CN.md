@@ -9,28 +9,28 @@
 Server：
 
 - `webcodex --version` 能打印版本。
-- `webcodex-cli server status --env-file /etc/webcodex/webcodex.env` 报告本地 server reachable。
+- `webcodex server status --env-file /etc/webcodex/webcodex.env` 报告本地 server reachable。
 - 在 server host 上，`curl http://127.0.0.1:8080/openapi.json` 返回 OpenAPI JSON。
 - 如果使用 nginx 或其他 reverse proxy，public HTTPS 可访问。
 
 Client：
 
 - `webcodex-runner --version` 能打印版本。
-- `webcodex-cli agent status --profile workstation` 能读取本地 agent config。
+- `webcodex agent status --profile workstation` 能读取本地 agent config。
 - canonical project 的 `webcodex doctor` 通过；managed deployment 则使用
-  `webcodex-cli ops status --strict --server-url https://your-domain.example`。
+  `webcodex ops status --strict --server-url https://your-domain.example`。
 - `listAgents` / `runtime_status` 显示 agent online。
 
 ## 常见问题
 
-### `webcodex-cli server install-service` 提示 service already exists
+### `webcodex server install` 提示 service already exists
 
 只有在明确要替换现有 unit 时才使用 `--overwrite`：
 
 ```bash
-sudo webcodex-cli server install-service \
+sudo webcodex server install \
   --env-file /etc/webcodex/webcodex.env \
-  --bin /usr/local/bin/webcodex \
+  --bin /usr/local/bin/webcodex-server \
   --overwrite
 sudo systemctl daemon-reload
 ```
@@ -49,25 +49,25 @@ curl http://127.0.0.1:8080/openapi.json
 
 如果本地 HTTP 正常但 public HTTPS 不通，检查 nginx upstream host/port 和 TLS 配置。WebCodex CLI 不会自动配置 reverse proxy。
 
-### Client 显示 `webcodex-cli: command not found`
+### Client 显示 `webcodex: command not found`
 
 把 CLI 安装或 symlink 到 client 的 `PATH`，例如：
 
 ```bash
-sudo ln -s /opt/webcodex/bin/webcodex-cli /usr/local/bin/webcodex-cli
+sudo ln -s /opt/webcodex/bin/webcodex /usr/local/bin/webcodex
 ```
 
 请使用你主机上的实际安装路径。
 
 ### Client 误运行 `pairing create`，且 `/etc/webcodex/webcodex.env` 缺失
 
-`webcodex-cli pairing create` 是 server/admin-side 命令，需要 server bootstrap env file。朋友或 client 机器应运行 `webcodex-cli client enroll`，并使用 server owner 发来的短期 `wc_pair_*` code。
+`webcodex pairing create` 是 server/admin-side 命令，需要 server bootstrap env file。朋友或 client 机器应运行 `webcodex client enroll`，并使用 server owner 发来的短期 `wc_pair_*` code。
 
 机器之间只复制 `wc_pair_*` code。不要复制 `WEBCODEX_TOKEN`、user API tokens、agent tokens、env files 或完整 `agent.toml` files。
 
 ### Client 上 doctor 警告 `binary webcodex not found in PATH`
 
-这在 agent-only client machines 上可能是正常的。Agent-only client 需要 `webcodex-runner` 和 `webcodex-cli`；server binary `webcodex` 只在 server host 上需要。
+这在 agent-only client machines 上可能是正常的。Agent-only client 需要公开 `webcodex` CLI 和 `webcodex-runner`；`webcodex-server` 只在 server host 上需要。
 
 ### `client online: no`
 

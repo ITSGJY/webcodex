@@ -147,7 +147,7 @@ For a persistent installation, use this order:
 4. Create a short-lived pairing code on the server; enroll each repository
    machine with that code instead of copying long-lived credentials.
 5. Install the `webcodex-runner` service on each repository machine and finish
-   with `webcodex-cli ops status --strict`.
+   with `webcodex ops status --strict`.
 
 The exact commands and rollback-safe credential rules are in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). OAuth2 is an optional later step for
@@ -288,7 +288,7 @@ Read [SECURITY.md](SECURITY.md) and
 WebCodex is self-hosted infrastructure, not a hosted SaaS or a full browser
 IDE. Advanced multi-client enrollment, production OAuth, remote deployment,
 QUIC, shell profiles, and operator observability remain available through the
-management documentation and `webcodex-cli`; they do not change the ordinary
+management documentation and `webcodex`; they do not change the ordinary
 project entry above.
 
 ## Documentation

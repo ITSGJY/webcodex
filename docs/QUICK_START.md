@@ -8,7 +8,7 @@ workflow session, executor reference, or internal config path.
 
 ## Prerequisites
 
-- All three WebCodex binaries installed (`webcodex`, `webcodex-cli`,
+- All three WebCodex binaries installed (`webcodex`, `webcodex-server`,
   `webcodex-runner`).
 - Git available on `PATH`.
 - A Git project you can safely inspect and edit.
@@ -275,7 +275,7 @@ Common stable codes:
 | `checks_stale` | The workspace changed after the last trusted check | Run a new check operation |
 
 Advanced server, enrollment, OAuth, transport, and fleet diagnostics remain in
-`webcodex-cli` and the operations documentation. They are not onboarding
+`webcodex` and the operations documentation. They are not onboarding
 steps.
 
 ## Local activity and command previews

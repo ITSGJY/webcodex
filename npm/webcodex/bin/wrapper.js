@@ -1,47 +1,62 @@
 "use strict";
 
+const childProcess = require("child_process");
 const fs = require("fs");
 const path = require("path");
-const childProcess = require("child_process");
 
-function exeName(name) {
-  return process.platform === "win32" ? `${name}.exe` : name;
+function exeName(name, platform = process.platform) {
+  return platform === "win32" ? `${name}.exe` : name;
 }
 
 function packageRoot() {
   return path.resolve(__dirname, "..");
 }
 
-function nativePath(name) {
-  if (process.env.WEBCODEX_BINARY_DIR) {
-    return path.join(process.env.WEBCODEX_BINARY_DIR, exeName(name));
-  }
-  return path.join(packageRoot(), "vendor", "bin", exeName(name));
+function nativePath(options = {}) {
+  const root = options.packageRoot || packageRoot();
+  return path.join(root, "vendor", "bin", exeName("webcodex", options.platform));
 }
 
-function runNative(name) {
-  const target = nativePath(name);
+function runNative(options = {}) {
+  const target = options.target || nativePath(options);
+  const argv = options.argv || process.argv.slice(2);
   if (!fs.existsSync(target)) {
-    console.error(
-      `WebCodex native binary not found: ${target}\nRun npm install again or set WEBCODEX_BINARY_DIR=/path/to/local/bin`
-    );
-    process.exit(127);
+    console.error("WebCodex installation is incomplete: the native webcodex binary is missing. Reinstall the npm package.");
+    process.exitCode = 127;
+    return null;
   }
-  const child = childProcess.spawn(target, process.argv.slice(2), {
+
+  const child = childProcess.spawn(target, argv, {
     stdio: "inherit",
-    windowsHide: false
+    windowsHide: false,
+    shell: false
   });
-  child.on("exit", (code, signal) => {
-    if (signal) {
-      process.kill(process.pid, signal);
+  let forwardedSignal = null;
+  const forward = (signal) => {
+    forwardedSignal = signal;
+    if (!child.killed) child.kill(signal);
+  };
+  const signals = process.platform === "win32" ? ["SIGINT", "SIGTERM"] : ["SIGINT", "SIGTERM", "SIGHUP"];
+  for (const signal of signals) process.once(signal, forward);
+
+  const cleanup = () => {
+    for (const signal of signals) process.removeListener(signal, forward);
+  };
+  child.once("error", (err) => {
+    cleanup();
+    console.error(`Failed to execute the native webcodex binary: ${err.message}`);
+    process.exitCode = 127;
+  });
+  child.once("exit", (code, signal) => {
+    cleanup();
+    if (signal || forwardedSignal) {
+      const exitSignal = signal || forwardedSignal;
+      process.kill(process.pid, exitSignal);
       return;
     }
-    process.exit(code === null ? 1 : code);
+    process.exitCode = code === null ? 1 : code;
   });
-  child.on("error", (err) => {
-    console.error(`Failed to execute ${target}: ${err.message}`);
-    process.exit(127);
-  });
+  return child;
 }
 
 module.exports = { exeName, nativePath, runNative };

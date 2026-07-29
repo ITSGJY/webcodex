@@ -133,7 +133,7 @@ Credential——console 永远不会显示它。需要在 schema 里固定公网
 4. 在 server 上创建短期 pairing code；每台代码机器用该 code enroll，不复制长期
    credential。
 5. 在每台代码机器上安装 `webcodex-runner` service，最后执行
-   `webcodex-cli ops status --strict`。
+   `webcodex ops status --strict`。
 
 完整命令和可回滚的 credential 规则见
 [docs/DEPLOYMENT.zh-CN.md](docs/DEPLOYMENT.zh-CN.md)。OAuth2 是之后可选的委托登录
@@ -243,7 +243,7 @@ legacy ToolRuntime discovery/operations tools 继续供管理和诊断使用，�
 
 WebCodex 是 self-hosted infrastructure，不是 hosted SaaS 或完整 Browser IDE。
 高级 multi-client enrollment、production OAuth、remote deployment、QUIC、shell
-profile 和 operator observability 继续通过管理文档和 `webcodex-cli` 提供，但不会
+profile 和 operator observability 继续通过管理文档和 `webcodex` 提供，但不会
 改变上面的普通项目入口。
 
 ## 文档

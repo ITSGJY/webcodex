@@ -69,8 +69,8 @@ shared key 不是 admin credential，不是 managed user identity，也不是 pr
 用户在本地用它执行：
 
 ```bash
-webcodex-cli token create-local
-webcodex-cli agent-token create-local
+webcodex token create-local
+webcodex agent-token create-local
 ```
 
 这些命令在本地生成 plaintext tokens，并只把 token hashes 注册到 server。

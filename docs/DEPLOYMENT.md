@@ -6,9 +6,9 @@ This guide covers the current WebCodex production shape: server bootstrap, servi
 
 ## Components
 
-- `webcodex`: server exposing REST, GPT Actions OpenAPI, MCP, and agent endpoints.
+- `webcodex`: public unified CLI for project workflows, server/agent lifecycle, enrollment, and operations.
+- `webcodex-server`: server process exposing REST, GPT Actions OpenAPI, MCP, and agent endpoints.
 - `webcodex-runner`: long-lived worker connected by `auto` transport (QUIC first, then WebSocket, then polling) or by an explicitly selected transport.
-- `webcodex-cli`: recommended management CLI for server bootstrap, pairing/enrollment, status, and doctor checks.
 
 ## First Deployment: Read This First
 
@@ -17,14 +17,14 @@ workflow. The minimum production path is:
 
 1. Use a Linux x64 host with systemd, `sudo`, and a public HTTPS domain or
    trusted tunnel.
-2. Install `@yyjeqhc/webcodex`, run `webcodex-cli server init`, and install the
-   `webcodex` service.
+2. Install `@yyjeqhc/webcodex`, run `webcodex server init`, and install the
+   `webcodex-server` service.
 3. Configure the reverse proxy and set `WEBCODEX_PUBLIC_URL` to the exact public
    HTTPS origin.
 4. Create a short-lived pairing code on the server and run
-   `webcodex-cli client enroll` on the machine that owns the repositories.
+   `webcodex client enroll` on the machine that owns the repositories.
 5. Install the `webcodex-runner` service on that repository machine.
-6. Run `webcodex-cli ops status --strict`; only then import the GPT Actions
+6. Run `webcodex ops status --strict`; only then import the GPT Actions
    schema or add the MCP connector.
 
 For a same-machine evaluation without a permanent service or public ingress,
@@ -115,7 +115,7 @@ The v0.3.0 npm wrapper is prepared for `linux-x64` only. `linux-arm64`, `darwin-
 Initialize the env file:
 
 ```bash
-sudo webcodex-cli server init \
+sudo webcodex server init \
   --listen 127.0.0.1:8080 \
   --data-dir /var/lib/webcodex \
   --env-file /etc/webcodex/webcodex.env
@@ -134,12 +134,12 @@ set +a
 Install and start the systemd service:
 
 ```bash
-sudo webcodex-cli server install-service \
+sudo webcodex server install \
   --env-file /etc/webcodex/webcodex.env \
-  --bin /usr/local/bin/webcodex
+  --bin /usr/local/bin/webcodex-server
 sudo systemctl daemon-reload
 sudo systemctl enable --now webcodex
-webcodex-cli server status --env-file /etc/webcodex/webcodex.env
+webcodex server status --env-file /etc/webcodex/webcodex.env
 ```
 
 The compatibility commands remain available:
@@ -148,35 +148,35 @@ The compatibility commands remain available:
 webcodex users ...
 webcodex tokens ...
 webcodex agent-tokens ...
-webcodex-cli setup single-user
+webcodex setup single-user
 ```
 
-Prefer `webcodex-cli` in new docs and automation.
+Prefer `webcodex` in new docs and automation.
 
 ## Binary deployment checklist
 
 Server:
 
-1. Install `webcodex` and `webcodex-cli` binaries.
-2. Run `webcodex-cli server init`.
-3. Run `webcodex-cli server install-service --overwrite` only if replacing an old unit.
+1. Install the public `webcodex` CLI and the `webcodex-server` binary.
+2. Run `webcodex server init`.
+3. Run `webcodex server install --overwrite` only if replacing an old unit.
 4. Run `sudo systemctl daemon-reload`.
 5. Run `sudo systemctl enable --now webcodex`.
-6. Run `webcodex-cli server status`.
+6. Run `webcodex server status`.
 
 Server/admin:
 
-7. Run `webcodex-cli pairing create`.
+7. Run `webcodex pairing create`.
 
 Client:
 
-8. Install `webcodex-runner` and `webcodex-cli` binaries.
-9. Run `webcodex-cli client enroll`.
-10. Run `webcodex-cli agent install-service`.
+8. Install the public `webcodex` CLI and the `webcodex-runner` binary.
+9. Run `webcodex client enroll`.
+10. Run `webcodex agent install`.
 11. Run `sudo systemctl daemon-reload`.
 12. Run `sudo systemctl enable --now webcodex-runner`.
-13. Run `webcodex-cli agent status`.
-14. Run `webcodex-cli ops status --strict`.
+13. Run `webcodex agent status`.
+14. Run `webcodex ops status --strict`.
 
 `/etc/webcodex/webcodex.env` is server-side only. Client-side files live under a profile directory such as `/etc/webcodex/clients/workstation/agent.toml`, `/etc/webcodex/clients/workstation/webcodex-user-token`, `/etc/webcodex/clients/workstation/webcodex-runner-token`, and `/etc/webcodex/clients/workstation/projects.d` when multiple users or clients share one machine.
 
@@ -185,9 +185,9 @@ Client:
 For deployments that do not use pairing, use the account credential flow below. The commands in this section use `https://your-domain.example` placeholders.
 
 1. Start the server with `WEBCODEX_TOKEN` in the server env file. This is the bootstrap/root/admin credential only.
-2. Create a user with `webcodex-cli users create --issue-credential` and give the returned `wc_acct_xxx` to that user once. The binary help for this path uses `users create` plus `--server-url`, while `token create-local` and `agent-token create-local` use `--server`.
-3. The user runs `webcodex-cli token create-local` with `wc_acct_xxx` to locally generate a `wc_pat_xxx` and register only its hash. Use this PAT for GPT Actions, MCP, and runtime API calls.
-4. The user runs `webcodex-cli agent-token create-local` with `wc_acct_xxx` and `--client-id <client_id>` to locally generate a `wc_agent_xxx` and register only its hash. Use this token only for `webcodex-runner`.
+2. Create a user with `webcodex users create --issue-credential` and give the returned `wc_acct_xxx` to that user once. The binary help for this path uses `users create` plus `--server-url`, while `token create-local` and `agent-token create-local` use `--server`.
+3. The user runs `webcodex token create-local` with `wc_acct_xxx` to locally generate a `wc_pat_xxx` and register only its hash. Use this PAT for GPT Actions, MCP, and runtime API calls.
+4. The user runs `webcodex agent-token create-local` with `wc_acct_xxx` and `--client-id <client_id>` to locally generate a `wc_agent_xxx` and register only its hash. Use this token only for `webcodex-runner`.
 5. Initialize `webcodex-runner`, add top-level agent `projects.d/*.toml` files, start the agent, then verify `runtime_status`, `projects/list`, and a read-only `tools/call` such as `git_status`.
 
 Do not use `wc_acct_xxx` as a GPT Action/MCP token and do not put it in `agent.toml`.
@@ -199,7 +199,7 @@ When a server owner invites a friend or another operator, use a short-lived pair
 Server/admin side:
 
 ```bash
-webcodex-cli pairing create \
+webcodex pairing create \
   --server-url https://your-domain.example \
   --env-file /etc/webcodex/webcodex.env \
   --username friendname \
@@ -213,7 +213,7 @@ webcodex-cli pairing create \
 Client/friend side:
 
 ```bash
-webcodex-cli client enroll \
+webcodex client enroll \
   --server-url https://your-domain.example \
   --pairing-code <wc_pair_...> \
   --client-id friend-laptop \
@@ -221,7 +221,7 @@ webcodex-cli client enroll \
   --profile workstation \
   --allowed-root /home/friend/git
 
-webcodex-cli agent install-service \
+webcodex agent install \
   --profile workstation \
   --bin /opt/webcodex/bin/webcodex-runner \
   --overwrite
@@ -229,7 +229,7 @@ webcodex-cli agent install-service \
 sudo systemctl daemon-reload
 sudo systemctl enable --now webcodex-runner-workstation
 
-webcodex-cli ops status \
+webcodex ops status \
   --server-url https://your-domain.example \
   --token-file /etc/webcodex/clients/workstation/webcodex-user-token \
   --strict
@@ -315,12 +315,12 @@ Keep WebCodex listening on `127.0.0.1:8080` behind the proxy. The QUIC agent tra
 Client enroll generates the agent config. Install a systemd unit with:
 
 ```bash
-sudo webcodex-cli agent install-service \
+sudo webcodex agent install \
   --profile workstation \
   --bin /opt/webcodex/bin/webcodex-runner
 sudo systemctl daemon-reload
 sudo systemctl enable --now webcodex-runner-workstation
-webcodex-cli agent status \
+webcodex agent status \
   --profile workstation \
   --server-url https://your-domain.example
 ```
@@ -331,7 +331,7 @@ For a foreground test, start the agent with:
 webcodex-runner --profile workstation
 ```
 
-Advanced manual initialization uses `webcodex-cli agent init`; the duplicate
+Advanced manual initialization uses `webcodex agent init`; the duplicate
 `webcodex-runner init` alias was removed.
 
 Important agent settings:
@@ -392,7 +392,7 @@ https://your-domain.example/openapi.json
 
 Configure GPT Actions authentication as HTTP Bearer/API key in the `Authorization` header.
 
-The OpenAPI GPT Actions management surface intentionally excludes users, API tokens, agent tokens, pairing/enrollment, setup, doctor, npm, server management, and audit endpoints. Use `webcodex-cli` for those tasks.
+The OpenAPI GPT Actions management surface intentionally excludes users, API tokens, agent tokens, pairing/enrollment, setup, doctor, npm, server management, and audit endpoints. Use `webcodex` for those tasks.
 
 MCP uses the same user API token and the same `ToolRuntime` as GPT Actions.
 
@@ -404,7 +404,7 @@ WebCodex no longer exposes `run_codex` or legacy `/api/codex/*` routes. GPT Acti
 
 Recommended production smoke sequence:
 
-1. `webcodex-cli ops status --server-url https://your-domain.example --token-file PATH --strict` passes its read-only checks.
+1. `webcodex ops status --server-url https://your-domain.example --token-file PATH --strict` passes its read-only checks.
 2. `POST /api/runtime/status` returns `service=webcodex` and the expected public URL.
 3. `listAgents` shows at least one online agent.
 4. `listProjects` shows `agent:<client_id>:<project_id>` ids.

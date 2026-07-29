@@ -6,22 +6,22 @@
 
 ## 组件
 
-- `webcodex`：服务器进程，暴露 REST、GPT Actions OpenAPI、MCP 和 agent endpoints。
+- `webcodex`：公开统一 CLI，用于项目工作流、server/agent 生命周期、enrollment 和运维。
+- `webcodex-server`：服务器进程，暴露 REST、GPT Actions OpenAPI、MCP 和 agent endpoints。
 - `webcodex-runner`：长驻 worker，通过 `auto` transport 连接（先 QUIC，再 WebSocket，再 polling），也可显式指定单一 transport。
-- `webcodex-cli`：推荐的管理 CLI，用于 server bootstrap、pairing/enrollment、status 和 doctor checks。
 
 ## 第一次部署先看这里
 
 首次部署不需要先配置 OAuth、QUIC 或 account credential flow。最小生产路径是：
 
 1. 准备一台带 systemd、`sudo` 和公网 HTTPS 域名或可信隧道的 Linux x64 主机。
-2. 安装 `@yyjeqhc/webcodex`，运行 `webcodex-cli server init`，再安装
-   `webcodex` service。
+2. 安装 `@yyjeqhc/webcodex`，运行 `webcodex server init`，再安装
+   `webcodex-server` service。
 3. 配置 reverse proxy，并把 `WEBCODEX_PUBLIC_URL` 设为准确的公网 HTTPS origin。
 4. 在 server 上创建短期 pairing code，在持有代码仓库的机器上运行
-   `webcodex-cli client enroll`。
+   `webcodex client enroll`。
 5. 在该代码机器上安装 `webcodex-runner` service。
-6. 执行 `webcodex-cli ops status --strict`；通过后再导入 GPT Actions schema 或添加
+6. 执行 `webcodex ops status --strict`；通过后再导入 GPT Actions schema 或添加
    MCP connector。
 
 只想在同一台机器试用、不需要长期 service 或公网 ingress 时，请走主 README 的
@@ -110,7 +110,7 @@ v0.3.0 npm wrapper 只按 `linux-x64` 准备。除非在发布前补齐匹配 ar
 初始化 env 文件：
 
 ```bash
-sudo webcodex-cli server init \
+sudo webcodex server init \
   --listen 127.0.0.1:8080 \
   --data-dir /var/lib/webcodex \
   --env-file /etc/webcodex/webcodex.env
@@ -129,12 +129,12 @@ set +a
 安装并启动 systemd service：
 
 ```bash
-sudo webcodex-cli server install-service \
+sudo webcodex server install \
   --env-file /etc/webcodex/webcodex.env \
-  --bin /usr/local/bin/webcodex
+  --bin /usr/local/bin/webcodex-server
 sudo systemctl daemon-reload
 sudo systemctl enable --now webcodex
-webcodex-cli server status --env-file /etc/webcodex/webcodex.env
+webcodex server status --env-file /etc/webcodex/webcodex.env
 ```
 
 兼容命令仍然可用：
@@ -143,35 +143,35 @@ webcodex-cli server status --env-file /etc/webcodex/webcodex.env
 webcodex users ...
 webcodex tokens ...
 webcodex agent-tokens ...
-webcodex-cli setup single-user
+webcodex setup single-user
 ```
 
-新文档和自动化脚本应优先使用 `webcodex-cli`。
+新文档和自动化脚本应优先使用 `webcodex`。
 
 ## 二进制部署清单
 
 Server：
 
-1. 安装 `webcodex` 和 `webcodex-cli` binaries。
-2. 运行 `webcodex-cli server init`。
-3. 仅在替换旧 unit 时运行 `webcodex-cli server install-service --overwrite`。
+1. 安装公开 `webcodex` CLI 和 `webcodex-server` binary。
+2. 运行 `webcodex server init`。
+3. 仅在替换旧 unit 时运行 `webcodex server install --overwrite`。
 4. 运行 `sudo systemctl daemon-reload`。
 5. 运行 `sudo systemctl enable --now webcodex`。
-6. 运行 `webcodex-cli server status`。
+6. 运行 `webcodex server status`。
 
 Server/admin：
 
-7. 运行 `webcodex-cli pairing create`。
+7. 运行 `webcodex pairing create`。
 
 Client：
 
-8. 安装 `webcodex-runner` 和 `webcodex-cli` binaries。
-9. 运行 `webcodex-cli client enroll`。
-10. 运行 `webcodex-cli agent install-service`。
+8. 安装公开 `webcodex` CLI 和 `webcodex-runner` binary。
+9. 运行 `webcodex client enroll`。
+10. 运行 `webcodex agent install`。
 11. 运行 `sudo systemctl daemon-reload`。
 12. 运行 `sudo systemctl enable --now webcodex-runner`。
-13. 运行 `webcodex-cli agent status`。
-14. 运行 `webcodex-cli ops status --strict`。
+13. 运行 `webcodex agent status`。
+14. 运行 `webcodex ops status --strict`。
 
 `/etc/webcodex/webcodex.env` 只属于 server 侧。多用户或多个 client 共享一台机器时，client 侧文件应放在 profile 目录下，例如 `/etc/webcodex/clients/workstation/agent.toml`、`/etc/webcodex/clients/workstation/webcodex-user-token`、`/etc/webcodex/clients/workstation/webcodex-runner-token` 和 `/etc/webcodex/clients/workstation/projects.d`。
 
@@ -180,9 +180,9 @@ Client：
 如果部署不使用 pairing，可以使用下面的 account credential flow。本节命令统一使用 `https://your-domain.example` 占位符。
 
 1. 使用 server env file 中的 `WEBCODEX_TOKEN` 启动服务器。它只是 bootstrap/root/admin 凭据。
-2. 管理员运行 `webcodex-cli users create --issue-credential` 创建用户，并把返回的 `wc_acct_xxx` 一次性发给该用户。这个路径的二进制帮助使用 `users create` 和 `--server-url`；`token create-local` 与 `agent-token create-local` 使用 `--server`。
-3. 用户运行 `webcodex-cli token create-local`，使用 `wc_acct_xxx` 在本地生成 `wc_pat_xxx`，服务器只登记其 hash。GPT Actions、MCP 和 runtime API 调用使用这个 PAT。
-4. 用户运行 `webcodex-cli agent-token create-local`，使用 `wc_acct_xxx` 和 `--client-id <client_id>` 在本地生成 `wc_agent_xxx`，服务器只登记其 hash。该 token 只用于 `webcodex-runner`。
+2. 管理员运行 `webcodex users create --issue-credential` 创建用户，并把返回的 `wc_acct_xxx` 一次性发给该用户。这个路径的二进制帮助使用 `users create` 和 `--server-url`；`token create-local` 与 `agent-token create-local` 使用 `--server`。
+3. 用户运行 `webcodex token create-local`，使用 `wc_acct_xxx` 在本地生成 `wc_pat_xxx`，服务器只登记其 hash。GPT Actions、MCP 和 runtime API 调用使用这个 PAT。
+4. 用户运行 `webcodex agent-token create-local`，使用 `wc_acct_xxx` 和 `--client-id <client_id>` 在本地生成 `wc_agent_xxx`，服务器只登记其 hash。该 token 只用于 `webcodex-runner`。
 5. 初始化 `webcodex-runner`，添加顶层 agent `projects.d/*.toml` 文件，启动 agent，然后验证 `runtime_status`、`projects/list` 和一个只读 `tools/call`，例如 `git_status`。
 
 不要把 `wc_acct_xxx` 当作 GPT Action/MCP token，也不要把它写进 `agent.toml`。
@@ -194,7 +194,7 @@ server owner 邀请朋友或其他 operator 时，应使用短期 pairing code�
 Server/admin 侧：
 
 ```bash
-webcodex-cli pairing create \
+webcodex pairing create \
   --server-url https://your-domain.example \
   --env-file /etc/webcodex/webcodex.env \
   --username friendname \
@@ -208,7 +208,7 @@ webcodex-cli pairing create \
 Client/friend 侧：
 
 ```bash
-webcodex-cli client enroll \
+webcodex client enroll \
   --server-url https://your-domain.example \
   --pairing-code <wc_pair_...> \
   --client-id friend-laptop \
@@ -216,7 +216,7 @@ webcodex-cli client enroll \
   --profile workstation \
   --allowed-root /home/friend/git
 
-webcodex-cli agent install-service \
+webcodex agent install \
   --profile workstation \
   --bin /opt/webcodex/bin/webcodex-runner \
   --overwrite
@@ -224,7 +224,7 @@ webcodex-cli agent install-service \
 sudo systemctl daemon-reload
 sudo systemctl enable --now webcodex-runner-workstation
 
-webcodex-cli ops status \
+webcodex ops status \
   --server-url https://your-domain.example \
   --token-file /etc/webcodex/clients/workstation/webcodex-user-token \
   --strict
@@ -308,12 +308,12 @@ server {
 `client enroll` 会生成 agent config。使用下面命令安装 systemd unit：
 
 ```bash
-sudo webcodex-cli agent install-service \
+sudo webcodex agent install \
   --profile workstation \
   --bin /opt/webcodex/bin/webcodex-runner
 sudo systemctl daemon-reload
 sudo systemctl enable --now webcodex-runner-workstation
-webcodex-cli agent status \
+webcodex agent status \
   --profile workstation \
   --server-url https://your-domain.example
 ```
@@ -324,7 +324,7 @@ webcodex-cli agent status \
 webcodex-runner --profile workstation
 ```
 
-高级手工初始化使用 `webcodex-cli agent init`；重复的
+高级手工初始化使用 `webcodex agent init`；重复的
 `webcodex-runner init` alias 已删除。
 
 重要 agent 设置：
@@ -385,7 +385,7 @@ https://your-domain.example/openapi.json
 
 在 GPT Actions 中把认证配置为 HTTP Bearer/API key，并放在 `Authorization` header。
 
-OpenAPI GPT Actions 管理面有意排除 users、API tokens、agent tokens、pairing/enrollment、setup、doctor、npm、server management 和 audit endpoints。这些任务请使用 `webcodex-cli`。
+OpenAPI GPT Actions 管理面有意排除 users、API tokens、agent tokens、pairing/enrollment、setup、doctor、npm、server management 和 audit endpoints。这些任务请使用 `webcodex`。
 
 MCP 使用同一个用户 API token，并使用与 GPT Actions 相同的 `ToolRuntime`。
 
@@ -397,7 +397,7 @@ WebCodex 不再暴露 `run_codex` 或 legacy `/api/codex/*` routes。GPT Actions
 
 推荐的生产 smoke sequence：
 
-1. `webcodex-cli ops status --server-url https://your-domain.example --token-file PATH --strict` 通过只读检查。
+1. `webcodex ops status --server-url https://your-domain.example --token-file PATH --strict` 通过只读检查。
 2. `POST /api/runtime/status` 返回 `service=webcodex` 和预期 public URL。
 3. `listAgents` 显示至少一个 online agent。
 4. `listProjects` 显示 `agent:<client_id>:<project_id>` ids。

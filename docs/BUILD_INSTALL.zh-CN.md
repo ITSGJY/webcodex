@@ -10,8 +10,8 @@
 
 ```text
 webcodex
+webcodex-server
 webcodex-runner
-webcodex-cli
 ```
 
 `webcodex-runner` 执行服务端下发的 shell 命令，并不是一个 agent 循环。
@@ -22,22 +22,22 @@ binary、npm 命令、systemd unit 与 QUIC ALPN（`webcodex-runner/1`）统一�
 
 ## 已按二进制 help 校验的命令形态
 
-本文档中的示例已对照当前 `webcodex-cli -h`、`webcodex-runner -h` 和 `webcodex -h` 的输出检查。需要特别注意这些 flag 差异：
+本文档中的示例已对照当前 `webcodex -h`、`webcodex server -h` 和 `webcodex agent -h` 的输出检查。需要特别注意这些 flag 差异：
 
 | 任务 | 推荐命令形态 |
 | --- | --- |
 | 普通项目 onboarding | `webcodex setup` |
 | 项目诊断/readiness | `webcodex doctor` / `webcodex status` |
-| 初始化服务器 env | `webcodex-cli server init --listen ... --data-dir ... --env-file ...` |
-| 安装服务器 systemd unit | `webcodex-cli server install-service --env-file ... --bin ...` |
-| 检查服务器状态 | `webcodex-cli server status --env-file ...` |
-| 管理员创建账户凭据 | `webcodex-cli users create --server-url ... --token ... --username ... --issue-credential` |
-| 用户创建 PAT | `webcodex-cli token create-local --server ... --user ... --credential ... --scopes ...` |
-| 用户创建 agent token | `webcodex-cli agent-token create-local --server ... --user ... --credential ... --client-id ...` |
-| 创建 pairing code | `webcodex-cli pairing create --server-url ... --username ... --client-id ...` |
-| 客户端 enrollment | `webcodex-cli client enroll --server-url ... --pairing-code ... --client-id ...` |
+| 初始化服务器 env | `webcodex server init --listen ... --data-dir ... --env-file ...` |
+| 安装服务器 systemd unit | `webcodex server install --env-file ... --bin ...` |
+| 检查服务器状态 | `webcodex server status --env-file ...` |
+| 管理员创建账户凭据 | `webcodex users create --server-url ... --token ... --username ... --issue-credential` |
+| 用户创建 PAT | `webcodex token create-local --server ... --user ... --credential ... --scopes ...` |
+| 用户创建 agent token | `webcodex agent-token create-local --server ... --user ... --credential ... --client-id ...` |
+| 创建 pairing code | `webcodex pairing create --server-url ... --username ... --client-id ...` |
+| 客户端 enrollment | `webcodex client enroll --server-url ... --pairing-code ... --client-id ...` |
 | 前台运行 agent | `webcodex-runner --profile ...` |
-| 安装 agent service | `webcodex-cli agent install-service --profile ... --bin ...` |
+| 安装 agent service | `webcodex agent install --profile ... --bin ...` |
 
 账户管理命令使用 `users create` 和 `--server-url`；本地 token 创建命令使用 `--server`。这是当前 CLI surface 的实际差异，示例中会按这个差异书写。
 
@@ -73,11 +73,11 @@ nginx 文件只是示例。WebCodex CLI 不会自动配置 reverse proxy。
 
 Server：
 
-1. 安装 `webcodex` 和 `webcodex-cli` binaries。
+1. 安装公开 `webcodex` CLI 和 `webcodex-server` binary。
 2. 初始化 server env file：
 
 ```bash
-sudo webcodex-cli server init \
+sudo webcodex server init \
   --listen 127.0.0.1:8080 \
   --data-dir /var/lib/webcodex \
   --env-file /etc/webcodex/webcodex.env
@@ -88,9 +88,9 @@ sudo webcodex-cli server init \
 3. 安装 server service。只有替换旧 unit 时才使用 `--overwrite`。
 
 ```bash
-sudo webcodex-cli server install-service \
+sudo webcodex server install \
   --env-file /etc/webcodex/webcodex.env \
-  --bin /usr/local/bin/webcodex
+  --bin /usr/local/bin/webcodex-server
 ```
 
 4. Reload systemd，启动 service 并检查状态：
@@ -98,7 +98,7 @@ sudo webcodex-cli server install-service \
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now webcodex
-webcodex-cli server status --env-file /etc/webcodex/webcodex.env
+webcodex server status --env-file /etc/webcodex/webcodex.env
 ```
 
 Server/admin：
@@ -106,7 +106,7 @@ Server/admin：
 5. 创建短期一次性 pairing code：
 
 ```bash
-webcodex-cli pairing create \
+webcodex pairing create \
   --server-url https://your-domain.example \
   --env-file /etc/webcodex/webcodex.env \
   --username friendname \
@@ -119,11 +119,11 @@ webcodex-cli pairing create \
 
 Client：
 
-6. 安装 `webcodex-runner` 和 `webcodex-cli` binaries。
+6. 安装公开 `webcodex` CLI 和 `webcodex-runner` binary。
 7. 通过 HTTPS 交换 pairing code，并写入 client-side credentials/config：
 
 ```bash
-sudo webcodex-cli client enroll \
+sudo webcodex client enroll \
   --server-url https://your-domain.example \
   --pairing-code <wc_pair_...> \
   --client-id friend-laptop \
@@ -136,16 +136,16 @@ sudo webcodex-cli client enroll \
 8. 安装并启动 agent service，然后验证：
 
 ```bash
-sudo webcodex-cli agent install-service \
+sudo webcodex agent install \
   --profile workstation \
   --bin /opt/webcodex/bin/webcodex-runner \
   --overwrite
 sudo systemctl daemon-reload
 sudo systemctl enable --now webcodex-runner-workstation
-webcodex-cli agent status \
+webcodex agent status \
   --profile workstation \
   --server-url https://your-domain.example
-webcodex-cli ops status \
+webcodex ops status \
   --server-url https://your-domain.example \
   --token-file /etc/webcodex/clients/workstation/webcodex-user-token
 ```
@@ -154,13 +154,13 @@ GPT Actions 应使用生成的 client-side user-token file。GPT Actions 需要 
 
 ## Agent config
 
-`client enroll` 会写入 `agent.toml`。systemd service 使用 `webcodex-cli agent install-service`；前台测试可运行：
+`client enroll` 会写入 `agent.toml`。systemd service 使用 `webcodex agent install`；前台测试可运行：
 
 ```bash
 webcodex-runner --profile workstation
 ```
 
-高级手工生成只保留低层入口 `webcodex-cli agent init`；
+高级手工生成只保留低层入口 `webcodex agent init`；
 `webcodex-runner init` alias 已删除。
 
 ## 项目 readiness
@@ -181,10 +181,10 @@ connection、Agent registration、必要 coding capability 和 structured valida
 高级 multi-client deployment 将项目 readiness 与 operator fleet diagnostics 分开：
 
 ```bash
-webcodex-cli agent status \
+webcodex agent status \
   --profile workstation \
   --server-url https://your-domain.example
-webcodex-cli ops status \
+webcodex ops status \
   --server-url https://your-domain.example \
   --token-file /etc/webcodex/clients/workstation/webcodex-user-token
 ```

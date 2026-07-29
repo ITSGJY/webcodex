@@ -3,4 +3,4 @@
 
 const { runNative } = require("./wrapper");
 
-runNative("webcodex");
+runNative();

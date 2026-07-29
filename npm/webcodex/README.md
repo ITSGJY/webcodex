@@ -1,61 +1,49 @@
 # @yyjeqhc/webcodex
 
-Thin npm installer/wrapper for WebCodex native binaries. It installs command wrappers for:
-
-- `webcodex`
-- `webcodex-runner`
-- `webcodex-cli`
-
-`webcodex-runner` runs shell commands the server sends; it is not an agent
-loop. The package exposes only the current command name.
-
-## Install
+Thin npm installer and public command wrapper for WebCodex.
 
 ```bash
 npm install -g @yyjeqhc/webcodex
+webcodex --help
 ```
 
-The package does not commit compiled binaries to git. During installation, `install.js` detects the current platform/architecture, reads `manifest.json`, downloads the matching `.tar.gz` artifact from the GitHub Release, verifies its SHA-256 checksum, and installs the native binaries into `vendor/bin`.
+The npm package exposes one command only: `webcodex`. The wrapper launches the package-local native `webcodex` executable with inherited standard streams, unchanged arguments, exit status, and terminal signals.
 
-## Supported platforms in v0.3.0
+During installation, `install.js` installs one atomic runtime set into `vendor/bin`:
 
-Current release artifacts include:
+- `webcodex`
+- `webcodex-server`
+- `webcodex-runner`
 
-- `linux-x64`
+`webcodex-server` and `webcodex-runner` are intentionally not npm `bin` entries. The public `webcodex` command finds those internal executables beside itself when `webcodex server run` or `webcodex agent run` is used. No `webcodex-cli` executable, wrapper, or symlink is installed.
 
-`linux-arm64`, `darwin-arm64`, `darwin-x64`, Windows, and other platforms are not included in v0.3.0. They remain future targets unless a later release adds matching artifacts.
+## Artifact and integrity model
 
-The release-preparation manifest for v0.3.0 intentionally keeps a checksum placeholder until the Linux x64 GitHub Release artifact has been built and uploaded. Replace it with the checksum of the exact uploaded tarball before npm publication. The `prepublishOnly` check rejects non-hex and all-zero placeholders.
+The installer recognizes `linux-x64`, `linux-arm64`, `darwin-x64`, `darwin-arm64`, and `win32-x64`. The artifacts actually declared in a manifest are that release's platform coverage; recognized platforms are not implicitly required to be published. Each declared artifact contains all three executables from one build. The installer downloads to a temporary file, verifies SHA-256, extracts to a staging directory, checks all three regular files, sets Unix execute permissions, runs bounded `--version` checks, verifies one shared build identity, and atomically replaces the prior `vendor/bin` directory. A failed download, checksum, extraction, or validation leaves the previous complete installation intact.
+
+Current v0.3.0 release coverage is `linux-x64`. Other recognized platform keys fail clearly as unavailable unless the manifest declares a matching artifact. Release operators build all three binaries together and create an artifact with:
+
+```bash
+cargo build --release -p webcodex-cli --bin webcodex -p webcodex --bin webcodex-server -p webcodex-runner --bin webcodex-runner
+bash scripts/package_release_artifact.sh
+```
+
+Do not publish npm until the checksum in `manifest.json` matches the immutable uploaded artifact.
 
 ## Development switches
 
-- `WEBCODEX_SKIP_DOWNLOAD=1` skips downloads.
-- `WEBCODEX_BINARY_DIR=/path/to/bin` copies local binaries.
-- `WEBCODEX_MANIFEST=/path/to/manifest.json` or `file:///.../manifest.json` uses a local manifest.
+- `WEBCODEX_SKIP_DOWNLOAD=1` skips installation.
+- `WEBCODEX_BINARY_DIR=/path/to/bin` atomically copies a local three-binary build.
+- `WEBCODEX_MANIFEST=/path/to/manifest.json` or a file/HTTP URL selects another manifest.
 
-The wrappers preserve arguments and execute the package-local native binary. If a binary is missing, they print:
-
-```text
-Run npm install again or set WEBCODEX_BINARY_DIR=...
-```
-
-## Local package smoke
-
-From the repository root, build local binaries, pack this npm package, install the tarball into a temporary prefix, and verify the wrapper commands without publishing:
+## Local verification
 
 ```bash
+npm --prefix npm/webcodex test
 bash scripts/npm_package_smoke.sh
 ```
 
-For a faster debug-build smoke:
-
-```bash
-WEBCODEX_NPM_SMOKE_PROFILE=debug bash scripts/npm_package_smoke.sh
-```
-
-## Enrollment flow
-
-Server init creates only the server bootstrap token. Pairing creates a short-lived `wc_pair_*` code, and client enroll creates/saves the user API token and agent token on the client side. GPT Actions should use the client-side user token, not the server bootstrap token.
+The smoke builds all three binaries, inspects `npm pack --dry-run`, creates and unpacks a local tarball, installs it into a temporary npm prefix, and verifies the public wrapper plus same-directory Server and Runner discovery. It does not publish.
 
 ## License
 

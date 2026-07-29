@@ -7,14 +7,14 @@ This guide covers day-to-day WebCodex operations: server initialization, client 
 Operator-friendly read-only checks are available through:
 
 ```bash
-webcodex-cli ops status --server-url "$SERVER_URL" --token-file "$USER_TOKEN_FILE"
-webcodex-cli ops agents --server-url "$SERVER_URL" --token-file "$USER_TOKEN_FILE"
-webcodex-cli ops projects --server-url "$SERVER_URL" --token-file "$USER_TOKEN_FILE"
-webcodex-cli ops smoke-preflight \
+webcodex ops status --server-url "$SERVER_URL" --token-file "$USER_TOKEN_FILE"
+webcodex ops agents --server-url "$SERVER_URL" --token-file "$USER_TOKEN_FILE"
+webcodex ops projects --server-url "$SERVER_URL" --token-file "$USER_TOKEN_FILE"
+webcodex ops smoke-preflight \
   --server-url "$SERVER_URL" \
   --token-file "$USER_TOKEN_FILE" \
   --project agent:workstation:my-repo
-webcodex-cli ops smoke-preflight \
+webcodex ops smoke-preflight \
   --server-url "$SERVER_URL" \
   --token-file "$USER_TOKEN_FILE" \
   --project agent:workstation:my-repo \
@@ -42,14 +42,14 @@ offline agent.
 
 ### Environment file
 
-`webcodex-cli server init` creates the server environment file containing the bootstrap admin token and runtime settings.
+`webcodex server init` creates the server environment file containing the bootstrap admin token and runtime settings.
 
 ```bash
 SERVER_URL="https://webcodex.example.com"
 ENV_FILE="/etc/webcodex/webcodex.env"
 DATA_DIR="/var/lib/webcodex"
-BIN="/opt/webcodex/bin/webcodex"
-CLI="/opt/webcodex/bin/webcodex-cli"
+SERVER_BIN="/opt/webcodex/bin/webcodex-server"
+CLI="/opt/webcodex/bin/webcodex"
 
 sudo "$CLI" server init \
   --listen 127.0.0.1:8080 \
@@ -84,9 +84,9 @@ Or pass `--env-file "$ENV_FILE"` when the command supports it.
 ### systemd (recommended)
 
 ```bash
-sudo "$CLI" server install-service \
+sudo "$CLI" server install \
   --env-file "$ENV_FILE" \
-  --bin "$BIN"
+  --bin "$SERVER_BIN"
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now webcodex
@@ -102,10 +102,10 @@ For testing or environments without systemd:
 
 ```bash
 # Foreground
-WEBCODEX_ENV_FILE="$ENV_FILE" "$BIN"
+WEBCODEX_ENV_FILE="$ENV_FILE" "$SERVER_BIN"
 
 # Background
-nohup env WEBCODEX_ENV_FILE="$ENV_FILE" "$BIN" > /var/log/webcodex.log 2>&1 &
+nohup env WEBCODEX_ENV_FILE="$ENV_FILE" "$SERVER_BIN" > /var/log/webcodex.log 2>&1 &
 ```
 
 Manual mode does not provide automatic restart, log rotation, or boot persistence. Use systemd for production.
@@ -226,7 +226,7 @@ Enroll a client with a profile:
 Install a profile-specific agent service:
 
 ```bash
-"$CLI" agent install-service \
+"$CLI" agent install \
   --profile workstation \
   --bin /opt/webcodex/bin/webcodex-runner \
   --overwrite
@@ -351,7 +351,7 @@ If `allowed_roots` is `/root/git`, then paths outside that root (e.g., `/tmp/...
 ### wc_pat_* (Personal API Token)
 
 - Belongs to a user (owner).
-- Generated locally by `webcodex-cli token create-local`; the server stores only the hash.
+- Generated locally by `webcodex token create-local`; the server stores only the hash.
 - Not bound to a single device — the same PAT works from any client.
 - Used for: GPT Actions, MCP, REST API, `callRuntimeTool`, `tools/list`, `tools/call`.
 - A single PAT can access multiple agents and projects under the same owner on the same server, provided the scopes are sufficient.
@@ -360,14 +360,14 @@ If `allowed_roots` is `/root/git`, then paths outside that root (e.g., `/tmp/...
 ### wc_agent_* (Agent Token)
 
 - Belongs to an agent instance.
-- Generated locally by `webcodex-cli agent-token create-local`; the server stores only the hash.
+- Generated locally by `webcodex agent-token create-local`; the server stores only the hash.
 - Bound to a specific `client_id`.
 - Used for: `webcodex-runner` WebSocket/QUIC connections only.
 - Do not use for: GPT Actions, MCP, REST API calls.
 
 ### wc_acct_* (Account Credential)
 
-- One-time credential issued by `webcodex-cli users create --issue-credential`.
+- One-time credential issued by `webcodex users create --issue-credential`.
 - Used to locally create `wc_pat_*` and `wc_agent_*` tokens.
 - Do not use for: GPT Actions, MCP, agent connections, or any ongoing auth.
 
@@ -1036,8 +1036,8 @@ sudo cp -a /opt/webcodex/bin/. "$backup_dir/"
 
 ```bash
 sudo install -m 0755 target/release/webcodex /opt/webcodex/bin/webcodex
+sudo install -m 0755 target/release/webcodex-server /opt/webcodex/bin/webcodex-server
 sudo install -m 0755 target/release/webcodex-runner /opt/webcodex/bin/webcodex-runner
-sudo install -m 0755 target/release/webcodex-cli /opt/webcodex/bin/webcodex-cli
 ```
 
 4. Restart services on the appropriate hosts:

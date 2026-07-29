@@ -60,32 +60,32 @@ WebCodex 不再暴露 `run_codex` 或 legacy `/api/codex/*` routes。GPT Actions
 优先使用：
 
 ```bash
-webcodex-cli server init
-webcodex-cli server install-service
-webcodex-cli server status
-webcodex-cli pairing create --server-url URL --username alice --client-id alice-laptop
-webcodex-cli client enroll --server-url URL --pairing-code CODE --client-id alice-laptop
-webcodex-cli agent install-service --profile workstation --bin /opt/webcodex/bin/webcodex-runner
-webcodex-cli agent status --profile workstation --server-url URL
-webcodex-cli ops status --strict --server-url URL --token-file PATH
+webcodex server init
+webcodex server install
+webcodex server status
+webcodex pairing create --server-url URL --username alice --client-id alice-laptop
+webcodex client enroll --server-url URL --pairing-code CODE --client-id alice-laptop
+webcodex agent install --profile workstation --bin /opt/webcodex/bin/webcodex-runner
+webcodex agent status --profile workstation --server-url URL
+webcodex ops status --strict --server-url URL --token-file PATH
 ```
 
-`pairing create` 是 server/admin-side。`client enroll`、`agent install-service` 和 `agent status` 是运行 `webcodex-runner` 的 client-side 操作。不要把 server tokens 复制到 client；只复制短期 pairing code。
+`pairing create` 是 server/admin-side。`client enroll`、`agent install` 和 `agent status` 是运行 `webcodex-runner` 的 client-side 操作。不要把 server tokens 复制到 client；只复制短期 pairing code。
 ## 二进制 help 校验
 
 发布前或大规模修改文档后，应对照实际二进制 help 检查命令示例：
 
 ```bash
-webcodex-cli -h
-webcodex-cli server init -h
-webcodex-cli server install-service -h
-webcodex-cli server status -h
-webcodex-cli pairing create -h
-webcodex-cli client enroll -h
-webcodex-cli agent install-service -h
-webcodex-cli agent status -h
+webcodex -h
+webcodex server init -h
+webcodex server install -h
+webcodex server status -h
+webcodex pairing create -h
+webcodex client enroll -h
+webcodex agent install -h
+webcodex agent status -h
 webcodex doctor -h
-webcodex-cli ops status -h
+webcodex ops status -h
 webcodex-runner -h
 webcodex -h
 ```
@@ -93,7 +93,7 @@ webcodex -h
 重点检查管理员创建账户凭据使用 `users create --server-url ...`，而本地 token 创建使用 `token create-local --server ...` 和 `agent-token create-local --server ...`。
 
 
-兼容入口仍然存在，但新的 validation docs 应使用 `webcodex-cli`。
+旧 `webcodex-cli` 入口已不再安装；validation 统一使用 `webcodex` 命令。
 
 ## Documentation scans
 

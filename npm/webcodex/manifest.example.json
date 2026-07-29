@@ -1,5 +1,6 @@
 {
   "version": "0.3.0",
+  "binaries": ["webcodex", "webcodex-server", "webcodex-runner"],
   "artifacts": {
     "linux-x64": {
       "url": "https://github.com/yyjeqhc/webcodex/releases/download/v0.3.0/webcodex-v0.3.0-linux-x64.tar.gz",

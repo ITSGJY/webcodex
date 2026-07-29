@@ -132,11 +132,11 @@ With a `quic-v1` agent, QUIC supports the runtime request loop used by WebCodex 
 Use operator status projections for bounded QUIC checks:
 
 ```sh
-webcodex-cli ops status \
+webcodex ops status \
   --server-url https://your-domain.example \
   --token-file /etc/webcodex/clients/workstation/webcodex-user-token \
   --strict
-webcodex-cli ops agents \
+webcodex ops agents \
   --server-url https://your-domain.example \
   --token-file /etc/webcodex/clients/workstation/webcodex-user-token \
   --strict

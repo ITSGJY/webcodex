@@ -8,7 +8,7 @@ reference 或内部 config path。
 
 ## 前置条件
 
-- 已安装三个 WebCodex binaries：`webcodex`、`webcodex-cli`、
+- 已安装三个 WebCodex binaries：`webcodex`、`webcodex-server`、
   `webcodex-runner`；
 - `PATH` 中有 Git；
 - 一个可以安全查看和修改的 Git 项目。
@@ -251,7 +251,7 @@ webcodex doctor
 | `checks_stale` | 上次可信 check 后 workspace 改变 | 运行新的 check operation |
 
 高级 server、enrollment、OAuth、transport 和 fleet diagnostics 继续放在
-`webcodex-cli` 与 operations 文档中，不是 onboarding 步骤。
+`webcodex` 与 operations 文档中，不是 onboarding 步骤。
 
 ## 本机活动记录与命令预览
 

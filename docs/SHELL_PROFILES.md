@@ -182,10 +182,10 @@ webcodex doctor
 For an advanced enrolled profile, combine Agent status with operator status:
 
 ```bash
-webcodex-cli agent status \
+webcodex agent status \
   --profile workstation \
   --server-url https://example.test
-webcodex-cli ops status \
+webcodex ops status \
   --server-url https://example.test \
   --token-file ~/.config/webcodex/user.token \
   --strict

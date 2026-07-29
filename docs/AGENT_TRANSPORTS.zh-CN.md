@@ -128,11 +128,11 @@ QUIC 是现有 agent envelope protocol 的另一种 transport。它在 QUIC 上�
 使用 operator status projection 做有界 QUIC 检查：
 
 ```sh
-webcodex-cli ops status \
+webcodex ops status \
   --server-url https://your-domain.example \
   --token-file /etc/webcodex/clients/workstation/webcodex-user-token \
   --strict
-webcodex-cli ops agents \
+webcodex ops agents \
   --server-url https://your-domain.example \
   --token-file /etc/webcodex/clients/workstation/webcodex-user-token \
   --strict

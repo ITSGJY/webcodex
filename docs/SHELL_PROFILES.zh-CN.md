@@ -129,7 +129,7 @@ canonical project 使用共享只读 readiness：
 webcodex doctor
 ```
 
-高级 enrolled profile 使用 `webcodex-cli agent status --profile workstation`
-和 `webcodex-cli ops status --strict`。profile preparation failure 继续经过
+高级 enrolled profile 使用 `webcodex agent status --profile workstation`
+和 `webcodex ops status --strict`。profile preparation failure 继续经过
 sanitization，不暴露 `init_script` body 或 env value。显式 project roundtrip 属于
 operator smoke，不是普通 onboarding。

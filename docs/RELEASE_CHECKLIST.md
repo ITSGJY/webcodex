@@ -96,9 +96,9 @@ For the planned v0.3.0 binary and npm release:
 - `Cargo.toml` and the root `webcodex` entry in `Cargo.lock` must be `0.3.0`.
 - `npm/webcodex/package.json`, `manifest.json`, `manifest.example.json`, and the npm self-test must agree on `0.3.0`.
 - The release-preparation/tag commit may keep `REPLACE_WITH_RELEASE_ARTIFACT_SHA256` in `manifest.json`. Never copy the v0.2.0 checksum or invent a checksum to make prepublish checks pass.
-- The Linux x64 artifact name is `webcodex-v0.3.0-linux-x64.tar.gz` and contains `webcodex`, `webcodex-cli`, and `webcodex-runner` from the tagged source revision.
+- The Linux x64 artifact name is `webcodex-v0.3.0-linux-x64.tar.gz` and contains `webcodex`, `webcodex-server`, and `webcodex-runner` from one tagged source revision.
 - After uploading the exact tarball, calculate its SHA-256, update only the release manifest in a clearly reported post-tag commit, and do not move the tag.
-- Release artifact smoke must run `webcodex --version`, `webcodex-cli --version`, and `webcodex-runner --version`; all three must report `0.3.0`, the same clean build revision, and `dirty=false`.
+- Release artifact smoke must run `webcodex --version`, `webcodex-server --version`, and `webcodex-runner --version`; all three must report `0.3.0`, the same clean build revision, and `dirty=false`. The npm package exposes only the `webcodex` wrapper.
 - Run `node npm/webcodex/test/release-manifest-check.js` only after the real checksum is present; it must reject non-hex and all-zero placeholders.
 - Run `bash scripts/npm_package_smoke.sh` before npm publication and verify the packed tarball identifies `@yyjeqhc/webcodex@0.3.0`.
 

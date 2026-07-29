@@ -87,8 +87,8 @@ the OAuth bridge.
 The user uses it locally with:
 
 ```bash
-webcodex-cli token create-local
-webcodex-cli agent-token create-local
+webcodex token create-local
+webcodex agent-token create-local
 ```
 
 Those commands generate plaintext tokens locally and register only token hashes with the server.

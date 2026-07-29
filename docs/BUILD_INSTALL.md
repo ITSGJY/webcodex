@@ -10,8 +10,8 @@ Build the three current binaries for your host:
 
 ```text
 webcodex
+webcodex-server
 webcodex-runner
-webcodex-cli
 ```
 
 `webcodex-runner` runs shell commands the server sends rather than an agent
@@ -22,22 +22,22 @@ Do not run unauthenticated production deployments.
 
 ## Help-verified command shape
 
-The examples in this guide were checked against the current binary help output from `webcodex-cli -h`, `webcodex-runner -h`, and `webcodex -h`. Keep these flag differences in mind:
+The examples in this guide were checked against the current help output from `webcodex -h`, `webcodex server -h`, and `webcodex agent -h`. Keep these flag differences in mind:
 
 | Task | Preferred command shape |
 | --- | --- |
 | Ordinary project onboarding | `webcodex setup` |
 | Project diagnostics/readiness | `webcodex doctor` / `webcodex status` |
-| Server env bootstrap | `webcodex-cli server init --listen ... --data-dir ... --env-file ...` |
-| Server systemd unit | `webcodex-cli server install-service --env-file ... --bin ...` |
-| Server status | `webcodex-cli server status --env-file ...` |
-| Admin-created account credential | `webcodex-cli users create --server-url ... --token ... --username ... --issue-credential` |
-| User-created PAT | `webcodex-cli token create-local --server ... --user ... --credential ... --scopes ...` |
-| User-created agent token | `webcodex-cli agent-token create-local --server ... --user ... --credential ... --client-id ...` |
-| Pairing code | `webcodex-cli pairing create --server-url ... --username ... --client-id ...` |
-| Client enrollment | `webcodex-cli client enroll --server-url ... --pairing-code ... --client-id ...` |
+| Server env bootstrap | `webcodex server init --listen ... --data-dir ... --env-file ...` |
+| Server systemd unit | `webcodex server install --env-file ... --bin ...` |
+| Server status | `webcodex server status --env-file ...` |
+| Admin-created account credential | `webcodex users create --server-url ... --token ... --username ... --issue-credential` |
+| User-created PAT | `webcodex token create-local --server ... --user ... --credential ... --scopes ...` |
+| User-created agent token | `webcodex agent-token create-local --server ... --user ... --credential ... --client-id ...` |
+| Pairing code | `webcodex pairing create --server-url ... --username ... --client-id ...` |
+| Client enrollment | `webcodex client enroll --server-url ... --pairing-code ... --client-id ...` |
 | Agent foreground run | `webcodex-runner --profile ...` |
-| Agent service | `webcodex-cli agent install-service --profile ... --bin ...` |
+| Agent service | `webcodex agent install --profile ... --bin ...` |
 
 The account-management command uses `users create` and `--server-url`; local token creation commands use `--server`. That difference comes from the current CLI surface and is intentionally reflected in the examples.
 
@@ -72,11 +72,11 @@ The nginx file is only an example. WebCodex CLI does not automate reverse proxy 
 
 Server:
 
-1. Install `webcodex` and `webcodex-cli` binaries.
+1. Install the public `webcodex` CLI and the `webcodex-server` binary.
 2. Initialize the server env file:
 
 ```bash
-sudo webcodex-cli server init \
+sudo webcodex server init \
   --listen 127.0.0.1:8080 \
   --data-dir /var/lib/webcodex \
   --env-file /etc/webcodex/webcodex.env
@@ -87,9 +87,9 @@ This creates only the server bootstrap/admin `WEBCODEX_TOKEN` in `/etc/webcodex/
 3. Install the server service. Use `--overwrite` only when replacing an old unit.
 
 ```bash
-sudo webcodex-cli server install-service \
+sudo webcodex server install \
   --env-file /etc/webcodex/webcodex.env \
-  --bin /usr/local/bin/webcodex
+  --bin /usr/local/bin/webcodex-server
 ```
 
 4. Reload systemd, start the service, and check status:
@@ -97,7 +97,7 @@ sudo webcodex-cli server install-service \
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now webcodex
-webcodex-cli server status --env-file /etc/webcodex/webcodex.env
+webcodex server status --env-file /etc/webcodex/webcodex.env
 ```
 
 Server/admin:
@@ -105,7 +105,7 @@ Server/admin:
 5. Create a temporary one-time pairing code:
 
 ```bash
-webcodex-cli pairing create \
+webcodex pairing create \
   --server-url https://your-domain.example \
   --env-file /etc/webcodex/webcodex.env \
   --username friendname \
@@ -118,11 +118,11 @@ webcodex-cli pairing create \
 
 Client:
 
-6. Install `webcodex-runner` and `webcodex-cli` binaries.
+6. Install the public `webcodex` CLI and the `webcodex-runner` binary.
 7. Exchange the pairing code over HTTPS and write client-side credentials/config:
 
 ```bash
-sudo webcodex-cli client enroll \
+sudo webcodex client enroll \
   --server-url https://your-domain.example \
   --pairing-code <wc_pair_...> \
   --client-id friend-laptop \
@@ -135,16 +135,16 @@ Client enroll creates the `wc_pat_*` user token, `wc_agent_*` agent token, and `
 8. Install and start the agent service, then validate:
 
 ```bash
-sudo webcodex-cli agent install-service \
+sudo webcodex agent install \
   --profile workstation \
   --bin /opt/webcodex/bin/webcodex-runner \
   --overwrite
 sudo systemctl daemon-reload
 sudo systemctl enable --now webcodex-runner-workstation
-webcodex-cli agent status \
+webcodex agent status \
   --profile workstation \
   --server-url https://your-domain.example
-webcodex-cli ops status \
+webcodex ops status \
   --server-url https://your-domain.example \
   --token-file /etc/webcodex/clients/workstation/webcodex-user-token
 ```
@@ -157,19 +157,19 @@ Compatibility commands still work, but should not be the first choice in new doc
 webcodex users ...
 webcodex tokens ...
 webcodex agent-tokens ...
-webcodex-cli setup single-user
+webcodex setup single-user
 ```
 
 ## Agent config
 
-Client enroll writes `agent.toml`. For a systemd service, use `webcodex-cli agent install-service`; for a foreground test, run:
+Client enroll writes `agent.toml`. For a systemd service, use `webcodex agent install`; for a foreground test, run:
 
 ```bash
 webcodex-runner --profile workstation
 ```
 
 For advanced manual generation, use the single low-level entry
-`webcodex-cli agent init`. The `webcodex-runner init` alias was removed.
+`webcodex agent init`. The `webcodex-runner init` alias was removed.
 
 ## Project readiness
 
@@ -190,10 +190,10 @@ For an advanced multi-client deployment, keep project readiness separate from
 operator fleet diagnostics:
 
 ```bash
-webcodex-cli agent status \
+webcodex agent status \
   --profile workstation \
   --server-url https://your-domain.example
-webcodex-cli ops status \
+webcodex ops status \
   --server-url https://your-domain.example \
   --token-file /etc/webcodex/clients/workstation/webcodex-user-token
 ```
