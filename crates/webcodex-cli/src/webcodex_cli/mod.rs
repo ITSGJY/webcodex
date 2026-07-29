@@ -59,9 +59,8 @@ pub(crate) use server::{
 };
 pub(crate) use setup::run_setup_single_user;
 pub(crate) use system::{
-    discover_named_binary_absolute, discover_webcodex_binary, is_systemd_platform,
-    query_systemd_service_status, query_systemd_status, read_optional_token, write_secret_file,
-    write_text_file,
+    discover_internal_binary, is_systemd_platform, query_systemd_service_status,
+    query_systemd_status, read_optional_token, write_secret_file, write_text_file,
 };
 #[cfg(test)]
 pub(crate) use token_commands::resolve_account_credential;

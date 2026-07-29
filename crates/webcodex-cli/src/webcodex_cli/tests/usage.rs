@@ -5,22 +5,16 @@ fn cli_help_and_version_exit_before_dispatch() {
     match cli_action(["--help"]) {
         CliAction::Exit { code, stdout, .. } => {
             assert_eq!(code, 0);
-            assert!(stdout.contains("Usage: webcodex-cli"));
+            assert!(stdout.contains("Usage: webcodex"));
         }
         other => panic!("expected help exit, got {other:?}"),
     }
     match cli_action(["--version"]) {
         CliAction::Exit { code, stdout, .. } => {
             assert_eq!(code, 0);
-            assert!(stdout.starts_with(&format!(
-                "webcodex-cli {} (commit ",
-                env!("CARGO_PKG_VERSION")
-            )));
+            assert!(stdout.starts_with(&format!("webcodex {} (commit ", env!("CARGO_PKG_VERSION"))));
             assert!(stdout.trim_end().ends_with(')'));
-            assert_ne!(
-                stdout,
-                format!("webcodex-cli {}\n", env!("CARGO_PKG_VERSION"))
-            );
+            assert_ne!(stdout, format!("webcodex {}\n", env!("CARGO_PKG_VERSION")));
         }
         other => panic!("expected version exit, got {other:?}"),
     }
@@ -36,7 +30,7 @@ fn cli_version_output_includes_build_metadata() {
         } => {
             assert_eq!(code, 0);
             assert!(stdout.contains("commit "));
-            assert!(stdout.starts_with("webcodex-cli "));
+            assert!(stdout.starts_with("webcodex "));
             assert!(stderr.is_empty());
         }
         other => panic!("expected version exit, got {other:?}"),
@@ -44,14 +38,16 @@ fn cli_version_output_includes_build_metadata() {
 }
 
 #[test]
-fn removed_onboarding_and_doctor_commands_do_not_dispatch() {
-    for command in ["connect", "doctor"] {
-        match cli_action([command]) {
-            CliAction::Exit {
-                code: 2, stderr, ..
-            } => assert!(stderr.contains("unknown command"), "{stderr}"),
-            other => panic!("{command} unexpectedly dispatched: {other:?}"),
-        }
+fn project_doctor_dispatches_and_removed_connect_does_not() {
+    assert!(matches!(
+        cli_action(["doctor"]),
+        CliAction::Project(args) if args == ["doctor"]
+    ));
+    match cli_action(["connect"]) {
+        CliAction::Exit {
+            code: 2, stderr, ..
+        } => assert!(stderr.contains("unknown command"), "{stderr}"),
+        other => panic!("connect unexpectedly dispatched: {other:?}"),
     }
 }
 
@@ -90,7 +86,7 @@ fn common_help_entrypoints_smoke() {
         (
             &["--help"],
             &[
-                "Usage: webcodex-cli <COMMAND>",
+                "Usage: webcodex <COMMAND>",
                 "Commands:",
                 "server up",
                 "setup single-user",
@@ -99,22 +95,12 @@ fn common_help_entrypoints_smoke() {
         (
             &["server", "--help"],
             &[
-                "Usage: webcodex-cli server <COMMAND>",
+                "Usage: webcodex server <COMMAND>",
                 "Commands:",
                 "up",
                 "init",
                 "install-service",
                 "status",
-            ],
-        ),
-        (
-            &["setup", "--help"],
-            &[
-                "Usage: webcodex-cli <COMMAND>",
-                "Commands:",
-                "setup single-user",
-                "Common flags",
-                "--server-url URL",
             ],
         ),
     ];
@@ -128,6 +114,29 @@ fn common_help_entrypoints_smoke() {
                 "help for {args:?} did not contain {needle:?}\n{out}"
             );
         }
+    }
+}
+
+#[test]
+fn unified_project_and_auth_commands_dispatch() {
+    for args in [
+        &["setup", "--help"][..],
+        &["status", "--help"][..],
+        &["doctor", "--help"][..],
+        &["task", "--help"][..],
+        &["agent", "start", "--help"][..],
+    ] {
+        assert!(matches!(
+            cli_action(args.iter().copied()),
+            CliAction::Project(_)
+        ));
+    }
+    match cli_action(["auth", "status", "--help"]) {
+        CliAction::Exit { code, stdout, .. } => {
+            assert_eq!(code, 0);
+            assert!(stdout.contains("Usage: webcodex auth status"));
+        }
+        other => panic!("expected auth status help, got {other:?}"),
     }
 }
 

@@ -4,7 +4,12 @@ version.workspace = true
 license.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "webcodex"
+path = "src/main.rs"
+
 [dependencies]
+webcodex = { path = "../.." }
 webcodex-admin = { path = "../webcodex-admin" }
 webcodex-agent-config = { path = "../webcodex-agent-config" }
 webcodex-core = { path = "../webcodex-core" }

@@ -2,7 +2,7 @@ use super::super::support::*;
 
 #[test]
 fn users_create_builds_admin_request_via_admin_cli() {
-    // webcodex-cli users create ... reuses admin_cli parsing.
+    // webcodex users create ... reuses admin_cli parsing.
     let action = cli_action(args(&[
         "users",
         "create",

@@ -1,12 +1,17 @@
 pub(crate) fn usage() -> &'static str {
-    "Usage: webcodex-cli <COMMAND>\n\n\
-     Management and setup commands for WebCodex.\n\n\
+    "Usage: webcodex <COMMAND>\n\n\
+     Unified command-line interface for WebCodex.\n\n\
      Commands:\n\n\
-     Everyday:\n\
-     \x20\x20login <server-url> --code CODE\n\
-     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20Log this device into a server\n\
+     Project coding:\n\
+     \x20\x20setup                         Configure the current Git project\n\
+     \x20\x20doctor                        Diagnose project readiness\n\
+     \x20\x20status                        Show concise project coding readiness\n\
+     \x20\x20agent start                   Start the project runtime and local Agent\n\
+     \x20\x20task                          Review tasks and make host-local decisions\n\n\
+     Authentication:\n\
+     \x20\x20login <server-url> --code CODE Log this device into a server\n\
      \x20\x20logout <server-url>           Remove this device's credentials for a server\n\
-     \x20\x20status                        Show which servers this device is logged in to\n\n\
+     \x20\x20auth status                   Show which servers this device is logged in to\n\n\
      Run the server:\n\
      \x20\x20server up                     Bootstrap server env with an auto-generated admin key\n\
      \x20\x20server init                   Create the server env bootstrap file\n\
@@ -42,13 +47,13 @@ pub(crate) fn usage() -> &'static str {
 }
 
 pub(crate) fn pairing_usage() -> &'static str {
-    "Usage: webcodex-cli pairing <COMMAND>\n\n\
+    "Usage: webcodex pairing <COMMAND>\n\n\
      Commands:\n\
        create       Create a short-lived pairing code for client enrollment\n"
 }
 
 pub(crate) fn pairing_create_usage() -> &'static str {
-    "Usage: webcodex-cli pairing create --server-url URL --username USER --client-id CLIENT_ID [OPTIONS]\n\n\
+    "Usage: webcodex pairing create --server-url URL --username USER --client-id CLIENT_ID [OPTIONS]\n\n\
      Options:\n\
        --server-url URL          WebCodex server URL\n\
        --env-file PATH           Read WEBCODEX_TOKEN from env file\n\
@@ -65,7 +70,7 @@ pub(crate) fn pairing_create_usage() -> &'static str {
      Server/admin-side command:\n\
        pairing create needs server bootstrap/admin auth. The default server\n\
        bootstrap env file lives on the server, not the client.\n\
-       On the client, use: webcodex-cli client enroll\n\n\
+       On the client, use: webcodex client enroll\n\n\
      Copy only the short-lived wc_pair_* code to the client. Do not copy\n\
      WEBCODEX_TOKEN, wc_pat_*, or wc_agent_* values from server to client.\n\
      This command does not create wc_pat_* or wc_agent_* token files on the\n\
@@ -73,13 +78,13 @@ pub(crate) fn pairing_create_usage() -> &'static str {
 }
 
 pub(crate) fn client_usage() -> &'static str {
-    "Usage: webcodex-cli client <COMMAND>\n\n\
+    "Usage: webcodex client <COMMAND>\n\n\
      Commands:\n\
        enroll       Enroll this client using a temporary pairing code\n"
 }
 
 pub(crate) fn server_up_usage() -> &'static str {
-    "Usage: webcodex-cli server up [OPTIONS]\n\n\
+    "Usage: webcodex server up [OPTIONS]\n\n\
      Quick-start server bootstrap. Generates a local bootstrap/admin key when no\n\
      WEBCODEX_TOKEN is configured, writes a user-writable env file, and prints\n\
      next steps. Anonymous access is rejected by default; pass --open only for\n\
@@ -98,7 +103,7 @@ pub(crate) fn server_up_usage() -> &'static str {
 }
 
 pub(crate) fn client_enroll_usage() -> &'static str {
-    "Usage: webcodex-cli client enroll --server-url URL --pairing-code CODE --client-id CLIENT_ID [OPTIONS]\n\n\
+    "Usage: webcodex client enroll --server-url URL --pairing-code CODE --client-id CLIENT_ID [OPTIONS]\n\n\
      Options:\n\
        --server-url URL              WebCodex server URL\n\
        --pairing-code CODE           Temporary one-time pairing code\n\
@@ -120,7 +125,7 @@ pub(crate) fn client_enroll_usage() -> &'static str {
 }
 
 pub(crate) fn ops_usage() -> &'static str {
-    "Usage: webcodex-cli ops <COMMAND>\n\n\
+    "Usage: webcodex ops <COMMAND>\n\n\
      Read-only operator workflow checks for WebCodex.\n\n\
      Commands:\n\
        status                  Summarize runtime, tools, jobs, agents, and projects\n\
@@ -140,7 +145,7 @@ pub(crate) fn ops_usage() -> &'static str {
 }
 
 pub(crate) fn ops_status_usage() -> &'static str {
-    "Usage: webcodex-cli ops status [OPTIONS]\n\n\
+    "Usage: webcodex ops status [OPTIONS]\n\n\
      Summarize runtime, tools, jobs, agents, and project health.\n\n\
      Options:\n\
        --server-url URL        WebCodex server URL [default: http://127.0.0.1:8080]\n\
@@ -154,7 +159,7 @@ pub(crate) fn ops_status_usage() -> &'static str {
 }
 
 pub(crate) fn ops_agents_usage() -> &'static str {
-    "Usage: webcodex-cli ops agents [OPTIONS]\n\n\
+    "Usage: webcodex ops agents [OPTIONS]\n\n\
      Show compact read-only agent fleet status.\n\n\
      Options:\n\
        --server-url URL        WebCodex server URL [default: http://127.0.0.1:8080]\n\
@@ -168,7 +173,7 @@ pub(crate) fn ops_agents_usage() -> &'static str {
 }
 
 pub(crate) fn ops_projects_usage() -> &'static str {
-    "Usage: webcodex-cli ops projects [OPTIONS]\n\n\
+    "Usage: webcodex ops projects [OPTIONS]\n\n\
      Show compact read-only project inventory and smoke suitability.\n\n\
      Options:\n\
        --server-url URL        WebCodex server URL [default: http://127.0.0.1:8080]\n\
@@ -182,7 +187,7 @@ pub(crate) fn ops_projects_usage() -> &'static str {
 }
 
 pub(crate) fn ops_smoke_preflight_usage() -> &'static str {
-    "Usage: webcodex-cli ops smoke-preflight --project PROJECT_ID [OPTIONS]\n\n\
+    "Usage: webcodex ops smoke-preflight --project PROJECT_ID [OPTIONS]\n\n\
      Read-only deploy smoke preflight for one project.\n\n\
      Options:\n\
        --project PROJECT_ID    Runtime project id to check\n\
@@ -198,7 +203,7 @@ pub(crate) fn ops_smoke_preflight_usage() -> &'static str {
 }
 
 pub(crate) fn server_usage() -> &'static str {
-    "Usage: webcodex-cli server <COMMAND>\n\n\
+    "Usage: webcodex server <COMMAND>\n\n\
      Server bootstrap commands.\n\n\
      Commands:\n\
        up                   Quick-start: auto-generate admin key + env, optional --open\n\
@@ -211,7 +216,7 @@ pub(crate) fn server_usage() -> &'static str {
 }
 
 pub(crate) fn server_init_usage() -> &'static str {
-    "Usage: webcodex-cli server init [OPTIONS]\n\n\
+    "Usage: webcodex server init [OPTIONS]\n\n\
      Options:\n\
        --listen ADDR          Listen address [default: 127.0.0.1:8080]\n\
        --data-dir PATH        Data directory [root: /var/lib/webcodex; user: ~/.local/share/webcodex]\n\
@@ -226,10 +231,10 @@ pub(crate) fn server_init_usage() -> &'static str {
 }
 
 pub(crate) fn server_install_service_usage() -> &'static str {
-    "Usage: webcodex-cli server install-service [OPTIONS]\n\n\
+    "Usage: webcodex server install-service [OPTIONS]\n\n\
      Options:\n\
        --env-file PATH             Env file [default: /etc/webcodex/webcodex.env]\n\
-       --bin PATH                  webcodex server binary path; defaults to webcodex from PATH when safely discoverable\n\
+       --bin PATH                  webcodex-server path; defaults to a sibling binary, then absolute PATH discovery\n\
        --service-file PATH         systemd unit path [default: /etc/systemd/system/webcodex.service]\n\
        --user USER                 Optional systemd User=\n\
        --group GROUP               Optional systemd Group=\n\
@@ -243,7 +248,7 @@ pub(crate) fn server_install_service_usage() -> &'static str {
 }
 
 pub(crate) fn server_status_usage() -> &'static str {
-    "Usage: webcodex-cli server status [OPTIONS]\n\n\
+    "Usage: webcodex server status [OPTIONS]\n\n\
      Options:\n\
        --url URL              Runtime URL [default: http://127.0.0.1:8080]\n\
        --env-file PATH        Read WEBCODEX_TOKEN from env file [default: root /etc/webcodex/webcodex.env; user ~/.config/webcodex/webcodex.env]\n\
@@ -255,7 +260,7 @@ pub(crate) fn server_status_usage() -> &'static str {
 }
 
 pub(crate) fn agent_usage() -> &'static str {
-    "Usage: webcodex-cli agent <COMMAND>\n\n\
+    "Usage: webcodex agent <COMMAND>\n\n\
      Client-side agent commands.\n\n\
      Commands:\n\
        init                 Generate an agent.toml config\n\
@@ -264,7 +269,7 @@ pub(crate) fn agent_usage() -> &'static str {
 }
 
 pub(crate) fn agent_init_usage() -> &'static str {
-    "Usage: webcodex-cli agent init --server-url URL [--token TOKEN|--token-file PATH] --client-id ID --owner USER [OPTIONS]\n\n\
+    "Usage: webcodex agent init --server-url URL [--token TOKEN|--token-file PATH] --client-id ID --owner USER [OPTIONS]\n\n\
      Options:\n\
        --server-url URL           WebCodex server URL\n\
        --token TOKEN              Agent token for generated config\n\
@@ -288,7 +293,7 @@ pub(crate) fn agent_init_usage() -> &'static str {
 }
 
 pub(crate) fn agent_install_service_usage() -> &'static str {
-    "Usage: webcodex-cli agent install-service [--config PATH] [--bin PATH] [OPTIONS]\n\n\
+    "Usage: webcodex agent install-service [--config PATH] [--bin PATH] [OPTIONS]\n\n\
      Options:\n\
        --profile NAME             Client config profile for config/service defaults\n\
        --config PATH              Agent config path [default: /etc/webcodex/agent.toml, or profile agent.toml]\n\
@@ -310,7 +315,7 @@ pub(crate) fn agent_install_service_usage() -> &'static str {
 }
 
 pub(crate) fn agent_status_usage() -> &'static str {
-    "Usage: webcodex-cli agent status [OPTIONS]\n\n\
+    "Usage: webcodex agent status [OPTIONS]\n\n\
      Options:\n\
        --profile NAME             Client config profile for config/token defaults\n\
        --config PATH              Agent config path [default: /etc/webcodex/agent.toml, or profile agent.toml]\n\
@@ -327,9 +332,9 @@ pub(crate) fn agent_status_usage() -> &'static str {
 }
 
 pub(crate) fn login_usage() -> &'static str {
-    "Usage: webcodex-cli login <SERVER-URL> --code <PAIRING-CODE> [OPTIONS]\n\n\
+    "Usage: webcodex login <SERVER-URL> --code <PAIRING-CODE> [OPTIONS]\n\n\
      Log this device into a WebCodex server. Ask whoever runs the server for a\n\
-     pairing code (`webcodex-cli pairing create`), then run this.\n\n\
+     pairing code (`webcodex pairing create`), then run this.\n\n\
      Options:\n\
      \x20\x20--code CODE          Pairing code from the server (required)\n\
      \x20\x20--device NAME        Name for this device [default: hostname]\n\
@@ -345,7 +350,7 @@ pub(crate) fn login_usage() -> &'static str {
 }
 
 pub(crate) fn logout_usage() -> &'static str {
-    "Usage: webcodex-cli logout <SERVER-URL> [OPTIONS]\n\n\
+    "Usage: webcodex logout <SERVER-URL> [OPTIONS]\n\n\
      Remove this device's stored credentials for a server.\n\n\
      Options:\n\
      \x20\x20--user NAME    Only log out this user [default: every user on that server]\n\
@@ -357,7 +362,7 @@ pub(crate) fn logout_usage() -> &'static str {
 }
 
 pub(crate) fn status_usage() -> &'static str {
-    "Usage: webcodex-cli status [OPTIONS]\n\n\
+    "Usage: webcodex auth status [OPTIONS]\n\n\
      Show which servers this device is logged in to.\n\n\
      Options:\n\
      \x20\x20--dir PATH     Where connections are stored [default: ~/.config/webcodex]\n\

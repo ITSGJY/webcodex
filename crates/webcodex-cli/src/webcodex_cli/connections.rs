@@ -348,7 +348,7 @@ pub(crate) fn descriptor_toml(
     logged_in_at: &str,
 ) -> String {
     format!(
-        "# Written by `webcodex-cli login`. The directory name is only an index;\n\
+        "# Written by `webcodex login`. The directory name is only an index;\n\
          # this file is the authoritative record of the connection.\n\
          server_url = {}\n\
          username = {}\n\

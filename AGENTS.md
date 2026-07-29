@@ -156,12 +156,12 @@ git status --short
 Use an explicit package for binary-focused tests:
 
 ```text
-cargo test -p webcodex --bin webcodex
-cargo test -p webcodex-cli --bin webcodex-cli
-cargo test -p webcodex-runner --bin webcodex-runner
+cargo test -p webcodex --all-targets
+cargo test -p webcodex-cli --all-targets
+cargo test -p webcodex-runner --all-targets
 ```
 
-Run `cargo test -p webcodex --bin webcodex` for broad server changes,
+Run `cargo test -p webcodex --all-targets` for broad server changes,
 release/merge readiness, or when the Agent judges focused lanes insufficient.
 Do not run it mechanically for pure documentation changes.
 

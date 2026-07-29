@@ -408,7 +408,7 @@ pub(crate) fn render_status(connections: &[Connection], json: bool) -> Result<St
     }
     if connections.is_empty() {
         return Ok(
-            "Not logged in to any server.\n\nRun: webcodex-cli login <server-url> --code <pairing-code>\n"
+            "Not logged in to any server.\n\nRun: webcodex login <server-url> --code <pairing-code>\n"
                 .to_string(),
         );
     }

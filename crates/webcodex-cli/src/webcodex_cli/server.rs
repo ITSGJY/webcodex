@@ -125,7 +125,7 @@ pub(crate) fn run_server_up(opts: ServerUpOptions) -> Result<String, String> {
         "  1. Load the env:  set -a && . {} && set +a\n",
         env_file.display()
     ));
-    out.push_str("  2. Start server:  webcodex\n");
+    out.push_str("  2. Start server:  webcodex-server\n");
     out.push_str("  3. For local coding, run in the Git project: webcodex setup\n");
     out.push_str("  4. GPT/MCP:       use the same --key value as a Bearer token\n");
     Ok(out)
@@ -167,11 +167,11 @@ pub(crate) fn run_server_init(opts: ServerInitOptions) -> Result<String, String>
     }
     out.push_str(&format!("  token prefix: {}\n", token_prefix(&token)));
     out.push_str("\nNext steps:\n");
-    out.push_str("  - Install the service: `webcodex-cli server install-service ...`\n");
+    out.push_str("  - Install the service: `webcodex server install-service ...`\n");
     out.push_str(
         "  - Start it: `sudo systemctl daemon-reload && sudo systemctl enable --now webcodex`\n",
     );
-    out.push_str("  - Check it: `webcodex-cli server status ...`\n");
+    out.push_str("  - Check it: `webcodex server status ...`\n");
     out.push_str("  - For GPT Actions, configure a public HTTPS URL separately.\n");
     out.push_str("\nNo user API tokens or agent tokens were created.\n");
     Ok(out)

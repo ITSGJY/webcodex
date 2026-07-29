@@ -13,10 +13,10 @@ set -euo pipefail
 #   1. workspace boundary check
 #   2. cargo fmt --all -- --check
 #   3. cargo check --workspace --all-targets
-#   4. cargo test -p webcodex --bin webcodex metadata -- --nocapture
-#   5. cargo test -p webcodex --bin webcodex schema -- --nocapture
-#   6. cargo test -p webcodex --bin webcodex openapi -- --nocapture
-#   7. cargo test -p webcodex --bin webcodex mcp -- --nocapture
+#   4. cargo test -p webcodex --lib metadata -- --nocapture
+#   5. cargo test -p webcodex --lib schema -- --nocapture
+#   6. cargo test -p webcodex --lib openapi -- --nocapture
+#   7. cargo test -p webcodex --lib mcp -- --nocapture
 #   8. bash syntax checks for scripts/*.sh
 #   9. static: no python runtime helper regressions
 #  10. static: no sensitive files tracked or staged by git
@@ -102,8 +102,8 @@ fi
 # ----------------------------------------------------------------------------
 # Stage 4: focused metadata tests
 # ----------------------------------------------------------------------------
-stage_start "cargo test -p webcodex --bin webcodex metadata -- --nocapture"
-if cargo test -p webcodex --bin webcodex metadata -- --nocapture; then
+stage_start "cargo test -p webcodex --lib metadata -- --nocapture"
+if cargo test -p webcodex --lib metadata -- --nocapture; then
     ok "metadata tests"
 else
     die "metadata tests"
@@ -112,8 +112,8 @@ fi
 # ----------------------------------------------------------------------------
 # Stage 5: focused schema tests
 # ----------------------------------------------------------------------------
-stage_start "cargo test -p webcodex --bin webcodex schema -- --nocapture"
-if cargo test -p webcodex --bin webcodex schema -- --nocapture; then
+stage_start "cargo test -p webcodex --lib schema -- --nocapture"
+if cargo test -p webcodex --lib schema -- --nocapture; then
     ok "schema tests"
 else
     die "schema tests"
@@ -122,8 +122,8 @@ fi
 # ----------------------------------------------------------------------------
 # Stage 6: focused OpenAPI tests
 # ----------------------------------------------------------------------------
-stage_start "cargo test -p webcodex --bin webcodex openapi -- --nocapture"
-if cargo test -p webcodex --bin webcodex openapi -- --nocapture; then
+stage_start "cargo test -p webcodex --lib openapi -- --nocapture"
+if cargo test -p webcodex --lib openapi -- --nocapture; then
     ok "openapi tests"
 else
     die "openapi tests"
@@ -132,8 +132,8 @@ fi
 # ----------------------------------------------------------------------------
 # Stage 7: focused MCP tests
 # ----------------------------------------------------------------------------
-stage_start "cargo test -p webcodex --bin webcodex mcp -- --nocapture"
-if cargo test -p webcodex --bin webcodex mcp -- --nocapture; then
+stage_start "cargo test -p webcodex --lib mcp -- --nocapture"
+if cargo test -p webcodex --lib mcp -- --nocapture; then
     ok "mcp tests"
 else
     die "mcp tests"

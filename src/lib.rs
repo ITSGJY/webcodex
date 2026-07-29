@@ -41,6 +41,7 @@ mod tool_request_trace;
 mod tool_runtime;
 mod users_http;
 
+#[cfg(test)]
 pub(crate) use webcodex_admin as admin_cli;
 pub(crate) use webcodex_agent_config as agent_init;
 pub(crate) use webcodex_core::{
@@ -65,118 +66,60 @@ pub(crate) use shell_client::{
     shell_file_op, shell_job, shell_job_log, shell_job_status, shell_job_stop, shell_jobs_list,
     shell_run, ShellClientRegistry,
 };
-use startup::{server_cli_action, ServerCliAction};
+pub use startup::{is_project_command, run_project_command, CliCommandOutput};
 
 // ============================================================================
 // Main
 // ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerBinaryAction {
+    Run,
+    Exit {
+        code: i32,
+        stdout: String,
+        stderr: String,
+    },
+}
+
+pub fn server_binary_action<I, S>(args: I) -> ServerBinaryAction
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let args: Vec<String> = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_string())
+        .collect();
+    match args.as_slice() {
+        [] => ServerBinaryAction::Run,
+        [arg] if matches!(arg.as_str(), "--help" | "-h") => ServerBinaryAction::Exit {
+            code: 0,
+            stdout: "Usage: webcodex-server [OPTIONS]\n\nRun the WebCodex server runtime.\n\nOptions:\n  -h, --help       Print help and exit\n  -V, --version    Print version and exit\n".to_string(),
+            stderr: String::new(),
+        },
+        [arg] if matches!(arg.as_str(), "--version" | "-V") => ServerBinaryAction::Exit {
+            code: 0,
+            stdout: build_info::version_output("webcodex-server"),
+            stderr: String::new(),
+        },
+        _ => ServerBinaryAction::Exit {
+            code: 2,
+            stdout: String::new(),
+            stderr: format!(
+                "unknown argument(s): {}\nRun `webcodex-server --help` for usage.\n",
+                args.join(" ")
+            ),
+        },
+    }
+}
 
 /// Whole-service HTTP request timeout (defense in depth). Must stay above the
 /// MCP dispatch hard bound (150s) plus response-write margin so the inner,
 /// better-reported timeouts always fire first.
 const REQUEST_HARD_TIMEOUT_SECS: u64 = 300;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    match server_cli_action(std::env::args().skip(1)) {
-        ServerCliAction::Run => {}
-        ServerCliAction::Setup(options) => {
-            match project_entry::setup(&options) {
-                Ok(report) if options.json => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "ok": true,
-                        "command": "setup",
-                        "project": report.project,
-                        "connection_url": report.connection_url,
-                        "status": report.status,
-                        "changed": report.changed,
-                        "next_action": report.next_action
-                    }))?
-                ),
-                Ok(report) => print!("{}", project_entry::render_setup_text(&report)),
-                Err(error) => {
-                    eprintln!("{}", project_entry::render_error(&error, options.json));
-                    std::process::exit(1);
-                }
-            }
-            return Ok(());
-        }
-        ServerCliAction::Doctor(options) => {
-            let readiness = project_entry::collect_readiness(&options).await;
-            if options.json {
-                println!("{}", serde_json::to_string_pretty(&readiness)?);
-            } else {
-                print!("{}", project_entry::render_doctor_text(&readiness));
-            }
-            if !readiness.ready {
-                std::process::exit(1);
-            }
-            return Ok(());
-        }
-        ServerCliAction::Status(options) => {
-            let readiness = project_entry::collect_readiness(&options).await;
-            if options.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "project": readiness.project,
-                        "connection": readiness.connection,
-                        "agent": readiness.agent,
-                        "capabilities": readiness.capabilities,
-                        "ready": readiness.ready,
-                        "next_action": readiness.next_action
-                    }))?
-                );
-            } else {
-                print!("{}", project_entry::render_status_text(&readiness));
-            }
-            if !readiness.ready {
-                std::process::exit(1);
-            }
-            return Ok(());
-        }
-        ServerCliAction::AgentStart(options) => {
-            if let Err(error) = project_entry::start_agent(&options).await {
-                eprintln!("{}", project_entry::render_error(&error, false));
-                std::process::exit(1);
-            }
-            return Ok(());
-        }
-        ServerCliAction::Task(command) => {
-            match task_cli::run(command) {
-                Ok(stdout) => println!("{}", stdout),
-                Err(stderr) => {
-                    eprintln!("{}", stderr);
-                    std::process::exit(1);
-                }
-            }
-            return Ok(());
-        }
-        ServerCliAction::Admin(cmd) => match admin_cli::run_admin_command(cmd).await {
-            Ok(stdout) => {
-                println!("{}", stdout);
-                std::process::exit(0);
-            }
-            Err(stderr) => {
-                eprintln!("{}", stderr);
-                std::process::exit(1);
-            }
-        },
-        ServerCliAction::Exit {
-            code,
-            stdout,
-            stderr,
-        } => {
-            if !stdout.is_empty() {
-                print!("{}", stdout);
-            }
-            if !stderr.is_empty() {
-                eprint!("{}", stderr);
-            }
-            std::process::exit(code);
-        }
-    }
+pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let env_loads = load_startup_env_files().map_err(std::io::Error::other)?;
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -202,7 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !config.is_auth_enabled() {
         tracing::warn!(
             "WEBCODEX_TOKEN is not set! Running in development mode without authentication. \
-Use `webcodex-cli server up` to generate a bootstrap/admin key, or set WEBCODEX_ALLOW_ANONYMOUS=true \
+Use `webcodex server up` to generate a bootstrap/admin key, or set WEBCODEX_ALLOW_ANONYMOUS=true \
 only for local/trusted-network demos."
         );
         tracing::warn!("Anonymous API access is rejected by default in production mode.");

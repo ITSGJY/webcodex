@@ -106,9 +106,7 @@ pub(crate) async fn run_pairing_create(opts: PairingCreateOptions) -> Result<Str
             "  pairing code: {}\n",
             value["pairing_code"].as_str().unwrap_or("")
         ));
-        out.push_str(
-            "\nCopy the pairing code to the client and run `webcodex-cli client enroll`.\n",
-        );
+        out.push_str("\nCopy the pairing code to the client and run `webcodex client enroll`.\n");
         out.push_str("No wc_pat_* or wc_agent_* token files were created on the server.\n");
         Ok(out)
     }

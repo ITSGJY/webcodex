@@ -26,7 +26,7 @@ Group=webcodex
 StateDirectory=webcodex
 WorkingDirectory=/opt/webcodex
 
-ExecStart=/opt/webcodex/webcodex
+ExecStart=/opt/webcodex/webcodex-server
 
 # Load secrets + public URL from the env file (chmod 0600, owner root).
 # See webcodex.env.example for the full set.

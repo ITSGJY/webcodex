@@ -62,8 +62,25 @@ pub(crate) fn write_text_file(
     Ok(())
 }
 
-pub(crate) fn discover_webcodex_binary() -> Option<PathBuf> {
-    discover_named_binary_absolute("webcodex")
+pub(crate) fn discover_internal_binary(name: &str) -> Option<PathBuf> {
+    discover_sibling_binary(name).or_else(|| discover_named_binary_absolute(name))
+}
+
+fn discover_sibling_binary(name: &str) -> Option<PathBuf> {
+    let current = std::env::current_exe().ok()?;
+    let directory = current.parent()?;
+    let candidate = directory.join(name);
+    if candidate.is_file() {
+        return Some(candidate);
+    }
+    #[cfg(windows)]
+    {
+        let candidate = directory.join(format!("{name}.exe"));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 pub(crate) fn discover_named_binary_absolute(name: &str) -> Option<PathBuf> {

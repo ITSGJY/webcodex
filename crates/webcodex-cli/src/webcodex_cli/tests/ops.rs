@@ -12,7 +12,7 @@ fn ops_help_entrypoints_print_usage() {
         (
             &["ops", "--help"],
             &[
-                "Usage: webcodex-cli ops <COMMAND>",
+                "Usage: webcodex ops <COMMAND>",
                 "status",
                 "agents",
                 "projects",
@@ -24,7 +24,7 @@ fn ops_help_entrypoints_print_usage() {
         (
             &["ops", "status", "--help"],
             &[
-                "Usage: webcodex-cli ops status",
+                "Usage: webcodex ops status",
                 "--server-url URL",
                 "--url URL",
                 "--env-file PATH",
@@ -37,7 +37,7 @@ fn ops_help_entrypoints_print_usage() {
         (
             &["ops", "agents", "--help"],
             &[
-                "Usage: webcodex-cli ops agents",
+                "Usage: webcodex ops agents",
                 "--server-url URL",
                 "--url URL",
                 "--env-file PATH",
@@ -50,7 +50,7 @@ fn ops_help_entrypoints_print_usage() {
         (
             &["ops", "projects", "--help"],
             &[
-                "Usage: webcodex-cli ops projects",
+                "Usage: webcodex ops projects",
                 "--server-url URL",
                 "--url URL",
                 "--env-file PATH",
@@ -63,7 +63,7 @@ fn ops_help_entrypoints_print_usage() {
         (
             &["ops", "smoke-preflight", "--help"],
             &[
-                "Usage: webcodex-cli ops smoke-preflight",
+                "Usage: webcodex ops smoke-preflight",
                 "--project PROJECT_ID",
                 "--server-url URL",
                 "--url URL",

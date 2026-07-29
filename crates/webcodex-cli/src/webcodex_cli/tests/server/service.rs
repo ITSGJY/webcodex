@@ -6,7 +6,7 @@ fn install_service_generates_expected_unit_without_tokens() {
         "--env-file",
         "/etc/webcodex/webcodex.env",
         "--bin",
-        "/usr/local/bin/webcodex",
+        "/usr/local/bin/webcodex-server",
         "--working-directory",
         "/var/lib/webcodex",
         "--user",
@@ -19,7 +19,7 @@ fn install_service_generates_expected_unit_without_tokens() {
     let unit = run_server_install_service(opts).unwrap();
     assert!(unit.contains("[Unit]\nDescription=WebCodex Runtime\n"));
     assert!(unit.contains("EnvironmentFile=/etc/webcodex/webcodex.env\n"));
-    assert!(unit.contains("ExecStart=/usr/local/bin/webcodex\n"));
+    assert!(unit.contains("ExecStart=/usr/local/bin/webcodex-server\n"));
     assert!(unit.contains("WorkingDirectory=/var/lib/webcodex\n"));
     assert!(unit.contains("User=webcodex\n"));
     assert!(unit.contains("Group=webcodex\n"));
@@ -34,7 +34,7 @@ fn install_service_refuses_overwrite_unless_requested() {
     std::fs::write(&service_file, "old").unwrap();
     let opts = parse_server_install_service(&args(&[
         "--bin",
-        "/usr/local/bin/webcodex",
+        "/usr/local/bin/webcodex-server",
         "--service-file",
         service_file.to_str().unwrap(),
     ]))
@@ -45,16 +45,19 @@ fn install_service_refuses_overwrite_unless_requested() {
 
 #[test]
 fn install_service_dry_run_and_output_work_without_systemd() {
-    let dry =
-        parse_server_install_service(&args(&["--bin", "/usr/local/bin/webcodex", "--dry-run"]))
-            .unwrap();
+    let dry = parse_server_install_service(&args(&[
+        "--bin",
+        "/usr/local/bin/webcodex-server",
+        "--dry-run",
+    ]))
+    .unwrap();
     assert!(run_server_install_service(dry)
         .unwrap()
-        .contains("ExecStart=/usr/local/bin/webcodex"));
+        .contains("ExecStart=/usr/local/bin/webcodex-server"));
 
     let out = parse_server_install_service(&args(&[
         "--bin",
-        "/usr/local/bin/webcodex",
+        "/usr/local/bin/webcodex-server",
         "--output",
         "-",
         "--json",
