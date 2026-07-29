@@ -135,7 +135,7 @@ fn tool_specs_schema_spot_checks() {
             vec!["job_id"],
             vec!["include_command_preview"],
         ),
-        ("job_tail", vec!["job_id"], vec!["tail_lines"]),
+        ("job_log", vec!["job_id"], vec![]),
     ];
     let specs = registered_tool_specs();
     for (name, expected_required, expected_forbidden) in &cases {

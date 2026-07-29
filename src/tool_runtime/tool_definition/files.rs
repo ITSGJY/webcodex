@@ -1,5 +1,5 @@
 use super::AgentCapability::{FileRead, Shell};
-use super::ToolVisibility::ModelVisible;
+use super::ToolVisibility::{ModelHidden, ModelVisible};
 use super::{def, ToolDefinition, TOOL_CATEGORY_FILE, TOOL_CATEGORY_PROJECT};
 use crate::tool_runtime::metadata::{
     ToolPathHint::{None as NoPath, SinglePath},

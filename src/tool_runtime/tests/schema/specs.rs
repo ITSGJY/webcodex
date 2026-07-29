@@ -433,15 +433,10 @@ fn tool_specs_covers_expected_tool_set() {
         "discard_untracked",
         // Phase A: read-only console tools
         "project_overview",
-        "list_project_files",
+        "list_project_tracked_files",
         "search_project_text",
         "list_jobs",
-        "job_tail",
         // Phase 4: file edit tools
-        "replace_in_file",
-        "replace_exact_block",
-        "insert_before_pattern",
-        "insert_after_pattern",
         "write_project_file",
         "save_project_artifact",
         "read_project_artifact_metadata",
@@ -450,9 +445,6 @@ fn tool_specs_covers_expected_tool_set() {
         "artifact_upload_chunk",
         "artifact_upload_finish",
         "artifact_upload_abort",
-        "replace_line_range",
-        "insert_at_line",
-        "delete_line_range",
         // Project management
         "register_project",
         "create_project",

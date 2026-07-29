@@ -3358,12 +3358,20 @@ mod tests {
             [TOOL_CALL_TOOL_FIELD]["description"]
             .as_str()
             .unwrap();
-        for tool in ["write_project_file", "replace_in_file"] {
+        for tool in ["write_project_file"] {
             assert!(
                 tool_desc.contains(tool),
                 "callRuntimeTool must document runtime tool {tool}"
             );
         }
+        // `replace_in_file` is ModelHidden (canonical apply_text_edits covers
+        // it): still dispatched for back-compat via callRuntimeTool and still
+        // gated by LEGACY_FORBIDDEN_PATHS, but no longer documented in the
+        // model-facing ToolCallRequest description.
+        assert!(
+            !tool_desc.contains("replace_in_file"),
+            "callRuntimeTool must not document the ModelHidden replace_in_file tool"
+        );
     }
 
     #[test]

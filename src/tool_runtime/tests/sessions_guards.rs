@@ -1261,32 +1261,22 @@ async fn deny_shell_only_allows_write_tools() {
 #[test]
 fn project_tool_schemas_include_optional_session_id() {
     let specs = registered_tool_specs();
-    let start_session = spec_named(&specs, "start_session");
-    assert_eq!(
-        start_session.input_schema["properties"]["mode"]["enum"],
-        json!(["normal", "inspect", "read_only"])
-    );
-    assert!(start_session.input_schema["properties"]
-        .get("deny_write_tools")
+    // `start_session` is ModelHidden (the model coding line is covered by
+    // `start_coding_task`): it has no public ToolSpec, so its guard schema is
+    // verified directly from the output schema builder rather than via
+    // `spec_named`, keeping the session guard-field contract asserted at the
+    // implementation level.
+    let start_session_output =
+        crate::tool_runtime::registry::output_schema_for_tool("start_session");
+    assert!(start_session_output["properties"]["output"]["properties"]
+        .get("mode")
         .is_some());
-    assert!(start_session.input_schema["properties"]
-        .get("deny_shell_tools")
+    assert!(start_session_output["properties"]["output"]["properties"]
+        .get("guards")
         .is_some());
-    assert!(
-        start_session.output_schema["properties"]["output"]["properties"]
-            .get("mode")
-            .is_some()
-    );
-    assert!(
-        start_session.output_schema["properties"]["output"]["properties"]
-            .get("guards")
-            .is_some()
-    );
-    assert!(
-        start_session.output_schema["properties"]["output"]["properties"]
-            .get("lifecycle")
-            .is_some()
-    );
+    assert!(start_session_output["properties"]["output"]["properties"]
+        .get("lifecycle")
+        .is_some());
     let session_summary = spec_named(&specs, "session_summary");
     assert!(
         session_summary.output_schema["properties"]["output"]["properties"]
@@ -1307,7 +1297,6 @@ fn project_tool_schemas_include_optional_session_id() {
         "read_file",
         "run_shell",
         "write_project_file",
-        "replace_line_range",
         "git_status",
         "git_log",
         "show_changes",

@@ -1,5 +1,5 @@
 use super::AgentCapability::FileWrite;
-use super::ToolVisibility::ModelVisible;
+use super::ToolVisibility::{ModelHidden, ModelVisible};
 use super::{def, ToolDefinition, TOOL_CATEGORY_EDIT};
 use crate::tool_runtime::metadata::{
     ToolPathHint::{PathList, SinglePath},
@@ -7,10 +7,13 @@ use crate::tool_runtime::metadata::{
     PROJECT_WRITE, TOOL_PROVIDER_AGENT,
 };
 
+// Single-purpose edit primitives superseded by the transactional
+// `apply_text_edits` batch. Kept dispatchable for back-compat, but withheld
+// from the model surface so it does not compete with the canonical entry.
 pub(super) const COMPATIBILITY_DEFINITIONS: &[ToolDefinition] = &[
     def(
         "replace_in_file",
-        ModelVisible,
+        ModelHidden,
         TOOL_CATEGORY_EDIT,
         Some(FileWrite),
         TOOL_PROVIDER_AGENT,
@@ -23,7 +26,7 @@ pub(super) const COMPATIBILITY_DEFINITIONS: &[ToolDefinition] = &[
     ),
     def(
         "replace_exact_block",
-        ModelVisible,
+        ModelHidden,
         TOOL_CATEGORY_EDIT,
         Some(FileWrite),
         TOOL_PROVIDER_AGENT,
@@ -36,7 +39,7 @@ pub(super) const COMPATIBILITY_DEFINITIONS: &[ToolDefinition] = &[
     ),
     def(
         "insert_before_pattern",
-        ModelVisible,
+        ModelHidden,
         TOOL_CATEGORY_EDIT,
         Some(FileWrite),
         TOOL_PROVIDER_AGENT,
@@ -49,7 +52,7 @@ pub(super) const COMPATIBILITY_DEFINITIONS: &[ToolDefinition] = &[
     ),
     def(
         "insert_after_pattern",
-        ModelVisible,
+        ModelHidden,
         TOOL_CATEGORY_EDIT,
         Some(FileWrite),
         TOOL_PROVIDER_AGENT,
@@ -78,7 +81,7 @@ pub(super) const COMPATIBILITY_DEFINITIONS: &[ToolDefinition] = &[
 pub(super) const LINE_DEFINITIONS: &[ToolDefinition] = &[
     def(
         "replace_line_range",
-        ModelVisible,
+        ModelHidden,
         TOOL_CATEGORY_EDIT,
         Some(FileWrite),
         TOOL_PROVIDER_AGENT,
@@ -91,7 +94,7 @@ pub(super) const LINE_DEFINITIONS: &[ToolDefinition] = &[
     ),
     def(
         "insert_at_line",
-        ModelVisible,
+        ModelHidden,
         TOOL_CATEGORY_EDIT,
         Some(FileWrite),
         TOOL_PROVIDER_AGENT,
@@ -104,7 +107,7 @@ pub(super) const LINE_DEFINITIONS: &[ToolDefinition] = &[
     ),
     def(
         "delete_line_range",
-        ModelVisible,
+        ModelHidden,
         TOOL_CATEGORY_EDIT,
         Some(FileWrite),
         TOOL_PROVIDER_AGENT,

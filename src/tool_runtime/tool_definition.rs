@@ -121,13 +121,18 @@ impl AgentCapability {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolVisibility {
+    /// The tool is offered to the model via `tools/list` and the manifest.
     ModelVisible,
+    /// The tool is dispatched normally but withheld from the model-facing
+    /// surface. Used for compatibility, duplicate-granularity, and management
+    /// tools that the canonical coding surface already covers. Internal
+    /// callers (CLI, tests, back-compat dispatch) keep working.
+    ModelHidden,
 }
 
 impl ToolVisibility {
-    #[cfg(test)]
     pub(crate) fn is_model_hidden(self) -> bool {
-        false
+        matches!(self, Self::ModelHidden)
     }
 
     pub(crate) fn is_model_visible(self) -> bool {

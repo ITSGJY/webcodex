@@ -1971,9 +1971,12 @@ async fn external_provider_discovery_cannot_change_public_tool_or_openapi_surfac
         .iter()
         .map(|spec| spec.name.clone())
         .collect::<BTreeSet<_>>();
-    let replace_schema_before = before
+    // Snapshot a model-visible tool's schema as the baseline that external
+    // provider discovery must not perturb. `replace_in_file` is ModelHidden
+    // (no public ToolSpec), so it cannot serve as the baseline here.
+    let write_schema_before = before
         .iter()
-        .find(|spec| spec.name == "replace_in_file")
+        .find(|spec| spec.name == "write_project_file")
         .unwrap()
         .input_schema
         .clone();
@@ -2042,10 +2045,10 @@ async fn external_provider_discovery_cannot_change_public_tool_or_openapi_surfac
     assert_eq!(
         after
             .iter()
-            .find(|spec| spec.name == "replace_in_file")
+            .find(|spec| spec.name == "write_project_file")
             .unwrap()
             .input_schema,
-        replace_schema_before
+        write_schema_before
     );
     let openapi = crate::openapi::build_openapi_spec();
     let operation_count: usize = openapi["paths"]

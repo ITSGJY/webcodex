@@ -267,12 +267,10 @@ pub(crate) fn is_model_visible_tool_name(name: &str) -> bool {
     lookup_tool_definition(name).is_some_and(|definition| definition.visibility.is_model_visible())
 }
 
-#[cfg(test)]
 pub(crate) fn is_model_hidden_tool_name(name: &str) -> bool {
     lookup_tool_definition(name).is_some_and(|definition| definition.visibility.is_model_hidden())
 }
 
-#[cfg(test)]
 pub(crate) fn model_hidden_tool_names() -> impl Iterator<Item = &'static str> {
     tool_definitions()
         .filter(|definition| definition.visibility.is_model_hidden())

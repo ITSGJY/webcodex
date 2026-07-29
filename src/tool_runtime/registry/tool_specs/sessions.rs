@@ -2,18 +2,13 @@ use super::super::input_schemas::{
     close_session_input_schema, current_session_input_schema, list_session_messages_input_schema,
     post_session_message_input_schema, resolve_session_message_input_schema,
     session_discussion_summary_input_schema, session_handoff_summary_input_schema,
-    session_summary_input_schema, start_session_input_schema, validation_summary_input_schema,
+    session_summary_input_schema, validation_summary_input_schema,
 };
 use super::tool_spec;
 use crate::tool_runtime::tool_spec::ToolSpec;
 
 pub(super) fn tool_specs() -> Vec<ToolSpec> {
     vec![
-        tool_spec(
-            "start_session",
-            "Create a bounded task tracking session and return its explicit wc_sess_* session_id. Read-only; records session ledger metadata where persistence is configured, never modifies a project, and does not by itself bind future calls as current.",
-            start_session_input_schema(),
-        ),
         tool_spec(
             "session_summary",
             "Return a bounded structured summary from the session ledger for an explicit session_id: recorded events, message-board summary, task mode, guards, and lifecycle. Uses durable ledger data where session persistence is configured; does not rely on current-session binding.",
@@ -53,11 +48,6 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
             "session_handoff_summary",
             "Read-only handoff for multi-step tasks, explicit session_id. Returns session ledger msgs, failed tools, ledger-derived validation, workspace/checkpoints. Diagnostics need bounded tails or safe result metadata; validation.parser.available false if missing. Does not depend on current-session binding.",
             session_handoff_summary_input_schema(),
-        ),
-        tool_spec(
-            "bind_current_session",
-            "Bind an active project-scoped Session for this exact caller, transport, stable window, project, and canonical root. Updates the process-local cache and hashed durable projection together and restores after restart. Read-only; never changes project files or returns binding/window/root hashes.",
-            current_session_input_schema(true),
         ),
         tool_spec(
             "current_session",

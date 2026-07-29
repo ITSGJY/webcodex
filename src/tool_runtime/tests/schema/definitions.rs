@@ -223,18 +223,56 @@ fn tool_call_parser_name_gate_matches_tool_definitions() {
         .is_err(),
         "delete_files must remain legacy route metadata only, not ToolCall parseable"
     );
+    // A ToolDefinition may be `ModelHidden`: dispatched for back-compat but
+    // withheld from the model-facing surface. These are compatibility,
+    // duplicate-granularity, and low-level plumbing tools the canonical
+    // coding surface already covers. The set is intentionally fixed and
+    // documented here so an accidental hide is caught.
+    let expected_hidden: BTreeSet<&str> = [
+        "start_session",
+        "bind_current_session",
+        "job_tail",
+        "replace_in_file",
+        "replace_exact_block",
+        "insert_before_pattern",
+        "insert_after_pattern",
+        "replace_line_range",
+        "insert_at_line",
+        "delete_line_range",
+    ]
+    .into_iter()
+    .collect();
     assert_eq!(
-        model_hidden_tool_names().collect::<Vec<_>>(),
-        Vec::<&'static str>::new(),
-        "hidden parser-known tools must be removed"
+        model_hidden_tool_names().collect::<BTreeSet<_>>(),
+        expected_hidden,
+        "hidden ToolDefinitions must match the documented compatibility batch"
     );
 }
 
 #[test]
 fn tool_definitions_match_agent_capability_dispatch_helper() {
-    use crate::tool_runtime::tool_definition::tool_definitions;
+    use crate::tool_runtime::tool_definition::{
+        is_model_visible_tool_name, lookup_tool_definition, tool_definitions,
+    };
 
     for definition in tool_definitions() {
+        // ModelHidden tools are dispatched for back-compat but have no
+        // model-facing ToolSpec, so sample_tool_args (which reads the spec's
+        // required fields) cannot build arguments for them. They are still
+        // covered by the parser-name-gate test. Here we assert the full
+        // dispatch-helper mirror only for model-visible tools.
+        if !is_model_visible_tool_name(definition.name) {
+            // Hidden tools have no spec, so we cannot synthesize valid args
+            // from required fields. They are still explained by a ToolDefinition
+            // and parser-known (covered by the parser-name-gate test); here we
+            // only confirm the definition exists and resolves.
+            assert!(
+                lookup_tool_definition(definition.name).is_some(),
+                "{} (hidden) must still resolve to a ToolDefinition",
+                definition.name
+            );
+            continue;
+        }
         let args = sample_tool_args(definition.name);
         let call = ToolCall::from_tool_name(definition.name, args)
             .unwrap_or_else(|e| panic!("{} should deserialize: {e}", definition.name));

@@ -162,8 +162,8 @@ fn openapi_generic_call_runtime_tool_schema_remains_strict_model_visible_surface
 
     assert_eq!(
         registered_tool_specs().len(),
-        tool_definitions().count(),
-        "model-visible specs must match ToolDefinition count"
+        model_visible_tool_definitions().count(),
+        "model-visible specs must match model-visible ToolDefinition count"
     );
 
     let tool_call = &openapi["components"]["schemas"]["ToolCallRequest"];

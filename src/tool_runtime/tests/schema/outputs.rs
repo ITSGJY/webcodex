@@ -393,27 +393,27 @@ fn key_tool_output_schemas_include_expected_fields() {
         "detected_summary",
     ] {
         assert!(
-            has_output_field("job_tail", field),
-            "job_tail missing {field}"
+            has_output_field("job_log", field),
+            "job_log missing {field}"
         );
     }
     for field in ["stdout_tail", "stderr_tail"] {
-        let description = output_schema_property(&specs, "job_tail", field)["description"]
+        let description = output_schema_property(&specs, "job_log", field)["description"]
             .as_str()
-            .expect("job_tail stream description")
+            .expect("job_log stream description")
             .to_lowercase();
         assert!(
             description.contains("bounded"),
-            "job_tail {field} description must describe bounded tail text: {description}"
+            "job_log {field} description must describe bounded tail text: {description}"
         );
     }
-    let cursor_description = output_schema_property(&specs, "job_tail", "cursor")["description"]
+    let cursor_description = output_schema_property(&specs, "job_log", "cursor")["description"]
         .as_str()
-        .expect("job_tail cursor description")
+        .expect("job_log cursor description")
         .to_lowercase();
     assert!(
         cursor_description.contains("cursor") && cursor_description.contains("bounded"),
-        "job_tail cursor must describe bounded continuation metadata: {cursor_description}"
+        "job_log cursor must describe bounded continuation metadata: {cursor_description}"
     );
     for field in [
         "path",
@@ -722,22 +722,10 @@ fn cleanup_output_schemas_describe_result_metadata_only() {
 fn compatibility_edit_output_schemas_include_metadata_fields() {
     let specs = registered_tool_specs();
 
-    for field in [
-        "changed",
-        "path",
-        "replacements",
-        "before_sha256",
-        "after_sha256",
-        "bytes_written",
-        "occurrences",
-        "expected",
-        "error",
-    ] {
-        assert!(
-            output_schema_properties(&specs, "replace_in_file").contains_key(field),
-            "replace_in_file missing {field}"
-        );
-    }
+    // `replace_in_file` is ModelHidden (canonical apply_text_edits covers it):
+    // no public ToolSpec/output schema. Its back-compat metadata safety is
+    // covered by implementation-level tests. Only the visible whole-file
+    // write tool's metadata schema is asserted here.
 
     for field in [
         "path",
@@ -755,10 +743,6 @@ fn compatibility_edit_output_schemas_include_metadata_fields() {
     }
 
     assert_eq!(
-        output_schema_property(&specs, "replace_in_file", "replacements")["type"],
-        "integer"
-    );
-    assert_eq!(
         output_schema_property(&specs, "write_project_file", "bytes_written")["type"],
         "integer"
     );
@@ -771,7 +755,6 @@ fn cleanup_and_compatibility_write_output_schemas_do_not_advertise_broad_exfiltr
     for tool in [
         "git_restore_paths",
         "discard_untracked",
-        "replace_in_file",
         "write_project_file",
     ] {
         let props = output_schema_properties(&specs, tool);
@@ -797,7 +780,7 @@ fn cleanup_and_compatibility_write_output_schemas_do_not_advertise_broad_exfiltr
         }
     }
 
-    for tool in ["replace_in_file", "write_project_file"] {
+    for tool in ["write_project_file"] {
         let descriptions = output_schema_description_text(output_schema_properties(&specs, tool));
         for phrase in [
             "result metadata",

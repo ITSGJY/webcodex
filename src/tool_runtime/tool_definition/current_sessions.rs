@@ -1,4 +1,4 @@
-use super::ToolVisibility::ModelVisible;
+use super::ToolVisibility::{ModelHidden, ModelVisible};
 use super::{
     creates_or_binds_session, current_session_control, def, ToolDefinition, TOOL_CATEGORY_SESSION,
 };
@@ -9,7 +9,7 @@ use crate::tool_runtime::metadata::{
 pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     creates_or_binds_session(current_session_control(def(
         "bind_current_session",
-        ModelVisible,
+        ModelHidden,
         TOOL_CATEGORY_SESSION,
         None,
         TOOL_PROVIDER_CONTROL,

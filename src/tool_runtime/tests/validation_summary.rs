@@ -5,7 +5,7 @@ use crate::shell_protocol::ShellClientCapabilities;
 use crate::tool_runtime::metadata::{lookup_tool_metadata, ToolRisk};
 use crate::tool_runtime::registry::output_schema_for_tool;
 use crate::tool_runtime::sessions::{SessionCreateOptions, SessionGuards, SessionTransport};
-use crate::tool_runtime::tool_definition::known_tool_names;
+use crate::tool_runtime::tool_definition::{known_tool_names, model_hidden_tool_names};
 use crate::tool_runtime::{registered_tool_specs, SessionMode, ToolCall, ToolRuntime};
 use serde_json::{json, Value};
 
@@ -34,8 +34,12 @@ fn validation_summary_registration_schema_metadata_and_openapi_are_synchronized(
     }
 
     let specs = registered_tool_specs();
-    assert_eq!(specs.len(), 77);
-    assert_eq!(known_tool_names().count(), 77);
+    let visible_count = specs.len();
+    assert_eq!(
+        visible_count + model_hidden_tool_names().count(),
+        known_tool_names().count(),
+        "visible specs + hidden tools should cover every known runtime tool"
+    );
     let spec = spec_named(&specs, "validation_summary");
     assert_eq!(spec.input_schema["additionalProperties"], false);
     assert_eq!(

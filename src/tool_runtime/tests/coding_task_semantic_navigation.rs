@@ -8,7 +8,8 @@ use crate::shell_protocol::{
     SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
 };
 use crate::tool_runtime::{
-    known_tool_names, registered_tool_specs, SessionMode, ToolCall, ToolResult, ToolRuntime,
+    known_tool_names, model_hidden_tool_names, registered_tool_specs, SessionMode, ToolCall,
+    ToolResult, ToolRuntime,
 };
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -549,10 +550,10 @@ fn coding_task_semantic_navigation_output_schema_is_explicit_and_surface_counts_
     let specs = registered_tool_specs();
     let runtime_tool_count = specs.len();
     assert_eq!(
-        runtime_tool_count, 77,
-        "runtime tool count must remain stable"
+        runtime_tool_count + model_hidden_tool_names().count(),
+        known_tool_names().count(),
+        "visible runtime tool count + hidden tools must cover every known tool"
     );
-    assert_eq!(runtime_tool_count, known_tool_names().count());
     let start = specs
         .iter()
         .find(|spec| spec.name == "start_coding_task")

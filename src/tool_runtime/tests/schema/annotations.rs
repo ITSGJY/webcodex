@@ -34,11 +34,6 @@ fn tool_specs_annotations_cover_safety_hints() {
     ] {
         assert_eq!(spec_named(&specs, name).annotations["readOnlyHint"], true);
     }
-    for name in ["replace_line_range", "insert_at_line", "delete_line_range"] {
-        let annotations = &spec_named(&specs, name).annotations;
-        assert_eq!(annotations["readOnlyHint"], false);
-        assert_eq!(annotations["openWorldHint"], false);
-    }
     for name in ["run_shell", "run_job"] {
         assert_eq!(spec_named(&specs, name).annotations["openWorldHint"], true);
     }

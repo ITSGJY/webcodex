@@ -6,17 +6,12 @@ fn session_tool_specs_describe_ledger_vs_current_binding() {
 
     let desc = |name: &str| spec_named(&specs, name).description.to_lowercase();
 
-    let start_desc = desc("start_session");
-    for phrase in [
-        "explicit wc_sess_* session_id",
-        "session ledger",
-        "does not by itself bind future calls as current",
-    ] {
-        assert!(
-            start_desc.contains(phrase),
-            "start_session description should mention {phrase}: {start_desc}"
-        );
-    }
+    // `start_session` and `bind_current_session` are ModelHidden: the model
+    // coding line is covered by `start_coding_task` (which creates a workflow
+    // session and binds via `resume_session_id` + `bind_current`), and
+    // `current_session` is the query-only view of the active binding. These
+    // hidden tools keep no public ToolSpec/description; their parser/dispatch
+    // and low-level behavior are covered by implementation-level tests.
 
     let summary_desc = desc("session_summary");
     for phrase in [
@@ -46,11 +41,7 @@ fn session_tool_specs_describe_ledger_vs_current_binding() {
         );
     }
 
-    for name in [
-        "bind_current_session",
-        "current_session",
-        "unbind_current_session",
-    ] {
+    for name in ["current_session", "unbind_current_session"] {
         let current_desc = desc(name);
         for phrase in ["process-local", "hashed durable"] {
             assert!(
@@ -60,12 +51,10 @@ fn session_tool_specs_describe_ledger_vs_current_binding() {
         }
     }
 
-    for name in ["bind_current_session", "current_session"] {
-        let current_desc = desc(name);
-        assert!(
-            current_desc.contains("after restart"),
-            "{name} description should mention exact restart recovery: {current_desc}"
-        );
-    }
+    let current_desc = desc("current_session");
+    assert!(
+        current_desc.contains("after restart"),
+        "current_session description should mention exact restart recovery: {current_desc}"
+    );
     assert!(desc("unbind_current_session").contains("keeps workflow session history intact"));
 }
