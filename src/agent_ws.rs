@@ -21,7 +21,7 @@ use crate::shell_client::{
     effective_register_owner, enforce_register_owner, require_agent_transport_scope,
     ShellClientRegistry, TRANSPORT_WEBSOCKET,
 };
-use crate::shell_protocol::{AgentEnvelope, ShellAgentPollRequest, ShellClientRegisterRequest};
+use crate::shell_protocol::{AgentEnvelope, ShellClientRegisterRequest};
 use futures_util::{SinkExt, StreamExt};
 use salvo::prelude::*;
 use salvo::websocket::{Message, WebSocket, WebSocketUpgrade};
@@ -37,9 +37,6 @@ const WS_MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
 /// Deadline for the agent to send its first `Register` envelope after the
 /// handshake. Prevents half-open connections from holding registry state.
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(15);
-/// Channel capacity for outgoing envelopes (requests + pongs). Provides
-/// backpressure if the agent reads slowly.
-const OUTGOING_CHANNEL_CAPACITY: usize = 64;
 
 /// WebSocket agent endpoint: `GET /api/agents/ws` (also mounted at
 /// `/api/agents/ws`). Requires auth via the shared `AuthMiddleware`, exactly
@@ -229,17 +226,28 @@ async fn handle_agent_ws(
 
     // 4. Split the socket into a writer (owned by a writer task) and a reader
     //    (owned by this task). Outgoing envelopes go through a single mpsc so
-    //    the request pump and pong replies share one writer.
+    //    the request pump and pong replies share one writer. The channel
+    //    carries `AgentEnvelope`s; the writer serializes each to text, so the
+    //    shared session loop (`run_agent_session`) is transport-neutral.
     let (sink, stream) = ws.split();
-    let (out_tx, out_rx) = mpsc::channel::<String>(OUTGOING_CHANNEL_CAPACITY);
+    let (out_tx, out_rx) =
+        mpsc::channel::<AgentEnvelope>(crate::agent_session::OUTGOING_CHANNEL_CAPACITY);
 
     let writer_task = tokio::spawn(async move {
         let mut sink = sink;
         let mut out_rx = out_rx;
-        while let Some(json) = out_rx.recv().await {
-            if let Err(e) = sink.send(Message::text(json)).await {
-                tracing::debug!(error = ?e, "agent websocket writer send failed; stopping writer");
-                break;
+        while let Some(env) = out_rx.recv().await {
+            match env.to_json() {
+                Ok(json) => {
+                    if let Err(e) = sink.send(Message::text(json)).await {
+                        tracing::debug!(error = ?e, "agent websocket writer send failed; stopping writer");
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "agent websocket writer failed to encode envelope; stopping writer");
+                    break;
+                }
             }
         }
         if let Err(e) = sink.close().await {
@@ -247,229 +255,67 @@ async fn handle_agent_ws(
         }
     });
 
-    // 5. Request pump: drain the registry queue for this client and push
-    //    Request envelopes. Waits on the notifier when idle. This is the only
-    //    consumer of the queue for this client; polling agents use the HTTP
-    //    poll endpoint against the same queue.
-    let pump_tx = out_tx.clone();
-    let pump_registry = registry.clone();
-    let pump_client_id = client_id.clone();
-    let pump_instance_id = agent_instance_id.clone();
-    let pump_notify = notify.clone();
-    let pump_connection_id = connection_id.clone();
-    let pump_task = tokio::spawn(async move {
-        loop {
-            // Create the notified future before polling so an enqueue that
-            // happens while poll returns None is not missed.
-            let notified = pump_notify.notified();
-            let poll_req = ShellAgentPollRequest {
-                client_id: pump_client_id.clone(),
-                agent_instance_id: pump_instance_id.clone(),
-                projects: None,
-            };
-            // The pump is bound to this concrete connection's lease. A
-            // same-instance reconnect installs a new connection_id; once this
-            // connection loses the lease, the scoped poll rejects it before
-            // dequeuing, so an older socket cannot steal requests that belong
-            // to the new connection. On rejection the pump stops rather than
-            // falling back to an unscoped poll or retrying.
-            match pump_registry
-                .poll_for_connection(poll_req, &pump_connection_id)
-                .await
-            {
-                Ok(Some(request)) => {
-                    let env = AgentEnvelope::Request { request };
-                    match env.to_json() {
-                        Ok(json) => {
-                            if pump_tx.send(json).await.is_err() {
-                                // Do not log the SendError<String>: its Debug
-                                // representation can include the unsent
-                                // request JSON, which may carry command/stdin
-                                // payloads. The channel state is enough for
-                                // diagnostics here.
-                                tracing::debug!(
-                                    client_id = %pump_client_id,
-                                    "agent websocket pump send channel closed; stopping pump"
-                                );
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                client_id = %pump_client_id,
-                                error = %e,
-                                "agent websocket pump failed to encode request envelope"
-                            );
-                            break;
-                        }
-                    }
-                }
-                Ok(None) => {
-                    notified.await;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        client_id = %pump_client_id,
-                        error = %e,
-                        "agent websocket pump poll failed; stopping pump"
-                    );
-                    break;
-                }
-            }
-        }
-    });
+    // 5-7. Pump, reader loop, and teardown are shared with the QUIC transport.
+    //      The reader adapter translates tungstenite messages into the
+    //      transport-neutral `RecvOutcome`.
+    let reader = WsReader { stream };
+    crate::agent_session::run_agent_session(
+        crate::agent_session::SessionContext {
+            registry: &registry,
+            client_id: &client_id,
+            agent_instance_id: &agent_instance_id,
+            connection_id: &connection_id,
+            notify,
+            transport_label: "websocket",
+        },
+        out_tx,
+        reader,
+        writer_task,
+    )
+    .await;
+    tracing::info!(client_id = %client_id, "agent websocket disconnected");
+}
 
-    // 6. Reader loop: handle Result/JobUpdate/Ping from the agent.
-    let mut stream = stream;
-    while let Some(msg) = stream.next().await {
+/// Adapter turning a tungstenite/salvo WebSocket read stream into the
+/// transport-neutral [`crate::agent_session::AgentReader`].
+///
+/// `Ping`/`Pong`/`Binary` frames are skipped (tungstenite auto-replies to
+/// protocol pings), close frames stop the reader, and malformed text envelopes
+/// are logged and skipped rather than fatal.
+struct WsReader {
+    stream: futures_util::stream::SplitStream<WebSocket>,
+}
+
+impl crate::agent_session::AgentReader for WsReader {
+    async fn recv(&mut self) -> crate::agent_session::RecvOutcome {
+        use futures_util::StreamExt;
+        let Some(msg) = self.stream.next().await else {
+            return crate::agent_session::RecvOutcome::Closed;
+        };
         let msg = match msg {
             Ok(m) => m,
             Err(e) => {
-                tracing::debug!(client_id = %client_id, error = ?e, "agent websocket read error");
-                break;
+                tracing::debug!(error = ?e, "agent websocket read error");
+                return crate::agent_session::RecvOutcome::Closed;
             }
         };
         if msg.is_close() {
-            break;
+            return crate::agent_session::RecvOutcome::Closed;
         }
         // tungstenite auto-replies to Ping with Pong at the protocol level,
         // so we only react to application Text messages here.
         let text = match msg.as_str() {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(_) => return crate::agent_session::RecvOutcome::Skip,
         };
-        let env = match AgentEnvelope::from_slice(text.as_bytes()) {
-            Ok(env) => env,
+        match AgentEnvelope::from_slice(text.as_bytes()) {
+            Ok(env) => crate::agent_session::RecvOutcome::Envelope(env),
             Err(e) => {
-                tracing::debug!(
-                    client_id = %client_id,
-                    error = %e,
-                    "agent websocket received malformed envelope; ignoring"
-                );
-                continue;
-            }
-        };
-        match env {
-            AgentEnvelope::Result { payload } => {
-                // `complete_for_connection` refreshes `last_seen` internally
-                // only when this connection still holds the lease; a late
-                // result on a stale same-instance connection is still applied
-                // but does not revive the new connection's liveness.
-                if let Err(e) = registry
-                    .complete_for_connection(payload, &connection_id)
-                    .await
-                {
-                    tracing::warn!(client_id = %client_id, error = %e, "ws result rejected");
-                }
-            }
-            AgentEnvelope::JobUpdate { payload } => {
-                // `update_job_for_connection` refreshes `last_seen` internally
-                // only when this connection still holds the lease.
-                if let Err(e) = registry
-                    .update_job_for_connection(payload, &connection_id)
-                    .await
-                {
-                    tracing::warn!(client_id = %client_id, error = %e, "ws job_update rejected");
-                }
-            }
-            AgentEnvelope::Ping { ts } => {
-                // Keepalive: refresh liveness before replying so an idle
-                // WebSocket agent (no pending requests) is not aged out of the
-                // online window by the 60s `CLIENT_ONLINE_WINDOW_SECS` check.
-                // Without this touch, a connected-but-idle agent decays to
-                // `"stale"` even though its socket is healthy.
-                if let Err(e) = registry
-                    .touch_client_for_connection(&client_id, &agent_instance_id, &connection_id)
-                    .await
-                {
-                    tracing::warn!(client_id = %client_id, error = %e, "ws ping liveness touch failed");
-                }
-                let pong = AgentEnvelope::Pong { ts };
-                if let Ok(json) = pong.to_json() {
-                    // Pong is a best-effort keepalive: never block the reader
-                    // if the outbound channel is full (a slow agent must not
-                    // stall inbound processing). try_send drops the pong when
-                    // the channel is saturated; the agent treats a missing
-                    // pong as a soft liveness signal, not a fatal error.
-                    if let Err(e) = out_tx.try_send(json) {
-                        let reason = match e {
-                            tokio::sync::mpsc::error::TrySendError::Full(_) => "full",
-                            tokio::sync::mpsc::error::TrySendError::Closed(_) => "closed",
-                        };
-                        tracing::debug!(
-                            client_id = %client_id,
-                            reason,
-                            "agent websocket pong send dropped"
-                        );
-                    }
-                }
-            }
-            AgentEnvelope::Pong { .. } => {
-                // Pong is a normal keepalive response. The server does not
-                // currently originate Pings, but a Pong (e.g. a stray or
-                // future server-initiated ping reply) must still count as
-                // live traffic so the client does not decay to stale, and it
-                // must never be treated as an unexpected envelope.
-                if let Err(e) = registry
-                    .touch_client_for_connection(&client_id, &agent_instance_id, &connection_id)
-                    .await
-                {
-                    tracing::debug!(client_id = %client_id, error = %e, "ws pong liveness touch failed");
-                }
-            }
-            AgentEnvelope::RuntimeMetadata { tool_providers } => {
-                let _ = registry
-                    .update_tool_providers_for_connection(
-                        &client_id,
-                        &agent_instance_id,
-                        &connection_id,
-                        Some(tool_providers),
-                    )
-                    .await;
-            }
-            AgentEnvelope::Goodbye { reason } => {
-                tracing::debug!(
-                    client_id = %client_id,
-                    reason = reason.as_deref().unwrap_or("unspecified"),
-                    "agent websocket sent goodbye"
-                );
-                registry
-                    .reconcile_disconnect_for_connection(
-                        &client_id,
-                        &agent_instance_id,
-                        &connection_id,
-                    )
-                    .await;
-                break;
-            }
-            AgentEnvelope::Register { .. } => {
-                // Ignore a redundant register mid-session.
-            }
-            other => {
-                tracing::debug!(
-                    client_id = %client_id,
-                    kind = other.kind(),
-                    "agent websocket received unexpected envelope; ignoring"
-                );
+                tracing::debug!(error = %e, "agent websocket received malformed envelope; ignoring");
+                crate::agent_session::RecvOutcome::Skip
             }
         }
     }
-
-    // 7. Cleanup: stop the pump, drain the writer, and remove the notifier so
-    //    the client naturally decays to stale/offline instead of staying
-    //    "online websocket" forever.
-    pump_task.abort();
-    drop(out_tx);
-    if let Err(e) = writer_task.await {
-        tracing::debug!(client_id = %client_id, error = ?e, "agent websocket writer task join failed");
-    }
-    // Reconcile: drop the notifier and mark running jobs lost so a
-    // disconnected agent never leaves jobs permanently "running" or appears
-    // permanently online (the client decays to stale via last_seen).
-    registry
-        .reconcile_disconnect_for_connection(&client_id, &agent_instance_id, &connection_id)
-        .await;
-    tracing::info!(client_id = %client_id, "agent websocket disconnected");
 }
 
 /// Read the first envelope from the socket, requiring it to be a `Register`.

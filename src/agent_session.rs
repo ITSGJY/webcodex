@@ -1,0 +1,321 @@
+//! Shared post-register agent session loop.
+//!
+//! Both long-lived agent transports — WebSocket (`agent_ws`) and custom QUIC
+//! (`agent_quic`) — run the *same* session once a connection is registered:
+//! a request pump that drains the shared registry queue and pushes `Request`
+//! envelopes, a reader loop that dispatches `Result`/`JobUpdate`/`Ping`/`Pong`/
+//! `RuntimeMetadata`/`Goodbye` envelopes into the connection-scoped registry
+//! lease, and a teardown that stops the pump, joins the writer, and reconciles
+//! the disconnect. The only differences are the wire I/O (how a frame is read
+//! or written) and a log label. This module owns that shared loop; the two
+//! transport modules own transport-specific registration, auth, and I/O.
+//!
+//! Connection-lease scoping: every registry call below takes the
+//! `connection_id` so a stale same-instance reconnect cannot consume or
+//! refresh the newer connection's lease. This mirrors the polling transport's
+//! `*_for_connection` discipline.
+
+use crate::shell_client::ShellClientRegistry;
+use crate::shell_protocol::{AgentEnvelope, ShellAgentPollRequest};
+use std::sync::Arc;
+use tokio::sync::{mpsc, Notify};
+use tokio::task::JoinHandle;
+
+/// Channel capacity for outgoing envelopes (requests + pongs). Provides
+/// backpressure if the agent reads slowly. Shared by both transports.
+pub(crate) const OUTGOING_CHANNEL_CAPACITY: usize = 64;
+
+/// Outcome of a single inbound read on the shared reader loop.
+#[derive(Debug)]
+pub(crate) enum RecvOutcome {
+    /// A decoded envelope ready to dispatch.
+    Envelope(AgentEnvelope),
+    /// A frame was consumed but yielded no envelope (e.g. a non-text
+    /// WebSocket frame, or a malformed envelope that was logged and skipped).
+    /// The reader loop continues.
+    Skip,
+    /// The peer closed the connection or a fatal read error occurred. The
+    /// transport logs the cause itself; the reader loop stops.
+    Closed,
+}
+
+/// Transport-neutral inbound reader. Implementations wrap a WebSocket
+/// `StreamExt` stream or a QUIC `RecvStream` and translate wire reads into
+/// [`RecvOutcome`]s, logging transport-specific errors themselves.
+pub(crate) trait AgentReader {
+    async fn recv(&mut self) -> RecvOutcome;
+}
+
+/// Shared session context handed to [`run_agent_session`] after a transport
+/// has authenticated, registered, and acknowledged the agent.
+pub(crate) struct SessionContext<'a> {
+    pub(crate) registry: &'a Arc<ShellClientRegistry>,
+    pub(crate) client_id: &'a str,
+    pub(crate) agent_instance_id: &'a str,
+    pub(crate) connection_id: &'a str,
+    pub(crate) notify: Arc<Notify>,
+    /// Log label: `"websocket"` or `"quic"`.
+    pub(crate) transport_label: &'static str,
+}
+
+/// Drive the post-register session to completion: request pump, reader-loop
+/// dispatch, and teardown.
+///
+/// The caller owns the transport-specific **writer task** (`writer_task`),
+/// which drains `out_tx` (an `AgentEnvelope` mpsc) onto the wire; this function
+/// owns the **pump** (which feeds `out_tx`) and the **reader loop**. On exit
+/// the pump is aborted, `out_tx` is dropped (so the writer flushes and exits),
+/// the writer is joined, and the disconnect is reconciled according to the
+/// registered capability: reconciliation-capable runners enter the bounded
+/// `recovering` state, while legacy runners become `lost`; the client then
+/// decays to stale/offline.
+///
+/// Returns when the reader loop ends (peer closed, sent `Goodbye`, or a fatal
+/// read). The caller is responsible for any post-teardown transport logging.
+pub(crate) async fn run_agent_session(
+    ctx: SessionContext<'_>,
+    out_tx: mpsc::Sender<AgentEnvelope>,
+    mut reader: impl AgentReader,
+    writer_task: JoinHandle<()>,
+) {
+    let SessionContext {
+        registry,
+        client_id,
+        agent_instance_id,
+        connection_id,
+        notify,
+        transport_label,
+    } = ctx;
+
+    // Request pump: drain the shared registry queue for this connection and
+    // push Request envelopes. Waits on the notifier when idle. This is the
+    // only consumer of the queue for this connection; polling agents use the
+    // HTTP poll endpoint against the same queue.
+    //
+    // The pump is bound to this concrete connection's lease. A same-instance
+    // reconnect installs a new connection_id; once this connection loses the
+    // lease, the scoped poll rejects it before dequeuing, so an older socket
+    // cannot steal requests that belong to the new connection. On rejection
+    // the pump stops rather than falling back to an unscoped poll or retrying.
+    let pump_tx = out_tx.clone();
+    let pump_registry = Arc::clone(registry);
+    let pump_client_id = client_id.to_string();
+    let pump_instance_id = agent_instance_id.to_string();
+    let pump_connection_id = connection_id.to_string();
+    let pump_notify = Arc::clone(&notify);
+    let pump_task = tokio::spawn(async move {
+        loop {
+            // Create the notified future before polling so an enqueue that
+            // happens while poll returns None is not missed.
+            let notified = pump_notify.notified();
+            let poll_req = ShellAgentPollRequest {
+                client_id: pump_client_id.clone(),
+                agent_instance_id: pump_instance_id.clone(),
+                projects: None,
+            };
+            match pump_registry
+                .poll_for_connection(poll_req, &pump_connection_id)
+                .await
+            {
+                Ok(Some(request)) => {
+                    // Do not log the SendError: its Debug representation can
+                    // include the unsent request envelope, which may carry
+                    // command/stdin payloads. The closed channel is enough.
+                    if pump_tx
+                        .send(AgentEnvelope::Request { request })
+                        .await
+                        .is_err()
+                    {
+                        tracing::debug!(
+                            client_id = %pump_client_id,
+                            "agent {} pump send channel closed; stopping pump",
+                            transport_label
+                        );
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    notified.await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        client_id = %pump_client_id,
+                        error = %e,
+                        "agent {} pump poll failed; stopping pump",
+                        transport_label
+                    );
+                    break;
+                }
+            }
+        }
+    });
+
+    // Reader loop: dispatch inbound envelopes into the connection lease. A
+    // `Goodbye` reconciles the disconnect inline and then breaks the loop.
+    loop {
+        match reader.recv().await {
+            RecvOutcome::Envelope(env) => {
+                let is_goodbye = matches!(&env, AgentEnvelope::Goodbye { .. });
+                dispatch_inbound(
+                    env,
+                    registry,
+                    client_id,
+                    agent_instance_id,
+                    connection_id,
+                    &out_tx,
+                    transport_label,
+                )
+                .await;
+                if is_goodbye {
+                    break;
+                }
+            }
+            RecvOutcome::Skip => continue,
+            RecvOutcome::Closed => break,
+        }
+    }
+
+    // Teardown: stop the pump, drop the writer's feed so it flushes and exits,
+    // join the writer, and reconcile the disconnect so a disconnected agent
+    // never leaves jobs permanently "running" or stays online forever (the
+    // client decays to stale via last_seen).
+    pump_task.abort();
+    drop(out_tx);
+    if let Err(e) = writer_task.await {
+        tracing::debug!(
+            client_id = client_id,
+            error = ?e,
+            "agent {} writer task join failed",
+            transport_label
+        );
+    }
+    registry
+        .reconcile_disconnect_for_connection(client_id, agent_instance_id, connection_id)
+        .await;
+}
+
+/// Dispatch one inbound envelope into the connection-scoped registry lease.
+async fn dispatch_inbound(
+    env: AgentEnvelope,
+    registry: &Arc<ShellClientRegistry>,
+    client_id: &str,
+    agent_instance_id: &str,
+    connection_id: &str,
+    out_tx: &mpsc::Sender<AgentEnvelope>,
+    transport_label: &'static str,
+) {
+    match env {
+        AgentEnvelope::Result { payload } => {
+            // `complete_for_connection` refreshes `last_seen` internally only
+            // when this connection still holds the lease; a late result on a
+            // stale same-instance connection is still applied but does not
+            // revive the new connection's liveness.
+            if let Err(e) = registry
+                .complete_for_connection(payload, connection_id)
+                .await
+            {
+                tracing::warn!(
+                    client_id = client_id,
+                    error = %e,
+                    "agent {} result rejected",
+                    transport_label
+                );
+            }
+        }
+        AgentEnvelope::JobUpdate { payload } => {
+            if let Err(e) = registry
+                .update_job_for_connection(payload, connection_id)
+                .await
+            {
+                tracing::warn!(
+                    client_id = client_id,
+                    error = %e,
+                    "agent {} job_update rejected",
+                    transport_label
+                );
+            }
+        }
+        AgentEnvelope::Ping { ts } => {
+            // Keepalive: refresh liveness before replying so an idle agent (no
+            // pending requests) is not aged out of the online window. Without
+            // this touch a connected-but-idle agent decays to "stale" even
+            // though its socket is healthy.
+            if let Err(e) = registry
+                .touch_client_for_connection(client_id, agent_instance_id, connection_id)
+                .await
+            {
+                tracing::warn!(
+                    client_id = client_id,
+                    error = %e,
+                    "agent {} ping liveness touch failed",
+                    transport_label
+                );
+            }
+            // Pong is best-effort: never block the reader if the outbound
+            // channel is full (a slow agent must not stall inbound processing).
+            // try_send drops the pong when saturated; the agent treats a
+            // missing pong as a soft liveness signal, not a fatal error.
+            if let Err(e) = out_tx.try_send(AgentEnvelope::Pong { ts }) {
+                let reason = match e {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => "full",
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => "closed",
+                };
+                tracing::debug!(
+                    client_id = client_id,
+                    reason,
+                    "agent {} pong send dropped",
+                    transport_label
+                );
+            }
+        }
+        AgentEnvelope::Pong { .. } => {
+            // Pong is a normal keepalive response. The server does not
+            // currently originate Pings, but a Pong must still count as live
+            // traffic so the client does not decay to stale, and must never be
+            // treated as an unexpected envelope.
+            if let Err(e) = registry
+                .touch_client_for_connection(client_id, agent_instance_id, connection_id)
+                .await
+            {
+                tracing::debug!(
+                    client_id = client_id,
+                    error = %e,
+                    "agent {} pong liveness touch failed",
+                    transport_label
+                );
+            }
+        }
+        AgentEnvelope::RuntimeMetadata { tool_providers } => {
+            let _ = registry
+                .update_tool_providers_for_connection(
+                    client_id,
+                    agent_instance_id,
+                    connection_id,
+                    Some(tool_providers),
+                )
+                .await;
+        }
+        AgentEnvelope::Goodbye { reason } => {
+            tracing::debug!(
+                client_id = client_id,
+                reason = reason.as_deref().unwrap_or("unspecified"),
+                "agent {} sent goodbye",
+                transport_label
+            );
+            registry
+                .reconcile_disconnect_for_connection(client_id, agent_instance_id, connection_id)
+                .await;
+        }
+        AgentEnvelope::Register { .. } => {
+            // Ignore a redundant register mid-session.
+        }
+        other => {
+            tracing::debug!(
+                client_id = client_id,
+                kind = other.kind(),
+                "agent {} received unexpected envelope; ignoring",
+                transport_label
+            );
+        }
+    }
+}
