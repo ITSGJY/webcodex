@@ -105,24 +105,14 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         );
     }
 
-    // Compatibility line/pattern tools remain callable and steer to apply_text_edits.
-    for name in [
-        "replace_line_range",
-        "insert_at_line",
-        "delete_line_range",
-        "replace_in_file",
-        "replace_exact_block",
-        "insert_before_pattern",
-        "insert_after_pattern",
-    ] {
-        let compat_desc = desc(name);
-        for phrase in ["compatibility tool", "prefer apply_text_edits"] {
-            assert!(
-                compat_desc.contains(phrase),
-                "{name} description should mention {phrase}: {compat_desc}"
-            );
-        }
-    }
+    // The compatibility line/pattern tools (replace_line_range,
+    // insert_at_line, delete_line_range, replace_in_file,
+    // replace_exact_block, insert_before_pattern, insert_after_pattern)
+    // are ModelHidden: still parser-known and dispatched for back-compat,
+    // but no longer carry a model-facing ToolSpec/description. Their hidden
+    // status and continued parseability are asserted by
+    // `anchor_edit_tools_are_hidden_from_model_surface` and the parser-name
+    // gate in `tool_call_parser_name_gate_matches_tool_definitions`.
 
     for name in ["cargo_check", "cargo_test"] {
         let validation_desc = desc(name);
@@ -167,36 +157,34 @@ fn tool_specs_describe_default_coding_loop_preferences() {
 }
 
 #[test]
-fn tool_specs_include_anchor_edit_tools() {
+fn anchor_edit_tools_are_hidden_from_model_surface() {
+    use crate::tool_runtime::tool_definition::is_model_hidden_tool_name;
+
     let specs = registered_tool_specs();
-    for required in [
+    let spec_names: std::collections::BTreeSet<&str> =
+        specs.iter().map(|s| s.name.as_str()).collect();
+    for hidden in [
         "replace_exact_block",
         "insert_before_pattern",
         "insert_after_pattern",
+        "replace_in_file",
+        "replace_line_range",
+        "insert_at_line",
+        "delete_line_range",
     ] {
-        let spec = specs
-            .iter()
-            .find(|s| s.name == required)
-            .expect("anchor edit spec");
-        assert!(spec.description.contains("literal"), "{}", spec.description);
         assert!(
-            spec.description.contains("no regex"),
-            "{}",
-            spec.description
+            is_model_hidden_tool_name(hidden),
+            "{hidden} must be ModelHidden (canonical apply_text_edits covers it)"
         );
         assert!(
-            spec.description
-                .to_lowercase()
-                .contains("compatibility tool"),
-            "{} should remain a compatibility tool: {}",
-            required,
-            spec.description
+            !spec_names.contains(hidden),
+            "{hidden} must not keep a model-facing ToolSpec"
         );
     }
 }
 
 #[test]
-fn edit_tool_surface_keeps_compat_tools_visible_and_schemas_stable() {
+fn edit_tool_surface_keeps_canonical_tools_visible_and_schemas_stable() {
     let specs = registered_tool_specs();
     let names: std::collections::BTreeSet<&str> =
         specs.iter().map(|spec| spec.name.as_str()).collect();
@@ -206,13 +194,6 @@ fn edit_tool_surface_keeps_compat_tools_visible_and_schemas_stable() {
         "apply_patch_checked",
         "apply_patch",
         "write_project_file",
-        "replace_in_file",
-        "replace_exact_block",
-        "insert_before_pattern",
-        "insert_after_pattern",
-        "replace_line_range",
-        "insert_at_line",
-        "delete_line_range",
     ] {
         assert!(
             names.contains(required),

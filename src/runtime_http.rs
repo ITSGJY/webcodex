@@ -2304,29 +2304,16 @@ mod tests {
         assert_eq!(effective_status(&resp), StatusCode::OK);
         let body: Value = resp.take_json().await.unwrap();
         let names = body["names"].as_array().unwrap();
-        assert!(names.iter().any(|n| n == "replace_in_file"));
+        // `replace_in_file` and `start_session` are ModelHidden: still
+        // dispatched for back-compat via callRuntimeTool, but withheld from the
+        // model-facing tools/list surface. Only the visible canonical tools
+        // appear here.
+        assert!(!names.iter().any(|n| n == "replace_in_file"));
+        assert!(!names.iter().any(|n| n == "start_session"));
+        assert!(!names.iter().any(|n| n == "bind_current_session"));
         assert!(names.iter().any(|n| n == "write_project_file"));
         assert_eq!(body["count"], names.len());
         let tools = body["tools"].as_array().unwrap();
-        let start_session = tools
-            .iter()
-            .find(|tool| tool["name"] == "start_session")
-            .expect("missing start_session");
-        assert_eq!(
-            start_session["inputSchema"]["properties"]["mode"]["enum"],
-            json!(["normal", "inspect", "read_only"])
-        );
-        assert!(start_session["inputSchema"]["properties"]
-            .get("deny_write_tools")
-            .is_some());
-        assert!(start_session["inputSchema"]["properties"]
-            .get("deny_shell_tools")
-            .is_some());
-        assert!(
-            start_session["outputSchema"]["properties"]["output"]["properties"]
-                .get("guards")
-                .is_some()
-        );
         for name in ["read_file", "run_shell", "write_project_file"] {
             let tool = tools
                 .iter()

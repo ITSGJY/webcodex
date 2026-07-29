@@ -234,8 +234,12 @@ fn edit_surface_table_matches_canonicalization_contract() {
 fn sample_edit_tool_args_are_not_required_by_telemetry_module() {
     // Sanity: telemetry classification is name-only; sample args (paths/content)
     // used elsewhere for schema fixtures must not be needed to classify tools.
+    // `apply_text_edits` is the canonical model-visible edit tool and can
+    // synthesize args from its spec; the ModelHidden compatibility edit tools
+    // (replace_in_file, etc.) carry no public ToolSpec, but their telemetry
+    // classification is still name-only and is asserted via `edit_tool_surface`
+    // above, so they need no sample-args construction here.
     let _ = sample_tool_args("apply_text_edits");
-    let _ = sample_tool_args("replace_in_file");
     let _ = json!({"path": "ignored-by-telemetry"});
     assert!(edit_tool_surface("apply_text_edits").is_some());
 }

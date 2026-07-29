@@ -968,8 +968,8 @@ fn tool_categories_and_recommended_flows_are_well_formed() {
             "apply_text_edits",
             "apply_patch_checked",
             "write_project_file",
-            "replace_line_range",
-            "insert_at_line",
+            "save_project_artifact",
+            "read_project_artifact_metadata",
         ],
         "canonical edit tools should lead the edit category"
     );
@@ -1010,12 +1010,16 @@ fn tool_categories_include_edit_group() {
     let edit = cats[TOOL_DISCOVERY_GROUP_EDIT]
         .as_array()
         .expect("edit category present");
-    assert!(edit.iter().any(|v| v == "replace_in_file"));
-    assert!(edit.iter().any(|v| v == "write_project_file"));
-    assert!(edit.iter().any(|v| v == "replace_line_range"));
-    assert!(edit.iter().any(|v| v == "insert_at_line"));
-    assert!(edit.iter().any(|v| v == "delete_line_range"));
+    // The edit category lists only model-visible canonical tools. The
+    // compatibility line/pattern/anchor tools are ModelHidden (dispatched
+    // for back-compat but withheld from the surface), so they must NOT
+    // appear here.
     assert!(edit.iter().any(|v| v == "apply_text_edits"));
+    assert!(edit.iter().any(|v| v == "write_project_file"));
+    assert!(edit.iter().any(|v| v == "apply_patch_checked"));
+    assert!(!edit.iter().any(|v| v == "replace_in_file"));
+    assert!(!edit.iter().any(|v| v == "replace_line_range"));
+    assert!(!edit.iter().any(|v| v == "insert_at_line"));
 }
 
 #[test]
@@ -1350,7 +1354,6 @@ async fn audit_and_exploration_intents_exclude_shell_and_jobs() {
                 "project_overview",
                 "read_file",
                 "search_project_text",
-                "list_project_files",
                 "git_status",
                 "git_diff_summary",
                 "git_diff_hunks",

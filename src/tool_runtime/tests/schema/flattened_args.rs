@@ -149,7 +149,7 @@ fn tool_call_request_flattened_properties_have_explicit_sources() {
 
 #[test]
 fn openapi_generic_call_runtime_tool_schema_remains_strict_model_visible_surface() {
-    use crate::tool_runtime::tool_definition::{model_visible_tool_definitions, tool_definitions};
+    use crate::tool_runtime::tool_definition::model_visible_tool_definitions;
 
     let openapi = crate::openapi::build_openapi_spec();
     let operation_count: usize = openapi["paths"]
@@ -162,8 +162,8 @@ fn openapi_generic_call_runtime_tool_schema_remains_strict_model_visible_surface
 
     assert_eq!(
         registered_tool_specs().len(),
-        tool_definitions().count(),
-        "model-visible specs must match ToolDefinition count"
+        model_visible_tool_definitions().count(),
+        "model-visible specs must match model-visible ToolDefinition count"
     );
 
     let tool_call = &openapi["components"]["schemas"]["ToolCallRequest"];

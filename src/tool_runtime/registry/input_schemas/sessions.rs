@@ -255,33 +255,6 @@ pub(crate) fn session_handoff_summary_input_schema() -> Value {
     })
 }
 
-pub(crate) fn start_session_input_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "project": {
-                "type": "string",
-                "description": "Optional runtime project id associated with this task. This association does not bind the session as current by itself."
-            },
-            "title": {
-                "type": "string",
-                "description": "Optional human-readable task title."
-            },
-            "mode": session_mode_schema("Optional session mode. Defaults to normal. inspect blocks structured write tools and runs shell/job-like tools in the Linux Landlock inspect sandbox; read_only blocks both write-like and shell/job-like tools."),
-            "deny_write_tools": {
-                "type": "boolean",
-                "description": "Optional task guard. When true, write-like tools such as apply_patch, write_project_file, replace_line_range, insert_at_line, and delete_line_range are blocked before execution."
-            },
-            "deny_shell_tools": {
-                "type": "boolean",
-                "description": "Optional task guard. When true, shell/job-like tools such as run_shell, run_job, cargo_fmt, cargo_check, and cargo_test are blocked before execution."
-            }
-        },
-        "required": [],
-        "additionalProperties": false,
-    })
-}
-
 pub(crate) fn current_session_input_schema(require_session_id: bool) -> Value {
     let mut fields = vec![(
         "project",

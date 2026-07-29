@@ -160,15 +160,3 @@ pub(crate) fn list_jobs_input_schema() -> Value {
         ),
     ])
 }
-
-pub(crate) fn job_tail_input_schema() -> Value {
-    object_schema(vec![
-        ("job_id", "string", "Job id.", true),
-        (
-            "tail_lines",
-            "integer",
-            "Optional number of trailing lines to return per stream. Defaults to 200 and is capped at 500.",
-            false,
-        ),
-    ])
-}

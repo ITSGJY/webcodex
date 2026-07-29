@@ -330,6 +330,7 @@ fn tool_definitions_drive_session_and_permission_policy() {
 #[test]
 fn required_agent_capability_matches_metadata_risk_table() {
     use crate::tool_runtime::metadata::{lookup_tool_metadata, ToolRisk, TOOL_PROVIDER_AGENT};
+    use crate::tool_runtime::tool_definition::is_model_visible_tool_name;
 
     let cases = [
         ("run_shell", ToolRisk::JobRun, AgentCapability::Shell),
@@ -568,19 +569,34 @@ fn required_agent_capability_matches_metadata_risk_table() {
     let table_project_tools = cases
         .iter()
         .map(|(name, _, _)| *name)
+        .filter(|name| is_model_visible_tool_name(name))
         .collect::<BTreeSet<_>>();
     assert_eq!(table_project_tools, expected_project_tools);
 
     for (name, risk, capability) in cases {
         let metadata = lookup_tool_metadata(name).unwrap();
         assert_eq!(metadata.risk, risk, "{name} metadata risk");
-        let call = ToolCall::from_tool_name(name, sample_tool_args(name))
-            .unwrap_or_else(|e| panic!("{name} should deserialize: {e}"));
-        assert_eq!(
-            required_agent_capability(&call),
-            Some(capability),
-            "{name} capability"
-        );
+        // Hidden tools have no spec, so sample_tool_args cannot build args.
+        // Their capability routing still matters (they dispatch); verify it
+        // against the ToolDefinition directly. Visible tools go through the
+        // full ToolCall path.
+        if is_model_visible_tool_name(name) {
+            let call = ToolCall::from_tool_name(name, sample_tool_args(name))
+                .unwrap_or_else(|e| panic!("{name} should deserialize: {e}"));
+            assert_eq!(
+                required_agent_capability(&call),
+                Some(capability),
+                "{name} capability"
+            );
+        } else {
+            assert_eq!(
+                crate::tool_runtime::tool_definition::lookup_tool_definition(name)
+                    .unwrap()
+                    .agent_capability,
+                Some(capability),
+                "{name} (hidden) capability must match dispatch helper"
+            );
+        }
     }
 }
 

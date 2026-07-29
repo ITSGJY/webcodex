@@ -1,5 +1,5 @@
 use super::AgentCapability::{GitOrShell, OwnerOnly};
-use super::ToolVisibility::ModelVisible;
+use super::ToolVisibility::{ModelHidden, ModelVisible};
 use super::{
     creates_or_binds_session, def, extra_accepted_flattened_args,
     requires_explicit_business_session, ToolDefinition, TOOL_CATEGORY_SESSION,
@@ -13,7 +13,7 @@ use crate::tool_runtime::metadata::{
 pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     creates_or_binds_session(def(
         "start_session",
-        ModelVisible,
+        ModelHidden,
         TOOL_CATEGORY_SESSION,
         None,
         TOOL_PROVIDER_CONTROL,

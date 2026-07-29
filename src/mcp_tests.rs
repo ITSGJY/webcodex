@@ -537,12 +537,17 @@ async fn session_tools_exposed_in_registry_and_mcp() {
     let runtime = test_runtime();
     let specs = registered_tool_specs();
     let registry_names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
-    assert!(registry_names.contains(&"start_session"));
     assert!(registry_names.contains(&"session_summary"));
     assert!(registry_names.contains(&"validation_summary"));
-    assert!(registry_names.contains(&"bind_current_session"));
     assert!(registry_names.contains(&"current_session"));
     assert!(registry_names.contains(&"unbind_current_session"));
+    // `start_session` and `bind_current_session` are ModelHidden: the
+    // model coding line is covered by `start_coding_task` (resume_session_id
+    // + bind_current), and `current_session` is the query-only view. They
+    // keep no public ToolSpec, so they must be absent from both the
+    // registry and the MCP tools/list surface.
+    assert!(!registry_names.contains(&"start_session"));
+    assert!(!registry_names.contains(&"bind_current_session"));
 
     let outcome = handle_mcp_request(
         &runtime,
@@ -560,32 +565,13 @@ async fn session_tools_exposed_in_registry_and_mcp() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap().to_string())
         .collect();
-    assert!(names.iter().any(|name| name == "start_session"));
     assert!(names.iter().any(|name| name == "session_summary"));
     assert!(names.iter().any(|name| name == "validation_summary"));
-    assert!(names.iter().any(|name| name == "bind_current_session"));
     assert!(names.iter().any(|name| name == "current_session"));
     assert!(names.iter().any(|name| name == "unbind_current_session"));
+    assert!(!names.iter().any(|name| name == "start_session"));
+    assert!(!names.iter().any(|name| name == "bind_current_session"));
     let tools = value["result"]["tools"].as_array().unwrap();
-    let start_session = tools
-        .iter()
-        .find(|tool| tool["name"] == "start_session")
-        .expect("missing MCP start_session tool");
-    assert_eq!(
-        start_session["inputSchema"]["properties"]["mode"]["enum"],
-        json!(["normal", "inspect", "read_only"])
-    );
-    assert!(start_session["inputSchema"]["properties"]
-        .get("deny_write_tools")
-        .is_some());
-    assert!(start_session["inputSchema"]["properties"]
-        .get("deny_shell_tools")
-        .is_some());
-    assert!(
-        start_session["outputSchema"]["properties"]["output"]["properties"]
-            .get("guards")
-            .is_some()
-    );
     let tool_description = |name: &str| {
         tools
             .iter()
@@ -595,16 +581,11 @@ async fn session_tools_exposed_in_registry_and_mcp() {
             .unwrap()
             .to_lowercase()
     };
-    assert!(tool_description("start_session").contains("explicit wc_sess_* session_id"));
     assert!(tool_description("session_summary").contains("session ledger"));
     assert!(tool_description("validation_summary").contains("does not run cargo"));
     assert!(tool_description("session_handoff_summary")
         .contains("does not depend on current-session binding"));
-    for name in [
-        "bind_current_session",
-        "current_session",
-        "unbind_current_session",
-    ] {
+    for name in ["current_session", "unbind_current_session"] {
         let description = tool_description(name);
         assert!(
                 description.contains("process-local")
@@ -612,20 +593,6 @@ async fn session_tools_exposed_in_registry_and_mcp() {
                 "MCP {name} description should distinguish the exact cache and hashed durable projection: {description}"
             );
     }
-    let bind_current = tools
-        .iter()
-        .find(|tool| tool["name"] == "bind_current_session")
-        .expect("missing MCP bind_current_session tool");
-    assert!(bind_current["inputSchema"]["required"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|field| field == "project"));
-    assert!(bind_current["inputSchema"]["required"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|field| field == "session_id"));
     let validation_summary = tools
         .iter()
         .find(|tool| tool["name"] == "validation_summary")

@@ -1,5 +1,5 @@
 use super::AgentCapability::{AsyncJobs, Shell};
-use super::ToolVisibility::ModelVisible;
+use super::ToolVisibility::{ModelHidden, ModelVisible};
 use super::{def, permission_risk, ToolDefinition, PERMISSION_RISK_JOB, TOOL_CATEGORY_JOB};
 use crate::tool_runtime::metadata::{
     ToolPathHint::None as NoPath,
@@ -97,7 +97,7 @@ pub(super) const LISTING_DEFINITIONS: &[ToolDefinition] = &[
     ),
     def(
         "job_tail",
-        ModelVisible,
+        ModelHidden,
         TOOL_CATEGORY_JOB,
         None,
         TOOL_PROVIDER_NATIVE,

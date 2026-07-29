@@ -470,8 +470,9 @@ fn known_tool_names_matches_spec_count() {
     }
     assert_eq!(
         specs.len(),
-        known_tool_names().count(),
-        "registered tool specs should cover every known runtime tool after hidden tools are removed"
+        known_tool_names().count() - model_hidden_tool_names().count(),
+        "registered tool specs should cover every model-visible known runtime tool; \
+         hidden tools are parser-known but carry no ToolSpec"
     );
     // Every known name must be recognized (i.e. must NOT yield the
     // "unknown tool" error). Unit tools parse with null args; non-unit

@@ -1,6 +1,6 @@
 use super::super::input_schemas::{
-    job_log_input_schema, job_status_input_schema, job_tail_input_schema, list_jobs_input_schema,
-    run_job_input_schema, run_shell_input_schema, stop_job_input_schema,
+    job_log_input_schema, job_status_input_schema, list_jobs_input_schema, run_job_input_schema,
+    run_shell_input_schema, stop_job_input_schema,
 };
 use super::tool_spec;
 use crate::tool_runtime::tool_spec::ToolSpec;
@@ -39,11 +39,6 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
                 + "Never returns stdout/stderr bodies — only metadata (job_id, kind, status, "
                 + "project, timestamps, exit_code).",
             list_jobs_input_schema(),
-        ),
-        tool_spec(
-            "job_tail",
-            "Return bounded stdout/stderr tails for a job.",
-            job_tail_input_schema(),
         ),
     ]
 }
