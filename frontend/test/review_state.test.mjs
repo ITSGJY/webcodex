@@ -225,6 +225,43 @@ test("controller advances cursor and ignores unchanged heartbeat", async () => {
   assert.deepEqual(rendered, [10, 11]);
 });
 
+test("controller renders guidance watermark changes without a new event", async () => {
+  const rendered = [];
+  const h = harness((review) =>
+    rendered.push([review.guidance_seen_seq, review.unread_guidance_seq])
+  );
+  h.controller.select(reviewA.task_id);
+  h.calls[0].response.resolve({
+    status: 200,
+    ok: true,
+    data: {
+      ...reviewA,
+      event_cursor: 10,
+      guidance_seen_seq: 0,
+      unread_guidance_seq: 8,
+    },
+  });
+  await settle();
+
+  h.scheduled.shift()();
+  h.calls[1].response.resolve({
+    status: 200,
+    ok: true,
+    data: {
+      ...reviewA,
+      event_cursor: 10,
+      guidance_seen_seq: 8,
+      unread_guidance_seq: null,
+    },
+  });
+  await settle();
+
+  assert.deepEqual(rendered, [
+    [0, 8],
+    [8, null],
+  ]);
+});
+
 test("controller aborts on switch and hidden, resumes once, stops on 401", async () => {
   const h = harness();
   h.controller.select(reviewA.task_id);

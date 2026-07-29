@@ -11,10 +11,16 @@ export function initialState() {
 export function reviewSnapshot(review) {
     const result = review && review.result ? review.result : null;
     const cursor = review && typeof review.event_cursor === "number" ? review.event_cursor : 0;
+    const guidanceSeen = review && typeof review.guidance_seen_seq === "number" ? review.guidance_seen_seq : null;
+    const unreadGuidance = review && typeof review.unread_guidance_seq === "number"
+        ? review.unread_guidance_seq
+        : null;
     return {
         taskId: review && review.task_id ? String(review.task_id) : "",
         resultId: result && result.result_id ? String(result.result_id) : null,
         eventCursor: cursor,
+        guidanceSeenSeq: guidanceSeen,
+        unreadGuidanceSeq: unreadGuidance,
         review: review,
     };
 }
@@ -134,6 +140,12 @@ export function createReviewController(options) {
             execution.stdout_cursor,
             execution.stderr_cursor,
             execution.assertion_status,
+            review && typeof review.guidance_seen_seq === "number"
+                ? review.guidance_seen_seq
+                : null,
+            review && typeof review.unread_guidance_seq === "number"
+                ? review.unread_guidance_seq
+                : null,
         ]);
     }
     async function request(full) {

@@ -388,7 +388,15 @@ impl ConnectorRuntime {
             )
             .await;
         if outcome.ok {
-            outcome.body = host_review_projection(&outcome.body);
+            // Read-only guidance read-state for the console timeline: the
+            // watermark the model has claimed, and the newest still-pending
+            // guidance. This never advances the watermark — opening the host
+            // review page must not consume guidance the model has yet to read.
+            let read_state = self
+                .db
+                .connector_guidance_read_state(&input.task_id, &self.context.project_id)
+                .unwrap_or(None);
+            outcome.body = host_review_projection(&outcome.body, read_state);
         }
         outcome
     }
@@ -3438,7 +3446,10 @@ fn error_envelope(
     })
 }
 
-fn host_review_projection(envelope: &Value) -> Value {
+fn host_review_projection(
+    envelope: &Value,
+    guidance_read_state: Option<crate::db::GuidanceReadState>,
+) -> Value {
     let mut review = envelope["data"].clone();
     review["task_id"] = envelope["task_id"].clone();
     review["run_id"] = envelope["run_id"].clone();
@@ -3456,6 +3467,16 @@ fn host_review_projection(envelope: &Value) -> Value {
     } else {
         "review"
     });
+    // Guidance read-state for the console timeline: the watermark the model
+    // has claimed (`guidance_seen_seq`) and the newest still-pending
+    // `human_guidance` sequence, or null when none is pending. The console
+    // renders unread guidance events (sequence > guidance_seen_seq) distinctly.
+    let (seen_seq, last_pending) = match guidance_read_state {
+        Some(state) => (json!(state.seen_seq), json!(state.last_pending_seq)),
+        None => (Value::Null, Value::Null),
+    };
+    review["guidance_seen_seq"] = seen_seq;
+    review["unread_guidance_seq"] = last_pending;
     review
 }
 

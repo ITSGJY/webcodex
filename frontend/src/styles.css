@@ -230,6 +230,23 @@ input[type="text"] {
   overflow-wrap: anywhere;
 }
 
+/* A task with guidance the model has not yet read: a left border flag plus a
+   compact badge, so the queue shows which conversations have an unread course
+   correction outstanding. */
+.task-guidance-pending {
+  border-left-color: var(--accent);
+}
+
+.guidance-badge {
+  margin-left: 8px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--panel);
+  background: var(--accent);
+}
+
 .task-meta {
   margin-top: 4px;
   display: flex;
@@ -363,6 +380,22 @@ input[type="text"] {
 
 .timeline-guidance {
   border-left-color: var(--accent);
+}
+
+/* Unread guidance the model has not yet seen on a capability response.
+   Stronger accent + a visible unread marker; read guidance fades to muted. */
+.timeline-guidance-unread {
+  border-left-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg));
+}
+
+.timeline-guidance-unread .guidance-state {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.timeline-guidance-read {
+  opacity: 0.78;
 }
 
 .guide-row {
