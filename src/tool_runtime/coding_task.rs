@@ -202,16 +202,18 @@ impl ToolRuntime {
             json!({
                 "bound": true,
                 "session_id": session_summary.session_id,
-                "process_local_in_memory": true,
-                "lost_after_restart": true,
+                "process_local_cache": true,
+                "durable_exact_binding": true,
+                "restored_after_restart": true,
                 "transport": transport.as_str(),
                 "resolved_project": resolved.resolved_id.clone(),
             })
         } else {
             json!({
                 "bound": false,
-                "process_local_in_memory": true,
-                "lost_after_restart": true,
+                "process_local_cache": true,
+                "durable_exact_binding": true,
+                "restored_after_restart": true,
                 "transport": transport.as_str(),
                 "reason_code": if bind_current {
                     "window_identity_unavailable"
@@ -248,10 +250,12 @@ impl ToolRuntime {
             } else {
                 json!("binding_disabled")
             },
-            "process_local_in_memory": true,
-            "lost_after_restart": true,
+            "process_local_cache": true,
+            "durable_exact_binding": true,
+            "restored_after_restart": true,
+            "requires_stable_window_identity": true,
             "transport": transport.as_str(),
-            "durable_resume": "explicit session_id resumes the durable wc_sess_* session",
+            "durable_resume": "the same exact principal, transport, stable window, project, and canonical repository root resumes the durable wc_sess_* session",
         });
         let recommended_flow = match &tool_manifest {
             Some(manifest) => recommended_flow_payload_for_manifest_tools(manifest),

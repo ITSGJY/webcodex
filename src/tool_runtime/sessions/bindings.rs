@@ -1,7 +1,7 @@
 //! Current-session bindings: bind / unbind / lookup.
 //!
-//! Bindings are process-local control metadata, not durable ledger state.
-//! All mutations go through `SessionStoreInner` helpers.
+//! Raw exact keys stay in a process-local cache. Only their domain-separated
+//! composite hashes enter the durable Workflow Session ledger.
 
 use super::model::{CurrentSessionKey, SessionSummary};
 use super::store::SessionStore;
@@ -12,13 +12,25 @@ impl SessionStore {
         key: CurrentSessionKey,
         session_id: &str,
     ) -> Option<SessionSummary> {
-        let mut inner = self.inner.lock().expect("session store mutex poisoned");
-        inner.bind_current(key, session_id)
+        let bound = {
+            let mut inner = self.inner.lock().expect("session store mutex poisoned");
+            inner.bind_current(key, session_id)
+        };
+        if bound.is_some() {
+            self.persist_after_mutation();
+        }
+        bound
     }
 
     pub(crate) fn current_session(&self, key: &CurrentSessionKey) -> Option<SessionSummary> {
-        let mut inner = self.inner.lock().expect("session store mutex poisoned");
-        inner.current_session(key)
+        let (summary, durable_changed) = {
+            let mut inner = self.inner.lock().expect("session store mutex poisoned");
+            inner.current_session(key)
+        };
+        if durable_changed {
+            self.persist_after_mutation();
+        }
+        summary
     }
 
     pub(crate) fn current_session_id(&self, key: &CurrentSessionKey) -> Option<String> {
@@ -26,7 +38,13 @@ impl SessionStore {
     }
 
     pub(crate) fn unbind_current_session(&self, key: &CurrentSessionKey) -> bool {
-        let mut inner = self.inner.lock().expect("session store mutex poisoned");
-        inner.unbind_current(key)
+        let removed = {
+            let mut inner = self.inner.lock().expect("session store mutex poisoned");
+            inner.unbind_current(key)
+        };
+        if removed {
+            self.persist_after_mutation();
+        }
+        removed
     }
 }

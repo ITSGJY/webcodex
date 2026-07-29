@@ -1,7 +1,6 @@
-//! Cross-process continuity tests: runner disconnect/reconnect, server
-//! restart (durable session ledger + process-local binding loss), stale
-//! registration semantics, meaningful-activity scoping, and mixed-version
-//! diagnostics.
+//! Cross-process continuity tests: runner disconnect/reconnect, durable exact
+//! Workflow Session binding recovery, stale registration semantics,
+//! meaningful-activity scoping, and mixed-version diagnostics.
 
 use super::support::*;
 use crate::auth::AuthContext;
@@ -11,7 +10,7 @@ use crate::shell_protocol::{
 };
 use crate::tool_runtime::tool_inputs::{SessionMode, StartupDetail};
 use crate::tool_runtime::{ToolCall, ToolRuntime};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 fn register_request(
     client_id: &str,
@@ -245,8 +244,16 @@ async fn no_runner_layers_are_not_observed_with_reason_codes() {
     assert_eq!(empty["project_registry"]["status"], "not_configured");
     assert_eq!(
         empty["session_binding"]["reason_code"],
-        "binding_is_process_local_and_principal_scoped"
+        "exact_binding_requires_window_and_project_observation"
     );
+    assert_eq!(empty["session_binding"]["process_local_cache"], true);
+    assert_eq!(empty["session_binding"]["durable_exact_binding"], true);
+    assert_eq!(empty["session_binding"]["restored_after_restart"], true);
+    assert_eq!(
+        empty["session_binding"]["requires_stable_window_identity"],
+        true
+    );
+    assert_eq!(empty["session_binding"]["missing_identity_fallback"], false);
     assert_eq!(empty["last_successful_tool_call"]["status"], "not_observed");
     assert_eq!(
         empty["last_successful_tool_call"]["reason_code"],
@@ -325,7 +332,7 @@ async fn meaningful_activity_is_scoped_and_not_refreshed_by_status_calls() {
 }
 
 #[tokio::test]
-async fn server_restart_keeps_durable_session_and_reports_binding_lost() {
+async fn durable_current_binding_restores_same_window_after_restart() {
     let dir = tempfile::tempdir().unwrap();
     let ledger = dir.path().join("sessions.json");
     let project_root = dir.path().join("proj");
@@ -361,58 +368,22 @@ async fn server_restart_keeps_durable_session_and_reports_binding_lost() {
         start.output["connection_state"]["session_binding"]["status"],
         "bound"
     );
+    assert_eq!(runtime1.sessions.status().durable_binding_count, 1);
     runtime1.sessions.flush_persistence();
+    drop(runtime1);
 
-    // "Restarted server process": same ledger, fresh in-memory state.
+    // "Restarted server process": same ledger and exact transport window,
+    // initially with an empty process-local cache.
     let runtime2 = ToolRuntime::new_for_tests().with_session_ledger(&ledger);
     register_agent_project_at_path(&runtime2, "restart-agent", "proj", &project_root).await;
+    assert_eq!(runtime2.sessions.process_local_binding_count_for_test(), 0);
+    let restored_status = runtime2.sessions.status();
+    assert_eq!(restored_status.restored_sessions, 1);
+    assert_eq!(restored_status.restored_binding_count, 1);
+    assert_eq!(restored_status.durable_binding_count, 1);
 
-    // The durable session is still queryable via the explicit session id.
-    let summary = runtime2
-        .dispatch_with_auth(
-            ToolCall::SessionSummary {
-                session_id: session_id.clone(),
-                limit: Some(10),
-            },
-            None,
-        )
-        .await;
-    assert!(summary.success, "{:?}", summary.error);
-    assert_eq!(summary.output["session_id"], json!(session_id));
-    assert_eq!(summary.output["title"], "restart continuity");
-    let restored_instruction = summary.output["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|event| event["kind"] == "task_instruction")
-        .expect("durable task instruction event");
-    assert_eq!(restored_instruction["instruction"], "restart continuity");
-    assert_eq!(restored_instruction["requested_mode"], "normal");
-    assert_eq!(restored_instruction["context_refreshed"], true);
-
-    // The process-local current binding is absent after restart and never
-    // guesses the durable session from the matching window/project alone.
-    let window = ClientWindow::for_test("reconnect-window");
-    let bootstrap = auth_context(None, true);
-    let current = runtime2
-        .dispatch_with_auth_transport_options_and_metadata_with_sandbox(
-            ToolCall::CurrentSession {
-                project: project.clone(),
-            },
-            Some(&bootstrap),
-            crate::tool_runtime::sessions::SessionTransport::Mcp,
-            true,
-            false,
-            Default::default(),
-            None,
-            Some(&window),
-        )
-        .await;
-    assert!(current.success, "{:?}", current.error);
-    assert_eq!(current.output["found"], false);
-
-    // Default startup creates a new exact binding; it does not accidentally
-    // attach the durable ledger from before restart.
+    // Default startup resolves the durable exact binding, restores the local
+    // cache, and appends a new instruction to the original Workflow Session.
     let restarted = dispatch_start_coding_task_with_local_agent(
         &runtime2,
         "restart-agent",
@@ -429,31 +400,323 @@ async fn server_restart_keeps_durable_session_and_reports_binding_lost() {
     )
     .await;
     assert!(restarted.success, "{:?}", restarted.error);
-    assert_ne!(
-        restarted.output["session"]["session_id"].as_str(),
-        Some(session_id.as_str()),
-        "restart guessed a durable Workflow Session from process-local identity"
+    assert_eq!(restarted.output["session"]["session_id"], session_id);
+    assert_eq!(restarted.output["session"]["continuation"], "continued");
+    assert_eq!(restarted.output["session"]["reused"], true);
+    assert_eq!(
+        runtime2
+            .sessions
+            .active_session_count_for_test(Some(&project)),
+        1
     );
+    assert_eq!(runtime2.sessions.process_local_binding_count_for_test(), 1);
     let binding = &restarted.output["connection_state"]["session_binding"];
     assert_eq!(binding["status"], "bound");
-    assert_eq!(binding["process_local_in_memory"], true);
-    assert_eq!(binding["lost_after_restart"], true);
+    assert_eq!(binding["process_local_cache"], true);
+    assert_eq!(binding["durable_exact_binding"], true);
+    assert_eq!(binding["restored_after_restart"], true);
     assert!(binding["durable_resume"]
         .as_str()
         .unwrap()
-        .contains("explicit session_id"));
+        .contains("same exact principal"));
 
-    // Continuing with the explicit durable session id still works.
-    let continued = runtime2
-        .dispatch_with_auth(
-            ToolCall::SessionSummary {
-                session_id,
-                limit: Some(5),
+    let summary = runtime2.sessions.summary(&session_id, Some(10)).unwrap();
+    assert_eq!(summary.title.as_deref(), Some("restart continuity"));
+    let instructions: Vec<_> = summary
+        .events
+        .iter()
+        .filter(|event| event.kind == "task_instruction")
+        .collect();
+    assert_eq!(instructions.len(), 2);
+    assert_eq!(
+        instructions[0].instruction.as_deref(),
+        Some("restart continuity")
+    );
+    assert_eq!(
+        instructions[1].instruction.as_deref(),
+        Some("new post-restart context")
+    );
+}
+
+#[tokio::test]
+async fn durable_current_binding_does_not_cross_windows_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = dir.path().join("sessions.json");
+    let project_root = dir.path().join("proj");
+    std::fs::create_dir_all(&project_root).unwrap();
+    init_git_repo(&project_root);
+    let auth = auth_context(None, true);
+
+    let runtime1 = ToolRuntime::new_for_tests().with_session_ledger(&ledger);
+    let project =
+        register_agent_project_at_path(&runtime1, "window-restart-agent", "proj", &project_root)
+            .await;
+    let first = dispatch_start_coding_task_in_window(
+        &runtime1,
+        "window-restart-agent",
+        coding_start_call(&project, "window A root", SessionMode::Normal, false),
+        Some(&auth),
+        "durable-window-a",
+    )
+    .await;
+    assert!(first.success, "{:?}", first.error);
+    let first_id = first.output["session"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    runtime1.sessions.flush_persistence();
+    drop(runtime1);
+
+    let runtime2 = ToolRuntime::new_for_tests().with_session_ledger(&ledger);
+    register_agent_project_at_path(&runtime2, "window-restart-agent", "proj", &project_root).await;
+    let other_window = dispatch_start_coding_task_in_window(
+        &runtime2,
+        "window-restart-agent",
+        coding_start_call(&project, "window B root", SessionMode::Normal, false),
+        Some(&auth),
+        "durable-window-b",
+    )
+    .await;
+    assert!(other_window.success, "{:?}", other_window.error);
+    assert_ne!(other_window.output["session"]["session_id"], first_id);
+    assert_eq!(other_window.output["session"]["continuation"], "created");
+    assert_eq!(
+        runtime2
+            .sessions
+            .active_session_count_for_test(Some(&project)),
+        2
+    );
+}
+
+#[tokio::test]
+async fn durable_current_binding_does_not_cross_changed_canonical_root_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = dir.path().join("sessions.json");
+    let first_root = dir.path().join("first");
+    let second_root = dir.path().join("second");
+    std::fs::create_dir_all(&first_root).unwrap();
+    std::fs::create_dir_all(&second_root).unwrap();
+    init_git_repo(&first_root);
+    init_git_repo(&second_root);
+    let auth = auth_context(None, true);
+
+    let runtime1 = ToolRuntime::new_for_tests().with_session_ledger(&ledger);
+    let project =
+        register_agent_project_at_path(&runtime1, "moving-restart-agent", "demo", &first_root)
+            .await;
+    let first = dispatch_start_coding_task_in_window(
+        &runtime1,
+        "moving-restart-agent",
+        coding_start_call(&project, "first root", SessionMode::Normal, false),
+        Some(&auth),
+        "durable-moving-window",
+    )
+    .await;
+    assert!(first.success, "{:?}", first.error);
+    let first_id = first.output["session"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    runtime1.sessions.flush_persistence();
+    drop(runtime1);
+
+    let runtime2 = ToolRuntime::new_for_tests().with_session_ledger(&ledger);
+    let moved_project =
+        register_agent_project_at_path(&runtime2, "moving-restart-agent", "demo", &second_root)
+            .await;
+    assert_eq!(moved_project, project);
+    let moved = dispatch_start_coding_task_in_window(
+        &runtime2,
+        "moving-restart-agent",
+        coding_start_call(&project, "second root", SessionMode::Normal, false),
+        Some(&auth),
+        "durable-moving-window",
+    )
+    .await;
+    assert!(moved.success, "{:?}", moved.error);
+    assert_ne!(moved.output["session"]["session_id"], first_id);
+    assert_eq!(moved.output["session"]["continuation"], "created");
+}
+
+#[tokio::test]
+async fn durable_current_binding_new_session_rebinds_across_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = dir.path().join("sessions.json");
+    let project_root = dir.path().join("proj");
+    std::fs::create_dir_all(&project_root).unwrap();
+    init_git_repo(&project_root);
+    let auth = auth_context(None, true);
+
+    let runtime1 = ToolRuntime::new_for_tests().with_session_ledger(&ledger);
+    let project =
+        register_agent_project_at_path(&runtime1, "new-session-agent", "proj", &project_root).await;
+    let first = dispatch_start_coding_task_in_window(
+        &runtime1,
+        "new-session-agent",
+        coding_start_call(&project, "old root", SessionMode::Normal, false),
+        Some(&auth),
+        "durable-new-session-window",
+    )
+    .await;
+    let isolated = dispatch_start_coding_task_in_window(
+        &runtime1,
+        "new-session-agent",
+        coding_start_call(&project, "new root", SessionMode::Normal, true),
+        Some(&auth),
+        "durable-new-session-window",
+    )
+    .await;
+    assert!(first.success && isolated.success);
+    let old_id = first.output["session"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let new_id = isolated.output["session"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(old_id, new_id);
+    assert!(runtime1.sessions.summary(&old_id, None).is_some());
+    runtime1.sessions.flush_persistence();
+    drop(runtime1);
+
+    let runtime2 = ToolRuntime::new_for_tests().with_session_ledger(&ledger);
+    register_agent_project_at_path(&runtime2, "new-session-agent", "proj", &project_root).await;
+    let continued = dispatch_start_coding_task_in_window(
+        &runtime2,
+        "new-session-agent",
+        coding_start_call(&project, "continue new root", SessionMode::Normal, false),
+        Some(&auth),
+        "durable-new-session-window",
+    )
+    .await;
+    assert!(continued.success, "{:?}", continued.error);
+    assert_eq!(continued.output["session"]["session_id"], new_id);
+    assert_eq!(continued.output["session"]["continuation"], "continued");
+    assert!(runtime2.sessions.summary(&old_id, None).is_some());
+    assert_eq!(
+        runtime2
+            .sessions
+            .active_session_count_for_test(Some(&project)),
+        2
+    );
+}
+
+#[tokio::test]
+async fn durable_current_binding_explicit_unbind_prevents_restart_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = dir.path().join("sessions.json");
+    let project_root = dir.path().join("proj");
+    std::fs::create_dir_all(&project_root).unwrap();
+    init_git_repo(&project_root);
+    let auth = auth_context(None, true);
+    let window = ClientWindow::for_test("durable-unbind-window");
+
+    let runtime1 = ToolRuntime::new_for_tests().with_session_ledger(&ledger);
+    let project =
+        register_agent_project_at_path(&runtime1, "unbind-agent", "proj", &project_root).await;
+    let first = dispatch_start_coding_task_in_window(
+        &runtime1,
+        "unbind-agent",
+        coding_start_call(&project, "bound root", SessionMode::Normal, false),
+        Some(&auth),
+        "durable-unbind-window",
+    )
+    .await;
+    assert!(first.success, "{:?}", first.error);
+    let old_id = first.output["session"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let unbound = runtime1
+        .dispatch_with_auth_transport_options_and_metadata_with_sandbox(
+            ToolCall::UnbindCurrentSession {
+                project: project.clone(),
             },
+            Some(&auth),
+            crate::tool_runtime::sessions::SessionTransport::Mcp,
+            true,
+            false,
+            Default::default(),
             None,
+            Some(&window),
         )
         .await;
-    assert!(continued.success, "{:?}", continued.error);
+    assert!(unbound.success, "{:?}", unbound.error);
+    assert_eq!(unbound.output["had_binding"], true);
+    assert_eq!(runtime1.sessions.status().durable_binding_count, 0);
+    runtime1.sessions.flush_persistence();
+    drop(runtime1);
+
+    let runtime2 = ToolRuntime::new_for_tests().with_session_ledger(&ledger);
+    register_agent_project_at_path(&runtime2, "unbind-agent", "proj", &project_root).await;
+    let restarted = dispatch_start_coding_task_in_window(
+        &runtime2,
+        "unbind-agent",
+        coding_start_call(&project, "fresh after unbind", SessionMode::Normal, false),
+        Some(&auth),
+        "durable-unbind-window",
+    )
+    .await;
+    assert!(restarted.success, "{:?}", restarted.error);
+    assert_ne!(restarted.output["session"]["session_id"], old_id);
+    assert!(runtime2.sessions.summary(&old_id, None).is_some());
+}
+
+#[tokio::test]
+async fn durable_current_binding_close_prevents_restart_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = dir.path().join("sessions.json");
+    let project_root = dir.path().join("proj");
+    std::fs::create_dir_all(&project_root).unwrap();
+    init_git_repo(&project_root);
+    let auth = auth_context(None, true);
+
+    let runtime1 = ToolRuntime::new_for_tests().with_session_ledger(&ledger);
+    let project =
+        register_agent_project_at_path(&runtime1, "close-agent", "proj", &project_root).await;
+    let first = dispatch_start_coding_task_in_window(
+        &runtime1,
+        "close-agent",
+        coding_start_call(&project, "closable root", SessionMode::Normal, false),
+        Some(&auth),
+        "durable-close-window",
+    )
+    .await;
+    assert!(first.success, "{:?}", first.error);
+    let closed_id = first.output["session"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let closed = runtime1
+        .dispatch_with_auth(
+            ToolCall::CloseSession {
+                session_id: closed_id.clone(),
+            },
+            Some(&auth),
+        )
+        .await;
+    assert!(closed.success, "{:?}", closed.error);
+    assert_eq!(runtime1.sessions.status().durable_binding_count, 0);
+    runtime1.sessions.flush_persistence();
+    drop(runtime1);
+
+    let runtime2 = ToolRuntime::new_for_tests().with_session_ledger(&ledger);
+    register_agent_project_at_path(&runtime2, "close-agent", "proj", &project_root).await;
+    let restarted = dispatch_start_coding_task_in_window(
+        &runtime2,
+        "close-agent",
+        coding_start_call(&project, "fresh after close", SessionMode::Normal, false),
+        Some(&auth),
+        "durable-close-window",
+    )
+    .await;
+    assert!(restarted.success, "{:?}", restarted.error);
+    assert_ne!(restarted.output["session"]["session_id"], closed_id);
+    assert_eq!(
+        runtime2.sessions.lifecycle_state(&closed_id),
+        Some(crate::tool_runtime::sessions::SessionLifecycle::Closed)
+    );
 }
 
 #[tokio::test]
@@ -1039,11 +1302,15 @@ async fn start_coding_task_mode_upgrade_is_atomic_and_permission_checked() {
 }
 
 #[tokio::test]
-async fn failed_continuity_commit_leaves_binding_and_ledger_unchanged() {
+async fn durable_current_binding_failed_continuity_commit_is_fully_atomic() {
     let dir = tempfile::tempdir().unwrap();
-    init_git_repo(dir.path());
-    let runtime = ToolRuntime::new_for_tests();
-    let project = register_agent_project_at_path(&runtime, "fault-agent", "demo", dir.path()).await;
+    let ledger = dir.path().join("sessions.json");
+    let project_root = dir.path().join("proj");
+    std::fs::create_dir_all(&project_root).unwrap();
+    init_git_repo(&project_root);
+    let runtime = ToolRuntime::new_for_tests().with_session_ledger(&ledger);
+    let project =
+        register_agent_project_at_path(&runtime, "fault-agent", "demo", &project_root).await;
     let auth = auth_context(None, true);
     let first = dispatch_start_coding_task_in_window(
         &runtime,
@@ -1058,6 +1325,11 @@ async fn failed_continuity_commit_leaves_binding_and_ledger_unchanged() {
         .as_str()
         .unwrap()
         .to_string();
+    runtime.sessions.flush_persistence();
+    let ledger_before_failure = std::fs::read(&ledger).unwrap();
+    assert_eq!(runtime.sessions.process_local_binding_count_for_test(), 1);
+    assert_eq!(runtime.sessions.status().durable_binding_count, 1);
+
     runtime
         .sessions
         .fail_next_coding_continuity_commit_for_test();
@@ -1084,9 +1356,20 @@ async fn failed_continuity_commit_leaves_binding_and_ledger_unchanged() {
             .count(),
         1
     );
+    assert_eq!(runtime.sessions.process_local_binding_count_for_test(), 1);
+    assert_eq!(runtime.sessions.status().durable_binding_count, 1);
+    runtime.sessions.flush_persistence();
+    assert_eq!(std::fs::read(&ledger).unwrap(), ledger_before_failure);
+    drop(runtime);
 
+    // A restart after the failed attempt still resolves the original binding;
+    // retrying appends exactly one copy of the rejected instruction.
+    let restarted = ToolRuntime::new_for_tests().with_session_ledger(&ledger);
+    register_agent_project_at_path(&restarted, "fault-agent", "demo", &project_root).await;
+    assert_eq!(restarted.sessions.process_local_binding_count_for_test(), 0);
+    assert_eq!(restarted.sessions.status().restored_binding_count, 1);
     let retried = dispatch_start_coding_task_in_window(
-        &runtime,
+        &restarted,
         "fault-agent",
         coding_start_call(&project, "must roll back", SessionMode::Normal, false),
         Some(&auth),
@@ -1095,7 +1378,8 @@ async fn failed_continuity_commit_leaves_binding_and_ledger_unchanged() {
     .await;
     assert!(retried.success, "{:?}", retried.error);
     assert_eq!(retried.output["session"]["session_id"], session_id);
-    let summary = runtime.sessions.summary(&session_id, Some(20)).unwrap();
+    assert_eq!(restarted.sessions.process_local_binding_count_for_test(), 1);
+    let summary = restarted.sessions.summary(&session_id, Some(20)).unwrap();
     assert_eq!(
         summary
             .events

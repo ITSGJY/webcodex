@@ -18,17 +18,19 @@ use super::events::{
 };
 use super::model::{
     CodingSessionError, CodingSessionOutcome, CodingSessionRequest, CurrentSessionKey,
-    ListSessionMessagesFilter, PersistedSessionLedger, PersistedSessionRecord,
+    DurableCurrentBinding, ListSessionMessagesFilter, PersistedCurrentBinding,
+    PersistedCurrentBindings, PersistedSessionLedger, PersistedSessionRecord,
     PostSessionMessageInput, SessionCloseError, SessionCloseOutcome, SessionCounts,
     SessionCreateOptions, SessionDiscussionSummary, SessionEvent, SessionGuardDenial,
     SessionGuards, SessionInboxHint, SessionLifecycle, SessionLifecycleDenial, SessionMessage,
     SessionMessageError, SessionMessageStatus, SessionRecord, SessionStoreStatus, SessionSummary,
     SessionTransport, ToolCallRecorderMetadata, ToolCallStart, DEFAULT_MAX_EVENTS_PER_SESSION,
     DEFAULT_MAX_MESSAGES_PER_SESSION, DEFAULT_MAX_SESSIONS, DEFAULT_MESSAGE_LIST_LIMIT,
-    DEFAULT_SUMMARY_LIMIT, EVENT_ID_PREFIX, MAX_CODING_INSTRUCTION_CHARS, MAX_MESSAGE_LIST_LIMIT,
-    MAX_SUMMARY_LIMIT, MESSAGE_ID_PREFIX, SESSION_ID_PREFIX, SESSION_LEDGER_VERSION,
+    DEFAULT_SUMMARY_LIMIT, DURABLE_CURRENT_BINDINGS_PER_SESSION, EVENT_ID_PREFIX,
+    MAX_CODING_INSTRUCTION_CHARS, MAX_MESSAGE_LIST_LIMIT, MAX_SUMMARY_LIMIT, MESSAGE_ID_PREFIX,
+    SESSION_ID_PREFIX, SESSION_LEDGER_VERSION,
 };
-use super::persistence::{load_persisted_sessions, write_ledger_atomic};
+use super::persistence::{load_persisted_ledger, write_ledger_atomic};
 use super::query::{
     build_discussion_summary, build_inbox_hint, build_messages_summary, validate_message_tags,
     validate_message_text, validate_resolution_text,
@@ -254,11 +256,17 @@ fn ledger_writer_loop(
 pub(super) struct SessionStoreInner {
     /// Durable workflow sessions. Mutated only via the helpers below.
     sessions: HashMap<String, SessionRecord>,
-    /// Process-local current-session bindings (not part of the JSON ledger).
+    /// Fast process-local cache of the exact binding tuple.
     current_sessions: HashMap<CurrentSessionKey, String>,
+    /// Durable projection keyed only by the domain-separated SHA-256 of the
+    /// complete CurrentSessionKey. Raw tuple components never enter the ledger.
+    durable_current_bindings: HashMap<String, DurableCurrentBinding>,
     lru: VecDeque<String>,
     max_sessions: usize,
+    max_durable_bindings: usize,
     max_events_per_session: usize,
+    restored_binding_count: usize,
+    discarded_binding_count: usize,
     persistence: Option<SessionPersistence>,
 }
 
@@ -267,6 +275,12 @@ struct SessionPersistence {
     path: PathBuf,
     restored_sessions: usize,
     last_persist_error: Option<String>,
+}
+
+fn max_durable_bindings(max_sessions: usize) -> usize {
+    max_sessions
+        .saturating_mul(DURABLE_CURRENT_BINDINGS_PER_SESSION)
+        .max(1)
 }
 
 impl Default for SessionStore {
@@ -281,13 +295,18 @@ impl SessionStore {
     }
 
     pub(crate) fn new_in_memory(max_sessions: usize, max_events_per_session: usize) -> Self {
+        let max_durable_bindings = max_durable_bindings(max_sessions);
         Self {
             inner: Arc::new(Mutex::new(SessionStoreInner {
                 sessions: HashMap::new(),
                 current_sessions: HashMap::new(),
+                durable_current_bindings: HashMap::new(),
                 lru: VecDeque::new(),
                 max_sessions,
+                max_durable_bindings,
                 max_events_per_session,
+                restored_binding_count: 0,
+                discarded_binding_count: 0,
                 persistence: None,
             })),
             persistence_write_mutex: Arc::new(Mutex::new(())),
@@ -303,18 +322,27 @@ impl SessionStore {
         max_events_per_session: usize,
     ) -> Self {
         let path = path.into();
-        let (sessions, lru, restored_sessions, last_persist_error) =
-            load_persisted_sessions(&path, max_sessions, max_events_per_session);
-        let inner = Arc::new(Mutex::new(SessionStoreInner {
-            sessions,
-            current_sessions: HashMap::new(),
-            lru,
+        let max_durable_bindings = max_durable_bindings(max_sessions);
+        let restored = load_persisted_ledger(
+            &path,
             max_sessions,
             max_events_per_session,
+            max_durable_bindings,
+        );
+        let inner = Arc::new(Mutex::new(SessionStoreInner {
+            sessions: restored.sessions,
+            current_sessions: HashMap::new(),
+            durable_current_bindings: restored.durable_current_bindings,
+            lru: restored.lru,
+            max_sessions,
+            max_durable_bindings,
+            max_events_per_session,
+            restored_binding_count: restored.restored_binding_count,
+            discarded_binding_count: restored.discarded_binding_count,
             persistence: Some(SessionPersistence {
                 path,
-                restored_sessions,
-                last_persist_error,
+                restored_sessions: restored.restored_sessions,
+                last_persist_error: restored.last_persist_error,
             }),
         }));
         let persistence_write_mutex = Arc::new(Mutex::new(()));
@@ -355,6 +383,10 @@ impl SessionStore {
         SessionStoreStatus {
             persistence,
             restored_sessions,
+            durable_binding_count: inner.durable_current_bindings.len(),
+            restored_binding_count: inner.restored_binding_count,
+            discarded_binding_count: inner.discarded_binding_count,
+            max_durable_bindings: inner.max_durable_bindings,
             max_sessions: inner.max_sessions,
             max_events_per_session: inner.max_events_per_session,
             max_messages_per_session: DEFAULT_MAX_MESSAGES_PER_SESSION,
@@ -373,6 +405,15 @@ impl SessionStore {
                     && project.is_none_or(|project| record.project.as_deref() == Some(project))
             })
             .count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn process_local_binding_count_for_test(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("session store mutex poisoned")
+            .current_sessions
+            .len()
     }
 
     /// Thin convenience wrapper — creation always goes through
@@ -444,7 +485,8 @@ impl SessionStore {
     ///
     /// Every fallible check happens before the in-memory commit. Once mutation
     /// begins, session creation or capability update, the instruction event,
-    /// and the process-local binding are applied under the same store lock.
+    /// process-local cache, and durable exact binding are applied under the
+    /// same store lock and enter one persistence generation.
     pub(crate) fn ensure_coding_session(
         &self,
         request: CodingSessionRequest,
@@ -464,11 +506,7 @@ impl SessionStore {
             let mut inner = self.inner.lock().expect("session store mutex poisoned");
             let reusable_session_id = if request.bind_current && !request.new_session {
                 request.key.as_ref().and_then(|key| {
-                    let session_id = inner.current_sessions.get(key)?;
-                    let record = inner.sessions.get(session_id)?;
-                    (record.lifecycle.allows_mutation()
-                        && record.project.as_deref() == Some(request.project.as_str()))
-                    .then(|| session_id.clone())
+                    inner.reusable_current_session_id(key, request.project.as_str())
                 })
             } else {
                 None
@@ -542,7 +580,7 @@ impl SessionStore {
                 inner.touch(&session_id);
                 if request.bind_current {
                     if let Some(key) = request.key {
-                        inner.current_sessions.insert(key, session_id.clone());
+                        inner.replace_current_binding(key, &session_id, now);
                     }
                 }
                 let summary = inner
@@ -576,7 +614,7 @@ impl SessionStore {
                 );
                 let record = SessionRecord {
                     session_id: new_session_id.clone(),
-                    project: Some(request.project),
+                    project: Some(request.project.clone()),
                     // The first accepted instruction remains the root title.
                     // Follow-up instructions never overwrite it.
                     title: instruction,
@@ -592,9 +630,7 @@ impl SessionStore {
                 let summary = inner.insert_session(record);
                 if request.bind_current {
                     if let Some(key) = request.key {
-                        inner
-                            .current_sessions
-                            .insert(key, summary.session_id.clone());
+                        inner.replace_current_binding(key, &summary.session_id, now);
                     }
                 }
                 CodingSessionOutcome {
@@ -660,9 +696,10 @@ impl SessionStore {
 
     /// Explicit close: `Active → Closed`. Idempotent for already-closed sessions.
     ///
-    /// Never creates a session for an unknown id. Does not bind/unbind
-    /// current-session. Emits a single `session_closed` ledger event only on
-    /// a real `Active → Closed` transition.
+    /// Never creates a session for an unknown id. Removes every process-local
+    /// and durable current binding that points at the session. Emits a single
+    /// `session_closed` ledger event only on a real `Active → Closed`
+    /// transition.
     pub(crate) fn close_session(
         &self,
         session_id: &str,
@@ -1198,6 +1235,7 @@ impl SessionStoreInner {
             .ok_or(SessionCloseError::UnknownSession)?;
         match lifecycle {
             SessionLifecycle::Closed | SessionLifecycle::Archived => {
+                self.remove_bindings_for_session(session_id);
                 let summary = self
                     .summary(session_id, Some(DEFAULT_SUMMARY_LIMIT))
                     .expect("known closed session must summarize");
@@ -1223,6 +1261,7 @@ impl SessionStoreInner {
                         record.events.pop_front();
                     }
                 }
+                self.remove_bindings_for_session(session_id);
                 let summary = self
                     .summary(session_id, Some(DEFAULT_SUMMARY_LIMIT))
                     .expect("just-closed session must summarize");
@@ -1234,35 +1273,132 @@ impl SessionStoreInner {
         }
     }
 
-    // --- bindings (process-local) ---
+    // --- exact current-session bindings ---
 
     pub(super) fn bind_current(
         &mut self,
         key: CurrentSessionKey,
         session_id: &str,
     ) -> Option<SessionSummary> {
+        let session_id = session_id.trim();
+        let record = self.sessions.get(session_id)?;
+        if !record.lifecycle.allows_mutation()
+            || record.project.as_deref() != Some(key.resolved_project.as_str())
+        {
+            return None;
+        }
         self.touch(session_id);
         let summary = self.summary(session_id, Some(DEFAULT_SUMMARY_LIMIT))?;
-        self.current_sessions
-            .insert(key, session_id.trim().to_string());
+        self.replace_current_binding(key, session_id, now_ts());
         Some(summary)
     }
 
-    pub(super) fn current_session(&mut self, key: &CurrentSessionKey) -> Option<SessionSummary> {
-        let session_id = self.current_sessions.get(key).cloned()?;
-        self.touch(&session_id);
-        match self.summary(&session_id, Some(DEFAULT_SUMMARY_LIMIT)) {
-            Some(summary) => Some(summary),
-            None => {
-                // Binding pointed at an evicted/missing session — drop it.
-                self.current_sessions.remove(key);
-                None
+    pub(super) fn current_session(
+        &mut self,
+        key: &CurrentSessionKey,
+    ) -> (Option<SessionSummary>, bool) {
+        let binding_key = key.durable_binding_key();
+        if let Some(session_id) = self.current_sessions.get(key).cloned() {
+            if self.binding_session_is_reusable(&session_id, &key.resolved_project) {
+                self.touch(&session_id);
+                let durable_matches = self
+                    .durable_current_bindings
+                    .get(&binding_key)
+                    .is_some_and(|binding| binding.session_id == session_id);
+                if !durable_matches {
+                    self.durable_current_bindings.insert(
+                        binding_key,
+                        DurableCurrentBinding {
+                            session_id: session_id.clone(),
+                            updated_at: now_ts(),
+                        },
+                    );
+                    self.enforce_durable_binding_bound();
+                }
+                return (
+                    self.summary(&session_id, Some(DEFAULT_SUMMARY_LIMIT)),
+                    !durable_matches,
+                );
             }
+            self.current_sessions.remove(key);
         }
+
+        let Some(binding) = self.durable_current_bindings.get(&binding_key).cloned() else {
+            return (None, false);
+        };
+        if self.binding_session_is_reusable(&binding.session_id, &key.resolved_project) {
+            self.current_sessions
+                .insert(key.clone(), binding.session_id.clone());
+            self.touch(&binding.session_id);
+            return (
+                self.summary(&binding.session_id, Some(DEFAULT_SUMMARY_LIMIT)),
+                false,
+            );
+        }
+
+        self.durable_current_bindings.remove(&binding_key);
+        self.discarded_binding_count = self.discarded_binding_count.saturating_add(1);
+        (None, true)
     }
 
     pub(super) fn unbind_current(&mut self, key: &CurrentSessionKey) -> bool {
-        self.current_sessions.remove(key).is_some()
+        let process_local_removed = self.current_sessions.remove(key).is_some();
+        let durable_removed = self
+            .durable_current_bindings
+            .remove(&key.durable_binding_key())
+            .is_some();
+        process_local_removed || durable_removed
+    }
+
+    fn reusable_current_session_id(
+        &self,
+        key: &CurrentSessionKey,
+        project: &str,
+    ) -> Option<String> {
+        self.current_sessions
+            .get(key)
+            .filter(|session_id| self.binding_session_is_reusable(session_id, project))
+            .cloned()
+            .or_else(|| {
+                self.durable_current_bindings
+                    .get(&key.durable_binding_key())
+                    .filter(|binding| {
+                        self.binding_session_is_reusable(&binding.session_id, project)
+                    })
+                    .map(|binding| binding.session_id.clone())
+            })
+    }
+
+    fn binding_session_is_reusable(&self, session_id: &str, project: &str) -> bool {
+        self.sessions.get(session_id).is_some_and(|record| {
+            record.lifecycle.allows_mutation() && record.project.as_deref() == Some(project)
+        })
+    }
+
+    fn replace_current_binding(
+        &mut self,
+        key: CurrentSessionKey,
+        session_id: &str,
+        updated_at: i64,
+    ) {
+        let binding_key = key.durable_binding_key();
+        self.current_sessions
+            .insert(key, session_id.trim().to_string());
+        self.durable_current_bindings.insert(
+            binding_key,
+            DurableCurrentBinding {
+                session_id: session_id.trim().to_string(),
+                updated_at,
+            },
+        );
+        self.enforce_durable_binding_bound();
+    }
+
+    fn remove_bindings_for_session(&mut self, session_id: &str) {
+        self.current_sessions
+            .retain(|_, bound_session_id| bound_session_id != session_id);
+        self.durable_current_bindings
+            .retain(|_, binding| binding.session_id != session_id);
     }
 
     // --- messages ---
@@ -1468,9 +1604,32 @@ impl SessionStoreInner {
             .filter_map(|session_id| self.sessions.get(session_id))
             .map(|record| PersistedSessionRecord::from_record(record, self.max_events_per_session))
             .collect();
+        let mut durable_current_bindings: Vec<PersistedCurrentBinding> = self
+            .durable_current_bindings
+            .iter()
+            .filter(|(_, binding)| {
+                self.sessions
+                    .get(&binding.session_id)
+                    .is_some_and(|session| session.lifecycle.allows_mutation())
+            })
+            .map(|(binding_key_sha256, binding)| PersistedCurrentBinding {
+                binding_key_sha256: binding_key_sha256.clone(),
+                session_id: binding.session_id.clone(),
+                updated_at: binding.updated_at,
+            })
+            .collect();
+        durable_current_bindings.sort_by(|left, right| {
+            left.updated_at
+                .cmp(&right.updated_at)
+                .then_with(|| left.binding_key_sha256.cmp(&right.binding_key_sha256))
+        });
         PersistedSessionLedger {
             version: SESSION_LEDGER_VERSION,
             sessions,
+            durable_current_bindings: PersistedCurrentBindings {
+                records: durable_current_bindings,
+                malformed_count: 0,
+            },
         }
     }
 
@@ -1487,6 +1646,27 @@ impl SessionStoreInner {
                 break;
             };
             self.sessions.remove(&oldest);
+            self.remove_bindings_for_session(&oldest);
+        }
+    }
+
+    fn enforce_durable_binding_bound(&mut self) {
+        while self.durable_current_bindings.len() > self.max_durable_bindings {
+            let Some(oldest_binding_key) = self
+                .durable_current_bindings
+                .iter()
+                .min_by(|(left_key, left), (right_key, right)| {
+                    left.updated_at
+                        .cmp(&right.updated_at)
+                        .then_with(|| left_key.cmp(right_key))
+                })
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.durable_current_bindings.remove(&oldest_binding_key);
+            self.current_sessions
+                .retain(|key, _| key.durable_binding_key() != oldest_binding_key);
         }
     }
 

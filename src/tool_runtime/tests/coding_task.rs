@@ -259,7 +259,15 @@ async fn start_coding_task_can_explicitly_disable_current_binding() {
         "bind_current=false must disable the current binding"
     );
     assert_eq!(
-        result.output["session"]["current_binding"]["process_local_in_memory"],
+        result.output["session"]["current_binding"]["process_local_cache"],
+        true
+    );
+    assert_eq!(
+        result.output["session"]["current_binding"]["durable_exact_binding"],
+        true
+    );
+    assert_eq!(
+        result.output["session"]["current_binding"]["restored_after_restart"],
         true
     );
     for field in [

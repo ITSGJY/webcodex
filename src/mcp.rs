@@ -1326,9 +1326,9 @@ mod tests {
         ] {
             let description = tool_description(name);
             assert!(
-                description.contains("process-local in-memory")
-                    && description.contains("not the durable session ledger"),
-                "MCP {name} description should distinguish current binding from ledger: {description}"
+                description.contains("process-local")
+                    && description.contains("hashed durable"),
+                "MCP {name} description should distinguish the exact cache and hashed durable projection: {description}"
             );
         }
         let bind_current = tools

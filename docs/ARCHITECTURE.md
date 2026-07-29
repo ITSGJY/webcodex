@@ -125,6 +125,9 @@ Workflow Session and appends a bounded `task_instruction` ledger event.
 `new_session=true` alone requests an isolated Session; a changed title never
 does. Project switches retain independent keys, and a mode transition updates
 guards and appends the capability-change event under one Session-store lock.
+The exact current binding has a process-local cache and a bounded durable
+projection in the Workflow Session JSON ledger, so restart recovery does not
+depend on an explicit model-supplied Session id.
 The Connector Task ledger and Workflow Session ledger remain separate internal
 models; neither is copied into the other.
 
@@ -133,10 +136,14 @@ MCP initialize mints `Mcp-Session-Id`, which a conforming client echoes on later
 requests. Hosted Actions use their conversation-scoped request header when
 present. Other HTTP clients use a server-generated `HttpOnly`, `SameSite=Lax`
 cookie and must keep separate cookie jars for separate logical windows.
-WebCodex stores only a domain-separated SHA-256 key, always scoped again by
-authenticated subject and exact project/root identity. Full-runtime current-
-session bindings include the same window key, preventing two windows with one
-credential from overwriting each other.
+WebCodex stores only domain-separated SHA-256 identities. The full-runtime
+durable current binding hashes the complete canonical tuple—principal kind/id,
+transport, already-hashed window identity, resolved project, and already-hashed
+canonical repository root—under a second domain separator with length-prefixed
+components. Its ledger row contains only that composite digest, a `wc_sess_*`
+id, and `updated_at`. Raw window ids, credentials, authorization material, and
+repository paths are not persisted or returned by this mechanism. Distinct
+windows using one credential therefore cannot overwrite each other.
 
 The continuity fingerprint contains hashes and identities, not repository file
 contents: canonical root, branch, HEAD, porcelain worktree state, applicable
@@ -162,7 +169,12 @@ and durable window binding share one SQLite transaction. If a previously
 prepared writable worktree cannot be committed to that transaction, the
 managed lease and registration are released so a retry cannot create a hidden
 active context. The full runtime commits Session creation/update, instruction
-event, and current binding under one Session-store lock.
+event, process-local cache replacement, and durable exact binding replacement
+under one Session-store lock. They enter the same background-writer generation
+and JSON ledger snapshot; `flush_persistence` therefore observes the Session,
+event, and binding together under the ledger's existing atomic-rename
+semantics. This does not add a stronger fsync or distributed-consistency
+guarantee.
 
 After a server restart, SQLite task/event history and exact window/project
 mappings remain. Process-local “currently viewed project” state is deliberately
@@ -176,6 +188,19 @@ lightweight task binding to the new stable window; it does not copy the task or
 let both windows inherit one active context. Existing running Connector
 executions continue to follow the pre-existing fail-safe restart rule and
 become interrupted rather than being silently resumed.
+
+Independently, the full runtime reloads its Workflow Session ledger and bounded
+durable exact bindings. On the next `start_coding_task`, the same principal,
+transport, stable window, resolved project, and canonical repository root may
+continue only a known active Session whose stored project matches, then
+repopulate the process-local cache and append the new instruction. Missing
+stable identity never falls back to a credential-wide key. Changed roots,
+closed or evicted Sessions, malformed/duplicate/excess binding rows, and
+project mismatches do not restore; stale rows are discarded without preventing
+valid Workflow Sessions, events, or messages from loading. `new_session=true`
+repoints the exact binding without closing or deleting prior history. This JSON
+binding remains separate from the Connector's SQLite Task mapping and does not
+recover running jobs or executions.
 
 ## Agent Bridge
 

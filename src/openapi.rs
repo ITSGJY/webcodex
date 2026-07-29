@@ -1003,7 +1003,7 @@ fn schemas() -> Value {
             "type": "object",
             "additionalProperties": false,
             "required": [TOOL_CALL_TOOL_FIELD],
-            "description": "Generic runtime tool call. `tool` is the runtime tool name. GPT Actions should pass tool-specific arguments as flattened top-level fields because some Action runtimes reject free-form params/arguments objects. `params` and `arguments` remain accepted for non-Action clients, with non-null `params` taking precedence; null wrappers do not suppress flattened arguments. Top-level `session_id` is ordinary tool business input; use `recording_session_id` to record this wrapper call in the session ledger and enforce that recorder session's guards. When no explicit tool session_id is provided, project tools may use the window/caller/transport/project/repository current session ensured by start_coding_task (default bind_current=true) or established manually by bind_current_session. That current-session binding is process-local in-memory control metadata, not the durable session ledger, and may be lost on restart. Missing window identity never falls back to a credential-wide binding. For reliable full-runtime restart or cross-client recovery, keep and pass explicit session_id or recording_session_id values. Ordinary project-bound Connector continuity is handled separately by task_start. For daily discovery prefer tool_manifest; it exposes accepted_flattened_args for GPT Action top-level calls. Use list_tools with summary_only/category/features/limit only for focused discovery.",
+            "description": "Generic runtime tool call. `tool` is the runtime tool name. GPT Actions should pass tool-specific arguments as flattened top-level fields because some Action runtimes reject free-form params/arguments objects. `params` and `arguments` remain accepted for non-Action clients, with non-null `params` taking precedence; null wrappers do not suppress flattened arguments. Top-level `session_id` is ordinary tool business input; use `recording_session_id` to record this wrapper call in the session ledger and enforce that recorder session's guards. When no explicit tool session_id is provided, project tools may use the exact window/caller/transport/project/canonical-root current session ensured by start_coding_task (default bind_current=true) or established manually by bind_current_session. Its process-local cache can be restored after restart from a hashed durable projection in the Workflow Session ledger when the client retains the same stable window identity; missing identity never falls back to a credential-wide binding. Explicit session_id or recording_session_id still wins and supports intentional cross-window recovery. Ordinary project-bound Connector continuity is handled separately by task_start. For daily discovery prefer tool_manifest; it exposes accepted_flattened_args for GPT Action top-level calls. Use list_tools with summary_only/category/features/limit only for focused discovery.",
             "properties": {
                 ALLOW_CROSS_PROJECT_SESSION_FIELD: {
                     "type": "boolean",
@@ -2796,9 +2796,10 @@ mod tests {
         );
         for phrase in [
             "record this wrapper call in the session ledger",
-            "current-session binding is process-local in-memory",
-            "not the durable session ledger",
-            "explicit session_id or recording_session_id",
+            "process-local cache can be restored after restart",
+            "hashed durable projection",
+            "missing identity never falls back",
+            "session_id or recording_session_id still wins",
         ] {
             assert!(
                 description.contains(phrase),

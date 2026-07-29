@@ -284,16 +284,16 @@ pub(crate) fn start_session_input_schema() -> Value {
 
 pub(crate) fn current_session_input_schema(require_session_id: bool) -> Value {
     let mut fields = vec![(
-            "project",
-            "string",
-            "Runtime project id whose process-local in-memory current-session binding should be inspected or updated.",
-            true,
-        )];
+        "project",
+        "string",
+        "Runtime project id whose exact window/caller/transport/project/canonical-root current-session binding should be inspected or updated.",
+        true,
+    )];
     if require_session_id {
         fields.push((
             "session_id",
             "string",
-            "Existing project-scoped wc_sess_* id returned by start_session. Binding it is in-memory control metadata, not durable ledger persistence.",
+            "Existing active project-scoped wc_sess_* id returned by start_session. Binding updates the process-local cache and hashed durable ledger projection without changing Session history.",
             true,
         ));
     }

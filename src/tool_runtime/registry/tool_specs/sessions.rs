@@ -56,17 +56,17 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
         ),
         tool_spec(
             "bind_current_session",
-            "Bind an existing project-scoped session as current for this client window, caller, transport, and project. This is process-local in-memory control metadata, not the durable session ledger, and may be lost on restart. Read-only; never modifies project files.",
+            "Bind an active project-scoped Session for this exact caller, transport, stable window, project, and canonical root. Updates the process-local cache and hashed durable projection together and restores after restart. Read-only; never changes project files or returns binding/window/root hashes.",
             current_session_input_schema(true),
         ),
         tool_spec(
             "current_session",
-            "Return the process-local in-memory current-session binding for this client window, caller, transport, and project, if a live binding exists. This is convenience control metadata, not the durable session ledger, and may be lost on restart.",
+            "Return this exact caller/transport/stable-window/project/canonical-root binding when it targets an active matching Session. Restores the process-local cache from the hashed durable projection after restart; missing window identity never falls back to a credential.",
             current_session_input_schema(false),
         ),
         tool_spec(
             "unbind_current_session",
-            "Remove the process-local in-memory current-session binding for this client window, caller, transport, and project. This only clears convenience control metadata, not the durable session ledger. Idempotent and read-only.",
+            "Remove the exact current-session binding for this client window, caller, transport, project, and canonical repository root from both the process-local cache and hashed durable projection. Keeps Workflow Session history intact. Idempotent and read-only.",
             current_session_input_schema(false),
         ),
     ]

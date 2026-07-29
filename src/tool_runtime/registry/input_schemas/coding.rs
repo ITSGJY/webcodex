@@ -33,7 +33,7 @@ pub(crate) fn start_coding_task_input_schema() -> Value {
             "bind_current": {
                 "type": "boolean",
                 "default": true,
-                "description": "Ensure and bind the window/caller/transport/project/repository current session. Defaults to true. Binding is process-local in-memory control metadata; a stable transport window is required for automatic reuse."
+                "description": "Ensure and bind the exact window/caller/transport/project/canonical-root current session. Defaults to true. A stable transport window is required; the process-local cache and hashed durable ledger projection support automatic reuse across restart without credential-wide fallback."
             },
             "new_session": {
                 "type": "boolean",
