@@ -339,39 +339,11 @@ pub(crate) fn resolve_executable(env_override: &str, executable_name: &str) -> O
         let trimmed = value.trim();
         if !trimmed.is_empty() {
             let path = PathBuf::from(trimmed);
-            return is_executable_file(&path).then_some(path);
+            return crate::webcodex_runner::util::is_executable_file(&path).then_some(path);
         }
     }
-    which_in_path(executable_name)
-}
-
-fn which_in_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(name);
-        if is_executable_file(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    crate::webcodex_runner::util::find_executable_in_path(executable_name, &path_var)
 }
 
 #[cfg(test)]

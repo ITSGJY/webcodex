@@ -1,5 +1,6 @@
 use super::language::{profile_for_kind, LanguageProfile};
 use super::protocol::{read_message, write_message, FramingError, MAX_LSP_MESSAGE_BYTES};
+use super::super::util::{find_executable_in_path, is_executable_file};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -1126,30 +1127,6 @@ fn command_with_default_args(
 fn find_executable_on_path(name: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
     find_executable_in_path(name, &path)
-}
-
-fn find_executable_in_path(name: &str, path: &OsStr) -> Option<PathBuf> {
-    env::split_paths(path)
-        .map(|directory| directory.join(name))
-        .find(|candidate| is_executable_file(candidate))
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(metadata) = path.metadata() else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
 }
 
 /// True when `path` is a rustup proxy for `rust-analyzer` whose active
