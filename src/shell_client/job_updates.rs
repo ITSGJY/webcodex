@@ -591,9 +591,34 @@ impl ShellClientRegistry {
         }
     }
 
+    /// Polling-transport job update entry point. Job ownership and update
+    /// sequence rules decide acceptance; this path refreshes `last_seen` for
+    /// the active instance. Used by the HTTP `/job_update` handler.
     pub async fn update_job(
         &self,
         body: ShellAgentJobUpdateRequest,
+    ) -> Result<ShellJobInfo, String> {
+        self.update_job_checked(body, None).await
+    }
+
+    /// Connection-scoped job update entry point for long-lived transports.
+    /// Acceptance still follows the existing `agent_instance_id`, job
+    /// ownership and `update_seq` rules so a legitimately-dispatched job's
+    /// late update is not dropped just because the transport connection was
+    /// replaced. A late update arriving on a stale same-instance connection,
+    /// however, must not refresh the new connection's `last_seen` liveness.
+    pub(crate) async fn update_job_for_connection(
+        &self,
+        body: ShellAgentJobUpdateRequest,
+        connection_id: &str,
+    ) -> Result<ShellJobInfo, String> {
+        self.update_job_checked(body, Some(connection_id)).await
+    }
+
+    async fn update_job_checked(
+        &self,
+        body: ShellAgentJobUpdateRequest,
+        expected_connection_id: Option<&str>,
     ) -> Result<ShellJobInfo, String> {
         validate_id(&body.client_id, "client_id")?;
         validate_id(&body.job_id, "job_id")?;
@@ -677,8 +702,19 @@ impl ShellClientRegistry {
                 "completed job_state_reconciliation update requires exit_code=0".to_string(),
             );
         }
-        if let Some(client) = inner.clients.get_mut(&body.client_id) {
-            client.last_seen = now_ts();
+        // Refresh liveness only for the connection that currently holds the
+        // transport lease. A late job update on a stale same-instance
+        // connection is still applied below, but it must not make the new
+        // connection appear online.
+        if expected_connection_id.is_none()
+            || inner
+                .clients
+                .get(&body.client_id)
+                .is_some_and(|client| client.connection_id.as_deref() == expected_connection_id)
+        {
+            if let Some(client) = inner.clients.get_mut(&body.client_id) {
+                client.last_seen = now_ts();
+            }
         }
         let mut request_id_to_remove = None;
         let view = {

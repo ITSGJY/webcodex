@@ -431,6 +431,7 @@ async fn handle_quic_connection(
         let pump_registry = registry.clone();
         let pump_client_id = client_id.clone();
         let pump_instance_id = agent_instance_id.clone();
+        let pump_connection_id = connection_id.clone();
         Some(tokio::spawn(async move {
             loop {
                 let notified = notify.notified();
@@ -439,7 +440,16 @@ async fn handle_quic_connection(
                     agent_instance_id: pump_instance_id.clone(),
                     projects: None,
                 };
-                match pump_registry.poll(poll_req).await {
+                // The pump is bound to this concrete connection's lease. A
+                // same-instance reconnect installs a new connection_id; once
+                // this connection loses the lease, the scoped poll rejects it
+                // before dequeuing, so an older stream cannot steal requests
+                // that belong to the new connection. On rejection the pump
+                // stops rather than falling back to an unscoped poll.
+                match pump_registry
+                    .poll_for_connection(poll_req, &pump_connection_id)
+                    .await
+                {
                     Ok(Some(request)) => {
                         if pump_tx
                             .send(AgentEnvelope::Request { request })
@@ -489,7 +499,10 @@ async fn handle_quic_connection(
         };
         match env {
             AgentEnvelope::Ping { ts } => {
-                if let Err(e) = registry.touch_client(&client_id, &agent_instance_id).await {
+                if let Err(e) = registry
+                    .touch_client_for_connection(&client_id, &agent_instance_id, &connection_id)
+                    .await
+                {
                     tracing::warn!(
                         client_id = %client_id,
                         error = %e,
@@ -510,7 +523,10 @@ async fn handle_quic_connection(
                 }
             }
             AgentEnvelope::Pong { .. } => {
-                if let Err(e) = registry.touch_client(&client_id, &agent_instance_id).await {
+                if let Err(e) = registry
+                    .touch_client_for_connection(&client_id, &agent_instance_id, &connection_id)
+                    .await
+                {
                     tracing::debug!(
                         client_id = %client_id,
                         error = %e,
@@ -520,7 +536,12 @@ async fn handle_quic_connection(
             }
             AgentEnvelope::RuntimeMetadata { tool_providers } => {
                 let _ = registry
-                    .update_tool_providers(&client_id, &agent_instance_id, Some(tool_providers))
+                    .update_tool_providers_for_connection(
+                        &client_id,
+                        &agent_instance_id,
+                        &connection_id,
+                        Some(tool_providers),
+                    )
                     .await;
             }
             AgentEnvelope::Goodbye { reason } => {
@@ -539,12 +560,18 @@ async fn handle_quic_connection(
                 break;
             }
             AgentEnvelope::Result { payload } => {
-                if let Err(e) = registry.complete(payload).await {
+                if let Err(e) = registry
+                    .complete_for_connection(payload, &connection_id)
+                    .await
+                {
                     tracing::warn!(client_id = %client_id, error = %e, "quic result rejected");
                 }
             }
             AgentEnvelope::JobUpdate { payload } => {
-                if let Err(e) = registry.update_job(payload).await {
+                if let Err(e) = registry
+                    .update_job_for_connection(payload, &connection_id)
+                    .await
+                {
                     tracing::warn!(client_id = %client_id, error = %e, "quic job_update rejected");
                 }
             }
@@ -1546,5 +1573,86 @@ mod tests {
         send.finish().unwrap();
         client_endpoint.close(quinn::VarInt::from_u32(0), b"");
         conn.close(quinn::VarInt::from_u32(0), b"done");
+    }
+
+    #[tokio::test]
+    async fn quic_stale_connection_pump_cannot_steal_new_request() {
+        // Same runner instance connects over QUIC stream A, then reconnects
+        // over stream B (same agent_instance_id, new connection_id lease). A
+        // request enqueued after B's register must be delivered to B's pump
+        // only — A's pump is bound to the stale connection lease and the
+        // connection-scoped poll rejects it, so A never receives the request.
+        let (cert_der, key_der) = self_signed_cert();
+        let registry = Arc::new(ShellClientRegistry::default());
+        let addr = start_quic_server(
+            registry.clone(),
+            test_config(None),
+            cert_der.clone(),
+            key_der,
+        )
+        .await;
+
+        // Connection A registers.
+        let (client_endpoint_a, conn_a, mut send_a, mut recv_a) =
+            connect_quic_client(&cert_der, addr).await;
+        write_quic_frame(&mut send_a, &register_envelope("quic-steal", "inst-x"))
+            .await
+            .expect("write register A");
+        let _ = tokio::time::timeout(Duration::from_secs(5), read_quic_frame(&mut recv_a))
+            .await
+            .expect("ack A timeout")
+            .expect("read ack A");
+
+        // Same instance reconnects over B (reconnect/refresh: accepted).
+        let (client_endpoint_b, conn_b, mut send_b, mut recv_b) =
+            connect_quic_client(&cert_der, addr).await;
+        write_quic_frame(&mut send_b, &register_envelope("quic-steal", "inst-x"))
+            .await
+            .expect("write register B");
+        let _ = tokio::time::timeout(Duration::from_secs(5), read_quic_frame(&mut recv_b))
+            .await
+            .expect("ack B timeout")
+            .expect("read ack B");
+
+        // Enqueue a request after B's register: it belongs to B's lease.
+        let (request_id, _rx) = registry
+            .enqueue_run(
+                ShellRunRequest {
+                    client_id: "quic-steal".to_string(),
+                    cwd: None,
+                    command: "echo hi".to_string(),
+                    stdin: None,
+                    timeout_secs: 5,
+                    wait_timeout_secs: 0,
+                },
+                "tester".to_string(),
+            )
+            .await
+            .unwrap();
+
+        // B's pump receives the request.
+        let req_env = tokio::time::timeout(Duration::from_secs(5), read_quic_frame(&mut recv_b))
+            .await
+            .expect("request timeout on B")
+            .expect("read request on B");
+        match req_env {
+            AgentEnvelope::Request { request } => assert_eq!(request.request_id, request_id),
+            other => panic!("expected request on B, got {:?}", other.kind()),
+        }
+
+        // A must not receive the (already-dispatched) request: it stays quiet.
+        let stolen =
+            tokio::time::timeout(Duration::from_millis(500), read_quic_frame(&mut recv_a)).await;
+        assert!(
+            stolen.is_err(),
+            "stale quic connection pump must not steal the request dispatched to B"
+        );
+
+        send_a.finish().unwrap();
+        send_b.finish().unwrap();
+        client_endpoint_a.close(quinn::VarInt::from_u32(0), b"");
+        client_endpoint_b.close(quinn::VarInt::from_u32(0), b"");
+        conn_a.close(quinn::VarInt::from_u32(0), b"done");
+        conn_b.close(quinn::VarInt::from_u32(0), b"done");
     }
 }

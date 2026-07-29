@@ -10,9 +10,43 @@ use crate::shell_protocol::{
 };
 
 impl ShellClientRegistry {
+    /// Polling-transport entry point. Polling registrations do not carry a
+    /// server-internal `connection_id`, so this requires only the public
+    /// `client_id` / `agent_instance_id` lease. The HTTP `/poll` handler uses
+    /// this path; long-lived transports (WebSocket/QUIC) use
+    /// [`ShellClientRegistry::poll_for_connection`] instead so an older
+    /// same-instance connection cannot steal requests from the current lease.
     pub async fn poll(
         &self,
         body: ShellAgentPollRequest,
+    ) -> Result<Option<ShellAgentShellRequest>, String> {
+        self.poll_checked(body, None).await
+    }
+
+    /// Connection-scoped entry point for long-lived transports. The pump for a
+    /// concrete WebSocket/QUIC connection passes its captured `connection_id`
+    /// so a stale same-instance connection (whose lease was replaced by a
+    /// reconnect) is rejected before it can dequeue a request that belongs to
+    /// the new connection.
+    pub(crate) async fn poll_for_connection(
+        &self,
+        body: ShellAgentPollRequest,
+        connection_id: &str,
+    ) -> Result<Option<ShellAgentShellRequest>, String> {
+        self.poll_checked(body, Some(connection_id)).await
+    }
+
+    /// Unified dequeue path. Every check below — `client_id`,
+    /// `agent_instance_id`, and (when provided) the current `connection_id`
+    /// — runs while holding the same registry mutex as the queue mutation,
+    /// `last_seen` update, project projection and `dispatched`/job-state
+    /// transitions. A stale connection returns a stable error with no side
+    /// effects: no `last_seen` refresh, no project update, no `pop_front()`,
+    /// no `dispatched=true`, and no job-state change.
+    async fn poll_checked(
+        &self,
+        body: ShellAgentPollRequest,
+        expected_connection_id: Option<&str>,
     ) -> Result<Option<ShellAgentShellRequest>, String> {
         validate_id(&body.client_id, "client_id")?;
         validate_agent_instance_id(&body.agent_instance_id)?;
@@ -26,6 +60,14 @@ impl ShellClientRegistry {
                     "agent client {} is no longer the active instance (stale or replaced)",
                     body.client_id
                 ));
+            }
+            if let Some(expected) = expected_connection_id {
+                if client.connection_id.as_deref() != Some(expected) {
+                    return Err(format!(
+                        "agent client {} transport connection is no longer active",
+                        body.client_id
+                    ));
+                }
             }
             if body.projects.is_some() {
                 client.projects = normalize_project_summaries(body.projects);
@@ -64,7 +106,33 @@ impl ShellClientRegistry {
         }
     }
 
+    /// Polling-transport result entry point. Requires the public
+    /// `client_id` / `agent_instance_id` lease and refreshes `last_seen` for
+    /// the active instance. Used by the HTTP `/result` handler.
     pub async fn complete(&self, body: ShellAgentResultRequest) -> Result<(), String> {
+        self.complete_checked(body, None).await
+    }
+
+    /// Connection-scoped result entry point for long-lived transports. A
+    /// late, legitimately-dispatched result arriving on a stale
+    /// same-instance connection (the request was polled before the
+    /// transport reconnect) is still accepted — it belongs to the same
+    /// agent instance and is gated by request/job ownership — but it must
+    /// not refresh the new connection's `last_seen` liveness. Only the
+    /// connection that currently holds the lease refreshes liveness.
+    pub(crate) async fn complete_for_connection(
+        &self,
+        body: ShellAgentResultRequest,
+        connection_id: &str,
+    ) -> Result<(), String> {
+        self.complete_checked(body, Some(connection_id)).await
+    }
+
+    async fn complete_checked(
+        &self,
+        body: ShellAgentResultRequest,
+        expected_connection_id: Option<&str>,
+    ) -> Result<(), String> {
         validate_id(&body.client_id, "client_id")?;
         validate_id(&body.request_id, "request_id")?;
         validate_agent_instance_id(&body.agent_instance_id)?;
@@ -73,8 +141,19 @@ impl ShellClientRegistry {
         // liveness: a dead process must not update the active lease's
         // `last_seen` or resolve its waiters.
         assert_active_instance_locked(&inner, &body.client_id, &body.agent_instance_id)?;
-        if let Some(client) = inner.clients.get_mut(&body.client_id) {
-            client.last_seen = now_ts();
+        // Refresh liveness only for the connection that currently holds the
+        // transport lease. A late result on a stale same-instance connection
+        // is still processed below, but it must not make the new connection
+        // appear online.
+        if expected_connection_id.is_none()
+            || inner
+                .clients
+                .get(&body.client_id)
+                .is_some_and(|client| client.connection_id.as_deref() == expected_connection_id)
+        {
+            if let Some(client) = inner.clients.get_mut(&body.client_id) {
+                client.last_seen = now_ts();
+            }
         }
         let Some(mut pending) = take_pending_request_locked(&mut inner, &body.request_id) else {
             return Err(format!(

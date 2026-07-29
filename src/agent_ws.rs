@@ -256,6 +256,7 @@ async fn handle_agent_ws(
     let pump_client_id = client_id.clone();
     let pump_instance_id = agent_instance_id.clone();
     let pump_notify = notify.clone();
+    let pump_connection_id = connection_id.clone();
     let pump_task = tokio::spawn(async move {
         loop {
             // Create the notified future before polling so an enqueue that
@@ -266,7 +267,16 @@ async fn handle_agent_ws(
                 agent_instance_id: pump_instance_id.clone(),
                 projects: None,
             };
-            match pump_registry.poll(poll_req).await {
+            // The pump is bound to this concrete connection's lease. A
+            // same-instance reconnect installs a new connection_id; once this
+            // connection loses the lease, the scoped poll rejects it before
+            // dequeuing, so an older socket cannot steal requests that belong
+            // to the new connection. On rejection the pump stops rather than
+            // falling back to an unscoped poll or retrying.
+            match pump_registry
+                .poll_for_connection(poll_req, &pump_connection_id)
+                .await
+            {
                 Ok(Some(request)) => {
                     let env = AgentEnvelope::Request { request };
                     match env.to_json() {
@@ -341,15 +351,24 @@ async fn handle_agent_ws(
         };
         match env {
             AgentEnvelope::Result { payload } => {
-                // `complete` refreshes `last_seen` internally; a redundant
-                // touch here would only add lock contention.
-                if let Err(e) = registry.complete(payload).await {
+                // `complete_for_connection` refreshes `last_seen` internally
+                // only when this connection still holds the lease; a late
+                // result on a stale same-instance connection is still applied
+                // but does not revive the new connection's liveness.
+                if let Err(e) = registry
+                    .complete_for_connection(payload, &connection_id)
+                    .await
+                {
                     tracing::warn!(client_id = %client_id, error = %e, "ws result rejected");
                 }
             }
             AgentEnvelope::JobUpdate { payload } => {
-                // `update_job` refreshes `last_seen` internally.
-                if let Err(e) = registry.update_job(payload).await {
+                // `update_job_for_connection` refreshes `last_seen` internally
+                // only when this connection still holds the lease.
+                if let Err(e) = registry
+                    .update_job_for_connection(payload, &connection_id)
+                    .await
+                {
                     tracing::warn!(client_id = %client_id, error = %e, "ws job_update rejected");
                 }
             }
@@ -359,7 +378,10 @@ async fn handle_agent_ws(
                 // online window by the 60s `CLIENT_ONLINE_WINDOW_SECS` check.
                 // Without this touch, a connected-but-idle agent decays to
                 // `"stale"` even though its socket is healthy.
-                if let Err(e) = registry.touch_client(&client_id, &agent_instance_id).await {
+                if let Err(e) = registry
+                    .touch_client_for_connection(&client_id, &agent_instance_id, &connection_id)
+                    .await
+                {
                     tracing::warn!(client_id = %client_id, error = %e, "ws ping liveness touch failed");
                 }
                 let pong = AgentEnvelope::Pong { ts };
@@ -388,13 +410,21 @@ async fn handle_agent_ws(
                 // future server-initiated ping reply) must still count as
                 // live traffic so the client does not decay to stale, and it
                 // must never be treated as an unexpected envelope.
-                if let Err(e) = registry.touch_client(&client_id, &agent_instance_id).await {
+                if let Err(e) = registry
+                    .touch_client_for_connection(&client_id, &agent_instance_id, &connection_id)
+                    .await
+                {
                     tracing::debug!(client_id = %client_id, error = %e, "ws pong liveness touch failed");
                 }
             }
             AgentEnvelope::RuntimeMetadata { tool_providers } => {
                 let _ = registry
-                    .update_tool_providers(&client_id, &agent_instance_id, Some(tool_providers))
+                    .update_tool_providers_for_connection(
+                        &client_id,
+                        &agent_instance_id,
+                        &connection_id,
+                        Some(tool_providers),
+                    )
                     .await;
             }
             AgentEnvelope::Goodbye { reason } => {
@@ -1475,6 +1505,76 @@ mod tests {
         assert!(
             after_b > before,
             "active instance ping must refresh last_seen"
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_stale_connection_pump_cannot_steal_new_request() {
+        // Same runner instance connects over socket A, then reconnects over
+        // socket B (same agent_instance_id, new connection_id lease). A
+        // request enqueued after B's register must be delivered to B's pump
+        // only — A's pump is bound to the stale connection lease and the
+        // connection-scoped poll rejects it, so A never receives the request
+        // and the request is dispatched exactly once.
+        let registry = Arc::new(ShellClientRegistry::default());
+        let addr = start_server(registry.clone()).await;
+        let url = format!("ws://{}/api/agents/ws", addr);
+
+        // Connection A registers.
+        let (mut ws_a, _resp) = connect_async(url.clone()).await.unwrap();
+        ws_a.send(TungsteniteMessage::Text(
+            register_envelope_with_instance("ws-steal", "inst-x")
+                .to_json()
+                .unwrap()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let _ = recv_envelope(&mut ws_a).await; // Registered
+
+        // Same instance reconnects over B (reconnect/refresh: accepted).
+        let (mut ws_b, _resp) = connect_async(url).await.unwrap();
+        ws_b.send(TungsteniteMessage::Text(
+            register_envelope_with_instance("ws-steal", "inst-x")
+                .to_json()
+                .unwrap()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let _ = recv_envelope(&mut ws_b).await; // Registered
+
+        // Enqueue a request after B's register: it belongs to B's lease.
+        let (request_id, _rx) = registry
+            .enqueue_run(
+                ShellRunRequest {
+                    client_id: "ws-steal".to_string(),
+                    cwd: None,
+                    command: "echo hi".to_string(),
+                    stdin: None,
+                    timeout_secs: 5,
+                    wait_timeout_secs: 0,
+                },
+                "tester".to_string(),
+            )
+            .await
+            .unwrap();
+
+        // B's pump receives the request.
+        let req_env = tokio::time::timeout(Duration::from_secs(2), recv_envelope(&mut ws_b))
+            .await
+            .unwrap();
+        match req_env {
+            AgentEnvelope::Request { request } => assert_eq!(request.request_id, request_id),
+            other => panic!("expected request on B, got {:?}", other),
+        }
+
+        // A must not receive the (already-dispatched) request: it remains
+        // quiet. Give it a window and assert nothing arrives.
+        let stolen = tokio::time::timeout(Duration::from_millis(500), ws_a.next()).await;
+        assert!(
+            stolen.is_err(),
+            "stale connection pump must not steal the request dispatched to B"
         );
     }
 }

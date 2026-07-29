@@ -249,7 +249,11 @@ impl ShellClientRegistry {
 
     /// Refresh `last_seen` for a registered client to "now" without performing
     /// any business operation. Used by keepalive traffic to keep active
-    /// long-lived transports inside the online window.
+    /// long-lived transports inside the online window. Polling agents have no
+    /// server-internal connection lease and use this path directly; long-lived
+    /// transports use [`Self::touch_client_for_connection`] instead so a stale
+    /// same-instance connection cannot revive the new lease.
+    #[allow(dead_code)]
     pub async fn touch_client(
         &self,
         client_id: &str,
@@ -270,13 +274,80 @@ impl ShellClientRegistry {
         Ok(())
     }
 
+    /// Connection-scoped keepalive refresh for long-lived transports
+    /// (WebSocket/QUIC Ping/Pong). Validates `client_id`,
+    /// `agent_instance_id`, and the current `connection_id` under the same
+    /// registry mutex that owns `last_seen`. A delayed Ping/Pong from a stale
+    /// same-instance connection (replaced by a reconnect) returns a stable
+    /// error and must not refresh the new connection's `last_seen` or revive
+    /// an already-disconnected client. Polling keepalive keeps using
+    /// [`ShellClientRegistry::touch_client`].
+    pub(crate) async fn touch_client_for_connection(
+        &self,
+        client_id: &str,
+        agent_instance_id: &str,
+        connection_id: &str,
+    ) -> Result<(), String> {
+        validate_agent_instance_id(agent_instance_id)?;
+        let mut inner = self.inner.lock().await;
+        let Some(client) = inner.clients.get_mut(client_id) else {
+            return Err(format!("unknown shell client: {}", client_id));
+        };
+        if client.agent_instance_id != agent_instance_id {
+            return Err(format!(
+                "agent client {} is no longer the active instance (stale or replaced)",
+                client_id
+            ));
+        }
+        if client.connection_id.as_deref() != Some(connection_id) {
+            return Err(format!(
+                "agent client {} transport connection is no longer active",
+                client_id
+            ));
+        }
+        client.last_seen = now_ts();
+        Ok(())
+    }
+
     /// Apply sanitized provider metadata to the active agent record. Optional
     /// metadata is best-effort: malformed/unknown state is ignored by the
     /// normalizer and never changes transport or tool completion semantics.
+    /// Polling-transport `RuntimeMetadata` uses this path.
     pub async fn update_tool_providers(
         &self,
         client_id: &str,
         agent_instance_id: &str,
+        status: Option<crate::shell_protocol::ToolProvidersStatus>,
+    ) -> Result<(), String> {
+        self.update_tool_providers_checked(client_id, agent_instance_id, None, status)
+            .await
+    }
+
+    /// Connection-scoped `RuntimeMetadata` for long-lived transports. A stale
+    /// same-instance connection must not overwrite the current connection's
+    /// provider metadata or refresh its liveness: when the connection no
+    /// longer holds the lease the update is rejected with a stable error.
+    pub(crate) async fn update_tool_providers_for_connection(
+        &self,
+        client_id: &str,
+        agent_instance_id: &str,
+        connection_id: &str,
+        status: Option<crate::shell_protocol::ToolProvidersStatus>,
+    ) -> Result<(), String> {
+        self.update_tool_providers_checked(
+            client_id,
+            agent_instance_id,
+            Some(connection_id),
+            status,
+        )
+        .await
+    }
+
+    async fn update_tool_providers_checked(
+        &self,
+        client_id: &str,
+        agent_instance_id: &str,
+        expected_connection_id: Option<&str>,
         status: Option<crate::shell_protocol::ToolProvidersStatus>,
     ) -> Result<(), String> {
         let Some(status) = normalize_tool_providers(status) else {
@@ -292,6 +363,14 @@ impl ShellClientRegistry {
                 "agent client {} is no longer the active instance (stale or replaced)",
                 client_id
             ));
+        }
+        if let Some(expected) = expected_connection_id {
+            if client.connection_id.as_deref() != Some(expected) {
+                return Err(format!(
+                    "agent client {} transport connection is no longer active",
+                    client_id
+                ));
+            }
         }
         if let Some(policy) = client.policy.as_mut() {
             policy.tool_providers = Some(status);
