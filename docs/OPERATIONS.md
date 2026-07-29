@@ -657,19 +657,35 @@ alive, the job may temporarily report `status="recovering"`. It is still
 active, has no `ended_at`, and does not imply a live connection. Do not submit
 a replacement command.
 
-The same `agent_instance_id` has a 120-second recovery window. Its next
-registration carries a complete active inventory and restores the original
-`job_id`, project/Session ownership, actual lifecycle state, validation
-progress, and bounded log tails. `job_status`, `job_log`/`job_tail`, and
-`stop_job` then continue with that id. If the command finished while the server
-was unavailable, the retained terminal snapshot restores its completed,
+The same `agent_instance_id` has a bounded recovery window (default 120 seconds;
+overridable with `WEBCODEX_JOB_RECOVERY_GRACE_SECS`, clamped to 5–3600 seconds).
+Its next registration carries a complete active inventory and restores the
+original `job_id`, project/Session ownership, actual lifecycle state,
+validation progress, and bounded log tails. `job_status`, `job_log`/`job_tail`,
+and `stop_job` then continue with that id. If the command finished while the
+server was unavailable, the retained terminal snapshot restores its completed,
 failed, stopped, or timeout result.
+
+`recovering` is bounded, not permanent. Even without request traffic, an
+in-process sweep transitions a `recovering` job whose recovery window has
+elapsed to terminal `lost` with `runner_recovery_deadline_exceeded`. The
+deadline is anchored to when the job entered `recovering` and is not extended
+by stale-connection keepalive, Ping/Pong, repeated disconnect, or late
+inventory. The recovery deadline is a per-Server-process property: the Job
+Registry is in-memory, a Server restart clears it, and the deadline is not
+persisted across Server processes. After a restart, recovery depends on the
+runner reconnecting and submitting its inventory, which begins a fresh
+recovery window; if the runner never reconnects, the Server has no durable
+record of the job. A durable Server-side Job ledger is a separate future
+phase.
 
 Useful bounded fields are:
 
 - job outputs: `recovery_state`, `recovered_after_server_restart`,
-  `reconciled_at`, `recovery_reason_code`, `last_update_seq`, and
-  `stdout_retained_from_line` / `stderr_retained_from_line`;
+  `reconciled_at`, `recovery_reason_code`, `recovery_reason` (a stable
+  human-readable summary derived from the bounded reason code, never from raw
+  error strings, tokens, commands, or connection identifiers), `last_update_seq`,
+  and `stdout_retained_from_line` / `stderr_retained_from_line`;
 - log outputs: `earlier_stdout_unavailable` /
   `earlier_stderr_unavailable`;
 - `runtime_status.jobs`: `recovering_count`, `reconciled_count`, and
@@ -679,14 +695,21 @@ While a job is still recovering, `stop_job` returns
 `runner_unavailable_recovering`; it does not mark the job stopped. Retry only
 after same-instance reconciliation. `runner_inventory_missing`,
 `runner_instance_replaced`, or `runner_recovery_deadline_exceeded` are terminal
-loss reasons and must not be interpreted as successful execution.
+loss reasons and must not be interpreted as successful execution. `recovering`
+is reported with a `recovery_reason` explaining that the Server is waiting for
+the same runner instance to reconnect; each terminal loss class carries a
+distinct `recovery_reason` so a Console can tell them apart, and an unknown
+reason code falls back to a safe generic summary.
 
 The runner keeps at most 64 active snapshots, 64 terminal snapshots for 15
 minutes, 64 KiB per log stream, and 1 MiB per registration inventory. Earlier
 log output can therefore be explicitly unavailable. Restarting the runner
 itself still loses child/process-group handles and cannot recover those jobs.
-There is no generalized exactly-once guarantee; `run_job` call-level
-idempotency remains future work.
+Older runners that do not advertise `job_state_reconciliation` keep the
+conservative immediate-`lost` disconnect behavior
+(`legacy_runner_disconnected`) and never enter `recovering`. There is no
+generalized exactly-once guarantee; `run_job` call-level idempotency remains
+future work.
 
 ### 5. Review and summarize
 

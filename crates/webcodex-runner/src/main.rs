@@ -1171,6 +1171,19 @@ where
     decode_json_response(path, status, &content_type, body)
 }
 
+/// Hidden, test/ops-only knob: parse `WEBCODEX_RUNNER_DISABLE_JOB_STATE_RECONCILIATION`
+/// as a boolean. Default false (reconciliation stays on). Inline rather than
+/// shared because the runner crate does not depend on the server config helpers.
+fn disable_job_state_reconciliation_for_test() -> bool {
+    matches!(
+        std::env::var("WEBCODEX_RUNNER_DISABLE_JOB_STATE_RECONCILIATION")
+            .ok()
+            .map(|raw| raw.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
 fn agent_register_capabilities(cfg: &AgentConfig) -> ShellClientCapabilities {
     let mut capabilities = cfg.capabilities.clone().unwrap_or_default();
     capabilities.jobs = true;
@@ -1180,7 +1193,14 @@ fn agent_register_capabilities(cfg: &AgentConfig) -> ShellClientCapabilities {
     capabilities.async_shell_jobs = true;
     capabilities.structured_validation_argv = true;
     capabilities.project_lifecycle = true;
-    capabilities.job_state_reconciliation = true;
+    // `job_state_reconciliation` is on by default. A hidden, test/ops-only env
+    // knob lets an E2E simulate a legacy runner that predates the capability
+    // (it then has no job inventory and a disconnect falls straight to `lost`).
+    // Default production behavior is unchanged: only the explicit opt-out
+    // disables it, and the server already rejects inventory without the
+    // capability and vice-versa.
+    capabilities.job_state_reconciliation = !disable_job_state_reconciliation_for_test();
+
     // New agents always advertise read-only LSP navigation. Older agents omit
     // the field and deserialize as false on the server.
     capabilities.lsp_read_only_navigation = true;
@@ -1250,7 +1270,14 @@ fn build_register_request_with_provider_status(
             )),
             process_started_at: Some(process_started_at()),
             build: Some(runner_build_info()),
-            job_inventory: Some(job_inventory),
+            // A legacy runner (capability disabled for E2E) must not send a job
+            // inventory: the server rejects inventory without the capability and
+            // vice-versa, so a true legacy client advertises neither.
+            job_inventory: if disable_job_state_reconciliation_for_test() {
+                None
+            } else {
+                Some(job_inventory)
+            },
         },
         Arc::clone(&hot.external_tools),
         revision,

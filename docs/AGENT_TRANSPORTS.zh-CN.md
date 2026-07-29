@@ -139,6 +139,13 @@ Registry mutation 前被拒绝。
 实例是 no-op —— 不清除当前 notifier，也不影响当前实例的 Job —— 也不改变旧实例
 已 terminal 的 `lost` Job（首次 `ended_at`/reason 保留）。
 
+跨所有 transport，`recovering` 都是有界的。进程内 sweep（不依赖请求流量）会将
+grace window 已到期的 `recovering` Job 转为 `lost`（`runner_recovery_deadline_exceeded`），
+不创建 per-job task，锁内不做磁盘/网络操作。deadline 不会被 stale connection 的
+Ping/Pong/metadata、重复 disconnect 或迟到 inventory 延长，且是单个 Server 进程的属性
+（不跨 Server 重启持久化）。不声明 `job_state_reconciliation` 的旧 Runner 保持立即 `lost`
+断线语义（`legacy_runner_disconnected`），永不进入 `recovering`。
+
 非法的 structured validation progress update 属于 executor protocol violation：
 Job 进入 terminal `failed`，错误为有界、稳定的 `validation_progress_invalid` 类，
 保留最后一次已接受的合法 progress，`ended_at` 只设置一次，释放 pending request，

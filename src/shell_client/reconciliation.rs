@@ -4,7 +4,7 @@ use super::jobs::{
 };
 use super::state::{ShellClientRegistryInner, ShellJobLogState, ShellJobRecord};
 use super::validation::validate_id;
-use super::JOB_RECOVERY_GRACE_SECS;
+use super::{job_recovery_grace_secs, ShellClientRegistry};
 use crate::shell_protocol::{
     ShellAgentProjectSummary, ShellJobInventory, ShellJobSnapshot, ShellJobStreamSnapshot,
     JOB_INVENTORY_MAX_ACTIVE_JOBS, JOB_INVENTORY_MAX_JOBS, JOB_INVENTORY_MAX_SERIALIZED_BYTES,
@@ -501,6 +501,106 @@ fn apply_snapshot(job: &mut ShellJobRecord, snapshot: &ShellJobSnapshot, now: i6
     job.recovery_original_status = None;
 }
 
+/// Maximum number of recovering jobs transitioned to lost in a single
+/// recovery-timeout sweep pass. Bounds worst-case registry-mutex hold time
+/// when many jobs belonging to one or more disconnected runners exceed the
+/// deadline together. Jobs beyond this cap stay `recovering` until the next
+/// pass (at most one sweep interval later), which is acceptable and
+/// self-correcting.
+pub(super) const RECOVERY_SWEEP_PASS_CAP: usize = 64;
+
+/// Transition `recovering` jobs whose recovery deadline has elapsed to
+/// terminal `lost` with `runner_recovery_deadline_exceeded`, and clean up
+/// their pending request / request-to-job mappings. Shared by the
+/// inventory-reconciliation path (scoped to one client) and the periodic
+/// recovery-timeout sweep (all clients). Returns the number of jobs lost.
+///
+/// Callers must already hold `inner`. Performs only in-memory work; no disk,
+/// network, or await. `mark_job_lost` is idempotent (terminal guard) and sets
+/// `ended_at` only once, so a race between this and the on-demand
+/// `refresh_job_status_locked` path is harmless — the second call is a no-op.
+pub(super) fn expire_recovering_jobs_locked(
+    inner: &mut ShellClientRegistryInner,
+    client_filter: Option<&str>,
+    now: i64,
+    pass_cap: usize,
+) -> usize {
+    let grace = job_recovery_grace_secs();
+    let expired = inner
+        .jobs_by_id
+        .iter()
+        .filter_map(|(job_id, job)| {
+            if job.status != "recovering" {
+                return None;
+            }
+            if let Some(client_id) = client_filter {
+                if job.client_id != client_id {
+                    return None;
+                }
+            }
+            let expired = job
+                .recovering_since
+                .is_some_and(|since| now.saturating_sub(since) >= grace);
+            expired.then(|| {
+                (
+                    job_id.clone(),
+                    job.client_id.clone(),
+                    job.request_id.clone(),
+                )
+            })
+        })
+        .take(pass_cap)
+        .collect::<Vec<_>>();
+    if expired.is_empty() {
+        return 0;
+    }
+    let expired_job_ids = expired
+        .iter()
+        .map(|(job_id, _, _)| job_id.clone())
+        .collect::<HashSet<_>>();
+    let distinct_clients = expired
+        .iter()
+        .map(|(_, client_id, _)| client_id.clone())
+        .collect::<HashSet<_>>();
+    for (job_id, _, _) in &expired {
+        if let Some(job) = inner.jobs_by_id.get_mut(job_id) {
+            // Re-check under the same lock: a concurrent reconciliation cannot
+            // interleave (we hold the mutex for the whole call), but the filter
+            // above ran on borrowed references; defend against the job having
+            // already left `recovering` by any path.
+            if job.status == "recovering" {
+                mark_job_lost(
+                    job,
+                    now,
+                    "runner_recovery_deadline_exceeded",
+                    "runner did not reconcile the job before the recovery deadline",
+                );
+            }
+        }
+    }
+    for (job_id, client_id, request_id) in &expired {
+        remove_job_request_mapping(inner, client_id, request_id.as_deref());
+        let _ = job_id;
+    }
+    for client_id in distinct_clients {
+        remove_job_control_requests(inner, &client_id, &expired_job_ids);
+    }
+    expired.len()
+}
+
+/// Periodic recovery-deadline sweep. NOT request-triggered: scans every
+/// `recovering` job across all clients and transitions any whose grace window
+/// has elapsed to `lost`. This closes the gap where a reconciliation-capable
+/// runner disconnects permanently and nobody queries the job, which would
+/// otherwise leave it in `recovering` forever. Pure in-memory: holds the
+/// registry mutex only for bounded HashMap work (capped by
+/// [`RECOVERY_SWEEP_PASS_CAP`]) and never awaits under it.
+pub(crate) async fn recovery_timeout_sweep(registry: &ShellClientRegistry) {
+    let now = crate::shell_client::now_ts();
+    let mut inner = registry.inner.lock().await;
+    expire_recovering_jobs_locked(&mut inner, None, now, RECOVERY_SWEEP_PASS_CAP);
+}
+
 pub(super) fn reconcile_inventory_locked(
     inner: &mut ShellClientRegistryInner,
     client_id: &str,
@@ -508,35 +608,7 @@ pub(super) fn reconcile_inventory_locked(
     inventory: &ShellJobInventory,
     now: i64,
 ) {
-    let expired_recovering = inner
-        .jobs_by_id
-        .iter()
-        .filter_map(|(job_id, job)| {
-            (job.client_id == client_id
-                && job.agent_instance_id == agent_instance_id
-                && job.status == "recovering"
-                && job
-                    .recovering_since
-                    .is_some_and(|since| now.saturating_sub(since) >= JOB_RECOVERY_GRACE_SECS))
-            .then(|| (job_id.clone(), job.request_id.clone()))
-        })
-        .collect::<Vec<_>>();
-    let expired_job_ids = expired_recovering
-        .iter()
-        .map(|(job_id, _)| job_id.clone())
-        .collect::<HashSet<_>>();
-    for (job_id, request_id) in expired_recovering {
-        if let Some(job) = inner.jobs_by_id.get_mut(&job_id) {
-            mark_job_lost(
-                job,
-                now,
-                "runner_recovery_deadline_exceeded",
-                "runner did not reconcile the job before the recovery deadline",
-            );
-        }
-        remove_job_request_mapping(inner, client_id, request_id.as_deref());
-    }
-    remove_job_control_requests(inner, client_id, &expired_job_ids);
+    expire_recovering_jobs_locked(inner, Some(client_id), now, RECOVERY_SWEEP_PASS_CAP);
 
     let inventory_ids = inventory
         .jobs

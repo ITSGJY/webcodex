@@ -80,16 +80,42 @@ The bounds are part of the internal protocol:
 - at most 1 MiB for the serialized inventory.
 
 On a recoverable disconnect, an already accepted job becomes `recovering` for
-up to 120 seconds. A complete same-instance inventory restores its actual
-state, logs, ownership, and original `job_id`; omission marks it `lost` with
-`runner_inventory_missing`. A replacement `agent_instance_id` marks the old
-instance's active jobs `lost` with `runner_instance_replaced` and fences late
-register/update traffic; the new instance does not migrate or inherit those
-jobs. A delayed disconnect from the already-replaced instance is a no-op with
-respect to the current instance — it neither clears the current notifier nor
-marks the current instance's jobs lost/recovering — but the old instance's
-jobs were already terminated to `lost` at replacement time. An undispatched
-server queue entry is not replayed.
+a bounded grace window (default 120 seconds, overridable with
+`WEBCODEX_JOB_RECOVERY_GRACE_SECS`, clamped to 5–3600 seconds). `recovering` is
+a bounded, not permanent, state: a complete same-instance inventory restores
+its actual state, logs, ownership, and original `job_id`; omission marks it
+`lost` with `runner_inventory_missing`. A replacement `agent_instance_id`
+marks the old instance's active jobs `lost` with `runner_instance_replaced`
+and fences late register/update traffic; the new instance does not migrate or
+inherit those jobs. A delayed disconnect from the already-replaced instance
+is a no-op with respect to the current instance — it neither clears the
+current notifier nor marks the current instance's jobs lost/recovering — but
+the old instance's jobs were already terminated to `lost` at replacement
+time. An undispatched server queue entry is not replayed.
+
+### Recovery deadline sweep
+
+The deadline is enforced even without request traffic: an in-process sweep
+runs on a fixed interval and transitions any `recovering` job whose grace
+window has elapsed to terminal `lost` with `runner_recovery_deadline_exceeded`.
+The sweep is bounded (a per-pass cap of expired jobs), holds the registry
+mutex only for in-memory work (no disk/network/await under the lock), is
+idempotent, and sets `ended_at` only once. A job reconciled before its
+deadline is never lost, and stale-connection Ping/Pong/metadata or a repeated
+disconnect does not extend the deadline (the deadline is anchored to
+`recovering_since`, set once when the job enters `recovering`, not to client
+liveness).
+
+The deadline is a per-Server-process property, not a durable record. The Job
+Registry is Server in-memory state; a Server restart clears it, and the
+deadline is not persisted across Server processes. Post-restart recovery
+depends on the runner reconnecting and submitting its inventory: when the
+inventory re-registers a job, a fresh bounded recovery window begins (this
+phase does not preserve recovery time already consumed before the restart).
+If the runner never reconnects after a restart, the Server has no durable
+record of the job and cannot run a recovery timeout on an unknown job. A
+durable Server-side Job ledger is a separate future phase and is out of scope
+here.
 
 A malformed structured validation progress update is an executor protocol
 violation, not a transient recoverable state: an out-of-order, regressing, or
@@ -104,9 +130,13 @@ late update or by register inventory.
 
 This phase requires the same runner process and the same
 `agent_instance_id`. Restarting the runner loses child/process-group handles
-and cannot recover those jobs. There is no generalized exactly-once command
-execution promise, and `run_job` call-level idempotency remains a separate
-future phase.
+and cannot recover those jobs. Older runners that do not advertise
+`job_state_reconciliation` keep the conservative immediate-`lost` disconnect
+behavior (`legacy_runner_disconnected`) and never enter `recovering`; a
+same-client new instance cannot take over their terminated jobs. There is no
+generalized exactly-once command execution promise, no cross-runner or
+cross-machine job migration, and `run_job` call-level idempotency remains a
+separate future phase.
 
 ## Policy summary
 

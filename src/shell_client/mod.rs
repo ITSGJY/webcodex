@@ -51,6 +51,7 @@ pub(crate) use job_updates::ShellJobStartMetadata;
 pub(crate) use jobs::{command_preview, COMMAND_PREVIEW_MAX_CHARS};
 #[cfg(test)]
 pub(crate) use projects::ShellClientLookupError;
+pub(crate) use reconciliation::recovery_timeout_sweep;
 pub(crate) use requests::EnqueueLspError;
 use state::ShellClientRegistryInner;
 use validation::sha256_hex;
@@ -63,7 +64,50 @@ const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 pub(crate) const CLIENT_ONLINE_WINDOW_SECS: i64 = 60;
 /// Same-process runners have this long to re-register and submit their
 /// complete active inventory before a recovering job becomes terminal lost.
+/// This is the documented production default; tests and operators may lower it
+/// via `WEBCODEX_JOB_RECOVERY_GRACE_SECS` (clamped to
+/// [`JOB_RECOVERY_GRACE_MIN_SECS`]..=[`JOB_RECOVERY_GRACE_MAX_SECS`]). The
+/// resolved value is read once per process via [`job_recovery_grace_secs`].
 pub(crate) const JOB_RECOVERY_GRACE_SECS: i64 = 120;
+/// Lower bound for the resolved recovery grace. Anything shorter risks
+/// mistaking a briefly-flapping transport for a permanently-gone runner, so
+/// the override is refused below this floor even in tests.
+pub(crate) const JOB_RECOVERY_GRACE_MIN_SECS: i64 = 5;
+/// Upper bound for the resolved recovery grace. Prevents a misconfigured
+/// operator from effectively disabling the deadline forever.
+pub(crate) const JOB_RECOVERY_GRACE_MAX_SECS: i64 = 3600;
+
+/// Period of the in-process recovery-timeout sweep, in seconds. Not
+/// configurable: the grace window (`WEBCODEX_JOB_RECOVERY_GRACE_SECS`) is the
+/// operator-facing deadline control, and this interval only bounds how long
+/// after the deadline a job waits before being transitioned to `lost` (at most
+/// one interval). `MissedTickBehavior::Delay` prevents burst catch-up.
+pub(crate) const RECOVERY_SWEEP_INTERVAL_SECS: u64 = 30;
+
+/// Clamp a raw recovery-grace value to the safe `[min, max]` window. Pure so it
+/// can be unit-tested without mutating the process env or the resolved cache.
+pub(crate) fn clamp_grace(raw: i64) -> i64 {
+    raw.clamp(JOB_RECOVERY_GRACE_MIN_SECS, JOB_RECOVERY_GRACE_MAX_SECS)
+}
+
+/// Resolve the recovery grace once per process. Reads
+/// `WEBCODEX_JOB_RECOVERY_GRACE_SECS`, clamps it to
+/// [`JOB_RECOVERY_GRACE_MIN_SECS`]-[`JOB_RECOVERY_GRACE_MAX_SECS`], and falls
+/// back to [`JOB_RECOVERY_GRACE_SECS`] when unset or unparseable. Production
+/// never mutates the env after startup, so the first read is cached; tests do
+/// not rely on this cached value for deadline logic — they manipulate a job's
+/// `recovering_since` directly and compute expectations from the documented
+/// default, matching the existing test idiom and avoiding env-mutation races.
+pub(crate) fn job_recovery_grace_secs() -> i64 {
+    static JOB_RECOVERY_GRACE: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *JOB_RECOVERY_GRACE.get_or_init(|| {
+        std::env::var("WEBCODEX_JOB_RECOVERY_GRACE_SECS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<i64>().ok())
+            .map(clamp_grace)
+            .unwrap_or(JOB_RECOVERY_GRACE_SECS)
+    })
+}
 const MAX_RETIRED_INSTANCES_PER_CLIENT: usize = 16;
 /// Maximum number of pending requests queued for a single agent client.
 /// Bounds memory when an agent is slow or disconnected: once a client's

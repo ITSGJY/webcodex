@@ -253,15 +253,28 @@ are absent from the inventory.
 
 On a capable-runner disconnect, the server changes accepted active jobs to
 nonterminal `recovering` instead of immediately claiming the result was lost.
-The same running `agent_instance_id` has 120 seconds to re-register with its
-complete active inventory. Registration validates the whole inventory before
-mutation and, under one registry mutex, resolves the instance lease,
-replacement loss, missing-active loss, and snapshot merge. Snapshot tails
-replace server tails; incremental and replay updates share the same monotonic
-sequence rule. Network I/O is never performed while the Registry or JobManager
-record lock is held. Long-lived transports also receive an internal
-per-connection lease, so cleanup from an older same-instance socket cannot
-disconnect the socket that just completed reconciliation.
+The same running `agent_instance_id` has a bounded grace window (default 120
+seconds; overridable with `WEBCODEX_JOB_RECOVERY_GRACE_SECS`, clamped to
+5–3600 seconds) to re-register with its complete active inventory. Registration
+validates the whole inventory before mutation and, under one registry mutex,
+resolves the instance lease, replacement loss, missing-active loss, and
+snapshot merge. Snapshot tails replace server tails; incremental and replay
+updates share the same monotonic sequence rule. Network I/O is never performed
+while the Registry or JobManager record lock is held. Long-lived transports
+also receive an internal per-connection lease, so cleanup from an older
+same-instance socket cannot disconnect the socket that just completed
+reconciliation.
+
+`recovering` is bounded even without request traffic: an in-process sweep
+transitions a job whose grace window has elapsed to terminal `lost`
+(`runner_recovery_deadline_exceeded`) with a per-pass cap and no disk/network
+work under the registry lock. The deadline is anchored to when the job entered
+`recovering` and is not extended by stale-connection keepalive, repeated
+disconnect, or late inventory. The Job Registry is server in-memory state, so
+the deadline is a per-Server-process property and is not persisted across a
+server restart; after a restart, recovery depends on the runner reconnecting
+and submitting its inventory (a fresh recovery window begins), and a durable
+server-side Job ledger remains a separate future phase.
 
 A fresh server can therefore rebuild the original `job_id`, ownership, status,
 bounded logs, and stop routing without re-executing the command. A recovered
@@ -270,13 +283,16 @@ active job continues through `job_status`, `job_log`/`job_tail`, and
 the retained terminal snapshot. A replacement `agent_instance_id` does not
 inherit the old instance's jobs (they are `lost` with `runner_instance_replaced`),
 and a delayed disconnect from a replaced instance is a no-op against the
-current instance. A malformed structured validation progress update is an
-executor protocol violation that moves the job to terminal `failed` with a
-bounded `validation_progress_invalid`-class error, retaining the last valid
-progress and never re-executing. Runner restart is deliberately outside this
-phase because the new process cannot recover old child handles. This layer
-does not merge Connector Execution with Full Runtime Job, provide generalized
-exactly-once command execution, or make a `run_job` invocation idempotent.
+current instance. Older runners that do not advertise `job_state_reconciliation`
+keep the immediate-`lost` disconnect behavior (`legacy_runner_disconnected`)
+and never enter `recovering`. A malformed structured validation progress
+update is an executor protocol violation that moves the job to terminal `failed`
+with a bounded `validation_progress_invalid`-class error, retaining the last
+valid progress and never re-executing. Runner restart is deliberately outside
+this phase because the new process cannot recover old child handles. This
+layer does not merge Connector Execution with Full Runtime Job, provide
+generalized exactly-once command execution, cross-runner or cross-machine job
+migration, or make a `run_job` invocation idempotent.
 
 ### Agent-Side LSP Architecture
 

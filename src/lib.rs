@@ -469,6 +469,29 @@ only for local/trusted-network demos."
     tracing::info!("Agent WebSocket: {}/api/agents/ws", base);
     tracing::info!("Agent polling (fallback): {}/api/shell/agent/poll", base);
     tracing::info!("Audit API (read-only): {}/api/audit/sessions", base);
+    // Periodic recovery-timeout sweep for disconnected reconciliation-capable
+    // runners. A job whose runner disconnected enters `recovering`; if that
+    // runner never reconnects and nobody queries the job, the on-demand
+    // deadline check would never run. This background task bounds `recovering`
+    // to the grace window independently of request traffic. It is pure
+    // in-memory, holds the registry mutex only for bounded HashMap work, and
+    // dies with the process. A server restart resets the in-memory registry;
+    // the deadline is re-anchored only when a runner reconnects and submits its
+    // inventory. See docs/AGENT_PROTOCOL.md (recovery deadline sweep).
+    let sweep_registry = shell_registry.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            shell_client::RECOVERY_SWEEP_INTERVAL_SECS,
+        ));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Skip the first (immediate) tick so a sweep does not race startup
+        // reconciliation before any runner has had a chance to re-register.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            shell_client::recovery_timeout_sweep(&sweep_registry).await;
+        }
+    });
     Server::new(acceptor).serve(router).await;
     Ok(())
 }

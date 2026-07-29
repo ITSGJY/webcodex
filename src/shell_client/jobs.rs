@@ -1,8 +1,5 @@
 use super::state::{ShellClientRegistryInner, ShellJobLogState, ShellJobRecord};
-use super::{
-    now_ts, CLIENT_ONLINE_WINDOW_SECS, JOB_RECOVERY_GRACE_SECS, MAX_OUTPUT_BYTES,
-    MAX_QUEUED_REQUESTS_PER_CLIENT,
-};
+use super::{now_ts, CLIENT_ONLINE_WINDOW_SECS, MAX_OUTPUT_BYTES, MAX_QUEUED_REQUESTS_PER_CLIENT};
 use crate::shell_protocol::{
     ShellAgentJobResult, ShellAgentShellJobResult, ShellJobInfo, ShellJobStreamSnapshot,
 };
@@ -499,9 +496,9 @@ pub(super) fn refresh_job_status_locked(inner: &mut ShellClientRegistryInner, jo
         return;
     }
     if job.status == "recovering" {
-        let expired = job
-            .recovering_since
-            .is_some_and(|since| now_ts().saturating_sub(since) >= JOB_RECOVERY_GRACE_SECS);
+        let expired = job.recovering_since.is_some_and(|since| {
+            now_ts().saturating_sub(since) >= super::job_recovery_grace_secs()
+        });
         if expired {
             if let Some(job) = inner.jobs_by_id.get_mut(job_id) {
                 mark_job_lost(

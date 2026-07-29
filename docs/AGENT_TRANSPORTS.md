@@ -150,6 +150,16 @@ no-op with respect to the current instance — it does not clear the current
 notifier or affect the current instance's jobs — and it does not change the
 old instance's already-terminal `lost` job (first `ended_at`/reason retained).
 
+`recovering` is bounded across all transports. A non-request-triggered
+in-process sweep transitions a `recovering` job whose grace window has elapsed
+to `lost` (`runner_recovery_deadline_exceeded`) regardless of transport, with
+no per-job task and no disk/network work under the registry lock. The deadline
+is not extended by stale-connection Ping/Pong/metadata, repeated disconnect,
+or late inventory, and is a per-Server-process property (not persisted across a
+Server restart). Older runners without `job_state_reconciliation` keep the
+immediate-`lost` disconnect behavior (`legacy_runner_disconnected`) and never
+enter `recovering`.
+
 A malformed structured validation progress update is an executor protocol
 violation: it moves the job to terminal `failed` with a bounded, stable
 `validation_progress_invalid`-class error, retains the last accepted valid

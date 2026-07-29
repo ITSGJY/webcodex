@@ -92,13 +92,71 @@ fn is_lifecycle_active_status(status: &str) -> bool {
     is_blocking_active_job_status(status) || is_stop_pending_job_status(status)
 }
 
-fn add_job_lifecycle_fields(output: &mut Value, status: &str) {
+fn add_job_lifecycle_fields(
+    output: &mut Value,
+    status: &str,
+    recovery_state: Option<&str>,
+    recovery_reason_code: Option<&str>,
+) {
     let blocking_active = is_blocking_active_job_status(status);
     let terminal_pending = is_stop_pending_job_status(status);
     output["active"] = json!(blocking_active || terminal_pending);
     output["blocking_active"] = json!(blocking_active);
     output["terminal"] = json!(is_terminal_job_status(status));
     output["terminal_pending"] = json!(terminal_pending);
+    if let Some(text) = recovery_reason_text(recovery_state, recovery_reason_code) {
+        output["recovery_reason"] = json!(text);
+    }
+}
+
+/// Map the bounded `recovery_state` / `recovery_reason_code` pair to a stable,
+/// human-readable `recovery_reason` string for the Console/API projection.
+///
+/// The text is derived only from the bounded reason codes and the recovery
+/// state — never from raw backend error strings, tokens, command payloads,
+/// environment, filesystem paths, transport connection ids, raw inventory, or
+/// internal notifier/request-channel state. Unknown reason codes fall back to
+/// a generic form that echoes only the code (safe to surface, not sensitive).
+pub(crate) fn recovery_reason_text(
+    recovery_state: Option<&str>,
+    recovery_reason_code: Option<&str>,
+) -> Option<String> {
+    match (recovery_state, recovery_reason_code) {
+        (Some("recovering"), _) => {
+            Some("server is waiting for the same runner instance to reconnect".to_string())
+        }
+        (Some("reconciled"), _) => Some("reconciled after runner reconnect".to_string()),
+        (Some("lost_after_reconcile"), Some(code)) => Some(match code {
+            "runner_recovery_deadline_exceeded" => {
+                "lost: runner did not reconnect before the recovery deadline".to_string()
+            }
+            "runner_inventory_missing" => {
+                "lost: runner reconnect did not report this job in its inventory".to_string()
+            }
+            "runner_instance_replaced" => {
+                "lost: runner instance was replaced by a newer process".to_string()
+            }
+            _ => format!("lost after reconciliation ({code})"),
+        }),
+        (Some("lost_after_reconcile"), None) => Some("lost after reconciliation".to_string()),
+        // Jobs lost without entering the reconciliation path keep their original
+        // reason code (e.g. legacy disconnect) and have recovery_state == None.
+        (_, Some("legacy_runner_disconnected")) => {
+            Some("lost: legacy runner disconnected without reconciliation support".to_string())
+        }
+        (_, Some("runner_transport_disconnected")) => {
+            Some("lost: runner transport disconnected".to_string())
+        }
+        (_, Some("runner_transport_stale")) => {
+            Some("lost: runner transport went stale while the job was running".to_string())
+        }
+        (_, Some("runner_request_not_dispatched")) => {
+            Some("lost: runner did not dispatch the job request".to_string())
+        }
+        (_, Some(code)) => Some(format!("recovery ({code})")),
+        (Some(state), None) => Some(format!("recovery ({state})")),
+        (None, None) => None,
+    }
 }
 
 fn command_preview_truncated(preview: &str) -> bool {
@@ -156,6 +214,10 @@ pub(crate) fn agent_job_summary_value(job: &ShellJobInfo) -> Value {
         "reconciled_at": job.reconciled_at,
         "recovery_reason_code": job.recovery_reason_code,
         "last_update_seq": job.last_update_seq,
+        "recovery_reason": recovery_reason_text(
+            job.recovery_state.as_deref(),
+            job.recovery_reason_code.as_deref(),
+        ),
     })
 }
 
@@ -240,7 +302,7 @@ pub(crate) fn local_job_status(
         "kind": meta.get("kind").cloned().unwrap_or_else(|| Value::String("shell".to_string())),
         "command_preview_included": include_command_preview,
     });
-    add_job_lifecycle_fields(&mut output, &status);
+    add_job_lifecycle_fields(&mut output, &status, None, None);
     if let Some(note) = timeout_note {
         output["note"] = Value::String(note);
     }
@@ -613,6 +675,10 @@ fn job_recovering_stop_result(project: &str, job: &ShellJobInfo) -> ToolResult {
             "status_after": "recovering",
             "recovery_state": job.recovery_state,
             "recovery_reason_code": job.recovery_reason_code,
+            "recovery_reason": recovery_reason_text(
+                job.recovery_state.as_deref(),
+                job.recovery_reason_code.as_deref(),
+            ),
             "already_finished": false,
             "already_stop_requested": false,
             "stop_request_accepted": false,
@@ -1074,7 +1140,12 @@ impl ToolRuntime {
                     "command_preview_included": include_command_preview,
                 });
                 let status = output["status"].as_str().unwrap_or_default().to_string();
-                add_job_lifecycle_fields(&mut output, &status);
+                add_job_lifecycle_fields(
+                    &mut output,
+                    &status,
+                    job.recovery_state.as_deref(),
+                    job.recovery_reason_code.as_deref(),
+                );
                 if include_command_preview {
                     add_command_preview_metadata(&mut output, job.command_preview);
                 }
@@ -1172,6 +1243,10 @@ impl ToolRuntime {
                         || job.stderr_log_truncated,
                     "recovery_state": job.recovery_state,
                     "recovery_reason_code": job.recovery_reason_code,
+                    "recovery_reason": recovery_reason_text(
+                        job.recovery_state.as_deref(),
+                        job.recovery_reason_code.as_deref(),
+                    ),
                     "last_update_seq": job.last_update_seq,
                     "cursor": {
                         "stdout": next_stdout_line,
@@ -1605,5 +1680,146 @@ impl ToolRuntime {
             return None;
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod recovery_projection_tests {
+    use super::recovery_reason_text;
+    use serde_json::json;
+
+    #[test]
+    fn recovery_reason_text_recovering_explains_wait() {
+        let text = recovery_reason_text(Some("recovering"), Some("runner_transport_disconnected"));
+        assert_eq!(
+            text.as_deref(),
+            Some("server is waiting for the same runner instance to reconnect")
+        );
+        // recovering state is described regardless of the specific reason code.
+        let text2 = recovery_reason_text(Some("recovering"), None);
+        assert_eq!(
+            text2.as_deref(),
+            Some("server is waiting for the same runner instance to reconnect")
+        );
+    }
+
+    #[test]
+    fn recovery_reason_text_lost_after_reconcile_codes_are_distinct() {
+        let deadline = recovery_reason_text(
+            Some("lost_after_reconcile"),
+            Some("runner_recovery_deadline_exceeded"),
+        );
+        let missing = recovery_reason_text(
+            Some("lost_after_reconcile"),
+            Some("runner_inventory_missing"),
+        );
+        let replaced = recovery_reason_text(
+            Some("lost_after_reconcile"),
+            Some("runner_instance_replaced"),
+        );
+        assert_eq!(
+            deadline.as_deref(),
+            Some("lost: runner did not reconnect before the recovery deadline")
+        );
+        assert_eq!(
+            missing.as_deref(),
+            Some("lost: runner reconnect did not report this job in its inventory")
+        );
+        assert_eq!(
+            replaced.as_deref(),
+            Some("lost: runner instance was replaced by a newer process")
+        );
+        // The three reasons must produce three distinct human strings so the
+        // Console can tell them apart.
+        let texts = [deadline, missing, replaced]
+            .into_iter()
+            .filter_map(|opt| opt.as_deref().map(str::to_string))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(texts.len(), 3, "distinct recoverable loss reasons");
+    }
+
+    #[test]
+    fn recovery_reason_text_legacy_runner_disconnect() {
+        let text = recovery_reason_text(None, Some("legacy_runner_disconnected"));
+        assert_eq!(
+            text.as_deref(),
+            Some("lost: legacy runner disconnected without reconciliation support")
+        );
+    }
+
+    #[test]
+    fn recovery_reason_text_unknown_code_falls_back_safely() {
+        let text = recovery_reason_text(Some("lost_after_reconcile"), Some("some_new_code"));
+        assert!(
+            text.as_deref().unwrap().contains("some_new_code"),
+            "unknown code is echoed for debuggability"
+        );
+        assert!(
+            !text.as_deref().unwrap().contains("token"),
+            "no sensitive leak"
+        );
+        let other = recovery_reason_text(None, Some("unknown_reason"));
+        assert!(other.as_deref().unwrap().contains("unknown_reason"));
+    }
+
+    #[test]
+    fn recovery_reason_text_none_when_no_state_or_code() {
+        assert_eq!(recovery_reason_text(None, None), None);
+    }
+
+    #[test]
+    fn agent_job_summary_includes_recovery_reason() {
+        use crate::shell_protocol::ShellJobInfo;
+        let job = ShellJobInfo {
+            job_id: "job-1".to_string(),
+            request_id: Some("req-1".to_string()),
+            client_id: "oe".to_string(),
+            kind: "shell".to_string(),
+            project_id: None,
+            session_id: None,
+            cwd: None,
+            project_cwd: None,
+            purpose: None,
+            shell: None,
+            command_preview: String::new(),
+            status: "lost".to_string(),
+            created_at: 1,
+            started_at: Some(2),
+            ended_at: Some(3),
+            exit_code: None,
+            duration_ms: None,
+            elapsed_secs: Some(1),
+            error: Some("runner did not reconcile".to_string()),
+            codex: None,
+            result: None,
+            validation_progress: None,
+            recovery_state: Some("lost_after_reconcile".to_string()),
+            recovered_after_server_restart: true,
+            reconciled_at: Some(3),
+            recovery_reason_code: Some("runner_recovery_deadline_exceeded".to_string()),
+            last_update_seq: Some(4),
+            stdout_retained_from_line: Some(1),
+            stderr_retained_from_line: Some(1),
+            stdout_log_truncated: false,
+            stderr_log_truncated: false,
+        };
+        let value = super::agent_job_summary_value(&job);
+        assert_eq!(
+            value["recovery_reason_code"],
+            json!("runner_recovery_deadline_exceeded")
+        );
+        assert_eq!(
+            value["recovery_reason"],
+            json!("lost: runner did not reconnect before the recovery deadline")
+        );
+        // Never expose the raw error string or command payload via the summary.
+        assert!(
+            value.get("error").is_none(),
+            "summary must not surface raw error"
+        );
+        assert!(
+            value.get("command").is_none(),
+            "summary must not surface command"
+        );
     }
 }

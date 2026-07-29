@@ -1,6 +1,11 @@
 use super::job_updates::ShellJobStartMetadata;
-use super::reconciliation::validate_job_inventory;
-use super::{now_ts, ShellClientRegistry, JOB_RECOVERY_GRACE_SECS, MAX_OUTPUT_BYTES};
+use super::reconciliation::{
+    recovery_timeout_sweep, validate_job_inventory, RECOVERY_SWEEP_PASS_CAP,
+};
+use super::{
+    clamp_grace, job_recovery_grace_secs, now_ts, ShellClientRegistry, JOB_RECOVERY_GRACE_SECS,
+    MAX_OUTPUT_BYTES,
+};
 use crate::shell_protocol::{
     ShellAgentJobUpdateRequest, ShellAgentPollRequest, ShellAgentProjectSummary,
     ShellClientCapabilities, ShellClientRegisterRequest, ShellJobContext, ShellJobInventory,
@@ -974,5 +979,422 @@ async fn job_reconciliation_legacy_capability_keeps_immediate_lost_semantics() {
     assert_eq!(
         lost.recovery_reason_code.as_deref(),
         Some("legacy_runner_disconnected")
+    );
+}
+
+// ---- Recovery-timeout sweep ----
+//
+// The sweep closes the gap left by the on-demand deadline check: a
+// reconciliation-capable runner that disconnects permanently and is never
+// queried again must not stay `recovering` forever. The sweep is
+// non-request-triggered and bounded. These tests drive a job into
+// `recovering` via the transport-disconnect path, manipulate
+// `recovering_since` directly (the existing test idiom), then invoke
+// `recovery_timeout_sweep` and assert the terminal transition.
+
+/// Drive the job for `instance` into `recovering` by disconnecting its
+/// transport, returning its job_id. Caller must have already started and
+/// polled the job so the runner "owns" it.
+async fn drive_into_recovering(registry: &ShellClientRegistry, job_id: &str, instance: &str) {
+    registry
+        .update_job(update(instance, job_id, 1, "running", None, false))
+        .await
+        .unwrap();
+    registry.reconcile_disconnect(CLIENT_ID, instance).await;
+    assert_eq!(registry.get_job(job_id).await.unwrap().status, "recovering");
+}
+
+/// Set a job's `recovering_since` to `now - offset_secs`, simulating the
+/// passage of the recovery deadline without sleeping the full grace window.
+async fn age_recovering_since(registry: &ShellClientRegistry, job_id: &str, offset_secs: i64) {
+    let mut inner = registry.inner.lock().await;
+    let job = inner.jobs_by_id.get_mut(job_id).expect("job exists");
+    job.recovering_since = Some(now_ts() - offset_secs);
+}
+
+#[tokio::test]
+async fn clamp_grace_bounds_the_resolved_recovery_window() {
+    assert_eq!(clamp_grace(0), 5);
+    assert_eq!(clamp_grace(-5), 5);
+    assert_eq!(clamp_grace(60), 60);
+    assert_eq!(clamp_grace(100_000), 3_600);
+    assert_eq!(clamp_grace(120), 120);
+}
+
+#[tokio::test]
+async fn recovery_sweep_transitions_expired_recovering_job_to_lost() {
+    let registry = ShellClientRegistry::default();
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let (job, _) = start_and_take_over(&registry, INSTANCE_A).await;
+    drive_into_recovering(&registry, &job.job_id, INSTANCE_A).await;
+    age_recovering_since(&registry, &job.job_id, job_recovery_grace_secs() + 1).await;
+
+    recovery_timeout_sweep(&registry).await;
+    let lost = registry.get_job(&job.job_id).await.unwrap();
+    assert_eq!(lost.status, "lost");
+    assert_eq!(lost.recovery_state.as_deref(), Some("lost_after_reconcile"));
+    assert_eq!(
+        lost.recovery_reason_code.as_deref(),
+        Some("runner_recovery_deadline_exceeded")
+    );
+    assert!(lost.ended_at.is_some(), "expired job records ended_at");
+}
+
+#[tokio::test]
+async fn recovery_sweep_noop_before_deadline() {
+    let registry = ShellClientRegistry::default();
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let (job, _) = start_and_take_over(&registry, INSTANCE_A).await;
+    drive_into_recovering(&registry, &job.job_id, INSTANCE_A).await;
+    // Deadline not yet elapsed (recovery just started).
+    age_recovering_since(&registry, &job.job_id, 1).await;
+
+    recovery_timeout_sweep(&registry).await;
+    let recovering = registry.get_job(&job.job_id).await.unwrap();
+    assert_eq!(recovering.status, "recovering");
+    assert!(
+        recovering.ended_at.is_none(),
+        "pre-deadline job stays recovering"
+    );
+}
+
+#[tokio::test]
+async fn recovery_sweep_is_idempotent_and_sets_ended_at_once() {
+    let registry = ShellClientRegistry::default();
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let (job, _) = start_and_take_over(&registry, INSTANCE_A).await;
+    drive_into_recovering(&registry, &job.job_id, INSTANCE_A).await;
+    age_recovering_since(&registry, &job.job_id, job_recovery_grace_secs() + 5).await;
+
+    recovery_timeout_sweep(&registry).await;
+    let first = registry.get_job(&job.job_id).await.unwrap();
+    assert_eq!(first.status, "lost");
+    let first_ended_at = first.ended_at.expect("ended_at set");
+
+    recovery_timeout_sweep(&registry).await;
+    let second = registry.get_job(&job.job_id).await.unwrap();
+    assert_eq!(second.status, "lost");
+    assert_eq!(
+        second.ended_at,
+        Some(first_ended_at),
+        "ended_at not rewritten"
+    );
+    assert_eq!(
+        second.recovery_reason_code.as_deref(),
+        Some("runner_recovery_deadline_exceeded"),
+        "reason not overwritten"
+    );
+}
+
+#[tokio::test]
+async fn recovery_sweep_skips_terminal_and_already_lost_jobs() {
+    let registry = ShellClientRegistry::default();
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let (job, _) = start_and_take_over(&registry, INSTANCE_A).await;
+    registry
+        .update_job(update(
+            INSTANCE_A,
+            &job.job_id,
+            1,
+            "completed",
+            Some("ok\n"),
+            true,
+        ))
+        .await
+        .unwrap();
+    // Defensively age a terminal job past the deadline; the sweep must not
+    // touch it.
+    {
+        let mut inner = registry.inner.lock().await;
+        let record = inner.jobs_by_id.get_mut(&job.job_id).unwrap();
+        record.recovering_since = Some(now_ts() - job_recovery_grace_secs() - 10);
+    }
+    recovery_timeout_sweep(&registry).await;
+    let completed = registry.get_job(&job.job_id).await.unwrap();
+    assert_eq!(completed.status, "completed");
+
+    // A job already lost with a different reason keeps its original reason.
+    let (job2, _) = start_and_take_over(&registry, INSTANCE_A).await;
+    drive_into_recovering(&registry, &job2.job_id, INSTANCE_A).await;
+    {
+        let mut inner = registry.inner.lock().await;
+        let record = inner.jobs_by_id.get_mut(&job2.job_id).unwrap();
+        super::jobs::mark_job_lost(
+            record,
+            now_ts(),
+            "runner_inventory_missing",
+            "runner complete active inventory did not contain this job",
+        );
+    }
+    recovery_timeout_sweep(&registry).await;
+    let still_lost = registry.get_job(&job2.job_id).await.unwrap();
+    assert_eq!(still_lost.status, "lost");
+    assert_eq!(
+        still_lost.recovery_reason_code.as_deref(),
+        Some("runner_inventory_missing"),
+        "sweep must not overwrite an existing terminal reason"
+    );
+}
+
+#[tokio::test]
+async fn recovery_sweep_clears_pending_control_requests() {
+    let registry = ShellClientRegistry::default();
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let (job, _) = start_and_take_over(&registry, INSTANCE_A).await;
+    drive_into_recovering(&registry, &job.job_id, INSTANCE_A).await;
+    age_recovering_since(&registry, &job.job_id, job_recovery_grace_secs() + 1).await;
+
+    recovery_timeout_sweep(&registry).await;
+    let inner = registry.inner.lock().await;
+    assert!(inner.pending_by_id.is_empty(), "pending_by_id cleared");
+    assert!(inner.request_to_job.is_empty(), "request_to_job cleared");
+    assert!(inner
+        .queues_by_client
+        .get(CLIENT_ID)
+        .is_none_or(|queue| queue.is_empty()));
+}
+
+#[tokio::test]
+async fn recovery_sweep_pass_cap_bounds_a_single_pass() {
+    let registry = ShellClientRegistry::default();
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    // Start more expired recovering jobs than the per-pass cap.
+    let count = RECOVERY_SWEEP_PASS_CAP + 6;
+    let mut job_ids = Vec::new();
+    for _ in 0..count {
+        let job = registry
+            .start_job(start_request("sleep 30"), "tester".to_string())
+            .await
+            .unwrap();
+        let request = registry
+            .poll(ShellAgentPollRequest {
+                client_id: CLIENT_ID.to_string(),
+                agent_instance_id: INSTANCE_A.to_string(),
+                projects: None,
+            })
+            .await
+            .unwrap()
+            .expect("start request");
+        registry
+            .update_job(update(INSTANCE_A, &job.job_id, 1, "running", None, false))
+            .await
+            .unwrap();
+        assert_eq!(request.kind, "start_job");
+        job_ids.push(job.job_id);
+    }
+    registry.reconcile_disconnect(CLIENT_ID, INSTANCE_A).await;
+    for job_id in &job_ids {
+        age_recovering_since(&registry, job_id, job_recovery_grace_secs() + 1).await;
+    }
+
+    recovery_timeout_sweep(&registry).await;
+    // Count via the inner record directly: `get_job` runs the on-demand deadline
+    // check (`refresh_job_status_locked`), which would transition the remaining
+    // expired recovering jobs during the measurement and hide the cap effect.
+    let lost_after_first = {
+        let inner = registry.inner.lock().await;
+        job_ids
+            .iter()
+            .filter(|id| {
+                inner
+                    .jobs_by_id
+                    .get(id.as_str())
+                    .is_some_and(|j| j.status == "lost")
+            })
+            .count()
+    };
+    assert_eq!(
+        lost_after_first, RECOVERY_SWEEP_PASS_CAP,
+        "first pass transitions at most the cap"
+    );
+    recovery_timeout_sweep(&registry).await;
+    let lost_after_second = {
+        let inner = registry.inner.lock().await;
+        job_ids
+            .iter()
+            .filter(|id| {
+                inner
+                    .jobs_by_id
+                    .get(id.as_str())
+                    .is_some_and(|j| j.status == "lost")
+            })
+            .count()
+    };
+    assert_eq!(lost_after_second, count, "second pass completes the rest");
+}
+
+#[tokio::test]
+async fn stale_keepalive_does_not_extend_recovery_deadline() {
+    let registry = ShellClientRegistry::default();
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let (job, _) = start_and_take_over(&registry, INSTANCE_A).await;
+    drive_into_recovering(&registry, &job.job_id, INSTANCE_A).await;
+    // Simulate a keepalive / Ping-Pong refreshing client liveness after the
+    // job already entered recovery. The deadline is anchored to
+    // recovering_since, not last_seen, so this must not extend it.
+    registry.set_last_seen_for_test(CLIENT_ID, now_ts()).await;
+    age_recovering_since(&registry, &job.job_id, job_recovery_grace_secs() + 1).await;
+
+    recovery_timeout_sweep(&registry).await;
+    assert_eq!(
+        registry.get_job(&job.job_id).await.unwrap().status,
+        "lost",
+        "keepalive must not extend the recovery deadline"
+    );
+}
+
+#[tokio::test]
+async fn runner_reconnect_before_deadline_cancels_timeout() {
+    let registry = ShellClientRegistry::default();
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let (job, request) = start_and_take_over(&registry, INSTANCE_A).await;
+    drive_into_recovering(&registry, &job.job_id, INSTANCE_A).await;
+    // Reconnect before the deadline: same instance submits inventory that
+    // reconciles the job back to running.
+    let reconciled = snapshot_from_request(&job, &request, "running", 2, stream("one\n", 1, false));
+    register(
+        &registry,
+        INSTANCE_A,
+        ShellJobInventory {
+            active_complete: true,
+            jobs: vec![reconciled],
+        },
+    )
+    .await;
+    let running = registry.get_job(&job.job_id).await.unwrap();
+    assert_eq!(running.status, "running");
+    assert_eq!(running.recovery_state.as_deref(), Some("reconciled"));
+
+    // A subsequent sweep is a no-op on the now-running job even if
+    // recovering_since were somehow stale.
+    recovery_timeout_sweep(&registry).await;
+    assert_eq!(
+        registry.get_job(&job.job_id).await.unwrap().status,
+        "running"
+    );
+}
+
+#[tokio::test]
+async fn late_update_after_timeout_does_not_revive_job() {
+    let registry = ShellClientRegistry::default();
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let (job, _) = start_and_take_over(&registry, INSTANCE_A).await;
+    drive_into_recovering(&registry, &job.job_id, INSTANCE_A).await;
+    age_recovering_since(&registry, &job.job_id, job_recovery_grace_secs() + 1).await;
+    recovery_timeout_sweep(&registry).await;
+    let first_ended_at = registry.get_job(&job.job_id).await.unwrap().ended_at;
+
+    // An older-sequence update is dropped by the seq guard.
+    let _ = registry
+        .update_job(update(INSTANCE_A, &job.job_id, 1, "running", None, false))
+        .await;
+    // An equal-sequence update is also a no-op.
+    let _ = registry
+        .update_job(update(INSTANCE_A, &job.job_id, 2, "running", None, false))
+        .await;
+    // Even a newer-sequence update cannot revive a terminal job.
+    let _ = registry
+        .update_job(update(
+            INSTANCE_A,
+            &job.job_id,
+            9,
+            "running",
+            Some("late\n"),
+            false,
+        ))
+        .await;
+    let lost = registry.get_job(&job.job_id).await.unwrap();
+    assert_eq!(lost.status, "lost", "terminal job must not revive");
+    assert_eq!(lost.ended_at, first_ended_at, "ended_at unchanged");
+}
+
+#[tokio::test]
+async fn registry_rebuild_re_anchors_deadline_after_restart() {
+    // Simulate a server restart: a fresh registry starts empty until the runner
+    // reconnects and submits inventory, which re-anchors recovering_since.
+    let registry_a = ShellClientRegistry::default();
+    register(&registry_a, INSTANCE_A, empty_inventory()).await;
+    let (job, request) = start_and_take_over(&registry_a, INSTANCE_A).await;
+    registry_a
+        .update_job(update(
+            INSTANCE_A,
+            &job.job_id,
+            2,
+            "running",
+            Some("one\n"),
+            false,
+        ))
+        .await
+        .unwrap();
+    registry_a.reconcile_disconnect(CLIENT_ID, INSTANCE_A).await;
+
+    // "Restart": fresh registry; the recovering job is gone until the runner
+    // reconnects and submits a running inventory snapshot.
+    let registry_b = ShellClientRegistry::default();
+    let snapshot = snapshot_from_request(&job, &request, "running", 3, stream("one\n", 1, false));
+    register(
+        &registry_b,
+        INSTANCE_A,
+        ShellJobInventory {
+            active_complete: true,
+            jobs: vec![snapshot],
+        },
+    )
+    .await;
+    let restored = registry_b.get_job(&job.job_id).await.unwrap();
+    assert_eq!(restored.status, "running");
+    assert_eq!(
+        restored.recovery_state.as_deref(),
+        Some("reconciled"),
+        "fresh window after restart: job is reconciled, not recovering"
+    );
+    assert!(restored.recovered_after_server_restart);
+
+    // If the runner now disconnects again, a fresh recovery window begins and
+    // the sweep's deadline is measured from the new recovering_since.
+    registry_b.reconcile_disconnect(CLIENT_ID, INSTANCE_A).await;
+    assert_eq!(
+        registry_b.get_job(&job.job_id).await.unwrap().status,
+        "recovering"
+    );
+    age_recovering_since(&registry_b, &job.job_id, job_recovery_grace_secs() + 1).await;
+    recovery_timeout_sweep(&registry_b).await;
+    let lost = registry_b.get_job(&job.job_id).await.unwrap();
+    assert_eq!(lost.status, "lost");
+    assert_eq!(
+        lost.recovery_reason_code.as_deref(),
+        Some("runner_recovery_deadline_exceeded")
+    );
+}
+
+#[tokio::test]
+async fn sweep_only_transitions_expired_jobs_and_leaves_recent_recovering() {
+    let registry = ShellClientRegistry::default();
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    // Two jobs: one aged past the deadline, one that just entered recovery.
+    let (expired, _) = start_and_take_over(&registry, INSTANCE_A).await;
+    let (fresh, _) = start_and_take_over(&registry, INSTANCE_A).await;
+    // A single transport disconnect drives both into `recovering`.
+    registry.reconcile_disconnect(CLIENT_ID, INSTANCE_A).await;
+    assert_eq!(
+        registry.get_job(&expired.job_id).await.unwrap().status,
+        "recovering"
+    );
+    assert_eq!(
+        registry.get_job(&fresh.job_id).await.unwrap().status,
+        "recovering"
+    );
+    age_recovering_since(&registry, &expired.job_id, job_recovery_grace_secs() + 1).await;
+    age_recovering_since(&registry, &fresh.job_id, 1).await;
+
+    recovery_timeout_sweep(&registry).await;
+    assert_eq!(
+        registry.get_job(&expired.job_id).await.unwrap().status,
+        "lost"
+    );
+    assert_eq!(
+        registry.get_job(&fresh.job_id).await.unwrap().status,
+        "recovering",
+        "non-expired recovering job is left alone by the sweep"
     );
 }

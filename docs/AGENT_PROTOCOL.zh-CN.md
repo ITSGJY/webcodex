@@ -73,14 +73,33 @@ register/ack 窗口内的状态变化。
 - 每个 stdout/stderr tail 最多 64 KiB；
 - 序列化 inventory 总计最多 1 MiB。
 
-可恢复断线后，已由 Runner 接管的 Job 最多 120 秒处于 `recovering`。同一实例的
-完整 inventory 会恢复实际状态、日志、归属和原 `job_id`；缺失项以
-`runner_inventory_missing` 变为 `lost`。不同 `agent_instance_id` 替换旧实例时，
-旧实例活动 Job 以 `runner_instance_replaced` 变为 `lost`，迟到的注册或 update
-继续被拒绝；新实例不会迁移或继承旧实例的 Job。旧实例迟到 disconnect 相对当前
-实例是 no-op —— 既不清除当前 notifier，也不把当前实例的 Job 标记为
-lost/recovering —— 但旧实例的 Job 在替换时已终结为 `lost`。尚未分发的
-Server queue entry 不会重放。
+可恢复断线后，已由 Runner 接管的 Job 在有界 grace window 内处于 `recovering`
+（默认 120 秒，可通过 `WEBCODEX_JOB_RECOVERY_GRACE_SECS` 覆盖，clamp ��� 5–3600 秒）。
+`recovering` 是有界而非永久状态：同一实例的完整 inventory 会恢复实际状态、日志、
+归属和原 `job_id`；缺失项以 `runner_inventory_missing` 变为 `lost`。不同
+`agent_instance_id` 替换旧实例时，旧实例活动 Job 以 `runner_instance_replaced`
+变为 `lost`，迟到的注册或 update 继续被拒绝；新实例不会迁移或继承旧实例的 Job。
+旧���例迟到 disconnect 相对当前实例是 no-op —— 既不清除当前 notifier，也不把当前
+实例的 Job 标记为 lost/recovering —— 但旧实例的 Job 在替换时已终结为 `lost`。
+尚未分发的 Server queue entry 不会重放。
+
+### 恢复超时扫描
+
+即便没有请求流量，进程内 sweep 也会按固定间隔运行，将 grace window 已到期的
+`recovering` Job 转为 terminal `lost`，reason 为
+`runner_recovery_deadline_exceeded`。sweep 有界（每轮转换数量有上限），仅在
+registry mutex 内做内存工作（锁内不做磁盘/网络/await），幂等且只设置一次
+`ended_at`。deadline 前完成 reconcile 的 Job 不会被置为 lost；stale connection 的
+Ping/Pong/metadata、重复 disconnect 或迟到 inventory 都不会延长 deadline
+（deadline 锚定在 Job 进入 `recovering` 时一次性写入的 `recovering_since`，而非
+client liveness）。
+
+deadline 是单个 Server 进程的属性，不是 durable record。Job Registry 是 Server
+内存状态，Server 重启会清空，deadline 不跨 Server 进程持久化。重启后的恢复依赖
+Runner 重新连接并提交 inventory：inventory 重新注册某 Job 时会开始一个全新的有界
+recovery window（本轮不保留重启前已消耗的恢复时间）；��� Runner 重启后永久不再连接，
+Server 没有该 Job 的 durable record，无法对未知 Job 执行 recovery timeout。durable
+的 Server 端 Job ledger 属于后续独立阶段，不在本轮实现。
 
 非法的 structured validation progress update 属于 executor protocol violation，
 而非可恢复的 transient 状态：乱序、回退或跳跃的 `completed` cursor、计划或 step
@@ -91,8 +110,11 @@ Job 进入 terminal `failed`，错误为有界、稳定且不泄露 payload 的
 旧序号重放保持幂等；已 terminal 的 Job 不会被迟到 update 或 register inventory 复活。
 
 本阶段要求 Runner 进程仍然存活且 `agent_instance_id` 不变。Runner 自身重启会
-丢失 child/process-group handle，无法恢复这些 Job。本机制不承诺通用的
-exactly-once command execution；`run_job` 调用级幂等属于后续独立阶段。
+丢失 child/process-group handle，无法恢复这些 Job。不声明
+`job_state_reconciliation` 的旧 Runner 保持保守的立即 `lost` 断线语义
+（`legacy_runner_disconnected`），永不进入 `recovering`；同 client 的新实例无法接管
+其已终结的 Job。本机制不承诺通用的 exactly-once command execution，也不提供跨
+Runner/跨机器的 Job 迁移；`run_job` 调用级幂等属于后续独立阶段。
 
 ## Policy summary
 
