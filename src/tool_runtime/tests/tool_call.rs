@@ -540,6 +540,38 @@ fn from_tool_name_parses_runtime_status() {
 }
 
 #[test]
+fn start_coding_task_defaults_to_continuation_and_requires_explicit_isolation() {
+    let call =
+        ToolCall::from_tool_name("start_coding_task", json!({"project": "agent:oe:demo"})).unwrap();
+    assert!(matches!(
+        call,
+        ToolCall::StartCodingTask {
+            bind_current: true,
+            new_session: false,
+            ..
+        }
+    ));
+
+    let isolated = ToolCall::from_tool_name(
+        "start_coding_task",
+        json!({
+            "project": "agent:oe:demo",
+            "bind_current": true,
+            "new_session": true
+        }),
+    )
+    .unwrap();
+    assert!(matches!(
+        isolated,
+        ToolCall::StartCodingTask {
+            bind_current: true,
+            new_session: true,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn from_tool_name_parses_finish_coding_task_workspace_projection_flag() {
     let call = ToolCall::from_tool_name(
         "finish_coding_task",

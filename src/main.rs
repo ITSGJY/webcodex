@@ -260,7 +260,14 @@ only for local/trusted-network demos."
             project_id = %runtime.context().project_id,
             profile = %runtime.context().profile,
             capabilities = connector_runtime::surface::CAPABILITY_NAMES.len(),
+            model_surface = connector_runtime::MODEL_SURFACE_CANONICAL_CONNECTOR,
             "Project-bound connector surface enabled"
+        );
+    } else {
+        tracing::warn!(
+            model_surface = connector_runtime::MODEL_SURFACE_FULL_OPERATOR_RUNTIME,
+            config = "WEBCODEX_CONNECTOR_SURFACE=task-v1",
+            "Canonical Connector is not configured; /mcp explicitly exposes the full operator runtime"
         );
     }
 

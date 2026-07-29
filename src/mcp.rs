@@ -252,9 +252,15 @@ pub async fn mcp_info(depot: &mut Depot, res: &mut Response) {
     let auth_required = crate::auth::get_config(depot)
         .map(|c| c.is_auth_enabled())
         .unwrap_or(false);
+    let connector_configured = depot
+        .obtain::<crate::connector_runtime::ConnectorRuntimeSlot>()
+        .ok()
+        .and_then(|slot| slot.0.as_ref())
+        .is_some();
     res.render(Json(json!({
         "name": "webcodex",
         "version": env!("CARGO_PKG_VERSION"),
+        "modelSurface": crate::connector_runtime::model_surface_name(connector_configured),
         "protocol": "mcp",
         "protocolVersion": MCP_PROTOCOL_VERSION,
         "transport": "streamable-http-jsonrpc",
@@ -526,7 +532,10 @@ async fn handle_mcp_request_with_lifecycle(
                 },
                 "serverInfo": {
                     "name": "webcodex",
-                    "version": env!("CARGO_PKG_VERSION")
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "modelSurface": crate::connector_runtime::model_surface_name(
+                        connector.is_some()
+                    )
                 }
             }),
         ),
@@ -791,6 +800,10 @@ mod tests {
                 assert_eq!(value["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
                 assert_eq!(value["result"]["serverInfo"]["name"], "webcodex");
                 assert!(value["result"]["serverInfo"]["version"].is_string());
+                assert_eq!(
+                    value["result"]["serverInfo"]["modelSurface"],
+                    crate::connector_runtime::MODEL_SURFACE_FULL_OPERATOR_RUNTIME
+                );
                 assert_eq!(
                     value["result"]["capabilities"]["tools"]["listChanged"],
                     false
@@ -1994,6 +2007,10 @@ mod tests {
         assert_eq!(body["jsonrpc"], "2.0");
         assert_eq!(body["id"], 1);
         assert_eq!(body["result"]["serverInfo"]["name"], "webcodex");
+        assert_eq!(
+            body["result"]["serverInfo"]["modelSurface"],
+            crate::connector_runtime::MODEL_SURFACE_FULL_OPERATOR_RUNTIME
+        );
         assert!(body["result"]["protocolVersion"].is_string());
         assert_eq!(
             body["result"]["capabilities"]["tools"]["listChanged"],
@@ -2049,6 +2066,17 @@ mod tests {
             "webcodex_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let runtime = Arc::new(test_runtime());
         let service = Service::new(build_connector_test_router(config, db, runtime, &project));
+
+        let mut discovery = TestClient::get("http://localhost/mcp")
+            .bearer_auth(user_token)
+            .send(&service)
+            .await;
+        assert_eq!(effective_status(&discovery), StatusCode::OK);
+        let discovery_body: Value = discovery.take_json().await.unwrap();
+        assert_eq!(
+            discovery_body["modelSurface"],
+            crate::connector_runtime::MODEL_SURFACE_CANONICAL_CONNECTOR
+        );
 
         let mut schema = TestClient::get("http://localhost/openapi.json")
             .send(&service)
@@ -2113,7 +2141,7 @@ mod tests {
             .unwrap()
             .contains("initialize"));
 
-        let initialized = TestClient::post("http://localhost/mcp")
+        let mut initialized = TestClient::post("http://localhost/mcp")
             .bearer_auth(user_token)
             .json(&json!({
                 "jsonrpc": "2.0",
@@ -2130,6 +2158,11 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .expect("connector initialize session id")
             .to_string();
+        let initialized_body: Value = initialized.take_json().await.unwrap();
+        assert_eq!(
+            initialized_body["result"]["serverInfo"]["modelSurface"],
+            crate::connector_runtime::MODEL_SURFACE_CANONICAL_CONNECTOR
+        );
 
         let mut action_started = TestClient::post("http://localhost/api/connector/task/start")
             .bearer_auth(user_token)
@@ -2709,6 +2742,10 @@ mod tests {
         assert_eq!(body["name"], "webcodex");
         assert!(body["version"].is_string());
         assert_eq!(body["protocol"], "mcp");
+        assert_eq!(
+            body["modelSurface"],
+            crate::connector_runtime::MODEL_SURFACE_FULL_OPERATOR_RUNTIME
+        );
         assert!(body["protocolVersion"].is_string());
         assert_eq!(body["endpoint"], "/mcp");
         let methods = body["methods"].as_array().unwrap();

@@ -25,8 +25,8 @@ use crate::connector_runtime::workspace::{
 use crate::db::{
     ConnectorApproval, ConnectorApprovalGate, ConnectorBinding, ConnectorEditOperationGate,
     ConnectorExecutionReservation, ConnectorTaskContinuation, ConnectorTaskResult,
-    ConnectorTaskSnapshot, ConnectorTaskStoreError, ConnectorWorkspaceTransition,
-    NewConnectorResult, NewConnectorTask,
+    ConnectorTaskSnapshot, ConnectorTaskStoreError, ConnectorWindowBinding,
+    ConnectorWorkspaceTransition, NewConnectorResult, NewConnectorTask,
 };
 use crate::project_context::{
     capture_project_context, compare_project_context, ContextRefreshSummary,
@@ -53,6 +53,8 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 
 const CONNECTOR_SURFACE_ENV: &str = "WEBCODEX_CONNECTOR_SURFACE";
 const CONNECTOR_SURFACE_TASK_V1: &str = "task-v1";
+pub(crate) const MODEL_SURFACE_CANONICAL_CONNECTOR: &str = "canonical_connector";
+pub(crate) const MODEL_SURFACE_FULL_OPERATOR_RUNTIME: &str = "full_operator_runtime";
 const MAX_EVENT_COUNT: usize = 50;
 /// Guidance messages delivered in one capability response. Bounded so a burst
 /// cannot bloat a response; the rest is claimed by the next one.
@@ -227,6 +229,7 @@ impl ConnectorRuntime {
         for warning in workspace.recover(&context, &preserved) {
             tracing::warn!(project_id = %context.project_id, warning = %warning, "Connector workspace recovery was incomplete");
         }
+        tools.observations.set_connector_configured();
         Ok(Self {
             tools,
             db,
@@ -269,9 +272,6 @@ impl ConnectorRuntime {
             "local-owner".to_string(),
             Path::new(&agent_token_path),
         )?;
-        // The connector endpoint layer distinguishes not_configured from
-        // not_observed; mark the surface as configured for this process.
-        tools.observations.set_connector_configured();
         Ok(ConnectorRuntimeSlot(Some(Arc::new(
             Self::new(tools, db, context, credential)?.with_project_agent_token(agent_token),
         ))))
@@ -743,27 +743,19 @@ impl ConnectorRuntime {
                         .await;
                 }
                 if task.run_status == "interrupted" && task.task_status == "needs_attention" {
-                    let cursor = match self.db.append_interrupted_connector_instruction(
+                    let window = window.expect("existing window context has a window");
+                    let cursor = match self.db.append_interrupted_connector_instruction_and_bind(
                         &task.task_id,
                         &self.context.project_id,
                         subject_id,
                         goal,
                         mode,
                         now,
+                        connector_window_binding(window, &fingerprint, now),
                     ) {
                         Ok(cursor) => cursor,
                         Err(error) => return store_error_outcome(error, Some(&task)),
                     };
-                    let window = window.expect("existing window context has a window");
-                    if let Err(error) = self.persist_window_context(
-                        window,
-                        subject_id,
-                        &task.task_id,
-                        &fingerprint,
-                        now,
-                    ) {
-                        return store_error_outcome(error, Some(&task));
-                    }
                     let navigation = self.db.activate_window_project(
                         subject_id,
                         window.key(),
@@ -802,7 +794,7 @@ impl ConnectorRuntime {
             Ok(prepared) => prepared,
             Err(outcome) => return outcome,
         };
-        let task = match self.db.start_connector_task(NewConnectorTask {
+        let new_task = NewConnectorTask {
             task_id: &task_id,
             run_id: &run_id,
             project_id: &self.context.project_id,
@@ -818,7 +810,15 @@ impl ConnectorRuntime {
             baseline_tree: prepared.baseline_tree.as_deref(),
             isolated: prepared.isolated,
             now,
-        }) {
+        };
+        let stored = match window {
+            Some(window) => self.db.start_connector_task_and_bind(
+                new_task,
+                connector_window_binding(window, &fingerprint, now),
+            ),
+            None => self.db.start_connector_task(new_task),
+        };
+        let task = match stored {
             Ok(task) => task,
             Err(error) => {
                 if let Some(cleanup) = self
@@ -831,11 +831,6 @@ impl ConnectorRuntime {
             }
         };
         let navigation = if let Some(window) = window {
-            if let Err(error) =
-                self.persist_window_context(window, subject_id, &task.task_id, &fingerprint, now)
-            {
-                return store_error_outcome(error, Some(&task));
-            }
             Some(
                 self.db
                     .activate_window_project(subject_id, window.key(), &project_identity),
@@ -1041,7 +1036,7 @@ impl ConnectorRuntime {
                 baseline_commit: prepared.baseline_commit.as_deref().unwrap_or_default(),
                 baseline_tree: prepared.baseline_tree.as_deref().unwrap_or_default(),
             });
-        let (continued, cursor, previous_mode) = match self.db.continue_connector_task(
+        let (continued, cursor, previous_mode) = match self.db.continue_connector_task_and_bind(
             ConnectorTaskContinuation {
                 task_id: &task.task_id,
                 project_id: &self.context.project_id,
@@ -1051,6 +1046,7 @@ impl ConnectorRuntime {
                 workspace,
                 now,
             },
+            connector_window_binding(window, fingerprint, now),
         ) {
             Ok(continued) => continued,
             Err(error) => {
@@ -1065,15 +1061,6 @@ impl ConnectorRuntime {
                 return store_error_outcome(error, Some(&task));
             }
         };
-        if let Err(error) = self.persist_window_context(
-            window,
-            &continued.owner_subject_id,
-            &continued.task_id,
-            fingerprint,
-            now,
-        ) {
-            return store_error_outcome(error, Some(&continued));
-        }
         let navigation = self.db.activate_window_project(
             &continued.owner_subject_id,
             window.key(),
@@ -2406,6 +2393,11 @@ impl ConnectorRuntime {
                 previous.as_ref().map(|context| &context.fingerprint),
                 &fingerprint,
             );
+            if let Err(error) =
+                self.persist_window_context(window, subject_id, &task.task_id, &fingerprint, now)
+            {
+                return store_error_outcome(error, Some(&task));
+            }
             let navigation = self.db.activate_window_project(
                 subject_id,
                 window.key(),
@@ -2414,11 +2406,6 @@ impl ConnectorRuntime {
                     self.context.project_id, fingerprint.project_root_sha256
                 ),
             );
-            if let Err(error) =
-                self.persist_window_context(window, subject_id, &task.task_id, &fingerprint, now)
-            {
-                return store_error_outcome(error, Some(&task));
-            }
             json!({
                 "window_rebound": true,
                 "context": context_refresh_payload(&refresh),
@@ -3218,6 +3205,14 @@ impl ConnectorRuntime {
             .replace(&self.context.runs_root, "<managed-runs>")
             .replace(&self.context.results_root, "<managed-results>")
             .replace(&self.context.projects_dir, "<managed-projects>")
+    }
+}
+
+pub(crate) fn model_surface_name(connector_configured: bool) -> &'static str {
+    if connector_configured {
+        MODEL_SURFACE_CANONICAL_CONNECTOR
+    } else {
+        MODEL_SURFACE_FULL_OPERATOR_RUNTIME
     }
 }
 
@@ -4031,17 +4026,37 @@ fn context_refresh_payload(refresh: &ContextRefreshSummary) -> Value {
     json!({
         "reused": refresh.reused,
         "refreshed": refresh.refreshed,
+        "partial": refresh.partial,
+        "unknown": refresh.unknown,
+        "warnings": refresh.warnings,
         "rules": {
             "reused": refresh.rules.reused,
             "refreshed": refresh.rules.refreshed,
-            "removed": refresh.rules.removed
+            "removed": refresh.rules.removed,
+            "unknown": refresh.rules.unknown
         },
         "manifests": {
             "reused_count": refresh.manifests.reused.len(),
             "refreshed": refresh.manifests.refreshed,
-            "removed": refresh.manifests.removed
+            "removed": refresh.manifests.removed,
+            "unknown": refresh.manifests.unknown
         }
     })
+}
+
+fn connector_window_binding<'a>(
+    window: &'a ClientWindow,
+    fingerprint: &'a ProjectContextFingerprint,
+    now: i64,
+) -> ConnectorWindowBinding<'a> {
+    ConnectorWindowBinding {
+        window_key: window.key(),
+        window_source: window.source(),
+        project_root_sha256: &fingerprint.project_root_sha256,
+        target_path: &fingerprint.target_directory,
+        fingerprint,
+        now,
+    }
 }
 
 fn navigation_payload(
@@ -5566,6 +5581,148 @@ pub(crate) mod tests {
             "guidance is claimed exactly once: {}",
             review_again.body
         );
+    }
+
+    #[tokio::test]
+    async fn failed_task_binding_releases_prepared_workspace_for_retry() {
+        use crate::shell_protocol::{ShellAgentPollRequest, ShellAgentResultRequest};
+
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        init_repo(&project);
+        let registry = Arc::new(ShellClientRegistry::default());
+        register_agent(&registry, "project", &project.to_string_lossy()).await;
+        let db = Arc::new(Database::open(&temp.path().join("connector.db")).unwrap());
+        let connector = ConnectorRuntime::new(
+            Arc::new(ToolRuntime::new_for_tests_with_shell_clients(
+                registry.clone(),
+            )),
+            db.clone(),
+            ConnectorContext {
+                project_id: "wc_proj_compensation1".to_string(),
+                project_name: "compensation".to_string(),
+                workspace_id: "wc_ws_compensation1".to_string(),
+                executor_project: "agent:hosted:project".to_string(),
+                executor_root: project.to_string_lossy().to_string(),
+                runs_root: temp.path().join("state/runs").to_string_lossy().to_string(),
+                results_root: temp
+                    .path()
+                    .join("state/results")
+                    .to_string_lossy()
+                    .to_string(),
+                projects_dir: temp
+                    .path()
+                    .join("state/agent/projects.d")
+                    .to_string_lossy()
+                    .to_string(),
+                profile: "personal".to_string(),
+                project_grant_id: PROJECT_GRANT_ID.to_string(),
+            },
+            credential(),
+        )
+        .unwrap();
+        db.conn_for_tests()
+            .execute_batch(
+                "CREATE TRIGGER wc_test_fail_connector_binding
+                 BEFORE INSERT ON wc_window_project_contexts
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected connector binding failure');
+                 END;",
+            )
+            .unwrap();
+
+        let responder_registry = registry.clone();
+        let responder = tokio::spawn(async move {
+            let mut registrations = 0;
+            for _ in 0..2_000 {
+                if let Some(request) = responder_registry
+                    .poll(ShellAgentPollRequest {
+                        client_id: "hosted".to_string(),
+                        agent_instance_id: "instance".to_string(),
+                        projects: None,
+                    })
+                    .await
+                    .unwrap()
+                {
+                    assert_eq!(request.kind, "register_project");
+                    let payload: Value =
+                        serde_json::from_str(request.stdin.as_deref().unwrap()).unwrap();
+                    responder_registry
+                        .complete(ShellAgentResultRequest {
+                            client_id: "hosted".to_string(),
+                            agent_instance_id: "instance".to_string(),
+                            request_id: request.request_id,
+                            exit_code: Some(0),
+                            stdout: Some(
+                                json!({
+                                    "agent_project_id": payload["id"],
+                                    "client_id": "hosted",
+                                    "name": payload["name"],
+                                    "path": payload["path"],
+                                    "allow_patch": true
+                                })
+                                .to_string(),
+                            ),
+                            stderr: Some(String::new()),
+                            duration_ms: Some(1),
+                            error: None,
+                        })
+                        .await
+                        .unwrap();
+                    registrations += 1;
+                    if registrations == 2 {
+                        return;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            panic!("connector did not issue both workspace registrations");
+        });
+
+        let owner = auth("u1");
+        let window = ClientWindow::for_test("compensation-window");
+        let failed = connector
+            .call_for_window(
+                "task_start",
+                json!({"goal": "first attempt", "mode": "normal"}),
+                Some(&owner),
+                ConnectorTransport::Mcp,
+                Some(&window),
+            )
+            .await;
+        assert!(!failed.ok);
+        assert!(db
+            .connector_tasks_for_subject(&connector.context.project_id, PROJECT_SUBJECT_ID, 10)
+            .unwrap()
+            .is_empty());
+        let lease = temp.path().join("state/runs/.wc-slot-write-01.lease.json");
+        let registration = temp
+            .path()
+            .join("state/agent/projects.d/wc-slot-write-01.toml");
+        assert!(!lease.exists(), "failed start retained the workspace lease");
+        assert!(
+            !registration.exists(),
+            "failed start retained the managed project registration"
+        );
+
+        db.conn_for_tests()
+            .execute_batch("DROP TRIGGER wc_test_fail_connector_binding;")
+            .unwrap();
+        let retried = connector
+            .call_for_window(
+                "task_start",
+                json!({"goal": "retry after rollback", "mode": "normal"}),
+                Some(&owner),
+                ConnectorTransport::Mcp,
+                Some(&window),
+            )
+            .await;
+        responder.await.unwrap();
+        assert!(retried.ok, "{}", retried.body);
+        let tasks = db
+            .connector_tasks_for_subject(&connector.context.project_id, PROJECT_SUBJECT_ID, 10)
+            .unwrap();
+        assert_eq!(tasks.len(), 1, "retry created duplicate active contexts");
     }
 
     #[tokio::test]

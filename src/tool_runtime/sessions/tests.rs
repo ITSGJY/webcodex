@@ -125,6 +125,25 @@ fn input_summary_redacts_sensitive_keys() {
     );
 }
 
+#[test]
+fn coding_instruction_redacts_reusable_credentials_without_truncating_normal_goals() {
+    assert_eq!(
+        super::util::redact_and_bound_instruction(
+            "continue with wc_pat_never_persist_this_value",
+            super::model::MAX_CODING_INSTRUCTION_CHARS,
+        ),
+        "[redacted]"
+    );
+    let goal = "x".repeat(1_000);
+    assert_eq!(
+        super::util::redact_and_bound_instruction(
+            &goal,
+            super::model::MAX_CODING_INSTRUCTION_CHARS,
+        ),
+        goal
+    );
+}
+
 fn persistent_store(path: PathBuf) -> SessionStore {
     SessionStore::with_persistence(path, 10, 10)
 }
@@ -732,6 +751,7 @@ fn test_binding_key(project: &str) -> CurrentSessionKey {
         transport: SessionTransport::Api.as_str().to_string(),
         window_key: "window-1".to_string(),
         resolved_project: project.to_string(),
+        repository_root_key: format!("root:{project}"),
     }
 }
 

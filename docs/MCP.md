@@ -28,10 +28,28 @@ tunnel, or expose a public port. Production enrollment, scoped user tokens, and
 OAuth are described in [AUTH_MODEL.md](AUTH_MODEL.md) and
 [DEPLOYMENT.md](DEPLOYMENT.md).
 
+## Model Surface Selection
+
+MCP exposes one model surface selected at server startup:
+
+- `WEBCODEX_CONNECTOR_SURFACE=task-v1`, together with the complete Connector
+  project configuration written by `webcodex setup`, selects
+  `canonical_connector` and the twelve project-bound capabilities below.
+- If that variable is absent, `/mcp` exposes `full_operator_runtime`. The
+  server emits a startup warning; this is an operator/debug surface, not an
+  implicit Connector with Connector continuity claims.
+- An unsupported surface value or incomplete Connector configuration is a
+  startup configuration error; it does not fall through to another surface.
+
+`GET /mcp` and MCP `initialize.serverInfo` report the selection as
+`modelSurface`. On the full operator surface, `runtime_status.model_surface`
+reports the same fact. The standard ordinary-user setup selects
+`canonical_connector`; the full runtime remains available only when an
+operator deliberately runs without Connector configuration.
+
 ## Project-Bound Surface
 
-When the runtime is started from `webcodex setup`, MCP `tools/list` contains
-exactly:
+When `modelSurface=canonical_connector`, MCP `tools/list` contains exactly:
 
 ```text
 task_start
@@ -63,9 +81,18 @@ project ID, executor reference, or workflow session.
 
 Before reuse, WebCodex compares the repository path, branch and HEAD, worktree,
 applicable repository rules, and project manifests. Unchanged context is
-reused; only changed slices are reported as refreshed. `task_list` and
-`task_resume` are explicit recovery tools for a client that lost its MCP
-transport session, not steps in the ordinary loop.
+reused; only changed slices are reported as refreshed. If a bounded scan cannot
+prove a slice complete, the response marks it partial/unknown and includes a
+compact warning instead of claiming reuse. `task_list` and `task_resume` are
+explicit recovery tools for a client that lost its MCP transport session, not
+steps in the ordinary loop.
+
+On `full_operator_runtime`, ordinary coding starts or continues with
+`start_coding_task`. A stable window continues the same repository by default;
+switching repositories changes context and switching back restores the prior
+Workflow Session. `new_session=true` is the explicit advanced isolation
+request. These current bindings are process-local, so retain the returned
+session id for explicit recovery after a server restart.
 
 The stable IDs have product purposes between model tools and host review, but
 ordinary users do not manage them:

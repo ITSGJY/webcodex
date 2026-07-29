@@ -6,6 +6,7 @@ use super::tool_definition::{
 use super::{ToolCall, ToolResult};
 use crate::auth::AuthContext;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 pub(crate) const SESSION_PROJECT_MISMATCH_KIND: &str = "session_project_mismatch";
 pub(crate) const ALLOW_CROSS_PROJECT_SESSION_FIELD: &str = "allow_cross_project_session";
@@ -265,6 +266,7 @@ pub(crate) fn current_session_key(
     auth: Option<&AuthContext>,
     transport: sessions::SessionTransport,
     resolved_project: &str,
+    repository_root: &str,
     window: Option<&crate::client_window::ClientWindow>,
 ) -> Result<sessions::CurrentSessionKey, String> {
     let (principal_kind, principal_id) = current_session_principal(auth)?;
@@ -279,7 +281,15 @@ pub(crate) fn current_session_key(
         transport: transport.as_str().to_string(),
         window_key: window.key().to_string(),
         resolved_project: resolved_project.to_string(),
+        repository_root_key: canonical_repository_key(repository_root),
     })
+}
+
+fn canonical_repository_key(repository_root: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"webcodex.workflow-repository-root.v1\0");
+    hasher.update(repository_root.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 pub(crate) fn current_session_principal(

@@ -159,12 +159,19 @@ layer is never presented as callable.
 | `server_registration` | `registered` \| `stale` \| `not_observed` | `stale` means `registration_instance_disconnected`. Facts: `runner_instance`, `registered_at`, `last_refreshed_at`. |
 | `project_registry` | `registered` \| `stale` \| `not_configured` | `stale` means `providing_runner_disconnected`; `not_configured` means `no_projects_registered`. Counts registered/online projects. |
 | `connector_endpoint` | `not_configured` \| `not_observed` \| `ready` \| `unknown` | `not_configured` when the connector runtime is disabled; `not_observed` (`no_connector_requests_observed`) until a real readiness probe (`/connector/readiness`) or successful connector request is seen. |
-| `session_binding` | `not_observed` (runtime_status) / `bound` \| `not_bound` (start_coding_task) | Full-runtime bindings are process-local and window+principal+transport+project scoped. `runtime_status` reports `not_observed` with reason `binding_is_process_local_and_principal_scoped`, `process_local=true`, `lost_after_restart=true`. Connector Task continuity uses a separate durable exact window/project map. |
+| `session_binding` | `not_observed` (runtime_status) / `bound` \| `not_bound` (start_coding_task) | Full-runtime bindings are process-local and window+principal+transport+project+canonical-root scoped. `runtime_status` reports `not_observed` with reason `binding_is_process_local_and_principal_scoped`, `process_local=true`, `lost_after_restart=true`. Connector Task continuity uses a separate durable exact window/project map. |
 | `last_successful_tool_call` | `observed` \| `not_observed` | Scoped by principal/project/surface/session/tool. Only successful meaningful calls are recorded — `runtime_status`, `list_tools`, `list_agents`, `list_projects`, and `tool_manifest` never refresh it. Bounded in-memory store; no arguments, outputs, or secrets. |
 
 After a server restart, session bindings are lost by design. The correct
 recovery is to continue with the explicit durable `wc_sess_*` session id — do
 not restart the runner to "fix" a `not_bound` binding.
+
+`runtime_status.model_surface` reports `canonical_connector` or
+`full_operator_runtime`. MCP GET and initialize expose the same selection as
+`modelSurface`. Complete `WEBCODEX_CONNECTOR_SURFACE=task-v1` configuration
+selects the Connector; an absent variable intentionally exposes the full
+operator MCP surface and emits a startup warning. Invalid or incomplete
+Connector configuration fails startup instead of falling through.
 
 `runtime_status` also reports `version_compatibility`:
 
@@ -481,15 +488,22 @@ create and close out a session while keeping all continuity explicit.
   "params": {
     "project": "agent:workstation:my-repo",
     "title": "fix authentication bug",
-    "detail": "standard",
-    "bind_current": false
+    "detail": "standard"
   }
 }
 ```
 
-Returns a `wc_sess_*` session id in `output.session.session_id`. Keep that id
-and pass it explicitly to subsequent project tools. `detail` is the canonical
-startup projection:
+With a stable client window, the default ensures or continues the current
+Workflow Session for the exact repository and appends `title` as the current
+instruction. Switching repositories preserves separate contexts and switching
+back restores the earlier one. Use `new_session=true` only for an explicitly
+isolated task; title differences do not create sessions. Use
+`bind_current=false` only to opt out of automatic continuation.
+
+The call returns a `wc_sess_*` session id in `output.session.session_id`. Keep
+that id for tools that require explicit business input and for recovery after a
+server restart; the automatic current binding itself is process-local.
+`detail` is the canonical startup projection:
 
 - `minimal`: session id, resolved project, branch/head/workspace state, compact
   runtime/readiness layers, semantic-navigation summary, hard blockers, and

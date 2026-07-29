@@ -93,7 +93,35 @@ handoff, and finish can reason about the same unit of work.
 | Module | `tool_runtime::sessions` (model, store, events, JSON persistence) |
 | Primary store | In-memory session store |
 | Durability | JSON-oriented session ledger (bounded events/messages per session) |
-| Current-session map | In-memory bindings isolated by client window, principal, transport, and resolved project |
+| Current-session map | In-memory bindings isolated by client window, principal, transport, resolved project, and canonical repository-root hash |
+
+### Full-runtime coding continuity
+
+`start_coding_task` is the ordinary start-or-continue aggregate on the full
+operator surface. With a stable transport window, its default behavior is:
+
+- no valid binding creates and binds one active Workflow Session;
+- an exact repository binding reuses that Session and appends the accepted
+  instruction as a `task_instruction` event;
+- switching repositories preserves independent bindings, and switching back
+  restores the earlier Session;
+- `inspect`/`read_only` to `normal` rechecks project-write scope and changes
+  mode/guards without changing Session identity;
+- `new_session=true` explicitly creates an isolated Session without closing or
+  rewriting the previous one.
+
+The first instruction remains the root title. Later instructions record their
+timestamp, requested mode/guards, capability-change result, and context-refresh
+fact without overwriting that root. Session create/update, instruction event,
+and current binding mutate under one store lock; a failed pre-commit check
+leaves all three unchanged. A title change is never an isolation signal.
+
+The binding is process-local; the bounded ledger is durable. After restart,
+automatic window continuity starts fresh and cannot guess a replacement
+window. An explicit durable Workflow Session id still restores the existing
+ledger. This is intentionally different storage from the Connector's durable
+window/project/Task map, while presenting the same ordinary window/repository
+semantics.
 
 ### Current lifecycle contract
 

@@ -183,6 +183,14 @@ Ordinary coding does not need `list_projects`, `runtime_status`,
 `tool_manifest`, `start_session`, `current_session`, Agent listing, or project
 registration calls.
 
+`webcodex setup` selects this ordinary-user surface with
+`WEBCODEX_CONNECTOR_SURFACE=task-v1`. A server started without Connector
+configuration exposes the full operator runtime on `/mcp` and logs an explicit
+warning; `GET /mcp` and MCP initialize identify the active surface. The full
+runtime's `start_coding_task` has the same window/repository start-or-continue
+semantics, but its current binding is process-local and its broader tool set is
+intended for operator and debugging workflows.
+
 Normal writable tasks must run structured checks before `task_finish`. The
 result remains isolated until a human reviews and accepts it locally. The same
 host-local human authority is reachable two ways — the offline CLI and the

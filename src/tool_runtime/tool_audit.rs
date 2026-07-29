@@ -837,7 +837,7 @@ impl ToolCall {
                 deny_shell_tools,
                 detail,
                 bind_current,
-                ..
+                new_session,
             } => serde_json::json!({
                 "project": project,
                 "title": title,
@@ -846,6 +846,7 @@ impl ToolCall {
                 "deny_shell_tools": deny_shell_tools,
                 "detail": detail,
                 "bind_current": bind_current,
+                "new_session": new_session,
             }),
             Self::FinishCodingTask {
                 project,

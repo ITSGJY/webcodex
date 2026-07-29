@@ -10,12 +10,14 @@ use super::events::{
 };
 use super::model::{
     PersistedSessionLedger, PersistedSessionRecord, SessionEvent, SessionGuards, SessionMessage,
-    SessionRecord, DEFAULT_MAX_MESSAGES_PER_SESSION, EVENT_ID_PREFIX, MAX_INPUT_ARRAY_ITEMS,
-    MAX_MESSAGE_CHARS, MAX_MESSAGE_RESOLUTION_CHARS, MESSAGE_ID_PREFIX, SESSION_LEDGER_VERSION,
+    SessionRecord, DEFAULT_MAX_MESSAGES_PER_SESSION, EVENT_ID_PREFIX, MAX_CODING_INSTRUCTION_CHARS,
+    MAX_INPUT_ARRAY_ITEMS, MAX_MESSAGE_CHARS, MAX_MESSAGE_RESOLUTION_CHARS, MESSAGE_ID_PREFIX,
+    SESSION_LEDGER_VERSION,
 };
 use super::query::validate_message_tags;
 use super::util::{
-    bound_chars, bound_event_error_summary, bound_summary_string, redact_and_bound_value,
+    bound_chars, bound_event_error_summary, bound_summary_string, redact_and_bound_instruction,
+    redact_and_bound_value,
 };
 
 impl PersistedSessionRecord {
@@ -224,6 +226,18 @@ pub(super) fn sanitize_persisted_event(
         .filter(|path| !path.is_empty())
         .collect();
     event.job_id = event.job_id.map(|value| bound_summary_string(value.trim()));
+    event.instruction = event
+        .instruction
+        .map(|value| redact_and_bound_instruction(value.trim(), MAX_CODING_INSTRUCTION_CHARS))
+        .filter(|value| !value.is_empty());
+    event.requested_mode = event
+        .requested_mode
+        .map(|value| bound_summary_string(value.trim()))
+        .filter(|value| !value.is_empty());
+    event.previous_mode = event
+        .previous_mode
+        .map(|value| bound_summary_string(value.trim()))
+        .filter(|value| !value.is_empty());
     event.input_summary = event
         .input_summary
         .map(|value| redact_and_bound_value(&value));

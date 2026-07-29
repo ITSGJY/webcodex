@@ -1091,6 +1091,7 @@ async fn finish_coding_task_validation_available_when_ledger_has_validation_even
                 deny_write_tools: false,
                 deny_shell_tools: false,
                 bind_current: false,
+                new_session: false,
             },
             Some(&auth),
         )

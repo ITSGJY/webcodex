@@ -90,6 +90,7 @@ pub(crate) const ACCEPTED_FLATTENED_ARG_PREFERRED_ORDER: &[&str] = &[
     "deny_shell_tools",
     "detail",
     "bind_current",
+    "new_session",
     "compact",
     "purpose",
     "shell",

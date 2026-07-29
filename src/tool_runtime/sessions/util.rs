@@ -68,6 +68,14 @@ pub(super) fn bound_summary_string(value: &str) -> String {
     bound_chars(value, MAX_SUMMARY_STRING_CHARS)
 }
 
+pub(super) fn redact_and_bound_instruction(value: &str, max_chars: usize) -> String {
+    if looks_like_secret_string(value) {
+        "[redacted]".to_string()
+    } else {
+        bound_chars(value, max_chars)
+    }
+}
+
 pub(super) fn bound_event_error_summary(value: &str, shell_like: bool) -> String {
     if !shell_like {
         return bound_summary_string(value);

@@ -20,6 +20,7 @@ impl ToolRuntime {
                 deny_shell_tools,
                 detail,
                 bind_current,
+                new_session,
             } => {
                 self.start_coding_task(
                     project,
@@ -29,6 +30,7 @@ impl ToolRuntime {
                     deny_shell_tools,
                     detail,
                     bind_current,
+                    new_session,
                     auth,
                     transport,
                     window,

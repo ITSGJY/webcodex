@@ -263,6 +263,9 @@ impl ToolRuntime {
 
         let mut output = json!({
             "service": "webcodex",
+            "model_surface": crate::connector_runtime::model_surface_name(
+                self.observations.connector_configured()
+            ),
             "version": env!("CARGO_PKG_VERSION"),
             "build": crate::build_info::runtime_build_info(),
             "server_time": now,
@@ -306,6 +309,10 @@ pub(crate) fn compact_runtime_status(status: &Value) -> Value {
     json!({
         "compact": true,
         "service": status.get("service").cloned().unwrap_or_else(|| json!("webcodex")),
+        "model_surface": status
+            .get("model_surface")
+            .cloned()
+            .unwrap_or_else(|| json!(crate::connector_runtime::MODEL_SURFACE_FULL_OPERATOR_RUNTIME)),
         "version": status.get("version").cloned().unwrap_or(Value::Null),
         "build": {
             "version": status.get("version").cloned().unwrap_or(Value::Null),

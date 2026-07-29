@@ -1116,6 +1116,7 @@ async fn tool_manifest_reports_accepted_flattened_args_without_schemas() {
         "deny_shell_tools",
         "detail",
         "bind_current",
+        "new_session",
         "session_id",
         TOOL_CALL_RECORDING_SESSION_ID_FIELD,
     ] {
@@ -1468,11 +1469,33 @@ async fn runtime_status_includes_build_metadata() {
     let runtime = test_runtime();
     let result = runtime.dispatch(runtime_status_call()).await;
     assert!(result.success, "{:?}", result.error);
+    assert_eq!(
+        result.output["model_surface"],
+        crate::connector_runtime::MODEL_SURFACE_FULL_OPERATOR_RUNTIME
+    );
     let build = &result.output["build"];
     assert!(build.is_object());
     assert!(build.get("git_commit").is_some());
     assert!(build.get("git_dirty").is_some());
     assert!(build.get("built_at").is_some());
+}
+
+#[tokio::test]
+async fn runtime_status_reports_canonical_connector_surface_when_configured() {
+    let runtime = test_runtime();
+    runtime.observations.set_connector_configured();
+    let full = runtime.dispatch(runtime_status_call()).await;
+    assert_eq!(
+        full.output["model_surface"],
+        crate::connector_runtime::MODEL_SURFACE_CANONICAL_CONNECTOR
+    );
+    let compact = runtime
+        .dispatch(ToolCall::from_tool_name("runtime_status", json!({"compact": true})).unwrap())
+        .await;
+    assert_eq!(
+        compact.output["model_surface"],
+        crate::connector_runtime::MODEL_SURFACE_CANONICAL_CONNECTOR
+    );
 }
 
 #[tokio::test]

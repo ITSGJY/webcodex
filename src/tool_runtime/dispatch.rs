@@ -185,7 +185,13 @@ impl ToolRuntime {
         if use_current_session && call.session_id().is_none() && is_current_session_eligible(&call)
         {
             if let (Some(resolved), Some(window)) = (resolved_project.as_ref(), window) {
-                match current_session_key(auth, transport, &resolved.resolved_id, Some(window)) {
+                match current_session_key(
+                    auth,
+                    transport,
+                    &resolved.resolved_id,
+                    &resolved.config.path,
+                    Some(window),
+                ) {
                     Ok(key) => {
                         if let Some(session_id) = self.sessions.current_session_id(&key) {
                             call = call.with_effective_session_id(session_id);

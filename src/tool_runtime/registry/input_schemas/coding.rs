@@ -12,7 +12,8 @@ pub(crate) fn start_coding_task_input_schema() -> Value {
             },
             "title": {
                 "type": "string",
-                "description": "Optional human-readable task title for the created session."
+                "maxLength": 4000,
+                "description": "Optional current user instruction. On creation it is retained as the root task title; on continuation it is appended to the existing ledger and never overwrites the root title."
             },
             "mode": session_mode_schema("Optional session mode. Defaults to normal. inspect blocks structured write tools and runs shell/job-like tools in the Linux Landlock inspect sandbox; read_only blocks both write-like and shell/job-like tools."),
             "deny_write_tools": {
@@ -31,7 +32,13 @@ pub(crate) fn start_coding_task_input_schema() -> Value {
             },
             "bind_current": {
                 "type": "boolean",
-                "description": "If true, bind the new session as the window/caller/transport/project current session. Defaults to false. Binding is process-local in-memory control metadata."
+                "default": true,
+                "description": "Ensure and bind the window/caller/transport/project/repository current session. Defaults to true. Binding is process-local in-memory control metadata; a stable transport window is required for automatic reuse."
+            },
+            "new_session": {
+                "type": "boolean",
+                "default": false,
+                "description": "Explicit advanced isolation request. When true, create and bind a new Workflow Session without closing or rewriting the previous one. Title differences never imply a new session."
             }
         },
         "required": ["project"],

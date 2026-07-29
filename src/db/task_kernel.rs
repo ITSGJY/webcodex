@@ -60,6 +60,15 @@ pub(crate) struct ConnectorWorkspaceTransition<'a> {
     pub baseline_tree: &'a str,
 }
 
+pub(crate) struct ConnectorWindowBinding<'a> {
+    pub window_key: &'a str,
+    pub window_source: &'a str,
+    pub project_root_sha256: &'a str,
+    pub target_path: &'a str,
+    pub fingerprint: &'a ProjectContextFingerprint,
+    pub now: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConnectorWindowContext {
     pub task_id: String,
@@ -385,73 +394,21 @@ impl Database {
         fingerprint: &ProjectContextFingerprint,
         now: i64,
     ) -> Result<(), ConnectorTaskStoreError> {
-        if fingerprint.project_root_sha256 != project_root_sha256 {
-            return Err(ConnectorTaskStoreError::InvalidState(
-                "window context root identity does not match its fingerprint".to_string(),
-            ));
-        }
-        let fingerprint_json = serde_json::to_string(fingerprint)?;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        let owns_task = tx
-            .query_row(
-                "SELECT 1 FROM wc_tasks
-                 WHERE id = ?1 AND project_id = ?2 AND owner_subject_id = ?3",
-                params![task_id, project_id, subject_id],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if !owns_task {
-            return Err(ConnectorTaskStoreError::NotFound);
-        }
-        // A task has one controlling window. Explicit recovery therefore
-        // moves this lightweight binding instead of letting two windows
-        // concurrently inherit one active context. Durable task history is
-        // untouched.
-        tx.execute(
-            "DELETE FROM wc_window_project_contexts
-             WHERE task_id = ?1
-               AND NOT (
-                    window_key = ?2 AND project_id = ?3
-                    AND owner_subject_id = ?4 AND project_root_sha256 = ?5
-               )",
-            params![
-                task_id,
-                window_key,
-                project_id,
-                subject_id,
-                project_root_sha256
-            ],
-        )?;
-        tx.execute(
-            "INSERT INTO wc_window_project_contexts
-                (window_key, window_source, project_id, owner_subject_id,
-                 project_root_sha256, task_id, target_path, fingerprint_json,
-                 created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
-             ON CONFLICT(
-                window_key,
-                project_id,
-                owner_subject_id,
-                project_root_sha256
-             ) DO UPDATE SET
-                window_source = excluded.window_source,
-                task_id = excluded.task_id,
-                target_path = excluded.target_path,
-                fingerprint_json = excluded.fingerprint_json,
-                updated_at = excluded.updated_at",
-            params![
+        bind_window_context(
+            &tx,
+            task_id,
+            project_id,
+            subject_id,
+            ConnectorWindowBinding {
                 window_key,
                 window_source,
-                project_id,
-                subject_id,
                 project_root_sha256,
-                task_id,
                 target_path,
-                fingerprint_json,
-                now
-            ],
+                fingerprint,
+                now,
+            },
         )?;
         tx.commit()?;
         Ok(())
@@ -506,6 +463,22 @@ impl Database {
     pub(crate) fn start_connector_task(
         &self,
         task: NewConnectorTask<'_>,
+    ) -> Result<ConnectorTaskSnapshot, ConnectorTaskStoreError> {
+        self.start_connector_task_transaction(task, None)
+    }
+
+    pub(crate) fn start_connector_task_and_bind(
+        &self,
+        task: NewConnectorTask<'_>,
+        binding: ConnectorWindowBinding<'_>,
+    ) -> Result<ConnectorTaskSnapshot, ConnectorTaskStoreError> {
+        self.start_connector_task_transaction(task, Some(binding))
+    }
+
+    fn start_connector_task_transaction(
+        &self,
+        task: NewConnectorTask<'_>,
+        binding: Option<ConnectorWindowBinding<'_>>,
     ) -> Result<ConnectorTaskSnapshot, ConnectorTaskStoreError> {
         match task.mode {
             "normal"
@@ -595,6 +568,9 @@ impl Database {
             }),
             task.now,
         )?;
+        if let Some(binding) = binding {
+            bind_window_context(&tx, task.task_id, task.project_id, task.subject_id, binding)?;
+        }
         tx.commit()?;
 
         Ok(ConnectorTaskSnapshot {
@@ -620,9 +596,18 @@ impl Database {
         })
     }
 
-    pub(crate) fn continue_connector_task(
+    pub(crate) fn continue_connector_task_and_bind(
         &self,
         continuation: ConnectorTaskContinuation<'_>,
+        binding: ConnectorWindowBinding<'_>,
+    ) -> Result<(ConnectorTaskSnapshot, i64, String), ConnectorTaskStoreError> {
+        self.continue_connector_task_transaction(continuation, Some(binding))
+    }
+
+    fn continue_connector_task_transaction(
+        &self,
+        continuation: ConnectorTaskContinuation<'_>,
+        binding: Option<ConnectorWindowBinding<'_>>,
     ) -> Result<(ConnectorTaskSnapshot, i64, String), ConnectorTaskStoreError> {
         if !matches!(continuation.mode, "normal" | "inspect" | "read_only") {
             return Err(ConnectorTaskStoreError::InvalidState(
@@ -699,6 +684,15 @@ impl Database {
             }),
             continuation.now,
         )?;
+        if let Some(binding) = binding {
+            bind_window_context(
+                &tx,
+                &task.task_id,
+                continuation.project_id,
+                continuation.subject_id,
+                binding,
+            )?;
+        }
         tx.commit()?;
         let task = load_task(
             &conn,
@@ -713,7 +707,8 @@ impl Database {
     /// Record a follow-up instruction without pretending an interrupted run
     /// resumed. This is metadata-only and intentionally does not change mode,
     /// run status, or workspace ownership.
-    pub(crate) fn append_interrupted_connector_instruction(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_interrupted_connector_instruction_and_bind(
         &self,
         task_id: &str,
         project_id: &str,
@@ -721,6 +716,29 @@ impl Database {
         instruction: &str,
         requested_mode: &str,
         now: i64,
+        binding: ConnectorWindowBinding<'_>,
+    ) -> Result<i64, ConnectorTaskStoreError> {
+        self.append_interrupted_connector_instruction_transaction(
+            task_id,
+            project_id,
+            subject_id,
+            instruction,
+            requested_mode,
+            now,
+            Some(binding),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_interrupted_connector_instruction_transaction(
+        &self,
+        task_id: &str,
+        project_id: &str,
+        subject_id: &str,
+        instruction: &str,
+        requested_mode: &str,
+        now: i64,
+        binding: Option<ConnectorWindowBinding<'_>>,
     ) -> Result<i64, ConnectorTaskStoreError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -747,6 +765,9 @@ impl Database {
             now,
         )?;
         touch_task(&tx, task_id, now)?;
+        if let Some(binding) = binding {
+            bind_window_context(&tx, task_id, project_id, subject_id, binding)?;
+        }
         tx.commit()?;
         Ok(sequence)
     }
@@ -2382,6 +2403,80 @@ pub(super) fn insert_event(
     Ok(())
 }
 
+fn bind_window_context(
+    tx: &Transaction<'_>,
+    task_id: &str,
+    project_id: &str,
+    subject_id: &str,
+    binding: ConnectorWindowBinding<'_>,
+) -> Result<(), ConnectorTaskStoreError> {
+    if binding.fingerprint.project_root_sha256 != binding.project_root_sha256 {
+        return Err(ConnectorTaskStoreError::InvalidState(
+            "window context root identity does not match its fingerprint".to_string(),
+        ));
+    }
+    let fingerprint_json = serde_json::to_string(binding.fingerprint)?;
+    let owns_task = tx
+        .query_row(
+            "SELECT 1 FROM wc_tasks
+             WHERE id = ?1 AND project_id = ?2 AND owner_subject_id = ?3",
+            params![task_id, project_id, subject_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !owns_task {
+        return Err(ConnectorTaskStoreError::NotFound);
+    }
+    // A task has one controlling window. Explicit recovery therefore moves
+    // this lightweight binding rather than cloning active context.
+    tx.execute(
+        "DELETE FROM wc_window_project_contexts
+         WHERE task_id = ?1
+           AND NOT (
+                window_key = ?2 AND project_id = ?3
+                AND owner_subject_id = ?4 AND project_root_sha256 = ?5
+           )",
+        params![
+            task_id,
+            binding.window_key,
+            project_id,
+            subject_id,
+            binding.project_root_sha256
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO wc_window_project_contexts
+            (window_key, window_source, project_id, owner_subject_id,
+             project_root_sha256, task_id, target_path, fingerprint_json,
+             created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+         ON CONFLICT(
+            window_key,
+            project_id,
+            owner_subject_id,
+            project_root_sha256
+         ) DO UPDATE SET
+            window_source = excluded.window_source,
+            task_id = excluded.task_id,
+            target_path = excluded.target_path,
+            fingerprint_json = excluded.fingerprint_json,
+            updated_at = excluded.updated_at",
+        params![
+            binding.window_key,
+            binding.window_source,
+            project_id,
+            subject_id,
+            binding.project_root_sha256,
+            task_id,
+            binding.target_path,
+            fingerprint_json,
+            binding.now
+        ],
+    )?;
+    Ok(())
+}
+
 fn new_id(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4().simple())
 }
@@ -2433,6 +2528,48 @@ mod tests {
         .unwrap()
     }
 
+    fn fingerprint(root_sha256: &str, target_path: &str) -> ProjectContextFingerprint {
+        ProjectContextFingerprint {
+            schema_version: 2,
+            project_root_sha256: root_sha256.to_string(),
+            target_directory: target_path.to_string(),
+            git: crate::project_context::GitContextFingerprint {
+                available: true,
+                branch: Some("main".to_string()),
+                head: Some("0123456789abcdef".to_string()),
+                worktree_sha256: Some("f".repeat(64)),
+                dirty: Some(false),
+            },
+            rules: Vec::new(),
+            manifests: Vec::new(),
+            completeness: crate::project_context::FingerprintCompleteness::default(),
+        }
+    }
+
+    fn fail_window_context_inserts(db: &Database) {
+        db.conn_for_tests()
+            .execute_batch(
+                "CREATE TRIGGER wc_test_fail_window_context_insert
+                 BEFORE INSERT ON wc_window_project_contexts
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected window binding failure');
+                 END;",
+            )
+            .unwrap();
+    }
+
+    fn fail_window_context_updates(db: &Database) {
+        db.conn_for_tests()
+            .execute_batch(
+                "CREATE TRIGGER wc_test_fail_window_context_update
+                 BEFORE UPDATE ON wc_window_project_contexts
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected window binding failure');
+                 END;",
+            )
+            .unwrap();
+    }
+
     #[test]
     fn start_creates_task_run_and_first_monotonic_event() {
         let (_temp, db) = database();
@@ -2460,6 +2597,149 @@ mod tests {
             events.iter().map(|e| e.sequence).collect::<Vec<_>>(),
             vec![1, 2]
         );
+    }
+
+    #[test]
+    fn failed_initial_window_binding_rolls_back_task_run_and_event() {
+        let (_temp, db) = database();
+        bind(&db, "user:one");
+        fail_window_context_inserts(&db);
+        let task_id = new_id("wc_task");
+        let run_id = new_id("wc_run");
+        let root_sha256 = "a".repeat(64);
+        let fingerprint = fingerprint(&root_sha256, "");
+
+        let result = db.start_connector_task_and_bind(
+            NewConnectorTask {
+                task_id: &task_id,
+                run_id: &run_id,
+                project_id: "wc_proj_demo",
+                workspace_id: "wc_ws_demo",
+                subject_id: "user:one",
+                goal: "must roll back",
+                mode: "read_only",
+                target_executor_ref: "agent:hosted:demo",
+                execution_executor_ref: "agent:hosted:demo",
+                target_root: "/workspace/demo",
+                execution_root: "/workspace/demo",
+                baseline_commit: None,
+                baseline_tree: None,
+                isolated: false,
+                now: 101,
+            },
+            ConnectorWindowBinding {
+                window_key: "mcp:window-one",
+                window_source: "mcp_session",
+                project_root_sha256: &root_sha256,
+                target_path: "",
+                fingerprint: &fingerprint,
+                now: 101,
+            },
+        );
+        assert!(result.is_err());
+
+        let conn = db.conn_for_tests();
+        for table in [
+            "wc_tasks",
+            "wc_runs",
+            "wc_run_contexts",
+            "wc_task_events",
+            "wc_window_project_contexts",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} retained a partial start");
+        }
+    }
+
+    #[test]
+    fn failed_continuation_binding_rolls_back_mode_workspace_and_instruction() {
+        let (_temp, db) = database();
+        bind(&db, "user:one");
+        let task_id = new_id("wc_task");
+        let run_id = new_id("wc_run");
+        let root_sha256 = "b".repeat(64);
+        let fingerprint = fingerprint(&root_sha256, "src");
+        let task = db
+            .start_connector_task(NewConnectorTask {
+                task_id: &task_id,
+                run_id: &run_id,
+                project_id: "wc_proj_demo",
+                workspace_id: "wc_ws_demo",
+                subject_id: "user:one",
+                goal: "inspect first",
+                mode: "read_only",
+                target_executor_ref: "agent:hosted:demo",
+                execution_executor_ref: "agent:hosted:demo",
+                target_root: "/workspace/demo",
+                execution_root: "/workspace/demo",
+                baseline_commit: None,
+                baseline_tree: None,
+                isolated: false,
+                now: 101,
+            })
+            .unwrap();
+        db.bind_connector_window_context(
+            "mcp:window-one",
+            "mcp_session",
+            "wc_proj_demo",
+            "user:one",
+            &root_sha256,
+            &task.task_id,
+            "src",
+            &fingerprint,
+            102,
+        )
+        .unwrap();
+        fail_window_context_updates(&db);
+
+        let result = db.continue_connector_task_and_bind(
+            ConnectorTaskContinuation {
+                task_id: &task.task_id,
+                project_id: "wc_proj_demo",
+                subject_id: "user:one",
+                instruction: "upgrade atomically",
+                mode: "normal",
+                workspace: Some(ConnectorWorkspaceTransition {
+                    target_executor_ref: "agent:hosted:demo",
+                    execution_executor_ref: "agent:hosted:run",
+                    target_root: "/workspace/demo",
+                    execution_root: "/workspace/runs/upgraded",
+                    baseline_commit: "0123456789abcdef",
+                    baseline_tree: "fedcba9876543210",
+                }),
+                now: 103,
+            },
+            ConnectorWindowBinding {
+                window_key: "mcp:window-one",
+                window_source: "mcp_session",
+                project_root_sha256: &root_sha256,
+                target_path: "src",
+                fingerprint: &fingerprint,
+                now: 103,
+            },
+        );
+        assert!(result.is_err());
+
+        let restored = db
+            .connector_task(&task.task_id, "wc_proj_demo", "user:one")
+            .unwrap();
+        assert_eq!(restored.mode, "read_only");
+        assert!(!restored.isolated);
+        assert_eq!(restored.execution_root, "/workspace/demo");
+        assert_eq!(restored.event_cursor, 1);
+        let events = db
+            .connector_task_events(&task.task_id, "wc_proj_demo", "user:one", 10)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let context = db
+            .connector_window_context("mcp:window-one", "wc_proj_demo", "user:one", &root_sha256)
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.updated_at, 102);
     }
 
     #[test]

@@ -9,6 +9,13 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
         "runtime_status" => Some(wrapped_output_schema(vec![
             ("service", schema_type("string", "Runtime service name.")),
+            (
+                "model_surface",
+                schema_type(
+                    "string",
+                    "Configured MCP model surface: canonical_connector or full_operator_runtime.",
+                ),
+            ),
             ("version", schema_type("string", "Runtime version.")),
             (
                 "build",

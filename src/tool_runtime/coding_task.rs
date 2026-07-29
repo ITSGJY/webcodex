@@ -47,10 +47,33 @@ impl ToolRuntime {
         deny_shell_tools: bool,
         detail: StartupDetail,
         bind_current: bool,
+        new_session: bool,
         auth: Option<&AuthContext>,
         transport: SessionTransport,
         window: Option<&crate::client_window::ClientWindow>,
     ) -> ToolResult {
+        let title = match title {
+            Some(title) => {
+                let title = title.trim().to_string();
+                if title.is_empty()
+                    || title.chars().count() > sessions::MAX_CODING_INSTRUCTION_CHARS
+                {
+                    return ToolResult::err_with_output(
+                        format!(
+                            "title must contain 1..={} characters",
+                            sessions::MAX_CODING_INSTRUCTION_CHARS
+                        ),
+                        json!({
+                            "error_kind": "invalid_coding_instruction",
+                            "field": "title",
+                            "max_chars": sessions::MAX_CODING_INSTRUCTION_CHARS,
+                        }),
+                    );
+                }
+                Some(title)
+            }
+            None => None,
+        };
         // `detail` is the single startup projection control: full keeps the
         // complete runtime status, recent commits, rules, and tool manifest;
         // standard/minimal use the compact projections.
@@ -77,67 +100,26 @@ impl ToolRuntime {
         } else {
             None
         };
-        let session_summary =
-            self.sessions
-                .start_session_with_options(sessions::SessionCreateOptions {
-                    project: Some(resolved.resolved_id.clone()),
-                    title,
-                    mode,
-                    guards: sessions::SessionGuards::effective(
-                        mode,
-                        sessions::SessionGuards {
-                            deny_write_tools,
-                            deny_shell_tools,
-                        },
-                    ),
-                    project_instructions: project_instructions.clone(),
-                });
-
         let mut warnings = Vec::new();
-        let current_binding = if bind_current {
-            match current_session_key(auth, transport, &resolved.resolved_id, window) {
-                Ok(key) => match self
-                    .sessions
-                    .bind_current_session(key, &session_summary.session_id)
-                {
-                    Some(bound) => json!({
-                        "bound": true,
-                        "session_id": bound.session_id,
-                        "process_local_in_memory": true,
-                        "transport": transport.as_str(),
-                        "resolved_project": resolved.resolved_id.clone(),
-                    }),
-                    None => {
-                        warnings.push(json!({
-                            "kind": "current_binding_failed",
-                            "message": "new session could not be bound as current",
-                        }));
-                        json!({
-                            "bound": false,
-                            "process_local_in_memory": true,
-                            "transport": transport.as_str(),
-                        })
-                    }
-                },
+        let continuity_key = if bind_current {
+            match current_session_key(
+                auth,
+                transport,
+                &resolved.resolved_id,
+                &resolved.config.path,
+                window,
+            ) {
+                Ok(key) => Some(key),
                 Err(message) => {
                     warnings.push(json!({
                         "kind": "current_binding_unavailable",
                         "message": message,
                     }));
-                    json!({
-                        "bound": false,
-                        "process_local_in_memory": true,
-                        "transport": transport.as_str(),
-                        "error_kind": "current_session_unavailable",
-                    })
+                    None
                 }
             }
         } else {
-            json!({
-                "bound": false,
-                "process_local_in_memory": true,
-                "transport": transport.as_str(),
-            })
+            None
         };
 
         let mut runtime_status_call_failed = false;
@@ -156,6 +138,88 @@ impl ToolRuntime {
                 result.output
             }
         };
+        let git = self
+            .start_coding_task_git_summary(
+                &resolved.resolved_id,
+                include_recent_commits,
+                &mut warnings,
+            )
+            .await;
+        // Surface dirty/conflict worktree state at top-level so compact Action
+        // responses that omit full git payloads still keep the warning reason.
+        if !git.is_null() {
+            append_workspace_warnings(&workspace_payload_from_git_summary(&git), &mut warnings);
+        }
+        let binding_available = bind_current && continuity_key.is_some();
+        let write_scope_verified = auth.is_none_or(|auth| {
+            !auth.is_oauth_token() || auth.has_scope(crate::auth::SCOPE_PROJECT_WRITE)
+        });
+        let session_outcome =
+            match self
+                .sessions
+                .ensure_coding_session(sessions::CodingSessionRequest {
+                    key: continuity_key.clone(),
+                    project: resolved.resolved_id.clone(),
+                    instruction: title.clone(),
+                    mode,
+                    guards: sessions::SessionGuards {
+                        deny_write_tools,
+                        deny_shell_tools,
+                    },
+                    project_instructions: project_instructions.clone(),
+                    transport,
+                    bind_current: binding_available,
+                    new_session,
+                    // Startup always re-reads bounded current Git state and, for
+                    // full detail, the fixed project-instruction candidates.
+                    context_refreshed: true,
+                    write_scope_verified,
+                }) {
+                Ok(outcome) => outcome,
+                Err(sessions::CodingSessionError::WriteScopeRequired) => {
+                    return ToolResult::err_with_output(
+                        "session capability upgrade requires project:write",
+                        json!({
+                            "error_kind": "session_capability_upgrade_denied",
+                            "required_scope": crate::auth::SCOPE_PROJECT_WRITE,
+                            "mode": mode.as_str(),
+                            "state_changed": false,
+                        }),
+                    );
+                }
+                Err(sessions::CodingSessionError::CommitFailed) => {
+                    return ToolResult::err_with_output(
+                        "coding continuity state could not be committed",
+                        json!({
+                            "error_kind": "coding_continuity_commit_failed",
+                            "state_changed": false,
+                        }),
+                    );
+                }
+            };
+        let session_summary = &session_outcome.summary;
+        let current_binding = if binding_available {
+            json!({
+                "bound": true,
+                "session_id": session_summary.session_id,
+                "process_local_in_memory": true,
+                "lost_after_restart": true,
+                "transport": transport.as_str(),
+                "resolved_project": resolved.resolved_id.clone(),
+            })
+        } else {
+            json!({
+                "bound": false,
+                "process_local_in_memory": true,
+                "lost_after_restart": true,
+                "transport": transport.as_str(),
+                "reason_code": if bind_current {
+                    "window_identity_unavailable"
+                } else {
+                    "binding_disabled"
+                },
+            })
+        };
         let mut connection_state = runtime_status
             .get("connection_layers")
             .cloned()
@@ -171,35 +235,24 @@ impl ToolRuntime {
                 })
             });
         connection_state["project_registry"]["resolved_project"] = json!(resolved.resolved_id);
-        let bound = current_binding
-            .get("bound")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
         connection_state["session_binding"] = json!({
-            "status": if bound { "bound" } else { "not_bound" },
+            "status": if binding_available { "bound" } else { "not_bound" },
             "observed_at": chrono::Utc::now().timestamp(),
             "source": "session_store",
             "age_secs": 0,
             "stale_after_secs": Value::Null,
-            "reason_code": if bound { Value::Null } else { json!("binding_not_requested_or_unavailable") },
+            "reason_code": if binding_available {
+                Value::Null
+            } else if bind_current {
+                json!("window_identity_unavailable")
+            } else {
+                json!("binding_disabled")
+            },
             "process_local_in_memory": true,
             "lost_after_restart": true,
             "transport": transport.as_str(),
             "durable_resume": "explicit session_id resumes the durable wc_sess_* session",
         });
-
-        let git = self
-            .start_coding_task_git_summary(
-                &resolved.resolved_id,
-                include_recent_commits,
-                &mut warnings,
-            )
-            .await;
-        // Surface dirty/conflict worktree state at top-level so compact Action
-        // responses that omit full git payloads still keep the warning reason.
-        if !git.is_null() {
-            append_workspace_warnings(&workspace_payload_from_git_summary(&git), &mut warnings);
-        }
         let recommended_flow = match &tool_manifest {
             Some(manifest) => recommended_flow_payload_for_manifest_tools(manifest),
             None => recommended_flow_payload(),
@@ -213,7 +266,27 @@ impl ToolRuntime {
                 "mode": session_summary.mode,
                 "guards": session_summary.guards,
                 "lifecycle": session_summary.lifecycle,
-                "explicit_session_id_recommended": true,
+                "continuation": if session_outcome.reused { "continued" } else { "created" },
+                "reused": session_outcome.reused,
+                "new_session_requested": new_session,
+                "instruction_appended": title.is_some(),
+                "root_title": session_summary.title,
+                "capability": {
+                    "changed": session_outcome.capability_changed,
+                    "previous_mode": session_outcome.previous_mode,
+                    "previous_guards": session_outcome.previous_guards,
+                    "requested_mode": mode,
+                    "mode": session_summary.mode,
+                    "guards": session_summary.guards,
+                    "write_scope_verified": write_scope_verified,
+                },
+                "context": {
+                    "refreshed": true,
+                    "git_state_recaptured": true,
+                    "rules_recaptured": include_rules,
+                },
+                "explicit_session_id_required_for_continuity": false,
+                "explicit_session_id_recommended": !binding_available,
                 "explicit_session_id_fields": {
                     "tool_business_input": "session_id",
                     "generic_wrapper_recorder": TOOL_CALL_RECORDING_SESSION_ID_FIELD

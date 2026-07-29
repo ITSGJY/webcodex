@@ -23,6 +23,7 @@ pub(crate) const MAX_VALIDATION_EXCERPT_CHARS: usize = 800;
 pub(super) const SESSION_LEDGER_VERSION: u32 = 1;
 pub(crate) const MESSAGE_ID_PREFIX: &str = "wc_msg_";
 pub(crate) const DEFAULT_MAX_MESSAGES_PER_SESSION: usize = 200;
+pub(crate) const MAX_CODING_INSTRUCTION_CHARS: usize = 4000;
 pub(crate) const DEFAULT_MESSAGE_LIST_LIMIT: usize = 50;
 pub(crate) const MAX_MESSAGE_LIST_LIMIT: usize = 100;
 pub(crate) const MAX_MESSAGE_CHARS: usize = 8000;
@@ -53,6 +54,10 @@ pub(crate) struct CurrentSessionKey {
     pub(crate) transport: String,
     pub(crate) window_key: String,
     pub(crate) resolved_project: String,
+    /// Domain-separated hash of the agent-reported canonical repository root.
+    /// A project registration that moves to another root must not inherit the
+    /// old root's current-session binding.
+    pub(crate) repository_root_key: String,
 }
 
 /// Workflow session lifecycle state.
@@ -141,6 +146,42 @@ pub(crate) struct SessionCreateOptions {
     pub(crate) mode: SessionMode,
     pub(crate) guards: SessionGuards,
     pub(crate) project_instructions: Option<ProjectInstructionsSnapshot>,
+}
+
+/// Atomic start-or-continue request used by `start_coding_task`.
+///
+/// The workflow session, instruction event, capability transition, and
+/// process-local current binding are committed under one store lock. This is
+/// deliberately an internal Workflow Session primitive, not another public
+/// task model.
+#[derive(Debug, Clone)]
+pub(crate) struct CodingSessionRequest {
+    pub(crate) key: Option<CurrentSessionKey>,
+    pub(crate) project: String,
+    pub(crate) instruction: Option<String>,
+    pub(crate) mode: SessionMode,
+    pub(crate) guards: SessionGuards,
+    pub(crate) project_instructions: Option<ProjectInstructionsSnapshot>,
+    pub(crate) transport: SessionTransport,
+    pub(crate) bind_current: bool,
+    pub(crate) new_session: bool,
+    pub(crate) context_refreshed: bool,
+    pub(crate) write_scope_verified: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CodingSessionOutcome {
+    pub(crate) summary: SessionSummary,
+    pub(crate) reused: bool,
+    pub(crate) previous_mode: Option<SessionMode>,
+    pub(crate) previous_guards: Option<SessionGuards>,
+    pub(crate) capability_changed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CodingSessionError {
+    WriteScopeRequired,
+    CommitFailed,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -310,6 +351,22 @@ pub(crate) struct SessionEvent {
     pub(crate) validation_output_summary: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) permission: Option<PermissionDecision>,
+    /// Full bounded user instruction for `task_instruction` events. Ordinary
+    /// tool-call events leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) instruction: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) requested_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) previous_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) requested_guards: Option<SessionGuards>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) previous_guards: Option<SessionGuards>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) capability_changed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) context_refreshed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

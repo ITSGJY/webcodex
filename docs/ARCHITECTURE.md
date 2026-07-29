@@ -82,7 +82,12 @@ The protocol adapters translate incoming requests into runtime tool calls. The T
 ## Runtime Surfaces
 
 - `runtime_http` exposes REST runtime routes, including generic runtime tool calls and dedicated project/file wrappers.
-- `mcp` exposes the remote MCP endpoint backed by the same ToolRuntime.
+- `mcp` exposes exactly one startup-selected model surface. Complete
+  `WEBCODEX_CONNECTOR_SURFACE=task-v1` configuration selects the twelve-tool
+  Canonical Connector. An absent surface variable explicitly selects the full
+  operator registry and emits a startup warning; invalid or incomplete
+  Connector configuration fails startup. MCP discovery/initialize and runtime
+  status report the active surface.
 - `openapi` builds the GPT Actions schema for the focused public operation surface.
 - `connector_runtime` owns the canonical project-bound coding path. It maps one
   transport window and exact repository identity to an existing durable
@@ -111,6 +116,18 @@ deleting history. The process-local current-project map reports navigation
 only. Durable task history and the per-repository window map live in SQLite, so
 switching projects neither closes nor deletes the previous task.
 
+The preceding paragraph describes the Canonical Connector surface. On the full
+operator runtime, `start_coding_task` provides the same ordinary user semantics
+without creating Connector Tasks: its internal current key contains principal,
+transport, stable window, resolved project, and a domain-separated hash of the
+canonical repository root. The default ensures or continues one active
+Workflow Session and appends a bounded `task_instruction` ledger event.
+`new_session=true` alone requests an isolated Session; a changed title never
+does. Project switches retain independent keys, and a mode transition updates
+guards and appends the capability-change event under one Session-store lock.
+The Connector Task ledger and Workflow Session ledger remain separate internal
+models; neither is copied into the other.
+
 Window identity is transport-owned and never accepted as a normal tool field.
 MCP initialize mints `Mcp-Session-Id`, which a conforming client echoes on later
 requests. Hosted Actions use their conversation-scoped request header when
@@ -124,9 +141,28 @@ credential from overwriting each other.
 The continuity fingerprint contains hashes and identities, not repository file
 contents: canonical root, branch, HEAD, porcelain worktree state, applicable
 root/nested instruction files, target directory, and supported manifests.
-Comparison reports unchanged slices as reused and changed, added, or removed
-files as refreshed. Repository rules are content-hashed so unchanged rules need
+Capture is strictly bounded: at most 512 untracked files, 256 KiB per
+untracked file, 4 MiB total untracked bytes, 2 MiB of tracked diff output, 128
+manifest candidates, 100,000 fallback scan entries, and three seconds of scan
+time. Context files are content-hashed up to 512 KiB. Large regular files use
+metadata plus a bounded prefix/suffix digest; untracked symlinks hash only the
+link target and are never followed. Manifest discovery uses manifest-specific
+Git pathspecs instead of enumerating every repository file. A clean porcelain
+status skips tracked diff and untracked content work entirely.
+
+Exhausting any budget marks the affected slice partial and emits only compact
+warning codes—never content or absolute paths. Comparisons treat an unchanged
+partial digest as unknown, not reused; a changed digest is still refreshed.
+Rule and manifest enumeration has the same conservative removed/unknown
+behavior. Repository rules are content-hashed so complete unchanged rules need
 not be reintroduced into the model context.
+
+Connector creation/continuation, its instruction event, capability transition,
+and durable window binding share one SQLite transaction. If a previously
+prepared writable worktree cannot be committed to that transaction, the
+managed lease and registration are released so a retry cannot create a hidden
+active context. The full runtime commits Session creation/update, instruction
+event, and current binding under one Session-store lock.
 
 After a server restart, SQLite task/event history and exact window/project
 mappings remain. Process-local “currently viewed project” state is deliberately

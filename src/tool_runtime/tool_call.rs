@@ -84,8 +84,12 @@ pub enum ToolCall {
         deny_shell_tools: bool,
         #[serde(default)]
         detail: StartupDetail,
-        #[serde(default)]
+        #[serde(default = "default_true")]
         bind_current: bool,
+        /// Explicitly create and bind an isolated Workflow Session instead of
+        /// continuing the current window/project/repository context.
+        #[serde(default)]
+        new_session: bool,
     },
 
     /// Return deterministic finish context for an explicit task session:
@@ -1043,6 +1047,7 @@ fn reject_unknown_start_coding_task_fields(arguments: &Value) -> Result<(), Stri
         "deny_shell_tools",
         "detail",
         "bind_current",
+        "new_session",
         // Wrapper/session metadata that transports may leave in params.
         "session_id",
         "recording_session_id",

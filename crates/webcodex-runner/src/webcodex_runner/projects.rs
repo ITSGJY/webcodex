@@ -398,18 +398,27 @@ fn agent_project_summary_with_shutdown(
 ) -> ShellAgentProjectSummary {
     let mut hooks = project.hooks.keys().cloned().collect::<Vec<_>>();
     hooks.sort();
+    // The server uses the reported path as part of its repository continuity
+    // identity. Report the actual root, not a mutable symlink alias, so a
+    // retargeted project registration cannot inherit another repository's
+    // current Workflow Session.
+    let resolved_path = canonicalize_existing(Path::new(&project.path))
+        .ok()
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(|| PathBuf::from(&project.path));
+    let resolved_path = resolved_path.to_string_lossy().to_string();
     let (git_branch, git_head, git_dirty) = if include_git {
         let branch = run_git_capture(
-            &project.path,
+            &resolved_path,
             &["rev-parse", "--abbrev-ref", "HEAD"],
             shutdown,
         );
         let head = run_git_capture(
-            &project.path,
+            &resolved_path,
             &["log", "-1", "--pretty=format:%h"],
             shutdown,
         );
-        let dirty = run_git_capture(&project.path, &["status", "--short"], shutdown)
+        let dirty = run_git_capture(&resolved_path, &["status", "--short"], shutdown)
             .map(|status| !status.trim().is_empty());
         (branch, head, dirty)
     } else {
@@ -418,7 +427,7 @@ fn agent_project_summary_with_shutdown(
     ShellAgentProjectSummary {
         id: project.id.clone(),
         name: project.name.clone().or_else(|| Some(project.id.clone())),
-        path: project.path.clone(),
+        path: resolved_path,
         allow_patch: project.allow_patch,
         kind: project.kind.clone(),
         description: project.description.clone(),
@@ -1480,6 +1489,45 @@ mod durability_tests {
         let projects = load_agent_project_summaries_from_dir(&projects_dir);
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].id, "demo");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_summary_reports_retargeted_symlinks_as_distinct_canonical_roots() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        let link = tmp.path().join("current");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        symlink(&first, &link).unwrap();
+        let project = AgentProjectFile {
+            id: "demo".to_string(),
+            path: link.to_string_lossy().to_string(),
+            shell_profile: None,
+            allow_patch: true,
+            name: None,
+            kind: None,
+            description: None,
+            disabled: false,
+            hooks: HashMap::new(),
+        };
+
+        let first_summary = agent_project_summary(&project, 1, false);
+        assert_eq!(
+            Path::new(&first_summary.path),
+            first.canonicalize().unwrap()
+        );
+        std::fs::remove_file(&link).unwrap();
+        symlink(&second, &link).unwrap();
+        let second_summary = agent_project_summary(&project, 2, false);
+        assert_eq!(
+            Path::new(&second_summary.path),
+            second.canonicalize().unwrap()
+        );
+        assert_ne!(first_summary.path, second_summary.path);
     }
 }
 

@@ -17,15 +17,16 @@ use super::events::{
     validation_output_summary_for_tool_result, SessionToolClassification,
 };
 use super::model::{
-    CurrentSessionKey, ListSessionMessagesFilter, PersistedSessionLedger, PersistedSessionRecord,
+    CodingSessionError, CodingSessionOutcome, CodingSessionRequest, CurrentSessionKey,
+    ListSessionMessagesFilter, PersistedSessionLedger, PersistedSessionRecord,
     PostSessionMessageInput, SessionCloseError, SessionCloseOutcome, SessionCounts,
     SessionCreateOptions, SessionDiscussionSummary, SessionEvent, SessionGuardDenial,
     SessionGuards, SessionInboxHint, SessionLifecycle, SessionLifecycleDenial, SessionMessage,
     SessionMessageError, SessionMessageStatus, SessionRecord, SessionStoreStatus, SessionSummary,
     SessionTransport, ToolCallRecorderMetadata, ToolCallStart, DEFAULT_MAX_EVENTS_PER_SESSION,
     DEFAULT_MAX_MESSAGES_PER_SESSION, DEFAULT_MAX_SESSIONS, DEFAULT_MESSAGE_LIST_LIMIT,
-    DEFAULT_SUMMARY_LIMIT, EVENT_ID_PREFIX, MAX_MESSAGE_LIST_LIMIT, MAX_SUMMARY_LIMIT,
-    MESSAGE_ID_PREFIX, SESSION_ID_PREFIX, SESSION_LEDGER_VERSION,
+    DEFAULT_SUMMARY_LIMIT, EVENT_ID_PREFIX, MAX_CODING_INSTRUCTION_CHARS, MAX_MESSAGE_LIST_LIMIT,
+    MAX_SUMMARY_LIMIT, MESSAGE_ID_PREFIX, SESSION_ID_PREFIX, SESSION_LEDGER_VERSION,
 };
 use super::persistence::{load_persisted_sessions, write_ledger_atomic};
 use super::query::{
@@ -33,7 +34,8 @@ use super::query::{
     validate_message_text, validate_resolution_text,
 };
 use super::util::{
-    bound_event_error_summary, bound_summary_string, now_ts, redact_and_bound_value,
+    bound_event_error_summary, bound_summary_string, now_ts, redact_and_bound_instruction,
+    redact_and_bound_value,
 };
 
 #[derive(Debug, Clone)]
@@ -47,6 +49,8 @@ pub(crate) struct SessionStore {
     /// stores or when the writer thread could not be spawned (mutations then
     /// fall back to the synchronous write path).
     writer: Option<Arc<LedgerWriterGuard>>,
+    #[cfg(test)]
+    fail_next_coding_continuity_commit: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Coordinates a dedicated OS thread that owns session-ledger serialize +
@@ -288,6 +292,8 @@ impl SessionStore {
             })),
             persistence_write_mutex: Arc::new(Mutex::new(())),
             writer: None,
+            #[cfg(test)]
+            fail_next_coding_continuity_commit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -321,6 +327,8 @@ impl SessionStore {
             inner,
             persistence_write_mutex,
             writer,
+            #[cfg(test)]
+            fail_next_coding_continuity_commit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -352,6 +360,19 @@ impl SessionStore {
             max_messages_per_session: DEFAULT_MAX_MESSAGES_PER_SESSION,
             last_persist_error,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_session_count_for_test(&self, project: Option<&str>) -> usize {
+        let inner = self.inner.lock().expect("session store mutex poisoned");
+        inner
+            .sessions
+            .values()
+            .filter(|record| {
+                record.lifecycle == SessionLifecycle::Active
+                    && project.is_none_or(|project| record.project.as_deref() == Some(project))
+            })
+            .count()
     }
 
     /// Thin convenience wrapper — creation always goes through
@@ -416,6 +437,194 @@ impl SessionStore {
         };
         self.persist_after_mutation();
         summary
+    }
+
+    /// Atomically ensure the window/project coding context and append the
+    /// accepted instruction to the durable Workflow Session ledger.
+    ///
+    /// Every fallible check happens before the in-memory commit. Once mutation
+    /// begins, session creation or capability update, the instruction event,
+    /// and the process-local binding are applied under the same store lock.
+    pub(crate) fn ensure_coding_session(
+        &self,
+        request: CodingSessionRequest,
+    ) -> Result<CodingSessionOutcome, CodingSessionError> {
+        let now = now_ts();
+        let new_session_id = format!("{SESSION_ID_PREFIX}{}", uuid::Uuid::new_v4().simple());
+        let new_event_id = format!("{EVENT_ID_PREFIX}{}", uuid::Uuid::new_v4().simple());
+        let requested_guards = SessionGuards::effective(request.mode, request.guards);
+        let instruction = request
+            .instruction
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| redact_and_bound_instruction(value, MAX_CODING_INSTRUCTION_CHARS));
+
+        let outcome = {
+            let mut inner = self.inner.lock().expect("session store mutex poisoned");
+            let reusable_session_id = if request.bind_current && !request.new_session {
+                request.key.as_ref().and_then(|key| {
+                    let session_id = inner.current_sessions.get(key)?;
+                    let record = inner.sessions.get(session_id)?;
+                    (record.lifecycle.allows_mutation()
+                        && record.project.as_deref() == Some(request.project.as_str()))
+                    .then(|| session_id.clone())
+                })
+            } else {
+                None
+            };
+
+            if let Some(session_id) = reusable_session_id {
+                let (previous_mode, previous_guards) = {
+                    let record = inner
+                        .sessions
+                        .get(&session_id)
+                        .expect("reusable session disappeared under store lock");
+                    (record.mode, record.guards)
+                };
+                // Repeating a mode preserves any stricter explicit guard from
+                // the root task. A real mode transition applies the newly
+                // requested effective guard profile.
+                let next_guards = if previous_mode == request.mode {
+                    SessionGuards {
+                        deny_write_tools: previous_guards.deny_write_tools
+                            || requested_guards.deny_write_tools,
+                        deny_shell_tools: previous_guards.deny_shell_tools
+                            || requested_guards.deny_shell_tools,
+                    }
+                } else {
+                    requested_guards
+                };
+                let capability_changed =
+                    previous_mode != request.mode || previous_guards != next_guards;
+                if previous_guards.deny_write_tools
+                    && !next_guards.deny_write_tools
+                    && !request.write_scope_verified
+                {
+                    return Err(CodingSessionError::WriteScopeRequired);
+                }
+                if self.take_coding_continuity_fault() {
+                    return Err(CodingSessionError::CommitFailed);
+                }
+
+                let event = coding_instruction_event(
+                    &new_event_id,
+                    &session_id,
+                    &request.project,
+                    instruction.clone(),
+                    request.transport,
+                    request.mode,
+                    Some(previous_mode),
+                    requested_guards,
+                    Some(previous_guards),
+                    capability_changed,
+                    request.context_refreshed,
+                    true,
+                    now,
+                );
+                {
+                    let max_events = inner.max_events_per_session;
+                    let record = inner
+                        .sessions
+                        .get_mut(&session_id)
+                        .expect("reusable session disappeared before commit");
+                    record.mode = request.mode;
+                    record.guards = next_guards;
+                    record.updated_at = now;
+                    if let Some(project_instructions) = request.project_instructions {
+                        record.project_instructions = Some(project_instructions);
+                    }
+                    record.events.push_back(event);
+                    while record.events.len() > max_events {
+                        record.events.pop_front();
+                    }
+                }
+                inner.touch(&session_id);
+                if request.bind_current {
+                    if let Some(key) = request.key {
+                        inner.current_sessions.insert(key, session_id.clone());
+                    }
+                }
+                let summary = inner
+                    .summary(&session_id, Some(DEFAULT_SUMMARY_LIMIT))
+                    .expect("continued session must summarize");
+                CodingSessionOutcome {
+                    summary,
+                    reused: true,
+                    previous_mode: Some(previous_mode),
+                    previous_guards: Some(previous_guards),
+                    capability_changed,
+                }
+            } else {
+                if self.take_coding_continuity_fault() {
+                    return Err(CodingSessionError::CommitFailed);
+                }
+                let event = coding_instruction_event(
+                    &new_event_id,
+                    &new_session_id,
+                    &request.project,
+                    instruction.clone(),
+                    request.transport,
+                    request.mode,
+                    None,
+                    requested_guards,
+                    None,
+                    false,
+                    request.context_refreshed,
+                    false,
+                    now,
+                );
+                let record = SessionRecord {
+                    session_id: new_session_id.clone(),
+                    project: Some(request.project),
+                    // The first accepted instruction remains the root title.
+                    // Follow-up instructions never overwrite it.
+                    title: instruction,
+                    mode: request.mode,
+                    guards: requested_guards,
+                    lifecycle: SessionLifecycle::Active,
+                    created_at: now,
+                    updated_at: now,
+                    messages: VecDeque::new(),
+                    events: VecDeque::from([event]),
+                    project_instructions: request.project_instructions,
+                };
+                let summary = inner.insert_session(record);
+                if request.bind_current {
+                    if let Some(key) = request.key {
+                        inner
+                            .current_sessions
+                            .insert(key, summary.session_id.clone());
+                    }
+                }
+                CodingSessionOutcome {
+                    summary,
+                    reused: false,
+                    previous_mode: None,
+                    previous_guards: None,
+                    capability_changed: false,
+                }
+            }
+        };
+        self.persist_after_mutation();
+        Ok(outcome)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_coding_continuity_commit_for_test(&self) {
+        self.fail_next_coding_continuity_commit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn take_coding_continuity_fault(&self) -> bool {
+        self.fail_next_coding_continuity_commit
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(not(test))]
+    fn take_coding_continuity_fault(&self) -> bool {
+        false
     }
 
     pub(crate) fn summary(&self, session_id: &str, limit: Option<usize>) -> Option<SessionSummary> {
@@ -631,6 +840,13 @@ impl SessionStore {
             input_summary,
             validation_output_summary: None,
             permission: None,
+            instruction: None,
+            requested_mode: None,
+            previous_mode: None,
+            requested_guards: None,
+            previous_guards: None,
+            capability_changed: None,
+            context_refreshed: None,
         });
         Some(start)
     }
@@ -743,6 +959,13 @@ impl SessionStore {
             input_summary: None,
             validation_output_summary,
             permission: start.permission,
+            instruction: None,
+            requested_mode: None,
+            previous_mode: None,
+            requested_guards: None,
+            previous_guards: None,
+            capability_changed: None,
+            context_refreshed: None,
         });
         Some(event_id)
     }
@@ -828,6 +1051,77 @@ fn lifecycle_blocks_tool(tool_name: &str) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn coding_instruction_event(
+    event_id: &str,
+    session_id: &str,
+    project: &str,
+    instruction: Option<String>,
+    transport: SessionTransport,
+    requested_mode: SessionMode,
+    previous_mode: Option<SessionMode>,
+    requested_guards: SessionGuards,
+    previous_guards: Option<SessionGuards>,
+    capability_changed: bool,
+    context_refreshed: bool,
+    reused: bool,
+    now: i64,
+) -> SessionEvent {
+    SessionEvent {
+        event_id: event_id.to_string(),
+        session_id: session_id.to_string(),
+        kind: "task_instruction".to_string(),
+        timestamp: now,
+        transport: transport.as_str().to_string(),
+        tool_name: "start_coding_task".to_string(),
+        project: Some(project.to_string()),
+        resolved_project: Some(project.to_string()),
+        risk_class: "read_only".to_string(),
+        read_like: true,
+        write_like: false,
+        shell_like: false,
+        git_like: false,
+        change_summary_like: false,
+        diff_review_like: false,
+        started_at: Some(now),
+        finished_at: Some(now),
+        duration_ms: Some(0),
+        status: Some("succeeded".to_string()),
+        exit_code: None,
+        failure_kind: None,
+        error_kind: None,
+        expected_failure: None,
+        expected_failure_kind: None,
+        assertion_name: None,
+        actual_failure_kind: None,
+        failure_expectation_result: None,
+        warning_kind: None,
+        session_project: None,
+        request_project: None,
+        allow_cross_project_session_required: None,
+        allow_cross_project_session: None,
+        error_message_summary: None,
+        changed_paths: Vec::new(),
+        job_id: None,
+        input_summary: Some(redact_and_bound_value(&serde_json::json!({
+            "requested_mode": requested_mode.as_str(),
+            "requested_guards": requested_guards,
+            "capability_changed": capability_changed,
+            "context_refreshed": context_refreshed,
+            "session_reused": reused,
+        }))),
+        validation_output_summary: None,
+        permission: None,
+        instruction,
+        requested_mode: Some(requested_mode.as_str().to_string()),
+        previous_mode: previous_mode.map(|mode| mode.as_str().to_string()),
+        requested_guards: Some(requested_guards),
+        previous_guards,
+        capability_changed: Some(capability_changed),
+        context_refreshed: Some(context_refreshed),
+    }
+}
+
 fn session_closed_system_event(session_id: &str, now: i64) -> SessionEvent {
     SessionEvent {
         event_id: format!("{EVENT_ID_PREFIX}{}", uuid::Uuid::new_v4().simple()),
@@ -868,6 +1162,13 @@ fn session_closed_system_event(session_id: &str, now: i64) -> SessionEvent {
         input_summary: None,
         validation_output_summary: None,
         permission: None,
+        instruction: None,
+        requested_mode: None,
+        previous_mode: None,
+        requested_guards: None,
+        previous_guards: None,
+        capability_changed: None,
+        context_refreshed: None,
     }
 }
 

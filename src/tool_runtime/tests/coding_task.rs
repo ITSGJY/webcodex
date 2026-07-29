@@ -40,6 +40,8 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
     assert_eq!(required_fields(start), vec!["project"]);
     let start_props = start.input_schema["properties"].as_object().unwrap();
     assert!(start_props.contains_key("detail"));
+    assert_eq!(start_props["bind_current"]["default"], true);
+    assert_eq!(start_props["new_session"]["default"], false);
     for removed in [
         "include_runtime_status",
         "compact_startup",
@@ -115,6 +117,7 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
     for field in [
         "detail",
         "bind_current",
+        "new_session",
         "include_hygiene",
         "include_handoff",
         "include_workspace",
@@ -151,7 +154,7 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
 }
 
 #[tokio::test]
-async fn start_coding_task_returns_session_and_does_not_bind_current_by_default() {
+async fn start_coding_task_can_explicitly_disable_current_binding() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     commit_file(
@@ -189,6 +192,7 @@ async fn start_coding_task_returns_session_and_does_not_bind_current_by_default(
                         deny_write_tools: false,
                         deny_shell_tools: false,
                         bind_current: false,
+                        new_session: false,
                     },
                     Some(&auth),
                 )
@@ -252,7 +256,7 @@ async fn start_coding_task_returns_session_and_does_not_bind_current_by_default(
     );
     assert_eq!(
         result.output["session"]["current_binding"]["bound"], false,
-        "start_coding_task must not bind current by default"
+        "bind_current=false must disable the current binding"
     );
     assert_eq!(
         result.output["session"]["current_binding"]["process_local_in_memory"],
@@ -376,6 +380,7 @@ async fn start_coding_task_can_omit_compact_tool_manifest() {
                 deny_write_tools: false,
                 deny_shell_tools: false,
                 bind_current: false,
+                new_session: false,
             },
             Some(&auth),
         )
@@ -1068,6 +1073,7 @@ async fn finish_coding_task_requires_explicit_session_and_returns_structured_fie
                 deny_write_tools: false,
                 deny_shell_tools: false,
                 bind_current: false,
+                new_session: false,
             },
             Some(&auth),
         )
@@ -2118,6 +2124,7 @@ async fn finish_coding_task_includes_active_jobs_warning_without_logs() {
                 deny_write_tools: false,
                 deny_shell_tools: false,
                 bind_current: false,
+                new_session: false,
             },
             Some(&auth),
         )
@@ -2242,6 +2249,7 @@ async fn finish_coding_task_treats_stop_requested_jobs_as_nonblocking() {
                 deny_write_tools: false,
                 deny_shell_tools: false,
                 bind_current: false,
+                new_session: false,
             },
             Some(&auth),
         )

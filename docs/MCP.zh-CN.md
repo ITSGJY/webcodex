@@ -28,9 +28,27 @@ Canonical setup 不打印 credential value 或 secret path，不创建 tunnel，
 [AUTH_MODEL.zh-CN.md](AUTH_MODEL.zh-CN.md) 与
 [DEPLOYMENT.zh-CN.md](DEPLOYMENT.zh-CN.md)。
 
+## Model surface 选择
+
+MCP 在 server 启动时选择一个 model surface：
+
+- `WEBCODEX_CONNECTOR_SURFACE=task-v1` 加上 `webcodex setup` 写入的完整
+  Connector 项目配置，会选择 `canonical_connector` 和下述十二项 project-bound
+  capability。
+- 未设置该变量时，`/mcp` 暴露 `full_operator_runtime`。server 会输出明确的启动
+  warning；这是 operator/debug surface，不是带有 Connector 连续性承诺的隐式
+  Connector。
+- surface value 不受支持或 Connector 配置不完整时，server 启动配置失败，不会
+  静默切换到另一个 surface。
+
+`GET /mcp` 和 MCP `initialize.serverInfo` 通过 `modelSurface` 报告选择结果。
+Full operator surface 上的 `runtime_status.model_surface` 也报告同一事实。标准普通
+用户 setup 选择 `canonical_connector`；只有 operator 明确不配置 Connector 时
+才使用 full runtime。
+
 ## Project-bound surface
 
-runtime 由 `webcodex setup` 配置时，MCP `tools/list` 恰好包含：
+当 `modelSurface=canonical_connector` 时，MCP `tools/list` 恰好包含：
 
 ```text
 task_start
@@ -58,9 +76,15 @@ Connector context 已绑定项目。直接从 `task_start` 开始；不要调用
 executor reference 或 workflow session。
 
 复用前，WebCodex 会比较仓库实际路径、分支与 HEAD、工作区、适用的仓库规则及
-项目 manifest。未变化的上下文直接复用，只把变化部分标为已刷新。`task_list`
-和 `task_resume` 只用于 client 丢失 MCP transport session 后的显式恢复，不是
-普通工作流的前置步骤。
+项目 manifest。未变化的上下文直接复用，只把变化部分标为已刷新。如果有界扫描
+无法证明某个 slice 完整，response 会把它标记为 partial/unknown 并返回紧凑
+warning，不会声称已经复用。`task_list` 和 `task_resume` 只用于 client 丢失 MCP
+transport session 后的显式恢复，不是普通工作流的前置步骤。
+
+在 `full_operator_runtime` 上，普通 coding 使用 `start_coding_task` 开始或继续。
+稳定窗口默认继续同一仓库；切换仓库会切换上下文，切回会恢复此前 Workflow
+Session。`new_session=true` 是显式的高级隔离请求。current binding 只存在于当前
+server process，因此应保留返回的 session id，以便 server 重启后显式恢复。
 
 这些 durable ID 用于模型工具与 host review 之间的稳定关联，普通用户无需管理：
 

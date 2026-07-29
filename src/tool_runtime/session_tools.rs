@@ -309,7 +309,13 @@ impl ToolRuntime {
                 }),
             );
         }
-        let key = match current_session_key(auth, transport, &resolved.resolved_id, window) {
+        let key = match current_session_key(
+            auth,
+            transport,
+            &resolved.resolved_id,
+            &resolved.config.path,
+            window,
+        ) {
             Ok(key) => key,
             Err(message) => return current_session_unavailable_result(message),
         };
@@ -337,7 +343,13 @@ impl ToolRuntime {
             Ok(resolved) => resolved,
             Err(err) => return err.into_tool_result(),
         };
-        let key = match current_session_key(auth, transport, &resolved.resolved_id, window) {
+        let key = match current_session_key(
+            auth,
+            transport,
+            &resolved.resolved_id,
+            &resolved.config.path,
+            window,
+        ) {
             Ok(key) => key,
             Err(message) => return current_session_unavailable_result(message),
         };
@@ -369,7 +381,13 @@ impl ToolRuntime {
             Ok(resolved) => resolved,
             Err(err) => return err.into_tool_result(),
         };
-        let key = match current_session_key(auth, transport, &resolved.resolved_id, window) {
+        let key = match current_session_key(
+            auth,
+            transport,
+            &resolved.resolved_id,
+            &resolved.config.path,
+            window,
+        ) {
             Ok(key) => key,
             Err(message) => return current_session_unavailable_result(message),
         };

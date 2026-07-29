@@ -110,10 +110,13 @@ remain implementation details in the ordinary Connector path.
 ### Session
 
 A Workflow Session is the full operator runtime's bounded evidence ledger.
-Those tools retain explicit `wc_sess_*` contracts for administration and
-specialized workflows, but project-bound Connector users do not create, bind,
-upgrade, or pass Workflow Session IDs. Their normal continuity comes from the
-project work context above.
+`start_coding_task` defaults to continuing the same window and exact repository,
+appending each follow-up instruction while retaining the original root goal.
+Repository switches preserve independent contexts; `new_session=true` is the
+explicit advanced isolation path. Current bindings are process-local, so an
+explicit returned id remains the restart-recovery path. Project-bound Connector
+users do not create, bind, upgrade, or pass Workflow Session IDs; their normal
+continuity comes from the project work context above.
 
 Dirty workspace is an expected development state and does not prevent starting a coding task. Existing worktree changes (tracked modified, staged, untracked, renamed, deleted, or conflicted) must be inspected and preserved. They are not automatically reverted, stashed, cleaned, or overwritten. Startup blocking is reserved for conditions that make the project inaccessible or the requested work unsafe or impossible (missing project path, resolution failure, agent offline when required, permission denial, or path safety failures). Review and finish tools may still treat a dirty closeout as non-pass evidence.
 

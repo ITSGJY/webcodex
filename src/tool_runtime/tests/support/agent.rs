@@ -46,6 +46,43 @@ pub(in crate::tool_runtime::tests) async fn register_agent_project_at_path(
     crate::tool_runtime::agent_project_runtime_id(client_id, project_id)
 }
 
+pub(in crate::tool_runtime::tests) async fn register_agent_project_at_path_with_auth(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    project_id: &str,
+    root: &Path,
+    auth: &crate::auth::AuthContext,
+) -> String {
+    let project_path = root.to_string_lossy().to_string();
+    runtime
+        .shell_clients
+        .register_with_auth(
+            ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
+                client_id: client_id.to_string(),
+                agent_instance_id: "inst".to_string(),
+                display_name: None,
+                owner: None,
+                hostname: None,
+                capabilities: Some(ShellClientCapabilities {
+                    shell: true,
+                    git: true,
+                    file_read: true,
+                    file_write: true,
+                    ..Default::default()
+                }),
+                projects: Some(vec![registered_project(project_id, &project_path)]),
+                agent_protocol_version: Some("polling-v1".to_string()),
+                policy: None,
+            },
+            Some(auth),
+        )
+        .await
+        .unwrap();
+    crate::tool_runtime::agent_project_runtime_id(client_id, project_id)
+}
+
 pub(in crate::tool_runtime::tests) fn run_agent_shell_request_locally(
     req: &ShellAgentShellRequest,
 ) -> (i32, String, String) {

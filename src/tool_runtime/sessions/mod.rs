@@ -28,12 +28,13 @@ pub(crate) use events::{
     validation_output_summary_for_tool_result as execution_output_summary_for_tool_result,
 };
 pub(crate) use model::{
-    CurrentSessionKey, ListSessionMessagesFilter, PostSessionMessageInput, SessionCloseError,
-    SessionCreateOptions, SessionDiscussionCounts, SessionDiscussionSummary, SessionEvent,
-    SessionGuardDenial, SessionGuards, SessionLifecycle, SessionLifecycleDenial, SessionMessage,
-    SessionMessageError, SessionMessageKind, SessionMessagePriority, SessionMessageStatus,
-    SessionSummary, SessionTransport, ToolCallRecorderMetadata, DEFAULT_MAX_EVENTS_PER_SESSION,
-    DEFAULT_MAX_SESSIONS, TOOL_ASSERTION_NAME_FIELD, TOOL_CALL_RECORDING_SESSION_ID_FIELD,
+    CodingSessionError, CodingSessionRequest, CurrentSessionKey, ListSessionMessagesFilter,
+    PostSessionMessageInput, SessionCloseError, SessionCreateOptions, SessionDiscussionCounts,
+    SessionDiscussionSummary, SessionEvent, SessionGuardDenial, SessionGuards, SessionLifecycle,
+    SessionLifecycleDenial, SessionMessage, SessionMessageError, SessionMessageKind,
+    SessionMessagePriority, SessionMessageStatus, SessionSummary, SessionTransport,
+    ToolCallRecorderMetadata, DEFAULT_MAX_EVENTS_PER_SESSION, DEFAULT_MAX_SESSIONS,
+    MAX_CODING_INSTRUCTION_CHARS, TOOL_ASSERTION_NAME_FIELD, TOOL_CALL_RECORDING_SESSION_ID_FIELD,
     TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE, TOOL_EXPECTED_FAILURE_FIELD,
     TOOL_EXPECTED_FAILURE_KIND_FIELD,
 };
