@@ -35,6 +35,49 @@ fn runtime(depot: &Depot) -> Option<Arc<ToolRuntime>> {
     depot.obtain::<Arc<ToolRuntime>>().ok().cloned()
 }
 
+/// Pull the [`ToolRuntime`] out of the depot, or render a 500 "Tool runtime
+/// not configured" error and return `None` so the handler can bail early.
+///
+/// Every GPT-Actions / MCP handler opens with the same guard; this collapses
+/// the seven-line `let Some(runtime) = runtime(depot) else { render; return }`
+/// block into `let Some(runtime) = require_runtime(depot, res) else { return };`.
+pub(crate) fn require_runtime(depot: &Depot, res: &mut Response) -> Option<Arc<ToolRuntime>> {
+    match runtime(depot) {
+        Some(runtime) => Some(runtime),
+        None => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Tool runtime not configured",
+            ));
+            None
+        }
+    }
+}
+
+/// Parse a JSON request body as `T`, or render a 400 "Invalid JSON" error and
+/// return `None` so the handler can bail early.
+///
+/// Mirrors the inline `match req.parse_json().await { Ok(b) => b, Err(e) => {
+/// render; return } }` block repeated across every handler. The error message
+/// format is byte-identical to the previous inline form.
+pub(crate) async fn parse_json_body<T>(req: &mut Request, res: &mut Response) -> Option<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    match req.parse_json().await {
+        Ok(body) => Some(body),
+        Err(e) => {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Invalid JSON: {}", e),
+            ));
+            None
+        }
+    }
+}
+
 fn render_result(
     res: &mut Response,
     audit: &ActionAudit,
@@ -92,12 +135,7 @@ fn prepare_action_tools_call_response(
 
 #[handler]
 pub async fn tools_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
+    let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
     let body = match req.payload().await {
@@ -349,12 +387,7 @@ fn extract_recording_session_id(body: &Value) -> Option<String> {
 #[handler]
 pub async fn runtime_status(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let audit = ActionAudit::start(req, depot, "/api/runtime/status", "getRuntimeStatus");
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
+    let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
     // Body is optional; tolerate an empty/missing body since this call takes

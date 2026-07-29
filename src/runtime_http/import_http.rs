@@ -1,4 +1,4 @@
-use super::{render_result, runtime};
+use super::{parse_json_body, render_result, require_runtime};
 use crate::action_audit::ActionAudit;
 use crate::json_error;
 use crate::tool_runtime::ToolCall;
@@ -172,24 +172,11 @@ pub async fn import_conversation_files_to_project(
         "/api/artifacts/import",
         "importConversationFilesToProject",
     );
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
+    let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
-    let body: ImportConversationFilesRequest = match req.parse_json().await {
-        Ok(body) => body,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid JSON: {}", e),
-            ));
-            return;
-        }
+    let Some(body) = parse_json_body::<ImportConversationFilesRequest>(req, res).await else {
+        return;
     };
     if body.openai_file_id_refs.is_empty() || body.openai_file_id_refs.len() > MAX_IMPORT_FILES {
         res.status_code(StatusCode::BAD_REQUEST);

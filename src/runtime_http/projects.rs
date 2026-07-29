@@ -1,6 +1,5 @@
-use super::{render_result, runtime};
+use super::{parse_json_body, render_result, require_runtime};
 use crate::action_audit::ActionAudit;
-use crate::json_error;
 use crate::tool_runtime::ToolCall;
 use salvo::prelude::*;
 use serde::Deserialize;
@@ -53,12 +52,7 @@ struct CreateProjectRequest {
 #[handler]
 pub async fn projects_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let audit = ActionAudit::start(req, depot, "/api/projects/list", "listProjects");
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
+    let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
     // Body is optional; reject non-empty invalid JSON for consistency but
@@ -81,24 +75,11 @@ pub async fn projects_list(req: &mut Request, depot: &mut Depot, res: &mut Respo
 #[handler]
 pub async fn projects_register(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let audit = ActionAudit::start(req, depot, "/api/projects/register", "registerProject");
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
+    let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
-    let body: RegisterProjectRequest = match req.parse_json().await {
-        Ok(body) => body,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid JSON: {}", e),
-            ));
-            return;
-        }
+    let Some(body) = parse_json_body::<RegisterProjectRequest>(req, res).await else {
+        return;
     };
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
     let result = runtime
@@ -124,24 +105,11 @@ pub async fn projects_register(req: &mut Request, depot: &mut Depot, res: &mut R
 #[handler]
 pub async fn projects_create(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let audit = ActionAudit::start(req, depot, "/api/projects/create", "createProject");
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
+    let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
-    let body: CreateProjectRequest = match req.parse_json().await {
-        Ok(body) => body,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid JSON: {}", e),
-            ));
-            return;
-        }
+    let Some(body) = parse_json_body::<CreateProjectRequest>(req, res).await else {
+        return;
     };
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
     let result = runtime
