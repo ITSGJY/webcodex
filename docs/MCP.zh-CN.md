@@ -83,8 +83,10 @@ transport session 后的显式恢复，不是普通工作流的前置步骤。
 
 在 `full_operator_runtime` 上，普通 coding 使用 `start_coding_task` 开始或继续。
 稳定窗口默认继续同一仓库；切换仓库会切换上下文，切回会恢复此前 Workflow
-Session。`new_session=true` 是显式的高级隔离请求。current binding 只存在于当前
-server process，因此应保留返回的 session id，以便 server 重启后显式恢复。
+Session。`new_session=true` 是显式的高级隔离请求。current binding 同时保留在
+server 的内存缓存和有界哈希持久化投影中；保留相同窗口身份与仓库时，server
+重启后可以自动恢复。仍应保留返回的 session id，以便 transport 身份丢失时显式
+恢复。
 
 这些 durable ID 用于模型工具与 host review 之间的稳定关联，普通用户无需管理：
 

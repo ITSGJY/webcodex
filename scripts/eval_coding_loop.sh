@@ -343,10 +343,7 @@ print(json.dumps({
     "project": sys.argv[1],
     "title": sys.argv[2],
     "mode": "normal",
-    "include_runtime_status": False,
-    "include_git": True,
-    "include_recent_commits": False,
-    "include_rules": False,
+    "detail": "minimal",
     "bind_current": False,
 }, separators=(",", ":")))
 PY
@@ -1074,7 +1071,7 @@ EOF
     CODEX_DEFAULT_TIMEOUT_SECS="30" \
     CODEX_APPROVAL_MODE="full-auto" \
     RUST_LOG="info" \
-    "$CARGO_BIN" run --quiet -p webcodex --bin webcodex >"$SERVER_LOG" 2>&1 &
+    "$CARGO_BIN" run --quiet -p webcodex --bin webcodex-server >"$SERVER_LOG" 2>&1 &
     SERVER_PID=$!
 
     if ! wait_for_port "$PORT" 90; then
@@ -1240,8 +1237,9 @@ data = json.loads(sys.argv[1])
 out = data.get("output") or {}
 ok = (
     data.get("success") is True
-    and isinstance(out.get("numbered_text"), str)
-    and "1 | pub fn greeting" in out.get("numbered_text", "")
+    and out.get("format") == "numbered"
+    and isinstance(out.get("text"), str)
+    and "1 | pub fn greeting" in out.get("text", "")
 )
 sys.exit(0 if ok else 1)
 PY
@@ -1387,8 +1385,8 @@ import json
 import sys
 
 data = json.loads(sys.argv[1])
-content = (data.get("output") or {}).get("content", "")
-ok = data.get("success") is True and '"hello"' in content and "should not apply" not in content
+text = (data.get("output") or {}).get("text", "")
+ok = data.get("success") is True and '"hello"' in text and "should not apply" not in text
 sys.exit(0 if ok else 1)
 PY
     then

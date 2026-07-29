@@ -2054,7 +2054,7 @@ mod tests {
                     structured_validation_argv: true,
                     lsp_read_only_navigation: true,
                     sandbox_inspect_commands: true,
-                    project_lifecycle: false,
+                    project_lifecycle: true,
                 }),
                 projects: None,
                 agent_protocol_version: None,

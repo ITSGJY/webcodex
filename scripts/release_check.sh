@@ -18,8 +18,9 @@ set -euo pipefail
 #   6. cargo test -p webcodex --lib openapi -- --nocapture
 #   7. cargo test -p webcodex --lib mcp -- --nocapture
 #   8. bash syntax checks for scripts/*.sh
-#   9. static: no python runtime helper regressions
-#  10. static: no sensitive files tracked or staged by git
+#   9. static: test harnesses use current runtime contracts
+#  10. static: no python runtime helper regressions
+#  11. static: no sensitive files tracked or staged by git
 #
 # Manual final acceptance steps live in docs/RELEASE_CHECKLIST.md:
 #   - cargo test --workspace -- --nocapture
@@ -152,7 +153,33 @@ for script in scripts/*.sh; do
 done
 
 # ----------------------------------------------------------------------------
-# Stage 9: static — no python runtime helper regressions
+# Stage 9: static — test harnesses use current runtime contracts
+# ----------------------------------------------------------------------------
+stage_start "static: current test harness contracts"
+if grep -En -- '--bin webcodex([[:space:]]|`|$)|target/debug/webcodex([^/-]|$)|include_runtime_status|include_git|include_recent_commits|include_rules|process_local_in_memory|output\.content|numbered_text' \
+    scripts/e2e_zero_config_ws.sh \
+    scripts/e2e_reconnect_ws.sh \
+    scripts/eval_coding_loop.sh \
+    scripts/test-agent-config-reload-e2e.sh \
+    scripts/test-claude-provider-e2e.sh \
+    docs/TESTING.md \
+    docs/RELEASE_CHECKLIST.md; then
+    die "stale runtime target or startup field in test harness guidance"
+else
+    ok "test harnesses use current server target and startup fields"
+fi
+if grep -En -- 'binding loss|lost process-local binding|lost_after_restart=true|binding_is_process_local_and_principal_scoped' \
+    scripts/e2e_reconnect_ws.sh \
+    docs/OPERATIONS.md \
+    docs/TESTING.md \
+    docs/agent/architecture-decisions.md; then
+    die "stale current-session binding durability guidance"
+else
+    ok "binding guidance reflects durable exact restoration"
+fi
+
+# ----------------------------------------------------------------------------
+# Stage 10: static — no python runtime helper regressions
 # ----------------------------------------------------------------------------
 stage_start "static: no python runtime helper regressions"
 if grep -R "python3 -c" -n src/tool_runtime src/shell_client crates/webcodex-runner/src; then
@@ -167,7 +194,7 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# Stage 10: static — no sensitive files tracked or staged by git
+# Stage 11: static — no sensitive files tracked or staged by git
 # ----------------------------------------------------------------------------
 stage_start "static: no sensitive files tracked/staged"
 # These are git-ignored deployment files that must NEVER be committed. We check
@@ -212,7 +239,7 @@ fi
 # Summary
 # ----------------------------------------------------------------------------
 printf '\n[release] ===== all stages passed =====\n'
-ok "workspace boundaries, fmt, check --all-targets, focused metadata/schema/openapi/mcp tests, bash syntax, static checks"
+ok "workspace boundaries, fmt, check --all-targets, focused metadata/schema/openapi/mcp tests, bash syntax, harness contracts, static checks"
 log "manual final acceptance: full suite, E2E websocket/polling, and eval compare (see docs/RELEASE_CHECKLIST.md)"
 log "release readiness gate PASSED"
 exit 0

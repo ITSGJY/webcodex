@@ -5,7 +5,7 @@ set -euo pipefail
 # WebCodex — Runner/Server Restart & Reconnect Continuity E2E
 #
 # Real-process integration harness for Iteration 9 Phase 2:
-#   1. Boots a real `webcodex` server and `webcodex-runner` (WebSocket).
+#   1. Boots a real `webcodex-server` and `webcodex-runner` (WebSocket).
 #   2. Verifies the layered connection observations (runner_process /
 #      server_transport / server_registration / project_registry /
 #      connector_endpoint / session_binding / last_successful_tool_call)
@@ -20,7 +20,7 @@ set -euo pipefail
 #      server restart.
 #   6. Restarts the server: the runner must auto-reconnect, the durable
 #      session must remain resumable via its explicit session_id, and the
-#      lost process-local binding must be reported as not_bound.
+#      exact binding must restore for the same stable HTTP window.
 #   7. Post-deploy smoke facts: server version/commit, authority mode,
 #      version_compatibility status.
 #
@@ -45,6 +45,7 @@ FAIL=0
 SERVER_PID=""
 AGENT_PID=""
 TMP_ROOT=""
+COOKIE_JAR=""
 START_EPOCH=$(date +%s)
 
 log() { printf '[reconnect-e2e] %s\n' "$*"; }
@@ -72,6 +73,7 @@ api_post() {
     local path="$1"; local body="${2:-}"
     if [ -z "$body" ]; then body="{}"; fi
     curl -sS --max-time 15 \
+        -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
         -H "Authorization: Bearer ${TOKEN}" \
         -H "Content-Type: application/json" \
         -X POST "http://127.0.0.1:${PORT}${path}" \
@@ -158,11 +160,13 @@ fi
 # Build once so restarts are fast and both restarts run the same binaries.
 log "building webcodex + webcodex-runner (release of the current tree, debug profile)"
 "$CARGO_BIN" build --quiet -p webcodex -p webcodex-runner --bins
-SERVER_BIN="$PROJECT_DIR/target/debug/webcodex"
+SERVER_BIN="$PROJECT_DIR/target/debug/webcodex-server"
 AGENT_BIN="$PROJECT_DIR/target/debug/webcodex-runner"
 
 PORT="${E2E_PORT:-$(find_free_port)}"
 TMP_ROOT="$(mktemp -d -t webcodex-reconnect-e2e-XXXXXX)"
+COOKIE_JAR="$TMP_ROOT/cookies.txt"
+: >"$COOKIE_JAR"
 DATA_DIR="$TMP_ROOT/data"
 PROJECTS_DIR="$TMP_ROOT/projects.d"
 AGENT_TOML="$TMP_ROOT/agent.toml"
@@ -357,7 +361,7 @@ assert_eq "calls recover after runner restart (no server restart)" \
     "$(json_get "$READ_BODY" success)" "True"
 
 # ----------------------------------------------------------------------------
-# Phase 4: server restart — durable session resume, binding honestly lost
+# Phase 4: server restart — durable session and exact binding restore
 # ----------------------------------------------------------------------------
 log "restarting server"
 kill "$SERVER_PID" 2>/dev/null || true
@@ -374,8 +378,10 @@ assert_eq "durable session resumable via explicit session_id" \
     "$(json_get "$SUMMARY_BODY" success)" "True"
 
 RESTART_START="$(api_post /api/tools/call "{\"tool\":\"start_coding_task\",\"params\":{\"project\":\"${RUNTIME_PROJECT_ID}\",\"title\":\"post restart\"}}")"
-assert_eq "process-local binding reported not_bound after restart" \
-    "$(json_get "$RESTART_START" output.connection_state.session_binding.status)" "not_bound"
+assert_eq "exact binding restored after server restart" \
+    "$(json_get "$RESTART_START" output.connection_state.session_binding.status)" "bound"
+assert_eq "restored binding continues the original session" \
+    "$(json_get "$RESTART_START" output.session.session_id)" "$SESSION_ID"
 
 # ----------------------------------------------------------------------------
 # Phase 5: post-deploy smoke facts

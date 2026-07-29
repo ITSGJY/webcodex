@@ -159,12 +159,13 @@ layer is never presented as callable.
 | `server_registration` | `registered` \| `stale` \| `not_observed` | `stale` means `registration_instance_disconnected`. Facts: `runner_instance`, `registered_at`, `last_refreshed_at`. |
 | `project_registry` | `registered` \| `stale` \| `not_configured` | `stale` means `providing_runner_disconnected`; `not_configured` means `no_projects_registered`. Counts registered/online projects. |
 | `connector_endpoint` | `not_configured` \| `not_observed` \| `ready` \| `unknown` | `not_configured` when the connector runtime is disabled; `not_observed` (`no_connector_requests_observed`) until a real readiness probe (`/connector/readiness`) or successful connector request is seen. |
-| `session_binding` | `not_observed` (runtime_status) / `bound` \| `not_bound` (start_coding_task) | Full-runtime bindings are process-local and window+principal+transport+project+canonical-root scoped. `runtime_status` reports `not_observed` with reason `binding_is_process_local_and_principal_scoped`, `process_local=true`, `lost_after_restart=true`. Connector Task continuity uses a separate durable exact window/project map. |
+| `session_binding` | `not_observed` (runtime_status) / `bound` \| `not_bound` (start_coding_task) | Full-runtime bindings are exact window+principal+transport+project+canonical-root mappings with a process-local cache and bounded hashed durable projection. `runtime_status` reports `not_observed` with reason `exact_binding_requires_window_and_project_observation`, `process_local_cache=true`, `durable_exact_binding=true`, `restored_after_restart=true`, and `missing_identity_fallback=false`. Connector Task continuity remains a separate durable exact window/project map. |
 | `last_successful_tool_call` | `observed` \| `not_observed` | Scoped by principal/project/surface/session/tool. Only successful meaningful calls are recorded — `runtime_status`, `list_tools`, `list_agents`, `list_projects`, and `tool_manifest` never refresh it. Bounded in-memory store; no arguments, outputs, or secrets. |
 
-After a server restart, session bindings are lost by design. The correct
-recovery is to continue with the explicit durable `wc_sess_*` session id — do
-not restart the runner to "fix" a `not_bound` binding.
+After a server restart, the same stable window and repository restore the exact
+full-runtime binding from its durable projection. If the transport no longer
+provides that identity, continue with the explicit durable `wc_sess_*` session
+id; do not restart the runner to "fix" a `not_bound` binding.
 
 `runtime_status.model_surface` reports `canonical_connector` or
 `full_operator_runtime`. MCP GET and initialize expose the same selection as
@@ -501,8 +502,9 @@ isolated task; title differences do not create sessions. Use
 `bind_current=false` only to opt out of automatic continuation.
 
 The call returns a `wc_sess_*` session id in `output.session.session_id`. Keep
-that id for tools that require explicit business input and for recovery after a
-server restart; the automatic current binding itself is process-local.
+that id for tools that require explicit business input and as a recovery fallback
+when stable transport identity is unavailable. The automatic exact binding uses
+a process-local cache plus a bounded hashed durable projection.
 `detail` is the canonical startup projection:
 
 - `minimal`: session id, resolved project, branch/head/workspace state, compact
@@ -548,8 +550,9 @@ successful tool call separately (see
 [Connection Layers and Version Compatibility](#connection-layers-and-version-compatibility)).
 `not_observed` means that layer has no evidence; it must not be collapsed into
 an overall offline verdict. `session_binding` here reports `bound` or
-`not_bound`; after a server restart, continue with the explicit durable
-`wc_sess_*` session id instead of restarting the runner.
+`not_bound`; after a server restart, the same stable window and repository
+restore the exact binding. If that identity is unavailable, continue with the
+explicit durable `wc_sess_*` session id instead of restarting the runner.
 
 Console **Connect a chat client** targets the project-bound canonical capability
 surface by default. Its connection projection reports
@@ -623,7 +626,7 @@ Specialized Cargo tools automatically declare purpose and parser metadata.
 General execution is equally valid evidence when its intent is explicit:
 
 ```json
-{"tool": "run_shell", "params": {"project": "agent:workstation:my-repo", "session_id": "wc_sess_example", "purpose": "test", "shell": "bash", "cwd": ".", "command": "cargo test -p webcodex --bin webcodex focused"}}
+{"tool": "run_shell", "params": {"project": "agent:workstation:my-repo", "session_id": "wc_sess_example", "purpose": "test", "shell": "bash", "cwd": ".", "command": "cargo test -p webcodex --lib focused"}}
 {"tool": "run_job", "params": {"project": "agent:workstation:my-repo", "session_id": "wc_sess_example", "purpose": "validation", "shell": "sh", "command": "make check"}}
 ```
 
@@ -899,8 +902,8 @@ count; use `manual_approved_count`, `auto_approved_count`, and
 
 - `_session_id` in arguments = reserved recorder metadata. Stripped before tool dispatch.
 - `session_id` in arguments = business parameter for `show_changes` or `session_summary`.
-- Current-session bindings are process-local in-memory convenience state, not
-  the durable session ledger.
+- Current-session bindings use a process-local cache backed by a bounded hashed
+  durable projection. They remain separate from the durable Session event ledger.
 
 ## Smoke Test (read-only)
 

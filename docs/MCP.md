@@ -91,8 +91,10 @@ On `full_operator_runtime`, ordinary coding starts or continues with
 `start_coding_task`. A stable window continues the same repository by default;
 switching repositories changes context and switching back restores the prior
 Workflow Session. `new_session=true` is the explicit advanced isolation
-request. These current bindings are process-local, so retain the returned
-session id for explicit recovery after a server restart.
+request. The exact binding is cached in-process and persisted as a bounded,
+hashed projection, so the same stable window and repository can restore it
+after a server restart. Retain the returned session id for explicit recovery
+when that transport identity is unavailable.
 
 The stable IDs have product purposes between model tools and host review, but
 ordinary users do not manage them:

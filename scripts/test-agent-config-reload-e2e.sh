@@ -195,7 +195,7 @@ run_shell_request() {
 }
 assert_marker() {
     run_shell_request 'printf %s "$WEBCODEX_RELOAD_MARKER"'
-    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["success"] and d["output"]["stdout"]==sys.argv[2] and d["output"]["stderr"]=="" and d["output"]["exit_code"]==0' \
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["success"] and d["output"]["stdout_tail"]==sys.argv[2] and d["output"]["stderr_tail"]=="" and d["output"]["exit_code"]==0' \
         "$RESPONSE_FILE" "$1" || fail "shell marker was not $1"
 }
 start_job() {
@@ -212,7 +212,7 @@ REPO_STATUS_BEFORE="$(git status --short)"
 if [ "${WEBCODEX_E2E_SKIP_BUILD:-0}" != "1" ]; then
     "$CARGO_BIN" build --quiet -p webcodex -p webcodex-runner --bins
 fi
-[ -x target/debug/webcodex ] && [ -x target/debug/webcodex-runner ] \
+[ -x target/debug/webcodex-server ] && [ -x target/debug/webcodex-runner ] \
     || fail "debug server/agent binaries are unavailable"
 TMP_ROOT="$(mktemp -d -t webcodex-runner-reload-e2e-XXXXXX)"
 DATA_DIR="$TMP_ROOT/data"
@@ -252,7 +252,7 @@ setsid env -i PATH="$PATH" LANG=C HOME="$ISOLATED_HOME" \
     XDG_STATE_HOME="$ISOLATED_HOME/.local/state" XDG_CACHE_HOME="$ISOLATED_HOME/.cache" \
     TMPDIR="$RUNTIME_TMP" WEBCODEX_ENV_FILE="$TMP_ROOT/empty.env" \
     WEBCODEX_ADDR="127.0.0.1:${PORT}" WEBCODEX_DATA="$DATA_DIR" WEBCODEX_TOKEN="$TOKEN" \
-    RUST_LOG=warn target/debug/webcodex >"$SERVER_LOG" 2>&1 &
+    RUST_LOG=warn target/debug/webcodex-server >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 wait_for_port open || fail "isolated server port did not open"
 setsid env -i PATH="$PATH" LANG=C HOME="$ISOLATED_HOME" \
@@ -276,7 +276,7 @@ wait_for_status 2 success null false - claude_code_then_native true \
 assert_agent_pid
 assert_marker generation-2
 run_shell_request 'sleep 3; printf unexpected'
-python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert not d["success"] and d["output"]["failure_kind"]=="timeout" and "unexpected" not in json.dumps(d)' \
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); out=d["output"]; assert not d["success"] and out["failure_kind"]=="timeout" and "unexpected" not in out.get("stdout_tail", "")' \
     "$RESPONSE_FILE" || fail "generation 2 timeout policy was not enforced"
 status_matches 2 success null false - claude_code_then_native true \
     || fail "provider status changed or Claude started after passive checks"
@@ -301,7 +301,7 @@ wait_for_status 3 partial null true display_name,max_concurrent_jobs native fals
 assert_agent_pid
 command='sleep 3; printf %s "$WEBCODEX_RELOAD_MARKER"'
 run_shell_request "$command"
-python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["success"] and d["output"]["stdout"]=="generation-3"' \
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["success"] and d["output"]["stdout_tail"]=="generation-3"' \
     "$RESPONSE_FILE" || fail "generation 3 hot policy/shell snapshot was not active"
 JOB_ONE="$(start_job "while [ ! -e '$GATE' ]; do sleep 0.05; done; printf first")"
 JOB_TWO="$(start_job 'printf %s "$WEBCODEX_RELOAD_MARKER"')"

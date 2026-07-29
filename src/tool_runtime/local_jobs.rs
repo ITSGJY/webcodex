@@ -710,6 +710,7 @@ mod tests {
     fn active_job_log_read_does_not_chase_appends() {
         use std::io::Write;
         use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
 
         let scratch = crate::command_sandbox::InspectScratch::create().unwrap();
         let dir = scratch.path().join("job");
@@ -719,16 +720,28 @@ mod tests {
         let record = LocalJobRecord::new("project".to_string(), dir);
         let keep_writing = Arc::new(AtomicBool::new(true));
         let writer_flag = keep_writing.clone();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let writer = std::thread::spawn(move || {
             let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
             let chunk = vec![b'z'; LOCAL_LOG_READ_CHUNK_BYTES];
+            let mut bytes_written = 0_usize;
+            let mut ready_sent = false;
             while writer_flag.load(Ordering::Relaxed) {
                 file.write_all(&chunk).unwrap();
+                bytes_written = bytes_written.saturating_add(chunk.len());
+                if !ready_sent && bytes_written > MAX_LOCAL_LOG_BYTES_PER_STREAM {
+                    ready_tx.send(()).unwrap();
+                    ready_sent = true;
+                }
                 std::thread::sleep(Duration::from_millis(1));
             }
         });
 
-        std::thread::sleep(Duration::from_millis(20));
+        if let Err(error) = ready_rx.recv_timeout(Duration::from_secs(2)) {
+            keep_writing.store(false, Ordering::Relaxed);
+            writer.join().unwrap();
+            panic!("writer did not exceed the log bound: {error}");
+        }
         let started = Instant::now();
         let (text, cursor, total_lines, truncated) =
             record.read_log_lines("stdout.log", None, Some(10));

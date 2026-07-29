@@ -341,14 +341,14 @@ log "runtime project id: $RUNTIME_PROJECT_ID"
 # 3. Start the server
 # ----------------------------------------------------------------------------
 
-log "starting server (cargo run -p webcodex --bin webcodex)"
+log "starting server (cargo run -p webcodex --bin webcodex-server)"
 WEBCODEX_ADDR="127.0.0.1:${PORT}" \
 WEBCODEX_DATA="$DATA_DIR" \
 WEBCODEX_TOKEN="$TOKEN" \
 CODEX_DEFAULT_TIMEOUT_SECS="30" \
 CODEX_APPROVAL_MODE="full-auto" \
 RUST_LOG="info" \
-"$CARGO_BIN" run --quiet -p webcodex --bin webcodex >"$SERVER_LOG" 2>&1 &
+"$CARGO_BIN" run --quiet -p webcodex --bin webcodex-server >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
 if ! wait_for_port "$PORT" 40; then
@@ -439,7 +439,7 @@ assert_success "getProjectGitStatus" "$body" || true
 # readProjectFile — reads README.md through the agent.
 body="$(api_post /api/projects/read_file "{\"project\":\"$RUNTIME_PROJECT_ID\",\"path\":\"README.md\"}")"
 assert_success "readProjectFile(README.md)" "$body" || true
-readme_content="$(json_get "$body" output.content)"
+readme_content="$(json_get "$body" output.text)"
 if echo "$readme_content" | grep -q "Smoke Project"; then
     pass "readProjectFile returns README content"
 else
@@ -453,7 +453,7 @@ assert_success "getProjectGitDiff" "$body" || true
 # runProjectShellCommand — runs `echo hi` through the agent.
 body="$(api_post /api/projects/run_shell "{\"project\":\"$RUNTIME_PROJECT_ID\",\"command\":\"echo hi\"}")"
 assert_success "runProjectShellCommand" "$body" || true
-shell_stdout="$(json_get "$body" output.stdout)"
+shell_stdout="$(json_get "$body" output.stdout_tail)"
 if echo "$shell_stdout" | grep -q "hi"; then
     pass "runProjectShellCommand returns echo output"
 else
@@ -507,7 +507,7 @@ else
     # getRuntimeJobLog — read bounded stdout for the job.
     body="$(api_post /api/jobs/log "{\"job_id\":\"$JOB_ID\"}")"
     assert_success "getRuntimeJobLog" "$body" || true
-    log_stdout="$(json_get "$body" output.stdout)"
+    log_stdout="$(json_get "$body" output.stdout_tail)"
     if echo "$log_stdout" | grep -q "job-log-ok"; then
         pass "getRuntimeJobLog contains async job output"
     else
@@ -1135,7 +1135,7 @@ fi
 log "---- Deterministic workflow tool smoke ----"
 
 workflow_session_id=""
-body="$(api_post /api/tools/call "{\"tool\":\"start_coding_task\",\"project\":\"$RUNTIME_PROJECT_ID\",\"title\":\"e2e deterministic coding task smoke\",\"mode\":\"normal\",\"include_runtime_status\":true,\"include_git\":true,\"include_recent_commits\":true,\"include_rules\":true,\"bind_current\":false}")"
+body="$(api_post /api/tools/call "{\"tool\":\"start_coding_task\",\"project\":\"$RUNTIME_PROJECT_ID\",\"title\":\"e2e deterministic coding task smoke\",\"mode\":\"normal\",\"detail\":\"full\",\"bind_current\":false}")"
 if workflow_session_id="$(python3 - "$body" <<'PY'
 import json, sys
 
@@ -1167,8 +1167,13 @@ if session.get("explicit_session_id_recommended") is not True:
     errors.append("output.session.explicit_session_id_recommended must be true")
 if binding.get("bound") is not False:
     errors.append("output.session.current_binding.bound must be false")
-if binding.get("process_local_in_memory") is not True:
-    errors.append("output.session.current_binding.process_local_in_memory must be true")
+for field in [
+    "process_local_cache",
+    "durable_exact_binding",
+    "restored_after_restart",
+]:
+    if binding.get(field) is not True:
+        errors.append(f"output.session.current_binding.{field} must be true")
 for name in ["read_file", "search_project_text", "show_changes"]:
     if not isinstance(inspect, list) or name not in inspect:
         errors.append(f"output.recommended_flow.inspect missing {name}")
@@ -1389,7 +1394,7 @@ else
     fail "gitRestorePaths(probe) failed (body: ${body:0:300})"
 fi
 body="$(api_post /api/projects/read_file "{\"project\":\"$RUNTIME_PROJECT_ID\",\"path\":\"RESTORE_PROBE.txt\"}")"
-restore_content="$(json_get "$body" output.content)"
+restore_content="$(json_get "$body" output.text)"
 if echo "$restore_content" | grep -q "original"; then
     pass "gitRestorePaths restored probe file to committed content"
 else
@@ -1435,7 +1440,7 @@ fi
 
 # readProjectFile confirms the probe content.
 body="$(api_post /api/projects/read_file "{\"project\":\"$RUNTIME_PROJECT_ID\",\"path\":\"EDIT_PROBE.txt\"}")"
-if echo "$(json_get "$body" output.content)" | grep -q "hello world"; then
+if echo "$(json_get "$body" output.text)" | grep -q "hello world"; then
     pass "readProjectFile confirms EDIT_PROBE.txt content"
 else
     fail "readProjectFile did not confirm probe content (got: ${body:0:200})"
@@ -1465,7 +1470,7 @@ fi
 
 # readProjectFile confirms the edited content.
 body="$(api_post /api/projects/read_file "{\"project\":\"$RUNTIME_PROJECT_ID\",\"path\":\"EDIT_PROBE.txt\"}")"
-if echo "$(json_get "$body" output.content)" | grep -q "hello rust"; then
+if echo "$(json_get "$body" output.text)" | grep -q "hello rust"; then
     pass "readProjectFile confirms replace_in_file edit"
 else
     fail "readProjectFile did not confirm edit (got: ${body:0:200})"
@@ -1491,7 +1496,7 @@ else
     fail "replace_in_file(missing old) unexpectedly succeeded (body: ${body:0:200})"
 fi
 body="$(api_post /api/projects/read_file "{\"project\":\"$RUNTIME_PROJECT_ID\",\"path\":\"EDIT_PROBE.txt\"}")"
-if echo "$(json_get "$body" output.content)" | grep -q "hello rust"; then
+if echo "$(json_get "$body" output.text)" | grep -q "hello rust"; then
     pass "replace_in_file(missing old) left file unchanged"
 else
     fail "replace_in_file(missing old) modified the file (got: ${body:0:200})"
@@ -1553,7 +1558,7 @@ fi
 
 # readProjectFile confirms the runtime-tool edit.
 body="$(api_post /api/projects/read_file "{\"project\":\"$RUNTIME_PROJECT_ID\",\"path\":\"REPLACE_PROBE.txt\"}")"
-if echo "$(json_get "$body" output.content)" | grep -q "alpha gamma"; then
+if echo "$(json_get "$body" output.text)" | grep -q "alpha gamma"; then
     pass "readProjectFile confirms replace_in_file edit"
 else
     fail "readProjectFile did not confirm runtime-tool edit (got: ${body:0:200})"
@@ -1579,7 +1584,7 @@ else
     fail "replace_in_file(missing old) unexpectedly succeeded (body: ${body:0:200})"
 fi
 body="$(api_post /api/projects/read_file "{\"project\":\"$RUNTIME_PROJECT_ID\",\"path\":\"REPLACE_PROBE.txt\"}")"
-if echo "$(json_get "$body" output.content)" | grep -q "alpha gamma"; then
+if echo "$(json_get "$body" output.text)" | grep -q "alpha gamma"; then
     pass "replace_in_file(missing old) left file unchanged"
 else
     fail "replace_in_file(missing old) modified the file (got: ${body:0:200})"
@@ -1715,7 +1720,7 @@ fi
 
 # Step 2: readProjectFile — read README.md.
 body="$(api_post /api/projects/read_file "{\"project\":\"$RUNTIME_PROJECT_ID\",\"path\":\"README.md\"}")"
-loop_readme="$(json_get "$body" output.content)"
+loop_readme="$(json_get "$body" output.text)"
 if echo "$loop_readme" | grep -q "$LOOP_MARKER_OLD"; then
     pass "loop: readProjectFile sees README.md with target marker"
 else
@@ -1772,7 +1777,7 @@ fi
 
 # Step 7: runProjectShellCommand — lightweight check (grep for the edited marker).
 body="$(api_post /api/projects/run_shell "{\"project\":\"$RUNTIME_PROJECT_ID\",\"command\":\"grep -c 'auto-loop' README.md\"}")"
-loop_shell_stdout="$(json_get "$body" output.stdout)"
+loop_shell_stdout="$(json_get "$body" output.stdout_tail)"
 if [ "$(json_get "$body" success)" = "True" ] && echo "$loop_shell_stdout" | grep -qE '^[0-9]+'; then
     pass "loop: runProjectShellCommand confirms edit via grep (matches=$loop_shell_stdout)"
 else
@@ -1798,7 +1803,7 @@ else
 fi
 # Double-check via git_status that README.md is back to its committed content.
 body="$(api_post /api/projects/read_file "{\"project\":\"$RUNTIME_PROJECT_ID\",\"path\":\"README.md\"}")"
-if echo "$(json_get "$body" output.content)" | grep -q "$LOOP_MARKER_OLD"; then
+if echo "$(json_get "$body" output.text)" | grep -q "$LOOP_MARKER_OLD"; then
     pass "loop: README.md content restored to original marker"
 else
     fail "loop: README.md content not restored (got: ${body:0:200})"
@@ -1901,7 +1906,7 @@ fi
 
 # Step 2: readProjectFile — confirm content.
 body="$(api_post /api/projects/read_file "{\"project\":\"$RUNTIME_PROJECT_ID\",\"path\":\"WRITE_ACTION_PROBE.txt\"}")"
-if echo "$(json_get "$body" output.content)" | grep -q "write-action-probe-v1"; then
+if echo "$(json_get "$body" output.text)" | grep -q "write-action-probe-v1"; then
     pass "readProjectFile confirms WRITE_ACTION_PROBE.txt content"
 else
     fail "readProjectFile did not confirm probe content (got: ${body:0:200})"
@@ -1931,7 +1936,7 @@ fi
 
 # Step 4: readProjectFile — confirm overwritten content.
 body="$(api_post /api/projects/read_file "{\"project\":\"$RUNTIME_PROJECT_ID\",\"path\":\"WRITE_ACTION_PROBE.txt\"}")"
-if echo "$(json_get "$body" output.content)" | grep -q "write-action-probe-v2"; then
+if echo "$(json_get "$body" output.text)" | grep -q "write-action-probe-v2"; then
     pass "readProjectFile confirms overwritten content"
 else
     fail "readProjectFile did not confirm overwritten content (got: ${body:0:200})"
@@ -1988,7 +1993,7 @@ fi
 
 # Step 8: getRuntimeJobTail — confirm the output contains job-ok.
 body="$(api_post /api/jobs/tail "{\"job_id\":\"$SJ_JOB_ID\",\"tail_lines\":50}")"
-sj_tail="$(json_get "$body" output.stdout)"
+sj_tail="$(json_get "$body" output.stdout_tail)"
 if echo "$sj_tail" | grep -q "job-ok"; then
     pass "getRuntimeJobTail confirms async job output (job-ok)"
 else

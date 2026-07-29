@@ -12,28 +12,28 @@ tests with different cost profiles sharing the same default lane.
 
 | Lane | Purpose | Default resources | Typical command |
 |---|---|---|---|
-| fast unit | Pure parsing, validation, helpers, local state machines, small fixtures. | No network, no global env mutation, no long sleeps. | `cargo test -p webcodex --bin webcodex tool_call` |
-| contract/schema | Keep metadata, registry, MCP `tools/list`, OpenAPI, and runtime tool names synchronized. | No external network; in-process services are preferred. | `cargo test -p webcodex --bin webcodex metadata`; `cargo test -p webcodex --bin webcodex mcp`; `cargo test -p webcodex --bin webcodex openapi` |
-| local integration | Exercise HTTP handlers, runtime dispatch, sessions, local agent registry, temp dirs, loopback listeners, and database fixtures. | Loopback only, isolated temp dirs, bounded waits, no shared mutable state without a lock. | `cargo test -p webcodex --bin webcodex runtime_http -- --nocapture`; `cargo test -p webcodex --bin webcodex session -- --nocapture` |
-| slow/manual ignored | Valuable coverage that is local but slow, serial, large-input, or global-state-sensitive. | Explicit operator opt-in; often `--ignored` and `--test-threads=1`. | `cargo test -p webcodex --bin webcodex import_http -- --ignored --nocapture --test-threads=1` |
+| fast unit | Pure parsing, validation, helpers, local state machines, small fixtures. | No network, no global env mutation, no long sleeps. | `cargo test -p webcodex --lib tool_call` |
+| contract/schema | Keep metadata, registry, MCP `tools/list`, OpenAPI, and runtime tool names synchronized. | No external network; in-process services are preferred. | `cargo test -p webcodex --lib metadata`; `cargo test -p webcodex --lib mcp`; `cargo test -p webcodex --lib openapi` |
+| local integration | Exercise HTTP handlers, runtime dispatch, sessions, local agent registry, temp dirs, loopback listeners, and database fixtures. | Loopback only, isolated temp dirs, bounded waits, no shared mutable state without a lock. | `cargo test -p webcodex --lib runtime_http -- --nocapture`; `cargo test -p webcodex --lib session -- --nocapture` |
+| slow/manual ignored | Valuable coverage that is local but slow, serial, large-input, or global-state-sensitive. | Explicit operator opt-in; often `--ignored` and `--test-threads=1`. | `cargo test -p webcodex --lib import_http -- --ignored --nocapture --test-threads=1` |
 | e2e/deployment smoke | Prove that binaries, local services, GPT Actions schema, MCP, artifact transfer, and an agent can work together. | Temporary local services and loopback ports; real deployment only when explicitly requested. | `bash scripts/e2e_zero_config_ws.sh`; `bash scripts/smoke_deployment.sh`; `bash scripts/smoke_artifact_transfer.sh` |
-| reconnect continuity | Runner disconnect/reconnect layer independence, stale-not-ready observations, server-restart durable session plus binding loss, lost-job terminal semantics, meaningful-activity scoping, and version-mismatch diagnostics. | In-process fixtures, no external network. | `cargo test -p webcodex --bin webcodex reconnect` |
-| trusted smoke | Disposable git fixture full chain (start → edit → failing shell validation → fix → pass → git review → finish) asserting zero approval interruptions under `trusted_agent` authority, resolved failure evidence, dirty-worktree advisory-only, and bounded payloads; prints baseline counters. | Temp git fixture, no external network. | `cargo test -p webcodex --bin webcodex trusted_smoke` |
-| real-process reconnect harness | Boot a real server plus runner, assert layered connection observations, crash the runner (layers degrade independently; running job goes terminal `lost`), restart the runner (new connection instance, no server restart), restart the server (runner auto-reconnect, durable session resume via explicit session id, binding reported `not_bound`), and print post-deploy smoke facts (server version/commit, authority mode, version compatibility, runner shell dialect). | Local processes and loopback ports. | `bash scripts/e2e_reconnect_ws.sh` |
-| security auth matrix | Cover OAuth, scope policy, shared-key behavior, token classes, read-only session guards, and denied mutations. | No external identity provider by default; use local fixtures and synthetic tokens. | `cargo test -p webcodex --bin webcodex oauth -- --nocapture`; `cargo test -p webcodex --bin webcodex scope -- --nocapture`; `cargo test -p webcodex --bin webcodex metadata -- --nocapture` |
+| reconnect continuity | Runner disconnect/reconnect layer independence, stale-not-ready observations, server-restart durable Session plus exact binding restoration, lost-job terminal semantics, meaningful-activity scoping, and version-mismatch diagnostics. | In-process fixtures, no external network. | `cargo test -p webcodex --lib reconnect` |
+| trusted smoke | Disposable git fixture full chain (start → edit → failing shell validation → fix → pass → git review → finish) asserting zero approval interruptions under `trusted_agent` authority, resolved failure evidence, dirty-worktree advisory-only, and bounded payloads; prints baseline counters. | Temp git fixture, no external network. | `cargo test -p webcodex --lib trusted_smoke` |
+| real-process reconnect harness | Boot a real server plus runner, assert layered connection observations, crash the runner (layers degrade independently; running job goes terminal `lost`), restart the runner (new connection instance, no server restart), then restart the server while preserving one HTTP window cookie and verify runner auto-reconnect, durable Session lookup by explicit id, and exact binding restoration to the original Session. It also prints post-deploy smoke facts (server version/commit, authority mode, version compatibility, runner shell dialect). | Local processes and loopback ports. | `bash scripts/e2e_reconnect_ws.sh` |
+| security auth matrix | Cover OAuth, scope policy, shared-key behavior, token classes, read-only session guards, and denied mutations. | No external identity provider by default; use local fixtures and synthetic tokens. | `cargo test -p webcodex --lib oauth -- --nocapture`; `cargo test -p webcodex --lib scope -- --nocapture`; `cargo test -p webcodex --lib metadata -- --nocapture` |
 
 Iteration 9 execution/reporting changes use the existing domain lanes rather
 than a new test suite:
 
-- `cargo test -p webcodex --bin webcodex validation_events -- --nocapture` covers dedicated
+- `cargo test -p webcodex --lib validation_events -- --nocapture` covers dedicated
   and declared-purpose generic execution evidence plus exact retry identity;
-- `cargo test -p webcodex --bin webcodex tool_runtime::tests::jobs -- --nocapture` covers
+- `cargo test -p webcodex --lib tool_runtime::tests::jobs -- --nocapture` covers
   shell/cwd metadata, bounded job tails, detected summaries, and cursors;
-- `cargo test -p webcodex --bin webcodex tool_runtime::tests::coding_task -- --nocapture`
-  and `cargo test -p webcodex --bin webcodex tool_runtime::tests::handoff -- --nocapture`
+- `cargo test -p webcodex --lib tool_runtime::tests::coding_task -- --nocapture`
+  and `cargo test -p webcodex --lib tool_runtime::tests::handoff -- --nocapture`
   cover facts/advisories/hard blockers and the `detail=minimal|standard|full`
   startup projection (the only startup projection control);
-- `cargo test -p webcodex --bin webcodex read_file -- --nocapture`, `metadata`, `mcp`, and
+- `cargo test -p webcodex --lib read_file -- --nocapture`, `metadata`, `mcp`, and
   `openapi` cover the single read representation, layered readiness, and
   project-bound versus operator surfaces.
 
@@ -46,9 +46,9 @@ current tree:
 Focused and real-process lanes:
 
 ```bash
-cargo test -p webcodex --bin webcodex trusted_smoke
-cargo test -p webcodex --bin webcodex reconnect
-cargo test -p webcodex --bin webcodex select_lines_tests   # bounded job-log tail + non-duplicating cursor
+cargo test -p webcodex --lib trusted_smoke
+cargo test -p webcodex --lib reconnect
+cargo test -p webcodex --lib select_lines_tests   # bounded job-log tail + non-duplicating cursor
 bash scripts/e2e_reconnect_ws.sh               # real server+runner restart/reconnect, durable session
 bash scripts/e2e_zero_config_ws.sh             # real MCP initialize/tools_list/tools_call + REST workflow
 ```
@@ -182,6 +182,6 @@ Recent structure work moved large test groups out of production roots:
 
 Do not add large ordinary test blocks to production facade files when one of
 these `tests/` module trees already exists. Exact full-suite pass counts should
-come from a fresh `cargo test -p webcodex --bin webcodex` run; recent full-suite scale is
-roughly 1.3k passing tests plus the four ignored `import_http` tests, but this
+come from a fresh `cargo test -p webcodex --lib` run; recent full-suite scale is
+roughly 1.7k passing tests plus the four ignored `import_http` tests, but this
 document should not be treated as the source of truth for exact counts.

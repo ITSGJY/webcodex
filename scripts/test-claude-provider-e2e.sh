@@ -271,7 +271,7 @@ EOF
 
 HOME="$ISOLATED_HOME" WEBCODEX_ADDR="127.0.0.1:${PORT}" \
 WEBCODEX_DATA="$DATA_DIR" WEBCODEX_TOKEN="$TOKEN" RUST_LOG=warn \
-    "$ROOT/target/debug/webcodex" >"$SERVER_LOG" 2>&1 &
+    "$ROOT/target/debug/webcodex-server" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 wait_for_port "$PORT" || fail "server port did not open"
 ok "isolated server started"
@@ -306,7 +306,7 @@ PY
 tool_call read_file "$READ_ARGS" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
-assert d["success"] and "before" in d["output"]["content"]
+assert d["success"] and "before" in d["output"]["text"]
 ' || fail "Native read failed"
 api_post /api/runtime/status '{}' | python3 -c '
 import json, sys
