@@ -45,6 +45,7 @@ use shell_protocol::{
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::net::SocketAddr;
+use webcodex_runner::contains_any;
 #[cfg(test)]
 use webcodex_runner::QuicClientConfig;
 #[cfg(test)]
@@ -73,7 +74,6 @@ use webcodex_runner::{
     HttpSendConfig, PreparedShellProfile, PreparedShellProfileCache, ReloadableAgentConfig,
     ShellConfig, SubmitResultError,
 };
-use webcodex_runner::contains_any;
 
 const JOB_UPDATE_INTERVAL_MS: u64 = 250;
 const AGENT_REGISTER_PATH: &str = "/api/shell/agent/register";
@@ -3447,7 +3447,6 @@ fn main() {
         std::process::exit(1);
     }
 }
-
 
 #[cfg(test)]
 #[path = "main_tests.rs"]

@@ -1,6 +1,6 @@
+use super::super::util::{find_executable_in_path, is_executable_file};
 use super::language::{profile_for_kind, LanguageProfile};
 use super::protocol::{read_message, write_message, FramingError, MAX_LSP_MESSAGE_BYTES};
-use super::super::util::{find_executable_in_path, is_executable_file};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};

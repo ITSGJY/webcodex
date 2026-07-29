@@ -4,12 +4,12 @@ use super::config::{
 };
 use super::lsp::LspSupervisor;
 use super::projects::AgentProjectCache;
-use super::util::contains_any;
 use super::shutdown::{
     ActivityTracker, BackgroundThreads, ShutdownCoordinator, ShutdownDeadline, ShutdownPhaseResult,
     ShutdownReport, BACKGROUND_JOIN_BUDGET, DEFAULT_SHUTDOWN_BUDGET, JOB_DRAIN_BUDGET,
     LSP_SHUTDOWN_BUDGET, PROVIDER_SHUTDOWN_BUDGET,
 };
+use super::util::contains_any;
 use crate::agent_init::{TRANSPORT_AUTO, TRANSPORT_POLLING, TRANSPORT_QUIC, TRANSPORT_WEBSOCKET};
 use crate::shell_protocol::{
     read_quic_frame, write_quic_frame, AgentEnvelope, QuicFrameError, ShellAgentJobUpdateRequest,
@@ -2490,7 +2490,6 @@ where
         AgentSessionExit::TransportDisconnected
     })
 }
-
 
 #[cfg(test)]
 #[path = "transport_tests.rs"]
