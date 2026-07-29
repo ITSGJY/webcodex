@@ -1,0 +1,2427 @@
+    use super::super::config::{AgentPolicy, ShellConfig};
+    use super::*;
+    use crate::shell_protocol::{
+        ShellAgentShellRequest, ShellClientCapabilities, AGENT_PROTOCOL_VERSION_WEBSOCKET_V1,
+    };
+    use futures_util::{SinkExt, StreamExt};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener as StdTcpListener, TcpStream};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
+    use std::thread;
+    use tokio::net::TcpListener;
+    use tokio::sync::{mpsc, oneshot};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    fn test_agent_config(server_url: String) -> AgentConfig {
+        AgentConfig {
+            server_url,
+            token: "test-token".to_string(),
+            client_id: "oe".to_string(),
+            display_name: Some("OE agent".to_string()),
+            owner: Some("tester".to_string()),
+            hostname: Some("oe-host".to_string()),
+            projects_dir: None,
+            poll_interval_ms: 10,
+            capabilities: Some(ShellClientCapabilities {
+                git: true,
+                ..ShellClientCapabilities::default()
+            }),
+            max_concurrent_jobs: Some(1),
+            // Transport tests run jobs in a temp dir and are not about the
+            // filesystem boundary; AgentPolicy::default() is fail-closed.
+            policy: AgentPolicy {
+                allow_cwd_anywhere: true,
+                ..AgentPolicy::default()
+            },
+            transport: Some(TRANSPORT_WEBSOCKET.to_string()),
+            websocket_connect_timeout_secs:
+                crate::webcodex_runner::default_websocket_connect_timeout_secs(),
+            quic: None,
+            shell: ShellConfig::default(),
+            tool_providers: Default::default(),
+        }
+    }
+
+    fn polling_agent_config(server_url: String, projects_dir: PathBuf) -> AgentConfig {
+        let mut cfg = test_agent_config(server_url);
+        cfg.transport = Some(TRANSPORT_POLLING.to_string());
+        cfg.projects_dir = Some(projects_dir);
+        cfg
+    }
+
+    fn test_runtime(cfg: &AgentConfig) -> AgentRuntimeState {
+        AgentRuntimeState::new(cfg, PathBuf::new())
+    }
+
+    #[test]
+    fn runtime_shutdown_is_fast_ordered_and_runs_once_without_resources() {
+        let cfg = test_agent_config("http://127.0.0.1:1".to_string());
+        let runtime = AgentRuntimeState::with_shutdown_budget(
+            &cfg,
+            PathBuf::new(),
+            Duration::from_millis(300),
+        );
+        let started = Instant::now();
+        let first = runtime.shutdown();
+        let second = runtime.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "empty shutdown was not fast"
+        );
+        assert_eq!(runtime.coordinator.run_count(), 1);
+        assert_eq!(first.phases, second.phases);
+        assert_eq!(
+            first
+                .phases
+                .iter()
+                .map(|phase| phase.phase)
+                .collect::<Vec<_>>(),
+            vec![
+                "signal_received",
+                "stop_accepting_work",
+                "config_reload_stop",
+                "queued_jobs_cancel",
+                "active_jobs_signal",
+                "active_jobs_drain",
+                "external_providers_stop",
+                "lsp_servers_stop",
+                "background_threads_join",
+                "shutdown_complete",
+            ]
+        );
+        let lines = first.log_lines();
+        assert_eq!(lines.len(), 1, "idle shutdown should stay concise");
+        assert!(lines[0].starts_with("webcodex-runner shutdown complete "));
+    }
+
+    #[test]
+    fn runtime_completion_log_follows_bounded_background_cleanup() {
+        let cfg = test_agent_config("http://127.0.0.1:1".to_string());
+        let runtime = AgentRuntimeState::with_shutdown_budget(
+            &cfg,
+            PathBuf::new(),
+            Duration::from_millis(500),
+        );
+        runtime.register_background_thread(thread::spawn(|| {
+            thread::sleep(Duration::from_millis(60));
+        }));
+
+        let report = runtime.shutdown();
+        let background = report
+            .phases
+            .iter()
+            .find(|phase| phase.phase == "background_threads_join")
+            .unwrap();
+        assert_eq!(
+            background.status,
+            super::super::shutdown::ShutdownPhaseStatus::Completed
+        );
+        assert!(
+            report.elapsed_ms >= 40,
+            "completion was recorded before background cleanup"
+        );
+        let lines = report.log_lines();
+        assert!(
+            lines
+                .last()
+                .unwrap()
+                .starts_with("webcodex-runner shutdown complete "),
+            "completion log was not last"
+        );
+    }
+
+    #[test]
+    fn runtime_shutdown_global_budget_bounds_unjoinable_background_thread() {
+        let cfg = test_agent_config("http://127.0.0.1:1".to_string());
+        let budget = Duration::from_millis(80);
+        let runtime = AgentRuntimeState::with_shutdown_budget(&cfg, PathBuf::new(), budget);
+        runtime.register_background_thread(thread::spawn(|| {
+            thread::sleep(Duration::from_millis(400));
+        }));
+
+        let started = Instant::now();
+        let report = runtime.shutdown();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(50) && elapsed < Duration::from_millis(250),
+            "global shutdown budget was not enforced: {elapsed:?}"
+        );
+        let background = report
+            .phases
+            .iter()
+            .find(|phase| phase.phase == "background_threads_join")
+            .unwrap();
+        assert_eq!(
+            background.status,
+            super::super::shutdown::ShutdownPhaseStatus::TimedOut
+        );
+        assert_eq!(runtime.coordinator.run_count(), 1);
+        assert!(
+            report
+                .log_lines()
+                .last()
+                .unwrap()
+                .starts_with("webcodex-runner shutdown complete "),
+            "completion must be emitted after the timed-out cleanup attempt"
+        );
+    }
+
+    #[test]
+    fn runtime_shutdown_wakes_and_joins_reload_listener() {
+        let cfg = test_agent_config("http://127.0.0.1:1".to_string());
+        let runtime = AgentRuntimeState::with_shutdown_budget(
+            &cfg,
+            PathBuf::new(),
+            Duration::from_millis(500),
+        );
+        let config = Arc::clone(&runtime.config);
+        runtime.register_reload_thread(thread::spawn(move || {
+            while !config.is_stopping() {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }));
+        let report = runtime.shutdown();
+        let reload = report
+            .phases
+            .iter()
+            .find(|phase| phase.phase == "config_reload_stop")
+            .unwrap();
+        assert_eq!(
+            reload.status,
+            super::super::shutdown::ShutdownPhaseStatus::Completed
+        );
+        assert_eq!(reload.resources, 1);
+    }
+
+    fn test_project(id: &str) -> ShellAgentProjectSummary {
+        ShellAgentProjectSummary {
+            id: id.to_string(),
+            name: Some(id.to_string()),
+            path: format!("/tmp/{}", id),
+            allow_patch: true,
+            kind: Some("repo".to_string()),
+            description: None,
+            hooks: vec!["check".to_string()],
+            disabled: false,
+            revision: None,
+            git_branch: None,
+            git_head: None,
+            git_dirty: None,
+            updated_at: 123,
+            shell_profile: None,
+        }
+    }
+
+    fn header_end(buf: &[u8]) -> Option<usize> {
+        buf.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    fn content_length(headers: &str) -> usize {
+        headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0)
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut buf = Vec::new();
+        loop {
+            let mut chunk = [0u8; 1024];
+            let n = stream.read(&mut chunk).expect("read request");
+            assert!(n > 0, "client closed before sending a complete request");
+            buf.extend_from_slice(&chunk[..n]);
+            let Some(end) = header_end(&buf) else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&buf[..end]);
+            let expected = end + 4 + content_length(&headers);
+            if buf.len() >= expected {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn request_path(request: &str) -> &str {
+        request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("")
+    }
+
+    fn write_http_response(stream: &mut TcpStream, status: &str, content_type: &str, body: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            status,
+            content_type,
+            body.as_bytes().len(),
+            body
+        )
+        .unwrap();
+    }
+
+    fn start_polling_http_server(
+        poll_status: &str,
+        poll_content_type: &str,
+        poll_body: &str,
+    ) -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let poll_count = Arc::new(AtomicUsize::new(0));
+        let server_poll_count = Arc::clone(&poll_count);
+        let poll_status = poll_status.to_string();
+        let poll_content_type = poll_content_type.to_string();
+        let poll_body = poll_body.to_string();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            assert_eq!(request_path(&request), "/api/shell/agent/register");
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                "application/json",
+                r#"{"success":true,"client":null,"error":null}"#,
+            );
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            assert_eq!(request_path(&request), "/api/shell/agent/poll");
+            server_poll_count.fetch_add(1, Ordering::SeqCst);
+            write_http_response(&mut stream, &poll_status, &poll_content_type, &poll_body);
+        });
+        (format!("http://{}", addr), poll_count, server)
+    }
+
+    fn start_auto_fallback_http_server(
+        poll_status: &str,
+        poll_content_type: &str,
+        poll_body: &str,
+    ) -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let poll_count = Arc::new(AtomicUsize::new(0));
+        let server_poll_count = Arc::clone(&poll_count);
+        let poll_status = poll_status.to_string();
+        let poll_content_type = poll_content_type.to_string();
+        let poll_body = poll_body.to_string();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            assert_eq!(request_path(&request), "/api/agents/ws");
+            write_http_response(
+                &mut stream,
+                "503 Service Unavailable",
+                "text/plain",
+                "websocket unavailable",
+            );
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            assert_eq!(request_path(&request), "/api/shell/agent/register");
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                "application/json",
+                r#"{"success":true,"client":null,"error":null}"#,
+            );
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            assert_eq!(request_path(&request), "/api/shell/agent/poll");
+            server_poll_count.fetch_add(1, Ordering::SeqCst);
+            write_http_response(&mut stream, &poll_status, &poll_content_type, &poll_body);
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            assert_eq!(request_path(&request), "/api/shell/agent/register");
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                "application/json",
+                r#"{"success":true,"client":null,"error":null}"#,
+            );
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            assert_eq!(request_path(&request), "/api/shell/agent/poll");
+            server_poll_count.fetch_add(1, Ordering::SeqCst);
+            write_http_response(
+                &mut stream,
+                "404 Not Found",
+                "application/json",
+                r#"{"success":false,"error":"poll endpoint missing"}"#,
+            );
+        });
+        (format!("http://{}", addr), poll_count, server)
+    }
+
+    fn run_polling_agent_against_server(
+        poll_status: &str,
+        poll_content_type: &str,
+        poll_body: &str,
+        once: bool,
+    ) -> (Result<(), String>, usize) {
+        let (server_url, poll_count, server) =
+            start_polling_http_server(poll_status, poll_content_type, poll_body);
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = polling_agent_config(server_url, tmp.path().join("projects.d"));
+        let runtime = test_runtime(&cfg);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let failsafe = Arc::clone(&shutdown);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(2));
+            failsafe.store(true, Ordering::SeqCst);
+        });
+        let result =
+            run_polling_agent_with_shutdown(cfg, once, "inst-poll-test", shutdown, &runtime);
+        server.join().unwrap();
+        (result, poll_count.load(Ordering::SeqCst))
+    }
+
+    /// Scripted step for the sequential fake agent HTTP server. Each step
+    /// asserts the endpoint the runner is expected to call next, which is
+    /// what distinguishes "kept polling" from "re-registered or resubmitted".
+    enum ScriptStep {
+        Register,
+        RegisterResponse {
+            status: &'static str,
+            body: &'static str,
+        },
+        RegisterTypedResponse {
+            status: &'static str,
+            content_type: &'static str,
+            body: &'static str,
+        },
+        PollDeliver(&'static str),
+        PollEmpty,
+        PollResponse {
+            status: &'static str,
+            body: &'static str,
+        },
+        PollTypedResponse {
+            status: &'static str,
+            content_type: &'static str,
+            body: &'static str,
+        },
+        PollOversized {
+            declared_len: usize,
+        },
+        PollClose,
+        Result {
+            status: &'static str,
+            body: &'static str,
+        },
+    }
+
+    struct ScriptedServer {
+        server_url: String,
+        requests: Arc<Mutex<Vec<(String, String)>>>,
+        shutdown: Arc<AtomicBool>,
+        handle: thread::JoinHandle<()>,
+    }
+
+    fn sync_file_request(request_id: &str) -> ShellAgentShellRequest {
+        ShellAgentShellRequest {
+            request_id: request_id.to_string(),
+            client_id: "oe".to_string(),
+            kind: "file_read".to_string(),
+            job_id: None,
+            cwd: None,
+            path: None,
+            content: None,
+            max_bytes: None,
+            old_text: None,
+            pattern: None,
+            expected_sha256: None,
+            expected_prefix: None,
+            start_line: None,
+            end_line: None,
+            line: None,
+            create_dirs: false,
+            command: String::new(),
+            stdin: None,
+            timeout_secs: 5,
+            requested_by: "tester".to_string(),
+            created_at: 0,
+            validation: None,
+            lsp: None,
+            sandbox: None,
+            job_context: None,
+        }
+    }
+
+    fn accept_with_deadline(listener: &StdTcpListener, deadline: Duration) -> TcpStream {
+        let start = Instant::now();
+        listener.set_nonblocking(true).unwrap();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    listener.set_nonblocking(false).unwrap();
+                    return stream;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        start.elapsed() < deadline,
+                        "scripted server timed out waiting for the next agent request"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("scripted server accept failed: {e}"),
+            }
+        }
+    }
+
+    fn start_scripted_agent_server(steps: Vec<ScriptStep>) -> ScriptedServer {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = Arc::clone(&shutdown);
+        let handle = thread::spawn(move || {
+            for step in steps {
+                let mut stream = accept_with_deadline(&listener, Duration::from_secs(8));
+                let request = read_http_request(&mut stream);
+                let path = request_path(&request).to_string();
+                let body = request
+                    .find("\r\n\r\n")
+                    .map(|index| request[index + 4..].to_string())
+                    .unwrap_or_default();
+                recorded.lock().unwrap().push((path.clone(), body));
+                match step {
+                    ScriptStep::Register => {
+                        assert_eq!(path, "/api/shell/agent/register");
+                        write_http_response(
+                            &mut stream,
+                            "200 OK",
+                            "application/json",
+                            r#"{"success":true,"client":null,"error":null}"#,
+                        );
+                    }
+                    ScriptStep::RegisterResponse { status, body } => {
+                        assert_eq!(path, "/api/shell/agent/register");
+                        write_http_response(&mut stream, status, "application/json", body);
+                    }
+                    ScriptStep::RegisterTypedResponse {
+                        status,
+                        content_type,
+                        body,
+                    } => {
+                        assert_eq!(path, "/api/shell/agent/register");
+                        write_http_response(&mut stream, status, content_type, body);
+                    }
+                    ScriptStep::PollDeliver(request_id) => {
+                        assert_eq!(path, "/api/shell/agent/poll", "expected poll, got {path}");
+                        let request_json =
+                            serde_json::to_string(&sync_file_request(request_id)).unwrap();
+                        let body = format!(
+                            r#"{{"success":true,"request":{},"error":null}}"#,
+                            request_json
+                        );
+                        write_http_response(&mut stream, "200 OK", "application/json", &body);
+                    }
+                    ScriptStep::PollEmpty => {
+                        assert_eq!(path, "/api/shell/agent/poll", "expected poll, got {path}");
+                        write_http_response(
+                            &mut stream,
+                            "200 OK",
+                            "application/json",
+                            r#"{"success":true,"request":null,"error":null}"#,
+                        );
+                    }
+                    ScriptStep::PollResponse { status, body } => {
+                        assert_eq!(path, "/api/shell/agent/poll", "expected poll, got {path}");
+                        write_http_response(&mut stream, status, "application/json", body);
+                    }
+                    ScriptStep::PollTypedResponse {
+                        status,
+                        content_type,
+                        body,
+                    } => {
+                        assert_eq!(path, "/api/shell/agent/poll", "expected poll, got {path}");
+                        write_http_response(&mut stream, status, content_type, body);
+                    }
+                    ScriptStep::PollOversized { declared_len } => {
+                        assert_eq!(path, "/api/shell/agent/poll", "expected poll, got {path}");
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            declared_len
+                        )
+                        .unwrap();
+                    }
+                    ScriptStep::PollClose => {
+                        assert_eq!(path, "/api/shell/agent/poll", "expected poll, got {path}");
+                        // Dropping the accepted socket without a response
+                        // exercises connection-closed / early-EOF recovery.
+                    }
+                    ScriptStep::Result { status, body } => {
+                        assert_eq!(
+                            path, "/api/shell/agent/result",
+                            "expected result submission, got {path}"
+                        );
+                        write_http_response(&mut stream, status, "application/json", body);
+                    }
+                }
+            }
+            server_shutdown.store(true, Ordering::SeqCst);
+        });
+        ScriptedServer {
+            server_url: format!("http://{}", addr),
+            requests,
+            shutdown,
+            handle,
+        }
+    }
+
+    fn run_polling_agent_against_scripted_server(
+        server: &ScriptedServer,
+        once: bool,
+    ) -> Result<(), String> {
+        let runner_shutdown = Arc::clone(&server.shutdown);
+        let failsafe_shutdown = Arc::clone(&server.shutdown);
+        let server_url = server.server_url.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let tmp = tempfile::tempdir().unwrap();
+            let cfg = polling_agent_config(server_url, tmp.path().join("projects.d"));
+            let runtime = test_runtime(&cfg);
+            let result = run_polling_agent_with_shutdown(
+                cfg,
+                once,
+                "inst-script",
+                runner_shutdown,
+                &runtime,
+            );
+            let _ = result_tx.send(result);
+        });
+        match result_rx.recv_timeout(Duration::from_secs(20)) {
+            Ok(result) => result,
+            Err(error) => {
+                failsafe_shutdown.store(true, Ordering::SeqCst);
+                panic!("scripted polling runner exceeded hard timeout: {error}");
+            }
+        }
+    }
+
+    fn recorded_result_bodies(requests: &Mutex<Vec<(String, String)>>) -> Vec<String> {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path == "/api/shell/agent/result")
+            .map(|(_, body)| body.clone())
+            .collect()
+    }
+
+    fn recorded_paths(requests: &Mutex<Vec<(String, String)>>) -> Vec<String> {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
+    #[test]
+    fn polling_502_reregisters_once_then_processes_request() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Register,
+            ScriptStep::PollResponse {
+                status: "502 Bad Gateway",
+                body: "<html>\n<h1>Bad Gateway</h1>\n</html>",
+            },
+            ScriptStep::Register,
+            ScriptStep::PollDeliver("req-after-502"),
+            ScriptStep::Result {
+                status: "200 OK",
+                body: r#"{"success":true}"#,
+            },
+            ScriptStep::PollEmpty,
+        ]);
+        let started = Instant::now();
+        run_polling_agent_against_scripted_server(&server, false)
+            .expect("a transient poll 502 must recover");
+        server.handle.join().unwrap();
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(450),
+            "poll recovery skipped its first backoff"
+        );
+        assert_eq!(
+            recorded_paths(&server.requests),
+            vec![
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+                "/api/shell/agent/result",
+                "/api/shell/agent/poll",
+            ],
+            "the first transient poll failure refreshes the same-instance session once"
+        );
+        let results = recorded_result_bodies(&server.requests);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].contains("req-after-502"), "{results:?}");
+    }
+
+    #[test]
+    fn polling_503_and_504_stay_live_without_registration_storm() {
+        for status in ["503 Service Unavailable", "504 Gateway Timeout"] {
+            let server = start_scripted_agent_server(vec![
+                ScriptStep::Register,
+                ScriptStep::PollResponse {
+                    status,
+                    body: "proxy unavailable",
+                },
+                ScriptStep::Register,
+                ScriptStep::PollEmpty,
+            ]);
+            run_polling_agent_against_scripted_server(&server, false)
+                .expect("gateway failure must recover");
+            server.handle.join().unwrap();
+            assert_eq!(
+                recorded_paths(&server.requests),
+                vec![
+                    "/api/shell/agent/register",
+                    "/api/shell/agent/poll",
+                    "/api/shell/agent/register",
+                    "/api/shell/agent/poll",
+                ],
+                "status {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn polling_connection_closed_enters_session_recovery() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Register,
+            ScriptStep::PollClose,
+            ScriptStep::Register,
+            ScriptStep::PollEmpty,
+        ]);
+        run_polling_agent_against_scripted_server(&server, false)
+            .expect("a closed poll connection must recover");
+        server.handle.join().unwrap();
+        assert_eq!(
+            recorded_paths(&server.requests),
+            vec![
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+            ]
+        );
+    }
+
+    #[test]
+    fn polling_repeated_transients_back_off_and_refresh_only_once() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Register,
+            ScriptStep::PollResponse {
+                status: "502 Bad Gateway",
+                body: "bad gateway",
+            },
+            ScriptStep::Register,
+            ScriptStep::PollResponse {
+                status: "503 Service Unavailable",
+                body: "unavailable",
+            },
+            ScriptStep::PollResponse {
+                status: "504 Gateway Timeout",
+                body: "timeout",
+            },
+            ScriptStep::PollEmpty,
+        ]);
+        let started = Instant::now();
+        run_polling_agent_against_scripted_server(&server, false)
+            .expect("consecutive gateway failures must recover");
+        let elapsed = started.elapsed();
+        server.handle.join().unwrap();
+
+        assert!(
+            elapsed >= Duration::from_millis(1_850),
+            "repeated failures did not apply 500ms/500ms/1s recovery delays: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "bounded recovery took unexpectedly long: {elapsed:?}"
+        );
+        assert_eq!(
+            recorded_paths(&server.requests),
+            vec![
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+                "/api/shell/agent/poll",
+                "/api/shell/agent/poll",
+            ],
+            "one recovery episode must not re-register on every 5xx"
+        );
+    }
+
+    #[test]
+    fn polling_truncated_json_recovers_and_stays_live() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Register,
+            ScriptStep::PollResponse {
+                status: "200 OK",
+                body: r#"{"success":true,"request":"#,
+            },
+            ScriptStep::Register,
+            ScriptStep::PollEmpty,
+        ]);
+        run_polling_agent_against_scripted_server(&server, false)
+            .expect("an incomplete poll response must recover");
+        server.handle.join().unwrap();
+        assert_eq!(
+            recorded_paths(&server.requests),
+            vec![
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+            ]
+        );
+    }
+
+    #[test]
+    fn polling_register_truncated_json_recovers_and_stays_live() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::RegisterResponse {
+                status: "200 OK",
+                body: r#"{"success":true,"client":"#,
+            },
+            ScriptStep::Register,
+            ScriptStep::PollEmpty,
+        ]);
+        run_polling_agent_against_scripted_server(&server, false)
+            .expect("an incomplete register response must recover");
+        server.handle.join().unwrap();
+        assert_eq!(
+            recorded_paths(&server.requests),
+            vec![
+                "/api/shell/agent/register",
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+            ]
+        );
+    }
+
+    #[test]
+    fn polling_http_200_html_bad_gateway_recovers() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Register,
+            ScriptStep::PollTypedResponse {
+                status: "200 OK",
+                content_type: "text/html; charset=utf-8",
+                body: "<!doctype html>\n<html><h1>Bad Gateway</h1></html>",
+            },
+            ScriptStep::Register,
+            ScriptStep::PollEmpty,
+        ]);
+        run_polling_agent_against_scripted_server(&server, false)
+            .expect("a poll proxy error page must recover");
+        server.handle.join().unwrap();
+        assert_eq!(
+            recorded_paths(&server.requests),
+            vec![
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+            ]
+        );
+    }
+
+    #[test]
+    fn polling_register_http_200_html_service_unavailable_recovers() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::RegisterTypedResponse {
+                status: "200 OK",
+                content_type: "text/html",
+                body: "<html>\n<h1>Service Unavailable</h1>\n</html>",
+            },
+            ScriptStep::Register,
+            ScriptStep::PollEmpty,
+        ]);
+        run_polling_agent_against_scripted_server(&server, false)
+            .expect("a register proxy error page must recover");
+        server.handle.join().unwrap();
+        assert_eq!(
+            recorded_paths(&server.requests),
+            vec![
+                "/api/shell/agent/register",
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+            ]
+        );
+    }
+
+    #[test]
+    fn polling_complete_schema_mismatch_is_terminal_without_recovery() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Register,
+            ScriptStep::PollResponse {
+                status: "200 OK",
+                body: r#"{"success":"yes","request":null,"error":null}"#,
+            },
+        ]);
+        let error = run_polling_agent_against_scripted_server(&server, false)
+            .expect_err("a complete incompatible poll response must stop");
+        server.handle.join().unwrap();
+        assert!(
+            error.contains("poll response incompatible with server protocol"),
+            "{error}"
+        );
+        assert!(error.contains("serde_category=data"), "{error}");
+        assert!(!error.contains("\"yes\""), "{error}");
+        assert_eq!(
+            recorded_paths(&server.requests),
+            vec!["/api/shell/agent/register", "/api/shell/agent/poll"],
+            "protocol incompatibility must neither re-register nor poll again"
+        );
+    }
+
+    #[test]
+    fn polling_unknown_json_shape_is_terminal_without_recovery() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Register,
+            ScriptStep::PollResponse {
+                status: "200 OK",
+                body: r#"{"unexpected":true}"#,
+            },
+        ]);
+        let error = run_polling_agent_against_scripted_server(&server, false)
+            .expect_err("an unknown complete poll shape must stop");
+        server.handle.join().unwrap();
+        assert!(
+            error.contains("poll response incompatible with server protocol"),
+            "{error}"
+        );
+        assert!(error.contains("serde_category=data"), "{error}");
+        assert!(!error.contains("unexpected"), "{error}");
+        assert_eq!(
+            recorded_paths(&server.requests),
+            vec!["/api/shell/agent/register", "/api/shell/agent/poll"]
+        );
+    }
+
+    #[test]
+    fn polling_register_complete_schema_mismatch_is_terminal_without_retry() {
+        let server = start_scripted_agent_server(vec![ScriptStep::RegisterResponse {
+            status: "200 OK",
+            body: r#"{"success":"yes","client":null,"error":null}"#,
+        }]);
+        let error = run_polling_agent_against_scripted_server(&server, false)
+            .expect_err("a complete incompatible register response must stop");
+        server.handle.join().unwrap();
+        assert!(
+            error.contains("register response incompatible with server protocol"),
+            "{error}"
+        );
+        assert!(error.contains("serde_category=data"), "{error}");
+        assert!(!error.contains("\"yes\""), "{error}");
+        assert_eq!(
+            recorded_paths(&server.requests),
+            vec!["/api/shell/agent/register"]
+        );
+    }
+
+    #[test]
+    fn polling_register_unknown_json_shape_is_terminal_without_retry() {
+        let server = start_scripted_agent_server(vec![ScriptStep::RegisterResponse {
+            status: "200 OK",
+            body: r#"{"unexpected":true}"#,
+        }]);
+        let error = run_polling_agent_against_scripted_server(&server, false)
+            .expect_err("an unknown complete register shape must stop");
+        server.handle.join().unwrap();
+        assert!(
+            error.contains("register response incompatible with server protocol"),
+            "{error}"
+        );
+        assert!(error.contains("serde_category=data"), "{error}");
+        assert!(!error.contains("unexpected"), "{error}");
+        assert_eq!(
+            recorded_paths(&server.requests),
+            vec!["/api/shell/agent/register"]
+        );
+    }
+
+    #[test]
+    fn polling_oversized_response_is_terminal_without_loading_the_body() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Register,
+            ScriptStep::PollOversized {
+                declared_len: crate::AGENT_HTTP_RESPONSE_BODY_MAX_BYTES + 1,
+            },
+        ]);
+        let error = run_polling_agent_against_scripted_server(&server, false)
+            .expect_err("an oversized poll response must stop at the protocol boundary");
+        server.handle.join().unwrap();
+        assert!(
+            error.contains("poll response incompatible with server protocol"),
+            "{error}"
+        );
+        assert!(
+            error.contains("declared response body exceeds limit_bytes=33554432"),
+            "{error}"
+        );
+        assert_eq!(
+            recorded_paths(&server.requests),
+            vec!["/api/shell/agent/register", "/api/shell/agent/poll"]
+        );
+    }
+
+    #[test]
+    fn polling_404_and_non_session_400_are_terminal_without_retry() {
+        for (status, body, expected) in [
+            (
+                "404 Not Found",
+                r#"{"success":false,"error":"missing"}"#,
+                "poll endpoint missing or incompatible server",
+            ),
+            (
+                "400 Bad Request",
+                r#"{"success":false,"error":"invalid poll payload"}"#,
+                "server permanently rejected polling",
+            ),
+        ] {
+            let server = start_scripted_agent_server(vec![
+                ScriptStep::Register,
+                ScriptStep::PollResponse { status, body },
+            ]);
+            let error = run_polling_agent_against_scripted_server(&server, false)
+                .expect_err("permanent poll failure must stop");
+            server.handle.join().unwrap();
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(
+                recorded_paths(&server.requests),
+                vec!["/api/shell/agent/register", "/api/shell/agent/poll"],
+                "status {status} must not retry or re-register"
+            );
+        }
+    }
+
+    #[test]
+    fn polling_unknown_session_reregisters_then_resumes() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Register,
+            ScriptStep::PollResponse {
+                status: "400 Bad Request",
+                body: r#"{"success":false,"error":"unknown shell client: oe"}"#,
+            },
+            ScriptStep::Register,
+            ScriptStep::PollEmpty,
+        ]);
+        run_polling_agent_against_scripted_server(&server, false)
+            .expect("an explicitly missing polling session must re-register");
+        server.handle.join().unwrap();
+        assert_eq!(
+            recorded_paths(&server.requests),
+            vec![
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+            ]
+        );
+    }
+
+    #[test]
+    fn polling_initial_register_502_recovers_without_supervisor_restart() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::RegisterResponse {
+                status: "502 Bad Gateway",
+                body: "<html>bad gateway</html>",
+            },
+            ScriptStep::Register,
+            ScriptStep::PollEmpty,
+        ]);
+        let started = Instant::now();
+        run_polling_agent_against_scripted_server(&server, false)
+            .expect("initial transient register failure must recover");
+        server.handle.join().unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(450));
+        assert_eq!(
+            recorded_paths(&server.requests),
+            vec![
+                "/api/shell/agent/register",
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+            ]
+        );
+    }
+
+    #[test]
+    fn polling_recovery_register_502_retries_then_resumes() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Register,
+            ScriptStep::PollResponse {
+                status: "502 Bad Gateway",
+                body: "bad gateway",
+            },
+            ScriptStep::RegisterResponse {
+                status: "502 Bad Gateway",
+                body: "bad gateway",
+            },
+            ScriptStep::Register,
+            ScriptStep::PollEmpty,
+        ]);
+        run_polling_agent_against_scripted_server(&server, false)
+            .expect("transient recovery register failure must recover");
+        server.handle.join().unwrap();
+        assert_eq!(
+            recorded_paths(&server.requests),
+            vec![
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+                "/api/shell/agent/register",
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+            ]
+        );
+    }
+
+    #[test]
+    fn polling_active_instance_lease_conflict_waits_then_registers() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::RegisterResponse {
+                status: "400 Bad Request",
+                body: r#"{"success":false,"error":"agent client oe is already online with a different instance"}"#,
+            },
+            ScriptStep::Register,
+            ScriptStep::PollEmpty,
+        ]);
+        let started = Instant::now();
+        run_polling_agent_against_scripted_server(&server, false)
+            .expect("temporary active-instance lease must be retried");
+        server.handle.join().unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(450));
+        assert_eq!(
+            recorded_paths(&server.requests),
+            vec![
+                "/api/shell/agent/register",
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+            ]
+        );
+    }
+
+    #[test]
+    fn polling_register_auth_404_and_identity_mismatch_are_terminal() {
+        for (status, body, expected) in [
+            (
+                "401 Unauthorized",
+                r#"{"success":false,"error":"invalid token"}"#,
+                "authentication failed",
+            ),
+            (
+                "403 Forbidden",
+                r#"{"success":false,"error":"forbidden"}"#,
+                "authentication failed",
+            ),
+            (
+                "404 Not Found",
+                r#"{"success":false,"error":"missing"}"#,
+                "endpoint missing or incompatible server",
+            ),
+            (
+                "400 Bad Request",
+                r#"{"success":false,"error":"agent token owner is 'alice'; cannot register owner 'bob'"}"#,
+                "server rejected /api/shell/agent/register request",
+            ),
+            (
+                "400 Bad Request",
+                r#"{"success":false,"error":"agent client identity is unavailable"}"#,
+                "server rejected /api/shell/agent/register request",
+            ),
+        ] {
+            let server =
+                start_scripted_agent_server(vec![ScriptStep::RegisterResponse { status, body }]);
+            let error = run_polling_agent_against_scripted_server(&server, false)
+                .expect_err("fatal register response must stop");
+            server.handle.join().unwrap();
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(
+                recorded_paths(&server.requests),
+                vec!["/api/shell/agent/register"],
+                "status {status} must not retry"
+            );
+        }
+    }
+
+    #[test]
+    fn polling_once_retries_transport_failures_until_one_successful_poll() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::RegisterResponse {
+                status: "502 Bad Gateway",
+                body: "bad gateway",
+            },
+            ScriptStep::Register,
+            ScriptStep::PollResponse {
+                status: "503 Service Unavailable",
+                body: "unavailable",
+            },
+            ScriptStep::PollEmpty,
+        ]);
+        run_polling_agent_against_scripted_server(&server, true)
+            .expect("--once must complete after one successful poll");
+        server.handle.join().unwrap();
+        assert_eq!(
+            recorded_paths(&server.requests),
+            vec![
+                "/api/shell/agent/register",
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+                "/api/shell/agent/poll",
+            ]
+        );
+    }
+
+    #[test]
+    fn polling_shutdown_interrupts_session_recovery_without_extra_request() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Register,
+            ScriptStep::PollResponse {
+                status: "502 Bad Gateway",
+                body: "bad gateway",
+            },
+        ]);
+        let started = Instant::now();
+        run_polling_agent_against_scripted_server(&server, false)
+            .expect("shutdown during recovery must be a clean exit");
+        let elapsed = started.elapsed();
+        server.handle.join().unwrap();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "shutdown did not interrupt recovery promptly: {elapsed:?}"
+        );
+        assert_eq!(
+            recorded_paths(&server.requests),
+            vec!["/api/shell/agent/register", "/api/shell/agent/poll"],
+            "shutdown must not leak a re-register request"
+        );
+    }
+
+    #[test]
+    fn polling_shutdown_uses_the_process_coordinator_once() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Register,
+            ScriptStep::PollResponse {
+                status: "502 Bad Gateway",
+                body: "bad gateway",
+            },
+        ]);
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = polling_agent_config(server.server_url.clone(), temp.path().join("projects.d"));
+        let runtime = AgentRuntimeState::with_shutdown_budget(
+            &cfg,
+            PathBuf::new(),
+            Duration::from_millis(500),
+        );
+        run_polling_agent_with_shutdown(
+            cfg,
+            false,
+            "inst-coordinator",
+            Arc::clone(&server.shutdown),
+            &runtime,
+        )
+        .unwrap();
+        server.handle.join().unwrap();
+        runtime.shutdown();
+        assert_eq!(runtime.coordinator.run_count(), 1);
+    }
+
+    #[test]
+    fn polling_result_permanent_400_is_dropped_once_and_polling_continues() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Register,
+            ScriptStep::PollDeliver("req-expired"),
+            ScriptStep::Result {
+                status: "400 Bad Request",
+                body: r#"{"success":false,"error":"unknown or expired shell request: req-expired"}"#,
+            },
+            // The old path treated this as general retryable recovery, adding
+            // a sleep and re-register before the next poll. The next call must
+            // now be a poll, with neither recovery churn nor resubmission.
+            ScriptStep::PollDeliver("req-next"),
+            ScriptStep::Result {
+                status: "200 OK",
+                body: r#"{"success":true}"#,
+            },
+            ScriptStep::PollEmpty,
+        ]);
+        run_polling_agent_against_scripted_server(&server, false)
+            .expect("script completion should shut the polling runner down cleanly");
+        server.handle.join().unwrap();
+
+        let result_bodies = recorded_result_bodies(&server.requests);
+        assert_eq!(
+            result_bodies.len(),
+            2,
+            "the permanently rejected request result must be submitted once"
+        );
+        assert!(
+            result_bodies[0].contains("req-expired"),
+            "{result_bodies:?}"
+        );
+        assert!(result_bodies[1].contains("req-next"), "{result_bodies:?}");
+        let paths: Vec<String> = server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+                "/api/shell/agent/result",
+                "/api/shell/agent/poll",
+                "/api/shell/agent/result",
+                "/api/shell/agent/poll",
+            ],
+        );
+    }
+
+    #[test]
+    fn polling_result_transient_500_retries_same_payload_then_succeeds() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Register,
+            ScriptStep::PollDeliver("req-transient"),
+            ScriptStep::Result {
+                status: "500 Internal Server Error",
+                body: r#"{"success":false,"error":"temporary backend failure"}"#,
+            },
+            ScriptStep::Result {
+                status: "200 OK",
+                body: r#"{"success":true}"#,
+            },
+            ScriptStep::PollEmpty,
+        ]);
+        run_polling_agent_against_scripted_server(&server, false)
+            .expect("script completion should shut the polling runner down cleanly");
+        server.handle.join().unwrap();
+
+        let result_bodies = recorded_result_bodies(&server.requests);
+        assert_eq!(
+            result_bodies.len(),
+            2,
+            "a transient failure must retry the same result payload"
+        );
+        assert!(
+            result_bodies[0].contains("req-transient"),
+            "{result_bodies:?}"
+        );
+        assert!(
+            result_bodies[1].contains("req-transient"),
+            "{result_bodies:?}"
+        );
+    }
+
+    #[test]
+    fn polling_result_503_retries_same_payload_then_continues() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Register,
+            ScriptStep::PollDeliver("req-503"),
+            ScriptStep::Result {
+                status: "503 Service Unavailable",
+                body: r#"{"success":false,"error":"temporary gateway failure"}"#,
+            },
+            ScriptStep::Result {
+                status: "200 OK",
+                body: r#"{"success":true}"#,
+            },
+            ScriptStep::PollEmpty,
+        ]);
+        run_polling_agent_against_scripted_server(&server, false)
+            .expect("script completion should shut the polling runner down cleanly");
+        server.handle.join().unwrap();
+
+        let result_bodies = recorded_result_bodies(&server.requests);
+        assert_eq!(result_bodies.len(), 2);
+        assert_eq!(
+            result_bodies[0], result_bodies[1],
+            "503 must retry the exact result body"
+        );
+        assert!(result_bodies[0].contains("req-503"), "{result_bodies:?}");
+        let paths: Vec<String> = server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+                "/api/shell/agent/result",
+                "/api/shell/agent/result",
+                "/api/shell/agent/poll",
+            ],
+            "503 recovery must neither re-register nor stop polling"
+        );
+    }
+
+    #[test]
+    fn polling_result_server_unavailable_retry_exhaustion_drops_then_continues() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Register,
+            ScriptStep::PollDeliver("req-exhausted"),
+            ScriptStep::Result {
+                status: "503 Service Unavailable",
+                body: r#"{"success":false,"error":"temporary gateway failure"}"#,
+            },
+            ScriptStep::Result {
+                status: "503 Service Unavailable",
+                body: r#"{"success":false,"error":"temporary gateway failure"}"#,
+            },
+            ScriptStep::Result {
+                status: "503 Service Unavailable",
+                body: r#"{"success":false,"error":"temporary gateway failure"}"#,
+            },
+            ScriptStep::Result {
+                status: "503 Service Unavailable",
+                body: r#"{"success":false,"error":"temporary gateway failure"}"#,
+            },
+            ScriptStep::PollEmpty,
+        ]);
+        run_polling_agent_against_scripted_server(&server, false)
+            .expect("script completion should shut the polling runner down cleanly");
+        server.handle.join().unwrap();
+
+        let result_bodies = recorded_result_bodies(&server.requests);
+        assert_eq!(
+            result_bodies.len(),
+            RESULT_SUBMIT_RETRY_BACKOFF.len() + 1,
+            "retry exhaustion must stop after the fixed total attempt count"
+        );
+        assert!(
+            result_bodies.iter().all(|body| body == &result_bodies[0]),
+            "every bounded retry must use the exact original payload"
+        );
+        let paths: Vec<String> = server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+                "/api/shell/agent/result",
+                "/api/shell/agent/result",
+                "/api/shell/agent/result",
+                "/api/shell/agent/result",
+                "/api/shell/agent/poll",
+            ],
+            "exhaustion must release the result and poll without re-registering"
+        );
+    }
+
+    #[test]
+    fn submit_result_503_retry_exhaustion_returns_dropped_outcome() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Result {
+                status: "503 Service Unavailable",
+                body: r#"{"success":false,"error":"temporary gateway failure"}"#,
+            },
+            ScriptStep::Result {
+                status: "503 Service Unavailable",
+                body: r#"{"success":false,"error":"temporary gateway failure"}"#,
+            },
+            ScriptStep::Result {
+                status: "503 Service Unavailable",
+                body: r#"{"success":false,"error":"temporary gateway failure"}"#,
+            },
+            ScriptStep::Result {
+                status: "503 Service Unavailable",
+                body: r#"{"success":false,"error":"temporary gateway failure"}"#,
+            },
+        ]);
+        let sink = AgentSink::Http(HttpSendConfig {
+            client: Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap(),
+            server_url: server.server_url.clone(),
+            token: "test-token".to_string(),
+            client_id: "oe".to_string(),
+            agent_instance_id: "inst-exhausted".to_string(),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        });
+        let outcome = sink
+            .submit_result(
+                "req-exhausted-outcome".to_string(),
+                CommandResult {
+                    exit_code: Some(0),
+                    stdout: Some("done".to_string()),
+                    stderr: None,
+                    duration_ms: Some(1),
+                    error: None,
+                },
+            )
+            .unwrap();
+        server.handle.join().unwrap();
+
+        assert_eq!(outcome, ResultSubmission::DroppedAfterRetryExhaustion);
+        assert_eq!(
+            recorded_result_bodies(&server.requests).len(),
+            RESULT_SUBMIT_RETRY_BACKOFF.len() + 1
+        );
+    }
+
+    #[test]
+    fn submit_result_retry_backoff_is_shutdown_aware() {
+        let server = start_scripted_agent_server(vec![ScriptStep::Result {
+            status: "503 Service Unavailable",
+            body: r#"{"success":false,"error":"temporary gateway failure"}"#,
+        }]);
+        let sink = AgentSink::Http(HttpSendConfig {
+            client: Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap(),
+            server_url: server.server_url.clone(),
+            token: "test-token".to_string(),
+            client_id: "oe".to_string(),
+            agent_instance_id: "inst-shutdown".to_string(),
+            shutdown: Arc::new(AtomicBool::new(true)),
+        });
+        let started = Instant::now();
+        let error = sink
+            .submit_result(
+                "req-shutdown".to_string(),
+                CommandResult {
+                    exit_code: Some(0),
+                    stdout: Some("done".to_string()),
+                    stderr: None,
+                    duration_ms: Some(1),
+                    error: None,
+                },
+            )
+            .expect_err("shutdown must interrupt the retry backoff");
+        server.handle.join().unwrap();
+
+        assert!(matches!(error, SubmitResultError::Shutdown(_)), "{error:?}");
+        assert_eq!(recorded_result_bodies(&server.requests).len(), 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "shutdown-aware result backoff did not return promptly"
+        );
+    }
+
+    #[test]
+    fn result_submission_gateway_and_connection_classes_are_transient() {
+        for status in [
+            reqwest::StatusCode::BAD_GATEWAY,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            reqwest::StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            let error = AgentHttpError::status(AGENT_RESULT_PATH, status, "{}");
+            assert_eq!(error.kind, AgentHttpErrorKind::ServerUnavailable);
+            assert_eq!(
+                result_http_error_disposition(&error.kind),
+                ResultHttpErrorDisposition::RetryTransient,
+                "status {status} must enter bounded result retry"
+            );
+        }
+        assert_eq!(
+            result_http_error_disposition(&AgentHttpErrorKind::ServerUnavailable),
+            ResultHttpErrorDisposition::RetryTransient,
+            "connection-refused/reset/closed classification must enter bounded retry"
+        );
+        for kind in [
+            AgentHttpErrorKind::Status,
+            AgentHttpErrorKind::RequestTimeout,
+            AgentHttpErrorKind::Request,
+            AgentHttpErrorKind::DecodeTransient,
+        ] {
+            assert_eq!(
+                result_http_error_disposition(&kind),
+                ResultHttpErrorDisposition::RetryTransient,
+                "{kind:?} must enter bounded result retry"
+            );
+        }
+        assert_eq!(
+            result_http_error_disposition(&AgentHttpErrorKind::ClientRejected),
+            ResultHttpErrorDisposition::RejectPermanent
+        );
+        assert_eq!(
+            result_http_error_disposition(&AgentHttpErrorKind::Auth),
+            ResultHttpErrorDisposition::FatalAuth
+        );
+        assert_eq!(
+            result_http_error_disposition(&AgentHttpErrorKind::NotFound),
+            ResultHttpErrorDisposition::FatalProtocol
+        );
+        assert_eq!(
+            result_http_error_disposition(&AgentHttpErrorKind::ProtocolDecode),
+            ResultHttpErrorDisposition::FatalProtocol
+        );
+        assert_eq!(
+            result_http_error_disposition(&AgentHttpErrorKind::Config),
+            ResultHttpErrorDisposition::FatalConfig
+        );
+    }
+
+    #[test]
+    fn polling_result_401_and_403_are_terminal_auth_errors_without_credentials() {
+        for status in ["401 Unauthorized", "403 Forbidden"] {
+            let server = start_scripted_agent_server(vec![
+                ScriptStep::Register,
+                ScriptStep::PollDeliver("req-auth"),
+                ScriptStep::Result {
+                    status,
+                    body: r#"{"success":false,"error":"unauthorized token=SECRET-BODY-TOKEN"}"#,
+                },
+            ]);
+            let error = run_polling_agent_against_scripted_server(&server, false)
+                .expect_err("auth rejection on result submission must stop the agent");
+            server.handle.join().unwrap();
+
+            assert_eq!(
+                recorded_result_bodies(&server.requests).len(),
+                1,
+                "an auth failure must not retry the result"
+            );
+            assert!(
+                error.contains("authentication failed for /api/shell/agent/result"),
+                "{error}"
+            );
+            assert!(error.contains("check agent token/config"), "{error}");
+            assert!(!error.contains("test-token"), "{error}");
+            assert!(!error.contains("SECRET-BODY-TOKEN"), "{error}");
+        }
+    }
+
+    #[test]
+    fn polling_result_404_is_terminal_protocol_error_without_retry() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Register,
+            ScriptStep::PollDeliver("req-missing-endpoint"),
+            ScriptStep::Result {
+                status: "404 Not Found",
+                body: r#"{"success":false,"error":"token=SECRET-BODY-TOKEN"}"#,
+            },
+        ]);
+        let error = run_polling_agent_against_scripted_server(&server, false)
+            .expect_err("missing result endpoint must stop the polling agent");
+        server.handle.join().unwrap();
+
+        assert_eq!(
+            recorded_result_bodies(&server.requests).len(),
+            1,
+            "404 must not retry the result"
+        );
+        assert!(
+            error.contains("endpoint missing or incompatible server for /api/shell/agent/result"),
+            "{error}"
+        );
+        assert!(!error.contains("test-token"), "{error}");
+        assert!(!error.contains("SECRET-BODY-TOKEN"), "{error}");
+    }
+
+    #[test]
+    fn polling_result_success_submits_once_and_continues() {
+        let server = start_scripted_agent_server(vec![
+            ScriptStep::Register,
+            ScriptStep::PollDeliver("req-success"),
+            ScriptStep::Result {
+                status: "200 OK",
+                body: r#"{"success":true}"#,
+            },
+            ScriptStep::PollEmpty,
+        ]);
+        run_polling_agent_against_scripted_server(&server, false)
+            .expect("script completion should shut the polling runner down cleanly");
+        server.handle.join().unwrap();
+
+        let result_bodies = recorded_result_bodies(&server.requests);
+        assert_eq!(result_bodies.len(), 1);
+        assert!(
+            result_bodies[0].contains("req-success"),
+            "{result_bodies:?}"
+        );
+        let paths: Vec<String> = server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/api/shell/agent/register",
+                "/api/shell/agent/poll",
+                "/api/shell/agent/result",
+                "/api/shell/agent/poll",
+            ]
+        );
+    }
+
+    #[test]
+    fn permanent_rejection_log_line_is_bounded_and_redacted() {
+        let token = "DO_NOT_LEAK_THIS_TOKEN";
+        let noisy_error = format!(
+            "server rejected /api/shell/agent/result request: HTTP 400 Bad Request: token={} url=https://host/path?token={}\n{}",
+            token,
+            token,
+            "<html><body>huge proxy page</body></html>".repeat(200)
+        );
+        let line = permanent_result_rejection_log_line("req-noisy", &noisy_error, token);
+        assert!(line.contains("request_id=req-noisy"), "{line}");
+        assert!(!line.contains(token), "{line}");
+        assert!(!line.contains("?token="), "{line}");
+        assert!(!line.contains('\n'), "{line}");
+        assert!(
+            line.chars().count() < 320,
+            "log line not bounded: {} chars",
+            line.chars().count()
+        );
+    }
+
+    #[test]
+    fn dropped_result_log_line_is_bounded_and_redacted() {
+        let token = "DO_NOT_LEAK_THIS_TOKEN";
+        let line = dropped_result_log_line(
+            &format!("req-\n{}{}", token, "x".repeat(500)),
+            RESULT_SUBMIT_RETRY_BACKOFF.len() + 1,
+            &format!(
+                "server unavailable token={} {}",
+                token,
+                "<html>proxy response</html>".repeat(200)
+            ),
+            token,
+        );
+        assert!(line.contains("attempts=4"), "{line}");
+        assert!(!line.contains(token), "{line}");
+        assert!(!line.contains('\n'), "{line}");
+        assert!(
+            line.chars().count() < 520,
+            "log line not bounded: {} chars",
+            line.chars().count()
+        );
+    }
+
+    async fn read_register(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) -> crate::shell_protocol::ShellClientRegisterRequest {
+        let msg = ws
+            .next()
+            .await
+            .expect("agent sent register")
+            .expect("register message is ok");
+        match AgentEnvelope::from_slice(msg.into_text().unwrap().as_bytes()).unwrap() {
+            AgentEnvelope::Register { payload, .. } => payload,
+            other => panic!("expected register envelope, got {}", other.kind()),
+        }
+    }
+
+    async fn send_registered_ack(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) {
+        let ack = AgentEnvelope::Registered {
+            success: true,
+            client: None,
+            error: None,
+        };
+        ws.send(WsMessage::Text(ack.to_json().unwrap().into()))
+            .await
+            .unwrap();
+    }
+
+    async fn send_register_rejected_ack(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) {
+        let ack = AgentEnvelope::Registered {
+            success: false,
+            client: None,
+            error: Some("unauthorized".to_string()),
+        };
+        ws.send(WsMessage::Text(ack.to_json().unwrap().into()))
+            .await
+            .unwrap();
+    }
+
+    fn start_job_request(cwd: &Path, command: &str) -> ShellAgentShellRequest {
+        ShellAgentShellRequest {
+            request_id: "req-active-job".to_string(),
+            client_id: "oe".to_string(),
+            kind: "start_job".to_string(),
+            job_id: Some("job-active".to_string()),
+            cwd: Some(cwd.to_string_lossy().to_string()),
+            path: None,
+            content: None,
+            max_bytes: None,
+            old_text: None,
+            pattern: None,
+            expected_sha256: None,
+            expected_prefix: None,
+            start_line: None,
+            end_line: None,
+            line: None,
+            create_dirs: false,
+            command: command.to_string(),
+            stdin: None,
+            timeout_secs: 5,
+            requested_by: "tester".to_string(),
+            created_at: 0,
+            validation: None,
+            lsp: None,
+            sandbox: None,
+            job_context: Some(crate::test_job_context(cwd, Vec::new())),
+        }
+    }
+
+    #[test]
+    fn reconnect_backoff_is_bounded_exponential() {
+        let mut backoff = ReconnectBackoff::new();
+        assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(2));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(5));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(10));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(30));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(30));
+        backoff.reset();
+        assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn polling_recovery_backoff_is_bounded_and_resets() {
+        let mut backoff = PollingRecoveryBackoff::new();
+        assert_eq!(backoff.next_delay(), Duration::from_millis(500));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(2));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(5));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(10));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(10));
+        backoff.reset();
+        assert_eq!(backoff.next_delay(), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn polling_lease_conflict_retry_has_a_finite_total_wait() {
+        let mut backoff = PollingRecoveryBackoff::new();
+        assert_eq!(
+            next_lease_conflict_delay(
+                &mut backoff,
+                POLLING_LEASE_CONFLICT_MAX_WAIT - Duration::from_millis(250)
+            ),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            next_lease_conflict_delay(&mut backoff, POLLING_LEASE_CONFLICT_MAX_WAIT),
+            None
+        );
+    }
+
+    #[test]
+    fn transport_error_classification_separates_transient_and_fatal() {
+        let transient = classify_session_error("websocket connect failed: connection refused");
+        assert!(!transient.is_fatal(), "{transient}");
+
+        let fatal = classify_session_error("register rejected by server: unauthorized");
+        assert!(fatal.is_fatal(), "{fatal}");
+
+        let fatal = classify_session_error(
+            "quic connect failed: certificate verify failed; check server_name",
+        );
+        assert!(fatal.is_fatal(), "{fatal}");
+    }
+
+    #[test]
+    fn auto_log_lines_are_concise_and_redacted() {
+        assert_eq!(
+            auto_quic_not_configured_log_line(),
+            "webcodex-runner transport auto: quic not configured; skipping"
+        );
+        assert_eq!(
+            auto_trying_log_line(TRANSPORT_WEBSOCKET),
+            "webcodex-runner transport auto: websocket trying"
+        );
+        assert_eq!(
+            auto_trying_log_line(TRANSPORT_POLLING),
+            "webcodex-runner transport auto: polling trying"
+        );
+
+        let token = "DO_NOT_LEAK_THIS_TOKEN";
+        let concise = concise_log_error(
+            "websocket connect failed: token=DO_NOT_LEAK_THIS_TOKEN\nwhile connecting",
+            token,
+        );
+        assert!(!concise.contains(token), "{concise}");
+        assert!(!concise.contains('\n'), "{concise}");
+    }
+
+    #[test]
+    fn registered_log_includes_actual_transport_without_url_query_or_token() {
+        let token = "DO_NOT_LEAK_THIS_TOKEN";
+        let mut cfg = test_agent_config(format!(
+            "https://webcodex.example.test/agent/path?token={}",
+            token
+        ));
+        cfg.token = token.to_string();
+        cfg.transport = Some(TRANSPORT_AUTO.to_string());
+
+        let line = registered_log_line(&cfg, TRANSPORT_POLLING, 11);
+        assert!(line.contains("client_id=oe"), "{line}");
+        assert!(
+            line.contains("server=https://webcodex.example.test"),
+            "{line}"
+        );
+        assert!(line.contains("preferred_transport=auto"), "{line}");
+        assert!(line.contains("actual_transport=polling"), "{line}");
+        assert!(line.contains("projects=11"), "{line}");
+        assert!(!line.contains(token), "{line}");
+        assert!(!line.contains("/agent/path"), "{line}");
+        assert!(!line.contains("?token="), "{line}");
+    }
+
+    #[test]
+    fn auto_websocket_failure_falls_back_to_polling() {
+        let (server_url, poll_count, server) = start_auto_fallback_http_server(
+            "502 Bad Gateway",
+            "text/html",
+            "<html>bad gateway</html>",
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = test_agent_config(server_url);
+        cfg.transport = Some(TRANSPORT_AUTO.to_string());
+        cfg.projects_dir = Some(tmp.path().join("projects.d"));
+        cfg.websocket_connect_timeout_secs = 1;
+
+        let runtime = test_runtime(&cfg);
+        let err = run_auto_agent(cfg, false, "inst-auto-fallback", &runtime)
+            .expect_err("terminal polling 404 should stop after recovering the first 502");
+        server.join().unwrap();
+        assert_eq!(poll_count.load(Ordering::SeqCst), 2);
+        assert!(
+            err.contains("poll endpoint missing or incompatible server"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn polling_502_html_is_transient_and_sanitized() {
+        let nginx_html = "<html>\n<head><title>502 Bad Gateway</title></head>\n<body>\n<center><h1>502 Bad Gateway</h1></center>\n<hr><center>nginx/1.31.1</center>\n</body>\n</html>";
+        let error = AgentHttpError::status(
+            "/api/shell/agent/poll",
+            reqwest::StatusCode::BAD_GATEWAY,
+            nginx_html,
+        );
+        let poll_error = crate::PollError::from_http(error, "oe");
+        assert_eq!(
+            poll_error.recovery_action(),
+            PollingRecoveryAction::RetryPoll
+        );
+        let message = poll_error.to_string();
+        assert!(
+            message.contains(
+                "server unavailable while polling /api/shell/agent/poll: HTTP 502 Bad Gateway"
+            ),
+            "{message}"
+        );
+        assert!(!message.contains("<html"), "{message}");
+        assert!(!message.contains("nginx/1.31.1"), "{message}");
+        assert!(!message.contains("<center><h1>502 Bad Gateway</h1></center>"));
+    }
+
+    #[test]
+    fn polling_503_and_504_are_transient_server_unavailable() {
+        for (status, expected) in [
+            (
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                "server unavailable while polling /api/shell/agent/poll: HTTP 503 Service Unavailable",
+            ),
+            (
+                reqwest::StatusCode::GATEWAY_TIMEOUT,
+                "server unavailable while polling /api/shell/agent/poll: HTTP 504 Gateway Timeout",
+            ),
+        ] {
+            let error = AgentHttpError::status("/api/shell/agent/poll", status, "proxy unavailable");
+            let poll_error = crate::PollError::from_http(error, "oe");
+            assert_eq!(
+                poll_error.recovery_action(),
+                PollingRecoveryAction::RetryPoll
+            );
+            let message = poll_error.to_string();
+            assert!(message.contains(expected), "{message}");
+            assert!(!message.contains("proxy unavailable"), "{message}");
+        }
+    }
+
+    #[test]
+    fn polling_401_and_403_are_terminal_auth_errors() {
+        for (status, expected) in [
+            (
+                "401 Unauthorized",
+                "authentication failed while polling /api/shell/agent/poll: HTTP 401 Unauthorized; check agent token/config",
+            ),
+            (
+                "403 Forbidden",
+                "authentication failed while polling /api/shell/agent/poll: HTTP 403 Forbidden; check agent token/config",
+            ),
+        ] {
+            let (result, poll_count) = run_polling_agent_against_server(
+                status,
+                "application/json",
+                r#"{"error":"unauthorized"}"#,
+                false,
+            );
+            let error = result.expect_err("auth poll response must stop the foreground agent");
+
+            assert_eq!(poll_count, 1);
+            assert!(error.contains(expected), "{error}");
+            assert!(!error.contains("unauthorized\""), "{error}");
+        }
+    }
+
+    #[test]
+    fn polling_idle_empty_response_remains_successful_once() {
+        let (result, poll_count) = run_polling_agent_against_server(
+            "200 OK",
+            "application/json",
+            r#"{"success":true,"request":null,"error":null}"#,
+            true,
+        );
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(poll_count, 1);
+    }
+
+    #[test]
+    fn polling_shutdown_interrupts_retry_sleep() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let trigger = Arc::clone(&shutdown);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            trigger.store(true, Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        assert!(sleep_or_shutdown(Duration::from_secs(5), shutdown.as_ref()));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "shutdown-aware polling sleep did not return promptly"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_close_returns_transport_disconnect_not_shutdown() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _register = read_register(&mut ws).await;
+            send_registered_ack(&mut ws).await;
+            ws.send(WsMessage::Close(None)).await.unwrap();
+            if let Ok(Some(Ok(msg))) =
+                tokio::time::timeout(Duration::from_millis(200), ws.next()).await
+            {
+                if msg.is_text() {
+                    let env =
+                        AgentEnvelope::from_slice(msg.into_text().unwrap().as_bytes()).unwrap();
+                    assert!(
+                        !matches!(env, AgentEnvelope::Goodbye { .. }),
+                        "ordinary transport disconnect must not send Goodbye"
+                    );
+                }
+            }
+        });
+
+        let cfg = test_agent_config(format!("http://{}", addr));
+        let exit = tokio::time::timeout(
+            Duration::from_secs(5),
+            websocket_session(
+                &cfg,
+                vec![test_project("close-test")],
+                "inst-close",
+                &test_runtime(&cfg),
+            ),
+        )
+        .await
+        .expect("session completed")
+        .expect("session should not error");
+
+        assert_eq!(exit, AgentSessionExit::TransportDisconnected);
+        assert_ne!(exit, AgentSessionExit::Shutdown);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn websocket_disconnect_with_active_job_returns_without_waiting_for_job() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let request = start_job_request(cwd.path(), "sleep 2");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _register = read_register(&mut ws).await;
+            send_registered_ack(&mut ws).await;
+            ws.send(WsMessage::Text(
+                AgentEnvelope::Request { request }.to_json().unwrap().into(),
+            ))
+            .await
+            .unwrap();
+
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let msg = ws.next().await.unwrap().unwrap();
+                    if !msg.is_text() {
+                        continue;
+                    }
+                    match AgentEnvelope::from_slice(msg.into_text().unwrap().as_bytes()).unwrap() {
+                        AgentEnvelope::JobUpdate { payload }
+                            if payload.job_id == "job-active" && !payload.finished =>
+                        {
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("agent did not report active job");
+
+            ws.send(WsMessage::Close(None)).await.unwrap();
+        });
+
+        let cfg = test_agent_config(format!("http://{}", addr));
+        let started = Instant::now();
+        let exit = tokio::time::timeout(
+            Duration::from_millis(900),
+            websocket_session(
+                &cfg,
+                vec![test_project("active-job-test")],
+                "inst-active-job",
+                &test_runtime(&cfg),
+            ),
+        )
+        .await
+        .expect("session must return promptly after disconnect despite active job")
+        .expect("session should not error");
+
+        assert_eq!(exit, AgentSessionExit::TransportDisconnected);
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "session waited for the active job instead of reconnecting"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn websocket_register_rejected_is_fatal() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _register = read_register(&mut ws).await;
+            send_register_rejected_ack(&mut ws).await;
+        });
+
+        let cfg = test_agent_config(format!("http://{}", addr));
+        let error = websocket_session(
+            &cfg,
+            vec![test_project("reject-test")],
+            "inst-reject",
+            &test_runtime(&cfg),
+        )
+        .await
+        .expect_err("register rejection must error");
+        let classified = classify_session_error(error);
+        assert!(classified.is_fatal(), "{classified}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn strict_websocket_transient_connect_failure_reconnects() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (first_stream, _) = listener.accept().await.unwrap();
+            drop(first_stream);
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _register = read_register(&mut ws).await;
+            send_register_rejected_ack(&mut ws).await;
+        });
+
+        let cfg = test_agent_config(format!("http://{}", addr));
+        let runtime = test_runtime(&cfg);
+        let started = Instant::now();
+        let runner = tokio::task::spawn_blocking(move || {
+            run_websocket_agent(cfg, false, "inst-retry", &runtime)
+        });
+        let error = tokio::time::timeout(Duration::from_secs(5), runner)
+            .await
+            .expect("strict websocket retry did not finish after fatal register rejection")
+            .unwrap()
+            .expect_err("register rejection after reconnect must be fatal");
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(900),
+            "strict websocket did not wait for reconnect backoff after transient connect failure"
+        );
+        assert!(error.contains("register rejected"), "{error}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn auto_websocket_register_rejected_is_fatal_without_polling_fallback() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _register = read_register(&mut ws).await;
+            send_register_rejected_ack(&mut ws).await;
+        });
+
+        let mut cfg = test_agent_config(format!("http://{}", addr));
+        cfg.transport = Some(TRANSPORT_AUTO.to_string());
+        let runtime = test_runtime(&cfg);
+        let runner = tokio::task::spawn_blocking(move || {
+            run_auto_agent(cfg, false, "inst-auto-reject", &runtime)
+        });
+        let error = tokio::time::timeout(Duration::from_secs(5), runner)
+            .await
+            .expect("auto websocket register rejection did not return")
+            .unwrap()
+            .expect_err("fatal register rejection must not fall back to polling");
+
+        assert!(error.contains("register rejected"), "{error}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn websocket_disconnect_loop_reregisters_client_projects_and_capabilities() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (reg_tx, mut reg_rx) = mpsc::channel(2);
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let register = read_register(&mut ws).await;
+                reg_tx.send(register).await.unwrap();
+                send_registered_ack(&mut ws).await;
+                ws.send(WsMessage::Close(None)).await.unwrap();
+            }
+        });
+
+        let cfg = test_agent_config(format!("http://{}", addr));
+        let projects = vec![test_project("repo-one")];
+        for instance in ["inst-reconnect", "inst-reconnect"] {
+            let exit = tokio::time::timeout(
+                Duration::from_secs(5),
+                websocket_session(&cfg, projects.clone(), instance, &test_runtime(&cfg)),
+            )
+            .await
+            .expect("session completed")
+            .expect("session should not error");
+            assert_eq!(exit, AgentSessionExit::TransportDisconnected);
+        }
+
+        let first = reg_rx.recv().await.expect("first register");
+        let second = reg_rx.recv().await.expect("second register");
+        for register in [first, second] {
+            assert_eq!(register.client_id, "oe");
+            assert_eq!(register.agent_instance_id, "inst-reconnect");
+            assert_eq!(
+                register.agent_protocol_version.as_deref(),
+                Some(AGENT_PROTOCOL_VERSION_WEBSOCKET_V1)
+            );
+            let caps = register.capabilities.expect("capabilities");
+            assert!(caps.shell);
+            assert!(caps.file_read);
+            assert!(caps.file_write);
+            assert!(caps.jobs);
+            assert!(caps.async_jobs);
+            assert!(caps.async_shell_jobs);
+            assert!(caps.git);
+            let projects = register.projects.expect("projects");
+            assert_eq!(projects.len(), 1);
+            assert_eq!(projects[0].id, "repo-one");
+        }
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn websocket_reconnect_backoff_is_interrupted_by_process_shutdown() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (closed_tx, closed_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _register = read_register(&mut ws).await;
+            send_registered_ack(&mut ws).await;
+            ws.send(WsMessage::Close(None)).await.unwrap();
+            closed_tx.send(()).unwrap();
+        });
+
+        let cfg = test_agent_config(format!("http://{}", addr));
+        let runtime = AgentRuntimeState::with_shutdown_budget(
+            &cfg,
+            PathBuf::new(),
+            Duration::from_millis(500),
+        );
+        let runner_runtime = runtime.clone();
+        let runner = tokio::task::spawn_blocking(move || {
+            run_websocket_agent(cfg, false, "inst-backoff-shutdown", &runner_runtime)
+        });
+        closed_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let started = Instant::now();
+        runtime.request_shutdown_signal();
+        tokio::time::timeout(Duration::from_secs(2), runner)
+            .await
+            .expect("websocket reconnect backoff ignored shutdown")
+            .unwrap()
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "websocket reconnect shutdown was delayed"
+        );
+        assert_eq!(runtime.coordinator.run_count(), 1);
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn quic_connect_or_reconnect_wait_is_interrupted_by_process_shutdown() {
+        let mut cfg = test_agent_config("https://localhost".to_string());
+        cfg.transport = Some(TRANSPORT_QUIC.to_string());
+        cfg.quic = Some(QuicClientConfig {
+            server_addr: "127.0.0.1:9".to_string(),
+            server_name: "localhost".to_string(),
+            alpn: crate::webcodex_runner::default_quic_alpn(),
+            connect_timeout_secs: 10,
+            keepalive_interval_secs: 20,
+        });
+        let runtime = AgentRuntimeState::with_shutdown_budget(
+            &cfg,
+            PathBuf::new(),
+            Duration::from_millis(500),
+        );
+        let trigger_runtime = runtime.clone();
+        let trigger = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(75));
+            trigger_runtime.request_shutdown_signal();
+        });
+        let started = Instant::now();
+        run_quic_agent(cfg, false, "inst-quic-shutdown", &runtime)
+            .expect("QUIC process shutdown should be a normal exit");
+        trigger.join().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "QUIC connect/reconnect wait ignored shutdown"
+        );
+        assert_eq!(runtime.coordinator.run_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn websocket_process_shutdown_exits_gracefully() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (registered_tx, registered_rx) = oneshot::channel();
+        let (goodbye_tx, goodbye_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _register = read_register(&mut ws).await;
+            send_registered_ack(&mut ws).await;
+            ws.send(WsMessage::Text(
+                serde_json::to_string(&AgentEnvelope::Ping { ts: 1 })
+                    .unwrap()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            let pong = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("agent did not enter the registered session")
+                .expect("stream open")
+                .expect("pong message ok");
+            assert!(matches!(
+                AgentEnvelope::from_slice(pong.into_text().unwrap().as_bytes()).unwrap(),
+                AgentEnvelope::Pong { ts: 1 }
+            ));
+            registered_tx.send(()).unwrap();
+            let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("agent did not send shutdown goodbye")
+                .expect("stream open")
+                .expect("message ok");
+            match AgentEnvelope::from_slice(msg.into_text().unwrap().as_bytes()).unwrap() {
+                AgentEnvelope::Goodbye { reason } => goodbye_tx.send(reason).unwrap(),
+                other => panic!("expected goodbye, got {}", other.kind()),
+            }
+        });
+
+        let cfg = test_agent_config(format!("http://{}", addr));
+        let runtime = test_runtime(&cfg);
+        let session_runtime = runtime.clone();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let session = tokio::spawn(async move {
+            websocket_session_with_shutdown(
+                &cfg,
+                vec![test_project("shutdown-test")],
+                "inst-shutdown",
+                &session_runtime,
+                async {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+
+        registered_rx.await.unwrap();
+        shutdown_tx.send(()).unwrap();
+        let exit = tokio::time::timeout(Duration::from_secs(5), session)
+            .await
+            .expect("shutdown completed")
+            .unwrap()
+            .expect("session should not error");
+        assert_eq!(exit, AgentSessionExit::Shutdown);
+        assert_eq!(
+            goodbye_rx.await.unwrap().as_deref(),
+            Some("process shutdown")
+        );
+        server.await.unwrap();
+        runtime.shutdown();
+        runtime.shutdown();
+        assert_eq!(runtime.coordinator.run_count(), 1);
+    }
