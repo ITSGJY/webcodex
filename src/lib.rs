@@ -14,6 +14,7 @@ mod action_audit_sessions;
 mod admin_http;
 mod admin_project_lifecycle;
 mod agent_quic;
+mod agent_session;
 mod agent_tokens_http;
 mod agent_ws;
 mod audit_http;

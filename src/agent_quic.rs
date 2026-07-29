@@ -21,9 +21,7 @@ use crate::shell_client::{
     effective_register_owner, enforce_register_owner, require_agent_transport_scope,
     ShellClientRegistry, TRANSPORT_QUIC,
 };
-use crate::shell_protocol::{
-    read_quic_frame, write_quic_frame, AgentEnvelope, ShellAgentPollRequest,
-};
+use crate::shell_protocol::{read_quic_frame, write_quic_frame, AgentEnvelope};
 use crate::Database;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::fs::File;
@@ -44,9 +42,6 @@ fn rustls_provider() -> Arc<rustls::crypto::CryptoProvider> {
 /// Deadline for the agent to send its first `Register` frame after the QUIC
 /// handshake. Mirrors the WebSocket `REGISTER_TIMEOUT`.
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(15);
-/// Channel capacity for QUIC outgoing envelopes (registered ack, request,
-/// pong/error). Provides backpressure if the agent reads slowly.
-const OUTGOING_CHANNEL_CAPACITY: usize = 64;
 /// Maximum time to keep an error-path QUIC stream open while waiting for the
 /// peer to read the final `Error` envelope.
 const ERROR_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -389,7 +384,8 @@ async fn handle_quic_connection(
 
     // 5. From this point on, all writes go through one writer task so the
     //    request pump and keepalive replies never concurrently hold SendStream.
-    let (out_tx, mut out_rx) = mpsc::channel::<AgentEnvelope>(OUTGOING_CHANNEL_CAPACITY);
+    let (out_tx, mut out_rx) =
+        mpsc::channel::<AgentEnvelope>(crate::agent_session::OUTGOING_CHANNEL_CAPACITY);
     let writer_client_id = client_id.clone();
     let writer_task = tokio::spawn(async move {
         while let Some(env) = out_rx.recv().await {
@@ -424,186 +420,48 @@ async fn handle_quic_connection(
     }
     tracing::info!(client_id = %client_id, "agent quic connected");
 
-    // 7. QUIC request pump: drain the shared registry queue and send
-    //    Request envelopes over the QUIC writer channel.
-    let pump_task = {
-        let pump_tx = out_tx.clone();
-        let pump_registry = registry.clone();
-        let pump_client_id = client_id.clone();
-        let pump_instance_id = agent_instance_id.clone();
-        let pump_connection_id = connection_id.clone();
-        Some(tokio::spawn(async move {
-            loop {
-                let notified = notify.notified();
-                let poll_req = ShellAgentPollRequest {
-                    client_id: pump_client_id.clone(),
-                    agent_instance_id: pump_instance_id.clone(),
-                    projects: None,
-                };
-                // The pump is bound to this concrete connection's lease. A
-                // same-instance reconnect installs a new connection_id; once
-                // this connection loses the lease, the scoped poll rejects it
-                // before dequeuing, so an older stream cannot steal requests
-                // that belong to the new connection. On rejection the pump
-                // stops rather than falling back to an unscoped poll.
-                match pump_registry
-                    .poll_for_connection(poll_req, &pump_connection_id)
-                    .await
-                {
-                    Ok(Some(request)) => {
-                        if pump_tx
-                            .send(AgentEnvelope::Request { request })
-                            .await
-                            .is_err()
-                        {
-                            tracing::debug!(
-                                client_id = %pump_client_id,
-                                "quic request pump send channel closed; stopping pump"
-                            );
-                            break;
-                        }
-                    }
-                    Ok(None) => {
-                        notified.await;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            client_id = %pump_client_id,
-                            error = %e,
-                            "quic request pump poll failed; stopping pump"
-                        );
-                        break;
-                    }
-                }
-            }
-            tracing::debug!(
-                client_id = %pump_client_id,
-                "quic request pump stopped"
-            );
-        }))
-    };
-
-    // 8. Reader loop: handle Result/JobUpdate/Ping/Pong from the agent.
-    loop {
-        let env = match read_quic_frame(&mut recv).await {
-            Ok(env) => env,
-            Err(crate::shell_protocol::QuicFrameError::EmptyStream) => break,
-            Err(e) => {
-                tracing::debug!(
-                    client_id = %client_id,
-                    error = %e,
-                    "quic agent stream read ended"
-                );
-                break;
-            }
-        };
-        match env {
-            AgentEnvelope::Ping { ts } => {
-                if let Err(e) = registry
-                    .touch_client_for_connection(&client_id, &agent_instance_id, &connection_id)
-                    .await
-                {
-                    tracing::warn!(
-                        client_id = %client_id,
-                        error = %e,
-                        "quic ping liveness touch failed"
-                    );
-                }
-                let pong = AgentEnvelope::Pong { ts };
-                if let Err(e) = out_tx.try_send(pong) {
-                    let reason = match e {
-                        tokio::sync::mpsc::error::TrySendError::Full(_) => "full",
-                        tokio::sync::mpsc::error::TrySendError::Closed(_) => "closed",
-                    };
-                    tracing::debug!(
-                        client_id = %client_id,
-                        reason,
-                        "quic pong send dropped"
-                    );
-                }
-            }
-            AgentEnvelope::Pong { .. } => {
-                if let Err(e) = registry
-                    .touch_client_for_connection(&client_id, &agent_instance_id, &connection_id)
-                    .await
-                {
-                    tracing::debug!(
-                        client_id = %client_id,
-                        error = %e,
-                        "quic pong liveness touch failed"
-                    );
-                }
-            }
-            AgentEnvelope::RuntimeMetadata { tool_providers } => {
-                let _ = registry
-                    .update_tool_providers_for_connection(
-                        &client_id,
-                        &agent_instance_id,
-                        &connection_id,
-                        Some(tool_providers),
-                    )
-                    .await;
-            }
-            AgentEnvelope::Goodbye { reason } => {
-                tracing::debug!(
-                    client_id = %client_id,
-                    reason = reason.as_deref().unwrap_or("unspecified"),
-                    "quic agent sent goodbye"
-                );
-                registry
-                    .reconcile_disconnect_for_connection(
-                        &client_id,
-                        &agent_instance_id,
-                        &connection_id,
-                    )
-                    .await;
-                break;
-            }
-            AgentEnvelope::Result { payload } => {
-                if let Err(e) = registry
-                    .complete_for_connection(payload, &connection_id)
-                    .await
-                {
-                    tracing::warn!(client_id = %client_id, error = %e, "quic result rejected");
-                }
-            }
-            AgentEnvelope::JobUpdate { payload } => {
-                if let Err(e) = registry
-                    .update_job_for_connection(payload, &connection_id)
-                    .await
-                {
-                    tracing::warn!(client_id = %client_id, error = %e, "quic job_update rejected");
-                }
-            }
-            AgentEnvelope::Register { .. } => {
-                // Ignore a redundant register mid-session.
-            }
-            other => {
-                tracing::debug!(
-                    client_id = %client_id,
-                    kind = other.kind(),
-                    "quic agent received unexpected envelope; ignoring"
-                );
-            }
-        }
-    }
-
-    // 9. Cleanup: stop pump/writer and reconcile disconnect so running jobs are marked lost and the
-    //    client decays to stale/offline via the normal online window. Mirrors
-    //    the WebSocket disconnect path.
-    if let Some(pump_task) = pump_task {
-        pump_task.abort();
-    }
-    drop(out_tx);
-    if let Err(e) = writer_task.await {
-        tracing::debug!(client_id = %client_id, error = ?e, "quic writer task join failed");
-    }
-    registry
-        .reconcile_disconnect_for_connection(&client_id, &agent_instance_id, &connection_id)
-        .await;
+    // 7-9. Pump, reader loop, and teardown are shared with the WebSocket
+    //      transport. The reader adapter wraps the QUIC receive stream.
+    let reader = QuicReader { recv };
+    crate::agent_session::run_agent_session(
+        crate::agent_session::SessionContext {
+            registry: &registry,
+            client_id: &client_id,
+            agent_instance_id: &agent_instance_id,
+            connection_id: &connection_id,
+            notify,
+            transport_label: "quic",
+        },
+        out_tx,
+        reader,
+        writer_task,
+    )
+    .await;
     tracing::info!(client_id = %client_id, "agent quic disconnected");
 }
 
+/// Adapter turning a QUIC receive stream into the transport-neutral
+/// [`crate::agent_session::AgentReader`]. A clean stream end stops the reader;
+/// framing errors are logged and treated as a closed connection (mirroring the
+/// previous inline reader loop).
+struct QuicReader {
+    recv: quinn::RecvStream,
+}
+
+impl crate::agent_session::AgentReader for QuicReader {
+    async fn recv(&mut self) -> crate::agent_session::RecvOutcome {
+        match read_quic_frame(&mut self.recv).await {
+            Ok(env) => crate::agent_session::RecvOutcome::Envelope(env),
+            Err(crate::shell_protocol::QuicFrameError::EmptyStream) => {
+                crate::agent_session::RecvOutcome::Closed
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "quic agent stream read ended");
+                crate::agent_session::RecvOutcome::Closed
+            }
+        }
+    }
+}
 /// Read and discard a bounded number of frames. Used to keep a QUIC connection
 /// alive long enough for the peer to receive a final `Error` frame without
 /// allowing a bad peer to hold the connection task indefinitely.
