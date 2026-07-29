@@ -1,228 +1,121 @@
-# AGENTS.md — WebCodex Trusted Agent Contract
+# AGENTS.md — WebCodex Repository Guide
 
-Executable rules for autonomous coding agents working in this repository.
-Long-form design context lives under [`docs/agent/`](docs/agent/).
+These are the always-on rules for ordinary repository work. This file is a map,
+not a complete design specification. Read linked documents only when the task
+touches their domain. A deeper `AGENTS.md`, if added later, governs its directory
+tree and may refine these rules.
 
----
+## 1. Verify the actual state
 
-## 1. Project Identity
+- Work only in the repository, worktree, and external target authorized by the
+  user.
+- Before editing, confirm the repository root, branch, HEAD, worktree status,
+  relevant existing changes, and recent history.
+- Treat hashes, paths, branches, and runtime state in a prompt as expectations to
+  verify, not reasons to overwrite the actual repository.
+- Preserve unrelated or concurrent work. Do not reset, rebase, restore, clean, or
+  rewrite history merely to match an expected baseline.
+- Inspect the relevant implementation, tests, documentation, and current diff
+  before changing them.
 
-- **Project:** WebCodex
-- **Canonical repository:** `https://github.com/yyjeqhc/webcodex.git`
-- Other registered checkouts or deployment paths may exist. Treat them as
-  independent worktrees and verify their branch, HEAD, remote, and dirty state
-  before using them.
-- Confirm the resolved project, active repository, branch, worktree state, and
-  recent commits before changing files.
-- Do not modify unrelated repositories, worktrees, hosts, or deployment targets.
+## 2. Follow intent with engineering judgment
 
----
+- The requested outcome, scope, prohibited actions, safety requirements, and
+  acceptance conditions are hard constraints.
+- Suggested file names, symbols, commands, code sketches, and step order are
+  guidance unless explicitly made mandatory.
+- If guidance conflicts with the current code, repository conventions, an
+  upstream interface, or a safer implementation, make the smallest necessary
+  adjustment that still satisfies the task.
+- Do not mechanically implement instructions that create a known bug,
+  inconsistent state, compatibility hazard, resource leak, or false validation.
+- Ask only when required information cannot be discovered, a credential or target
+  is missing, instructions materially conflict, or proceeding could destroy work.
+  Otherwise continue with reasonable judgment.
+- Explain material deviations and their evidence in the final report.
 
-## 2. Operating Model
+## 3. Protect data, security, and ownership
 
-This repository uses a **trusted-agent** workflow.
-
-- Platform, system, and user instructions define the authorization boundary.
-  Do not create a second approval system inside the coding workflow.
-- Once the user assigns a task, autonomously perform the inspection, edits,
-  shell commands, tests, builds, local service operations, Git operations, and
-  recovery steps reasonably required to complete it.
-- Use project tools as a reliable execution and evidence layer, not as a
-  substitute for contextual engineering judgment.
-- Tool verdicts are facts or signals. The Agent owns the final task conclusion.
-- Do not interrupt merely because the worktree is dirty, a generic shell/job
-  tool was used, output was truncated, a retry was needed, or a previous attempt
-  failed and was later corrected.
-- Ask the user only when a required credential or external target is missing,
-  the requested outcome is materially ambiguous, instructions conflict, or
-  unknown overlapping work may be destroyed.
-- For a large task, form and update a plan while continuing execution. Do not
-  stop solely because the task spans many files or subsystems.
-
-The target interaction is: the user gives an outcome, the Agent completes the
-work, validates it, and returns one evidence-based report.
-
----
-
-## 3. Hard Boundaries
-
-These are execution-correctness and privacy boundaries, not a second layer of
-product judgment.
-
-- Never print, commit, or expose reusable credentials, authorization headers,
-  private keys, token values, or secret file contents.
-- Stay inside the resolved project and explicitly authorized deployment roots.
-- Inspect and preserve existing user work. Stop only when ownership is unclear,
-  changes overlap, or proceeding could lose work.
-- Do not silently overwrite concurrent file changes; use guarded or
-  transactional edits when available.
-- Do not weaken security checks, required schema fields, permission enforcement,
+- Never print, commit, or expose credentials, authorization headers, private
+  keys, tokens, secret files, or sensitive command output.
+- Do not silently overwrite concurrent changes; prefer guarded or
+  conflict-detecting edits.
+- Do not weaken authentication, authorization, validation, schemas, sandboxing,
   or meaningful tests merely to obtain a green result.
-- Do not bypass platform policy, valid session guards, or an explicit user
-  restriction.
-- Do not force-push, overwrite tags/releases, rewrite published history, or
-  destructively reset other work unless the user explicitly requests that exact
-  destructive operation and its target.
-- Redact sensitive command output. Prefer bounded summaries and retrieve full
-  logs only when needed for diagnosis.
+- Do not force-push, move published tags, overwrite releases, destructively reset
+  other work, or rewrite published history without an explicit request naming
+  that operation and target.
+- Push, publish, tag, release, deploy, restart production services, or alter
+  external systems only when the task explicitly includes it and identifies the
+  destination sufficiently.
 
----
+## 4. Make coherent changes
 
-## 4. Editing and Execution
+- Prefer the smallest coherent change that fully resolves the requested behavior.
+- Follow existing architecture and naming unless the task requires changing them.
+  Avoid speculative compatibility, duplicate representations, unrelated cleanup,
+  and broad refactors without a named current need.
+- Keep code, tests, schemas, generated surfaces, packaging, and documentation
+  consistent across every affected interface.
+- Add or update tests for behavior changes and regressions when practical.
+- Update user or operator documentation when commands, configuration, public
+  behavior, packaging, or operational procedures change.
+- Prefer repository-native scripts and workflows over ad hoc substitutes.
 
-- Inspect relevant code, documentation, and existing diffs before editing.
-- Keep changes aligned with the requested outcome, but make all necessary
-  cross-cutting fixes rather than leaving knowingly inconsistent surfaces.
-- Choose the most effective execution path:
-  - use `apply_text_edits` for guarded transactional text changes;
-  - use `apply_patch_checked` for complex unified diffs;
-  - use `write_project_file` for creates or intentional full rewrites;
-  - use shell, scripts, or repository-native tools whenever they are the clearer
-    or more complete way to perform project work.
-- Shell is a first-class execution path. It may be used for inspection, editing,
-  tests, builds, package management, Git, service control, release work, and
-  diagnostics within the authorized task scope.
-- Specialized tools are preferred only when they improve transactional safety,
-  structured evidence, or efficiency. Their absence does not make an operation
-  invalid.
-- Do not preserve compatibility aliases, dual response shapes, or obsolete
-  paths for hypothetical consumers. Add compatibility only for a named current
-  contract or an explicitly requested migration.
-- Code-size reduction and legacy migration are not current iteration goals.
-  Perform them only when directly required by the task or when deletion is the
-  clearest fix for the behavior being changed.
-
-For current product direction, read [`docs/ROADMAP.md`](docs/ROADMAP.md) and
+Product direction and structure:
+[`docs/ROADMAP.md`](docs/ROADMAP.md) and
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
----
+## 5. Validate proportionally
 
-## 5. Git, Commit, Release, and Deployment
+- Run checks relevant to the changed files and behavior; do not run the full
+  workspace mechanically for documentation-only edits.
+- For code, normally include formatting, compilation or static checks, focused
+  tests, and broader tests when the affected surface or release risk warrants it.
+- Record commands, working directory when relevant, exit status, result summary,
+  skipped checks, and output truncation.
+- Distinguish current failures from pre-existing failures, expected negative
+  tests, and failures resolved by a successful retry.
+- Interpret underlying evidence rather than treating a dirty worktree, optional
+  tool absence, or generic tool label as proof of failure.
+- Before finishing, review the diff, check whitespace, and confirm worktree,
+  conflict, and active-job state.
 
-- Check `git status` and recent `git log` before editing and before commit.
-- A dirty worktree is context, not automatic failure. Understand and preserve
-  it; ordinary development does not require a globally clean tree.
-- Create commits when the user requests a commit or when the assigned task
-  explicitly includes completing the repository change as a committed unit.
-- Commit prefixes: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`.
-- Prefer coherent commits. Do not split changes mechanically when one behavior
-  requires code, tests, and documentation together.
-- Push, tag, publish, create a GitHub Release, or deploy when the user's task
-  explicitly includes that action and identifies the target sufficiently to
-  execute safely.
-- Before an external release action, verify the actual repository, branch,
-  version/tag/package, remote target, relevant validation, and immutable-target
-  state. Never print credentials or move an existing published tag.
-- Report post-tag checksum/manifest commits without moving the tag.
+Testing guidance: [`docs/TESTING.md`](docs/TESTING.md).
 
-Expanded release mechanics:
+## 6. Keep Git and delivery explicit
+
+- Review status, diff, and recent history before committing.
+- Commit when requested or when a committed repository unit is clearly part of
+  the assignment. Use `feat:`, `fix:`, `refactor:`, `docs:`, or `test:`.
+- Do not mix unrelated work into the task commit or amend an unrelated commit.
+- Before release or deployment, verify the actual repository, branch, version,
+  artifact, remote target, validation state, and immutable targets.
+
+Release guidance:
 [`docs/agent/release-process.md`](docs/agent/release-process.md) and
 [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md).
 
----
+## 7. Load domain rules when relevant
 
-## 6. Validation and Evidence
+- Runtime tools, API projections, and hosted surfaces:
+  [`docs/agent/openapi-guidelines.md`](docs/agent/openapi-guidelines.md).
+- Workflow and audit sessions:
+  [`docs/agent/session-model.md`](docs/agent/session-model.md).
+- Authority and execution boundaries:
+  [`docs/agent/permission-model.md`](docs/agent/permission-model.md).
+- Architecture decisions and compatibility policy:
+  [`docs/agent/architecture-decisions.md`](docs/agent/architecture-decisions.md).
+- Experimental Claude Code MCP provider:
+  [`docs/agent/claude-code-mcp-provider.md`](docs/agent/claude-code-mcp-provider.md).
 
-The Agent chooses validation proportional to the change and owns the final
-interpretation.
+Use these documents as sources of truth instead of copying subsystem invariants
+into every task prompt.
 
-- Code changes require relevant validation before claiming completion.
-- Any successfully recorded execution path may provide validation evidence:
-  `cargo_*`, `run_shell`, `run_job`, repository scripts, or other native tools.
-- Prefer structured tools when they reduce parsing or preserve better evidence,
-  but never report `validation_not_run` solely because validation used shell or
-  a generic job path.
-- Record what ran, the resolved cwd/shell when relevant, exit status, detected
-  test/build summary, truncation, and skipped checks.
-- Distinguish current failures, historical failures, resolved retries, and
-  pre-existing failures. A later successful retry should mark the earlier
-  failure as resolved without deleting its evidence.
-- Dirty worktree, optional LSP unavailability, output truncation, or absence of
-  a full suite are advisory facts unless the current task makes them blocking.
-- Deterministic hard blockers are limited to facts such as permission denial,
-  unresolved conflict, command/test failure, sensitive-path risk, lost
-  execution state, or an explicitly required check not completed.
+## 8. Report the completed state
 
-Typical Rust baseline, adjusted to the touched domain:
-
-```text
-cargo fmt --all -- --check
-cargo check --workspace --all-targets
-focused cargo test lanes
-git diff --check
-git status --short
-```
-
-Use an explicit package for binary-focused tests:
-
-```text
-cargo test -p webcodex --all-targets
-cargo test -p webcodex-cli --all-targets
-cargo test -p webcodex-runner --all-targets
-```
-
-Run `cargo test -p webcodex --all-targets` for broad server changes,
-release/merge readiness, or when the Agent judges focused lanes insufficient.
-Do not run it mechanically for pure documentation changes.
-
-Broader lanes: [`docs/TESTING.md`](docs/TESTING.md).
-
----
-
-## 7. Architecture Invariants
-
-### Runtime and hosted surfaces
-
-- Runtime tool metadata, registry, OAuth scope policy, MCP `tools/list`, and
-  OpenAPI names must stay synchronized when a tool is added or renamed.
-- The project-bound model surface remains the canonical minimal coding surface.
-  The full operator runtime is for administration and internal execution.
-- Do not add dedicated tools merely to predict every project situation. Prefer
-  general execution plus reliable evidence and Agent reasoning.
-- GPT Actions must stay below the 30-operation limit and must not expose legacy
-  `/api/codex`, token-management, or pairing endpoints.
-
-### Sessions
-
-- Workflow session IDs retain the `wc_sess_*` format.
-- Explicit `session_id` wins over current-session binding.
-- Unknown explicit IDs fail as `unknown_session_id`; never silently fall back.
-- Explicit `close_session` moves `active` sessions to `closed`;
-  `finish_coding_task` and summary tools do not close them.
-- Explicitly read-only sessions deny writes and shell/jobs.
-- Session denial occurs before mutation or agent enqueue and is recorded when
-  the session is valid.
-- Current-session bindings remain isolated by principal, transport, and project.
-
-### Compatibility
-
-- One canonical field per concept.
-- No alias/dual shape without a named migration.
-- No compatibility code for hypothetical consumers.
-
-Detailed architecture:
-[`docs/agent/architecture-decisions.md`](docs/agent/architecture-decisions.md),
-[`docs/agent/session-model.md`](docs/agent/session-model.md), and
-[`docs/agent/openapi-guidelines.md`](docs/agent/openapi-guidelines.md).
-
----
-
-## 8. Final Agent Report
-
-For code, documentation, operations, release, or deployment tasks, return one
-complete contextual report containing:
-
-- outcome and behavior changed;
-- files or external resources changed;
-- commands and validation performed;
-- validations passed, failed, skipped, or resolved by retry;
-- current worktree and commit state;
-- remaining risks or limitations;
-- whether commit, merge, push, release, or deployment is recommended or already
-  completed.
-
-Do not copy a tool's aggregate verdict as the task conclusion. Explain what the
-recorded facts mean for the user's requested outcome.
-
-For review-only tasks, report findings, evidence, and recommendations without
-inventing changes or validation.
+Report the outcome, changed files or external resources, validation performed,
+final Git and job state, material deviations, and remaining risks. State whether
+push, release, publication, deployment, or service operations were performed.
+For review-only work, report findings and evidence without inventing changes.
+Tool output is evidence, not a substitute for engineering judgment.
