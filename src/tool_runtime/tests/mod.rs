@@ -8,6 +8,7 @@ mod coding_task;
 mod coding_task_semantic_navigation;
 mod dispatch;
 mod edit_tool_telemetry;
+mod explicit_resume;
 mod files;
 mod files_helpers;
 mod files_line_edit;

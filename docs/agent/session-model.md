@@ -84,6 +84,7 @@ handoff, and finish can reason about the same unit of work.
 |---|---|
 | ID form | `wc_sess_*` (`SESSION_ID_PREFIX`) |
 | Business field | `session_id` on tools that take a workflow session as input |
+| Coding resume field | `resume_session_id` on `start_coding_task`; distinct from ordinary project-tool `session_id` |
 | Recorder field | `recording_session_id` on generic wrappers (metadata only; stripped before concrete tool dispatch) |
 
 ### Storage and ownership
@@ -110,12 +111,35 @@ operator surface. With a stable transport window, its default behavior is:
 - `new_session=true` explicitly creates an isolated Session without closing or
   rewriting the previous one.
 
+Startup selection is strict and ordered:
+
+1. `resume_session_id` resumes only that existing Workflow Session. A malformed
+   or unknown id, non-active lifecycle, project mismatch, access denial, or
+   unsafe capability change fails without consulting a current binding or
+   creating a replacement.
+2. Without an explicit resume, `new_session=true` creates an isolated Session.
+   The two fields are mutually exclusive.
+3. With neither field, the stable-window exact binding keeps the default
+   get-or-create/continue behavior above.
+
+Explicit resume preserves both the `wc_sess_*` id and root title, then appends
+exactly one new `task_instruction`. With a stable window and
+`bind_current=true`, it atomically replaces that exact window/repository
+binding; a previously bound Session remains active and available by explicit
+id. `bind_current=false` leaves both binding layers unchanged. Without a stable
+window identity, explicit resume still succeeds but creates neither a
+process-local nor durable binding. The result reports that state, and later
+project tools must continue to pass the resumed `session_id` explicitly.
+
 The first instruction remains the root title. Later instructions record their
-timestamp, requested mode/guards, capability-change result, and context-refresh
-fact without overwriting that root. Session create/update, instruction event,
-process-local cache replacement, and durable binding replacement mutate under
-one store lock and enter one ledger snapshot generation; a failed pre-commit
-check leaves all four unchanged. A title change is never an isolation signal.
+timestamp, requested mode/guards, capability-change result, context-refresh
+fact, explicit-resume fact, and whether the current binding was established,
+without overwriting that root. Target validation, Session create/update,
+instruction event, process-local cache replacement, and durable binding
+replacement are decided under one store lock and enter one ledger snapshot
+generation; a failed validation, permission check, or injected pre-commit
+failure leaves them unchanged. Retrying after such a failure appends the
+instruction only once. A title change is never an isolation signal.
 
 The durable projection stores only:
 
@@ -143,6 +167,14 @@ that exact binding and preserves the previous Session for explicit-id access.
 Explicit bind and unbind update both layers; close and LRU eviction remove all
 bindings to the affected Session.
 
+When the complete exact key cannot be formed, `resume_session_id` is the
+intentional recovery path. It validates the Session against the currently
+resolved project and derives any binding key from that project's current
+canonical repository root, never a client-supplied path. It never derives a
+Workflow Session from a Connector Task or Action Audit Session. Missing window
+identity does not manufacture a key, create a credential-wide projection, or
+write a durable binding.
+
 The binding field is an additive, serde-defaulted field in ledger version 1, so
 older ledgers load it as empty without migration and keep their existing
 Session events/messages. Restore accepts only bounded, lowercase SHA-256 keys
@@ -154,7 +186,8 @@ only bounded counts (`durable_binding_count`, `restored_binding_count`,
 
 This remains intentionally separate storage and state from the Connector's
 SQLite window/project/Task map, while presenting the same ordinary
-window/repository continuity semantics.
+window/repository continuity semantics. Connector Task continuation and resume
+remain their own model and do not infer or mutate Workflow Sessions.
 
 ### Current lifecycle contract
 

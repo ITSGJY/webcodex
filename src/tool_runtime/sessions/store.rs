@@ -491,6 +491,19 @@ impl SessionStore {
         &self,
         request: CodingSessionRequest,
     ) -> Result<CodingSessionOutcome, CodingSessionError> {
+        if request.resume_session_id.is_some() && request.new_session {
+            return Err(CodingSessionError::ResumeNewSessionConflict);
+        }
+        let explicit_resume_session_id = match request.resume_session_id.as_deref() {
+            Some(session_id)
+                if session_id != session_id.trim() || !is_valid_session_id(session_id) =>
+            {
+                return Err(CodingSessionError::InvalidResumeSessionId);
+            }
+            Some(session_id) => Some(session_id.to_string()),
+            None => None,
+        };
+        let explicit_resume = explicit_resume_session_id.is_some();
         let now = now_ts();
         let new_session_id = format!("{SESSION_ID_PREFIX}{}", uuid::Uuid::new_v4().simple());
         let new_event_id = format!("{EVENT_ID_PREFIX}{}", uuid::Uuid::new_v4().simple());
@@ -504,7 +517,25 @@ impl SessionStore {
 
         let outcome = {
             let mut inner = self.inner.lock().expect("session store mutex poisoned");
-            let reusable_session_id = if request.bind_current && !request.new_session {
+            let reusable_session_id = if let Some(session_id) = explicit_resume_session_id {
+                let Some(record) = inner.sessions.get(&session_id) else {
+                    return Err(CodingSessionError::UnknownResumeSession { session_id });
+                };
+                if !record.lifecycle.allows_mutation() {
+                    return Err(CodingSessionError::ResumeSessionNotActive {
+                        session_id,
+                        lifecycle: record.lifecycle,
+                    });
+                }
+                if record.project.as_deref() != Some(request.project.as_str()) {
+                    return Err(CodingSessionError::ResumeProjectMismatch {
+                        session_id,
+                        session_project: record.project.clone(),
+                        request_project: request.project.clone(),
+                    });
+                }
+                Some(session_id)
+            } else if request.bind_current && !request.new_session {
                 request.key.as_ref().and_then(|key| {
                     inner.reusable_current_session_id(key, request.project.as_str())
                 })
@@ -558,6 +589,8 @@ impl SessionStore {
                     capability_changed,
                     request.context_refreshed,
                     true,
+                    explicit_resume,
+                    request.bind_current && request.key.is_some(),
                     now,
                 );
                 {
@@ -610,6 +643,8 @@ impl SessionStore {
                     false,
                     request.context_refreshed,
                     false,
+                    false,
+                    request.bind_current && request.key.is_some(),
                     now,
                 );
                 let record = SessionRecord {
@@ -1102,6 +1137,8 @@ fn coding_instruction_event(
     capability_changed: bool,
     context_refreshed: bool,
     reused: bool,
+    explicit_resume: bool,
+    current_binding_established: bool,
     now: i64,
 ) -> SessionEvent {
     SessionEvent {
@@ -1146,6 +1183,8 @@ fn coding_instruction_event(
             "capability_changed": capability_changed,
             "context_refreshed": context_refreshed,
             "session_reused": reused,
+            "explicit_resume": explicit_resume,
+            "current_binding_established": current_binding_established,
         }))),
         validation_output_summary: None,
         permission: None,

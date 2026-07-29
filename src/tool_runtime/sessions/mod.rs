@@ -24,7 +24,7 @@ mod tests;
 // Only symbols referenced outside this module are re-exported here; internal
 // helpers stay `pub(super)` / module-private.
 pub(crate) use events::{
-    strip_tool_call_expectation_metadata, tool_failure_summary_from_events,
+    is_valid_session_id, strip_tool_call_expectation_metadata, tool_failure_summary_from_events,
     validation_output_summary_for_tool_result as execution_output_summary_for_tool_result,
 };
 pub(crate) use model::{

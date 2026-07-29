@@ -50,6 +50,7 @@ fn start_call(project: String, mode: SessionMode) -> ToolCall {
         detail: Default::default(),
         deny_write_tools: false,
         deny_shell_tools: false,
+        resume_session_id: None,
         bind_current: false,
         new_session: false,
     }

@@ -353,6 +353,7 @@ async fn durable_current_binding_restores_same_window_after_restart() {
             deny_write_tools: false,
             deny_shell_tools: false,
             detail: StartupDetail::Standard,
+            resume_session_id: None,
             bind_current: true,
             new_session: false,
         },
@@ -394,6 +395,7 @@ async fn durable_current_binding_restores_same_window_after_restart() {
             deny_write_tools: false,
             deny_shell_tools: false,
             detail: StartupDetail::Standard,
+            resume_session_id: None,
             bind_current: true,
             new_session: false,
         },
@@ -961,6 +963,7 @@ fn coding_start_call(
         deny_write_tools: false,
         deny_shell_tools: false,
         detail: StartupDetail::Standard,
+        resume_session_id: None,
         bind_current: true,
         new_session,
     }

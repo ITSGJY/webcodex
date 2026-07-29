@@ -186,6 +186,7 @@ pub(crate) struct SessionCreateOptions {
 pub(crate) struct CodingSessionRequest {
     pub(crate) key: Option<CurrentSessionKey>,
     pub(crate) project: String,
+    pub(crate) resume_session_id: Option<String>,
     pub(crate) instruction: Option<String>,
     pub(crate) mode: SessionMode,
     pub(crate) guards: SessionGuards,
@@ -208,6 +209,20 @@ pub(crate) struct CodingSessionOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CodingSessionError {
+    InvalidResumeSessionId,
+    UnknownResumeSession {
+        session_id: String,
+    },
+    ResumeSessionNotActive {
+        session_id: String,
+        lifecycle: SessionLifecycle,
+    },
+    ResumeProjectMismatch {
+        session_id: String,
+        session_project: Option<String>,
+        request_project: String,
+    },
+    ResumeNewSessionConflict,
     WriteScopeRequired,
     CommitFailed,
 }

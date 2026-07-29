@@ -122,6 +122,9 @@ without creating Connector Tasks: its internal current key contains principal,
 transport, stable window, resolved project, and a domain-separated hash of the
 canonical repository root. The default ensures or continues one active
 Workflow Session and appends a bounded `task_instruction` ledger event.
+`resume_session_id` instead selects exactly one known active Workflow Session;
+it wins over any current binding, never falls back or creates on failure, and
+is mutually exclusive with `new_session=true`. Without an explicit resume,
 `new_session=true` alone requests an isolated Session; a changed title never
 does. Project switches retain independent keys, and a mode transition updates
 guards and appends the capability-change event under one Session-store lock.
@@ -143,7 +146,10 @@ canonical repository root—under a second domain separator with length-prefixed
 components. Its ledger row contains only that composite digest, a `wc_sess_*`
 id, and `updated_at`. Raw window ids, credentials, authorization material, and
 repository paths are not persisted or returned by this mechanism. Distinct
-windows using one credential therefore cannot overwrite each other.
+windows using one credential therefore cannot overwrite each other. Explicit
+Workflow Session recovery is the bounded exception to requiring that key: it
+accepts a `wc_sess_*` id, not a window id, and does not create a binding when
+stable window identity is absent.
 
 The continuity fingerprint contains hashes and identities, not repository file
 contents: canonical root, branch, HEAD, porcelain worktree state, applicable
@@ -170,11 +176,15 @@ prepared writable worktree cannot be committed to that transaction, the
 managed lease and registration are released so a retry cannot create a hidden
 active context. The full runtime commits Session creation/update, instruction
 event, process-local cache replacement, and durable exact binding replacement
-under one Session-store lock. They enter the same background-writer generation
-and JSON ledger snapshot; `flush_persistence` therefore observes the Session,
-event, and binding together under the ledger's existing atomic-rename
-semantics. This does not add a stronger fsync or distributed-consistency
-guarantee.
+under one Session-store lock. Explicit resume validates id, active lifecycle,
+exact resolved project, caller access, and safe mode/guard changes before that
+commit; enabling writes rechecks `project:write`. The instruction event records
+the requested capability/context refresh, explicit resume, and binding result.
+They enter the same background-writer generation and JSON ledger snapshot;
+`flush_persistence` therefore observes the Session, event, and binding together
+under the ledger's existing atomic-rename semantics. A failed pre-commit check
+leaves all of them unchanged, so retry adds one instruction. This does not add
+a stronger fsync or distributed-consistency guarantee.
 
 After a server restart, SQLite task/event history and exact window/project
 mappings remain. Process-local “currently viewed project” state is deliberately
@@ -201,6 +211,17 @@ valid Workflow Sessions, events, or messages from loading. `new_session=true`
 repoints the exact binding without closing or deleting prior history. This JSON
 binding remains separate from the Connector's SQLite Task mapping and does not
 recover running jobs or executions.
+
+If the client knows an existing `wc_sess_*` but cannot retain stable window
+identity, `start_coding_task(resume_session_id=...)` can continue that active
+Session after exact project, lifecycle, access, and capability validation. It
+preserves the Session id and root title and appends the new instruction. No
+process-local, durable, fabricated-window, or credential-wide binding is
+created, so later project tools must keep passing `session_id`. With a stable
+window and `bind_current=true`, the explicit Session atomically replaces the
+exact current binding without closing the previously bound Session; setting
+`bind_current=false` leaves both layers untouched. Connector Tasks and Action
+Audit Sessions are never sources for this Workflow Session lookup.
 
 ## Agent Bridge
 
