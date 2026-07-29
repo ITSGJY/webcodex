@@ -628,18 +628,20 @@ fn connection_layers(
         }
     };
 
-    // -- session_binding: process-local by design ------------------------------
+    // -- session_binding: exact durable identity + process-local cache ----------
     let session_binding = layer_observation(
         "not_observed",
         None,
         "session_store",
         None,
-        Some("binding_is_process_local_and_principal_scoped"),
+        Some("exact_binding_requires_window_and_project_observation"),
         now,
         json!({
-            "process_local": true,
-            "lost_after_restart": true,
-            "durable_resume": "explicit session_id resumes the durable wc_sess_* session",
+            "process_local_cache": true,
+            "durable_exact_binding": true,
+            "restored_after_restart": true,
+            "requires_stable_window_identity": true,
+            "missing_identity_fallback": false,
         }),
     );
 

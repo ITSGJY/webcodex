@@ -20,7 +20,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "session",
-                open_object_schema("Created session id, mode, guards, explicit-session guidance, and current binding state."),
+                open_object_schema("Created, automatically continued, or explicitly resumed session id; root title, mode/guards, resume/reuse state, explicit-session guidance, and current exact-binding result."),
             ),
             (
                 "runtime_status",

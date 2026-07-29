@@ -8,7 +8,7 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
     vec![
         tool_spec(
             "start_coding_task",
-            "Start or continue coding. By default, a stable window reuses its active Workflow Session for the same project and canonical repository, appends the instruction, and applies safe capability upgrades. Set new_session=true for isolation. Returns bounded startup context. Never calls an LLM.",
+            "Start/continue coding. Stable windows reuse a Workflow Session by default. resume_session_id resumes an active Session across or without windows; failure never creates or falls back. If unbound, tools need session_id. new_session=true isolates and is mutually exclusive. Returns startup context.",
             start_coding_task_input_schema(),
         ),
         tool_spec(

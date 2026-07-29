@@ -43,6 +43,26 @@ pub(crate) fn compact_start_coding_task_output(output: &Value) -> Value {
         .pointer("/session/mode")
         .cloned()
         .unwrap_or(Value::Null);
+    let continuation = output
+        .pointer("/session/continuation")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let reused = output
+        .pointer("/session/reused")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let resume_requested = output
+        .pointer("/session/resume_requested")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let current_binding = output
+        .pointer("/session/current_binding")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let explicit_session_id_required_for_continuity = output
+        .pointer("/session/explicit_session_id_required_for_continuity")
+        .cloned()
+        .unwrap_or(Value::Null);
     let resolved_project = compact_resolved_project(output.get("resolved_project"));
     let verdict = output.get("startup_verdict");
     let status = verdict
@@ -69,6 +89,11 @@ pub(crate) fn compact_start_coding_task_output(output: &Value) -> Value {
         "project": project,
         "resolved_project": resolved_project,
         "mode": mode,
+        "continuation": continuation,
+        "reused": reused,
+        "resume_requested": resume_requested,
+        "current_binding": current_binding,
+        "explicit_session_id_required_for_continuity": explicit_session_id_required_for_continuity,
         "summary": summary,
         "next_steps": next_steps.clone(),
         "startup_verdict": {
@@ -309,6 +334,29 @@ mod tests {
         assert_eq!(compact["git"]["clean"], true);
         assert_eq!(compact["git"]["changed_files_count"], 0);
         assert_eq!(compact["semantic_navigation"]["recommended"], true);
+    }
+
+    #[test]
+    fn explicit_resume_compact_output_keeps_continuity_and_unbound_state() {
+        let mut full = sample_start_coding_task_output();
+        full["session"]["continuation"] = json!("resumed_explicitly");
+        full["session"]["reused"] = json!(true);
+        full["session"]["resume_requested"] = json!(true);
+        full["session"]["explicit_session_id_required_for_continuity"] = json!(true);
+        full["session"]["current_binding"] = json!({
+            "bound": false,
+            "reason_code": "stable_window_identity_unavailable"
+        });
+
+        let compact = compact_start_coding_task_output(&full);
+        assert_eq!(compact["continuation"], "resumed_explicitly");
+        assert_eq!(compact["reused"], true);
+        assert_eq!(compact["resume_requested"], true);
+        assert_eq!(
+            compact["current_binding"]["reason_code"],
+            "stable_window_identity_unavailable"
+        );
+        assert_eq!(compact["explicit_session_id_required_for_continuity"], true);
     }
 
     #[test]

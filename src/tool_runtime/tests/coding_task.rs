@@ -191,6 +191,7 @@ async fn start_coding_task_can_explicitly_disable_current_binding() {
                         detail: crate::tool_runtime::StartupDetail::Full,
                         deny_write_tools: false,
                         deny_shell_tools: false,
+                        resume_session_id: None,
                         bind_current: false,
                         new_session: false,
                     },
@@ -259,7 +260,15 @@ async fn start_coding_task_can_explicitly_disable_current_binding() {
         "bind_current=false must disable the current binding"
     );
     assert_eq!(
-        result.output["session"]["current_binding"]["process_local_in_memory"],
+        result.output["session"]["current_binding"]["process_local_cache"],
+        true
+    );
+    assert_eq!(
+        result.output["session"]["current_binding"]["durable_exact_binding"],
+        true
+    );
+    assert_eq!(
+        result.output["session"]["current_binding"]["restored_after_restart"],
         true
     );
     for field in [
@@ -379,6 +388,7 @@ async fn start_coding_task_can_omit_compact_tool_manifest() {
                 detail: Default::default(),
                 deny_write_tools: false,
                 deny_shell_tools: false,
+                resume_session_id: None,
                 bind_current: false,
                 new_session: false,
             },
@@ -1072,6 +1082,7 @@ async fn finish_coding_task_requires_explicit_session_and_returns_structured_fie
                 detail: Default::default(),
                 deny_write_tools: false,
                 deny_shell_tools: false,
+                resume_session_id: None,
                 bind_current: false,
                 new_session: false,
             },
@@ -2123,6 +2134,7 @@ async fn finish_coding_task_includes_active_jobs_warning_without_logs() {
                 detail: Default::default(),
                 deny_write_tools: false,
                 deny_shell_tools: false,
+                resume_session_id: None,
                 bind_current: false,
                 new_session: false,
             },
@@ -2248,6 +2260,7 @@ async fn finish_coding_task_treats_stop_requested_jobs_as_nonblocking() {
                 detail: Default::default(),
                 deny_write_tools: false,
                 deny_shell_tools: false,
+                resume_session_id: None,
                 bind_current: false,
                 new_session: false,
             },

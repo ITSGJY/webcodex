@@ -52,7 +52,7 @@ fn session_tool_specs_describe_ledger_vs_current_binding() {
         "unbind_current_session",
     ] {
         let current_desc = desc(name);
-        for phrase in ["process-local in-memory", "not the durable session ledger"] {
+        for phrase in ["process-local", "hashed durable"] {
             assert!(
                 current_desc.contains(phrase),
                 "{name} description should mention {phrase}: {current_desc}"
@@ -63,8 +63,9 @@ fn session_tool_specs_describe_ledger_vs_current_binding() {
     for name in ["bind_current_session", "current_session"] {
         let current_desc = desc(name);
         assert!(
-            current_desc.contains("may be lost on restart"),
-            "{name} description should mention restart loss: {current_desc}"
+            current_desc.contains("after restart"),
+            "{name} description should mention exact restart recovery: {current_desc}"
         );
     }
+    assert!(desc("unbind_current_session").contains("keeps workflow session history intact"));
 }

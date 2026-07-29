@@ -46,12 +46,45 @@ impl ToolRuntime {
         deny_write_tools: bool,
         deny_shell_tools: bool,
         detail: StartupDetail,
+        resume_session_id: Option<String>,
         bind_current: bool,
         new_session: bool,
         auth: Option<&AuthContext>,
         transport: SessionTransport,
         window: Option<&crate::client_window::ClientWindow>,
     ) -> ToolResult {
+        let resume_requested = resume_session_id.is_some();
+        if resume_requested && new_session {
+            return ToolResult::err_with_output(
+                "resume_session_id and new_session=true are mutually exclusive",
+                json!({
+                    "error_kind": "invalid_arguments",
+                    "failure_kind": "invalid_arguments",
+                    "conflicting_fields": ["resume_session_id", "new_session"],
+                    "constraint": "resume_session_id_mutually_exclusive_with_new_session",
+                    "state_changed": false,
+                }),
+            );
+        }
+        let resume_session_id = match resume_session_id {
+            Some(session_id)
+                if session_id != session_id.trim()
+                    || !sessions::is_valid_session_id(&session_id) =>
+            {
+                return ToolResult::err_with_output(
+                    "resume_session_id must be a valid wc_sess_* Workflow Session id",
+                    json!({
+                        "error_kind": "invalid_resume_session_id",
+                        "failure_kind": "invalid_arguments",
+                        "field": "resume_session_id",
+                        "expected_format": "wc_sess_*",
+                        "state_changed": false,
+                    }),
+                );
+            }
+            Some(session_id) => Some(session_id),
+            None => None,
+        };
         let title = match title {
             Some(title) => {
                 let title = title.trim().to_string();
@@ -111,10 +144,18 @@ impl ToolRuntime {
             ) {
                 Ok(key) => Some(key),
                 Err(message) => {
-                    warnings.push(json!({
-                        "kind": "current_binding_unavailable",
-                        "message": message,
-                    }));
+                    warnings.push(if resume_requested {
+                        json!({
+                            "kind": "current_binding_unavailable",
+                            "reason_code": "stable_window_identity_unavailable",
+                            "message": "explicit Workflow Session resume continued without a current binding because stable chat-window identity was unavailable",
+                        })
+                    } else {
+                        json!({
+                            "kind": "current_binding_unavailable",
+                            "message": message,
+                        })
+                    });
                     None
                 }
             }
@@ -154,67 +195,142 @@ impl ToolRuntime {
         let write_scope_verified = auth.is_none_or(|auth| {
             !auth.is_oauth_token() || auth.has_scope(crate::auth::SCOPE_PROJECT_WRITE)
         });
-        let session_outcome =
-            match self
-                .sessions
-                .ensure_coding_session(sessions::CodingSessionRequest {
-                    key: continuity_key.clone(),
-                    project: resolved.resolved_id.clone(),
-                    instruction: title.clone(),
-                    mode,
-                    guards: sessions::SessionGuards {
-                        deny_write_tools,
-                        deny_shell_tools,
-                    },
-                    project_instructions: project_instructions.clone(),
-                    transport,
-                    bind_current: binding_available,
-                    new_session,
-                    // Startup always re-reads bounded current Git state and, for
-                    // full detail, the fixed project-instruction candidates.
-                    context_refreshed: true,
-                    write_scope_verified,
-                }) {
-                Ok(outcome) => outcome,
-                Err(sessions::CodingSessionError::WriteScopeRequired) => {
-                    return ToolResult::err_with_output(
-                        "session capability upgrade requires project:write",
-                        json!({
-                            "error_kind": "session_capability_upgrade_denied",
-                            "required_scope": crate::auth::SCOPE_PROJECT_WRITE,
-                            "mode": mode.as_str(),
-                            "state_changed": false,
-                        }),
-                    );
-                }
-                Err(sessions::CodingSessionError::CommitFailed) => {
-                    return ToolResult::err_with_output(
-                        "coding continuity state could not be committed",
-                        json!({
-                            "error_kind": "coding_continuity_commit_failed",
-                            "state_changed": false,
-                        }),
-                    );
-                }
-            };
+        let session_outcome = match self.sessions.ensure_coding_session(
+            sessions::CodingSessionRequest {
+                key: continuity_key.clone(),
+                project: resolved.resolved_id.clone(),
+                resume_session_id: resume_session_id.clone(),
+                instruction: title.clone(),
+                mode,
+                guards: sessions::SessionGuards {
+                    deny_write_tools,
+                    deny_shell_tools,
+                },
+                project_instructions: project_instructions.clone(),
+                transport,
+                bind_current: binding_available,
+                new_session,
+                // Startup always re-reads bounded current Git state and, for
+                // full detail, the fixed project-instruction candidates.
+                context_refreshed: true,
+                write_scope_verified,
+            },
+        ) {
+            Ok(outcome) => outcome,
+            Err(sessions::CodingSessionError::InvalidResumeSessionId) => {
+                return ToolResult::err_with_output(
+                    "resume_session_id must be a valid wc_sess_* Workflow Session id",
+                    json!({
+                        "error_kind": "invalid_resume_session_id",
+                        "failure_kind": "invalid_arguments",
+                        "field": "resume_session_id",
+                        "expected_format": "wc_sess_*",
+                        "state_changed": false,
+                    }),
+                );
+            }
+            Err(sessions::CodingSessionError::UnknownResumeSession { session_id }) => {
+                return unknown_session_result(&session_id);
+            }
+            Err(sessions::CodingSessionError::ResumeSessionNotActive {
+                session_id,
+                lifecycle,
+            }) => {
+                let error_kind = match lifecycle {
+                    sessions::SessionLifecycle::Closed => "session_closed",
+                    sessions::SessionLifecycle::Archived => "session_archived",
+                    sessions::SessionLifecycle::Active => "session_lifecycle_denied",
+                };
+                return ToolResult::err_with_output(
+                    format!(
+                        "{error_kind}: start_coding_task cannot resume a {} session",
+                        lifecycle.as_str()
+                    ),
+                    json!({
+                        "error_kind": error_kind,
+                        "failure_kind": error_kind,
+                        "session_id": session_id,
+                        "lifecycle": lifecycle,
+                        "resume_requested": true,
+                        "state_changed": false,
+                    }),
+                );
+            }
+            Err(sessions::CodingSessionError::ResumeProjectMismatch {
+                session_id,
+                session_project,
+                request_project,
+            }) => {
+                return ToolResult::err_with_output(
+                    "session_project_mismatch: explicit Workflow Session resume requires an exact project match",
+                    json!({
+                        "error_kind": "session_project_mismatch",
+                        "failure_kind": "session_project_mismatch",
+                        "session_id": session_id,
+                        "session_project": session_project,
+                        "request_project": request_project,
+                        "resume_requested": true,
+                        "state_changed": false,
+                    }),
+                );
+            }
+            Err(sessions::CodingSessionError::ResumeNewSessionConflict) => {
+                return ToolResult::err_with_output(
+                    "resume_session_id and new_session=true are mutually exclusive",
+                    json!({
+                        "error_kind": "invalid_arguments",
+                        "failure_kind": "invalid_arguments",
+                        "conflicting_fields": ["resume_session_id", "new_session"],
+                        "constraint": "resume_session_id_mutually_exclusive_with_new_session",
+                        "state_changed": false,
+                    }),
+                );
+            }
+            Err(sessions::CodingSessionError::WriteScopeRequired) => {
+                return ToolResult::err_with_output(
+                    "session capability upgrade requires project:write",
+                    json!({
+                        "error_kind": "session_capability_upgrade_denied",
+                        "required_scope": crate::auth::SCOPE_PROJECT_WRITE,
+                        "mode": mode.as_str(),
+                        "state_changed": false,
+                    }),
+                );
+            }
+            Err(sessions::CodingSessionError::CommitFailed) => {
+                return ToolResult::err_with_output(
+                    "coding continuity state could not be committed",
+                    json!({
+                        "error_kind": "coding_continuity_commit_failed",
+                        "state_changed": false,
+                    }),
+                );
+            }
+        };
         let session_summary = &session_outcome.summary;
         let current_binding = if binding_available {
             json!({
                 "bound": true,
                 "session_id": session_summary.session_id,
-                "process_local_in_memory": true,
-                "lost_after_restart": true,
+                "process_local_cache": true,
+                "durable_exact_binding": true,
+                "restored_after_restart": true,
                 "transport": transport.as_str(),
                 "resolved_project": resolved.resolved_id.clone(),
             })
         } else {
             json!({
                 "bound": false,
-                "process_local_in_memory": true,
-                "lost_after_restart": true,
+                "process_local_cache": true,
+                "durable_exact_binding": true,
+                "restored_after_restart": true,
                 "transport": transport.as_str(),
                 "reason_code": if bind_current {
-                    "window_identity_unavailable"
+                    if resume_requested {
+                        "stable_window_identity_unavailable"
+                    } else {
+                        "window_identity_unavailable"
+                    }
                 } else {
                     "binding_disabled"
                 },
@@ -244,14 +360,20 @@ impl ToolRuntime {
             "reason_code": if binding_available {
                 Value::Null
             } else if bind_current {
-                json!("window_identity_unavailable")
+                if resume_requested {
+                    json!("stable_window_identity_unavailable")
+                } else {
+                    json!("window_identity_unavailable")
+                }
             } else {
                 json!("binding_disabled")
             },
-            "process_local_in_memory": true,
-            "lost_after_restart": true,
+            "process_local_cache": true,
+            "durable_exact_binding": true,
+            "restored_after_restart": true,
+            "requires_stable_window_identity": true,
             "transport": transport.as_str(),
-            "durable_resume": "explicit session_id resumes the durable wc_sess_* session",
+            "durable_resume": "the same exact principal, transport, stable window, project, and canonical repository root resumes the durable wc_sess_* session",
         });
         let recommended_flow = match &tool_manifest {
             Some(manifest) => recommended_flow_payload_for_manifest_tools(manifest),
@@ -266,8 +388,15 @@ impl ToolRuntime {
                 "mode": session_summary.mode,
                 "guards": session_summary.guards,
                 "lifecycle": session_summary.lifecycle,
-                "continuation": if session_outcome.reused { "continued" } else { "created" },
+                "continuation": if resume_requested {
+                    "resumed_explicitly"
+                } else if session_outcome.reused {
+                    "continued"
+                } else {
+                    "created"
+                },
                 "reused": session_outcome.reused,
+                "resume_requested": resume_requested,
                 "new_session_requested": new_session,
                 "instruction_appended": title.is_some(),
                 "root_title": session_summary.title,
@@ -285,7 +414,7 @@ impl ToolRuntime {
                     "git_state_recaptured": true,
                     "rules_recaptured": include_rules,
                 },
-                "explicit_session_id_required_for_continuity": false,
+                "explicit_session_id_required_for_continuity": !binding_available,
                 "explicit_session_id_recommended": !binding_available,
                 "explicit_session_id_fields": {
                     "tool_business_input": "session_id",

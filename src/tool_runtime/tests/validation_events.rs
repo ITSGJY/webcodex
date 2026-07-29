@@ -1090,6 +1090,7 @@ async fn finish_coding_task_validation_available_when_ledger_has_validation_even
                 detail: Default::default(),
                 deny_write_tools: false,
                 deny_shell_tools: false,
+                resume_session_id: None,
                 bind_current: false,
                 new_session: false,
             },

@@ -30,19 +30,30 @@ pub(crate) fn start_coding_task_input_schema() -> Value {
                 "default": "standard",
                 "description": "Startup projection detail. minimal returns the session/project/Git/readiness/navigation essentials; standard adds the permission profile while retaining the compact continuous-coding projection; full explicitly adds full runtime status, recent commits, rules, recommended flow, and compact tool manifest."
             },
+            "resume_session_id": {
+                "type": "string",
+                "pattern": "^wc_sess_[A-Za-z0-9_]+$",
+                "description": "Optional explicit Workflow Session recovery id. When present, start_coding_task only resumes that known active Session after exact project, lifecycle, access, and capability checks; failure never falls back to a current binding or creates a Session. Without a stable window, resume still succeeds but no current binding is created and later project tools must pass session_id explicitly. Distinct from project-tool session_id and wrapper recording_session_id. Mutually exclusive with new_session=true."
+            },
             "bind_current": {
                 "type": "boolean",
                 "default": true,
-                "description": "Ensure and bind the window/caller/transport/project/repository current session. Defaults to true. Binding is process-local in-memory control metadata; a stable transport window is required for automatic reuse."
+                "description": "Ensure and bind the exact window/caller/transport/project/canonical-root current session. Defaults to true. A stable transport window is required; the process-local cache and hashed durable ledger projection support automatic reuse across restart without credential-wide fallback."
             },
             "new_session": {
                 "type": "boolean",
                 "default": false,
-                "description": "Explicit advanced isolation request. When true, create and bind a new Workflow Session without closing or rewriting the previous one. Title differences never imply a new session."
+                "description": "Explicit advanced isolation request. When true, create and bind a new Workflow Session without closing or rewriting the previous one. Title differences never imply a new session. Mutually exclusive with resume_session_id."
             }
         },
         "required": ["project"],
         "additionalProperties": false,
+        "not": {
+            "required": ["resume_session_id", "new_session"],
+            "properties": {
+                "new_session": {"const": true}
+            }
+        },
     })
 }
 

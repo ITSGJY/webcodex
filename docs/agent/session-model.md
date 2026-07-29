@@ -84,6 +84,7 @@ handoff, and finish can reason about the same unit of work.
 |---|---|
 | ID form | `wc_sess_*` (`SESSION_ID_PREFIX`) |
 | Business field | `session_id` on tools that take a workflow session as input |
+| Coding resume field | `resume_session_id` on `start_coding_task`; distinct from ordinary project-tool `session_id` |
 | Recorder field | `recording_session_id` on generic wrappers (metadata only; stripped before concrete tool dispatch) |
 
 ### Storage and ownership
@@ -93,7 +94,7 @@ handoff, and finish can reason about the same unit of work.
 | Module | `tool_runtime::sessions` (model, store, events, JSON persistence) |
 | Primary store | In-memory session store |
 | Durability | JSON-oriented session ledger (bounded events/messages per session) |
-| Current-session map | In-memory bindings isolated by client window, principal, transport, resolved project, and canonical repository-root hash |
+| Current-session binding | In-memory exact-key cache plus a bounded durable projection in the same JSON ledger; isolated by client window, principal, transport, resolved project, and canonical repository-root hash |
 
 ### Full-runtime coding continuity
 
@@ -110,18 +111,83 @@ operator surface. With a stable transport window, its default behavior is:
 - `new_session=true` explicitly creates an isolated Session without closing or
   rewriting the previous one.
 
-The first instruction remains the root title. Later instructions record their
-timestamp, requested mode/guards, capability-change result, and context-refresh
-fact without overwriting that root. Session create/update, instruction event,
-and current binding mutate under one store lock; a failed pre-commit check
-leaves all three unchanged. A title change is never an isolation signal.
+Startup selection is strict and ordered:
 
-The binding is process-local; the bounded ledger is durable. After restart,
-automatic window continuity starts fresh and cannot guess a replacement
-window. An explicit durable Workflow Session id still restores the existing
-ledger. This is intentionally different storage from the Connector's durable
-window/project/Task map, while presenting the same ordinary window/repository
-semantics.
+1. `resume_session_id` resumes only that existing Workflow Session. A malformed
+   or unknown id, non-active lifecycle, project mismatch, access denial, or
+   unsafe capability change fails without consulting a current binding or
+   creating a replacement.
+2. Without an explicit resume, `new_session=true` creates an isolated Session.
+   The two fields are mutually exclusive.
+3. With neither field, the stable-window exact binding keeps the default
+   get-or-create/continue behavior above.
+
+Explicit resume preserves both the `wc_sess_*` id and root title, then appends
+exactly one new `task_instruction`. With a stable window and
+`bind_current=true`, it atomically replaces that exact window/repository
+binding; a previously bound Session remains active and available by explicit
+id. `bind_current=false` leaves both binding layers unchanged. Without a stable
+window identity, explicit resume still succeeds but creates neither a
+process-local nor durable binding. The result reports that state, and later
+project tools must continue to pass the resumed `session_id` explicitly.
+
+The first instruction remains the root title. Later instructions record their
+timestamp, requested mode/guards, capability-change result, context-refresh
+fact, explicit-resume fact, and whether the current binding was established,
+without overwriting that root. Target validation, Session create/update,
+instruction event, process-local cache replacement, and durable binding
+replacement are decided under one store lock and enter one ledger snapshot
+generation; a failed validation, permission check, or injected pre-commit
+failure leaves them unchanged. Retrying after such a failure appends the
+instruction only once. A title change is never an isolation signal.
+
+The durable projection stores only:
+
+```text
+domain-separated SHA-256(exact CurrentSessionKey)
+→ wc_sess_* session_id
+→ updated_at
+```
+
+The canonical hash input is the principal kind/id, transport, already-hashed
+stable window identity, resolved project, and already-hashed canonical
+repository root. It uses fixed field order and length prefixes under
+`webcodex.workflow-current-binding.v1`. Raw MCP session ids, hosted
+conversation ids, cookies, credentials, authorization headers, and repository
+paths never enter this projection, and neither binding hashes nor component
+hashes are returned to the model.
+
+After restart, a request with the same complete exact key may restore only an
+existing active Workflow Session whose project still matches, repopulate the
+process-local cache, and continue it. Missing stable window identity never
+falls back to a principal-, credential-, project-, or repository-wide binding.
+Changed principal, transport, window, resolved project, or canonical root
+derives a different durable key. `new_session=true` atomically repoints only
+that exact binding and preserves the previous Session for explicit-id access.
+Explicit bind and unbind update both layers; close and LRU eviction remove all
+bindings to the affected Session.
+
+When the complete exact key cannot be formed, `resume_session_id` is the
+intentional recovery path. It validates the Session against the currently
+resolved project and derives any binding key from that project's current
+canonical repository root, never a client-supplied path. It never derives a
+Workflow Session from a Connector Task or Action Audit Session. Missing window
+identity does not manufacture a key, create a credential-wide projection, or
+write a durable binding.
+
+The binding field is an additive, serde-defaulted field in ledger version 1, so
+older ledgers load it as empty without migration and keep their existing
+Session events/messages. Restore accepts only bounded, lowercase SHA-256 keys
+that reference known active `wc_sess_*` records. Malformed, duplicate,
+conflicting, missing, closed, project-mismatched-on-lookup, and excess entries
+are discarded without rejecting valid Session data. Internal status exposes
+only bounded counts (`durable_binding_count`, `restored_binding_count`,
+`discarded_binding_count`) and never a binding key.
+
+This remains intentionally separate storage and state from the Connector's
+SQLite window/project/Task map, while presenting the same ordinary
+window/repository continuity semantics. Connector Task continuation and resume
+remain their own model and do not infer or mutate Workflow Sessions.
 
 ### Current lifecycle contract
 
@@ -132,13 +198,16 @@ semantics.
   `unknown_session_id` for malformed or unknown IDs without creating a session.
 - Re-closing a closed session is idempotent. Only a real transition records one
   `session_closed` event.
+- Closing removes process-local and durable current bindings that point at the
+  Session; it does not delete the Workflow Session ledger.
 - Closed sessions still allow queries and pure reads. They reject write-like
   tools, shell/job tools, session-message mutation, and session-scoped
   checkpoint create/restore/delete with `session_closed`.
 - `finish_coding_task`, `session_handoff_summary`, and other summary/query tools
   produce closeout information but do not close the session.
 - `archived` is a reserved wire state that current code does not produce. LRU
-  eviction is capacity management, not a lifecycle transition.
+  eviction is capacity management, not a lifecycle transition, and removes
+  bindings to the evicted Session.
 - Session modes (`normal`, `inspect`, `read_only`) are execution policy, not
   lifecycle state.
 

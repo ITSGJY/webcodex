@@ -84,6 +84,11 @@ pub enum ToolCall {
         deny_shell_tools: bool,
         #[serde(default)]
         detail: StartupDetail,
+        /// Explicitly continue one existing Workflow Session. This business
+        /// input is distinct from project-tool `session_id` and wrapper-level
+        /// `recording_session_id` metadata.
+        #[serde(default)]
+        resume_session_id: Option<String>,
         #[serde(default = "default_true")]
         bind_current: bool,
         /// Explicitly create and bind an isolated Workflow Session instead of
@@ -122,7 +127,8 @@ pub enum ToolCall {
 
     /// Explicitly close a workflow session (`Active → Closed`). Requires an
     /// explicit `session_id` (never current-session fallback). Idempotent when
-    /// already closed. Does not archive, evict, or unbind current-session.
+    /// already closed. Does not archive or evict; clears bindings to the closed
+    /// Session.
     CloseSession {
         session_id: String,
     },
@@ -208,14 +214,14 @@ pub enum ToolCall {
         session_id: String,
     },
 
-    /// Return this window/caller/transport's process-local current session
-    /// binding for a project, if any.
+    /// Return this window/caller/transport's exact current session binding for
+    /// a project, restoring its process-local cache from the ledger if needed.
     CurrentSession {
         project: String,
     },
 
-    /// Remove this window/caller/transport's process-local current session
-    /// binding for a project. Idempotent.
+    /// Remove this window/caller/transport's exact current session binding from
+    /// both the process-local cache and durable ledger projection. Idempotent.
     UnbindCurrentSession {
         project: String,
     },
@@ -1046,6 +1052,7 @@ fn reject_unknown_start_coding_task_fields(arguments: &Value) -> Result<(), Stri
         "deny_write_tools",
         "deny_shell_tools",
         "detail",
+        "resume_session_id",
         "bind_current",
         "new_session",
         // Wrapper/session metadata that transports may leave in params.

@@ -1170,6 +1170,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn explicit_resume_mcp_schema_and_metadata_are_exposed() {
+        let _guard = crate::admin_cli::TEST_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("WEBCODEX_MCP_COMPACT_SCHEMAS");
+        let payload = mcp_tools_list_payload();
+        let tool = payload["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "start_coding_task")
+            .expect("start_coding_task MCP metadata");
+        let property = &tool["inputSchema"]["properties"]["resume_session_id"];
+        assert_eq!(property["type"], "string");
+        assert_eq!(property["pattern"], "^wc_sess_[A-Za-z0-9_]+$");
+        let description = property["description"].as_str().unwrap();
+        assert!(description.contains("failure never falls back"));
+        assert!(description.contains("no current binding"));
+        assert!(description.contains("recording_session_id"));
+        assert_eq!(
+            tool["inputSchema"]["not"]["required"],
+            json!(["resume_session_id", "new_session"])
+        );
+        assert!(tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("resume_session_id"));
+    }
+
     #[tokio::test]
     async fn mcp_tools_list_compact_omits_output_schema_only() {
         let _guard = crate::admin_cli::TEST_ENV_LOCK.lock().unwrap();
@@ -1326,9 +1354,9 @@ mod tests {
         ] {
             let description = tool_description(name);
             assert!(
-                description.contains("process-local in-memory")
-                    && description.contains("not the durable session ledger"),
-                "MCP {name} description should distinguish current binding from ledger: {description}"
+                description.contains("process-local")
+                    && description.contains("hashed durable"),
+                "MCP {name} description should distinguish the exact cache and hashed durable projection: {description}"
             );
         }
         let bind_current = tools

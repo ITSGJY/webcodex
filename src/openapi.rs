@@ -1003,7 +1003,7 @@ fn schemas() -> Value {
             "type": "object",
             "additionalProperties": false,
             "required": [TOOL_CALL_TOOL_FIELD],
-            "description": "Generic runtime tool call. `tool` is the runtime tool name. GPT Actions should pass tool-specific arguments as flattened top-level fields because some Action runtimes reject free-form params/arguments objects. `params` and `arguments` remain accepted for non-Action clients, with non-null `params` taking precedence; null wrappers do not suppress flattened arguments. Top-level `session_id` is ordinary tool business input; use `recording_session_id` to record this wrapper call in the session ledger and enforce that recorder session's guards. When no explicit tool session_id is provided, project tools may use the window/caller/transport/project/repository current session ensured by start_coding_task (default bind_current=true) or established manually by bind_current_session. That current-session binding is process-local in-memory control metadata, not the durable session ledger, and may be lost on restart. Missing window identity never falls back to a credential-wide binding. For reliable full-runtime restart or cross-client recovery, keep and pass explicit session_id or recording_session_id values. Ordinary project-bound Connector continuity is handled separately by task_start. For daily discovery prefer tool_manifest; it exposes accepted_flattened_args for GPT Action top-level calls. Use list_tools with summary_only/category/features/limit only for focused discovery.",
+            "description": "Generic runtime tool call. `tool` is the runtime tool name. GPT Actions should pass tool-specific arguments as flattened top-level fields because some Action runtimes reject free-form params/arguments objects. `params` and `arguments` remain accepted for non-Action clients, with non-null `params` taking precedence; null wrappers do not suppress flattened arguments. Top-level `session_id` is ordinary project-tool business input; `resume_session_id` is the distinct start_coding_task input that resumes one known active Workflow Session and never creates on failure; `recording_session_id` records this wrapper call in a Session ledger and enforces that recorder Session's guards. When no explicit tool session_id is provided, project tools may use the exact window/caller/transport/project/canonical-root current Session ensured by start_coding_task (default bind_current=true) or established manually by bind_current_session. Its process-local cache can be restored after restart from a hashed durable projection when the client retains the same stable window identity. Missing identity never falls back to a credential-wide binding; explicit resume can still continue without a window, but cannot establish a current binding and later project tools must pass session_id. Ordinary project-bound Connector continuity is handled separately by task_start. For daily discovery prefer tool_manifest; it exposes accepted_flattened_args for GPT Action top-level calls. Use list_tools with summary_only/category/features/limit only for focused discovery.",
             "properties": {
                 ALLOW_CROSS_PROJECT_SESSION_FIELD: {
                     "type": "boolean",
@@ -1012,6 +1012,11 @@ fn schemas() -> Value {
                 "session_id": {
                     "type": "string",
                     "description": "Flattened tool-specific argument. For session_summary and message-board tools this is the required business session id to read or update in the session ledger; for project tools it is the explicit tool session that wins over current-session binding. Use recording_session_id to record the wrapper call itself."
+                },
+                "resume_session_id": {
+                    "type": "string",
+                    "pattern": "^wc_sess_[A-Za-z0-9_]+$",
+                    "description": "Flattened start_coding_task business input. Explicitly resumes exactly one known active wc_sess_* Workflow Session after project, lifecycle, access, and capability checks. Failure never falls back or creates. Without stable window identity it resumes unbound, so later project tools need session_id. Distinct from session_id and recording_session_id; mutually exclusive with new_session=true. Used only when params and arguments are absent."
                 },
                 "kind": {
                     "type": "string",
@@ -1165,7 +1170,7 @@ fn schemas() -> Value {
                 },
                 "bind_current": {
                     "type": "boolean",
-                    "description": "Flattened start_coding_task flag. Defaults to true and enables same-window/project/repository continuation through a process-local binding. Used only when `params` and `arguments` are absent."
+                    "description": "Flattened start_coding_task flag. Defaults to true and enables same-window/project/repository continuation through process-local and hashed durable exact bindings. Explicit resume without stable window identity remains allowed but cannot bind. Used only when `params` and `arguments` are absent."
                 },
                 "new_session": {
                     "type": "boolean",
@@ -2003,6 +2008,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn explicit_resume_openapi_metadata_is_distinct_from_session_recording() {
+        let spec = build_openapi_spec();
+        let properties = spec["components"]["schemas"]["ToolCallRequest"]["properties"]
+            .as_object()
+            .unwrap();
+        let resume = &properties["resume_session_id"];
+        assert_eq!(resume["type"], "string");
+        assert_eq!(resume["pattern"], "^wc_sess_[A-Za-z0-9_]+$");
+        let resume_description = resume["description"].as_str().unwrap();
+        for phrase in [
+            "start_coding_task business input",
+            "failure never falls back or creates",
+            "without stable window identity",
+            "mutually exclusive with new_session=true",
+        ] {
+            assert!(
+                resume_description.to_lowercase().contains(phrase),
+                "missing {phrase}: {resume_description}"
+            );
+        }
+        assert_ne!(
+            resume["description"],
+            properties["session_id"]["description"]
+        );
+        assert_ne!(
+            resume["description"],
+            properties[TOOL_CALL_RECORDING_SESSION_ID_FIELD]["description"]
+        );
+        let wrapper_description = spec["components"]["schemas"]["ToolCallRequest"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(wrapper_description.contains("resume_session_id"));
+        assert!(wrapper_description.contains("cannot establish a current binding"));
+    }
+
     /// Recursively collect every `$ref` string found anywhere in a JSON value.
     fn collect_refs(value: &Value, out: &mut Vec<String>) {
         match value {
@@ -2796,9 +2837,10 @@ mod tests {
         );
         for phrase in [
             "record this wrapper call in the session ledger",
-            "current-session binding is process-local in-memory",
-            "not the durable session ledger",
-            "explicit session_id or recording_session_id",
+            "process-local cache can be restored after restart",
+            "hashed durable projection",
+            "missing identity never falls back",
+            "session_id or recording_session_id still wins",
         ] {
             assert!(
                 description.contains(phrase),

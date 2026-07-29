@@ -19,6 +19,7 @@ impl ToolRuntime {
                 deny_write_tools,
                 deny_shell_tools,
                 detail,
+                resume_session_id,
                 bind_current,
                 new_session,
             } => {
@@ -29,6 +30,7 @@ impl ToolRuntime {
                     deny_write_tools,
                     deny_shell_tools,
                     detail,
+                    resume_session_id,
                     bind_current,
                     new_session,
                     auth,

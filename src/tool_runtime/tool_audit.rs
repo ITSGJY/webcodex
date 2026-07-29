@@ -836,6 +836,7 @@ impl ToolCall {
                 deny_write_tools,
                 deny_shell_tools,
                 detail,
+                resume_session_id,
                 bind_current,
                 new_session,
             } => serde_json::json!({
@@ -845,6 +846,7 @@ impl ToolCall {
                 "deny_write_tools": deny_write_tools,
                 "deny_shell_tools": deny_shell_tools,
                 "detail": detail,
+                "resume_session_id": resume_session_id,
                 "bind_current": bind_current,
                 "new_session": new_session,
             }),
