@@ -77,7 +77,18 @@ register/ack 窗口内的状态变化。
 完整 inventory 会恢复实际状态、日志、归属和原 `job_id`；缺失项以
 `runner_inventory_missing` 变为 `lost`。不同 `agent_instance_id` 替换旧实例时，
 旧实例活动 Job 以 `runner_instance_replaced` 变为 `lost`，迟到的注册或 update
-继续被拒绝。尚未分发的 Server queue entry 不会重放。
+继续被拒绝；新实例不会迁移或继承旧实例的 Job。旧实例迟到 disconnect 相对当前
+实例是 no-op —— 既不清除当前 notifier，也不把当前实例的 Job 标记为
+lost/recovering —— 但旧实例的 Job 在替换时已终结为 `lost`。尚未分发的
+Server queue entry 不会重放。
+
+非法的 structured validation progress update 属于 executor protocol violation，
+而非可恢复的 transient 状态：乱序、回退或跳跃的 `completed` cursor、计划或 step
+名称不一致、重复或不一致的完成、或无 validation 计划的 Job 携带 progress，都会令
+Job 进入 terminal `failed`，错误为有界、稳定且不泄露 payload 的
+`validation_progress_invalid` 类；最后一次已接受的合法 progress 保留，`ended_at`
+只设置一次，pending request 与 request-to-job 映射释放，不会重新执行。相同或更
+旧序号重放保持幂等；已 terminal 的 Job 不会被迟到 update 或 register inventory 复活。
 
 本阶段要求 Runner 进程仍然存活且 `agent_instance_id` 不变。Runner 自身重启会
 丢失 child/process-group handle，无法恢复这些 Job。本机制不承诺通用的

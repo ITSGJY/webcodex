@@ -1002,6 +1002,22 @@ the runner, it is not an async-job continuity test: same-process job
 reconciliation intentionally cannot recover a child handle across that runner
 restart.
 
+For active async-job continuity across a server restart specifically, run the
+job-reconciliation harness, which keeps the runner process alive and only
+restarts the server:
+
+```bash
+bash scripts/e2e_job_reconciliation_ws.sh
+```
+
+This verifies a running async job survives a server restart with the same
+runner instance (original `job_id`, preserved ownership, non-regressing
+`last_update_seq`, non-duplicating logs, `stop_job` of the original process
+group) and that a job completing while the server is offline reconciles to
+`completed`. The runner process must stay alive; it cannot recover a child
+handle across its own restart, and `run_job` call-level idempotency remains
+future work.
+
 Alternatively, call `POST /api/runtime/status` (or the `runtime_status` tool)
 and verify:
 

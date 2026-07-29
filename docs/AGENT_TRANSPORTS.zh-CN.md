@@ -134,6 +134,16 @@ Registry mutation 前被拒绝。
 `job_status`、有界日志以及 `stop_job(original_job_id)` 会继续工作。Job 仍处于
 `recovering` 时，`stop_job` 返回 `runner_unavailable_recovering`，不会伪造成功。
 
+新的 `agent_instance_id` 不会迁移或继承旧实例的 Job；旧实例活动 Job 在注册时
+以 `runner_instance_replaced` 终结为 `lost`。旧实例迟到 disconnect 相对当前
+实例是 no-op —— 不清除当前 notifier，也不影响当前实例的 Job —— 也不改变旧实例
+已 terminal 的 `lost` Job（首次 `ended_at`/reason 保留）。
+
+非法的 structured validation progress update 属于 executor protocol violation：
+Job 进入 terminal `failed`，错误为有界、稳定的 `validation_progress_invalid` 类，
+保留最后一次已接受的合法 progress，`ended_at` 只设置���次，释放 pending request，
+不重新执行；已 terminal 的 Job 不会被迟到 update 或 register inventory 复活。
+
 该连续性只适用于 Runner 进程和 `agent_instance_id` 均未变化的情况。Runner
 进程重启无法重新获得旧 child handle。本机制不是 command exactly-once 或
 `run_job` request idempotency 保证。

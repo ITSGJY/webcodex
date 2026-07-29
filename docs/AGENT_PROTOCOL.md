@@ -84,7 +84,23 @@ up to 120 seconds. A complete same-instance inventory restores its actual
 state, logs, ownership, and original `job_id`; omission marks it `lost` with
 `runner_inventory_missing`. A replacement `agent_instance_id` marks the old
 instance's active jobs `lost` with `runner_instance_replaced` and fences late
-register/update traffic. An undispatched server queue entry is not replayed.
+register/update traffic; the new instance does not migrate or inherit those
+jobs. A delayed disconnect from the already-replaced instance is a no-op with
+respect to the current instance — it neither clears the current notifier nor
+marks the current instance's jobs lost/recovering — but the old instance's
+jobs were already terminated to `lost` at replacement time. An undispatched
+server queue entry is not replayed.
+
+A malformed structured validation progress update is an executor protocol
+violation, not a transient recoverable state: an out-of-order, regressing, or
+skipped `completed` cursor, a plan/step-name mismatch, a duplicated or
+inconsistent completion, or progress on a job without a validation plan moves
+the job to terminal `failed` with a bounded, stable, non-payload-leaking
+`validation_progress_invalid`-class error, the last accepted valid progress is
+retained, `ended_at` is set once, the pending request and request-to-job
+mapping are released, and no re-execution occurs. Equal- and older-sequence
+replays remain idempotent, and an already terminal job is never revived by a
+late update or by register inventory.
 
 This phase requires the same runner process and the same
 `agent_instance_id`. Restarting the runner loses child/process-group handles

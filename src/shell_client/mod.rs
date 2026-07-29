@@ -3659,6 +3659,12 @@ mod tests {
 
     #[tokio::test]
     async fn lease_stale_instance_job_update_rejected() {
+        // A new `agent_instance_id` replacing the old instance terminates the
+        // old instance's active/recovering jobs to `lost` with
+        // `runner_instance_replaced` immediately at registration. The old
+        // instance's late update is rejected, the new instance cannot inherit
+        // or update the old instance's job, and the terminal state never
+        // revives.
         let registry = ShellClientRegistry::default();
         register_with_instance(&registry, "oe", "inst-a").await;
         let job = registry
@@ -3681,13 +3687,27 @@ mod tests {
             .await
             .unwrap();
 
-        // Replace instance A with B after aging out.
+        // Replace instance A with B after aging out. The replacement must
+        // terminate A's job to `lost` at registration time.
         registry
             .set_last_seen_for_test("oe", chrono::Utc::now().timestamp() - 120)
             .await;
         register_with_instance(&registry, "oe", "inst-b").await;
 
-        // The stale instance A cannot update the job.
+        let lost = registry.get_job(&job.job_id).await.unwrap();
+        assert_eq!(lost.status, "lost");
+        assert_eq!(
+            lost.recovery_reason_code.as_deref(),
+            Some("runner_instance_replaced")
+        );
+        assert!(lost.ended_at.is_some(), "replaced job must record ended_at");
+        assert_eq!(
+            lost.recovery_state.as_deref(),
+            Some("lost_after_reconcile"),
+            "replaced job must record lost_after_reconcile"
+        );
+
+        // The stale instance A cannot update the job (lease check).
         let err = registry
             .update_job(ShellAgentJobUpdateRequest {
                 client_id: "oe".to_string(),
@@ -3714,8 +3734,9 @@ mod tests {
             "error was: {err}"
         );
 
-        // The active instance B can update the job.
-        registry
+        // The active instance B cannot inherit or update A's job: it belongs
+        // to the replaced runner instance.
+        let err = registry
             .update_job(ShellAgentJobUpdateRequest {
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst-b".to_string(),
@@ -3735,7 +3756,42 @@ mod tests {
                 finished: false,
             })
             .await
-            .expect("active instance must update job");
+            .unwrap_err();
+        assert!(
+            err.contains("replaced runner instance"),
+            "active instance must not inherit replaced job: {err}"
+        );
+
+        // The terminal state is stable: a second late update from A does not
+        // revive the job or change the first `ended_at` / reason.
+        let first_ended_at = lost.ended_at.unwrap();
+        let _ = registry
+            .update_job(ShellAgentJobUpdateRequest {
+                client_id: "oe".to_string(),
+                agent_instance_id: "inst-a".to_string(),
+                update_seq: None,
+                job_id: job.job_id.clone(),
+                request_id: None,
+                status: "completed".to_string(),
+                stdout_chunk: None,
+                stderr_chunk: None,
+                stdout_tail: None,
+                stderr_tail: None,
+                log_snapshot: None,
+                exit_code: Some(0),
+                duration_ms: Some(1),
+                error: None,
+                validation_progress: None,
+                finished: true,
+            })
+            .await;
+        let still_lost = registry.get_job(&job.job_id).await.unwrap();
+        assert_eq!(still_lost.status, "lost");
+        assert_eq!(still_lost.ended_at, Some(first_ended_at));
+        assert_eq!(
+            still_lost.recovery_reason_code.as_deref(),
+            Some("runner_instance_replaced")
+        );
     }
 
     #[tokio::test]
@@ -3751,9 +3807,11 @@ mod tests {
 
     #[tokio::test]
     async fn lease_reconcile_disconnect_stale_instance_is_noop() {
-        // A stale instance disconnecting after a newer instance has taken over
-        // must NOT clear the active notifier or mark the active instance's
-        // jobs lost.
+        // A delayed disconnect from a stale, replaced instance must not affect
+        // the current active instance: it must not clear B's notifier, not mark
+        // B's freshly-created job lost/recovering, and not change A's old job
+        // which was already terminated to `lost` (`runner_instance_replaced`)
+        // at replacement time. Only B's own disconnect reconciles B's job.
         let registry = ShellClientRegistry::default();
         register_with_instance(&registry, "oe", "inst-a").await;
         // Install a notifier for instance A.
@@ -3762,8 +3820,9 @@ mod tests {
             .register_notifier("oe", "inst-a", notify_a.clone())
             .await
             .unwrap();
-        // Start a job under instance A.
-        let job = registry
+        // Start a job under instance A. It is terminated to `lost` when B
+        // replaces A, before any disconnect runs.
+        let old_job = registry
             .start_job(
                 ShellJobOpRequest {
                     op: "start".to_string(),
@@ -3783,7 +3842,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Age out A and let B take over.
+        // Age out A and let B take over. The replacement terminates A's job.
         registry
             .set_last_seen_for_test("oe", chrono::Utc::now().timestamp() - 120)
             .await;
@@ -3795,18 +3854,103 @@ mod tests {
             .await
             .unwrap();
 
-        // A's transport finally disconnects. This must be a no-op: B's notifier
-        // stays and B's job is not marked lost.
-        registry.reconcile_disconnect("oe", "inst-a").await;
-        let job_view = registry.get_job(&job.job_id).await.unwrap();
-        assert_ne!(
-            job_view.status, "lost",
-            "stale disconnect must not mark active instance job lost"
+        // B starts a fresh job of its own after the replacement.
+        let b_job = registry
+            .start_job(
+                ShellJobOpRequest {
+                    op: "start".to_string(),
+                    client_id: Some("oe".to_string()),
+                    cwd: None,
+                    command: Some("sleep 10".to_string()),
+                    timeout_secs: Some(10),
+                    job_id: None,
+                    since_stdout_line: None,
+                    since_stderr_line: None,
+                    tail_lines: None,
+                    limit: None,
+                    codex: None,
+                },
+                "tester".to_string(),
+            )
+            .await
+            .unwrap();
+
+        // Snapshot A's old job terminal state before the stale disconnect.
+        let old_lost = registry.get_job(&old_job.job_id).await.unwrap();
+        assert_eq!(old_lost.status, "lost");
+        assert_eq!(
+            old_lost.recovery_reason_code.as_deref(),
+            Some("runner_instance_replaced")
         );
-        // B's disconnect, however, does reconcile.
+        let old_ended_at = old_lost.ended_at.unwrap();
+
+        // A's transport finally disconnects. This must be a no-op: B stays the
+        // current instance, B's notifier stays installed, B's job stays
+        // active, and A's old job keeps its first `ended_at`/reason.
+        registry.reconcile_disconnect("oe", "inst-a").await;
+
+        let view = registry.get_client_view("oe").await.unwrap();
+        assert_eq!(view.agent_instance_id, "inst-b");
+        assert!(view.connected, "stale disconnect must not drop B's lease");
+
+        // B's notifier remains installed (still addressable) and B's job is
+        // untouched.
+        let b_view = registry.get_job(&b_job.job_id).await.unwrap();
+        assert_ne!(
+            b_view.status, "lost",
+            "stale disconnect must not mark B's active job lost"
+        );
+        assert_ne!(
+            b_view.status, "recovering",
+            "stale disconnect must not drive B's job into recovering"
+        );
+
+        let old_after = registry.get_job(&old_job.job_id).await.unwrap();
+        assert_eq!(old_after.status, "lost");
+        assert_eq!(old_after.ended_at, Some(old_ended_at));
+        assert_eq!(
+            old_after.recovery_reason_code.as_deref(),
+            Some("runner_instance_replaced")
+        );
+
+        // B can still poll/update/complete its own job after A's stale
+        // disconnect.
+        let updated = registry
+            .update_job(ShellAgentJobUpdateRequest {
+                client_id: "oe".to_string(),
+                agent_instance_id: "inst-b".to_string(),
+                update_seq: None,
+                job_id: b_job.job_id.clone(),
+                request_id: None,
+                status: "running".to_string(),
+                stdout_chunk: None,
+                stderr_chunk: None,
+                stdout_tail: None,
+                stderr_tail: None,
+                log_snapshot: None,
+                exit_code: None,
+                duration_ms: None,
+                error: None,
+                validation_progress: None,
+                finished: false,
+            })
+            .await
+            .expect("B must still update its own job after A's stale disconnect");
+        assert_eq!(updated.status, "running");
+
+        // Only B's own disconnect reconciles B's job. A non-reconciliation
+        // client's active job becomes `lost` (legacy_runner_disconnected).
         registry.reconcile_disconnect("oe", "inst-b").await;
-        let job_view = registry.get_job(&job.job_id).await.unwrap();
-        assert_eq!(job_view.status, "lost");
+        let b_final = registry.get_job(&b_job.job_id).await.unwrap();
+        assert_eq!(b_final.status, "lost");
+        assert_eq!(
+            b_final.recovery_reason_code.as_deref(),
+            Some("legacy_runner_disconnected")
+        );
+        // A's old job is unaffected by B's disconnect.
+        let old_final = registry.get_job(&old_job.job_id).await.unwrap();
+        assert_eq!(old_final.status, "lost");
+        assert_eq!(old_final.ended_at, Some(old_ended_at));
     }
 
     #[tokio::test]

@@ -3378,6 +3378,17 @@ fn handle_one_poll(
             Ok(result) => break result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if shutdown.load(Ordering::SeqCst) {
+                    // A dispatch is already in flight: its result may itself be
+                    // a terminal auth/protocol error that must surface rather
+                    // than be masked as a clean shutdown. Give the in-flight
+                    // submission a bounded window to deliver its result before
+                    // falling back to the shutdown outcome. This avoids losing
+                    // a fatal submit (e.g. a 401/403/404 the server already
+                    // returned) when the shutdown flag flips during the HTTP
+                    // round-trip.
+                    if let Ok(result) = result_rx.recv_timeout(Duration::from_millis(500)) {
+                        break result;
+                    }
                     return Err(PollError::from_submit(SubmitResultError::Shutdown(
                         "process shutdown".to_string(),
                     )));
