@@ -701,11 +701,6 @@ impl ConnectorRuntime {
             "{}:{}",
             self.context.project_id, fingerprint.project_root_sha256
         );
-        let navigation = window.map(|window| {
-            self.db
-                .activate_window_project(subject_id, window.key(), &project_identity)
-        });
-
         let existing_context = if let Some(window) = window {
             match self.db.connector_window_context(
                 window.key(),
@@ -743,7 +738,6 @@ impl ConnectorRuntime {
                             window.expect("existing window context has a window"),
                             &fingerprint,
                             &refresh,
-                            navigation.as_ref(),
                             now,
                         )
                         .await;
@@ -760,8 +754,9 @@ impl ConnectorRuntime {
                         Ok(cursor) => cursor,
                         Err(error) => return store_error_outcome(error, Some(&task)),
                     };
+                    let window = window.expect("existing window context has a window");
                     if let Err(error) = self.persist_window_context(
-                        window.expect("existing window context has a window"),
+                        window,
                         subject_id,
                         &task.task_id,
                         &fingerprint,
@@ -769,6 +764,11 @@ impl ConnectorRuntime {
                     ) {
                         return store_error_outcome(error, Some(&task));
                     }
+                    let navigation = self.db.activate_window_project(
+                        subject_id,
+                        window.key(),
+                        &project_identity,
+                    );
                     return ConnectorCallOutcome::error_for_task_at(
                         409,
                         "task_interrupted",
@@ -782,7 +782,7 @@ impl ConnectorRuntime {
                             "continuation": "recovered",
                             "instruction_appended": true,
                             "context": context_refresh_payload(&refresh),
-                            "project_switch": navigation_payload(navigation.as_ref(), true),
+                            "project_switch": navigation_payload(Some(&navigation), true),
                             "local_command": format!("webcodex task resume {}", task.task_id)
                         }),
                     );
@@ -830,13 +830,19 @@ impl ConnectorRuntime {
                 return store_error_outcome(error, None);
             }
         };
-        if let Some(window) = window {
+        let navigation = if let Some(window) = window {
             if let Err(error) =
                 self.persist_window_context(window, subject_id, &task.task_id, &fingerprint, now)
             {
                 return store_error_outcome(error, Some(&task));
             }
-        }
+            Some(
+                self.db
+                    .activate_window_project(subject_id, window.key(), &project_identity),
+            )
+        } else {
+            None
+        };
         let brief = project_brief(
             &task,
             prepared.project_overview.as_ref(),
@@ -1011,7 +1017,6 @@ impl ConnectorRuntime {
         window: &ClientWindow,
         fingerprint: &ProjectContextFingerprint,
         refresh: &ContextRefreshSummary,
-        navigation: Option<&crate::db::WindowProjectActivation>,
         now: i64,
     ) -> ConnectorCallOutcome {
         let event_cursor_before = task.event_cursor;
@@ -1069,6 +1074,14 @@ impl ConnectorRuntime {
         ) {
             return store_error_outcome(error, Some(&continued));
         }
+        let navigation = self.db.activate_window_project(
+            &continued.owner_subject_id,
+            window.key(),
+            &format!(
+                "{}:{}",
+                self.context.project_id, fingerprint.project_root_sha256
+            ),
+        );
         let brief = match prepared.as_ref() {
             Some(prepared) => project_brief(
                 &continued,
@@ -1105,7 +1118,7 @@ impl ConnectorRuntime {
                     "workspace_upgraded": prepared.is_some()
                 },
                 "context": context_refresh_payload(refresh),
-                "project_switch": navigation_payload(navigation, true),
+                "project_switch": navigation_payload(Some(&navigation), true),
                 "brief": brief,
                 "next": "Continue from the preserved history; read only context reported as refreshed before editing or validating."
             }),
@@ -4896,6 +4909,31 @@ pub(crate) mod tests {
                 Some(&window),
             )
             .await;
+        let failed_b = connector_b
+            .call_for_window(
+                "task_start",
+                json!({"goal": "attempt B write", "mode": "normal"}),
+                Some(&owner),
+                ConnectorTransport::Mcp,
+                Some(&window),
+            )
+            .await;
+        assert!(!failed_b.ok, "B has no registered writable executor");
+        let a_after_failed_b = connector_a
+            .call_for_window(
+                "task_start",
+                json!({"goal": "continue A after failed switch", "mode": "read_only"}),
+                Some(&owner),
+                ConnectorTransport::Mcp,
+                Some(&window),
+            )
+            .await;
+        assert!(a_after_failed_b.ok, "{}", a_after_failed_b.body);
+        assert_eq!(a_after_failed_b.body["task_id"], a_first.body["task_id"]);
+        assert_eq!(
+            a_after_failed_b.body["data"]["project_switch"]["switched"], false,
+            "a failed project start must not mutate successful navigation state"
+        );
         let b = connector_b
             .call_for_window(
                 "task_start",
