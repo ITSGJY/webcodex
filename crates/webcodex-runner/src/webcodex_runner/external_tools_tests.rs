@@ -205,6 +205,7 @@ fn agent_request(
         validation: None,
         lsp: None,
         sandbox: None,
+        job_context: None,
     }
 }
 

@@ -338,6 +338,7 @@ pub(crate) const ACTIVE_JOB_STATUSES: &[&str] = &[
     "started",
     "agent_queued",
     "stop_requested",
+    "recovering",
 ];
 
 /// Outcome of attempting to terminate a local job's process group.

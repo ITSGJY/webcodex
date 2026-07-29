@@ -1,5 +1,6 @@
 use super::jobs::{
-    assert_active_instance_locked, command_preview, truncate_output, truncate_output_to,
+    assert_active_instance_locked, command_preview, replace_log_limited, truncate_output,
+    truncate_output_to,
 };
 use super::requests::take_pending_request_locked;
 use super::validation::{normalize_project_summaries, validate_agent_instance_id, validate_id};
@@ -107,8 +108,8 @@ impl ShellClientRegistry {
                 job.ended_at = Some(now_ts());
                 job.exit_code = body.exit_code;
                 job.duration_ms = body.duration_ms;
-                job.stdout = stdout.clone();
-                job.stderr = stderr.clone();
+                replace_log_limited(&mut job.stdout, stdout.clone());
+                replace_log_limited(&mut job.stderr, stderr.clone());
                 job.error = error.clone();
             }
         }

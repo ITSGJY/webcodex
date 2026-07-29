@@ -203,6 +203,7 @@ pub fn generated_agent_config_toml(opts: &AgentInitOptions) -> Result<String, St
             lsp_read_only_navigation: true,
             sandbox_inspect_commands: false,
             project_lifecycle: false,
+            job_state_reconciliation: false,
         },
         policy: GeneratedAgentPolicy {
             allow_raw_shell: true,
@@ -367,6 +368,7 @@ mod tests {
             opts.allowed_roots.clear();
             let content = generated_agent_config_toml(&opts).unwrap();
             assert!(content.contains(&format!("allowed_roots = [\"{}\"]", home.to_string_lossy())));
+            assert!(!content.contains("job_state_reconciliation"));
         }
     }
 }

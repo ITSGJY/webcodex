@@ -96,6 +96,7 @@ async fn handle_agent_ws(
     };
     let client_id = register_payload.client_id.clone();
     let agent_instance_id = register_payload.agent_instance_id.clone();
+    let connection_id = uuid::Uuid::new_v4().to_string();
 
     // 1b. Enforce the agent transport boundary before mutating the registry.
     //     This mirrors the polling register handler: bootstrap may register
@@ -142,7 +143,7 @@ async fn handle_agent_ws(
     //    then flip the transport label and install a push notifier so the
     //    request pump can be woken on enqueue.
     if let Err(e) = registry
-        .register_with_auth(register_payload, auth.as_ref())
+        .register_with_auth_connection(register_payload, auth.as_ref(), Some(&connection_id))
         .await
     {
         send_envelope_or_log(
@@ -156,12 +157,37 @@ async fn handle_agent_ws(
         .await;
         return;
     }
-    let _ = registry
-        .set_transport(&client_id, TRANSPORT_WEBSOCKET)
+    if let Err(e) = registry
+        .set_transport_for_connection(
+            &client_id,
+            &agent_instance_id,
+            &connection_id,
+            TRANSPORT_WEBSOCKET,
+        )
+        .await
+    {
+        send_envelope_or_log(
+            &mut ws,
+            AgentEnvelope::Error {
+                code: "register_failed".to_string(),
+                message: e,
+            },
+            "register_failed",
+        )
         .await;
+        registry
+            .reconcile_disconnect_for_connection(&client_id, &agent_instance_id, &connection_id)
+            .await;
+        return;
+    }
     let notify = Arc::new(Notify::new());
     if registry
-        .register_notifier(&client_id, &agent_instance_id, notify.clone())
+        .register_notifier_for_connection(
+            &client_id,
+            &agent_instance_id,
+            &connection_id,
+            notify.clone(),
+        )
         .await
         .is_err()
     {
@@ -174,11 +200,17 @@ async fn handle_agent_ws(
             "register_failed",
         )
         .await;
+        registry
+            .reconcile_disconnect_for_connection(&client_id, &agent_instance_id, &connection_id)
+            .await;
         return;
     }
     // Fetch the view after set_transport so the ack reflects the websocket
     // transport label rather than the default "polling".
-    let Some(view) = registry.get_client_view(&client_id).await else {
+    let Some(view) = registry
+        .get_client_view_for_connection(&client_id, &agent_instance_id, &connection_id)
+        .await
+    else {
         return;
     };
 
@@ -372,7 +404,11 @@ async fn handle_agent_ws(
                     "agent websocket sent goodbye"
                 );
                 registry
-                    .reconcile_disconnect(&client_id, &agent_instance_id)
+                    .reconcile_disconnect_for_connection(
+                        &client_id,
+                        &agent_instance_id,
+                        &connection_id,
+                    )
                     .await;
                 break;
             }
@@ -401,7 +437,7 @@ async fn handle_agent_ws(
     // disconnected agent never leaves jobs permanently "running" or appears
     // permanently online (the client decays to stale via last_seen).
     registry
-        .reconcile_disconnect(&client_id, &agent_instance_id)
+        .reconcile_disconnect_for_connection(&client_id, &agent_instance_id, &connection_id)
         .await;
     tracing::info!(client_id = %client_id, "agent websocket disconnected");
 }
@@ -464,6 +500,7 @@ mod tests {
             payload: ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: client_id.to_string(),
                 agent_instance_id: instance_id.to_string(),
                 display_name: Some("ws-test".to_string()),
@@ -481,6 +518,7 @@ mod tests {
                     lsp_read_only_navigation: false,
                     sandbox_inspect_commands: false,
                     project_lifecycle: false,
+                    job_state_reconciliation: false,
                 }),
                 projects: None,
                 agent_protocol_version: Some(

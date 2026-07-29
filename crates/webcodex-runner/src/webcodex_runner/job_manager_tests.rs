@@ -1,6 +1,328 @@
 use super::*;
 use serde_json::json;
 
+fn retained_terminal_job(job_id: &str, ended_at: i64) -> RunningJob {
+    let mut snapshot = test_job_snapshot(job_id);
+    snapshot.status = "completed".to_string();
+    snapshot.ended_at = Some(ended_at);
+    snapshot.exit_code = Some(0);
+    snapshot.duration_ms = Some(1);
+    RunningJob {
+        client_id: "test-agent".to_string(),
+        agent_instance_id: "test-instance".to_string(),
+        snapshot,
+        child: None,
+        process_group_id: None,
+        stop_requested: Arc::new(AtomicBool::new(false)),
+        slot_reserved: false,
+    }
+}
+
+#[test]
+fn job_reconciliation_inventory_prioritizes_active_and_bounds_terminal_history() {
+    let manager = JobManager::new(1);
+    let now = chrono::Utc::now().timestamp();
+    let mut active = test_job_snapshot("active-original-job");
+    active.created_at = now - 100;
+    active.context.command_preview = "safe preview".to_string();
+    lock_unpoison(&manager.jobs).insert(
+        active.job_id.clone(),
+        RunningJob {
+            client_id: "test-agent".to_string(),
+            agent_instance_id: "test-instance".to_string(),
+            snapshot: active,
+            child: None,
+            process_group_id: None,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            slot_reserved: true,
+        },
+    );
+    for index in 0..(JOB_INVENTORY_MAX_TERMINAL_JOBS + 8) {
+        let job_id = format!("terminal-{index}");
+        lock_unpoison(&manager.jobs).insert(
+            job_id.clone(),
+            retained_terminal_job(&job_id, now - index as i64),
+        );
+    }
+    let expired_id = "terminal-expired";
+    lock_unpoison(&manager.jobs).insert(
+        expired_id.to_string(),
+        retained_terminal_job(expired_id, now - JOB_TERMINAL_RETENTION_SECS),
+    );
+
+    let inventory = manager.inventory();
+    assert!(inventory.active_complete);
+    assert_eq!(inventory.jobs[0].job_id, "active-original-job");
+    assert_eq!(
+        inventory
+            .jobs
+            .iter()
+            .filter(|snapshot| runner_job_is_terminal(&snapshot.status))
+            .count(),
+        JOB_INVENTORY_MAX_TERMINAL_JOBS
+    );
+    assert_eq!(
+        inventory
+            .jobs
+            .iter()
+            .filter(|snapshot| runner_job_is_active(&snapshot.status))
+            .count(),
+        1
+    );
+    assert!(!inventory
+        .jobs
+        .iter()
+        .any(|snapshot| snapshot.job_id == expired_id));
+    assert!(inventory
+        .jobs
+        .iter()
+        .skip(1)
+        .all(|snapshot| runner_job_is_terminal(&snapshot.status)));
+}
+
+#[test]
+fn job_reconciliation_inventory_drops_terminal_payload_before_active_jobs() {
+    let manager = JobManager::new(1);
+    let now = chrono::Utc::now().timestamp();
+    let mut active = test_job_snapshot("active-safe-metadata");
+    active.context.command_preview = "safe preview".to_string();
+    lock_unpoison(&manager.jobs).insert(
+        active.job_id.clone(),
+        RunningJob {
+            client_id: "test-agent".to_string(),
+            agent_instance_id: "test-instance".to_string(),
+            snapshot: active,
+            child: None,
+            process_group_id: None,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            slot_reserved: true,
+        },
+    );
+    let tail = "x\n".repeat(JOB_SNAPSHOT_STREAM_MAX_BYTES / 2);
+    for index in 0..JOB_INVENTORY_MAX_TERMINAL_JOBS {
+        let job_id = format!("large-terminal-{index}");
+        let mut job = retained_terminal_job(&job_id, now - index as i64);
+        job.snapshot.stdout = ShellJobStreamSnapshot {
+            tail: tail.clone(),
+            first_retained_line: 1,
+            next_line: 1 + tail.lines().count(),
+            truncated: false,
+        };
+        job.snapshot.stderr = job.snapshot.stdout.clone();
+        lock_unpoison(&manager.jobs).insert(job_id, job);
+    }
+
+    let inventory = manager.inventory();
+    assert_eq!(inventory.jobs[0].job_id, "active-safe-metadata");
+    assert!(
+        inventory.jobs.len() < JOB_INVENTORY_MAX_TERMINAL_JOBS + 1,
+        "terminal snapshots must yield before the active record"
+    );
+    let encoded = serde_json::to_vec(&inventory).unwrap();
+    assert!(encoded.len() <= JOB_INVENTORY_MAX_SERIALIZED_BYTES);
+    assert!(!String::from_utf8(encoded)
+        .unwrap()
+        .contains("super-secret-raw-command"));
+}
+
+#[test]
+fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
+    let manager = JobManager::new(1);
+    let mut snapshot = test_job_snapshot("offline-terminal-job");
+    snapshot.context.validation_steps = vec!["check".to_string()];
+    lock_unpoison(&manager.jobs).insert(
+        snapshot.job_id.clone(),
+        RunningJob {
+            client_id: "test-agent".to_string(),
+            agent_instance_id: "test-instance".to_string(),
+            snapshot,
+            child: None,
+            process_group_id: None,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            slot_reserved: true,
+        },
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    manager.install_sink(AgentSink::WebSocket {
+        tx,
+        client_id: "test-agent".to_string(),
+        agent_instance_id: "test-instance".to_string(),
+    });
+    manager.update_and_send(
+        "offline-terminal-job",
+        RunnerJobDelta {
+            status: "running".to_string(),
+            stdout_chunk: Some("one\n".to_string()),
+            validation_progress: Some(ShellJobValidationProgress {
+                completed: 0,
+                current_step: Some("check".to_string()),
+                failed_step: None,
+            }),
+            ..Default::default()
+        },
+    );
+    let first = rx.try_recv().expect("incremental update");
+    let AgentEnvelope::JobUpdate { payload: first } = first else {
+        panic!("expected job update");
+    };
+    assert_eq!(first.update_seq, Some(2));
+    assert!(first.stdout_chunk.is_none());
+    let first_logs = first
+        .log_snapshot
+        .expect("sequenced update has authoritative logs");
+    assert_eq!(first_logs.stdout.tail, "one\n");
+    assert_eq!(first_logs.stdout.next_line, 2);
+
+    drop(rx);
+    manager.update_and_send(
+        "offline-terminal-job",
+        RunnerJobDelta {
+            status: "completed".to_string(),
+            stdout_chunk: Some("two\n".to_string()),
+            exit_code: Some(0),
+            duration_ms: Some(25),
+            validation_progress: Some(ShellJobValidationProgress {
+                completed: 1,
+                current_step: None,
+                failed_step: None,
+            }),
+            finished: true,
+            ..Default::default()
+        },
+    );
+    let inventory = manager.inventory();
+    let retained = inventory
+        .jobs
+        .iter()
+        .find(|snapshot| snapshot.job_id == "offline-terminal-job")
+        .expect("terminal snapshot remains after transport send fails");
+    assert_eq!(retained.status, "completed");
+    assert_eq!(retained.update_seq, 3);
+    assert_eq!(retained.stdout.tail, "one\ntwo\n");
+    assert_eq!(retained.stdout.next_line, 3);
+    assert_eq!(retained.exit_code, Some(0));
+    assert_eq!(retained.duration_ms, Some(25));
+    assert_eq!(
+        retained.validation_progress,
+        Some(ShellJobValidationProgress {
+            completed: 1,
+            current_step: None,
+            failed_step: None,
+        })
+    );
+    let record = lock_unpoison(&manager.jobs)
+        .get("offline-terminal-job")
+        .cloned()
+        .unwrap();
+    assert!(record.child.is_none());
+    assert!(record.process_group_id.is_none());
+    assert!(!record.slot_reserved);
+
+    manager.update_and_send(
+        "offline-terminal-job",
+        RunnerJobDelta {
+            status: "running".to_string(),
+            stdout_chunk: Some("late\n".to_string()),
+            ..Default::default()
+        },
+    );
+    let immutable_terminal = manager
+        .inventory()
+        .jobs
+        .into_iter()
+        .find(|snapshot| snapshot.job_id == "offline-terminal-job")
+        .unwrap();
+    assert_eq!(immutable_terminal.status, "completed");
+    assert_eq!(immutable_terminal.update_seq, 3);
+    assert_eq!(immutable_terminal.stdout.tail, "one\ntwo\n");
+
+    let mut registered_inventory = manager.inventory();
+    let (reconnected_tx, mut reconnected_rx) = tokio::sync::mpsc::channel(4);
+    manager.install_sink(AgentSink::WebSocket {
+        tx: reconnected_tx,
+        client_id: "test-agent".to_string(),
+        agent_instance_id: "test-instance".to_string(),
+    });
+    manager.replay_snapshots_since(&registered_inventory);
+    assert!(
+        reconnected_rx.try_recv().is_err(),
+        "unchanged register snapshots need no network replay"
+    );
+    registered_inventory
+        .jobs
+        .iter_mut()
+        .find(|snapshot| snapshot.job_id == "offline-terminal-job")
+        .unwrap()
+        .update_seq -= 1;
+    manager.replay_snapshots_since(&registered_inventory);
+    let replay = reconnected_rx.try_recv().expect("post-register replay");
+    let AgentEnvelope::JobUpdate { payload: replay } = replay else {
+        panic!("expected replay job update");
+    };
+    assert_eq!(replay.job_id, "offline-terminal-job");
+    assert_eq!(replay.update_seq, Some(3));
+    assert!(replay.finished);
+    let logs = replay.log_snapshot.expect("authoritative replay logs");
+    assert_eq!(logs.stdout.tail, "one\ntwo\n");
+    assert_eq!(logs.stdout.next_line, 3);
+
+    manager.stop("offline-terminal-job").unwrap();
+    let stopped_race = reconnected_rx
+        .try_recv()
+        .expect("stop racing a lost terminal update replays the terminal snapshot");
+    let AgentEnvelope::JobUpdate {
+        payload: stopped_race,
+    } = stopped_race
+    else {
+        panic!("expected replay job update");
+    };
+    assert_eq!(stopped_race.status, "completed");
+    assert_eq!(stopped_race.update_seq, Some(3));
+    assert!(stopped_race.finished);
+}
+
+#[test]
+fn job_reconciliation_utf8_log_tail_is_bounded_with_absolute_cursor() {
+    let emoji = "🙂".as_bytes();
+    let mut split_scalar = emoji[..2].to_vec();
+    assert!(take_utf8_output(&mut split_scalar, false).is_empty());
+    assert_eq!(split_scalar, emoji[..2]);
+    split_scalar.extend_from_slice(&emoji[2..]);
+    assert_eq!(take_utf8_output(&mut split_scalar, false), "🙂");
+    assert!(split_scalar.is_empty());
+
+    let mut stream = ShellJobStreamSnapshot::default();
+    let chunk = "🙂\n".repeat(JOB_SNAPSHOT_STREAM_MAX_BYTES / 2);
+    append_runner_stream(&mut stream, Some(&chunk));
+    assert!(stream.tail.len() <= JOB_SNAPSHOT_STREAM_MAX_BYTES);
+    assert!(stream.truncated);
+    assert!(stream.first_retained_line > 1);
+    assert_eq!(
+        stream.next_line,
+        stream
+            .first_retained_line
+            .saturating_add(stream.tail.lines().count())
+    );
+    assert!(std::str::from_utf8(stream.tail.as_bytes()).is_ok());
+
+    let mut long_partial = ShellJobStreamSnapshot::default();
+    append_runner_stream(
+        &mut long_partial,
+        Some(&format!(
+            "first\nsecond\n{}",
+            "z".repeat(JOB_SNAPSHOT_STREAM_MAX_BYTES + 1)
+        )),
+    );
+    assert_eq!(long_partial.first_retained_line, 3);
+    assert_eq!(long_partial.next_line, 4);
+    let observed_next = long_partial.next_line;
+    trim_runner_stream_to(&mut long_partial, 0);
+    assert!(long_partial.tail.is_empty());
+    assert_eq!(long_partial.first_retained_line, observed_next);
+    assert_eq!(long_partial.next_line, observed_next);
+}
+
 #[test]
 fn validation_wait_failure_is_executor_owned_without_a_failed_check() {
     let error = std::io::Error::other("synthetic wait failure");
@@ -58,9 +380,12 @@ fn job_manager_stop_terminates_the_process_group() {
         "process-group-job".into(),
         RunningJob {
             client_id: "test-agent".into(),
+            agent_instance_id: "test-instance".into(),
+            snapshot: test_job_snapshot("process-group-job"),
             child: Some(child.clone()),
             process_group_id: Some(leader_pid),
             stop_requested: stop_requested.clone(),
+            slot_reserved: true,
         },
     );
     manager.stop("process-group-job").unwrap();
@@ -106,9 +431,12 @@ fn job_shutdown_reaps_a_sigterm_responsive_child() {
         "term-responsive".into(),
         RunningJob {
             client_id: "test-agent".into(),
+            agent_instance_id: "test-instance".into(),
+            snapshot: test_job_snapshot("term-responsive"),
             child: Some(Arc::clone(&child)),
             process_group_id: Some(leader_pid),
             stop_requested: Arc::clone(&stop_requested),
+            slot_reserved: true,
         },
     );
 
@@ -156,9 +484,12 @@ fn job_shutdown_escalates_ignored_sigterm_for_parent_and_descendant() {
         "term-ignoring".into(),
         RunningJob {
             client_id: "test-agent".into(),
+            agent_instance_id: "test-instance".into(),
+            snapshot: test_job_snapshot("term-ignoring"),
             child: Some(Arc::clone(&child)),
             process_group_id: Some(leader_pid),
             stop_requested: Arc::clone(&stop_requested),
+            slot_reserved: true,
         },
     );
     let started = Instant::now();
@@ -297,7 +628,8 @@ fn inspect_job_manager_path_landlocks_commands_and_descendants() {
             "timeout_secs": 30,
             "requested_by": "test",
             "created_at": 1,
-            "sandbox": crate::command_sandbox::INSPECT_SANDBOX_MODE
+            "sandbox": crate::command_sandbox::INSPECT_SANDBOX_MODE,
+            "job_context": test_job_context(&project, Vec::new())
         }))
         .unwrap(),
     );
@@ -401,7 +733,11 @@ fn run_fail_fast_validation_job(attempt: usize) -> FailFastAttempt {
             // collector deadline below.
             "timeout_secs": 60,
             "requested_by": "test",
-            "created_at": 1
+            "created_at": 1,
+            "job_context": test_job_context(
+                temp.path(),
+                steps.iter().map(|step| step.name.clone()).collect(),
+            )
         }))
         .unwrap(),
     );
@@ -535,14 +871,15 @@ fn validation_spawn_failure_is_infrastructure_without_failed_assertion() {
             }]).unwrap(),
             "timeout_secs": 10,
             "requested_by": "test",
-            "created_at": 1
+            "created_at": 1,
+            "job_context": test_job_context(temp.path(), vec!["check".to_string()])
         }))
         .unwrap(),
     );
     let update = (0..100)
         .find_map(|_| {
             let update = rx.try_recv().ok().and_then(|envelope| match envelope {
-                AgentEnvelope::JobUpdate { payload } => Some(payload),
+                AgentEnvelope::JobUpdate { payload } if payload.finished => Some(payload),
                 _ => None,
             });
             if update.is_none() {
@@ -628,7 +965,7 @@ fn python_module_probe_reports_tool_unavailable_without_running_recipe() {
 }
 
 #[cfg(target_os = "linux")]
-fn process_running(pid: u32) -> bool {
+pub(super) fn process_running(pid: u32) -> bool {
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return false;
     };

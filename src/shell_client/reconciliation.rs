@@ -1,0 +1,633 @@
+use super::jobs::{
+    command_preview, is_final_job_status, is_runner_active_job_status, mark_job_lost,
+    replace_log_from_snapshot, COMMAND_PREVIEW_MAX_CHARS,
+};
+use super::state::{ShellClientRegistryInner, ShellJobLogState, ShellJobRecord};
+use super::validation::validate_id;
+use super::JOB_RECOVERY_GRACE_SECS;
+use crate::shell_protocol::{
+    ShellAgentProjectSummary, ShellJobInventory, ShellJobSnapshot, ShellJobStreamSnapshot,
+    JOB_INVENTORY_MAX_ACTIVE_JOBS, JOB_INVENTORY_MAX_JOBS, JOB_INVENTORY_MAX_SERIALIZED_BYTES,
+    JOB_INVENTORY_MAX_TERMINAL_JOBS, JOB_SNAPSHOT_STREAM_MAX_BYTES,
+};
+use std::collections::HashSet;
+
+const MAX_CONTEXT_FIELD_CHARS: usize = 1_024;
+const MAX_SNAPSHOT_ERROR_CHARS: usize = 4_096;
+
+fn valid_bounded_text(value: &str, max_chars: usize) -> bool {
+    !value.contains('\0') && value.chars().count() <= max_chars
+}
+
+fn retained_line_count(value: &str) -> usize {
+    value.lines().count()
+}
+
+pub(super) fn validate_stream_snapshot(
+    stream: &ShellJobStreamSnapshot,
+    field: &str,
+) -> Result<(), String> {
+    if stream.tail.len() > JOB_SNAPSHOT_STREAM_MAX_BYTES {
+        return Err(format!(
+            "job inventory {field} exceeds {} bytes",
+            JOB_SNAPSHOT_STREAM_MAX_BYTES
+        ));
+    }
+    if stream.first_retained_line == 0
+        || stream.next_line
+            != stream
+                .first_retained_line
+                .saturating_add(retained_line_count(&stream.tail))
+    {
+        return Err(format!("job inventory {field} line range is inconsistent"));
+    }
+    if stream.first_retained_line > 1 && !stream.truncated {
+        return Err(format!(
+            "job inventory {field} omits earlier lines without truncated=true"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_context(
+    client_id: &str,
+    projects: &[ShellAgentProjectSummary],
+    snapshot: &ShellJobSnapshot,
+) -> Result<(), String> {
+    let context = &snapshot.context;
+    if command_preview(&context.command_preview) != context.command_preview
+        || context.command_preview.chars().count() > COMMAND_PREVIEW_MAX_CHARS + 1
+    {
+        return Err("job inventory command_preview is not canonical and bounded".to_string());
+    }
+    for (name, value) in [
+        ("project_cwd", context.project_cwd.as_deref()),
+        ("cwd", context.cwd.as_deref()),
+        ("purpose", context.purpose.as_deref()),
+        ("shell", context.shell.as_deref()),
+    ] {
+        if value.is_some_and(|value| !valid_bounded_text(value, MAX_CONTEXT_FIELD_CHARS)) {
+            return Err(format!("job inventory {name} is invalid or oversized"));
+        }
+    }
+    if context.purpose.as_deref().is_some_and(|purpose| {
+        !matches!(
+            purpose,
+            "validation"
+                | "test"
+                | "build"
+                | "format"
+                | "release"
+                | "diagnostic"
+                | "operation"
+                | "other"
+        )
+    }) {
+        return Err("job inventory purpose is invalid".to_string());
+    }
+    if context
+        .shell
+        .as_deref()
+        .is_some_and(|shell| !matches!(shell, "sh" | "bash" | "configured" | "custom"))
+    {
+        return Err("job inventory shell is invalid".to_string());
+    }
+    if context.validation_steps.len() > 3
+        || context
+            .validation_steps
+            .iter()
+            .collect::<HashSet<_>>()
+            .len()
+            != context.validation_steps.len()
+        || context
+            .validation_steps
+            .iter()
+            .any(|step| !matches!(step.as_str(), "format" | "check" | "test"))
+    {
+        return Err("job inventory validation_steps are invalid".to_string());
+    }
+    if context
+        .workflow_session_id
+        .as_deref()
+        .is_some_and(|session_id| {
+            !crate::tool_runtime::sessions::is_valid_session_id(session_id)
+                || session_id.chars().count() > 128
+        })
+    {
+        return Err("job inventory workflow_session_id is invalid".to_string());
+    }
+    if context.workflow_session_id.is_some() && context.runtime_project_id.is_none() {
+        return Err("job inventory workflow_session_id requires runtime_project_id".to_string());
+    }
+    if let Some(runtime_project_id) = context.runtime_project_id.as_deref() {
+        let prefix = format!("agent:{client_id}:");
+        let project_id = runtime_project_id
+            .strip_prefix(&prefix)
+            .filter(|project_id| !project_id.is_empty())
+            .ok_or_else(|| {
+                "job inventory runtime_project_id does not belong to client_id".to_string()
+            })?;
+        if !projects
+            .iter()
+            .any(|project| !project.disabled && project.id == project_id)
+        {
+            return Err(
+                "job inventory runtime_project_id is not registered by this runner".to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_snapshot(
+    client_id: &str,
+    projects: &[ShellAgentProjectSummary],
+    snapshot: &ShellJobSnapshot,
+) -> Result<bool, String> {
+    validate_id(&snapshot.job_id, "job_id")?;
+    validate_id(&snapshot.request_id, "request_id")?;
+    if snapshot.update_seq == 0 {
+        return Err("job inventory update_seq must be greater than zero".to_string());
+    }
+    let active = matches!(
+        snapshot.status.as_str(),
+        "agent_queued" | "running" | "stop_requested"
+    );
+    let terminal = is_final_job_status(&snapshot.status);
+    if !active && !terminal {
+        return Err(format!(
+            "job inventory status '{}' is invalid",
+            snapshot.status
+        ));
+    }
+    if snapshot.created_at <= 0
+        || snapshot
+            .started_at
+            .is_some_and(|started| started < snapshot.created_at)
+        || snapshot
+            .ended_at
+            .is_some_and(|ended| ended < snapshot.started_at.unwrap_or(snapshot.created_at))
+    {
+        return Err("job inventory timestamps are inconsistent".to_string());
+    }
+    if active && snapshot.ended_at.is_some() {
+        return Err("active job inventory snapshot must not have ended_at".to_string());
+    }
+    if active && (snapshot.exit_code.is_some() || snapshot.duration_ms.is_some()) {
+        return Err(
+            "active job inventory snapshot must not contain terminal result fields".to_string(),
+        );
+    }
+    if terminal && snapshot.ended_at.is_none() {
+        return Err("terminal job inventory snapshot requires ended_at".to_string());
+    }
+    if snapshot.status == "completed" && snapshot.exit_code != Some(0) {
+        return Err("completed job inventory snapshot requires exit_code=0".to_string());
+    }
+    if matches!(snapshot.status.as_str(), "running" | "stop_requested")
+        && snapshot.started_at.is_none()
+    {
+        return Err("running job inventory snapshot requires started_at".to_string());
+    }
+    if snapshot
+        .error
+        .as_deref()
+        .is_some_and(|error| !valid_bounded_text(error, MAX_SNAPSHOT_ERROR_CHARS))
+    {
+        return Err("job inventory error is invalid or oversized".to_string());
+    }
+    validate_context(client_id, projects, snapshot)?;
+    validate_stream_snapshot(&snapshot.stdout, "stdout")?;
+    validate_stream_snapshot(&snapshot.stderr, "stderr")?;
+    if snapshot.context.validation_steps.is_empty() && snapshot.validation_progress.is_some() {
+        return Err("job inventory validation_progress is unexpected".to_string());
+    }
+    if let Some(progress) = snapshot.validation_progress.as_ref() {
+        if progress.completed > snapshot.context.validation_steps.len()
+            || progress
+                .current_step
+                .as_ref()
+                .is_some_and(|step| !snapshot.context.validation_steps.contains(step))
+            || progress
+                .failed_step
+                .as_ref()
+                .is_some_and(|step| !snapshot.context.validation_steps.contains(step))
+            || (progress.current_step.is_some() && progress.failed_step.is_some())
+        {
+            return Err("job inventory validation_progress is inconsistent".to_string());
+        }
+    }
+    if !snapshot.context.validation_steps.is_empty() {
+        let steps = &snapshot.context.validation_steps;
+        let progress = snapshot.validation_progress.as_ref();
+        let structurally_valid = match snapshot.status.as_str() {
+            "agent_queued" => progress.is_none(),
+            "running" | "stop_requested" => progress.is_some_and(|progress| {
+                progress.completed < steps.len()
+                    && progress.current_step.as_ref() == steps.get(progress.completed)
+                    && progress.failed_step.is_none()
+            }),
+            "completed" => progress.is_some_and(|progress| {
+                progress.completed == steps.len()
+                    && progress.current_step.is_none()
+                    && progress.failed_step.is_none()
+            }),
+            "failed" => progress.is_none_or(|progress| {
+                progress.current_step.is_none()
+                    && progress.failed_step.as_ref().is_none_or(|failed| {
+                        progress.completed < steps.len()
+                            && steps.get(progress.completed) == Some(failed)
+                    })
+            }),
+            "stopped" | "timeout" | "timed_out" | "cancelled" | "lost" => {
+                progress.is_none_or(|progress| {
+                    progress.current_step.is_none() && progress.failed_step.is_none()
+                })
+            }
+            _ => false,
+        };
+        if !structurally_valid {
+            return Err("job inventory validation_progress does not match status".to_string());
+        }
+    }
+    Ok(active)
+}
+
+pub(super) fn validate_job_inventory(
+    client_id: &str,
+    projects: &[ShellAgentProjectSummary],
+    inventory: &ShellJobInventory,
+) -> Result<(), String> {
+    if !inventory.active_complete {
+        return Err("job_state_reconciliation requires active_complete job inventory".to_string());
+    }
+    if inventory.jobs.len() > JOB_INVENTORY_MAX_JOBS {
+        return Err(format!(
+            "job inventory exceeds {} records",
+            JOB_INVENTORY_MAX_JOBS
+        ));
+    }
+    let serialized = serde_json::to_vec(inventory)
+        .map_err(|error| format!("could not serialize job inventory: {error}"))?;
+    if serialized.len() > JOB_INVENTORY_MAX_SERIALIZED_BYTES {
+        return Err(format!(
+            "job inventory exceeds {} serialized bytes",
+            JOB_INVENTORY_MAX_SERIALIZED_BYTES
+        ));
+    }
+    let mut ids = HashSet::with_capacity(inventory.jobs.len());
+    let mut request_ids = HashSet::with_capacity(inventory.jobs.len());
+    let mut active_count = 0usize;
+    let mut terminal_count = 0usize;
+    let mut saw_terminal = false;
+    for snapshot in &inventory.jobs {
+        if !ids.insert(snapshot.job_id.as_str()) {
+            return Err(format!(
+                "job inventory contains duplicate job_id {}",
+                snapshot.job_id
+            ));
+        }
+        if !request_ids.insert(snapshot.request_id.as_str()) {
+            return Err(format!(
+                "job inventory contains duplicate request_id {}",
+                snapshot.request_id
+            ));
+        }
+        let active = validate_snapshot(client_id, projects, snapshot)?;
+        if active {
+            if saw_terminal {
+                return Err(
+                    "job inventory must order all active jobs before terminal history".to_string(),
+                );
+            }
+            active_count += 1;
+        } else {
+            saw_terminal = true;
+            terminal_count += 1;
+        }
+    }
+    if active_count > JOB_INVENTORY_MAX_ACTIVE_JOBS {
+        return Err(format!(
+            "job inventory exceeds {} active records",
+            JOB_INVENTORY_MAX_ACTIVE_JOBS
+        ));
+    }
+    if terminal_count > JOB_INVENTORY_MAX_TERMINAL_JOBS {
+        return Err(format!(
+            "job inventory exceeds {} terminal records",
+            JOB_INVENTORY_MAX_TERMINAL_JOBS
+        ));
+    }
+    Ok(())
+}
+
+fn same_context(job: &ShellJobRecord, snapshot: &ShellJobSnapshot) -> bool {
+    let context = &snapshot.context;
+    job.request_id.as_deref() == Some(snapshot.request_id.as_str())
+        && job.project_id == context.runtime_project_id
+        && job.session_id == context.workflow_session_id
+        && job.cwd == context.cwd
+        && job.project_cwd == context.project_cwd
+        && job.purpose == context.purpose
+        && job.shell == context.shell
+        && job.command_preview == context.command_preview
+        && job.validation_steps == context.validation_steps
+}
+
+pub(super) fn preflight_inventory_locked(
+    inner: &ShellClientRegistryInner,
+    client_id: &str,
+    agent_instance_id: &str,
+    inventory: &ShellJobInventory,
+) -> Result<(), String> {
+    for snapshot in &inventory.jobs {
+        if inner
+            .request_to_job
+            .get(&snapshot.request_id)
+            .is_some_and(|job_id| job_id != &snapshot.job_id)
+        {
+            return Err(format!(
+                "job inventory request_id {} belongs to a different job",
+                snapshot.request_id
+            ));
+        }
+        let Some(existing) = inner.jobs_by_id.get(&snapshot.job_id) else {
+            continue;
+        };
+        if existing.client_id != client_id {
+            return Err(format!(
+                "job inventory job_id {} belongs to a different client",
+                snapshot.job_id
+            ));
+        }
+        if existing.agent_instance_id != agent_instance_id {
+            return Err(format!(
+                "job inventory job_id {} belongs to a replaced runner instance",
+                snapshot.job_id
+            ));
+        }
+        if !same_context(existing, snapshot) {
+            return Err(format!(
+                "job inventory job_id {} has inconsistent ownership context",
+                snapshot.job_id
+            ));
+        }
+        let would_apply = snapshot.update_seq > existing.last_update_seq
+            || (snapshot.update_seq == existing.last_update_seq && existing.status == "recovering");
+        if !is_final_job_status(&existing.status) && would_apply {
+            let existing_progress = existing
+                .validation_progress
+                .as_ref()
+                .map(|progress| progress.completed)
+                .unwrap_or(0);
+            let snapshot_progress = snapshot
+                .validation_progress
+                .as_ref()
+                .map(|progress| progress.completed)
+                .unwrap_or(0);
+            if snapshot_progress < existing_progress {
+                return Err(format!(
+                    "job inventory job_id {} regresses validation progress",
+                    snapshot.job_id
+                ));
+            }
+            if snapshot.stdout.next_line < existing.stdout.next_line
+                || snapshot.stderr.next_line < existing.stderr.next_line
+            {
+                return Err(format!(
+                    "job inventory job_id {} regresses an absolute log cursor",
+                    snapshot.job_id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_job_request_mapping(
+    inner: &mut ShellClientRegistryInner,
+    client_id: &str,
+    request_id: Option<&str>,
+) {
+    let Some(request_id) = request_id else {
+        return;
+    };
+    inner.pending_by_id.remove(request_id);
+    inner.request_to_job.remove(request_id);
+    if let Some(queue) = inner.queues_by_client.get_mut(client_id) {
+        queue.retain(|queued| queued != request_id);
+    }
+}
+
+fn remove_job_control_requests(
+    inner: &mut ShellClientRegistryInner,
+    client_id: &str,
+    job_ids: &HashSet<String>,
+) {
+    let request_ids = inner
+        .pending_by_id
+        .iter()
+        .filter_map(|(request_id, pending)| {
+            (pending.request.client_id == client_id
+                && pending
+                    .job_id
+                    .as_ref()
+                    .is_some_and(|job_id| job_ids.contains(job_id)))
+            .then(|| request_id.clone())
+        })
+        .collect::<Vec<_>>();
+    for request_id in request_ids {
+        remove_job_request_mapping(inner, client_id, Some(&request_id));
+    }
+}
+
+fn record_from_snapshot(
+    client_id: &str,
+    agent_instance_id: &str,
+    snapshot: &ShellJobSnapshot,
+    now: i64,
+) -> ShellJobRecord {
+    let context = &snapshot.context;
+    ShellJobRecord {
+        job_id: snapshot.job_id.clone(),
+        request_id: Some(snapshot.request_id.clone()),
+        client_id: client_id.to_string(),
+        agent_instance_id: agent_instance_id.to_string(),
+        kind: "shell".to_string(),
+        project_id: context.runtime_project_id.clone(),
+        session_id: context.workflow_session_id.clone(),
+        cwd: context.cwd.clone(),
+        project_cwd: context.project_cwd.clone(),
+        purpose: context.purpose.clone(),
+        shell: context.shell.clone(),
+        command_preview: context.command_preview.clone(),
+        status: snapshot.status.clone(),
+        created_at: snapshot.created_at,
+        started_at: snapshot.started_at,
+        ended_at: snapshot.ended_at,
+        exit_code: snapshot.exit_code,
+        duration_ms: snapshot.duration_ms,
+        stdout: ShellJobLogState::default(),
+        stderr: ShellJobLogState::default(),
+        error: snapshot.error.clone(),
+        codex: None,
+        validation_steps: context.validation_steps.clone(),
+        validation_progress: snapshot.validation_progress.clone(),
+        last_update_seq: snapshot.update_seq,
+        recovery_state: Some("reconciled".to_string()),
+        recovered_after_server_restart: true,
+        reconciled_at: Some(now),
+        recovery_reason_code: Some("server_restart_reconciliation".to_string()),
+        recovering_since: None,
+        recovery_original_status: None,
+    }
+}
+
+fn apply_snapshot(job: &mut ShellJobRecord, snapshot: &ShellJobSnapshot, now: i64) {
+    job.status = snapshot.status.clone();
+    job.started_at = snapshot.started_at;
+    job.ended_at = snapshot.ended_at;
+    job.exit_code = snapshot.exit_code;
+    job.duration_ms = snapshot.duration_ms;
+    job.error = snapshot.error.clone();
+    job.validation_progress = snapshot.validation_progress.clone();
+    replace_log_from_snapshot(&mut job.stdout, &snapshot.stdout);
+    replace_log_from_snapshot(&mut job.stderr, &snapshot.stderr);
+    job.last_update_seq = snapshot.update_seq;
+    job.recovery_state = Some("reconciled".to_string());
+    job.reconciled_at = Some(now);
+    job.recovery_reason_code = Some("same_instance_reconciliation".to_string());
+    job.recovering_since = None;
+    job.recovery_original_status = None;
+}
+
+pub(super) fn reconcile_inventory_locked(
+    inner: &mut ShellClientRegistryInner,
+    client_id: &str,
+    agent_instance_id: &str,
+    inventory: &ShellJobInventory,
+    now: i64,
+) {
+    let expired_recovering = inner
+        .jobs_by_id
+        .iter()
+        .filter_map(|(job_id, job)| {
+            (job.client_id == client_id
+                && job.agent_instance_id == agent_instance_id
+                && job.status == "recovering"
+                && job
+                    .recovering_since
+                    .is_some_and(|since| now.saturating_sub(since) >= JOB_RECOVERY_GRACE_SECS))
+            .then(|| (job_id.clone(), job.request_id.clone()))
+        })
+        .collect::<Vec<_>>();
+    let expired_job_ids = expired_recovering
+        .iter()
+        .map(|(job_id, _)| job_id.clone())
+        .collect::<HashSet<_>>();
+    for (job_id, request_id) in expired_recovering {
+        if let Some(job) = inner.jobs_by_id.get_mut(&job_id) {
+            mark_job_lost(
+                job,
+                now,
+                "runner_recovery_deadline_exceeded",
+                "runner did not reconcile the job before the recovery deadline",
+            );
+        }
+        remove_job_request_mapping(inner, client_id, request_id.as_deref());
+    }
+    remove_job_control_requests(inner, client_id, &expired_job_ids);
+
+    let inventory_ids = inventory
+        .jobs
+        .iter()
+        .map(|snapshot| snapshot.job_id.as_str())
+        .collect::<HashSet<_>>();
+    let missing = inner
+        .jobs_by_id
+        .iter()
+        .filter_map(|(job_id, job)| {
+            (job.client_id == client_id
+                && job.agent_instance_id == agent_instance_id
+                && is_runner_active_job_status(&job.status)
+                && !inventory_ids.contains(job_id.as_str()))
+            .then(|| (job_id.clone(), job.request_id.clone()))
+        })
+        .collect::<Vec<_>>();
+    let missing_job_ids = missing
+        .iter()
+        .map(|(job_id, _)| job_id.clone())
+        .collect::<HashSet<_>>();
+    for (job_id, request_id) in missing {
+        if let Some(job) = inner.jobs_by_id.get_mut(&job_id) {
+            mark_job_lost(
+                job,
+                now,
+                "runner_inventory_missing",
+                "runner complete active inventory did not contain this job",
+            );
+        }
+        remove_job_request_mapping(inner, client_id, request_id.as_deref());
+    }
+    remove_job_control_requests(inner, client_id, &missing_job_ids);
+
+    for snapshot in &inventory.jobs {
+        if let Some(existing) = inner.jobs_by_id.get_mut(&snapshot.job_id) {
+            if is_final_job_status(&existing.status) {
+                // A server-authoritative terminal state (deadline, replacement,
+                // or a previously accepted terminal result) never revives or
+                // changes terminal class.
+                continue;
+            }
+            if snapshot.update_seq < existing.last_update_seq {
+                continue;
+            }
+            if snapshot.update_seq == existing.last_update_seq && existing.status != "recovering" {
+                continue;
+            }
+            apply_snapshot(existing, snapshot, now);
+        } else {
+            let mut record = record_from_snapshot(client_id, agent_instance_id, snapshot, now);
+            replace_log_from_snapshot(&mut record.stdout, &snapshot.stdout);
+            replace_log_from_snapshot(&mut record.stderr, &snapshot.stderr);
+            inner.jobs_by_id.insert(snapshot.job_id.clone(), record);
+        }
+        if is_final_job_status(&snapshot.status) {
+            remove_job_request_mapping(inner, client_id, Some(&snapshot.request_id));
+        }
+    }
+}
+
+pub(super) fn terminate_instance_jobs_locked(
+    inner: &mut ShellClientRegistryInner,
+    client_id: &str,
+    agent_instance_id: &str,
+    now: i64,
+) {
+    let jobs = inner
+        .jobs_by_id
+        .iter()
+        .filter_map(|(job_id, job)| {
+            (job.client_id == client_id
+                && job.agent_instance_id == agent_instance_id
+                && (job.status == "queued" || is_runner_active_job_status(&job.status)))
+            .then(|| (job_id.clone(), job.request_id.clone()))
+        })
+        .collect::<Vec<_>>();
+    let terminated_job_ids = jobs
+        .iter()
+        .map(|(job_id, _)| job_id.clone())
+        .collect::<HashSet<_>>();
+    for (job_id, request_id) in jobs {
+        if let Some(job) = inner.jobs_by_id.get_mut(&job_id) {
+            mark_job_lost(
+                job,
+                now,
+                "runner_instance_replaced",
+                "runner instance was replaced before the job completed or reconciled",
+            );
+        }
+        remove_job_request_mapping(inner, client_id, request_id.as_deref());
+    }
+    remove_job_control_requests(inner, client_id, &terminated_job_ids);
+}

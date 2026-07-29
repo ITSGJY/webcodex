@@ -1,6 +1,11 @@
-use super::state::{ShellClientRegistryInner, ShellJobRecord};
-use super::{now_ts, CLIENT_ONLINE_WINDOW_SECS, MAX_OUTPUT_BYTES, MAX_QUEUED_REQUESTS_PER_CLIENT};
-use crate::shell_protocol::{ShellAgentJobResult, ShellAgentShellJobResult, ShellJobInfo};
+use super::state::{ShellClientRegistryInner, ShellJobLogState, ShellJobRecord};
+use super::{
+    now_ts, CLIENT_ONLINE_WINDOW_SECS, JOB_RECOVERY_GRACE_SECS, MAX_OUTPUT_BYTES,
+    MAX_QUEUED_REQUESTS_PER_CLIENT,
+};
+use crate::shell_protocol::{
+    ShellAgentJobResult, ShellAgentShellJobResult, ShellJobInfo, ShellJobStreamSnapshot,
+};
 use std::collections::VecDeque;
 use std::fmt;
 
@@ -207,9 +212,19 @@ pub(super) fn job_view(job: &ShellJobRecord) -> ShellJobInfo {
         codex: job.codex.clone(),
         result,
         validation_progress: job.validation_progress.clone(),
+        recovery_state: job.recovery_state.clone(),
+        recovered_after_server_restart: job.recovered_after_server_restart,
+        reconciled_at: job.reconciled_at,
+        recovery_reason_code: job.recovery_reason_code.clone(),
+        last_update_seq: (job.last_update_seq > 0).then_some(job.last_update_seq),
+        stdout_retained_from_line: Some(job.stdout.first_retained_line),
+        stderr_retained_from_line: Some(job.stderr.first_retained_line),
+        stdout_log_truncated: job.stdout.truncated,
+        stderr_log_truncated: job.stderr.truncated,
     }
 }
 
+#[cfg(test)]
 pub(super) fn select_lines(
     value: Option<&String>,
     since_line: Option<usize>,
@@ -240,30 +255,112 @@ pub(super) fn select_lines(
     (Some(text), lines.len() + 1, lines.len(), start_idx > 0)
 }
 
-pub(super) fn append_limited(target: &mut Option<String>, chunk: Option<String>) {
+fn retained_line_count(value: &str) -> usize {
+    value.lines().count()
+}
+
+pub(super) fn append_log_limited(target: &mut ShellJobLogState, chunk: Option<String>) {
     let Some(chunk) = chunk else {
         return;
     };
-    let target_value = target.get_or_insert_with(String::new);
-    target_value.push_str(&chunk);
-    if target_value.len() > MAX_OUTPUT_BYTES {
-        let mut start = target_value.len() - MAX_OUTPUT_BYTES;
-        while start < target_value.len() && !target_value.is_char_boundary(start) {
-            start += 1;
+    target.tail.push_str(&chunk);
+    if target.tail.len() > MAX_OUTPUT_BYTES {
+        let observed_next = target
+            .first_retained_line
+            .saturating_add(retained_line_count(&target.tail));
+        let minimum_start = target.tail.len() - MAX_OUTPUT_BYTES;
+        if let Some(relative_newline) = target.tail[minimum_start..].find('\n') {
+            let drop_end = minimum_start + relative_newline + 1;
+            let dropped_lines = target.tail[..drop_end]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count();
+            target.tail.drain(..drop_end);
+            target.first_retained_line = target.first_retained_line.saturating_add(dropped_lines);
+        } else {
+            let mut start = minimum_start;
+            while start < target.tail.len() && !target.tail.is_char_boundary(start) {
+                start += 1;
+            }
+            let dropped_lines = target.tail[..start]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count();
+            target.tail.drain(..start);
+            target.first_retained_line = target.first_retained_line.saturating_add(dropped_lines);
         }
-        *target_value = format!(
-            "[output truncated to last {} bytes]\n{}",
-            MAX_OUTPUT_BYTES,
-            &target_value[start..]
-        );
+        if target.tail.is_empty() {
+            target.first_retained_line = observed_next;
+        }
+        target.truncated = true;
     }
+    target.next_line = target
+        .first_retained_line
+        .saturating_add(retained_line_count(&target.tail));
 }
 
-pub(super) fn replace_limited(target: &mut Option<String>, value: Option<String>) {
+pub(super) fn replace_log_limited(target: &mut ShellJobLogState, value: Option<String>) {
     let Some(value) = value else {
         return;
     };
-    *target = truncate_output(Some(value));
+    let value = truncate_output(Some(value)).unwrap_or_default();
+    target.tail = value;
+    target.first_retained_line = 1;
+    target.next_line = 1usize.saturating_add(retained_line_count(&target.tail));
+    target.truncated = target.tail.starts_with("[output truncated to last ");
+}
+
+pub(super) fn replace_log_from_snapshot(
+    target: &mut ShellJobLogState,
+    snapshot: &ShellJobStreamSnapshot,
+) {
+    target.tail = snapshot.tail.clone();
+    target.first_retained_line = snapshot.first_retained_line;
+    target.next_line = snapshot.next_line;
+    target.truncated = snapshot.truncated;
+}
+
+pub(super) fn select_log_lines(
+    log: &ShellJobLogState,
+    since_line: Option<usize>,
+    tail_lines: Option<usize>,
+) -> (Option<String>, usize, usize, bool) {
+    let lines = log.tail.lines().collect::<Vec<_>>();
+    if let Some(tail) = tail_lines.filter(|n| *n > 0) {
+        let start = lines.len().saturating_sub(tail);
+        let selected = lines[start..].join("\n");
+        let text = if selected.is_empty() {
+            selected
+        } else {
+            format!("{}\n", selected)
+        };
+        return (
+            Some(text),
+            log.next_line,
+            log.next_line.saturating_sub(1),
+            log.first_retained_line > 1 || start > 0 || log.truncated,
+        );
+    }
+    let requested = since_line
+        .unwrap_or(log.first_retained_line)
+        .max(log.first_retained_line);
+    let start_idx = requested
+        .saturating_sub(log.first_retained_line)
+        .min(lines.len());
+    let selected = lines[start_idx..].join("\n");
+    let text = if selected.is_empty() {
+        selected
+    } else {
+        format!("{}\n", selected)
+    };
+    (
+        Some(text),
+        log.next_line,
+        log.next_line.saturating_sub(1),
+        since_line.is_some_and(|line| line < log.first_retained_line)
+            || start_idx > 0
+            || log.truncated,
+    )
 }
 
 pub(super) fn is_final_job_status(status: &str) -> bool {
@@ -271,6 +368,48 @@ pub(super) fn is_final_job_status(status: &str) -> bool {
         status,
         "completed" | "failed" | "stopped" | "timeout" | "timed_out" | "lost" | "cancelled"
     )
+}
+
+pub(super) fn is_runner_active_job_status(status: &str) -> bool {
+    matches!(
+        status,
+        "agent_queued" | "running" | "stop_requested" | "recovering"
+    )
+}
+
+pub(super) fn begin_job_recovery(job: &mut ShellJobRecord, now: i64, reason_code: &str) {
+    if is_final_job_status(&job.status) || job.status == "queued" {
+        return;
+    }
+    if job.status != "recovering" {
+        job.recovery_original_status = Some(job.status.clone());
+        job.status = "recovering".to_string();
+        job.recovering_since = Some(now);
+    }
+    job.recovery_state = Some("recovering".to_string());
+    job.recovery_reason_code = Some(reason_code.to_string());
+    job.ended_at = None;
+}
+
+pub(super) fn mark_job_lost(job: &mut ShellJobRecord, now: i64, reason_code: &str, message: &str) {
+    if is_final_job_status(&job.status) {
+        return;
+    }
+    job.status = "lost".to_string();
+    if job.ended_at.is_none() {
+        job.ended_at = Some(now);
+    }
+    job.error = Some(message.to_string());
+    job.recovery_state = matches!(
+        reason_code,
+        "runner_inventory_missing"
+            | "runner_instance_replaced"
+            | "runner_recovery_deadline_exceeded"
+    )
+    .then(|| "lost_after_reconcile".to_string());
+    job.recovery_reason_code = Some(reason_code.to_string());
+    job.recovering_since = None;
+    job.recovery_original_status = None;
 }
 
 fn client_is_connected_locked(inner: &ShellClientRegistryInner, client_id: &str) -> bool {
@@ -356,21 +495,43 @@ pub(super) fn refresh_job_status_locked(inner: &mut ShellClientRegistryInner, jo
     let Some(job) = inner.jobs_by_id.get(job_id) else {
         return;
     };
-    if is_final_job_status(&job.status)
-        || !matches!(
-            job.status.as_str(),
-            "agent_queued" | "running" | "stop_requested"
-        )
-    {
+    if is_final_job_status(&job.status) || !is_runner_active_job_status(&job.status) {
+        return;
+    }
+    if job.status == "recovering" {
+        let expired = job
+            .recovering_since
+            .is_some_and(|since| now_ts().saturating_sub(since) >= JOB_RECOVERY_GRACE_SECS);
+        if expired {
+            if let Some(job) = inner.jobs_by_id.get_mut(job_id) {
+                mark_job_lost(
+                    job,
+                    now_ts(),
+                    "runner_recovery_deadline_exceeded",
+                    "runner did not reconcile the job before the recovery deadline",
+                );
+            }
+        }
         return;
     }
     let client_id = job.client_id.clone();
     if client_is_connected_locked(inner, &client_id) {
         return;
     }
+    let recoverable = inner
+        .clients
+        .get(&client_id)
+        .is_some_and(|client| client.capabilities.job_state_reconciliation);
     if let Some(job) = inner.jobs_by_id.get_mut(job_id) {
-        job.status = "lost".to_string();
-        job.ended_at = Some(now_ts());
-        job.error = Some("shell client went stale while job was running".to_string());
+        if recoverable {
+            begin_job_recovery(job, now_ts(), "runner_transport_stale");
+        } else {
+            mark_job_lost(
+                job,
+                now_ts(),
+                "legacy_runner_disconnected",
+                "shell client went stale while job was running",
+            );
+        }
     }
 }

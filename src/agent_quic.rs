@@ -281,6 +281,7 @@ async fn handle_quic_connection(
     };
     let client_id = register_payload.client_id.clone();
     let agent_instance_id = register_payload.agent_instance_id.clone();
+    let connection_id = uuid::Uuid::new_v4().to_string();
 
     // 2. Authenticate the agent token exactly like the HTTP/WebSocket paths.
     //    The token is dropped immediately after auth so it is never logged.
@@ -330,7 +331,7 @@ async fn handle_quic_connection(
     //    flip the transport label to "quic". QUIC v1 is the full envelope flow
     //    and keeps the agent's real capabilities.
     if let Err(e) = registry
-        .register_with_auth(register_payload, Some(&auth))
+        .register_with_auth_connection(register_payload, Some(&auth), Some(&connection_id))
         .await
     {
         tracing::warn!(
@@ -341,25 +342,41 @@ async fn handle_quic_connection(
         send_error(&mut send, &mut recv, "register_failed", &e).await;
         return;
     }
-    if let Err(e) = registry.set_transport(&client_id, TRANSPORT_QUIC).await {
+    if let Err(e) = registry
+        .set_transport_for_connection(
+            &client_id,
+            &agent_instance_id,
+            &connection_id,
+            TRANSPORT_QUIC,
+        )
+        .await
+    {
         send_error(&mut send, &mut recv, "register_failed", &e).await;
         registry
-            .reconcile_disconnect(&client_id, &agent_instance_id)
+            .reconcile_disconnect_for_connection(&client_id, &agent_instance_id, &connection_id)
             .await;
         return;
     }
     let notify = Arc::new(Notify::new());
     if let Err(e) = registry
-        .register_notifier(&client_id, &agent_instance_id, notify.clone())
+        .register_notifier_for_connection(
+            &client_id,
+            &agent_instance_id,
+            &connection_id,
+            notify.clone(),
+        )
         .await
     {
         send_error(&mut send, &mut recv, "register_failed", &e).await;
         registry
-            .reconcile_disconnect(&client_id, &agent_instance_id)
+            .reconcile_disconnect_for_connection(&client_id, &agent_instance_id, &connection_id)
             .await;
         return;
     }
-    let Some(view) = registry.get_client_view(&client_id).await else {
+    let Some(view) = registry
+        .get_client_view_for_connection(&client_id, &agent_instance_id, &connection_id)
+        .await
+    else {
         send_error(
             &mut send,
             &mut recv,
@@ -400,7 +417,7 @@ async fn handle_quic_connection(
             "quic agent register ack channel closed"
         );
         registry
-            .reconcile_disconnect(&client_id, &agent_instance_id)
+            .reconcile_disconnect_for_connection(&client_id, &agent_instance_id, &connection_id)
             .await;
         let _ = writer_task.await;
         return;
@@ -513,7 +530,11 @@ async fn handle_quic_connection(
                     "quic agent sent goodbye"
                 );
                 registry
-                    .reconcile_disconnect(&client_id, &agent_instance_id)
+                    .reconcile_disconnect_for_connection(
+                        &client_id,
+                        &agent_instance_id,
+                        &connection_id,
+                    )
                     .await;
                 break;
             }
@@ -551,7 +572,7 @@ async fn handle_quic_connection(
         tracing::debug!(client_id = %client_id, error = ?e, "quic writer task join failed");
     }
     registry
-        .reconcile_disconnect(&client_id, &agent_instance_id)
+        .reconcile_disconnect_for_connection(&client_id, &agent_instance_id, &connection_id)
         .await;
     tracing::info!(client_id = %client_id, "agent quic disconnected");
 }
@@ -660,6 +681,7 @@ mod tests {
             payload: ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: client_id.to_string(),
                 agent_instance_id: instance.to_string(),
                 display_name: Some("quic-test".to_string()),
@@ -677,6 +699,7 @@ mod tests {
                     lsp_read_only_navigation: false,
                     sandbox_inspect_commands: false,
                     project_lifecycle: false,
+                    job_state_reconciliation: false,
                 }),
                 projects: None,
                 agent_protocol_version: Some(protocol.to_string()),
@@ -1082,6 +1105,7 @@ mod tests {
                 payload: ShellAgentJobUpdateRequest {
                     client_id: "quic-job".to_string(),
                     agent_instance_id: "inst-job".to_string(),
+                    update_seq: None,
                     job_id: job.job_id.clone(),
                     request_id: Some(request_id),
                     status: "running".to_string(),
@@ -1089,6 +1113,7 @@ mod tests {
                     stderr_chunk: None,
                     stdout_tail: None,
                     stderr_tail: None,
+                    log_snapshot: None,
                     exit_code: None,
                     duration_ms: None,
                     error: None,

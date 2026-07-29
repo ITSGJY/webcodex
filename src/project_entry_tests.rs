@@ -211,6 +211,7 @@ async fn authenticated_project_fixture_for(recipe: &str) -> AuthenticatedProject
             ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: config.executor_client_id.clone(),
                 agent_instance_id: "project-agent-instance".to_string(),
                 display_name: Some("configured project Agent".to_string()),
@@ -521,6 +522,7 @@ async fn complete_project_job(
         .update_job(ShellAgentJobUpdateRequest {
             client_id: client_id.to_string(),
             agent_instance_id: PROJECT_AGENT_INSTANCE.to_string(),
+            update_seq: None,
             job_id,
             request_id: None,
             status: "completed".to_string(),
@@ -532,6 +534,7 @@ async fn complete_project_job(
             stderr_chunk: None,
             stdout_tail: None,
             stderr_tail: None,
+            log_snapshot: None,
             exit_code: Some(0),
             duration_ms: Some(1),
             error: None,

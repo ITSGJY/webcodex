@@ -16,7 +16,10 @@ use crate::shell_client::{command_preview, ShellJobStartMetadata, COMMAND_PREVIE
 use crate::shell_protocol::{ShellJobInfo, ShellJobOpRequest, ShellJobValidationStep};
 
 pub(crate) fn is_blocking_active_job_status(status: &str) -> bool {
-    matches!(status, "queued" | "running" | "started" | "agent_queued")
+    matches!(
+        status,
+        "queued" | "running" | "started" | "agent_queued" | "recovering"
+    )
 }
 
 pub(crate) fn is_stop_pending_job_status(status: &str) -> bool {
@@ -148,6 +151,11 @@ pub(crate) fn agent_job_summary_value(job: &ShellJobInfo) -> Value {
         "duration_ms": job.duration_ms,
         "elapsed_secs": job.elapsed_secs,
         "exit_code": job.exit_code,
+        "recovery_state": job.recovery_state,
+        "recovered_after_server_restart": job.recovered_after_server_restart,
+        "reconciled_at": job.reconciled_at,
+        "recovery_reason_code": job.recovery_reason_code,
+        "last_update_seq": job.last_update_seq,
     })
 }
 
@@ -592,6 +600,32 @@ fn job_session_unknown_warning() -> Value {
     })
 }
 
+fn job_recovering_stop_result(project: &str, job: &ShellJobInfo) -> ToolResult {
+    ToolResult::err_with_output(
+        "runner_unavailable_recovering: the runner must reconcile this job before it can be stopped"
+            .to_string(),
+        json!({
+            "error_kind": "runner_unavailable_recovering",
+            "failure_kind": "runner_unavailable_recovering",
+            "project": project,
+            "job_id": job.job_id,
+            "status_before": "recovering",
+            "status_after": "recovering",
+            "recovery_state": job.recovery_state,
+            "recovery_reason_code": job.recovery_reason_code,
+            "already_finished": false,
+            "already_stop_requested": false,
+            "stop_request_accepted": false,
+            "target_was_active_at_request": true,
+            "terminal": false,
+            "terminal_pending": false,
+            "final_status": Value::Null,
+            "stop_effect": "runner_unavailable",
+            "command_started": false,
+        }),
+    )
+}
+
 fn ownership_basis_for_stop(
     request_project: &str,
     job_id: &str,
@@ -1028,6 +1062,15 @@ impl ToolRuntime {
                     "elapsed_secs": job.elapsed_secs,
                     "client_id": job.client_id,
                     "error": job.error,
+                    "recovery_state": job.recovery_state,
+                    "recovered_after_server_restart": job.recovered_after_server_restart,
+                    "reconciled_at": job.reconciled_at,
+                    "recovery_reason_code": job.recovery_reason_code,
+                    "last_update_seq": job.last_update_seq,
+                    "stdout_retained_from_line": job.stdout_retained_from_line,
+                    "stderr_retained_from_line": job.stderr_retained_from_line,
+                    "stdout_log_truncated": job.stdout_log_truncated,
+                    "stderr_log_truncated": job.stderr_log_truncated,
                     "command_preview_included": include_command_preview,
                 });
                 let status = output["status"].as_str().unwrap_or_default().to_string();
@@ -1117,6 +1160,19 @@ impl ToolRuntime {
                     "stderr_returned_lines": stderr_lines,
                     "stdout_truncated": stdout_lines < next_stdout_line.saturating_sub(1),
                     "stderr_truncated": stderr_lines < next_stderr_line.saturating_sub(1),
+                    "stdout_retained_from_line": job.stdout_retained_from_line,
+                    "stderr_retained_from_line": job.stderr_retained_from_line,
+                    "earlier_stdout_unavailable": job
+                        .stdout_retained_from_line
+                        .is_some_and(|line| line > 1)
+                        || job.stdout_log_truncated,
+                    "earlier_stderr_unavailable": job
+                        .stderr_retained_from_line
+                        .is_some_and(|line| line > 1)
+                        || job.stderr_log_truncated,
+                    "recovery_state": job.recovery_state,
+                    "recovery_reason_code": job.recovery_reason_code,
+                    "last_update_seq": job.last_update_seq,
                     "cursor": {
                         "stdout": next_stdout_line,
                         "stderr": next_stderr_line,
@@ -1343,6 +1399,9 @@ impl ToolRuntime {
             Err(result) => return result,
         };
         let status_before = job.status.clone();
+        if status_before == "recovering" {
+            return job_recovering_stop_result(&request_project, &job);
+        }
         if is_stop_pending_job_status(&status_before) {
             return ToolResult::ok(stop_job_output(
                 &request_project,
@@ -1373,6 +1432,14 @@ impl ToolRuntime {
             .await
         {
             Ok(job) => job,
+            Err(error) if error.contains("runner_unavailable_recovering") => {
+                let recovering = self
+                    .shell_clients
+                    .get_job_for_auth(auth, &job_id)
+                    .await
+                    .unwrap_or(job);
+                return job_recovering_stop_result(&request_project, &recovering);
+            }
             Err(_) => return job_not_found_result(&request_project, &job_id),
         };
         ToolResult::ok(stop_job_output(

@@ -1578,6 +1578,7 @@ async fn register_job_agent_for_auth(
             ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: client_id.to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,

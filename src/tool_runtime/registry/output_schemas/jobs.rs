@@ -200,6 +200,42 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 nullable_schema("string", "Job error message, when available."),
             ),
             (
+                "recovery_state",
+                nullable_schema("string", "Bounded recovery state such as recovering or reconciled."),
+            ),
+            (
+                "recovered_after_server_restart",
+                schema_type("boolean", "True when this record was rebuilt from a same-runner inventory."),
+            ),
+            (
+                "reconciled_at",
+                nullable_schema("integer", "Latest same-instance reconciliation timestamp."),
+            ),
+            (
+                "recovery_reason_code",
+                nullable_schema("string", "Structured bounded recovery reason code."),
+            ),
+            (
+                "last_update_seq",
+                nullable_schema("integer", "Latest accepted runner-owned monotonic update sequence."),
+            ),
+            (
+                "stdout_retained_from_line",
+                nullable_schema("integer", "First retained absolute stdout line."),
+            ),
+            (
+                "stderr_retained_from_line",
+                nullable_schema("integer", "First retained absolute stderr line."),
+            ),
+            (
+                "stdout_log_truncated",
+                schema_type("boolean", "True when the retained stdout begins after discarded bytes."),
+            ),
+            (
+                "stderr_log_truncated",
+                schema_type("boolean", "True when the retained stderr begins after discarded bytes."),
+            ),
+            (
                 "command_preview_included",
                 schema_type("boolean", "True only when include_command_preview=true was requested."),
             ),
@@ -270,6 +306,34 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 schema_type("boolean", "Whether stderr_tail omits observed lines."),
             ),
             (
+                "stdout_retained_from_line",
+                nullable_schema("integer", "First retained absolute stdout line."),
+            ),
+            (
+                "stderr_retained_from_line",
+                nullable_schema("integer", "First retained absolute stderr line."),
+            ),
+            (
+                "earlier_stdout_unavailable",
+                schema_type("boolean", "True when earlier stdout is outside the bounded retained tail."),
+            ),
+            (
+                "earlier_stderr_unavailable",
+                schema_type("boolean", "True when earlier stderr is outside the bounded retained tail."),
+            ),
+            (
+                "recovery_state",
+                nullable_schema("string", "Bounded recovery state such as recovering or reconciled."),
+            ),
+            (
+                "recovery_reason_code",
+                nullable_schema("string", "Structured bounded recovery reason code."),
+            ),
+            (
+                "last_update_seq",
+                nullable_schema("integer", "Latest accepted runner-owned monotonic update sequence."),
+            ),
+            (
                 "cursor",
                 super::common::open_object_schema(
                     "Next 1-based stdout/stderr cursors for bounded continuation.",
@@ -326,7 +390,12 @@ fn job_summary_schema() -> Value {
             "ended_at": nullable_schema("integer", "Job end timestamp, when available."),
             "duration_ms": nullable_schema("integer", "Job duration in milliseconds, when available."),
             "elapsed_secs": nullable_schema("integer", "Elapsed job runtime in seconds, when available."),
-            "exit_code": nullable_schema("integer", "Process exit code, when available.")
+            "exit_code": nullable_schema("integer", "Process exit code, when available."),
+            "recovery_state": nullable_schema("string", "Bounded recovery state, when applicable."),
+            "recovered_after_server_restart": schema_type("boolean", "True when rebuilt from a same-runner inventory."),
+            "reconciled_at": nullable_schema("integer", "Latest reconciliation timestamp."),
+            "recovery_reason_code": nullable_schema("string", "Structured bounded recovery reason code."),
+            "last_update_seq": nullable_schema("integer", "Latest accepted runner update sequence.")
         },
         "required": [
             "job_id",

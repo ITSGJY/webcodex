@@ -98,6 +98,7 @@ async fn register_agent_projects_for_auth(
             ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: client_id.to_string(),
                 agent_instance_id: format!("inst-{}", client_id),
                 display_name: None,
@@ -115,6 +116,7 @@ async fn register_agent_projects_for_auth(
                     lsp_read_only_navigation: false,
                     sandbox_inspect_commands: false,
                     project_lifecycle: false,
+                    job_state_reconciliation: false,
                 }),
                 projects: Some(vec![registered_project(
                     project_id,
@@ -593,6 +595,7 @@ async fn runtime_status_shell_profiles_summary_is_sanitized() {
         .register(crate::shell_protocol::ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_inventory: None,
             client_id: "profile-agent".to_string(),
             agent_instance_id: "inst".to_string(),
             display_name: None,
@@ -1775,6 +1778,7 @@ async fn runtime_status_agent_summary_includes_protocol_version() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_inventory: None,
             client_id: "agent-1".to_string(),
             agent_instance_id: "inst".to_string(),
             display_name: Some("Workstation".to_string()),
@@ -1840,6 +1844,7 @@ async fn runtime_status_includes_sanitized_policy_summary() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_inventory: None,
             client_id: "policy-agent".to_string(),
             agent_instance_id: "inst-p".to_string(),
             display_name: None,
@@ -1977,6 +1982,7 @@ async fn external_provider_discovery_cannot_change_public_tool_or_openapi_surfac
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_inventory: None,
             client_id: "provider-surface".to_string(),
             agent_instance_id: "inst-surface".to_string(),
             display_name: None,
@@ -2060,6 +2066,7 @@ async fn runtime_status_policy_summary_is_null_for_older_agents() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_inventory: None,
             client_id: "legacy-agent".to_string(),
             agent_instance_id: "inst-l".to_string(),
             display_name: None,
@@ -2092,6 +2099,7 @@ async fn list_agents_includes_sanitized_policy_summary() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_inventory: None,
             client_id: "list-policy-agent".to_string(),
             agent_instance_id: "inst-lp".to_string(),
             display_name: None,
@@ -2154,6 +2162,7 @@ async fn runtime_status_distinguishes_stale_registration_from_transport_connecti
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_inventory: None,
             client_id: "ws-stale".to_string(),
             agent_instance_id: "inst".to_string(),
             display_name: Some("Stale WS".to_string()),
@@ -2222,6 +2231,7 @@ async fn runtime_status_reflects_websocket_transport_label() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_inventory: None,
             client_id: "ws-agent".to_string(),
             agent_instance_id: "inst".to_string(),
             display_name: None,

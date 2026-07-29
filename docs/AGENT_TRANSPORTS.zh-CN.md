@@ -112,6 +112,32 @@ QUIC 是现有 agent envelope protocol 的另一种 transport。它在 QUIC 上�
 
 当前模型是每个 agent connection 一个 bidirectional stream，frames 串行化。尚未实现 stream multiplexing。
 
+## 跨 transport 的 Job reconciliation
+
+Runner 声明 `job_state_reconciliation` 后，polling registration、WebSocket
+`Register` envelope 和 QUIC `Register` envelope 都序列化同一个
+`job_inventory` 模型。重连状态机只在共享 Registry 和 Runner JobManager 中实现
+一次，不为三种 transport 分别维护。
+
+WebSocket 与 QUIC 注册还会获得内部 connection lease。同一 Runner instance
+已经完成新注册后，旧 socket 的延迟清理不能再断开新连接。
+
+完成认证和 active-instance lease 校验后，Server 会在同一个 Registry 临界区内把
+完整 inventory 与 client lease 一起合并。同实例重连按单调 `update_seq` 解除
+`recovering`；新实例会使旧实例活动 Job 进入 `lost`；完整 inventory 缺少已知活动
+Job 时，该 Job 也会进入 `lost`。Malformed、重复、不一致或超限 inventory 会在
+Registry mutation 前被拒绝。
+
+短暂 WebSocket、QUIC 或 polling session 中断期间，即使 best-effort JobUpdate
+发送失败，Runner 仍继续更新进程内 record。注册成功并安装新 sink 后，它会重放
+最新的有界权威 snapshot；相同序号重放幂等。完成 reconciliation 后，
+`job_status`、有界日志以及 `stop_job(original_job_id)` 会继续工作。Job 仍处于
+`recovering` 时，`stop_job` 返回 `runner_unavailable_recovering`，不会伪造成功。
+
+该连续性只适用于 Runner 进程和 `agent_instance_id` 均未变化的情况。Runner
+进程重启无法重新获得旧 child handle。本机制不是 command exactly-once 或
+`run_job` request idempotency 保证。
+
 ## QUIC capabilities
 
 使用 `quic-v1` agent 时，QUIC 支持 WebCodex tools 使用的 runtime request loop，包括：

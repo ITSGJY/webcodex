@@ -550,6 +550,7 @@ async fn apply_patch_agent_does_not_require_server_local_project_root() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_inventory: None,
             client_id: "patcher".to_string(),
             agent_instance_id: "inst".to_string(),
             display_name: None,

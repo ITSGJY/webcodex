@@ -997,6 +997,7 @@ mod tests {
                 policy: None,
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
             })
             .await
             .unwrap();
@@ -1533,6 +1534,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "mcp-client".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,

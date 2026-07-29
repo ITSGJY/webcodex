@@ -203,7 +203,7 @@ impl ToolRuntime {
 
         // -- jobs summary -----------------------------------------------------
         // Agent-known jobs come from the registry; local jobs come from the
-        // in-memory map. Active = running/queued/agent_queued/stop_requested.
+        // in-memory map. Active includes same-runner `recovering` jobs.
         let agent_known_count = agent_jobs.len();
         let local_job_dirs: Vec<PathBuf> = if local_jobs_visible_to_auth(auth) {
             let local_jobs_map = self.local_jobs.lock().await;
@@ -222,6 +222,28 @@ impl ToolRuntime {
             .iter()
             .filter(|j| ACTIVE_JOB_STATUSES.contains(&j.status.as_str()))
             .count();
+        let recovering_count = agent_jobs
+            .iter()
+            .filter(|job| job.status == "recovering")
+            .count();
+        let reconciled_count = agent_jobs
+            .iter()
+            .filter(|job| job.recovery_state.as_deref() == Some("reconciled"))
+            .count();
+        let lost_after_reconcile_count = agent_jobs
+            .iter()
+            .filter(|job| {
+                job.status == "lost"
+                    && matches!(
+                        job.recovery_reason_code.as_deref(),
+                        Some(
+                            "runner_inventory_missing"
+                                | "runner_instance_replaced"
+                                | "runner_recovery_deadline_exceeded"
+                        )
+                    )
+            })
+            .count();
         let mut local_active = 0usize;
         for dir in local_job_dirs {
             if let Some(status) = std::fs::read_to_string(dir.join("status"))
@@ -239,6 +261,9 @@ impl ToolRuntime {
             "agent_known_count": agent_known_count,
             "local_known_count": local_known_count,
             "active_count": active_count,
+            "recovering_count": recovering_count,
+            "reconciled_count": reconciled_count,
+            "lost_after_reconcile_count": lost_after_reconcile_count,
         });
 
         // -- tools summary ----------------------------------------------------

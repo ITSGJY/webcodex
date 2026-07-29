@@ -26,8 +26,11 @@ use shell_protocol::{
     validation_infrastructure_failure_code, AgentPolicySummary, ShellAgentJobUpdateRequest,
     ShellAgentPollPayload, ShellAgentPollRequest, ShellAgentPollResponse, ShellAgentProjectSummary,
     ShellAgentShellRequest, ShellClientCapabilities, ShellClientRegisterRequest,
-    ShellClientRegisterResponse, ShellJobValidationProgress, ShellJobValidationStep,
+    ShellClientRegisterResponse, ShellJobContext, ShellJobInventory, ShellJobLogSnapshot,
+    ShellJobSnapshot, ShellJobStreamSnapshot, ShellJobValidationProgress, ShellJobValidationStep,
     ShellProfileSummaryEntry, ShellProfilesSummary, AGENT_PROTOCOL_VERSION_POLLING_V1,
+    JOB_INVENTORY_MAX_ACTIVE_JOBS, JOB_INVENTORY_MAX_SERIALIZED_BYTES,
+    JOB_INVENTORY_MAX_TERMINAL_JOBS, JOB_SNAPSHOT_STREAM_MAX_BYTES, JOB_TERMINAL_RETENTION_SECS,
     VALIDATION_STEP_SPAWN_FAILED_CODE, VALIDATION_STEP_WAIT_FAILED_CODE,
     VALIDATION_TOOL_UNAVAILABLE_CODE,
 };
@@ -99,6 +102,7 @@ struct JobManager {
     lifecycle: Arc<Mutex<()>>,
     shutting_down: Arc<AtomicBool>,
     workers: ActivityTracker,
+    current_sink: Arc<Mutex<Option<AgentSink>>>,
 }
 
 impl JobManager {
@@ -111,6 +115,7 @@ impl JobManager {
             lifecycle: Arc::new(Mutex::new(())),
             shutting_down: Arc::new(AtomicBool::new(false)),
             workers: ActivityTracker::default(),
+            current_sink: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -118,9 +123,55 @@ impl JobManager {
 #[derive(Debug, Clone)]
 struct RunningJob {
     client_id: String,
+    agent_instance_id: String,
+    snapshot: ShellJobSnapshot,
     child: Option<Arc<Mutex<Child>>>,
     process_group_id: Option<u32>,
     stop_requested: Arc<AtomicBool>,
+    slot_reserved: bool,
+}
+
+#[cfg(test)]
+fn test_job_snapshot(job_id: &str) -> ShellJobSnapshot {
+    ShellJobSnapshot {
+        job_id: job_id.to_string(),
+        request_id: format!("request-{job_id}"),
+        status: "running".to_string(),
+        update_seq: 1,
+        created_at: chrono::Utc::now().timestamp(),
+        started_at: Some(chrono::Utc::now().timestamp()),
+        ended_at: None,
+        exit_code: None,
+        duration_ms: None,
+        error: None,
+        context: shell_protocol::ShellJobContext {
+            runtime_project_id: None,
+            workflow_session_id: None,
+            project_cwd: None,
+            cwd: None,
+            purpose: Some("other".to_string()),
+            shell: Some("configured".to_string()),
+            command_preview: "test job".to_string(),
+            validation_steps: Vec::new(),
+        },
+        stdout: ShellJobStreamSnapshot::default(),
+        stderr: ShellJobStreamSnapshot::default(),
+        validation_progress: None,
+    }
+}
+
+#[cfg(test)]
+fn test_job_context(cwd: &Path, validation_steps: Vec<String>) -> shell_protocol::ShellJobContext {
+    shell_protocol::ShellJobContext {
+        runtime_project_id: None,
+        workflow_session_id: None,
+        project_cwd: None,
+        cwd: Some(cwd.to_string_lossy().into_owned()),
+        purpose: Some("other".to_string()),
+        shell: Some("configured".to_string()),
+        command_preview: "test command".to_string(),
+        validation_steps,
+    }
 }
 
 #[derive(Debug)]
@@ -1132,6 +1183,7 @@ fn agent_register_capabilities(cfg: &AgentConfig) -> ShellClientCapabilities {
     capabilities.async_shell_jobs = true;
     capabilities.structured_validation_argv = true;
     capabilities.project_lifecycle = true;
+    capabilities.job_state_reconciliation = true;
     // New agents always advertise read-only LSP navigation. Older agents omit
     // the field and deserialize as false on the server.
     capabilities.lsp_read_only_navigation = true;
@@ -1159,6 +1211,10 @@ fn build_register_request(
         protocol_version,
         agent_instance_id,
         prepared_cache_count,
+        ShellJobInventory {
+            active_complete: true,
+            jobs: Vec::new(),
+        },
     )
     .0
 }
@@ -1170,6 +1226,7 @@ fn build_register_request_with_provider_status(
     protocol_version: &str,
     agent_instance_id: &str,
     prepared_cache_count: usize,
+    job_inventory: ShellJobInventory,
 ) -> (
     ShellClientRegisterRequest,
     Arc<webcodex_runner::external_tools::ExternalToolRouter>,
@@ -1196,6 +1253,7 @@ fn build_register_request_with_provider_status(
             )),
             process_started_at: Some(process_started_at()),
             build: Some(runner_build_info()),
+            job_inventory: Some(job_inventory),
         },
         Arc::clone(&hot.external_tools),
         revision,
@@ -1326,9 +1384,11 @@ fn register(
     shutdown: Option<&AtomicBool>,
     agent_instance_id: &str,
     prepared_cache_count: usize,
-) -> Result<usize, RegisterError> {
+    jobs: &JobManager,
+) -> Result<(usize, ShellJobInventory), RegisterError> {
     let projects = project_cache.get_with_shutdown(cfg, shutdown);
     let projects_count = projects.iter().filter(|project| !project.disabled).count();
+    let job_inventory = jobs.inventory();
     let (body, provider, provider_revision) = build_register_request_with_provider_status(
         cfg,
         runtime,
@@ -1336,12 +1396,13 @@ fn register(
         AGENT_PROTOCOL_VERSION_POLLING_V1,
         agent_instance_id,
         prepared_cache_count,
+        job_inventory.clone(),
     );
     let response: ShellClientRegisterResponse = post_json(client, cfg, AGENT_REGISTER_PATH, &body)
         .map_err(|error| RegisterError::from_http(error, &cfg.client_id))?;
     if response.success {
         provider.mark_status_reported(provider_revision);
-        Ok(projects_count)
+        Ok((projects_count, job_inventory))
     } else {
         Err(RegisterError::from_response_error(
             &cfg.client_id,
@@ -1476,21 +1537,82 @@ fn spawn_reader<R: Read + Send + 'static>(
         // one enormous line) from retaining unbounded output in the runner
         // while a transport send is slow.
         let mut buf = [0_u8; 8 * 1024];
+        let mut utf8_pending = Vec::with_capacity(buf.len() + 3);
         loop {
             match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(read) => {
-                    let text = String::from_utf8_lossy(&buf[..read]).to_string();
-                    let _ = if stdout {
-                        tx.send(OutputChunk::Stdout(text))
-                    } else {
-                        tx.send(OutputChunk::Stderr(text))
-                    };
+                Ok(0) => {
+                    let text = take_utf8_output(&mut utf8_pending, true);
+                    if !text.is_empty() {
+                        let _ = if stdout {
+                            tx.send(OutputChunk::Stdout(text))
+                        } else {
+                            tx.send(OutputChunk::Stderr(text))
+                        };
+                    }
+                    break;
                 }
-                Err(_) => break,
+                Ok(read) => {
+                    utf8_pending.extend_from_slice(&buf[..read]);
+                    let text = take_utf8_output(&mut utf8_pending, false);
+                    if !text.is_empty() {
+                        let _ = if stdout {
+                            tx.send(OutputChunk::Stdout(text))
+                        } else {
+                            tx.send(OutputChunk::Stderr(text))
+                        };
+                    }
+                }
+                Err(_) => {
+                    let text = take_utf8_output(&mut utf8_pending, true);
+                    if !text.is_empty() {
+                        let _ = if stdout {
+                            tx.send(OutputChunk::Stdout(text))
+                        } else {
+                            tx.send(OutputChunk::Stderr(text))
+                        };
+                    }
+                    break;
+                }
             }
         }
     })
+}
+
+/// Drain every complete UTF-8 sequence from `pending`, retaining only a
+/// trailing incomplete scalar between reads. Truly invalid bytes keep the
+/// runner's historical lossy-decoding behavior, but a valid scalar split at
+/// the fixed read boundary is never replaced or cut.
+fn take_utf8_output(pending: &mut Vec<u8>, end_of_stream: bool) -> String {
+    let mut output = String::new();
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(text) => {
+                output.push_str(text);
+                pending.clear();
+                break;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                if valid_up_to > 0 {
+                    let valid = std::str::from_utf8(&pending[..valid_up_to])
+                        .expect("valid_up_to always identifies valid UTF-8");
+                    output.push_str(valid);
+                    pending.drain(..valid_up_to);
+                }
+                if let Some(error_len) = error.error_len() {
+                    pending.drain(..error_len);
+                    output.push('\u{fffd}');
+                    continue;
+                }
+                if end_of_stream {
+                    output.push_str(&String::from_utf8_lossy(pending));
+                    pending.clear();
+                }
+                break;
+            }
+        }
+    }
+    output
 }
 
 fn join_reader_threads_until(mut readers: Vec<std::thread::JoinHandle<()>>, deadline: Instant) {
@@ -1518,31 +1640,6 @@ fn join_reader_threads_until(mut readers: Vec<std::thread::JoinHandle<()>>, dead
     }
 }
 
-/// Report a job-start failure over the active transport. Used by
-/// `JobManager::start_shell_job` when spawn/cwd/policy checks fail before the
-/// job can run.
-fn send_start_failure(sink: &AgentSink, request: ShellAgentShellRequest, error: String) {
-    send_job_start_failure(sink, request, error, None);
-}
-
-fn send_validation_executor_failure(
-    sink: &AgentSink,
-    request: ShellAgentShellRequest,
-    completed: usize,
-    code: &str,
-) {
-    send_job_start_failure(
-        sink,
-        request,
-        code.to_string(),
-        Some(ShellJobValidationProgress {
-            completed,
-            current_step: None,
-            failed_step: None,
-        }),
-    );
-}
-
 fn wait_failure_error(validation: bool, error: &std::io::Error) -> String {
     if validation {
         VALIDATION_STEP_WAIT_FAILED_CODE.to_string()
@@ -1557,32 +1654,6 @@ fn validation_failed_step(status: &str, error: Option<&str>, step_name: &str) ->
             .and_then(validation_infrastructure_failure_code)
             .is_none())
     .then(|| step_name.to_string())
-}
-
-fn send_job_start_failure(
-    sink: &AgentSink,
-    request: ShellAgentShellRequest,
-    error: String,
-    validation_progress: Option<ShellJobValidationProgress>,
-) {
-    if let Some(job_id) = request.job_id {
-        let _ = sink.send_job_update(&ShellAgentJobUpdateRequest {
-            client_id: sink.client_id().to_string(),
-            agent_instance_id: sink.agent_instance_id().to_string(),
-            job_id,
-            request_id: Some(request.request_id),
-            status: "failed".to_string(),
-            stdout_chunk: None,
-            stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
-            exit_code: None,
-            duration_ms: Some(0),
-            error: Some(error),
-            validation_progress,
-            finished: true,
-        });
-    }
 }
 
 fn validation_module_available(
@@ -1778,9 +1849,486 @@ fn shutdown_target_running(target: &mut JobShutdownTarget) -> bool {
     child_running || group_running
 }
 
+fn shutdown_target_child_running(target: &mut JobShutdownTarget) -> bool {
+    !matches!(try_reap_job_child(&target.child), Ok(true))
+}
+
+#[derive(Debug, Default)]
+struct RunnerJobDelta {
+    status: String,
+    stdout_chunk: Option<String>,
+    stderr_chunk: Option<String>,
+    exit_code: Option<i32>,
+    duration_ms: Option<u64>,
+    error: Option<String>,
+    validation_progress: Option<ShellJobValidationProgress>,
+    finished: bool,
+}
+
+fn runner_job_is_terminal(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "failed" | "stopped" | "timeout" | "timed_out" | "lost" | "cancelled"
+    )
+}
+
+fn runner_job_is_active(status: &str) -> bool {
+    matches!(status, "agent_queued" | "running" | "stop_requested")
+}
+
+fn job_update_from_snapshot(
+    client_id: &str,
+    agent_instance_id: &str,
+    snapshot: &ShellJobSnapshot,
+) -> ShellAgentJobUpdateRequest {
+    ShellAgentJobUpdateRequest {
+        client_id: client_id.to_string(),
+        agent_instance_id: agent_instance_id.to_string(),
+        job_id: snapshot.job_id.clone(),
+        request_id: Some(snapshot.request_id.clone()),
+        update_seq: Some(snapshot.update_seq),
+        status: snapshot.status.clone(),
+        stdout_chunk: None,
+        stderr_chunk: None,
+        stdout_tail: None,
+        stderr_tail: None,
+        log_snapshot: Some(ShellJobLogSnapshot {
+            stdout: snapshot.stdout.clone(),
+            stderr: snapshot.stderr.clone(),
+        }),
+        exit_code: snapshot.exit_code,
+        duration_ms: snapshot.duration_ms,
+        error: snapshot.error.clone(),
+        validation_progress: snapshot.validation_progress.clone(),
+        finished: runner_job_is_terminal(&snapshot.status),
+    }
+}
+
+fn runner_retained_line_count(value: &str) -> usize {
+    value.lines().count()
+}
+
+fn append_runner_stream(stream: &mut ShellJobStreamSnapshot, chunk: Option<&str>) {
+    let Some(chunk) = chunk else {
+        return;
+    };
+    stream.tail.push_str(chunk);
+    if stream.tail.len() > JOB_SNAPSHOT_STREAM_MAX_BYTES {
+        let observed_next = stream
+            .first_retained_line
+            .saturating_add(runner_retained_line_count(&stream.tail));
+        let minimum_start = stream.tail.len() - JOB_SNAPSHOT_STREAM_MAX_BYTES;
+        if let Some(relative_newline) = stream.tail[minimum_start..].find('\n') {
+            let drop_end = minimum_start + relative_newline + 1;
+            let dropped_lines = stream.tail[..drop_end]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count();
+            stream.tail.drain(..drop_end);
+            stream.first_retained_line = stream.first_retained_line.saturating_add(dropped_lines);
+        } else {
+            let mut start = minimum_start;
+            while start < stream.tail.len() && !stream.tail.is_char_boundary(start) {
+                start += 1;
+            }
+            let dropped_lines = stream.tail[..start]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count();
+            stream.tail.drain(..start);
+            stream.first_retained_line = stream.first_retained_line.saturating_add(dropped_lines);
+        }
+        if stream.tail.is_empty() {
+            // The last retained partial line was dropped too. Preserve the
+            // absolute next cursor by advancing the empty range to the
+            // observed end rather than resetting it backwards.
+            stream.first_retained_line = observed_next;
+        }
+        stream.truncated = true;
+    }
+    stream.next_line = stream
+        .first_retained_line
+        .saturating_add(runner_retained_line_count(&stream.tail));
+}
+
+fn trim_runner_stream_to(stream: &mut ShellJobStreamSnapshot, max_bytes: usize) {
+    if stream.tail.len() <= max_bytes {
+        return;
+    }
+    let observed_next = stream
+        .first_retained_line
+        .saturating_add(runner_retained_line_count(&stream.tail));
+    let minimum_start = stream.tail.len().saturating_sub(max_bytes);
+    if let Some(relative_newline) = stream.tail[minimum_start..].find('\n') {
+        let drop_end = minimum_start + relative_newline + 1;
+        let dropped_lines = stream.tail[..drop_end]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        stream.tail.drain(..drop_end);
+        stream.first_retained_line = stream.first_retained_line.saturating_add(dropped_lines);
+    } else {
+        let mut start = minimum_start;
+        while start < stream.tail.len() && !stream.tail.is_char_boundary(start) {
+            start += 1;
+        }
+        let dropped_lines = stream.tail[..start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        stream.tail.drain(..start);
+        stream.first_retained_line = stream.first_retained_line.saturating_add(dropped_lines);
+    }
+    if stream.tail.is_empty() {
+        stream.first_retained_line = observed_next;
+    }
+    stream.truncated = true;
+    stream.next_line = stream
+        .first_retained_line
+        .saturating_add(runner_retained_line_count(&stream.tail));
+}
+
+fn bounded_runner_error(error: Option<String>) -> Option<String> {
+    error.map(|error| error.chars().take(4_096).collect())
+}
+
+fn validate_runner_job_context(
+    context: &ShellJobContext,
+    request: &ShellAgentShellRequest,
+    client_id: &str,
+) -> Result<(), String> {
+    const MAX_CONTEXT_FIELD_CHARS: usize = 1_024;
+    const MAX_COMMAND_PREVIEW_CHARS: usize = 121;
+    let bounded =
+        |value: &str, max_chars: usize| !value.contains('\0') && value.chars().count() <= max_chars;
+    if !bounded(&context.command_preview, MAX_COMMAND_PREVIEW_CHARS)
+        || context.command_preview.contains(['\r', '\n'])
+    {
+        return Err("job recovery context command_preview is invalid or oversized".to_string());
+    }
+    for (name, value) in [
+        ("project_cwd", context.project_cwd.as_deref()),
+        ("cwd", context.cwd.as_deref()),
+        ("purpose", context.purpose.as_deref()),
+        ("shell", context.shell.as_deref()),
+    ] {
+        if value.is_some_and(|value| !bounded(value, MAX_CONTEXT_FIELD_CHARS)) {
+            return Err(format!(
+                "job recovery context {name} is invalid or oversized"
+            ));
+        }
+    }
+    if context.cwd != request.cwd {
+        return Err("job recovery context cwd does not match the execution request".to_string());
+    }
+    if context.purpose.as_deref().is_some_and(|purpose| {
+        !matches!(
+            purpose,
+            "validation"
+                | "test"
+                | "build"
+                | "format"
+                | "release"
+                | "diagnostic"
+                | "operation"
+                | "other"
+        )
+    }) {
+        return Err("job recovery context purpose is invalid".to_string());
+    }
+    if context
+        .shell
+        .as_deref()
+        .is_some_and(|shell| !matches!(shell, "sh" | "bash" | "configured" | "custom"))
+    {
+        return Err("job recovery context shell is invalid".to_string());
+    }
+    let validation_context = request.kind == "start_validation_job";
+    if (validation_context && !(1..=3).contains(&context.validation_steps.len()))
+        || (!validation_context && !context.validation_steps.is_empty())
+        || context
+            .validation_steps
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != context.validation_steps.len()
+        || context
+            .validation_steps
+            .iter()
+            .any(|step| !matches!(step.as_str(), "format" | "check" | "test"))
+    {
+        return Err("job recovery context validation_steps are invalid".to_string());
+    }
+    if let Some(project_id) = context.runtime_project_id.as_deref() {
+        let prefix = format!("agent:{client_id}:");
+        if !bounded(project_id, MAX_CONTEXT_FIELD_CHARS)
+            || project_id
+                .strip_prefix(&prefix)
+                .is_none_or(|suffix| suffix.is_empty())
+        {
+            return Err(
+                "job recovery context runtime_project_id does not match the runner".to_string(),
+            );
+        }
+    }
+    if let Some(session_id) = context.workflow_session_id.as_deref() {
+        if context.runtime_project_id.is_none()
+            || session_id.len() > 128
+            || !session_id.starts_with("wc_sess_")
+            || !session_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err("job recovery context workflow_session_id is invalid".to_string());
+        }
+    }
+    Ok(())
+}
+
 impl JobManager {
+    fn install_sink(&self, sink: AgentSink) {
+        *lock_unpoison(&self.current_sink) = Some(sink);
+    }
+
+    fn current_sink(&self) -> Option<AgentSink> {
+        lock_unpoison(&self.current_sink).clone()
+    }
+
+    fn send_recorded_update(&self, update: ShellAgentJobUpdateRequest) {
+        let Some(sink) = self.current_sink() else {
+            return;
+        };
+        let _ = sink.send_job_update(&update);
+    }
+
+    fn record_update(
+        &self,
+        job_id: &str,
+        mut delta: RunnerJobDelta,
+    ) -> Option<ShellAgentJobUpdateRequest> {
+        let update = {
+            let mut jobs = lock_unpoison(&self.jobs);
+            let job = jobs.get_mut(job_id)?;
+            if runner_job_is_terminal(&job.snapshot.status) {
+                // The first locally observed terminal outcome is immutable.
+                // In particular, a racing stop request or late output poll
+                // must not revive a handle-free retained record.
+                return None;
+            }
+            let now = chrono::Utc::now().timestamp();
+            append_runner_stream(&mut job.snapshot.stdout, delta.stdout_chunk.as_deref());
+            append_runner_stream(&mut job.snapshot.stderr, delta.stderr_chunk.as_deref());
+            job.snapshot.update_seq = job.snapshot.update_seq.saturating_add(1);
+            if !delta.status.trim().is_empty() {
+                let incoming_status = delta.status.trim();
+                let would_regress_stop = job.snapshot.status == "stop_requested"
+                    && matches!(incoming_status, "agent_queued" | "running");
+                let would_regress_running =
+                    job.snapshot.status == "running" && incoming_status == "agent_queued";
+                if !would_regress_stop && !would_regress_running {
+                    job.snapshot.status = incoming_status.to_string();
+                }
+            }
+            if job.snapshot.started_at.is_none()
+                && matches!(
+                    job.snapshot.status.as_str(),
+                    "running"
+                        | "completed"
+                        | "failed"
+                        | "stopped"
+                        | "timeout"
+                        | "timed_out"
+                        | "cancelled"
+                )
+            {
+                job.snapshot.started_at = Some(now);
+            }
+            if delta.validation_progress.is_some() {
+                job.snapshot.validation_progress = delta.validation_progress.clone();
+            }
+            if runner_job_is_terminal(&job.snapshot.status) || delta.finished {
+                job.snapshot.ended_at.get_or_insert(now);
+                job.snapshot.exit_code = delta.exit_code;
+                job.snapshot.duration_ms = delta.duration_ms;
+                job.snapshot.error = bounded_runner_error(delta.error.take());
+                job.child = None;
+                job.process_group_id = None;
+                job.slot_reserved = false;
+            } else if delta.error.is_some() {
+                job.snapshot.error = bounded_runner_error(delta.error.take());
+            }
+            // Each sequenced update carries the current authoritative bounded
+            // tails. If transport calls complete out of order, a higher
+            // sequence still contains every retained byte visible to the
+            // lower one, so ignoring stale updates cannot lose or duplicate
+            // output.
+            job_update_from_snapshot(&job.client_id, &job.agent_instance_id, &job.snapshot)
+        };
+        self.prune_terminal_records();
+        Some(update)
+    }
+
+    fn update_and_send(&self, job_id: &str, delta: RunnerJobDelta) {
+        if let Some(update) = self.record_update(job_id, delta) {
+            self.send_recorded_update(update);
+        }
+    }
+
+    fn replay_snapshots_since(&self, registered: &ShellJobInventory) {
+        let Some(sink) = self.current_sink() else {
+            return;
+        };
+        let registered_sequences = registered
+            .jobs
+            .iter()
+            .map(|snapshot| (snapshot.job_id.as_str(), snapshot.update_seq))
+            .collect::<std::collections::HashMap<_, _>>();
+        for snapshot in self.inventory().jobs.into_iter().filter(|snapshot| {
+            registered_sequences
+                .get(snapshot.job_id.as_str())
+                .is_none_or(|sequence| snapshot.update_seq > *sequence)
+        }) {
+            let update =
+                job_update_from_snapshot(sink.client_id(), sink.agent_instance_id(), &snapshot);
+            let _ = sink.send_job_update(&update);
+        }
+    }
+
+    fn resend_snapshot(&self, job_id: &str) {
+        let update = lock_unpoison(&self.jobs).get(job_id).map(|job| {
+            job_update_from_snapshot(&job.client_id, &job.agent_instance_id, &job.snapshot)
+        });
+        if let Some(update) = update {
+            self.send_recorded_update(update);
+        }
+    }
+
+    fn fail_job(
+        &self,
+        request: &ShellAgentShellRequest,
+        error: String,
+        validation_progress: Option<ShellJobValidationProgress>,
+    ) {
+        let Some(job_id) = request.job_id.as_deref() else {
+            return;
+        };
+        self.update_and_send(
+            job_id,
+            RunnerJobDelta {
+                status: "failed".to_string(),
+                duration_ms: Some(0),
+                error: Some(error),
+                validation_progress,
+                finished: true,
+                ..Default::default()
+            },
+        );
+        self.start_available_queued();
+    }
+
+    fn prune_terminal_records(&self) {
+        let now = chrono::Utc::now().timestamp();
+        let mut jobs = lock_unpoison(&self.jobs);
+        let expired = jobs
+            .iter()
+            .filter_map(|(job_id, job)| {
+                (runner_job_is_terminal(&job.snapshot.status)
+                    && job.snapshot.ended_at.is_some_and(|ended| {
+                        now.saturating_sub(ended) >= JOB_TERMINAL_RETENTION_SECS
+                    }))
+                .then(|| job_id.clone())
+            })
+            .collect::<Vec<_>>();
+        for job_id in expired {
+            jobs.remove(&job_id);
+        }
+        let mut terminal = jobs
+            .iter()
+            .filter(|(_, job)| runner_job_is_terminal(&job.snapshot.status))
+            .map(|(job_id, job)| {
+                (
+                    job_id.clone(),
+                    job.snapshot.ended_at.unwrap_or(job.snapshot.created_at),
+                )
+            })
+            .collect::<Vec<_>>();
+        terminal.sort_by_key(|(_, ended_at)| *ended_at);
+        let excess = terminal
+            .len()
+            .saturating_sub(JOB_INVENTORY_MAX_TERMINAL_JOBS);
+        for (job_id, _) in terminal.into_iter().take(excess) {
+            jobs.remove(&job_id);
+        }
+    }
+
+    fn inventory(&self) -> ShellJobInventory {
+        self.prune_terminal_records();
+        let jobs = lock_unpoison(&self.jobs);
+        let mut active = jobs
+            .values()
+            .filter(|job| runner_job_is_active(&job.snapshot.status))
+            .map(|job| job.snapshot.clone())
+            .collect::<Vec<_>>();
+        let mut terminal = jobs
+            .values()
+            .filter(|job| runner_job_is_terminal(&job.snapshot.status))
+            .map(|job| job.snapshot.clone())
+            .collect::<Vec<_>>();
+        drop(jobs);
+        active.sort_by_key(|snapshot| snapshot.created_at);
+        terminal.sort_by(|left, right| {
+            right
+                .ended_at
+                .unwrap_or(right.created_at)
+                .cmp(&left.ended_at.unwrap_or(left.created_at))
+        });
+        terminal.truncate(JOB_INVENTORY_MAX_TERMINAL_JOBS);
+        let mut inventory = ShellJobInventory {
+            active_complete: true,
+            jobs: active,
+        };
+
+        // Active records are never omitted. Only when active records alone
+        // exceed the frame budget do their authoritative tails shrink.
+        let mut tail_limit = JOB_SNAPSHOT_STREAM_MAX_BYTES;
+        while serde_json::to_vec(&inventory)
+            .map(|bytes| bytes.len() > JOB_INVENTORY_MAX_SERIALIZED_BYTES)
+            .unwrap_or(true)
+            && tail_limit > 0
+        {
+            tail_limit /= 2;
+            for snapshot in &mut inventory.jobs {
+                trim_runner_stream_to(&mut snapshot.stdout, tail_limit);
+                trim_runner_stream_to(&mut snapshot.stderr, tail_limit);
+            }
+        }
+
+        // Add newest terminal history only while it fits. Serializing each
+        // record once avoids repeatedly encoding a multi-megabyte inventory
+        // while preserving the newest-first eviction rule.
+        let mut serialized_len = serde_json::to_vec(&inventory)
+            .map(|bytes| bytes.len())
+            .unwrap_or(JOB_INVENTORY_MAX_SERIALIZED_BYTES.saturating_add(1));
+        for snapshot in terminal {
+            let Ok(encoded) = serde_json::to_vec(&snapshot) else {
+                continue;
+            };
+            let separator = usize::from(!inventory.jobs.is_empty());
+            let added = encoded.len().saturating_add(separator);
+            if serialized_len.saturating_add(added) > JOB_INVENTORY_MAX_SERIALIZED_BYTES {
+                break;
+            }
+            serialized_len = serialized_len.saturating_add(added);
+            inventory.jobs.push(snapshot);
+        }
+        inventory
+    }
+
     fn has_work(&self) -> bool {
-        !lock_unpoison(&self.jobs).is_empty() || !lock_unpoison(&self.queued).is_empty()
+        lock_unpoison(&self.jobs)
+            .values()
+            .any(|job| runner_job_is_active(&job.snapshot.status))
+            || !lock_unpoison(&self.queued).is_empty()
     }
 
     fn stop_accepting_work(&self) {
@@ -1800,6 +2348,7 @@ impl JobManager {
         let running = {
             let jobs = lock_unpoison(&self.jobs);
             jobs.iter()
+                .filter(|(_, job)| runner_job_is_active(&job.snapshot.status))
                 .map(|(_, job)| {
                     (
                         job.child.clone(),
@@ -1856,9 +2405,6 @@ impl JobManager {
         }
 
         for target in &mut batch.targets {
-            if !shutdown_target_running(target) {
-                continue;
-            }
             #[cfg(unix)]
             if let Some(process_group_id) = target.process_group_id {
                 if signal_process_group(process_group_id, libc::SIGKILL).is_err() {
@@ -1866,7 +2412,8 @@ impl JobManager {
                 }
             }
             #[cfg(not(unix))]
-            if lock_unpoison(&target.child).kill().is_err() {
+            if shutdown_target_child_running(target) && lock_unpoison(&target.child).kill().is_err()
+            {
                 batch.failures += 1;
             }
         }
@@ -1875,7 +2422,7 @@ impl JobManager {
             if batch
                 .targets
                 .iter_mut()
-                .all(|target| !shutdown_target_running(target))
+                .all(|target| !shutdown_target_child_running(target))
             {
                 break;
             }
@@ -1884,7 +2431,7 @@ impl JobManager {
         }
         let mut timed_out = 0;
         for target in &mut batch.targets {
-            timed_out += usize::from(shutdown_target_running(target));
+            timed_out += usize::from(shutdown_target_child_running(target));
         }
         JobShutdownOutcome {
             resources,
@@ -1915,15 +2462,8 @@ impl JobManager {
         self.workers.active()
     }
 
-    fn active_job_count(&self, client_id: &str) -> usize {
-        lock_unpoison(&self.jobs)
-            .values()
-            .filter(|job| job.client_id == client_id)
-            .count()
-    }
-
-    fn shutdown_rejection(&self, sink: &AgentSink, request: ShellAgentShellRequest) {
-        send_job_start_failure(sink, request, "runner is shutting down".to_string(), None);
+    fn shutdown_rejection(&self, request: &ShellAgentShellRequest) {
+        self.fail_job(request, "runner is shutting down".to_string(), None);
     }
 
     fn enqueue(
@@ -1938,46 +2478,143 @@ impl JobManager {
         let Some(job_id) = request.job_id.clone() else {
             return;
         };
-        if self.shutting_down.load(Ordering::SeqCst) {
-            self.shutdown_rejection(&sink, request);
-            return;
-        }
-        let client_id = sink.client_id().to_string();
-        let active = self.active_job_count(&client_id);
-        if active >= self.max_concurrent {
-            let queued_update = ShellAgentJobUpdateRequest {
-                client_id: client_id.clone(),
+        let Some(context) = request.job_context.clone() else {
+            let _ = sink.send_job_update(&ShellAgentJobUpdateRequest {
+                client_id: sink.client_id().to_string(),
                 agent_instance_id: sink.agent_instance_id().to_string(),
-                job_id: job_id.clone(),
-                request_id: Some(request.request_id.clone()),
-                status: "agent_queued".to_string(),
+                job_id,
+                request_id: Some(request.request_id),
+                update_seq: Some(1),
+                status: "failed".to_string(),
                 stdout_chunk: None,
                 stderr_chunk: None,
                 stdout_tail: None,
                 stderr_tail: None,
+                log_snapshot: None,
                 exit_code: None,
-                duration_ms: None,
-                error: None,
+                duration_ms: Some(0),
+                error: Some("job start request is missing recovery context".to_string()),
                 validation_progress: None,
-                finished: false,
-            };
-            let lifecycle = lock_unpoison(&self.lifecycle);
-            if self.shutting_down.load(Ordering::SeqCst) {
-                drop(lifecycle);
-                self.shutdown_rejection(&sink, request);
+                finished: true,
+            });
+            return;
+        };
+        if let Err(error) = validate_runner_job_context(&context, &request, sink.client_id()) {
+            let _ = sink.send_job_update(&ShellAgentJobUpdateRequest {
+                client_id: sink.client_id().to_string(),
+                agent_instance_id: sink.agent_instance_id().to_string(),
+                job_id,
+                request_id: Some(request.request_id),
+                update_seq: Some(1),
+                status: "failed".to_string(),
+                stdout_chunk: None,
+                stderr_chunk: None,
+                stdout_tail: None,
+                stderr_tail: None,
+                log_snapshot: None,
+                exit_code: None,
+                duration_ms: Some(0),
+                error: Some(error),
+                validation_progress: None,
+                finished: true,
+            });
+            return;
+        }
+        self.install_sink(sink.clone());
+        let client_id = sink.client_id().to_string();
+        let agent_instance_id = sink.agent_instance_id().to_string();
+        let (queue_locally, immediate_failure) = {
+            let _lifecycle = lock_unpoison(&self.lifecycle);
+            let shutting_down = self.shutting_down.load(Ordering::SeqCst);
+            let mut jobs = lock_unpoison(&self.jobs);
+            if jobs.contains_key(&job_id) {
                 return;
             }
-            let update_sink = sink.clone();
-            lock_unpoison(&self.queued).push_back((
-                sink,
-                generation,
-                policy,
-                shell,
-                projects_dir,
-                request,
-            ));
-            drop(lifecycle);
-            let _ = update_sink.send_job_update(&queued_update);
+            let active_count = jobs
+                .values()
+                .filter(|job| runner_job_is_active(&job.snapshot.status))
+                .count();
+            let reserved = jobs
+                .values()
+                .filter(|job| {
+                    job.client_id == client_id
+                        && job.slot_reserved
+                        && runner_job_is_active(&job.snapshot.status)
+                })
+                .count();
+            let inventory_full = active_count >= JOB_INVENTORY_MAX_ACTIVE_JOBS;
+            let immediate_failure = if inventory_full {
+                Some(format!(
+                    "runner active job inventory limit reached ({})",
+                    JOB_INVENTORY_MAX_ACTIVE_JOBS
+                ))
+            } else if shutting_down {
+                Some("runner is shutting down".to_string())
+            } else {
+                None
+            };
+            let queue_locally = immediate_failure.is_none() && reserved >= self.max_concurrent;
+            let slot_reserved = immediate_failure.is_none() && !queue_locally;
+            let now = chrono::Utc::now().timestamp();
+            let terminal = immediate_failure.is_some();
+            jobs.insert(
+                job_id.clone(),
+                RunningJob {
+                    client_id: client_id.clone(),
+                    agent_instance_id,
+                    snapshot: ShellJobSnapshot {
+                        job_id: job_id.clone(),
+                        request_id: request.request_id.clone(),
+                        status: if terminal {
+                            "failed".to_string()
+                        } else {
+                            "agent_queued".to_string()
+                        },
+                        update_seq: u64::from(terminal),
+                        created_at: request.created_at,
+                        started_at: None,
+                        ended_at: terminal.then_some(now),
+                        exit_code: None,
+                        duration_ms: terminal.then_some(0),
+                        error: immediate_failure.clone(),
+                        context,
+                        stdout: ShellJobStreamSnapshot::default(),
+                        stderr: ShellJobStreamSnapshot::default(),
+                        validation_progress: None,
+                    },
+                    child: None,
+                    process_group_id: None,
+                    stop_requested: Arc::new(AtomicBool::new(false)),
+                    slot_reserved,
+                },
+            );
+            drop(jobs);
+            if queue_locally {
+                lock_unpoison(&self.queued).push_back((
+                    sink.clone(),
+                    generation,
+                    policy.clone(),
+                    shell.clone(),
+                    projects_dir.clone(),
+                    request.clone(),
+                ));
+            }
+            (queue_locally, immediate_failure)
+        };
+        if let Some(error) = immediate_failure {
+            debug_assert!(!error.is_empty());
+            self.resend_snapshot(&job_id);
+            self.prune_terminal_records();
+            return;
+        }
+        self.update_and_send(
+            &job_id,
+            RunnerJobDelta {
+                status: "agent_queued".to_string(),
+                ..Default::default()
+            },
+        );
+        if queue_locally {
             return;
         }
         self.start_now(sink, generation, policy, shell, projects_dir, request);
@@ -1993,7 +2630,7 @@ impl JobManager {
         request: ShellAgentShellRequest,
     ) {
         if self.shutting_down.load(Ordering::SeqCst) {
-            self.shutdown_rejection(&sink, request);
+            self.shutdown_rejection(&request);
             return;
         }
         self.start_shell_job(sink, generation, policy, shell, projects_dir, request);
@@ -2011,22 +2648,35 @@ impl JobManager {
                     lock_unpoison(&self.queued).clear();
                     return;
                 }
-                let jobs = lock_unpoison(&self.jobs);
+                let mut jobs = lock_unpoison(&self.jobs);
                 let mut queued = lock_unpoison(&self.queued);
                 let mut selected = None;
                 for (idx, (_, _, _policy, _shell, _projects_dir, request)) in
                     queued.iter().enumerate()
                 {
-                    let active = jobs
+                    let reserved = jobs
                         .values()
-                        .filter(|job| job.client_id == request.client_id)
+                        .filter(|job| {
+                            job.client_id == request.client_id
+                                && job.slot_reserved
+                                && runner_job_is_active(&job.snapshot.status)
+                        })
                         .count();
-                    if active < self.max_concurrent {
+                    if reserved < self.max_concurrent {
                         selected = Some(idx);
                         break;
                     }
                 }
-                selected.and_then(|idx| queued.remove(idx))
+                if let Some(idx) = selected {
+                    if let Some(job_id) = queued[idx].5.job_id.as_deref() {
+                        if let Some(job) = jobs.get_mut(job_id) {
+                            job.slot_reserved = true;
+                        }
+                    }
+                    queued.remove(idx)
+                } else {
+                    None
+                }
             };
             let Some((sink, generation, policy, shell, projects_dir, request)) = next else {
                 return;
@@ -2037,7 +2687,7 @@ impl JobManager {
 
     fn start_shell_job(
         &self,
-        sink: AgentSink,
+        _sink: AgentSink,
         generation: u64,
         policy: AgentPolicy,
         shell: ShellConfig,
@@ -2048,10 +2698,10 @@ impl JobManager {
             return;
         };
         if !policy.allow_raw_shell {
-            send_start_failure(
-                &sink,
-                request,
+            self.fail_job(
+                &request,
                 "raw shell is disabled by local agent policy".to_string(),
+                None,
             );
             return;
         }
@@ -2061,7 +2711,7 @@ impl JobManager {
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
         if let Err(e) = cwd_allowed(&policy, &cwd_path) {
-            send_start_failure(&sink, request, e);
+            self.fail_job(&request, e, None);
             return;
         }
         let validation = request.kind == "start_validation_job";
@@ -2079,10 +2729,10 @@ impl JobManager {
                     steps
                 }
                 _ => {
-                    send_start_failure(
-                        &sink,
-                        request,
+                    self.fail_job(
+                        &request,
                         "invalid structured validation plan".to_string(),
+                        None,
                     );
                     return;
                 }
@@ -2090,6 +2740,26 @@ impl JobManager {
         } else {
             Vec::new()
         };
+        if validation
+            && request.job_context.as_ref().is_none_or(|context| {
+                context.validation_steps
+                    != steps
+                        .iter()
+                        .map(|step| step.name.clone())
+                        .collect::<Vec<_>>()
+            })
+        {
+            self.fail_job(
+                &request,
+                "structured validation plan does not match recovery context".to_string(),
+                Some(ShellJobValidationProgress {
+                    completed: 0,
+                    current_step: None,
+                    failed_step: None,
+                }),
+            );
+            return;
+        }
         let sandbox_mode = request.sandbox.clone();
         let inspect_scratch = match sandbox_mode.as_deref() {
             None => None,
@@ -2097,17 +2767,17 @@ impl JobManager {
                 match crate::command_sandbox::InspectScratch::create() {
                     Ok(scratch) => Some(scratch),
                     Err(error) => {
-                        send_start_failure(
-                            &sink,
-                            request,
+                        self.fail_job(
+                            &request,
                             format!("inspect sandbox unavailable: {error}"),
+                            None,
                         );
                         return;
                     }
                 }
             }
             Some(other) => {
-                send_start_failure(&sink, request, format!("unknown sandbox mode '{other}'"));
+                self.fail_job(&request, format!("unknown sandbox mode '{other}'"), None);
                 return;
             }
         };
@@ -2127,7 +2797,7 @@ impl JobManager {
             ) {
                 Ok(profile) => profile,
                 Err(e) => {
-                    send_start_failure(&sink, request, e);
+                    self.fail_job(&request, e, None);
                     return;
                 }
             },
@@ -2144,7 +2814,15 @@ impl JobManager {
                 )
             })
         {
-            send_validation_executor_failure(&sink, request, 0, VALIDATION_TOOL_UNAVAILABLE_CODE);
+            self.fail_job(
+                &request,
+                VALIDATION_TOOL_UNAVAILABLE_CODE.to_string(),
+                Some(ShellJobValidationProgress {
+                    completed: 0,
+                    current_step: None,
+                    failed_step: None,
+                }),
+            );
             return;
         }
         let step_count = if validation { steps.len() } else { 1 };
@@ -2168,7 +2846,7 @@ impl JobManager {
             let mut command = match configured {
                 Ok(command) => command,
                 Err(error) => {
-                    send_start_failure(&sink, request, error);
+                    self.fail_job(&request, error, None);
                     return;
                 }
             };
@@ -2184,10 +2862,10 @@ impl JobManager {
                 if let Err(error) =
                     crate::command_sandbox::sandbox_command_inspect(&mut command, scratch)
                 {
-                    send_start_failure(
-                        &sink,
-                        request,
+                    self.fail_job(
+                        &request,
                         format!("inspect sandbox unavailable: {error}"),
+                        None,
                     );
                     return;
                 }
@@ -2198,27 +2876,23 @@ impl JobManager {
                 .stderr(Stdio::piped());
             commands.push_back(command);
         }
-        let stop_requested = Arc::new(AtomicBool::new(false));
-        let client_id = sink.client_id().to_string();
-        {
+        let stop_requested = {
             let _lifecycle = lock_unpoison(&self.lifecycle);
             if self.shutting_down.load(Ordering::SeqCst) {
-                self.shutdown_rejection(&sink, request);
-                return;
+                None
+            } else {
+                let mut jobs = lock_unpoison(&self.jobs);
+                let Some(job) = jobs.get_mut(&job_id) else {
+                    return;
+                };
+                job.slot_reserved = true;
+                Some(Arc::clone(&job.stop_requested))
             }
-            // Reserve the job before spawning outside the lifecycle mutex.
-            // Shutdown can then set this stop flag even while Command::spawn
-            // is waiting for a child-side pre-exec hook.
-            lock_unpoison(&self.jobs).insert(
-                job_id.clone(),
-                RunningJob {
-                    client_id: client_id.clone(),
-                    child: None,
-                    process_group_id: None,
-                    stop_requested: Arc::clone(&stop_requested),
-                },
-            );
-        }
+        };
+        let Some(stop_requested) = stop_requested else {
+            self.shutdown_rejection(&request);
+            return;
+        };
         let start = Instant::now();
         let spawn = commands
             .pop_front()
@@ -2227,13 +2901,15 @@ impl JobManager {
         let mut child = match spawn {
             Ok(c) => c,
             Err(e) => {
-                lock_unpoison(&self.jobs).remove(&job_id);
                 if validation {
-                    send_validation_executor_failure(
-                        &sink,
-                        request,
-                        0,
-                        VALIDATION_STEP_SPAWN_FAILED_CODE,
+                    self.fail_job(
+                        &request,
+                        VALIDATION_STEP_SPAWN_FAILED_CODE.to_string(),
+                        Some(ShellJobValidationProgress {
+                            completed: 0,
+                            current_step: None,
+                            failed_step: None,
+                        }),
                     );
                 } else {
                     let error = prepared_profile
@@ -2245,7 +2921,7 @@ impl JobManager {
                             )
                         })
                         .unwrap_or_else(|| format!("failed to spawn command: {}", e));
-                    send_start_failure(&sink, request, error);
+                    self.fail_job(&request, error, None);
                 }
                 return;
             }
@@ -2257,7 +2933,6 @@ impl JobManager {
         let reject_for_shutdown = {
             let _lifecycle = lock_unpoison(&self.lifecycle);
             if self.shutting_down.load(Ordering::SeqCst) || stop_requested.load(Ordering::SeqCst) {
-                lock_unpoison(&self.jobs).remove(&job_id);
                 true
             } else if let Some(job) = lock_unpoison(&self.jobs).get_mut(&job_id) {
                 job.child = Some(child.clone());
@@ -2269,36 +2944,25 @@ impl JobManager {
         };
         if reject_for_shutdown {
             let _ = kill_child_group(&child);
-            self.shutdown_rejection(&sink, request);
+            self.shutdown_rejection(&request);
             return;
         }
-        let _ = sink.send_job_update(&ShellAgentJobUpdateRequest {
-            client_id: client_id.clone(),
-            agent_instance_id: sink.agent_instance_id().to_string(),
-            job_id: job_id.clone(),
-            request_id: Some(request.request_id.clone()),
-            status: "running".to_string(),
-            stdout_chunk: None,
-            stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
-            exit_code: None,
-            duration_ms: None,
-            error: None,
-            validation_progress: validation.then(|| ShellJobValidationProgress {
-                completed: 0,
-                current_step: Some(steps[0].name.clone()),
-                failed_step: None,
-            }),
-            finished: false,
-        });
+        self.update_and_send(
+            &job_id,
+            RunnerJobDelta {
+                status: "running".to_string(),
+                validation_progress: validation.then(|| ShellJobValidationProgress {
+                    completed: 0,
+                    current_step: Some(steps[0].name.clone()),
+                    failed_step: None,
+                }),
+                ..Default::default()
+            },
+        );
         let jobs = self.jobs.clone();
-        let queued = self.queued.clone();
-        let prepared_profiles = self.prepared_profiles.clone();
         let lifecycle = Arc::clone(&self.lifecycle);
         let shutting_down = Arc::clone(&self.shutting_down);
-        let workers = self.workers.clone();
-        let max_concurrent = self.max_concurrent;
+        let manager = self.clone();
         let inspect_scratch_guard = inspect_scratch;
         let worker_guard = self.workers.enter();
         std::thread::spawn(move || {
@@ -2329,26 +2993,22 @@ impl JobManager {
                         }
                     }
                     if !out.is_empty() || !err.is_empty() {
-                        let _ = sink.send_job_update(&ShellAgentJobUpdateRequest {
-                            client_id: sink.client_id().to_string(),
-                            agent_instance_id: sink.agent_instance_id().to_string(),
-                            job_id: job_id.clone(),
-                            request_id: Some(request.request_id.clone()),
-                            status: "running".to_string(),
-                            stdout_chunk: (!out.is_empty()).then_some(out),
-                            stderr_chunk: (!err.is_empty()).then_some(err),
-                            stdout_tail: None,
-                            stderr_tail: None,
-                            exit_code: None,
-                            duration_ms: None,
-                            error: None,
-                            validation_progress: validation.then(|| ShellJobValidationProgress {
-                                completed: step_index,
-                                current_step: Some(steps[step_index].name.clone()),
-                                failed_step: None,
-                            }),
-                            finished: false,
-                        });
+                        manager.update_and_send(
+                            &job_id,
+                            RunnerJobDelta {
+                                status: "running".to_string(),
+                                stdout_chunk: (!out.is_empty()).then_some(out),
+                                stderr_chunk: (!err.is_empty()).then_some(err),
+                                validation_progress: validation.then(|| {
+                                    ShellJobValidationProgress {
+                                        completed: step_index,
+                                        current_step: Some(steps[step_index].name.clone()),
+                                        failed_step: None,
+                                    }
+                                }),
+                                ..Default::default()
+                            },
+                        );
                     }
                     let wait_result = {
                         let mut child = lock_unpoison(&child);
@@ -2521,26 +3181,20 @@ impl JobManager {
                         );
                     }
                     child = next;
-                    let _ = sink.send_job_update(&ShellAgentJobUpdateRequest {
-                        client_id: sink.client_id().to_string(),
-                        agent_instance_id: sink.agent_instance_id().to_string(),
-                        job_id: job_id.clone(),
-                        request_id: Some(request.request_id.clone()),
-                        status: "running".to_string(),
-                        stdout_chunk: (!out.is_empty()).then_some(out),
-                        stderr_chunk: (!err.is_empty()).then_some(err),
-                        stdout_tail: None,
-                        stderr_tail: None,
-                        exit_code: None,
-                        duration_ms: None,
-                        error: None,
-                        validation_progress: validation.then(|| ShellJobValidationProgress {
-                            completed: step_index,
-                            current_step: Some(steps[step_index].name.clone()),
-                            failed_step: None,
-                        }),
-                        finished: false,
-                    });
+                    manager.update_and_send(
+                        &job_id,
+                        RunnerJobDelta {
+                            status: "running".to_string(),
+                            stdout_chunk: (!out.is_empty()).then_some(out),
+                            stderr_chunk: (!err.is_empty()).then_some(err),
+                            validation_progress: validation.then(|| ShellJobValidationProgress {
+                                completed: step_index,
+                                current_step: Some(steps[step_index].name.clone()),
+                                failed_step: None,
+                            }),
+                            ..Default::default()
+                        },
+                    );
                     stdout = next_stdout;
                     stderr = next_stderr;
                     continue;
@@ -2563,38 +3217,27 @@ impl JobManager {
                 });
                 break (step_status, out, err, progress);
             };
-            let _ = sink.send_job_update(&ShellAgentJobUpdateRequest {
-                client_id: sink.client_id().to_string(),
-                agent_instance_id: sink.agent_instance_id().to_string(),
-                job_id: job_id.clone(),
-                request_id: Some(request.request_id),
-                status: final_status.0,
-                stdout_chunk: (!out.is_empty()).then_some(out),
-                stderr_chunk: (!err.is_empty()).then_some(err),
-                stdout_tail: None,
-                stderr_tail: None,
-                exit_code: final_status.1,
-                duration_ms: Some(start.elapsed().as_millis() as u64),
-                error: final_status.2,
-                validation_progress: final_progress,
-                finished: true,
-            });
-            lock_unpoison(&jobs).remove(&job_id);
-            let manager = JobManager {
-                max_concurrent,
-                jobs: jobs.clone(),
-                queued: queued.clone(),
-                prepared_profiles,
-                lifecycle,
-                shutting_down,
-                workers,
-            };
+            manager.update_and_send(
+                &job_id,
+                RunnerJobDelta {
+                    status: final_status.0,
+                    stdout_chunk: (!out.is_empty()).then_some(out),
+                    stderr_chunk: (!err.is_empty()).then_some(err),
+                    exit_code: final_status.1,
+                    duration_ms: Some(start.elapsed().as_millis() as u64),
+                    error: final_status.2,
+                    validation_progress: final_progress,
+                    finished: true,
+                    ..Default::default()
+                },
+            );
             manager.start_available_queued();
         });
     }
 
     fn stop(&self, job_id: &str) -> Result<(), String> {
         let queued_job = {
+            let _lifecycle = lock_unpoison(&self.lifecycle);
             let mut queued = lock_unpoison(&self.queued);
             if let Some(pos) = queued
                 .iter()
@@ -2605,25 +3248,20 @@ impl JobManager {
                 None
             }
         };
-        if let Some((sink, _generation, _policy, _shell, _projects_dir, request)) = queued_job {
-            let request_id = request.request_id.clone();
-            let job_id = request.job_id.clone().unwrap_or_default();
-            let _ = sink.send_job_update(&ShellAgentJobUpdateRequest {
-                client_id: sink.client_id().to_string(),
-                agent_instance_id: sink.agent_instance_id().to_string(),
+        if let Some((_sink, _generation, _policy, _shell, _projects_dir, _request)) = queued_job {
+            self.update_and_send(
                 job_id,
-                request_id: Some(request_id),
-                status: "stopped".to_string(),
-                stdout_chunk: None,
-                stderr_chunk: None,
-                stdout_tail: None,
-                stderr_tail: Some("job stopped before start".to_string()),
-                exit_code: Some(-1),
-                duration_ms: Some(0),
-                error: Some("job stopped before start".to_string()),
-                validation_progress: None,
-                finished: true,
-            });
+                RunnerJobDelta {
+                    status: "stopped".to_string(),
+                    stderr_chunk: Some("job stopped before start".to_string()),
+                    exit_code: Some(-1),
+                    duration_ms: Some(0),
+                    error: Some("job stopped before start".to_string()),
+                    finished: true,
+                    ..Default::default()
+                },
+            );
+            self.start_available_queued();
             return Ok(());
         }
         let (child, stop_requested) = {
@@ -2631,9 +3269,26 @@ impl JobManager {
             let Some(job) = jobs.get(job_id) else {
                 return Err(format!("unknown local job: {}", job_id));
             };
+            if runner_job_is_terminal(&job.snapshot.status) {
+                drop(jobs);
+                // A stop can race a terminal update that failed in transport.
+                // Replay the retained terminal snapshot with its original
+                // sequence so the server converges instead of remaining
+                // `stop_requested`.
+                self.resend_snapshot(job_id);
+                return Ok(());
+            }
             (job.child.clone(), job.stop_requested.clone())
         };
         stop_requested.store(true, Ordering::SeqCst);
+        self.update_and_send(
+            job_id,
+            RunnerJobDelta {
+                status: "stop_requested".to_string(),
+                error: Some("stop requested".to_string()),
+                ..Default::default()
+            },
+        );
         if let Some(child) = child {
             kill_child_group(&child).map_err(|e| format!("failed to kill job {}: {}", job_id, e))
         } else {
@@ -2696,10 +3351,6 @@ fn handle_one_poll(
     if let Some((_, provider, revision)) = provider_update {
         provider.mark_status_reported(revision);
     }
-    let Some(request) = response.request else {
-        return Ok(false);
-    };
-    let project_op = is_project_op(&request.kind);
     let sink = AgentSink::Http(HttpSendConfig {
         client: client.clone(),
         server_url: cfg.server_url.clone(),
@@ -2708,6 +3359,11 @@ fn handle_one_poll(
         agent_instance_id: agent_instance_id.to_string(),
         shutdown: Arc::clone(shutdown),
     });
+    jobs.install_sink(sink.clone());
+    let Some(request) = response.request else {
+        return Ok(false);
+    };
+    let project_op = is_project_op(&request.kind);
     let hot = runtime.snapshot();
     let runtime = Arc::clone(runtime);
     let jobs = jobs.clone();
@@ -4360,6 +5016,7 @@ shell_profile = "../rust"
             validation: None,
             lsp: None,
             sandbox: None,
+            job_context: Some(test_job_context(cwd, Vec::new())),
         }
     }
 
@@ -4369,7 +5026,9 @@ shell_profile = "../rust"
         while Instant::now() < deadline {
             match rx.try_recv() {
                 Ok(AgentEnvelope::JobUpdate { payload }) => {
-                    if let Some(chunk) = payload.stdout_chunk {
+                    if let Some(snapshot) = payload.log_snapshot {
+                        stdout = snapshot.stdout.tail;
+                    } else if let Some(chunk) = payload.stdout_chunk {
                         stdout.push_str(&chunk);
                     }
                     if payload.finished {
@@ -4422,6 +5081,7 @@ shell_profile = "../rust"
             validation: None,
             lsp: None,
             sandbox: None,
+            job_context: None,
         }
     }
 
@@ -4459,6 +5119,7 @@ shell_profile = "../rust"
             validation: None,
             lsp: None,
             sandbox: None,
+            job_context: None,
         }
     }
 
@@ -4494,6 +5155,7 @@ shell_profile = "../rust"
             validation: None,
             lsp: None,
             sandbox: None,
+            job_context: None,
         }
     }
 
@@ -5014,6 +5676,7 @@ shell_profile = "../rust"
             validation: None,
             lsp: None,
             sandbox: None,
+            job_context: None,
         }
     }
 
@@ -5048,6 +5711,7 @@ shell_profile = "../rust"
             validation: None,
             lsp: None,
             sandbox: None,
+            job_context: None,
         }
     }
 
@@ -7575,6 +8239,20 @@ shell_profile = "../rust"
         if pid == 0 {
             return false;
         }
+        #[cfg(target_os = "linux")]
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            let zombie = stat
+                .rsplit_once(") ")
+                .and_then(|(_, rest)| rest.chars().next())
+                .is_some_and(|state| state == 'Z');
+            if zombie {
+                // A zombie cannot execute and proves the process-group signal
+                // terminated the descendant. Minimal container PID 1
+                // implementations may leave adopted zombies visible long
+                // after the runner has exhausted everything it can reap.
+                return true;
+            }
+        }
         // SAFETY: signal 0 only probes the PID written by this test command;
         // it does not deliver a signal to the process.
         let missing = unsafe { libc::kill(pid as i32, 0) == -1 };
@@ -7997,11 +8675,13 @@ shell_profile = "../rust"
                 agent_instance_id: sink.agent_instance_id().to_string(),
                 job_id: "job-1".to_string(),
                 request_id: Some("req-1".to_string()),
+                update_seq: None,
                 status: "running".to_string(),
                 stdout_chunk: Some(format!("{label}-chunk")),
                 stderr_chunk: None,
                 stdout_tail: None,
                 stderr_tail: None,
+                log_snapshot: None,
                 exit_code: None,
                 duration_ms: None,
                 error: None,
@@ -8053,9 +8733,12 @@ shell_profile = "../rust"
             "running-job".to_string(),
             RunningJob {
                 client_id: "ws-client".to_string(),
+                agent_instance_id: "ws-instance".to_string(),
+                snapshot: test_job_snapshot("running-job"),
                 child: Some(Arc::clone(&running_child)),
                 process_group_id: Some(running_pid),
                 stop_requested: stop_requested.clone(),
+                slot_reserved: true,
             },
         );
         let (sink, mut rx) = ws_sink("ws-client");
@@ -8084,6 +8767,7 @@ shell_profile = "../rust"
             validation: None,
             lsp: None,
             sandbox: None,
+            job_context: Some(test_job_context(tmp.path(), Vec::new())),
         };
         let mut rejected_request = request.clone();
         rejected_request.request_id = "req-after-shutdown".to_string();
@@ -8111,7 +8795,7 @@ shell_profile = "../rust"
         assert!(stop_requested.load(Ordering::SeqCst));
         assert!(jobs.queued.lock().unwrap().is_empty());
         assert!(lock_unpoison(&running_child).try_wait().unwrap().is_some());
-        assert_eq!(signal_process_group(running_pid, 0), Ok(false));
+        assert!(!job_manager_tests::process_running(running_pid));
         assert!(
             !tmp.path().join("queued-started").exists(),
             "queued job started during shutdown"
@@ -8127,15 +8811,19 @@ shell_profile = "../rust"
             rejected_request,
         );
         assert!(jobs.queued.lock().unwrap().is_empty());
-        match rejected_rx.try_recv().expect("shutdown rejection was sent") {
-            AgentEnvelope::JobUpdate { payload } => {
-                assert_eq!(payload.job_id, "job-after-shutdown");
-                assert_eq!(payload.status, "failed");
-                assert!(payload.finished);
-                assert_eq!(payload.error.as_deref(), Some("runner is shutting down"));
-            }
-            other => panic!("expected job_update, got {:?}", other.kind()),
-        }
+        let rejected = (0..2)
+            .find_map(
+                |_| match rejected_rx.try_recv().expect("shutdown update was sent") {
+                    AgentEnvelope::JobUpdate { payload } if payload.finished => Some(payload),
+                    AgentEnvelope::JobUpdate { .. } => None,
+                    other => panic!("expected job_update, got {:?}", other.kind()),
+                },
+            )
+            .expect("shutdown rejection terminal update was sent");
+        assert_eq!(rejected.job_id, "job-after-shutdown");
+        assert_eq!(rejected.status, "failed");
+        assert!(rejected.finished);
+        assert_eq!(rejected.error.as_deref(), Some("runner is shutting down"));
     }
 
     #[test]
@@ -8219,6 +8907,7 @@ shell_profile = "../rust"
             validation: None,
             lsp: None,
             sandbox: None,
+            job_context: None,
         };
         let pdir = projects_dir(&cfg);
         let lsp = webcodex_runner::LspSupervisor::default();
@@ -8286,6 +8975,7 @@ shell_profile = "../rust"
                 validation: None,
                 lsp: None,
                 sandbox: None,
+                job_context: None,
             };
             let ran = dispatch_request(
                 &sink,
@@ -8347,6 +9037,7 @@ shell_profile = "../rust"
             validation: None,
             lsp: None,
             sandbox: None,
+            job_context: None,
         }
     }
 
@@ -9078,6 +9769,7 @@ shell_profile = "../rust"
             None,
             "inst-empty-token",
             0,
+            &JobManager::new(1),
         )
         .unwrap();
         server.join().unwrap();

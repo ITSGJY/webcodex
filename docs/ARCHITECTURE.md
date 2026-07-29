@@ -210,7 +210,8 @@ project mismatches do not restore; stale rows are discarded without preventing
 valid Workflow Sessions, events, or messages from loading. `new_session=true`
 repoints the exact binding without closing or deleting prior history. This JSON
 binding remains separate from the Connector's SQLite Task mapping and does not
-recover running jobs or executions.
+itself recover running jobs or executions. Agent-backed shell jobs use the
+separate same-runner reconciliation layer described below.
 
 If the client knows an existing `wc_sess_*` but cannot retain stable window
 identity, `start_coding_task(resume_session_id=...)` can continue that active
@@ -231,6 +232,45 @@ Audit Sessions are never sources for this Workflow Session lookup.
 - `tool_runtime::semantic_navigation` builds the always-present compact `start_coding_task.semantic_navigation` capability summary. It sends only typed `AgentLspRequest::Status` under one two-second deadline and parses the versioned result contract directly, without recursively dispatching the public `lsp_status` ToolCall or recording a nested session event. Agent status resolution may inspect Cargo workspace presence, executable availability, and an existing supervisor slot, but it never starts a language server, runs Cargo or shell commands, or retrieves symbol/location data. This startup summary is currently Rust-focused (a Rust readiness hint); the seven runtime tools themselves are multi-language. The summary is read-only, workspace-only, dependency-limited by `cargo.noDeps=true`, and marked `full_text_sync_only`: validated workspace `.rs` files refresh open LSP documents from current disk content, without editor-style incremental synchronization. Probe failure or unavailability remains optional acceleration metadata and does not affect the coding startup verdict or warnings.
 
 The agent is where private repository paths are interpreted. The server routes by runtime project id, such as `agent:<client_id>:<project_id>`.
+
+### Same-Runner Job Continuity
+
+Agent-backed async jobs have a bounded, process-local continuity layer
+independent of Workflow Session persistence and Connector execution state.
+When a job is accepted, the server sends the already-authorized project,
+Workflow Session, cwd, purpose, shell, safe command preview, and validation
+plan to the runner. The runner stores those fields with lifecycle/result state,
+monotonic `update_seq`, bounded log tails and absolute line ranges, validation
+progress, and live child/process-group control handles.
+
+Every executor transition updates that runner record under the JobManager lock
+before best-effort network delivery. Active records are never evicted. Terminal
+records release process-control resources but remain in memory for 15 minutes,
+up to 64 records. Each stream is capped at 64 KiB; the complete registration
+inventory is capped at 1 MiB and always prioritizes at most 64 active records.
+Raw command, stdin, environment, credentials, and complete Agent configuration
+are absent from the inventory.
+
+On a capable-runner disconnect, the server changes accepted active jobs to
+nonterminal `recovering` instead of immediately claiming the result was lost.
+The same running `agent_instance_id` has 120 seconds to re-register with its
+complete active inventory. Registration validates the whole inventory before
+mutation and, under one registry mutex, resolves the instance lease,
+replacement loss, missing-active loss, and snapshot merge. Snapshot tails
+replace server tails; incremental and replay updates share the same monotonic
+sequence rule. Network I/O is never performed while the Registry or JobManager
+record lock is held. Long-lived transports also receive an internal
+per-connection lease, so cleanup from an older same-instance socket cannot
+disconnect the socket that just completed reconciliation.
+
+A fresh server can therefore rebuild the original `job_id`, ownership, status,
+bounded logs, and stop routing without re-executing the command. A recovered
+active job continues through `job_status`, `job_log`/`job_tail`, and
+`stop_job`; a job completed while the server was unavailable is restored from
+the retained terminal snapshot. Runner restart is deliberately outside this
+phase because the new process cannot recover old child handles. This layer
+does not merge Connector Execution with Full Runtime Job, provide generalized
+exactly-once command execution, or make a `run_job` invocation idempotent.
 
 ### Agent-Side LSP Architecture
 

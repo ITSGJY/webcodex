@@ -28,6 +28,9 @@ mod job_updates;
 mod jobs;
 mod polling;
 mod projects;
+mod reconciliation;
+#[cfg(test)]
+mod reconciliation_tests;
 mod requests;
 mod state;
 mod validation;
@@ -57,6 +60,10 @@ use validation::{
 
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 pub(crate) const CLIENT_ONLINE_WINDOW_SECS: i64 = 60;
+/// Same-process runners have this long to re-register and submit their
+/// complete active inventory before a recovering job becomes terminal lost.
+pub(crate) const JOB_RECOVERY_GRACE_SECS: i64 = 120;
+const MAX_RETIRED_INSTANCES_PER_CLIENT: usize = 16;
 /// Maximum number of pending requests queued for a single agent client.
 /// Bounds memory when an agent is slow or disconnected: once a client's
 /// queue reaches this depth, new enqueues are rejected with a structured
@@ -1497,6 +1504,7 @@ mod tests {
                     ShellClientRegisterRequest {
                         process_started_at: None,
                         build: None,
+                        job_inventory: None,
                         client_id: client_id.to_string(),
                         agent_instance_id: format!("inst-{}", client_id),
                         display_name: None,
@@ -1516,6 +1524,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "managed".to_string(),
                 agent_instance_id: "inst-managed".to_string(),
                 display_name: None,
@@ -1631,6 +1640,7 @@ mod tests {
         let registration = |hostname: &str, project: &str| ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_inventory: None,
             client_id: "same-project-agent".to_string(),
             agent_instance_id: "same-instance-id".to_string(),
             display_name: None,
@@ -1707,6 +1717,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "xrh".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: Some("XRH".to_string()),
@@ -1733,6 +1744,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -1761,6 +1773,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -1799,6 +1812,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "alice-client".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -1815,6 +1829,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "bob-client".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -1904,6 +1919,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -1927,6 +1943,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "xrh".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -1954,6 +1971,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -1981,6 +1999,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -2038,6 +2057,10 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: Some(crate::shell_protocol::ShellJobInventory {
+                    active_complete: true,
+                    jobs: Vec::new(),
+                }),
                 client_id: "all".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -2055,6 +2078,7 @@ mod tests {
                     lsp_read_only_navigation: true,
                     sandbox_inspect_commands: true,
                     project_lifecycle: true,
+                    job_state_reconciliation: true,
                 }),
                 projects: None,
                 agent_protocol_version: None,
@@ -2078,6 +2102,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "xrh".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -2170,6 +2195,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: client_id.to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -2297,6 +2323,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: client_id.to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -2453,6 +2480,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "quic-stop".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -2541,6 +2569,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -2649,6 +2678,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -2703,6 +2733,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -2770,6 +2801,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -2827,6 +2859,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -2865,6 +2898,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "ws-1".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -3150,6 +3184,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "full".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -3211,6 +3246,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "stale".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -3257,6 +3293,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -3312,6 +3349,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -3398,6 +3436,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: client_id.to_string(),
                 agent_instance_id: instance.to_string(),
                 display_name: None,
@@ -3444,6 +3483,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst-b".to_string(),
                 display_name: None,
@@ -3618,6 +3658,7 @@ mod tests {
             .update_job(ShellAgentJobUpdateRequest {
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst-a".to_string(),
+                update_seq: None,
                 job_id: job.job_id.clone(),
                 request_id: None,
                 status: "running".to_string(),
@@ -3625,6 +3666,7 @@ mod tests {
                 stderr_chunk: None,
                 stdout_tail: None,
                 stderr_tail: None,
+                log_snapshot: None,
                 exit_code: None,
                 duration_ms: None,
                 error: None,
@@ -3643,6 +3685,7 @@ mod tests {
             .update_job(ShellAgentJobUpdateRequest {
                 client_id: "oe".to_string(),
                 agent_instance_id: "inst-b".to_string(),
+                update_seq: None,
                 job_id: job.job_id.clone(),
                 request_id: None,
                 status: "running".to_string(),
@@ -3650,6 +3693,7 @@ mod tests {
                 stderr_chunk: None,
                 stdout_tail: None,
                 stderr_tail: None,
+                log_snapshot: None,
                 exit_code: None,
                 duration_ms: None,
                 error: None,
@@ -3764,6 +3808,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "oe".to_string(),
                 agent_instance_id: "".to_string(),
                 display_name: None,

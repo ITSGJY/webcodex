@@ -1289,11 +1289,22 @@ fn run_polling_agent_with_shutdown(
                 Some(shutdown.as_ref()),
                 agent_instance_id,
                 jobs.prepared_profiles.len(),
+                &jobs,
             ) {
-                Ok(projects_count) => {
+                Ok((projects_count, registered_jobs)) => {
                     registered = true;
                     lease_conflict_started = None;
                     recovery_backoff.reset();
+                    let sink = AgentSink::Http(HttpSendConfig {
+                        client: client.clone(),
+                        server_url: cfg.server_url.clone(),
+                        token: cfg.token.clone(),
+                        client_id: cfg.client_id.clone(),
+                        agent_instance_id: agent_instance_id.to_string(),
+                        shutdown: Arc::clone(&shutdown),
+                    });
+                    jobs.install_sink(sink);
+                    jobs.replay_snapshots_since(&registered_jobs);
                     if recovering {
                         eprintln!(
                             "webcodex-runner polling session refreshed during recovery client_id={}",
@@ -1736,6 +1747,7 @@ async fn quic_session(
     // Register. The token is carried in `auth_token`; the server authenticates
     // it exactly like the websocket/polling paths. It is never logged.
     let projects_count = enabled_projects_count(&projects);
+    let registered_jobs = runtime.jobs.inventory();
     let (register_payload, provider, provider_revision) =
         build_register_request_with_provider_status(
             cfg,
@@ -1744,6 +1756,7 @@ async fn quic_session(
             AGENT_PROTOCOL_VERSION_QUIC_V1,
             agent_instance_id,
             0,
+            registered_jobs.clone(),
         );
     let reg_env = AgentEnvelope::Register {
         payload: register_payload,
@@ -1856,6 +1869,8 @@ async fn quic_session(
         agent_instance_id: agent_instance_id.to_string(),
     };
     let jobs = runtime.jobs.clone();
+    jobs.install_sink(sink_handle.clone());
+    jobs.replay_snapshots_since(&registered_jobs);
     let mut ping_interval = tokio::time::interval(QUIC_PING_INTERVAL);
     ping_interval.tick().await; // skip immediate first tick
     let mut shutdown = Box::pin(runtime.wait_for_shutdown());
@@ -2184,6 +2199,7 @@ where
     // registration time (snapshots are prepared lazily on first use), so
     // `prepared_cache_count` is reported as 0 here.
     let projects_count = enabled_projects_count(&projects);
+    let registered_jobs = runtime.jobs.inventory();
     let (register_payload, provider, provider_revision) =
         build_register_request_with_provider_status(
             cfg,
@@ -2192,6 +2208,7 @@ where
             AGENT_PROTOCOL_VERSION_WEBSOCKET_V1,
             agent_instance_id,
             0,
+            registered_jobs.clone(),
         );
     let reg_env = AgentEnvelope::Register {
         payload: register_payload,
@@ -2282,6 +2299,8 @@ where
         agent_instance_id: agent_instance_id.to_string(),
     };
     let jobs = runtime.jobs.clone();
+    jobs.install_sink(sink_handle.clone());
+    jobs.replay_snapshots_since(&registered_jobs);
     let mut ping_interval = tokio::time::interval(WS_PING_INTERVAL);
     ping_interval.tick().await; // skip immediate first tick
     let mut quit_after_session = false;
@@ -2939,6 +2958,7 @@ mod tests {
             validation: None,
             lsp: None,
             sandbox: None,
+            job_context: None,
         }
     }
 
@@ -4275,6 +4295,7 @@ mod tests {
             validation: None,
             lsp: None,
             sandbox: None,
+            job_context: Some(crate::test_job_context(cwd, Vec::new())),
         }
     }
 

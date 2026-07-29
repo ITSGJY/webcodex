@@ -65,6 +65,7 @@ impl ConnectorExecution {
                 | "running"
                 | "started"
                 | "stop_requested"
+                | "recovering"
                 | "completed"
                 | "stopped"
                 | "cancelled"
@@ -140,6 +141,14 @@ pub(super) fn observed_state(
         "queued" | "agent_queued" => active_state(execution, "queued"),
         "running" | "started" => active_state(execution, "running"),
         "stop_requested" => active_state(execution, "running"),
+        "recovering" => active_state(
+            execution,
+            if execution.state == "queued" {
+                "queued"
+            } else {
+                "running"
+            },
+        ),
         "completed"
             if execution.kind == "check"
                 && observation.exit_code == Some(0)

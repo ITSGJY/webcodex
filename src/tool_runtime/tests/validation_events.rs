@@ -982,6 +982,7 @@ async fn completed_run_job_validation_enters_handoff_from_job_authority() {
         .update_job(crate::shell_protocol::ShellAgentJobUpdateRequest {
             client_id: "validation-job".to_string(),
             agent_instance_id: "inst-validation-job".to_string(),
+            update_seq: None,
             job_id: job_id.clone(),
             request_id: Some(request.request_id),
             status: "completed".to_string(),
@@ -991,6 +992,7 @@ async fn completed_run_job_validation_enters_handoff_from_job_authority() {
                 "running 1 test\n\ntest result: ok. 1 passed; 0 failed; 0 ignored\n".to_string(),
             ),
             stderr_tail: Some(String::new()),
+            log_snapshot: None,
             exit_code: Some(0),
             duration_ms: Some(12),
             error: None,

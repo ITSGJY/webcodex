@@ -8,6 +8,10 @@ fn default_shell_true() -> bool {
     true
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn default_timeout_secs() -> u64 {
     120
 }
@@ -101,6 +105,9 @@ pub const SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION: &str = "lsp_read_onl
 /// Linux Landlock ABI v3 inspect-command write sandbox.
 pub const SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS: &str = "sandbox_inspect_commands";
 pub const SHELL_CLIENT_CAPABILITY_PROJECT_LIFECYCLE: &str = "project_lifecycle";
+/// Same-process async job recovery across server restarts and transport
+/// reconnects. Missing on older runners and therefore defaults to `false`.
+pub const SHELL_CLIENT_CAPABILITY_JOB_STATE_RECONCILIATION: &str = "job_state_reconciliation";
 pub const SHELL_CLIENT_CAPABILITY_NAMES: &[&str] = &[
     SHELL_CLIENT_CAPABILITY_SHELL,
     SHELL_CLIENT_CAPABILITY_FILE_READ,
@@ -113,7 +120,26 @@ pub const SHELL_CLIENT_CAPABILITY_NAMES: &[&str] = &[
     SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
     SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS,
     SHELL_CLIENT_CAPABILITY_PROJECT_LIFECYCLE,
+    SHELL_CLIENT_CAPABILITY_JOB_STATE_RECONCILIATION,
 ];
+
+/// Maximum retained bytes for one stdout or stderr stream in a runner job
+/// snapshot. The server may retain a larger live tail, but reconciliation
+/// deliberately converges to this bounded authoritative runner tail.
+pub const JOB_SNAPSHOT_STREAM_MAX_BYTES: usize = 64 * 1024;
+/// Runner inventory includes every active job or rejects further job starts.
+pub const JOB_INVENTORY_MAX_ACTIVE_JOBS: usize = 64;
+/// Terminal snapshots retained by one runner process.
+pub const JOB_INVENTORY_MAX_TERMINAL_JOBS: usize = 64;
+pub const JOB_INVENTORY_MAX_JOBS: usize =
+    JOB_INVENTORY_MAX_ACTIVE_JOBS + JOB_INVENTORY_MAX_TERMINAL_JOBS;
+/// Leaves headroom below the server's default 2 MiB polling request-body
+/// ceiling as well as the shared 8 MiB WebSocket/QUIC frame ceiling for
+/// registration, project, policy, and envelope metadata.
+pub const JOB_INVENTORY_MAX_SERIALIZED_BYTES: usize = 1024 * 1024;
+/// Same-process terminal results remain available long enough for ordinary
+/// reconnect backoff without becoming an unbounded process-lifetime ledger.
+pub const JOB_TERMINAL_RETENTION_SECS: i64 = 15 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShellClientCapabilities {
@@ -147,6 +173,10 @@ pub struct ShellClientCapabilities {
     /// runners and therefore fail-closed.
     #[serde(default)]
     pub project_lifecycle: bool,
+    /// The runner retains bounded active and recent terminal job snapshots and
+    /// submits a complete active inventory at register/re-register time.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub job_state_reconciliation: bool,
 }
 
 /// Bounded, non-secret status for the agent's active configuration generation.
@@ -187,6 +217,7 @@ impl Default for ShellClientCapabilities {
             lsp_read_only_navigation: false,
             sandbox_inspect_commands: false,
             project_lifecycle: false,
+            job_state_reconciliation: false,
         }
     }
 }
@@ -400,6 +431,11 @@ pub struct ShellClientRegisterRequest {
     /// for mixed-version diagnostics; never carries paths or environment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<AgentBuildInfo>,
+    /// Complete active plus bounded recent-terminal inventory for the current
+    /// runner process. Required when `job_state_reconciliation` is declared;
+    /// absent for older runners.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_inventory: Option<ShellJobInventory>,
 }
 
 /// Non-secret runner build identity for mixed-version diagnostics.
@@ -616,6 +652,11 @@ pub struct ShellAgentShellRequest {
     /// Absent on the wire when unset so older agents continue to deserialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<String>,
+    /// Server-derived safe ownership and display metadata retained by the
+    /// runner for same-process recovery. Present only for async job starts and
+    /// never contains raw command text, stdin, environment, or credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_context: Option<ShellJobContext>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -662,6 +703,10 @@ pub struct ShellAgentJobUpdateRequest {
     pub job_id: String,
     #[serde(default)]
     pub request_id: Option<String>,
+    /// Runner-owned per-job monotonic sequence. Current reconciliation-capable
+    /// runners always send it; older runners omit it and keep legacy behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_seq: Option<u64>,
     pub status: String,
     #[serde(default)]
     pub stdout_chunk: Option<String>,
@@ -671,6 +716,10 @@ pub struct ShellAgentJobUpdateRequest {
     pub stdout_tail: Option<String>,
     #[serde(default)]
     pub stderr_tail: Option<String>,
+    /// Full authoritative tails with absolute line metadata. Reconciliation-
+    /// capable runners use this for sequenced updates and post-register replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_snapshot: Option<ShellJobLogSnapshot>,
     #[serde(default)]
     pub exit_code: Option<i32>,
     #[serde(default)]
@@ -886,6 +935,108 @@ pub struct ShellJobValidationProgress {
     pub failed_step: Option<String>,
 }
 
+/// Safe server-derived metadata needed to reconstruct a job record after a
+/// server restart. This is an internal agent protocol model, not a public
+/// `run_job` input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellJobContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+    pub command_preview: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validation_steps: Vec<String>,
+}
+
+/// One bounded stream tail plus absolute line range. `next_line` is the
+/// cursor immediately after the last retained/observed line; reconciliation
+/// replaces the server stream with this authoritative range instead of
+/// appending it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellJobStreamSnapshot {
+    #[serde(default)]
+    pub tail: String,
+    #[serde(default = "default_first_retained_line")]
+    pub first_retained_line: usize,
+    #[serde(default = "default_first_retained_line")]
+    pub next_line: usize,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+fn default_first_retained_line() -> usize {
+    1
+}
+
+impl Default for ShellJobStreamSnapshot {
+    fn default() -> Self {
+        Self {
+            tail: String::new(),
+            first_retained_line: 1,
+            next_line: 1,
+            truncated: false,
+        }
+    }
+}
+
+/// Authoritative bounded log view attached to a sequenced replay update.
+/// This closes the register/ack race where executor state advances after the
+/// register inventory was serialized but before the new sink becomes usable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellJobLogSnapshot {
+    pub stdout: ShellJobStreamSnapshot,
+    pub stderr: ShellJobStreamSnapshot,
+}
+
+/// Runner-authoritative same-process job state used only during registration
+/// reconciliation. Raw command, stdin, environment, tokens, and agent config
+/// are intentionally absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellJobSnapshot {
+    pub job_id: String,
+    pub request_id: String,
+    pub status: String,
+    pub update_seq: u64,
+    pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub context: ShellJobContext,
+    #[serde(default)]
+    pub stdout: ShellJobStreamSnapshot,
+    #[serde(default)]
+    pub stderr: ShellJobStreamSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_progress: Option<ShellJobValidationProgress>,
+}
+
+/// Register-time inventory. Terminal records are deliberately partial history,
+/// while `active_complete=true` guarantees every locally active/queued job is
+/// present so omission can safely reconcile a server record to `lost`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellJobInventory {
+    #[serde(default)]
+    pub active_complete: bool,
+    #[serde(default)]
+    pub jobs: Vec<ShellJobSnapshot>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShellAgentShellJobResult {
     #[serde(default)]
@@ -946,6 +1097,24 @@ pub struct ShellJobInfo {
     pub result: Option<ShellAgentJobResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation_progress: Option<ShellJobValidationProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_state: Option<String>,
+    #[serde(default)]
+    pub recovered_after_server_restart: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciled_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_update_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout_retained_from_line: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_retained_from_line: Option<usize>,
+    #[serde(default)]
+    pub stdout_log_truncated: bool,
+    #[serde(default)]
+    pub stderr_log_truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1293,10 +1462,12 @@ mod envelope_tests {
                 lsp_read_only_navigation: false,
                 sandbox_inspect_commands: false,
                 project_lifecycle: false,
+                job_state_reconciliation: false,
             }),
             projects: None,
             agent_protocol_version: Some(AGENT_PROTOCOL_VERSION_WEBSOCKET_V1.to_string()),
             policy: None,
+            job_inventory: None,
         }
     }
 
@@ -1348,6 +1519,90 @@ mod envelope_tests {
         }
     }
 
+    fn reconciliation_inventory() -> ShellJobInventory {
+        ShellJobInventory {
+            active_complete: true,
+            jobs: vec![ShellJobSnapshot {
+                job_id: "job-original".to_string(),
+                request_id: "request-original".to_string(),
+                status: "running".to_string(),
+                update_seq: 9,
+                created_at: 1_700_000_000,
+                started_at: Some(1_700_000_001),
+                ended_at: None,
+                exit_code: None,
+                duration_ms: None,
+                error: None,
+                context: ShellJobContext {
+                    runtime_project_id: Some("agent:oe:demo".to_string()),
+                    workflow_session_id: Some("wc_sess_reconcile".to_string()),
+                    project_cwd: Some("/srv/demo".to_string()),
+                    cwd: Some("/srv/demo".to_string()),
+                    purpose: Some("test".to_string()),
+                    shell: Some("bash".to_string()),
+                    command_preview: "cargo test focused".to_string(),
+                    validation_steps: Vec::new(),
+                },
+                stdout: ShellJobStreamSnapshot {
+                    tail: "one\n".to_string(),
+                    first_retained_line: 1,
+                    next_line: 2,
+                    truncated: false,
+                },
+                stderr: ShellJobStreamSnapshot::default(),
+                validation_progress: None,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn job_reconciliation_inventory_round_trips_across_all_register_transports() {
+        let inventory = reconciliation_inventory();
+        let mut polling = sample_register();
+        polling.agent_protocol_version = Some(AGENT_PROTOCOL_VERSION_POLLING_V1.to_string());
+        polling
+            .capabilities
+            .as_mut()
+            .unwrap()
+            .job_state_reconciliation = true;
+        polling.job_inventory = Some(inventory.clone());
+        let polling_json = serde_json::to_vec(&polling).unwrap();
+        let polling_back: ShellClientRegisterRequest =
+            serde_json::from_slice(&polling_json).unwrap();
+        assert_eq!(polling_back.job_inventory.as_ref(), Some(&inventory));
+
+        let mut websocket = polling.clone();
+        websocket.agent_protocol_version = Some(AGENT_PROTOCOL_VERSION_WEBSOCKET_V1.to_string());
+        let websocket_json = AgentEnvelope::Register {
+            payload: websocket,
+            auth_token: None,
+        }
+        .to_json()
+        .unwrap();
+        let websocket_back = AgentEnvelope::from_slice(websocket_json.as_bytes()).unwrap();
+        match websocket_back {
+            AgentEnvelope::Register { payload, .. } => {
+                assert_eq!(payload.job_inventory.as_ref(), Some(&inventory));
+            }
+            other => panic!("expected websocket register, got {:?}", other.kind()),
+        }
+
+        let mut quic = polling;
+        quic.agent_protocol_version = Some(AGENT_PROTOCOL_VERSION_QUIC_V1.to_string());
+        let quic_frame = encode_quic_frame(&AgentEnvelope::Register {
+            payload: quic,
+            auth_token: Some("test-only-token".to_string()),
+        })
+        .unwrap();
+        let mut quic_reader = quic_frame.as_slice();
+        match read_quic_frame(&mut quic_reader).await.unwrap() {
+            AgentEnvelope::Register { payload, .. } => {
+                assert_eq!(payload.job_inventory.as_ref(), Some(&inventory));
+            }
+            other => panic!("expected quic register, got {:?}", other.kind()),
+        }
+    }
+
     #[test]
     fn request_envelope_flattens_shell_request_fields() {
         let request = ShellAgentShellRequest {
@@ -1375,6 +1630,7 @@ mod envelope_tests {
             validation: None,
             lsp: None,
             sandbox: None,
+            job_context: None,
         };
         let env = AgentEnvelope::Request { request };
         let json = env.to_json().unwrap();
@@ -1420,11 +1676,13 @@ mod envelope_tests {
                 agent_instance_id: "11111111-1111-1111-1111-111111111111".to_string(),
                 job_id: "job-1".to_string(),
                 request_id: Some("req-1".to_string()),
+                update_seq: None,
                 status: "running".to_string(),
                 stdout_chunk: Some("out".to_string()),
                 stderr_chunk: None,
                 stdout_tail: None,
                 stderr_tail: None,
+                log_snapshot: None,
                 exit_code: None,
                 duration_ms: None,
                 error: None,
@@ -1588,11 +1846,13 @@ mod envelope_tests {
             agent_instance_id: "22222222-2222-2222-2222-222222222222".to_string(),
             job_id: "job-1".to_string(),
             request_id: None,
+            update_seq: None,
             status: "running".to_string(),
             stdout_chunk: None,
             stderr_chunk: None,
             stdout_tail: None,
             stderr_tail: None,
+            log_snapshot: None,
             exit_code: None,
             duration_ms: None,
             error: None,
@@ -1713,6 +1973,7 @@ mod envelope_tests {
                 projects: None,
                 agent_protocol_version: Some(AGENT_PROTOCOL_VERSION_QUIC_V1.to_string()),
                 policy: None,
+                job_inventory: None,
             },
             auth_token: Some("wc_agent_secret".to_string()),
         };

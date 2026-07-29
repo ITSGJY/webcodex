@@ -116,6 +116,38 @@ QUIC is an alternative transport for the existing agent envelope protocol. It us
 
 The current model is one bidirectional stream per agent connection with serialized frames. Stream multiplexing is not implemented yet.
 
+## Job reconciliation across transports
+
+Polling registration, the WebSocket `Register` envelope, and the QUIC
+`Register` envelope all serialize the same `job_inventory` model when the
+runner advertises `job_state_reconciliation`. Reconnect state is implemented
+once in the shared registry and runner JobManager; transports do not have
+separate job state machines.
+
+WebSocket and QUIC registrations also receive an internal connection lease.
+This fences delayed cleanup from an older socket after the same runner instance
+has already completed a newer registration.
+
+After authentication and active-instance lease validation, registration merges
+the complete inventory atomically with the client lease. A same-instance
+reconnect resolves `recovering` jobs by monotonic `update_seq`. A new instance
+loses the old instance's active jobs, and a complete inventory missing a known
+active job loses that job. A malformed, duplicate, inconsistent, or oversized
+inventory is rejected before registry mutation.
+
+During a short WebSocket, QUIC, or polling-session interruption, the runner
+continues updating its in-memory records even when best-effort JobUpdate
+delivery fails. After registration succeeds and the new sink is installed, it
+replays the latest bounded authoritative snapshots; equal sequences are
+idempotent. `job_status`, bounded logs, and `stop_job(original_job_id)` resume
+after reconciliation. While the job is still `recovering`, `stop_job` reports
+`runner_unavailable_recovering` rather than fabricating success.
+
+This continuity applies only while the runner process and its
+`agent_instance_id` survive. A runner process restart cannot reacquire old
+child handles. It is not a command exactly-once or `run_job` request
+idempotency guarantee.
+
 ## Capabilities over QUIC
 
 With a `quic-v1` agent, QUIC supports the runtime request loop used by WebCodex tools, including:

@@ -100,6 +100,7 @@ pub(crate) async fn console_fixture() -> ConsoleFixture {
             ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "laptop".into(),
                 agent_instance_id: "instance-b".into(),
                 display_name: None,
@@ -155,6 +156,7 @@ async fn fixture_built(
             ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "hosted".into(),
                 agent_instance_id: "instance".into(),
                 display_name: None,
@@ -384,6 +386,7 @@ async fn update_job(
         .update_job(ShellAgentJobUpdateRequest {
             client_id: "hosted".into(),
             agent_instance_id: "instance".into(),
+            update_seq: None,
             job_id: job_id.into(),
             request_id: None,
             status: status.into(),
@@ -391,6 +394,7 @@ async fn update_job(
             stderr_chunk: None,
             stdout_tail: None,
             stderr_tail: None,
+            log_snapshot: None,
             exit_code,
             duration_ms: Some(1),
             error: None,
@@ -423,6 +427,7 @@ fn validation_job_update(
     ShellAgentJobUpdateRequest {
         client_id: "hosted".into(),
         agent_instance_id: "instance".into(),
+        update_seq: None,
         job_id: job_id.into(),
         request_id: None,
         status: status.into(),
@@ -430,6 +435,7 @@ fn validation_job_update(
         stderr_chunk: None,
         stdout_tail: None,
         stderr_tail: None,
+        log_snapshot: None,
         exit_code: None,
         duration_ms: Some(1),
         error: None,
@@ -536,6 +542,7 @@ async fn connector_readiness_uses_registered_agent_capabilities() {
             ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "hosted".into(),
                 agent_instance_id: "instance".into(),
                 display_name: None,
@@ -1796,6 +1803,7 @@ async fn structured_progress_rejects_invalid_order_and_preserves_fail_fast_plan(
         let malformed = ShellAgentJobUpdateRequest {
             client_id: "hosted".into(),
             agent_instance_id: "instance".into(),
+            update_seq: None,
             job_id: job.job_id,
             request_id: None,
             status: status.into(),
@@ -1803,6 +1811,7 @@ async fn structured_progress_rejects_invalid_order_and_preserves_fail_fast_plan(
             stderr_chunk: None,
             stdout_tail: None,
             stderr_tail: None,
+            log_snapshot: None,
             exit_code,
             duration_ms: Some(1),
             error: None,
@@ -1830,6 +1839,7 @@ async fn ordinary_jobs_reject_validation_progress_without_changing_normal_update
         .update_job(ShellAgentJobUpdateRequest {
             client_id: "hosted".into(),
             agent_instance_id: "instance".into(),
+            update_seq: None,
             job_id: job.job_id.clone(),
             request_id: None,
             status: "running".into(),
@@ -1837,6 +1847,7 @@ async fn ordinary_jobs_reject_validation_progress_without_changing_normal_update
             stderr_chunk: None,
             stdout_tail: None,
             stderr_tail: None,
+            log_snapshot: None,
             exit_code: None,
             duration_ms: None,
             error: None,
@@ -1872,6 +1883,7 @@ async fn old_agent_cannot_receive_a_structured_validation_job() {
             ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "hosted".into(),
                 agent_instance_id: "instance".into(),
                 display_name: None,
@@ -2825,6 +2837,118 @@ async fn nonzero_exit_keeps_submission_and_execution_outcomes_separate() {
 }
 
 #[tokio::test]
+async fn connector_execution_recovering_status_remains_active_without_duplicate_or_success() {
+    let fixture = fixture(20).await;
+    let db = &fixture.connector.db;
+    let task = task(&fixture);
+    let execution = created(
+        db.reserve_connector_execution(
+            &task,
+            "command",
+            "recovering-operation",
+            "recovering-request-hash",
+            &[],
+            None,
+            None,
+            30,
+            2,
+        )
+        .unwrap(),
+    );
+    db.attach_connector_executor(&execution.execution_id, "job-recovering", "queued", 3)
+        .unwrap();
+    let queued_recovery = db
+        .observe_connector_execution(
+            &execution.execution_id,
+            ConnectorExecutionObservation {
+                executor_status: "recovering",
+                stdout_cursor: 1,
+                stderr_cursor: 1,
+                exit_code: None,
+                started_at: None,
+                finished_at: None,
+                check_completed: None,
+                failed_check: None,
+                assertion_evidence: None,
+                validated_workspace_sha256: None,
+                executor_failure_code: None,
+                now: 4,
+            },
+        )
+        .unwrap();
+    assert_eq!(queued_recovery.state, "queued");
+    assert!(queued_recovery.is_active());
+    assert!(queued_recovery.failure_code.is_none());
+    assert!(queued_recovery.terminal_reason.is_none());
+
+    let running = db
+        .observe_connector_execution(
+            &execution.execution_id,
+            ConnectorExecutionObservation {
+                executor_status: "running",
+                stdout_cursor: 2,
+                stderr_cursor: 1,
+                exit_code: None,
+                started_at: Some(5),
+                finished_at: None,
+                check_completed: None,
+                failed_check: None,
+                assertion_evidence: None,
+                validated_workspace_sha256: None,
+                executor_failure_code: None,
+                now: 5,
+            },
+        )
+        .unwrap();
+    assert_eq!(running.state, "running");
+    let running_recovery = db
+        .observe_connector_execution(
+            &execution.execution_id,
+            ConnectorExecutionObservation {
+                executor_status: "recovering",
+                stdout_cursor: 2,
+                stderr_cursor: 1,
+                exit_code: None,
+                started_at: Some(5),
+                finished_at: None,
+                check_completed: None,
+                failed_check: None,
+                assertion_evidence: None,
+                validated_workspace_sha256: None,
+                executor_failure_code: None,
+                now: 6,
+            },
+        )
+        .unwrap();
+    assert_eq!(running_recovery.state, "running");
+    assert!(running_recovery.is_active());
+    assert_ne!(running_recovery.state, "succeeded");
+    assert_ne!(running_recovery.state, "failed");
+
+    match db
+        .reserve_connector_execution(
+            &task,
+            "command",
+            "recovering-operation",
+            "recovering-request-hash",
+            &[],
+            None,
+            None,
+            30,
+            7,
+        )
+        .unwrap()
+    {
+        ConnectorExecutionReservation::Existing(existing) => {
+            assert_eq!(existing.execution_id, execution.execution_id);
+        }
+        ConnectorExecutionReservation::Created(_) => {
+            panic!("recovering observation must not trigger duplicate execution")
+        }
+    }
+}
+
+#[tokio::test]
 async fn unrecognized_executor_status_is_degraded_instead_of_running() {
     let fixture = fixture(50).await;
     let db = &fixture.connector.db;
@@ -2987,6 +3111,7 @@ async fn read_only_commands_run_is_denied_even_when_agent_advertises_sandbox() {
             ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "hosted".into(),
                 agent_instance_id: "instance".into(),
                 display_name: None,
@@ -3041,6 +3166,7 @@ async fn enable_inspect_sandbox(fixture: &Fixture) {
             ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "hosted".into(),
                 agent_instance_id: "instance".into(),
                 display_name: None,
@@ -3537,6 +3663,7 @@ async fn manifestless_python_unittest_checks_finish_with_clean_result() {
             ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "hosted".into(),
                 agent_instance_id: "instance".into(),
                 display_name: None,

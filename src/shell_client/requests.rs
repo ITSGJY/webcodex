@@ -222,6 +222,7 @@ impl ShellClientRegistry {
             validation: None,
             lsp: None,
             sandbox: None,
+            job_context: None,
         };
         let mut inner = self.inner.lock().await;
         enqueue_pending_request_locked(
@@ -279,6 +280,7 @@ impl ShellClientRegistry {
             validation: None,
             lsp: None,
             sandbox: sandbox.clone(),
+            job_context: None,
         };
         let mut inner = self.inner.lock().await;
         if let Some(mode) = sandbox.as_deref() {
@@ -370,6 +372,7 @@ impl ShellClientRegistry {
             validation: None,
             lsp: None,
             sandbox: None,
+            job_context: None,
         };
         let mut inner = self.inner.lock().await;
         enqueue_pending_request_locked(
@@ -432,6 +435,7 @@ impl ShellClientRegistry {
             validation: None,
             lsp: Some(payload),
             sandbox: None,
+            job_context: None,
         };
         let mut inner = self.inner.lock().await;
         enqueue_pending_request_locked(

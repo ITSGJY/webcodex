@@ -1,12 +1,19 @@
 use super::auth::{assert_shell_client_access, shell_client_visible_to_auth, ShellClientAuthGroup};
-use super::jobs::{is_final_job_status, offline_last_seen};
+use super::jobs::{begin_job_recovery, is_final_job_status, mark_job_lost, offline_last_seen};
+use super::reconciliation::{
+    preflight_inventory_locked, reconcile_inventory_locked, terminate_instance_jobs_locked,
+    validate_job_inventory,
+};
 use super::requests::resolve_disconnected_sync_requests_locked;
 use super::state::{NotifierEntry, ShellClientRecord, ShellClientRegistryInner};
 use super::validation::{
     normalize_project_summaries, normalize_tool_providers, trim_string, validate_agent_instance_id,
     validate_id, validate_optional_field,
 };
-use super::{now_ts, ShellClientRegistry, CLIENT_ONLINE_WINDOW_SECS, TRANSPORT_POLLING};
+use super::{
+    now_ts, ShellClientRegistry, CLIENT_ONLINE_WINDOW_SECS, MAX_RETIRED_INSTANCES_PER_CLIENT,
+    TRANSPORT_POLLING,
+};
 use crate::shell_protocol::{ShellClientRegisterRequest, ShellClientView};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -26,6 +33,15 @@ impl ShellClientRegistry {
         body: ShellClientRegisterRequest,
         auth: Option<&crate::auth::AuthContext>,
     ) -> Result<ShellClientView, String> {
+        self.register_with_auth_connection(body, auth, None).await
+    }
+
+    pub(crate) async fn register_with_auth_connection(
+        &self,
+        body: ShellClientRegisterRequest,
+        auth: Option<&crate::auth::AuthContext>,
+        connection_id: Option<&str>,
+    ) -> Result<ShellClientView, String> {
         validate_id(&body.client_id, "client_id")?;
         validate_agent_instance_id(&body.agent_instance_id)?;
         validate_optional_field(&body.display_name, "display_name")?;
@@ -34,6 +50,8 @@ impl ShellClientRegistry {
 
         let client_id = body.client_id.trim().to_string();
         let agent_instance_id = body.agent_instance_id.trim().to_string();
+        let capabilities = body.capabilities.clone().unwrap_or_default();
+        let job_inventory = body.job_inventory.clone();
         let mut policy = body.policy;
         if let Some(policy) = policy.as_mut() {
             policy.tool_providers = normalize_tool_providers(policy.tool_providers.take());
@@ -45,7 +63,7 @@ impl ShellClientRegistry {
             display_name: trim_string(body.display_name),
             owner: trim_string(body.owner),
             hostname: trim_string(body.hostname),
-            capabilities: body.capabilities.unwrap_or_default(),
+            capabilities: capabilities.clone(),
             projects: normalize_project_summaries(body.projects),
             last_seen: now,
             agent_protocol_version: body
@@ -58,10 +76,30 @@ impl ShellClientRegistry {
             auth_group: auth.and_then(ShellClientAuthGroup::from_auth),
             registered_at: now,
             connected_at: now,
+            connection_id: connection_id.map(str::to_string),
             disconnected_at: None,
             process_started_at: body.process_started_at,
             build: body.build,
         };
+        match (
+            capabilities.job_state_reconciliation,
+            job_inventory.as_ref(),
+        ) {
+            (true, Some(inventory)) => {
+                validate_job_inventory(&client_id, &record.projects, inventory)?;
+            }
+            (true, None) => {
+                return Err(
+                    "job_state_reconciliation capability requires job_inventory".to_string()
+                );
+            }
+            (false, Some(_)) => {
+                return Err(
+                    "job_inventory requires job_state_reconciliation capability".to_string()
+                );
+            }
+            (false, None) => {}
+        }
         let mut inner = self.inner.lock().await;
 
         if inner
@@ -70,6 +108,26 @@ impl ShellClientRegistry {
             .is_some_and(|existing| existing.auth_group != record.auth_group)
         {
             return Err("agent client identity is unavailable".to_string());
+        }
+        if inner
+            .retired_instances
+            .get(&client_id)
+            .is_some_and(|retired| retired.iter().any(|id| id == &agent_instance_id))
+        {
+            return Err(format!(
+                "agent client {} instance was replaced and cannot reclaim the lease",
+                client_id
+            ));
+        }
+        if inner.clients.get(&client_id).is_some_and(|existing| {
+            existing.agent_instance_id == agent_instance_id
+                && existing.capabilities.job_state_reconciliation
+                && !capabilities.job_state_reconciliation
+        }) {
+            return Err(
+                "same runner instance cannot downgrade job_state_reconciliation capability"
+                    .to_string(),
+            );
         }
         // Enforce the agent instance lease. `client_id` is the unique active
         // agent identity: at most one agent process may be online for it at a
@@ -90,8 +148,32 @@ impl ShellClientRegistry {
             .get(&client_id)
             .map(|existing| existing.agent_instance_id != agent_instance_id)
             .unwrap_or(false);
+        let replaced_instance_id = replaced_instance.then(|| {
+            inner
+                .clients
+                .get(&client_id)
+                .expect("replacement requires existing client")
+                .agent_instance_id
+                .clone()
+        });
+        if let Some(inventory) = job_inventory.as_ref() {
+            preflight_inventory_locked(&inner, &client_id, &agent_instance_id, inventory)?;
+        }
         if replaced_instance {
-            inner.notifiers.remove(&client_id);
+            let replaced_instance_id = replaced_instance_id
+                .as_deref()
+                .expect("replacement id captured");
+            terminate_instance_jobs_locked(&mut inner, &client_id, replaced_instance_id, now);
+            let retired = inner
+                .retired_instances
+                .entry(client_id.clone())
+                .or_default();
+            if !retired.iter().any(|id| id == replaced_instance_id) {
+                retired.push_back(replaced_instance_id.to_string());
+                while retired.len() > MAX_RETIRED_INSTANCES_PER_CLIENT {
+                    retired.pop_front();
+                }
+            }
         }
 
         // Same-instance re-register is a transport reconnect: keep the
@@ -104,7 +186,15 @@ impl ShellClientRegistry {
             }
         }
 
+        // Every successful registration replaces the concrete transport
+        // lease, including a same-instance reconnect. Removing the previous
+        // notifier here ensures an older connection cannot keep receiving new
+        // requests while its eventual disconnect races the new connection.
+        inner.notifiers.remove(&client_id);
         inner.clients.insert(client_id.clone(), record);
+        if let Some(inventory) = job_inventory.as_ref() {
+            reconcile_inventory_locked(&mut inner, &client_id, &agent_instance_id, inventory, now);
+        }
         Ok(Self::client_view_locked(&inner, &client_id).expect("client just inserted"))
     }
 
@@ -112,11 +202,47 @@ impl ShellClientRegistry {
     /// WebSocket handler after a successful register so observability and
     /// `list_agents` reflect how the agent is actually connected. Polling
     /// agents keep the default `"polling"` label set during `register`.
+    #[cfg(test)]
     pub async fn set_transport(&self, client_id: &str, transport: &str) -> Result<(), String> {
+        self.set_transport_checked(client_id, None, None, transport)
+            .await
+    }
+
+    pub(crate) async fn set_transport_for_connection(
+        &self,
+        client_id: &str,
+        agent_instance_id: &str,
+        connection_id: &str,
+        transport: &str,
+    ) -> Result<(), String> {
+        self.set_transport_checked(
+            client_id,
+            Some(agent_instance_id),
+            Some(connection_id),
+            transport,
+        )
+        .await
+    }
+
+    async fn set_transport_checked(
+        &self,
+        client_id: &str,
+        agent_instance_id: Option<&str>,
+        connection_id: Option<&str>,
+        transport: &str,
+    ) -> Result<(), String> {
         let mut inner = self.inner.lock().await;
         let Some(client) = inner.clients.get_mut(client_id) else {
             return Err(format!("unknown shell client: {}", client_id));
         };
+        if agent_instance_id.is_some_and(|id| client.agent_instance_id != id)
+            || connection_id.is_some_and(|id| client.connection_id.as_deref() != Some(id))
+        {
+            return Err(format!(
+                "agent client {} transport connection is no longer active",
+                client_id
+            ));
+        }
         client.transport = transport.to_string();
         Ok(())
     }
@@ -188,10 +314,33 @@ impl ShellClientRegistry {
     /// this after register; the server's request pump waits on the notifier
     /// between polls. Calling this replaces any previously registered
     /// notifier for the client (e.g. after a reconnect).
+    #[cfg(test)]
     pub async fn register_notifier(
         &self,
         client_id: &str,
         agent_instance_id: &str,
+        notify: Arc<Notify>,
+    ) -> Result<(), String> {
+        self.register_notifier_checked(client_id, agent_instance_id, None, notify)
+            .await
+    }
+
+    pub(crate) async fn register_notifier_for_connection(
+        &self,
+        client_id: &str,
+        agent_instance_id: &str,
+        connection_id: &str,
+        notify: Arc<Notify>,
+    ) -> Result<(), String> {
+        self.register_notifier_checked(client_id, agent_instance_id, Some(connection_id), notify)
+            .await
+    }
+
+    async fn register_notifier_checked(
+        &self,
+        client_id: &str,
+        agent_instance_id: &str,
+        connection_id: Option<&str>,
         notify: Arc<Notify>,
     ) -> Result<(), String> {
         validate_agent_instance_id(agent_instance_id)?;
@@ -205,11 +354,18 @@ impl ShellClientRegistry {
                 client_id
             ));
         }
+        if connection_id.is_some_and(|id| client.connection_id.as_deref() != Some(id)) {
+            return Err(format!(
+                "agent client {} transport connection is no longer active",
+                client_id
+            ));
+        }
         inner.notifiers.insert(
             client_id.to_string(),
             NotifierEntry {
                 notify,
                 agent_instance_id: agent_instance_id.to_string(),
+                connection_id: connection_id.map(str::to_string),
             },
         );
         Ok(())
@@ -217,12 +373,38 @@ impl ShellClientRegistry {
 
     /// Reconcile state after an agent transport disconnects or sends a
     /// graceful offline notice.
+    #[cfg(test)]
     pub async fn reconcile_disconnect(&self, client_id: &str, agent_instance_id: &str) {
+        self.reconcile_disconnect_checked(client_id, agent_instance_id, None)
+            .await;
+    }
+
+    pub(crate) async fn reconcile_disconnect_for_connection(
+        &self,
+        client_id: &str,
+        agent_instance_id: &str,
+        connection_id: &str,
+    ) {
+        self.reconcile_disconnect_checked(client_id, agent_instance_id, Some(connection_id))
+            .await;
+    }
+
+    async fn reconcile_disconnect_checked(
+        &self,
+        client_id: &str,
+        agent_instance_id: &str,
+        connection_id: Option<&str>,
+    ) {
         let mut inner = self.inner.lock().await;
         let is_active = inner
             .clients
             .get(client_id)
-            .map(|client| client.agent_instance_id == agent_instance_id)
+            .map(|client| {
+                client.agent_instance_id == agent_instance_id
+                    && connection_id
+                        .map(|id| client.connection_id.as_deref() == Some(id))
+                        .unwrap_or(true)
+            })
             .unwrap_or(false);
         if !is_active {
             return;
@@ -230,18 +412,26 @@ impl ShellClientRegistry {
         if inner
             .notifiers
             .get(client_id)
-            .map(|entry| entry.agent_instance_id == agent_instance_id)
+            .map(|entry| {
+                entry.agent_instance_id == agent_instance_id
+                    && connection_id
+                        .map(|id| entry.connection_id.as_deref() == Some(id))
+                        .unwrap_or(true)
+            })
             .unwrap_or(false)
         {
             inner.notifiers.remove(client_id);
         }
-        let lost_error = "agent transport disconnected".to_string();
         let now = now_ts();
+        let recoverable = inner
+            .clients
+            .get(client_id)
+            .is_some_and(|client| client.capabilities.job_state_reconciliation);
         if let Some(client) = inner.clients.get_mut(client_id) {
             client.last_seen = offline_last_seen(now);
             client.disconnected_at = Some(now);
         }
-        let lost_job_ids: Vec<String> = inner
+        let affected_job_ids: Vec<String> = inner
             .jobs_by_id
             .iter()
             .filter_map(|(job_id, job)| {
@@ -259,15 +449,25 @@ impl ShellClientRegistry {
                 Some(job_id.clone())
             })
             .collect();
-        for job_id in lost_job_ids {
+        for job_id in affected_job_ids {
             let request_id = inner
                 .jobs_by_id
                 .get(&job_id)
                 .and_then(|j| j.request_id.clone());
             if let Some(job) = inner.jobs_by_id.get_mut(&job_id) {
-                job.status = "lost".to_string();
-                job.ended_at = Some(now);
-                job.error = Some(lost_error.clone());
+                if recoverable && job.status != "queued" {
+                    begin_job_recovery(job, now, "runner_transport_disconnected");
+                } else {
+                    let (reason, message) = if job.status == "queued" {
+                        (
+                            "runner_request_not_dispatched",
+                            "agent transport disconnected before the queued request was dispatched",
+                        )
+                    } else {
+                        ("legacy_runner_disconnected", "agent transport disconnected")
+                    };
+                    mark_job_lost(job, now, reason, message);
+                }
             }
             if let Some(request_id) = request_id {
                 inner.pending_by_id.remove(&request_id);
@@ -275,6 +475,24 @@ impl ShellClientRegistry {
                 if let Some(queue) = inner.queues_by_client.get_mut(client_id) {
                     queue.retain(|id| id != &request_id);
                 }
+            }
+        }
+        // Drop any additional job-backed control request (for example an
+        // undispatched stop request). Reconciliation restores executor truth;
+        // it never replays a stale server queue after reconnect.
+        let extra_job_requests = inner
+            .pending_by_id
+            .iter()
+            .filter_map(|(request_id, pending)| {
+                (pending.request.client_id == client_id && pending.job_id.is_some())
+                    .then(|| request_id.clone())
+            })
+            .collect::<Vec<_>>();
+        for request_id in extra_job_requests {
+            inner.pending_by_id.remove(&request_id);
+            inner.request_to_job.remove(&request_id);
+            if let Some(queue) = inner.queues_by_client.get_mut(client_id) {
+                queue.retain(|id| id != &request_id);
             }
         }
         // Synchronous tool requests (run_shell/read_file/write/lsp/project ops)
@@ -320,6 +538,22 @@ impl ShellClientRegistry {
 
     pub async fn get_client_view(&self, client_id: &str) -> Option<ShellClientView> {
         let inner = self.inner.lock().await;
+        Self::client_view_locked(&inner, client_id)
+    }
+
+    pub(crate) async fn get_client_view_for_connection(
+        &self,
+        client_id: &str,
+        agent_instance_id: &str,
+        connection_id: &str,
+    ) -> Option<ShellClientView> {
+        let inner = self.inner.lock().await;
+        let client = inner.clients.get(client_id)?;
+        if client.agent_instance_id != agent_instance_id
+            || client.connection_id.as_deref() != Some(connection_id)
+        {
+            return None;
+        }
         Self::client_view_locked(&inner, client_id)
     }
 

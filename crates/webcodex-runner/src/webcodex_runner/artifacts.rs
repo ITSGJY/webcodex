@@ -1501,6 +1501,7 @@ mod tests {
             validation: None,
             lsp: None,
             sandbox: None,
+            job_context: None,
         }
     }
 

@@ -84,6 +84,7 @@ fn shell_lsp_request(payload: AgentLspPayload) -> ShellAgentShellRequest {
         validation: None,
         lsp: Some(payload),
         sandbox: None,
+        job_context: None,
     }
 }
 
@@ -301,6 +302,7 @@ fn status_does_not_start_server_and_unavailable_succeeds() {
             request: AgentLspRequest::Status,
         }),
         sandbox: None,
+        job_context: None,
     };
     let result = handle_lsp_request(&policy, &projects_dir, &supervisor, &req);
     let envelope = parse_agent_lsp_result_envelope(result.stdout.as_deref().unwrap()).unwrap();
@@ -1042,6 +1044,7 @@ fn missing_lsp_payload_returns_structured_error() {
         validation: None,
         lsp: None,
         sandbox: None,
+        job_context: None,
     };
     let result = handle_lsp_request(
         &fixture.policy,
@@ -1087,6 +1090,7 @@ fn lsp_request_ignores_command_field() {
             request: AgentLspRequest::Status,
         }),
         sandbox: None,
+        job_context: None,
     };
     let result = handle_lsp_request(
         &fixture.policy,

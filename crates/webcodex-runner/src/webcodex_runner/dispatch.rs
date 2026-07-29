@@ -82,6 +82,7 @@ pub(crate) fn dispatch_request(
             Ok(true)
         }
         "stop_job" => {
+            jobs.install_sink(sink.clone());
             if let Some(job_id) = request.job_id.as_deref() {
                 if let Err(e) = jobs.stop(job_id) {
                     eprintln!("webcodex-runner stop_job error: {}", e);

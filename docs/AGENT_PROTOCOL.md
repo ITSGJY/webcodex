@@ -38,6 +38,60 @@ Agents register with:
 
 `agent_instance_id` identifies a running agent instance separately from the stable `client_id`.
 
+## Same-process job state reconciliation
+
+Current runners advertise `job_state_reconciliation`. Every registration and
+same-instance re-registration then includes one complete active and bounded
+recent-terminal `job_inventory`. Polling uses the registration body; WebSocket
+and QUIC carry the same model in the `Register` envelope. A declaration without
+the required complete inventory is a protocol error. Older runners do not
+advertise the capability and retain the conservative immediate-`lost`
+disconnect behavior.
+
+Roll this protocol out server-first, then upgrade runners. New server fields
+are optional/defaulted for older runners; once a runner advertises
+`job_state_reconciliation`, the inventory and sequenced-update contract is
+mandatory rather than silently downgraded.
+
+Each snapshot keeps the original `job_id` and `request_id`, lifecycle/result
+fields, a runner-owned monotonic `update_seq`, validation progress, bounded
+stdout/stderr tails with absolute retained-line cursors, and server-derived
+project/Workflow Session/execution metadata. The start request supplies that
+safe job context only after normal project resolution and permission checks.
+It contains the existing redacted, bounded command preview, not another raw
+command copy. Inventory never carries stdin, environment values, tokens, authorization
+headers, or complete agent configuration.
+
+The runner updates its in-memory record before attempting network delivery.
+Server updates with a higher sequence are accepted; equal-sequence replay is
+idempotent and older updates are ignored. Register reconciliation replaces the
+server's bounded tail with the authoritative runner tail instead of appending
+it. Each current-runner sequenced update carries that bounded authoritative
+tail, so an out-of-order higher update subsumes retained output from lower
+updates. The runner also replays its latest bounded snapshot after a new
+transport sink is installed, closing the register/ack race with the same sequence rule.
+Accepted terminal states never revert to active or change terminal class.
+
+The bounds are part of the internal protocol:
+
+- at most 64 active records, always ordered before terminal history;
+- at most 64 terminal records, retained for 15 minutes by the runner;
+- at most 64 KiB per stdout/stderr tail;
+- at most 1 MiB for the serialized inventory.
+
+On a recoverable disconnect, an already accepted job becomes `recovering` for
+up to 120 seconds. A complete same-instance inventory restores its actual
+state, logs, ownership, and original `job_id`; omission marks it `lost` with
+`runner_inventory_missing`. A replacement `agent_instance_id` marks the old
+instance's active jobs `lost` with `runner_instance_replaced` and fences late
+register/update traffic. An undispatched server queue entry is not replayed.
+
+This phase requires the same runner process and the same
+`agent_instance_id`. Restarting the runner loses child/process-group handles
+and cannot recover those jobs. There is no generalized exactly-once command
+execution promise, and `run_job` call-level idempotency remains a separate
+future phase.
+
 ## Policy summary
 
 `runtime_status` and `listAgents` expose a redacted summary for operators:

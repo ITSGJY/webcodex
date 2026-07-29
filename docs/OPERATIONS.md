@@ -648,6 +648,46 @@ continue with `offset=cursor.stdout`. They never return an unbounded full log.
 To stop a WebCodex-started job, call `stop_job` with the same project, job id,
 explicit session id when available, and `confirm=true`.
 
+#### Recovering agent jobs
+
+Runners with the `job_state_reconciliation` capability retain active jobs and
+recent terminal snapshots in process memory. If the WebCodex server restarts
+or the agent transport drops briefly while that same runner process remains
+alive, the job may temporarily report `status="recovering"`. It is still
+active, has no `ended_at`, and does not imply a live connection. Do not submit
+a replacement command.
+
+The same `agent_instance_id` has a 120-second recovery window. Its next
+registration carries a complete active inventory and restores the original
+`job_id`, project/Session ownership, actual lifecycle state, validation
+progress, and bounded log tails. `job_status`, `job_log`/`job_tail`, and
+`stop_job` then continue with that id. If the command finished while the server
+was unavailable, the retained terminal snapshot restores its completed,
+failed, stopped, or timeout result.
+
+Useful bounded fields are:
+
+- job outputs: `recovery_state`, `recovered_after_server_restart`,
+  `reconciled_at`, `recovery_reason_code`, `last_update_seq`, and
+  `stdout_retained_from_line` / `stderr_retained_from_line`;
+- log outputs: `earlier_stdout_unavailable` /
+  `earlier_stderr_unavailable`;
+- `runtime_status.jobs`: `recovering_count`, `reconciled_count`, and
+  `lost_after_reconcile_count`.
+
+While a job is still recovering, `stop_job` returns
+`runner_unavailable_recovering`; it does not mark the job stopped. Retry only
+after same-instance reconciliation. `runner_inventory_missing`,
+`runner_instance_replaced`, or `runner_recovery_deadline_exceeded` are terminal
+loss reasons and must not be interpreted as successful execution.
+
+The runner keeps at most 64 active snapshots, 64 terminal snapshots for 15
+minutes, 64 KiB per log stream, and 1 MiB per registration inventory. Earlier
+log output can therefore be explicitly unavailable. Restarting the runner
+itself still loses child/process-group handles and cannot recover those jobs.
+There is no generalized exactly-once guarantee; `run_job` call-level
+idempotency remains future work.
+
 ### 5. Review and summarize
 
 ```json
@@ -956,6 +996,11 @@ restarts both sides, and prints post-deploy smoke facts:
 ```bash
 bash scripts/e2e_reconnect_ws.sh
 ```
+
+This harness verifies transport/process reconnect behavior. Because it restarts
+the runner, it is not an async-job continuity test: same-process job
+reconciliation intentionally cannot recover a child handle across that runner
+restart.
 
 Alternatively, call `POST /api/runtime/status` (or the `runtime_status` tool)
 and verify:

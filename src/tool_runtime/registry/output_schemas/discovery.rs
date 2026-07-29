@@ -39,7 +39,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "agents",
                 open_object_schema("Agent counts and client summaries. Canonical top-level counts are count, online_count, and stale_count in full, compact, and summary_only output."),
             ),
-            ("jobs", open_object_schema("Runtime job counts.")),
+            (
+                "jobs",
+                open_object_schema("Bounded runtime job counts, including active_count, recovering_count, reconciled_count, and lost_after_reconcile_count."),
+            ),
             ("tools", open_object_schema("Runtime tool counts and names.")),
             (
                 "authority",

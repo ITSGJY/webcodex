@@ -38,6 +38,51 @@ Agents 注册时提交：
 
 `agent_instance_id` 标识一个正在运行的 agent instance，区别于稳定的 `client_id`。
 
+## 同一进程内的 Job 状态协调
+
+当前 Runner 会声明 `job_state_reconciliation` capability。此后每次注册及同实例
+重新注册都必须提交一个完整 active、并对近期 terminal history 设限的
+`job_inventory`。Polling 通过 registration body 携带；WebSocket 和 QUIC 在
+`Register` envelope 中携带完全相同的模型。声明 capability 却缺少完整 inventory
+属于协议错误。未声明该能力的旧 Runner 保持保守语义：断线后立即将活动 Job 标为
+`lost`。
+
+滚动升级应先升级 Server，再升级 Runner。新 Server 对旧 Runner 缺失的字段使用
+optional/default 兼容；Runner 一旦声明 `job_state_reconciliation`，inventory
+与单调 update 协议就是强制要求，不能静默降级。
+
+每个 snapshot 保留原 `job_id` 和 `request_id`、生命周期与结果字段、Runner
+生成的单调 `update_seq`、validation progress，以及带绝对 retained-line cursor
+的有界 stdout/stderr tail。Server 仅在完成正常 project resolution 和权限检查后，
+通过 start request 提供恢复所需的 project、Workflow Session 与执行元数据。
+其中只有沿用现有限制与脱敏规则的有界 command preview，不保存第二份 raw command。
+Inventory 不包含 stdin、环境变量值、token、认证 header 或完整 Agent 配置。
+
+Runner 总是先更新进程内 record，再尝试网络发送。Server 只接受更高序号；相同序号
+重放幂等，旧序号被忽略。Register reconciliation 会用 Runner 的权威有界 tail
+替换 Server tail，而不是再次 append。当前 Runner 的每个单调 update 也携带该有界
+权威 tail，因此乱序到达的更高序号已经包含低序号的 retained output。新 transport
+sink 安装后，Runner 还会使用同一序号规则重放最新有界 snapshot，以覆盖
+register/ack 窗口内的状态变化。
+已接受的 terminal 状态不会回退为 active，也不会被另一种 terminal 状态覆盖。
+
+内部协议边界为：
+
+- active record 最多 64 个，并始终排在 terminal history 前；
+- terminal record 最多 64 个，在 Runner 中保留 15 分钟；
+- 每个 stdout/stderr tail 最多 64 KiB；
+- 序列化 inventory 总计最多 1 MiB。
+
+可恢复断线后，已由 Runner 接管的 Job 最多 120 秒处于 `recovering`。同一实例的
+完整 inventory 会恢复实际状态、日志、归属和原 `job_id`；缺失项以
+`runner_inventory_missing` 变为 `lost`。不同 `agent_instance_id` 替换旧实例时，
+旧实例活动 Job 以 `runner_instance_replaced` 变为 `lost`，迟到的注册或 update
+继续被拒绝。尚未分发的 Server queue entry 不会重放。
+
+本阶段要求 Runner 进程仍然存活且 `agent_instance_id` 不变。Runner 自身重启会
+丢失 child/process-group handle，无法恢复这些 Job。本机制不承诺通用的
+exactly-once command execution；`run_job` 调用级幂等属于后续独立阶段。
+
 ## Policy summary
 
 `runtime_status` 和 `listAgents` 为 operators 暴露 redacted summary：

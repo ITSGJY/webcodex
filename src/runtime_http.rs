@@ -546,6 +546,7 @@ mod tests {
             .register(ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_inventory: None,
                 client_id: "importer".to_string(),
                 agent_instance_id: "inst-import".to_string(),
                 display_name: None,

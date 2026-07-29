@@ -4478,6 +4478,7 @@ pub(crate) mod tests {
                 ShellClientRegisterRequest {
                     process_started_at: None,
                     build: None,
+                    job_inventory: None,
                     client_id: "hosted".to_string(),
                     agent_instance_id: "instance".to_string(),
                     display_name: None,
@@ -4495,6 +4496,7 @@ pub(crate) mod tests {
                         lsp_read_only_navigation: false,
                         sandbox_inspect_commands: false,
                         project_lifecycle: false,
+                        job_state_reconciliation: false,
                     }),
                     projects: Some(vec![ShellAgentProjectSummary {
                         id: project_id.to_string(),
@@ -5448,6 +5450,7 @@ pub(crate) mod tests {
                         .update_job(crate::shell_protocol::ShellAgentJobUpdateRequest {
                             client_id: "hosted".to_string(),
                             agent_instance_id: "instance".to_string(),
+                            update_seq: None,
                             job_id: request.job_id.unwrap(),
                             request_id: Some(request.request_id),
                             status: "completed".to_string(),
@@ -5455,6 +5458,7 @@ pub(crate) mod tests {
                             stderr_chunk: None,
                             stdout_tail: None,
                             stderr_tail: None,
+                            log_snapshot: None,
                             exit_code: Some(0),
                             duration_ms: Some(1),
                             error: None,

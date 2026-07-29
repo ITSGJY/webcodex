@@ -1,8 +1,9 @@
 use super::auth::{assert_shell_client_access, shell_job_visible_to_auth};
 use super::jobs::{
-    append_limited, assert_active_instance_locked, command_preview, is_final_job_status, job_view,
-    refresh_job_status_locked, replace_limited, select_lines,
+    append_log_limited, assert_active_instance_locked, command_preview, is_final_job_status,
+    job_view, refresh_job_status_locked, replace_log_limited, select_log_lines,
 };
+use super::reconciliation::validate_stream_snapshot;
 use super::requests::{
     enqueue_pending_request_locked, next_request_id, notify_client_locked,
     remove_pending_request_locked,
@@ -12,7 +13,7 @@ use super::validation::{validate_agent_instance_id, validate_id, validate_run_re
 use super::{now_ts, ShellClientRegistry};
 use crate::shell_protocol::{
     validation_infrastructure_failure_code, ShellAgentJobUpdateRequest, ShellAgentShellRequest,
-    ShellJobInfo, ShellJobOpRequest, ShellJobValidationStep, ShellRunRequest,
+    ShellJobContext, ShellJobInfo, ShellJobOpRequest, ShellJobValidationStep, ShellRunRequest,
 };
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -62,7 +63,7 @@ fn validate_validation_progress(
         .as_ref()
         .map(|progress| progress.completed)
         .unwrap_or(0);
-    if progress.completed < previous || progress.completed > previous.saturating_add(1) {
+    if progress.completed < previous {
         return invalid_progress("validation_progress_invalid");
     }
     let no_active_step = progress.current_step.is_none() && progress.failed_step.is_none();
@@ -182,12 +183,32 @@ impl ShellClientRegistry {
             serde_json::to_string(&validation_steps)
                 .map_err(|error| format!("could not serialize validation plan: {error}"))?
         };
+        let validation_step_names = validation_steps
+            .iter()
+            .map(|step| step.name.clone())
+            .collect::<Vec<_>>();
+        let normalized_job_cwd = run.cwd.clone().map(|cwd| cwd.trim().to_string());
+        let safe_command_preview = if validation_steps.is_empty() {
+            command_preview(&run.command)
+        } else {
+            format!("validation: {}", validation_step_names.join(", "))
+        };
+        let job_context = ShellJobContext {
+            runtime_project_id: metadata.project_id.clone(),
+            workflow_session_id: metadata.session_id.clone(),
+            project_cwd: metadata.project_cwd.clone(),
+            cwd: normalized_job_cwd.clone(),
+            purpose: metadata.purpose.clone(),
+            shell: metadata.shell.clone(),
+            command_preview: safe_command_preview.clone(),
+            validation_steps: validation_step_names.clone(),
+        };
         let request = ShellAgentShellRequest {
             request_id: request_id.clone(),
             client_id: client_id.clone(),
             kind: request_kind.to_string(),
             job_id: Some(job_id.clone()),
-            cwd: run.cwd.clone().map(|cwd| cwd.trim().to_string()),
+            cwd: normalized_job_cwd.clone(),
             path: None,
             content: None,
             max_bytes: None,
@@ -207,6 +228,7 @@ impl ShellClientRegistry {
             validation: None,
             lsp: None,
             sandbox,
+            job_context: Some(job_context),
         };
         let mut inner = self.inner.lock().await;
         let Some(client) = inner.clients.get(&client_id) else {
@@ -246,6 +268,7 @@ impl ShellClientRegistry {
         {
             return Err("project_unregister_in_progress".to_string());
         }
+        let agent_instance_id = client.agent_instance_id.clone();
         enqueue_pending_request_locked(
             &mut inner,
             &client_id,
@@ -258,37 +281,34 @@ impl ShellClientRegistry {
             job_id: job_id.clone(),
             request_id: Some(request_id.clone()),
             client_id: client_id.clone(),
+            agent_instance_id,
             kind: "shell".to_string(),
             project_id: metadata.project_id,
             session_id: metadata.session_id,
-            cwd: run.cwd.clone(),
+            cwd: normalized_job_cwd,
             project_cwd: metadata.project_cwd,
             purpose: metadata.purpose,
             shell: metadata.shell,
-            command_preview: if validation_steps.is_empty() {
-                command_preview(&run.command)
-            } else {
-                format!(
-                    "validation: {}",
-                    validation_steps
-                        .iter()
-                        .map(|step| step.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            },
+            command_preview: safe_command_preview,
             status: "queued".to_string(),
             created_at,
             started_at: None,
             ended_at: None,
             exit_code: None,
             duration_ms: None,
-            stdout: None,
-            stderr: None,
+            stdout: Default::default(),
+            stderr: Default::default(),
             error: None,
             codex: body.codex.clone(),
-            validation_steps: validation_steps.into_iter().map(|step| step.name).collect(),
+            validation_steps: validation_step_names,
             validation_progress: None,
+            last_update_seq: 0,
+            recovery_state: None,
+            recovered_after_server_restart: false,
+            reconciled_at: None,
+            recovery_reason_code: None,
+            recovering_since: None,
+            recovery_original_status: None,
         };
         inner.request_to_job.insert(request_id, job_id.clone());
         inner.jobs_by_id.insert(job_id.clone(), job);
@@ -471,9 +491,9 @@ impl ShellClientRegistry {
             return Err(format!("unknown shell job: {}", job_id));
         }
         let (stdout, next_stdout_line, _, _) =
-            select_lines(job.stdout.as_ref(), since_stdout_line, tail_lines);
+            select_log_lines(&job.stdout, since_stdout_line, tail_lines);
         let (stderr, next_stderr_line, _, _) =
-            select_lines(job.stderr.as_ref(), since_stderr_line, tail_lines);
+            select_log_lines(&job.stderr, since_stderr_line, tail_lines);
         Ok((
             job_view(job),
             stdout,
@@ -499,6 +519,7 @@ impl ShellClientRegistry {
     ) -> Result<ShellJobInfo, String> {
         validate_id(job_id, "job_id")?;
         let mut inner = self.inner.lock().await;
+        refresh_job_status_locked(&mut inner, job_id);
         let Some(job) = inner.jobs_by_id.get(job_id).cloned() else {
             return Err(format!("unknown shell job: {}", job_id));
         };
@@ -545,6 +566,7 @@ impl ShellClientRegistry {
                     validation: None,
                     lsp: None,
                     sandbox: None,
+                    job_context: None,
                 };
                 enqueue_pending_request_locked(
                     &mut inner,
@@ -561,6 +583,10 @@ impl ShellClientRegistry {
                 notify_client_locked(&inner, &notify_client_id);
                 Ok(job_view(inner.jobs_by_id.get(job_id).expect("job exists")))
             }
+            "recovering" => Err(
+                "runner_unavailable_recovering: wait for same-instance job reconciliation before retrying stop_job"
+                    .to_string(),
+            ),
             _ => Ok(job_view(inner.jobs_by_id.get(job_id).expect("job exists"))),
         }
     }
@@ -572,10 +598,85 @@ impl ShellClientRegistry {
         validate_id(&body.client_id, "client_id")?;
         validate_id(&body.job_id, "job_id")?;
         validate_agent_instance_id(&body.agent_instance_id)?;
+        if let Some(snapshot) = body.log_snapshot.as_ref() {
+            validate_stream_snapshot(&snapshot.stdout, "job update stdout snapshot")?;
+            validate_stream_snapshot(&snapshot.stderr, "job update stderr snapshot")?;
+            if body.stdout_chunk.is_some()
+                || body.stderr_chunk.is_some()
+                || body.stdout_tail.is_some()
+                || body.stderr_tail.is_some()
+            {
+                return Err(
+                    "job update log_snapshot cannot be combined with chunk or legacy tail fields"
+                        .to_string(),
+                );
+            }
+        }
         let mut inner = self.inner.lock().await;
         // Reject job updates from a stale/replaced instance before refreshing
         // liveness or mutating job state.
         assert_active_instance_locked(&inner, &body.client_id, &body.agent_instance_id)?;
+        let sequenced = inner
+            .clients
+            .get(&body.client_id)
+            .is_some_and(|client| client.capabilities.job_state_reconciliation);
+        let incoming_seq = if sequenced {
+            Some(
+                body.update_seq
+                    .filter(|sequence| *sequence > 0)
+                    .ok_or_else(|| {
+                        "job_state_reconciliation update requires update_seq".to_string()
+                    })?,
+            )
+        } else {
+            body.update_seq
+        };
+        let incoming_status = body.status.trim();
+        if sequenced && body.status != incoming_status {
+            return Err(
+                "job_state_reconciliation update status must be canonical without surrounding whitespace"
+                    .to_string(),
+            );
+        }
+        if sequenced
+            && !matches!(
+                incoming_status,
+                "agent_queued"
+                    | "running"
+                    | "stop_requested"
+                    | "completed"
+                    | "failed"
+                    | "stopped"
+                    | "timeout"
+                    | "timed_out"
+                    | "cancelled"
+                    | "lost"
+            )
+        {
+            return Err(format!(
+                "job_state_reconciliation update status '{}' is invalid",
+                incoming_status
+            ));
+        }
+        if sequenced && body.finished != is_final_job_status(incoming_status) {
+            return Err(
+                "job_state_reconciliation update has inconsistent finished/status".to_string(),
+            );
+        }
+        if sequenced
+            && !is_final_job_status(incoming_status)
+            && (body.exit_code.is_some() || body.duration_ms.is_some())
+        {
+            return Err(
+                "active job_state_reconciliation update contains terminal result fields"
+                    .to_string(),
+            );
+        }
+        if sequenced && incoming_status == "completed" && body.exit_code != Some(0) {
+            return Err(
+                "completed job_state_reconciliation update requires exit_code=0".to_string(),
+            );
+        }
         if let Some(client) = inner.clients.get_mut(&body.client_id) {
             client.last_seen = now_ts();
         }
@@ -587,8 +688,43 @@ impl ShellClientRegistry {
             if job.client_id != body.client_id {
                 return Err("job_id does not belong to client_id".to_string());
             }
-            if is_final_job_status(&job.status) {
+            if job.agent_instance_id != body.agent_instance_id {
+                return Err("job_id belongs to a replaced runner instance".to_string());
+            }
+            if body
+                .request_id
+                .as_deref()
+                .is_some_and(|request_id| job.request_id.as_deref() != Some(request_id))
+            {
+                return Err("job update request_id does not match job_id".to_string());
+            }
+            if body.log_snapshot.is_some() && !sequenced {
+                return Err(
+                    "job update log_snapshot requires job_state_reconciliation capability"
+                        .to_string(),
+                );
+            }
+            if job.status == "recovering" && sequenced && body.log_snapshot.is_none() {
+                return Err(
+                    "recovering job update requires an authoritative log_snapshot or register inventory"
+                        .to_string(),
+                );
+            }
+            if sequenced && incoming_seq.is_some_and(|sequence| sequence <= job.last_update_seq) {
                 return Ok(job_view(job));
+            }
+            if is_final_job_status(&job.status) {
+                // Terminal class is server-authoritative once accepted.
+                return Ok(job_view(job));
+            }
+            if body.log_snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.stdout.next_line < job.stdout.next_line
+                    || snapshot.stderr.next_line < job.stderr.next_line
+            }) {
+                return Err(
+                    "job update authoritative log snapshot regresses an absolute cursor"
+                        .to_string(),
+                );
             }
             if let Err(error) = validate_validation_progress(job, &body) {
                 job.status = "failed".to_string();
@@ -598,10 +734,16 @@ impl ShellClientRegistry {
                 job.error = Some(format!("executor protocol violation: {}", error.0));
                 request_id_to_remove = job.request_id.clone();
             } else {
-                replace_limited(&mut job.stdout, body.stdout_tail);
-                replace_limited(&mut job.stderr, body.stderr_tail);
-                append_limited(&mut job.stdout, body.stdout_chunk);
-                append_limited(&mut job.stderr, body.stderr_chunk);
+                let was_recovering = job.status == "recovering";
+                if let Some(snapshot) = body.log_snapshot {
+                    super::jobs::replace_log_from_snapshot(&mut job.stdout, &snapshot.stdout);
+                    super::jobs::replace_log_from_snapshot(&mut job.stderr, &snapshot.stderr);
+                } else {
+                    replace_log_limited(&mut job.stdout, body.stdout_tail);
+                    replace_log_limited(&mut job.stderr, body.stderr_tail);
+                    append_log_limited(&mut job.stdout, body.stdout_chunk);
+                    append_log_limited(&mut job.stderr, body.stderr_chunk);
+                }
                 if body.validation_progress.is_some() {
                     job.validation_progress = body.validation_progress.clone();
                 }
@@ -627,6 +769,9 @@ impl ShellClientRegistry {
                     job.exit_code = body.exit_code;
                     job.duration_ms = body.duration_ms;
                     job.error = body.error;
+                    job.recovery_state = job.reconciled_at.map(|_| "reconciled".to_string());
+                    job.recovering_since = None;
+                    job.recovery_original_status = None;
                     request_id_to_remove = job.request_id.clone();
                 } else if body.error.is_some() {
                     job.error = body.error;
@@ -640,6 +785,17 @@ impl ShellClientRegistry {
                     job.ended_at = Some(now_ts());
                     request_id_to_remove = job.request_id.clone();
                 }
+                if was_recovering {
+                    job.recovery_state = Some("reconciled".to_string());
+                    job.reconciled_at = Some(now_ts());
+                    job.recovery_reason_code =
+                        Some("same_instance_update_reconciliation".to_string());
+                    job.recovering_since = None;
+                    job.recovery_original_status = None;
+                }
+            }
+            if let Some(sequence) = incoming_seq {
+                job.last_update_seq = sequence;
             }
             job_view(job)
         };
