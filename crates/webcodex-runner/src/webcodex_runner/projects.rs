@@ -1538,9 +1538,31 @@ mod shutdown_tests {
     use std::sync::Arc;
 
     fn process_exists(pid: i32) -> bool {
-        // SAFETY: signal 0 only probes a test child pid read from our fixture.
-        (unsafe { libc::kill(pid, 0) }) == 0
-            || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        // A Git descendant that ignored SIGTERM is SIGKILL'd by the private
+        // process-group cleanup; once its parent (the Git leader) exits, it
+        // lingers as a zombie until reaped. `kill(pid, 0)` still succeeds for a
+        // zombie because the PID entry persists, so it cannot tell a reaped
+        // leader from an unreaped zombie. Treat a zombie (state `Z`) as gone
+        // on Linux; on other Unixes fall back to the kill probe, which is the
+        // best liveness signal available without `/proc`.
+        #[cfg(target_os = "linux")]
+        {
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return false;
+            };
+            // /proc/<pid>/stat is `pid (comm) state ...`; `comm` may contain
+            // spaces or parens, so split on the last `") "`.
+            return stat
+                .rsplit_once(") ")
+                .and_then(|(_, rest)| rest.chars().next())
+                .is_some_and(|state| state != 'Z');
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // SAFETY: signal 0 only probes a test child pid read from our fixture.
+            (unsafe { libc::kill(pid, 0) }) == 0
+                || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        }
     }
 
     #[test]

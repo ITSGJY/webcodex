@@ -267,7 +267,13 @@ A fresh server can therefore rebuild the original `job_id`, ownership, status,
 bounded logs, and stop routing without re-executing the command. A recovered
 active job continues through `job_status`, `job_log`/`job_tail`, and
 `stop_job`; a job completed while the server was unavailable is restored from
-the retained terminal snapshot. Runner restart is deliberately outside this
+the retained terminal snapshot. A replacement `agent_instance_id` does not
+inherit the old instance's jobs (they are `lost` with `runner_instance_replaced`),
+and a delayed disconnect from a replaced instance is a no-op against the
+current instance. A malformed structured validation progress update is an
+executor protocol violation that moves the job to terminal `failed` with a
+bounded `validation_progress_invalid`-class error, retaining the last valid
+progress and never re-executing. Runner restart is deliberately outside this
 phase because the new process cannot recover old child handles. This layer
 does not merge Connector Execution with Full Runtime Job, provide generalized
 exactly-once command execution, or make a `run_job` invocation idempotent.

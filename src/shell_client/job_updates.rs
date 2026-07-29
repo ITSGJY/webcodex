@@ -63,7 +63,12 @@ fn validate_validation_progress(
         .as_ref()
         .map(|progress| progress.completed)
         .unwrap_or(0);
-    if progress.completed < previous {
+    // The `completed` cursor advances at most one step per update: an equal
+    // value is an idempotent replay, `previous + 1` is the legitimate single
+    // advance, and anything else is a protocol violation. Skipping ahead past
+    // unreported steps (or regressing) corrupts the fail-fast validation plan,
+    // so reject both directions rather than only the regression.
+    if progress.completed < previous || progress.completed > previous.saturating_add(1) {
         return invalid_progress("validation_progress_invalid");
     }
     let no_active_step = progress.current_step.is_none() && progress.failed_step.is_none();

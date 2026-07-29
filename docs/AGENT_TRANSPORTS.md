@@ -143,6 +143,20 @@ idempotent. `job_status`, bounded logs, and `stop_job(original_job_id)` resume
 after reconciliation. While the job is still `recovering`, `stop_job` reports
 `runner_unavailable_recovering` rather than fabricating success.
 
+A new `agent_instance_id` does not migrate or inherit the old instance's
+jobs; they are terminated to `lost` (`runner_instance_replaced`) at
+registration. A delayed disconnect from the already-replaced instance is a
+no-op with respect to the current instance — it does not clear the current
+notifier or affect the current instance's jobs — and it does not change the
+old instance's already-terminal `lost` job (first `ended_at`/reason retained).
+
+A malformed structured validation progress update is an executor protocol
+violation: it moves the job to terminal `failed` with a bounded, stable
+`validation_progress_invalid`-class error, retains the last accepted valid
+progress, sets `ended_at` once, releases the pending request, and never
+re-executes; an already terminal job is not revived by a late update or by
+register inventory.
+
 This continuity applies only while the runner process and its
 `agent_instance_id` survive. A runner process restart cannot reacquire old
 child handles. It is not a command exactly-once or `run_job` request
