@@ -1,6 +1,5 @@
-use super::{render_result, runtime};
+use super::{parse_json_body, render_result, require_runtime};
 use crate::action_audit::ActionAudit;
-use crate::json_error;
 use crate::tool_runtime::ToolCall;
 use salvo::prelude::*;
 use serde::Deserialize;
@@ -73,24 +72,11 @@ struct JobTailRequest {
 #[handler]
 pub async fn job_status(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let audit = ActionAudit::start(req, depot, "/api/jobs/status", "jobStatus");
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
+    let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
-    let body: JobStatusRequest = match req.parse_json().await {
-        Ok(body) => body,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid JSON: {}", e),
-            ));
-            return;
-        }
+    let Some(body) = parse_json_body::<JobStatusRequest>(req, res).await else {
+        return;
     };
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
     let result = runtime
@@ -108,24 +94,11 @@ pub async fn job_status(req: &mut Request, depot: &mut Depot, res: &mut Response
 #[handler]
 pub async fn job_log(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let audit = ActionAudit::start(req, depot, "/api/jobs/log", "jobLog");
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
+    let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
-    let body: JobLogRequest = match req.parse_json().await {
-        Ok(body) => body,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid JSON: {}", e),
-            ));
-            return;
-        }
+    let Some(body) = parse_json_body::<JobLogRequest>(req, res).await else {
+        return;
     };
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
     let result = runtime
@@ -149,24 +122,11 @@ pub async fn job_log(req: &mut Request, depot: &mut Depot, res: &mut Response) {
 #[handler]
 pub async fn job_stop(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let audit = ActionAudit::start(req, depot, "/api/jobs/stop", "jobStop");
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
+    let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
-    let body: JobStopRequest = match req.parse_json().await {
-        Ok(body) => body,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid JSON: {}", e),
-            ));
-            return;
-        }
+    let Some(body) = parse_json_body::<JobStopRequest>(req, res).await else {
+        return;
     };
     let result = runtime.stop_job(body.job_id).await;
     render_result(res, &audit, "job_stop", None, result);
@@ -179,24 +139,11 @@ pub async fn job_stop(req: &mut Request, depot: &mut Depot, res: &mut Response) 
 #[handler]
 pub async fn projects_run_job(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let audit = ActionAudit::start(req, depot, "/api/projects/run_job", "startProjectShellJob");
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
+    let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
-    let body: StartProjectShellJobRequest = match req.parse_json().await {
-        Ok(body) => body,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid JSON: {}", e),
-            ));
-            return;
-        }
+    let Some(body) = parse_json_body::<StartProjectShellJobRequest>(req, res).await else {
+        return;
     };
     let project = Some(body.project.clone());
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
@@ -228,24 +175,11 @@ pub async fn projects_run_shell(req: &mut Request, depot: &mut Depot, res: &mut 
         "/api/projects/run_shell",
         "runProjectShellCommand",
     );
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
+    let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
-    let body: RunShellRequest = match req.parse_json().await {
-        Ok(body) => body,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid JSON: {}", e),
-            ));
-            return;
-        }
+    let Some(body) = parse_json_body::<RunShellRequest>(req, res).await else {
+        return;
     };
     let project = Some(body.project.clone());
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
@@ -270,24 +204,11 @@ pub async fn projects_run_shell(req: &mut Request, depot: &mut Depot, res: &mut 
 #[handler]
 pub async fn jobs_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let audit = ActionAudit::start(req, depot, "/api/jobs/list", "listRuntimeJobs");
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
+    let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
-    let body: ListJobsRequest = match req.parse_json().await {
-        Ok(body) => body,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid JSON: {}", e),
-            ));
-            return;
-        }
+    let Some(body) = parse_json_body::<ListJobsRequest>(req, res).await else {
+        return;
     };
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
     let result = runtime
@@ -306,24 +227,11 @@ pub async fn jobs_list(req: &mut Request, depot: &mut Depot, res: &mut Response)
 #[handler]
 pub async fn job_tail(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let audit = ActionAudit::start(req, depot, "/api/jobs/tail", "getRuntimeJobTail");
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
+    let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
-    let body: JobTailRequest = match req.parse_json().await {
-        Ok(body) => body,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid JSON: {}", e),
-            ));
-            return;
-        }
+    let Some(body) = parse_json_body::<JobTailRequest>(req, res).await else {
+        return;
     };
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
     let result = runtime

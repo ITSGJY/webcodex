@@ -1,6 +1,5 @@
-use super::{render_result, runtime};
+use super::{parse_json_body, render_result, require_runtime};
 use crate::action_audit::ActionAudit;
-use crate::json_error;
 use crate::tool_runtime::ToolCall;
 use salvo::prelude::*;
 use serde::Deserialize;
@@ -130,24 +129,11 @@ struct SearchProjectTextRequest {
 #[handler]
 pub async fn projects_read_file(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let audit = ActionAudit::start(req, depot, "/api/projects/read_file", "readProjectFile");
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
+    let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
-    let body: ReadProjectFileRequest = match req.parse_json().await {
-        Ok(body) => body,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid JSON: {}", e),
-            ));
-            return;
-        }
+    let Some(body) = parse_json_body::<ReadProjectFileRequest>(req, res).await else {
+        return;
     };
     let project = Some(body.project.clone());
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
@@ -175,24 +161,11 @@ pub async fn projects_git_status(req: &mut Request, depot: &mut Depot, res: &mut
         "/api/projects/git_status",
         "getProjectGitStatus",
     );
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
+    let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
-    let body: ProjectIdRequest = match req.parse_json().await {
-        Ok(body) => body,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid JSON: {}", e),
-            ));
-            return;
-        }
+    let Some(body) = parse_json_body::<ProjectIdRequest>(req, res).await else {
+        return;
     };
     let project = Some(body.project.clone());
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
@@ -213,24 +186,11 @@ pub async fn projects_git_status(req: &mut Request, depot: &mut Depot, res: &mut
 #[handler]
 pub async fn projects_git_diff(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let audit = ActionAudit::start(req, depot, "/api/projects/git_diff", "getProjectGitDiff");
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
+    let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
-    let body: ProjectGitDiffRequest = match req.parse_json().await {
-        Ok(body) => body,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid JSON: {}", e),
-            ));
-            return;
-        }
+    let Some(body) = parse_json_body::<ProjectGitDiffRequest>(req, res).await else {
+        return;
     };
     let project = Some(body.project.clone());
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
@@ -253,24 +213,11 @@ pub async fn projects_git_diff(req: &mut Request, depot: &mut Depot, res: &mut R
 #[handler]
 pub async fn projects_apply_patch(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let audit = ActionAudit::start(req, depot, "/api/projects/apply_patch", "applyProjectPatch");
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
+    let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
-    let body: ApplyPatchRequest = match req.parse_json().await {
-        Ok(body) => body,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid JSON: {}", e),
-            ));
-            return;
-        }
+    let Some(body) = parse_json_body::<ApplyPatchRequest>(req, res).await else {
+        return;
     };
     let project = Some(body.project.clone());
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
@@ -299,24 +246,11 @@ pub async fn projects_validate_patch(req: &mut Request, depot: &mut Depot, res: 
         "/api/projects/validate_patch",
         "validateProjectPatch",
     );
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
+    let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
-    let body: ValidatePatchRequest = match req.parse_json().await {
-        Ok(body) => body,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid JSON: {}", e),
-            ));
-            return;
-        }
+    let Some(body) = parse_json_body::<ValidatePatchRequest>(req, res).await else {
+        return;
     };
     let project = Some(body.project.clone());
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
@@ -351,24 +285,11 @@ pub async fn projects_apply_patch_checked(
         "/api/projects/apply_patch_checked",
         "applyProjectPatchChecked",
     );
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
+    let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
-    let body: ApplyPatchCheckedRequest = match req.parse_json().await {
-        Ok(body) => body,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid JSON: {}", e),
-            ));
-            return;
-        }
+    let Some(body) = parse_json_body::<ApplyPatchCheckedRequest>(req, res).await else {
+        return;
     };
     let project = Some(body.project.clone());
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
@@ -398,24 +319,11 @@ pub async fn projects_delete_files(req: &mut Request, depot: &mut Depot, res: &m
         "/api/projects/delete_files",
         "deleteProjectFiles",
     );
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
+    let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
-    let body: DeleteProjectFilesRequest = match req.parse_json().await {
-        Ok(body) => body,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid JSON: {}", e),
-            ));
-            return;
-        }
+    let Some(body) = parse_json_body::<DeleteProjectFilesRequest>(req, res).await else {
+        return;
     };
     let project = Some(body.project.clone());
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
@@ -444,24 +352,11 @@ pub async fn projects_git_restore_paths(req: &mut Request, depot: &mut Depot, re
         "/api/projects/git_restore_paths",
         "gitRestorePaths",
     );
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
+    let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
-    let body: GitRestorePathsRequest = match req.parse_json().await {
-        Ok(body) => body,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid JSON: {}", e),
-            ));
-            return;
-        }
+    let Some(body) = parse_json_body::<GitRestorePathsRequest>(req, res).await else {
+        return;
     };
     let project = Some(body.project.clone());
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
@@ -490,24 +385,11 @@ pub async fn projects_discard_untracked(req: &mut Request, depot: &mut Depot, re
         "/api/projects/discard_untracked",
         "discardUntrackedFiles",
     );
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
+    let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
-    let body: DiscardUntrackedRequest = match req.parse_json().await {
-        Ok(body) => body,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid JSON: {}", e),
-            ));
-            return;
-        }
+    let Some(body) = parse_json_body::<DiscardUntrackedRequest>(req, res).await else {
+        return;
     };
     let project = Some(body.project.clone());
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
@@ -528,24 +410,11 @@ pub async fn projects_discard_untracked(req: &mut Request, depot: &mut Depot, re
 #[handler]
 pub async fn projects_list_files(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let audit = ActionAudit::start(req, depot, "/api/projects/list_files", "listProjectFiles");
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
+    let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
-    let body: ListProjectFilesRequest = match req.parse_json().await {
-        Ok(body) => body,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid JSON: {}", e),
-            ));
-            return;
-        }
+    let Some(body) = parse_json_body::<ListProjectFilesRequest>(req, res).await else {
+        return;
     };
     let project = body.project.clone();
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
@@ -567,24 +436,11 @@ pub async fn projects_list_files(req: &mut Request, depot: &mut Depot, res: &mut
 #[handler]
 pub async fn projects_search_text(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let audit = ActionAudit::start(req, depot, "/api/projects/search_text", "searchProjectText");
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
+    let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
-    let body: SearchProjectTextRequest = match req.parse_json().await {
-        Ok(body) => body,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid JSON: {}", e),
-            ));
-            return;
-        }
+    let Some(body) = parse_json_body::<SearchProjectTextRequest>(req, res).await else {
+        return;
     };
     let project = body.project.clone();
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
@@ -618,24 +474,11 @@ pub async fn projects_git_diff_summary(req: &mut Request, depot: &mut Depot, res
         "/api/projects/git_diff_summary",
         "getProjectGitDiffSummary",
     );
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
+    let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
-    let body: ProjectIdRequest = match req.parse_json().await {
-        Ok(body) => body,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid JSON: {}", e),
-            ));
-            return;
-        }
+    let Some(body) = parse_json_body::<ProjectIdRequest>(req, res).await else {
+        return;
     };
     let project = body.project.clone();
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
