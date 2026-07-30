@@ -1,5 +1,6 @@
 use crate::auth::{
-    generate_api_token, hash_token, scopes_to_string, token_prefix, validate_scopes,
+    clean_token_name, generate_api_token, hash_token, is_unique_constraint_error,
+    normalize_token_hash, scopes_to_string, token_prefix, validate_scopes, validate_token_prefix,
     validate_username, AuthContext, SCOPE_ADMIN,
 };
 use crate::json_error;
@@ -12,8 +13,6 @@ use super::{reject_agent_token, require_admin_or_self, require_user_by_username}
 
 /// Maximum number of tokens returned by `listApiTokens`.
 const MAX_TOKENS_LIST: usize = 200;
-/// Maximum length of a token `name`.
-const MAX_TOKEN_NAME_LEN: usize = 128;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct CreateApiTokenRequest {
@@ -67,37 +66,6 @@ fn token_summary(key: &ApiKeyRecord) -> Value {
     })
 }
 
-fn normalize_token_hash(value: &str) -> Result<String, String> {
-    let raw = value
-        .trim()
-        .strip_prefix("sha256:")
-        .unwrap_or_else(|| value.trim());
-    if raw.len() != 64 || !raw.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err("token_hash must be sha256:<64 hex> or bare 64 hex".to_string());
-    }
-    Ok(raw.to_ascii_lowercase())
-}
-
-fn validate_pat_prefix(value: &str) -> Result<String, String> {
-    let value = value.trim();
-    if !value.starts_with("wc_pat_") {
-        return Err("token_prefix must start with wc_pat_".to_string());
-    }
-    if value.len() <= "wc_pat_".len() || value.len() > 32 {
-        return Err("token_prefix length is invalid".to_string());
-    }
-    if !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return Err("token_prefix contains invalid characters".to_string());
-    }
-    Ok(value.to_string())
-}
-
-fn is_unique_constraint_error(e: &anyhow::Error) -> bool {
-    e.to_string()
-        .to_ascii_lowercase()
-        .contains("unique constraint failed")
-}
-
 /// `POST /api/tokens/create` — operationId `createApiToken`.
 ///
 /// Bootstrap/admin may create a token for any user; a normal user may create a
@@ -144,19 +112,14 @@ pub(crate) async fn tokens_create(req: &mut Request, depot: &mut Depot, res: &mu
         return;
     }
 
-    let token_name = body
-        .name
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "default".to_string());
-    if token_name.chars().count() > MAX_TOKEN_NAME_LEN {
-        res.status_code(StatusCode::BAD_REQUEST);
-        res.render(json_error(
-            StatusCode::BAD_REQUEST,
-            "token name is too long",
-        ));
-        return;
-    }
+    let token_name = match clean_token_name(body.name, "default") {
+        Ok(n) => n,
+        Err(e) => {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(json_error(StatusCode::BAD_REQUEST, e));
+            return;
+        }
+    };
 
     let scopes = match validate_scopes(&body.scopes.unwrap_or_default()) {
         Ok(s) => s,
@@ -290,19 +253,14 @@ pub(crate) async fn tokens_register_hash(req: &mut Request, depot: &mut Depot, r
         return;
     }
 
-    let token_name = body
-        .name
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "default".to_string());
-    if token_name.chars().count() > MAX_TOKEN_NAME_LEN {
-        res.status_code(StatusCode::BAD_REQUEST);
-        res.render(json_error(
-            StatusCode::BAD_REQUEST,
-            "token name is too long",
-        ));
-        return;
-    }
+    let token_name = match clean_token_name(body.name, "default") {
+        Ok(n) => n,
+        Err(e) => {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(json_error(StatusCode::BAD_REQUEST, e));
+            return;
+        }
+    };
     let token_hash = match normalize_token_hash(&body.token_hash) {
         Ok(h) => h,
         Err(e) => {
@@ -311,7 +269,7 @@ pub(crate) async fn tokens_register_hash(req: &mut Request, depot: &mut Depot, r
             return;
         }
     };
-    let token_prefix = match validate_pat_prefix(&body.token_prefix) {
+    let token_prefix = match validate_token_prefix(&body.token_prefix, "wc_pat_") {
         Ok(p) => p,
         Err(e) => {
             res.status_code(StatusCode::BAD_REQUEST);

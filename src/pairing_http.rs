@@ -7,10 +7,10 @@
 //! OpenAPI and are not exposed as MCP tools.
 
 use crate::auth::{
-    generate_agent_token, generate_api_token, hash_token, scopes_to_string, token_prefix,
-    validate_allowed_client_id, validate_username, AuthContext, SCOPE_AGENT_JOB_UPDATE,
-    SCOPE_AGENT_POLL, SCOPE_AGENT_REGISTER, SCOPE_AGENT_RESULT, SCOPE_JOB_RUN, SCOPE_PROJECT_READ,
-    SCOPE_PROJECT_WRITE, SCOPE_RUNTIME_READ,
+    clean_token_name, generate_agent_token, generate_api_token, hash_token, scopes_to_string,
+    token_prefix, validate_allowed_client_id, validate_username, AuthContext,
+    SCOPE_AGENT_JOB_UPDATE, SCOPE_AGENT_POLL, SCOPE_AGENT_REGISTER, SCOPE_AGENT_RESULT,
+    SCOPE_JOB_RUN, SCOPE_PROJECT_READ, SCOPE_PROJECT_WRITE, SCOPE_RUNTIME_READ,
 };
 use crate::db::PairingConsumeResult;
 use crate::json_error;
@@ -24,7 +24,6 @@ use serde_json::{json, Value};
 const DEFAULT_TTL_SECS: i64 = 600;
 const MIN_TTL_SECS: i64 = 60;
 const MAX_TTL_SECS: i64 = 3600;
-const MAX_TOKEN_NAME_LEN: usize = 128;
 
 const ENROLL_USER_SCOPES: &[&str] = &[
     SCOPE_RUNTIME_READ,
@@ -82,17 +81,6 @@ fn clean_display_name(value: Option<String>) -> Result<Option<String>, String> {
         if v.chars().count() > 128 {
             return Err("display_name is too long".to_string());
         }
-    }
-    Ok(value)
-}
-
-fn clean_token_name(value: Option<String>, fallback: &str) -> Result<String, String> {
-    let value = value
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| fallback.to_string());
-    if value.chars().count() > MAX_TOKEN_NAME_LEN {
-        return Err("token name is too long".to_string());
     }
     Ok(value)
 }

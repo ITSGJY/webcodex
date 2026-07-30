@@ -83,10 +83,11 @@ pub(crate) use middleware::{
 
 #[allow(unused_imports)]
 pub(crate) use pat::{
-    generate_account_credential, generate_agent_token, generate_api_token,
+    clean_token_name, generate_account_credential, generate_agent_token, generate_api_token,
     generate_oauth_access_token, generate_oauth_authorization_code, generate_oauth_client_id,
-    generate_oauth_client_secret, generate_oauth_refresh_token, hash_token, token_prefix,
-    validate_allowed_client_id, validate_role, validate_username,
+    generate_oauth_client_secret, generate_oauth_refresh_token, hash_token,
+    is_unique_constraint_error, normalize_token_hash, token_prefix, validate_allowed_client_id,
+    validate_role, validate_token_prefix, validate_username, MAX_TOKEN_NAME_LEN,
 };
 
 #[allow(unused_imports)]

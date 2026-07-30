@@ -1,6 +1,7 @@
 use crate::auth::{
-    generate_agent_token, hash_token, is_agent_scope, scopes_to_string, token_prefix,
-    validate_agent_scopes, validate_allowed_client_id, validate_username, AuthContext,
+    clean_token_name, generate_agent_token, hash_token, is_agent_scope, is_unique_constraint_error,
+    normalize_token_hash, scopes_to_string, token_prefix, validate_agent_scopes,
+    validate_allowed_client_id, validate_token_prefix, validate_username, AuthContext,
     AGENT_SCOPES,
 };
 use crate::json_error;
@@ -9,18 +10,10 @@ use salvo::prelude::*;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{
-    require_admin_or_self, require_user_by_username,
-    responses::{
-        agent_token_summary, is_unique_constraint_error, normalize_token_hash,
-        validate_agent_prefix,
-    },
-};
+use super::{require_admin_or_self, require_user_by_username, responses::agent_token_summary};
 
 /// Maximum number of agent tokens returned by `listAgentTokens`.
 const MAX_AGENT_TOKENS_LIST: usize = 200;
-/// Maximum length of a token `name`.
-const MAX_TOKEN_NAME_LEN: usize = 128;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct CreateAgentTokenRequest {
@@ -121,19 +114,14 @@ pub(crate) async fn agent_tokens_create(req: &mut Request, depot: &mut Depot, re
         }
     };
 
-    let token_name = body
-        .name
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "default".to_string());
-    if token_name.chars().count() > MAX_TOKEN_NAME_LEN {
-        res.status_code(StatusCode::BAD_REQUEST);
-        res.render(json_error(
-            StatusCode::BAD_REQUEST,
-            "token name is too long",
-        ));
-        return;
-    }
+    let token_name = match clean_token_name(body.name, "default") {
+        Ok(n) => n,
+        Err(e) => {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(json_error(StatusCode::BAD_REQUEST, e));
+            return;
+        }
+    };
 
     // Default to all agent transport scopes when omitted.
     let scopes = match body.scopes {
@@ -297,19 +285,14 @@ pub(crate) async fn agent_tokens_register_hash(
             return;
         }
     };
-    let token_name = body
-        .name
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| allowed_client_id.clone());
-    if token_name.chars().count() > MAX_TOKEN_NAME_LEN {
-        res.status_code(StatusCode::BAD_REQUEST);
-        res.render(json_error(
-            StatusCode::BAD_REQUEST,
-            "token name is too long",
-        ));
-        return;
-    }
+    let token_name = match clean_token_name(body.name, &allowed_client_id) {
+        Ok(n) => n,
+        Err(e) => {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(json_error(StatusCode::BAD_REQUEST, e));
+            return;
+        }
+    };
     let token_hash = match normalize_token_hash(&body.token_hash) {
         Ok(h) => h,
         Err(e) => {
@@ -318,7 +301,7 @@ pub(crate) async fn agent_tokens_register_hash(
             return;
         }
     };
-    let token_prefix = match validate_agent_prefix(&body.token_prefix) {
+    let token_prefix = match validate_token_prefix(&body.token_prefix, "wc_agent_") {
         Ok(p) => p,
         Err(e) => {
             res.status_code(StatusCode::BAD_REQUEST);

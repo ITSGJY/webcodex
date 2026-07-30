@@ -11,6 +11,10 @@ use sha2::{Digest, Sha256};
 /// Two uuid v4 simple values concatenated = 64 hex chars = 256 bits of entropy.
 const TOKEN_RANDOM_HEX_LEN: usize = 64;
 
+/// Maximum length (in chars) of a token `name` supplied by clients. Shared by
+/// the PAT, agent-token, and pairing endpoints.
+pub(crate) const MAX_TOKEN_NAME_LEN: usize = 128;
+
 /// Hash a plaintext token with SHA-256 and return a lowercase hex digest.
 ///
 /// This is the **single** place token hashing is performed; all token lookups
@@ -201,6 +205,58 @@ pub(crate) fn validate_role(role: &str) -> Result<String, String> {
         "admin" | "user" => Ok(role.to_string()),
         _ => Err(format!("role must be 'admin' or 'user', got '{}'", role)),
     }
+}
+
+/// Normalize a client-supplied token hash to a bare lowercase 64-char hex
+/// string, accepting either a `sha256:<hex>` prefix or a bare hash. Shared by
+/// the PAT and agent-token registration endpoints.
+pub(crate) fn normalize_token_hash(value: &str) -> Result<String, String> {
+    let raw = value
+        .trim()
+        .strip_prefix("sha256:")
+        .unwrap_or_else(|| value.trim());
+    if raw.len() != 64 || !raw.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("token_hash must be sha256:<64 hex> or bare 64 hex".to_string());
+    }
+    Ok(raw.to_ascii_lowercase())
+}
+
+/// Validate a token prefix against its expected leading tag (e.g. `wc_pat_`
+/// or `wc_agent_`): must start with `tag`, be longer than the tag, at most 32
+/// chars, and contain only `[A-Za-z0-9_]`.
+pub(crate) fn validate_token_prefix(value: &str, tag: &str) -> Result<String, String> {
+    let value = value.trim();
+    if !value.starts_with(tag) {
+        return Err(format!("token_prefix must start with {tag}"));
+    }
+    if value.len() <= tag.len() || value.len() > 32 {
+        return Err("token_prefix length is invalid".to_string());
+    }
+    if !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err("token_prefix contains invalid characters".to_string());
+    }
+    Ok(value.to_string())
+}
+
+/// True when a database insert failed because of a uniqueness violation.
+pub(crate) fn is_unique_constraint_error(e: &anyhow::Error) -> bool {
+    e.to_string()
+        .to_ascii_lowercase()
+        .contains("unique constraint failed")
+}
+
+/// Normalize a client-supplied token `name`: trim, fall back to `fallback`
+/// when empty, and reject names longer than [`MAX_TOKEN_NAME_LEN`]. Shared by
+/// the PAT, agent-token, and pairing endpoints.
+pub(crate) fn clean_token_name(value: Option<String>, fallback: &str) -> Result<String, String> {
+    let value = value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| fallback.to_string());
+    if value.chars().count() > MAX_TOKEN_NAME_LEN {
+        return Err("token name is too long".to_string());
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
