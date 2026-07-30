@@ -8,7 +8,7 @@ use salvo::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{is_admin_caller, reject_agent_token, require_admin_or_self, require_user_by_username};
+use super::{reject_agent_token, require_admin_or_self, require_user_by_username};
 
 /// Maximum number of tokens returned by `listApiTokens`.
 const MAX_TOKENS_LIST: usize = 200;
@@ -168,7 +168,7 @@ pub(crate) async fn tokens_create(req: &mut Request, depot: &mut Depot, res: &mu
     };
     // A normal user may not grant themselves the `admin` scope; only
     // bootstrap/admin callers can mint admin-scoped tokens.
-    if scopes.iter().any(|s| s == SCOPE_ADMIN) && !is_admin_caller(auth) {
+    if scopes.iter().any(|s| s == SCOPE_ADMIN) && !auth.is_admin_caller() {
         res.status_code(StatusCode::FORBIDDEN);
         res.render(json_error(
             StatusCode::FORBIDDEN,
@@ -327,7 +327,7 @@ pub(crate) async fn tokens_register_hash(req: &mut Request, depot: &mut Depot, r
             return;
         }
     };
-    if scopes.iter().any(|s| s == SCOPE_ADMIN) && !is_admin_caller(auth) {
+    if scopes.iter().any(|s| s == SCOPE_ADMIN) && !auth.is_admin_caller() {
         res.status_code(StatusCode::FORBIDDEN);
         res.render(json_error(
             StatusCode::FORBIDDEN,

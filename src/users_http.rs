@@ -16,7 +16,7 @@
 //! - Unauthorized responses are JSON with a generic `error` message that does
 //!   not leak whether a token prefix or username exists.
 
-use crate::auth::{AuthContext, SCOPE_ADMIN};
+use crate::auth::AuthContext;
 #[cfg(test)]
 use crate::models::ApiKeyRecord;
 use crate::models::UserRecord;
@@ -35,13 +35,6 @@ pub(crate) use users::{users_create, users_list, users_me};
 // Auth helpers
 // ---------------------------------------------------------------------------
 
-/// True when the caller may manage any user (bootstrap token or `admin` role).
-fn is_admin_caller(auth: &AuthContext) -> bool {
-    auth.is_bootstrap
-        || auth.role.as_deref() == Some("admin")
-        || auth.scopes.iter().any(|s| s == SCOPE_ADMIN)
-}
-
 /// Phase 3: agent tokens must not be able to call user/token management
 /// endpoints. Returns an error response tuple when the caller is an agent
 /// token.
@@ -56,16 +49,6 @@ fn reject_agent_token(auth: &AuthContext) -> Result<(), (StatusCode, String)> {
     }
 }
 
-/// Resolve the authenticated caller's username, if any. Bootstrap callers do
-/// not have a username.
-fn caller_username(auth: &AuthContext) -> Option<&str> {
-    if auth.is_bootstrap {
-        None
-    } else {
-        auth.username.as_deref()
-    }
-}
-
 /// Enforce that the caller may act on `target_username`:
 /// - bootstrap/admin may act on anyone;
 /// - a normal user may only act on themselves.
@@ -73,10 +56,10 @@ fn require_admin_or_self(
     auth: &AuthContext,
     target_username: &str,
 ) -> Result<(), (StatusCode, String)> {
-    if is_admin_caller(auth) {
+    if auth.is_admin_caller() {
         return Ok(());
     }
-    match caller_username(auth) {
+    match auth.caller_username() {
         Some(caller) if caller == target_username => Ok(()),
         _ => Err((
             StatusCode::FORBIDDEN,

@@ -21,9 +21,9 @@
 //! - Agent tokens may not call the Phase 2 personal API token management
 //!   endpoints either.
 
+use crate::auth::AuthContext;
 #[cfg(test)]
 use crate::auth::AGENT_SCOPES;
-use crate::auth::{AuthContext, SCOPE_ADMIN};
 #[cfg(test)]
 use crate::models::ApiKeyRecord;
 use crate::Database;
@@ -44,23 +44,6 @@ pub(crate) use routes::{
 // Auth helpers (mirror users_http.rs)
 // ---------------------------------------------------------------------------
 
-/// True when the caller may manage any user (bootstrap token or `admin` role).
-fn is_admin_caller(auth: &AuthContext) -> bool {
-    auth.is_bootstrap
-        || auth.role.as_deref() == Some("admin")
-        || auth.scopes.iter().any(|s| s == SCOPE_ADMIN)
-}
-
-/// Resolve the authenticated caller's username, if any. Bootstrap callers do
-/// not have a username.
-fn caller_username(auth: &AuthContext) -> Option<&str> {
-    if auth.is_bootstrap {
-        None
-    } else {
-        auth.username.as_deref()
-    }
-}
-
 /// Enforce that the caller may act on `target_username`:
 /// - bootstrap/admin may act on anyone;
 /// - a normal user may only act on themselves.
@@ -68,10 +51,10 @@ fn require_admin_or_self(
     auth: &AuthContext,
     target_username: &str,
 ) -> Result<(), (StatusCode, String)> {
-    if is_admin_caller(auth) {
+    if auth.is_admin_caller() {
         return Ok(());
     }
-    match caller_username(auth) {
+    match auth.caller_username() {
         Some(caller) if caller == target_username => Ok(()),
         _ => Err((
             StatusCode::FORBIDDEN,

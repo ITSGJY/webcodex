@@ -8,7 +8,7 @@ use salvo::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{is_admin_caller, reject_agent_token};
+use super::reject_agent_token;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct CreateUserRequest {
@@ -74,7 +74,7 @@ pub(crate) async fn users_create(req: &mut Request, depot: &mut Depot, res: &mut
         ));
         return;
     };
-    if !is_admin_caller(auth) {
+    if !auth.is_admin_caller() {
         res.status_code(StatusCode::FORBIDDEN);
         res.render(json_error(
             StatusCode::FORBIDDEN,
@@ -253,7 +253,7 @@ pub(crate) async fn users_list(depot: &mut Depot, res: &mut Response) {
         ));
         return;
     };
-    if !is_admin_caller(auth) {
+    if !auth.is_admin_caller() {
         res.status_code(StatusCode::FORBIDDEN);
         res.render(json_error(
             StatusCode::FORBIDDEN,

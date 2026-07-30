@@ -114,4 +114,25 @@ impl AuthContext {
     pub fn is_lightweight(&self) -> bool {
         self.is_shared_key() || self.is_open_anonymous()
     }
+
+    /// True when the caller may manage any user (bootstrap token, `admin`
+    /// role, or the `admin` scope). Shared by the user/token/pairing HTTP
+    /// handlers; kept distinct from [`AuthContext::is_admin`] because some
+    /// callers historically also treat an explicit `admin` role as
+    /// authoritative.
+    pub fn is_admin_caller(&self) -> bool {
+        self.is_bootstrap
+            || self.role.as_deref() == Some("admin")
+            || self.scopes.iter().any(|s| s == SCOPE_ADMIN)
+    }
+
+    /// Resolve the authenticated caller's username, if any. Bootstrap callers
+    /// do not have a username.
+    pub fn caller_username(&self) -> Option<&str> {
+        if self.is_bootstrap {
+            None
+        } else {
+            self.username.as_deref()
+        }
+    }
 }

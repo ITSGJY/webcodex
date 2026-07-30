@@ -8,9 +8,9 @@
 
 use crate::auth::{
     generate_agent_token, generate_api_token, hash_token, scopes_to_string, token_prefix,
-    validate_allowed_client_id, validate_username, AuthContext, SCOPE_ADMIN,
-    SCOPE_AGENT_JOB_UPDATE, SCOPE_AGENT_POLL, SCOPE_AGENT_REGISTER, SCOPE_AGENT_RESULT,
-    SCOPE_JOB_RUN, SCOPE_PROJECT_READ, SCOPE_PROJECT_WRITE, SCOPE_RUNTIME_READ,
+    validate_allowed_client_id, validate_username, AuthContext, SCOPE_AGENT_JOB_UPDATE,
+    SCOPE_AGENT_POLL, SCOPE_AGENT_REGISTER, SCOPE_AGENT_RESULT, SCOPE_JOB_RUN, SCOPE_PROJECT_READ,
+    SCOPE_PROJECT_WRITE, SCOPE_RUNTIME_READ,
 };
 use crate::db::PairingConsumeResult;
 use crate::json_error;
@@ -72,12 +72,6 @@ pub(crate) struct PairingEnrollRequest {
     pub allowed_roots: Option<Vec<String>>,
     #[serde(default)]
     pub allow_cwd_anywhere: Option<bool>,
-}
-
-fn is_admin_caller(auth: &AuthContext) -> bool {
-    auth.is_bootstrap
-        || auth.role.as_deref() == Some("admin")
-        || auth.scopes.iter().any(|s| s == SCOPE_ADMIN)
 }
 
 fn clean_display_name(value: Option<String>) -> Result<Option<String>, String> {
@@ -143,7 +137,7 @@ pub(crate) async fn pairing_create(req: &mut Request, depot: &mut Depot, res: &m
         ));
         return;
     };
-    if auth.is_agent_token() || !is_admin_caller(auth) {
+    if auth.is_agent_token() || !auth.is_admin_caller() {
         res.status_code(StatusCode::FORBIDDEN);
         res.render(json_error(
             StatusCode::FORBIDDEN,
