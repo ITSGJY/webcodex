@@ -118,7 +118,9 @@ session 是 task-continuity evidence，不是完整监控日志。它记录有�
 
 `finish_coding_task` 是常规收口工具。它可以包含 review evidence、workspace hygiene、validation summary、job state、warnings 和规范的 task/evidence outcomes。
 
-`session_handoff_summary` 是只读 handoff 工具。当另一个 operator、client 或后续 session 需要接手时使用。
+`session_handoff_summary` 是只读 handoff 工���。当另一个 operator、client 或后续 session 需要接手时使用。
+
+两者与 `start_coding_task` 一并暴露确定性的 `continuation_feedback` 投影，描述上一轮 attempt 的活动、已修改路径、validation 状态以及可证明的 Job/guidance 状态，并提供仅在两次 validation 运行被证明覆盖同一 scope 时才可比的 `validation_delta`。它既不是 LLM summary，也不是新的 verdict，更不会重新执行 validation。
 
 ### Validation
 

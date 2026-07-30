@@ -174,6 +174,19 @@ See also [`TESTING.md`](../TESTING.md).
 - `validation_summary` is a read of existing ledger evidence; it does not
   re-run Cargo/shell or replace `finish_coding_task`. Handoff and finish reuse
   this projection instead of building independent validation truth.
+- `continuation_feedback` (surfaced by `start_coding_task`,
+  `finish_coding_task`, `session_handoff_summary`; its `validation_delta` part
+  also by `validation_summary`) is a deterministic, read-only projection of
+  the prior attempt over existing ledger/evidence/Job/message-board state. It
+  is never an LLM summary, never a new verdict, never a second attempt state
+  machine, and introduces no new persistent table. Validation delta is only
+  comparable when scope/evidence and parser identity are proven; otherwise it
+  reports a stable reason code. `scope_identity` is an opaque, domain-separated
+  SHA-256 over the normalized structured scope — it never re-exposes command
+  text or absolute paths. When the attempt boundary has been evicted by the
+  bounded event window, the projection reports `complete = false` rather than
+  masquerading a truncated window as the session start. See
+  [`session-model.md`](session-model.md) §Continuation feedback.
 
 Closeout is an Agent-ready fact package, not a context-free engineering judge.
 Its primary layers are `facts`, `hard_blockers`, and `advisories`. Ordinary

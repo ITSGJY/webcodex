@@ -94,7 +94,11 @@ Workflow Session. `new_session=true` is the explicit advanced isolation
 request. The exact binding is cached in-process and persisted as a bounded,
 hashed projection, so the same stable window and repository can restore it
 after a server restart. Retain the returned session id for explicit recovery
-when that transport identity is unavailable.
+when that transport identity is unavailable. The returned
+`continuation_feedback` is a deterministic, read-only projection of the
+*previous* attempt's activity, changes, and validation state (plus a
+`validation_delta` only comparable across proven-equal scope); it is never an
+LLM summary or a new verdict, and it does not run validation.
 
 The stable IDs have product purposes between model tools and host review, but
 ordinary users do not manage them:

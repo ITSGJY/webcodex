@@ -332,6 +332,8 @@ The parser is deterministic and fail-closed. It consumes only the bounded, sanit
 
 `validation_summary` is a project-read, explicit-session query over this same aggregation. It does not execute Cargo or shell, enqueue an agent request, read project files, mutate the workspace, or record itself as validation evidence. It is useful for a fresh MCP window or review, but it does not replace `finish_coding_task`, which also evaluates workspace, jobs, hygiene, failure expectations, evidence integrity, and the canonical final task/evidence outcomes.
 
+`start_coding_task`, `finish_coding_task`, and `session_handoff_summary` (and `validation_summary`, for its `validation_delta` part) surface a deterministic `continuation_feedback` projection of the previous attempt over existing ledger/evidence/Job/message-board state. It is read-only — no shell, file reads, agent/runner requests, ledger mutation, activity refresh, guidance consumption, or LLM call — and adds no new persistent table or second attempt state machine. Validation delta is comparable only when both runs are proven to cover the same structured scope with complete evidence and a consistent parser identity; otherwise it reports a stable reason code. Its `scope_identity` is an opaque, domain-separated SHA-256 that never re-exposes command text or absolute paths, and when the attempt boundary has been evicted by the bounded event window it reports `complete = false` rather than claiming a full attempt.
+
 ## Auth, Policy, And Audit
 
 - `auth` owns bearer authentication, principal modeling, scope constants, route gates, shared-key helpers, PAT verification, and OAuth token verification.

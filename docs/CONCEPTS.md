@@ -128,6 +128,8 @@ Sessions are task-continuity evidence, not a full surveillance log. They record 
 
 `session_handoff_summary` is the read-only handoff tool. Use it when another operator, client, or later session needs to continue from the current state.
 
+Both, together with `start_coding_task`, also surface a deterministic `continuation_feedback` projection of the previous attempt — a read-only summary of the last attempt's activity, changed paths, validation state, and proven Job/guidance status, plus a `validation_delta` that is only comparable when the two validation runs are proven to cover the same scope. It is never an LLM summary, never a new verdict, and never re-runs validation.
+
 ### Validation
 
 Validation is evidence that the change was checked. WebCodex provides structured helpers such as `validate_patch`, `cargo_fmt`, `cargo_check`, and `cargo_test`.

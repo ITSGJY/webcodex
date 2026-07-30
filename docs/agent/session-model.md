@@ -215,6 +215,60 @@ This is **not** the same state machine as Action Audit Sessions. Lifecycle
 tools and error kinds (`unknown_session_id`, `session_closed`, mode denials,
 guard failures) apply only to Workflow Sessions.
 
+### Continuation feedback (`continuation_feedback`)
+
+`continuation_feedback` is a **deterministic, read-only projection** surfaced
+by `start_coding_task`, `finish_coding_task`, `session_handoff_summary`, and
+(as `validation_delta`) `validation_summary`. It is derived only from existing
+persistent state — the Workflow Session ledger, validation evidence, bounded
+Job metadata, and the session message board — and it is never a substitute for
+a `finish_coding_task` verdict.
+
+- **Read-only contract:** it never executes shell, reads project files,
+  enqueues Agent/Runner requests, mutates the ledger, refreshes activity,
+  consumes or auto-resolves guidance, or calls an LLM. Surfacing it on
+  `start_coding_task` appends only the legitimate new `task_instruction` event
+  and no further events; reading it never changes `updated`/activity timestamps.
+- **Startup describes the previous attempt:** for reused, explicitly resumed,
+  and restored-after-restart sessions, `start_coding_task` snapshots the
+  pre-instruction state *before* appending the new instruction, so
+  `continuation_feedback.attempt` describes the *previous* attempt's activity,
+  changes, and validation — not the empty new attempt. A fresh session reports
+  `status = not_applicable`, `reason_code = fresh_session`.
+- **Attempt boundary:** the attempt window is segmented by the most recent
+  `task_instruction` retained in the ledger window. When that instruction has
+  been evicted by the bounded event limit, the boundary is reported as
+  `source = unavailable`, `reason_code = attempt_boundary_evicted`, and
+  `event_range.complete = false` — the projection never masquerades a truncated
+  retained window as `session_start` with `complete = true`.
+- **Handoff is independent of the display limit:** `session_handoff_summary`
+  builds its display list from the caller-supplied `limit`, but
+  `continuation_feedback` reads an independent bounded evidence snapshot (the
+  maximum retained event window), so a small display limit cannot shrink the
+  attempt boundary. `include_validation = false` does not fabricate validation;
+  it reports `validation_not_requested` rather than `not_run`.
+- **Validation delta comparability:** `validation_delta` is `available` only
+  when the latest and prior runs are *proven* comparable — same validation
+  kind/tool/cwd and structured scope (package, filter, features, targets,
+  purpose), with complete evidence on both sides and a consistent parser
+  identity. Otherwise it reports a stable reason code
+  (`no_previous_validation`, `validation_scope_changed`,
+  `previous_evidence_incomplete`, `current_evidence_incomplete`,
+  `parser_changed`, `parser_identity_unavailable`, `test_identity_unavailable`,
+  `insufficient_scope_identity`, `validation_not_requested`). Count deltas are
+  signed integers (a decrease in passed tests yields a negative `passed_delta`);
+  zero-test success never resolves a prior test failure.
+- **Opaque scope identity:** `comparison.scope_identity` is a domain-separated,
+  opaque stable identity (`validation_scope:v1:<sha256>`) over the normalized
+  *structured* scope. It never returns a raw command, absolute path, or test
+  filter — command text is not re-exposed through another field.
+- **Jobs report only proven status:** the `attempt.jobs` block reports counts
+  computed over the full bounded active Job aggregate, never the truncated
+  `recent` list, so a hidden recovering job is never misreported as healthy.
+  Fields that cannot be reliably proven are not reported.
+- **No new persistence:** continuation feedback introduces no new durable table
+  and no second attempt state machine; it is a projection over existing state.
+
 ### Invariants (must)
 
 These are also summarized in `AGENTS.md` §7, **Sessions**:
