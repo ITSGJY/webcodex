@@ -126,6 +126,18 @@ fn continuation_feedback_schema_enums_and_signed_ints_are_stable() {
         .collect::<Vec<_>>();
     assert_eq!(status_enum, ["available", "not_applicable", "unknown"]);
 
+    let validation_status_enum = schema["properties"]["attempt"]["properties"]["validation"]
+        ["properties"]["latest_status"]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        validation_status_enum,
+        ["passed", "failed", "not_run", "unknown", "unavailable"]
+    );
+
     let boundary_source_enum = schema["properties"]["attempt"]["properties"]["boundary"]
         ["properties"]["source"]["enum"]
         .as_array()
@@ -1409,6 +1421,11 @@ async fn start_coding_task_continuation_describes_previous_attempt_not_empty_new
         "task_instruction"
     );
     assert_eq!(feedback["attempt"]["instruction"]["status"], "available");
+    assert_eq!(
+        feedback["attempt"]["instruction"]["excerpt"],
+        "instruction A"
+    );
+    assert_eq!(feedback["attempt"]["instruction"]["truncated"], false);
     // A's attempt had a successful write tool call and a failed validation run;
     // both count as meaningful tool calls.
     assert_eq!(feedback["attempt"]["activity"]["meaningful_tool_calls"], 2);
@@ -1416,6 +1433,20 @@ async fn start_coding_task_continuation_describes_previous_attempt_not_empty_new
     assert_eq!(feedback["attempt"]["activity"]["failed_tool_calls"], 1);
     assert_eq!(feedback["attempt"]["validation"]["latest_status"], "failed");
     assert_eq!(feedback["attempt"]["activity"]["unresolved_failures"], 1);
+    assert_eq!(feedback["attempt"]["validation"]["total_open_failures"], 1);
+    assert_eq!(
+        feedback["attempt"]["validation"]["open_failures"][0]["kind"],
+        "test"
+    );
+    assert_eq!(
+        feedback["attempt"]["validation"]["open_failures"][0]["name"],
+        "tests::a"
+    );
+    assert!(feedback["attempt"]["suggested_next_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| action == "fix failing test tests::a"));
     assert_eq!(feedback["attempt"]["changes"]["total_changed_paths"], 1);
 
     // Instruction B must be appended exactly once.

@@ -37,6 +37,8 @@ use super::tool_definition::{
     runtime_tool_is_write_like,
 };
 
+/// Maximum number of characters returned from the previous instruction.
+const MAX_INSTRUCTION_EXCERPT_CHARS: usize = 500;
 /// Maximum number of changed paths surfaced in the attempt summary.
 const MAX_CHANGED_PATHS: usize = 100;
 /// Maximum number of unresolved failure identities surfaced in the attempt
@@ -97,6 +99,10 @@ pub(crate) struct AttemptInstruction {
     /// `not_observed` otherwise.
     pub(crate) status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) excerpt: Option<String>,
+    /// True when the persisted instruction exceeded the excerpt bound.
+    pub(crate) truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) recorded_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) requested_mode: Option<String>,
@@ -144,6 +150,9 @@ pub(crate) struct AttemptValidation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) latest_at: Option<i64>,
     pub(crate) unresolved_failure_count: usize,
+    pub(crate) open_failures: Vec<FailureIdentity>,
+    pub(crate) total_open_failures: usize,
+    pub(crate) failures_truncated: bool,
     pub(crate) delta_available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) delta_reason_code: Option<String>,
@@ -359,6 +368,8 @@ fn empty_attempt() -> AttemptSummary {
         },
         instruction: AttemptInstruction {
             status: "not_observed",
+            excerpt: None,
+            truncated: false,
             recorded_at: None,
             requested_mode: None,
             effective_mode: None,
@@ -391,6 +402,9 @@ fn empty_attempt() -> AttemptSummary {
             latest_kind: None,
             latest_at: None,
             unresolved_failure_count: 0,
+            open_failures: Vec::new(),
+            total_open_failures: 0,
+            failures_truncated: false,
             delta_available: false,
             delta_reason_code: None,
         },
@@ -638,6 +652,8 @@ fn instruction_from_boundary(
         // than guessing an instruction.
         return AttemptInstruction {
             status: "not_observed",
+            excerpt: None,
+            truncated: false,
             recorded_at: None,
             requested_mode: None,
             effective_mode: None,
@@ -658,8 +674,17 @@ fn instruction_from_boundary(
             .and_then(|summary| summary.get("explicit_resume"))
             .and_then(Value::as_bool),
     };
+    let (excerpt, truncated) = event
+        .instruction
+        .as_deref()
+        .map(|instruction| bounded_excerpt(instruction, MAX_INSTRUCTION_EXCERPT_CHARS))
+        .map_or((None, false), |(excerpt, truncated)| {
+            (Some(excerpt), truncated)
+        });
     AttemptInstruction {
         status: "available",
+        excerpt,
+        truncated,
         recorded_at: Some(event.timestamp),
         requested_mode: event.requested_mode.as_deref().map(str::to_string),
         effective_mode: event.requested_mode.as_deref().map(str::to_string),
@@ -710,6 +735,11 @@ fn build_attempt_validation(
         .get("available")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let (open_failures, total_open_failures, failures_truncated) = if not_requested {
+        (Vec::new(), 0, false)
+    } else {
+        attempt_open_failures(attempt_validation)
+    };
     let latest_status = if not_requested {
         "unavailable".to_string()
     } else {
@@ -737,6 +767,9 @@ fn build_attempt_validation(
             latest_kind: None,
             latest_at: None,
             unresolved_failure_count: 0,
+            open_failures,
+            total_open_failures,
+            failures_truncated,
             delta_available,
             delta_reason_code,
         };
@@ -764,6 +797,9 @@ fn build_attempt_validation(
         latest_kind,
         latest_at,
         unresolved_failure_count,
+        open_failures,
+        total_open_failures,
+        failures_truncated,
         delta_available,
         delta_reason_code,
     }
@@ -904,10 +940,21 @@ fn build_suggested_next_actions(
 ) -> Vec<String> {
     let mut actions = Vec::new();
     if unresolved_failures > 0 {
-        push_unique(
-            &mut actions,
-            "review unresolved validation failures before continuing",
-        );
+        if let Some(failure) = validation.open_failures.first() {
+            let target = match failure.kind {
+                "test" => format!("fix failing test {}", failure.name),
+                "diagnostic" => match (&failure.file, failure.line) {
+                    (Some(file), Some(line)) => {
+                        format!("fix diagnostic {} at {file}:{line}", failure.name)
+                    }
+                    _ => format!("fix diagnostic {}", failure.name),
+                },
+                _ => format!("fix validation failure {}", failure.name),
+            };
+            actions.push(target);
+        } else {
+            actions.push("review unresolved validation failures before continuing".to_string());
+        }
     }
     if jobs.recovering_count > 0 {
         push_unique(
@@ -1586,6 +1633,29 @@ fn compare_failure_identity(left: &FailureIdentity, right: &FailureIdentity) -> 
 
 fn optional_string_sort_key(value: Option<&str>) -> (bool, &str) {
     (value.is_none(), value.unwrap_or_default())
+}
+
+fn attempt_open_failures(validation: &Value) -> (Vec<FailureIdentity>, usize, bool) {
+    let mut failures = validation
+        .pointer("/unresolved_failures/events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(failure_identities)
+        .collect::<Vec<_>>();
+    failures.sort_by(compare_failure_identity);
+    failures.dedup();
+    let total = failures.len();
+    let truncated = total > MAX_FAILURE_IDENTITIES;
+    failures.truncate(MAX_FAILURE_IDENTITIES);
+    (failures, total, truncated)
+}
+
+fn bounded_excerpt(value: &str, max_chars: usize) -> (String, bool) {
+    let mut chars = value.chars();
+    let excerpt = chars.by_ref().take(max_chars).collect::<String>();
+    let truncated = chars.next().is_some();
+    (excerpt, truncated)
 }
 
 fn push_unique(values: &mut Vec<String>, value: &str) {

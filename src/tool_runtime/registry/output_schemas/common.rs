@@ -412,13 +412,15 @@ fn attempt_instruction_schema() -> Value {
                 "type": "string",
                 "enum": ["available", "not_observed"]
             },
+            "excerpt": nullable_schema("string", "Bounded, redacted excerpt of the previous attempt instruction."),
+            "truncated": schema_type("boolean", "True when the persisted instruction exceeded the excerpt bound."),
             "recorded_at": nullable_schema("integer", "Unix timestamp when the instruction was recorded."),
             "requested_mode": nullable_schema("string", "Mode requested with the instruction, if any."),
             "effective_mode": nullable_schema("string", "Effective mode after applying the instruction, if any."),
             "capability_changed": nullable_schema("boolean", "Whether capability changed with the instruction."),
             "resumed": nullable_schema("boolean", "True when the instruction explicitly resumed an existing session.")
         },
-        "required": ["status"]
+        "required": ["status", "truncated"]
     })
 }
 
@@ -478,15 +480,18 @@ fn attempt_validation_schema() -> Value {
         "properties": {
             "latest_status": {
                 "type": "string",
-                "enum": ["available", "not_run", "unknown"]
+                "enum": ["passed", "failed", "not_run", "unknown", "unavailable"]
             },
             "latest_kind": nullable_schema("string", "Validation kind of the latest run, when present."),
             "latest_at": nullable_schema("integer", "Unix timestamp of the latest run, when present."),
-            "unresolved_failure_count": schema_type("integer", "Unresolved failure count from the latest run."),
+            "unresolved_failure_count": schema_type("integer", "Unresolved failure event count from this attempt."),
+            "open_failures": array_schema(failure_identity_schema(), "Bounded stable identities for currently unresolved failures in this attempt."),
+            "total_open_failures": schema_type("integer", "Total unresolved failure identities before bounding."),
+            "failures_truncated": schema_type("boolean", "True when open_failures was capped at the bound."),
             "delta_available": schema_type("boolean", "Whether the validation delta is comparable."),
             "delta_reason_code": nullable_schema("string", "Reason code when the delta is not available; null otherwise.")
         },
-        "required": ["latest_status", "unresolved_failure_count", "delta_available"]
+        "required": ["latest_status", "unresolved_failure_count", "open_failures", "total_open_failures", "failures_truncated", "delta_available"]
     })
 }
 

@@ -232,8 +232,11 @@ a `finish_coding_task` verdict.
 - **Startup describes the previous attempt:** for reused, explicitly resumed,
   and restored-after-restart sessions, `start_coding_task` snapshots the
   pre-instruction state *before* appending the new instruction, so
-  `continuation_feedback.attempt` describes the *previous* attempt's activity,
-  changes, and validation — not the empty new attempt. A fresh session reports
+  `continuation_feedback.attempt` describes the *previous* attempt's bounded,
+  redacted instruction excerpt, activity, changes, current unresolved failure
+  identities, and validation — not the empty new attempt. When an unresolved
+  identity is available, the first suggested action names that concrete target.
+  A fresh session reports
   `status = not_applicable`, `reason_code = fresh_session`.
 - **Attempt boundary:** the attempt window is segmented by the most recent
   `task_instruction` retained in the ledger window. When that instruction has

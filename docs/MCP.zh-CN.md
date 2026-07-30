@@ -87,9 +87,9 @@ Session。`new_session=true` 是显式的高级隔离请求。current binding �
 server 的内存缓存和有界哈希持久化投影中；保留相同窗口身份与仓库时，server
 重启后可以自动恢复。仍应保留返回的 session id，以便 transport 身份丢失时显式
 恢复。返回的 `continuation_feedback` 是对*上一轮* attempt 的活动、改动与
-validation 状态的确定性只读投影（并附带仅在两次运行被证明 scope 一致时才可比的
-`validation_delta`）；它既不是 LLM summary，也不是新的 verdict，更不会执行
-validation。
+validation 状态的确定性只读投影，并包含有界的上一轮指令摘录和当前未解决失败标识
+（另附带仅在两次运行被证明 scope 一致时才可比的 `validation_delta`）；
+它既不是 LLM summary，也不是新的 verdict，更不会执行 validation。
 
 这些 durable ID 用于模型工具与 host review 之间的稳定关联，普通用户无需管理：
 
