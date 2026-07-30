@@ -335,3 +335,317 @@ pub(crate) fn wrapped_output_schema(output_properties: Vec<(&str, Value)>) -> Va
 pub(crate) fn default_output_schema() -> Value {
     wrapped_output_schema(vec![])
 }
+
+/// Deterministic continuation-feedback projection: an attempt summary plus a
+/// validation delta over comparable prior evidence. Always bounded and
+/// read-only; never an LLM summary, never a new verdict. Core sub-objects use
+/// strict `additionalProperties: false` schemas so field drift fails loudly.
+pub(crate) fn continuation_feedback_schema(description: &str) -> Value {
+    json!({
+        "type": "object",
+        "description": description,
+        "additionalProperties": false,
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["available", "not_applicable", "unknown"],
+                "description": "available when an attempt summary was derived; not_applicable for a fresh empty session."
+            },
+            "reason_code": nullable_schema("string", "Reason code when status is not available/not_applicable; null otherwise."),
+            "deterministic": schema_type("boolean", "True: the projection is derived only from existing persistent state."),
+            "llm_summary": schema_type("boolean", "Always false; never an LLM-generated summary."),
+            "attempt": attempt_summary_schema(),
+            "validation_delta": validation_delta_schema("Deterministic diff between the latest validation evidence and the most recent prior comparable evidence. unavailable with a stable reason code when the two runs are not proven comparable; never a new pass/fail verdict.")
+        },
+        "required": ["status", "deterministic", "llm_summary", "attempt", "validation_delta"]
+    })
+}
+
+/// Strict schema for the deterministic attempt summary.
+fn attempt_summary_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Bounded deterministic summary of the current attempt: boundary, instruction, event range, activity, changes, validation, jobs, guidance, outcome, and suggested next actions. Pointer fields only; never raw commands, stdout/stderr, full guidance text, or secrets.",
+        "additionalProperties": false,
+        "properties": {
+            "boundary": attempt_boundary_schema(),
+            "instruction": attempt_instruction_schema(),
+            "event_range": attempt_event_range_schema(),
+            "activity": attempt_activity_schema(),
+            "changes": attempt_changes_schema(),
+            "validation": attempt_validation_schema(),
+            "jobs": attempt_jobs_schema(),
+            "guidance": attempt_guidance_schema(),
+            "outcome": attempt_outcome_schema(),
+            "suggested_next_actions": array_schema(schema_type("string", "A bounded, deterministic suggested next action."), "Bounded suggested next actions (<=8).")
+        },
+        "required": ["boundary", "instruction", "event_range", "activity", "changes", "validation", "jobs", "guidance", "outcome", "suggested_next_actions"]
+    })
+}
+
+fn attempt_boundary_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "How the attempt boundary was determined.",
+        "additionalProperties": false,
+        "properties": {
+            "source": {
+                "type": "string",
+                "enum": ["task_instruction", "session_start", "unavailable", "no_events"],
+                "description": "task_instruction when the last accepted instruction event was retained; session_start when no instruction exists and nothing was evicted; unavailable when the window truncated and the instruction is gone; no_events for an empty session."
+            },
+            "reason_code": nullable_schema("string", "attempt_boundary_evicted when source is unavailable; null otherwise."),
+            "event_id": nullable_schema("string", "Event id of the boundary event, when present."),
+            "event_index": schema_type("integer", "0-based position of the boundary event within the summarized events.")
+        },
+        "required": ["source", "event_index"]
+    })
+}
+
+fn attempt_instruction_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "The instruction that defines the current attempt, if observed.",
+        "additionalProperties": false,
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["available", "not_observed"]
+            },
+            "recorded_at": nullable_schema("integer", "Unix timestamp when the instruction was recorded."),
+            "requested_mode": nullable_schema("string", "Mode requested with the instruction, if any."),
+            "effective_mode": nullable_schema("string", "Effective mode after applying the instruction, if any."),
+            "capability_changed": nullable_schema("boolean", "Whether capability changed with the instruction."),
+            "resumed": nullable_schema("boolean", "True when the instruction explicitly resumed an existing session.")
+        },
+        "required": ["status"]
+    })
+}
+
+fn attempt_event_range_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Bounded event range covered by the attempt.",
+        "additionalProperties": false,
+        "properties": {
+            "start_event_id": nullable_schema("string", "Event id at the start of the attempt, when retained."),
+            "end_event_id": nullable_schema("string", "Event id at the end of the attempt, when retained."),
+            "start_sequence": schema_type("integer", "0-based start sequence within the summarized events."),
+            "end_sequence": schema_type("integer", "0-based end sequence within the summarized events."),
+            "event_count": schema_type("integer", "Number of events in the attempt window."),
+            "complete": schema_type("boolean", "False when the retained window was truncated and the boundary is unavailable.")
+        },
+        "required": ["start_sequence", "end_sequence", "event_count", "complete"]
+    })
+}
+
+fn attempt_activity_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Meaningful tool-call activity within the attempt window.",
+        "additionalProperties": false,
+        "properties": {
+            "meaningful_tool_calls": schema_type("integer", "Count of meaningful (status/manifest-excluding) tool calls."),
+            "successful_tool_calls": schema_type("integer", "Succeeded meaningful tool calls."),
+            "failed_tool_calls": schema_type("integer", "Failed meaningful tool calls."),
+            "expected_failures": schema_type("integer", "Expected failure tool calls."),
+            "resolved_failures": schema_type("integer", "Validation failures resolved by the attempt."),
+            "unresolved_failures": schema_type("integer", "Validation failures still unresolved.")
+        },
+        "required": ["meaningful_tool_calls", "successful_tool_calls", "failed_tool_calls", "expected_failures", "resolved_failures", "unresolved_failures"]
+    })
+}
+
+fn attempt_changes_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Deduped, bounded changed paths within the attempt window.",
+        "additionalProperties": false,
+        "properties": {
+            "changed_paths": array_schema(schema_type("string", "A project-relative changed path."), "Bounded deduped changed paths (<=100), deterministic sorted order."),
+            "total_changed_paths": schema_type("integer", "Real deduped changed-path count over the attempt window."),
+            "truncated": schema_type("boolean", "True when changed_paths was capped at the bound.")
+        },
+        "required": ["changed_paths", "total_changed_paths", "truncated"]
+    })
+}
+
+fn attempt_validation_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Current-attempt validation verdict (projection only; never a new verdict).",
+        "additionalProperties": false,
+        "properties": {
+            "latest_status": {
+                "type": "string",
+                "enum": ["available", "not_run", "unknown"]
+            },
+            "latest_kind": nullable_schema("string", "Validation kind of the latest run, when present."),
+            "latest_at": nullable_schema("integer", "Unix timestamp of the latest run, when present."),
+            "unresolved_failure_count": schema_type("integer", "Unresolved failure count from the latest run."),
+            "delta_available": schema_type("boolean", "Whether the validation delta is comparable."),
+            "delta_reason_code": nullable_schema("string", "Reason code when the delta is not available; null otherwise.")
+        },
+        "required": ["latest_status", "unresolved_failure_count", "delta_available"]
+    })
+}
+
+fn attempt_jobs_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Proven job lifecycle fields from the bounded active job aggregate; counts never depend on the truncated recent list.",
+        "additionalProperties": false,
+        "properties": {
+            "active_count": schema_type("integer", "Total active jobs (blocking + nonblocking) from the bounded aggregate."),
+            "running_count": schema_type("integer", "Blocking-active jobs (queued/running/started/agent_queued/recovering)."),
+            "recovering_count": schema_type("integer", "Recovering jobs counted over the full active aggregate."),
+            "terminal_pending_count": schema_type("integer", "Jobs awaiting terminal status after a stop request."),
+            "recent_truncated": schema_type("boolean", "True when the aggregate truncated its recent list; counts remain reliable."),
+            "latest_job_status": schema_type("string", "Latest active/recovering job status, or not_observed when none."),
+            "recovery_state": {
+                "type": "string",
+                "enum": ["none", "recovering", "terminal_pending", "active", "unknown"],
+                "description": "Derived only from proven aggregate fields, never wall-clock or the truncated recent list. active is reported instead of healthy because the aggregate cannot prove every active job is healthy running."
+            }
+        },
+        "required": ["active_count", "running_count", "recovering_count", "terminal_pending_count", "recent_truncated", "latest_job_status", "recovery_state"]
+    })
+}
+
+fn attempt_guidance_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Read-only open-guidance counts from the message board; never changes message status.",
+        "additionalProperties": false,
+        "properties": {
+            "open_count": schema_type("integer", "Total open guidance messages."),
+            "open_risk_count": schema_type("integer", "Open risk messages."),
+            "open_todo_count": schema_type("integer", "Open todo messages."),
+            "latest_open_kind": nullable_schema("string", "Kind of the most recent open guidance, when any."),
+            "latest_open_at": nullable_schema("integer", "Unix timestamp of the most recent open guidance, when any."),
+            "latest_open_message_id": nullable_schema("string", "Id of the most recent open guidance, when any.")
+        },
+        "required": ["open_count", "open_risk_count", "open_todo_count"]
+    })
+}
+
+fn attempt_outcome_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Deterministic attempt outcome derived from proven activity, validation, jobs, and guidance.",
+        "additionalProperties": false,
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["in_progress", "blocked", "clean", "unknown"]
+            },
+            "reason_codes": array_schema(schema_type("string", "A deterministic outcome reason code."), "Bounded outcome reason codes.")
+        },
+        "required": ["status", "reason_codes"]
+    })
+}
+
+/// Validation delta projection surfaced by `validation_summary` and inside
+/// `continuation_feedback`. Strict `additionalProperties: false` on all
+/// sub-objects so field drift fails loudly.
+pub(crate) fn validation_delta_schema(description: &str) -> Value {
+    json!({
+        "type": "object",
+        "description": description,
+        "additionalProperties": false,
+        "properties": {
+            "comparison": validation_comparison_schema(),
+            "counts": validation_delta_counts_schema(),
+            "failures": validation_delta_failures_schema()
+        },
+        "required": ["comparison", "counts", "failures"]
+    })
+}
+
+fn validation_comparison_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Comparison status, reason code (when unavailable), current/previous event identities, and a proven scope identity string.",
+        "additionalProperties": false,
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["available", "unavailable"]
+            },
+            "reason_code": {
+                "type": "string",
+                "enum": [
+                    "no_previous_validation",
+                    "validation_scope_changed",
+                    "previous_evidence_incomplete",
+                    "current_evidence_incomplete",
+                    "parser_changed",
+                    "parser_identity_unavailable",
+                    "test_identity_unavailable",
+                    "insufficient_scope_identity",
+                    "validation_not_requested"
+                ],
+                "description": "Stable reason code when status is unavailable."
+            },
+            "current_event_id": nullable_schema("string", "Event id of the current validation run, when retained."),
+            "previous_event_id": nullable_schema("string", "Event id of the previous comparable run, when retained."),
+            "scope_identity": nullable_schema("string", "Opaque, domain-separated scope identity (validation_scope:v1:<sha256>); never a raw command or absolute path.")
+        },
+        "required": ["status"]
+    })
+}
+
+fn validation_delta_counts_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Signed count deltas (passed, failed, ignored, total) between the two comparable validation runs.",
+        "additionalProperties": false,
+        "properties": {
+            "passed_delta": schema_type("integer", "Signed delta of passed tests; may be negative."),
+            "failed_delta": schema_type("integer", "Signed delta of failed tests; may be negative."),
+            "ignored_delta": schema_type("integer", "Signed delta of ignored tests; may be negative."),
+            "total_delta": schema_type("integer", "Signed delta of total tests; may be negative.")
+        },
+        "required": ["passed_delta", "failed_delta", "ignored_delta", "total_delta"]
+    })
+}
+
+fn validation_delta_failures_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Newly failed, resolved, and still-failing stable failure identities with totals and a truncation flag.",
+        "additionalProperties": false,
+        "properties": {
+            "identity_status": {
+                "type": "string",
+                "enum": ["available", "unavailable"],
+                "description": "available when stable failure identities are present; unavailable (with identity_reason_code) when only counts could be compared."
+            },
+            "identity_reason_code": nullable_schema("string", "Reason code when identity_status is unavailable; null otherwise."),
+            "newly_failed": array_schema(failure_identity_schema(), "Bounded newly-failed stable failure identities."),
+            "resolved": array_schema(failure_identity_schema(), "Bounded resolved stable failure identities."),
+            "still_failing": array_schema(failure_identity_schema(), "Bounded still-failing stable failure identities."),
+            "total_still_failing": schema_type("integer", "Real count of still-failing identities (may exceed the bounded list)."),
+            "list_truncated": schema_type("boolean", "True when a failure list was capped at the bound.")
+        },
+        "required": ["identity_status", "newly_failed", "resolved", "still_failing", "total_still_failing", "list_truncated"]
+    })
+}
+
+fn failure_identity_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "A bounded, stable failure identity derived from the existing parser.",
+        "additionalProperties": false,
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": ["test", "diagnostic", "unknown"]
+            },
+            "name": schema_type("string", "Stable failure name."),
+            "file": nullable_schema("string", "Source file, when available."),
+            "line": nullable_schema("integer", "Source line, when available.")
+        },
+        "required": ["kind", "name"]
+    })
+}

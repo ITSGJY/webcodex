@@ -4,9 +4,9 @@ use super::super::input_schemas::{
     session_guards_schema, session_lifecycle_schema, session_mode_schema,
 };
 use super::common::{
-    array_schema, evidence_history_schema, evidence_integrity_schema, job_lifecycle_summary_schema,
-    nullable_schema, open_object_schema, permission_summary_schema, schema_type,
-    task_outcome_schema, wrapped_output_schema,
+    array_schema, continuation_feedback_schema, evidence_history_schema, evidence_integrity_schema,
+    job_lifecycle_summary_schema, nullable_schema, open_object_schema, permission_summary_schema,
+    schema_type, task_outcome_schema, validation_delta_schema, wrapped_output_schema,
 };
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
@@ -412,6 +412,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                     "Bounded suggested next actions for the receiving agent.",
                 ),
             ),
+            (
+                "continuation_feedback",
+                continuation_feedback_schema("Deterministic continuation feedback for normal and summary_only handoff. A read-only attempt summary plus validation delta over existing handoff evidence; never an LLM summary, never an Agent loop, never a new verdict, and it never re-runs validation, mutates the ledger, refreshes activity, or consumes guidance."),
+            ),
         ])),
         "bind_current_session" => Some(wrapped_output_schema(vec![
             ("bound", schema_type("boolean", "True when the binding was stored.")),
@@ -474,6 +478,10 @@ fn validation_summary_tool_output_schema() -> Value {
             schema_type("string", "Explicit business session id queried."),
         ),
         ("validation", validation_evidence_schema()),
+        (
+            "validation_delta",
+            validation_delta_schema("Deterministic diff between the latest validation evidence and the most recent prior comparable validation evidence. A read-only projection derived only from the ledger validation summary above; never re-runs validation, mutates the ledger, changes the verdict, or consumes guidance. unavailable with a stable reason code when the two runs are not proven comparable."),
+        ),
     ]);
     schema["properties"]["output"]["additionalProperties"] = json!(false);
     schema

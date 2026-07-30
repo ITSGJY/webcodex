@@ -39,6 +39,7 @@ impl PersistedSessionRecord {
             updated_at: record.updated_at,
             events: record.events.iter().skip(event_skip).cloned().collect(),
             messages: record.messages.iter().skip(message_skip).cloned().collect(),
+            events_observed: record.events_observed,
         }
     }
 
@@ -67,6 +68,11 @@ impl PersistedSessionRecord {
             .into_iter()
             .rev()
             .collect();
+        // On restore, `events_observed` is at least the count of events we just
+        // retained, so a freshly-restored legacy ledger does not falsely report
+        // eviction. A live ledger that exceeded the cap has the true cumulative
+        // count persisted.
+        let retained_events = events.len() as u64;
         Some(SessionRecord {
             session_id,
             project: self.project.map(|value| bound_summary_string(value.trim())),
@@ -78,6 +84,7 @@ impl PersistedSessionRecord {
             created_at: self.created_at,
             updated_at: self.updated_at.max(self.created_at),
             events,
+            events_observed: self.events_observed.max(retained_events),
             messages,
             project_instructions: None,
         })

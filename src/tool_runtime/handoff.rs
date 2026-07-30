@@ -13,6 +13,7 @@
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::continuation_feedback::{continuation_feedback_value, ContinuationFeedbackInput};
 use super::permissions::permission_summary_from_events;
 use super::session_context::{
     session_project_mismatch_warning, SessionProjectMismatch, SESSION_PROJECT_MISMATCH_KIND,
@@ -226,24 +227,46 @@ impl ToolRuntime {
         }
 
         // --- optional ledger-derived validation summary ---
+        // The continuation feedback projection uses an *independent* bounded
+        // evidence snapshot capped at the full validation evidence limit, not the
+        // caller's display `limit`, so a small display limit cannot shrink the
+        // attempt boundary detection. The validation summary itself is only built
+        // when requested; when it is not, the feedback validation is reported as
+        // explicitly unavailable (`validation_not_requested`) rather than
+        // masquerading as `not_run`.
+        let feedback_session = self
+            .sessions
+            .summary(&session_id, Some(HANDOFF_VALIDATION_SESSION_EVENT_LIMIT))
+            .unwrap_or_else(|| summary.clone());
+        let feedback_validation: Value = if include_validation {
+            self.validation_summary_for_session_with_jobs(
+                &feedback_session,
+                DEFAULT_HANDOFF_LIMIT,
+                auth,
+            )
+            .await
+        } else {
+            json!({ "available": false, "not_requested": true })
+        };
         if include_validation {
-            let validation_session = self
-                .sessions
-                .summary(&session_id, Some(HANDOFF_VALIDATION_SESSION_EVENT_LIMIT))
-                .unwrap_or_else(|| summary.clone());
-            let validation_summary = self
-                .validation_summary_for_session_with_jobs(
-                    &validation_session,
-                    DEFAULT_HANDOFF_LIMIT,
-                    auth,
-                )
-                .await;
-            output["validation"] = validation_summary;
+            output["validation"] = feedback_validation.clone();
         }
         let (work_performed, changed_paths) = closeout_work_projection(&summary.events);
         output["work_performed"] = work_performed;
         output["changed_paths"] = changed_paths;
 
+        // Continuation feedback: a read-only attempt-summary + validation-delta
+        // projection reused across handoff, finish, and start. Built from the
+        // independent bounded evidence snapshot, validation value, and job
+        // metadata already gathered here; never re-runs validation, mutates the
+        // ledger, refreshes activity, or consumes guidance.
+        output["continuation_feedback"] = continuation_feedback_value(ContinuationFeedbackInput {
+            session_summary: &feedback_session,
+            validation: &feedback_validation,
+            jobs: output.get("jobs").unwrap_or(&Value::Null),
+            discussion: &discussion,
+            continuation: "continued",
+        });
         let workspace_checked = output.get("workspace").is_some();
         let resolved_unexpected_validation_failures = resolved_unexpected_validation_failure_count(
             &summary.events,
@@ -529,6 +552,15 @@ fn compact_handoff_output(output: &Value, resolved_unexpected_validation_failure
         "review_evidence": compact_review_evidence(output.get("review_evidence").unwrap_or(&Value::Null)),
         "work_performed": output.get("work_performed").cloned().unwrap_or_else(|| json!([])),
         "changed_paths": output.get("changed_paths").cloned().unwrap_or_else(|| json!([])),
+        "continuation_feedback": output
+            .get("continuation_feedback")
+            .cloned()
+            .unwrap_or_else(|| json!({
+                "status": "not_applicable",
+                "reason_code": "no_continuation_evidence",
+                "deterministic": true,
+                "llm_summary": false,
+            })),
         "warnings": output.get("warnings").cloned().unwrap_or_else(|| json!([])),
         "suggested_next_actions": output.get("suggested_next_actions").cloned().unwrap_or_else(|| json!([])),
     });

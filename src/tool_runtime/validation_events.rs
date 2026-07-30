@@ -173,10 +173,16 @@ impl ToolRuntime {
             .validation_summary_for_session_with_jobs(&summary, limit, auth)
             .await;
         remove_public_validation_input_summaries(&mut validation);
+        // Pure read-only projection derived only from the ledger validation
+        // summary above. Never re-runs validation, mutates the ledger, or
+        // changes the verdict; `unavailable` with a stable reason code when the
+        // two validation attempts are not proven comparable.
+        let validation_delta = super::continuation_feedback::validation_delta_value(&validation);
         ToolResult::ok(json!({
             "project": resolved.resolved_id,
             "session_id": session_id,
             "validation": validation,
+            "validation_delta": validation_delta,
         }))
     }
 

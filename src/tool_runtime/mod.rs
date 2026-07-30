@@ -10,6 +10,7 @@ mod cargo_tools;
 mod checkpoint;
 mod coding_task;
 mod coding_task_tools;
+mod continuation_feedback;
 mod discovery_tools;
 mod dispatch;
 mod edit_tool_telemetry;

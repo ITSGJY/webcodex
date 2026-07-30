@@ -1,9 +1,9 @@
 use serde_json::{json, Value};
 
 use super::common::{
-    array_schema, authority_profile_schema, evidence_history_schema, evidence_integrity_schema,
-    job_lifecycle_summary_schema, nullable_schema, open_object_schema, permission_summary_schema,
-    schema_type, task_outcome_schema, wrapped_output_schema,
+    array_schema, authority_profile_schema, continuation_feedback_schema, evidence_history_schema,
+    evidence_integrity_schema, job_lifecycle_summary_schema, nullable_schema, open_object_schema,
+    permission_summary_schema, schema_type, task_outcome_schema, wrapped_output_schema,
 };
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
@@ -59,6 +59,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 open_object_schema("Operator-friendly startup sanity verdict: status pass/warn/fail, blocking boolean, compact checks, and bounded suggested_next_actions. Additive UX summary only; does not change safety semantics."),
             ),
             (
+                "continuation_feedback",
+                continuation_feedback_schema("Deterministic continuation feedback for reused, resumed, or restored-after-restart sessions. not_applicable for a freshly created empty session. A read-only projection over existing session ledger, validation evidence, bounded job metadata, and the message board; never an LLM summary, never an Agent loop, never a new verdict, and it never executes shell, reads project files, enqueues Agent requests, mutates the ledger, refreshes activity, or consumes guidance."),
+            ),
+            (
                 "warnings",
                 array_schema(open_object_schema("Startup warning."), "Bounded startup warnings."),
             ),
@@ -97,6 +101,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             (
                 "validation",
                 open_object_schema("Unified bounded execution evidence from dedicated validation tools and run_shell/run_job calls that declare validation/test/build/format/release purpose. Preserves historical, resolved, and unresolved failures by stable identity."),
+            ),
+            (
+                "continuation_feedback",
+                continuation_feedback_schema("Deterministic continuation feedback reused from the same projection as start/handoff. A read-only attempt summary plus validation delta over existing closeout evidence; it never re-runs validation, mutates the ledger, or replaces the closeout verdict."),
             ),
             (
                 "review_evidence",

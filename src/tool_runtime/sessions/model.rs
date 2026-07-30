@@ -160,6 +160,12 @@ pub(super) struct SessionRecord {
     pub(super) created_at: i64,
     pub(super) updated_at: i64,
     pub(super) events: VecDeque<SessionEvent>,
+    /// Cumulative number of events ever appended to this session ledger,
+    /// including events the per-session event cap has since evicted. This is
+    /// the source of truth for "did the durable ledger ever hold more events
+    /// than are retained now". The persisted counterpart carries the additive
+    /// serde default; the in-memory record is always constructed explicitly.
+    pub(super) events_observed: u64,
     pub(super) messages: VecDeque<SessionMessage>,
     pub(super) project_instructions: Option<ProjectInstructionsSnapshot>,
 }
@@ -201,6 +207,11 @@ pub(crate) struct CodingSessionRequest {
 #[derive(Debug, Clone)]
 pub(crate) struct CodingSessionOutcome {
     pub(crate) summary: SessionSummary,
+    /// For a reused/resumed session, a bounded summary taken *before* the new
+    /// `task_instruction` was appended. Continuation feedback projects over this
+    /// so it describes the previous attempt's work rather than the empty new
+    /// attempt. `None` for a freshly created session (no previous attempt).
+    pub(crate) pre_instruction_summary: Option<SessionSummary>,
     pub(crate) reused: bool,
     pub(crate) previous_mode: Option<SessionMode>,
     pub(crate) previous_guards: Option<SessionGuards>,
@@ -321,6 +332,12 @@ pub(super) struct PersistedSessionRecord {
     pub(super) updated_at: i64,
     pub(super) events: Vec<SessionEvent>,
     pub(super) messages: Vec<SessionMessage>,
+    /// Additive v1 field. Cumulative number of events ever appended, including
+    /// those the per-session event cap has evicted. Older ledgers omit it and
+    /// deserialize to 0; the restore path treats 0 as "retain exactly the
+    /// persisted events" for legacy compatibility.
+    #[serde(default)]
+    pub(super) events_observed: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -490,6 +507,22 @@ pub(crate) enum SessionMessageKind {
     Todo,
 }
 
+impl SessionMessageKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Note => "note",
+            Self::Proposal => "proposal",
+            Self::Question => "question",
+            Self::Answer => "answer",
+            Self::Decision => "decision",
+            Self::Risk => "risk",
+            Self::Progress => "progress",
+            Self::Guidance => "guidance",
+            Self::Todo => "todo",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SessionMessageStatus {
@@ -637,6 +670,28 @@ pub(crate) struct SessionSummary {
     pub(crate) updated_at: i64,
     pub(crate) counts: SessionCounts,
     pub(crate) events: Vec<SessionEvent>,
+    /// Total number of events retained in the durable ledger for the session
+    /// *before* the returned window was sliced. This is the source of truth for
+    /// whether older events (e.g. an attempt boundary `task_instruction`) were
+    /// evicted by the per-session event cap. Older persisted sessions that predate
+    /// these additive fields deserialize to 0/0/true and are treated as the
+    /// returned window being the whole retained ledger (no eviction observed).
+    #[serde(default)]
+    pub(crate) events_total: usize,
+    /// Number of events actually returned in `events` (the retained tail).
+    #[serde(default)]
+    pub(crate) events_returned: usize,
+    /// True when the durable ledger retained more events than were returned
+    /// (`events_total > events_returned`), i.e. the returned window is a tail
+    /// slice and older events are not present.
+    #[serde(default)]
+    pub(crate) events_truncated: bool,
+    /// 0-based sequence of the first returned event within the retained ledger
+    /// (`events_total - events_returned`). `0` means the returned window starts
+    /// at the ledger head. Read-only projections use this to avoid mistaking a
+    /// truncated tail for the session start.
+    #[serde(default)]
+    pub(crate) first_retained_sequence: usize,
     pub(crate) messages: SessionMessagesSummary,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) project_instructions: Option<ProjectInstructionsSummarySnapshot>,

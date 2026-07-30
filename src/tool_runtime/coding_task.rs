@@ -7,6 +7,7 @@
 
 use serde_json::{json, Value};
 
+use super::continuation_feedback::{continuation_feedback_value, ContinuationFeedbackInput};
 use super::handoff::{
     apply_compact_workflow_outcomes, closeout_work_projection, compact_jobs, compact_permissions,
     compact_review_evidence, compact_tool_failures, compact_validation,
@@ -379,6 +380,28 @@ impl ToolRuntime {
             Some(manifest) => recommended_flow_payload_for_manifest_tools(manifest),
             None => recommended_flow_payload(),
         };
+        // Continuation feedback for reused/resumed/restored sessions. Pure
+        // read-only projection over existing session ledger, validation evidence,
+        // bounded job metadata, and the message board. Never executes shell,
+        // reads project files, enqueues Agent requests, mutates the ledger,
+        // refreshes activity, or consumes guidance. `created` (fresh empty
+        // session) surfaces a compact `not_applicable` verdict.
+        let continuation_kind = if resume_requested {
+            "resumed_explicitly"
+        } else if session_outcome.reused {
+            "continued"
+        } else {
+            "created"
+        };
+        let continuation_feedback = self
+            .start_continuation_feedback(
+                &session_outcome.summary,
+                session_outcome.pre_instruction_summary.as_ref(),
+                continuation_kind,
+                &resolved.resolved_id,
+                auth,
+            )
+            .await;
         let mut output = json!({
             "detail": detail.as_str(),
             "project": project,
@@ -429,6 +452,7 @@ impl ToolRuntime {
             "git": git,
             "semantic_navigation": semantic_navigation,
             "recommended_flow": recommended_flow,
+            "continuation_feedback": continuation_feedback,
             "deterministic": true,
             "llm_summary": false,
             "warnings": warnings,
@@ -636,6 +660,15 @@ impl ToolRuntime {
         let (work_performed, changed_paths) =
             closeout_work_projection(&closeout_session_summary.events);
 
+        // Continuation feedback reuses the same attempt summary and validation
+        // delta projections as start/handoff. It is a read-only projection over
+        // the existing closeout summary, validation, and job metadata; it never
+        // re-runs validation, mutates the ledger, or replaces the closeout
+        // verdict.
+        let continuation_feedback = self
+            .closeout_continuation_feedback(&closeout_session_summary, &resolved.resolved_id, auth)
+            .await;
+
         let mut output = json!({
             "project": project,
             "resolved_project": resolved_project_payload(&resolved),
@@ -649,6 +682,7 @@ impl ToolRuntime {
                     .unwrap_or(false),
             },
             "validation": validation,
+            "continuation_feedback": continuation_feedback,
             "permissions": permissions,
             "tool_failures": tool_failure_summary_from_events(&session_summary.events, 10),
             "review_evidence": review_evidence,
@@ -709,6 +743,125 @@ impl ToolRuntime {
         }
         output["suggested_next_actions"] = compact["suggested_next_actions"].clone();
         ToolResult::ok(output)
+    }
+
+    /// Build the bounded continuation feedback projection for `start_coding_task`.
+    ///
+    /// Pure read-only: validation is derived from the session ledger only
+    /// (`validation_summary_from_events`, no job-status enrichment), jobs come
+    /// from the bounded `active_jobs_summary` metadata, and guidance is read
+    /// from the message board without marking anything read or resolved. No
+    /// shell, no file reads, no Agent requests, no ledger mutation.
+    async fn start_continuation_feedback(
+        &self,
+        summary: &sessions::SessionSummary,
+        pre_instruction_summary: Option<&sessions::SessionSummary>,
+        continuation_kind: &'static str,
+        resolved_project: &str,
+        auth: Option<&AuthContext>,
+    ) -> Value {
+        // Fresh new session: nothing to continue from.
+        if continuation_kind == "created" {
+            return json!({
+                "status": "not_applicable",
+                "reason_code": "fresh_session",
+                "deterministic": true,
+                "llm_summary": false,
+            });
+        }
+        // For a reused/resumed/restored session, project over the snapshot taken
+        // *before* this new `task_instruction` was appended, so the feedback
+        // describes the previous attempt's work rather than the empty new
+        // attempt. The returned session itself still contains the new
+        // instruction; only the projection uses the pre-instruction window.
+        // Guidance and job state are read from the live session id at the same
+        // instant; neither is mutated.
+        let projection_summary = pre_instruction_summary.unwrap_or(summary);
+        if projection_summary.events.is_empty() {
+            return json!({
+                "status": "not_applicable",
+                "reason_code": "empty_session",
+                "deterministic": true,
+                "llm_summary": false,
+            });
+        }
+        let validation = super::validation_events::validation_summary_from_events(
+            &projection_summary.events,
+            20,
+        );
+        let jobs = self
+            .active_jobs_summary(Some(resolved_project), auth, 10)
+            .await;
+        let discussion = self.empty_discussion_on_err(&summary.session_id);
+        continuation_feedback_value(ContinuationFeedbackInput {
+            session_summary: projection_summary,
+            validation: &validation,
+            jobs: &jobs,
+            discussion: &discussion,
+            continuation: continuation_kind,
+        })
+    }
+
+    /// Build the bounded continuation feedback projection for closeout
+    /// (`finish_coding_task` / `session_handoff_summary`). Validation is derived
+    /// from the session ledger only, jobs from bounded job metadata, and
+    /// guidance from a read-only message-board snapshot. Pure read-only: no
+    /// shell, no file reads, no Agent requests, no ledger mutation, no
+    /// activity refresh, no guidance consumption.
+    pub(crate) async fn closeout_continuation_feedback(
+        &self,
+        summary: &sessions::SessionSummary,
+        resolved_project: &str,
+        auth: Option<&AuthContext>,
+    ) -> Value {
+        if summary.events.is_empty() {
+            return json!({
+                "status": "not_applicable",
+                "reason_code": "empty_session",
+                "deterministic": true,
+                "llm_summary": false,
+            });
+        }
+        let validation =
+            super::validation_events::validation_summary_from_events(&summary.events, 20);
+        let jobs = self
+            .active_jobs_summary(Some(resolved_project), auth, 10)
+            .await;
+        let discussion = self.empty_discussion_on_err(&summary.session_id);
+        continuation_feedback_value(ContinuationFeedbackInput {
+            session_summary: summary,
+            validation: &validation,
+            jobs: &jobs,
+            discussion: &discussion,
+            // Closeout is a continuation boundary in itself; we do not assume a
+            // specific start-path continuation kind here. The instruction block
+            // reports `resumed` from the recorded boundary event metadata.
+            continuation: "continued",
+        })
+    }
+
+    fn empty_discussion_on_err(&self, session_id: &str) -> sessions::SessionDiscussionSummary {
+        self.sessions
+            .discussion_summary(session_id, Some(20))
+            .unwrap_or_else(|_| sessions::SessionDiscussionSummary {
+                counts: sessions::SessionDiscussionCounts {
+                    total: 0,
+                    open: 0,
+                    resolved: 0,
+                    guidance: 0,
+                    progress: 0,
+                    risk: 0,
+                    todo: 0,
+                    question: 0,
+                    decision: 0,
+                },
+                open_guidance: Vec::new(),
+                open_questions: Vec::new(),
+                open_risks: Vec::new(),
+                open_todos: Vec::new(),
+                recent_progress: Vec::new(),
+                recent_decisions: Vec::new(),
+            })
     }
 
     async fn start_coding_task_git_summary(

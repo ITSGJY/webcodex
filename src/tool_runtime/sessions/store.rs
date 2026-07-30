@@ -470,6 +470,7 @@ impl SessionStore {
             updated_at: now,
             messages: VecDeque::new(),
             events: VecDeque::new(),
+            events_observed: 0,
             project_instructions: opts.project_instructions,
         };
         let summary = {
@@ -576,6 +577,15 @@ impl SessionStore {
                     return Err(CodingSessionError::CommitFailed);
                 }
 
+                // Snapshot the previous attempt *before* appending the new
+                // task_instruction. Continuation feedback projects over this so
+                // it describes what the previous attempt did, not the empty new
+                // attempt. Use the per-session evidence cap so a long previous
+                // attempt's work is retained for the projection.
+                let pre_instruction_summary = inner
+                    .summary(&session_id, Some(DEFAULT_MAX_EVENTS_PER_SESSION))
+                    .expect("reusable session must summarize before instruction append");
+
                 let event = coding_instruction_event(
                     &new_event_id,
                     &session_id,
@@ -606,6 +616,7 @@ impl SessionStore {
                         record.project_instructions = Some(project_instructions);
                     }
                     record.events.push_back(event);
+                    record.events_observed = record.events_observed.saturating_add(1);
                     while record.events.len() > max_events {
                         record.events.pop_front();
                     }
@@ -621,6 +632,7 @@ impl SessionStore {
                     .expect("continued session must summarize");
                 CodingSessionOutcome {
                     summary,
+                    pre_instruction_summary: Some(pre_instruction_summary),
                     reused: true,
                     previous_mode: Some(previous_mode),
                     previous_guards: Some(previous_guards),
@@ -660,6 +672,7 @@ impl SessionStore {
                     updated_at: now,
                     messages: VecDeque::new(),
                     events: VecDeque::from([event]),
+                    events_observed: 1,
                     project_instructions: request.project_instructions,
                 };
                 let summary = inner.insert_session(record);
@@ -670,6 +683,7 @@ impl SessionStore {
                 }
                 CodingSessionOutcome {
                     summary,
+                    pre_instruction_summary: None,
                     reused: false,
                     previous_mode: None,
                     previous_guards: None,
@@ -1296,6 +1310,7 @@ impl SessionStoreInner {
                     record.lifecycle = SessionLifecycle::Closed;
                     record.updated_at = now;
                     record.events.push_back(event);
+                    record.events_observed = record.events_observed.saturating_add(1);
                     while record.events.len() > max_events {
                         record.events.pop_front();
                     }
@@ -1580,6 +1595,7 @@ impl SessionStoreInner {
         if let Some(record) = self.sessions.get_mut(&event.session_id) {
             record.updated_at = now_ts();
             record.events.push_back(event);
+            record.events_observed = record.events_observed.saturating_add(1);
             while record.events.len() > max_events_per_session {
                 record.events.pop_front();
             }
@@ -1750,7 +1766,25 @@ impl SessionStoreInner {
                 .filter(|event| event.change_summary_like)
                 .count(),
         };
-        let skip = record.events.len().saturating_sub(limit);
+        // The retained ledger is the per-session-capped tail `record.events`.
+        // `events_observed` counts every event ever appended, including those
+        // the per-session cap evicted; it is the durable source of truth for
+        // "did this session ever hold more events than are retained now".
+        let retained_total = record.events.len();
+        let observed_total = record.events_observed.max(retained_total as u64) as usize;
+        // The returned window is further sliced by the requested `limit`.
+        let skip = retained_total.saturating_sub(limit);
+        let events: Vec<SessionEvent> = record.events.iter().skip(skip).cloned().collect();
+        let events_returned = events.len();
+        // Truncated when the durable ledger ever held more events than we are
+        // returning: either the per-session cap evicted older events, or the
+        // requested limit sliced a shorter tail than the retained ledger.
+        let events_truncated = observed_total > events_returned;
+        // Absolute sequence of the first returned event within the durable
+        // ledger's observed event stream. Older evicted events occupy sequences
+        // before this; a read-only projection must not mistake the retained tail
+        // for the session start when this is non-zero.
+        let first_retained_sequence = observed_total.saturating_sub(events_returned);
         let project_instructions = record
             .project_instructions
             .as_ref()
@@ -1765,7 +1799,11 @@ impl SessionStoreInner {
             created_at: record.created_at,
             updated_at: record.updated_at,
             counts,
-            events: record.events.iter().skip(skip).cloned().collect(),
+            events,
+            events_total: observed_total,
+            events_returned,
+            events_truncated,
+            first_retained_sequence,
             project_instructions,
             messages: build_messages_summary(record),
         })

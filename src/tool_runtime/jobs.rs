@@ -1590,6 +1590,14 @@ impl ToolRuntime {
                     .is_some_and(is_blocking_active_job_status)
             })
             .count();
+        // `recovering` jobs are a subset of running/blocking-active jobs that the
+        // runner must reconcile before their output can be trusted. Counted over
+        // the full active vector (not the truncated `recent` list) so the count is
+        // reliable regardless of how many recent jobs are surfaced.
+        let recovering_count = active
+            .iter()
+            .filter(|summary| summary.get("status").and_then(Value::as_str) == Some("recovering"))
+            .count();
         let stop_requested_count = active
             .iter()
             .filter(|summary| {
@@ -1634,6 +1642,7 @@ impl ToolRuntime {
         json!({
             "active_count": active_count,
             "running_count": running_count,
+            "recovering_count": recovering_count,
             "stop_requested_count": stop_requested_count,
             "terminal_pending_count": terminal_pending_count,
             "blocking_active_count": blocking_active_count,
