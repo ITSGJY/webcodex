@@ -259,8 +259,11 @@ it never infers readiness from configuration.
 | Decision | Choice |
 |---|---|
 | Removed | `compact_startup`, `include_runtime_status`, `include_git`, `include_recent_commits`, `include_rules`, `include_tool_manifest`, `tool_manifest_intent`, `tool_manifest_categories`, `tool_manifest_limit` — removed from the wire and internals |
-| `full` | Full runtime status + recent commits + rules + tool manifest + recommended flow |
-| `minimal` | Additionally omits the `authority` block |
+| Shared core | MCP, REST, and the GPT Actions wrapper carry one deterministic startup-brief projection; transports do not reconstruct its fields |
+| `standard` | Default bounded Coding brief: strict session/project/workspace, incremental repository instructions, bounded continuation evidence, semantic-navigation summary, blockers/warnings, and concrete next actions; no runtime/connection/authority diagnostics or absolute execution path |
+| `minimal` | Same strict core contract with instruction bodies and bulk continuation lists omitted; keeps Session identity, workspace blockers, and the first next action |
+| `full` | Preserves full runtime/connection/authority/binding diagnostics, recent commits, rules summary, tool manifest, and recommended flow, and embeds the shared core as `startup_brief` |
+| Rule snapshot lifecycle | Fresh sessions load bounded content; unchanged same-process continuations reuse the in-memory fingerprint snapshot without repeating content; source additions/deletions/content/truncation changes return new bounded content; explicit or restart-restored Sessions reload because durable storage never contains rule bodies |
 | Unknown/legacy fields | Strict unknown-field error; no silent acceptance |
 
 No alias or dual shape is kept for the removed flags (consistent with §2).

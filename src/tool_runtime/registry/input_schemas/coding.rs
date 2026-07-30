@@ -28,7 +28,7 @@ pub(crate) fn start_coding_task_input_schema() -> Value {
                 "type": "string",
                 "enum": ["minimal", "standard", "full"],
                 "default": "standard",
-                "description": "Startup projection detail. minimal returns the session/project/Git/readiness/navigation essentials; standard adds the permission profile while retaining the compact continuous-coding projection; full explicitly adds full runtime status, recent commits, rules, recommended flow, and compact tool manifest."
+                "description": "Startup projection detail. minimal returns the strict model-facing session/project/workspace/blocker essentials and instruction status without rule content; standard is the default bounded Coding brief with repository rules, continuation evidence, semantic-navigation readiness, blockers, warnings, and concrete next actions; full preserves the complete diagnostic runtime, connection, authority, binding, Git/recent-commit, rules-summary, manifest, and recommended-flow blocks and also embeds the same startup_brief core."
             },
             "resume_session_id": {
                 "type": "string",

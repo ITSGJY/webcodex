@@ -353,7 +353,7 @@ async fn durable_current_binding_restores_same_window_after_restart() {
             mode: SessionMode::Normal,
             deny_write_tools: false,
             deny_shell_tools: false,
-            detail: StartupDetail::Standard,
+            detail: StartupDetail::Full,
             resume_session_id: None,
             bind_current: true,
             new_session: false,
@@ -384,7 +384,7 @@ async fn durable_current_binding_restores_same_window_after_restart() {
     assert_eq!(restored_status.restored_binding_count, 1);
     assert_eq!(restored_status.durable_binding_count, 1);
 
-    // Default startup resolves the durable exact binding, restores the local
+    // Startup resolves the durable exact binding, restores the local
     // cache, and appends a new instruction to the original Workflow Session.
     let restarted = dispatch_start_coding_task_with_local_agent(
         &runtime2,
@@ -395,7 +395,7 @@ async fn durable_current_binding_restores_same_window_after_restart() {
             mode: SessionMode::Normal,
             deny_write_tools: false,
             deny_shell_tools: false,
-            detail: StartupDetail::Standard,
+            detail: StartupDetail::Full,
             resume_session_id: None,
             bind_current: true,
             new_session: false,
@@ -1285,15 +1285,9 @@ async fn start_coding_task_mode_upgrade_is_atomic_and_permission_checked() {
     assert!(upgraded.success, "{:?}", upgraded.error);
     assert_eq!(upgraded.output["session"]["session_id"], session_id);
     assert_eq!(upgraded.output["session"]["mode"], "normal");
-    assert_eq!(
-        upgraded.output["session"]["guards"]["deny_write_tools"],
-        false
-    );
-    assert_eq!(
-        upgraded.output["session"]["guards"]["deny_shell_tools"],
-        false
-    );
     let summary = runtime.sessions.summary(&session_id, Some(20)).unwrap();
+    assert!(!summary.guards.deny_write_tools);
+    assert!(!summary.guards.deny_shell_tools);
     let transition = summary
         .events
         .iter()

@@ -3,70 +3,13 @@ use serde_json::{json, Value};
 use super::common::{
     array_schema, authority_profile_schema, continuation_feedback_schema, evidence_history_schema,
     evidence_integrity_schema, job_lifecycle_summary_schema, nullable_schema, open_object_schema,
-    permission_summary_schema, schema_type, task_outcome_schema, wrapped_output_schema,
+    permission_decision_schema, permission_summary_schema, schema_type, session_hint_schema,
+    task_outcome_schema, wrapped_output_schema,
 };
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
-        "start_coding_task" => Some(wrapped_output_schema(vec![
-            (
-                "detail",
-                schema_type("string", "Effective startup detail: minimal, standard, or full."),
-            ),
-            ("project", schema_type("string", "Original project input.")),
-            (
-                "resolved_project",
-                open_object_schema("Resolved project id, path, executor, and safe project metadata."),
-            ),
-            (
-                "session",
-                open_object_schema("Created, automatically continued, or explicitly resumed session id; root title, mode/guards, resume/reuse state, explicit-session guidance, and current exact-binding result."),
-            ),
-            (
-                "runtime_status",
-                nullable_schema("object", "Compact runtime observability for minimal/standard detail, full runtime_status for full detail."),
-            ),
-            (
-                "connection_state",
-                open_object_schema("Layered runner process, server transport/registration, project registry, connector endpoint, session binding, and last successful tool-call observations."),
-            ),
-            (
-                "authority",
-                authority_profile_schema("Canonical authority profile for this task."),
-            ),
-            (
-                "rules",
-                nullable_schema("object", "Deterministic project instruction source summary when requested; null otherwise."),
-            ),
-            (
-                "git",
-                nullable_schema("object", "Structured worktree/git summary when requested; null otherwise."),
-            ),
-            (
-                "semantic_navigation",
-                semantic_navigation_schema(),
-            ),
-            (
-                "tool_manifest",
-                open_object_schema("Compact tool_manifest output when requested; absent otherwise. Never includes full input/output schemas."),
-            ),
-            (
-                "recommended_flow",
-                open_object_schema("Deterministic recommended inspect/edit/validate/review/handoff tool groups."),
-            ),
-            (
-                "startup_verdict",
-                open_object_schema("Operator-friendly startup sanity verdict: status pass/warn/fail, blocking boolean, compact checks, and bounded suggested_next_actions. Additive UX summary only; does not change safety semantics."),
-            ),
-            (
-                "continuation_feedback",
-                continuation_feedback_schema("Deterministic continuation feedback for reused, resumed, or restored-after-restart sessions. not_applicable for a freshly created empty session. A read-only projection over existing session ledger, validation evidence, bounded job metadata, and the message board; never an LLM summary, never an Agent loop, never a new verdict, and it never executes shell, reads project files, enqueues Agent requests, mutates the ledger, refreshes activity, or consumes guidance."),
-            ),
-            (
-                "warnings",
-                array_schema(open_object_schema("Startup warning."), "Bounded startup warnings."),
-            ),
-        ])),
+        "start_coding_task" => Some(start_coding_task_output_schema()),
         "finish_coding_task" => Some(wrapped_output_schema(vec![
             (
                 "summary_only",
@@ -176,6 +119,585 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
         ])),
         _ => None,
     }
+}
+
+fn start_coding_task_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "success": {"type": "boolean"},
+            "output": {
+                "oneOf": [
+                    startup_brief_output_schema("minimal"),
+                    startup_brief_output_schema("standard"),
+                    full_startup_output_schema(),
+                ]
+            },
+            "error": {
+                "anyOf": [
+                    {"type": "string"},
+                    {"type": "null"}
+                ]
+            }
+        },
+        "required": ["success"],
+        "additionalProperties": false,
+    })
+}
+
+fn startup_brief_output_schema(detail: &str) -> Value {
+    let mut schema = startup_brief_schema(detail);
+    add_startup_recorder_metadata(&mut schema);
+    schema
+}
+
+fn add_startup_recorder_metadata(schema: &mut Value) {
+    let properties = schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .expect("startup output schema properties");
+    properties.insert(
+        "session_recorded".to_string(),
+        schema_type(
+            "boolean",
+            "True when wrapper-level recording_session_id recorded this startup call.",
+        ),
+    );
+    properties.insert(
+        "session_id".to_string(),
+        schema_type(
+            "string",
+            "Workflow Session id used only for wrapper-level telemetry recording.",
+        ),
+    );
+    properties.insert(
+        "session_event_id".to_string(),
+        schema_type("string", "Recorded wrapper event id when available."),
+    );
+    properties.insert("session_hint".to_string(), session_hint_schema());
+    properties.insert("permission".to_string(), permission_decision_schema());
+}
+
+fn startup_brief_schema(detail: &str) -> Value {
+    json!({
+        "type": "object",
+        "description": "Deterministic, bounded model-facing coding startup brief shared by MCP, REST, and GPT Actions.",
+        "properties": {
+            "detail": {"type": "string", "const": detail},
+            "session": startup_session_schema(),
+            "project": startup_project_schema(),
+            "workspace": startup_workspace_schema(),
+            "instructions": startup_instructions_schema(),
+            "continuation": startup_continuation_schema(),
+            "semantic_navigation": startup_semantic_navigation_schema(),
+            "blockers": startup_issue_list_schema(true),
+            "warnings": startup_issue_list_schema(false),
+            "startup_verdict": startup_verdict_schema(),
+            "deterministic": {"type": "boolean", "const": true},
+            "llm_summary": {"type": "boolean", "const": false}
+        },
+        "required": [
+            "detail",
+            "session",
+            "project",
+            "workspace",
+            "instructions",
+            "continuation",
+            "semantic_navigation",
+            "blockers",
+            "warnings",
+            "startup_verdict",
+            "deterministic",
+            "llm_summary"
+        ],
+        "additionalProperties": false,
+    })
+}
+
+fn full_startup_output_schema() -> Value {
+    let mut schema = json!({
+        "type": "object",
+        "description": "Full diagnostic startup output. Preserves the existing operator-facing blocks and embeds the shared model-facing startup_brief.",
+        "properties": {
+            "detail": {"type": "string", "const": "full"},
+            "project": schema_type("string", "Original project input."),
+            "resolved_project": open_object_schema("Resolved project id, absolute execution path, executor, and diagnostic project metadata."),
+            "session": open_object_schema("Full Workflow Session, guard, capability, context-refresh, exact-binding, and explicitly resumed session diagnostics."),
+            "runtime_status": open_object_schema("Full runtime status diagnostics."),
+            "connection_state": open_object_schema("Full layered connection diagnostics."),
+            "authority": authority_profile_schema("Canonical authority profile for this task."),
+            "rules": open_object_schema("Full deterministic rules source summary."),
+            "git": open_object_schema("Full bounded Git/worktree summary including recent commits."),
+            "semantic_navigation": semantic_navigation_schema(),
+            "tool_manifest": open_object_schema("Bounded compact tool manifest."),
+            "recommended_flow": open_object_schema("Deterministic recommended tool groups."),
+            "startup_verdict": open_object_schema("Legacy full diagnostic startup checks and suggested actions."),
+            "continuation_feedback": continuation_feedback_schema("Complete bounded continuation_feedback projection retained for full diagnostics."),
+            "warnings": array_schema(open_object_schema("Full diagnostic startup warning."), "Bounded diagnostic warnings."),
+            "startup_brief": startup_brief_schema("full"),
+            "deterministic": {"type": "boolean", "const": true},
+            "llm_summary": {"type": "boolean", "const": false}
+        },
+        "required": [
+            "detail",
+            "project",
+            "resolved_project",
+            "session",
+            "runtime_status",
+            "connection_state",
+            "authority",
+            "rules",
+            "git",
+            "semantic_navigation",
+            "tool_manifest",
+            "recommended_flow",
+            "startup_verdict",
+            "continuation_feedback",
+            "warnings",
+            "startup_brief",
+            "deterministic",
+            "llm_summary"
+        ],
+        "additionalProperties": false,
+    });
+    add_startup_recorder_metadata(&mut schema);
+    schema
+}
+
+fn startup_session_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "pattern": "^wc_sess_[A-Za-z0-9_]+$"},
+            "mode": {"type": "string", "enum": ["normal", "inspect", "read_only"]},
+            "continuation": {"type": "string", "enum": ["created", "continued", "resumed_explicitly"]},
+            "reused": {"type": "boolean"},
+            "resume_requested": {"type": "boolean"},
+            "current_binding": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["bound", "not_bound"]},
+                    "reason_code": {
+                        "anyOf": [
+                            {
+                                "type": "string",
+                                "enum": [
+                                    "stable_window_identity_unavailable",
+                                    "window_identity_unavailable",
+                                    "binding_disabled"
+                                ]
+                            },
+                            {"type": "null"}
+                        ]
+                    }
+                },
+                "required": ["status", "reason_code"],
+                "additionalProperties": false
+            },
+            "explicit_session_id_required_for_continuity": {"type": "boolean"}
+        },
+        "required": [
+            "session_id",
+            "mode",
+            "continuation",
+            "reused",
+            "resume_requested",
+            "current_binding",
+            "explicit_session_id_required_for_continuity"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn startup_project_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "requested": {"type": "string"},
+            "resolved_id": {"type": "string"},
+            "repository_identity": {
+                "type": "string",
+                "pattern": "^repository:v1:[0-9a-f]{64}$",
+                "description": "Domain-separated identity of the currently resolved canonical repository root; never contains the path."
+            },
+            "canonical_repository_root_matches": {
+                "anyOf": [
+                    {"type": "boolean"},
+                    {"type": "null"}
+                ],
+                "description": "true means the Session root identity is proved to match; null means this recovery path did not perform or cannot prove the comparison."
+            }
+        },
+        "required": [
+            "requested",
+            "resolved_id",
+            "repository_identity",
+            "canonical_repository_root_matches"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn startup_workspace_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "enum": ["clean", "dirty", "blocked", "unavailable"]},
+            "git_available": nullable_schema("boolean", "Whether bounded Git inspection was available."),
+            "branch": nullable_schema("string", "Current branch when observed."),
+            "head": nullable_schema("string", "Current full HEAD commit when observed."),
+            "clean": nullable_schema("boolean", "Whether the worktree is clean when observed."),
+            "conflicts": {"type": "integer", "minimum": 0},
+            "modified": {"type": "integer", "minimum": 0},
+            "untracked": {"type": "integer", "minimum": 0},
+            "staged": {"type": "integer", "minimum": 0},
+            "ahead": nullable_schema("integer", "Ahead count when a reliable source is available."),
+            "behind": nullable_schema("integer", "Behind count when a reliable source is available.")
+        },
+        "required": [
+            "status",
+            "git_available",
+            "branch",
+            "head",
+            "clean",
+            "conflicts",
+            "modified",
+            "untracked",
+            "staged",
+            "ahead",
+            "behind"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn startup_instructions_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["loaded", "reused", "changed", "not_found", "unavailable"]
+            },
+            "sources": {
+                "type": "array",
+                "maxItems": 5,
+                "items": startup_instruction_source_schema(),
+                "description": "Fixed, ordered repository-rule sources."
+            },
+            "changed_sources": {
+                "type": "array",
+                "uniqueItems": true,
+                "maxItems": 5,
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "AGENTS.md",
+                        "agents.md",
+                        "CLAUDE.md",
+                        ".codex/AGENTS.md",
+                        ".github/copilot-instructions.md"
+                    ]
+                }
+            },
+            "content_included": {"type": "boolean"},
+            "truncated": {"type": "boolean"},
+            "total_chars": {"type": "integer", "minimum": 0, "maximum": 32768}
+        },
+        "required": [
+            "status",
+            "sources",
+            "changed_sources",
+            "content_included",
+            "truncated",
+            "total_chars"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn startup_instruction_source_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "enum": [
+                    "AGENTS.md",
+                    "agents.md",
+                    "CLAUDE.md",
+                    ".codex/AGENTS.md",
+                    ".github/copilot-instructions.md"
+                ]
+            },
+            "fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "truncated": {"type": "boolean"},
+            "headings": {
+                "type": "array",
+                "maxItems": 6,
+                "items": {"type": "string", "maxLength": 160}
+            },
+            "content": {
+                "anyOf": [
+                    {
+                        "type": "string",
+                        "maxLength": 10240,
+                        "description": "Bounded repository-rule body only when loaded or changed."
+                    },
+                    {"type": "null"}
+                ]
+            },
+            "read_more": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "start_line": {"type": "integer", "minimum": 1},
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 400}
+                        },
+                        "required": ["path", "start_line", "limit"],
+                        "additionalProperties": false
+                    },
+                    {"type": "null"}
+                ]
+            }
+        },
+        "required": ["path", "fingerprint", "truncated", "headings", "content", "read_more"],
+        "additionalProperties": false
+    })
+}
+
+fn startup_continuation_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "enum": ["available", "not_applicable", "unknown"]},
+            "reason_code": nullable_schema("string", "Stable reason when continuation is not available."),
+            "instruction": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["available", "not_observed"]},
+                    "excerpt": {
+                        "anyOf": [
+                            {"type": "string", "maxLength": 768},
+                            {"type": "null"}
+                        ]
+                    },
+                    "truncated": {"type": "boolean"}
+                },
+                "required": ["status", "excerpt", "truncated"],
+                "additionalProperties": false
+            },
+            "outcome": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["in_progress", "blocked", "clean", "unknown"]},
+                    "reason_codes": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": {"type": "string", "maxLength": 96},
+                        "description": "Bounded outcome reasons."
+                    }
+                },
+                "required": ["status", "reason_codes"],
+                "additionalProperties": false
+            },
+            "changed_paths": bounded_list_schema(
+                json!({"type": "string", "maxLength": 192}),
+                20
+            ),
+            "validation": startup_validation_schema(),
+            "jobs": {
+                "type": "object",
+                "properties": {
+                    "active_count": {"type": "integer", "minimum": 0},
+                    "blocking_active_count": {"type": "integer", "minimum": 0},
+                    "nonblocking_active_count": {"type": "integer", "minimum": 0},
+                    "recovering_count": {"type": "integer", "minimum": 0},
+                    "terminal_pending_count": {"type": "integer", "minimum": 0},
+                    "latest_status": {"type": "string"}
+                },
+                "required": [
+                    "active_count",
+                    "blocking_active_count",
+                    "nonblocking_active_count",
+                    "recovering_count",
+                    "terminal_pending_count",
+                    "latest_status"
+                ],
+                "additionalProperties": false
+            },
+            "open_guidance": {
+                "type": "object",
+                "properties": {
+                    "count": {"type": "integer", "minimum": 0},
+                    "risk_count": {"type": "integer", "minimum": 0},
+                    "todo_count": {"type": "integer", "minimum": 0},
+                    "latest_kind": nullable_schema("string", "Latest open guidance kind when observed.")
+                },
+                "required": ["count", "risk_count", "todo_count", "latest_kind"],
+                "additionalProperties": false
+            },
+            "suggested_next_actions": bounded_list_schema(
+                json!({"type": "string", "maxLength": 384}),
+                5
+            )
+        },
+        "required": [
+            "status",
+            "reason_code",
+            "instruction",
+            "outcome",
+            "changed_paths",
+            "validation",
+            "jobs",
+            "open_guidance",
+            "suggested_next_actions"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn startup_validation_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "latest_status": {
+                "type": "string",
+                "enum": ["passed", "failed", "not_run", "unknown", "unavailable"]
+            },
+            "open_failures": bounded_list_schema(startup_failure_schema(), 10),
+            "delta": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["available", "unavailable"]},
+                    "reason_code": nullable_schema("string", "Stable validation comparison reason."),
+                    "new_failures": bounded_list_schema(startup_failure_schema(), 10),
+                    "resolved_failures": bounded_list_schema(startup_failure_schema(), 10),
+                    "still_failing": bounded_list_schema(startup_failure_schema(), 10)
+                },
+                "required": [
+                    "status",
+                    "reason_code",
+                    "new_failures",
+                    "resolved_failures",
+                    "still_failing"
+                ],
+                "additionalProperties": false
+            }
+        },
+        "required": ["latest_status", "open_failures", "delta"],
+        "additionalProperties": false
+    })
+}
+
+fn startup_failure_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "kind": {"type": "string", "enum": ["test", "diagnostic", "unknown"]},
+            "name": {"type": "string", "maxLength": 160},
+            "file": {
+                "anyOf": [
+                    {"type": "string", "maxLength": 160},
+                    {"type": "null"}
+                ]
+            },
+            "line": nullable_schema("integer", "Source line when available.")
+        },
+        "required": ["kind", "name", "file", "line"],
+        "additionalProperties": false
+    })
+}
+
+fn bounded_list_schema(items: Value, max_items: usize) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "items": {"type": "array", "maxItems": max_items, "items": items},
+            "total": {"type": "integer", "minimum": 0},
+            "returned": {"type": "integer", "minimum": 0, "maximum": max_items},
+            "truncated": {"type": "boolean"}
+        },
+        "required": ["items", "total", "returned", "truncated"],
+        "additionalProperties": false
+    })
+}
+
+fn startup_semantic_navigation_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": [
+                    "running",
+                    "available",
+                    "initializing",
+                    "crashed",
+                    "unavailable",
+                    "not_applicable",
+                    "agent_unavailable",
+                    "agent_capability_unavailable",
+                    "probe_timeout",
+                    "probe_failed"
+                ]
+            },
+            "available": {"type": "boolean"},
+            "provider": nullable_schema("string", "Semantic provider when applicable."),
+            "capability": nullable_schema("string", "Bounded advertised capability summary."),
+            "reason_code": nullable_schema("string", "Stable semantic-navigation reason.")
+        },
+        "required": ["status", "available", "provider", "capability", "reason_code"],
+        "additionalProperties": false
+    })
+}
+
+fn startup_issue_list_schema(blockers: bool) -> Value {
+    let values = if blockers {
+        json!([
+            "workspace_conflicts",
+            "project_unavailable",
+            "write_scope_missing",
+            "runner_unavailable",
+            "runtime_unavailable",
+            "active_jobs_blocking"
+        ])
+    } else {
+        json!([
+            "dirty_worktree",
+            "git_unavailable",
+            "semantic_navigation_unavailable",
+            "current_binding_unavailable",
+            "rules_unavailable",
+            "runtime_status_unavailable",
+            "active_jobs_present"
+        ])
+    };
+    json!({
+        "type": "array",
+        "uniqueItems": true,
+        "maxItems": 8,
+        "items": {"type": "string", "enum": values}
+    })
+}
+
+fn startup_verdict_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "enum": ["pass", "warn", "fail"]},
+            "blocking": {"type": "boolean"},
+            "suggested_next_actions": {
+                "type": "array",
+                "maxItems": 5,
+                "items": {"type": "string", "maxLength": 384}
+            }
+        },
+        "required": ["status", "blocking", "suggested_next_actions"],
+        "additionalProperties": false
+    })
 }
 
 fn semantic_navigation_schema() -> Value {

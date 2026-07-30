@@ -117,11 +117,17 @@ fn prepare_action_tools_call_response(
         StatusCode::BAD_REQUEST
     };
     // Audit the full execution payload so compacting the client body does not
-    // erase operator-visible tool output from the action audit trail.
+    // erase operator-visible tool output from the action audit trail. Coding
+    // startup rule prose is response-only and is redacted from durable audit.
+    let audit_output = if tool == "start_coding_task" {
+        crate::tool_runtime::startup_brief::startup_output_for_audit(&result.output)
+    } else {
+        result.output.clone()
+    };
     let mut event = ActionAuditRecord::new(tool.to_string(), result.success, status)
         .error(result.error.clone())
         .summary(json!({
-            "output": result.output.clone(),
+            "output": audit_output,
         }));
     event.project = project;
     audit.record(event);

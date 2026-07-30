@@ -35,7 +35,13 @@ fn continuation_feedback_output_schemas_are_synchronized() {
         "session_handoff_summary",
     ] {
         let spec = spec_named(&specs, name);
-        let props = &spec.output_schema["properties"]["output"]["properties"];
+        let props = if name == "start_coding_task" {
+            start_full_output_schema(spec)
+                .get("properties")
+                .expect("full startup properties")
+        } else {
+            &spec.output_schema["properties"]["output"]["properties"]
+        };
         assert!(
             props
                 .as_object()
@@ -56,7 +62,20 @@ fn continuation_feedback_output_schemas_are_synchronized() {
 /// Locate the `continuation_feedback` strict sub-schema inside a tool output.
 fn continuation_feedback_subschema(specs: &[ToolSpec], tool: &str) -> Value {
     let spec = spec_named(specs, tool);
-    spec.output_schema["properties"]["output"]["properties"]["continuation_feedback"].clone()
+    if tool == "start_coding_task" {
+        start_full_output_schema(spec)["properties"]["continuation_feedback"].clone()
+    } else {
+        spec.output_schema["properties"]["output"]["properties"]["continuation_feedback"].clone()
+    }
+}
+
+fn start_full_output_schema(spec: &ToolSpec) -> &Value {
+    spec.output_schema["properties"]["output"]["oneOf"]
+        .as_array()
+        .expect("start_coding_task detail variants")
+        .iter()
+        .find(|variant| variant["properties"]["detail"]["const"] == "full")
+        .expect("full startup output schema")
 }
 
 /// Walk every object node reachable from `schema` and assert it carries
@@ -1349,7 +1368,10 @@ fn coding_call(
         mode: SessionMode::Normal,
         deny_write_tools: false,
         deny_shell_tools: false,
-        detail: StartupDetail::Standard,
+        // These integration assertions exercise the complete underlying
+        // continuation_feedback block retained by full diagnostics. Standard
+        // uses the separately tested bounded model-facing projection.
+        detail: StartupDetail::Full,
         resume_session_id: resume.map(str::to_string),
         bind_current,
         new_session: false,

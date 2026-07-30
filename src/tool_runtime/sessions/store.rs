@@ -613,7 +613,15 @@ impl SessionStore {
                     record.guards = next_guards;
                     record.updated_at = now;
                     if let Some(project_instructions) = request.project_instructions {
-                        record.project_instructions = Some(project_instructions);
+                        // A transient runner/read failure must not erase the
+                        // last complete in-memory rules snapshot. Fresh
+                        // sessions may still retain a partial/unavailable
+                        // snapshot so startup can report it conservatively.
+                        if project_instructions.scan_complete
+                            || record.project_instructions.is_none()
+                        {
+                            record.project_instructions = Some(project_instructions);
+                        }
                     }
                     record.events.push_back(event);
                     record.events_observed = record.events_observed.saturating_add(1);

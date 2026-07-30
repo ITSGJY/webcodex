@@ -1,490 +1,225 @@
-//! GPT Action response compact experiment.
+//! GPT Action response wrapper for the shared coding startup brief.
 //!
-//! Applied only on the HTTP `POST /api/tools/call` response path after tool
-//! execution completes. Does not change MCP, tools/list, OpenAPI schemas,
-//! tool execution, session ledger events, or permission decisions.
+//! Tool execution constructs the model-facing projection once. This transport
+//! layer may wrap that exact value, but must never rebuild, trim, or rename its
+//! core fields.
 
+use crate::tool_runtime::startup_brief::startup_brief_from_output;
 use crate::tool_runtime::ToolResult;
 use serde_json::{json, Value};
 
-/// Optionally shrink a successful GPT Action tool result for the HTTP client.
+const STARTUP_RESULT_METADATA_FIELDS: &[&str] = &[
+    "session_recorded",
+    "session_id",
+    "session_event_id",
+    "session_hint",
+    "permission",
+];
+
+/// Optionally wrap a successful GPT Action startup result.
 ///
-/// Errors are returned unchanged so failure details stay identical.
+/// Errors and all non-startup tools remain byte-for-byte equivalent at the
+/// `ToolResult` value level.
 pub(crate) fn compact_action_tool_result(tool: &str, result: ToolResult) -> ToolResult {
-    if !result.success {
+    if !result.success || tool != "start_coding_task" {
         return result;
     }
-    match tool {
-        "start_coding_task" => ToolResult {
-            success: true,
-            output: compact_start_coding_task_output(&result.output),
-            error: None,
-        },
-        _ => result,
+    ToolResult {
+        success: true,
+        output: compact_start_coding_task_output(&result.output),
+        error: None,
     }
 }
 
-/// Compact `start_coding_task` success output for GPT Actions.
-///
-/// Keeps identifiers and operator guidance needed to continue the coding loop.
-/// Drops large startup aggregates (tool_manifest, full runtime_status, rules
-/// content, git details, permissions profile, recommended_flow, etc.). Callers
-/// can re-query those via focused tools.
+/// Carry the already-built core brief behind the one Action-only wrapper.
 pub(crate) fn compact_start_coding_task_output(output: &Value) -> Value {
-    let session_id = output
-        .pointer("/session/session_id")
+    let mut startup_brief = startup_brief_from_output(output)
         .cloned()
-        .unwrap_or(Value::Null);
-    // Coding-task identifier is the workflow session id; surface both names
-    // so Action clients can treat either field as the task handle.
-    let task_id = session_id.clone();
-    let project = output.get("project").cloned().unwrap_or(Value::Null);
-    let mode = output
-        .pointer("/session/mode")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let continuation = output
-        .pointer("/session/continuation")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let reused = output
-        .pointer("/session/reused")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let resume_requested = output
-        .pointer("/session/resume_requested")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let current_binding = output
-        .pointer("/session/current_binding")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let explicit_session_id_required_for_continuity = output
-        .pointer("/session/explicit_session_id_required_for_continuity")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let resolved_project = compact_resolved_project(output.get("resolved_project"));
-    let verdict = output.get("startup_verdict");
-    let status = verdict
-        .and_then(|v| v.get("status"))
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    let blocking = verdict
-        .and_then(|v| v.get("blocking"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let next_steps = verdict
-        .and_then(|v| v.get("suggested_next_actions"))
-        .cloned()
-        .unwrap_or_else(|| json!([]));
-    let git = compact_git_workspace(output.get("git"));
-    let summary = build_startup_summary(status, blocking, &project, &session_id, &git);
-    let semantic_navigation = compact_semantic_navigation(output.get("semantic_navigation"));
-    let warnings = compact_warnings(output.get("warnings"));
-
-    json!({
-        "compact": true,
-        "session_id": session_id,
-        "task_id": task_id,
-        "project": project,
-        "resolved_project": resolved_project,
-        "mode": mode,
-        "continuation": continuation,
-        "reused": reused,
-        "resume_requested": resume_requested,
-        "current_binding": current_binding,
-        "explicit_session_id_required_for_continuity": explicit_session_id_required_for_continuity,
-        "summary": summary,
-        "next_steps": next_steps.clone(),
-        "startup_verdict": {
-            "status": status,
-            "blocking": blocking,
-            "suggested_next_actions": next_steps,
-        },
-        "git": git,
-        "semantic_navigation": semantic_navigation,
-        "warnings": warnings,
-        "deterministic": true,
-        "llm_summary": false,
-    })
-}
-
-fn compact_resolved_project(resolved: Option<&Value>) -> Value {
-    let Some(resolved) = resolved.filter(|v| v.is_object()) else {
-        return Value::Null;
-    };
-    json!({
-        "id": resolved.get("id").cloned().unwrap_or(Value::Null),
-        "input": resolved.get("input").cloned().unwrap_or(Value::Null),
-        "executor": resolved.get("executor").cloned().unwrap_or(Value::Null),
-    })
-}
-
-fn compact_semantic_navigation(nav: Option<&Value>) -> Value {
-    let Some(nav) = nav.filter(|v| v.is_object()) else {
-        return Value::Null;
-    };
-    json!({
-        "supported": nav.get("supported").cloned().unwrap_or(Value::Null),
-        "available": nav.get("available").cloned().unwrap_or(Value::Null),
-        "recommended": nav.get("recommended").cloned().unwrap_or(Value::Null),
-        "status": nav.get("status").cloned().unwrap_or(Value::Null),
-        "language": nav.get("language").cloned().unwrap_or(Value::Null),
-        "server": nav.get("server").cloned().unwrap_or(Value::Null),
-    })
-}
-
-fn compact_warnings(warnings: Option<&Value>) -> Value {
-    match warnings {
-        Some(Value::Array(items)) => {
-            // Keep a short bound so compact mode never reintroduces bulk.
-            let trimmed: Vec<Value> = items.iter().take(8).cloned().collect();
-            Value::Array(trimmed)
+        .unwrap_or_else(|| json!({}));
+    if output.get("detail").and_then(Value::as_str) != Some("full") {
+        if let Some(object) = startup_brief.as_object_mut() {
+            for field in STARTUP_RESULT_METADATA_FIELDS {
+                object.remove(*field);
+            }
         }
-        Some(other) => other.clone(),
-        None => json!([]),
     }
-}
 
-/// Keep only operator-critical workspace status for compact Action responses.
-///
-/// Full file lists, show_changes payloads, and recent commits are omitted so
-/// dirty worktrees stay visible without reintroducing bulk.
-fn compact_git_workspace(git: Option<&Value>) -> Value {
-    let Some(git) = git.filter(|v| v.is_object()) else {
-        return Value::Null;
-    };
-    let counts = git.get("counts").cloned().unwrap_or_else(|| json!({}));
-    json!({
-        "available": git.get("available").cloned().unwrap_or(Value::Null),
-        "clean": git.get("clean").cloned().unwrap_or(Value::Null),
-        "changed_files_count": git
-            .get("changed_files_count")
-            .cloned()
-            .unwrap_or(Value::Null),
-        "counts": {
-            "modified": counts.get("modified").cloned().unwrap_or(json!(0)),
-            "added": counts.get("added").cloned().unwrap_or(json!(0)),
-            "deleted": counts.get("deleted").cloned().unwrap_or(json!(0)),
-            "renamed": counts.get("renamed").cloned().unwrap_or(json!(0)),
-            "copied": counts.get("copied").cloned().unwrap_or(json!(0)),
-            "untracked": counts.get("untracked").cloned().unwrap_or(json!(0)),
-            "conflicted": counts.get("conflicted").cloned().unwrap_or(json!(0)),
-            "staged": counts.get("staged").cloned().unwrap_or(json!(0)),
-            "unstaged": counts.get("unstaged").cloned().unwrap_or(json!(0)),
-        },
-    })
-}
-
-fn build_startup_summary(
-    status: &str,
-    blocking: bool,
-    project: &Value,
-    session_id: &Value,
-    git: &Value,
-) -> String {
-    let project = project.as_str().unwrap_or("unknown project");
-    let session = session_id.as_str().unwrap_or("unknown session");
-    if blocking {
-        return format!(
-            "Startup {status} (blocking) for {project}; session {session}. Follow next_steps before editing."
-        );
+    let mut compact = json!({
+        "compact": true,
+        "startup_brief": startup_brief,
+    });
+    if let Some(object) = compact.as_object_mut() {
+        for field in STARTUP_RESULT_METADATA_FIELDS {
+            if let Some(value) = output.get(*field) {
+                object.insert((*field).to_string(), value.clone());
+            }
+        }
     }
-    let dirty = git.get("clean").and_then(Value::as_bool) == Some(false);
-    let conflicted = git
-        .pointer("/counts/conflicted")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        > 0;
-    if conflicted {
-        format!(
-            "Startup {status} for {project}; session {session} ready with merge/rebase conflicts. Inspect and preserve existing worktree state; not a startup failure."
-        )
-    } else if dirty {
-        format!(
-            "Startup {status} for {project}; session {session} ready with existing worktree changes. Inspect and preserve them while editing; not a startup failure."
-        )
-    } else {
-        format!(
-            "Startup {status} for {project}; session {session} ready. Use session_id on later tools."
-        )
-    }
+    compact
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
-    fn sample_start_coding_task_output() -> Value {
+    fn sample_brief() -> Value {
         json!({
-            "project": "demo",
-            "resolved_project": {
-                "input": "demo",
-                "id": "agent:importer:demo",
-                "path": "/tmp/demo",
-                "executor": "agent",
-                "client_id": "importer",
-                "allow_patch": true
-            },
+            "detail": "standard",
             "session": {
                 "session_id": "wc_sess_test123",
                 "mode": "normal",
-                "guards": {"deny_write_tools": false, "deny_shell_tools": false},
-                "lifecycle": {"state": "open"},
-                "explicit_session_id_recommended": true,
-                "current_binding": {"bound": false}
+                "continuation": "continued",
+                "reused": true,
+                "resume_requested": false,
+                "current_binding": {"status": "bound", "reason_code": null},
+                "explicit_session_id_required_for_continuity": false
             },
-            "runtime_status": {
-                "service": "webcodex",
-                "tools": {"count": 75, "names": ["a", "b", "c"]},
-                "agents": {"clients": [{"id": "x"}, {"id": "y"}]}
+            "project": {
+                "requested": "demo",
+                "resolved_id": "agent:test:demo",
+                "repository_identity": "repository:v1:abc",
+                "canonical_repository_root_matches": true
             },
-            "permissions": {
-                "policy": "dev_auto_approve",
-                "auto_approve": true,
-                "details": "large profile blob"
-            },
-            "rules": {
-                "present": true,
-                "sources": [{"path": "AGENTS.md", "first_lines": ["# Rules"]}]
-            },
-            "git": {
-                "available": true,
+            "workspace": {
+                "status": "clean",
+                "git_available": true,
+                "branch": "main",
+                "head": "abc",
                 "clean": true,
-                "changed_files_count": 0,
-                "counts": {
-                    "modified": 0,
-                    "added": 0,
-                    "deleted": 0,
-                    "renamed": 0,
-                    "copied": 0,
-                    "untracked": 0,
-                    "conflicted": 0,
-                    "staged": 0,
-                    "unstaged": 0
+                "conflicts": 0,
+                "modified": 0,
+                "untracked": 0,
+                "staged": 0,
+                "ahead": null,
+                "behind": null
+            },
+            "instructions": {
+                "status": "reused",
+                "sources": [{
+                    "path": "AGENTS.md",
+                    "fingerprint": "abc",
+                    "truncated": false,
+                    "headings": ["# Rules"],
+                    "content": null,
+                    "read_more": null
+                }],
+                "changed_sources": [],
+                "content_included": false,
+                "truncated": false,
+                "total_chars": 10
+            },
+            "continuation": {
+                "status": "available",
+                "reason_code": null,
+                "instruction": {"status": "available", "excerpt": "fix it", "truncated": false},
+                "outcome": {"status": "in_progress", "reason_codes": []},
+                "changed_paths": {"items": ["src/lib.rs"], "total": 1, "returned": 1, "truncated": false},
+                "validation": {
+                    "latest_status": "failed",
+                    "open_failures": {"items": [], "total": 0, "returned": 0, "truncated": false},
+                    "delta": {
+                        "status": "unavailable",
+                        "reason_code": "no_previous_validation",
+                        "new_failures": {"items": [], "total": 0, "returned": 0, "truncated": false},
+                        "resolved_failures": {"items": [], "total": 0, "returned": 0, "truncated": false},
+                        "still_failing": {"items": [], "total": 0, "returned": 0, "truncated": false}
+                    }
                 },
-                "recent_commits": [{"subject": "init"}, {"subject": "more"}],
-                "show_changes": {"files": ["bulk"]}
+                "jobs": {
+                    "active_count": 0,
+                    "blocking_active_count": 0,
+                    "nonblocking_active_count": 0,
+                    "recovering_count": 0,
+                    "terminal_pending_count": 0,
+                    "latest_status": "not_observed"
+                },
+                "open_guidance": {"count": 0, "risk_count": 0, "todo_count": 0, "latest_kind": null},
+                "suggested_next_actions": {"items": ["fix failing test x"], "total": 1, "returned": 1, "truncated": false}
             },
             "semantic_navigation": {
-                "supported": true,
-                "available": true,
-                "recommended": true,
                 "status": "available",
-                "language": "rust",
-                "server": "rust-analyzer",
-                "tools": ["lsp_definition", "lsp_references"]
+                "available": true,
+                "provider": "rust-analyzer",
+                "capability": "lsp_read_only_navigation",
+                "reason_code": null
             },
-            "tool_manifest": {
-                "schema_version": 1,
-                "count": 75,
-                "tools": [
-                    {"name": "start_coding_task", "accepted_flattened_args": ["project", "title"], "purpose": "start a coding task with startup context"},
-                    {"name": "read_file", "accepted_flattened_args": ["project", "path"], "purpose": "read a project file range"},
-                    {"name": "show_changes", "accepted_flattened_args": ["project", "session_id"], "purpose": "review worktree changes"},
-                    {"name": "workspace_hygiene_check", "accepted_flattened_args": ["project"], "purpose": "hygiene findings"},
-                    {"name": "finish_coding_task", "accepted_flattened_args": ["project", "session_id"], "purpose": "close out a coding task"},
-                    {"name": "replace_line_range", "accepted_flattened_args": ["project", "path", "start_line", "end_line", "content"], "purpose": "line edit"},
-                    {"name": "cargo_test", "accepted_flattened_args": ["project", "filter"], "purpose": "run cargo test"}
-                ]
-            },
-            "recommended_flow": {
-                "inspect": ["read_file", "search_project_text"],
-                "edit": ["replace_line_range"]
-            },
+            "blockers": [],
+            "warnings": [],
             "startup_verdict": {
                 "status": "pass",
                 "blocking": false,
-                "checks": [
-                    {"name": "runtime_status", "status": "pass"},
-                    {"name": "workspace", "status": "pass"}
-                ],
-                "suggested_next_actions": [
-                    "proceed with the coding task using the explicit session_id"
-                ]
+                "suggested_next_actions": ["fix failing test x"]
             },
-            "warnings": [],
             "deterministic": true,
             "llm_summary": false
         })
     }
 
     #[test]
-    fn compact_start_coding_task_keeps_ids_summary_and_next_steps() {
-        let full = sample_start_coding_task_output();
-        let compact = compact_start_coding_task_output(&full);
-
+    fn compact_action_keeps_the_exact_standard_core() {
+        let brief = sample_brief();
+        let compact = compact_start_coding_task_output(&brief);
         assert_eq!(compact["compact"], true);
-        assert_eq!(compact["session_id"], "wc_sess_test123");
-        assert_eq!(compact["task_id"], "wc_sess_test123");
-        assert_eq!(compact["project"], "demo");
-        assert_eq!(compact["resolved_project"]["id"], "agent:importer:demo");
-        assert_eq!(compact["mode"], "normal");
-        assert!(compact["summary"]
-            .as_str()
-            .unwrap()
-            .contains("wc_sess_test123"));
+        assert_eq!(compact["startup_brief"], brief);
+        assert_eq!(compact["startup_brief"]["instructions"]["status"], "reused");
         assert_eq!(
-            compact["next_steps"][0],
-            "proceed with the coding task using the explicit session_id"
+            compact["startup_brief"]["continuation"]["suggested_next_actions"]["items"][0],
+            "fix failing test x"
         );
-        assert_eq!(compact["startup_verdict"]["status"], "pass");
-        assert_eq!(compact["startup_verdict"]["blocking"], false);
-        assert_eq!(compact["git"]["clean"], true);
-        assert_eq!(compact["git"]["changed_files_count"], 0);
-        assert_eq!(compact["semantic_navigation"]["recommended"], true);
     }
 
     #[test]
-    fn explicit_resume_compact_output_keeps_continuity_and_unbound_state() {
-        let mut full = sample_start_coding_task_output();
-        full["session"]["continuation"] = json!("resumed_explicitly");
-        full["session"]["reused"] = json!(true);
-        full["session"]["resume_requested"] = json!(true);
-        full["session"]["explicit_session_id_required_for_continuity"] = json!(true);
-        full["session"]["current_binding"] = json!({
-            "bound": false,
-            "reason_code": "stable_window_identity_unavailable"
+    fn compact_action_extracts_the_same_core_from_full_diagnostics() {
+        let brief = sample_brief();
+        let full = json!({
+            "detail": "full",
+            "runtime_status": {"large": true},
+            "connection_state": {"diagnostic": true},
+            "startup_brief": brief,
+        });
+        let compact = compact_start_coding_task_output(&full);
+        assert_eq!(compact["startup_brief"], sample_brief());
+        assert!(compact.get("runtime_status").is_none());
+        assert!(compact.get("connection_state").is_none());
+    }
+
+    #[test]
+    fn compact_action_keeps_recorder_metadata_outside_the_shared_core() {
+        let brief = sample_brief();
+        let mut recorded = brief.clone();
+        recorded["session_recorded"] = json!(true);
+        recorded["session_id"] = json!("wc_sess_recorder");
+        recorded["session_event_id"] = json!("evt_recorded");
+        recorded["session_hint"] = json!({
+            "has_open_messages": true,
+            "open_counts": {"guidance": 1, "question": 0, "todo": 0, "risk": 0},
+            "highest_priority": "normal",
+            "suggested_next_tool": "session_discussion_summary"
         });
 
-        let compact = compact_start_coding_task_output(&full);
-        assert_eq!(compact["continuation"], "resumed_explicitly");
-        assert_eq!(compact["reused"], true);
-        assert_eq!(compact["resume_requested"], true);
-        assert_eq!(
-            compact["current_binding"]["reason_code"],
-            "stable_window_identity_unavailable"
-        );
-        assert_eq!(compact["explicit_session_id_required_for_continuity"], true);
+        let compact = compact_start_coding_task_output(&recorded);
+        assert_eq!(compact["startup_brief"], brief);
+        assert_eq!(compact["session_recorded"], true);
+        assert_eq!(compact["session_id"], "wc_sess_recorder");
+        assert_eq!(compact["session_event_id"], "evt_recorded");
+        assert!(compact["session_hint"].is_object());
+        assert!(compact["startup_brief"].get("session_recorded").is_none());
+        assert!(compact["startup_brief"].get("session_hint").is_none());
     }
 
     #[test]
-    fn compact_start_coding_task_drops_large_optional_blocks() {
-        let full = sample_start_coding_task_output();
-        let compact = compact_start_coding_task_output(&full);
-
-        for dropped in [
-            "tool_manifest",
-            "runtime_status",
-            "permissions",
-            "rules",
-            "recommended_flow",
-        ] {
-            assert!(
-                compact.get(dropped).is_none(),
-                "compact output must drop {dropped}"
-            );
-        }
-        // Compact git keeps clean/counts only — not bulk show_changes/commits.
-        assert!(compact.get("git").is_some());
-        assert!(compact["git"].get("show_changes").is_none());
-        assert!(compact["git"].get("recent_commits").is_none());
-        assert!(
-            compact.pointer("/startup_verdict/checks").is_none(),
-            "compact startup_verdict must omit verbose checks"
-        );
-        assert!(
-            compact.pointer("/semantic_navigation/tools").is_none(),
-            "compact semantic_navigation must omit tools list"
-        );
-        assert!(
-            compact.pointer("/resolved_project/path").is_none(),
-            "compact resolved_project must omit path"
-        );
-    }
-
-    #[test]
-    fn compact_start_coding_task_preserves_dirty_workspace_warning_without_blocking() {
-        let mut full = sample_start_coding_task_output();
-        full["git"] = json!({
-            "available": true,
-            "clean": false,
-            "changed_files_count": 2,
-            "counts": {
-                "modified": 1,
-                "added": 0,
-                "deleted": 0,
-                "renamed": 0,
-                "copied": 0,
-                "untracked": 1,
-                "conflicted": 0,
-                "staged": 0,
-                "unstaged": 1
-            }
-        });
-        full["startup_verdict"] = json!({
-            "status": "warn",
-            "blocking": false,
-            "checks": [
-                {"name": "workspace", "status": "warn", "reason": "workspace_dirty"}
-            ],
-            "suggested_next_actions": [
-                "inspect existing worktree changes with show_changes and preserve them while editing"
-            ]
-        });
-        full["warnings"] = json!([{
-            "kind": "dirty_worktree",
-            "changed_files_count": 2,
-            "message": "workspace has existing tracked or untracked changes; inspect and preserve them while editing"
-        }]);
-
-        let compact = compact_start_coding_task_output(&full);
-        assert_eq!(compact["startup_verdict"]["status"], "warn");
-        assert_eq!(compact["startup_verdict"]["blocking"], false);
-        assert_eq!(compact["git"]["clean"], false);
-        assert_eq!(compact["git"]["changed_files_count"], 2);
-        assert_eq!(compact["git"]["counts"]["modified"], 1);
-        assert_eq!(compact["git"]["counts"]["untracked"], 1);
-        assert!(compact["summary"]
-            .as_str()
-            .unwrap()
-            .contains("existing worktree changes"));
-        assert!(compact["summary"]
-            .as_str()
-            .unwrap()
-            .contains("not a startup failure"));
-        assert_eq!(compact["warnings"][0]["kind"], "dirty_worktree");
-        assert!(compact["next_steps"][0]
-            .as_str()
-            .unwrap()
-            .contains("preserve"));
-    }
-
-    #[test]
-    fn compact_start_coding_task_is_much_smaller() {
-        let full = sample_start_coding_task_output();
-        let compact = compact_start_coding_task_output(&full);
-        let full_bytes = serde_json::to_vec(&full).unwrap().len();
-        let compact_bytes = serde_json::to_vec(&compact).unwrap().len();
-        assert!(
-            compact_bytes < full_bytes / 2,
-            "compact ({compact_bytes}) should be under half of full ({full_bytes})"
-        );
-    }
-
-    #[test]
-    fn compact_action_tool_result_preserves_errors() {
-        let err = ToolResult::err_with_output(
+    fn compact_action_tool_result_preserves_errors_and_other_tools() {
+        let error = ToolResult::err_with_output(
             "project not found",
             json!({"code": "unknown_project", "project": "missing"}),
         );
-        let out = compact_action_tool_result("start_coding_task", err);
-        assert!(!out.success);
-        assert_eq!(out.error.as_deref(), Some("project not found"));
-        assert_eq!(out.output["code"], "unknown_project");
-        assert!(out.output.get("compact").is_none());
-    }
+        let output = compact_action_tool_result("start_coding_task", error);
+        assert!(!output.success);
+        assert_eq!(output.error.as_deref(), Some("project not found"));
+        assert_eq!(output.output["code"], "unknown_project");
 
-    #[test]
-    fn compact_action_tool_result_leaves_other_tools_unchanged() {
-        let result = ToolResult::ok(json!({
-            "tools": [{"name": "read_file"}, {"name": "write_file"}],
-            "count": 2
-        }));
-        let out = compact_action_tool_result("list_tools", result);
-        assert_eq!(out.output["count"], 2);
-        assert_eq!(out.output["tools"].as_array().unwrap().len(), 2);
-        assert!(out.output.get("compact").is_none());
+        let other = ToolResult::ok(json!({"count": 2}));
+        let output = compact_action_tool_result("list_tools", other);
+        assert_eq!(output.output["count"], 2);
     }
 }

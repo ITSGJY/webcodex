@@ -244,6 +244,8 @@ pub(crate) struct ValidationDeltaFailures {
     pub(crate) newly_failed: Vec<FailureIdentity>,
     pub(crate) resolved: Vec<FailureIdentity>,
     pub(crate) still_failing: Vec<FailureIdentity>,
+    pub(crate) total_newly_failed: usize,
+    pub(crate) total_resolved: usize,
     pub(crate) total_still_failing: usize,
     pub(crate) list_truncated: bool,
 }
@@ -315,6 +317,8 @@ impl ContinuationFeedback {
                         newly_failed: Vec::new(),
                         resolved: Vec::new(),
                         still_failing: Vec::new(),
+                        total_newly_failed: 0,
+                        total_resolved: 0,
                         total_still_failing: 0,
                         list_truncated: false,
                     },
@@ -1070,6 +1074,8 @@ fn validation_delta(validation: &Value) -> ValidationDelta {
                 newly_failed: Vec::new(),
                 resolved: Vec::new(),
                 still_failing: Vec::new(),
+                total_newly_failed: 0,
+                total_resolved: 0,
                 total_still_failing: 0,
                 list_truncated: false,
             },
@@ -1104,6 +1110,8 @@ fn validation_delta(validation: &Value) -> ValidationDelta {
             newly_failed: failures.newly_failed,
             resolved: failures.resolved,
             still_failing: failures.still_failing,
+            total_newly_failed: failures.total_newly_failed,
+            total_resolved: failures.total_resolved,
             total_still_failing: failures.total_still_failing,
             list_truncated: failures.list_truncated,
         },
@@ -1131,6 +1139,8 @@ fn unavailable_delta(reason: &'static str) -> ValidationDelta {
             newly_failed: Vec::new(),
             resolved: Vec::new(),
             still_failing: Vec::new(),
+            total_newly_failed: 0,
+            total_resolved: 0,
             total_still_failing: 0,
             list_truncated: false,
         },
@@ -1453,6 +1463,8 @@ struct DeltaFailures {
     newly_failed: Vec<FailureIdentity>,
     resolved: Vec<FailureIdentity>,
     still_failing: Vec<FailureIdentity>,
+    total_newly_failed: usize,
+    total_resolved: usize,
     total_still_failing: usize,
     list_truncated: bool,
 }
@@ -1491,6 +1503,8 @@ fn delta_failures(current: &Value, previous: &Value) -> (DeltaFailures, Option<&
                     newly_failed: Vec::new(),
                     resolved: Vec::new(),
                     still_failing: Vec::new(),
+                    total_newly_failed: 0,
+                    total_resolved: 0,
                     total_still_failing: 0,
                     list_truncated: false,
                 },
@@ -1512,6 +1526,8 @@ fn delta_failures(current: &Value, previous: &Value) -> (DeltaFailures, Option<&
                 newly_failed: Vec::new(),
                 resolved: Vec::new(),
                 still_failing: Vec::new(),
+                total_newly_failed: 0,
+                total_resolved: 0,
                 total_still_failing: 0,
                 list_truncated: false,
             },
@@ -1540,6 +1556,8 @@ fn delta_failures(current: &Value, previous: &Value) -> (DeltaFailures, Option<&
     resolved.sort_by(compare_failure_identity);
     still_failing.sort_by(compare_failure_identity);
 
+    let total_newly_failed = newly_failed.len();
+    let total_resolved = resolved.len();
     let total_still_failing = still_failing.len();
     let list_truncated = newly_failed.len() > MAX_FAILURE_IDENTITIES
         || resolved.len() > MAX_FAILURE_IDENTITIES
@@ -1553,6 +1571,8 @@ fn delta_failures(current: &Value, previous: &Value) -> (DeltaFailures, Option<&
             newly_failed,
             resolved,
             still_failing,
+            total_newly_failed,
+            total_resolved,
             total_still_failing,
             list_truncated,
         },

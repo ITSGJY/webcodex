@@ -189,7 +189,7 @@ pub(crate) fn job_lifecycle_summary_schema(description: &str) -> Value {
     })
 }
 
-fn permission_decision_schema() -> Value {
+pub(super) fn permission_decision_schema() -> Value {
     open_object_schema("Permission decision metadata for high-risk tools after hard safety checks pass. Never includes stdout, stderr, env, tokens, secrets, or raw input content.")
 }
 
@@ -238,7 +238,7 @@ pub(crate) fn search_match_schema() -> Value {
     })
 }
 
-fn session_hint_schema() -> Value {
+pub(super) fn session_hint_schema() -> Value {
     json!({
         "type": "object",
         "description": "Optional lightweight hint that the recorder session has open guidance, question, todo, or risk messages. Counts only; never includes message text.",
@@ -357,7 +357,20 @@ pub(crate) fn continuation_feedback_schema(description: &str) -> Value {
             "attempt": attempt_summary_schema(),
             "validation_delta": validation_delta_schema("Deterministic diff between the latest validation evidence and the most recent prior comparable evidence. unavailable with a stable reason code when the two runs are not proven comparable; never a new pass/fail verdict.")
         },
-        "required": ["status", "deterministic", "llm_summary", "attempt", "validation_delta"]
+        "required": ["status", "deterministic", "llm_summary"],
+        "allOf": [
+            {
+                "if": {
+                    "properties": {
+                        "status": {"const": "available"}
+                    },
+                    "required": ["status"]
+                },
+                "then": {
+                    "required": ["attempt", "validation_delta"]
+                }
+            }
+        ]
     })
 }
 
@@ -630,10 +643,12 @@ fn validation_delta_failures_schema() -> Value {
             "newly_failed": array_schema(failure_identity_schema(), "Bounded newly-failed stable failure identities."),
             "resolved": array_schema(failure_identity_schema(), "Bounded resolved stable failure identities."),
             "still_failing": array_schema(failure_identity_schema(), "Bounded still-failing stable failure identities."),
+            "total_newly_failed": schema_type("integer", "Real count of newly-failed identities before bounding."),
+            "total_resolved": schema_type("integer", "Real count of resolved identities before bounding."),
             "total_still_failing": schema_type("integer", "Real count of still-failing identities (may exceed the bounded list)."),
             "list_truncated": schema_type("boolean", "True when a failure list was capped at the bound.")
         },
-        "required": ["identity_status", "newly_failed", "resolved", "still_failing", "total_still_failing", "list_truncated"]
+        "required": ["identity_status", "newly_failed", "resolved", "still_failing", "total_newly_failed", "total_resolved", "total_still_failing", "list_truncated"]
     })
 }
 

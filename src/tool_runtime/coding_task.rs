@@ -23,6 +23,7 @@ use super::session_context::{
 };
 use super::sessions::tool_failure_summary_from_events;
 use super::sessions::{self, SessionTransport, TOOL_CALL_RECORDING_SESSION_ID_FIELD};
+use super::startup_brief::{build_startup_brief, StartupBriefInput};
 use super::tool_catalog::TOOL_RECOMMENDED_FLOWS;
 use super::tool_inputs::{SessionMode, StartupDetail};
 use super::tool_result::ToolResult;
@@ -113,7 +114,6 @@ impl ToolRuntime {
         // standard/minimal use the compact projections.
         let compact_startup = detail != StartupDetail::Full;
         let include_recent_commits = detail == StartupDetail::Full;
-        let include_rules = detail == StartupDetail::Full;
         let include_tool_manifest = detail == StartupDetail::Full;
         let tool_manifest = if include_tool_manifest {
             match self.compact_tool_manifest_payload_bounded(None, None, None) {
@@ -128,12 +128,22 @@ impl ToolRuntime {
             Ok(resolved) => resolved,
             Err(err) => return err.into_tool_result(),
         };
-        let semantic_navigation = self.probe_semantic_navigation_for_startup(&resolved).await;
-        let project_instructions = if include_rules {
-            Some(self.load_project_instructions(&resolved.config).await)
-        } else {
-            None
-        };
+        let semantic_navigation =
+            serde_json::to_value(self.probe_semantic_navigation_for_startup(&resolved).await)
+                .unwrap_or_else(|_| {
+                    json!({
+                        "supported": false,
+                        "available": false,
+                        "status": "probe_failed",
+                        "reason_code": "status_probe_failed",
+                    })
+                });
+        // Coding startup always observes every fixed repository-rule
+        // candidate. The complete bounded body remains only in the in-memory
+        // Workflow Session; the ledger persistence path omits it.
+        let project_instructions = self
+            .load_coding_project_instructions(&resolved.config)
+            .await;
         let mut warnings = Vec::new();
         let continuity_key = if bind_current {
             match current_session_key(
@@ -165,21 +175,28 @@ impl ToolRuntime {
         };
 
         let mut runtime_status_call_failed = false;
-        let runtime_status = {
+        let (runtime_status, runtime_status_for_brief) = {
             let result = self.runtime_status(auth).await;
             if !result.success {
                 runtime_status_call_failed = true;
                 warnings.push(json!({
                     "kind": "runtime_status_unavailable",
-                    "message": result.error,
+                    "message": "runtime status was unavailable during startup",
                 }));
             }
-            if compact_startup {
-                compact_runtime_status(&result.output)
+            let raw = result.output;
+            let projected = if compact_startup {
+                compact_runtime_status(&raw)
             } else {
-                result.output
-            }
+                raw.clone()
+            };
+            (projected, raw)
         };
+        let owning_runner_available = owning_runner_available(
+            &resolved,
+            &runtime_status_for_brief,
+            runtime_status_call_failed,
+        );
         let git = self
             .start_coding_task_git_summary(
                 &resolved.resolved_id,
@@ -207,12 +224,12 @@ impl ToolRuntime {
                     deny_write_tools,
                     deny_shell_tools,
                 },
-                project_instructions: project_instructions.clone(),
+                project_instructions: Some(project_instructions.clone()),
                 transport,
                 bind_current: binding_available,
                 new_session,
-                // Startup always re-reads bounded current Git state and, for
-                // full detail, the fixed project-instruction candidates.
+                // Startup always re-reads bounded current Git state and the
+                // fixed project-instruction candidates.
                 context_refreshed: true,
                 write_scope_verified,
             },
@@ -393,18 +410,23 @@ impl ToolRuntime {
         } else {
             "created"
         };
+        // Read the lifecycle-aware, project-scoped summary once, after the
+        // potentially slow startup probes, then share it across continuation,
+        // the legacy full verdict, and the model-facing brief.
+        let active_jobs = self
+            .active_jobs_summary(Some(&resolved.resolved_id), auth, 10)
+            .await;
         let continuation_feedback = self
             .start_continuation_feedback(
                 &session_outcome.summary,
                 session_outcome.pre_instruction_summary.as_ref(),
                 continuation_kind,
-                &resolved.resolved_id,
-                auth,
+                &active_jobs,
             )
             .await;
         let mut output = json!({
             "detail": detail.as_str(),
-            "project": project,
+            "project": project.clone(),
             "resolved_project": resolved_project_payload(&resolved),
             "session": {
                 "session_id": session_summary.session_id,
@@ -435,7 +457,7 @@ impl ToolRuntime {
                 "context": {
                     "refreshed": true,
                     "git_state_recaptured": true,
-                    "rules_recaptured": include_rules,
+                    "rules_recaptured": true,
                 },
                 "explicit_session_id_required_for_continuity": !binding_available,
                 "explicit_session_id_recommended": !binding_available,
@@ -445,14 +467,14 @@ impl ToolRuntime {
                 },
                 "current_binding": current_binding,
             },
-            "runtime_status": runtime_status,
+            "runtime_status": runtime_status.clone(),
             "connection_state": connection_state,
             "authority": authority_profile_payload(),
-            "rules": rules_summary(project_instructions.as_ref()),
-            "git": git,
-            "semantic_navigation": semantic_navigation,
+            "rules": rules_summary(Some(&project_instructions)),
+            "git": git.clone(),
+            "semantic_navigation": semantic_navigation.clone(),
             "recommended_flow": recommended_flow,
-            "continuation_feedback": continuation_feedback,
+            "continuation_feedback": continuation_feedback.clone(),
             "deterministic": true,
             "llm_summary": false,
             "warnings": warnings,
@@ -460,22 +482,65 @@ impl ToolRuntime {
         if let Some(tool_manifest) = tool_manifest {
             output["tool_manifest"] = tool_manifest;
         }
-        if !include_rules {
-            output.as_object_mut().map(|object| object.remove("rules"));
+        output["startup_verdict"] = startup_verdict(
+            &output,
+            &active_jobs,
+            owning_runner_available,
+            runtime_status_call_failed,
+            include_tool_manifest,
+        );
+        let previous_instructions = session_outcome
+            .pre_instruction_summary
+            .as_ref()
+            .and_then(|summary| summary.project_instructions.as_ref());
+        let force_instruction_load =
+            !session_outcome.reused || resume_requested || previous_instructions.is_none();
+        let binding_reason_code = if binding_available {
+            None
+        } else if bind_current {
+            Some(if resume_requested {
+                "stable_window_identity_unavailable"
+            } else {
+                "window_identity_unavailable"
+            })
+        } else {
+            Some("binding_disabled")
+        };
+        let canonical_repository_root_matches = if resume_requested {
+            None
+        } else {
+            // A fresh Session starts at the resolved root. Automatic reuse can
+            // only come from the exact current binding, whose identity includes
+            // the canonical repository-root key.
+            Some(true)
+        };
+        let startup_brief = build_startup_brief(StartupBriefInput {
+            detail,
+            requested_project: &project,
+            resolved: &resolved,
+            session: session_summary,
+            continuation_kind,
+            reused: session_outcome.reused,
+            resume_requested,
+            binding_available,
+            binding_reason_code,
+            instructions: &project_instructions,
+            previous_instructions,
+            force_instruction_load,
+            git: &git,
+            semantic_navigation: &semantic_navigation,
+            continuation_feedback: &continuation_feedback,
+            active_jobs: &active_jobs,
+            owning_runner_available,
+            canonical_repository_root_matches,
+            runtime_status_call_failed,
+        });
+        if detail == StartupDetail::Full {
+            output["startup_brief"] = startup_brief;
+            ToolResult::ok(output)
+        } else {
+            ToolResult::ok(startup_brief)
         }
-        if detail != StartupDetail::Full {
-            if let Some(object) = output.as_object_mut() {
-                object.remove("recommended_flow");
-            }
-        }
-        if detail == StartupDetail::Minimal {
-            if let Some(object) = output.as_object_mut() {
-                object.remove("authority");
-            }
-        }
-        output["startup_verdict"] =
-            startup_verdict(&output, runtime_status_call_failed, include_tool_manifest);
-        ToolResult::ok(output)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -757,8 +822,7 @@ impl ToolRuntime {
         summary: &sessions::SessionSummary,
         pre_instruction_summary: Option<&sessions::SessionSummary>,
         continuation_kind: &'static str,
-        resolved_project: &str,
-        auth: Option<&AuthContext>,
+        jobs: &Value,
     ) -> Value {
         // Fresh new session: nothing to continue from.
         if continuation_kind == "created" {
@@ -789,9 +853,6 @@ impl ToolRuntime {
             &projection_summary.events,
             20,
         );
-        let jobs = self
-            .active_jobs_summary(Some(resolved_project), auth, 10)
-            .await;
         let discussion = self.empty_discussion_on_err(&summary.session_id);
         continuation_feedback_value(ContinuationFeedbackInput {
             session_summary: projection_summary,
@@ -967,6 +1028,7 @@ fn rules_summary(snapshot: Option<&ProjectInstructionsSnapshot>) -> Value {
         "total_chars": snapshot.total_chars,
         "max_total_chars": snapshot.max_total_chars,
         "truncated": snapshot.truncated,
+        "scan_complete": snapshot.scan_complete,
         "summary": if snapshot.loaded {
             "deterministic instruction source summary; read listed sources for full content"
         } else {
@@ -979,6 +1041,7 @@ fn rules_summary(snapshot: Option<&ProjectInstructionsSnapshot>) -> Value {
 fn rule_source_summary(file: &ProjectInstructionFile) -> Value {
     json!({
         "path": file.path.clone(),
+        "fingerprint": file.fingerprint.clone(),
         "chars": file.chars,
         "total_lines": file.total_lines,
         "start_line": file.start_line,
@@ -1173,6 +1236,8 @@ fn compact_finish_output(output: &Value, resolved_unexpected_validation_failures
 
 fn startup_verdict(
     output: &Value,
+    active_jobs: &Value,
+    owning_runner_available: Option<bool>,
     runtime_status_call_failed: bool,
     tool_manifest_requested: bool,
 ) -> Value {
@@ -1185,8 +1250,12 @@ fn startup_verdict(
         runtime_status_check(output, runtime_status_call_failed),
     );
     push_startup_check(&mut checks, "workspace", workspace_check(output));
-    push_startup_check(&mut checks, "jobs", startup_jobs_check(output));
-    push_startup_check(&mut checks, "agent", startup_agent_check(output));
+    push_startup_check(&mut checks, "jobs", startup_jobs_check(active_jobs));
+    push_startup_check(
+        &mut checks,
+        "agent",
+        startup_agent_check(output, owning_runner_available),
+    );
     push_startup_check(
         &mut checks,
         "tool_manifest",
@@ -1282,10 +1351,7 @@ fn workspace_check(output: &Value) -> (&'static str, Option<&'static str>) {
     }
 }
 
-fn startup_jobs_check(output: &Value) -> (&'static str, Option<&'static str>) {
-    let jobs = output
-        .pointer("/runtime_status/jobs")
-        .unwrap_or(&Value::Null);
+fn startup_jobs_check(jobs: &Value) -> (&'static str, Option<&'static str>) {
     if jobs
         .get("blocking_active_count")
         .and_then(Value::as_u64)
@@ -1301,21 +1367,46 @@ fn startup_jobs_check(output: &Value) -> (&'static str, Option<&'static str>) {
     }
 }
 
-fn startup_agent_check(output: &Value) -> (&'static str, Option<&'static str>) {
+fn startup_agent_check(
+    output: &Value,
+    owning_runner_available: Option<bool>,
+) -> (&'static str, Option<&'static str>) {
     let executor = output
         .pointer("/resolved_project/executor")
         .and_then(Value::as_str);
-    let online = output
-        .pointer("/runtime_status/agents/summary/online")
-        .or_else(|| output.pointer("/runtime_status/agents/online_count"))
-        .and_then(Value::as_u64);
-    match (executor, online) {
-        (Some("agent"), Some(0)) => ("fail", Some("agent_offline")),
-        (Some("agent"), Some(_)) => ("pass", None),
+    match (executor, owning_runner_available) {
+        (Some("agent"), Some(false)) => ("fail", Some("agent_offline")),
+        (Some("agent"), Some(true)) => ("pass", None),
+        (Some("agent"), None) => ("warn", Some("agent_health_unknown")),
         (Some("local"), _) => ("pass", None),
-        (_, Some(_)) => ("pass", None),
         _ => ("warn", Some("agent_health_unknown")),
     }
+}
+
+fn owning_runner_available(
+    resolved: &ResolvedProject,
+    runtime_status: &Value,
+    runtime_status_call_failed: bool,
+) -> Option<bool> {
+    if !resolved.config.is_agent() {
+        return Some(true);
+    }
+    if runtime_status_call_failed {
+        return None;
+    }
+    Some(
+        runtime_status
+            .pointer("/agents/summary/clients")
+            .and_then(Value::as_array)
+            .and_then(|clients| {
+                clients.iter().find(|client| {
+                    client.get("client_id").and_then(Value::as_str)
+                        == Some(resolved.config.client_id.as_str())
+                })
+            })
+            .and_then(|client| client.get("status").and_then(Value::as_str))
+            == Some("online"),
+    )
 }
 
 fn startup_tool_manifest_check(
@@ -1532,5 +1623,56 @@ fn append_hygiene_warnings(hygiene: &Value, warnings: &mut Vec<Value>) {
             "findings": finding_count,
             "message": "workspace hygiene findings should be reviewed",
         }));
+    }
+}
+
+#[cfg(test)]
+mod startup_runner_tests {
+    use super::*;
+    use crate::projects::ProjectConfig;
+
+    fn resolved_agent(client_id: &str) -> ResolvedProject {
+        ResolvedProject {
+            input: "demo".to_string(),
+            resolved_id: format!("agent:{client_id}:demo"),
+            config: ProjectConfig {
+                path: "/tmp/demo".to_string(),
+                client_id: client_id.to_string(),
+                allow_patch: true,
+            },
+        }
+    }
+
+    #[test]
+    fn missing_target_runner_is_unavailable_even_when_a_peer_is_online() {
+        let runtime_status = json!({
+            "agents": {
+                "summary": {
+                    "clients": [{"client_id": "peer", "status": "online"}]
+                }
+            }
+        });
+        assert_eq!(
+            owning_runner_available(&resolved_agent("target"), &runtime_status, false),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn target_runner_online_is_available_even_when_a_peer_is_stale() {
+        let runtime_status = json!({
+            "agents": {
+                "summary": {
+                    "clients": [
+                        {"client_id": "peer", "status": "stale"},
+                        {"client_id": "target", "status": "online"}
+                    ]
+                }
+            }
+        });
+        assert_eq!(
+            owning_runner_available(&resolved_agent("target"), &runtime_status, false),
+            Some(true)
+        );
     }
 }

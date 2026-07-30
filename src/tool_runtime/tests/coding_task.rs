@@ -59,19 +59,34 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
         );
     }
     let start_output = crate::tool_runtime::registry::output_schema_for_tool("start_coding_task");
+    let startup_variants = start_output["properties"]["output"]["oneOf"]
+        .as_array()
+        .expect("start output should expose detail-specific variants");
+    assert_eq!(startup_variants.len(), 3);
+    let standard = startup_variants
+        .iter()
+        .find(|variant| variant["properties"]["detail"]["const"] == "standard")
+        .expect("standard startup brief schema");
     assert!(
-        start_output["properties"]["output"]["properties"]
+        standard["properties"]
             .as_object()
             .unwrap()
-            .contains_key("authority"),
-        "start_coding_task output schema should include authority"
+            .contains_key("instructions"),
+        "standard startup brief should include instructions"
     );
     assert!(
-        start_output["properties"]["output"]["properties"]
+        standard["properties"]
             .as_object()
             .unwrap()
             .contains_key("startup_verdict"),
         "start_coding_task output schema should include startup_verdict"
+    );
+    assert!(
+        !standard["properties"]
+            .as_object()
+            .unwrap()
+            .contains_key("runtime_status"),
+        "standard startup brief must omit full runtime diagnostics"
     );
     let finish = spec_named(&specs, "finish_coding_task");
     assert_eq!(required_fields(finish), vec!["project", "session_id"]);
@@ -160,15 +175,7 @@ async fn start_coding_task_can_explicitly_disable_current_binding() {
     commit_file(
         tmp.path(),
         "AGENTS.md",
-        &json!({
-            "format": "webcodex.file_read_range.v1",
-            "content": "# Rules\n\nUse focused tests.\n",
-            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "total_lines": 3,
-            "start_line": 1,
-            "limit": 2000
-        })
-        .to_string(),
+        "# Rules\n\nUse focused tests.\n",
         "add instructions",
     );
     commit_file(tmp.path(), "README.md", "hello\n", "add readme");
@@ -201,50 +208,17 @@ async fn start_coding_task_can_explicitly_disable_current_binding() {
         }
     });
 
-    let rules_req = next_patch_agent_request(&runtime, "coding-start")
-        .await
-        .expect("start_coding_task should load rules through the agent");
-    assert_eq!(rules_req.kind, "file_read");
-    complete_patch_agent_request(
-        &runtime,
-        "coding-start",
-        &rules_req.request_id,
-        0,
-        &canonical_agent_file_read_output("# Rules\n\nUse focused tests.\n", 3),
-        "",
-    )
-    .await;
-
-    let status_req = next_patch_agent_request(&runtime, "coding-start")
-        .await
-        .expect("start_coding_task should inspect git status through the agent");
-    assert!(status_req.command.contains("git status --porcelain=v1 -b"));
-    let show_changes_stdout =
-        "## main\n@@WEBCODEX_SHOW_CHANGES_SEP@@\nabc123\0abc123\0add readme\n@@WEBCODEX_SHOW_CHANGES_SEP@@\n";
-    complete_patch_agent_request(
-        &runtime,
-        "coding-start",
-        &status_req.request_id,
-        0,
-        show_changes_stdout,
-        "",
-    )
-    .await;
-
-    let log_req = next_patch_agent_request(&runtime, "coding-start")
-        .await
-        .expect("start_coding_task should inspect recent commits through the agent");
-    assert!(log_req.command.contains("git log"));
-    let commit_stdout = "0123456789012345678901234567890123456789\u{1f}0123456\u{1f}HEAD -> main\u{1f}WebCodex Test\u{1f}test@example.com\u{1f}2026-01-01T00:00:00+00:00\u{1f}add readme\u{1e}";
-    complete_patch_agent_request(
-        &runtime,
-        "coding-start",
-        &log_req.request_id,
-        0,
-        commit_stdout,
-        "",
-    )
-    .await;
+    for _ in 0..200 {
+        if task.is_finished() {
+            break;
+        }
+        if let Some(request) = next_patch_agent_request(&runtime, "coding-start").await {
+            complete_agent_request_by_running_locally(&runtime, "coding-start", request).await;
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+    assert!(task.is_finished(), "start_coding_task did not finish");
 
     let result = task.await.unwrap();
 
@@ -404,7 +378,7 @@ async fn start_coding_task_can_omit_compact_tool_manifest() {
 }
 
 #[tokio::test]
-async fn start_coding_task_minimal_runtime_status_is_compact_and_path_safe() {
+async fn start_coding_task_minimal_brief_is_bounded_and_path_safe() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     let runtime = test_runtime();
@@ -422,57 +396,54 @@ async fn start_coding_task_minimal_runtime_status_is_compact_and_path_safe() {
     let auth = auth_context(None, true);
     let project = "agent:coding-full-status:demo".to_string();
 
-    let task = tokio::spawn({
-        let runtime = runtime.clone();
-        let project = project.clone();
-        let auth = auth.clone();
-        async move {
-            runtime
-                .dispatch_with_auth(
-                    ToolCall::from_tool_name(
-                        "start_coding_task",
-                        json!({
-                            "project": project,
-                            "detail": "minimal"
-                        }),
-                    )
-                    .unwrap(),
-                    Some(&auth),
-                )
-                .await
-        }
-    });
-    let request = next_patch_agent_request(&runtime, "coding-full-status")
-        .await
-        .expect("minimal startup should inspect workspace state");
-    complete_agent_request_by_running_locally(&runtime, "coding-full-status", request).await;
-    let result = task.await.unwrap();
+    let result = start_coding_task_serviced(
+        &runtime,
+        "coding-full-status",
+        json!({
+            "project": project,
+            "detail": "minimal"
+        }),
+        &auth,
+    )
+    .await;
 
     assert!(result.success, "{:?}", result.error);
-    let runtime_status = &result.output["runtime_status"];
-    assert_eq!(runtime_status["compact"], true);
-    assert!(runtime_status["tools"]["names"].is_null());
-    assert!(!serde_json::to_string(runtime_status)
+    assert_eq!(result.output["detail"], "minimal");
+    assert!(result.output["session"]["session_id"].is_string());
+    assert!(result.output["project"]["repository_identity"]
+        .as_str()
+        .is_some_and(|value| value.starts_with("repository:v1:")));
+    assert_eq!(result.output["instructions"]["content_included"], false);
+    assert_eq!(
+        result.output["startup_verdict"]["suggested_next_actions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(!serde_json::to_string(&result.output)
         .unwrap()
         .contains("/tmp/startup-full-allowed-root"));
-    assert!(result.output["connection_state"]["runner_process"]["status"].is_string());
     for omitted in [
         "tool_manifest",
         "rules",
         "recent_commits",
         "authority",
         "recommended_flow",
+        "runtime_status",
+        "connection_state",
+        "git",
     ] {
         assert!(
             result.output.get(omitted).is_none(),
             "minimal startup must omit {omitted}"
         );
     }
-    assert!(result.output["git"].get("recent_commits").is_none());
+    assert!(result.output["workspace"].is_object());
 }
 
 #[tokio::test]
-async fn start_coding_task_compact_startup_returns_sanitized_runtime_summary() {
+async fn start_coding_task_standard_returns_model_facing_brief_without_diagnostics() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     let runtime = test_runtime();
@@ -499,61 +470,43 @@ async fn start_coding_task_compact_startup_returns_sanitized_runtime_summary() {
     .await;
 
     assert!(result.success, "{:?}", result.error);
-    let summary = &result.output["runtime_status"];
-    assert_eq!(summary["compact"], true);
-    for pointer in [
-        "/build/version",
-        "/build/git_commit",
-        "/build/git_dirty",
-        "/tools/count",
-        "/jobs/active_count",
-        "/agents/summary/online",
-        "/projects/effective/status",
-        "/projects/agent_registered/online_count",
+    assert_eq!(result.output["detail"], "standard");
+    for field in [
+        "session",
+        "project",
+        "workspace",
+        "instructions",
+        "continuation",
+        "semantic_navigation",
+        "blockers",
+        "warnings",
+        "startup_verdict",
     ] {
         assert!(
-            summary.pointer(pointer).is_some(),
-            "compact startup runtime_status should include {pointer}"
+            result.output.get(field).is_some(),
+            "standard startup brief should include {field}"
         );
     }
-    assert_eq!(summary["build"]["version"], env!("CARGO_PKG_VERSION"));
-    assert!(summary["build"].get("git_commit").is_some());
-    assert!(summary["build"].get("git_dirty").is_some());
-    assert!(summary["tools"]["count"].as_u64().unwrap() > 0);
-    assert!(summary["tools"].get("names").is_none());
-    assert_eq!(summary["jobs"]["active_count"], 0);
-    assert!(summary["agents"]["summary"].is_object());
-    assert_eq!(summary["agents"]["summary"]["count"], 1);
-    assert_eq!(summary["agents"]["summary"]["online"], 1);
-    assert_eq!(
-        summary["agents"]["summary"]["clients"][0]["client_id"],
-        "coding-compact-status"
-    );
-    assert_eq!(
-        summary["agents"]["summary"]["clients"][0]["status"],
-        "online"
-    );
-    assert_eq!(
-        summary["agents"]["summary"]["clients"][0]["transport"],
-        "polling"
-    );
-    assert_eq!(
-        summary["agents"]["summary"]["clients"][0]["projects_count"],
-        1
-    );
-    assert_eq!(summary["projects"]["effective"]["status"], "ok");
-    assert_eq!(summary["projects"]["effective"]["count"], 1);
-    assert_eq!(summary["projects"]["agent_registered"]["count"], 1);
-    assert_eq!(summary["projects"]["agent_registered"]["online_count"], 1);
-    assert!(summary["projects"].get("server_static").is_none());
+    for diagnostic in [
+        "runtime_status",
+        "connection_state",
+        "authority",
+        "git",
+        "rules",
+        "tool_manifest",
+        "recommended_flow",
+        "resolved_project",
+    ] {
+        assert!(
+            result.output.get(diagnostic).is_none(),
+            "standard startup brief must omit {diagnostic}"
+        );
+    }
     let verdict = &result.output["startup_verdict"];
-    assert_startup_verdict_shape(verdict);
     assert_ne!(verdict["status"], "fail");
     assert_eq!(verdict["blocking"], false);
-    assert_check_reason(verdict, "tool_manifest", "tool_manifest_not_requested");
-    assert_compact_verdict_safe(verdict, "startup verdict");
 
-    let serialized = serde_json::to_string(summary).unwrap();
+    let serialized = serde_json::to_string(&result.output).unwrap();
     for forbidden in [
         "tools.names",
         "policy",
@@ -630,10 +583,20 @@ async fn start_coding_task_with_git_inspection(
                 .await
         }
     });
-    let req = next_patch_agent_request(runtime, client_id)
-        .await
-        .expect("start_coding_task should inspect workspace git status");
-    complete_agent_request_by_running_locally(runtime, client_id, req).await;
+    for _ in 0..200 {
+        if task.is_finished() {
+            break;
+        }
+        if let Some(req) = next_patch_agent_request(runtime, client_id).await {
+            complete_agent_request_by_running_locally(runtime, client_id, req).await;
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+    assert!(
+        task.is_finished(),
+        "start_coding_task did not finish after servicing startup agent requests"
+    );
     task.await.unwrap()
 }
 
@@ -681,7 +644,6 @@ fn assert_startup_nonblocking_dirty(result: &ToolResult, workspace_reason: &str)
         .expect("session_id");
     assert!(session_id.starts_with("wc_sess_"), "{session_id}");
     let verdict = &result.output["startup_verdict"];
-    assert_startup_verdict_shape(verdict);
     assert_eq!(
         verdict["blocking"], false,
         "dirty workspace must not block: {verdict}"
@@ -691,15 +653,15 @@ fn assert_startup_nonblocking_dirty(result: &ToolResult, workspace_reason: &str)
         "dirty workspace must not fail startup: {verdict}"
     );
     assert_eq!(verdict["status"], "warn");
-    assert_check_status(verdict, "workspace", "warn");
-    assert_check_reason(verdict, "workspace", workspace_reason);
-    assert_eq!(result.output["git"]["clean"], false);
+    assert_eq!(workspace_reason, "workspace_dirty");
+    assert_eq!(result.output["workspace"]["status"], "dirty");
+    assert_eq!(result.output["workspace"]["clean"], false);
     assert!(
         result.output["warnings"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|w| w["kind"] == "dirty_worktree"),
+            .any(|warning| warning == "dirty_worktree"),
         "top-level dirty_worktree warning expected: {}",
         result.output["warnings"]
     );
@@ -721,8 +683,8 @@ async fn start_coding_task_untracked_only_is_nonblocking_warning() {
     let result = start_coding_task_with_git_inspection(&runtime, client_id, &project, &auth).await;
 
     assert_startup_nonblocking_dirty(&result, "workspace_dirty");
-    assert_eq!(result.output["git"]["counts"]["untracked"], 1);
-    assert_eq!(result.output["git"]["counts"]["modified"], 0);
+    assert_eq!(result.output["workspace"]["untracked"], 1);
+    assert_eq!(result.output["workspace"]["modified"], 0);
     assert_eq!(
         fs::read_to_string(tmp.path().join("report.md")).unwrap(),
         report_before,
@@ -753,8 +715,7 @@ async fn start_coding_task_tracked_modified_is_nonblocking_and_allows_continued_
     let result = start_coding_task_with_git_inspection(&runtime, client_id, &project, &auth).await;
 
     assert_startup_nonblocking_dirty(&result, "workspace_dirty");
-    assert_eq!(result.output["git"]["counts"]["modified"], 1);
-    assert_eq!(result.output["git"]["counts"]["unstaged"], 1);
+    assert_eq!(result.output["workspace"]["modified"], 1);
 
     // Worktree content is the real baseline: edit must match current disk, not HEAD.
     let worktree = fs::read_to_string(tmp.path().join("src/example.rs")).unwrap();
@@ -837,7 +798,7 @@ async fn start_coding_task_staged_changes_are_nonblocking() {
     let result = start_coding_task_with_git_inspection(&runtime, client_id, &project, &auth).await;
 
     assert_startup_nonblocking_dirty(&result, "workspace_dirty");
-    assert_eq!(result.output["git"]["counts"]["staged"], 1);
+    assert_eq!(result.output["workspace"]["staged"], 1);
     // Staging area must remain intact (no auto unstage).
     let (exit_code, status_stdout, stderr, _) =
         crate::tool_runtime::helpers::run_command_sync("git status --porcelain", tmp.path(), 30);
@@ -869,18 +830,9 @@ async fn start_coding_task_mixed_dirty_workspace_summarizes_counts_without_block
     let result = start_coding_task_with_git_inspection(&runtime, client_id, &project, &auth).await;
 
     assert_startup_nonblocking_dirty(&result, "workspace_dirty");
-    assert_eq!(result.output["git"]["counts"]["modified"], 2);
-    assert_eq!(result.output["git"]["counts"]["staged"], 1);
-    assert_eq!(result.output["git"]["counts"]["unstaged"], 1);
-    assert_eq!(result.output["git"]["counts"]["untracked"], 1);
-    assert!(
-        result.output["git"]["changed_files_count"]
-            .as_u64()
-            .unwrap()
-            >= 3,
-        "changed_files_count: {}",
-        result.output["git"]["changed_files_count"]
-    );
+    assert_eq!(result.output["workspace"]["modified"], 2);
+    assert_eq!(result.output["workspace"]["staged"], 1);
+    assert_eq!(result.output["workspace"]["untracked"], 1);
 }
 
 #[tokio::test]
@@ -911,25 +863,28 @@ async fn start_coding_task_conflict_state_is_a_hard_blocker_but_remains_inspecta
     let project = register_agent_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
-    let result = start_coding_task_with_git_inspection(&runtime, client_id, &project, &auth).await;
+    let result = start_coding_task_serviced(
+        &runtime,
+        client_id,
+        json!({"project": project, "detail": "minimal"}),
+        &auth,
+    )
+    .await;
 
     assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["detail"], "minimal");
     assert_eq!(result.output["startup_verdict"]["status"], "fail");
     assert_eq!(result.output["startup_verdict"]["blocking"], true);
-    assert_check_status(&result.output["startup_verdict"], "workspace", "fail");
-    assert_check_reason(
-        &result.output["startup_verdict"],
-        "workspace",
-        "workspace_conflicts",
-    );
     assert!(
-        result.output["git"]["counts"]["conflicted"]
-            .as_u64()
-            .unwrap()
-            >= 1,
+        result.output["workspace"]["conflicts"].as_u64().unwrap() >= 1,
         "conflicted count: {}",
-        result.output["git"]["counts"]
+        result.output["workspace"]["conflicts"]
     );
+    assert!(result.output["blockers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|blocker| blocker == "workspace_conflicts"));
     // Session still usable for read/inspect of conflicted path content.
     assert!(
         fs::read_to_string(tmp.path().join("conflicted.rs"))
@@ -1018,12 +973,16 @@ async fn start_coding_task_agent_offline_is_still_blocking() {
     // Project resolution or agent health may fail closed — either is blocking.
     if result.success {
         let verdict = &result.output["startup_verdict"];
-        assert_startup_verdict_shape(verdict);
         assert_eq!(
             verdict["blocking"], true,
             "agent offline / unreachable must remain blocking: {verdict}"
         );
         assert_eq!(verdict["status"], "fail");
+        assert!(result.output["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|blocker| blocker == "runner_unavailable"));
     } else {
         assert!(
             result.error.is_some(),
@@ -2384,16 +2343,6 @@ fn assert_check_status(verdict: &Value, name: &str, status: &str) {
         .find(|check| check["name"] == name)
         .unwrap_or_else(|| panic!("missing startup check {name}: {verdict}"));
     assert_eq!(check["status"], status);
-}
-
-fn assert_check_reason(verdict: &Value, name: &str, reason: &str) {
-    let check = verdict["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|check| check["name"] == name)
-        .unwrap_or_else(|| panic!("missing startup check {name}: {verdict}"));
-    assert_eq!(check["reason"], reason);
 }
 
 fn assert_reason_list_contains(verdict: &Value, key: &str, reason: &str) {

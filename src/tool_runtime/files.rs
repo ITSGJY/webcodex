@@ -133,28 +133,38 @@ pub(crate) fn effective_read_file_range(
 
 /// Parse the stdout of a best-effort agent `file_read` for an instruction
 /// candidate. Only the canonical `webcodex.file_read_range.v1` JSON envelope
-/// is accepted. Returns `None` for empty, malformed, or obsolete output so the
-/// caller skips to the next candidate.
-fn parse_instruction_agent_stdout(stdout: String) -> Option<(String, usize)> {
+/// is accepted. Empty content is a successfully observed absent rule body;
+/// malformed or obsolete output is conservatively unavailable.
+fn parse_instruction_agent_stdout(
+    stdout: String,
+) -> Result<Option<(String, usize, Option<String>)>, ()> {
     let trimmed = stdout.trim();
     if !trimmed.is_empty() {
         if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
             if value.get("format").and_then(|format| format.as_str())
                 == Some("webcodex.file_read_range.v1")
             {
-                let content = value.get("content").and_then(|c| c.as_str())?.to_string();
+                let content = value
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .ok_or(())?
+                    .to_string();
                 let total_lines = value
                     .get("total_lines")
                     .and_then(|t| t.as_u64())
                     .unwrap_or(0) as usize;
                 if content_is_empty_instruction(&content) {
-                    return None;
+                    return Ok(None);
                 }
-                return Some((content, total_lines));
+                let full_sha256 = value
+                    .get("sha256")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                return Ok(Some((content, total_lines, full_sha256)));
             }
         }
     }
-    None
+    Err(())
 }
 
 /// True when an instruction body carries no meaningful content (empty or
@@ -162,6 +172,24 @@ fn parse_instruction_agent_stdout(stdout: String) -> Option<(String, usize)> {
 /// can win.
 fn content_is_empty_instruction(content: &str) -> bool {
     content.trim().is_empty()
+}
+
+enum InstructionCandidateRead {
+    Found(super::project_instructions::LoadedInstructionCandidate),
+    Missing,
+    Unavailable,
+}
+
+fn instruction_candidate_missing(error: &Option<String>, stderr: &Option<String>) -> bool {
+    error
+        .iter()
+        .chain(stderr.iter())
+        .map(|value| value.to_ascii_lowercase())
+        .any(|value| {
+            value.contains("no such file")
+                || value.contains("not found")
+                || value.contains("cannot find the file")
+        })
 }
 
 fn add_line_number_fields<T: AsRef<str>>(output: &mut Value, start_line: usize, texts: &[T]) {
@@ -3640,18 +3668,57 @@ impl ToolRuntime {
         use super::project_instructions::{
             ProjectInstructionsSnapshot, INSTRUCTION_CANDIDATE_PATHS,
         };
+        let mut scan_complete = true;
         for candidate in INSTRUCTION_CANDIDATE_PATHS {
-            if let Some((content, total_lines)) =
-                self.read_instruction_candidate(config, candidate).await
-            {
-                return ProjectInstructionsSnapshot::from_single_file(
-                    candidate,
-                    content,
-                    total_lines,
-                );
+            match self.read_instruction_candidate(config, candidate).await {
+                InstructionCandidateRead::Found(candidate) => {
+                    return ProjectInstructionsSnapshot::from_candidates(
+                        vec![candidate],
+                        scan_complete,
+                    );
+                }
+                InstructionCandidateRead::Missing => {}
+                InstructionCandidateRead::Unavailable => scan_complete = false,
             }
         }
-        ProjectInstructionsSnapshot::empty()
+        if scan_complete {
+            ProjectInstructionsSnapshot::empty()
+        } else {
+            ProjectInstructionsSnapshot::unavailable()
+        }
+    }
+
+    /// Observe every fixed project-instruction candidate for model-facing
+    /// coding startup. Requests run concurrently under the existing per-read
+    /// deadline, while the resulting sources retain the fixed candidate order.
+    /// This is what lets a Workflow Session detect additions, removals,
+    /// content changes, and truncation changes across continuations.
+    pub(crate) async fn load_coding_project_instructions(
+        &self,
+        config: &ProjectConfig,
+    ) -> super::project_instructions::ProjectInstructionsSnapshot {
+        use super::project_instructions::{
+            ProjectInstructionsSnapshot, INSTRUCTION_CANDIDATE_PATHS,
+        };
+        let reads = INSTRUCTION_CANDIDATE_PATHS
+            .iter()
+            .map(|candidate| self.read_instruction_candidate(config, candidate));
+        let mut found = Vec::new();
+        let mut scan_complete = true;
+        for result in futures_util::future::join_all(reads).await {
+            match result {
+                InstructionCandidateRead::Found(candidate) => found.push(candidate),
+                InstructionCandidateRead::Missing => {}
+                InstructionCandidateRead::Unavailable => scan_complete = false,
+            }
+        }
+        if found.is_empty() && scan_complete {
+            ProjectInstructionsSnapshot::empty()
+        } else if found.is_empty() {
+            ProjectInstructionsSnapshot::unavailable()
+        } else {
+            ProjectInstructionsSnapshot::from_candidates(found, scan_complete)
+        }
     }
 
     /// Read a single instruction candidate from a resolved project. Returns
@@ -3663,15 +3730,18 @@ impl ToolRuntime {
         &self,
         config: &ProjectConfig,
         path: &str,
-    ) -> Option<(String, usize)> {
-        use super::project_instructions::MAX_LINES_PER_FILE;
+    ) -> InstructionCandidateRead {
+        use super::project_instructions::{LoadedInstructionCandidate, MAX_LINES_PER_FILE};
         // Request one extra line so canonical envelope total/selection metadata
         // reliably signals truncation beyond the per-file cap.
         let read_limit = MAX_LINES_PER_FILE + 1;
         const WAIT_TIMEOUT: u64 = 6;
 
-        let client_id = config.agent_client_id().ok()?;
-        let (request_id, rx) = self
+        let client_id = match config.agent_client_id() {
+            Ok(client_id) => client_id,
+            Err(_) => return InstructionCandidateRead::Unavailable,
+        };
+        let (request_id, rx) = match self
             .shell_clients
             .enqueue_file_op(
                 ShellFileOpRequest {
@@ -3694,14 +3764,35 @@ impl ToolRuntime {
                 "project_instructions".to_string(),
             )
             .await
-            .ok()?;
+        {
+            Ok(enqueued) => enqueued,
+            Err(_) => return InstructionCandidateRead::Unavailable,
+        };
         match tokio::time::timeout(Duration::from_secs(WAIT_TIMEOUT + 2), rx).await {
             Ok(Ok(resp)) if resp.exit_code == Some(0) && resp.error.is_none() => {
-                parse_instruction_agent_stdout(resp.stdout.unwrap_or_default())
+                match parse_instruction_agent_stdout(resp.stdout.unwrap_or_default()) {
+                    Ok(Some((content, total_lines, full_sha256))) => {
+                        InstructionCandidateRead::Found(LoadedInstructionCandidate {
+                            path: path.to_string(),
+                            content,
+                            total_lines,
+                            full_sha256,
+                        })
+                    }
+                    Ok(None) => InstructionCandidateRead::Missing,
+                    Err(()) => InstructionCandidateRead::Unavailable,
+                }
+            }
+            Ok(Ok(resp)) => {
+                if instruction_candidate_missing(&resp.error, &resp.stderr) {
+                    InstructionCandidateRead::Missing
+                } else {
+                    InstructionCandidateRead::Unavailable
+                }
             }
             _ => {
                 self.shell_clients.cancel_request(&request_id).await;
-                None
+                InstructionCandidateRead::Unavailable
             }
         }
     }

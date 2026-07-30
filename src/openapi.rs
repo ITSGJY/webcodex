@@ -1162,7 +1162,7 @@ fn schemas() -> Value {
                 "detail": {
                     "type": "string",
                     "enum": ["minimal", "standard", "full"],
-                    "description": "Flattened start_coding_task detail level. Defaults to standard. Use minimal for the continuous coding loop and full only when the rules, manifest, recent commits, and full runtime projection are needed."
+                    "description": "Flattened start_coding_task detail level. Defaults to the bounded model-facing standard brief, including repository rules and continuation evidence. minimal retains identity, workspace blockers, instruction status, and the first next action without rule bodies. full preserves complete runtime/connection/authority/binding/Git/manifest diagnostics and embeds the same startup_brief core."
                 },
                 "compact": {
                     "type": "boolean",

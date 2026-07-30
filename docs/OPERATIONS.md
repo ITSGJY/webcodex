@@ -507,12 +507,20 @@ when stable transport identity is unavailable. The automatic exact binding uses
 a process-local cache plus a bounded hashed durable projection.
 `detail` is the canonical startup projection:
 
-- `minimal`: session id, resolved project, branch/head/workspace state, compact
-  runtime/readiness layers, semantic-navigation summary, hard blockers, and
-  advisories; the `authority` block is omitted;
-- `standard` (default): minimal plus the `authority` block;
-- `full`: explicitly adds full runtime status, recent commits, project rules,
-  recommended flow, and the compact tool manifest.
+- `minimal`: the strict model-facing session and repository identity,
+  branch/HEAD/workspace state, instruction status without rule bodies,
+  blockers/warnings, and the first concrete next action;
+- `standard` (default): the bounded model-facing Coding brief:
+  `session`, `project`, `workspace`, `instructions`, `continuation`,
+`semantic_navigation`, `blockers`, `warnings`, and `startup_verdict`;
+- `full`: the existing operator diagnostics (runtime status, connection state,
+  authority, full binding details, Git/recent commits, rules summary,
+  recommended flow, and tool manifest) plus the same model-facing core under
+  `output.startup_brief`.
+
+The shared core reserves transport-envelope headroom with a 30 KiB hard limit;
+ordinary clean standard startup is expected to stay below 16 KiB, and the
+complete GPT Actions response remains below 32 KiB in the bounded worst case.
 
 `detail` is the only projection control. The legacy startup flags
 (`compact_startup`, `include_runtime_status`, `include_git`,
@@ -520,11 +528,23 @@ a process-local cache plus a bounded hashed durable projection.
 `tool_manifest_intent`, `tool_manifest_categories`, `tool_manifest_limit`) are
 removed; sending any of them returns a strict unknown-field error.
 
-Minimal and standard do not return repeated manifest/rules/recent-commit
-payloads. Use `tool_manifest` directly when focused discovery is needed.
-Read `output.startup_verdict.status` first. If it is `warn` or `fail`, inspect
-`startup_verdict.checks` and `startup_verdict.suggested_next_actions`; detailed
-startup fields remain the audit source.
+Standard loads every fixed repository-instruction candidate on a fresh
+Workflow Session and returns bounded content. An ordinary continuation compares
+the current source fingerprints with that Session's in-memory snapshot:
+unchanged rules return `instructions.status=reused` without repeating content;
+additions, deletions, content changes, or truncation changes return
+`status=changed`, `changed_sources`, and the new bounded content. Explicit
+resume, restart-restored sessions, and sessions without an in-memory snapshot
+reload content and return `status=loaded`. Rule bodies are never written to the
+durable Session ledger or Action audit records; those retain only safe source
+identity and truncation metadata.
+
+Minimal and standard omit manifest, recent commits, absolute execution paths,
+and runtime/connection/authority diagnostics. Use `tool_manifest` directly when
+focused discovery is needed. Read `output.startup_verdict.status` first. If it
+is `warn` or `fail`, inspect the top-level `blockers`, `warnings`, and bounded
+`startup_verdict.suggested_next_actions`. Full diagnostics retain the legacy
+check list for operator troubleshooting.
 
 Standalone `runtime_status` also accepts `summary_only=true` or `compact=true`
 for the same compact health shape. Use that for first-contact deployed sanity;
@@ -544,7 +564,7 @@ Startup sanity verdict rules:
   infrastructure/safety condition makes the project inaccessible or the
   requested work unsafe or impossible. Ordinary dirty state is not a blocker.
 
-`output.connection_state` reports runner process, server transport, server
+At `detail=full`, `output.connection_state` reports runner process, server transport, server
 registration, project registry, connector endpoint, session binding, and last
 successful tool call separately (see
 [Connection Layers and Version Compatibility](#connection-layers-and-version-compatibility)).
@@ -560,7 +580,7 @@ surface by default. Its connection projection reports
 operator runtime remains available for management, development, and internal
 execution, but it is not the model-default project chat endpoint.
 
-The response also includes `output.authority` (omitted at `detail=minimal`).
+The full response also includes `output.authority`.
 On a default self-hosted deployment this reports `mode=trusted_agent`,
 `source=default`, `human_approval_required=false`, and
 `release=user_task_scoped`. See [Authority Mode](#authority-mode).

@@ -24,7 +24,7 @@ fn coding_call(
         mode,
         deny_write_tools: false,
         deny_shell_tools: false,
-        detail: StartupDetail::Standard,
+        detail: StartupDetail::Full,
         resume_session_id: resume_session_id.map(str::to_string),
         bind_current,
         new_session,
@@ -967,8 +967,13 @@ fn explicit_resume_schema_metadata_and_business_input_are_distinct() {
     assert!(accepted.contains(&"resume_session_id".to_string()));
     assert!(accepted.contains(&"session_id".to_string()));
     assert!(accepted.contains(&"recording_session_id".to_string()));
-    let output_description = spec.output_schema["properties"]["output"]["properties"]["session"]
-        ["description"]
+    let full_output = spec.output_schema["properties"]["output"]["oneOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|variant| variant["properties"]["detail"]["const"] == "full")
+        .expect("full startup schema");
+    let output_description = full_output["properties"]["session"]["description"]
         .as_str()
         .unwrap();
     assert!(output_description.contains("explicitly resumed"));

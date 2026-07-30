@@ -807,11 +807,21 @@ fn default_output_schema_field_names() -> BTreeSet<&'static str> {
 }
 
 fn output_schema_field_names(spec: &ToolSpec) -> BTreeSet<&str> {
-    spec.output_schema["properties"]["output"]["properties"]
-        .as_object()
-        .unwrap_or_else(|| panic!("{} output schema properties", spec.name))
-        .keys()
-        .map(String::as_str)
+    let output = &spec.output_schema["properties"]["output"];
+    if let Some(properties) = output["properties"].as_object() {
+        return properties.keys().map(String::as_str).collect();
+    }
+    output["oneOf"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{} output schema properties or variants", spec.name))
+        .iter()
+        .flat_map(|variant| {
+            variant["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{} output variant properties", spec.name))
+                .keys()
+                .map(String::as_str)
+        })
         .collect()
 }
 

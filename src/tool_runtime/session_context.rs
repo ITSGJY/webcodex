@@ -285,7 +285,7 @@ pub(crate) fn current_session_key(
     })
 }
 
-fn canonical_repository_key(repository_root: &str) -> String {
+pub(crate) fn canonical_repository_key(repository_root: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"webcodex.workflow-repository-root.v1\0");
     hasher.update(repository_root.as_bytes());

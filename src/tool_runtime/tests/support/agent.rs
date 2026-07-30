@@ -88,6 +88,9 @@ pub(in crate::tool_runtime::tests) async fn register_agent_project_at_path_with_
 pub(in crate::tool_runtime::tests) fn run_agent_shell_request_locally(
     req: &ShellAgentShellRequest,
 ) -> (i32, String, String) {
+    if req.kind == "file_read" {
+        return run_agent_file_read_request_locally(req);
+    }
     let mut command = std::process::Command::new("sh");
     command.arg("-c").arg(&req.command);
     if let Some(cwd) = req.cwd.as_deref() {
@@ -122,6 +125,51 @@ pub(in crate::tool_runtime::tests) fn run_agent_shell_request_locally(
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
     )
+}
+
+fn run_agent_file_read_request_locally(req: &ShellAgentShellRequest) -> (i32, String, String) {
+    use sha2::{Digest, Sha256};
+
+    let Some(cwd) = req.cwd.as_deref() else {
+        return (-1, String::new(), "file_read missing cwd".to_string());
+    };
+    let Some(path) = req.path.as_deref() else {
+        return (-1, String::new(), "file_read missing path".to_string());
+    };
+    let target = Path::new(cwd).join(path);
+    let content = match std::fs::read_to_string(&target) {
+        Ok(content) => content,
+        Err(error) => return (-1, String::new(), error.to_string()),
+    };
+    let start_line = req.start_line.unwrap_or(1).max(1);
+    let end_line = req.end_line.unwrap_or(usize::MAX);
+    let lines: Vec<&str> = content.lines().collect();
+    let selected = lines
+        .iter()
+        .skip(start_line.saturating_sub(1))
+        .take(end_line.saturating_sub(start_line).saturating_add(1))
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if req
+        .max_bytes
+        .is_some_and(|max_bytes| selected.len() > max_bytes)
+    {
+        return (
+            -1,
+            String::new(),
+            "range output exceeds max_bytes".to_string(),
+        );
+    }
+    let output = json!({
+        "format": "webcodex.file_read_range.v1",
+        "content": selected,
+        "sha256": format!("{:x}", Sha256::digest(content.as_bytes())),
+        "total_lines": lines.len(),
+        "start_line": start_line,
+        "limit": end_line.saturating_sub(start_line).saturating_add(1),
+    });
+    (0, output.to_string(), String::new())
 }
 
 pub(in crate::tool_runtime::tests) async fn complete_agent_request_by_running_locally(

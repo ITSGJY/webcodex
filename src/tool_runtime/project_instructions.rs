@@ -7,10 +7,13 @@
 //! These files are project-local guidance only; they never override system,
 //! platform, or WebCodex safety policy. Only a fixed candidate whitelist is
 //! read; arbitrary caller-supplied paths and secrets are never read. Read
-//! failures never cause `start_session` to fail — a candidate that cannot be
-//! read is simply skipped.
+//! failures never cause startup itself to fail. `start_session` retains its
+//! first-match behavior; coding startup observes every fixed candidate and
+//! marks an incomplete scan unavailable so a transient read failure cannot be
+//! mistaken for a source deletion.
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 /// Conservative total character cap across all loaded instruction files.
 pub(crate) const MAX_TOTAL_CHARS: usize = 32 * 1024;
@@ -37,10 +40,11 @@ pub(crate) struct ReadMoreHint {
     pub(crate) limit: usize,
 }
 
-/// One loaded instruction file (full content). Returned by `start_session`.
+/// One bounded loaded instruction source retained only in memory.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ProjectInstructionFile {
     pub(crate) path: String,
+    pub(crate) fingerprint: String,
     pub(crate) content: String,
     pub(crate) chars: usize,
     pub(crate) total_lines: usize,
@@ -55,6 +59,7 @@ pub(crate) struct ProjectInstructionFile {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ProjectInstructionFileSummary {
     pub(crate) path: String,
+    pub(crate) fingerprint: String,
     pub(crate) chars: usize,
     pub(crate) total_lines: usize,
     pub(crate) start_line: usize,
@@ -63,8 +68,8 @@ pub(crate) struct ProjectInstructionFileSummary {
     pub(crate) read_more: Option<ReadMoreHint>,
 }
 
-/// Full snapshot of loaded project instructions (with content). Stored on the
-/// `SessionRecord` and returned in `start_session` output.
+/// Bounded snapshot of loaded project instructions (with content). Stored only
+/// on the in-memory `SessionRecord`; durable persistence deliberately drops it.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ProjectInstructionsSnapshot {
     pub(crate) loaded: bool,
@@ -73,6 +78,10 @@ pub(crate) struct ProjectInstructionsSnapshot {
     pub(crate) total_chars: usize,
     pub(crate) max_total_chars: usize,
     pub(crate) truncated: bool,
+    /// False when one or more fixed candidates could not be observed because
+    /// the owning runner/capability/read operation was unavailable. Missing
+    /// files and empty files are successful observations.
+    pub(crate) scan_complete: bool,
     pub(crate) note: String,
 }
 
@@ -86,7 +95,21 @@ pub(crate) struct ProjectInstructionsSummarySnapshot {
     pub(crate) total_chars: usize,
     pub(crate) max_total_chars: usize,
     pub(crate) truncated: bool,
+    pub(crate) scan_complete: bool,
     pub(crate) note: String,
+}
+
+/// One successfully observed, non-empty fixed instruction candidate before
+/// the shared per-file and aggregate snapshot bounds are applied.
+#[derive(Debug, Clone)]
+pub(crate) struct LoadedInstructionCandidate {
+    pub(crate) path: String,
+    pub(crate) content: String,
+    pub(crate) total_lines: usize,
+    /// Full-file SHA-256 reported by the trusted runner range-read envelope.
+    /// The snapshot fingerprint also incorporates the returned bounded body,
+    /// so a malformed/stale test double cannot hide a visible content change.
+    pub(crate) full_sha256: Option<String>,
 }
 
 fn candidate_paths() -> Vec<String> {
@@ -106,24 +129,67 @@ impl ProjectInstructionsSnapshot {
             total_chars: 0,
             max_total_chars: MAX_TOTAL_CHARS,
             truncated: false,
+            scan_complete: true,
             note: PROJECT_INSTRUCTIONS_NOTE.to_string(),
+        }
+    }
+
+    /// Empty, conservatively unavailable snapshot used when one or more fixed
+    /// candidates could not be observed and no rule body was recovered.
+    pub(crate) fn unavailable() -> Self {
+        Self {
+            scan_complete: false,
+            ..Self::empty()
         }
     }
 
     /// Build a snapshot from a single successfully-read instruction file,
     /// applying the per-file line cap and the total char cap. The first
     /// successful candidate wins, so `files` holds at most one entry.
+    #[cfg(test)]
     pub(crate) fn from_single_file(path: &str, content: String, total_lines: usize) -> Self {
-        let file = build_instruction_file(path, content, total_lines);
-        let total_chars = file.chars;
-        let truncated = file.truncated;
+        Self::from_candidates(
+            vec![LoadedInstructionCandidate {
+                path: path.to_string(),
+                content,
+                total_lines,
+                full_sha256: None,
+            }],
+            true,
+        )
+    }
+
+    /// Build one ordered, aggregate-bounded snapshot from all successfully
+    /// observed fixed candidates. This is used by coding startup so additions,
+    /// removals, and changes in any supported repository rule source can be
+    /// detected without reading caller-selected paths.
+    pub(crate) fn from_candidates(
+        candidates: Vec<LoadedInstructionCandidate>,
+        scan_complete: bool,
+    ) -> Self {
+        let mut remaining_chars = MAX_TOTAL_CHARS;
+        let mut files = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let file = build_instruction_file(
+                &candidate.path,
+                candidate.content,
+                candidate.total_lines,
+                candidate.full_sha256.as_deref(),
+                remaining_chars,
+            );
+            remaining_chars = remaining_chars.saturating_sub(file.chars);
+            files.push(file);
+        }
+        let total_chars = files.iter().map(|file| file.chars).sum();
+        let truncated = files.iter().any(|file| file.truncated);
         Self {
-            loaded: true,
-            files: vec![file],
+            loaded: !files.is_empty(),
+            files,
             candidate_paths: candidate_paths(),
             total_chars,
             max_total_chars: MAX_TOTAL_CHARS,
             truncated,
+            scan_complete,
             note: PROJECT_INSTRUCTIONS_NOTE.to_string(),
         }
     }
@@ -137,6 +203,7 @@ impl ProjectInstructionsSnapshot {
                 .iter()
                 .map(|f| ProjectInstructionFileSummary {
                     path: f.path.clone(),
+                    fingerprint: f.fingerprint.clone(),
                     chars: f.chars,
                     total_lines: f.total_lines,
                     start_line: f.start_line,
@@ -149,6 +216,7 @@ impl ProjectInstructionsSnapshot {
             total_chars: self.total_chars,
             max_total_chars: self.max_total_chars,
             truncated: self.truncated,
+            scan_complete: self.scan_complete,
             note: self.note.clone(),
         }
     }
@@ -168,10 +236,13 @@ fn build_instruction_file(
     path: &str,
     content: String,
     total_lines: usize,
+    full_sha256: Option<&str>,
+    max_chars: usize,
 ) -> ProjectInstructionFile {
+    let fingerprint = instruction_fingerprint(path, &content, total_lines, full_sha256);
     let all_lines: Vec<&str> = content.lines().collect();
     let returned_lines = all_lines.len();
-    let line_truncated = returned_lines > MAX_LINES_PER_FILE;
+    let line_truncated = returned_lines > MAX_LINES_PER_FILE || total_lines > MAX_LINES_PER_FILE;
     let line_cap = if line_truncated {
         MAX_LINES_PER_FILE
     } else {
@@ -188,7 +259,7 @@ fn build_instruction_file(
     for (idx, line) in all_lines.iter().take(line_cap).enumerate() {
         let line_chars = line.chars().count();
         let separator = if idx == 0 { 0 } else { 1 };
-        if char_count + separator + line_chars > MAX_TOTAL_CHARS {
+        if char_count + separator + line_chars > max_chars {
             char_truncated = true;
             break;
         }
@@ -219,6 +290,7 @@ fn build_instruction_file(
 
     ProjectInstructionFile {
         path: path.to_string(),
+        fingerprint,
         content: kept,
         chars,
         total_lines: reported_total,
@@ -227,6 +299,36 @@ fn build_instruction_file(
         truncated,
         read_more,
     }
+}
+
+fn instruction_fingerprint(
+    path: &str,
+    returned_content: &str,
+    total_lines: usize,
+    full_sha256: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"webcodex.project-instruction-source.v1\0");
+    for value in [
+        path.as_bytes(),
+        full_sha256
+            .filter(|value| is_lower_hex_sha256(value))
+            .unwrap_or("")
+            .as_bytes(),
+        returned_content.as_bytes(),
+    ] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+    hasher.update((total_lines as u64).to_be_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(test)]

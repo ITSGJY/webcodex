@@ -235,6 +235,61 @@ async fn complete_one_agent_request(
         .unwrap();
 }
 
+fn spawn_startup_agent_executor(registry: Arc<ShellClientRegistry>) -> tokio::task::JoinHandle<()> {
+    use crate::shell_protocol::{
+        ShellAgentPollRequest, ShellAgentResultRequest, ShellAgentShellRequest,
+    };
+    use std::path::Path;
+
+    fn execute(request: &ShellAgentShellRequest) -> (i32, String, String) {
+        if request.kind == "file_read" {
+            return (1, String::new(), "No such file or directory".to_string());
+        }
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&request.command)
+            .current_dir(Path::new(request.cwd.as_deref().unwrap_or(".")))
+            .output()
+            .unwrap();
+        (
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    }
+
+    tokio::spawn(async move {
+        loop {
+            if let Some(request) = registry
+                .poll(ShellAgentPollRequest {
+                    client_id: "importer".to_string(),
+                    agent_instance_id: "inst-import".to_string(),
+                    projects: None,
+                })
+                .await
+                .unwrap()
+            {
+                let (exit_code, stdout, stderr) = execute(&request);
+                registry
+                    .complete(ShellAgentResultRequest {
+                        client_id: "importer".to_string(),
+                        agent_instance_id: "inst-import".to_string(),
+                        request_id: request.request_id,
+                        exit_code: Some(exit_code),
+                        stdout: Some(stdout),
+                        stderr: Some(stderr),
+                        duration_ms: Some(1),
+                        error: None,
+                    })
+                    .await
+                    .unwrap();
+            } else {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    })
+}
+
 // =========================================================================
 // listProjects
 // =========================================================================
@@ -491,7 +546,18 @@ async fn http_start_coding_task_default_response_is_standard() {
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
     let tmp_proj = tempfile::tempdir().unwrap();
-    let (runtime, _registry) = register_import_agent(tmp_proj.path()).await;
+    let (runtime, registry) = register_import_agent_with_capabilities(
+        tmp_proj.path(),
+        Some(crate::shell_protocol::ShellClientCapabilities {
+            shell: true,
+            file_read: true,
+            file_write: true,
+            git: true,
+            ..Default::default()
+        }),
+    )
+    .await;
+    let executor = spawn_startup_agent_executor(registry);
     let service = Service::new(build_projects_router(config, db, runtime));
 
     let mut resp = TestClient::post("http://localhost/api/tools/call")
@@ -515,35 +581,51 @@ async fn http_start_coding_task_default_response_is_standard() {
     assert!(body["output"].get("tool_manifest").is_none());
     assert!(body["output"].get("recommended_flow").is_none());
     assert!(body["output"].get("rules").is_none());
+    assert!(body["output"].get("runtime_status").is_none());
+    assert!(body["output"]["instructions"].is_object());
+    assert!(body["output"]["continuation"].is_object());
+    assert!(body["output"]["workspace"].is_object());
     assert!(body["output"]["startup_verdict"].is_object());
+    executor.abort();
 }
 
 #[tokio::test]
-async fn http_start_coding_task_compact_mode_shrinks_payload_and_keeps_ids() {
+async fn http_start_coding_task_action_compact_wraps_the_shared_core_brief() {
     let _compact = ActionCompactEnvGuard::enabled();
 
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
     let tmp_proj = tempfile::tempdir().unwrap();
-    let (runtime, _registry) = register_import_agent(tmp_proj.path()).await;
+    let (runtime, registry) = register_import_agent_with_capabilities(
+        tmp_proj.path(),
+        Some(crate::shell_protocol::ShellClientCapabilities {
+            shell: true,
+            file_read: true,
+            file_write: true,
+            git: true,
+            ..Default::default()
+        }),
+    )
+    .await;
+    let executor = spawn_startup_agent_executor(registry);
     let service = Service::new(build_projects_router(config, db, runtime));
 
-    // Full-mode reference size (same tool path; temporarily disable compact).
+    // REST without the Actions wrapper returns the shared core directly.
     std::env::set_var("WEBCODEX_ACTION_COMPACT_RESPONSES", "false");
-    let mut full_resp = TestClient::post("http://localhost/api/tools/call")
+    let mut standard_resp = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
         .json(&standard_start_coding_task_call_body("agent:importer:demo"))
         .send(&service)
         .await;
-    assert_eq!(effective_status(&full_resp), StatusCode::OK);
-    let full_body: Value = full_resp.take_json().await.unwrap();
-    let full_bytes = serde_json::to_vec(&full_body).unwrap().len();
-    let full_session = full_body["output"]["session"]["session_id"]
+    let standard_status = effective_status(&standard_resp);
+    let standard_body: Value = standard_resp.take_json().await.unwrap();
+    assert_eq!(standard_status, StatusCode::OK, "{standard_body}");
+    let standard_session = standard_body["output"]["session"]["session_id"]
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(full_body["output"]["detail"], "standard");
-    assert!(full_body["output"]["runtime_status"].is_object());
+    assert_eq!(standard_body["output"]["detail"], "standard");
+    assert!(standard_body["output"].get("runtime_status").is_none());
 
     std::env::set_var("WEBCODEX_ACTION_COMPACT_RESPONSES", "true");
     let mut compact_resp = TestClient::post("http://localhost/api/tools/call")
@@ -551,31 +633,56 @@ async fn http_start_coding_task_compact_mode_shrinks_payload_and_keeps_ids() {
         .json(&standard_start_coding_task_call_body("agent:importer:demo"))
         .send(&service)
         .await;
-    assert_eq!(effective_status(&compact_resp), StatusCode::OK);
+    let compact_status = effective_status(&compact_resp);
     let compact_body: Value = compact_resp.take_json().await.unwrap();
+    assert_eq!(compact_status, StatusCode::OK, "{compact_body}");
     let compact_bytes = serde_json::to_vec(&compact_body).unwrap().len();
 
     assert_eq!(compact_body["success"], true);
     assert_eq!(compact_body["output"]["compact"], true);
-    let compact_session = compact_body["output"]["session_id"]
+    let core = &compact_body["output"]["startup_brief"];
+    let compact_session = core["session"]["session_id"]
         .as_str()
-        .expect("compact response must include session_id");
+        .expect("Actions wrapper must retain core session identity");
     assert!(compact_session.starts_with("wc_sess_"));
-    assert_eq!(
-        compact_body["output"]["task_id"].as_str(),
-        Some(compact_session)
-    );
-    assert!(compact_body["output"]["summary"].is_string());
-    assert!(compact_body["output"]["next_steps"].is_array());
+    assert_eq!(core["detail"], "standard");
+    assert!(core["instructions"].is_object());
+    assert!(core["continuation"].is_object());
+    assert!(core["workspace"].is_object());
+    assert!(core["startup_verdict"]["suggested_next_actions"].is_array());
+    assert!(core.get("runtime_status").is_none());
+    for field in [
+        "detail",
+        "project",
+        "workspace",
+        "instructions",
+        "continuation",
+        "semantic_navigation",
+        "blockers",
+        "warnings",
+        "startup_verdict",
+        "deterministic",
+        "llm_summary",
+    ] {
+        assert_eq!(
+            core[field], standard_body["output"][field],
+            "REST and GPT Actions must carry the same shared core field {field}"
+        );
+    }
+    let mut rest_session = standard_body["output"]["session"].clone();
+    let mut action_session = core["session"].clone();
+    rest_session.as_object_mut().unwrap().remove("session_id");
+    action_session.as_object_mut().unwrap().remove("session_id");
+    assert_eq!(action_session, rest_session);
     assert!(compact_body["output"].get("tool_manifest").is_none());
     assert!(compact_body["output"].get("recommended_flow").is_none());
-    assert!(compact_body["output"].get("session").is_none());
     assert!(
-        compact_bytes < full_bytes / 2,
-        "compact bytes ({compact_bytes}) should be under half of full ({full_bytes})"
+        compact_bytes < 32 * 1024,
+        "Actions-wrapped standard startup must remain below 32 KiB: {compact_bytes}"
     );
     // Both modes create real sessions (execution unchanged).
-    assert_ne!(compact_session, full_session);
+    assert_ne!(compact_session, standard_session);
+    executor.abort();
 }
 
 #[tokio::test]

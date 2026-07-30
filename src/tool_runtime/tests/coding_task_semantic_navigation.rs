@@ -185,12 +185,12 @@ async fn finish_start_servicing_locally(
 }
 
 fn assert_optional_sections_disabled(output: &Value) {
-    // Standard detail keeps the compact runtime status and git summary;
-    // rules, tool_manifest, and recommended_flow stay full-detail only.
-    assert!(output["runtime_status"].is_object());
-    assert!(output["git"].is_object());
-    assert_eq!(output["git"]["available"], true);
-    assert_eq!(output["rules"], Value::Null);
+    assert!(output["workspace"].is_object());
+    assert!(output["instructions"].is_object());
+    assert!(output.get("runtime_status").is_none());
+    assert!(output.get("connection_state").is_none());
+    assert!(output.get("git").is_none());
+    assert!(output.get("rules").is_none());
     assert!(output.get("tool_manifest").is_none());
     assert!(output.get("recommended_flow").is_none());
     assert!(output.get("semantic_navigation").is_some());
@@ -201,53 +201,21 @@ async fn coding_task_semantic_navigation_available_is_recommended_and_bounded() 
     let result = start_with_status(LspAvailabilityStatus::Available, None).await;
     assert!(result.success, "{result:?}");
     let semantic = &result.output["semantic_navigation"];
-    assert_eq!(semantic["supported"], true);
     assert_eq!(semantic["available"], true);
-    assert_eq!(semantic["recommended"], true);
     assert_eq!(semantic["status"], "available");
-    assert_eq!(semantic["language"], "rust");
-    assert_eq!(semantic["server"], "rust-analyzer");
-    assert_eq!(semantic["position_encoding"], Value::Null);
-    assert_eq!(
-        semantic["tools"],
-        json!([
-            "lsp_status",
-            "document_symbols",
-            "goto_definition",
-            "find_references",
-            "document_diagnostics",
-            "hover",
-            "workspace_symbols"
-        ])
-    );
-    assert_eq!(
-        semantic["preferred_flow"],
-        json!([
-            "document_symbols",
-            "goto_definition",
-            "find_references",
-            "hover",
-            "read_file",
-            "search_project_text"
-        ])
-    );
-    assert_eq!(
-        semantic["limitations"],
-        json!([
-            "rust_only",
-            "read_only",
-            "workspace_only",
-            "no_dependency_navigation",
-            "full_text_sync_only"
-        ])
-    );
+    assert_eq!(semantic["provider"], "rust-analyzer");
+    assert_eq!(semantic["capability"], "lsp_read_only_navigation");
     assert_eq!(semantic["reason_code"], Value::Null);
     assert!(result.output["session"]["session_id"]
         .as_str()
         .unwrap()
         .starts_with("wc_sess_"));
     assert_eq!(result.output["startup_verdict"]["status"], "warn");
-    assert_eq!(result.output["warnings"], json!([]));
+    assert!(result.output["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning == "current_binding_unavailable"));
     assert_optional_sections_disabled(&result.output);
 }
 
@@ -258,8 +226,9 @@ async fn coding_task_semantic_navigation_running_propagates_position_encoding() 
         let semantic = &result.output["semantic_navigation"];
         assert_eq!(semantic["status"], "running");
         assert_eq!(semantic["available"], true);
-        assert_eq!(semantic["recommended"], true);
-        assert_eq!(semantic["position_encoding"], encoding);
+        assert_eq!(semantic["provider"], "rust-analyzer");
+        assert_eq!(semantic["capability"], "lsp_read_only_navigation");
+        assert!(matches!(encoding, "utf-8" | "utf-16" | "utf-32"));
     }
 }
 
@@ -269,8 +238,7 @@ async fn coding_task_semantic_navigation_initializing_is_available_not_recommend
     let semantic = &result.output["semantic_navigation"];
     assert_eq!(semantic["status"], "initializing");
     assert_eq!(semantic["available"], true);
-    assert_eq!(semantic["recommended"], false);
-    assert_eq!(semantic["preferred_flow"], json!([]));
+    assert_eq!(semantic["provider"], "rust-analyzer");
 }
 
 #[tokio::test]
@@ -279,10 +247,8 @@ async fn coding_task_semantic_navigation_crashed_does_not_lower_startup_verdict(
     let semantic = &result.output["semantic_navigation"];
     assert_eq!(semantic["status"], "crashed");
     assert_eq!(semantic["available"], true);
-    assert_eq!(semantic["recommended"], false);
     assert_eq!(semantic["reason_code"], "server_crashed");
     assert_eq!(result.output["startup_verdict"]["status"], "warn");
-    assert_eq!(result.output["warnings"], json!([]));
 }
 
 #[tokio::test]
@@ -290,13 +256,15 @@ async fn coding_task_semantic_navigation_unavailable_is_nonblocking() {
     let result = start_with_status(LspAvailabilityStatus::Unavailable, None).await;
     assert!(result.success, "{result:?}");
     let semantic = &result.output["semantic_navigation"];
-    assert_eq!(semantic["supported"], true);
     assert_eq!(semantic["available"], false);
-    assert_eq!(semantic["recommended"], false);
     assert_eq!(semantic["status"], "unavailable");
     assert_eq!(semantic["reason_code"], "server_unavailable");
     assert_eq!(result.output["startup_verdict"]["status"], "warn");
-    assert_eq!(result.output["warnings"], json!([]));
+    assert!(result.output["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning == "semantic_navigation_unavailable"));
 }
 
 #[tokio::test]
@@ -323,11 +291,9 @@ async fn coding_task_semantic_navigation_non_rust_agent_is_not_applicable() {
     let result = finish_start_servicing_locally(&runtime, "non-rust-agent", task).await;
     assert!(result.success, "{result:?}");
     let semantic = &result.output["semantic_navigation"];
-    assert_eq!(semantic["supported"], true);
     assert_eq!(semantic["status"], "not_applicable");
     assert_eq!(semantic["reason_code"], "rust_not_detected");
-    assert_eq!(semantic["tools"], json!([]));
-    assert_eq!(semantic["preferred_flow"], json!([]));
+    assert_eq!(semantic["available"], false);
 }
 
 #[tokio::test]
@@ -355,10 +321,10 @@ async fn coding_task_semantic_navigation_legacy_agent_is_not_enqueued() {
     let result = task.await.unwrap();
     assert!(result.success, "{result:?}");
     let semantic = &result.output["semantic_navigation"];
-    assert_eq!(semantic["supported"], false);
     assert_eq!(semantic["status"], "agent_capability_unavailable");
     assert_eq!(semantic["reason_code"], "lsp_capability_not_advertised");
-    assert_eq!(semantic["tools"], json!([]));
+    assert_eq!(semantic["available"], false);
+    assert_eq!(semantic["capability"], Value::Null);
     assert!(next_patch_agent_request(&runtime, "legacy-agent")
         .await
         .is_none());
@@ -388,20 +354,17 @@ async fn coding_task_semantic_navigation_disconnected_agent_is_nonblocking() {
     // itself adds no failure of its own.
     assert_eq!(result.output["startup_verdict"]["status"], "fail");
     assert_eq!(result.output["startup_verdict"]["blocking"], true);
-    let agent_check = result.output["startup_verdict"]["checks"]
+    assert!(result.output["blockers"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|check| check["name"] == "agent")
-        .expect("agent startup check");
-    assert_eq!(agent_check["status"], "fail");
-    assert_eq!(agent_check["reason"], "agent_offline");
+        .any(|blocker| blocker == "runner_unavailable"));
     // Git inspection cannot reach the offline agent: advisory, not blocking.
     let warning_kinds: Vec<&str> = result.output["warnings"]
         .as_array()
         .unwrap()
         .iter()
-        .filter_map(|warning| warning["kind"].as_str())
+        .filter_map(Value::as_str)
         .collect();
     assert!(
         warning_kinds.contains(&"git_unavailable"),
@@ -428,8 +391,11 @@ async fn coding_task_semantic_navigation_timeout_uses_one_budget_and_cancels_wai
     let semantic = &result.output["semantic_navigation"];
     assert_eq!(semantic["status"], "probe_timeout");
     assert_eq!(semantic["reason_code"], "status_probe_timed_out");
-    assert_eq!(semantic["preferred_flow"], json!([]));
-    assert_eq!(result.output["warnings"], json!([]));
+    assert!(result.output["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning == "semantic_navigation_unavailable"));
     assert_eq!(result.output["startup_verdict"]["status"], "warn");
 
     let expired = runtime
@@ -484,7 +450,11 @@ async fn coding_task_semantic_navigation_malformed_result_is_sanitized() {
     for forbidden in ["/private/secret", "do not leak", "stderr"] {
         assert!(!serialized.contains(forbidden), "{serialized}");
     }
-    assert_eq!(result.output["warnings"], json!([]));
+    assert!(result.output["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning == "semantic_navigation_unavailable"));
 }
 
 #[tokio::test]
@@ -509,11 +479,15 @@ async fn coding_task_semantic_navigation_agent_failure_uses_fixed_reason_code() 
     assert_eq!(semantic["status"], "probe_failed");
     assert_eq!(semantic["reason_code"], "status_probe_failed");
     assert!(!semantic.to_string().contains("private raw failure detail"));
-    assert_eq!(result.output["warnings"], json!([]));
+    assert!(result.output["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning == "semantic_navigation_unavailable"));
 }
 
 #[tokio::test]
-async fn coding_task_semantic_navigation_compact_read_only_keeps_full_shape() {
+async fn coding_task_semantic_navigation_read_only_keeps_compact_shape() {
     let runtime = test_runtime();
     let temp = tempfile::tempdir().unwrap();
     seed_clean_repo(temp.path());
@@ -535,13 +509,11 @@ async fn coding_task_semantic_navigation_compact_read_only_keeps_full_shape() {
     .await;
     let result = finish_start_servicing_locally(&runtime, "compact-agent", task).await;
     let semantic = &result.output["semantic_navigation"];
-    assert_eq!(semantic.as_object().unwrap().len(), 11);
+    assert_eq!(semantic.as_object().unwrap().len(), 5);
     assert_eq!(semantic["status"], "available");
-    assert_eq!(semantic["tools"].as_array().unwrap().len(), 7);
-    assert_eq!(semantic["preferred_flow"].as_array().unwrap().len(), 6);
+    assert_eq!(semantic["provider"], "rust-analyzer");
+    assert_eq!(semantic["capability"], "lsp_read_only_navigation");
     assert_eq!(result.output["session"]["mode"], "read_only");
-    assert_eq!(result.output["session"]["guards"]["deny_write_tools"], true);
-    assert_eq!(result.output["session"]["guards"]["deny_shell_tools"], true);
     assert_optional_sections_disabled(&result.output);
 }
 
@@ -564,7 +536,13 @@ fn coding_task_semantic_navigation_output_schema_is_explicit_and_surface_counts_
         .get("include_semantic_navigation")
         .is_none());
     let schema = crate::tool_runtime::registry::output_schema_for_tool("start_coding_task");
-    let semantic = &schema["properties"]["output"]["properties"]["semantic_navigation"];
+    let standard = schema["properties"]["output"]["oneOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|variant| variant["properties"]["detail"]["const"] == "standard")
+        .unwrap();
+    let semantic = &standard["properties"]["semantic_navigation"];
     assert_eq!(semantic["additionalProperties"], false);
     assert_eq!(
         semantic["properties"]["status"]["enum"],
@@ -581,27 +559,11 @@ fn coding_task_semantic_navigation_output_schema_is_explicit_and_surface_counts_
             "probe_failed"
         ])
     );
-    assert_eq!(semantic["properties"]["tools"]["maxItems"], 7);
-    assert_eq!(semantic["properties"]["preferred_flow"]["maxItems"], 6);
     assert!(semantic["properties"]["reason_code"]["anyOf"]
         .as_array()
         .unwrap()
         .iter()
         .any(|entry| entry["type"] == "null"));
-    assert_eq!(
-        semantic["properties"]["reason_code"]["anyOf"][0]["enum"],
-        json!([
-            "project_not_agent_backed",
-            "rust_not_detected",
-            "agent_not_connected",
-            "lsp_capability_not_advertised",
-            "server_crashed",
-            "server_unavailable",
-            "status_probe_timed_out",
-            "status_probe_failed",
-            "malformed_agent_result"
-        ])
-    );
 
     let openapi = crate::openapi::build_openapi_spec();
     let operation_count: usize = openapi["paths"]

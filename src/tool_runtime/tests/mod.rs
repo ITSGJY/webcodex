@@ -28,6 +28,7 @@ mod sessions_git;
 mod sessions_guards;
 mod sessions_instructions;
 mod sessions_resolver;
+mod startup_brief;
 mod sync_timeout;
 mod tool_call;
 mod trusted_smoke;
