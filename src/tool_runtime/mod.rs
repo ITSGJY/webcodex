@@ -20,6 +20,7 @@ pub(crate) mod files;
 mod git;
 mod git_tools;
 mod handoff;
+mod handoff_brief;
 mod handoff_tools;
 mod helpers;
 mod hygiene;

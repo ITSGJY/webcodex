@@ -827,6 +827,40 @@ integrity. `hard_blockers` and `advisories` classify only deterministic facts.
 They do not change authorization, guards, session binding, expected-failure
 classification, or job lifecycle behavior.
 
+Both compact and full forms of `session_handoff_summary` and
+`finish_coding_task` include `handoff_brief`. One shared pure builder derives
+it from the Session/continuation/workspace/validation/Job/guidance snapshots
+already gathered by the enclosing call; it never runs Git, validation, shell,
+file/search/LSP, Agent, or Runner work of its own and the builder never appends
+a ledger event. A direct internal projection therefore adds no business event.
+Public MCP, REST, and runtime dispatch still append the uniform
+`tool_call_started` / `tool_call_finished` telemetry; do not expect
+`events_total` or `updated_at` to remain unchanged across a public call, and do
+not add a recorder bypass for this tool. `start_coding_task` deliberately omits
+the brief.
+
+Operationally, `handoff_brief` is the concise new-window/new-Agent/human view;
+`continuation_feedback` is the detailed attempt evidence. The brief is not a
+replay and does not restore model-private context or persist another summary.
+It has an actual serialized JSON hard limit of 8192 bytes: instructions are
+capped at 600 characters each, changes at 12, newest-first recent exploration
+files at 8, open failure identities at 5, and fixed next actions at 5.
+
+Read `workspace.status` as `available`, `not_requested`, or `unavailable` and
+`validation.status` as `passed`, `failed`, `not_run`, `not_requested`, or
+`unavailable`. Caller-disabled projections use `not_requested` and never
+trigger an implicit probe. `basis.complete=false` plus sorted stable
+`reason_codes` identifies omitted/unavailable evidence or an evicted attempt
+boundary without returning internal errors.
+
+`progress.state` is deterministic: closed lifecycle first; then `blocked` for
+workspace conflicts, blocking/recovering Jobs, unresolved validation failures,
+or open risks; then `needs_validation` for workspace changes without a proven
+latest validation pass; then `insufficient_evidence`; otherwise
+`ready_to_continue`. Dirty alone, questions/todos, and terminal-pending Jobs
+are not blockers. The projection never claims a percentage, completion,
+merge, commit, or deploy verdict.
+
 For `summary_only=true` final outputs, sanity checks should reject stdout/stderr
 bodies, command text, tails, and excerpts. Raw lower-level diagnostic/status
 payloads may contain empty string fields such as `stderr: ""`; treat non-empty
@@ -871,6 +905,11 @@ For a read-only handoff without finish aggregation:
   }
 }
 ```
+
+A fresh window may create its own Session and then read the old
+`session_handoff_summary` by explicit id. Use `resume_session_id` only when the
+new window is intentionally continuing the same active Workflow Session; its
+existing project, lifecycle, authority, guard, and binding rules are unchanged.
 
 Smoke and acceptance tests can mark intentional negative paths with runtime
 testing metadata:

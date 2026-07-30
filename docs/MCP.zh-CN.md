@@ -99,6 +99,18 @@ workset。自动 continuation、显式 resume、inspect/read_only 升级 normal 
 startup core 中 `minimal` 最多 3 条路径，`standard` 及 `full` 内嵌 core 最多
 12 条；完整 feedback 最多 100 条并保留真实 total/truncation。
 
+在该 surface 上进行显式跨窗口或人工交接时，使用旧 `wc_sess_*` id 调用
+`session_handoff_summary`。它与 `finish_coding_task` 返回同一份 strict
+`handoff_brief`：这是对有界任务摘录、workspace 状态、changed/recent exploration
+路径、validation、Job/guidance attention 计数和固定 next actions 的确定性只读
+投影。brief 按实际 JSON 序列化大小硬限制为 8 KiB，不新增 handoff 持久化，
+builder 也不执行额外工具；但公开 MCP dispatch 仍会向指定 Workflow Session
+统一追加正常的 `tool_call_started` / `tool_call_finished` telemetry。这些 recorder
+事件不代表投影发生业务修改。它不是 Session replay，也不会恢复模型隐藏上下文；
+需要完整 attempt 证据时读取同时返回的 `continuation_feedback`。新窗口可以正常
+创建自己的 Session，再显式读取旧 Session 的 handoff。若选择
+`resume_session_id`，仍会执行既有严格的 active-session resume 检查。
+
 这些 durable ID 用于模型工具与 host review 之间的稳定关联，普通用户无需管理：
 
 - `task_id`：继续/review 一个 bounded task；

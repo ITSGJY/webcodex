@@ -111,6 +111,22 @@ does not execute tools or replace model judgment. The compact startup core
 returns at most 3 paths for `minimal` and 12 for `standard`/embedded `full`;
 complete feedback returns at most 100 and preserves the real total/truncation.
 
+For an explicit cross-window or human handoff on this surface, call
+`session_handoff_summary` with the old `wc_sess_*` id. It and
+`finish_coding_task` return the same strict `handoff_brief`: a deterministic
+read-only projection of bounded task excerpts, workspace state, changed and
+recently explored paths, validation, Job/guidance attention counts, and fixed
+next actions. The brief is capped by actual serialized size at 8 KiB, adds no
+new handoff persistence, and its builder executes no extra tools. The public
+MCP dispatch still appends the uniform `tool_call_started` /
+`tool_call_finished` telemetry to the named Workflow Session; those recorder
+events are not a business mutation by the projection. It is not Session replay
+and does not restore hidden model context; use the co-returned
+`continuation_feedback` when detailed attempt evidence is needed. A new window
+may create its own Session and then read the old Session's handoff explicitly.
+Choosing `resume_session_id` instead still invokes the existing strict
+active-session resume checks.
+
 The stable IDs have product purposes between model tools and host review, but
 ordinary users do not manage them:
 

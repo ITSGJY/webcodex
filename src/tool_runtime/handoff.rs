@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::continuation_feedback::{continuation_feedback_value, ContinuationFeedbackInput};
+use super::handoff_brief::{build_handoff_brief, HandoffBriefInput};
 use super::permissions::permission_summary_from_events;
 use super::session_context::{
     session_project_mismatch_warning, SessionProjectMismatch, SESSION_PROJECT_MISMATCH_KIND,
@@ -64,32 +65,36 @@ impl ToolRuntime {
         };
 
         // --- message board state ---
-        let discussion = match self.sessions.discussion_summary(&session_id, Some(limit)) {
-            Ok(discussion) => discussion,
-            Err(_) => {
-                // UnknownSession is already caught by summary() above; any
-                // other error is treated as an empty board.
-                SessionDiscussionSummary {
-                    counts: SessionDiscussionCounts {
-                        total: 0,
-                        open: 0,
-                        resolved: 0,
-                        guidance: 0,
-                        progress: 0,
-                        risk: 0,
-                        todo: 0,
-                        question: 0,
-                        decision: 0,
-                    },
-                    open_guidance: Vec::new(),
-                    open_questions: Vec::new(),
-                    open_risks: Vec::new(),
-                    open_todos: Vec::new(),
-                    recent_progress: Vec::new(),
-                    recent_decisions: Vec::new(),
+        let (discussion, guidance_available) =
+            match self.sessions.discussion_summary(&session_id, Some(limit)) {
+                Ok(discussion) => (discussion, true),
+                Err(_) => {
+                    // UnknownSession is already caught by summary() above; any
+                    // other error is treated as an empty board.
+                    (
+                        SessionDiscussionSummary {
+                            counts: SessionDiscussionCounts {
+                                total: 0,
+                                open: 0,
+                                resolved: 0,
+                                guidance: 0,
+                                progress: 0,
+                                risk: 0,
+                                todo: 0,
+                                question: 0,
+                                decision: 0,
+                            },
+                            open_guidance: Vec::new(),
+                            open_questions: Vec::new(),
+                            open_risks: Vec::new(),
+                            open_todos: Vec::new(),
+                            recent_progress: Vec::new(),
+                            recent_decisions: Vec::new(),
+                        },
+                        false,
+                    )
                 }
-            }
-        };
+            };
 
         // --- recent failed tool calls (from finished events) ---
         let recent_failed_tools: Vec<Value> = summary
@@ -267,7 +272,11 @@ impl ToolRuntime {
             discussion: &discussion,
             continuation: "continued",
             suggest_exploration_continuity: false,
-            workspace_conflicts: false,
+            workspace_conflicts: output
+                .pointer("/workspace/counts/conflicted")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                > 0,
         });
         let workspace_checked = output.get("workspace").is_some();
         let resolved_unexpected_validation_failures = resolved_unexpected_validation_failure_count(
@@ -292,6 +301,17 @@ impl ToolRuntime {
             &output,
             resolved_unexpected_validation_failures,
         ));
+        output["handoff_brief"] = build_handoff_brief(HandoffBriefInput {
+            session_summary: &feedback_session,
+            continuation_feedback: output.get("continuation_feedback").unwrap_or(&Value::Null),
+            workspace_requested: include_workspace,
+            workspace: output.get("workspace"),
+            validation_requested: include_validation,
+            validation: Some(&feedback_validation),
+            jobs: output.get("jobs"),
+            guidance_available,
+            existing_suggested_actions: output.get("suggested_next_actions"),
+        });
 
         let compact = compact_handoff_output(&output, resolved_unexpected_validation_failures);
         if summary_only {
@@ -563,6 +583,7 @@ fn compact_handoff_output(output: &Value, resolved_unexpected_validation_failure
                 "deterministic": true,
                 "llm_summary": false,
             })),
+        "handoff_brief": output.get("handoff_brief").cloned().unwrap_or(Value::Null),
         "warnings": output.get("warnings").cloned().unwrap_or_else(|| json!([])),
         "suggested_next_actions": output.get("suggested_next_actions").cloned().unwrap_or_else(|| json!([])),
     });

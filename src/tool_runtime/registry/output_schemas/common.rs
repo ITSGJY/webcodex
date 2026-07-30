@@ -388,6 +388,275 @@ pub(crate) fn continuation_feedback_schema(description: &str) -> Value {
     })
 }
 
+/// Strict compact handoff projection shared by `session_handoff_summary` and
+/// `finish_coding_task`.
+pub(crate) fn handoff_brief_schema(description: &str) -> Value {
+    fn nullable_with(schema: Value) -> Value {
+        json!({
+            "anyOf": [
+                schema,
+                {"type": "null"}
+            ]
+        })
+    }
+
+    fn instruction_schema(description: &str) -> Value {
+        json!({
+            "type": "object",
+            "description": description,
+            "additionalProperties": false,
+            "properties": {
+                "excerpt": nullable_with(json!({
+                    "type": "string",
+                    "maxLength": 600,
+                    "description": "Redacted bounded task instruction excerpt."
+                })),
+                "truncated": schema_type("boolean", "True when credential redaction, the 600-character limit, or the final serialized byte budget changed the returned excerpt.")
+            },
+            "required": ["excerpt", "truncated"]
+        })
+    }
+
+    fn bounded_string_list_schema(max_items: usize, max_length: usize, description: &str) -> Value {
+        json!({
+            "type": "object",
+            "description": description,
+            "additionalProperties": false,
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "maxItems": max_items,
+                    "uniqueItems": true,
+                    "items": {
+                        "type": "string",
+                        "maxLength": max_length
+                    }
+                },
+                "total": {"type": "integer", "minimum": 0},
+                "returned": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": max_items
+                },
+                "truncated": schema_type("boolean", "True when count, safety, or byte-budget bounds omitted items.")
+            },
+            "required": ["items", "total", "returned", "truncated"]
+        })
+    }
+
+    let workspace_reason = nullable_with(json!({
+        "type": "string",
+        "enum": ["workspace_not_requested", "workspace_unavailable"]
+    }));
+    let validation_reason = nullable_with(json!({
+        "type": "string",
+        "enum": ["validation_not_requested", "validation_unavailable"]
+    }));
+    let nullable_bool = || nullable_with(json!({"type": "boolean"}));
+    let nullable_count = || {
+        nullable_with(json!({
+            "type": "integer",
+            "minimum": 0
+        }))
+    };
+
+    json!({
+        "type": "object",
+        "description": description,
+        "additionalProperties": false,
+        "properties": {
+            "version": {
+                "type": "integer",
+                "const": 1
+            },
+            "session": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "maxLength": 128
+                    },
+                    "lifecycle": {
+                        "type": "string",
+                        "enum": ["active", "closed", "archived"]
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["normal", "inspect", "read_only"]
+                    }
+                },
+                "required": ["session_id", "lifecycle", "mode"]
+            },
+            "task": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "root_instruction": instruction_schema("The Workflow Session root instruction. It remains separate from later accepted task instructions."),
+                    "latest_instruction": instruction_schema("The latest retained task_instruction event. The same excerpt is returned when it equals the root instruction.")
+                },
+                "required": ["root_instruction", "latest_instruction"]
+            },
+            "workspace": {
+                "type": "object",
+                "description": "Workspace facts from the caller's already-obtained projection only. No implicit Git query is performed.",
+                "additionalProperties": false,
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["available", "not_requested", "unavailable"]
+                    },
+                    "reason_code": workspace_reason,
+                    "branch": nullable_with(json!({
+                        "type": "string",
+                        "maxLength": 256
+                    })),
+                    "head": nullable_with(json!({
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{7,64}$"
+                    })),
+                    "dirty": nullable_bool(),
+                    "conflicted": nullable_bool(),
+                    "ahead": nullable_count(),
+                    "behind": nullable_count()
+                },
+                "required": [
+                    "status", "reason_code", "branch", "head", "dirty",
+                    "conflicted", "ahead", "behind"
+                ]
+            },
+            "progress": {
+                "type": "object",
+                "description": "Proven progress facts only; never a percentage, completion estimate, or merge verdict.",
+                "additionalProperties": false,
+                "properties": {
+                    "state": {
+                        "type": "string",
+                        "enum": [
+                            "blocked",
+                            "needs_validation",
+                            "ready_to_continue",
+                            "closed",
+                            "insufficient_evidence"
+                        ]
+                    },
+                    "meaningful_tool_calls": {
+                        "type": "integer",
+                        "minimum": 0
+                    },
+                    "changes": bounded_string_list_schema(
+                        12,
+                        512,
+                        "Attempt changed paths from continuation feedback."
+                    ),
+                    "recent_files": bounded_string_list_schema(
+                        8,
+                        512,
+                        "Recent relevant exploration paths, newest observation first. This is a continuity hint, not complete history."
+                    )
+                },
+                "required": [
+                    "state", "meaningful_tool_calls", "changes", "recent_files"
+                ]
+            },
+            "validation": {
+                "type": "object",
+                "description": "Latest provable validation state projected from existing ledger evidence; never raw commands, output, or diagnostics bodies.",
+                "additionalProperties": false,
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": [
+                            "passed",
+                            "failed",
+                            "not_run",
+                            "not_requested",
+                            "unavailable"
+                        ]
+                    },
+                    "open_failures": bounded_string_list_schema(
+                        5,
+                        240,
+                        "Bounded stable open failure identities only."
+                    ),
+                    "reason_code": validation_reason
+                },
+                "required": ["status", "open_failures", "reason_code"]
+            },
+            "attention": {
+                "type": "object",
+                "description": "Proven workspace, Job, and open guidance counts. Null means the corresponding evidence was unavailable.",
+                "additionalProperties": false,
+                "properties": {
+                    "workspace_conflict": nullable_bool(),
+                    "blocking_jobs": nullable_count(),
+                    "terminal_pending_jobs": nullable_count(),
+                    "recovering_jobs": nullable_count(),
+                    "open_guidance": nullable_count(),
+                    "open_risks": nullable_count(),
+                    "open_questions": nullable_count(),
+                    "open_todos": nullable_count()
+                },
+                "required": [
+                    "workspace_conflict", "blocking_jobs",
+                    "terminal_pending_jobs", "recovering_jobs", "open_guidance",
+                    "open_risks", "open_questions", "open_todos"
+                ]
+            },
+            "next_actions": {
+                "type": "array",
+                "maxItems": 5,
+                "uniqueItems": true,
+                "items": {
+                    "type": "string",
+                    "maxLength": 160
+                },
+                "description": "Fixed deterministic action templates in priority order."
+            },
+            "basis": {
+                "type": "object",
+                "description": "Whether all requested evidence needed to describe the retained attempt was available.",
+                "additionalProperties": false,
+                "properties": {
+                    "complete": schema_type("boolean", "True only when no fixed evidence-gap reason applies."),
+                    "reason_codes": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "uniqueItems": true,
+                        "items": {
+                            "type": "string",
+                            "enum": [
+                                "attempt_boundary_evicted",
+                                "continuation_unavailable",
+                                "guidance_unavailable",
+                                "job_summary_unavailable",
+                                "validation_not_requested",
+                                "validation_unavailable",
+                                "workspace_not_requested",
+                                "workspace_unavailable"
+                            ]
+                        }
+                    }
+                },
+                "required": ["complete", "reason_codes"]
+            },
+            "deterministic": {
+                "type": "boolean",
+                "const": true
+            },
+            "llm_summary": {
+                "type": "boolean",
+                "const": false
+            }
+        },
+        "required": [
+            "version", "session", "task", "workspace", "progress",
+            "validation", "attention", "next_actions", "basis",
+            "deterministic", "llm_summary"
+        ]
+    })
+}
+
 /// Strict schema for the deterministic attempt summary.
 fn attempt_summary_schema() -> Value {
     json!({

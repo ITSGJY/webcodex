@@ -2,9 +2,10 @@ use serde_json::{json, Value};
 
 use super::common::{
     array_schema, authority_profile_schema, continuation_feedback_schema, evidence_history_schema,
-    evidence_integrity_schema, exploration_tool_name_schema, job_lifecycle_summary_schema,
-    nullable_schema, open_object_schema, permission_decision_schema, permission_summary_schema,
-    schema_type, session_hint_schema, task_outcome_schema, wrapped_output_schema,
+    evidence_integrity_schema, exploration_tool_name_schema, handoff_brief_schema,
+    job_lifecycle_summary_schema, nullable_schema, open_object_schema, permission_decision_schema,
+    permission_summary_schema, schema_type, session_hint_schema, task_outcome_schema,
+    wrapped_output_schema,
 };
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
@@ -48,6 +49,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             (
                 "continuation_feedback",
                 continuation_feedback_schema("Deterministic continuation feedback reused from the same projection as start/handoff. A read-only attempt summary plus validation delta over existing closeout evidence; it never re-runs validation, mutates the ledger, or replaces the closeout verdict."),
+            ),
+            (
+                "handoff_brief",
+                handoff_brief_schema("Compact deterministic task handoff for a new window, new Agent, or human receiver. It is a read-only projection over already-obtained Session, continuation, workspace, validation, Job, and guidance evidence; it is not Session replay and never restores hidden model context."),
             ),
             (
                 "review_evidence",

@@ -17,6 +17,7 @@ use super::handoff::{
     resolved_unexpected_validation_failure_count, review_evidence_summary_for_session,
     unresolved_unexpected_failure_count, validation_has_cargo_test_zero_tests,
 };
+use super::handoff_brief::{build_handoff_brief, HandoffBriefInput};
 use super::permissions::{authority_profile_payload, permission_summary_from_events};
 use super::project_instructions::{ProjectInstructionFile, ProjectInstructionsSnapshot};
 use super::project_resolution::ResolvedProject;
@@ -737,9 +738,29 @@ impl ToolRuntime {
         // the existing closeout summary, validation, and job metadata; it never
         // re-runs validation, mutates the ledger, or replaces the closeout
         // verdict.
-        let continuation_feedback = self
-            .closeout_continuation_feedback(&closeout_session_summary, &resolved.resolved_id, auth)
-            .await;
+        let (discussion, guidance_available) = self.discussion_snapshot(&session_id);
+        let continuation_validation = if include_validation_summary {
+            validation.clone()
+        } else {
+            json!({ "available": false, "not_requested": true })
+        };
+        let continuation_feedback = if closeout_session_summary.events.is_empty() {
+            not_applicable_continuation_feedback_value("empty_session")
+        } else {
+            continuation_feedback_value(ContinuationFeedbackInput {
+                session_summary: &closeout_session_summary,
+                validation: &continuation_validation,
+                jobs: &jobs,
+                discussion: &discussion,
+                continuation: "continued",
+                suggest_exploration_continuity: false,
+                workspace_conflicts: workspace
+                    .pointer("/counts/conflicted")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    > 0,
+            })
+        };
 
         let mut output = json!({
             "project": project,
@@ -798,6 +819,17 @@ impl ToolRuntime {
             &output,
             resolved_unexpected_validation_failures,
         ));
+        output["handoff_brief"] = build_handoff_brief(HandoffBriefInput {
+            session_summary: &closeout_session_summary,
+            continuation_feedback: output.get("continuation_feedback").unwrap_or(&Value::Null),
+            workspace_requested: include_workspace,
+            workspace: output.get("workspace"),
+            validation_requested: include_validation_summary,
+            validation: output.get("validation"),
+            jobs: output.get("jobs"),
+            guidance_available,
+            existing_suggested_actions: output.get("suggested_next_actions"),
+        });
         let compact = compact_finish_output(&output, resolved_unexpected_validation_failures);
         if summary_only {
             return ToolResult::ok(compact);
@@ -851,7 +883,7 @@ impl ToolRuntime {
             &projection_summary.events,
             20,
         );
-        let discussion = self.empty_discussion_on_err(&summary.session_id);
+        let (discussion, _) = self.discussion_snapshot(&summary.session_id);
         continuation_feedback_value(ContinuationFeedbackInput {
             session_summary: projection_summary,
             validation: &validation,
@@ -863,63 +895,32 @@ impl ToolRuntime {
         })
     }
 
-    /// Build the bounded continuation feedback projection for closeout
-    /// (`finish_coding_task` / `session_handoff_summary`). Validation is derived
-    /// from the session ledger only, jobs from bounded job metadata, and
-    /// guidance from a read-only message-board snapshot. Pure read-only: no
-    /// shell, no file reads, no Agent requests, no ledger mutation, no
-    /// activity refresh, no guidance consumption.
-    pub(crate) async fn closeout_continuation_feedback(
-        &self,
-        summary: &sessions::SessionSummary,
-        resolved_project: &str,
-        auth: Option<&AuthContext>,
-    ) -> Value {
-        if summary.events.is_empty() {
-            return not_applicable_continuation_feedback_value("empty_session");
-        }
-        let validation =
-            super::validation_events::validation_summary_from_events(&summary.events, 20);
-        let jobs = self
-            .active_jobs_summary(Some(resolved_project), auth, 10)
-            .await;
-        let discussion = self.empty_discussion_on_err(&summary.session_id);
-        continuation_feedback_value(ContinuationFeedbackInput {
-            session_summary: summary,
-            validation: &validation,
-            jobs: &jobs,
-            discussion: &discussion,
-            // Closeout is a continuation boundary in itself; we do not assume a
-            // specific start-path continuation kind here. The instruction block
-            // reports `resumed` from the recorded boundary event metadata.
-            continuation: "continued",
-            suggest_exploration_continuity: false,
-            workspace_conflicts: false,
-        })
-    }
-
-    fn empty_discussion_on_err(&self, session_id: &str) -> sessions::SessionDiscussionSummary {
-        self.sessions
-            .discussion_summary(session_id, Some(20))
-            .unwrap_or_else(|_| sessions::SessionDiscussionSummary {
-                counts: sessions::SessionDiscussionCounts {
-                    total: 0,
-                    open: 0,
-                    resolved: 0,
-                    guidance: 0,
-                    progress: 0,
-                    risk: 0,
-                    todo: 0,
-                    question: 0,
-                    decision: 0,
+    fn discussion_snapshot(&self, session_id: &str) -> (sessions::SessionDiscussionSummary, bool) {
+        match self.sessions.discussion_summary(session_id, Some(20)) {
+            Ok(discussion) => (discussion, true),
+            Err(_) => (
+                sessions::SessionDiscussionSummary {
+                    counts: sessions::SessionDiscussionCounts {
+                        total: 0,
+                        open: 0,
+                        resolved: 0,
+                        guidance: 0,
+                        progress: 0,
+                        risk: 0,
+                        todo: 0,
+                        question: 0,
+                        decision: 0,
+                    },
+                    open_guidance: Vec::new(),
+                    open_questions: Vec::new(),
+                    open_risks: Vec::new(),
+                    open_todos: Vec::new(),
+                    recent_progress: Vec::new(),
+                    recent_decisions: Vec::new(),
                 },
-                open_guidance: Vec::new(),
-                open_questions: Vec::new(),
-                open_risks: Vec::new(),
-                open_todos: Vec::new(),
-                recent_progress: Vec::new(),
-                recent_decisions: Vec::new(),
-            })
+                false,
+            ),
+        }
     }
 
     async fn start_coding_task_git_summary(
@@ -1213,6 +1214,7 @@ fn compact_finish_output(output: &Value, resolved_unexpected_validation_failures
         "review_evidence": compact_review_evidence(output.get("review_evidence").unwrap_or(&Value::Null)),
         "work_performed": output.get("work_performed").cloned().unwrap_or_else(|| json!([])),
         "changed_paths": output.get("changed_paths").cloned().unwrap_or_else(|| json!([])),
+        "handoff_brief": output.get("handoff_brief").cloned().unwrap_or(Value::Null),
         "warnings": output.get("final_warnings").cloned().unwrap_or_else(|| json!([])),
         "suggested_next_actions": output.get("suggested_next_actions").cloned().unwrap_or_else(|| json!([])),
     });

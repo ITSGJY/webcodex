@@ -1839,7 +1839,20 @@ fn schemas() -> Value {
                 "success": { "type": "boolean" },
                 "output": {
                     "description": "Tool-specific JSON output.",
-                    "type": ["object", "array", "string", "number", "boolean", "null"]
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "additionalProperties": true,
+                            "properties": {
+                                "handoff_brief": {
+                                    "$ref": "#/components/schemas/HandoffBrief"
+                                }
+                            }
+                        },
+                        {
+                            "type": ["array", "string", "number", "boolean", "null"]
+                        }
+                    ]
                 },
                 "error": {
                     "type": "string",
@@ -1890,7 +1903,24 @@ fn schemas() -> Value {
     });
     insert_tool_call_request_flattened_arg_properties(&mut schemas);
     insert_tool_call_request_reserved_properties(&mut schemas);
+    insert_handoff_brief_schema(&mut schemas);
     schemas
+}
+
+fn insert_handoff_brief_schema(schemas: &mut Value) {
+    let schema = registered_tool_specs()
+        .into_iter()
+        .find(|spec| spec.name == "session_handoff_summary")
+        .and_then(|spec| {
+            spec.output_schema
+                .pointer("/properties/output/properties/handoff_brief")
+                .cloned()
+        })
+        .expect("session_handoff_summary must publish handoff_brief");
+    schemas
+        .as_object_mut()
+        .expect("OpenAPI schemas must be an object")
+        .insert("HandoffBrief".to_string(), schema);
 }
 
 fn tool_call_request_properties_mut(

@@ -15,6 +15,7 @@ mod files_helpers;
 mod files_line_edit;
 mod git;
 mod handoff;
+mod handoff_brief;
 mod hygiene;
 mod jobs;
 mod lsp;

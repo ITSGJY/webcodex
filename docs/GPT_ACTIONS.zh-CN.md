@@ -55,6 +55,16 @@ continuation 数据。该 core 的 attempt-scoped exploration workset 只包含�
 但不会自动执行工具。standard/full core 最多返回 12 条路径（`minimal` 为 3），
 完整 Action response 仍保持在 32 KiB 以下。
 
+该 generic runtime schema 还公开 strict `HandoffBrief` component。
+`session_handoff_summary` 与 `finish_coding_task` 复用它，返回同一语义、
+确定性只读且不超过 8 KiB 的 `handoff_brief`。这个紧凑投影面向新窗口、新 Agent
+或人工接班；详细证据仍由 `continuation_feedback` 提供。它不是 Session replay，
+不会恢复模型隐藏上下文；builder 本身不保存新的 Session 数据，也不执行额外工具。
+但公开 generic-runtime 调用仍会按统一 dispatch recorder 正常写入
+`tool_call_started` / `tool_call_finished` Session telemetry；这不属于 handoff
+投影的业务副作用。新窗口可以新建 Session 后显式读取旧 Session 的 handoff；
+显式 resume 继续遵守原有安全检查。
+
 在同一个可保留的聊天窗口身份内，`task_start` 会自动继续该仓库的持久上下文并
 追加新指令。切换到另一份已配置仓库时两边历史严格隔离，切回时恢复原仓库。
 WebCodex 只刷新发生变化的 Git、工作区、仓库规则、目标目录和 manifest 状态。

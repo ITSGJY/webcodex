@@ -41,6 +41,7 @@ pub(crate) use model::{
     TOOL_EXPECTED_FAILURE_KIND_FIELD,
 };
 pub(crate) use store::SessionStore;
+pub(crate) use util::redact_and_bound_instruction;
 
 // Test-only surface: keep the runtime re-export list narrow while still
 // allowing crate-level tests to reach these constants without pub-ing `model`.

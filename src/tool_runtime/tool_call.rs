@@ -1292,6 +1292,7 @@ impl ToolCall {
             | Self::WorkspaceSymbols { session_id, .. }
             | Self::GotoDefinition { session_id, .. }
             | Self::FindReferences { session_id, .. } => session_id.as_deref(),
+            Self::SessionHandoffSummary { session_id, .. } => Some(session_id.as_str()),
             _ => None,
         }
     }

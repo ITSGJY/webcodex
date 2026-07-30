@@ -60,6 +60,18 @@ reused across continuation, explicit resume, mode upgrade, and restart without
 automatically executing tools. The standard/full core returns at most 12 paths
 (`minimal`: 3), and the complete Action response remains below 32 KiB.
 
+That generic runtime schema also publishes the strict `HandoffBrief` component.
+`session_handoff_summary` and `finish_coding_task` reuse it for the same
+deterministic, read-only, at-most-8-KiB `handoff_brief`. This compact projection
+is for a new window, new Agent, or human receiver; detailed evidence remains in
+`continuation_feedback`. It is not Session replay, does not recover hidden
+model context, and its builder stores no new Session data or executes additional
+tools. A public generic-runtime call still records the standard
+`tool_call_started` / `tool_call_finished` Session telemetry; this is uniform
+dispatch recording, not a business side effect of the handoff projection. A new
+window may create a new Session and explicitly read the old Session's handoff;
+explicit resume keeps its existing safety checks.
+
 Within one retained chat-window identity, `task_start` automatically continues
 the repository's active durable context and appends the new instruction.
 Changing to another configured repository keeps the two histories isolated;

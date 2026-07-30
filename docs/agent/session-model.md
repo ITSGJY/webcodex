@@ -224,11 +224,15 @@ persistent state — the Workflow Session ledger, validation evidence, bounded
 Job metadata, and the session message board — and it is never a substitute for
 a `finish_coding_task` verdict.
 
-- **Read-only contract:** it never executes shell, reads project files,
-  enqueues Agent/Runner requests, mutates the ledger, refreshes activity,
-  consumes or auto-resolves guidance, or calls an LLM. Surfacing it on
-  `start_coding_task` appends only the legitimate new `task_instruction` event
-  and no further events; reading it never changes `updated`/activity timestamps.
+- **Read-only projection contract:** building it directly never executes shell,
+  reads project files, enqueues Agent/Runner requests, mutates the ledger,
+  refreshes activity, consumes or auto-resolves guidance, or calls an LLM.
+  `start_coding_task` still appends its legitimate new `task_instruction`.
+  Public MCP, REST, or runtime dispatch also records the enclosing tool's
+  uniform `tool_call_started` / `tool_call_finished` telemetry, so
+  `events_total`, `updated_at`, and activity telemetry are not required to stay
+  unchanged across a public call. Those recorder facts are separate from the
+  projection's business semantics.
 - **Startup describes the previous attempt:** for reused, explicitly resumed,
   and restored-after-restart sessions, `start_coding_task` snapshots the
   pre-instruction state *before* appending the new instruction, so
@@ -293,6 +297,76 @@ a `finish_coding_task` verdict.
   serde-defaulted field to the existing version-1 event ledger, so older
   ledgers restore it as empty without a version bump; feedback remains a
   projection over that existing state.
+
+### Task handoff brief (`handoff_brief`)
+
+`session_handoff_summary` and `finish_coding_task` return the same version-1
+`handoff_brief`, built by one shared pure projection. It is the compact,
+model-friendly view for a new window, a new Agent, or a human receiver;
+`continuation_feedback` remains the more detailed diagnostic evidence. The
+brief is not Session replay, does not reconstruct chat or hidden model
+context, and does not decide that implementation work is complete.
+
+The builder consumes only the bounded Session summary, continuation feedback,
+workspace, validation, Job, guidance, exploration, and suggested-action
+snapshots that its caller already obtained. It performs no shell, Git, file,
+search, LSP, Agent, or Runner request; does not refresh activity, consume
+guidance, append a ledger event, or call an LLM; and stores no new Session
+data. `start_coding_task` intentionally does not return `handoff_brief`, so the
+standard startup core's worst-case size does not grow.
+
+A direct internal `session_handoff_summary(...)` call does not add business
+events beyond those snapshots. Calls through MCP, REST, or runtime dispatch
+remain subject to the uniform recorder and normally append exactly
+`tool_call_started` and `tool_call_finished`. This telemetry is not guidance
+consumption or a handoff-builder mutation, and `session_handoff_summary` must
+not receive a recorder bypass.
+
+The projection has these stable bounds and semantics:
+
+- root and latest task instruction excerpts reuse the existing Session
+  credential redaction (including token, Bearer, and client-secret styles) and
+  are capped at 600 Unicode characters. Unix,
+  Windows-drive, UNC, and `file://` locations; shell commands and parameters;
+  fenced and inline code; and ordinary task prose remain available as useful
+  handoff context. The latest excerpt is the latest retained
+  `task_instruction`; when it equals the root, the same excerpt is returned.
+  It is null when no such retained event exists. Its `truncated` flag is true
+  only when credential redaction, the 600-character bound, or final
+  byte-budget reduction changed the returned excerpt.
+- changed paths reuse continuation changes (12 maximum); recent files reuse
+  the attempt exploration workset (8 maximum, deduplicated newest-first);
+  unresolved failure identities are capped at 5; deterministic next actions
+  are capped at 5. Each bounded evidence list preserves
+  `total`/`returned`/`truncated`. Recent files are only continuity hints, not
+  complete history.
+- `progress.state` is selected in order: a non-mutable lifecycle is `closed`;
+  a workspace conflict, blocking/recovering Job, unresolved validation
+  failure, or open risk is `blocked`; workspace changes without a proven
+  latest validation pass are `needs_validation`; missing critical evidence is
+  `insufficient_evidence`; otherwise an active Session is
+  `ready_to_continue`. A dirty worktree alone is not a blocker, questions and
+  todos are counts rather than blockers, and terminal-pending Jobs are
+  nonblocking.
+- workspace is `available`, `not_requested`, or `unavailable`.
+  `include_workspace=false` never causes an implicit Git query. Validation is
+  `passed`, `failed`, `not_run`, `not_requested`, or `unavailable`;
+  `include_validation=false` never masquerades as `not_run`.
+- `basis.complete` is false whenever a sorted fixed `reason_codes` entry
+  identifies omitted or unavailable evidence, including an evicted attempt
+  boundary. Internal error text is never a reason code.
+
+The complete object is checked against its actual serialized JSON size and
+hard-capped at 8192 bytes. Stable reduction removes recent files, changed
+paths, failure identities, next actions, and then instruction excerpt
+characters while retaining lifecycle/mode, progress and validation status,
+attention counts, basis, and deterministic/LLM flags.
+
+A new window can start a new Session normally and then explicitly read the old
+Session with `session_handoff_summary(session_id=...)`. Explicit
+`resume_session_id` remains available when the caller truly intends to resume
+the same active Session and continues to obey the existing identity,
+lifecycle, project, guard, and binding rules.
 
 ### Invariants (must)
 

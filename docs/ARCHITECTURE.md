@@ -334,6 +334,21 @@ The parser is deterministic and fail-closed. It consumes only the bounded, sanit
 
 `start_coding_task`, `finish_coding_task`, and `session_handoff_summary` (and `validation_summary`, for its `validation_delta` part) surface a deterministic `continuation_feedback` projection of the previous attempt over existing ledger/evidence/Job/message-board state. It is read-only — no shell, file reads, agent/runner requests, ledger mutation, activity refresh, guidance consumption, or LLM call — and adds no new persistent table or second attempt state machine. Validation delta is comparable only when both runs are proven to cover the same structured scope with complete evidence and a consistent parser identity; otherwise it reports a stable reason code. Its `scope_identity` is an opaque, domain-separated SHA-256 that never re-exposes command text or absolute paths, and when the attempt boundary has been evicted by the bounded event window it reports `complete = false` rather than claiming a full attempt.
 
+`finish_coding_task` and `session_handoff_summary` additionally call one shared
+pure `handoff_brief` builder over snapshots already obtained by their enclosing
+call. This strict versioned projection is the at-most-8-KiB task/workspace/
+progress/validation/attention view for a new window, new Agent, or human
+receiver; the more detailed evidence remains in `continuation_feedback`. The
+builder performs no I/O or execution, mutates no Session or guidance, adds no
+persistent representation, and is intentionally absent from
+`start_coding_task` so startup's bounded core does not grow. It is neither
+Session replay nor recovery of hidden model context.
+Calling the internal projection path directly adds no business event. MCP,
+REST, and runtime dispatch still wrap `session_handoff_summary` in the uniform
+recorder and append the normal `tool_call_started` / `tool_call_finished`
+telemetry; that recorder activity may change Session counters/timestamps and is
+not a side effect of the builder. The tool has no recorder bypass.
+
 ## Auth, Policy, And Audit
 
 - `auth` owns bearer authentication, principal modeling, scope constants, route gates, shared-key helpers, PAT verification, and OAuth token verification.
