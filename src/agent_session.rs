@@ -15,8 +15,12 @@
 //! refresh the newer connection's lease. This mirrors the polling transport's
 //! `*_for_connection` discipline.
 
-use crate::shell_client::ShellClientRegistry;
-use crate::shell_protocol::{AgentEnvelope, ShellAgentPollRequest};
+use crate::auth::{AuthContext, SCOPE_AGENT_REGISTER};
+use crate::shell_client::{
+    effective_register_owner, enforce_register_owner, require_agent_transport_scope,
+    ShellClientRegistry,
+};
+use crate::shell_protocol::{AgentEnvelope, ShellAgentPollRequest, ShellClientRegisterRequest};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
@@ -24,6 +28,60 @@ use tokio::task::JoinHandle;
 /// Channel capacity for outgoing envelopes (requests + pongs). Provides
 /// backpressure if the agent reads slowly. Shared by both transports.
 pub(crate) const OUTGOING_CHANNEL_CAPACITY: usize = 64;
+
+/// Error from [`register_session_prelude`]: the agent transport boundary
+/// rejected the register. Both variants surface to the wire as the
+/// `register_forbidden` error code; they are distinguished only so the caller
+/// can log which gate failed.
+#[derive(Debug)]
+pub(crate) enum RegisterPreludeError {
+    /// `require_agent_transport_scope` rejected the caller (wrong scope / not a
+    /// bootstrap or agent token).
+    ForbiddenScope(String),
+    /// `enforce_register_owner` rejected the client_id/owner binding.
+    ForbiddenOwner(String),
+}
+
+impl RegisterPreludeError {
+    /// Wire error code shared by both prelude gates.
+    pub(crate) const CODE: &'static str = "register_forbidden";
+
+    /// The human-readable message to send to the agent.
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::ForbiddenScope(m) | Self::ForbiddenOwner(m) => m,
+        }
+    }
+}
+
+/// Enforce the agent transport boundary shared by the WebSocket and QUIC
+/// register handlers, and resolve the effective owner onto `register_payload`.
+///
+/// This is the transport-neutral half of registration: it mirrors the polling
+/// register handler's checks — bootstrap may register any owner, an agent
+/// token may register only when its `allowed_client_id` matches and its owner
+/// matches the requested owner (or fills it in when absent), and user tokens
+/// are rejected. It stops **before** any wire I/O: on failure it returns the
+/// reason and lets the caller send its transport-specific error envelope and
+/// log the cause. On success `register_payload.owner` is set to the effective
+/// owner and the caller proceeds to mutate the registry.
+pub(crate) fn register_session_prelude(
+    auth: Option<&AuthContext>,
+    register_payload: &mut ShellClientRegisterRequest,
+) -> Result<(), RegisterPreludeError> {
+    if let Err(e) = require_agent_transport_scope(auth, SCOPE_AGENT_REGISTER) {
+        return Err(RegisterPreludeError::ForbiddenScope(e));
+    }
+    if let Err(e) = enforce_register_owner(
+        auth,
+        &register_payload.client_id,
+        register_payload.owner.as_deref(),
+    ) {
+        return Err(RegisterPreludeError::ForbiddenOwner(e));
+    }
+    register_payload.owner = effective_register_owner(auth, register_payload.owner.as_deref());
+    Ok(())
+}
 
 /// Outcome of a single inbound read on the shared reader loop.
 #[derive(Debug)]

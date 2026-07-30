@@ -15,12 +15,9 @@
 //! or a Phase 2/3 API/agent token looked up by SHA-256 hash. TLS certificates
 //! are NOT trusted as authentication — the agent token is always validated.
 
-use crate::auth::{authenticate_bearer, SCOPE_AGENT_REGISTER};
+use crate::auth::authenticate_bearer;
 use crate::config::{Config, QuicRuntimeStatus, QuicServerConfig};
-use crate::shell_client::{
-    effective_register_owner, enforce_register_owner, require_agent_transport_scope,
-    ShellClientRegistry, TRANSPORT_QUIC,
-};
+use crate::shell_client::{ShellClientRegistry, TRANSPORT_QUIC};
 use crate::shell_protocol::{read_quic_frame, write_quic_frame, AgentEnvelope};
 use crate::Database;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -297,30 +294,32 @@ async fn handle_quic_connection(
     };
 
     // 3. Enforce the same transport scope/owner boundary as the WS handler.
-    if let Err(e) = require_agent_transport_scope(Some(&auth), SCOPE_AGENT_REGISTER) {
+    //    The shared `register_session_prelude` performs the checks and resolves
+    //    the effective owner; it stops before any wire I/O so this handler sends
+    //    its own error frame and logs which gate failed.
+    if let Err(e) =
+        crate::agent_session::register_session_prelude(Some(&auth), &mut register_payload)
+    {
+        let reason = match &e {
+            crate::agent_session::RegisterPreludeError::ForbiddenScope(_) => "forbidden scope",
+            crate::agent_session::RegisterPreludeError::ForbiddenOwner(_) => {
+                "client_id/owner binding mismatch"
+            }
+        };
         tracing::warn!(
             client_id = %client_id,
-            error = %e,
-            "quic agent register rejected: forbidden scope"
+            error = e.message(),
+            "quic agent register rejected: {reason}"
         );
-        send_error(&mut send, &mut recv, "register_forbidden", &e).await;
+        send_error(
+            &mut send,
+            &mut recv,
+            crate::agent_session::RegisterPreludeError::CODE,
+            e.message(),
+        )
+        .await;
         return;
     }
-    if let Err(e) = enforce_register_owner(
-        Some(&auth),
-        &register_payload.client_id,
-        register_payload.owner.as_deref(),
-    ) {
-        tracing::warn!(
-            client_id = %client_id,
-            error = %e,
-            "quic agent register rejected: client_id/owner binding mismatch"
-        );
-        send_error(&mut send, &mut recv, "register_forbidden", &e).await;
-        return;
-    }
-    register_payload.owner =
-        effective_register_owner(Some(&auth), register_payload.owner.as_deref());
 
     // 4. Register into the shared registry (same path as polling/ws), then
     //    flip the transport label to "quic". QUIC v1 is the full envelope flow

@@ -17,10 +17,7 @@
 //!
 //! Polling remains a fully supported fallback transport.
 
-use crate::shell_client::{
-    effective_register_owner, enforce_register_owner, require_agent_transport_scope,
-    ShellClientRegistry, TRANSPORT_WEBSOCKET,
-};
+use crate::shell_client::{ShellClientRegistry, TRANSPORT_WEBSOCKET};
 use crate::shell_protocol::{AgentEnvelope, ShellClientRegisterRequest};
 use futures_util::{SinkExt, StreamExt};
 use salvo::prelude::*;
@@ -76,7 +73,7 @@ async fn handle_agent_ws(
     auth: Option<crate::auth::AuthContext>,
 ) {
     // 1. Read the first message: it must be a Register envelope.
-    let register_payload = match read_register(&mut ws).await {
+    let mut register_payload = match read_register(&mut ws).await {
         Ok(payload) => payload,
         Err(e) => {
             send_envelope_or_log(
@@ -101,40 +98,24 @@ async fn handle_agent_ws(
     //     allowed_client_id matches and its owner matches the requested owner
     //     (or fills it in when absent); user tokens are rejected. When no
     //     AuthContext is present (unit tests without AuthMiddleware) the check
-    //     is a no-op; production always runs behind AuthMiddleware.
-    if let Err(e) = require_agent_transport_scope(auth.as_ref(), crate::auth::SCOPE_AGENT_REGISTER)
+    //     is a no-op; production always runs behind AuthMiddleware. The shared
+    //     `register_session_prelude` performs the scope/owner checks and
+    //     resolves the effective owner; it stops before any wire I/O so this
+    //     handler sends its own error envelope.
+    if let Err(e) =
+        crate::agent_session::register_session_prelude(auth.as_ref(), &mut register_payload)
     {
         send_envelope_or_log(
             &mut ws,
             AgentEnvelope::Error {
-                code: "register_forbidden".to_string(),
-                message: e,
+                code: crate::agent_session::RegisterPreludeError::CODE.to_string(),
+                message: e.message().to_string(),
             },
-            "register_forbidden",
+            crate::agent_session::RegisterPreludeError::CODE,
         )
         .await;
         return;
     }
-    if let Err(e) = enforce_register_owner(
-        auth.as_ref(),
-        &register_payload.client_id,
-        register_payload.owner.as_deref(),
-    ) {
-        send_envelope_or_log(
-            &mut ws,
-            AgentEnvelope::Error {
-                code: "register_forbidden".to_string(),
-                message: e,
-            },
-            "register_forbidden",
-        )
-        .await;
-        return;
-    }
-    // Resolve the effective owner (agent token fills owner from its username).
-    let mut register_payload = register_payload;
-    register_payload.owner =
-        effective_register_owner(auth.as_ref(), register_payload.owner.as_deref());
 
     // 2. Register into the shared registry (same path as polling register),
     //    then flip the transport label and install a push notifier so the
