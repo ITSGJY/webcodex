@@ -89,6 +89,7 @@ pub(crate) const ACCEPTED_FLATTENED_ARG_PREFERRED_ORDER: &[&str] = &[
     "mode",
     "deny_write_tools",
     "deny_shell_tools",
+    "execution_context",
     "detail",
     "bind_current",
     "new_session",

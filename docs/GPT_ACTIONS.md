@@ -60,6 +60,14 @@ reused across continuation, explicit resume, mode upgrade, and restart without
 automatically executing tools. The standard/full core returns at most 12 paths
 (`minimal`: 3), and the complete Action response remains below 32 KiB.
 
+The same generic path exposes a strict flattened `execution_context` object
+with only `default_cwd` (project-relative) and `default_shell` (`sh` or
+`bash`). `start_coding_task` can set or replace it and
+`update_session_context` can replace or clear it for an explicit active
+Workflow Session. It affects only `run_shell`/`run_job`; per-call arguments
+remain authoritative, and no environment, credential, or persistent shell
+state is accepted.
+
 That generic runtime schema also publishes the strict `HandoffBrief` component.
 `session_handoff_summary` and `finish_coding_task` reuse it for the same
 deterministic, read-only, at-most-8-KiB `handoff_brief`. This compact projection

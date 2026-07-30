@@ -55,6 +55,14 @@ continuation 数据。该 core 的 attempt-scoped exploration workset 只包含�
 但不会自动执行工具。standard/full core 最多返回 12 条路径（`minimal` 为 3），
 完整 Action response 仍保持在 32 KiB 以下。
 
+同一 generic runtime schema 还公开 strict `execution_context` 对象，只包含
+已注册项目内的 project-relative `default_cwd` 和 `default_shell`
+（`sh`/`bash`）。`start_coding_task` 可设置或替换它，
+`update_session_context` 可针对显式 active Workflow Session 完整替换或以 `{}`
+清空。`run_shell`/`run_job` 的单次 `cwd`/`shell` 始终优先；上下文不保存 env、
+凭据或持久 shell 状态。每条命令仍是 fresh process，`cd`/`export` 不会写回
+Session；SSH 与 persistent shell 不在本轮范围内。
+
 该 generic runtime schema 还公开 strict `HandoffBrief` component。
 `session_handoff_summary` 与 `finish_coding_task` 复用它，返回同一语义、
 确定性只读且不超过 8 KiB 的 `handoff_brief`。这个紧凑投影面向新窗口、新 Agent

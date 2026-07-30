@@ -1,7 +1,8 @@
 use serde_json::{json, Value};
 
 use super::super::input_schemas::{
-    session_guards_schema, session_lifecycle_schema, session_mode_schema,
+    session_execution_context_schema, session_guards_schema, session_lifecycle_schema,
+    session_mode_schema,
 };
 use super::common::{
     array_schema, continuation_feedback_schema, evidence_history_schema, evidence_integrity_schema,
@@ -40,6 +41,12 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 session_guards_schema("Effective task guard settings for this session."),
             ),
             (
+                "execution_context",
+                session_execution_context_schema(
+                    "Persistent run_shell/run_job defaults for this Workflow Session.",
+                ),
+            ),
+            (
                 "lifecycle",
                 session_lifecycle_schema(
                     "Workflow session lifecycle. Create returns active; close_session transitions to closed.",
@@ -73,6 +80,12 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 session_guards_schema("Effective task guard settings for this session."),
             ),
             (
+                "execution_context",
+                session_execution_context_schema(
+                    "Persistent run_shell/run_job defaults for this Workflow Session.",
+                ),
+            ),
+            (
                 "lifecycle",
                 session_lifecycle_schema(
                     "Workflow session lifecycle. Missing on pre-lifecycle ledgers is treated as active on load; closed after explicit close_session.",
@@ -101,6 +114,54 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                     "object",
                     "Summary-only projection of project-local instructions loaded at session start (no content bodies). Present when the session was created with a project. Project-local guidance only; does not override system/platform/WebCodex safety policy.",
                 ),
+            ),
+        ])),
+        "update_session_context" => Some(wrapped_output_schema(vec![
+            ("success", schema_type("boolean", "Always true on success.")),
+            (
+                "session_id",
+                schema_type("string", "Explicit Workflow Session id that was updated."),
+            ),
+            (
+                "project",
+                schema_type("string", "Project scoped to this Workflow Session."),
+            ),
+            (
+                "title",
+                nullable_schema("string", "Optional Workflow Session title."),
+            ),
+            ("mode", session_mode_schema("Effective session mode.")),
+            (
+                "guards",
+                session_guards_schema("Effective task guards."),
+            ),
+            (
+                "lifecycle",
+                session_lifecycle_schema("Lifecycle after update; always active on success."),
+            ),
+            (
+                "execution_context",
+                session_execution_context_schema(
+                    "Complete current execution defaults after replacement.",
+                ),
+            ),
+            (
+                "previous_execution_context",
+                session_execution_context_schema(
+                    "Complete execution defaults immediately before replacement.",
+                ),
+            ),
+            (
+                "changed",
+                schema_type("boolean", "Whether the stored context changed."),
+            ),
+            (
+                "created_at",
+                schema_type("integer", "Unix timestamp when the Session was created."),
+            ),
+            (
+                "updated_at",
+                schema_type("integer", "Unix timestamp of the session's last update."),
             ),
         ])),
         "close_session" => Some(wrapped_output_schema(vec![
@@ -259,6 +320,12 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             (
                 "guards",
                 session_guards_schema("Effective session guards."),
+            ),
+            (
+                "execution_context",
+                session_execution_context_schema(
+                    "Persistent run_shell/run_job defaults for this Workflow Session.",
+                ),
             ),
             (
                 "lifecycle",
@@ -435,6 +502,12 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "guards",
                 session_guards_schema("Effective guards for the bound session."),
             ),
+            (
+                "execution_context",
+                session_execution_context_schema(
+                    "Persistent run_shell/run_job defaults for the bound Workflow Session.",
+                ),
+            ),
         ])),
         "current_session" => Some(wrapped_output_schema(vec![
             ("found", schema_type("boolean", "True when a live binding exists.")),
@@ -451,6 +524,12 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             (
                 "guards",
                 session_guards_schema("Effective guards for the bound session."),
+            ),
+            (
+                "execution_context",
+                session_execution_context_schema(
+                    "Persistent run_shell/run_job defaults for the bound Workflow Session, when found.",
+                ),
             ),
         ])),
         "unbind_current_session" => Some(wrapped_output_schema(vec![

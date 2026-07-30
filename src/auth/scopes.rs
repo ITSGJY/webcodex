@@ -601,6 +601,10 @@ mod tests {
                 OAuthToolScopePolicy::Require(SCOPE_RUNTIME_READ),
             ),
             (
+                "update_session_context",
+                OAuthToolScopePolicy::Require(SCOPE_RUNTIME_READ),
+            ),
+            (
                 "post_session_message",
                 OAuthToolScopePolicy::Require(SCOPE_RUNTIME_READ),
             ),
@@ -696,6 +700,7 @@ mod tests {
             "list_tools",
             "start_session",
             "session_summary",
+            "update_session_context",
             "post_session_message",
             "list_session_messages",
             "resolve_session_message",

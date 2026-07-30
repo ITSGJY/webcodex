@@ -1943,7 +1943,15 @@ fn insert_tool_call_request_flattened_arg_properties(schemas: &mut Value) {
                 continue;
             }
             if let Some(input_schema) = input_properties.and_then(|props| props.get(&field)) {
-                if let Some(schema) = flattened_tool_arg_schema_from_input(input_schema) {
+                let schema = if field == "execution_context" {
+                    let mut schema = input_schema.clone();
+                    schema["description"] =
+                        Value::String(FLATTENED_TOOL_ARG_DESCRIPTION.to_string());
+                    Some(schema)
+                } else {
+                    flattened_tool_arg_schema_from_input(input_schema)
+                };
+                if let Some(schema) = schema {
                     properties.insert(field, schema);
                 }
             } else {

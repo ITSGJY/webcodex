@@ -87,6 +87,7 @@ pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
         "kind" => json!("note"),
         "message" => json!("hello"),
         "message_id" => json!("wc_msg_0001"),
+        "execution_context" => json!({}),
         other => panic!("missing sample value for required field {other}"),
     }
 }
@@ -116,6 +117,7 @@ pub(in crate::tool_runtime::tests) fn placeholder_from_prop(prop: &Value) -> Val
     match kind {
         "integer" => json!(1),
         "array" => json!([]),
+        "object" => json!({}),
         "boolean" => json!(true),
         _ => json!("value"),
     }

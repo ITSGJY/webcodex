@@ -45,6 +45,11 @@ fn tool_definition_runtime_tool_policy_inventory_is_stable() {
             "explicit_business_session",
         ),
         ("session_summary", "session", "explicit_business_session"),
+        (
+            "update_session_context",
+            "session",
+            "explicit_business_session",
+        ),
         ("close_session", "session", "explicit_business_session"),
         (
             "validation_summary",

@@ -41,6 +41,27 @@ pub(crate) fn session_guards_schema(description: &str) -> Value {
     })
 }
 
+pub(crate) fn session_execution_context_schema(description: &str) -> Value {
+    json!({
+        "type": "object",
+        "description": description,
+        "additionalProperties": false,
+        "properties": {
+            "default_cwd": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "description": "Optional project-relative cwd inherited by run_shell and run_job. Absolute paths, URI forms, controls, and parent traversal are rejected. Filesystem and allowed-root checks remain fail-closed in the existing execution path."
+            },
+            "default_shell": {
+                "type": "string",
+                "enum": ["sh", "bash"],
+                "description": "Optional explicit shell dialect inherited by run_shell and run_job."
+            }
+        }
+    })
+}
+
 fn session_message_kind_schema(description: &str) -> Value {
     json!({
         "type": "string",
@@ -167,6 +188,24 @@ pub(crate) fn close_session_input_schema() -> Value {
         "Required explicit wc_sess_* id to close. Never falls back to current-session. Unknown ids fail without creating a session. Idempotent when already closed. finish_coding_task does not close.",
         true,
     )])
+}
+
+pub(crate) fn update_session_context_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "session_id": {
+                "type": "string",
+                "pattern": "^wc_sess_[A-Za-z0-9_]+$",
+                "description": "Required explicit active, project-scoped Workflow Session id. Never falls back to a current binding and never creates an unknown Session."
+            },
+            "execution_context": session_execution_context_schema(
+                "Complete replacement execution context. `{}` clears both defaults. The context cannot store environment variables, credentials, or arbitrary options."
+            )
+        },
+        "required": ["session_id", "execution_context"],
+        "additionalProperties": false
+    })
 }
 
 pub(crate) fn validation_summary_input_schema() -> Value {

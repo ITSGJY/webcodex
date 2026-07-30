@@ -104,16 +104,16 @@ async fn validation_summary_is_guard_safe_read_only_and_does_not_pollute_ledger(
             .await;
     let session = runtime
         .sessions
-        .start_session_with_options(SessionCreateOptions {
-            project: Some(project.clone()),
-            title: Some("validation summary safe".to_string()),
-            mode: SessionMode::ReadOnly,
-            guards: SessionGuards {
+        .start_session_with_options(SessionCreateOptions::new(
+            Some(project.clone()),
+            Some("validation summary safe".to_string()),
+            SessionMode::ReadOnly,
+            SessionGuards {
                 deny_write_tools: true,
                 deny_shell_tools: true,
             },
-            project_instructions: None,
-        });
+        ))
+        .unwrap();
     let auth = bootstrap_auth_context();
 
     let first = runtime

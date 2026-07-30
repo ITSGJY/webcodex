@@ -999,6 +999,7 @@ async fn checkpoint_session_guards() {
                 mode: SessionMode::ReadOnly,
                 deny_write_tools: false,
                 deny_shell_tools: false,
+                execution_context: None,
             },
             Some(&bootstrap),
         )

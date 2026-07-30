@@ -201,6 +201,7 @@ async fn start_coding_task_can_explicitly_disable_current_binding() {
                         resume_session_id: None,
                         bind_current: false,
                         new_session: false,
+                        execution_context: None,
                     },
                     Some(&auth),
                 )
@@ -365,6 +366,7 @@ async fn start_coding_task_can_omit_compact_tool_manifest() {
                 resume_session_id: None,
                 bind_current: false,
                 new_session: false,
+                execution_context: None,
             },
             Some(&auth),
         )
@@ -1044,6 +1046,7 @@ async fn finish_coding_task_requires_explicit_session_and_returns_structured_fie
                 resume_session_id: None,
                 bind_current: false,
                 new_session: false,
+                execution_context: None,
             },
             Some(&auth),
         )
@@ -2096,6 +2099,7 @@ async fn finish_coding_task_includes_active_jobs_warning_without_logs() {
                 resume_session_id: None,
                 bind_current: false,
                 new_session: false,
+                execution_context: None,
             },
             Some(&auth),
         )
@@ -2222,6 +2226,7 @@ async fn finish_coding_task_treats_stop_requested_jobs_as_nonblocking() {
                 resume_session_id: None,
                 bind_current: false,
                 new_session: false,
+                execution_context: None,
             },
             Some(&auth),
         )

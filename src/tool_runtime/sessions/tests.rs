@@ -1,5 +1,5 @@
 use super::super::project_instructions::ProjectInstructionsSnapshot;
-use super::super::tool_inputs::SessionMode;
+use super::super::tool_inputs::{ExecutionShell, SessionMode};
 use super::events::{
     changed_paths_for_tool, normalize_observed_project_path, observed_paths_for_successful_result,
     session_input_summary_for_tool, SessionToolClassification,
@@ -417,6 +417,283 @@ fn session_store_persists_and_restores_basic_session() {
     assert_eq!(summary.project.as_deref(), Some("agent:oe:private-drop"));
     assert_eq!(summary.title.as_deref(), Some("persistent work"));
     assert_eq!(summary.lifecycle, SessionLifecycle::Active);
+    assert_eq!(
+        summary.execution_context,
+        SessionExecutionContext::default()
+    );
+}
+
+#[test]
+fn session_execution_context_persists_and_legacy_ledgers_default_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("sessions.json");
+    let store = persistent_store(ledger.clone());
+    let expected = SessionExecutionContext {
+        default_cwd: Some("frontend/./src".to_string()),
+        default_shell: Some(ExecutionShell::Bash),
+    };
+    let session = store
+        .start_session_with_options(
+            SessionCreateOptions::new(
+                Some("agent:oe:private-drop".to_string()),
+                Some("persistent context".to_string()),
+                SessionMode::Normal,
+                SessionGuards::default(),
+            )
+            .with_execution_context(expected),
+        )
+        .unwrap();
+    assert_eq!(
+        session.execution_context,
+        SessionExecutionContext {
+            default_cwd: Some("frontend/src".to_string()),
+            default_shell: Some(ExecutionShell::Bash),
+        }
+    );
+
+    store.flush_persistence();
+    let raw = std::fs::read_to_string(&ledger).unwrap();
+    let mut value: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        value["sessions"][0]["execution_context"],
+        json!({"default_cwd": "frontend/src", "default_shell": "bash"})
+    );
+    let restored = SessionStore::with_persistence(ledger.clone(), 10, 10);
+    assert_eq!(
+        restored
+            .summary(&session.session_id, None)
+            .unwrap()
+            .execution_context,
+        session.execution_context
+    );
+
+    value["sessions"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("execution_context");
+    std::fs::write(&ledger, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    let legacy = SessionStore::with_persistence(ledger, 10, 10);
+    assert_eq!(
+        legacy
+            .summary(&session.session_id, None)
+            .unwrap()
+            .execution_context,
+        SessionExecutionContext::default()
+    );
+}
+
+#[test]
+fn coding_session_context_creation_preserve_replace_and_failed_commit_are_atomic() {
+    fn request(
+        resume_session_id: Option<String>,
+        execution_context: Option<SessionExecutionContext>,
+    ) -> CodingSessionRequest {
+        CodingSessionRequest {
+            key: None,
+            project: "agent:oe:private-drop".to_string(),
+            resume_session_id,
+            instruction: Some("continue".to_string()),
+            mode: SessionMode::Normal,
+            guards: SessionGuards::default(),
+            execution_context,
+            project_instructions: None,
+            transport: SessionTransport::Api,
+            bind_current: false,
+            new_session: false,
+            context_refreshed: true,
+            write_scope_verified: true,
+        }
+    }
+
+    let store = SessionStore::default();
+    let initial = SessionExecutionContext {
+        default_cwd: Some("frontend".to_string()),
+        default_shell: Some(ExecutionShell::Bash),
+    };
+    let created = store
+        .ensure_coding_session(request(None, Some(initial.clone())))
+        .unwrap();
+    assert!(!created.reused);
+    assert!(created.execution_context_changed);
+    assert_eq!(created.summary.execution_context, initial);
+
+    let session_id = created.summary.session_id.clone();
+    let preserved = store
+        .ensure_coding_session(request(Some(session_id.clone()), None))
+        .unwrap();
+    assert!(preserved.reused);
+    assert!(!preserved.execution_context_changed);
+    assert_eq!(preserved.summary.execution_context, initial);
+
+    let replacement = SessionExecutionContext {
+        default_cwd: Some("backend".to_string()),
+        default_shell: Some(ExecutionShell::Sh),
+    };
+    let replaced = store
+        .ensure_coding_session(request(Some(session_id.clone()), Some(replacement.clone())))
+        .unwrap();
+    assert!(replaced.execution_context_changed);
+    assert_eq!(replaced.summary.execution_context, replacement);
+    let event = replaced.summary.events.last().unwrap();
+    assert_eq!(event.execution_context, Some(replacement.clone()));
+    assert_eq!(event.previous_execution_context, Some(initial.clone()));
+
+    let event_count = replaced.summary.events_total;
+    store.fail_next_coding_continuity_commit_for_test();
+    let error = store
+        .ensure_coding_session(request(
+            Some(session_id.clone()),
+            Some(SessionExecutionContext::default()),
+        ))
+        .unwrap_err();
+    assert_eq!(error, CodingSessionError::CommitFailed);
+    let after_failure = store.summary(&session_id, None).unwrap();
+    assert_eq!(after_failure.execution_context, replacement);
+    assert_eq!(after_failure.events_total, event_count);
+}
+
+#[test]
+fn update_session_execution_context_sets_clears_and_rejects_invalid_states() {
+    let store = SessionStore::default();
+    let session = store.start_session(
+        Some("agent:oe:private-drop".to_string()),
+        Some("context update".to_string()),
+    );
+    let replacement = SessionExecutionContext {
+        default_cwd: Some("frontend".to_string()),
+        default_shell: Some(ExecutionShell::Bash),
+    };
+    let set = store
+        .update_execution_context(
+            &session.session_id,
+            replacement.clone(),
+            SessionTransport::Api,
+        )
+        .unwrap();
+    assert!(set.changed);
+    assert_eq!(
+        set.previous_execution_context,
+        SessionExecutionContext::default()
+    );
+    assert_eq!(set.summary.execution_context, replacement);
+    assert_eq!(
+        set.summary.events.last().unwrap().kind,
+        "session_execution_context_updated"
+    );
+
+    let cleared = store
+        .update_execution_context(
+            &session.session_id,
+            SessionExecutionContext::default(),
+            SessionTransport::Mcp,
+        )
+        .unwrap();
+    assert!(cleared.changed);
+    assert_eq!(
+        cleared.summary.execution_context,
+        SessionExecutionContext::default()
+    );
+
+    let before_invalid = cleared.summary.events_total;
+    let invalid = store
+        .update_execution_context(
+            &session.session_id,
+            SessionExecutionContext {
+                default_cwd: Some("../outside".to_string()),
+                default_shell: None,
+            },
+            SessionTransport::Api,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        invalid,
+        SessionExecutionContextUpdateError::InvalidExecutionContext(_)
+    ));
+    assert_eq!(
+        store
+            .summary(&session.session_id, None)
+            .unwrap()
+            .events_total,
+        before_invalid
+    );
+
+    assert_eq!(
+        store
+            .update_execution_context(
+                "wc_sess_missingcontext01",
+                SessionExecutionContext::default(),
+                SessionTransport::Api,
+            )
+            .unwrap_err(),
+        SessionExecutionContextUpdateError::UnknownSession
+    );
+    let unscoped = store.start_session(None, Some("unscoped".to_string()));
+    assert_eq!(
+        store
+            .update_execution_context(
+                &unscoped.session_id,
+                SessionExecutionContext::default(),
+                SessionTransport::Api,
+            )
+            .unwrap_err(),
+        SessionExecutionContextUpdateError::SessionHasNoProject
+    );
+    store.close_session(&session.session_id).unwrap();
+    assert_eq!(
+        store
+            .update_execution_context(
+                &session.session_id,
+                SessionExecutionContext::default(),
+                SessionTransport::Api,
+            )
+            .unwrap_err(),
+        SessionExecutionContextUpdateError::SessionNotActive {
+            lifecycle: SessionLifecycle::Closed
+        }
+    );
+}
+
+#[test]
+fn archived_session_rejects_execution_context_update() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("sessions.json");
+    std::fs::write(
+        &ledger,
+        serde_json::to_vec_pretty(&json!({
+            "version": SESSION_LEDGER_VERSION,
+            "sessions": [{
+                "session_id": "wc_sess_archivedcontext01",
+                "project": "agent:oe:private-drop",
+                "title": "archived",
+                "mode": "normal",
+                "guards": {
+                    "deny_write_tools": false,
+                    "deny_shell_tools": false
+                },
+                "execution_context": {"default_cwd": "frontend"},
+                "lifecycle": "archived",
+                "created_at": 1,
+                "updated_at": 1,
+                "events": [],
+                "messages": []
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let store = SessionStore::with_persistence(ledger, 10, 10);
+    assert_eq!(
+        store
+            .update_execution_context(
+                "wc_sess_archivedcontext01",
+                SessionExecutionContext::default(),
+                SessionTransport::Api,
+            )
+            .unwrap_err(),
+        SessionExecutionContextUpdateError::SessionNotActive {
+            lifecycle: SessionLifecycle::Archived
+        }
+    );
 }
 
 #[test]
@@ -1047,17 +1324,23 @@ fn project_instructions_content_not_persisted_or_leaked_after_restore() {
     let ledger = tmp.path().join("sessions.json");
     let secret_body = "secret project rule that must not persist";
     let store = persistent_store(ledger.clone());
-    let session = store.start_session_with_options(SessionCreateOptions {
-        project: Some("agent:oe:private-drop".to_string()),
-        title: Some("instructions".to_string()),
-        mode: SessionMode::Normal,
-        guards: SessionGuards::default(),
-        project_instructions: Some(ProjectInstructionsSnapshot::from_single_file(
-            "AGENTS.md",
-            secret_body.to_string(),
-            1,
-        )),
-    });
+    let session = store
+        .start_session_with_options(
+            SessionCreateOptions::new(
+                Some("agent:oe:private-drop".to_string()),
+                Some("instructions".to_string()),
+                SessionMode::Normal,
+                SessionGuards::default(),
+            )
+            .with_project_instructions(Some(
+                ProjectInstructionsSnapshot::from_single_file(
+                    "AGENTS.md",
+                    secret_body.to_string(),
+                    1,
+                ),
+            )),
+        )
+        .unwrap();
 
     store.flush_persistence();
     let serialized = std::fs::read_to_string(&ledger).unwrap();
@@ -1409,13 +1692,14 @@ fn start_session_wrappers_funnel_to_single_create_entry() {
         SessionMode::Normal,
         SessionGuards::default(),
     );
-    let via_options = store.start_session_with_options(SessionCreateOptions {
-        project: Some("proj-a".to_string()),
-        title: Some("t3".to_string()),
-        mode: SessionMode::Normal,
-        guards: SessionGuards::default(),
-        project_instructions: None,
-    });
+    let via_options = store
+        .start_session_with_options(SessionCreateOptions::new(
+            Some("proj-a".to_string()),
+            Some("t3".to_string()),
+            SessionMode::Normal,
+            SessionGuards::default(),
+        ))
+        .unwrap();
     let via_read_only = store.start_session_with_guards(
         Some("proj-a".to_string()),
         Some("ro".to_string()),

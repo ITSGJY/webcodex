@@ -98,6 +98,7 @@ pub(crate) fn build_startup_brief(input: StartupBriefInput<'_>) -> Value {
         "session": {
             "session_id": input.session.session_id,
             "mode": input.session.mode,
+            "execution_context": input.session.execution_context,
             "continuation": input.continuation_kind,
             "reused": input.reused,
             "resume_requested": input.resume_requested,

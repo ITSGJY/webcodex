@@ -23,7 +23,8 @@ use super::model::{
     DurableCurrentBinding, ListSessionMessagesFilter, PersistedCurrentBinding,
     PersistedCurrentBindings, PersistedSessionLedger, PersistedSessionRecord,
     PostSessionMessageInput, SessionCloseError, SessionCloseOutcome, SessionCounts,
-    SessionCreateOptions, SessionDiscussionSummary, SessionEvent, SessionGuardDenial,
+    SessionCreateOptions, SessionDiscussionSummary, SessionEvent, SessionExecutionContext,
+    SessionExecutionContextUpdateError, SessionExecutionContextUpdateOutcome, SessionGuardDenial,
     SessionGuards, SessionInboxHint, SessionLifecycle, SessionLifecycleDenial, SessionMessage,
     SessionMessageError, SessionMessageStatus, SessionRecord, SessionStoreStatus, SessionSummary,
     SessionTransport, ToolCallRecorderMetadata, ToolCallStart, DEFAULT_MAX_EVENTS_PER_SESSION,
@@ -443,20 +444,25 @@ impl SessionStore {
         mode: SessionMode,
         guards: SessionGuards,
     ) -> SessionSummary {
-        self.start_session_with_options(SessionCreateOptions {
-            project,
-            title,
-            mode,
-            guards,
-            project_instructions: None,
-        })
+        self.start_session_with_options(SessionCreateOptions::new(project, title, mode, guards))
+            .expect("default Session execution context must be valid")
     }
 
     /// Sole create entry point for workflow sessions.
     ///
     /// Stores session-creation inputs (including project instructions) on the
     /// `SessionRecord`. Convenience wrappers above all delegate here.
-    pub(crate) fn start_session_with_options(&self, opts: SessionCreateOptions) -> SessionSummary {
+    pub(crate) fn start_session_with_options(
+        &self,
+        mut opts: SessionCreateOptions,
+    ) -> Result<SessionSummary, String> {
+        opts.execution_context = opts.execution_context.validated()?;
+        if opts.project.is_none() && !opts.execution_context.is_empty() {
+            return Err(
+                "execution_context requires a Workflow Session bound to a registered project"
+                    .to_string(),
+            );
+        }
         let session_id = format!("{SESSION_ID_PREFIX}{}", uuid::Uuid::new_v4().simple());
         let now = now_ts();
         let guards = SessionGuards::effective(opts.mode, opts.guards);
@@ -466,6 +472,7 @@ impl SessionStore {
             title: opts.title,
             mode: opts.mode,
             guards,
+            execution_context: opts.execution_context,
             // Create always yields Active; only explicit close transitions later.
             lifecycle: SessionLifecycle::Active,
             created_at: now,
@@ -480,7 +487,7 @@ impl SessionStore {
             inner.insert_session(record)
         };
         self.persist_after_mutation();
-        summary
+        Ok(summary)
     }
 
     /// Atomically ensure the window/project coding context and append the
@@ -511,6 +518,12 @@ impl SessionStore {
         let new_session_id = format!("{SESSION_ID_PREFIX}{}", uuid::Uuid::new_v4().simple());
         let new_event_id = format!("{EVENT_ID_PREFIX}{}", uuid::Uuid::new_v4().simple());
         let requested_guards = SessionGuards::effective(request.mode, request.guards);
+        let requested_execution_context = request
+            .execution_context
+            .clone()
+            .map(SessionExecutionContext::validated)
+            .transpose()
+            .map_err(CodingSessionError::InvalidExecutionContext)?;
         let instruction = request
             .instruction
             .as_deref()
@@ -547,12 +560,12 @@ impl SessionStore {
             };
 
             if let Some(session_id) = reusable_session_id {
-                let (previous_mode, previous_guards) = {
+                let (previous_mode, previous_guards, previous_execution_context) = {
                     let record = inner
                         .sessions
                         .get(&session_id)
                         .expect("reusable session disappeared under store lock");
-                    (record.mode, record.guards)
+                    (record.mode, record.guards, record.execution_context.clone())
                 };
                 // Repeating a mode preserves any stricter explicit guard from
                 // the root task. A real mode transition applies the newly
@@ -569,6 +582,11 @@ impl SessionStore {
                 };
                 let capability_changed =
                     previous_mode != request.mode || previous_guards != next_guards;
+                let next_execution_context = requested_execution_context
+                    .clone()
+                    .unwrap_or_else(|| previous_execution_context.clone());
+                let execution_context_changed =
+                    next_execution_context != previous_execution_context;
                 if previous_guards.deny_write_tools
                     && !next_guards.deny_write_tools
                     && !request.write_scope_verified
@@ -600,6 +618,9 @@ impl SessionStore {
                     Some(previous_guards),
                     capability_changed,
                     request.context_refreshed,
+                    requested_execution_context.clone(),
+                    Some(previous_execution_context.clone()),
+                    execution_context_changed,
                     true,
                     explicit_resume,
                     request.bind_current && request.key.is_some(),
@@ -613,6 +634,7 @@ impl SessionStore {
                         .expect("reusable session disappeared before commit");
                     record.mode = request.mode;
                     record.guards = next_guards;
+                    record.execution_context = next_execution_context;
                     record.updated_at = now;
                     if let Some(project_instructions) = request.project_instructions {
                         // A transient runner/read failure must not erase the
@@ -647,11 +669,14 @@ impl SessionStore {
                     previous_mode: Some(previous_mode),
                     previous_guards: Some(previous_guards),
                     capability_changed,
+                    execution_context_changed,
                 }
             } else {
                 if self.take_coding_continuity_fault() {
                     return Err(CodingSessionError::CommitFailed);
                 }
+                let execution_context = requested_execution_context.clone().unwrap_or_default();
+                let execution_context_changed = !execution_context.is_empty();
                 let event = coding_instruction_event(
                     &new_event_id,
                     &new_session_id,
@@ -664,6 +689,9 @@ impl SessionStore {
                     None,
                     false,
                     request.context_refreshed,
+                    requested_execution_context,
+                    None,
+                    execution_context_changed,
                     false,
                     false,
                     request.bind_current && request.key.is_some(),
@@ -677,6 +705,7 @@ impl SessionStore {
                     title: instruction,
                     mode: request.mode,
                     guards: requested_guards,
+                    execution_context,
                     lifecycle: SessionLifecycle::Active,
                     created_at: now,
                     updated_at: now,
@@ -698,6 +727,7 @@ impl SessionStore {
                     previous_mode: None,
                     previous_guards: None,
                     capability_changed: false,
+                    execution_context_changed,
                 }
             }
         };
@@ -743,6 +773,19 @@ impl SessionStore {
         inner.session_project(session_id)
     }
 
+    /// Return inherited defaults only for an active Session whose registered
+    /// project exactly matches the already-resolved request project.
+    pub(crate) fn execution_context_for_project(
+        &self,
+        session_id: &str,
+        resolved_project: &str,
+    ) -> Option<SessionExecutionContext> {
+        let inner = self.inner.lock().expect("session store mutex poisoned");
+        let record = inner.sessions.get(session_id)?;
+        (record.lifecycle.allows_mutation() && record.project.as_deref() == Some(resolved_project))
+            .then(|| record.execution_context.clone())
+    }
+
     pub(crate) fn guard_state(&self, session_id: &str) -> Option<(SessionMode, SessionGuards)> {
         let inner = self.inner.lock().expect("session store mutex poisoned");
         inner.guard_state(session_id)
@@ -770,6 +813,75 @@ impl SessionStore {
         let outcome = {
             let mut inner = self.inner.lock().expect("session store mutex poisoned");
             inner.close_session(session_id)?
+        };
+        self.persist_after_mutation();
+        Ok(outcome)
+    }
+
+    /// Atomically replace the complete execution context and append one safe
+    /// metadata event. `{}` clears both defaults.
+    pub(crate) fn update_execution_context(
+        &self,
+        session_id: &str,
+        execution_context: SessionExecutionContext,
+        transport: SessionTransport,
+    ) -> Result<SessionExecutionContextUpdateOutcome, SessionExecutionContextUpdateError> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() || !is_valid_session_id(session_id) {
+            return Err(SessionExecutionContextUpdateError::UnknownSession);
+        }
+        let outcome = {
+            let mut inner = self.inner.lock().expect("session store mutex poisoned");
+            let (lifecycle, project, previous_execution_context) = inner
+                .sessions
+                .get(session_id)
+                .map(|record| {
+                    (
+                        record.lifecycle,
+                        record.project.clone(),
+                        record.execution_context.clone(),
+                    )
+                })
+                .ok_or(SessionExecutionContextUpdateError::UnknownSession)?;
+            if !lifecycle.allows_mutation() {
+                return Err(SessionExecutionContextUpdateError::SessionNotActive { lifecycle });
+            }
+            let project = project.ok_or(SessionExecutionContextUpdateError::SessionHasNoProject)?;
+            let execution_context = execution_context
+                .validated()
+                .map_err(SessionExecutionContextUpdateError::InvalidExecutionContext)?;
+            let changed = execution_context != previous_execution_context;
+            let now = now_ts();
+            let event = session_execution_context_updated_event(
+                session_id,
+                &project,
+                transport,
+                execution_context.clone(),
+                previous_execution_context.clone(),
+                changed,
+                now,
+            );
+            let max_events = inner.max_events_per_session;
+            let record = inner
+                .sessions
+                .get_mut(session_id)
+                .expect("validated Session disappeared under store lock");
+            record.execution_context = execution_context;
+            record.updated_at = now;
+            record.events.push_back(event);
+            record.events_observed = record.events_observed.saturating_add(1);
+            while record.events.len() > max_events {
+                record.events.pop_front();
+            }
+            inner.touch(session_id);
+            let summary = inner
+                .summary(session_id, Some(DEFAULT_SUMMARY_LIMIT))
+                .expect("updated Session must summarize");
+            SessionExecutionContextUpdateOutcome {
+                summary,
+                previous_execution_context,
+                changed,
+            }
         };
         self.persist_after_mutation();
         Ok(outcome)
@@ -946,6 +1058,9 @@ impl SessionStore {
             previous_guards: None,
             capability_changed: None,
             context_refreshed: None,
+            execution_context: None,
+            previous_execution_context: None,
+            execution_context_changed: None,
         });
         Some(start)
     }
@@ -1075,6 +1190,9 @@ impl SessionStore {
             previous_guards: None,
             capability_changed: None,
             context_refreshed: None,
+            execution_context: None,
+            previous_execution_context: None,
+            execution_context_changed: None,
         });
         Some(event_id)
     }
@@ -1154,6 +1272,7 @@ fn lifecycle_blocks_tool(tool_name: &str) -> bool {
         tool_name,
         "post_session_message"
             | "resolve_session_message"
+            | "update_session_context"
             | "workspace_checkpoint_create"
             | "workspace_checkpoint_restore"
             | "workspace_checkpoint_delete"
@@ -1173,6 +1292,9 @@ fn coding_instruction_event(
     previous_guards: Option<SessionGuards>,
     capability_changed: bool,
     context_refreshed: bool,
+    execution_context: Option<SessionExecutionContext>,
+    previous_execution_context: Option<SessionExecutionContext>,
+    execution_context_changed: bool,
     reused: bool,
     explicit_resume: bool,
     current_binding_established: bool,
@@ -1220,6 +1342,10 @@ fn coding_instruction_event(
             "requested_guards": requested_guards,
             "capability_changed": capability_changed,
             "context_refreshed": context_refreshed,
+            "execution_context_provided": execution_context.is_some(),
+            "execution_context_changed": execution_context_changed,
+            "execution_context": execution_context,
+            "previous_execution_context": previous_execution_context,
             "session_reused": reused,
             "explicit_resume": explicit_resume,
             "current_binding_established": current_binding_established,
@@ -1233,6 +1359,9 @@ fn coding_instruction_event(
         previous_guards,
         capability_changed: Some(capability_changed),
         context_refreshed: Some(context_refreshed),
+        execution_context,
+        previous_execution_context,
+        execution_context_changed: Some(execution_context_changed),
     }
 }
 
@@ -1284,6 +1413,75 @@ fn session_closed_system_event(session_id: &str, now: i64) -> SessionEvent {
         previous_guards: None,
         capability_changed: None,
         context_refreshed: None,
+        execution_context: None,
+        previous_execution_context: None,
+        execution_context_changed: None,
+    }
+}
+
+fn session_execution_context_updated_event(
+    session_id: &str,
+    project: &str,
+    transport: SessionTransport,
+    execution_context: SessionExecutionContext,
+    previous_execution_context: SessionExecutionContext,
+    changed: bool,
+    now: i64,
+) -> SessionEvent {
+    SessionEvent {
+        event_id: format!("{EVENT_ID_PREFIX}{}", uuid::Uuid::new_v4().simple()),
+        session_id: session_id.to_string(),
+        kind: "session_execution_context_updated".to_string(),
+        timestamp: now,
+        transport: transport.as_str().to_string(),
+        tool_name: "update_session_context".to_string(),
+        project: Some(project.to_string()),
+        resolved_project: Some(project.to_string()),
+        risk_class: "read_only".to_string(),
+        read_like: true,
+        write_like: false,
+        shell_like: false,
+        git_like: false,
+        change_summary_like: false,
+        diff_review_like: false,
+        started_at: Some(now),
+        finished_at: Some(now),
+        duration_ms: Some(0),
+        status: Some("succeeded".to_string()),
+        exit_code: None,
+        failure_kind: None,
+        error_kind: None,
+        expected_failure: None,
+        expected_failure_kind: None,
+        assertion_name: None,
+        actual_failure_kind: None,
+        failure_expectation_result: None,
+        warning_kind: None,
+        session_project: None,
+        request_project: None,
+        allow_cross_project_session_required: None,
+        allow_cross_project_session: None,
+        error_message_summary: None,
+        changed_paths: Vec::new(),
+        observed_paths: Vec::new(),
+        job_id: None,
+        input_summary: Some(redact_and_bound_value(&serde_json::json!({
+            "execution_context": execution_context,
+            "previous_execution_context": previous_execution_context,
+            "execution_context_changed": changed,
+        }))),
+        validation_output_summary: None,
+        permission: None,
+        instruction: None,
+        requested_mode: None,
+        previous_mode: None,
+        requested_guards: None,
+        previous_guards: None,
+        capability_changed: None,
+        context_refreshed: None,
+        execution_context: Some(execution_context),
+        previous_execution_context: Some(previous_execution_context),
+        execution_context_changed: Some(changed),
     }
 }
 
@@ -1820,6 +2018,7 @@ impl SessionStoreInner {
             title: record.title.clone(),
             mode: record.mode,
             guards: record.guards,
+            execution_context: record.execution_context.clone(),
             lifecycle: record.lifecycle,
             created_at: record.created_at,
             updated_at: record.updated_at,

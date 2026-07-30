@@ -294,6 +294,7 @@ async fn meaningful_activity_is_scoped_and_not_refreshed_by_status_calls() {
                 mode: SessionMode::Normal,
                 deny_write_tools: false,
                 deny_shell_tools: false,
+                execution_context: None,
             },
             None,
         )
@@ -357,6 +358,7 @@ async fn durable_current_binding_restores_same_window_after_restart() {
             resume_session_id: None,
             bind_current: true,
             new_session: false,
+            execution_context: None,
         },
     )
     .await;
@@ -399,6 +401,7 @@ async fn durable_current_binding_restores_same_window_after_restart() {
             resume_session_id: None,
             bind_current: true,
             new_session: false,
+            execution_context: None,
         },
     )
     .await;
@@ -967,6 +970,7 @@ fn coding_start_call(
         resume_session_id: None,
         bind_current: true,
         new_session,
+        execution_context: None,
     }
 }
 

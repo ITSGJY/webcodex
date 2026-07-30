@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-use super::sessions::session_mode_schema;
+use super::sessions::{session_execution_context_schema, session_mode_schema};
 
 pub(crate) fn start_coding_task_input_schema() -> Value {
     json!({
@@ -24,6 +24,9 @@ pub(crate) fn start_coding_task_input_schema() -> Value {
                 "type": "boolean",
                 "description": "Optional task guard for the created session. Defaults to false unless mode=read_only."
             },
+            "execution_context": session_execution_context_schema(
+                "Optional complete Workflow Session execution defaults. On creation this becomes the initial context. On continuation or explicit resume, omission preserves the existing context while an explicit object replaces it atomically; `{}` clears both defaults."
+            ),
             "detail": {
                 "type": "string",
                 "enum": ["minimal", "standard", "full"],

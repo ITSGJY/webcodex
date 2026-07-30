@@ -55,6 +55,7 @@ impl ToolRuntime {
         resume_session_id: Option<String>,
         bind_current: bool,
         new_session: bool,
+        execution_context: Option<sessions::SessionExecutionContext>,
         auth: Option<&AuthContext>,
         transport: SessionTransport,
         window: Option<&crate::client_window::ClientWindow>,
@@ -72,6 +73,23 @@ impl ToolRuntime {
                 }),
             );
         }
+        let execution_context = match execution_context
+            .map(sessions::SessionExecutionContext::validated)
+            .transpose()
+        {
+            Ok(context) => context,
+            Err(error) => {
+                return ToolResult::err_with_output(
+                    error,
+                    json!({
+                        "error_kind": "invalid_execution_context",
+                        "failure_kind": "invalid_arguments",
+                        "field": "execution_context",
+                        "state_changed": false,
+                    }),
+                );
+            }
+        };
         let resume_session_id = match resume_session_id {
             Some(session_id)
                 if session_id != session_id.trim()
@@ -228,6 +246,7 @@ impl ToolRuntime {
                     deny_write_tools,
                     deny_shell_tools,
                 },
+                execution_context,
                 project_instructions: Some(project_instructions.clone()),
                 transport,
                 bind_current: binding_available,
@@ -315,6 +334,17 @@ impl ToolRuntime {
                         "error_kind": "session_capability_upgrade_denied",
                         "required_scope": crate::auth::SCOPE_PROJECT_WRITE,
                         "mode": mode.as_str(),
+                        "state_changed": false,
+                    }),
+                );
+            }
+            Err(sessions::CodingSessionError::InvalidExecutionContext(error)) => {
+                return ToolResult::err_with_output(
+                    error,
+                    json!({
+                        "error_kind": "invalid_execution_context",
+                        "failure_kind": "invalid_arguments",
+                        "field": "execution_context",
                         "state_changed": false,
                     }),
                 );
@@ -440,6 +470,7 @@ impl ToolRuntime {
                 "session_id": session_summary.session_id,
                 "mode": session_summary.mode,
                 "guards": session_summary.guards,
+                "execution_context": session_summary.execution_context,
                 "lifecycle": session_summary.lifecycle,
                 "continuation": if resume_requested {
                     "resumed_explicitly"
@@ -466,6 +497,7 @@ impl ToolRuntime {
                     "refreshed": true,
                     "git_state_recaptured": true,
                     "rules_recaptured": true,
+                    "execution_context_changed": session_outcome.execution_context_changed,
                 },
                 "explicit_session_id_required_for_continuity": !binding_available,
                 "explicit_session_id_recommended": !binding_available,

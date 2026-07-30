@@ -387,6 +387,7 @@ async fn start_session_without_project_is_allowed() {
                 mode: SessionMode::Normal,
                 deny_write_tools: false,
                 deny_shell_tools: false,
+                execution_context: None,
             },
             None,
         )
@@ -410,6 +411,10 @@ async fn start_session_valid_full_id_stores_resolved_project() {
                 mode: SessionMode::Normal,
                 deny_write_tools: false,
                 deny_shell_tools: false,
+                execution_context: Some(sessions::SessionExecutionContext {
+                    default_cwd: Some("frontend/./src".to_string()),
+                    default_shell: Some(ExecutionShell::Bash),
+                }),
             },
             None,
         )
@@ -420,6 +425,25 @@ async fn start_session_valid_full_id_stores_resolved_project() {
     assert_eq!(
         result.output["resolved_project"],
         "agent:workstation:my-repo"
+    );
+    assert_eq!(
+        result.output["execution_context"],
+        serde_json::json!({
+            "default_cwd": "frontend/src",
+            "default_shell": "bash"
+        })
+    );
+    let summary = runtime
+        .sessions
+        .summary(result.output["session_id"].as_str().unwrap(), None)
+        .unwrap();
+    assert_eq!(
+        summary.execution_context.default_cwd.as_deref(),
+        Some("frontend/src")
+    );
+    assert_eq!(
+        summary.execution_context.default_shell,
+        Some(ExecutionShell::Bash)
     );
 }
 
@@ -434,6 +458,7 @@ async fn start_session_valid_short_id_stores_resolved_project() {
                 mode: SessionMode::Normal,
                 deny_write_tools: false,
                 deny_shell_tools: false,
+                execution_context: None,
             },
             None,
         )
@@ -458,6 +483,7 @@ async fn start_session_ambiguous_project_fails_with_candidates() {
                 mode: SessionMode::Normal,
                 deny_write_tools: false,
                 deny_shell_tools: false,
+                execution_context: None,
             },
             None,
         )
@@ -481,6 +507,7 @@ async fn start_session_unknown_project_fails_with_candidates() {
                 mode: SessionMode::Normal,
                 deny_write_tools: false,
                 deny_shell_tools: false,
+                execution_context: None,
             },
             None,
         )
@@ -503,6 +530,7 @@ async fn close_session_tool_active_to_closed_and_query_still_works() {
             mode: SessionMode::Normal,
             deny_write_tools: false,
             deny_shell_tools: false,
+            execution_context: None,
         })
         .await;
     assert!(started.success, "{:?}", started.error);

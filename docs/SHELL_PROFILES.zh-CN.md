@@ -108,11 +108,31 @@ runner 注册时会上报 shell dialect 事实，server 与 agent 永远不需�
 - Dialect 上报只是 metadata：不会向 server 发送任何 PATH、env values 或
   `init_script` 内容。
 
-## 9. 修改配置需要重启 agent
+## 9. Workflow Session 执行默认值
+
+在 full operator runtime 上，绑定已注册项目的 Workflow Session 可以保存可选的
+project-relative `default_cwd` 和可选的 `default_shell`（`sh` 或 `bash`）。
+它们只是执行默认值，不是 prepared environment snapshot，也不会创建持久 shell。
+
+`run_shell` 和 `run_job` 按以下优先级解析：
+
+1. 单次调用显式传入的 `cwd` / `shell`；
+2. 与项目精确匹配且仍为 active 的 Workflow Session 默认值；
+3. 现有的项目根目录 / configured shell-profile 行为。
+
+不传 Session 时行为不变；其他项目的 Session 永远不会提供默认值。无效、不存在或
+越出项目根目录的 cwd 会沿用现有安全检查并失败，不会静默退回项目根目录。每条命令
+仍是独立进程，某次命令中的 `cd sub` 不会影响后续调用。
+
+`start_coding_task(execution_context=...)` 可以设置或替换该上下文；续接时省略会保留，
+显式 `{}` 会清空。`update_session_context` 针对一个显式 active Workflow Session
+执行完整替换。上下文不能保存 env values、tokens、任意 options 或 shell state。
+
+## 10. 修改配置需要重启 agent
 
 当前没有 reload API。修改 `agent.toml` 或 project TOML 后，需要重启 `webcodex-runner`。重启会丢弃已有 snapshots，并在下一次命令时 lazy re-prepare。
 
-## 10. 安全提示
+## 11. 安全提示
 
 - **不要**在 `init_script` 中放 tokens。
 - **不要**在 `init_script` 中 `echo`/`printf` secrets。
@@ -121,7 +141,7 @@ runner 注册时会上报 shell dialect 事实，server 与 agent 永远不需�
 - Agent token 相关环境变量会从 child process environment 中剥离。
 - `prepare` 使用 `env_clear` 和显式 inherited keys allowlist；profiles 必须声明所需 env。
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
 canonical project 使用共享只读 readiness：
 

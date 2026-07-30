@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
 
+use super::super::input_schemas::session_execution_context_schema;
 use super::common::{
     array_schema, authority_profile_schema, continuation_feedback_schema, evidence_history_schema,
     evidence_integrity_schema, exploration_tool_name_schema, handoff_brief_schema,
@@ -275,6 +276,9 @@ fn startup_session_schema() -> Value {
         "properties": {
             "session_id": {"type": "string", "pattern": "^wc_sess_[A-Za-z0-9_]+$"},
             "mode": {"type": "string", "enum": ["normal", "inspect", "read_only"]},
+            "execution_context": session_execution_context_schema(
+                "Persistent run_shell/run_job defaults currently stored for this Workflow Session."
+            ),
             "continuation": {"type": "string", "enum": ["created", "continued", "resumed_explicitly"]},
             "reused": {"type": "boolean"},
             "resume_requested": {"type": "boolean"},
@@ -304,6 +308,7 @@ fn startup_session_schema() -> Value {
         "required": [
             "session_id",
             "mode",
+            "execution_context",
             "continuation",
             "reused",
             "resume_requested",

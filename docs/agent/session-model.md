@@ -96,6 +96,54 @@ handoff, and finish can reason about the same unit of work.
 | Durability | JSON-oriented session ledger (bounded events/messages per session) |
 | Current-session binding | In-memory exact-key cache plus a bounded durable projection in the same JSON ledger; isolated by client window, principal, transport, resolved project, and canonical repository-root hash |
 
+### Persistent execution context
+
+An existing registered-project-bound Workflow Session may persist this
+strongly typed execution context:
+
+```text
+SessionExecutionContext {
+  default_cwd: project-relative path?,
+  default_shell: sh | bash?
+}
+```
+
+It is not an arbitrary context bag. It cannot contain environment variables,
+credentials, SSH state, shell input, connection data, or custom options.
+`default_cwd` is validated and normalized before entering the ledger; absolute
+paths, URI forms, control characters, and parent traversal fail without
+changing Session state. Filesystem existence, canonicalization, symlink, and
+allowed-root checks remain in the normal Runner execution path and fail closed
+there without retrying from the project root.
+
+`start_session` can set the initial context. `start_coding_task` also sets it
+when creating a Session; on automatic continuation or explicit resume,
+omitting `execution_context` preserves the stored value, while an explicit
+object replaces it atomically with the instruction/capability/binding update.
+An explicit `{}` clears both defaults. `update_session_context` performs the
+same full replacement for one explicit known active project-scoped
+`session_id`; it never uses current-session fallback, never creates an unknown
+Session, and rejects closed, archived, or project-less Sessions.
+
+Only `run_shell` and `run_job` inherit these defaults, with this precedence:
+
+```text
+per-call cwd/shell
+> exact active project-matched Workflow Session default
+> existing project-root/configured-shell behavior
+```
+
+A missing Session leaves execution unchanged. A mismatched Session fails or,
+on an explicitly authorized cross-project escape path, executes without
+inheriting its context. Commands remain independent processes: the runtime
+does not parse or persist `cd`, shell variables, aliases, or process state.
+
+The context is an additive serde-defaulted ledger-version-1 field, so older
+ledgers load it as `{}` without a version bump. Startup and Session summaries
+return the complete current context. Context changes record bounded structured
+metadata only; no command, environment, token, or secret content is added to
+the audit ledger.
+
 ### Full-runtime coding continuity
 
 `start_coding_task` is the ordinary start-or-continue aggregate on the full

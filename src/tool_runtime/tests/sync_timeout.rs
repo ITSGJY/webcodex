@@ -264,6 +264,7 @@ async fn timeout_rejection_does_not_pollute_validation_summary() {
                 mode: SessionMode::Normal,
                 deny_write_tools: false,
                 deny_shell_tools: false,
+                execution_context: None,
             },
             Some(&auth),
         )

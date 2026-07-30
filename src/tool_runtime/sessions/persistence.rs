@@ -34,6 +34,7 @@ impl PersistedSessionRecord {
             title: record.title.clone(),
             mode: record.mode,
             guards: record.guards,
+            execution_context: record.execution_context.clone(),
             lifecycle: record.lifecycle,
             created_at: record.created_at,
             updated_at: record.updated_at,
@@ -73,12 +74,19 @@ impl PersistedSessionRecord {
         // eviction. A live ledger that exceeded the cap has the true cumulative
         // count persisted.
         let retained_events = events.len() as u64;
+        let project = self.project.map(|value| bound_summary_string(value.trim()));
+        let execution_context = if project.is_some() {
+            self.execution_context.sanitized_for_restore()
+        } else {
+            Default::default()
+        };
         Some(SessionRecord {
             session_id,
-            project: self.project.map(|value| bound_summary_string(value.trim())),
+            project,
             title: self.title.map(|value| bound_summary_string(value.trim())),
             mode: self.mode,
             guards: SessionGuards::effective(self.mode, self.guards),
+            execution_context,
             // Missing ledger field deserializes via #[serde(default)] → Active.
             lifecycle: self.lifecycle,
             created_at: self.created_at,
@@ -349,6 +357,12 @@ pub(super) fn sanitize_persisted_event(
     event.validation_output_summary = event
         .validation_output_summary
         .and_then(|value| sanitize_persisted_validation_output_summary(&event.tool_name, &value));
+    event.execution_context = event
+        .execution_context
+        .map(|context| context.sanitized_for_restore());
+    event.previous_execution_context = event
+        .previous_execution_context
+        .map(|context| context.sanitized_for_restore());
     Some(event)
 }
 

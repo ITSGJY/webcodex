@@ -9,6 +9,7 @@ mod coding_task_semantic_navigation;
 mod continuation_feedback;
 mod dispatch;
 mod edit_tool_telemetry;
+mod execution_context;
 mod explicit_resume;
 mod files;
 mod files_helpers;

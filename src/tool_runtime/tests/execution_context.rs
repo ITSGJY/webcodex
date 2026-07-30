@@ -1,0 +1,419 @@
+//! Persistent Workflow Session execution-context integration tests.
+
+use super::super::*;
+use super::support::*;
+use crate::shell_protocol::{ShellAgentResultRequest, ShellClientCapabilities};
+
+fn context(cwd: Option<&str>, shell: Option<ExecutionShell>) -> sessions::SessionExecutionContext {
+    sessions::SessionExecutionContext {
+        default_cwd: cwd.map(str::to_string),
+        default_shell: shell,
+    }
+}
+
+#[tokio::test]
+async fn run_shell_inherits_session_context_and_explicit_arguments_override_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    let frontend = root.join("frontend");
+    let override_dir = root.join("override");
+    std::fs::create_dir_all(&frontend).unwrap();
+    std::fs::create_dir_all(&override_dir).unwrap();
+
+    let runtime = test_runtime();
+    let project = register_agent_project_at_path(&runtime, "context-shell", "demo", &root).await;
+    let auth = auth_context(None, true);
+    let session = runtime
+        .sessions
+        .start_session_with_options(
+            sessions::SessionCreateOptions::new(
+                Some(project.clone()),
+                Some("context inheritance".to_string()),
+                SessionMode::Normal,
+                sessions::SessionGuards::default(),
+            )
+            .with_execution_context(context(Some("frontend"), Some(ExecutionShell::Bash))),
+        )
+        .unwrap();
+
+    let inherited_task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        let session_id = session.session_id.clone();
+        let auth = auth.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::RunShell {
+                        project,
+                        command: "pwd".to_string(),
+                        session_id: Some(session_id),
+                        timeout_secs: Some(30),
+                        cwd: None,
+                        purpose: None,
+                        shell: None,
+                    },
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    let inherited_request = next_patch_agent_request(&runtime, "context-shell")
+        .await
+        .expect("inherited run_shell should enqueue");
+    assert_eq!(
+        inherited_request.cwd.as_deref(),
+        Some(frontend.to_string_lossy().as_ref())
+    );
+    assert!(inherited_request.command.starts_with("exec bash -c "));
+    complete_patch_agent_request(
+        &runtime,
+        "context-shell",
+        &inherited_request.request_id,
+        0,
+        "",
+        "",
+    )
+    .await;
+    let inherited = inherited_task.await.unwrap();
+    assert!(inherited.success, "{:?}", inherited.error);
+    assert_eq!(inherited.output["cwd"], "frontend");
+    assert_eq!(inherited.output["shell"], "bash");
+
+    let override_task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        let session_id = session.session_id.clone();
+        let auth = auth.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::RunShell {
+                        project,
+                        command: "pwd".to_string(),
+                        session_id: Some(session_id),
+                        timeout_secs: Some(30),
+                        cwd: Some("override".to_string()),
+                        purpose: None,
+                        shell: Some(ExecutionShell::Sh),
+                    },
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    let override_request = next_patch_agent_request(&runtime, "context-shell")
+        .await
+        .expect("overridden run_shell should enqueue");
+    assert_eq!(
+        override_request.cwd.as_deref(),
+        Some(override_dir.to_string_lossy().as_ref())
+    );
+    assert!(override_request.command.starts_with("exec sh -c "));
+    complete_patch_agent_request(
+        &runtime,
+        "context-shell",
+        &override_request.request_id,
+        0,
+        "",
+        "",
+    )
+    .await;
+    let overridden = override_task.await.unwrap();
+    assert!(overridden.success, "{:?}", overridden.error);
+    assert_eq!(overridden.output["cwd"], "override");
+    assert_eq!(overridden.output["shell"], "sh");
+
+    let no_session_task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        let auth = auth.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::RunShell {
+                        project,
+                        command: "pwd".to_string(),
+                        session_id: None,
+                        timeout_secs: Some(30),
+                        cwd: None,
+                        purpose: None,
+                        shell: None,
+                    },
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    let no_session_request = next_patch_agent_request(&runtime, "context-shell")
+        .await
+        .expect("sessionless run_shell should enqueue");
+    assert_eq!(
+        no_session_request.cwd.as_deref(),
+        Some(root.to_string_lossy().as_ref())
+    );
+    assert_eq!(no_session_request.command, "pwd");
+    complete_patch_agent_request(
+        &runtime,
+        "context-shell",
+        &no_session_request.request_id,
+        0,
+        "",
+        "",
+    )
+    .await;
+    let no_session = no_session_task.await.unwrap();
+    assert!(no_session.success, "{:?}", no_session.error);
+    assert_eq!(no_session.output["cwd"], ".");
+    assert_eq!(no_session.output["shell"], "configured");
+}
+
+#[tokio::test]
+async fn run_job_inherits_session_cwd_and_shell() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    let frontend = root.join("frontend");
+    std::fs::create_dir_all(&frontend).unwrap();
+    let runtime = test_runtime();
+    let auth = open_auth_context();
+    let mut capabilities = ShellClientCapabilities::default();
+    capabilities.async_shell_jobs = true;
+    register_agent_projects_for_auth(
+        &runtime,
+        "context-job",
+        &auth,
+        capabilities,
+        vec![registered_project("demo", &root.to_string_lossy())],
+    )
+    .await;
+    let project = "agent:context-job:demo".to_string();
+    let session = runtime
+        .sessions
+        .start_session_with_options(
+            sessions::SessionCreateOptions::new(
+                Some(project.clone()),
+                Some("job context".to_string()),
+                SessionMode::Normal,
+                sessions::SessionGuards::default(),
+            )
+            .with_execution_context(context(Some("frontend"), Some(ExecutionShell::Bash))),
+        )
+        .unwrap();
+
+    let result = runtime
+        .dispatch_with_auth(
+            ToolCall::RunJob {
+                project,
+                command: "pwd".to_string(),
+                session_id: Some(session.session_id),
+                timeout_secs: Some(30),
+                cwd: None,
+                purpose: None,
+                shell: None,
+            },
+            Some(&auth),
+        )
+        .await;
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["cwd"], "frontend");
+    assert_eq!(result.output["shell"], "bash");
+    let request = next_agent_request_for_client(&runtime, "context-job")
+        .await
+        .expect("run_job should enqueue a start_job request");
+    assert_eq!(request.kind, "start_job");
+    assert_eq!(
+        request.cwd.as_deref(),
+        Some(frontend.to_string_lossy().as_ref())
+    );
+    assert!(request.command.starts_with("exec bash -c "));
+}
+
+#[tokio::test]
+async fn mismatch_and_invalid_context_fail_closed_without_root_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    let first_root = temp.path().join("first");
+    let second_root = temp.path().join("second");
+    std::fs::create_dir_all(first_root.join("frontend")).unwrap();
+    std::fs::create_dir_all(&second_root).unwrap();
+    let runtime = test_runtime();
+    let first_project =
+        register_agent_project_at_path(&runtime, "context-first", "demo", &first_root).await;
+    let second_project =
+        register_agent_project_at_path(&runtime, "context-second", "demo", &second_root).await;
+    let auth = auth_context(None, true);
+    let session = runtime
+        .sessions
+        .start_session_with_options(
+            sessions::SessionCreateOptions::new(
+                Some(first_project),
+                Some("fail closed".to_string()),
+                SessionMode::Normal,
+                sessions::SessionGuards::default(),
+            )
+            .with_execution_context(context(Some("frontend"), Some(ExecutionShell::Bash))),
+        )
+        .unwrap();
+
+    let mismatch = runtime
+        .dispatch_with_auth(
+            ToolCall::RunShell {
+                project: second_project,
+                command: "pwd".to_string(),
+                session_id: Some(session.session_id.clone()),
+                timeout_secs: Some(30),
+                cwd: None,
+                purpose: None,
+                shell: None,
+            },
+            Some(&auth),
+        )
+        .await;
+    assert!(!mismatch.success);
+    assert_eq!(mismatch.output["failure_kind"], "session_project_mismatch");
+    assert!(
+        next_patch_agent_request(&runtime, "context-second")
+            .await
+            .is_none(),
+        "mismatched Session must not enqueue with inherited context"
+    );
+
+    let before = runtime.sessions.summary(&session.session_id, None).unwrap();
+    let invalid = runtime
+        .dispatch(ToolCall::UpdateSessionContext {
+            session_id: session.session_id.clone(),
+            execution_context: context(Some("../outside"), None),
+        })
+        .await;
+    assert!(!invalid.success);
+    assert_eq!(invalid.output["error_kind"], "invalid_execution_context");
+    let after = runtime.sessions.summary(&session.session_id, None).unwrap();
+    assert_eq!(after.execution_context, before.execution_context);
+    assert_eq!(after.events_total, before.events_total);
+}
+
+#[tokio::test]
+async fn nonexistent_inherited_cwd_is_not_retried_at_project_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    let runtime = test_runtime();
+    let project = register_agent_project_at_path(&runtime, "context-missing", "demo", &root).await;
+    let auth = auth_context(None, true);
+    let session = runtime
+        .sessions
+        .start_session_with_options(
+            sessions::SessionCreateOptions::new(
+                Some(project.clone()),
+                Some("missing cwd".to_string()),
+                SessionMode::Normal,
+                sessions::SessionGuards::default(),
+            )
+            .with_execution_context(context(Some("missing"), None)),
+        )
+        .unwrap();
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::RunShell {
+                        project,
+                        command: "pwd".to_string(),
+                        session_id: Some(session.session_id),
+                        timeout_secs: Some(30),
+                        cwd: None,
+                        purpose: None,
+                        shell: None,
+                    },
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    let request = next_patch_agent_request(&runtime, "context-missing")
+        .await
+        .expect("run_shell should dispatch the inherited cwd once");
+    assert_eq!(
+        request.cwd.as_deref(),
+        Some(root.join("missing").to_string_lossy().as_ref())
+    );
+    runtime
+        .shell_clients
+        .complete(ShellAgentResultRequest {
+            client_id: "context-missing".to_string(),
+            agent_instance_id: "inst".to_string(),
+            request_id: request.request_id,
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            duration_ms: Some(1),
+            error: Some("cwd does not exist".to_string()),
+        })
+        .await
+        .unwrap();
+    let result = task.await.unwrap();
+    assert!(!result.success);
+    assert!(result
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("cwd does not exist"));
+    assert!(
+        next_patch_agent_request(&runtime, "context-missing")
+            .await
+            .is_none(),
+        "invalid inherited cwd must not fall back to the project root"
+    );
+}
+
+#[tokio::test]
+async fn update_session_context_tool_replaces_clears_and_rejects_closed_or_unknown_sessions() {
+    let runtime = test_runtime();
+    let session = runtime.sessions.start_session(
+        Some("agent:context:demo".to_string()),
+        Some("update tool".to_string()),
+    );
+    let set = runtime
+        .dispatch(ToolCall::UpdateSessionContext {
+            session_id: session.session_id.clone(),
+            execution_context: context(Some("frontend"), Some(ExecutionShell::Bash)),
+        })
+        .await;
+    assert!(set.success, "{:?}", set.error);
+    assert_eq!(set.output["execution_context"]["default_cwd"], "frontend");
+    assert_eq!(set.output["execution_context"]["default_shell"], "bash");
+    assert_eq!(
+        set.output["previous_execution_context"],
+        serde_json::json!({})
+    );
+    assert_eq!(set.output["changed"], true);
+
+    let clear = runtime
+        .dispatch(ToolCall::UpdateSessionContext {
+            session_id: session.session_id.clone(),
+            execution_context: sessions::SessionExecutionContext::default(),
+        })
+        .await;
+    assert!(clear.success, "{:?}", clear.error);
+    assert_eq!(clear.output["execution_context"], serde_json::json!({}));
+
+    runtime.sessions.close_session(&session.session_id).unwrap();
+    let closed = runtime
+        .dispatch(ToolCall::UpdateSessionContext {
+            session_id: session.session_id,
+            execution_context: sessions::SessionExecutionContext::default(),
+        })
+        .await;
+    assert!(!closed.success);
+    assert_eq!(closed.output["error_kind"], "session_closed");
+
+    let unknown = runtime
+        .dispatch(ToolCall::UpdateSessionContext {
+            session_id: "wc_sess_unknowncontext01".to_string(),
+            execution_context: sessions::SessionExecutionContext::default(),
+        })
+        .await;
+    assert!(!unknown.success);
+    assert_eq!(unknown.output["error_kind"], "unknown_session_id");
+}

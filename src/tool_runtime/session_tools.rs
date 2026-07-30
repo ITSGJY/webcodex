@@ -24,6 +24,7 @@ impl ToolRuntime {
                 mode,
                 deny_write_tools,
                 deny_shell_tools,
+                execution_context,
             } => {
                 self.start_session_tool(
                     project,
@@ -31,6 +32,7 @@ impl ToolRuntime {
                     mode,
                     deny_write_tools,
                     deny_shell_tools,
+                    execution_context,
                     auth,
                 )
                 .await
@@ -38,6 +40,10 @@ impl ToolRuntime {
             ToolCall::SessionSummary { session_id, limit } => {
                 self.session_summary_tool(session_id, limit)
             }
+            ToolCall::UpdateSessionContext {
+                session_id,
+                execution_context,
+            } => self.update_session_context_tool(session_id, execution_context, transport),
             ToolCall::CloseSession { session_id } => self.close_session_tool(session_id),
             ToolCall::ValidationSummary {
                 project,
@@ -97,8 +103,16 @@ impl ToolRuntime {
         mode: SessionMode,
         deny_write_tools: bool,
         deny_shell_tools: bool,
+        execution_context: Option<sessions::SessionExecutionContext>,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
+        let execution_context = match execution_context
+            .map(sessions::SessionExecutionContext::validated)
+            .transpose()
+        {
+            Ok(context) => context,
+            Err(error) => return invalid_execution_context_result(error),
+        };
         let resolved = match project {
             Some(project_input) => match self
                 .resolve_project_input_for_auth(&project_input, auth)
@@ -116,23 +130,28 @@ impl ToolRuntime {
             Some(resolved) => Some(self.load_project_instructions(&resolved.config).await),
             None => None,
         };
-        let summary = self
-            .sessions
-            .start_session_with_options(sessions::SessionCreateOptions {
-                project: resolved
-                    .as_ref()
-                    .map(|resolved| resolved.resolved_id.clone()),
-                title,
+        let options = sessions::SessionCreateOptions::new(
+            resolved
+                .as_ref()
+                .map(|resolved| resolved.resolved_id.clone()),
+            title,
+            mode,
+            sessions::SessionGuards::effective(
                 mode,
-                guards: sessions::SessionGuards::effective(
-                    mode,
-                    sessions::SessionGuards {
-                        deny_write_tools,
-                        deny_shell_tools,
-                    },
-                ),
-                project_instructions: project_instructions.clone(),
-            });
+                sessions::SessionGuards {
+                    deny_write_tools,
+                    deny_shell_tools,
+                },
+            ),
+        )
+        .with_project_instructions(project_instructions.clone())
+        .with_execution_context(execution_context.unwrap_or_default());
+        let summary = match self.sessions.start_session_with_options(options) {
+            Ok(summary) => summary,
+            Err(error) => {
+                return invalid_execution_context_result(error);
+            }
+        };
         ToolResult::ok(json!({
             "success": true,
             "session_id": summary.session_id,
@@ -142,10 +161,62 @@ impl ToolRuntime {
             "title": summary.title,
             "mode": summary.mode,
             "guards": summary.guards,
+            "execution_context": summary.execution_context,
             "lifecycle": summary.lifecycle,
             "created_at": summary.created_at,
             "project_instructions": project_instructions,
         }))
+    }
+
+    pub(crate) fn update_session_context_tool(
+        &self,
+        session_id: String,
+        execution_context: sessions::SessionExecutionContext,
+        transport: sessions::SessionTransport,
+    ) -> ToolResult {
+        match self
+            .sessions
+            .update_execution_context(&session_id, execution_context, transport)
+        {
+            Ok(outcome) => ToolResult::ok(json!({
+                "success": true,
+                "session_id": outcome.summary.session_id,
+                "project": outcome.summary.project,
+                "title": outcome.summary.title,
+                "mode": outcome.summary.mode,
+                "guards": outcome.summary.guards,
+                "lifecycle": outcome.summary.lifecycle,
+                "execution_context": outcome.summary.execution_context,
+                "previous_execution_context": outcome.previous_execution_context,
+                "changed": outcome.changed,
+                "created_at": outcome.summary.created_at,
+                "updated_at": outcome.summary.updated_at,
+            })),
+            Err(sessions::SessionExecutionContextUpdateError::UnknownSession) => {
+                unknown_session_result(&session_id)
+            }
+            Err(sessions::SessionExecutionContextUpdateError::SessionNotActive { lifecycle }) => {
+                session_lifecycle_denied_result(
+                    &session_id,
+                    "update_session_context",
+                    sessions::SessionLifecycleDenial { lifecycle },
+                )
+            }
+            Err(sessions::SessionExecutionContextUpdateError::SessionHasNoProject) => {
+                ToolResult::err_with_output(
+                    "session_execution_context_requires_project",
+                    json!({
+                        "error_kind": "session_execution_context_requires_project",
+                        "failure_kind": "invalid_session_state",
+                        "session_id": session_id,
+                        "state_changed": false,
+                    }),
+                )
+            }
+            Err(sessions::SessionExecutionContextUpdateError::InvalidExecutionContext(error)) => {
+                invalid_execution_context_result(error)
+            }
+        }
     }
 
     pub(crate) fn session_summary_tool(
@@ -329,6 +400,7 @@ impl ToolRuntime {
             "resolved_project": resolved.resolved_id,
             "mode": bound.mode,
             "guards": bound.guards,
+            "execution_context": bound.execution_context,
         }))
     }
 
@@ -361,6 +433,7 @@ impl ToolRuntime {
                 "resolved_project": resolved.resolved_id,
                 "mode": summary.mode,
                 "guards": summary.guards,
+                "execution_context": summary.execution_context,
             })),
             None => ToolResult::ok(json!({
                 "found": false,
@@ -399,4 +472,16 @@ impl ToolRuntime {
             "resolved_project": resolved.resolved_id,
         }))
     }
+}
+
+fn invalid_execution_context_result(error: String) -> ToolResult {
+    ToolResult::err_with_output(
+        error,
+        json!({
+            "error_kind": "invalid_execution_context",
+            "failure_kind": "invalid_arguments",
+            "field": "execution_context",
+            "state_changed": false,
+        }),
+    )
 }

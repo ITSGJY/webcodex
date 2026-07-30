@@ -28,6 +28,7 @@ fn coding_call(
         resume_session_id: resume_session_id.map(str::to_string),
         bind_current,
         new_session,
+        execution_context: None,
     }
 }
 

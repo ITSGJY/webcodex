@@ -538,6 +538,7 @@ async fn session_tools_exposed_in_registry_and_mcp() {
     let specs = registered_tool_specs();
     let registry_names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
     assert!(registry_names.contains(&"session_summary"));
+    assert!(registry_names.contains(&"update_session_context"));
     assert!(registry_names.contains(&"validation_summary"));
     assert!(registry_names.contains(&"current_session"));
     assert!(registry_names.contains(&"unbind_current_session"));
@@ -566,6 +567,7 @@ async fn session_tools_exposed_in_registry_and_mcp() {
         .map(|tool| tool["name"].as_str().unwrap().to_string())
         .collect();
     assert!(names.iter().any(|name| name == "session_summary"));
+    assert!(names.iter().any(|name| name == "update_session_context"));
     assert!(names.iter().any(|name| name == "validation_summary"));
     assert!(names.iter().any(|name| name == "current_session"));
     assert!(names.iter().any(|name| name == "unbind_current_session"));
@@ -582,6 +584,7 @@ async fn session_tools_exposed_in_registry_and_mcp() {
             .to_lowercase()
     };
     assert!(tool_description("session_summary").contains("session ledger"));
+    assert!(tool_description("update_session_context").contains("atomically replace"));
     assert!(tool_description("validation_summary").contains("does not run cargo"));
     assert!(tool_description("session_handoff_summary")
         .contains("does not depend on current-session binding"));
@@ -2093,7 +2096,26 @@ async fn mcp_tools_list_exposes_coding_task_and_runtime_status_ux_flags() {
         start_props["detail"]["enum"],
         json!(["minimal", "standard", "full"])
     );
+    assert_eq!(
+        start_props["execution_context"]["properties"]["default_shell"]["enum"],
+        json!(["sh", "bash"])
+    );
+    assert_eq!(
+        start_props["execution_context"]["additionalProperties"],
+        false
+    );
     assert!(!start_props.contains_key("tool_manifest_intent"));
+
+    let update = tool("update_session_context");
+    assert_eq!(
+        update["inputSchema"]["required"],
+        json!(["session_id", "execution_context"])
+    );
+    assert_eq!(update["inputSchema"]["additionalProperties"], false);
+    assert_eq!(
+        update["inputSchema"]["properties"]["execution_context"]["additionalProperties"],
+        false
+    );
 
     let runtime_props = tool("runtime_status")["inputSchema"]["properties"]
         .as_object()

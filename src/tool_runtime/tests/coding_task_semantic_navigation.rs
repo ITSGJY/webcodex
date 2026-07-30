@@ -54,6 +54,7 @@ fn start_call(project: String, mode: SessionMode) -> ToolCall {
         resume_session_id: None,
         bind_current: false,
         new_session: false,
+        execution_context: None,
     }
 }
 

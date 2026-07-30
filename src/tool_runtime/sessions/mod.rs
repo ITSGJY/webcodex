@@ -32,7 +32,8 @@ pub(crate) use events::{
 pub(crate) use model::{
     CodingSessionError, CodingSessionRequest, CurrentSessionKey, ListSessionMessagesFilter,
     PostSessionMessageInput, SessionCloseError, SessionCreateOptions, SessionDiscussionCounts,
-    SessionDiscussionSummary, SessionEvent, SessionGuardDenial, SessionGuards, SessionLifecycle,
+    SessionDiscussionSummary, SessionEvent, SessionExecutionContext,
+    SessionExecutionContextUpdateError, SessionGuardDenial, SessionGuards, SessionLifecycle,
     SessionLifecycleDenial, SessionMessage, SessionMessageError, SessionMessageKind,
     SessionMessagePriority, SessionMessageStatus, SessionSummary, SessionTransport,
     ToolCallRecorderMetadata, DEFAULT_MAX_EVENTS_PER_SESSION, DEFAULT_MAX_SESSIONS,

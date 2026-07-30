@@ -3,7 +3,7 @@ use super::super::permissions::PermissionDecision;
 use super::super::project_instructions::{
     ProjectInstructionsSnapshot, ProjectInstructionsSummarySnapshot,
 };
-use super::super::tool_inputs::SessionMode;
+use super::super::tool_inputs::{ExecutionShell, SessionMode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -52,6 +52,84 @@ pub(crate) const TOOL_CALL_EXPECTATION_METADATA_FIELDS: &[&str] = &[
     TOOL_EXPECTED_FAILURE_KIND_FIELD,
     TOOL_ASSERTION_NAME_FIELD,
 ];
+
+/// Durable defaults inherited by shell-like tools attached to a
+/// project-scoped Workflow Session.
+///
+/// This intentionally contains no environment, credential, connection, or
+/// arbitrary option bag. `default_cwd` is always a project-relative path and
+/// `default_shell` reuses the runtime's existing explicit shell dialect.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionExecutionContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) default_cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) default_shell: Option<ExecutionShell>,
+}
+
+impl SessionExecutionContext {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.default_cwd.is_none() && self.default_shell.is_none()
+    }
+
+    /// Validate and normalize the only persisted cwd representation.
+    ///
+    /// Filesystem existence and symlink/allowed-root checks remain in the
+    /// existing shell/job execution path. This lexical gate prevents absolute
+    /// host paths, traversal, URI forms, controls, and unbounded strings from
+    /// entering the Session ledger.
+    pub(crate) fn validated(mut self) -> Result<Self, String> {
+        if let Some(raw_cwd) = self.default_cwd.take() {
+            let cwd = raw_cwd.trim();
+            crate::validation_bridge::validate_project_relative_path(cwd)
+                .map_err(|error| format!("execution_context.default_cwd {error}"))?;
+            let normalized = cwd
+                .split(['/', '\\'])
+                .filter(|component| !component.is_empty() && *component != ".")
+                .collect::<Vec<_>>()
+                .join("/");
+            self.default_cwd = Some(if normalized.is_empty() {
+                ".".to_string()
+            } else {
+                normalized
+            });
+        }
+        Ok(self)
+    }
+
+    /// Restore valid fields independently so a malformed persisted cwd cannot
+    /// bypass the project boundary or erase a valid explicit shell choice.
+    pub(super) fn sanitized_for_restore(mut self) -> Self {
+        if let Some(raw_cwd) = self.default_cwd.take() {
+            let cwd_only = Self {
+                default_cwd: Some(raw_cwd),
+                default_shell: None,
+            };
+            self.default_cwd = cwd_only
+                .validated()
+                .ok()
+                .and_then(|context| context.default_cwd);
+        }
+        self
+    }
+
+    /// Audit-safe form for pre-validation request logging. Invalid cwd text is
+    /// represented only by booleans and never copied into evidence.
+    pub(crate) fn audit_summary(&self) -> Value {
+        let cwd = self
+            .clone()
+            .validated()
+            .ok()
+            .and_then(|context| context.default_cwd);
+        serde_json::json!({
+            "default_cwd": cwd,
+            "default_cwd_present": self.default_cwd.is_some(),
+            "default_cwd_valid": self.default_cwd.is_none() || cwd.is_some(),
+            "default_shell": self.default_shell,
+        })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CurrentSessionKey {
@@ -159,6 +237,7 @@ pub(super) struct SessionRecord {
     pub(super) title: Option<String>,
     pub(super) mode: SessionMode,
     pub(super) guards: SessionGuards,
+    pub(super) execution_context: SessionExecutionContext,
     /// Explicit lifecycle; always set in memory. Default on load: Active.
     pub(super) lifecycle: SessionLifecycle,
     pub(super) created_at: i64,
@@ -184,6 +263,41 @@ pub(crate) struct SessionCreateOptions {
     pub(crate) mode: SessionMode,
     pub(crate) guards: SessionGuards,
     pub(crate) project_instructions: Option<ProjectInstructionsSnapshot>,
+    pub(crate) execution_context: SessionExecutionContext,
+}
+
+impl SessionCreateOptions {
+    pub(crate) fn new(
+        project: Option<String>,
+        title: Option<String>,
+        mode: SessionMode,
+        guards: SessionGuards,
+    ) -> Self {
+        Self {
+            project,
+            title,
+            mode,
+            guards,
+            project_instructions: None,
+            execution_context: SessionExecutionContext::default(),
+        }
+    }
+
+    pub(crate) fn with_project_instructions(
+        mut self,
+        project_instructions: Option<ProjectInstructionsSnapshot>,
+    ) -> Self {
+        self.project_instructions = project_instructions;
+        self
+    }
+
+    pub(crate) fn with_execution_context(
+        mut self,
+        execution_context: SessionExecutionContext,
+    ) -> Self {
+        self.execution_context = execution_context;
+        self
+    }
 }
 
 /// Atomic start-or-continue request used by `start_coding_task`.
@@ -200,6 +314,9 @@ pub(crate) struct CodingSessionRequest {
     pub(crate) instruction: Option<String>,
     pub(crate) mode: SessionMode,
     pub(crate) guards: SessionGuards,
+    /// `None` preserves an existing Session value during continuation.
+    /// `Some({})` explicitly clears both defaults.
+    pub(crate) execution_context: Option<SessionExecutionContext>,
     pub(crate) project_instructions: Option<ProjectInstructionsSnapshot>,
     pub(crate) transport: SessionTransport,
     pub(crate) bind_current: bool,
@@ -220,6 +337,7 @@ pub(crate) struct CodingSessionOutcome {
     pub(crate) previous_mode: Option<SessionMode>,
     pub(crate) previous_guards: Option<SessionGuards>,
     pub(crate) capability_changed: bool,
+    pub(crate) execution_context_changed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,7 +357,23 @@ pub(crate) enum CodingSessionError {
     },
     ResumeNewSessionConflict,
     WriteScopeRequired,
+    InvalidExecutionContext(String),
     CommitFailed,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SessionExecutionContextUpdateOutcome {
+    pub(crate) summary: SessionSummary,
+    pub(crate) previous_execution_context: SessionExecutionContext,
+    pub(crate) changed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SessionExecutionContextUpdateError {
+    UnknownSession,
+    SessionNotActive { lifecycle: SessionLifecycle },
+    SessionHasNoProject,
+    InvalidExecutionContext(String),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -329,6 +463,9 @@ pub(super) struct PersistedSessionRecord {
     pub(super) title: Option<String>,
     pub(super) mode: SessionMode,
     pub(super) guards: SessionGuards,
+    /// Additive ledger-v1 field. Older ledgers restore an empty context.
+    #[serde(default)]
+    pub(super) execution_context: SessionExecutionContext,
     /// Optional on disk for ledger compatibility; missing → Active.
     #[serde(default)]
     pub(super) lifecycle: SessionLifecycle,
@@ -502,6 +639,13 @@ pub(crate) struct SessionEvent {
     pub(crate) capability_changed: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) context_refreshed: Option<bool>,
+    /// Safe, strongly typed context supplied by a creation/resume/update call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) execution_context: Option<SessionExecutionContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) previous_execution_context: Option<SessionExecutionContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) execution_context_changed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -676,6 +820,7 @@ pub(crate) struct SessionSummary {
     pub(crate) title: Option<String>,
     pub(crate) mode: SessionMode,
     pub(crate) guards: SessionGuards,
+    pub(crate) execution_context: SessionExecutionContext,
     pub(crate) lifecycle: SessionLifecycle,
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,

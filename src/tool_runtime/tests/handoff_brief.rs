@@ -48,6 +48,7 @@ fn add_instruction_for_project(
             instruction: Some(instruction.to_string()),
             mode: SessionMode::Normal,
             guards: SessionGuards::default(),
+            execution_context: None,
             project_instructions: None,
             transport: SessionTransport::Api,
             bind_current: false,

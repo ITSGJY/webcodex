@@ -131,6 +131,13 @@ guards and appends the capability-change event under one Session-store lock.
 The exact current binding has a process-local cache and a bounded durable
 projection in the Workflow Session JSON ledger, so restart recovery does not
 depend on an explicit model-supplied Session id.
+Project-scoped Workflow Sessions may additionally persist a strongly typed
+`default_cwd` (project-relative) and `default_shell` (`sh`/`bash`). Creation,
+continuation replacement, explicit context update, instruction append,
+capability transition, and binding changes share the Session-store atomic
+commit boundary. `run_shell`/`run_job` inherit only from an exact active
+project match, after per-call arguments and before the existing root/profile
+defaults; cross-project escape never inherits this state.
 The Connector Task ledger and Workflow Session ledger remain separate internal
 models; neither is copied into the other.
 

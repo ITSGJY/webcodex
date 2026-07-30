@@ -5,8 +5,8 @@
 //! logging.
 
 use super::sessions::{
-    strip_tool_call_expectation_metadata, SessionMessageKind, SessionMessagePriority,
-    SessionMessageStatus, ToolCallRecorderMetadata,
+    strip_tool_call_expectation_metadata, SessionExecutionContext, SessionMessageKind,
+    SessionMessagePriority, SessionMessageStatus, ToolCallRecorderMetadata,
 };
 use super::tool_definition::{lookup_tool_definition, model_visible_tool_names_csv};
 use super::tool_inputs::{
@@ -63,6 +63,8 @@ pub enum ToolCall {
         deny_write_tools: bool,
         #[serde(default)]
         deny_shell_tools: bool,
+        #[serde(default)]
+        execution_context: Option<SessionExecutionContext>,
     },
 
     /// Create a task session and return deterministic startup context: project
@@ -95,6 +97,10 @@ pub enum ToolCall {
         /// continuing the current window/project/repository context.
         #[serde(default)]
         new_session: bool,
+        /// Optional complete replacement. Omission preserves the current value
+        /// on continuation; `{}` explicitly clears it.
+        #[serde(default)]
+        execution_context: Option<SessionExecutionContext>,
     },
 
     /// Return deterministic finish context for an explicit task session:
@@ -123,6 +129,13 @@ pub enum ToolCall {
         session_id: String,
         #[serde(default)]
         limit: Option<usize>,
+    },
+
+    /// Atomically replace the complete execution defaults of one known active,
+    /// project-scoped Workflow Session. `{}` clears both defaults.
+    UpdateSessionContext {
+        session_id: String,
+        execution_context: SessionExecutionContext,
     },
 
     /// Explicitly close a workflow session (`Active → Closed`). Requires an
@@ -1055,6 +1068,7 @@ fn reject_unknown_start_coding_task_fields(arguments: &Value) -> Result<(), Stri
         "resume_session_id",
         "bind_current",
         "new_session",
+        "execution_context",
         // Wrapper/session metadata that transports may leave in params.
         "session_id",
         "recording_session_id",
@@ -1163,6 +1177,7 @@ impl ToolCall {
             Self::StartCodingTask { .. } => "start_coding_task",
             Self::FinishCodingTask { .. } => "finish_coding_task",
             Self::SessionSummary { .. } => "session_summary",
+            Self::UpdateSessionContext { .. } => "update_session_context",
             Self::CloseSession { .. } => "close_session",
             Self::ValidationSummary { .. } => "validation_summary",
             Self::PostSessionMessage { .. } => "post_session_message",
@@ -1353,6 +1368,26 @@ impl ToolCall {
             | Self::FindReferences { session_id, .. } => {
                 if session_id.is_none() {
                     *session_id = Some(effective_session_id);
+                }
+            }
+            _ => {}
+        }
+        self
+    }
+
+    /// Apply project-matched Session defaults without overwriting explicit
+    /// per-call arguments.
+    pub(crate) fn with_session_execution_context(
+        mut self,
+        execution_context: &SessionExecutionContext,
+    ) -> Self {
+        match &mut self {
+            Self::RunShell { cwd, shell, .. } | Self::RunJob { cwd, shell, .. } => {
+                if cwd.is_none() {
+                    *cwd = execution_context.default_cwd.clone();
+                }
+                if shell.is_none() {
+                    *shell = execution_context.default_shell;
                 }
             }
             _ => {}

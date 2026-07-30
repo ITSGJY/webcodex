@@ -935,6 +935,7 @@ async fn read_only_session_allows_lsp_tools() {
                 mode: crate::tool_runtime::SessionMode::ReadOnly,
                 deny_write_tools: true,
                 deny_shell_tools: true,
+                execution_context: None,
             },
             Some(&auth),
         )

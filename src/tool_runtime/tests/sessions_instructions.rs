@@ -36,6 +36,7 @@ async fn start_session_without_project_instructions_when_no_candidate_exists() {
                         mode: SessionMode::Normal,
                         deny_write_tools: false,
                         deny_shell_tools: false,
+                        execution_context: None,
                     },
                     None,
                 )
@@ -106,6 +107,7 @@ async fn start_session_loads_agents_md_from_agent_project() {
                         mode: SessionMode::Normal,
                         deny_write_tools: false,
                         deny_shell_tools: false,
+                        execution_context: None,
                     },
                     None,
                 )
@@ -177,6 +179,7 @@ async fn start_session_truncates_large_instruction_file() {
                         mode: SessionMode::Normal,
                         deny_write_tools: false,
                         deny_shell_tools: false,
+                        execution_context: None,
                     },
                     None,
                 )
@@ -251,6 +254,7 @@ async fn session_summary_returns_project_instructions_without_content() {
                         mode: SessionMode::Normal,
                         deny_write_tools: false,
                         deny_shell_tools: false,
+                        execution_context: None,
                     },
                     None,
                 )

@@ -99,6 +99,15 @@ workset。自动 continuation、显式 resume、inspect/read_only 升级 normal 
 startup core 中 `minimal` 最多 3 条路径，`standard` 及 `full` 内嵌 core 最多
 12 条；完整 feedback 最多 100 条并保留真实 total/truncation。
 
+该 surface 还支持已注册项目 Workflow Session 的有界持久化执行上下文：
+`execution_context = {default_cwd?, default_shell?}`。创建时会保存它；
+continuation/resume 时省略会保留原值，显式对象会原子替换，`{}` 会清空。
+`update_session_context` 可针对一个显式 active Session 再次完整替换。
+`run_shell`/`run_job` 先采用单次调用参数，再采用项目精确匹配的 Session 默认值，
+最后才使用现有项目根目录和 configured shell；不跨项目继承。上下文不保存 env、
+凭据、任意 options 或 shell 状态。每条命令仍启动 fresh shell，`cd`/`export`
+不会隐式写回 Session；SSH 与 persistent shell 属于后续阶段。
+
 在该 surface 上进行显式跨窗口或人工交接时，使用旧 `wc_sess_*` id 调用
 `session_handoff_summary`。它与 `finish_coding_task` 返回同一份 strict
 `handoff_brief`：这是对有界任务摘录、workspace 状态、changed/recent exploration

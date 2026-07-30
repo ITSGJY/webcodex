@@ -111,6 +111,16 @@ does not execute tools or replace model judgment. The compact startup core
 returns at most 3 paths for `minimal` and 12 for `standard`/embedded `full`;
 complete feedback returns at most 100 and preserves the real total/truncation.
 
+That surface also supports a bounded persistent execution context for
+registered-project Workflow Sessions:
+`execution_context = {default_cwd?, default_shell?}`. Creation stores it;
+continuation/resume omission preserves it; an explicit object replaces it
+atomically and `{}` clears it. `update_session_context` replaces it later for
+one explicit active Session. `run_shell`/`run_job` resolve explicit per-call
+arguments first, then exact project-matched Session defaults, then their
+existing root/configured-shell behavior. No env, credential, arbitrary option,
+or persistent shell state is stored.
+
 For an explicit cross-window or human handoff on this surface, call
 `session_handoff_summary` with the old `wc_sess_*` id. It and
 `finish_coding_task` return the same strict `handoff_brief`: a deterministic

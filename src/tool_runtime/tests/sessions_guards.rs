@@ -1275,6 +1275,9 @@ fn project_tool_schemas_include_optional_session_id() {
         .get("guards")
         .is_some());
     assert!(start_session_output["properties"]["output"]["properties"]
+        .get("execution_context")
+        .is_some());
+    assert!(start_session_output["properties"]["output"]["properties"]
         .get("lifecycle")
         .is_some());
     let session_summary = spec_named(&specs, "session_summary");
@@ -1286,6 +1289,11 @@ fn project_tool_schemas_include_optional_session_id() {
     assert!(
         session_summary.output_schema["properties"]["output"]["properties"]
             .get("guards")
+            .is_some()
+    );
+    assert!(
+        session_summary.output_schema["properties"]["output"]["properties"]
+            .get("execution_context")
             .is_some()
     );
     assert!(

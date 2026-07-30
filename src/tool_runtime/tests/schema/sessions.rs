@@ -25,6 +25,29 @@ fn session_tool_specs_describe_ledger_vs_current_binding() {
         );
     }
 
+    let update = spec_named(&specs, "update_session_context");
+    assert_eq!(
+        update.input_schema["required"],
+        serde_json::json!(["session_id", "execution_context"])
+    );
+    assert_eq!(update.input_schema["additionalProperties"], false);
+    assert_eq!(
+        update.input_schema["properties"]["execution_context"]["additionalProperties"],
+        false
+    );
+    let update_desc = update.description.to_lowercase();
+    for phrase in [
+        "atomically replace",
+        "active project-scoped",
+        "never falls back",
+        "never creates",
+    ] {
+        assert!(
+            update_desc.contains(phrase),
+            "update_session_context description should mention {phrase}: {update_desc}"
+        );
+    }
+
     let handoff_desc = desc("session_handoff_summary");
     for phrase in [
         "session ledger",

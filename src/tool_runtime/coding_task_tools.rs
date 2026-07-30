@@ -22,6 +22,7 @@ impl ToolRuntime {
                 resume_session_id,
                 bind_current,
                 new_session,
+                execution_context,
             } => {
                 self.start_coding_task(
                     project,
@@ -33,6 +34,7 @@ impl ToolRuntime {
                     resume_session_id,
                     bind_current,
                     new_session,
+                    execution_context,
                     auth,
                     transport,
                     window,

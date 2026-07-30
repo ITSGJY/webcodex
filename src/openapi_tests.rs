@@ -19,6 +19,23 @@ fn openapi_flattened_session_mode_includes_inspect() {
 }
 
 #[test]
+fn openapi_flattened_execution_context_is_strongly_typed() {
+    let spec = build_openapi_spec();
+    let execution_context =
+        &spec["components"]["schemas"]["ToolCallRequest"]["properties"]["execution_context"];
+    assert_eq!(execution_context["type"], "object");
+    assert_eq!(execution_context["additionalProperties"], false);
+    assert_eq!(
+        execution_context["properties"]["default_shell"]["enum"],
+        json!(["sh", "bash"])
+    );
+    assert_eq!(
+        execution_context["properties"]["default_cwd"]["maxLength"],
+        512
+    );
+}
+
+#[test]
 fn explicit_resume_openapi_metadata_is_distinct_from_session_recording() {
     let spec = build_openapi_spec();
     let properties = spec["components"]["schemas"]["ToolCallRequest"]["properties"]

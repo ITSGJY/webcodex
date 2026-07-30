@@ -257,6 +257,21 @@ impl ToolRuntime {
                 return result;
             }
         }
+        // Inherit execution defaults only after exact project matching has
+        // been established. Explicit per-call cwd/shell fields remain
+        // authoritative; cross-project escape never carries Session context.
+        if session_project_mismatch.is_none() {
+            if let (Some(session_id), Some(resolved)) =
+                (session_id.as_deref(), resolved_project.as_ref())
+            {
+                if let Some(execution_context) = self
+                    .sessions
+                    .execution_context_for_project(session_id, &resolved.resolved_id)
+                {
+                    call = call.with_session_execution_context(&execution_context);
+                }
+            }
+        }
         if let Some(mut result) = tool_disabled_result_from_definition(call.tool_name()) {
             if let Some(session_id) = session_id.as_deref() {
                 let session_start = self.sessions.record_tool_call_started_with_metadata(
@@ -474,6 +489,7 @@ impl ToolRuntime {
 
             call @ (ToolCall::StartSession { .. }
             | ToolCall::SessionSummary { .. }
+            | ToolCall::UpdateSessionContext { .. }
             | ToolCall::CloseSession { .. }
             | ToolCall::ValidationSummary { .. }
             | ToolCall::PostSessionMessage { .. }

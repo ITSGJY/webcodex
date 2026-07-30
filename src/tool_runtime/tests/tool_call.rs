@@ -573,6 +573,64 @@ fn start_coding_task_defaults_to_continuation_and_requires_explicit_isolation() 
 }
 
 #[test]
+fn session_execution_context_parses_as_strongly_typed_replacement() {
+    let call = ToolCall::from_tool_name(
+        "start_coding_task",
+        json!({
+            "project": "agent:oe:demo",
+            "execution_context": {
+                "default_cwd": "frontend",
+                "default_shell": "bash"
+            }
+        }),
+    )
+    .unwrap();
+    assert!(matches!(
+        call,
+        ToolCall::StartCodingTask {
+            execution_context: Some(sessions::SessionExecutionContext {
+                default_cwd: Some(ref cwd),
+                default_shell: Some(ExecutionShell::Bash),
+            }),
+            ..
+        } if cwd == "frontend"
+    ));
+
+    let clear = ToolCall::from_tool_name(
+        "update_session_context",
+        json!({
+            "session_id": "wc_sess_context01",
+            "execution_context": {}
+        }),
+    )
+    .unwrap();
+    assert!(matches!(
+        clear,
+        ToolCall::UpdateSessionContext {
+            ref session_id,
+            execution_context: sessions::SessionExecutionContext {
+                default_cwd: None,
+                default_shell: None,
+            },
+        } if session_id == "wc_sess_context01"
+    ));
+
+    for invalid in [
+        json!({
+            "session_id": "wc_sess_context01",
+            "execution_context": {"env": {"TOKEN": "secret"}}
+        }),
+        json!({
+            "session_id": "wc_sess_context01",
+            "execution_context": {"default_shell": "zsh"}
+        }),
+    ] {
+        let error = ToolCall::from_tool_name("update_session_context", invalid).unwrap_err();
+        assert!(error.contains("invalid arguments"));
+    }
+}
+
+#[test]
 fn from_tool_name_parses_finish_coding_task_workspace_projection_flag() {
     let call = ToolCall::from_tool_name(
         "finish_coding_task",

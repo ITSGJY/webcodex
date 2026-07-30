@@ -518,6 +518,14 @@ a process-local cache plus a bounded hashed durable projection.
   recommended flow, and tool manifest) plus the same model-facing core under
   `output.startup_brief`.
 
+For a registered-project Workflow Session, `start_coding_task` may also accept
+`execution_context = {default_cwd?, default_shell?}`. This is durable Session
+metadata, not an environment snapshot: continuation/resume omission preserves
+it, an explicit object replaces it atomically, and `{}` clears it.
+`update_session_context` performs the same complete replacement for one
+explicit active Session. The context cannot contain environment values,
+credentials, arbitrary options, SSH state, or persistent shell state.
+
 `continuation.exploration` is the bounded startup projection of the previous
 attempt's exploration workset. It carries only validated project-relative
 paths from successful focused reads, structured search records, and typed LSP
@@ -678,6 +686,15 @@ omission uses the Agent's configured shell and records it as configured.
 For both tools, omitted cwd, `cwd=""`, and `cwd="."` mean the project root.
 Other cwd values are project-relative and cannot escape the project root.
 Responses expose only `.` or a project-relative cwd.
+
+When an exact active Workflow Session for the same registered project is
+provided, resolution is per-call `cwd`/`shell`, then its persisted
+`default_cwd`/`default_shell`, then the existing project-root/configured-shell
+behavior. A missing or cross-project Session never contributes defaults, and
+an invalid, missing, or disallowed inherited cwd fails without retrying at the
+project root. Every command still starts a fresh process: `cd`, `export`, and
+shell functions do not carry across calls or update Session metadata. SSH and
+persistent shells remain out of scope.
 
 Use `run_job` for async diagnostics/build/test work, then supervise it with
 `job_status`, `job_log`/`job_tail`, or `list_jobs`. Job log responses default to

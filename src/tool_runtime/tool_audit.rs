@@ -26,6 +26,33 @@ pub(crate) fn session_log_arguments_for_tool_request(tool_name: &str, arguments:
                 );
             }
         }
+        "start_session" | "start_coding_task" | "update_session_context" => {
+            copy_keys(
+                obj,
+                &mut out,
+                &[
+                    "project",
+                    "title",
+                    "mode",
+                    "deny_write_tools",
+                    "deny_shell_tools",
+                    "detail",
+                    "resume_session_id",
+                    "bind_current",
+                    "new_session",
+                    "session_id",
+                ],
+            );
+            let context = obj
+                .get("execution_context")
+                .cloned()
+                .and_then(|value| {
+                    serde_json::from_value::<super::sessions::SessionExecutionContext>(value).ok()
+                })
+                .map(|context| context.audit_summary())
+                .unwrap_or(Value::Null);
+            out.insert("execution_context".to_string(), context);
+        }
         "search_project_text" => {
             copy_keys(
                 obj,
@@ -895,6 +922,23 @@ impl ToolCall {
                 "summary_only": summary_only,
                 "limit": limit,
             }),
+            Self::StartSession {
+                project,
+                title,
+                mode,
+                deny_write_tools,
+                deny_shell_tools,
+                execution_context,
+            } => serde_json::json!({
+                "project": project,
+                "title": title,
+                "mode": mode,
+                "deny_write_tools": deny_write_tools,
+                "deny_shell_tools": deny_shell_tools,
+                "execution_context": execution_context
+                    .as_ref()
+                    .map(super::sessions::SessionExecutionContext::audit_summary),
+            }),
             Self::StartCodingTask {
                 project,
                 title,
@@ -905,6 +949,7 @@ impl ToolCall {
                 resume_session_id,
                 bind_current,
                 new_session,
+                execution_context,
             } => serde_json::json!({
                 "project": project,
                 "title": title,
@@ -915,6 +960,16 @@ impl ToolCall {
                 "resume_session_id": resume_session_id,
                 "bind_current": bind_current,
                 "new_session": new_session,
+                "execution_context": execution_context
+                    .as_ref()
+                    .map(super::sessions::SessionExecutionContext::audit_summary),
+            }),
+            Self::UpdateSessionContext {
+                session_id,
+                execution_context,
+            } => serde_json::json!({
+                "session_id": session_id,
+                "execution_context": execution_context.audit_summary(),
             }),
             Self::FinishCodingTask {
                 project,

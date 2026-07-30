@@ -1699,6 +1699,7 @@ fn coding_call(
         resume_session_id: resume.map(str::to_string),
         bind_current,
         new_session: false,
+        execution_context: None,
     }
 }
 
@@ -2057,13 +2058,13 @@ async fn validation_summary_surfaces_validation_delta_without_shell_or_new_event
     // no agent request).
     let session = runtime
         .sessions
-        .start_session_with_options(sessions::SessionCreateOptions {
-            project: Some(project.clone()),
-            title: Some("validation delta".to_string()),
-            mode: SessionMode::Normal,
-            guards: SessionGuards::default(),
-            project_instructions: None,
-        })
+        .start_session_with_options(sessions::SessionCreateOptions::new(
+            Some(project.clone()),
+            Some("validation delta".to_string()),
+            SessionMode::Normal,
+            SessionGuards::default(),
+        ))
+        .unwrap()
         .session_id;
     // Use a Normal-mode instruction so the attempt boundary is task_instruction.
     add_instruction_for(
@@ -2350,6 +2351,7 @@ fn add_instruction(runtime: &ToolRuntime, session_id: &str, instruction: &str, m
             instruction: Some(instruction.to_string()),
             mode,
             guards: SessionGuards::default(),
+            execution_context: None,
             project_instructions: None,
             transport: SessionTransport::Api,
             bind_current: false,
@@ -2470,6 +2472,7 @@ fn add_instruction_for(
             instruction: Some(instruction.to_string()),
             mode,
             guards: SessionGuards::default(),
+            execution_context: None,
             project_instructions: None,
             transport: SessionTransport::Api,
             bind_current: false,

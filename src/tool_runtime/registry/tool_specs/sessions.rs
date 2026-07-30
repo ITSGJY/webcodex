@@ -2,7 +2,8 @@ use super::super::input_schemas::{
     close_session_input_schema, current_session_input_schema, list_session_messages_input_schema,
     post_session_message_input_schema, resolve_session_message_input_schema,
     session_discussion_summary_input_schema, session_handoff_summary_input_schema,
-    session_summary_input_schema, validation_summary_input_schema,
+    session_summary_input_schema, update_session_context_input_schema,
+    validation_summary_input_schema,
 };
 use super::tool_spec;
 use crate::tool_runtime::tool_spec::ToolSpec;
@@ -13,6 +14,11 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
             "session_summary",
             "Return a bounded structured summary from the session ledger for an explicit session_id: recorded events, message-board summary, task mode, guards, and lifecycle. Uses durable ledger data where session persistence is configured; does not rely on current-session binding.",
             session_summary_input_schema(),
+        ),
+        tool_spec(
+            "update_session_context",
+            "Atomically replace the complete run_shell/run_job execution defaults for one explicit active project-scoped Workflow Session. An empty object clears both defaults. Never falls back to current-session binding and never creates an unknown Session.",
+            update_session_context_input_schema(),
         ),
         tool_spec(
             "close_session",

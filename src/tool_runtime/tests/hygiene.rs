@@ -522,21 +522,18 @@ async fn workspace_hygiene_check_read_only_session_allowed() {
     let (_tmp, project) = setup_clean_git_repo(&runtime, "hyc-ro", "demo").await;
 
     // Start a read_only session.
-    let session = runtime.sessions.start_session_with_options(
-        crate::tool_runtime::sessions::SessionCreateOptions {
-            project: Some(project.clone()),
-            title: Some("hygiene read-only".to_string()),
-            mode: SessionMode::ReadOnly,
-            guards: crate::tool_runtime::sessions::SessionGuards::effective(
-                SessionMode::ReadOnly,
-                crate::tool_runtime::sessions::SessionGuards {
-                    deny_write_tools: true,
-                    deny_shell_tools: true,
-                },
-            ),
-            project_instructions: None,
-        },
-    );
+    let session = runtime
+        .sessions
+        .start_session_with_options(crate::tool_runtime::sessions::SessionCreateOptions::new(
+            Some(project.clone()),
+            Some("hygiene read-only".to_string()),
+            SessionMode::ReadOnly,
+            crate::tool_runtime::sessions::SessionGuards {
+                deny_write_tools: true,
+                deny_shell_tools: true,
+            },
+        ))
+        .unwrap();
 
     let result = dispatch_hygiene_with_agent(
         &runtime,

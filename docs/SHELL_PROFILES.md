@@ -139,7 +139,32 @@ have to guess the remote shell:
 - Dialect reporting is metadata only: no PATH, env values, or `init_script`
   contents are ever sent to the server.
 
-## 9. Changing config requires restarting the agent
+## 9. Workflow Session execution defaults
+
+On the full operator runtime, a registered-project-bound Workflow Session can
+store an optional project-relative `default_cwd` and an optional
+`default_shell` (`sh` or `bash`). These are execution defaults, not a prepared
+environment snapshot and not a persistent shell.
+
+For `run_shell` and `run_job`, resolution is:
+
+1. explicit per-call `cwd` / `shell`;
+2. the exact active project-matched Workflow Session defaults;
+3. the existing project root / configured shell-profile behavior.
+
+Omitting a Session keeps the existing behavior. A Session from another project
+never contributes defaults. Invalid, missing, or outside-root directories fail
+through the existing cwd safety checks without silently retrying at the project
+root. Each command is still an independent process; a command such as `cd sub`
+does not affect later calls.
+
+`start_coding_task(execution_context=...)` can set or replace the context.
+Omission during continuation preserves it, while `{}` clears it.
+`update_session_context` performs a full replacement for an explicit active
+Workflow Session. The context cannot store env values, tokens, arbitrary
+options, or shell state.
+
+## 10. Changing config requires restarting the agent
 
 There is **no reload API** in this phase. Changing a shell profile config
 requires restarting the agent so the in-memory snapshot cache is rebuilt:
@@ -151,7 +176,7 @@ After editing `agent.toml` or a project TOML, restart the `webcodex-runner`
 service. Existing snapshots are dropped on restart and re-prepared lazily on
 the next command.
 
-## 10. Security notes
+## 11. Security notes
 
 - **Never** put tokens in `init_script`.
 - **Never** `echo`/`printf` secrets in `init_script` — anything the script
@@ -171,7 +196,7 @@ the next command.
 - `prepare` runs with `env_clear` + an explicit allowlist of inherited keys;
   profiles must declare the env they need.
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
 For a canonical project, run the shared read-only readiness checks:
 

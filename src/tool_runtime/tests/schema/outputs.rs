@@ -70,6 +70,22 @@ fn key_tool_output_schemas_include_expected_fields() {
     };
 
     for field in [
+        "session_id",
+        "project",
+        "title",
+        "execution_context",
+        "previous_execution_context",
+        "changed",
+        "created_at",
+        "updated_at",
+    ] {
+        assert!(
+            has_output_field("update_session_context", field),
+            "update_session_context missing {field}"
+        );
+    }
+
+    for field in [
         "duration_ms",
         "exit_code",
         "stdout_tail",
