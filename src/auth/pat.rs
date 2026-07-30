@@ -76,7 +76,6 @@ pub(crate) fn generate_account_credential() -> String {
 /// Generate an OAuth2 client identifier. Format: `wc_client_<random>` where
 /// `<random>` is 256 bits of hex-encoded randomness. This is the public
 /// identifier shown to the client; the secret is separate.
-#[allow(dead_code)]
 pub(crate) fn generate_oauth_client_id() -> String {
     let mut random = String::with_capacity(TOKEN_RANDOM_HEX_LEN);
     while random.len() < TOKEN_RANDOM_HEX_LEN {
@@ -90,7 +89,6 @@ pub(crate) fn generate_oauth_client_id() -> String {
 /// `<random>` is 256 bits of hex-encoded randomness. The plaintext secret is
 /// returned **only** here (at creation time) and is never persisted; only its
 /// SHA-256 hash is stored.
-#[allow(dead_code)]
 pub(crate) fn generate_oauth_client_secret() -> String {
     let mut random = String::with_capacity(TOKEN_RANDOM_HEX_LEN);
     while random.len() < TOKEN_RANDOM_HEX_LEN {
@@ -103,7 +101,6 @@ pub(crate) fn generate_oauth_client_secret() -> String {
 /// Generate an OAuth2 authorization code. Format: `wc_oac_<random>` where
 /// `<random>` is 256 bits of hex-encoded randomness. Short-lived and
 /// single-use; only the SHA-256 hash is stored.
-#[allow(dead_code)]
 pub(crate) fn generate_oauth_authorization_code() -> String {
     let mut random = String::with_capacity(TOKEN_RANDOM_HEX_LEN);
     while random.len() < TOKEN_RANDOM_HEX_LEN {
@@ -117,7 +114,6 @@ pub(crate) fn generate_oauth_authorization_code() -> String {
 /// `<random>` is 256 bits of hex-encoded randomness. The plaintext token is
 /// returned **only** here (at creation time) and is never persisted; only its
 /// SHA-256 hash is stored.
-#[allow(dead_code)]
 pub(crate) fn generate_oauth_access_token() -> String {
     let mut random = String::with_capacity(TOKEN_RANDOM_HEX_LEN);
     while random.len() < TOKEN_RANDOM_HEX_LEN {
@@ -131,7 +127,6 @@ pub(crate) fn generate_oauth_access_token() -> String {
 /// `<random>` is 256 bits of hex-encoded randomness. The plaintext token is
 /// returned **only** here (at creation time) and is never persisted; only its
 /// SHA-256 hash is stored.
-#[allow(dead_code)]
 pub(crate) fn generate_oauth_refresh_token() -> String {
     let mut random = String::with_capacity(TOKEN_RANDOM_HEX_LEN);
     while random.len() < TOKEN_RANDOM_HEX_LEN {
