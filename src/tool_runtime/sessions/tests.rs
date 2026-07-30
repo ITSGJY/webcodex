@@ -1,9 +1,12 @@
 use super::super::project_instructions::ProjectInstructionsSnapshot;
 use super::super::tool_inputs::SessionMode;
-use super::events::{changed_paths_for_tool, SessionToolClassification};
+use super::events::{
+    changed_paths_for_tool, normalize_observed_project_path, observed_paths_for_successful_result,
+    session_input_summary_for_tool, SessionToolClassification,
+};
 use super::model::{
-    PersistedSessionLedger, PersistedSessionRecord, SessionLifecycle, MAX_VALIDATION_EXCERPT_CHARS,
-    MESSAGE_ID_PREFIX, SESSION_ID_PREFIX, SESSION_LEDGER_VERSION,
+    PersistedSessionLedger, PersistedSessionRecord, SessionLifecycle, MAX_OBSERVED_PATHS_PER_EVENT,
+    MAX_VALIDATION_EXCERPT_CHARS, MESSAGE_ID_PREFIX, SESSION_ID_PREFIX, SESSION_LEDGER_VERSION,
 };
 use super::persistence::write_ledger_atomic;
 use super::*;
@@ -79,6 +82,245 @@ fn changed_paths_single_path_and_path_list_from_metadata() {
         &json!({"project": "demo", "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n"}),
     )
     .is_empty());
+}
+
+#[test]
+fn exploration_paths_are_normalized_and_reject_escape_absolute_and_uri_forms() {
+    for (raw, expected) in [
+        (
+            " src\\tool_runtime\\mod.rs ",
+            Some("src/tool_runtime/mod.rs"),
+        ),
+        ("src/./lib.rs", Some("src/lib.rs")),
+        ("", None),
+        (".", None),
+        ("/etc/passwd", None),
+        ("../secret", None),
+        ("src/../../secret", None),
+        ("C:\\repo\\file.rs", None),
+        ("\\\\server\\share\\file.rs", None),
+        ("\\repo\\file.rs", None),
+        ("file:///root/git/repo/src/lib.rs", None),
+        ("https://example.test/source.rs", None),
+        ("src/\0secret.rs", None),
+        ("src/\nsecret.rs", None),
+    ] {
+        assert_eq!(
+            normalize_observed_project_path(raw).as_deref(),
+            expected,
+            "{raw:?}"
+        );
+    }
+}
+
+#[test]
+fn successful_reads_record_input_paths_but_failed_reads_do_not_finish_with_evidence() {
+    let store = SessionStore::new(10, 20);
+    let session = store.start_session(None, Some("read evidence".to_string()));
+
+    let successful = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "read_file",
+        &json!({"project": "demo", "path": "src\\lib.rs"}),
+    );
+    store.record_tool_call_finished(
+        successful,
+        true,
+        &json!({"content": "not persisted"}),
+        None,
+        None,
+    );
+
+    let failed = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "read_file",
+        &json!({"project": "demo", "path": "src/failed.rs"}),
+    );
+    store.record_tool_call_finished(
+        failed,
+        false,
+        &json!({"content": "failed body must not become evidence"}),
+        Some("read failed"),
+        None,
+    );
+
+    let summary = store.summary(&session.session_id, Some(20)).unwrap();
+    let finished = summary
+        .events
+        .iter()
+        .filter(|event| event.kind == "tool_call_finished")
+        .collect::<Vec<_>>();
+    assert_eq!(finished[0].observed_paths, ["src/lib.rs"]);
+    assert!(finished[1].observed_paths.is_empty());
+    assert!(!serde_json::to_string(&summary)
+        .unwrap()
+        .contains("not persisted"));
+    assert!(!serde_json::to_string(&summary)
+        .unwrap()
+        .contains("failed body must not become evidence"));
+}
+
+#[test]
+fn search_result_modes_extract_only_known_structured_file_paths() {
+    let cases = [
+        (
+            "matches",
+            json!({
+                "matches": [
+                    {
+                        "path": "src/matches.rs",
+                        "line": 7,
+                        "preview": "SEARCH_PREVIEW_MUST_NOT_PERSIST",
+                        "context_before": ["SEARCH_CONTEXT_BEFORE_MUST_NOT_PERSIST"],
+                        "context_after": ["SEARCH_CONTEXT_AFTER_MUST_NOT_PERSIST"]
+                    },
+                    {"path": "src/shared.rs", "line": 9, "preview": "duplicate"}
+                ],
+                "unrelated": {"path": "src/not-evidence.rs"}
+            }),
+            vec!["src/matches.rs", "src/shared.rs"],
+        ),
+        (
+            "files_with_matches",
+            json!({
+                "files": [
+                    {"path": "src/files.rs", "match_count": 4},
+                    {"path": "src/shared.rs", "match_count": 1}
+                ],
+                "matches": []
+            }),
+            vec!["src/files.rs", "src/shared.rs"],
+        ),
+        (
+            "count",
+            json!({
+                "files": [
+                    {"path": "src/count.rs", "match_count": 8},
+                    {"path": "../escape.rs", "match_count": 1}
+                ],
+                "total_match_count": 9
+            }),
+            vec!["src/count.rs"],
+        ),
+    ];
+
+    for (mode, output, expected) in cases {
+        let paths =
+            observed_paths_for_successful_result("search_project_text", Vec::new(), &output);
+        assert_eq!(paths, expected, "{mode}");
+    }
+
+    let bounded = observed_paths_for_successful_result(
+        "search_project_text",
+        Vec::new(),
+        &json!({
+            "files": (0..MAX_OBSERVED_PATHS_PER_EVENT + 5)
+                .map(|index| json!({"path": format!("src/file-{index:03}.rs"), "match_count": 1}))
+                .collect::<Vec<_>>()
+        }),
+    );
+    assert_eq!(bounded.len(), MAX_OBSERVED_PATHS_PER_EVENT);
+}
+
+#[test]
+fn lsp_observations_use_path_metadata_and_known_typed_result_locations_only() {
+    let store = SessionStore::new(10, 20);
+    let session = store.start_session(None, Some("lsp evidence".to_string()));
+    let start = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "goto_definition",
+        &json!({
+            "project": "demo",
+            "path": "src/caller.rs",
+            "line": 4,
+            "column": 9
+        }),
+    );
+    store.record_tool_call_finished(
+        start,
+        true,
+        &json!({
+            "project": "demo",
+            "path": "src/caller.rs",
+            "query_position": {"line": 4, "column": 9},
+            "locations": [
+                {
+                    "path": "src/definition.rs",
+                    "range": {
+                        "start": {"line": 1, "column": 1},
+                        "end": {"line": 1, "column": 7}
+                    }
+                },
+                {
+                    "path": "src/shared.rs",
+                    "range": {
+                        "start": {"line": 2, "column": 1},
+                        "end": {"line": 2, "column": 7}
+                    }
+                }
+            ],
+            "total_results": 2,
+            "returned_count": 2,
+            "truncated": false,
+            "external_results_omitted": 0,
+            "invalid_results_omitted": 0,
+            "arbitrary": {"path": "src/not-evidence.rs"}
+        }),
+        None,
+        None,
+    );
+
+    let summary = store.summary(&session.session_id, Some(20)).unwrap();
+    let finished = summary
+        .events
+        .iter()
+        .find(|event| event.kind == "tool_call_finished")
+        .unwrap();
+    assert_eq!(
+        finished.observed_paths,
+        ["src/caller.rs", "src/definition.rs", "src/shared.rs"]
+    );
+    assert!(!finished
+        .observed_paths
+        .iter()
+        .any(|path| path == "src/not-evidence.rs"));
+}
+
+#[test]
+fn exploration_input_audit_omits_queries_and_shell_commands() {
+    let search = session_input_summary_for_tool(
+        "search_project_text",
+        &json!({
+            "project": "demo",
+            "pattern": "RAW_SEARCH_PATTERN wc_pat_PRIVATE_TOKEN",
+            "pattern_present": true,
+            "path": "src"
+        }),
+    );
+    assert_eq!(search["pattern_present"], true);
+    assert!(search.get("pattern").is_none());
+
+    let symbols = session_input_summary_for_tool(
+        "workspace_symbols",
+        &json!({"project": "demo", "query": "RAW_SYMBOL_QUERY", "limit": 20}),
+    );
+    assert!(symbols.get("query").is_none());
+
+    let shell = session_input_summary_for_tool(
+        "run_shell",
+        &json!({
+            "project": "demo",
+            "command": "printf RAW_SHELL_COMMAND",
+            "command_summary": "printf RAW_SHELL_COMMAND",
+            "command_present": true
+        }),
+    );
+    assert_eq!(shell["command_present"], true);
+    assert!(shell.get("command").is_none());
+    assert!(shell.get("command_summary").is_none());
 }
 
 #[test]
@@ -428,6 +670,262 @@ fn legacy_session_events_without_validation_output_summary_restore() {
     assert_eq!(summary.counts.tool_calls, 1);
     assert_eq!(finished.tool_name, "cargo_check");
     assert!(finished.validation_output_summary.is_none());
+}
+
+#[test]
+fn legacy_session_events_without_observed_paths_restore_with_empty_evidence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("sessions.json");
+    let store = persistent_store(ledger.clone());
+    let session = store.start_session(None, Some("legacy exploration".to_string()));
+    let start = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "read_file",
+        &json!({"project": "demo", "path": "src/legacy.rs"}),
+    );
+    store.record_tool_call_finished(start, true, &json!({"content": "omitted"}), None, None);
+    store.flush_persistence();
+
+    let mut ledger_value: Value =
+        serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+    for event in ledger_value["sessions"][0]["events"]
+        .as_array_mut()
+        .unwrap()
+    {
+        event.as_object_mut().unwrap().remove("observed_paths");
+    }
+    std::fs::write(&ledger, serde_json::to_vec_pretty(&ledger_value).unwrap()).unwrap();
+
+    let restored = SessionStore::with_persistence(ledger, 10, 10);
+    let summary = restored.summary(&session.session_id, Some(10)).unwrap();
+    assert!(summary
+        .events
+        .iter()
+        .all(|event| event.observed_paths.is_empty()));
+    assert_eq!(restored.status().restored_sessions, 1);
+}
+
+#[test]
+fn exploration_ledger_persists_only_bounded_relative_paths_and_safe_metadata() {
+    const PRIVATE_ROOT: &str = "/root/git/private-drop";
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("sessions.json");
+    let store = SessionStore::with_persistence(&ledger, 10, 30);
+    let session = store.start_session(None, Some("private exploration".to_string()));
+
+    let search = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "search_project_text",
+        &json!({
+            "project": "demo",
+            "pattern": "RAW_SEARCH_PATTERN wc_pat_PRIVATE_TOKEN",
+            "pattern_present": true,
+            "context_before": 2,
+            "context_after": 2
+        }),
+    );
+    store.record_tool_call_finished(
+        search,
+        true,
+        &json!({
+            "matches": [{
+                "path": "src/search.rs",
+                "line": 3,
+                "preview": "RAW_SEARCH_PREVIEW Authorization: Bearer PRIVATE_SECRET",
+                "context_before": ["RAW_CONTEXT_BEFORE"],
+                "context_after": ["RAW_CONTEXT_AFTER"]
+            }, {
+                "path": format!("{PRIVATE_ROOT}/src/absolute.rs"),
+                "line": 4,
+                "preview": "ABSOLUTE_PATH_PREVIEW"
+            }]
+        }),
+        None,
+        None,
+    );
+
+    let hover = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "hover",
+        &json!({
+            "project": "demo",
+            "path": "src/hover.rs",
+            "line": 1,
+            "column": 1
+        }),
+    );
+    store.record_tool_call_finished(
+        hover,
+        true,
+        &json!({
+            "project": "demo",
+            "path": "src/hover.rs",
+            "position": {"line": 1, "column": 1},
+            "hover": {"kind": "markdown", "value": "RAW_HOVER_BODY"},
+            "truncated": false,
+            "range_omitted": false
+        }),
+        None,
+        None,
+    );
+
+    let symbols = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "workspace_symbols",
+        &json!({
+            "project": "demo",
+            "query": "RAW_SYMBOL_QUERY",
+            "query_present": true,
+            "limit": 10
+        }),
+    );
+    store.record_tool_call_finished(
+        symbols,
+        true,
+        &json!({
+            "project": "demo",
+            "query": "RAW_SYMBOL_QUERY",
+            "symbols": [{
+                "name": "RAW_SYMBOL_NAME",
+                "kind": "struct",
+                "kind_code": 23,
+                "container_name": null,
+                "path": "src/symbol.rs",
+                "range": null
+            }],
+            "total_results": 1,
+            "returned_count": 1,
+            "truncated": false,
+            "external_results_omitted": 0,
+            "invalid_results_omitted": 0
+        }),
+        None,
+        None,
+    );
+
+    let diagnostics = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "document_diagnostics",
+        &json!({"project": "demo", "path": "src/diagnostics.rs", "limit": 10}),
+    );
+    store.record_tool_call_finished(
+        diagnostics,
+        true,
+        &json!({
+            "project": "demo",
+            "path": "src/diagnostics.rs",
+            "language": "rust",
+            "diagnostics": [{
+                "range": {
+                    "start": {"line": 1, "column": 1},
+                    "end": {"line": 1, "column": 2}
+                },
+                "severity": "warning",
+                "severity_code": 2,
+                "code": "unused",
+                "source": "rust-analyzer",
+                "message": "RAW_DIAGNOSTIC_BODY",
+                "tags": []
+            }],
+            "total_count": 1,
+            "returned_count": 1,
+            "truncated": false,
+            "status": "complete",
+            "clean": false,
+            "published_version": 1,
+            "invalid_results_omitted": 0,
+            "related_information_omitted": 0
+        }),
+        None,
+        None,
+    );
+
+    for (tool, arguments, output) in [
+        (
+            "list_project_files",
+            json!({"project": "demo", "path": "src"}),
+            json!({"entries": [{"path": "src/listed.rs", "kind": "file"}]}),
+        ),
+        (
+            "run_shell",
+            json!({
+                "project": "demo",
+                "command": "printf RAW_SHELL_COMMAND",
+                "command_summary": "printf RAW_SHELL_COMMAND",
+                "command_present": true
+            }),
+            json!({
+                "stdout": "RAW_SHELL_STDOUT",
+                "stderr": "RAW_SHELL_STDERR",
+                "path": "src/from-shell.rs"
+            }),
+        ),
+    ] {
+        let start = store.record_tool_call_started(
+            Some(&session.session_id),
+            SessionTransport::Api,
+            tool,
+            &arguments,
+        );
+        store.record_tool_call_finished(start, true, &output, None, None);
+    }
+
+    store.flush_persistence();
+    let serialized = std::fs::read_to_string(&ledger).unwrap();
+    for forbidden in [
+        "RAW_SEARCH_PATTERN",
+        "wc_pat_PRIVATE_TOKEN",
+        "RAW_SEARCH_PREVIEW",
+        "Authorization: Bearer PRIVATE_SECRET",
+        "RAW_CONTEXT_BEFORE",
+        "RAW_CONTEXT_AFTER",
+        "RAW_HOVER_BODY",
+        "RAW_SYMBOL_QUERY",
+        "RAW_SYMBOL_NAME",
+        "RAW_DIAGNOSTIC_BODY",
+        "RAW_SHELL_COMMAND",
+        "RAW_SHELL_STDOUT",
+        "RAW_SHELL_STDERR",
+        "src/listed.rs",
+        "src/from-shell.rs",
+        PRIVATE_ROOT,
+    ] {
+        assert!(
+            !serialized.contains(forbidden),
+            "ledger leaked {forbidden}: {serialized}"
+        );
+    }
+    assert!(serialized.contains("src/search.rs"));
+    assert!(serialized.contains("src/hover.rs"));
+    assert!(serialized.contains("src/symbol.rs"));
+    assert!(serialized.contains("src/diagnostics.rs"));
+
+    let restored = SessionStore::with_persistence(ledger, 10, 30);
+    let summary = restored.summary(&session.session_id, Some(30)).unwrap();
+    let successful_observations = summary
+        .events
+        .iter()
+        .filter(|event| {
+            event.kind == "tool_call_finished"
+                && event.status.as_deref() == Some("succeeded")
+                && !event.observed_paths.is_empty()
+        })
+        .flat_map(|event| event.observed_paths.iter().map(String::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        successful_observations,
+        [
+            "src/search.rs",
+            "src/hover.rs",
+            "src/symbol.rs",
+            "src/diagnostics.rs"
+        ]
+    );
 }
 
 #[test]

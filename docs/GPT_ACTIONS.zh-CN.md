@@ -46,6 +46,15 @@ Connector 已拥有确定性 project binding。Custom GPT 普通 coding 前不�
 `listProjects`、`runtime_status`、`tool_manifest`、`start_session` 或 Agent listing，
 prompt 也不包含 Agent client ID 或 runtime project ID。
 
+若部署同时开放高级 generic `callRuntimeTool` 兼容路径，成功的
+`start_coding_task` Action 只包装 MCP/REST 共用的 startup core，不会重建
+continuation 数据。该 core 的 attempt-scoped exploration workset 只包含由成功
+定向读取、结构化搜索和 typed LSP 导航产生的、有界且已验证的项目相对路径；它
+排除搜索/文件/LSP 正文、命令/输出和绝对根路径，attempt boundary 被淘汰时标记
+`complete=false`，并可在 continuation、显式 resume、mode upgrade 和重启后复用，
+但不会自动执行工具。standard/full core 最多返回 12 条路径（`minimal` 为 3），
+完整 Action response 仍保持在 32 KiB 以下。
+
 在同一个可保留的聊天窗口身份内，`task_start` 会自动继续该仓库的持久上下文并
 追加新指令。切换到另一份已配置仓库时两边历史严格隔离，切回时恢复原仓库。
 WebCodex 只刷新发生变化的 Git、工作区、仓库规则、目标目录和 manifest 状态。

@@ -58,6 +58,35 @@ fn lsp_tools_are_registered_read_only_and_not_shell_like() {
 }
 
 #[test]
+fn typed_lsp_session_audit_keeps_paths_but_never_symbol_queries() {
+    let definition = ToolCall::GotoDefinition {
+        project: "agent:test:demo".to_string(),
+        path: "src/caller.rs".to_string(),
+        line: 4,
+        column: 8,
+        limit: Some(20),
+        session_id: Some("wc_sess_test".to_string()),
+    }
+    .session_log_arguments();
+    assert_eq!(definition["path"], "src/caller.rs");
+    assert_eq!(definition["line"], 4);
+    assert_eq!(definition["column"], 8);
+
+    let symbols = ToolCall::WorkspaceSymbols {
+        project: "agent:test:demo".to_string(),
+        query: "PRIVATE_SYMBOL_QUERY".to_string(),
+        limit: Some(10),
+        session_id: Some("wc_sess_test".to_string()),
+    }
+    .session_log_arguments();
+    assert_eq!(symbols["query_present"], true);
+    assert!(
+        !symbols.to_string().contains("PRIVATE_SYMBOL_QUERY"),
+        "workspace symbol query must not enter the session ledger"
+    );
+}
+
+#[test]
 fn lsp_input_schemas_have_required_bounds() {
     use crate::tool_runtime::registry::registered_tool_specs;
     let specs = registered_tool_specs();

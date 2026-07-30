@@ -31,6 +31,9 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 use super::handoff::closeout_work_projection;
+use super::sessions::{
+    exploration_tool_kind, normalize_observed_project_path, ExplorationToolKind,
+};
 use super::sessions::{SessionDiscussionSummary, SessionEvent, SessionMessage, SessionSummary};
 use super::tool_definition::{
     runtime_tool_captures_validation_output, runtime_tool_is_git_like, runtime_tool_is_shell_like,
@@ -41,11 +44,15 @@ use super::tool_definition::{
 const MAX_INSTRUCTION_EXCERPT_CHARS: usize = 500;
 /// Maximum number of changed paths surfaced in the attempt summary.
 const MAX_CHANGED_PATHS: usize = 100;
+/// Maximum unique paths returned by the full attempt exploration projection.
+const MAX_EXPLORATION_PATHS: usize = 100;
 /// Maximum number of unresolved failure identities surfaced in the attempt
 /// summary and per failure list in the validation delta.
 const MAX_FAILURE_IDENTITIES: usize = 20;
 /// Maximum number of suggested next actions.
 const MAX_SUGGESTED_ACTIONS: usize = 8;
+pub(crate) const EXPLORATION_CONTINUITY_ACTION: &str =
+    "continue from the recent exploration workset before repeating broad discovery";
 
 /// Root continuation feedback projection returned to the model.
 #[derive(Debug, Clone, Serialize)]
@@ -70,6 +77,7 @@ pub(crate) struct AttemptSummary {
     pub(crate) event_range: AttemptEventRange,
     pub(crate) activity: AttemptActivity,
     pub(crate) changes: AttemptChanges,
+    pub(crate) exploration: AttemptExploration,
     pub(crate) validation: AttemptValidation,
     pub(crate) jobs: AttemptJobs,
     pub(crate) guidance: AttemptGuidance,
@@ -139,6 +147,22 @@ pub(crate) struct AttemptChanges {
     pub(crate) changed_paths: Vec<String>,
     pub(crate) total_changed_paths: usize,
     pub(crate) truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct AttemptExploration {
+    /// Unique validated project-relative paths, newest successful observation
+    /// first.
+    pub(crate) observed_paths: Vec<String>,
+    /// Real unique count before the projection list cap.
+    pub(crate) total_observed_paths: usize,
+    pub(crate) truncated: bool,
+    pub(crate) read_count: usize,
+    pub(crate) search_count: usize,
+    pub(crate) navigation_count: usize,
+    pub(crate) latest_tool: Option<String>,
+    /// False when the attempt boundary was evicted from the retained ledger.
+    pub(crate) complete: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -277,6 +301,12 @@ pub(crate) struct ContinuationFeedbackInput<'a> {
     /// Continuation kind reported by the session start path:
     /// `created`, `continued`, `resumed_explicitly`, or `restored`.
     pub(crate) continuation: &'static str,
+    /// True only for a coding-start continuation/resume. Closeout callers do
+    /// not add startup-oriented exploration guidance.
+    pub(crate) suggest_exploration_continuity: bool,
+    /// Current startup workspace conflict fact, gathered outside this pure
+    /// projection. It gates the optional exploration continuity suggestion.
+    pub(crate) workspace_conflicts: bool,
 }
 
 impl ContinuationFeedback {
@@ -293,39 +323,7 @@ impl ContinuationFeedback {
             } else {
                 "empty_session"
             };
-            return to_value(ContinuationFeedback {
-                status: "not_applicable",
-                reason_code: Some(reason_code),
-                attempt: empty_attempt(),
-                validation_delta: ValidationDelta {
-                    comparison: ValidationComparison {
-                        status: "unavailable",
-                        reason_code: Some("no_previous_validation"),
-                        current_event_id: None,
-                        previous_event_id: None,
-                        scope_identity: None,
-                    },
-                    counts: ValidationDeltaCounts {
-                        passed_delta: 0,
-                        failed_delta: 0,
-                        ignored_delta: 0,
-                        total_delta: 0,
-                    },
-                    failures: ValidationDeltaFailures {
-                        identity_status: "unavailable",
-                        identity_reason_code: Some("no_previous_validation"),
-                        newly_failed: Vec::new(),
-                        resolved: Vec::new(),
-                        still_failing: Vec::new(),
-                        total_newly_failed: 0,
-                        total_resolved: 0,
-                        total_still_failing: 0,
-                        list_truncated: false,
-                    },
-                },
-                deterministic: true,
-                llm_summary: false,
-            });
+            return not_applicable_continuation_feedback_value(reason_code);
         }
 
         let boundary = resolve_attempt_boundary(events, input.session_summary);
@@ -346,6 +344,8 @@ impl ContinuationFeedback {
             input.jobs,
             input.discussion,
             input.continuation,
+            input.suggest_exploration_continuity,
+            input.workspace_conflicts,
         );
 
         let validation_delta = validation_delta(input.validation);
@@ -400,6 +400,16 @@ fn empty_attempt() -> AttemptSummary {
             changed_paths: Vec::new(),
             total_changed_paths: 0,
             truncated: false,
+        },
+        exploration: AttemptExploration {
+            observed_paths: Vec::new(),
+            total_observed_paths: 0,
+            truncated: false,
+            read_count: 0,
+            search_count: 0,
+            navigation_count: 0,
+            latest_tool: None,
+            complete: true,
         },
         validation: AttemptValidation {
             latest_status: "not_run".to_string(),
@@ -505,6 +515,8 @@ fn build_attempt_summary(
     jobs: &Value,
     discussion: &SessionDiscussionSummary,
     continuation: &'static str,
+    suggest_exploration_continuity: bool,
+    workspace_conflicts: bool,
 ) -> AttemptSummary {
     let total_events = attempt_events.len();
 
@@ -585,6 +597,7 @@ fn build_attempt_summary(
     let total_changed_paths = changed_paths.len();
     let truncated = total_changed_paths > MAX_CHANGED_PATHS;
     changed_paths.truncate(MAX_CHANGED_PATHS);
+    let exploration = build_attempt_exploration(attempt_events, complete);
 
     // --- validation (current attempt verdict, history must not pollute) ---
     let delta = validation_delta(validation);
@@ -612,6 +625,9 @@ fn build_attempt_summary(
         &jobs_block,
         &guidance_block,
         &validation_block,
+        &exploration,
+        suggest_exploration_continuity,
+        workspace_conflicts,
     );
 
     AttemptSummary {
@@ -636,6 +652,7 @@ fn build_attempt_summary(
             total_changed_paths,
             truncated,
         },
+        exploration,
         validation: validation_block,
         jobs: jobs_block,
         guidance: guidance_block,
@@ -644,6 +661,57 @@ fn build_attempt_summary(
             reason_codes,
         },
         suggested_next_actions,
+    }
+}
+
+fn build_attempt_exploration(
+    attempt_events: &[SessionEvent],
+    complete: bool,
+) -> AttemptExploration {
+    let mut read_count = 0usize;
+    let mut search_count = 0usize;
+    let mut navigation_count = 0usize;
+    let mut latest_tool = None;
+    let mut seen = BTreeSet::new();
+    let mut observed_paths = Vec::new();
+
+    for event in attempt_events.iter().rev().filter(|event| {
+        event.kind == "tool_call_finished" && event.status.as_deref() == Some("succeeded")
+    }) {
+        let Some(kind) = exploration_tool_kind(&event.tool_name) else {
+            continue;
+        };
+        match kind {
+            ExplorationToolKind::Read => read_count += 1,
+            ExplorationToolKind::Search => search_count += 1,
+            ExplorationToolKind::Navigation => navigation_count += 1,
+        }
+
+        let mut event_has_evidence = false;
+        for raw_path in &event.observed_paths {
+            let Some(path) = normalize_observed_project_path(raw_path) else {
+                continue;
+            };
+            event_has_evidence = true;
+            if seen.insert(path.clone()) && observed_paths.len() < MAX_EXPLORATION_PATHS {
+                observed_paths.push(path);
+            }
+        }
+        if event_has_evidence && latest_tool.is_none() {
+            latest_tool = Some(event.tool_name.clone());
+        }
+    }
+
+    let total_observed_paths = seen.len();
+    AttemptExploration {
+        observed_paths,
+        total_observed_paths,
+        truncated: total_observed_paths > MAX_EXPLORATION_PATHS,
+        read_count,
+        search_count,
+        navigation_count,
+        latest_tool,
+        complete,
     }
 }
 
@@ -941,6 +1009,9 @@ fn build_suggested_next_actions(
     jobs: &AttemptJobs,
     guidance: &AttemptGuidance,
     validation: &AttemptValidation,
+    exploration: &AttemptExploration,
+    suggest_exploration_continuity: bool,
+    workspace_conflicts: bool,
 ) -> Vec<String> {
     let mut actions = Vec::new();
     if unresolved_failures > 0 {
@@ -984,6 +1055,15 @@ fn build_suggested_next_actions(
             "run validation before proceeding when the task warrants it",
         );
     }
+    if suggest_exploration_continuity
+        && !exploration.observed_paths.is_empty()
+        && unresolved_failures == 0
+        && jobs.running_count == 0
+        && guidance.open_risk_count == 0
+        && !workspace_conflicts
+    {
+        push_unique(&mut actions, EXPLORATION_CONTINUITY_ACTION);
+    }
     if actions.is_empty() {
         actions.push("continue with the next task step".to_string());
     }
@@ -1009,6 +1089,20 @@ pub(crate) fn validation_delta_value(validation: &Value) -> Value {
 /// the filesystem.
 pub(crate) fn continuation_feedback_value(input: ContinuationFeedbackInput<'_>) -> Value {
     ContinuationFeedback::from_snapshots(input)
+}
+
+/// Stable full empty shape for fresh/empty Workflow Sessions. Keeping the
+/// attempt object present means every caller sees the same empty exploration
+/// contract instead of transport-specific omissions.
+pub(crate) fn not_applicable_continuation_feedback_value(reason_code: &'static str) -> Value {
+    to_value(ContinuationFeedback {
+        status: "not_applicable",
+        reason_code: Some(reason_code),
+        attempt: empty_attempt(),
+        validation_delta: unavailable_delta("no_previous_validation"),
+        deterministic: true,
+        llm_summary: false,
+    })
 }
 
 /// Build the deterministic validation delta from the current validation

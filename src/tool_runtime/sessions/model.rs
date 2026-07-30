@@ -14,6 +14,10 @@ pub(crate) const SESSION_ID_PREFIX: &str = "wc_sess_";
 pub(super) const EVENT_ID_PREFIX: &str = "evt_";
 pub(crate) const DEFAULT_MAX_SESSIONS: usize = 100;
 pub(crate) const DEFAULT_MAX_EVENTS_PER_SESSION: usize = 200;
+/// Maximum project-relative exploration paths retained on one ledger event.
+/// This covers the largest currently supported structured search/LSP result
+/// while keeping every event independently bounded.
+pub(crate) const MAX_OBSERVED_PATHS_PER_EVENT: usize = 201;
 pub(super) const DEFAULT_SUMMARY_LIMIT: usize = 50;
 pub(super) const MAX_SUMMARY_LIMIT: usize = 200;
 pub(super) const MAX_SUMMARY_STRING_CHARS: usize = 240;
@@ -387,6 +391,9 @@ pub(crate) struct ToolCallStart {
     /// `show_changes(include_diff=true)`). Never stores raw input or diffs.
     pub(crate) diff_review_like: bool,
     pub(crate) changed_paths: Vec<String>,
+    /// Validated project-relative paths that the call may establish as
+    /// exploration evidence if and only if it finishes successfully.
+    pub(crate) observed_paths: Vec<String>,
     pub(crate) started_at: i64,
     pub(crate) started_instant: Instant,
     pub(crate) permission: Option<PermissionDecision>,
@@ -469,6 +476,10 @@ pub(crate) struct SessionEvent {
     pub(crate) allow_cross_project_session: Option<bool>,
     pub(crate) error_message_summary: Option<String>,
     pub(crate) changed_paths: Vec<String>,
+    /// Additive ledger-v1 field. Only validated project-relative paths are
+    /// retained; older ledgers deserialize it as an empty workset.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) observed_paths: Vec<String>,
     pub(crate) job_id: Option<String>,
     pub(crate) input_summary: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

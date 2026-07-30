@@ -1210,6 +1210,19 @@ async fn failed_project_start_does_not_pollute_full_runtime_binding() {
 async fn start_coding_task_mode_upgrade_is_atomic_and_permission_checked() {
     let dir = tempfile::tempdir().unwrap();
     init_git_repo(dir.path());
+    commit_file(
+        dir.path(),
+        "AGENTS.md",
+        "# Test rules\n\nPreserve focused exploration.\n",
+        "add rules",
+    );
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    commit_file(
+        dir.path(),
+        "src/inspect.rs",
+        "pub fn inspected() -> bool { true }\n",
+        "add inspected source",
+    );
     let runtime = ToolRuntime::new_for_tests();
     let read_auth = oauth_bridge_auth_context(
         "continuity-subject",
@@ -1237,7 +1250,7 @@ async fn start_coding_task_mode_upgrade_is_atomic_and_permission_checked() {
     let inspected = dispatch_start_coding_task_in_window(
         &runtime,
         "oauth-client",
-        coding_start_call(&project, "inspect first", SessionMode::ReadOnly, false),
+        coding_start_call(&project, "inspect first", SessionMode::Inspect, false),
         Some(&read_auth),
         "upgrade-window",
     )
@@ -1247,6 +1260,22 @@ async fn start_coding_task_mode_upgrade_is_atomic_and_permission_checked() {
         .as_str()
         .unwrap()
         .to_string();
+    let read = dispatch_start_coding_task_in_window(
+        &runtime,
+        "oauth-client",
+        ToolCall::ReadFile {
+            project: project.clone(),
+            path: "src/inspect.rs".to_string(),
+            session_id: Some(session_id.clone()),
+            start_line: None,
+            limit: None,
+            with_line_numbers: None,
+        },
+        Some(&read_auth),
+        "upgrade-window",
+    )
+    .await;
+    assert!(read.success, "{:?}", read.error);
 
     let denied = dispatch_start_coding_task_in_window(
         &runtime,
@@ -1262,9 +1291,9 @@ async fn start_coding_task_mode_upgrade_is_atomic_and_permission_checked() {
         "session_capability_upgrade_denied"
     );
     let unchanged = runtime.sessions.summary(&session_id, Some(20)).unwrap();
-    assert_eq!(unchanged.mode, SessionMode::ReadOnly);
+    assert_eq!(unchanged.mode, SessionMode::Inspect);
     assert!(unchanged.guards.deny_write_tools);
-    assert!(unchanged.guards.deny_shell_tools);
+    assert!(!unchanged.guards.deny_shell_tools);
     assert_eq!(
         unchanged
             .events
@@ -1285,6 +1314,20 @@ async fn start_coding_task_mode_upgrade_is_atomic_and_permission_checked() {
     assert!(upgraded.success, "{:?}", upgraded.error);
     assert_eq!(upgraded.output["session"]["session_id"], session_id);
     assert_eq!(upgraded.output["session"]["mode"], "normal");
+    assert_eq!(upgraded.output["instructions"]["status"], "reused");
+    assert_eq!(upgraded.output["instructions"]["content_included"], false);
+    assert_eq!(
+        upgraded.output["continuation"]["exploration"]["paths"]["items"],
+        serde_json::json!(["src/inspect.rs"])
+    );
+    assert_eq!(
+        upgraded.output["continuation"]["exploration"]["read_count"],
+        1
+    );
+    assert_eq!(
+        upgraded.output["continuation"]["exploration"]["complete"],
+        true
+    );
     let summary = runtime.sessions.summary(&session_id, Some(20)).unwrap();
     assert!(!summary.guards.deny_write_tools);
     assert!(!summary.guards.deny_shell_tools);
@@ -1294,9 +1337,22 @@ async fn start_coding_task_mode_upgrade_is_atomic_and_permission_checked() {
         .rev()
         .find(|event| event.kind == "task_instruction")
         .unwrap();
-    assert_eq!(transition.previous_mode.as_deref(), Some("read_only"));
+    assert_eq!(transition.previous_mode.as_deref(), Some("inspect"));
     assert_eq!(transition.requested_mode.as_deref(), Some("normal"));
     assert_eq!(transition.capability_changed, Some(true));
+    assert_eq!(
+        summary
+            .events
+            .iter()
+            .filter(|event| {
+                event.kind == "tool_call_finished"
+                    && event.tool_name == "read_file"
+                    && event.status.as_deref() == Some("succeeded")
+            })
+            .count(),
+        1,
+        "start_coding_task must not reread ordinary explored source files"
+    );
 }
 
 #[tokio::test]

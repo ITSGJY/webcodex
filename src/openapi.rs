@@ -1162,7 +1162,7 @@ fn schemas() -> Value {
                 "detail": {
                     "type": "string",
                     "enum": ["minimal", "standard", "full"],
-                    "description": "Flattened start_coding_task detail level. Defaults to the bounded model-facing standard brief, including repository rules and continuation evidence. minimal retains identity, workspace blockers, instruction status, and the first next action without rule bodies. full preserves complete runtime/connection/authority/binding/Git/manifest diagnostics and embeds the same startup_brief core."
+                    "description": "Flattened start_coding_task detail level. Defaults to the bounded model-facing standard brief, including repository rules, continuation evidence, and the attempt-scoped exploration workset of validated project-relative paths. minimal retains identity, workspace blockers, instruction status, up to 3 exploration paths, and the first next action without rule bodies; standard and the embedded full startup_brief return up to 12 exploration paths. The workset never contains search text, file/LSP bodies, commands, output, or absolute roots and never executes tools. full preserves complete runtime/connection/authority/binding/Git/manifest diagnostics and embeds the same startup_brief core."
                 },
                 "compact": {
                     "type": "boolean",

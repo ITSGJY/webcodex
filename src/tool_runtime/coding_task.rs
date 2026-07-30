@@ -7,7 +7,10 @@
 
 use serde_json::{json, Value};
 
-use super::continuation_feedback::{continuation_feedback_value, ContinuationFeedbackInput};
+use super::continuation_feedback::{
+    continuation_feedback_value, not_applicable_continuation_feedback_value,
+    ContinuationFeedbackInput,
+};
 use super::handoff::{
     apply_compact_workflow_outcomes, closeout_work_projection, compact_jobs, compact_permissions,
     compact_review_evidence, compact_tool_failures, compact_validation,
@@ -422,6 +425,10 @@ impl ToolRuntime {
                 session_outcome.pre_instruction_summary.as_ref(),
                 continuation_kind,
                 &active_jobs,
+                git.pointer("/counts/conflicted")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    > 0,
             )
             .await;
         let mut output = json!({
@@ -823,15 +830,11 @@ impl ToolRuntime {
         pre_instruction_summary: Option<&sessions::SessionSummary>,
         continuation_kind: &'static str,
         jobs: &Value,
+        workspace_conflicts: bool,
     ) -> Value {
         // Fresh new session: nothing to continue from.
         if continuation_kind == "created" {
-            return json!({
-                "status": "not_applicable",
-                "reason_code": "fresh_session",
-                "deterministic": true,
-                "llm_summary": false,
-            });
+            return not_applicable_continuation_feedback_value("fresh_session");
         }
         // For a reused/resumed/restored session, project over the snapshot taken
         // *before* this new `task_instruction` was appended, so the feedback
@@ -842,12 +845,7 @@ impl ToolRuntime {
         // instant; neither is mutated.
         let projection_summary = pre_instruction_summary.unwrap_or(summary);
         if projection_summary.events.is_empty() {
-            return json!({
-                "status": "not_applicable",
-                "reason_code": "empty_session",
-                "deterministic": true,
-                "llm_summary": false,
-            });
+            return not_applicable_continuation_feedback_value("empty_session");
         }
         let validation = super::validation_events::validation_summary_from_events(
             &projection_summary.events,
@@ -860,6 +858,8 @@ impl ToolRuntime {
             jobs: &jobs,
             discussion: &discussion,
             continuation: continuation_kind,
+            suggest_exploration_continuity: true,
+            workspace_conflicts,
         })
     }
 
@@ -876,12 +876,7 @@ impl ToolRuntime {
         auth: Option<&AuthContext>,
     ) -> Value {
         if summary.events.is_empty() {
-            return json!({
-                "status": "not_applicable",
-                "reason_code": "empty_session",
-                "deterministic": true,
-                "llm_summary": false,
-            });
+            return not_applicable_continuation_feedback_value("empty_session");
         }
         let validation =
             super::validation_events::validation_summary_from_events(&summary.events, 20);
@@ -898,6 +893,8 @@ impl ToolRuntime {
             // specific start-path continuation kind here. The instruction block
             // reports `resumed` from the recorded boundary event metadata.
             continuation: "continued",
+            suggest_exploration_continuity: false,
+            workspace_conflicts: false,
         })
     }
 

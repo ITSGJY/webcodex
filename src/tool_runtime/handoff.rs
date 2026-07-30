@@ -266,6 +266,8 @@ impl ToolRuntime {
             jobs: output.get("jobs").unwrap_or(&Value::Null),
             discussion: &discussion,
             continuation: "continued",
+            suggest_exploration_continuity: false,
+            workspace_conflicts: false,
         });
         let workspace_checked = output.get("workspace").is_some();
         let resolved_unexpected_validation_failures = resolved_unexpected_validation_failure_count(

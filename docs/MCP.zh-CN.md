@@ -90,6 +90,14 @@ server 的内存缓存和有界哈希持久化投影中；保留相同窗口身�
 validation 状态的确定性只读投影，并包含有界的上一轮指令摘录和当前未解决失败标识
 （另附带仅在两次运行被证明 scope 一致时才可比的 `validation_delta`）；
 它既不是 LLM summary，也不是新的 verdict，更不会执行 validation。
+其中 `attempt.exploration` 只包含由成功的定向读取、结构化项目搜索结果或 typed
+LSP 导航证明的、有界且已验证的项目相对路径。workset 按 attempt 分段并按最近
+成功观察优先；attempt boundary 被淘汰时返回 `complete=false`。搜索文本和
+preview、文件或 LSP 正文、任意结果、命令/输出及仓库绝对根路径都不会进入
+workset。自动 continuation、显式 resume、inspect/read_only 升级 normal 和重启
+恢复都可复用它，但 startup 不会自动执行工具，也不能替代模型判断。compact
+startup core 中 `minimal` 最多 3 条路径，`standard` 及 `full` 内嵌 core 最多
+12 条；完整 feedback 最多 100 条并保留真实 total/truncation。
 
 这些 durable ID 用于模型工具与 host review 之间的稳定关联，普通用户无需管理：
 

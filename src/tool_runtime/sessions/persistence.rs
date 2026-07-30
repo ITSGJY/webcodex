@@ -5,8 +5,9 @@ use std::io;
 use std::path::PathBuf;
 
 use super::events::{
-    is_valid_session_id, sanitize_failure_expectation_result,
-    sanitize_persisted_validation_output_summary,
+    exploration_tool_kind, is_valid_session_id, sanitize_failure_expectation_result,
+    sanitize_observed_paths, sanitize_persisted_validation_output_summary,
+    session_input_summary_for_tool,
 };
 use super::model::{
     DurableCurrentBinding, PersistedSessionLedger, PersistedSessionRecord, SessionEvent,
@@ -18,7 +19,6 @@ use super::model::{
 use super::query::validate_message_tags;
 use super::util::{
     bound_chars, bound_event_error_summary, bound_summary_string, redact_and_bound_instruction,
-    redact_and_bound_value,
 };
 
 impl PersistedSessionRecord {
@@ -322,6 +322,14 @@ pub(super) fn sanitize_persisted_event(
         .map(|path| bound_summary_string(path.trim()))
         .filter(|path| !path.is_empty())
         .collect();
+    event.observed_paths = if exploration_tool_kind(&event.tool_name).is_some()
+        && (event.kind == "tool_call_started"
+            || (event.kind == "tool_call_finished" && event.status.as_deref() == Some("succeeded")))
+    {
+        sanitize_observed_paths(event.observed_paths)
+    } else {
+        Vec::new()
+    };
     event.job_id = event.job_id.map(|value| bound_summary_string(value.trim()));
     event.instruction = event
         .instruction
@@ -337,7 +345,7 @@ pub(super) fn sanitize_persisted_event(
         .filter(|value| !value.is_empty());
     event.input_summary = event
         .input_summary
-        .map(|value| redact_and_bound_value(&value));
+        .map(|value| session_input_summary_for_tool(&event.tool_name, &value));
     event.validation_output_summary = event
         .validation_output_summary
         .and_then(|value| sanitize_persisted_validation_output_summary(&event.tool_name, &value));

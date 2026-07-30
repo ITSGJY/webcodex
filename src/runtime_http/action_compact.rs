@@ -114,6 +114,19 @@ mod tests {
                 "instruction": {"status": "available", "excerpt": "fix it", "truncated": false},
                 "outcome": {"status": "in_progress", "reason_codes": []},
                 "changed_paths": {"items": ["src/lib.rs"], "total": 1, "returned": 1, "truncated": false},
+                "exploration": {
+                    "paths": {
+                        "items": ["src/tool_runtime/startup_brief.rs"],
+                        "total": 1,
+                        "returned": 1,
+                        "truncated": false
+                    },
+                    "read_count": 1,
+                    "search_count": 1,
+                    "navigation_count": 2,
+                    "latest_tool": "goto_definition",
+                    "complete": true
+                },
                 "validation": {
                     "latest_status": "failed",
                     "open_failures": {"items": [], "total": 0, "returned": 0, "truncated": false},
@@ -165,6 +178,10 @@ mod tests {
         assert_eq!(
             compact["startup_brief"]["continuation"]["suggested_next_actions"]["items"][0],
             "fix failing test x"
+        );
+        assert_eq!(
+            compact["startup_brief"]["continuation"]["exploration"],
+            brief["continuation"]["exploration"]
         );
     }
 

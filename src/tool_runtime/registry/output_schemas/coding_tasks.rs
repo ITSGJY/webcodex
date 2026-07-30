@@ -2,9 +2,9 @@ use serde_json::{json, Value};
 
 use super::common::{
     array_schema, authority_profile_schema, continuation_feedback_schema, evidence_history_schema,
-    evidence_integrity_schema, job_lifecycle_summary_schema, nullable_schema, open_object_schema,
-    permission_decision_schema, permission_summary_schema, schema_type, session_hint_schema,
-    task_outcome_schema, wrapped_output_schema,
+    evidence_integrity_schema, exploration_tool_name_schema, job_lifecycle_summary_schema,
+    nullable_schema, open_object_schema, permission_decision_schema, permission_summary_schema,
+    schema_type, session_hint_schema, task_outcome_schema, wrapped_output_schema,
 };
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
@@ -188,7 +188,7 @@ fn startup_brief_schema(detail: &str) -> Value {
             "project": startup_project_schema(),
             "workspace": startup_workspace_schema(),
             "instructions": startup_instructions_schema(),
-            "continuation": startup_continuation_schema(),
+            "continuation": startup_continuation_schema(detail),
             "semantic_navigation": startup_semantic_navigation_schema(),
             "blockers": startup_issue_list_schema(true),
             "warnings": startup_issue_list_schema(false),
@@ -468,7 +468,8 @@ fn startup_instruction_source_schema() -> Value {
     })
 }
 
-fn startup_continuation_schema() -> Value {
+fn startup_continuation_schema(detail: &str) -> Value {
+    let exploration_limit = if detail == "minimal" { 3 } else { 12 };
     json!({
         "type": "object",
         "properties": {
@@ -507,6 +508,29 @@ fn startup_continuation_schema() -> Value {
                 json!({"type": "string", "maxLength": 192}),
                 20
             ),
+            "exploration": {
+                "type": "object",
+                "properties": {
+                    "paths": bounded_list_schema(
+                        json!({"type": "string", "maxLength": 512}),
+                        exploration_limit
+                    ),
+                    "read_count": {"type": "integer", "minimum": 0},
+                    "search_count": {"type": "integer", "minimum": 0},
+                    "navigation_count": {"type": "integer", "minimum": 0},
+                    "latest_tool": exploration_tool_name_schema(),
+                    "complete": {"type": "boolean"}
+                },
+                "required": [
+                    "paths",
+                    "read_count",
+                    "search_count",
+                    "navigation_count",
+                    "latest_tool",
+                    "complete"
+                ],
+                "additionalProperties": false
+            },
             "validation": startup_validation_schema(),
             "jobs": {
                 "type": "object",
@@ -550,6 +574,7 @@ fn startup_continuation_schema() -> Value {
             "instruction",
             "outcome",
             "changed_paths",
+            "exploration",
             "validation",
             "jobs",
             "open_guidance",

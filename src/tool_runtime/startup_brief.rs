@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 #[cfg(test)]
 use std::collections::BTreeSet;
 
+use super::continuation_feedback::EXPLORATION_CONTINUITY_ACTION;
 use super::project_instructions::{
     ProjectInstructionFile, ProjectInstructionsSnapshot, ProjectInstructionsSummarySnapshot,
     INSTRUCTION_CANDIDATE_PATHS, MAX_LINES_PER_FILE,
@@ -25,6 +26,8 @@ const MIN_INSTRUCTION_CONTENT_JSON_BYTES: usize = 512;
 const MAX_RULE_HEADINGS: usize = 6;
 const MAX_RULE_HEADING_JSON_BYTES: usize = 160;
 const MAX_CHANGED_PATHS: usize = 20;
+const MAX_MINIMAL_EXPLORATION_PATHS: usize = 3;
+const MAX_STANDARD_EXPLORATION_PATHS: usize = 12;
 const MAX_FAILURES: usize = 10;
 const MAX_SUGGESTED_ACTIONS: usize = 5;
 const MAX_PATH_JSON_BYTES: usize = 192;
@@ -173,6 +176,30 @@ pub(crate) fn startup_output_for_audit(output: &Value) -> Value {
         }
         if source.get("headings").is_some() {
             source["headings"] = json!([]);
+        }
+    }
+    for pointer in [
+        "/continuation/exploration/paths",
+        "/startup_brief/continuation/exploration/paths",
+    ] {
+        if let Some(paths) = audit.pointer_mut(pointer) {
+            let total = paths.get("total").and_then(Value::as_u64).unwrap_or(0);
+            paths["items"] = json!([]);
+            paths["returned"] = json!(0);
+            paths["truncated"] = json!(total > 0);
+        }
+    }
+    for pointer in [
+        "/continuation_feedback/attempt/exploration",
+        "/startup_brief/continuation_feedback/attempt/exploration",
+    ] {
+        if let Some(exploration) = audit.pointer_mut(pointer) {
+            let total = exploration
+                .get("total_observed_paths")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            exploration["observed_paths"] = json!([]);
+            exploration["truncated"] = json!(total > 0);
         }
     }
     audit
@@ -436,6 +463,7 @@ fn continuation_projection(
     let delta = feedback.get("validation_delta").unwrap_or(&Value::Null);
     let delta_failures = delta.get("failures").unwrap_or(&Value::Null);
     let changes = attempt.get("changes").unwrap_or(&Value::Null);
+    let exploration = attempt.get("exploration").unwrap_or(&Value::Null);
     let actions = attempt
         .get("suggested_next_actions")
         .and_then(Value::as_array)
@@ -483,6 +511,45 @@ fn continuation_projection(
             if minimal { 0 } else { MAX_CHANGED_PATHS },
             project_path_item,
         ),
+        "exploration": {
+            "paths": bounded_list(
+                exploration.get("observed_paths"),
+                exploration
+                    .get("total_observed_paths")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize),
+                exploration
+                    .get("truncated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                if minimal {
+                    MAX_MINIMAL_EXPLORATION_PATHS
+                } else {
+                    MAX_STANDARD_EXPLORATION_PATHS
+                },
+                exploration_path_item,
+            ),
+            "read_count": exploration
+                .get("read_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            "search_count": exploration
+                .get("search_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            "navigation_count": exploration
+                .get("navigation_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            "latest_tool": exploration
+                .get("latest_tool")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "complete": exploration
+                .get("complete")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        },
         "validation": {
             "latest_status": normalized_validation_status(
                 validation.get("latest_status").and_then(Value::as_str),
@@ -643,6 +710,12 @@ fn project_path_item(value: &Value) -> Option<Value> {
         .map(|value| json!(bounded_json_string(value, MAX_PATH_JSON_BYTES).0))
 }
 
+fn exploration_path_item(value: &Value) -> Option<Value> {
+    value.as_str().and_then(|value| {
+        super::sessions::normalize_observed_project_path(value).map(Value::String)
+    })
+}
+
 fn action_item(value: &Value) -> Option<Value> {
     value
         .as_str()
@@ -753,11 +826,25 @@ fn startup_verdict(
     minimal: bool,
 ) -> Value {
     let mut actions = Vec::new();
-    if blockers.iter().any(|item| item == "workspace_conflicts") {
-        push_unique(
-            &mut actions,
-            "resolve the existing workspace conflicts before editing unrelated code",
-        );
+    let continuation_actions = continuation
+        .pointer("/suggested_next_actions/items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    if continuation
+        .pointer("/validation/open_failures/total")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        > 0
+    {
+        if let Some(action) = continuation_actions.first() {
+            push_unique(&mut actions, action);
+        }
+    }
+    if blockers.iter().any(|item| item == "active_jobs_blocking") {
+        push_unique(&mut actions, "inspect or await blocking active jobs");
     }
     if blockers.iter().any(|item| item == "runner_unavailable") {
         push_unique(
@@ -765,15 +852,27 @@ fn startup_verdict(
             "restore the project runner connection before attempting coding tools",
         );
     }
-    if blockers.iter().any(|item| item == "active_jobs_blocking") {
-        push_unique(&mut actions, "inspect or await blocking active jobs");
+    if continuation
+        .pointer("/open_guidance/risk_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        > 0
+    {
+        push_unique(
+            &mut actions,
+            "address open guidance on the session message board",
+        );
     }
-    for action in continuation
-        .pointer("/suggested_next_actions/items")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
+    if blockers.iter().any(|item| item == "workspace_conflicts") {
+        push_unique(
+            &mut actions,
+            "resolve the existing workspace conflicts before editing unrelated code",
+        );
+    }
+    for action in continuation_actions
+        .iter()
+        .copied()
+        .filter(|action| *action != EXPLORATION_CONTINUITY_ACTION)
     {
         push_unique(&mut actions, action);
     }
@@ -797,6 +896,12 @@ fn startup_verdict(
             &mut actions,
             "pass the explicit Workflow Session id on subsequent project tools",
         );
+    }
+    if continuation_actions
+        .iter()
+        .any(|action| *action == EXPLORATION_CONTINUITY_ACTION)
+    {
+        push_unique(&mut actions, EXPLORATION_CONTINUITY_ACTION);
     }
     if actions.is_empty() {
         actions.push("begin the requested coding task".to_string());
@@ -902,6 +1007,7 @@ fn enforce_hard_size_limit(brief: &mut Value) {
         "/continuation/validation/delta/new_failures",
         "/continuation/validation/delta/still_failing",
         "/continuation/validation/open_failures",
+        "/continuation/exploration/paths",
         "/continuation/changed_paths",
     ];
     loop {
@@ -1235,6 +1341,9 @@ mod tests {
         let paths = (0..120)
             .map(|index| json!(format!("src/generated/{index}/{}.rs", "p".repeat(220))))
             .collect::<Vec<_>>();
+        let observed_paths = (0..100)
+            .map(|index| json!(format!("src/explored/{index}/{}.rs", "e".repeat(220))))
+            .collect::<Vec<_>>();
         let failures = (0..30).map(failure).collect::<Vec<_>>();
         json!({
             "status": "available",
@@ -1253,6 +1362,16 @@ mod tests {
                     "changed_paths": paths,
                     "total_changed_paths": 120,
                     "truncated": false,
+                },
+                "exploration": {
+                    "observed_paths": observed_paths,
+                    "total_observed_paths": 140,
+                    "truncated": true,
+                    "read_count": 80,
+                    "search_count": 40,
+                    "navigation_count": 20,
+                    "latest_tool": "goto_definition",
+                    "complete": true,
                 },
                 "validation": {
                     "latest_status": "failed",
@@ -1346,6 +1465,48 @@ mod tests {
             "terminal_pending_count": 0,
             "recent": [],
         })
+    }
+
+    #[test]
+    fn startup_exploration_projection_uses_minimal_and_standard_path_limits() {
+        let feedback = json!({
+            "status": "available",
+            "attempt": {
+                "exploration": {
+                    "observed_paths": (0..20)
+                        .map(|index| format!("src/explored-{index:02}.rs"))
+                        .collect::<Vec<_>>(),
+                    "total_observed_paths": 20,
+                    "truncated": false,
+                    "read_count": 3,
+                    "search_count": 2,
+                    "navigation_count": 4,
+                    "latest_tool": "read_file",
+                    "complete": true
+                }
+            },
+            "validation_delta": {}
+        });
+        let minimal = continuation_projection(&feedback, &empty_active_jobs(), true, "continued");
+        let standard = continuation_projection(&feedback, &empty_active_jobs(), false, "continued");
+
+        assert_eq!(
+            minimal["exploration"]["paths"],
+            json!({
+                "items": ["src/explored-00.rs", "src/explored-01.rs", "src/explored-02.rs"],
+                "total": 20,
+                "returned": 3,
+                "truncated": true
+            })
+        );
+        assert_eq!(standard["exploration"]["paths"]["returned"], 12);
+        assert_eq!(standard["exploration"]["paths"]["total"], 20);
+        assert_eq!(standard["exploration"]["paths"]["truncated"], true);
+        assert_eq!(standard["exploration"]["read_count"], 3);
+        assert_eq!(standard["exploration"]["search_count"], 2);
+        assert_eq!(standard["exploration"]["navigation_count"], 4);
+        assert_eq!(standard["exploration"]["latest_tool"], "read_file");
+        assert_eq!(standard["exploration"]["complete"], true);
     }
 
     #[test]
@@ -1504,6 +1665,17 @@ mod tests {
                 <= 20
         );
         assert_eq!(first["continuation"]["changed_paths"]["truncated"], true);
+        assert_eq!(first["continuation"]["exploration"]["paths"]["total"], 140);
+        assert!(
+            first["continuation"]["exploration"]["paths"]["returned"]
+                .as_u64()
+                .unwrap()
+                <= MAX_STANDARD_EXPLORATION_PATHS as u64
+        );
+        assert_eq!(
+            first["continuation"]["exploration"]["paths"]["truncated"],
+            true
+        );
         for pointer in [
             "/continuation/validation/open_failures",
             "/continuation/validation/delta/new_failures",
@@ -1527,7 +1699,13 @@ mod tests {
         assert!(first["startup_verdict"]["suggested_next_actions"][0]
             .as_str()
             .unwrap()
-            .starts_with("inspect or await blocking active jobs"));
+            .starts_with("rerun focused target 0"));
+        assert!(first["startup_verdict"]["suggested_next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|action| action.starts_with("inspect or await blocking active jobs")));
         assert!(first["blockers"]
             .as_array()
             .unwrap()
@@ -1544,6 +1722,7 @@ mod tests {
     #[test]
     fn startup_audit_projection_never_retains_repository_rule_prose() {
         let marker = "RULE_BODY_MUST_NOT_ENTER_ACTION_AUDIT";
+        let exploration_marker = "src/EXPLORATION_PATH_MUST_NOT_ENTER_ACTION_AUDIT.rs";
         let output = json!({
             "detail": "full",
             "rules": {
@@ -1560,11 +1739,31 @@ mod tests {
                         "content": marker,
                         "headings": [format!("# {marker}")],
                     }]
+                },
+                "continuation": {
+                    "exploration": {
+                        "paths": {
+                            "items": [exploration_marker],
+                            "total": 1,
+                            "returned": 1,
+                            "truncated": false
+                        }
+                    }
+                }
+            },
+            "continuation_feedback": {
+                "attempt": {
+                    "exploration": {
+                        "observed_paths": [exploration_marker],
+                        "total_observed_paths": 1,
+                        "truncated": false
+                    }
                 }
             }
         });
         let audit = startup_output_for_audit(&output);
         assert!(!audit.to_string().contains(marker));
+        assert!(!audit.to_string().contains(exploration_marker));
         assert!(
             output.to_string().contains(marker),
             "redaction must not mutate the transport response"
@@ -1574,5 +1773,13 @@ mod tests {
             Value::Null
         );
         assert_eq!(audit["rules"]["sources"][0]["first_lines"], json!([]));
+        assert_eq!(
+            audit["startup_brief"]["continuation"]["exploration"]["paths"]["items"],
+            json!([])
+        );
+        assert_eq!(
+            audit["continuation_feedback"]["attempt"]["exploration"]["observed_paths"],
+            json!([])
+        );
     }
 }

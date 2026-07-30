@@ -28,7 +28,7 @@ pub(crate) fn start_coding_task_input_schema() -> Value {
                 "type": "string",
                 "enum": ["minimal", "standard", "full"],
                 "default": "standard",
-                "description": "Startup projection detail. minimal returns the strict model-facing session/project/workspace/blocker essentials and instruction status without rule content; standard is the default bounded Coding brief with repository rules, continuation evidence, semantic-navigation readiness, blockers, warnings, and concrete next actions; full preserves the complete diagnostic runtime, connection, authority, binding, Git/recent-commit, rules-summary, manifest, and recommended-flow blocks and also embeds the same startup_brief core."
+                "description": "Startup projection detail. minimal returns the strict model-facing session/project/workspace/blocker essentials, instruction status without rule content, and at most 3 validated project-relative exploration paths; standard is the default bounded Coding brief with repository rules, continuation evidence (including at most 12 attempt-scoped exploration paths), semantic-navigation readiness, blockers, warnings, and concrete next actions; full preserves the complete diagnostic runtime, connection, authority, binding, Git/recent-commit, rules-summary, manifest, and recommended-flow blocks and also embeds the same startup_brief core. Exploration is a read-only ledger projection and never executes tools or includes search/file/LSP content, commands/output, or absolute roots."
             },
             "resume_session_id": {
                 "type": "string",

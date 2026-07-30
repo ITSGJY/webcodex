@@ -1,5 +1,7 @@
 use serde_json::{json, Value};
 
+use crate::tool_runtime::sessions::EXPLORATION_TOOL_NAMES;
+
 pub(crate) fn schema_type(kind: &str, description: &str) -> Value {
     json!({
         "type": kind,
@@ -14,6 +16,18 @@ pub(crate) fn nullable_schema(kind: &str, description: &str) -> Value {
             { "type": "null" }
         ],
         "description": description,
+    })
+}
+
+pub(crate) fn exploration_tool_name_schema() -> Value {
+    json!({
+        "anyOf": [
+            {
+                "type": "string",
+                "enum": EXPLORATION_TOOL_NAMES
+            },
+            {"type": "null"}
+        ]
     })
 }
 
@@ -378,7 +392,7 @@ pub(crate) fn continuation_feedback_schema(description: &str) -> Value {
 fn attempt_summary_schema() -> Value {
     json!({
         "type": "object",
-        "description": "Bounded deterministic summary of the current attempt: boundary, instruction, event range, activity, changes, validation, jobs, guidance, outcome, and suggested next actions. Pointer fields only; never raw commands, stdout/stderr, full guidance text, or secrets.",
+        "description": "Bounded deterministic summary of the current attempt: boundary, instruction, event range, activity, changes, exploration, validation, jobs, guidance, outcome, and suggested next actions. Pointer fields only; never raw search text, file/LSP bodies, commands, stdout/stderr, full guidance text, absolute roots, or secrets.",
         "additionalProperties": false,
         "properties": {
             "boundary": attempt_boundary_schema(),
@@ -386,13 +400,14 @@ fn attempt_summary_schema() -> Value {
             "event_range": attempt_event_range_schema(),
             "activity": attempt_activity_schema(),
             "changes": attempt_changes_schema(),
+            "exploration": attempt_exploration_schema(),
             "validation": attempt_validation_schema(),
             "jobs": attempt_jobs_schema(),
             "guidance": attempt_guidance_schema(),
             "outcome": attempt_outcome_schema(),
             "suggested_next_actions": array_schema(schema_type("string", "A bounded, deterministic suggested next action."), "Bounded suggested next actions (<=8).")
         },
-        "required": ["boundary", "instruction", "event_range", "activity", "changes", "validation", "jobs", "guidance", "outcome", "suggested_next_actions"]
+        "required": ["boundary", "instruction", "event_range", "activity", "changes", "exploration", "validation", "jobs", "guidance", "outcome", "suggested_next_actions"]
     })
 }
 
@@ -482,6 +497,40 @@ fn attempt_changes_schema() -> Value {
             "truncated": schema_type("boolean", "True when changed_paths was capped at the bound.")
         },
         "required": ["changed_paths", "total_changed_paths", "truncated"]
+    })
+}
+
+fn attempt_exploration_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Attempt-scoped exploration workset projected only from successful structured ledger evidence. Paths are validated project-relative values in newest-observation-first order; no search text, file/LSP content, commands, output, absolute roots, or secrets.",
+        "additionalProperties": false,
+        "properties": {
+            "observed_paths": {
+                "type": "array",
+                "maxItems": 100,
+                "uniqueItems": true,
+                "items": {"type": "string", "maxLength": 512},
+                "description": "Unique project-relative paths, newest successful observation first."
+            },
+            "total_observed_paths": schema_type("integer", "Real unique path count before the 100-path projection cap."),
+            "truncated": schema_type("boolean", "True when observed_paths was capped."),
+            "read_count": schema_type("integer", "Successful direct read_file calls in the attempt."),
+            "search_count": schema_type("integer", "Successful search_project_text calls in the attempt."),
+            "navigation_count": schema_type("integer", "Successful LSP navigation calls in the attempt."),
+            "latest_tool": exploration_tool_name_schema(),
+            "complete": schema_type("boolean", "False when the attempt boundary was evicted and only a retained tail is available.")
+        },
+        "required": [
+            "observed_paths",
+            "total_observed_paths",
+            "truncated",
+            "read_count",
+            "search_count",
+            "navigation_count",
+            "latest_tool",
+            "complete"
+        ]
     })
 }
 

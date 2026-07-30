@@ -698,6 +698,13 @@ async fn explicit_resume_rejects_closed_and_project_mismatch_without_binding_cha
 async fn explicit_resume_mode_upgrade_rechecks_write_scope_atomically() {
     let root = tempfile::tempdir().unwrap();
     init_git_repo(root.path());
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    commit_file(
+        root.path(),
+        "src/read_only.rs",
+        "pub fn observed_before_resume() {}\n",
+        "add read-only source",
+    );
     let runtime = ToolRuntime::new_for_tests();
     let read_auth = oauth_bridge_auth_context(
         "explicit-upgrade-subject",
@@ -748,6 +755,22 @@ async fn explicit_resume_mode_upgrade_rechecks_write_scope_atomically() {
         "read-only session B",
         SessionMode::ReadOnly,
     );
+    let read = dispatch_start_coding_task_in_window(
+        &runtime,
+        "oauth-client",
+        ToolCall::ReadFile {
+            project: project.clone(),
+            path: "src/read_only.rs".to_string(),
+            session_id: Some(session_b.clone()),
+            start_line: None,
+            limit: None,
+            with_line_numbers: None,
+        },
+        Some(&read_auth),
+        "explicit-upgrade-window",
+    )
+    .await;
+    assert!(read.success, "{:?}", read.error);
     let before = session_value(&runtime, &session_b);
 
     let denied = dispatch_start_coding_task_in_window(
@@ -807,10 +830,39 @@ async fn explicit_resume_mode_upgrade_rechecks_write_scope_atomically() {
         upgraded.output["session"]["capability"]["write_scope_verified"],
         true
     );
+    assert_eq!(
+        upgraded.output["continuation_feedback"]["attempt"]["exploration"]["observed_paths"],
+        json!(["src/read_only.rs"])
+    );
+    assert_eq!(
+        upgraded.output["startup_brief"]["continuation"]["exploration"]["paths"]["items"],
+        json!(["src/read_only.rs"])
+    );
+    assert_eq!(
+        upgraded.output["continuation_feedback"]["attempt"]["exploration"]["read_count"],
+        1
+    );
+    assert_eq!(
+        upgraded.output["continuation_feedback"]["attempt"]["exploration"]["complete"],
+        true
+    );
     let summary = runtime.sessions.summary(&session_b, Some(20)).unwrap();
     assert_eq!(summary.mode, SessionMode::Normal);
     assert!(!summary.guards.deny_write_tools);
     assert_eq!(instruction_events(&runtime, &session_b).len(), 1);
+    assert_eq!(
+        summary
+            .events
+            .iter()
+            .filter(|event| {
+                event.kind == "tool_call_finished"
+                    && event.tool_name == "read_file"
+                    && event.status.as_deref() == Some("succeeded")
+            })
+            .count(),
+        1,
+        "explicit resume must not reread an explored source file"
+    );
     let current = current_session_in_window(
         &runtime,
         &project,

@@ -244,6 +244,25 @@ a `finish_coding_task` verdict.
   `source = unavailable`, `reason_code = attempt_boundary_evicted`, and
   `event_range.complete = false` — the projection never masquerades a truncated
   retained window as `session_start` with `complete = true`.
+- **Exploration workset:** `attempt.exploration` projects only successful,
+  structured evidence from focused `read_file`, `search_project_text`, and
+  typed LSP navigation calls. The existing ledger retains only a bounded set
+  of validated project-relative paths; it never retains search patterns or
+  previews, file contents, symbol/hover/diagnostic bodies, arbitrary result
+  JSON, shell commands/output, or the absolute repository root for this
+  workset. Paths are deduplicated newest successful observation first.
+  Enumeration tools such as `project_overview`, `list_project_files`, and
+  `list_project_tracked_files`, Git diff lists, failed calls, error text, and
+  shell output are not exploration evidence. The workset is segmented by the
+  same attempt boundary; when that boundary was evicted,
+  `exploration.complete = false` as well.
+- **Continuation reuse, not execution:** automatic continuation, explicit
+  resume, inspect/read-only to normal mode upgrades, and ledger restoration
+  reuse the prior attempt's workset. Startup returns at most 3 paths in
+  `minimal` and 12 in `standard` (including the core embedded by `full`); full
+  continuation feedback returns at most 100 with the real total and
+  truncation state. This is a hint for model judgment only: startup never
+  reads, searches, or navigates those paths automatically.
 - **Handoff is independent of the display limit:** `session_handoff_summary`
   builds its display list from the caller-supplied `limit`, but
   `continuation_feedback` reads an independent bounded evidence snapshot (the
@@ -269,8 +288,11 @@ a `finish_coding_task` verdict.
   computed over the full bounded active Job aggregate, never the truncated
   `recent` list, so a hidden recovering job is never misreported as healthy.
   Fields that cannot be reliably proven are not reported.
-- **No new persistence:** continuation feedback introduces no new durable table
-  and no second attempt state machine; it is a projection over existing state.
+- **No new persistence model:** continuation feedback introduces no new
+  durable table and no second attempt state machine. Exploration adds only a
+  serde-defaulted field to the existing version-1 event ledger, so older
+  ledgers restore it as empty without a version bump; feedback remains a
+  projection over that existing state.
 
 ### Invariants (must)
 

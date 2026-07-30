@@ -518,6 +518,25 @@ a process-local cache plus a bounded hashed durable projection.
   recommended flow, and tool manifest) plus the same model-facing core under
   `output.startup_brief`.
 
+`continuation.exploration` is the bounded startup projection of the previous
+attempt's exploration workset. It carries only validated project-relative
+paths from successful focused reads, structured search records, and typed LSP
+navigation, newest observation first. `minimal` returns at most 3 paths;
+`standard` and the core embedded by `full` return at most 12. The complete
+`continuation_feedback.attempt.exploration` returns at most 100 paths with the
+real total and truncation flag. If event eviction removed the attempt boundary,
+`complete=false`; no retained tail is presented as complete.
+
+The workset is stored as a serde-defaulted, bounded field in the existing
+version-1 Workflow Session ledger. It never stores search patterns/previews,
+file contents, symbol/hover/diagnostic bodies, arbitrary tool results, shell
+commands/output, or the repository absolute root. Failed calls, repository
+enumeration tools, Git diff lists, errors, and shell output do not create
+exploration evidence. Automatic continuation, explicit resume, mode upgrade,
+and restart recovery reuse this projection; `start_coding_task` never
+automatically reads/searches/navigates its paths and the workset does not
+replace model judgment.
+
 The shared core reserves transport-envelope headroom with a 30 KiB hard limit;
 ordinary clean standard startup is expected to stay below 16 KiB, and the
 complete GPT Actions response remains below 32 KiB in the bounded worst case.

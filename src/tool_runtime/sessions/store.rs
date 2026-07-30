@@ -14,7 +14,9 @@ use std::time::Instant;
 use super::events::{
     actual_failure_kind_for_tool_result, changed_paths_for_tool, classify_failure_expectation,
     diff_review_like_for_tool, extract_job_id, extract_project, is_valid_session_id,
-    validation_output_summary_for_tool_result, SessionToolClassification,
+    observed_input_paths_for_tool, observed_paths_for_successful_result,
+    session_input_summary_for_tool, validation_output_summary_for_tool_result,
+    SessionToolClassification,
 };
 use super::model::{
     CodingSessionError, CodingSessionOutcome, CodingSessionRequest, CurrentSessionKey,
@@ -872,8 +874,9 @@ impl SessionStore {
         let classification = SessionToolClassification::for_tool(tool_name);
         let risk_class = classification.risk_class.to_string();
         let changed_paths = changed_paths_for_tool(tool_name, arguments);
+        let observed_paths = observed_input_paths_for_tool(tool_name, arguments);
         let diff_review_like = diff_review_like_for_tool(tool_name, arguments);
-        let input_summary = Some(redact_and_bound_value(arguments));
+        let input_summary = Some(session_input_summary_for_tool(tool_name, arguments));
         let expectation = metadata.expectation;
         let start = ToolCallStart {
             event_id: event_id.clone(),
@@ -890,6 +893,7 @@ impl SessionStore {
             change_summary_like: classification.change_summary_like,
             diff_review_like,
             changed_paths: changed_paths.clone(),
+            observed_paths: observed_paths.clone(),
             started_at: now,
             started_instant: Instant::now(),
             permission: None,
@@ -930,6 +934,7 @@ impl SessionStore {
             allow_cross_project_session: None,
             error_message_summary: None,
             changed_paths,
+            observed_paths,
             job_id: None,
             input_summary,
             validation_output_summary: None,
@@ -1014,6 +1019,15 @@ impl SessionStore {
             error.map(|message| bound_event_error_summary(message, start.shell_like));
         let validation_output_summary =
             validation_output_summary_for_tool_result(&start.tool_name, output);
+        let observed_paths = if success {
+            observed_paths_for_successful_result(
+                &start.tool_name,
+                start.observed_paths.clone(),
+                output,
+            )
+        } else {
+            Vec::new()
+        };
         self.push_event(SessionEvent {
             event_id: event_id.clone(),
             session_id: start.session_id,
@@ -1049,6 +1063,7 @@ impl SessionStore {
             allow_cross_project_session,
             error_message_summary,
             changed_paths: start.changed_paths,
+            observed_paths,
             job_id: extract_job_id(output),
             input_summary: None,
             validation_output_summary,
@@ -1198,6 +1213,7 @@ fn coding_instruction_event(
         allow_cross_project_session: None,
         error_message_summary: None,
         changed_paths: Vec::new(),
+        observed_paths: Vec::new(),
         job_id: None,
         input_summary: Some(redact_and_bound_value(&serde_json::json!({
             "requested_mode": requested_mode.as_str(),
@@ -1256,6 +1272,7 @@ fn session_closed_system_event(session_id: &str, now: i64) -> SessionEvent {
         allow_cross_project_session: None,
         error_message_summary: None,
         changed_paths: Vec::new(),
+        observed_paths: Vec::new(),
         job_id: None,
         input_summary: None,
         validation_output_summary: None,

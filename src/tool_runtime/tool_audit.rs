@@ -482,6 +482,72 @@ impl ToolCall {
                 "result_mode": result_mode,
                 "timeout_secs": timeout_secs,
             }),
+            Self::LspStatus { project, .. } => serde_json::json!({
+                "project": project,
+            }),
+            Self::DocumentSymbols {
+                project,
+                path,
+                limit,
+                ..
+            }
+            | Self::DocumentDiagnostics {
+                project,
+                path,
+                limit,
+                ..
+            } => serde_json::json!({
+                "project": project,
+                "path": path,
+                "limit": limit,
+            }),
+            Self::Hover {
+                project,
+                path,
+                line,
+                column,
+                ..
+            } => serde_json::json!({
+                "project": project,
+                "path": path,
+                "line": line,
+                "column": column,
+            }),
+            Self::WorkspaceSymbols { project, limit, .. } => serde_json::json!({
+                "project": project,
+                "query_present": true,
+                "limit": limit,
+            }),
+            Self::GotoDefinition {
+                project,
+                path,
+                line,
+                column,
+                limit,
+                ..
+            } => serde_json::json!({
+                "project": project,
+                "path": path,
+                "line": line,
+                "column": column,
+                "limit": limit,
+            }),
+            Self::FindReferences {
+                project,
+                path,
+                line,
+                column,
+                include_declaration,
+                limit,
+                ..
+            } => serde_json::json!({
+                "project": project,
+                "path": path,
+                "line": line,
+                "column": column,
+                "include_declaration": include_declaration,
+                "limit": limit,
+            }),
             Self::ShowChanges {
                 project,
                 include_diff,

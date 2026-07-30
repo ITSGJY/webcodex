@@ -500,6 +500,14 @@ async fn coding_task_project_switching_keeps_rule_snapshots_isolated() {
 async fn restart_restored_coding_task_session_reloads_rules_without_persisting_body() {
     let root = tempfile::tempdir().unwrap();
     seed_rules(root.path());
+    let source_marker = "SOURCE_BODY_MUST_NEVER_ENTER_THE_DURABLE_LEDGER";
+    fs::create_dir_all(root.path().join("src")).unwrap();
+    commit_file(
+        root.path(),
+        "src/restart.rs",
+        &format!("pub const MARKER: &str = \"{source_marker}\";\n"),
+        "add restart source",
+    );
     let ledger_dir = tempfile::tempdir().unwrap();
     let ledger = ledger_dir.path().join("sessions.json");
     let marker = "RULE_BODY_MUST_NEVER_ENTER_THE_DURABLE_LEDGER";
@@ -532,9 +540,26 @@ async fn restart_restored_coding_task_session_reloads_rules_without_persisting_b
         .as_str()
         .unwrap()
         .to_string();
+    let read = dispatch_start_coding_task_in_window(
+        &runtime1,
+        "rules-restart",
+        ToolCall::ReadFile {
+            project: project.clone(),
+            path: "src/restart.rs".to_string(),
+            session_id: Some(session_id.clone()),
+            start_line: None,
+            limit: None,
+            with_line_numbers: None,
+        },
+        Some(&auth),
+        "rules-restart-window",
+    )
+    .await;
+    assert!(read.success, "{:?}", read.error);
     runtime1.sessions.flush_persistence();
     let persisted = fs::read_to_string(&ledger).unwrap();
     assert!(!persisted.contains(marker));
+    assert!(!persisted.contains(source_marker));
     assert!(!persisted.contains("Repository rules"));
     drop(runtime1);
 
@@ -560,10 +585,36 @@ async fn restart_restored_coding_task_session_reloads_rules_without_persisting_b
     assert_eq!(restored.output["session"]["continuation"], "continued");
     assert_eq!(restored.output["instructions"]["status"], "loaded");
     assert_eq!(restored.output["instructions"]["content_included"], true);
+    assert_eq!(
+        restored.output["continuation"]["exploration"]["paths"]["items"],
+        json!(["src/restart.rs"])
+    );
+    assert_eq!(
+        restored.output["continuation"]["exploration"]["read_count"],
+        1
+    );
+    assert_eq!(
+        restored.output["continuation"]["exploration"]["complete"],
+        true
+    );
     assert!(instruction_source(&restored.output, "AGENTS.md")["content"]
         .as_str()
         .unwrap()
         .contains(marker));
+    let summary = runtime2.sessions.summary(&session_id, Some(30)).unwrap();
+    assert_eq!(
+        summary
+            .events
+            .iter()
+            .filter(|event| {
+                event.kind == "tool_call_finished"
+                    && event.tool_name == "read_file"
+                    && event.status.as_deref() == Some("succeeded")
+            })
+            .count(),
+        1,
+        "restart continuation must not reread explored source files"
+    );
 }
 
 #[tokio::test]
@@ -1072,4 +1123,11 @@ async fn minimal_standard_and_full_coding_task_outputs_validate_against_strict_s
     unknown["output"]["continuation"]["validation"]["latest_status"] =
         json!("implementation_schema_drift");
     assert!(validate_schema_instance_for_test(&unknown, &schema).is_err());
+
+    unknown["output"]["continuation"]["validation"]["latest_status"] = json!("not_run");
+    unknown["output"]["continuation"]["exploration"]["unknown_field"] = json!(true);
+    assert!(
+        validate_schema_instance_for_test(&unknown, &schema).is_err(),
+        "strict exploration schema must reject unknown fields"
+    );
 }

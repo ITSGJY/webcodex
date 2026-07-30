@@ -49,6 +49,17 @@ not call `listProjects`, `runtime_status`, `tool_manifest`, `start_session`, or
 Agent listing before normal coding, and the prompt must not contain an Agent
 client ID or runtime project ID.
 
+On deployments that also expose the advanced generic `callRuntimeTool`
+compatibility path, a successful `start_coding_task` Action only wraps the
+shared MCP/REST startup core; it does not rebuild continuation data. That core's
+attempt-scoped exploration workset contains only bounded, validated
+project-relative paths from successful focused reads, structured searches, and
+typed LSP navigation. It excludes search/file/LSP content, commands/output, and
+absolute roots, marks an evicted attempt boundary `complete=false`, and is
+reused across continuation, explicit resume, mode upgrade, and restart without
+automatically executing tools. The standard/full core returns at most 12 paths
+(`minimal`: 3), and the complete Action response remains below 32 KiB.
+
 Within one retained chat-window identity, `task_start` automatically continues
 the repository's active durable context and appends the new instruction.
 Changing to another configured repository keeps the two histories isolated;

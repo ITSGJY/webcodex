@@ -100,6 +100,16 @@ when that transport identity is unavailable. The returned
 unresolved failure identities, and validation state (plus a `validation_delta`
 only comparable across proven-equal scope); it is never an
 LLM summary or a new verdict, and it does not run validation.
+Its `attempt.exploration` workset contains only bounded, validated
+project-relative paths proven by successful focused reads, structured project
+search results, or typed LSP navigation. It is attempt-scoped, newest-first,
+and reports `complete=false` if the boundary was evicted. Search text/previews,
+file or LSP contents, arbitrary results, commands/output, and absolute roots
+are never part of the workset. Automatic continuation, explicit resume,
+inspect/read-only mode upgrades, and restart recovery can reuse it, but startup
+does not execute tools or replace model judgment. The compact startup core
+returns at most 3 paths for `minimal` and 12 for `standard`/embedded `full`;
+complete feedback returns at most 100 and preserves the real total/truncation.
 
 The stable IDs have product purposes between model tools and host review, but
 ordinary users do not manage them:

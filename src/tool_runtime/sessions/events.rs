@@ -1,20 +1,26 @@
 //! Tool-call event helpers: classification, expectations, validation excerpts, path extraction.
 use super::super::metadata::{ToolPathHint, ToolRisk};
 use super::super::tool_definition::{
-    runtime_tool_captures_validation_output, runtime_tool_is_change_summary_like,
-    runtime_tool_is_git_like, runtime_tool_is_read_like, runtime_tool_is_shell_like,
-    runtime_tool_is_write_like, runtime_tool_metadata, runtime_tool_session_risk_class,
+    runtime_tool_captures_validation_output, runtime_tool_category,
+    runtime_tool_is_change_summary_like, runtime_tool_is_git_like, runtime_tool_is_read_like,
+    runtime_tool_is_shell_like, runtime_tool_is_write_like, runtime_tool_metadata,
+    runtime_tool_session_risk_class, TOOL_CATEGORY_LSP,
+};
+use crate::lsp_bridge::{
+    DocumentDiagnosticsResult, DocumentSymbolsResult, HoverResult, LocationsResult,
+    WorkspaceSymbolsResult,
 };
 use serde_json::{json, Value};
 
 use super::model::{
-    SessionEvent, ToolCallExpectation, ToolCallRecorderMetadata, MAX_VALIDATION_EXCERPT_CHARS,
-    SESSION_ID_PREFIX, TOOL_ASSERTION_NAME_FIELD, TOOL_CALL_EXPECTATION_METADATA_FIELDS,
-    TOOL_EXPECTATION_RESULT_MATCHED, TOOL_EXPECTATION_RESULT_MISMATCH,
-    TOOL_EXPECTATION_RESULT_NONE, TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE,
-    TOOL_EXPECTATION_RESULT_UNEXPECTED_SUCCESS, TOOL_EXPECTED_FAILURE_FIELD,
-    TOOL_EXPECTED_FAILURE_KIND_FIELD,
+    SessionEvent, ToolCallExpectation, ToolCallRecorderMetadata, MAX_OBSERVED_PATHS_PER_EVENT,
+    MAX_VALIDATION_EXCERPT_CHARS, SESSION_ID_PREFIX, TOOL_ASSERTION_NAME_FIELD,
+    TOOL_CALL_EXPECTATION_METADATA_FIELDS, TOOL_EXPECTATION_RESULT_MATCHED,
+    TOOL_EXPECTATION_RESULT_MISMATCH, TOOL_EXPECTATION_RESULT_NONE,
+    TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE, TOOL_EXPECTATION_RESULT_UNEXPECTED_SUCCESS,
+    TOOL_EXPECTED_FAILURE_FIELD, TOOL_EXPECTED_FAILURE_KIND_FIELD,
 };
+use super::util::redact_and_bound_value;
 use super::util::{bound_summary_string, validation_excerpt};
 
 impl ToolCallRecorderMetadata {
@@ -309,6 +315,228 @@ pub(crate) fn changed_paths_for_tool(tool_name: &str, arguments: &Value) -> Vec<
         ToolPathHint::Patch | ToolPathHint::None => {}
     }
     paths
+}
+
+/// Internal exploration classification derived from the canonical
+/// ToolDefinition category/path metadata. This is deliberately not exposed in
+/// the public tool metadata surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExplorationToolKind {
+    Read,
+    Search,
+    Navigation,
+}
+
+pub(crate) const EXPLORATION_TOOL_NAMES: &[&str] = &[
+    "read_file",
+    "search_project_text",
+    "document_symbols",
+    "document_diagnostics",
+    "hover",
+    "workspace_symbols",
+    "goto_definition",
+    "find_references",
+];
+
+pub(crate) fn exploration_tool_kind(tool_name: &str) -> Option<ExplorationToolKind> {
+    if !EXPLORATION_TOOL_NAMES.contains(&tool_name) {
+        return None;
+    }
+    match tool_name {
+        "read_file" => Some(ExplorationToolKind::Read),
+        "search_project_text" => Some(ExplorationToolKind::Search),
+        _ if runtime_tool_category(tool_name) == TOOL_CATEGORY_LSP => {
+            Some(ExplorationToolKind::Navigation)
+        }
+        _ => None,
+    }
+}
+
+/// Extract only explicit input paths for tools that establish focused
+/// exploration evidence. Search roots are intentionally excluded: search
+/// evidence comes from successful structured result records instead.
+pub(crate) fn observed_input_paths_for_tool(tool_name: &str, arguments: &Value) -> Vec<String> {
+    let Some(kind) = exploration_tool_kind(tool_name) else {
+        return Vec::new();
+    };
+    if kind == ExplorationToolKind::Search {
+        return Vec::new();
+    }
+    let metadata = runtime_tool_metadata(tool_name);
+    if metadata.path_hint != ToolPathHint::SinglePath {
+        return Vec::new();
+    }
+    let mut paths = Vec::new();
+    if let Some(path) = arguments.get("path").and_then(Value::as_str) {
+        push_observed_path(&mut paths, path);
+    }
+    paths
+}
+
+/// Build the bounded audit input retained on a session event while ensuring
+/// exploration queries and shell command summaries never enter the ledger,
+/// even when an internal caller bypasses `ToolCall::session_log_arguments`.
+pub(crate) fn session_input_summary_for_tool(tool_name: &str, arguments: &Value) -> Value {
+    let mut summary = redact_and_bound_value(arguments);
+    let Some(object) = summary.as_object_mut() else {
+        return summary;
+    };
+    match tool_name {
+        "search_project_text" => {
+            object.remove("pattern");
+        }
+        "workspace_symbols" => {
+            object.remove("query");
+        }
+        "run_shell" | "run_job" => {
+            object.remove("command");
+            object.remove("command_summary");
+        }
+        _ => {}
+    }
+    summary
+}
+
+/// Add paths from a successful structured tool result. Every branch follows a
+/// known output schema; this never recursively searches arbitrary JSON for
+/// fields named `path`.
+pub(crate) fn observed_paths_for_successful_result(
+    tool_name: &str,
+    input_paths: Vec<String>,
+    output: &Value,
+) -> Vec<String> {
+    let Some(kind) = exploration_tool_kind(tool_name) else {
+        return Vec::new();
+    };
+    let mut paths = sanitize_observed_paths(input_paths);
+    match kind {
+        ExplorationToolKind::Read => {}
+        ExplorationToolKind::Search => {
+            for key in ["matches", "files"] {
+                for record in output
+                    .get(key)
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(path) = record.get("path").and_then(Value::as_str) {
+                        push_observed_path(&mut paths, path);
+                    }
+                }
+            }
+        }
+        ExplorationToolKind::Navigation => {
+            push_lsp_result_paths(tool_name, output, &mut paths);
+        }
+    }
+    paths
+}
+
+fn push_lsp_result_paths(tool_name: &str, output: &Value, paths: &mut Vec<String>) {
+    match tool_name {
+        "document_symbols" => {
+            if let Ok(result) = serde_json::from_value::<DocumentSymbolsResult>(output.clone()) {
+                push_observed_path(paths, &result.path);
+            }
+        }
+        "document_diagnostics" => {
+            if let Ok(result) = serde_json::from_value::<DocumentDiagnosticsResult>(output.clone())
+            {
+                push_observed_path(paths, &result.path);
+            }
+        }
+        "hover" => {
+            if let Ok(result) = serde_json::from_value::<HoverResult>(output.clone()) {
+                push_observed_path(paths, &result.path);
+            }
+        }
+        "workspace_symbols" => {
+            if let Ok(result) = serde_json::from_value::<WorkspaceSymbolsResult>(output.clone()) {
+                for symbol in result.symbols {
+                    push_observed_path(paths, &symbol.path);
+                }
+            }
+        }
+        "goto_definition" | "find_references" => {
+            if let Ok(result) = serde_json::from_value::<LocationsResult>(output.clone()) {
+                push_observed_path(paths, &result.path);
+                for location in result.locations {
+                    push_observed_path(paths, &location.path);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Normalize one untrusted path into the only representation allowed in
+/// exploration evidence. Validation is lexical and never touches the
+/// filesystem, resolves symlinks, or reveals the repository root.
+pub(crate) fn normalize_observed_project_path(path: &str) -> Option<String> {
+    const MAX_OBSERVED_PATH_BYTES: usize = 512;
+
+    let path = path.trim();
+    if path.is_empty()
+        || path.as_bytes().len() > MAX_OBSERVED_PATH_BYTES
+        || path.starts_with('\\')
+        || path.chars().any(char::is_control)
+    {
+        return None;
+    }
+    if starts_with_uri_scheme(path)
+        || crate::validation_bridge::validate_project_relative_path(path).is_err()
+    {
+        return None;
+    }
+    let normalized = path
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect::<Vec<_>>()
+        .join("/");
+    if normalized.is_empty()
+        || normalized.as_bytes().len() > MAX_OBSERVED_PATH_BYTES
+        || crate::validation_bridge::validate_project_relative_path(&normalized).is_err()
+    {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn starts_with_uri_scheme(path: &str) -> bool {
+    let Some((scheme, _rest)) = path.split_once(':') else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && chars.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+        })
+}
+
+pub(crate) fn sanitize_observed_paths<I>(paths: I) -> Vec<String>
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+{
+    let mut sanitized = Vec::new();
+    for path in paths {
+        push_observed_path(&mut sanitized, path.as_ref());
+    }
+    sanitized
+}
+
+fn push_observed_path(paths: &mut Vec<String>, path: &str) {
+    if paths.len() >= MAX_OBSERVED_PATHS_PER_EVENT {
+        return;
+    }
+    let Some(path) = normalize_observed_project_path(path) else {
+        return;
+    };
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
 }
 
 pub(super) fn push_path(paths: &mut Vec<String>, path: &str) {

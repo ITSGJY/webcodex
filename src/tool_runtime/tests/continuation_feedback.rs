@@ -388,6 +388,14 @@ fn evicted_task_instruction_reports_unavailable_boundary_not_session_start() {
     for i in 0..30 {
         record_write(&runtime, &session, &[&format!("src/file_{i}.rs")]);
     }
+    record_exploration_event(
+        &runtime,
+        &session,
+        "read_file",
+        json!({"project": "test-project", "path": "src/retained-tail.rs"}),
+        true,
+        json!({}),
+    );
 
     let summary = runtime.sessions.summary(&session, Some(200)).unwrap();
     assert!(
@@ -408,6 +416,11 @@ fn evicted_task_instruction_reports_unavailable_boundary_not_session_start() {
         "attempt_boundary_evicted"
     );
     assert_eq!(feedback["attempt"]["event_range"]["complete"], false);
+    assert_eq!(feedback["attempt"]["exploration"]["complete"], false);
+    assert_eq!(
+        feedback["attempt"]["exploration"]["observed_paths"],
+        json!(["src/retained-tail.rs"])
+    );
 }
 
 #[test]
@@ -428,6 +441,305 @@ fn retained_task_instruction_still_segments_and_reports_complete() {
     assert_eq!(feedback["attempt"]["activity"]["meaningful_tool_calls"], 1);
 }
 
+#[test]
+fn exploration_workset_is_attempt_scoped_deduped_and_newest_first() {
+    let runtime = test_runtime();
+    let session = create_session(&runtime, "exploration ordering");
+    add_instruction(
+        &runtime,
+        &session,
+        "inspect the implementation",
+        SessionMode::Inspect,
+    );
+
+    record_exploration_event(
+        &runtime,
+        &session,
+        "read_file",
+        json!({"project": "test-project", "path": "src/read.rs"}),
+        true,
+        json!({"content": "READ_BODY_MUST_NOT_APPEAR"}),
+    );
+    record_exploration_event(
+        &runtime,
+        &session,
+        "search_project_text",
+        json!({
+            "project": "test-project",
+            "pattern": "RAW_PATTERN_MUST_NOT_APPEAR wc_pat_PRIVATE_TOKEN",
+            "pattern_present": true
+        }),
+        true,
+        json!({
+            "matches": [
+                {"path": "src/search.rs", "line": 1, "preview": "RAW_PREVIEW_MUST_NOT_APPEAR"},
+                {"path": "src/read.rs", "line": 2, "preview": "Authorization: Bearer PRIVATE_SECRET"},
+                {"path": "/root/git/private-drop/src/absolute.rs", "line": 3, "preview": "absolute"}
+            ]
+        }),
+    );
+    record_exploration_event(
+        &runtime,
+        &session,
+        "goto_definition",
+        json!({
+            "project": "test-project",
+            "path": "src/caller.rs",
+            "line": 3,
+            "column": 5
+        }),
+        true,
+        locations_output("src/caller.rs", &["src/definition.rs", "src/search.rs"]),
+    );
+    record_exploration_event(
+        &runtime,
+        &session,
+        "read_file",
+        json!({"project": "test-project", "path": "src/failed.rs"}),
+        false,
+        json!({"content": "FAILED_BODY_MUST_NOT_APPEAR"}),
+    );
+    for (tool, output) in [
+        (
+            "list_project_files",
+            json!({"entries": [{"path": "src/listed.rs", "kind": "file"}]}),
+        ),
+        (
+            "list_project_tracked_files",
+            json!({"files": [{"path": "src/tracked.rs"}]}),
+        ),
+        (
+            "project_overview",
+            json!({"key_files": [{"path": "src/overview.rs"}]}),
+        ),
+        (
+            "run_shell",
+            json!({"stdout": "src/from-shell.rs", "path": "src/from-shell.rs"}),
+        ),
+    ] {
+        record_exploration_event(
+            &runtime,
+            &session,
+            tool,
+            json!({"project": "test-project"}),
+            true,
+            output,
+        );
+    }
+
+    let summary = runtime.sessions.summary(&session, Some(200)).unwrap();
+    let feedback = feedback_for(&runtime, &summary, "continued");
+    let exploration = &feedback["attempt"]["exploration"];
+    assert_eq!(
+        exploration["observed_paths"],
+        json!([
+            "src/caller.rs",
+            "src/definition.rs",
+            "src/search.rs",
+            "src/read.rs"
+        ])
+    );
+    assert_eq!(exploration["total_observed_paths"], 4);
+    assert_eq!(exploration["truncated"], false);
+    assert_eq!(exploration["read_count"], 1);
+    assert_eq!(exploration["search_count"], 1);
+    assert_eq!(exploration["navigation_count"], 1);
+    assert_eq!(exploration["latest_tool"], "goto_definition");
+    assert_eq!(exploration["complete"], true);
+    assert!(feedback["attempt"]["suggested_next_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| action
+            == "continue from the recent exploration workset before repeating broad discovery"));
+
+    let serialized = serde_json::to_string(&feedback).unwrap();
+    for forbidden in [
+        "RAW_PATTERN_MUST_NOT_APPEAR",
+        "wc_pat_PRIVATE_TOKEN",
+        "RAW_PREVIEW_MUST_NOT_APPEAR",
+        "Authorization: Bearer PRIVATE_SECRET",
+        "/root/git/private-drop",
+        "READ_BODY_MUST_NOT_APPEAR",
+        "FAILED_BODY_MUST_NOT_APPEAR",
+        "src/listed.rs",
+        "src/tracked.rs",
+        "src/overview.rs",
+        "src/from-shell.rs",
+    ] {
+        assert!(
+            !serialized.contains(forbidden),
+            "feedback leaked {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn exploration_workset_reports_real_total_at_under_equal_and_over_limit() {
+    for (count, expected_returned, truncated) in [
+        (99usize, 99usize, false),
+        (100usize, 100usize, false),
+        (101usize, 100usize, true),
+    ] {
+        let runtime = test_runtime();
+        let session = create_session(&runtime, &format!("exploration limit {count}"));
+        add_instruction(&runtime, &session, "search", SessionMode::Inspect);
+        record_exploration_event(
+            &runtime,
+            &session,
+            "search_project_text",
+            json!({
+                "project": "test-project",
+                "pattern_present": true,
+                "result_mode": "count"
+            }),
+            true,
+            json!({
+                "files": (0..count)
+                    .map(|index| json!({
+                        "path": format!("src/observed-{index:03}.rs"),
+                        "match_count": index + 1
+                    }))
+                    .collect::<Vec<_>>(),
+                "total_match_count": count
+            }),
+        );
+        let summary = runtime.sessions.summary(&session, Some(200)).unwrap();
+        let feedback = feedback_for(&runtime, &summary, "continued");
+        let exploration = &feedback["attempt"]["exploration"];
+        assert_eq!(exploration["total_observed_paths"], count);
+        assert_eq!(
+            exploration["observed_paths"].as_array().unwrap().len(),
+            expected_returned
+        );
+        assert_eq!(exploration["truncated"], truncated);
+    }
+}
+
+#[test]
+fn exploration_is_segmented_by_the_latest_attempt_instruction() {
+    let runtime = test_runtime();
+    let session = create_session(&runtime, "exploration attempts");
+    add_instruction(&runtime, &session, "attempt A", SessionMode::Inspect);
+    record_exploration_event(
+        &runtime,
+        &session,
+        "read_file",
+        json!({"project": "test-project", "path": "src/attempt-a.rs"}),
+        true,
+        json!({}),
+    );
+    add_instruction(&runtime, &session, "attempt B", SessionMode::Normal);
+    record_exploration_event(
+        &runtime,
+        &session,
+        "read_file",
+        json!({"project": "test-project", "path": "src/attempt-b.rs"}),
+        true,
+        json!({}),
+    );
+
+    let summary = runtime.sessions.summary(&session, Some(200)).unwrap();
+    let feedback = feedback_for(&runtime, &summary, "continued");
+    assert_eq!(
+        feedback["attempt"]["exploration"]["observed_paths"],
+        json!(["src/attempt-b.rs"])
+    );
+    assert_eq!(feedback["attempt"]["exploration"]["read_count"], 1);
+}
+
+#[test]
+fn exploration_continuity_suggestion_is_lower_priority_than_blocking_evidence() {
+    let has_exploration_action = |feedback: &Value| {
+        feedback["attempt"]["suggested_next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| {
+                action
+                    == "continue from the recent exploration workset before repeating broad discovery"
+            })
+    };
+    let seed_read = |runtime: &ToolRuntime, title: &str| {
+        let session = create_session(runtime, title);
+        add_instruction(runtime, &session, "inspect", SessionMode::Inspect);
+        record_exploration_event(
+            runtime,
+            &session,
+            "read_file",
+            json!({"project": "test-project", "path": "src/seed.rs"}),
+            true,
+            json!({}),
+        );
+        session
+    };
+
+    let runtime = test_runtime();
+    let validation_session = seed_read(&runtime, "validation blocks exploration");
+    record_validation_event(
+        &runtime,
+        &validation_session,
+        "cargo_test",
+        false,
+        test_output(0, 1, 0, &["tests::failing"]),
+    );
+    let validation_summary = runtime
+        .sessions
+        .summary(&validation_session, Some(200))
+        .unwrap();
+    let validation_feedback = feedback_for(&runtime, &validation_summary, "continued");
+    assert_eq!(
+        validation_feedback["attempt"]["suggested_next_actions"][0],
+        "fix failing test tests::failing"
+    );
+    assert!(!has_exploration_action(&validation_feedback));
+
+    let job_session = seed_read(&runtime, "job blocks exploration");
+    let job_summary = runtime.sessions.summary(&job_session, Some(200)).unwrap();
+    let job_feedback = feedback_for_with_jobs(
+        &runtime,
+        &job_summary,
+        &json!({
+            "active_count": 1,
+            "running_count": 1,
+            "recovering_count": 0,
+            "terminal_pending_count": 0,
+            "recent": [{"status": "running"}]
+        }),
+        "continued",
+    );
+    assert!(!has_exploration_action(&job_feedback));
+
+    let risk_session = seed_read(&runtime, "risk blocks exploration");
+    post_session_message(&runtime, &risk_session, "risk", "review this risk");
+    let risk_summary = runtime.sessions.summary(&risk_session, Some(200)).unwrap();
+    let risk_discussion = runtime
+        .sessions
+        .discussion_summary(&risk_session, Some(20))
+        .unwrap();
+    let risk_feedback =
+        feedback_for_with_discussion(&runtime, &risk_summary, &risk_discussion, "continued");
+    assert!(!has_exploration_action(&risk_feedback));
+
+    let conflict_session = seed_read(&runtime, "conflict blocks exploration");
+    let conflict_summary = runtime
+        .sessions
+        .summary(&conflict_session, Some(200))
+        .unwrap();
+    let conflict_validation = validation_summary_from_events(&conflict_summary.events, 20);
+    let conflict_discussion = empty_discussion();
+    let conflict_feedback = continuation_feedback_value(ContinuationFeedbackInput {
+        session_summary: &conflict_summary,
+        validation: &conflict_validation,
+        jobs: &json!({"active_count": 0, "running_count": 0, "recent": []}),
+        discussion: &conflict_discussion,
+        continuation: "continued",
+        suggest_exploration_continuity: true,
+        workspace_conflicts: true,
+    });
+    assert!(!has_exploration_action(&conflict_feedback));
+}
+
 // =========================================================================
 // Resume / restart determinism
 // =========================================================================
@@ -437,6 +749,14 @@ fn resume_and_restart_produce_the_same_attempt_summary_without_appending_events(
     let runtime = test_runtime();
     let session = create_session(&runtime, "resume determinism");
     add_instruction(&runtime, &session, "do work", SessionMode::Normal);
+    record_exploration_event(
+        &runtime,
+        &session,
+        "read_file",
+        json!({"project": "test-project", "path": "src/deterministic.rs"}),
+        true,
+        json!({}),
+    );
     record_validation_event(&runtime, &session, "cargo_check", false, check_output(1, 0));
     record_validation_event(&runtime, &session, "cargo_check", true, check_output(0, 0));
 
@@ -450,6 +770,10 @@ fn resume_and_restart_produce_the_same_attempt_summary_without_appending_events(
     let feedback_b = feedback_for(&runtime, &summary_b, "resumed_explicitly");
 
     assert_eq!(feedback_a, feedback_b, "deterministic resume projection");
+    assert_eq!(
+        feedback_a["attempt"]["exploration"]["observed_paths"],
+        json!(["src/deterministic.rs"])
+    );
     assert_eq!(feedback_a["attempt"]["instruction"]["resumed"], true);
     assert_eq!(feedback_a["attempt"]["instruction"]["status"], "available");
 }
@@ -1528,6 +1852,19 @@ async fn start_coding_task_fresh_session_continuation_is_not_applicable() {
     let feedback = &first.output["continuation_feedback"];
     assert_eq!(feedback["status"], "not_applicable");
     assert_eq!(feedback["reason_code"], "fresh_session");
+    assert_eq!(
+        feedback["attempt"]["exploration"],
+        json!({
+            "observed_paths": [],
+            "total_observed_paths": 0,
+            "truncated": false,
+            "read_count": 0,
+            "search_count": 0,
+            "navigation_count": 0,
+            "latest_tool": null,
+            "complete": true
+        })
+    );
 }
 
 // =========================================================================
@@ -1692,6 +2029,14 @@ fn fresh_session_reports_not_applicable() {
     let feedback = feedback_for(&runtime, &summary, "created");
     assert_eq!(feedback["status"], "not_applicable");
     assert_eq!(feedback["reason_code"], "fresh_session");
+    assert_eq!(
+        feedback["attempt"]["exploration"]["observed_paths"],
+        json!([])
+    );
+    assert_eq!(
+        feedback["attempt"]["exploration"]["latest_tool"],
+        Value::Null
+    );
 }
 
 // =========================================================================
@@ -2060,6 +2405,53 @@ fn record_write(runtime: &ToolRuntime, session_id: &str, paths: &[&str]) {
         .record_tool_call_finished(start, true, &json!({"applied": true}), None, None);
 }
 
+fn record_exploration_event(
+    runtime: &ToolRuntime,
+    session_id: &str,
+    tool_name: &str,
+    arguments: Value,
+    success: bool,
+    output: Value,
+) {
+    let start = runtime.sessions.record_tool_call_started(
+        Some(session_id),
+        SessionTransport::Api,
+        tool_name,
+        &arguments,
+    );
+    runtime.sessions.record_tool_call_finished(
+        start,
+        success,
+        &output,
+        (!success).then_some("exploration failed"),
+        None,
+    );
+}
+
+fn locations_output(path: &str, locations: &[&str]) -> Value {
+    json!({
+        "project": "test-project",
+        "path": path,
+        "query_position": {"line": 3, "column": 5},
+        "locations": locations
+            .iter()
+            .enumerate()
+            .map(|(index, path)| json!({
+                "path": path,
+                "range": {
+                    "start": {"line": index + 1, "column": 1},
+                    "end": {"line": index + 1, "column": 2}
+                }
+            }))
+            .collect::<Vec<_>>(),
+        "total_results": locations.len(),
+        "returned_count": locations.len(),
+        "truncated": false,
+        "external_results_omitted": 0,
+        "invalid_results_omitted": 0
+    })
+}
+
 /// Project-scoped variants of the helpers above for real entry tests that
 /// dispatch tools against a registered agent project (e.g. validation_summary).
 fn add_instruction_for(
@@ -2242,6 +2634,8 @@ fn feedback_for_with_discussion(
         jobs: &jobs,
         discussion,
         continuation,
+        suggest_exploration_continuity: true,
+        workspace_conflicts: false,
     })
 }
 
@@ -2259,5 +2653,7 @@ fn feedback_for_with_jobs(
         jobs,
         discussion: &discussion,
         continuation,
+        suggest_exploration_continuity: true,
+        workspace_conflicts: false,
     })
 }
