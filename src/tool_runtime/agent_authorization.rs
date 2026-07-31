@@ -3,7 +3,7 @@ use super::{ProjectResolverError, ToolCall, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
 use crate::shell_protocol::{
     SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL, SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL,
-    SHELL_CLIENT_CAPABILITY_SSH_SHELL,
+    SHELL_CLIENT_CAPABILITY_SSH_SHELL, SHELL_CLIENT_CAPABILITY_SSH_WORKSPACE_READ,
 };
 
 /// The capability an agent-backed tool variant requires from the agent
@@ -48,6 +48,12 @@ impl ToolRuntime {
             return Ok(());
         }
         let client_id = proj.agent_client_id().map_err(ToolResult::err)?.to_string();
+        // Resource-bound operations this round does not support fail closed
+        // before any agent capability check or enqueue: the Runner-local
+        // project must never be touched.
+        if ssh_resource.is_some() && super::ssh_workspace::is_ssh_workspace_fail_closed_call(call) {
+            return Err(super::ssh_workspace::ssh_resource_unsupported_result(call));
+        }
         if self
             .shell_clients
             .get_client_view_for_auth(&client_id, auth)
@@ -103,6 +109,29 @@ impl ToolRuntime {
             }
         }
         if ssh_resource.is_some() {
+            // A resource-bound SSH workspace read requires the explicit
+            // `ssh_workspace_read` capability. A legacy runner that declares
+            // `ssh_shell` + `file_read`/`git` locally must fail closed here
+            // (before enqueue) rather than running the read on its local
+            // project checkout.
+            if super::ssh_workspace::is_ssh_workspace_read_call(call) {
+                if !self
+                    .shell_clients
+                    .client_supports_for_auth(
+                        &client_id,
+                        SHELL_CLIENT_CAPABILITY_SSH_WORKSPACE_READ,
+                        auth,
+                    )
+                    .await
+                    .map_err(ToolResult::err)?
+                {
+                    return Err(ToolResult::err(format!(
+                        "agent_capability_unavailable: agent client {} does not support {}",
+                        client_id, SHELL_CLIENT_CAPABILITY_SSH_WORKSPACE_READ
+                    )));
+                }
+                return Ok(());
+            }
             // An SSH persistent shell requires all three capabilities. A legacy
             // runner that predates ssh_persistent_shell must fail closed here
             // (before enqueue) rather than silently opening a local shell.

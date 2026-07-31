@@ -1207,6 +1207,11 @@ fn agent_register_capabilities(cfg: &AgentConfig) -> ShellClientCapabilities {
     // Older binaries omit this field and therefore fail closed; it is never
     // inferred from `ssh_shell` + `persistent_shell`.
     capabilities.ssh_persistent_shell = SshConnectionPool::is_available() && cfg!(unix);
+    // Structured SSH workspace reads are declared only when the Runner can
+    // really execute them: the OpenSSH executable plus the remote_workspace
+    // module present in this binary. Never inferred from `ssh_shell` +
+    // `file_read` + `git`.
+    capabilities.ssh_workspace_read = SshConnectionPool::is_available() && cfg!(unix);
     capabilities.structured_validation_argv = true;
     capabilities.project_lifecycle = true;
     // `job_state_reconciliation` is on by default. A hidden, test/ops-only env

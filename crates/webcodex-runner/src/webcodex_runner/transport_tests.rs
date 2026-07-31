@@ -454,6 +454,7 @@ fn sync_file_request(request_id: &str) -> ShellAgentShellRequest {
         sandbox: None,
         job_context: None,
         persistent_shell: None,
+        remote_workspace: None,
     }
 }
 
@@ -1782,6 +1783,7 @@ fn start_job_request(cwd: &Path, command: &str) -> ShellAgentShellRequest {
         sandbox: None,
         job_context: Some(crate::test_job_context(cwd, Vec::new())),
         persistent_shell: None,
+        remote_workspace: None,
     }
 }
 

@@ -555,7 +555,7 @@ pub(crate) fn search_agent_timeout_budget(effective_timeout_secs: u64) -> (u64, 
 }
 
 impl SearchResultMode {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Matches => "matches",
             Self::FilesWithMatches => "files_with_matches",

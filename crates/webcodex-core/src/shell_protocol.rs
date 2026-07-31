@@ -46,6 +46,10 @@ fn default_transport_polling() -> String {
 /// Protocol version announced by current `webcodex-runner` polling builds.
 pub const AGENT_PROTOCOL_VERSION_POLLING_V1: &str = "polling-v1";
 pub const VALIDATION_STEP_SPAWN_FAILED_CODE: &str = "validation_step_spawn_failed";
+/// Request kind carrying a typed [`RemoteWorkspaceReadRequest`] to a Runner that
+/// advertises `ssh_workspace_read`. The Runner builds fixed commands from the
+/// validated fields; it never treats this as arbitrary shell text.
+pub const SSH_WORKSPACE_READ_REQUEST_KIND: &str = "ssh_workspace_read";
 pub const VALIDATION_TOOL_UNAVAILABLE_CODE: &str = "validation_tool_unavailable";
 /// The step ran, but the executor lost the ability to reap it — `waitpid`
 /// answered with an error rather than a status. Distinct from a spawn
@@ -110,6 +114,12 @@ pub const SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL: &str = "persistent_shell";
 /// SSH persistent shell requires all three, and older runners that predate it
 /// must reject the request rather than silently opening a local shell.
 pub const SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL: &str = "ssh_persistent_shell";
+/// Structured read-only workspace tools executed on a Workflow Session's SSH
+/// resource (project overview, file reads/lists, text search, Git reads).
+/// Deliberately separate from `ssh_shell`, `file_read`, and `git`: an older
+/// runner that declares those locally must not silently run a Session-bound
+/// read against its local project checkout.
+pub const SHELL_CLIENT_CAPABILITY_SSH_WORKSPACE_READ: &str = "ssh_workspace_read";
 pub const SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV: &str = "structured_validation_argv";
 /// Explicit capability for agent-side read-only LSP navigation. Missing on
 /// older agents and defaults to `false` so the server never dispatches typed
@@ -132,6 +142,7 @@ pub const SHELL_CLIENT_CAPABILITY_NAMES: &[&str] = &[
     SHELL_CLIENT_CAPABILITY_SSH_SHELL,
     SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL,
     SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL,
+    SHELL_CLIENT_CAPABILITY_SSH_WORKSPACE_READ,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV,
     SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
     SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS,
@@ -186,6 +197,11 @@ pub struct ShellClientCapabilities {
     /// never inferred from `ssh_shell` + `persistent_shell`.
     #[serde(default)]
     pub ssh_persistent_shell: bool,
+    /// The Runner can run structured read-only workspace tools on a Workflow
+    /// Session's SSH resource. Missing on older runners and therefore fails
+    /// closed; it is never inferred from `ssh_shell` + `file_read` + `git`.
+    #[serde(default)]
+    pub ssh_workspace_read: bool,
     /// Validation plans use a fixed executable plus argv, never shell text.
     /// Missing on older agents and therefore fail-closed.
     #[serde(default)]
@@ -245,6 +261,7 @@ impl Default for ShellClientCapabilities {
             ssh_shell: false,
             persistent_shell: false,
             ssh_persistent_shell: false,
+            ssh_workspace_read: false,
             structured_validation_argv: false,
             lsp_read_only_navigation: false,
             sandbox_inspect_commands: false,
@@ -694,6 +711,65 @@ pub struct ShellAgentShellRequest {
     /// `job_id`/Job state and absent on all legacy request kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persistent_shell: Option<PersistentShellRequest>,
+    /// Typed structured read-only workspace operation on a Workflow Session's
+    /// SSH resource. Present only for `kind = "ssh_workspace_read"`. Never
+    /// carries arbitrary shell command text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_workspace: Option<RemoteWorkspaceReadRequest>,
+}
+
+/// Structured read-only workspace operation executed on a Workflow Session's
+/// SSH resource.
+///
+/// The Server sends only this validated operation plus validated fields; the
+/// Runner builds fixed commands from it with its own shell-quoting helper and
+/// never treats the payload as arbitrary shell text. `job_context` (not this
+/// struct) carries the named resource and Workflow Session id; `cwd` on the
+/// enclosing request is the Session's remote default cwd when one is set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteWorkspaceReadRequest {
+    /// Fixed operation name, one of: `read_file`, `list_project_files`,
+    /// `list_project_tracked_files`, `project_overview`, `search_project_text`,
+    /// `git_status`, `git_diff_summary`, `git_diff`, `git_diff_hunks`,
+    /// `git_log`.
+    pub operation: String,
+    /// Project-relative path (or `"."` for the workspace root). Absolute
+    /// paths and `..` are rejected before this payload is built.
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_globs: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_globs: Option<Vec<String>>,
+    /// `matches`, `files_with_matches`, or `count`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_before: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_after: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub with_line_numbers: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip: Option<usize>,
+    pub timeout_secs: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1594,6 +1670,7 @@ mod envelope_tests {
                 ssh_shell: true,
                 persistent_shell: true,
                 ssh_persistent_shell: true,
+                ssh_workspace_read: true,
                 structured_validation_argv: true,
                 lsp_read_only_navigation: false,
                 sandbox_inspect_commands: false,
@@ -1784,6 +1861,7 @@ mod envelope_tests {
             sandbox: None,
             job_context: None,
             persistent_shell: None,
+            remote_workspace: None,
         };
         let env = AgentEnvelope::Request { request };
         let json = env.to_json().unwrap();

@@ -138,11 +138,18 @@ ledger is then queued to the existing background writer. Persistence failures
 are reported through existing status and logs, and success does not mean a
 synchronous disk flush or promise rollback on a later writer failure.
 
-`run_shell`, `run_job`, and `open_session_shell` inherit these defaults.
-`run_shell` and `run_job` remain independent-process tools. When an SSH
-resource is selected, only those two tools execute remotely; file, Git, LSP,
-checkpoint, and persistent-shell tools remain bound to the registered project
-host. Remote cwd precedence for one-shot SSH commands is:
+`run_shell`, `run_job`, `open_session_shell`, and the structured SSH
+workspace-read tools inherit these defaults. When an SSH resource is selected:
+
+- `run_shell` and `run_job` execute remotely as independent-process tools.
+- The read-only workspace tools execute on the remote workspace (see
+  "Structured SSH workspace reads" below).
+- Write/edit/patch/artifact/checkpoint/validation/LSP/lifecycle tools are NOT
+  supported on an SSH resource and fail closed with
+  `ssh_resource_unsupported_for_request`; they never touch the Runner-local
+  project.
+
+Remote cwd precedence for one-shot SSH commands is:
 
 ```text
 per-call cwd
@@ -155,6 +162,50 @@ Each SSH `run_shell` / `run_job` command gets an independent remote exec
 channel. The Runner may reuse the authenticated transport for the same
 Session/resource pair, but it does not preserve `cd`, exports, aliases,
 functions, umask, or shell-process state between commands.
+
+### Structured SSH workspace reads
+
+When an exact, active, project-matched Workflow Session sets
+`execution_context.resource`, the following read-only tools execute against the
+SSH resource's remote workspace instead of the Runner-local project:
+
+```text
+project_overview
+list_project_files
+list_project_tracked_files
+read_file
+search_project_text
+git_status
+git_diff_summary
+git_diff
+git_diff_hunks
+git_log
+```
+
+The remote workspace root is resolved once per request:
+
+```text
+exact Session default_cwd
+> SSH resource default_cwd
+> remote login default directory
+```
+
+The Runner enters the effective root and pins the authoritative physical path
+via `pwd -P`; if the root cannot be entered or observed the request fails
+closed (`ssh_workspace_root_unavailable`). Tool paths are project-relative:
+absolute paths, URI forms, NUL/control characters, parent traversal, Windows
+drive/UNC forms, and overlong paths are rejected
+(`ssh_workspace_path_invalid`). A symlink resolving outside the root fails
+closed.
+
+Each structured read is a fixed, validated command executed on an independent
+SSH exec channel that reuses the existing authenticated transport. It never
+reuses an SSH persistent shell process: variables, functions, cwd, umask, and
+redirections set in a persistent shell cannot influence structured tools.
+Unsupported resource-bound operations (writes, edits, patches, artifact
+writes, checkpoints, structured validation, LSP, project lifecycle) fail
+closed with `ssh_resource_unsupported_for_request`, `command_started=false`,
+and no Agent request enqueued.
 
 A missing Session leaves execution unchanged. A mismatched Session fails or,
 on an explicitly authorized cross-project escape path, executes without
@@ -177,10 +228,11 @@ shell per Workflow Session. For an `agent:<client>:<project>` it is owned by
 that project's Runner process. The process manager also has a Server-owned
 executor branch for a hosting surface that supplies a Server-local project,
 although the current built-in public project registry advertises Agent projects
-only. It never executes through
-`execution_context.resource`: an SSH resource is rejected with
-`persistent_shell_ssh_resource_unsupported` rather than falling back locally.
-`inspect` and `read_only` Sessions cannot open or execute a persistent shell.
+only. When the exact Session pins an SSH resource, opening the shell executes
+remotely: the Runner opens a persistent shell process on the SSH resource's
+host (see the SSH persistent shell section below) rather than falling back
+locally. `inspect` and `read_only` Sessions cannot open or execute a persistent
+shell.
 
 Open resolution is explicit `cwd`/`shell`, then the exact Session's
 `default_cwd`/`default_shell`, then the project/Runner defaults. Profile
@@ -211,9 +263,11 @@ proved, it kills the group, marks the shell poisoned/lost, returns
 
 Persistent shells are process-local and are not durable Job records. Neither a
 Server nor Runner restart claims to recover or reattach one from ledger data.
-There is no SSH persistent shell, PTY, raw keystroke/input stream, terminal
-resize, WebSocket terminal UI, or full-screen terminal application support.
-The Session ledger stores bounded lifecycle and permission evidence
+An SSH persistent shell lives on the SSH resource's host and is likewise
+process-local. There is no PTY, raw keystroke/input stream, terminal resize,
+WebSocket terminal UI, or full-screen terminal application support. The
+structured SSH workspace reads never reuse a persistent shell process, and the
+Session ledger stores bounded lifecycle and permission evidence
 (`shell_id`, action, shell/execution state, error code, and completion flags),
 never command text, stdout/stderr, the complete environment, internal shell
 state, credentials, or unbounded command output.

@@ -255,6 +255,7 @@ impl ShellClientRegistry {
             sandbox,
             job_context: Some(job_context),
             persistent_shell: None,
+            remote_workspace: None,
         };
         let mut inner = self.inner.lock().await;
         let Some(client) = inner.clients.get(&client_id) else {
@@ -600,7 +601,8 @@ impl ShellClientRegistry {
                     lsp: None,
                     sandbox: None,
                     job_context: None,
-                    persistent_shell: None,
+            persistent_shell: None,
+            remote_workspace: None,
                 };
                 enqueue_pending_request_locked(
                     &mut inner,

@@ -86,6 +86,7 @@ fn shell_lsp_request(payload: AgentLspPayload) -> ShellAgentShellRequest {
         sandbox: None,
         job_context: None,
         persistent_shell: None,
+        remote_workspace: None,
     }
 }
 
@@ -305,6 +306,7 @@ fn status_does_not_start_server_and_unavailable_succeeds() {
         sandbox: None,
         job_context: None,
         persistent_shell: None,
+        remote_workspace: None,
     };
     let result = handle_lsp_request(&policy, &projects_dir, &supervisor, &req);
     let envelope = parse_agent_lsp_result_envelope(result.stdout.as_deref().unwrap()).unwrap();
@@ -1048,6 +1050,7 @@ fn missing_lsp_payload_returns_structured_error() {
         sandbox: None,
         job_context: None,
         persistent_shell: None,
+        remote_workspace: None,
     };
     let result = handle_lsp_request(
         &fixture.policy,
@@ -1095,6 +1098,7 @@ fn lsp_request_ignores_command_field() {
         sandbox: None,
         job_context: None,
         persistent_shell: None,
+        remote_workspace: None,
     };
     let result = handle_lsp_request(
         &fixture.policy,

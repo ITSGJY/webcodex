@@ -10,6 +10,7 @@ pub(crate) mod patches;
 pub(crate) mod persistent_shell;
 pub(crate) mod projects;
 pub(crate) mod remote_shell;
+pub(crate) mod remote_workspace;
 pub(crate) mod shell;
 pub(crate) mod shutdown;
 pub(crate) mod ssh;
@@ -56,6 +57,7 @@ pub(crate) use projects::{
 pub(crate) use projects::{
     handle_project_lifecycle_op, handle_project_op_with_temporary_projects_root, AgentProjectCache,
 };
+pub(crate) use remote_workspace::run_remote_workspace_read;
 #[cfg(test)]
 pub(crate) use shell::run_shell;
 #[cfg(test)]

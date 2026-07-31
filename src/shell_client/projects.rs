@@ -9,7 +9,8 @@ use crate::shell_protocol::{
     SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION, SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL,
     SHELL_CLIENT_CAPABILITY_PROJECT_LIFECYCLE, SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS,
     SHELL_CLIENT_CAPABILITY_SHELL, SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL,
-    SHELL_CLIENT_CAPABILITY_SSH_SHELL, SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV,
+    SHELL_CLIENT_CAPABILITY_SSH_SHELL, SHELL_CLIENT_CAPABILITY_SSH_WORKSPACE_READ,
+    SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV,
 };
 use std::fmt;
 
@@ -30,7 +31,7 @@ impl fmt::Display for ShellClientLookupError {
 
 impl std::error::Error for ShellClientLookupError {}
 
-fn capability_enabled(caps: &ShellClientCapabilities, capability: &str) -> bool {
+pub(crate) fn capability_enabled(caps: &ShellClientCapabilities, capability: &str) -> bool {
     match capability {
         SHELL_CLIENT_CAPABILITY_SHELL => caps.shell,
         SHELL_CLIENT_CAPABILITY_FILE_READ => caps.file_read,
@@ -42,6 +43,7 @@ fn capability_enabled(caps: &ShellClientCapabilities, capability: &str) -> bool 
         SHELL_CLIENT_CAPABILITY_SSH_SHELL => caps.ssh_shell,
         SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL => caps.persistent_shell,
         SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL => caps.ssh_persistent_shell,
+        SHELL_CLIENT_CAPABILITY_SSH_WORKSPACE_READ => caps.ssh_workspace_read,
         SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV => caps.structured_validation_argv,
         SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION => caps.lsp_read_only_navigation,
         SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS => caps.sandbox_inspect_commands,

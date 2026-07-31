@@ -49,6 +49,7 @@ mod session_tools;
 pub(crate) mod sessions;
 mod shell;
 mod shell_tools;
+mod ssh_workspace;
 pub(crate) mod startup_brief;
 mod surface;
 mod tool_audit;

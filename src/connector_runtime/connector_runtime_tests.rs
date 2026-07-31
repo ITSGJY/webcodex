@@ -36,6 +36,7 @@ async fn register_agent(registry: &ShellClientRegistry, project_id: &str, path: 
                     ssh_shell: false,
                     persistent_shell: false,
                     ssh_persistent_shell: false,
+                    ssh_workspace_read: false,
                     structured_validation_argv: true,
                     lsp_read_only_navigation: false,
                     sandbox_inspect_commands: false,

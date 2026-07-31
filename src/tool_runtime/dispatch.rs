@@ -265,16 +265,18 @@ impl ToolRuntime {
             if let (Some(session_id), Some(resolved)) =
                 (session_id.as_deref(), resolved_project.as_ref())
             {
-                if let Some(execution_context) = self
+                let ctx = self
                     .sessions
-                    .execution_context_for_project(session_id, &resolved.resolved_id)
-                {
+                    .execution_context_for_project(session_id, &resolved.resolved_id);
+                if let Some(execution_context) = ctx {
                     if matches!(
                         &call,
                         ToolCall::RunShell { .. }
                             | ToolCall::RunJob { .. }
                             | ToolCall::OpenSessionShell { .. }
-                    ) {
+                    ) || super::ssh_workspace::is_ssh_workspace_read_call(&call)
+                        || super::ssh_workspace::is_ssh_workspace_fail_closed_call(&call)
+                    {
                         ssh_resource = execution_context.resource.clone();
                     }
                     call = call.with_session_execution_context(&execution_context);
@@ -427,6 +429,7 @@ impl ToolRuntime {
                 execution_sandbox,
                 window,
                 ssh_resource.as_deref(),
+                session_id.as_deref(),
             )
             .await;
         let permission = permission.filter(|_| {
@@ -500,7 +503,22 @@ impl ToolRuntime {
         execution_sandbox: Option<&'static str>,
         window: Option<&crate::client_window::ClientWindow>,
         ssh_resource: Option<&str>,
+        ssh_session_id: Option<&str>,
     ) -> ToolResult {
+        // A resource-bound read tool executes against the SSH workspace, never
+        // the Runner-local project. A resource-bound operation this round does
+        // not support fails closed (no local access, no Agent request).
+        if let Some(resource) = ssh_resource {
+            if super::ssh_workspace::is_ssh_workspace_read_call(&call) {
+                let session_id = ssh_session_id.unwrap_or("");
+                return self
+                    .dispatch_ssh_workspace_read(call, resource, session_id, auth)
+                    .await;
+            }
+            if super::ssh_workspace::is_ssh_workspace_fail_closed_call(&call) {
+                return super::ssh_workspace::ssh_resource_unsupported_result(&call);
+            }
+        }
         match call {
             call @ (ToolCall::ListTools { .. }
             | ToolCall::ListAgents

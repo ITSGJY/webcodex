@@ -31,6 +31,7 @@ mod sessions_git;
 mod sessions_guards;
 mod sessions_instructions;
 mod sessions_resolver;
+mod ssh_workspace;
 mod startup_brief;
 mod sync_timeout;
 mod tool_call;

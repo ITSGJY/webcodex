@@ -2,7 +2,7 @@ use super::jobs::{
     command_preview, ensure_dispatch_supported_locked, ensure_queue_capacity_locked,
     PendingRequestEnqueueError,
 };
-use super::projects::ShellClientLookupError;
+use super::projects::{capability_enabled, ShellClientLookupError};
 use super::state::{PendingShellRequest, ShellClientRegistryInner};
 use super::validation::{
     validate_file_request, validate_id, validate_run_request, MAX_COMMAND_LEN,
@@ -10,10 +10,11 @@ use super::validation::{
 use super::{now_ts, ShellClientRegistry, CLIENT_ONLINE_WINDOW_SECS};
 use crate::lsp_bridge::{AgentLspPayload, AGENT_LSP_REQUEST_KIND};
 use crate::shell_protocol::{
-    PersistentShellRequest, PersistentShellResult, ShellAgentShellRequest, ShellFileOpRequest,
-    ShellJobContext, ShellRunRequest, ShellRunResponse,
+    PersistentShellRequest, PersistentShellResult, RemoteWorkspaceReadRequest,
+    ShellAgentShellRequest, ShellFileOpRequest, ShellJobContext, ShellRunRequest, ShellRunResponse,
     SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION, SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL,
     SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS, SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL,
+    SHELL_CLIENT_CAPABILITY_SSH_WORKSPACE_READ, SSH_WORKSPACE_READ_REQUEST_KIND,
 };
 use std::fmt;
 use tokio::sync::oneshot;
@@ -228,6 +229,7 @@ impl ShellClientRegistry {
             sandbox: None,
             job_context: None,
             persistent_shell: None,
+            remote_workspace: None,
         };
         let mut inner = self.inner.lock().await;
         enqueue_pending_request_locked(
@@ -323,6 +325,7 @@ impl ShellClientRegistry {
             sandbox: sandbox.clone(),
             job_context: ssh_context,
             persistent_shell: None,
+            remote_workspace: None,
         };
         let mut inner = self.inner.lock().await;
         if request
@@ -451,6 +454,7 @@ impl ShellClientRegistry {
             sandbox: None,
             job_context: job_context.clone(),
             persistent_shell: Some(request),
+            remote_workspace: None,
         };
         let mut inner = self.inner.lock().await;
         let Some(client) = inner.clients.get(&client_id) else {
@@ -542,6 +546,7 @@ impl ShellClientRegistry {
             sandbox: None,
             job_context: None,
             persistent_shell: None,
+            remote_workspace: None,
         };
         let mut inner = self.inner.lock().await;
         enqueue_pending_request_locked(
@@ -606,6 +611,7 @@ impl ShellClientRegistry {
             sandbox: None,
             job_context: None,
             persistent_shell: None,
+            remote_workspace: None,
         };
         let mut inner = self.inner.lock().await;
         enqueue_pending_request_locked(
@@ -617,6 +623,122 @@ impl ShellClientRegistry {
             None,
         )
         .map_err(EnqueueLspError::from)?;
+        notify_client_locked(&inner, &client_id);
+        Ok((request_id, rx))
+    }
+
+    /// Enqueue a typed structured read-only workspace operation on a Workflow
+    /// Session's SSH resource. The Server sends only the validated operation
+    /// plus validated fields; the Runner builds fixed commands from them.
+    ///
+    /// Capability gates before enqueue: `ssh_workspace_read` plus the base
+    /// capabilities the operation needs (`ssh_shell` + `file_read`/`git`).
+    /// A legacy runner that predates `ssh_workspace_read` is never sent the
+    /// request and never silently falls back to its local project checkout.
+    pub async fn enqueue_remote_workspace_read(
+        &self,
+        client_id: String,
+        read: RemoteWorkspaceReadRequest,
+        ssh_resource: String,
+        ssh_session_id: String,
+        requested_by: String,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+        validate_id(&client_id, "client_id")?;
+        let mut inner = self.inner.lock().await;
+        let Some(client) = inner.clients.get(&client_id) else {
+            return Err(format!("unknown shell client: {client_id}"));
+        };
+        if !client.capabilities.ssh_workspace_read {
+            return Err(format!(
+                "agent_capability_unavailable: agent client {} does not support {}",
+                client_id, SHELL_CLIENT_CAPABILITY_SSH_WORKSPACE_READ
+            ));
+        }
+        if !client.capabilities.ssh_shell {
+            return Err(format!(
+                "agent_capability_unavailable: agent client {} does not support ssh_shell",
+                client_id
+            ));
+        }
+        // The operation's base capability: file reads/list/scans need
+        // `file_read`; Git reads and the tracked-file index need `git`.
+        let needs_git = matches!(
+            read.operation.as_str(),
+            "git_status"
+                | "git_diff"
+                | "git_diff_summary"
+                | "git_diff_hunks"
+                | "git_log"
+                | "list_project_tracked_files"
+        );
+        let base = if needs_git { "git" } else { "file_read" };
+        if !capability_enabled(&client.capabilities, base) {
+            return Err(format!(
+                "agent_capability_unavailable: agent client {} does not support {}",
+                client_id, base
+            ));
+        }
+        let request_id = next_request_id();
+        let (tx, rx) = oneshot::channel();
+        let job_context = ShellJobContext {
+            runtime_project_id: None,
+            workflow_session_id: Some(ssh_session_id),
+            ssh_resource: Some(ssh_resource),
+            project_cwd: None,
+            cwd: None,
+            purpose: None,
+            shell: None,
+            command_preview: String::new(),
+            validation_steps: Vec::new(),
+        };
+        let request = ShellAgentShellRequest {
+            request_id: request_id.clone(),
+            client_id: client_id.clone(),
+            kind: SSH_WORKSPACE_READ_REQUEST_KIND.to_string(),
+            job_id: None,
+            cwd: None,
+            path: None,
+            content: None,
+            max_bytes: None,
+            old_text: None,
+            pattern: None,
+            expected_sha256: None,
+            expected_prefix: None,
+            start_line: None,
+            end_line: None,
+            line: None,
+            create_dirs: false,
+            command: String::new(),
+            stdin: None,
+            timeout_secs: read.timeout_secs.max(1),
+            requested_by,
+            created_at: now_ts(),
+            validation: None,
+            lsp: None,
+            sandbox: None,
+            job_context: Some(job_context),
+            persistent_shell: None,
+            remote_workspace: Some(read),
+        };
+        enqueue_pending_request_locked(
+            &mut inner,
+            &client_id,
+            request_id.clone(),
+            request,
+            Some(tx),
+            None,
+        )
+        .map_err(|error| match error {
+            PendingRequestEnqueueError::UnknownClient { client_id } => {
+                format!("unknown shell client: {client_id}")
+            }
+            PendingRequestEnqueueError::ClientOffline { client_id } => {
+                format!("shell client {client_id} is offline; reconnect the agent before retrying")
+            }
+            PendingRequestEnqueueError::QueueFull { client_id, limit } => {
+                format!("too many pending requests for shell client {client_id} (limit {limit})")
+            }
+        })?;
         notify_client_locked(&inner, &client_id);
         Ok((request_id, rx))
     }

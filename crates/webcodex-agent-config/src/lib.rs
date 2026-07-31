@@ -206,6 +206,7 @@ pub fn generated_agent_config_toml(opts: &AgentInitOptions) -> Result<String, St
             // after it has installed the persistent-shell manager.
             persistent_shell: false,
             ssh_persistent_shell: false,
+            ssh_workspace_read: false,
             structured_validation_argv: true,
             lsp_read_only_navigation: true,
             sandbox_inspect_commands: false,

@@ -1643,6 +1643,7 @@ fn shell_job_request(cwd: &Path, command: &str) -> ShellAgentShellRequest {
         sandbox: None,
         job_context: Some(test_job_context(cwd, Vec::new())),
         persistent_shell: None,
+        remote_workspace: None,
     }
 }
 
@@ -1709,6 +1710,7 @@ fn line_edit_request(
         sandbox: None,
         job_context: None,
         persistent_shell: None,
+        remote_workspace: None,
     }
 }
 
@@ -1748,6 +1750,7 @@ fn anchor_edit_request(
         sandbox: None,
         job_context: None,
         persistent_shell: None,
+        remote_workspace: None,
     }
 }
 
@@ -1785,6 +1788,7 @@ fn file_read_request(
         sandbox: None,
         job_context: None,
         persistent_shell: None,
+        remote_workspace: None,
     }
 }
 
@@ -2305,6 +2309,7 @@ fn apply_text_edits_request(
         sandbox: None,
         job_context: None,
         persistent_shell: None,
+        remote_workspace: None,
     }
 }
 
@@ -2341,6 +2346,7 @@ fn json_file_op_request(
         sandbox: None,
         job_context: None,
         persistent_shell: None,
+        remote_workspace: None,
     }
 }
 
@@ -5397,6 +5403,7 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
         sandbox: None,
         job_context: Some(test_job_context(tmp.path(), Vec::new())),
         persistent_shell: None,
+        remote_workspace: None,
     };
     let mut rejected_request = request.clone();
     rejected_request.request_id = "req-after-shutdown".to_string();
@@ -5540,6 +5547,7 @@ fn dispatch_request_anchor_edit_routes_to_file_handler() {
         sandbox: None,
         job_context: None,
         persistent_shell: None,
+        remote_workspace: None,
     };
     let pdir = projects_dir(&cfg);
     let lsp = webcodex_runner::LspSupervisor::default();
@@ -5626,6 +5634,7 @@ fn dispatch_request_run_shell_sends_result_over_sink() {
             sandbox: None,
             job_context: None,
             persistent_shell: None,
+            remote_workspace: None,
         };
         let ran = dispatch_request(
             &sink,
@@ -5690,6 +5699,7 @@ fn project_request(kind: &str, payload: serde_json::Value) -> ShellAgentShellReq
         sandbox: None,
         job_context: None,
         persistent_shell: None,
+        remote_workspace: None,
     }
 }
 

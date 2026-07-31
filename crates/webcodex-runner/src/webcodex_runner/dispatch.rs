@@ -4,10 +4,11 @@ use super::transport::ResultSubmission;
 use super::validation::{handle_validation_request, is_validation_request_kind};
 use super::{
     handle_project_lifecycle_op, handle_project_op_with_temporary_projects_root,
-    run_shell_with_profiles_in_sandbox, run_ssh_shell, AgentSink, CommandResult, HotAgentConfig,
-    PersistentShellManager, ReloadableAgentConfig, SubmitResultError,
+    run_remote_workspace_read, run_shell_with_profiles_in_sandbox, run_ssh_shell, AgentSink,
+    CommandResult, HotAgentConfig, PersistentShellManager, ReloadableAgentConfig,
+    SubmitResultError,
 };
-use crate::shell_protocol::ShellAgentShellRequest;
+use crate::shell_protocol::{ShellAgentShellRequest, SSH_WORKSPACE_READ_REQUEST_KIND};
 use crate::{handle_file_request, is_file_request_kind, JobManager};
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -63,6 +64,54 @@ pub(crate) fn dispatch_request(
             }
         }
         return submitted.map(|_| true);
+    }
+    // Structured read-only workspace tools execute on the SSH resource through
+    // a fixed, typed operation. This branch is independent of `ssh_resource`
+    // presence: a missing payload, resource, or Workflow Session fails closed
+    // rather than falling through to arbitrary shell execution.
+    if request.kind == SSH_WORKSPACE_READ_REQUEST_KIND {
+        let result = match (ssh_resource, ssh_session_id, request.remote_workspace.as_ref()) {
+            (Some(resource), Some(session_id), Some(read)) => run_remote_workspace_read(
+                &jobs.ssh_pool,
+                config.generation,
+                &config.ssh,
+                policy,
+                resource,
+                session_id,
+                request.cwd.as_deref(),
+                read,
+            ),
+            (None, _, _) => CommandResult {
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+                duration_ms: Some(0),
+                error: Some(
+                    "ssh_resource_required: structured SSH workspace reads require a Workflow Session SSH resource; command was not started".to_string(),
+                ),
+            },
+            (_, None, _) => CommandResult {
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+                duration_ms: Some(0),
+                error: Some(
+                    "ssh_session_required: an SSH resource requires a Workflow Session id; command was not started".to_string(),
+                ),
+            },
+            (_, _, None) => CommandResult {
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+                duration_ms: Some(0),
+                error: Some(
+                    "ssh_workspace_read_missing_payload: the structured SSH workspace read payload is missing; command was not started".to_string(),
+                ),
+            },
+        };
+        return sink
+            .submit_result_with_metadata(request.request_id, result, config, runtime)
+            .map(|_| true);
     }
     // Inspect requests must stay on the native execution path where Landlock
     // is applied in pre_exec. External providers are not an equivalent local

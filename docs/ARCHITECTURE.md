@@ -149,8 +149,22 @@ advertises Agent projects only. One-shot `run_shell`/`run_job` never share its
 process state.
 Dedicated control framing separates completion from bounded stdout/stderr;
 timeout synchronization failure poisons and kills the shell. Shell records do
-not imply restart recovery, and SSH resources, PTYs, or terminal streams are
-not part of this model.
+not imply restart recovery. When the exact Workflow Session pins an SSH
+resource, the persistent shell is opened and executed on that resource's host
+over the authenticated transport; a legacy Runner or a resource lacking the
+required capabilities fails closed rather than opening a local shell. PTYs,
+raw terminal streams, and full-screen terminal applications are not part of
+this model.
+Separate from the persistent shell, an exact Session-pinned SSH resource also
+routes the read-only workspace tools (`read_file`, `list_project_files`,
+`list_project_tracked_files`, `project_overview`, `search_project_text`,
+`git_status`, `git_diff_summary`, `git_diff`, `git_diff_hunks`, `git_log`) to
+the remote workspace behind an explicit `ssh_workspace_read` capability.
+Unsupported resource-bound operations (writes, edits, patches, artifacts,
+checkpoints, structured validation, LSP, lifecycle) fail closed with
+`ssh_resource_unsupported_for_request` and never touch the Runner-local
+project or enqueue an Agent request. Structured reads run as fixed commands on
+independent exec channels and never reuse a persistent shell process.
 The Connector Task ledger and Workflow Session ledger remain separate internal
 models; neither is copied into the other.
 

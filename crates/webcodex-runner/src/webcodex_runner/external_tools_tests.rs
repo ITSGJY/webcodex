@@ -207,6 +207,7 @@ fn agent_request(
         sandbox: None,
         job_context: None,
         persistent_shell: None,
+        remote_workspace: None,
     }
 }
 

@@ -1066,6 +1066,7 @@ mod tests {
                 timeout_secs: Some(5),
                 purpose: None,
             }),
+            remote_workspace: None,
         }
     }
 
