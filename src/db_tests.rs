@@ -2,7 +2,6 @@
 
 use super::*;
 
-
 #[test]
 fn open_drops_retired_legacy_tables() {
     let tmp = tempfile::tempdir().unwrap();

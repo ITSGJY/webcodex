@@ -8,9 +8,10 @@
 //! rendering approval/result/review/validation projections. They live here so
 //! the runtime module reads as orchestration rather than a wall of formatting.
 
+use super::wire_models::FilesSearchInput;
 use super::{
-    execution, CONNECTOR_SEARCH_WINDOW, MODEL_SURFACE_CANONICAL_CONNECTOR,
-    MODEL_SURFACE_FULL_OPERATOR_RUNTIME, ConnectorCallOutcome,
+    execution, ConnectorCallOutcome, CONNECTOR_SEARCH_WINDOW, MODEL_SURFACE_CANONICAL_CONNECTOR,
+    MODEL_SURFACE_FULL_OPERATOR_RUNTIME,
 };
 use crate::auth::{
     AuthContext, AuthKind, SCOPE_JOB_RUN, SCOPE_PROJECT_READ, SCOPE_PROJECT_WRITE,
@@ -24,7 +25,6 @@ use crate::db::{
 use crate::project_context::{ContextRefreshSummary, ProjectContextFingerprint};
 use crate::tool_runtime::validation_profile::RecipeError;
 use crate::tool_runtime::{ApplyFileChangeInput, SearchResultMode, ToolResult};
-use super::wire_models::FilesSearchInput;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
