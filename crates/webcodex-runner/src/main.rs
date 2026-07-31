@@ -1203,6 +1203,10 @@ fn agent_register_capabilities(cfg: &AgentConfig) -> ShellClientCapabilities {
     // This binary installs the bounded, process-local persistent-shell
     // manager. Older binaries omit this field and therefore fail closed.
     capabilities.persistent_shell = cfg!(unix);
+    // SSH persistent shells reuse the same OpenSSH executable as `ssh_shell`.
+    // Older binaries omit this field and therefore fail closed; it is never
+    // inferred from `ssh_shell` + `persistent_shell`.
+    capabilities.ssh_persistent_shell = SshConnectionPool::is_available() && cfg!(unix);
     capabilities.structured_validation_argv = true;
     capabilities.project_lifecycle = true;
     // `job_state_reconciliation` is on by default. A hidden, test/ops-only env

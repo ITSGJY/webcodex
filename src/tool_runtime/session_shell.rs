@@ -3,7 +3,7 @@ use super::helpers::{
 };
 use super::{ExecutionPurpose, ExecutionShell, ToolResult, ToolRuntime};
 use crate::projects::ProjectConfig;
-use crate::shell_protocol::{PersistentShellRequest, PersistentShellResult};
+use crate::shell_protocol::{PersistentShellRequest, PersistentShellResult, ShellJobContext};
 use serde_json::json;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -30,9 +30,14 @@ struct SessionShellRecord {
     runtime_project_id: String,
     executor: String,
     client_id: Option<String>,
+    /// Named SSH resource this shell is bound to, if any. `None` for local and
+    /// plain agent shells. Bound at open and never re-derived from Session
+    /// context, so a later context change cannot redirect an open shell.
+    resource: Option<String>,
     shell: String,
     profile: Option<String>,
     initial_cwd: String,
+    initial_cwd_frozen: bool,
     cwd: String,
     created_at: i64,
     last_activity_at: i64,
@@ -45,6 +50,23 @@ struct SessionShellRecord {
 impl SessionShellRecord {
     fn is_active(&self) -> bool {
         matches!(self.state.as_str(), "opening" | "running")
+    }
+
+    /// Build the safe `ShellJobContext` that routes this shell to its bound
+    /// Runner resource. Carries only the named resource + ids; never host,
+    /// ControlPath, credentials, or command text.
+    fn job_context(&self) -> Option<ShellJobContext> {
+        self.resource.as_ref().map(|resource| ShellJobContext {
+            runtime_project_id: Some(self.runtime_project_id.clone()),
+            workflow_session_id: Some(self.workflow_session_id.clone()),
+            ssh_resource: Some(resource.clone()),
+            project_cwd: None,
+            cwd: None,
+            purpose: None,
+            shell: None,
+            command_preview: String::new(),
+            validation_steps: Vec::new(),
+        })
     }
 }
 
@@ -80,6 +102,7 @@ impl SessionShellRegistry {
         runtime_project_id: &str,
         executor: &str,
         client_id: Option<String>,
+        resource: Option<String>,
         shell: &str,
         initial_cwd: &str,
     ) -> Result<String, String> {
@@ -114,9 +137,11 @@ impl SessionShellRegistry {
                 runtime_project_id: runtime_project_id.to_string(),
                 executor: executor.to_string(),
                 client_id,
+                resource,
                 shell: shell.to_string(),
                 profile: None,
                 initial_cwd: initial_cwd.to_string(),
+                initial_cwd_frozen: false,
                 cwd: initial_cwd.to_string(),
                 created_at: now,
                 last_activity_at: now,
@@ -215,8 +240,11 @@ impl SessionShellRegistry {
         if let Some(cwd) = &result.cwd {
             record.cwd = cwd.clone();
         }
-        if let Some(initial_cwd) = &result.initial_cwd {
-            record.initial_cwd = initial_cwd.clone();
+        if !record.initial_cwd_frozen {
+            if let Some(initial_cwd) = result.initial_cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
+                record.initial_cwd = initial_cwd.to_string();
+                record.initial_cwd_frozen = true;
+            }
         }
         if let Some(shell) = &result.shell {
             record.shell = shell.clone();
@@ -324,14 +352,7 @@ impl ToolRuntime {
                 cwd,
                 shell,
             } => {
-                if ssh_resource.is_some() {
-                    return shell_tool_error(
-                        "persistent_shell_ssh_resource_unsupported",
-                        "Session persistent shells execute only on the project host; SSH resources are unsupported",
-                        None,
-                    );
-                }
-                self.open_session_shell(project, session_id, cwd, shell)
+                self.open_session_shell(project, session_id, cwd, shell, ssh_resource)
                     .await
             }
             super::ToolCall::SessionShellExec {
@@ -378,6 +399,7 @@ impl ToolRuntime {
         session_id: String,
         cwd: Option<String>,
         shell: Option<ExecutionShell>,
+        ssh_resource: Option<&str>,
     ) -> ToolResult {
         let resolved = match self.resolve_project_input(&project).await {
             Ok(resolved) => resolved,
@@ -388,6 +410,102 @@ impl ToolRuntime {
         self.reconcile_active_shell_before_open(&session_id, &runtime_project_id)
             .await;
         let shell_name = shell.map(|shell| shell.as_str()).unwrap_or("sh");
+        // An SSH persistent shell still runs through the agent Runner (the
+        // Runner opens the remote shell on its host). It is only valid for an
+        // agent-backed project with a named SSH resource.
+        if let Some(resource) = ssh_resource {
+            if !project_config.is_agent() {
+                return shell_tool_error(
+                    "ssh_resource_requires_agent_project",
+                    "SSH resources require a project owned by a connected Runner",
+                    None,
+                );
+            }
+            let client_id = match project_config.agent_client_id() {
+                Ok(client_id) => client_id.to_string(),
+                Err(error) => return ToolResult::err(error),
+            };
+            // Remote cwd: explicit open cwd > Session default_cwd (already
+            // validated remote-path-shaped) > Runner resource default_cwd /
+            // remote login default (filled by the Runner). It is NOT constrained
+            // to the local project root.
+            let effective_cwd = match resolve_remote_cwd(cwd.as_deref()) {
+                Ok(cwd) => cwd,
+                Err(error) => return shell_tool_error("persistent_shell_cwd_invalid", error, None),
+            };
+            let shell_id = match self
+                .session_shells
+                .reserve_open(
+                    &session_id,
+                    &runtime_project_id,
+                    "ssh",
+                    Some(client_id.clone()),
+                    Some(resource.to_string()),
+                    shell_name,
+                    effective_cwd.as_deref().unwrap_or(""),
+                )
+                .await
+            {
+                Ok(shell_id) => shell_id,
+                Err(error) => return shell_tool_error_from_message(error, None),
+            };
+            let job_context = ShellJobContext {
+                runtime_project_id: Some(runtime_project_id.clone()),
+                workflow_session_id: Some(session_id.clone()),
+                ssh_resource: Some(resource.to_string()),
+                project_cwd: None,
+                cwd: effective_cwd.clone(),
+                purpose: None,
+                shell: None,
+                command_preview: String::new(),
+                validation_steps: Vec::new(),
+            };
+            let request = PersistentShellRequest {
+                action: "open".to_string(),
+                shell_id: shell_id.clone(),
+                workflow_session_id: session_id.clone(),
+                runtime_project_id: runtime_project_id.clone(),
+                cwd: effective_cwd,
+                shell: shell.map(|shell| shell.as_str().to_string()),
+                command: None,
+                timeout_secs: None,
+                purpose: None,
+            };
+            let result = match self
+                .run_agent_persistent_shell(&client_id, request, Some(job_context), 35)
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    if let Ok(record) = self
+                        .session_shells
+                        .record_for_operation(&session_id, &runtime_project_id, &shell_id)
+                        .await
+                    {
+                        self.close_or_mark_lost(&record, "runner_open_result_lost", &error)
+                            .await;
+                    }
+                    return shell_tool_lost_error_from_message(error, Some(&shell_id));
+                }
+            };
+            self.session_shells.apply_result(&result).await;
+            if let Some(error) = self
+                .close_opened_shell_if_session_inactive(&session_id, &runtime_project_id, &shell_id)
+                .await
+            {
+                return error;
+            }
+            return persistent_result_to_tool(
+                result,
+                &project_config,
+                &runtime_project_id,
+                &session_id,
+                "open",
+                "ssh",
+                ssh_resource,
+                None,
+            );
+        }
         if project_config.is_agent() {
             let client_id = match project_config.agent_client_id() {
                 Ok(client_id) => client_id.to_string(),
@@ -404,6 +522,7 @@ impl ToolRuntime {
                     &runtime_project_id,
                     "agent",
                     Some(client_id.clone()),
+                    None,
                     shell_name,
                     &effective_cwd,
                 )
@@ -424,7 +543,7 @@ impl ToolRuntime {
                 purpose: None,
             };
             let result = match self
-                .run_agent_persistent_shell(&client_id, request, 35)
+                .run_agent_persistent_shell(&client_id, request, None, 35)
                 .await
             {
                 Ok(result) => result,
@@ -453,6 +572,8 @@ impl ToolRuntime {
                 &runtime_project_id,
                 &session_id,
                 "open",
+                "agent",
+                None,
                 None,
             )
         } else {
@@ -467,6 +588,7 @@ impl ToolRuntime {
                     &session_id,
                     &runtime_project_id,
                     "local",
+                    None,
                     None,
                     shell_name,
                     &cwd_text,
@@ -498,6 +620,8 @@ impl ToolRuntime {
                         &runtime_project_id,
                         &session_id,
                         "open",
+                        "local",
+                        None,
                         None,
                     )
                 }
@@ -587,7 +711,7 @@ impl ToolRuntime {
                 );
             }
         }
-        let result = if record.executor == "agent" {
+        let result = if record.executor == "agent" || record.executor == "ssh" {
             let client_id = record.client_id.as_deref().unwrap_or_default();
             let request = PersistentShellRequest {
                 action: "exec".to_string(),
@@ -600,8 +724,13 @@ impl ToolRuntime {
                 timeout_secs: Some(timeout_secs),
                 purpose: purpose.map(|purpose| purpose.as_str().to_string()),
             };
-            self.run_agent_persistent_shell(client_id, request, timeout_secs + 5)
-                .await
+            self.run_agent_persistent_shell(
+                client_id,
+                request,
+                record.job_context(),
+                timeout_secs + 5,
+            )
+            .await
         } else {
             let local_processes = self.session_shells.local_processes.clone();
             let local_shell_id = shell_id.clone();
@@ -687,6 +816,8 @@ impl ToolRuntime {
             &runtime_project_id,
             &session_id,
             "exec",
+            record.executor.as_str(),
+            record.resource.as_deref(),
             purpose,
         )
     }
@@ -714,7 +845,7 @@ impl ToolRuntime {
         if !record.is_active() {
             return persistent_record_to_tool(record, &project_config, "status");
         }
-        let result = if record.executor == "agent" {
+        let result = if record.executor == "agent" || record.executor == "ssh" {
             self.run_agent_persistent_shell(
                 record.client_id.as_deref().unwrap_or_default(),
                 PersistentShellRequest {
@@ -728,6 +859,7 @@ impl ToolRuntime {
                     timeout_secs: None,
                     purpose: None,
                 },
+                record.job_context(),
                 5,
             )
             .await
@@ -766,6 +898,8 @@ impl ToolRuntime {
             &runtime_project_id,
             &session_id,
             "status",
+            record.executor.as_str(),
+            record.resource.as_deref(),
             None,
         )
     }
@@ -803,6 +937,8 @@ impl ToolRuntime {
                     &runtime_project_id,
                     &session_id,
                     "close",
+                    record.executor.as_str(),
+                    record.resource.as_deref(),
                     None,
                 )
             }
@@ -818,7 +954,7 @@ impl ToolRuntime {
         record: &SessionShellRecord,
         reason: &str,
     ) -> Result<PersistentShellResult, String> {
-        if record.executor == "agent" {
+        if record.executor == "agent" || record.executor == "ssh" {
             self.run_agent_persistent_shell(
                 record.client_id.as_deref().unwrap_or_default(),
                 PersistentShellRequest {
@@ -832,6 +968,7 @@ impl ToolRuntime {
                     timeout_secs: None,
                     purpose: Some(reason.to_string()),
                 },
+                record.job_context(),
                 10,
             )
             .await
@@ -865,7 +1002,7 @@ impl ToolRuntime {
             .into_iter()
             .filter(|record| record.runtime_project_id == runtime_project_id)
         {
-            let result = if record.executor == "agent" {
+            let result = if record.executor == "agent" || record.executor == "ssh" {
                 self.run_agent_persistent_shell(
                     record.client_id.as_deref().unwrap_or_default(),
                     PersistentShellRequest {
@@ -879,6 +1016,7 @@ impl ToolRuntime {
                         timeout_secs: None,
                         purpose: None,
                     },
+                    record.job_context(),
                     5,
                 )
                 .await
@@ -1032,11 +1170,17 @@ impl ToolRuntime {
         &self,
         client_id: &str,
         request: PersistentShellRequest,
+        job_context: Option<ShellJobContext>,
         wait_secs: u64,
     ) -> Result<PersistentShellResult, String> {
         let (request_id, receiver) = self
             .shell_clients
-            .enqueue_persistent_shell(client_id.to_string(), request, "tool_runtime".to_string())
+            .enqueue_persistent_shell(
+                client_id.to_string(),
+                request,
+                job_context,
+                "tool_runtime".to_string(),
+            )
             .await?;
         match tokio::time::timeout(Duration::from_secs(wait_secs), receiver).await {
             Ok(Ok(result)) => Ok(result),
@@ -1056,6 +1200,20 @@ impl ToolRuntime {
             }
         }
     }
+}
+
+/// Resolve the remote cwd for an SSH persistent shell. Unlike the local/agent
+/// paths it is NOT constrained to the project root: it is a remote path that
+/// only needs the existing bounded remote-path shape validation. `None` lets
+/// the Runner fall back to the resource default_cwd / remote login default.
+fn resolve_remote_cwd(cwd: Option<&str>) -> Result<Option<String>, String> {
+    let Some(cwd) = cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) else {
+        return Ok(None);
+    };
+    if cwd.len() > 4096 || cwd.chars().any(char::is_control) {
+        return Err("cwd must be a bounded remote path without control characters".to_string());
+    }
+    Ok(Some(cwd.to_string()))
 }
 
 fn local_cwd_within_project(project: &ProjectConfig, cwd: &Path) -> bool {
@@ -1206,6 +1364,8 @@ fn persistent_record_to_tool(
         &record.runtime_project_id,
         &record.workflow_session_id,
         action,
+        record.executor.as_str(),
+        record.resource.as_deref(),
         None,
     )
 }
@@ -1216,6 +1376,8 @@ fn persistent_result_to_tool(
     runtime_project_id: &str,
     session_id: &str,
     action: &str,
+    executor: &str,
+    resource: Option<&str>,
     purpose: Option<ExecutionPurpose>,
 ) -> ToolResult {
     normalize_persistent_result_state(&mut result);
@@ -1226,7 +1388,8 @@ fn persistent_result_to_tool(
         "shell_id": result.shell_id,
         "project": runtime_project_id,
         "session_id": session_id,
-        "executor": if project.is_agent() { "agent" } else { "local" },
+        "executor": executor,
+        "resource": resource,
         "shell": result.shell,
         "profile": result.profile,
         "initial_cwd": initial_cwd,

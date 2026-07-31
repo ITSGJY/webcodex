@@ -4335,7 +4335,10 @@ fn prepared_profile_run_shell_and_run_job_see_same_env() {
     let mut cfg = test_config(projects_dir.clone());
     cfg.shell = shell.clone();
     let hot = runtime_config(&cfg);
-    let persistent_shells = webcodex_runner::PersistentShellManager::new(&cfg.shell);
+    let persistent_shells = webcodex_runner::PersistentShellManager::new(
+        &cfg.shell,
+        webcodex_runner::SshConnectionPool::default(),
+    );
     dispatch_request(
         &sink,
         &hot.snapshot(),
@@ -5541,7 +5544,10 @@ fn dispatch_request_anchor_edit_routes_to_file_handler() {
     let pdir = projects_dir(&cfg);
     let lsp = webcodex_runner::LspSupervisor::default();
     let hot = runtime_config(&cfg);
-    let persistent_shells = webcodex_runner::PersistentShellManager::new(&cfg.shell);
+    let persistent_shells = webcodex_runner::PersistentShellManager::new(
+        &cfg.shell,
+        webcodex_runner::SshConnectionPool::default(),
+    );
     let ran = dispatch_request(
         &sink,
         &hot.snapshot(),
@@ -5577,7 +5583,10 @@ fn dispatch_request_run_shell_sends_result_over_sink() {
     let jobs = JobManager::new(max_concurrent_jobs(&cfg));
     let pdir = projects_dir(&cfg);
     let hot = runtime_config(&cfg);
-    let persistent_shells = webcodex_runner::PersistentShellManager::new(&cfg.shell);
+    let persistent_shells = webcodex_runner::PersistentShellManager::new(
+        &cfg.shell,
+        webcodex_runner::SshConnectionPool::default(),
+    );
 
     type SinkFactory = fn(&str) -> (AgentSink, tokio::sync::mpsc::Receiver<AgentEnvelope>);
     for (label, make_sink, client_id, cmd) in [

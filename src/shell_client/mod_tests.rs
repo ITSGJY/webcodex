@@ -812,6 +812,7 @@ async fn client_supports_recognizes_all_protocol_capability_names() {
                 async_shell_jobs: true,
                 ssh_shell: true,
                 persistent_shell: true,
+                ssh_persistent_shell: true,
                 structured_validation_argv: true,
                 lsp_read_only_navigation: true,
                 sandbox_inspect_commands: true,

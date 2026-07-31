@@ -140,11 +140,16 @@ impl AgentRuntimeState {
     }
 
     fn with_shutdown_budget(cfg: &AgentConfig, path: PathBuf, budget: Duration) -> Self {
+        let jobs = JobManager::new(max_concurrent_jobs(cfg));
+        // Persistent shells reuse the same authenticated OpenSSH multiplex pool
+        // as async jobs: one transport per (session, resource, generation),
+        // never a second SSH configuration or connection pool.
+        let persistent_shells = PersistentShellManager::new(&cfg.shell, jobs.ssh_pool.clone());
         Self {
             lsp: LspSupervisor::default(),
             config: Arc::new(ReloadableAgentConfig::new(cfg.clone(), path)),
-            jobs: JobManager::new(max_concurrent_jobs(cfg)),
-            persistent_shells: PersistentShellManager::new(&cfg.shell),
+            jobs,
+            persistent_shells,
             coordinator: Arc::new(ShutdownCoordinator::new(budget)),
             reload_threads: Arc::new(BackgroundThreads::default()),
             background_threads: Arc::new(BackgroundThreads::default()),

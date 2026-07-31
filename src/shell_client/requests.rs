@@ -13,7 +13,7 @@ use crate::shell_protocol::{
     PersistentShellRequest, PersistentShellResult, ShellAgentShellRequest, ShellFileOpRequest,
     ShellJobContext, ShellRunRequest, ShellRunResponse,
     SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION, SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL,
-    SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS,
+    SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS, SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL,
 };
 use std::fmt;
 use tokio::sync::oneshot;
@@ -378,10 +378,17 @@ impl ShellClientRegistry {
 
     /// Enqueue one explicit persistent-shell lifecycle operation. Capability
     /// absence is a hard failure; there is no fallback to `run_shell`.
+    ///
+    /// `job_context` carries safe Session/resource metadata so the Runner can
+    /// route an SSH persistent shell to its bound resource; it is `None` for
+    /// local persistent shells. SSH persistent shells additionally require the
+    /// `ssh_persistent_shell` capability (plus `ssh_shell` and
+    /// `persistent_shell`); absence fails closed before enqueue.
     pub(crate) async fn enqueue_persistent_shell(
         &self,
         client_id: String,
         request: PersistentShellRequest,
+        job_context: Option<ShellJobContext>,
         requested_by: String,
     ) -> Result<(String, oneshot::Receiver<PersistentShellResult>), String> {
         validate_id(&client_id, "client_id")?;
@@ -442,7 +449,7 @@ impl ShellClientRegistry {
             validation: None,
             lsp: None,
             sandbox: None,
-            job_context: None,
+            job_context: job_context.clone(),
             persistent_shell: Some(request),
         };
         let mut inner = self.inner.lock().await;
@@ -452,6 +459,18 @@ impl ShellClientRegistry {
         if !client.capabilities.persistent_shell {
             return Err(format!(
                 "agent_capability_unavailable: agent client {client_id} does not support {SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL}"
+            ));
+        }
+        // An SSH persistent shell requires all three capabilities; a legacy
+        // runner that predates ssh_persistent_shell must fail closed here rather
+        // than silently opening a local shell on the Runner host.
+        if job_context
+            .as_ref()
+            .is_some_and(|ctx| ctx.ssh_resource.is_some())
+            && (!client.capabilities.ssh_shell || !client.capabilities.ssh_persistent_shell)
+        {
+            return Err(format!(
+                "agent_capability_unavailable: agent client {client_id} does not support {SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL}"
             ));
         }
         enqueue_pending_request_locked(

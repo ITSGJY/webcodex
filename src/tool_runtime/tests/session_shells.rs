@@ -82,6 +82,38 @@ async fn complete(
     error_code: Option<&str>,
 ) {
     let operation = request.persistent_shell.as_ref().unwrap();
+    let cwd = operation.cwd.as_deref();
+    let initial_cwd = if operation.action == "open" {
+        cwd
+    } else {
+        None
+    };
+    complete_with_cwds(
+        runtime,
+        request,
+        shell_state,
+        execution_state,
+        stdout,
+        exit_code,
+        error_code,
+        cwd,
+        initial_cwd,
+    )
+    .await;
+}
+
+async fn complete_with_cwds(
+    runtime: &ToolRuntime,
+    request: &crate::shell_protocol::ShellAgentShellRequest,
+    shell_state: &str,
+    execution_state: &str,
+    stdout: &str,
+    exit_code: Option<i32>,
+    error_code: Option<&str>,
+    cwd: Option<&str>,
+    initial_cwd: Option<&str>,
+) {
+    let operation = request.persistent_shell.as_ref().unwrap();
     runtime
         .shell_clients
         .complete_persistent_shell(ShellAgentPersistentShellResultRequest {
@@ -102,10 +134,8 @@ async fn complete(
                 stdout_truncated: false,
                 stderr_truncated: false,
                 duration_ms: 3,
-                cwd: operation.cwd.clone(),
-                initial_cwd: (operation.action == "open")
-                    .then(|| operation.cwd.clone())
-                    .flatten(),
+                cwd: cwd.map(str::to_string),
+                initial_cwd: initial_cwd.map(str::to_string),
                 shell: operation.shell.clone().or_else(|| Some("bash".to_string())),
                 profile: None,
                 created_at: Some(1),
@@ -696,10 +726,14 @@ async fn capability_modes_and_ssh_resource_fail_closed_without_enqueue() {
             .await
     };
     assert!(!ssh.success);
-    assert_eq!(
-        ssh.output["error_code"],
-        "persistent_shell_ssh_resource_unsupported"
-    );
+    // An SSH persistent shell requires ssh_shell + persistent_shell +
+    // ssh_persistent_shell. The default test agent advertises only
+    // persistent_shell, so the request fails closed without enqueuing.
+    assert!(ssh
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("agent_capability_unavailable"));
 
     for mode in [SessionMode::Inspect, SessionMode::ReadOnly] {
         let (runtime, project, session) = setup(temp.path(), true, mode, None).await;
@@ -721,4 +755,262 @@ async fn capability_modes_and_ssh_resource_fail_closed_without_enqueue() {
         assert_eq!(result.output["error_kind"], "session_guard_denied");
         assert!(result.output.get("guard").is_some());
     }
+}
+
+/// An SSH persistent shell enqueues to the Runner with a `job_context` carrying
+/// the bound resource, and later exec/status/close route by the saved record
+/// (not the current Session context). A context change after open must not
+/// redirect an already-open shell.
+async fn setup_ssh(
+    root: &std::path::Path,
+    resource: &str,
+) -> (ToolRuntime, String, sessions::SessionSummary) {
+    let runtime = test_runtime();
+    register_agent_with_projects(
+        &runtime,
+        CLIENT,
+        None,
+        ShellClientCapabilities {
+            shell: true,
+            persistent_shell: true,
+            ssh_shell: true,
+            ssh_persistent_shell: true,
+            ..Default::default()
+        },
+        vec![ShellAgentProjectSummary {
+            id: PROJECT_ID.to_string(),
+            name: Some(PROJECT_ID.to_string()),
+            path: root.to_string_lossy().to_string(),
+            allow_patch: true,
+            kind: None,
+            description: None,
+            hooks: Vec::new(),
+            disabled: false,
+            revision: None,
+            git_branch: None,
+            git_head: None,
+            git_dirty: None,
+            updated_at: 1,
+            shell_profile: None,
+        }],
+    )
+    .await;
+    let project = crate::tool_runtime::agent_project_runtime_id(CLIENT, PROJECT_ID);
+    let context = sessions::SessionExecutionContext {
+        default_cwd: None,
+        default_shell: None,
+        resource: Some(resource.to_string()),
+    };
+    let options = sessions::SessionCreateOptions::new(
+        Some(project.clone()),
+        Some("ssh persistent shell".to_string()),
+        SessionMode::Normal,
+        sessions::SessionGuards::default(),
+    )
+    .with_execution_context(context);
+    let session = runtime
+        .sessions
+        .start_session_with_options(options)
+        .unwrap();
+    (runtime, project, session)
+}
+
+#[tokio::test]
+async fn ssh_persistent_shell_enqueues_with_bound_resource_and_routes_by_record() {
+    let temp = tempfile::tempdir().unwrap();
+    let (runtime, project, session) = setup_ssh(temp.path(), "prod").await;
+
+    // Open carries the bound SSH resource on job_context.
+    let open_task = dispatch(
+        runtime.clone(),
+        ToolCall::OpenSessionShell {
+            project: project.clone(),
+            session_id: session.session_id.clone(),
+            cwd: None,
+            shell: Some(ExecutionShell::Bash),
+        },
+    );
+    let open_request = next_persistent_request(&runtime).await;
+    let open = open_request.persistent_shell.as_ref().unwrap();
+    assert_eq!(open.action, "open");
+    assert_eq!(
+        open_request
+            .job_context
+            .as_ref()
+            .and_then(|ctx| ctx.ssh_resource.as_deref()),
+        Some("prod")
+    );
+    complete(&runtime, &open_request, "running", "opened", "", None, None).await;
+    let opened = open_task.await.unwrap();
+    assert!(opened.success, "{opened:?}");
+    assert_eq!(opened.output["executor"], "ssh");
+    assert_eq!(opened.output["resource"], "prod");
+    let shell_id = opened.output["shell_id"].as_str().unwrap().to_string();
+
+    // Exec routes by the saved record: the exec request carries the bound
+    // resource from the record, not from the current Session context.
+    let exec_task = dispatch(
+        runtime.clone(),
+        ToolCall::SessionShellExec {
+            project: project.clone(),
+            session_id: session.session_id.clone(),
+            shell_id: shell_id.clone(),
+            command: "printf remote".to_string(),
+            timeout_secs: Some(5),
+            purpose: None,
+        },
+    );
+    let exec_request = next_persistent_request(&runtime).await;
+    assert_eq!(
+        exec_request
+            .job_context
+            .as_ref()
+            .and_then(|ctx| ctx.ssh_resource.as_deref()),
+        Some("prod"),
+        "exec must route by the saved binding, not the current Session context"
+    );
+    complete(
+        &runtime,
+        &exec_request,
+        "running",
+        "completed",
+        "remote",
+        Some(0),
+        None,
+    )
+    .await;
+    let exec = exec_task.await.unwrap();
+    assert!(exec.success, "{exec:?}");
+    assert_eq!(exec.output["stdout"], "remote");
+
+    // Close also routes by the saved record.
+    let close_task = dispatch(
+        runtime.clone(),
+        ToolCall::CloseSessionShell {
+            project,
+            session_id: session.session_id,
+            shell_id,
+        },
+    );
+    let close_request = next_persistent_request(&runtime).await;
+    assert_eq!(
+        close_request.persistent_shell.as_ref().unwrap().action,
+        "close"
+    );
+    assert_eq!(
+        close_request
+            .job_context
+            .as_ref()
+            .and_then(|ctx| ctx.ssh_resource.as_deref()),
+        Some("prod")
+    );
+    complete(&runtime, &close_request, "closed", "closed", "", None, None).await;
+    let closed = close_task.await.unwrap();
+    assert!(closed.success, "{closed:?}");
+}
+
+#[tokio::test]
+async fn server_record_does_not_replace_initial_cwd_from_later_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let login = temp.path().join("login");
+    let current = temp.path().join("current");
+    std::fs::create_dir(&login).unwrap();
+    std::fs::create_dir(&current).unwrap();
+    let login = login.to_string_lossy().into_owned();
+    let current = current.to_string_lossy().into_owned();
+    let (runtime, project, session) = setup_ssh(temp.path(), "prod").await;
+
+    let open_task = dispatch(
+        runtime.clone(),
+        ToolCall::OpenSessionShell {
+            project: project.clone(),
+            session_id: session.session_id.clone(),
+            cwd: None,
+            shell: Some(ExecutionShell::Bash),
+        },
+    );
+    let open_request = next_persistent_request(&runtime).await;
+    complete_with_cwds(
+        &runtime,
+        &open_request,
+        "running",
+        "opened",
+        "",
+        None,
+        None,
+        Some(&login),
+        Some(&login),
+    )
+    .await;
+    let opened = open_task.await.unwrap();
+    assert!(opened.success, "{opened:?}");
+    assert_eq!(opened.output["cwd"], "login");
+    assert_eq!(opened.output["initial_cwd"], "login");
+    let shell_id = opened.output["shell_id"].as_str().unwrap().to_string();
+
+    let status_task = dispatch(
+        runtime.clone(),
+        ToolCall::SessionShellStatus {
+            project: project.clone(),
+            session_id: session.session_id.clone(),
+            shell_id: shell_id.clone(),
+        },
+    );
+    let status_request = next_persistent_request(&runtime).await;
+    complete_with_cwds(
+        &runtime,
+        &status_request,
+        "running",
+        "idle",
+        "",
+        None,
+        None,
+        Some(&current),
+        Some(&current),
+    )
+    .await;
+    assert!(status_task.await.unwrap().success);
+
+    let close_task = dispatch(
+        runtime.clone(),
+        ToolCall::CloseSessionShell {
+            project: project.clone(),
+            session_id: session.session_id.clone(),
+            shell_id: shell_id.clone(),
+        },
+    );
+    let close_request = next_persistent_request(&runtime).await;
+    complete_with_cwds(
+        &runtime,
+        &close_request,
+        "closed",
+        "closed",
+        "",
+        None,
+        None,
+        Some(&current),
+        None,
+    )
+    .await;
+    assert!(close_task.await.unwrap().success);
+
+    let terminal_status = {
+        let auth = auth_context(None, true);
+        runtime
+            .dispatch_with_auth(
+                ToolCall::SessionShellStatus {
+                    project,
+                    session_id: session.session_id,
+                    shell_id,
+                },
+                Some(&auth),
+            )
+            .await
+    };
+    assert!(terminal_status.success, "{terminal_status:?}");
+    assert_eq!(terminal_status.output["cwd"], "current");
+    assert_eq!(
+        terminal_status.output["initial_cwd"], "login",
+        "a later status result must not overwrite the authoritative initial cwd"
+    );
 }

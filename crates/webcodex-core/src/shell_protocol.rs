@@ -105,6 +105,11 @@ pub const SHELL_CLIENT_CAPABILITY_SSH_SHELL: &str = "ssh_shell";
 /// Command-oriented, long-lived local shell processes owned by one Workflow
 /// Session. Missing on older runners and therefore fails closed.
 pub const SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL: &str = "persistent_shell";
+/// Long-lived persistent shells opened on a Workflow Session's SSH resource.
+/// This is deliberately separate from `ssh_shell` and `persistent_shell`: an
+/// SSH persistent shell requires all three, and older runners that predate it
+/// must reject the request rather than silently opening a local shell.
+pub const SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL: &str = "ssh_persistent_shell";
 pub const SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV: &str = "structured_validation_argv";
 /// Explicit capability for agent-side read-only LSP navigation. Missing on
 /// older agents and defaults to `false` so the server never dispatches typed
@@ -126,6 +131,7 @@ pub const SHELL_CLIENT_CAPABILITY_NAMES: &[&str] = &[
     SHELL_CLIENT_CAPABILITY_ASYNC_SHELL_JOBS,
     SHELL_CLIENT_CAPABILITY_SSH_SHELL,
     SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL,
+    SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV,
     SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
     SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS,
@@ -175,6 +181,11 @@ pub struct ShellClientCapabilities {
     /// own host. This does not imply SSH or PTY support.
     #[serde(default)]
     pub persistent_shell: bool,
+    /// The Runner can open a long-lived persistent shell on a Workflow Session's
+    /// SSH resource. Missing on older runners and therefore fails closed; it is
+    /// never inferred from `ssh_shell` + `persistent_shell`.
+    #[serde(default)]
+    pub ssh_persistent_shell: bool,
     /// Validation plans use a fixed executable plus argv, never shell text.
     /// Missing on older agents and therefore fail-closed.
     #[serde(default)]
@@ -233,6 +244,7 @@ impl Default for ShellClientCapabilities {
             async_shell_jobs: false,
             ssh_shell: false,
             persistent_shell: false,
+            ssh_persistent_shell: false,
             structured_validation_argv: false,
             lsp_read_only_navigation: false,
             sandbox_inspect_commands: false,
@@ -1581,6 +1593,7 @@ mod envelope_tests {
                 async_shell_jobs: true,
                 ssh_shell: true,
                 persistent_shell: true,
+                ssh_persistent_shell: true,
                 structured_validation_argv: true,
                 lsp_read_only_navigation: false,
                 sandbox_inspect_commands: false,
@@ -1650,6 +1663,11 @@ mod envelope_tests {
         assert!(capabilities.shell);
         assert!(capabilities.jobs);
         assert!(!capabilities.persistent_shell);
+        // SSH persistent shells are never implied by ssh_shell or persistent_shell;
+        // a legacy/older runner that omits the field fails closed.
+        assert!(!capabilities.ssh_shell);
+        assert!(!capabilities.ssh_persistent_shell);
+        assert!(!ShellClientCapabilities::default().ssh_persistent_shell);
     }
 
     fn reconciliation_inventory() -> ShellJobInventory {

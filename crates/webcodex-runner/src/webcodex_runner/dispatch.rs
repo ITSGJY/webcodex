@@ -43,7 +43,14 @@ pub(crate) fn dispatch_request(
     if request.kind == "persistent_shell" {
         let request_id = request.request_id.clone();
         let operation = request.persistent_shell.clone();
-        let result = persistent_shells.handle(policy, shell, projects_dir, &request);
+        let result = persistent_shells.handle(
+            policy,
+            shell,
+            &config.ssh,
+            config.generation,
+            projects_dir,
+            &request,
+        );
         let submitted = sink.submit_persistent_shell_result(request_id, result);
         if !matches!(&submitted, Ok(ResultSubmission::Accepted)) {
             if let Some(operation) = operation {

@@ -20,12 +20,12 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-const STDOUT_SYNC_FD: RawFd = 7;
-const STDERR_SYNC_FD: RawFd = 8;
+pub const STDOUT_SYNC_FD: RawFd = 7;
+pub const STDERR_SYNC_FD: RawFd = 8;
 const CONTROL_FD: RawFd = 9;
-const CONTROL_MAGIC: &[u8] = b"WCPS1";
-const STDOUT_SYNC_MAGIC: &[u8] = b"WCPSO1";
-const STDERR_SYNC_MAGIC: &[u8] = b"WCPSE1";
+pub const CONTROL_MAGIC: &[u8] = b"WCPS1";
+pub const STDOUT_SYNC_MAGIC: &[u8] = b"WCPSO1";
+pub const STDERR_SYNC_MAGIC: &[u8] = b"WCPSE1";
 const CONTROL_FIELD_MAX_BYTES: usize = 8 * 1024;
 const CONTROL_CHANNEL_CAPACITY: usize = 2;
 const OUTPUT_SYNC_CHANNEL_CAPACITY: usize = 2;
@@ -58,6 +58,23 @@ pub struct ShellIdentity {
     pub runtime_project_id: String,
     pub executor: String,
     pub client_id: Option<String>,
+}
+
+/// Opaque transport-binding metadata captured at open time and preserved for
+/// the life of one shell entry.
+///
+/// A transport reports whatever immutable facts its bindings depend on without
+/// exposing transport details to the shared state machine. The Runner uses it
+/// to remember the named SSH resource and its configuration generation at open,
+/// so a later config change invalidates the shell instead of letting a stale
+/// transport keep accepting commands. Nothing host-, credential-, or
+/// ControlPath-shaped is ever stored here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransportMetadata {
+    /// Named resource the transport is bound to, if any.
+    pub resource: Option<String>,
+    /// Configuration generation the transport was opened against, if any.
+    pub generation: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,7 +167,7 @@ pub struct ShellError {
 }
 
 impl ShellError {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -183,8 +200,77 @@ impl Default for ShellLimits {
     }
 }
 
+/// One parsed completion control frame emitted by a shell transport.
 #[derive(Debug)]
-struct BoundedBuffer {
+pub struct ControlFrame {
+    pub token: String,
+    pub status: i32,
+    pub cwd: PathBuf,
+}
+
+/// Accumulated synchronization evidence for one in-flight command. A transport
+/// fills `control`, `stdout_synced`, and `stderr_synced` as it observes the
+/// per-command markers; the manager treats a frame as complete only once both
+/// output streams are synced and the control frame has arrived.
+#[derive(Default)]
+pub struct CompletionProgress {
+    pub control: Option<ControlFrame>,
+    pub stdout_synced: bool,
+    pub stderr_synced: bool,
+}
+
+/// Outcome of waiting for a command's completion frame.
+pub enum WaitOutcome {
+    Frame(ControlFrame),
+    Exited(ExitStatus),
+    TimedOut,
+    ControlLost,
+}
+
+/// Minimal transport boundary for one long-lived shell process.
+///
+/// Only the mechanics that differ between a local spawned child and a remote
+/// shell driven over an SSH channel are abstracted here. The
+/// [`PersistentShellManager`] owns all shared semantics on top of this trait:
+/// identity binding, the `ShellState` machine, the busy guard, output limits,
+/// timeout recovery, poisoned/lost transitions, idle reclamation, and lifecycle
+/// (`close_session` / `close_project` / `close_all`).
+///
+/// `write_command` feeds a command plus its per-command high-entropy `token`
+/// to the shell; the transport's readers surface the matching sync markers and
+/// control frame through `wait_for_completion`. `interrupt` delivers a timeout
+/// signal to the shell's process group so the manager can attempt sync
+/// recovery. `stdout`/`stderr` expose the bounded buffers the manager snapshots
+/// per command.
+pub trait ShellTransport: Send + Sync {
+    fn set_expected_token(&self, token: &str);
+    fn write_command(&self, command: &str, token: &str) -> Result<(), ShellError>;
+    fn wait_for_completion(
+        &self,
+        token: &str,
+        timeout: Duration,
+        progress: &mut CompletionProgress,
+    ) -> WaitOutcome;
+    fn try_wait(&self) -> Option<ExitStatus>;
+    /// Signal the shell's process group during timeout recovery. Best-effort:
+    /// the manager decides whether to keep or poison the shell based on whether
+    /// synchronization is recovered afterward.
+    fn interrupt(&self);
+    fn shutdown(&self);
+    fn terminate_remaining_group_after_exit(&self);
+    fn stdout(&self) -> &Arc<Mutex<BoundedBuffer>>;
+    fn stderr(&self) -> &Arc<Mutex<BoundedBuffer>>;
+    /// Opaque binding metadata captured at open. The shared manager stores it
+    /// on the entry so callers can validate bindings that a transport depends
+    /// on (e.g. an SSH resource + config generation). The default is no
+    /// metadata; only transports with a real binding override this.
+    fn metadata(&self) -> Option<TransportMetadata> {
+        None
+    }
+}
+
+#[derive(Debug)]
+pub struct BoundedBuffer {
     bytes: VecDeque<u8>,
     first_offset: u64,
     next_offset: u64,
@@ -192,7 +278,7 @@ struct BoundedBuffer {
 }
 
 impl BoundedBuffer {
-    fn new(max_bytes: usize) -> Self {
+    pub fn new(max_bytes: usize) -> Self {
         Self {
             bytes: VecDeque::with_capacity(max_bytes.min(8192)),
             first_offset: 0,
@@ -201,7 +287,7 @@ impl BoundedBuffer {
         }
     }
 
-    fn append(&mut self, bytes: &[u8]) {
+    pub fn append(&mut self, bytes: &[u8]) {
         self.next_offset = self
             .next_offset
             .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
@@ -212,7 +298,7 @@ impl BoundedBuffer {
         }
     }
 
-    fn set_max_bytes(&mut self, max_bytes: usize) {
+    pub fn set_max_bytes(&mut self, max_bytes: usize) {
         self.max_bytes = max_bytes.max(MIN_OUTPUT_BYTES);
         while self.bytes.len() > self.max_bytes {
             self.bytes.pop_front();
@@ -220,11 +306,11 @@ impl BoundedBuffer {
         }
     }
 
-    fn cursor(&self) -> u64 {
+    pub fn cursor(&self) -> u64 {
         self.next_offset
     }
 
-    fn snapshot_since(&self, requested_start: u64) -> (String, bool) {
+    pub fn snapshot_since(&self, requested_start: u64) -> (String, bool) {
         let start = requested_start.max(self.first_offset).min(self.next_offset);
         let skip = usize::try_from(start.saturating_sub(self.first_offset)).unwrap_or(usize::MAX);
         let retained = self.bytes.iter().skip(skip).copied().collect::<Vec<_>>();
@@ -233,13 +319,6 @@ impl BoundedBuffer {
             requested_start < self.first_offset,
         )
     }
-}
-
-#[derive(Debug)]
-struct ControlFrame {
-    token: String,
-    status: i32,
-    cwd: PathBuf,
 }
 
 #[derive(Debug)]
@@ -314,12 +393,12 @@ impl Drop for SpawnedChildGuard {
     }
 }
 
-#[derive(Debug)]
 struct ShellEntry {
     identity: ShellIdentity,
     dialect: String,
     profile: Option<String>,
-    initial_cwd: PathBuf,
+    initial_cwd: Mutex<PathBuf>,
+    initial_cwd_frozen: AtomicBool,
     current_cwd: Mutex<PathBuf>,
     created_at: i64,
     last_activity_at: AtomicU64,
@@ -328,17 +407,32 @@ struct ShellEntry {
     busy: AtomicBool,
     exit_code: Mutex<Option<i32>>,
     close_reason: Mutex<Option<String>>,
-    process: ShellProcess,
+    metadata: Mutex<Option<TransportMetadata>>,
+    process: Box<dyn ShellTransport>,
+}
+
+impl std::fmt::Debug for ShellEntry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ShellEntry")
+            .field("identity", &self.identity)
+            .field("dialect", &self.dialect)
+            .field("profile", &self.profile)
+            .field("initial_cwd", &*lock_unpoison(&self.initial_cwd))
+            .field("state", &*lock_unpoison(&self.state))
+            .finish_non_exhaustive()
+    }
 }
 
 impl ShellEntry {
     fn summary(&self) -> ShellSummary {
+        let current_cwd = lock_unpoison(&self.current_cwd).clone();
         ShellSummary {
             identity: self.identity.clone(),
             dialect: self.dialect.clone(),
             profile: self.profile.clone(),
-            initial_cwd: self.initial_cwd.clone(),
-            cwd: lock_unpoison(&self.current_cwd).clone(),
+            initial_cwd: lock_unpoison(&self.initial_cwd).clone(),
+            cwd: current_cwd,
             created_at: self.created_at,
             last_activity_at: self.last_activity_at.load(Ordering::SeqCst) as i64,
             state: *lock_unpoison(&self.state),
@@ -465,13 +559,14 @@ impl PersistentShellManager {
             }
         }
 
-        let process = spawn_shell_process(&launch)?;
+        let process: Box<dyn ShellTransport> = Box::new(spawn_shell_process(&launch)?);
         let timestamp = now_ts();
         let entry = Arc::new(ShellEntry {
             identity: launch.identity.clone(),
             dialect: launch.dialect,
             profile: launch.profile,
-            initial_cwd: launch.initial_cwd.clone(),
+            initial_cwd: Mutex::new(launch.initial_cwd.clone()),
+            initial_cwd_frozen: AtomicBool::new(true),
             current_cwd: Mutex::new(launch.initial_cwd),
             created_at: timestamp,
             last_activity_at: AtomicU64::new(timestamp.max(0) as u64),
@@ -480,9 +575,93 @@ impl PersistentShellManager {
             busy: AtomicBool::new(false),
             exit_code: Mutex::new(None),
             close_reason: Mutex::new(None),
+            metadata: Mutex::new(process.metadata()),
             process,
         });
 
+        let initialization = launch.initialization.unwrap_or_default();
+        self.register_and_initialize(&entry, &initialization)
+    }
+
+    /// Open a persistent shell backed by an externally-provided transport
+    /// (e.g. a remote SSH shell). The caller is responsible for spawning the
+    /// transport and for the remote cwd/bootstrap; this method runs the same
+    /// registration, initialization, and synchronization logic as [`open`], so
+    /// the shared state machine, limits, idle sweeper, and lifecycle apply
+    /// unchanged. `initial_cwd_seed` is provisional opening state only. A
+    /// successful first control frame replaces it with the authoritative,
+    /// absolute cwd reported by the transport and freezes that value.
+    pub fn open_with_transport(
+        &self,
+        identity: ShellIdentity,
+        dialect: String,
+        profile: Option<String>,
+        initial_cwd_seed: PathBuf,
+        initialization: Option<String>,
+        transport: Box<dyn ShellTransport>,
+    ) -> Result<ShellSummary, ShellError> {
+        self.ensure_idle_sweeper();
+        self.sweep_idle();
+        {
+            let entries = lock_unpoison(&self.inner.entries);
+            if entries.contains_key(&identity.shell_id) {
+                return Err(ShellError::new(
+                    "persistent_shell_id_conflict",
+                    "persistent shell id already exists",
+                ));
+            }
+            let active = entries
+                .values()
+                .filter(|entry| lock_unpoison(&entry.state).is_active())
+                .count();
+            if active >= self.inner.max_shells.load(Ordering::SeqCst) {
+                return Err(ShellError::new(
+                    "persistent_shell_limit_reached",
+                    format!(
+                        "persistent shell limit reached ({})",
+                        self.inner.max_shells.load(Ordering::SeqCst)
+                    ),
+                ));
+            }
+        }
+        {
+            let active = lock_unpoison(&self.inner.active_by_session);
+            if active.contains_key(&identity.workflow_session_id) {
+                return Err(ShellError::new(
+                    "persistent_shell_already_open",
+                    "Workflow Session already has an active persistent shell",
+                ));
+            }
+        }
+
+        let timestamp = now_ts();
+        let entry = Arc::new(ShellEntry {
+            identity,
+            dialect,
+            profile,
+            initial_cwd: Mutex::new(initial_cwd_seed.clone()),
+            initial_cwd_frozen: AtomicBool::new(false),
+            current_cwd: Mutex::new(initial_cwd_seed),
+            created_at: timestamp,
+            last_activity_at: AtomicU64::new(timestamp.max(0) as u64),
+            last_activity_instant: Mutex::new(Instant::now()),
+            state: Mutex::new(ShellState::Opening),
+            busy: AtomicBool::new(false),
+            exit_code: Mutex::new(None),
+            close_reason: Mutex::new(None),
+            metadata: Mutex::new(transport.metadata()),
+            process: transport,
+        });
+
+        let initialization = initialization.unwrap_or_default();
+        self.register_and_initialize(&entry, &initialization)
+    }
+
+    fn register_and_initialize(
+        &self,
+        entry: &Arc<ShellEntry>,
+        initialization: &str,
+    ) -> Result<ShellSummary, ShellError> {
         {
             let mut entries = lock_unpoison(&self.inner.entries);
             let mut active = lock_unpoison(&self.inner.active_by_session);
@@ -511,16 +690,15 @@ impl PersistentShellManager {
                 entry.identity.workflow_session_id.clone(),
                 entry.identity.shell_id.clone(),
             );
-            entries.insert(entry.identity.shell_id.clone(), Arc::clone(&entry));
+            entries.insert(entry.identity.shell_id.clone(), Arc::clone(entry));
         }
 
         let init_token = command_token();
         entry.process.set_expected_token(&init_token);
         let mut completion = CompletionProgress::default();
-        let init = launch.initialization.unwrap_or_default();
-        if let Err(error) = entry.process.write_command(&init, &init_token) {
+        if let Err(error) = entry.process.write_command(initialization, &init_token) {
             self.transition_terminal(
-                &entry,
+                entry,
                 ShellState::Poisoned,
                 None,
                 Some("initialization_write_failed".to_string()),
@@ -536,7 +714,7 @@ impl PersistentShellManager {
             WaitOutcome::Frame(frame) if frame.status == 0 => {
                 if !frame.cwd.is_absolute() {
                     self.transition_terminal(
-                        &entry,
+                        entry,
                         ShellState::Poisoned,
                         None,
                         Some("initialization_cwd_unobservable".to_string()),
@@ -563,13 +741,24 @@ impl PersistentShellManager {
                         "persistent shell was closed while it was opening",
                     ));
                 }
-                *lock_unpoison(&entry.current_cwd) = frame.cwd;
+                let authoritative_cwd = frame.cwd;
+                {
+                    let mut initial_cwd = lock_unpoison(&entry.initial_cwd);
+                    if entry
+                        .initial_cwd_frozen
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        *initial_cwd = authoritative_cwd.clone();
+                    }
+                }
+                *lock_unpoison(&entry.current_cwd) = authoritative_cwd;
                 entry.touch();
                 Ok(entry.summary())
             }
             WaitOutcome::Frame(frame) => {
                 self.transition_terminal(
-                    &entry,
+                    entry,
                     ShellState::Poisoned,
                     Some(frame.status),
                     Some("initialization_failed".to_string()),
@@ -586,7 +775,7 @@ impl PersistentShellManager {
             WaitOutcome::Exited(status) => {
                 let code = status.code();
                 self.transition_terminal(
-                    &entry,
+                    entry,
                     ShellState::Exited,
                     code,
                     Some("shell_exited_during_initialization".to_string()),
@@ -599,7 +788,7 @@ impl PersistentShellManager {
             }
             WaitOutcome::TimedOut | WaitOutcome::ControlLost => {
                 self.transition_terminal(
-                    &entry,
+                    entry,
                     ShellState::Poisoned,
                     None,
                     Some("initialization_sync_lost".to_string()),
@@ -671,8 +860,8 @@ impl PersistentShellManager {
         };
         entry.touch();
 
-        let stdout_start = lock_unpoison(&entry.process.stdout).cursor();
-        let stderr_start = lock_unpoison(&entry.process.stderr).cursor();
+        let stdout_start = lock_unpoison(entry.process.stdout()).cursor();
+        let stderr_start = lock_unpoison(entry.process.stderr()).cursor();
         let token = command_token();
         entry.process.set_expected_token(&token);
         let mut completion = CompletionProgress::default();
@@ -695,7 +884,7 @@ impl PersistentShellManager {
         let resolved = match outcome {
             WaitOutcome::TimedOut => {
                 timed_out = true;
-                let _ = signal_process_group(entry.process.process_group_id, libc::SIGINT);
+                entry.process.interrupt();
                 entry
                     .process
                     .wait_for_completion(&token, TIMEOUT_RECOVERY_WINDOW, &mut completion)
@@ -711,9 +900,9 @@ impl PersistentShellManager {
             );
             entry.process.shutdown();
             let (stdout, stdout_truncated) =
-                lock_unpoison(&entry.process.stdout).snapshot_since(stdout_start);
+                lock_unpoison(entry.process.stdout()).snapshot_since(stdout_start);
             let (stderr, stderr_truncated) =
-                lock_unpoison(&entry.process.stderr).snapshot_since(stderr_start);
+                lock_unpoison(entry.process.stderr()).snapshot_since(stderr_start);
             entry.touch();
             return Ok(ShellExecResult {
                 shell_id: shell_id.to_string(),
@@ -742,9 +931,9 @@ impl PersistentShellManager {
             WaitOutcome::Frame(_) => {}
         }
         let (stdout, stdout_truncated) =
-            lock_unpoison(&entry.process.stdout).snapshot_since(stdout_start);
+            lock_unpoison(entry.process.stdout()).snapshot_since(stdout_start);
         let (stderr, stderr_truncated) =
-            lock_unpoison(&entry.process.stderr).snapshot_since(stderr_start);
+            lock_unpoison(entry.process.stderr()).snapshot_since(stderr_start);
         let duration_ms = started.elapsed().as_millis() as u64;
         entry.touch();
 
@@ -915,8 +1104,8 @@ impl PersistentShellManager {
         max_output_bytes: usize,
     ) -> Result<(), ShellError> {
         let entry = self.lookup(shell_id, workflow_session_id, runtime_project_id)?;
-        lock_unpoison(&entry.process.stdout).set_max_bytes(max_output_bytes);
-        lock_unpoison(&entry.process.stderr).set_max_bytes(max_output_bytes);
+        lock_unpoison(entry.process.stdout()).set_max_bytes(max_output_bytes);
+        lock_unpoison(entry.process.stderr()).set_max_bytes(max_output_bytes);
         Ok(())
     }
 
@@ -1018,6 +1207,21 @@ impl PersistentShellManager {
         lock_unpoison(&self.inner.active_by_session).len()
     }
 
+    /// The opaque transport binding metadata captured when the shell was
+    /// opened, if the transport reported any. Used by callers to validate that
+    /// the bindings an open shell depends on are still current (e.g. a named
+    /// SSH resource at the configuration generation it was opened against).
+    pub fn metadata(
+        &self,
+        shell_id: &str,
+        workflow_session_id: &str,
+        runtime_project_id: &str,
+    ) -> Result<Option<TransportMetadata>, ShellError> {
+        let entry = self.lookup(shell_id, workflow_session_id, runtime_project_id)?;
+        let metadata = lock_unpoison(&entry.metadata).clone();
+        Ok(metadata)
+    }
+
     pub fn sweep_idle(&self) -> usize {
         let idle = Duration::from_secs(self.inner.idle_timeout_secs.load(Ordering::SeqCst));
         let entries = lock_unpoison(&self.inner.entries)
@@ -1109,6 +1313,9 @@ impl PersistentShellManager {
         entry.busy.store(false, Ordering::SeqCst);
         *lock_unpoison(&entry.exit_code) = exit_code;
         *lock_unpoison(&entry.close_reason) = reason;
+        // A terminal shell can never be reused; release its transport-binding
+        // metadata so a stale binding cannot keep validating a dead entry.
+        *lock_unpoison(&entry.metadata) = None;
         entry.touch();
         let mut active = lock_unpoison(&self.inner.active_by_session);
         if active
@@ -1157,23 +1364,21 @@ impl Drop for BusyGuard {
     }
 }
 
-#[derive(Default)]
-struct CompletionProgress {
-    control: Option<ControlFrame>,
-    stdout_synced: bool,
-    stderr_synced: bool,
-}
-
-enum WaitOutcome {
-    Frame(ControlFrame),
-    Exited(ExitStatus),
-    TimedOut,
-    ControlLost,
-}
-
 impl ShellProcess {
     fn set_expected_token(&self, token: &str) {
         *lock_unpoison(&self.expected_token) = Some(token.to_string());
+    }
+
+    fn interrupt(&self) {
+        let _ = signal_process_group(self.process_group_id, libc::SIGINT);
+    }
+
+    fn stdout_buffer(&self) -> &Arc<Mutex<BoundedBuffer>> {
+        &self.stdout
+    }
+
+    fn stderr_buffer(&self) -> &Arc<Mutex<BoundedBuffer>> {
+        &self.stderr
     }
 
     fn write_command(&self, command: &str, token: &str) -> Result<(), ShellError> {
@@ -1347,6 +1552,49 @@ impl Drop for ShellProcess {
     }
 }
 
+impl ShellTransport for ShellProcess {
+    fn set_expected_token(&self, token: &str) {
+        ShellProcess::set_expected_token(self, token);
+    }
+
+    fn write_command(&self, command: &str, token: &str) -> Result<(), ShellError> {
+        ShellProcess::write_command(self, command, token)
+    }
+
+    fn wait_for_completion(
+        &self,
+        token: &str,
+        timeout: Duration,
+        progress: &mut CompletionProgress,
+    ) -> WaitOutcome {
+        ShellProcess::wait_for_completion(self, token, timeout, progress)
+    }
+
+    fn try_wait(&self) -> Option<ExitStatus> {
+        ShellProcess::try_wait(self)
+    }
+
+    fn interrupt(&self) {
+        ShellProcess::interrupt(self);
+    }
+
+    fn shutdown(&self) {
+        ShellProcess::shutdown(self);
+    }
+
+    fn terminate_remaining_group_after_exit(&self) {
+        ShellProcess::terminate_remaining_group_after_exit(self);
+    }
+
+    fn stdout(&self) -> &Arc<Mutex<BoundedBuffer>> {
+        ShellProcess::stdout_buffer(self)
+    }
+
+    fn stderr(&self) -> &Arc<Mutex<BoundedBuffer>> {
+        ShellProcess::stderr_buffer(self)
+    }
+}
+
 fn validate_launch(launch: &ShellLaunch) -> Result<(), ShellError> {
     for (field, value) in [
         ("shell_id", launch.identity.shell_id.as_str()),
@@ -1414,7 +1662,50 @@ fn command_token() -> String {
     Uuid::new_v4().simple().to_string()
 }
 
-fn shell_quote(value: &str) -> String {
+/// Build the command wrapper for a remote shell that has reserved FD 7 (a dup
+/// of the SSH channel's original stdout) and FD 8 (a dup of the original
+/// stderr) at startup. Because an SSH exec channel has no extra control FD,
+/// the control frame travels inline on the reserved stderr (FD 8) right after
+/// the stderr sync marker.
+///
+/// Frame layout written after the user command (same magic + NUL framing as the
+/// local shell, so the manager's marker parsing is shared):
+///   - `WCPSO1\0{token}\0`            -> FD 7   (stdout sync boundary)
+///   - `WCPSE1\0{token}\0`            -> FD 8   (stderr sync boundary)
+///   - `WCPS1\0{token}\0{status}\0`   -> FD 8   (control frame: exit status)
+///   - `pwd -P` output                -> FD 8   (absolute cwd)
+///   - `\0`                           -> FD 8   (control frame terminator)
+///
+/// The remote shell's own `printf`/`pwd` builtins are used. User redirects
+/// (`exec 2>&1`, etc.) cannot move the protocol targets because FD 7/8 are
+/// reserved at startup, not bound to the current stdout/stderr.
+pub fn remote_command_wrapper(command: &str, token: &str) -> String {
+    let status_variable = format!("__wc_ps_status_{token}");
+    let framed = format!(
+        "\\eval {}\n\
+         {status_variable}=$?\n\
+         printf 'WCPSO1\\000{}\\000' >&{}\n\
+         printf 'WCPSE1\\000{}\\000' >&{}\n\
+         printf 'WCPS1\\000{}\\000%s\\000' \"${status_variable}\" >&{}\n\
+         pwd -P >&{}\n\
+         printf '\\000' >&{}\n",
+        shell_quote(command),
+        token,
+        STDOUT_SYNC_FD,
+        token,
+        STDERR_SYNC_FD,
+        token,
+        STDERR_SYNC_FD,
+        STDERR_SYNC_FD,
+        STDERR_SYNC_FD,
+    );
+    // Same eval/alias-suppression hardening as the local command_wrapper.
+    format!("\\eval {}\n", shell_quote(&framed))
+}
+
+/// Single-quote a value for a POSIX shell, escaping embedded quotes. Reused by
+/// remote transports so the trusted postamble stays in one resolved builtin.
+pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
@@ -1706,7 +1997,7 @@ fn process_output_pending(
     }
 }
 
-fn output_sync_marker(magic: &[u8], token: &str) -> Vec<u8> {
+pub fn output_sync_marker(magic: &[u8], token: &str) -> Vec<u8> {
     let mut marker = Vec::with_capacity(magic.len() + token.len() + 2);
     marker.extend_from_slice(magic);
     marker.push(0);
@@ -1715,7 +2006,7 @@ fn output_sync_marker(magic: &[u8], token: &str) -> Vec<u8> {
     marker
 }
 
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+pub fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     (!needle.is_empty() && haystack.len() >= needle.len())
         .then(|| {
             haystack
@@ -1725,7 +2016,7 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .flatten()
 }
 
-fn longest_suffix_prefix(value: &[u8], marker: &[u8]) -> usize {
+pub fn longest_suffix_prefix(value: &[u8], marker: &[u8]) -> usize {
     let max = value.len().min(marker.len().saturating_sub(1));
     (1..=max)
         .rev()
@@ -1917,6 +2208,119 @@ mod tests {
                 Duration::from_secs(3),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn external_transport_freezes_login_cwd_from_first_control_frame() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = PersistentShellManager::new(ShellLimits::default());
+        let spec = launch(
+            temp.path(),
+            "wc_shell_external_login",
+            "wc_sess_external_login",
+        );
+        let process = spawn_shell_process(&spec).unwrap();
+        let opened = manager
+            .open_with_transport(
+                spec.identity,
+                spec.dialect,
+                spec.profile,
+                PathBuf::new(),
+                spec.initialization,
+                Box::new(process),
+            )
+            .unwrap();
+        let login_cwd = temp.path().canonicalize().unwrap();
+        assert_eq!(opened.cwd, login_cwd);
+        assert_eq!(opened.initial_cwd, login_cwd);
+
+        let changed = exec(
+            &manager,
+            "wc_shell_external_login",
+            "wc_sess_external_login",
+            "cd /tmp",
+        );
+        assert_eq!(changed.cwd, PathBuf::from("/tmp"));
+
+        let status = manager
+            .status(
+                "wc_shell_external_login",
+                "wc_sess_external_login",
+                "agent:oe:test",
+            )
+            .unwrap();
+        assert_eq!(status.cwd, PathBuf::from("/tmp"));
+        assert_eq!(status.initial_cwd, login_cwd);
+
+        let closed = manager
+            .close(
+                "wc_shell_external_login",
+                "wc_sess_external_login",
+                "agent:oe:test",
+                "explicit_close",
+            )
+            .unwrap();
+        assert_eq!(closed.summary.initial_cwd, login_cwd);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_transport_replaces_symlink_seed_with_physical_cwd() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let physical = temp.path().join("physical");
+        let logical = temp.path().join("logical");
+        std::fs::create_dir(&physical).unwrap();
+        symlink(&physical, &logical).unwrap();
+        let manager = PersistentShellManager::new(ShellLimits::default());
+        let spec = launch(
+            &logical,
+            "wc_shell_external_symlink",
+            "wc_sess_external_symlink",
+        );
+        let process = spawn_shell_process(&spec).unwrap();
+        let opened = manager
+            .open_with_transport(
+                spec.identity,
+                spec.dialect,
+                spec.profile,
+                logical,
+                spec.initialization,
+                Box::new(process),
+            )
+            .unwrap();
+        let physical = physical.canonicalize().unwrap();
+        assert_eq!(opened.cwd, physical);
+        assert_eq!(opened.initial_cwd, physical);
+
+        exec(
+            &manager,
+            "wc_shell_external_symlink",
+            "wc_sess_external_symlink",
+            "cd /tmp",
+        );
+        let status = manager
+            .status(
+                "wc_shell_external_symlink",
+                "wc_sess_external_symlink",
+                "agent:oe:test",
+            )
+            .unwrap();
+        assert_eq!(status.cwd, PathBuf::from("/tmp"));
+        assert_eq!(status.initial_cwd, physical);
+    }
+
+    #[test]
+    fn local_initial_cwd_stays_at_launch_directory_when_initialization_changes_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = PersistentShellManager::new(ShellLimits::default());
+        let mut spec = launch(temp.path(), "wc_shell_local_init", "wc_sess_local_init");
+        spec.initialization = Some("cd /tmp".to_string());
+        let opened = manager.open(spec).unwrap();
+
+        assert_eq!(opened.initial_cwd, temp.path());
+        assert_eq!(opened.cwd, PathBuf::from("/tmp"));
     }
 
     #[test]

@@ -66,6 +66,14 @@ pub(crate) struct PreparedSshCommand {
     pub(crate) key: SshConnectionKey,
 }
 
+/// A ready-to-spawn long-lived SSH shell command paired with the pool entry it
+/// reuses and the resource's default remote cwd.
+pub(crate) struct PreparedPersistentShellCommand {
+    pub(crate) command: Command,
+    pub(crate) key: SshConnectionKey,
+    pub(crate) default_cwd: Option<String>,
+}
+
 impl SshConnectionPool {
     /// Whether this Runner can advertise SSH-shell support. A missing OpenSSH
     /// executable is a capability absence, not a later silent local fallback.
@@ -153,6 +161,69 @@ impl SshConnectionPool {
         if let Some(connection) = state.entries.remove(key) {
             close_control_socket(&connection);
         }
+    }
+
+    /// Resolve a named resource, establish/reuse its control transport, and
+    /// construct a ready-to-spawn `ssh` command that runs one long-lived remote
+    /// shell. Unlike `prepare_command`, the remote command is just the shell
+    /// binary (no `-c` script); the Runner drives it over stdin. The long-lived
+    /// channel reuses the same authenticated control socket (`ControlMaster=no
+    /// -S <path>`) and never creates a second master.
+    pub(crate) fn prepare_persistent_shell_command(
+        &self,
+        generation: u64,
+        config: &SshConfig,
+        resource_name: &str,
+        session_id: &str,
+        shell_program: &str,
+    ) -> Result<PreparedPersistentShellCommand, String> {
+        if !cfg!(unix) {
+            return Err("ssh_shell_unavailable: this Runner host does not support SSH resources; shell was not started".to_string());
+        }
+        if !is_safe_resource_name(resource_name) {
+            return Err(
+                "ssh_resource_invalid: resource name is invalid; shell was not started".to_string(),
+            );
+        }
+        if !is_safe_session_id(session_id) {
+            return Err(
+                "ssh_session_required: an SSH resource requires a valid Workflow Session id; shell was not started".to_string(),
+            );
+        }
+        let resource = match config.resources.get(resource_name) {
+            Some(resource) => resource,
+            None => {
+                self.release_resource(resource_name);
+                return Err(format!(
+                    "ssh_resource_not_found: resource '{}' is not configured on this Runner; shell was not started",
+                    resource_name
+                ));
+            }
+        };
+        let connection = self.connection_for(
+            generation,
+            resource_name,
+            session_id,
+            &resource.host,
+            resource.default_cwd.as_deref(),
+        )?;
+        let mut ssh = ssh_command(&connection);
+        ssh.arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("LogLevel=ERROR")
+            .arg("-o")
+            .arg("ControlMaster=no")
+            .arg("-S")
+            .arg(&connection.control_path)
+            .arg(&connection.host)
+            .arg(shell_program);
+        configure_private_process_group(&mut ssh);
+        Ok(PreparedPersistentShellCommand {
+            command: ssh,
+            key: connection.key,
+            default_cwd: connection.default_cwd.clone(),
+        })
     }
 
     /// Release every Session's generation for a resource that is no longer
@@ -811,7 +882,7 @@ mod tests {
     use crate::webcodex_runner::config::{AgentPolicy, SshConfig, SshResourceConfig};
     use std::collections::BTreeMap;
     use std::net::{TcpListener, TcpStream};
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
@@ -1380,5 +1451,783 @@ mod tests {
             }
         }
         panic!("timed out waiting for remote SSH job {job_id}");
+    }
+
+    /// A projects.d directory with a registered `remote-project` owned by the
+    /// `ssh-agent` Runner. SSH persistent shells still require the project to
+    /// be registered on the Runner (it owns the agent + resource binding);
+    /// only execution happens remotely.
+    fn ssh_projects_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("create ssh projects dir");
+        std::fs::write(
+            dir.path().join("remote-project.toml"),
+            "id = \"remote-project\"\npath = \"/srv/remote-project\"\n",
+        )
+        .expect("write remote-project.toml");
+        dir
+    }
+
+    fn ssh_persistent_shell_request(
+        action: &str,
+        shell_id: &str,
+        resource: &str,
+        command: Option<&str>,
+    ) -> crate::shell_protocol::ShellAgentShellRequest {
+        ssh_persistent_shell_request_at_cwd(action, shell_id, resource, None, command)
+    }
+
+    fn ssh_persistent_shell_request_at_cwd(
+        action: &str,
+        shell_id: &str,
+        resource: &str,
+        cwd: Option<&str>,
+        command: Option<&str>,
+    ) -> crate::shell_protocol::ShellAgentShellRequest {
+        serde_json::from_value(serde_json::json!({
+            "request_id": format!("req-{action}-{shell_id}"),
+            "client_id": "ssh-agent",
+            "kind": "persistent_shell",
+            "command": command.unwrap_or(""),
+            "timeout_secs": 30,
+            "requested_by": "test",
+            "created_at": 1,
+            "job_context": {
+                "runtime_project_id": "agent:ssh-agent:remote-project",
+                "workflow_session_id": "wc_sess_ssh_pshell",
+                "ssh_resource": resource,
+                "project_cwd": ".",
+                "purpose": "other",
+                "shell": "remote",
+                "command_preview": "",
+                "validation_steps": []
+            },
+            "persistent_shell": {
+                "action": action,
+                "shell_id": shell_id,
+                "workflow_session_id": "wc_sess_ssh_pshell",
+                "runtime_project_id": "agent:ssh-agent:remote-project",
+                "cwd": cwd,
+                "shell": "bash",
+                "command": command,
+                "timeout_secs": 20,
+                "purpose": null
+            }
+        }))
+        .expect("build remote SSH persistent shell request")
+    }
+
+    fn ssh_config_without_default(server: &TestSshServer) -> SshConfig {
+        let mut resources = BTreeMap::new();
+        resources.insert(
+            "nodefault".to_string(),
+            SshResourceConfig {
+                host: server.alias.clone(),
+                default_cwd: None,
+            },
+        );
+        SshConfig { resources }
+    }
+
+    #[test]
+    fn remote_persistent_shell_preserves_state_across_execs() {
+        let Some(server) = TestSshServer::start() else {
+            eprintln!("skipping SSH integration test because sshd is unavailable");
+            return;
+        };
+        let config = ssh_config(&server);
+        let pool = SshConnectionPool::with_test_config(server.client_config.clone());
+        let manager = crate::webcodex_runner::PersistentShellManager::new(
+            &crate::webcodex_runner::ShellConfig::default(),
+            pool,
+        );
+        let policy = AgentPolicy::default();
+        let projects_dir = ssh_projects_dir();
+        let projects = projects_dir.path().to_path_buf();
+
+        let opened = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            7,
+            &projects,
+            &ssh_persistent_shell_request("open", "wc_shell_rps", "tmp", None),
+        );
+        assert_eq!(opened.shell_state, "running", "{opened:?}");
+        assert_eq!(opened.error_code, None, "{opened:?}");
+
+        // cd, export, a shell variable, a function, and umask must all persist.
+        let setup = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            7,
+            &projects,
+            &ssh_persistent_shell_request(
+                "exec",
+                "wc_shell_rps",
+                "tmp",
+                Some("cd /tmp; export WC_RPS=kept; WC_LOCAL=v; rps_fn() { printf fn; }; umask 027"),
+            ),
+        );
+        assert_eq!(setup.exit_code, Some(0), "{setup:?}");
+        assert_eq!(setup.shell_state, "running", "{setup:?}");
+
+        let observed = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            7,
+            &projects,
+            &ssh_persistent_shell_request(
+                "exec",
+                "wc_shell_rps",
+                "tmp",
+                Some("printf '%s:%s:' \"$PWD\" \"$WC_RPS\"; rps_fn; printf ':%s' \"$(umask)\""),
+            ),
+        );
+        assert_eq!(observed.exit_code, Some(0), "{observed:?}");
+        assert_eq!(observed.shell_state, "running", "{observed:?}");
+        assert!(
+            observed.stdout.contains("/tmp:kept:fn:0027"),
+            "remote state did not persist: {:?}",
+            observed.stdout
+        );
+        // Internal markers must never leak into user output.
+        assert!(
+            !observed.stdout.contains("WCPS"),
+            "marker leaked: {:?}",
+            observed.stdout
+        );
+        assert!(
+            !observed.stderr.contains("WCPS"),
+            "marker leaked: {:?}",
+            observed.stderr
+        );
+
+        // unset propagates.
+        let unset = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            7,
+            &projects,
+            &ssh_persistent_shell_request("exec", "wc_shell_rps", "tmp", Some("unset WC_RPS")),
+        );
+        assert_eq!(unset.exit_code, Some(0), "{unset:?}");
+        let gone = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            7,
+            &projects,
+            &ssh_persistent_shell_request(
+                "exec",
+                "wc_shell_rps",
+                "tmp",
+                Some("printf '%s' \"${WC_RPS-unset}\""),
+            ),
+        );
+        assert_eq!(gone.stdout, "unset", "{gone:?}");
+
+        let closed = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            7,
+            &projects,
+            &ssh_persistent_shell_request("close", "wc_shell_rps", "tmp", None),
+        );
+        assert_eq!(closed.shell_state, "closed", "{closed:?}");
+    }
+
+    #[test]
+    fn remote_persistent_shell_resets_when_resource_is_removed() {
+        let Some(server) = TestSshServer::start() else {
+            eprintln!("skipping SSH integration test because sshd is unavailable");
+            return;
+        };
+        let config = ssh_config(&server);
+        let pool = SshConnectionPool::with_test_config(server.client_config.clone());
+        let manager = crate::webcodex_runner::PersistentShellManager::new(
+            &crate::webcodex_runner::ShellConfig::default(),
+            pool,
+        );
+        let policy = AgentPolicy::default();
+        let projects_dir = ssh_projects_dir();
+        let projects = projects_dir.path().to_path_buf();
+
+        let opened = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            7,
+            &projects,
+            &ssh_persistent_shell_request("open", "wc_shell_rps_reset", "tmp", None),
+        );
+        assert_eq!(opened.shell_state, "running", "{opened:?}");
+
+        // Removing the resource from the active config invalidates the shell.
+        let mut removed = config.clone();
+        removed.resources.remove("tmp");
+        let exec = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &removed,
+            7,
+            &projects,
+            &ssh_persistent_shell_request(
+                "exec",
+                "wc_shell_rps_reset",
+                "tmp",
+                Some("printf forbidden"),
+            ),
+        );
+        assert_eq!(
+            exec.error_code.as_deref(),
+            Some("shell_reset_required"),
+            "{exec:?}"
+        );
+    }
+
+    #[test]
+    fn remote_persistent_shell_resets_when_config_generation_changes() {
+        let Some(server) = TestSshServer::start() else {
+            eprintln!("skipping SSH integration test because sshd is unavailable");
+            return;
+        };
+        let config = ssh_config(&server);
+        let pool = SshConnectionPool::with_test_config(server.client_config.clone());
+        let manager = crate::webcodex_runner::PersistentShellManager::new(
+            &crate::webcodex_runner::ShellConfig::default(),
+            pool,
+        );
+        let policy = AgentPolicy::default();
+        let projects_dir = ssh_projects_dir();
+        let projects = projects_dir.path().to_path_buf();
+        let shell_id = "wc_shell_rps_gen";
+        let resource = "tmp";
+
+        let opened = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            7,
+            &projects,
+            &ssh_persistent_shell_request("open", shell_id, resource, None),
+        );
+        assert_eq!(opened.shell_state, "running", "{opened:?}");
+
+        // The first exec runs on the generation-7 binding and reaches the
+        // remote host.
+        let first = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            7,
+            &projects,
+            &ssh_persistent_shell_request(
+                "exec",
+                shell_id,
+                resource,
+                Some("printf generation-7-command"),
+            ),
+        );
+        assert_eq!(first.exit_code, Some(0), "{first:?}");
+        assert_eq!(first.stdout, "generation-7-command", "{first:?}");
+        assert_eq!(first.shell_state, "running", "{first:?}");
+
+        // The Runner config advanced to generation 8 for the same resource
+        // name. The old shell must not run the user command.
+        let reset = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            8,
+            &projects,
+            &ssh_persistent_shell_request("exec", shell_id, resource, Some("printf forbidden")),
+        );
+        assert_eq!(
+            reset.error_code.as_deref(),
+            Some("shell_reset_required"),
+            "{reset:?}"
+        );
+        assert_eq!(reset.command_started, false, "{reset:?}");
+        assert_eq!(reset.stdout, "", "{reset:?}");
+
+        // The old shell is closed and can no longer run user commands; a
+        // further exec reports its terminal state instead of executing.
+        let stale = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            8,
+            &projects,
+            &ssh_persistent_shell_request("exec", shell_id, resource, Some("printf stale")),
+        );
+        assert!(
+            stale.error_code.is_some(),
+            "closed old shell must reject further execs: {stale:?}"
+        );
+        assert_eq!(stale.command_started, false, "{stale:?}");
+        assert_eq!(stale.stdout, "", "{stale:?}");
+        assert_eq!(manager.active_count(), 0, "{stale:?}");
+
+        // Reopening on generation 8 gives a working shell again.
+        let reopened = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            8,
+            &projects,
+            &ssh_persistent_shell_request("open", "wc_shell_rps_gen_new", resource, None),
+        );
+        assert_eq!(reopened.shell_state, "running", "{reopened:?}");
+        let after = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            8,
+            &projects,
+            &ssh_persistent_shell_request(
+                "exec",
+                "wc_shell_rps_gen_new",
+                resource,
+                Some("printf generation-8-command"),
+            ),
+        );
+        assert_eq!(after.exit_code, Some(0), "{after:?}");
+        assert_eq!(after.stdout, "generation-8-command", "{after:?}");
+    }
+
+    #[test]
+    fn remote_persistent_shell_applies_explicit_cwd_over_resource_default() {
+        let Some(server) = TestSshServer::start() else {
+            eprintln!("skipping SSH integration test because sshd is unavailable");
+            return;
+        };
+        let config = ssh_config(&server);
+        let pool = SshConnectionPool::with_test_config(server.client_config.clone());
+        let manager = crate::webcodex_runner::PersistentShellManager::new(
+            &crate::webcodex_runner::ShellConfig::default(),
+            pool,
+        );
+        let policy = AgentPolicy::default();
+        let projects_dir = ssh_projects_dir();
+        let projects = projects_dir.path().to_path_buf();
+
+        // The resource default_cwd is server.remote_cwd; an explicit cwd must
+        // win.
+        let opened = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            7,
+            &projects,
+            &ssh_persistent_shell_request_at_cwd(
+                "open",
+                "wc_shell_cwd_explicit",
+                "tmp",
+                Some("/tmp"),
+                None,
+            ),
+        );
+        assert_eq!(opened.shell_state, "running", "{opened:?}");
+        assert_eq!(opened.cwd.as_deref(), Some("/tmp"), "{opened:?}");
+        assert_eq!(opened.initial_cwd.as_deref(), Some("/tmp"), "{opened:?}");
+        assert!(
+            !opened.stdout.contains("WCPS"),
+            "marker leaked: {:?}",
+            opened.stdout
+        );
+
+        let observed = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            7,
+            &projects,
+            &ssh_persistent_shell_request("exec", "wc_shell_cwd_explicit", "tmp", Some("pwd -P")),
+        );
+        assert_eq!(observed.exit_code, Some(0), "{observed:?}");
+        assert_eq!(observed.stdout.trim(), "/tmp", "{observed:?}");
+        assert_eq!(observed.cwd.as_deref(), Some("/tmp"), "{observed:?}");
+        assert!(
+            !observed.stdout.contains("WCPS"),
+            "marker leaked: {:?}",
+            observed.stdout
+        );
+        assert!(
+            !observed.stderr.contains("WCPS"),
+            "marker leaked: {:?}",
+            observed.stderr
+        );
+    }
+
+    #[test]
+    fn remote_persistent_shell_uses_session_cwd_when_no_explicit_open_cwd() {
+        let Some(server) = TestSshServer::start() else {
+            eprintln!("skipping SSH integration test because sshd is unavailable");
+            return;
+        };
+        let config = ssh_config(&server);
+        let pool = SshConnectionPool::with_test_config(server.client_config.clone());
+        let manager = crate::webcodex_runner::PersistentShellManager::new(
+            &crate::webcodex_runner::ShellConfig::default(),
+            pool,
+        );
+        let policy = AgentPolicy::default();
+        let projects_dir = ssh_projects_dir();
+        let projects = projects_dir.path().to_path_buf();
+        let session_cwd = server.remote_cwd.join("session-dir");
+        std::fs::create_dir(&session_cwd).expect("create session cwd");
+        let session_cwd = session_cwd.to_string_lossy().into_owned();
+
+        // The Server sends the Session default_cwd as operation.cwd. It must
+        // become the actual remote initial cwd even though the resource also
+        // has a default_cwd.
+        let opened = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            7,
+            &projects,
+            &ssh_persistent_shell_request_at_cwd(
+                "open",
+                "wc_shell_cwd_session",
+                "tmp",
+                Some(&session_cwd),
+                None,
+            ),
+        );
+        assert_eq!(opened.shell_state, "running", "{opened:?}");
+        assert_eq!(
+            opened.cwd.as_deref(),
+            Some(session_cwd.as_str()),
+            "{opened:?}"
+        );
+        assert_eq!(
+            opened.initial_cwd.as_deref(),
+            Some(session_cwd.as_str()),
+            "{opened:?}"
+        );
+
+        let observed = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            7,
+            &projects,
+            &ssh_persistent_shell_request("exec", "wc_shell_cwd_session", "tmp", Some("pwd -P")),
+        );
+        assert_eq!(observed.exit_code, Some(0), "{observed:?}");
+        assert_eq!(observed.stdout.trim(), session_cwd, "{observed:?}");
+        assert_eq!(
+            observed.cwd.as_deref(),
+            Some(session_cwd.as_str()),
+            "{observed:?}"
+        );
+    }
+
+    #[test]
+    fn remote_persistent_shell_uses_resource_default_cwd_when_nothing_else() {
+        let Some(server) = TestSshServer::start() else {
+            eprintln!("skipping SSH integration test because sshd is unavailable");
+            return;
+        };
+        let config = ssh_config(&server);
+        let pool = SshConnectionPool::with_test_config(server.client_config.clone());
+        let manager = crate::webcodex_runner::PersistentShellManager::new(
+            &crate::webcodex_runner::ShellConfig::default(),
+            pool,
+        );
+        let policy = AgentPolicy::default();
+        let projects_dir = ssh_projects_dir();
+        let projects = projects_dir.path().to_path_buf();
+        let resource_cwd = server.remote_cwd.to_string_lossy().into_owned();
+
+        let opened = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            7,
+            &projects,
+            &ssh_persistent_shell_request("open", "wc_shell_cwd_resource", "tmp", None),
+        );
+        assert_eq!(opened.shell_state, "running", "{opened:?}");
+        assert_eq!(
+            opened.cwd.as_deref(),
+            Some(resource_cwd.as_str()),
+            "{opened:?}"
+        );
+
+        let observed = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            7,
+            &projects,
+            &ssh_persistent_shell_request("exec", "wc_shell_cwd_resource", "tmp", Some("pwd -P")),
+        );
+        assert_eq!(observed.exit_code, Some(0), "{observed:?}");
+        assert_eq!(observed.stdout.trim(), resource_cwd, "{observed:?}");
+        assert_eq!(
+            observed.cwd.as_deref(),
+            Some(resource_cwd.as_str()),
+            "{observed:?}"
+        );
+    }
+
+    #[test]
+    fn remote_persistent_shell_keeps_login_dir_when_no_cwd_is_specified() {
+        let Some(server) = TestSshServer::start() else {
+            eprintln!("skipping SSH integration test because sshd is unavailable");
+            return;
+        };
+        let config = ssh_config_without_default(&server);
+        let pool = SshConnectionPool::with_test_config(server.client_config.clone());
+        let manager = crate::webcodex_runner::PersistentShellManager::new(
+            &crate::webcodex_runner::ShellConfig::default(),
+            pool,
+        );
+        let policy = AgentPolicy::default();
+        let projects_dir = ssh_projects_dir();
+        let projects = projects_dir.path().to_path_buf();
+
+        // The remote login directory: what a plain `ssh host pwd -P` reports
+        // when no cd is issued.
+        let login_dir = Command::new("ssh")
+            .arg("-F")
+            .arg(&server.client_config)
+            .arg(&server.alias)
+            .arg("pwd -P")
+            .output()
+            .expect("resolve SSH test login directory");
+        assert!(
+            login_dir.status.success(),
+            "could not resolve SSH test login directory: {}",
+            String::from_utf8_lossy(&login_dir.stderr)
+        );
+        let login_dir = String::from_utf8_lossy(&login_dir.stdout)
+            .trim()
+            .to_string();
+        assert!(!login_dir.is_empty(), "SSH login directory is empty");
+
+        let opened = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            7,
+            &projects,
+            &ssh_persistent_shell_request("open", "wc_shell_cwd_login", "nodefault", None),
+        );
+        assert_eq!(opened.shell_state, "running", "{opened:?}");
+        assert!(opened.error.is_none(), "{opened:?}");
+        assert_eq!(
+            opened.cwd.as_deref(),
+            Some(login_dir.as_str()),
+            "{opened:?}"
+        );
+        assert_eq!(
+            opened.initial_cwd.as_deref(),
+            Some(login_dir.as_str()),
+            "without any requested cwd the reported initial cwd is the login directory, not an empty seed"
+        );
+
+        let changed = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            7,
+            &projects,
+            &ssh_persistent_shell_request(
+                "exec",
+                "wc_shell_cwd_login",
+                "nodefault",
+                Some("cd /tmp"),
+            ),
+        );
+        assert_eq!(changed.exit_code, Some(0), "{changed:?}");
+        assert_eq!(changed.cwd.as_deref(), Some("/tmp"), "{changed:?}");
+
+        let status = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            7,
+            &projects,
+            &ssh_persistent_shell_request("status", "wc_shell_cwd_login", "nodefault", None),
+        );
+        assert_eq!(status.cwd.as_deref(), Some("/tmp"), "{status:?}");
+        assert_eq!(
+            status.initial_cwd.as_deref(),
+            Some(login_dir.as_str()),
+            "status must retain the login directory as initial_cwd: {status:?}"
+        );
+
+        let closed = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            7,
+            &projects,
+            &ssh_persistent_shell_request("close", "wc_shell_cwd_login", "nodefault", None),
+        );
+        assert_eq!(closed.cwd.as_deref(), Some("/tmp"), "{closed:?}");
+        assert_eq!(
+            closed.initial_cwd.as_deref(),
+            Some(login_dir.as_str()),
+            "close must retain the login directory as initial_cwd: {closed:?}"
+        );
+    }
+
+    #[test]
+    fn remote_persistent_shell_freezes_physical_cwd_from_symlink_request() {
+        let Some(server) = TestSshServer::start() else {
+            eprintln!("skipping SSH integration test because sshd is unavailable");
+            return;
+        };
+        let config = ssh_config(&server);
+        let pool = SshConnectionPool::with_test_config(server.client_config.clone());
+        let manager = crate::webcodex_runner::PersistentShellManager::new(
+            &crate::webcodex_runner::ShellConfig::default(),
+            pool,
+        );
+        let policy = AgentPolicy::default();
+        let projects_dir = ssh_projects_dir();
+        let projects = projects_dir.path().to_path_buf();
+        let physical = server.remote_cwd.join("physical");
+        let logical = server.remote_cwd.join("logical");
+        std::fs::create_dir(&physical).expect("create physical remote cwd");
+        symlink(&physical, &logical).expect("create remote cwd symlink");
+        let physical = physical.canonicalize().expect("canonicalize physical cwd");
+        let physical = physical.to_string_lossy().into_owned();
+        let logical = logical.to_string_lossy().into_owned();
+
+        let opened = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            7,
+            &projects,
+            &ssh_persistent_shell_request_at_cwd(
+                "open",
+                "wc_shell_cwd_symlink",
+                "tmp",
+                Some(&logical),
+                None,
+            ),
+        );
+        assert_eq!(opened.shell_state, "running", "{opened:?}");
+        assert_eq!(opened.cwd.as_deref(), Some(physical.as_str()), "{opened:?}");
+        assert_eq!(
+            opened.initial_cwd.as_deref(),
+            Some(physical.as_str()),
+            "initial_cwd must use pwd -P rather than the requested symlink: {opened:?}"
+        );
+
+        let changed = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            7,
+            &projects,
+            &ssh_persistent_shell_request("exec", "wc_shell_cwd_symlink", "tmp", Some("cd /tmp")),
+        );
+        assert_eq!(changed.exit_code, Some(0), "{changed:?}");
+
+        let status = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            7,
+            &projects,
+            &ssh_persistent_shell_request("status", "wc_shell_cwd_symlink", "tmp", None),
+        );
+        assert_eq!(status.cwd.as_deref(), Some("/tmp"), "{status:?}");
+        assert_eq!(
+            status.initial_cwd.as_deref(),
+            Some(physical.as_str()),
+            "{status:?}"
+        );
+
+        let closed = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            7,
+            &projects,
+            &ssh_persistent_shell_request("close", "wc_shell_cwd_symlink", "tmp", None),
+        );
+        assert_eq!(closed.cwd.as_deref(), Some("/tmp"), "{closed:?}");
+        assert_eq!(
+            closed.initial_cwd.as_deref(),
+            Some(physical.as_str()),
+            "{closed:?}"
+        );
+    }
+
+    #[test]
+    fn remote_persistent_shell_open_fails_when_cwd_is_unavailable() {
+        let Some(server) = TestSshServer::start() else {
+            eprintln!("skipping SSH integration test because sshd is unavailable");
+            return;
+        };
+        let config = ssh_config(&server);
+        let pool = SshConnectionPool::with_test_config(server.client_config.clone());
+        let manager = crate::webcodex_runner::PersistentShellManager::new(
+            &crate::webcodex_runner::ShellConfig::default(),
+            pool,
+        );
+        let policy = AgentPolicy::default();
+        let projects_dir = ssh_projects_dir();
+        let projects = projects_dir.path().to_path_buf();
+        let missing = server
+            .remote_cwd
+            .join("does-not-exist")
+            .to_string_lossy()
+            .into_owned();
+
+        let opened = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            7,
+            &projects,
+            &ssh_persistent_shell_request_at_cwd(
+                "open",
+                "wc_shell_cwd_missing",
+                "tmp",
+                Some(&missing),
+                None,
+            ),
+        );
+        assert_eq!(
+            opened.error_code.as_deref(),
+            Some("persistent_shell_initialization_failed"),
+            "{opened:?}"
+        );
+        assert_ne!(opened.shell_state, "running", "{opened:?}");
+        assert_eq!(manager.active_count(), 0, "{opened:?}");
+
+        // The failed shell is fully torn down; nothing can be executed against
+        // a shell that failed to open.
+        let stale = manager.handle(
+            &policy,
+            &crate::webcodex_runner::ShellConfig::default(),
+            &config,
+            7,
+            &projects,
+            &ssh_persistent_shell_request(
+                "exec",
+                "wc_shell_cwd_missing",
+                "tmp",
+                Some("printf never-runs"),
+            ),
+        );
+        assert!(
+            stale.error_code.is_some(),
+            "failed open must leave no usable shell: {stale:?}"
+        );
+        assert_eq!(stale.stdout, "", "{stale:?}");
     }
 }

@@ -1,6 +1,10 @@
-use super::config::{validate_shell_config, AgentPolicy, ShellConfig, ShellProfileConfig};
+use super::config::{
+    validate_shell_config, AgentPolicy, ShellConfig, ShellProfileConfig, SshConfig,
+};
 use super::projects::{find_project_shell_context_by_id, AgentProjectShellContext};
+use super::remote_shell::{remote_shell_bootstrap, RemoteShellTransport};
 use super::shell::{base_shell_env, cwd_allowed, shell_quote};
+use super::ssh::SshConnectionPool;
 use crate::shell_protocol::{
     PersistentShellRequest, PersistentShellResult, ShellAgentShellRequest,
 };
@@ -12,18 +16,21 @@ use webcodex_persistent_shell::{
 };
 
 const EXECUTOR_AGENT: &str = "agent";
+const EXECUTOR_SSH: &str = "ssh";
 const TERMINAL_RECORDS: usize = 128;
 const MAX_COMMAND_BYTES: usize = 8_000;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PersistentShellManager {
     processes: ProcessManager,
+    ssh_pool: SshConnectionPool,
 }
 
 impl PersistentShellManager {
-    pub(crate) fn new(shell: &ShellConfig) -> Self {
+    pub(crate) fn new(shell: &ShellConfig, ssh_pool: SshConnectionPool) -> Self {
         Self {
             processes: ProcessManager::new(limits(shell)),
+            ssh_pool,
         }
     }
 
@@ -31,10 +38,16 @@ impl PersistentShellManager {
         &self,
         policy: &AgentPolicy,
         shell: &ShellConfig,
+        ssh: &SshConfig,
+        ssh_generation: u64,
         projects_dir: &Path,
         request: &ShellAgentShellRequest,
     ) -> PersistentShellResult {
         self.processes.update_limits(limits(shell));
+        let ssh_resource = request
+            .job_context
+            .as_ref()
+            .and_then(|context| context.ssh_resource.as_deref());
         let Some(operation) = request.persistent_shell.as_ref() else {
             return error_result(
                 "",
@@ -71,9 +84,35 @@ impl PersistentShellManager {
             };
 
         match operation.action.as_str() {
-            "open" => self.open(policy, shell, request, operation, &project),
-            "exec" => self.exec(policy, shell, operation, &project),
-            "status" => self.status(operation),
+            "open" => {
+                if let Some(resource) = ssh_resource {
+                    self.open_ssh(
+                        policy,
+                        ssh,
+                        ssh_generation,
+                        request,
+                        operation,
+                        resource,
+                        &project,
+                    )
+                } else {
+                    self.open(policy, shell, request, operation, &project)
+                }
+            }
+            "exec" => {
+                if let Some(resource) = ssh_resource {
+                    self.exec_ssh(policy, ssh, ssh_generation, operation, resource, &project)
+                } else {
+                    self.exec(policy, shell, operation, &project)
+                }
+            }
+            "status" => {
+                if let Some(resource) = ssh_resource {
+                    self.status_ssh(ssh, ssh_generation, operation, resource)
+                } else {
+                    self.status(operation)
+                }
+            }
             _ => error_result(
                 &operation.shell_id,
                 &operation.workflow_session_id,
@@ -82,6 +121,233 @@ impl PersistentShellManager {
                 format!("unsupported persistent shell action '{}'", operation.action),
             ),
         }
+    }
+
+    fn open_ssh(
+        &self,
+        policy: &AgentPolicy,
+        ssh: &SshConfig,
+        ssh_generation: u64,
+        request: &ShellAgentShellRequest,
+        operation: &PersistentShellRequest,
+        resource_name: &str,
+        _project: &AgentProjectShellContext,
+    ) -> PersistentShellResult {
+        if !policy.allow_raw_shell {
+            return error_result(
+                &operation.shell_id,
+                &operation.workflow_session_id,
+                &operation.runtime_project_id,
+                "raw_shell_disabled",
+                "persistent shells are disabled by the current Runner raw shell policy",
+            );
+        }
+        let explicit = operation.shell.as_deref();
+        if explicit.is_some_and(|dialect| !matches!(dialect, "sh" | "bash")) {
+            return error_result(
+                &operation.shell_id,
+                &operation.workflow_session_id,
+                &operation.runtime_project_id,
+                "persistent_shell_dialect_unsupported",
+                "persistent shell must be 'sh' or 'bash'",
+            );
+        }
+        let shell_program = explicit.unwrap_or("sh");
+        let dialect = canonical_dialect(shell_program).unwrap_or("sh").to_string();
+        let requested_cwd = operation
+            .cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|cwd| !cwd.is_empty())
+            .map(str::to_string);
+        let (transport, default_cwd) = match RemoteShellTransport::spawn(
+            &self.ssh_pool,
+            ssh_generation,
+            ssh,
+            resource_name,
+            &operation.workflow_session_id,
+            shell_program,
+            policy.max_output_bytes,
+        ) {
+            Ok((transport, default_cwd)) => (transport, default_cwd),
+            Err(error) => {
+                return error_result(
+                    &operation.shell_id,
+                    &operation.workflow_session_id,
+                    &operation.runtime_project_id,
+                    error.code,
+                    error.message,
+                )
+            }
+        };
+        // Remote cwd priority: explicit open cwd > Session/runner-provided cwd
+        // > SSH resource default_cwd > remote login default. The effective cwd
+        // is applied to the remote shell's bootstrap below; `initial_cwd` only
+        // seeds the summary until the first control frame reports the trusted
+        // absolute cwd. When nothing is requested, no `cd` is issued and the
+        // shell keeps the remote login directory (never a fabricated `/`).
+        let effective_cwd = requested_cwd.or(default_cwd);
+        let initial_cwd = effective_cwd
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        let identity = ShellIdentity {
+            shell_id: operation.shell_id.clone(),
+            workflow_session_id: operation.workflow_session_id.clone(),
+            runtime_project_id: operation.runtime_project_id.clone(),
+            executor: EXECUTOR_SSH.to_string(),
+            client_id: Some(request.client_id.clone()),
+        };
+        // The bootstrap is the initialization command: it reserves FD 7/8 on the
+        // remote shell (so the shared command wrapper's markers always reach the
+        // Runner regardless of later user redirects) and applies the effective
+        // remote cwd, runs once, drains, and its control frame reports the
+        // trusted absolute cwd used to seed the shell. A failed `cd` makes the
+        // initialization control frame report a non-zero status, so open fails
+        // and the remote shell is torn down instead of falling back to the
+        // login directory. It never reaches later commands. No local profile
+        // env or init script is sent to the remote host.
+        let initialization = remote_shell_bootstrap(effective_cwd.as_deref());
+        let transport_box: Box<dyn webcodex_persistent_shell::ShellTransport> = Box::new(transport);
+        match self.processes.open_with_transport(
+            identity,
+            dialect,
+            None,
+            initial_cwd,
+            Some(initialization),
+            transport_box,
+        ) {
+            Ok(summary) => summary_result(summary, "opened", false),
+            Err(error) => shell_error_result(operation, error),
+        }
+    }
+
+    fn exec_ssh(
+        &self,
+        policy: &AgentPolicy,
+        ssh: &SshConfig,
+        ssh_generation: u64,
+        operation: &PersistentShellRequest,
+        resource_name: &str,
+        _project: &AgentProjectShellContext,
+    ) -> PersistentShellResult {
+        if !policy.allow_raw_shell {
+            return error_result(
+                &operation.shell_id,
+                &operation.workflow_session_id,
+                &operation.runtime_project_id,
+                "raw_shell_disabled",
+                "persistent shells are disabled by the current Runner raw shell policy",
+            );
+        }
+        if let Err((code, message)) = validate_ssh_binding_current(
+            &self.processes,
+            ssh,
+            ssh_generation,
+            operation,
+            resource_name,
+        ) {
+            let _ = self.processes.close(
+                &operation.shell_id,
+                &operation.workflow_session_id,
+                &operation.runtime_project_id,
+                code,
+            );
+            return error_result(
+                &operation.shell_id,
+                &operation.workflow_session_id,
+                &operation.runtime_project_id,
+                code,
+                message,
+            );
+        }
+        let command = match operation.command.as_deref() {
+            Some(command) => command,
+            None => {
+                return summary_error_result_from_status(
+                    &self.processes,
+                    operation,
+                    "persistent_shell_invalid_request",
+                    "command is required for persistent shell exec",
+                )
+            }
+        };
+        if command.len() > MAX_COMMAND_BYTES {
+            return summary_error_result_from_status(
+                &self.processes,
+                operation,
+                "persistent_shell_invalid_command",
+                format!("command exceeds the {MAX_COMMAND_BYTES}-byte Runner limit"),
+            );
+        }
+        let timeout_secs = operation.timeout_secs.unwrap_or(30);
+        if timeout_secs == 0 || timeout_secs > policy.max_timeout_secs {
+            return summary_error_result_from_status(
+                &self.processes,
+                operation,
+                "persistent_shell_invalid_timeout",
+                format!(
+                    "timeout_secs must be between 1 and {}",
+                    policy.max_timeout_secs
+                ),
+            );
+        }
+        if let Err(error) = self.processes.set_output_limit(
+            &operation.shell_id,
+            &operation.workflow_session_id,
+            &operation.runtime_project_id,
+            policy.max_output_bytes,
+        ) {
+            return shell_error_result(operation, error);
+        }
+        match self.processes.exec(
+            &operation.shell_id,
+            &operation.workflow_session_id,
+            &operation.runtime_project_id,
+            command,
+            Duration::from_secs(timeout_secs),
+        ) {
+            Ok(result) => exec_result(operation, result),
+            Err(error) => match self.processes.status(
+                &operation.shell_id,
+                &operation.workflow_session_id,
+                &operation.runtime_project_id,
+            ) {
+                Ok(summary) => summary_error_result(summary, error.code, error.message),
+                Err(_) => shell_error_result(operation, error),
+            },
+        }
+    }
+
+    fn status_ssh(
+        &self,
+        ssh: &SshConfig,
+        ssh_generation: u64,
+        operation: &PersistentShellRequest,
+        resource_name: &str,
+    ) -> PersistentShellResult {
+        if let Err((code, message)) = validate_ssh_binding_current(
+            &self.processes,
+            ssh,
+            ssh_generation,
+            operation,
+            resource_name,
+        ) {
+            let _ = self.processes.close(
+                &operation.shell_id,
+                &operation.workflow_session_id,
+                &operation.runtime_project_id,
+                code,
+            );
+            return error_result(
+                &operation.shell_id,
+                &operation.workflow_session_id,
+                &operation.runtime_project_id,
+                code,
+                message,
+            );
+        }
+        self.status(operation)
     }
 
     fn open(
@@ -359,6 +625,99 @@ fn validate_boundary(
     })
 }
 
+/// Confirm the SSH binding this shell opened against is still current. The
+/// binding captures the named resource and the Runner configuration generation
+/// at open time (stored as transport metadata on the shared shell entry), and
+/// every later `exec`/`status` on an *active* shell compares it against the
+/// active config. A removed resource, an unknown active generation, or a
+/// generation that advanced past the opened one invalidates an already-open
+/// remote shell: it must be closed and reopened rather than reused against a
+/// stale transport. A terminal shell (closed, exited, poisoned, lost) has
+/// already released its binding and simply reports its terminal state through
+/// the shared state machine.
+fn validate_ssh_binding_current(
+    processes: &ProcessManager,
+    ssh: &SshConfig,
+    ssh_generation: u64,
+    operation: &PersistentShellRequest,
+    resource_name: &str,
+) -> Result<(), (&'static str, String)> {
+    let summary = match processes.status(
+        &operation.shell_id,
+        &operation.workflow_session_id,
+        &operation.runtime_project_id,
+    ) {
+        Ok(summary) => summary,
+        Err(error) => return Err((error.code, error.message)),
+    };
+    if !matches!(summary.state, ShellState::Opening | ShellState::Running) {
+        // The shell cannot run a command anymore; leave its terminal state and
+        // the Server record intact instead of forcing a reset.
+        return Ok(());
+    }
+    let metadata = match processes.metadata(
+        &operation.shell_id,
+        &operation.workflow_session_id,
+        &operation.runtime_project_id,
+    ) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return Err((error.code, error.message));
+        }
+    };
+    let opened_generation = match metadata.as_ref().and_then(|metadata| metadata.generation) {
+        Some(generation) => generation,
+        None => {
+            // No transport binding was recorded: the shell was not opened as an
+            // SSH persistent shell (or has already gone terminal). Never run a
+            // user command against a shell whose binding cannot be verified.
+            return Err((
+                "shell_reset_required",
+                "persistent shell has no recorded SSH binding; close and reopen it".to_string(),
+            ));
+        }
+    };
+    if metadata
+        .as_ref()
+        .and_then(|metadata| metadata.resource.as_deref())
+        != Some(resource_name)
+    {
+        return Err((
+            "shell_reset_required",
+            format!(
+                "persistent shell is bound to a different SSH resource than requested; close and reopen it (expected '{}')",
+                resource_name
+            ),
+        ));
+    }
+    if !ssh.resources.contains_key(resource_name) {
+        return Err((
+            "shell_reset_required",
+            format!(
+                "SSH resource '{}' is no longer configured on this Runner; close and reopen the persistent shell",
+                resource_name
+            ),
+        ));
+    }
+    if ssh_generation == 0 {
+        return Err((
+            "shell_reset_required",
+            "SSH configuration generation is unknown; close and reopen the persistent shell"
+                .to_string(),
+        ));
+    }
+    if opened_generation != ssh_generation {
+        return Err((
+            "shell_reset_required",
+            format!(
+                "SSH resource '{}' changed to configuration generation {ssh_generation} after this persistent shell was opened at generation {opened_generation}; close and reopen the persistent shell",
+                resource_name
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn resolve_cwd(
     project: &AgentProjectShellContext,
     requested: Option<&str>,
@@ -605,6 +964,25 @@ fn summary_error_result(
     result
 }
 
+/// Like `summary_error_result` but fetches the current status from the manager
+/// first, so an SSH exec rejection still reports the authoritative running
+/// state (and closes a stale shell) the way the local path does.
+fn summary_error_result_from_status(
+    processes: &ProcessManager,
+    operation: &PersistentShellRequest,
+    code: &str,
+    message: impl Into<String>,
+) -> PersistentShellResult {
+    match processes.status(
+        &operation.shell_id,
+        &operation.workflow_session_id,
+        &operation.runtime_project_id,
+    ) {
+        Ok(summary) => summary_error_result(summary, code, message),
+        Err(error) => shell_error_result(operation, error),
+    }
+}
+
 fn error_result(
     shell_id: &str,
     workflow_session_id: &str,
@@ -717,12 +1095,14 @@ mod tests {
     fn runner_preserves_state_and_rechecks_raw_shell_policy() {
         let (_temp, _project, projects, policy) = fixture();
         let shell = ShellConfig::default();
-        let manager = PersistentShellManager::new(&shell);
+        let manager = PersistentShellManager::new(&shell, SshConnectionPool::default());
         let mut denied_open_policy = policy.clone();
         denied_open_policy.allow_raw_shell = false;
         let denied_open = manager.handle(
             &denied_open_policy,
             &shell,
+            &SshConfig::default(),
+            1,
             &projects,
             &request("open", "wc_shell_denied_open", None),
         );
@@ -735,6 +1115,8 @@ mod tests {
         let opened = manager.handle(
             &policy,
             &shell,
+            &SshConfig::default(),
+            1,
             &projects,
             &request("open", "wc_shell_runner", None),
         );
@@ -743,6 +1125,8 @@ mod tests {
         let exported = manager.handle(
             &policy,
             &shell,
+            &SshConfig::default(),
+            1,
             &projects,
             &request(
                 "exec",
@@ -754,6 +1138,8 @@ mod tests {
         let observed = manager.handle(
             &policy,
             &shell,
+            &SshConfig::default(),
+            1,
             &projects,
             &request(
                 "exec",
@@ -769,6 +1155,8 @@ mod tests {
         let denied = manager.handle(
             &denied_policy,
             &shell,
+            &SshConfig::default(),
+            1,
             &projects,
             &request("exec", "wc_shell_runner", Some("printf denied")),
         );
@@ -780,12 +1168,14 @@ mod tests {
     fn rejected_exec_keeps_authoritative_running_state() {
         let (_temp, _project, projects, policy) = fixture();
         let shell = ShellConfig::default();
-        let manager = PersistentShellManager::new(&shell);
+        let manager = PersistentShellManager::new(&shell, SshConnectionPool::default());
         assert_eq!(
             manager
                 .handle(
                     &policy,
                     &shell,
+                    &SshConfig::default(),
+                    1,
                     &projects,
                     &request("open", "wc_shell_rejected_exec", None),
                 )
@@ -795,7 +1185,14 @@ mod tests {
 
         let mut invalid = request("exec", "wc_shell_rejected_exec", Some("printf ignored"));
         invalid.persistent_shell.as_mut().unwrap().timeout_secs = Some(policy.max_timeout_secs + 1);
-        let rejected = manager.handle(&policy, &shell, &projects, &invalid);
+        let rejected = manager.handle(
+            &policy,
+            &shell,
+            &SshConfig::default(),
+            1,
+            &projects,
+            &invalid,
+        );
         assert_eq!(
             rejected.error_code.as_deref(),
             Some("persistent_shell_invalid_timeout")
@@ -806,6 +1203,8 @@ mod tests {
         let oversized = manager.handle(
             &policy,
             &shell,
+            &SshConfig::default(),
+            1,
             &projects,
             &request(
                 "exec",
@@ -822,6 +1221,8 @@ mod tests {
         let observed = manager.handle(
             &policy,
             &shell,
+            &SshConfig::default(),
+            1,
             &projects,
             &request(
                 "exec",
@@ -836,12 +1237,14 @@ mod tests {
     fn exec_reapplies_current_output_limit() {
         let (_temp, _project, projects, mut policy) = fixture();
         let shell = ShellConfig::default();
-        let manager = PersistentShellManager::new(&shell);
+        let manager = PersistentShellManager::new(&shell, SshConnectionPool::default());
         assert_eq!(
             manager
                 .handle(
                     &policy,
                     &shell,
+                    &SshConfig::default(),
+                    1,
                     &projects,
                     &request("open", "wc_shell_output_policy", None),
                 )
@@ -853,6 +1256,8 @@ mod tests {
         let result = manager.handle(
             &policy,
             &shell,
+            &SshConfig::default(),
+            1,
             &projects,
             &request(
                 "exec",
@@ -882,12 +1287,14 @@ mod tests {
             ..ShellConfig::default()
         };
         shell.max_persistent_shells = 2;
-        let manager = PersistentShellManager::new(&shell);
+        let manager = PersistentShellManager::new(&shell, SshConnectionPool::default());
         assert_eq!(
             manager
                 .handle(
                     &policy,
                     &shell,
+                    &SshConfig::default(),
+                    1,
                     &projects,
                     &request("open", "wc_shell_profile", None),
                 )
@@ -897,6 +1304,8 @@ mod tests {
         let first = manager.handle(
             &policy,
             &shell,
+            &SshConfig::default(),
+            1,
             &projects,
             &request(
                 "exec",
@@ -908,6 +1317,8 @@ mod tests {
         let second = manager.handle(
             &policy,
             &shell,
+            &SshConfig::default(),
+            1,
             &projects,
             &request(
                 "exec",
@@ -934,11 +1345,13 @@ mod tests {
             profiles,
             ..ShellConfig::default()
         };
-        let manager = PersistentShellManager::new(&shell);
+        let manager = PersistentShellManager::new(&shell, SshConnectionPool::default());
 
         let result = manager.handle(
             &policy,
             &shell,
+            &SshConfig::default(),
+            1,
             &projects,
             &request("open", "wc_shell_profile_escape", None),
         );
@@ -954,12 +1367,14 @@ mod tests {
     fn runner_closes_shell_that_moves_outside_project() {
         let (_temp, _project, projects, policy) = fixture();
         let shell = ShellConfig::default();
-        let manager = PersistentShellManager::new(&shell);
+        let manager = PersistentShellManager::new(&shell, SshConnectionPool::default());
         assert_eq!(
             manager
                 .handle(
                     &policy,
                     &shell,
+                    &SshConfig::default(),
+                    1,
                     &projects,
                     &request("open", "wc_shell_boundary", None),
                 )
@@ -970,6 +1385,8 @@ mod tests {
         let escaped = manager.handle(
             &policy,
             &shell,
+            &SshConfig::default(),
+            1,
             &projects,
             &request("exec", "wc_shell_boundary", Some("cd ..")),
         );
@@ -982,11 +1399,11 @@ mod tests {
     fn runner_rejects_runtime_project_identity_mismatch() {
         let (_temp, _project, projects, policy) = fixture();
         let shell = ShellConfig::default();
-        let manager = PersistentShellManager::new(&shell);
+        let manager = PersistentShellManager::new(&shell, SshConnectionPool::default());
         let mut wrong = request("open", "wc_shell_wrong", None);
         wrong.persistent_shell.as_mut().unwrap().runtime_project_id =
             "agent:other:demo".to_string();
-        let result = manager.handle(&policy, &shell, &projects, &wrong);
+        let result = manager.handle(&policy, &shell, &SshConfig::default(), 1, &projects, &wrong);
         assert_eq!(
             result.error_code.as_deref(),
             Some("persistent_shell_project_mismatch")

@@ -9,6 +9,7 @@ pub(crate) mod output;
 pub(crate) mod patches;
 pub(crate) mod persistent_shell;
 pub(crate) mod projects;
+pub(crate) mod remote_shell;
 pub(crate) mod shell;
 pub(crate) mod shutdown;
 pub(crate) mod ssh;
