@@ -337,6 +337,7 @@ webcodex-runner --profile workstation
 | `owner` | 该 agent 的 owner principal。 |
 | `transport` | 推荐配置 `[quic]` 并使用 `auto`：先 QUIC，再 WebSocket，再 polling。只有明确需要单一 transport 时才使用 strict `quic`、`websocket` 或 `polling`。 |
 | `projects_dir` | 项目注册文件目录。 |
+| `temporary_projects_root` | 可选的、已存在的 Runner 托管临时项目根目录；它会按 effective Runner path policy 校验（收窄部署时必须位于 `allowed_roots` 内）。 |
 | `[policy]` | 本地执行边界。 |
 | `[shell]` | 可选 shell profile 定义，用于项目开发环境。 |
 

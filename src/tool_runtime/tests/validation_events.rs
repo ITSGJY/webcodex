@@ -1087,6 +1087,8 @@ async fn finish_coding_task_validation_available_when_ledger_has_validation_even
         .dispatch_with_auth(
             ToolCall::StartCodingTask {
                 project: project.clone(),
+                client_id: None,
+                temporary_project_name: None,
                 title: Some("validation finish".to_string()),
                 mode: SessionMode::Normal,
                 detail: Default::default(),

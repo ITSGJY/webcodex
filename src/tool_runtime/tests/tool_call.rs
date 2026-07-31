@@ -366,6 +366,7 @@ fn tool_call_project_accessor_covers_project_tool_specs() {
         // args omit it (it is not required), so `project()` returns `None`.
         let expected_project = if schema_has_project
             && spec.name != "start_session"
+            && spec.name != "start_coding_task"
             && spec.name != "session_handoff_summary"
         {
             Some("agent:oe:private-drop")
@@ -552,6 +553,7 @@ fn start_coding_task_defaults_to_continuation_and_requires_explicit_isolation() 
             ..
         }
     ));
+    assert_eq!(call.project(), Some("agent:oe:demo"));
 
     let isolated = ToolCall::from_tool_name(
         "start_coding_task",
@@ -570,6 +572,33 @@ fn start_coding_task_defaults_to_continuation_and_requires_explicit_isolation() 
             ..
         }
     ));
+}
+
+#[test]
+fn start_coding_task_parses_managed_temporary_project_request_without_project() {
+    let call = ToolCall::from_tool_name(
+        "start_coding_task",
+        json!({
+            "client_id": "runner-1",
+            "temporary_project_name": "Scratch task"
+        }),
+    )
+    .unwrap();
+
+    match &call {
+        ToolCall::StartCodingTask {
+            project,
+            client_id,
+            temporary_project_name,
+            ..
+        } => {
+            assert!(project.is_empty());
+            assert_eq!(client_id.as_deref(), Some("runner-1"));
+            assert_eq!(temporary_project_name.as_deref(), Some("Scratch task"));
+        }
+        _ => panic!("expected start_coding_task"),
+    }
+    assert!(call.project().is_none());
 }
 
 #[test]

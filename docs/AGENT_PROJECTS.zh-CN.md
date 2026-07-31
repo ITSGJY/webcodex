@@ -55,6 +55,29 @@ path = "/srv/webcodex/projects/webcodex"
 
 这些工具可通过 runtime tool list、MCP tools/list 和 dedicated GPT Actions 使用，并受所选 agent policy 约束。
 
+## Runner 托管的临时项目
+
+在 `agent.toml` 配置一个已存在、由运维方控制的
+`temporary_projects_root` 后，调用方可以在 `start_coding_task` 中提供
+`client_id` 而不提供 `project`，由 Runner 创建临时项目：
+
+```toml
+temporary_projects_root = "/srv/webcodex/temporary-projects"
+
+[policy]
+allow_cwd_anywhere = false
+allowed_roots = ["/srv/webcodex"]
+```
+
+Runner 会自行生成目录名和 project id，只在该根目录下创建新的直接子目录，
+规范化结果路径，并写入普通的 `projects.d/*.toml` 记录，其中
+`kind = "managed_temporary"`。之后它使用普通 runtime id
+`agent:<client_id>:<project_id>`，可直接用于 session、shell、文件、Git、LSP
+和 checkpoint；`listProjects` 会将其 `source` 标为 `managed_temporary`。
+
+该根目录必须预先存在，且位于 Runner policy 允许的范围内。目前没有自动过期
+或删除；将来的保留/删除逻辑必须以受管记录为依据并重新校验根目录后才能删除。
+
 ## Policy boundaries
 
 `allowed_roots` 控制哪些 project paths 可以被注册或创建。

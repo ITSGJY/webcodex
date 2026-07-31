@@ -14,6 +14,8 @@ impl ToolRuntime {
         match call {
             ToolCall::StartCodingTask {
                 project,
+                client_id,
+                temporary_project_name,
                 title,
                 mode,
                 deny_write_tools,
@@ -26,6 +28,8 @@ impl ToolRuntime {
             } => {
                 self.start_coding_task(
                     project,
+                    client_id,
+                    temporary_project_name,
                     title,
                     mode,
                     deny_write_tools,

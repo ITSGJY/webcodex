@@ -41,12 +41,16 @@ pub(crate) use patches::{
     validate_line_edit_agent_path,
 };
 #[cfg(test)]
+pub(crate) use projects::handle_project_op;
+#[cfg(test)]
 pub(crate) use projects::load_agent_project_summaries_from_dir;
 #[cfg(test)]
 pub(crate) use projects::{
     agent_project_summary, parse_agent_project_toml, validate_project_path_policy,
 };
-pub(crate) use projects::{handle_project_lifecycle_op, handle_project_op, AgentProjectCache};
+pub(crate) use projects::{
+    handle_project_lifecycle_op, handle_project_op_with_temporary_projects_root, AgentProjectCache,
+};
 #[cfg(test)]
 pub(crate) use shell::run_shell;
 #[cfg(test)]

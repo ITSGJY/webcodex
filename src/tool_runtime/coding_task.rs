@@ -35,6 +35,7 @@ use super::validation_events::skipped_validation_summary;
 use super::{current_session_key, unknown_session_result};
 use super::{ToolCall, ToolRuntime};
 use crate::auth::AuthContext;
+use crate::shell_protocol::{SHELL_CLIENT_CAPABILITY_GIT, SHELL_CLIENT_CAPABILITY_SHELL};
 use std::collections::HashSet;
 
 const RULES_MAX_HEADINGS: usize = 8;
@@ -47,6 +48,8 @@ impl ToolRuntime {
     pub(crate) async fn start_coding_task(
         &self,
         project: String,
+        client_id: Option<String>,
+        temporary_project_name: Option<String>,
         title: Option<String>,
         mode: SessionMode,
         deny_write_tools: bool,
@@ -60,6 +63,20 @@ impl ToolRuntime {
         transport: SessionTransport,
         window: Option<&crate::client_window::ClientWindow>,
     ) -> ToolResult {
+        let create_managed_temporary_project = project.trim().is_empty();
+        if !create_managed_temporary_project
+            && (client_id.is_some() || temporary_project_name.is_some())
+        {
+            return ToolResult::err_with_output(
+                "project cannot be combined with client_id or temporary_project_name",
+                json!({
+                    "error_kind": "invalid_arguments",
+                    "failure_kind": "invalid_arguments",
+                    "constraint": "existing_project_or_managed_temporary_project",
+                    "state_changed": false,
+                }),
+            );
+        }
         let resume_requested = resume_session_id.is_some();
         if resume_requested && new_session {
             return ToolResult::err_with_output(
@@ -130,6 +147,107 @@ impl ToolRuntime {
                 Some(title)
             }
             None => None,
+        };
+        let project = if create_managed_temporary_project {
+            if resume_session_id.is_some() {
+                return ToolResult::err_with_output(
+                    "resume_session_id requires an existing project",
+                    json!({
+                        "error_kind": "invalid_arguments",
+                        "failure_kind": "invalid_arguments",
+                        "field": "resume_session_id",
+                        "constraint": "managed_temporary_project_cannot_resume",
+                        "state_changed": false,
+                    }),
+                );
+            }
+            let client_id = match client_id.map(|id| id.trim().to_string()) {
+                Some(client_id) if !client_id.is_empty() => client_id,
+                _ => {
+                    return ToolResult::err_with_output(
+                        "start_coding_task requires project or client_id",
+                        json!({
+                            "error_kind": "invalid_arguments",
+                            "failure_kind": "invalid_arguments",
+                            "required_any_of": ["project", "client_id"],
+                            "state_changed": false,
+                        }),
+                    )
+                }
+            };
+            if auth.is_some_and(|auth| {
+                auth.is_oauth_token() && !auth.has_scope(crate::auth::SCOPE_PROJECT_WRITE)
+            }) {
+                return ToolResult::err_with_output(
+                    "managed temporary project creation requires project:write",
+                    json!({
+                        "error_kind": "insufficient_scope",
+                        "failure_kind": "insufficient_scope",
+                        "required_scope": crate::auth::SCOPE_PROJECT_WRITE,
+                        "state_changed": false,
+                    }),
+                );
+            }
+            if let Some(decision) = self.permission_evaluator.evaluate("create_project", None) {
+                if !decision.allows_execution() {
+                    let mut result =
+                        super::permissions::permission_execution_denied_result(&decision);
+                    super::permissions::add_permission_to_result(&mut result, &decision);
+                    return result;
+                }
+            }
+            let supports_shell = match self
+                .shell_clients
+                .client_supports_for_auth(&client_id, SHELL_CLIENT_CAPABILITY_SHELL, auth)
+                .await
+            {
+                Ok(supported) => supported,
+                Err(error) => return ToolResult::err(error),
+            };
+            let supports_git = if supports_shell {
+                false
+            } else {
+                match self
+                    .shell_clients
+                    .client_supports_for_auth(&client_id, SHELL_CLIENT_CAPABILITY_GIT, auth)
+                    .await
+                {
+                    Ok(supported) => supported,
+                    Err(error) => return ToolResult::err(error),
+                }
+            };
+            if !supports_shell && !supports_git {
+                return ToolResult::err(format!(
+                    "agent client {} does not support shell or git",
+                    client_id
+                ));
+            }
+            let created = self
+                .create_managed_temporary_project(client_id, temporary_project_name, auth)
+                .await;
+            if !created.success {
+                return created;
+            }
+            match created
+                .output
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+            {
+                Some(id) => id.to_string(),
+                None => {
+                    return ToolResult::err_with_output(
+                        "agent returned a managed temporary project without a runtime id",
+                        json!({
+                            "error_kind": "operation_failed",
+                            "failure_kind": "operation_failed",
+                            "state_changed": true,
+                        }),
+                    )
+                }
+            }
+        } else {
+            project
         };
         // `detail` is the single startup projection control: full keeps the
         // complete runtime status, recent commits, rules, and tool manifest;

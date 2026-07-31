@@ -31,6 +31,11 @@ pub(crate) struct AgentConfig {
     pub(crate) hostname: Option<String>,
     #[serde(default)]
     pub(crate) projects_dir: Option<PathBuf>,
+    /// Optional Runner-owned root for managed temporary projects. When absent,
+    /// temporary project creation is disabled; ordinary project registration is
+    /// unchanged.
+    #[serde(default)]
+    pub(crate) temporary_projects_root: Option<PathBuf>,
     #[serde(default = "default_poll_interval_ms")]
     pub(crate) poll_interval_ms: u64,
     #[serde(default)]
@@ -274,6 +279,13 @@ impl ReloadableAgentConfig {
         &self.stopping
     }
 
+    /// Startup-owned managed temporary-project root. Like `projects_dir`, a
+    /// changed value is reported as restart-required so one running Runner
+    /// cannot silently switch its project-registration boundary.
+    pub(crate) fn temporary_projects_root(&self) -> Option<&Path> {
+        self.startup.temporary_projects_root.as_deref()
+    }
+
     pub(crate) fn is_stopping(&self) -> bool {
         self.stopping.load(Ordering::SeqCst)
     }
@@ -375,6 +387,7 @@ pub(crate) fn restart_required_fields(
         owner,
         poll_interval_ms,
         projects_dir,
+        temporary_projects_root,
         quic,
         server_url,
         token,
@@ -724,6 +737,11 @@ pub(crate) fn load_config(path: &Path) -> Result<AgentConfig, String> {
     }
     if cfg.websocket_connect_timeout_secs == 0 {
         return Err("websocket_connect_timeout_secs must be > 0".to_string());
+    }
+    if let Some(root) = cfg.temporary_projects_root.as_ref() {
+        if root.as_os_str().is_empty() || !root.is_absolute() {
+            return Err("temporary_projects_root must be a non-empty absolute path".to_string());
+        }
     }
     if let Some(transport) = cfg.transport.as_deref().map(str::trim) {
         if !transport.is_empty()

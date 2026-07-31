@@ -350,6 +350,8 @@ async fn durable_current_binding_restores_same_window_after_restart() {
         "restart-agent",
         ToolCall::StartCodingTask {
             project: project.clone(),
+            client_id: None,
+            temporary_project_name: None,
             title: Some("restart continuity".to_string()),
             mode: SessionMode::Normal,
             deny_write_tools: false,
@@ -393,6 +395,8 @@ async fn durable_current_binding_restores_same_window_after_restart() {
         "restart-agent",
         ToolCall::StartCodingTask {
             project: project.clone(),
+            client_id: None,
+            temporary_project_name: None,
             title: Some("new post-restart context".to_string()),
             mode: SessionMode::Normal,
             deny_write_tools: false,
@@ -962,6 +966,8 @@ fn coding_start_call(
 ) -> ToolCall {
     ToolCall::StartCodingTask {
         project: project.to_string(),
+        client_id: None,
+        temporary_project_name: None,
         title: Some(instruction.to_string()),
         mode,
         deny_write_tools: false,

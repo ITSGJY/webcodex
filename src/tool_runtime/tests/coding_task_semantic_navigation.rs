@@ -46,6 +46,8 @@ async fn register_semantic_agent(
 fn start_call(project: String, mode: SessionMode) -> ToolCall {
     ToolCall::StartCodingTask {
         project,
+        client_id: None,
+        temporary_project_name: None,
         title: Some("semantic navigation startup".to_string()),
         mode,
         detail: Default::default(),

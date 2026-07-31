@@ -941,6 +941,8 @@ impl ToolCall {
             }),
             Self::StartCodingTask {
                 project,
+                client_id,
+                temporary_project_name,
                 title,
                 mode,
                 deny_write_tools,
@@ -952,6 +954,8 @@ impl ToolCall {
                 execution_context,
             } => serde_json::json!({
                 "project": project,
+                "client_id": client_id,
+                "temporary_project_name": temporary_project_name,
                 "title": title,
                 "mode": mode,
                 "deny_write_tools": deny_write_tools,

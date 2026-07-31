@@ -344,6 +344,7 @@ Important agent settings:
 | `owner` | Owner principal for this agent. |
 | `transport` | Prefer `auto` with `[quic]` configured: QUIC first, then WebSocket, then polling. Use strict `quic`, `websocket`, or `polling` only when you want exactly one transport. |
 | `projects_dir` | Directory of project registry files. |
+| `temporary_projects_root` | Optional existing Runner-owned root for managed temporary projects; it is validated against the effective Runner path policy (and must be inside `allowed_roots` in narrowed deployments). |
 | `[policy]` | Local execution boundary. |
 | `[shell]` | Optional shell profile definitions for project development environments. |
 

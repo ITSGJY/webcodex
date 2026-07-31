@@ -75,7 +75,17 @@ pub enum ToolCall {
     /// flags (`compact_startup`, `include_*`, `tool_manifest_*`) are rejected
     /// as unknown fields by strict argument validation.
     StartCodingTask {
+        /// Existing runtime project id. Omit this only with `client_id` to ask
+        /// the selected Runner to create a managed temporary project first.
+        #[serde(default)]
         project: String,
+        /// Runner client that should create the managed temporary project when
+        /// no existing `project` is supplied.
+        #[serde(default)]
+        client_id: Option<String>,
+        /// Optional safe display name for a Runner-managed temporary project.
+        #[serde(default)]
+        temporary_project_name: Option<String>,
         #[serde(default)]
         title: Option<String>,
         #[serde(default)]
@@ -1062,6 +1072,8 @@ pub enum ToolCall {
 fn reject_unknown_start_coding_task_fields(arguments: &Value) -> Result<(), String> {
     const ALLOWED: &[&str] = &[
         "project",
+        "client_id",
+        "temporary_project_name",
         "title",
         "mode",
         "deny_write_tools",
@@ -1454,9 +1466,10 @@ impl ToolCall {
             | Self::WorkspaceSymbols { project, .. }
             | Self::GotoDefinition { project, .. }
             | Self::FindReferences { project, .. } => Some(project.as_str()),
-            Self::StartCodingTask { project, .. } | Self::FinishCodingTask { project, .. } => {
+            Self::StartCodingTask { project, .. } if !project.trim().is_empty() => {
                 Some(project.as_str())
             }
+            Self::FinishCodingTask { project, .. } => Some(project.as_str()),
             Self::UpdateSessionContext { project, .. }
             | Self::ValidationSummary { project, .. } => Some(project.as_str()),
             Self::SessionHandoffSummary { project, .. } => project.as_deref(),

@@ -8,7 +8,18 @@ pub(crate) fn start_coding_task_input_schema() -> Value {
         "properties": {
             "project": {
                 "type": "string",
-                "description": "Required runtime project id. Use a full id from list_projects, such as agent:<client_id>:<project_id>."
+                "minLength": 1,
+                "description": "Existing runtime project id. Use a full id from list_projects, such as agent:<client_id>:<project_id>. Omit only with client_id to create a Runner-managed temporary project."
+            },
+            "client_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Runner client_id used only when project is omitted. The Runner creates a new managed temporary project under its configured temporary_projects_root, registers it normally, and binds the new Session to it."
+            },
+            "temporary_project_name": {
+                "type": "string",
+                "maxLength": 120,
+                "description": "Optional display name for a managed temporary project. The Runner generates the directory name; path-like and traversal-looking names are rejected."
             },
             "title": {
                 "type": "string",
@@ -49,7 +60,22 @@ pub(crate) fn start_coding_task_input_schema() -> Value {
                 "description": "Explicit advanced isolation request. When true, create and bind a new Workflow Session without closing or rewriting the previous one. Title differences never imply a new session. Mutually exclusive with resume_session_id."
             }
         },
-        "required": ["project"],
+        "required": [],
+        "oneOf": [
+            {
+                "required": ["project"],
+                "not": {
+                    "anyOf": [
+                        {"required": ["client_id"]},
+                        {"required": ["temporary_project_name"]}
+                    ]
+                }
+            },
+            {
+                "required": ["client_id"],
+                "not": {"required": ["project"]}
+            }
+        ],
         "additionalProperties": false,
         "not": {
             "required": ["resume_session_id", "new_session"],

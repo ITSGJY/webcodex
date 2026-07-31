@@ -23,6 +23,7 @@ fn test_agent_config(server_url: String) -> AgentConfig {
         owner: Some("tester".to_string()),
         hostname: Some("oe-host".to_string()),
         projects_dir: None,
+        temporary_projects_root: None,
         poll_interval_ms: 10,
         capabilities: Some(ShellClientCapabilities {
             git: true,

@@ -56,6 +56,31 @@ Current project management tools:
 
 These tools are available through the runtime tool list, MCP tools/list, and dedicated GPT Actions. They are constrained by the selected agent's policy.
 
+## Runner-managed temporary projects
+
+Set an existing, operator-controlled `temporary_projects_root` in `agent.toml`
+to let `start_coding_task` create a project when the caller supplies
+`client_id` instead of `project`:
+
+```toml
+temporary_projects_root = "/srv/webcodex/temporary-projects"
+
+[policy]
+allow_cwd_anywhere = false
+allowed_roots = ["/srv/webcodex"]
+```
+
+The Runner generates the directory and project id, creates only a new direct
+child of that root, canonicalizes the resulting path, and persists a normal
+`projects.d/*.toml` record with `kind = "managed_temporary"`. The regular
+runtime id (`agent:<client_id>:<project_id>`) then works with sessions, shell,
+files, Git, LSP, and checkpoints exactly like any other registered project.
+`listProjects` reports its `source` as `managed_temporary`.
+
+The root must already exist and must be allowed by the Runner policy. There is
+currently no automatic expiration or deletion; future retention work must use
+the managed record and re-verify the root before deleting anything.
+
 ## Policy boundaries
 
 `allowed_roots` controls where project paths may be registered or created.

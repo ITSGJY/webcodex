@@ -8,7 +8,7 @@ use crate::{CommandResult, CreatedProjectPaths};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +21,10 @@ const PROJECT_SCAN_CACHE_MS: u64 = 5000;
 const PROJECT_GIT_TIMEOUT: Duration = Duration::from_secs(2);
 const PROJECT_GIT_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
 const PROJECT_GIT_OUTPUT_MAX_BYTES: usize = 64 * 1024;
+const MANAGED_TEMPORARY_PROJECT_KIND: &str = "managed_temporary";
+const DEFAULT_MANAGED_TEMPORARY_PROJECT_NAME: &str = "Temporary Project";
+const MANAGED_TEMPORARY_PROJECT_ID_PREFIX: &str = "temporary";
+const MANAGED_TEMPORARY_PROJECT_CREATE_ATTEMPTS: usize = 16;
 static PROJECT_REGISTRY_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn project_registry_write_lock() -> &'static Mutex<()> {
@@ -606,10 +610,24 @@ fn build_project_toml(
     description: &Option<String>,
     allow_patch: bool,
 ) -> String {
+    build_project_toml_with_kind(id, name, path, None, description, allow_patch)
+}
+
+fn build_project_toml_with_kind(
+    id: &str,
+    name: &str,
+    path: &str,
+    kind: Option<&str>,
+    description: &Option<String>,
+    allow_patch: bool,
+) -> String {
     let mut toml = String::new();
     toml.push_str(&format!("id = {}\n", toml_basic_string(id)));
     toml.push_str(&format!("name = {}\n", toml_basic_string(name)));
     toml.push_str(&format!("path = {}\n", toml_basic_string(path)));
+    if let Some(kind) = kind {
+        toml.push_str(&format!("kind = {}\n", toml_basic_string(kind)));
+    }
     if let Some(desc) = description {
         toml.push_str(&format!("description = {}\n", toml_basic_string(desc)));
     }
@@ -655,6 +673,21 @@ fn validate_project_op_name(name: &str) -> Result<(), String> {
     }
     if name.len() > 120 {
         return Err("name must be at most 120 characters".to_string());
+    }
+    Ok(())
+}
+
+/// A managed temporary project name is persisted as display metadata, never
+/// used as a filesystem path. Still reject path-looking input at the Runner
+/// boundary so callers cannot mistake it for a directory selector.
+fn validate_managed_temporary_project_name(name: &str) -> Result<(), String> {
+    validate_project_op_name(name)?;
+    let name = name.trim();
+    if name == "." || name == ".." || name.contains("..") {
+        return Err("name must not contain dot-dot traversal".to_string());
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err("name must not contain slash or backslash".to_string());
     }
     Ok(())
 }
@@ -1072,14 +1105,158 @@ fn recovered_project_result(
     })
 }
 
+/// Create and persist one Runner-managed temporary project. The directory name
+/// and project id are generated here, never accepted from the server, and the
+/// canonical result must be exactly one direct child of the configured root.
+///
+/// TODO: add an explicit retention policy plus a safe managed-project deletion
+/// path that re-verifies this kind and root before removing anything.
+fn handle_managed_temporary_project(
+    policy: &AgentPolicy,
+    projects_dir: &Path,
+    temporary_projects_root: Option<&Path>,
+    request: &ShellAgentShellRequest,
+    json: &serde_json::Value,
+    start: Instant,
+) -> CommandResult {
+    // This internal request accepts no caller-selected directory/id or
+    // create-project behavior. Rejecting those fields makes the generated
+    // direct-child invariant explicit even if a future caller bypasses the
+    // public start_coding_task schema.
+    if [
+        "id",
+        "path",
+        "description",
+        "allow_patch",
+        "template",
+        "git_init",
+        "allow_existing_empty",
+        "overwrite",
+    ]
+    .iter()
+    .any(|field| json.get(*field).is_some())
+    {
+        return project_error_cmd(start, "invalid_request");
+    }
+    let name = match json.get("name") {
+        None | Some(serde_json::Value::Null) => DEFAULT_MANAGED_TEMPORARY_PROJECT_NAME.to_string(),
+        Some(serde_json::Value::String(value)) => {
+            if validate_managed_temporary_project_name(value).is_err() {
+                return project_error_cmd(start, "invalid_request");
+            }
+            value.trim().to_string()
+        }
+        Some(_) => return project_error_cmd(start, "invalid_request"),
+    };
+    let Some(temporary_projects_root) = temporary_projects_root else {
+        return project_error_cmd(start, "temporary_projects_not_configured");
+    };
+    let canonical_root = match canonicalize_existing(temporary_projects_root) {
+        Ok(root) if root.is_dir() => root,
+        _ => return project_error_cmd(start, "temporary_projects_root_unavailable"),
+    };
+    if validate_project_path_policy(policy, &canonical_root).is_err() {
+        return project_error_cmd(start, "temporary_projects_root_outside_allowed_roots");
+    }
+
+    for _ in 0..MANAGED_TEMPORARY_PROJECT_CREATE_ATTEMPTS {
+        let id = format!(
+            "{MANAGED_TEMPORARY_PROJECT_ID_PREFIX}-{}",
+            uuid::Uuid::new_v4()
+        );
+        if projects_dir.join(format!("{id}.toml")).exists() {
+            continue;
+        }
+        let requested_path = canonical_root.join(&id);
+        match std::fs::create_dir(&requested_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(_) => return project_error_cmd(start, "temporary_project_create_failed"),
+        }
+        let canonical_path = match canonicalize_existing(&requested_path) {
+            Ok(path) if path.is_dir() && path.parent() == Some(canonical_root.as_path()) => path,
+            _ => return project_error_cmd(start, "temporary_project_path_escape"),
+        };
+        let path = canonical_path.to_string_lossy().to_string();
+        match run_git_bounded(&canonical_path, &["init"], Duration::from_secs(5), None) {
+            Ok(output) if output.status.success() => {}
+            Ok(_) | Err(_) => {
+                let _ = std::fs::remove_dir_all(&canonical_path);
+                return project_error_cmd(start, "temporary_project_git_init_failed");
+            }
+        }
+        let description = None;
+        let toml_content = build_project_toml_with_kind(
+            &id,
+            &name,
+            &path,
+            Some(MANAGED_TEMPORARY_PROJECT_KIND),
+            &description,
+            true,
+        );
+        let write_result = match write_project_toml_atomic(projects_dir, &id, &toml_content, false)
+        {
+            Ok(result) => result,
+            Err(ProjectTomlWriteError::BeforeRename) => {
+                // The directory is a newly created direct child of the managed
+                // root and only contains the Git metadata initialized above.
+                let _ = std::fs::remove_dir_all(&canonical_path);
+                return project_error_cmd(start, "operation_failed");
+            }
+            Err(ProjectTomlWriteError::AfterRename) => {
+                return project_error_cmd(start, "operation_indeterminate");
+            }
+        };
+        let project = parse_agent_project_toml(&toml_content)
+            .expect("generated managed temporary project TOML must parse");
+        return ok_cmd(
+            start,
+            serde_json::json!({
+                "id": format!("agent:{}:{}", request.client_id, id),
+                "agent_project_id": id,
+                "client_id": request.client_id,
+                "name": name,
+                "path": path,
+                "description": serde_json::Value::Null,
+                "kind": MANAGED_TEMPORARY_PROJECT_KIND,
+                "source": MANAGED_TEMPORARY_PROJECT_KIND,
+                "managed_temporary": true,
+                "projects_config_path": write_result.config_path.to_string_lossy(),
+                "created_directory": true,
+                "created_config": write_result.created_config,
+                "overwritten": false,
+                "allow_patch": true,
+                "template": "empty",
+                "git_initialized": true,
+                "revision": project_revision(&project),
+                "operation": "create",
+                "outcome": "created",
+                "changed": true,
+                "recovered": false,
+            }),
+        );
+    }
+    project_error_cmd(start, "temporary_project_name_collision")
+}
+
 /// Handle `register_project` / `create_project` agent requests. Parses the
 /// JSON payload from `request.stdin`, validates fields and path against
 /// policy, writes `projects_dir/<id>.toml` atomically (and for
 /// `create_project` creates the directory / templates / optional git init),
 /// and returns structured JSON in `CommandResult.stdout`.
+#[cfg(test)]
 pub(crate) fn handle_project_op(
     policy: &AgentPolicy,
     projects_dir: &Path,
+    request: &ShellAgentShellRequest,
+) -> CommandResult {
+    handle_project_op_with_temporary_projects_root(policy, projects_dir, None, request)
+}
+
+pub(crate) fn handle_project_op_with_temporary_projects_root(
+    policy: &AgentPolicy,
+    projects_dir: &Path,
+    temporary_projects_root: Option<&Path>,
     request: &ShellAgentShellRequest,
 ) -> CommandResult {
     let _registry_guard = match project_registry_write_lock().lock() {
@@ -1112,6 +1289,21 @@ pub(crate) fn handle_project_op(
             };
         }
     };
+    if kind == "create_project"
+        && json
+            .get("managed_temporary_project")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    {
+        return handle_managed_temporary_project(
+            policy,
+            projects_dir,
+            temporary_projects_root,
+            request,
+            &json,
+            start,
+        );
+    }
     let get_str = |key: &str| -> Result<String, String> {
         json.get(key)
             .and_then(|v| v.as_str())

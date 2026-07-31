@@ -1,5 +1,6 @@
-//! Agent-side project management tools: `register_project` and
-//! `create_project`.
+//! Agent-side project management tools: `register_project`, `create_project`,
+//! and the internal Runner-managed temporary-project path used by coding-task
+//! startup.
 //!
 //! Both tools route to the selected agent via `enqueue_project_op`. The agent
 //! validates the path against its own policy, writes `projects_dir/<id>.toml`
@@ -26,6 +27,7 @@ use crate::shell_protocol::ShellAgentProjectSummary;
 /// operations are fast (write a small TOML, maybe create a directory + git
 /// init), so 30s is generous while still bounding the caller.
 const PROJECT_OP_WAIT_SECS: u64 = 32;
+const MANAGED_TEMPORARY_PROJECT_SOURCE: &str = "managed_temporary";
 
 impl ToolRuntime {
     pub(crate) async fn list_projects(&self, auth: Option<&AuthContext>) -> ToolResult {
@@ -61,7 +63,7 @@ impl ToolRuntime {
                     "disabled": project.disabled,
                     "revision": project.revision,
                     "active_jobs": active_jobs,
-                    "source": "agent_registered",
+                    "source": project_source(project),
                     "agent_status": client.status,
                     "connected": client.connected,
                     "last_seen": client.last_seen,
@@ -162,6 +164,35 @@ impl ToolRuntime {
         .await
     }
 
+    /// Ask a Runner to create a directory under its configured managed
+    /// temporary-project root and register it through the ordinary projects.d
+    /// lifecycle. The Runner, rather than this server, owns all directory-name
+    /// generation, path validation, and filesystem mutation.
+    pub(crate) async fn create_managed_temporary_project(
+        &self,
+        client_id: String,
+        name: Option<String>,
+        auth: Option<&AuthContext>,
+    ) -> ToolResult {
+        if let Some(name) = name.as_deref() {
+            if let Err(error) = validate_project_op_name(name) {
+                return ToolResult::err(error);
+            }
+        }
+        self.submit_project_op(
+            "create_project",
+            client_id.clone(),
+            json!({
+                "kind": "create_project",
+                "client_id": client_id,
+                "managed_temporary_project": true,
+                "name": name,
+            }),
+            auth,
+        )
+        .await
+    }
+
     /// Shared implementation for both `register_project` and `create_project`.
     /// `kind` is `"register_project"` or `"create_project"`. Fields not
     /// applicable to `register_project` (template, git_init,
@@ -201,6 +232,32 @@ impl ToolRuntime {
             return ToolResult::err(e);
         }
 
+        let payload = json!({
+            "kind": kind,
+            "client_id": client_id,
+            "id": id,
+            "name": name,
+            "path": path,
+            "description": description,
+            "allow_patch": allow_patch,
+            "template": template,
+            "git_init": git_init,
+            "allow_existing_empty": allow_existing_empty,
+            "overwrite": overwrite,
+        });
+        self.submit_project_op(kind, client_id, payload, auth).await
+    }
+
+    /// Shared transport, response parsing, cache-upsert, and owner-boundary
+    /// path for public project operations and internal managed temporary
+    /// project creation.
+    async fn submit_project_op(
+        &self,
+        kind: &str,
+        client_id: String,
+        payload: Value,
+        auth: Option<&AuthContext>,
+    ) -> ToolResult {
         // -- owner boundary + client existence --------------------------------
         if self
             .shell_clients
@@ -221,20 +278,7 @@ impl ToolRuntime {
             return ToolResult::err(e);
         }
 
-        // -- build JSON payload and route to the agent ------------------------
-        let payload = json!({
-            "kind": kind,
-            "client_id": client_id,
-            "id": id,
-            "name": name,
-            "path": path,
-            "description": description,
-            "allow_patch": allow_patch,
-            "template": template,
-            "git_init": git_init,
-            "allow_existing_empty": allow_existing_empty,
-            "overwrite": overwrite,
-        });
+        // -- route the already validated payload to the agent -----------------
         let payload_str = match serde_json::to_string(&payload) {
             Ok(s) => s,
             Err(e) => {
@@ -323,6 +367,14 @@ fn agent_protocol_reports_project_git(protocol: &str) -> bool {
             | crate::shell_protocol::AGENT_PROTOCOL_VERSION_WEBSOCKET_V1
             | crate::shell_protocol::AGENT_PROTOCOL_VERSION_QUIC_V1
     )
+}
+
+fn project_source(project: &ShellAgentProjectSummary) -> &'static str {
+    if project.kind.as_deref() == Some(MANAGED_TEMPORARY_PROJECT_SOURCE) {
+        MANAGED_TEMPORARY_PROJECT_SOURCE
+    } else {
+        "agent_registered"
+    }
 }
 
 fn project_git_available(
@@ -511,7 +563,10 @@ fn parse_project_summary_from_result(
         name: name.or_else(|| Some(agent_project_id.to_string())),
         path: path.to_string(),
         allow_patch,
-        kind: None,
+        kind: result
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         description: result
             .get("description")
             .and_then(|v| v.as_str())

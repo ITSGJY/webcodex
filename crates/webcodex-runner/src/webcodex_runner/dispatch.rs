@@ -2,8 +2,9 @@ use super::external_tools::ExternalRoute;
 use super::lsp::{handle_lsp_request, is_lsp_request_kind, LspSupervisor};
 use super::validation::{handle_validation_request, is_validation_request_kind};
 use super::{
-    handle_project_lifecycle_op, handle_project_op, run_shell_with_profiles_in_sandbox, AgentSink,
-    HotAgentConfig, ReloadableAgentConfig, SubmitResultError,
+    handle_project_lifecycle_op, handle_project_op_with_temporary_projects_root,
+    run_shell_with_profiles_in_sandbox, AgentSink, HotAgentConfig, ReloadableAgentConfig,
+    SubmitResultError,
 };
 use crate::shell_protocol::ShellAgentShellRequest;
 use crate::{handle_file_request, is_file_request_kind, JobManager};
@@ -98,7 +99,12 @@ pub(crate) fn dispatch_request(
         }
         "register_project" | "create_project" => {
             let request_id = request.request_id.clone();
-            let result = handle_project_op(policy, projects_dir, &request);
+            let result = handle_project_op_with_temporary_projects_root(
+                policy,
+                projects_dir,
+                runtime.temporary_projects_root(),
+                &request,
+            );
             sink.submit_result_with_metadata(request_id, result, config, runtime)
                 .map(|_| true)
         }
