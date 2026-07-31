@@ -118,6 +118,10 @@ fn tool_definition_runtime_tool_policy_inventory_is_stable() {
             "current_session_fallback",
         ),
         ("run_shell", "job", "current_session_fallback"),
+        ("open_session_shell", "job", "explicit_business_session"),
+        ("session_shell_exec", "job", "explicit_business_session"),
+        ("session_shell_status", "job", "explicit_business_session"),
+        ("close_session_shell", "job", "explicit_business_session"),
         ("apply_patch", "patch", "current_session_fallback"),
         ("apply_patch_checked", "patch", "current_session_fallback"),
         (

@@ -187,6 +187,14 @@ pub(crate) struct ShellConfig {
     pub(crate) env: HashMap<String, String>,
     #[serde(default)]
     pub(crate) init_script: Option<PathBuf>,
+    /// Maximum number of live command-oriented persistent shells owned by
+    /// this Runner process.
+    #[serde(default = "default_max_persistent_shells")]
+    pub(crate) max_persistent_shells: usize,
+    /// Idle shells are reclaimed after this many seconds. Commands in flight
+    /// are never interrupted by the idle collector.
+    #[serde(default = "default_persistent_shell_idle_timeout_secs")]
+    pub(crate) persistent_shell_idle_timeout_secs: u64,
 }
 
 impl Default for ShellConfig {
@@ -199,6 +207,8 @@ impl Default for ShellConfig {
             path_prepend: Vec::new(),
             env: HashMap::new(),
             init_script: None,
+            max_persistent_shells: default_max_persistent_shells(),
+            persistent_shell_idle_timeout_secs: default_persistent_shell_idle_timeout_secs(),
         }
     }
 }
@@ -428,6 +438,14 @@ fn default_shell_program() -> String {
 
 fn default_shell_args() -> Vec<String> {
     vec!["-c".to_string()]
+}
+
+pub(crate) fn default_max_persistent_shells() -> usize {
+    8
+}
+
+pub(crate) fn default_persistent_shell_idle_timeout_secs() -> u64 {
+    30 * 60
 }
 
 pub(crate) fn default_true() -> bool {
@@ -693,6 +711,14 @@ pub(crate) fn validate_shell_config(shell: &ShellConfig) -> Result<(), String> {
         .is_some_and(|path| path.as_os_str().is_empty())
     {
         return Err("shell.init_script cannot be empty".to_string());
+    }
+    if !(1..=64).contains(&shell.max_persistent_shells) {
+        return Err("shell.max_persistent_shells must be between 1 and 64".to_string());
+    }
+    if !(1..=86_400).contains(&shell.persistent_shell_idle_timeout_secs) {
+        return Err(
+            "shell.persistent_shell_idle_timeout_secs must be between 1 and 86400".to_string(),
+        );
     }
     Ok(())
 }

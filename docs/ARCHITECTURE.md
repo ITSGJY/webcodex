@@ -138,6 +138,19 @@ capability transition, and binding changes share the Session-store atomic
 commit boundary. `run_shell`/`run_job` inherit only from an exact active
 project match, after per-call arguments and before the existing root/profile
 defaults; cross-project escape never inherits this state.
+The full runtime also keeps `PersistentShell` distinct from `Job`.
+`open_session_shell` explicitly starts one process-local, command-oriented
+`sh`/`bash` per active Workflow Session; `session_shell_exec` serializes
+commands against that process, while status and idempotent close use its
+unpredictable Session/project-bound id. Agent projects execute it on their
+owning Runner. A Server-owned executor branch is retained for hosting surfaces
+that supply a Server-local project, while the built-in public registry currently
+advertises Agent projects only. One-shot `run_shell`/`run_job` never share its
+process state.
+Dedicated control framing separates completion from bounded stdout/stderr;
+timeout synchronization failure poisons and kills the shell. Shell records do
+not imply restart recovery, and SSH resources, PTYs, or terminal streams are
+not part of this model.
 The Connector Task ledger and Workflow Session ledger remain separate internal
 models; neither is copied into the other.
 

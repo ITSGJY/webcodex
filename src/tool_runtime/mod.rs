@@ -44,6 +44,7 @@ mod runtime;
 mod runtime_info;
 mod semantic_navigation;
 mod session_context;
+mod session_shell;
 mod session_tools;
 pub(crate) mod sessions;
 mod shell;
@@ -118,6 +119,7 @@ pub(crate) use session_context::{
     add_session_telemetry_hint, current_session_key, current_session_principal,
     session_guard_denied_result, unknown_session_result, ALLOW_CROSS_PROJECT_SESSION_FIELD,
 };
+pub(crate) use session_shell::SessionShellRegistry;
 #[cfg(test)]
 pub(crate) use surface::{recommended_flows, registered_tool_categories};
 

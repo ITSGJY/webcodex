@@ -1,10 +1,11 @@
 use super::external_tools::ExternalRoute;
 use super::lsp::{handle_lsp_request, is_lsp_request_kind, LspSupervisor};
+use super::transport::ResultSubmission;
 use super::validation::{handle_validation_request, is_validation_request_kind};
 use super::{
     handle_project_lifecycle_op, handle_project_op_with_temporary_projects_root,
     run_shell_with_profiles_in_sandbox, run_ssh_shell, AgentSink, CommandResult, HotAgentConfig,
-    ReloadableAgentConfig, SubmitResultError,
+    PersistentShellManager, ReloadableAgentConfig, SubmitResultError,
 };
 use crate::shell_protocol::ShellAgentShellRequest;
 use crate::{handle_file_request, is_file_request_kind, JobManager};
@@ -20,6 +21,7 @@ pub(crate) fn dispatch_request(
     config: &HotAgentConfig,
     runtime: &ReloadableAgentConfig,
     jobs: &JobManager,
+    persistent_shells: &PersistentShellManager,
     projects_dir: &Path,
     lsp: &LspSupervisor,
     request: ShellAgentShellRequest,
@@ -38,6 +40,23 @@ pub(crate) fn dispatch_request(
         .job_context
         .as_ref()
         .and_then(|context| context.workflow_session_id.as_deref());
+    if request.kind == "persistent_shell" {
+        let request_id = request.request_id.clone();
+        let operation = request.persistent_shell.clone();
+        let result = persistent_shells.handle(policy, shell, projects_dir, &request);
+        let submitted = sink.submit_persistent_shell_result(request_id, result);
+        if !matches!(&submitted, Ok(ResultSubmission::Accepted)) {
+            if let Some(operation) = operation {
+                let _ = persistent_shells.close_exact(
+                    &operation.shell_id,
+                    &operation.workflow_session_id,
+                    &operation.runtime_project_id,
+                    "persistent_shell_result_not_accepted",
+                );
+            }
+        }
+        return submitted.map(|_| true);
+    }
     // Inspect requests must stay on the native execution path where Landlock
     // is applied in pre_exec. External providers are not an equivalent local
     // filesystem write boundary.
@@ -141,6 +160,18 @@ pub(crate) fn dispatch_request(
         | "project_lifecycle_unregister" => {
             let request_id = request.request_id.clone();
             let result = handle_project_lifecycle_op(policy, projects_dir, &request);
+            if result.exit_code == Some(0)
+                && matches!(
+                    request.kind.as_str(),
+                    "project_lifecycle_disable" | "project_lifecycle_unregister"
+                )
+            {
+                if let Some(project_id) = lifecycle_project_id(&request) {
+                    let runtime_project_id = format!("agent:{}:{}", request.client_id, project_id);
+                    persistent_shells
+                        .close_project(&runtime_project_id, "project_execution_disabled");
+                }
+            }
             sink.submit_result_with_metadata(request_id, result, config, runtime)
                 .map(|_| true)
         }
@@ -210,6 +241,19 @@ pub(crate) fn dispatch_request(
                 .map(|_| true)
         }
     }
+}
+
+fn lifecycle_project_id(request: &ShellAgentShellRequest) -> Option<String> {
+    request
+        .stdin
+        .as_deref()
+        .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .and_then(|payload| {
+            payload
+                .get("project_id")
+                .and_then(|project_id| project_id.as_str())
+                .map(str::to_string)
+        })
 }
 
 pub(crate) fn is_project_op(kind: &str) -> bool {

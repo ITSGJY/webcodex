@@ -215,7 +215,11 @@ fn tool_definitions_drive_session_and_permission_policy() {
             "list_session_messages",
             "resolve_session_message",
             "session_discussion_summary",
-            "session_handoff_summary"
+            "session_handoff_summary",
+            "open_session_shell",
+            "session_shell_exec",
+            "session_shell_status",
+            "close_session_shell"
         ]
     );
 
@@ -295,6 +299,7 @@ fn tool_definitions_drive_session_and_permission_policy() {
         ("run_shell", PERMISSION_RISK_SHELL),
         ("run_job", PERMISSION_RISK_JOB),
         ("stop_job", PERMISSION_RISK_JOB),
+        ("close_session_shell", PERMISSION_RISK_JOB),
         ("delete_project_files", PERMISSION_RISK_DESTRUCTIVE),
         ("save_project_artifact", PERMISSION_RISK_ARTIFACT_WRITE),
         ("apply_patch", PERMISSION_RISK_PATCH),
@@ -335,6 +340,26 @@ fn required_agent_capability_matches_metadata_risk_table() {
 
     let cases = [
         ("run_shell", ToolRisk::JobRun, AgentCapability::Shell),
+        (
+            "open_session_shell",
+            ToolRisk::JobRun,
+            AgentCapability::PersistentShell,
+        ),
+        (
+            "session_shell_exec",
+            ToolRisk::JobRun,
+            AgentCapability::PersistentShell,
+        ),
+        (
+            "session_shell_status",
+            ToolRisk::ReadOnly,
+            AgentCapability::PersistentShell,
+        ),
+        (
+            "close_session_shell",
+            ToolRisk::JobRun,
+            AgentCapability::PersistentShell,
+        ),
         (
             "apply_patch",
             ToolRisk::ProjectWrite,

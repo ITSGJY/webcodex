@@ -15,19 +15,20 @@ use super::events::{
     actual_failure_kind_for_tool_result, changed_paths_for_tool, classify_failure_expectation,
     diff_review_like_for_tool, extract_job_id, extract_project, is_valid_session_id,
     observed_input_paths_for_tool, observed_paths_for_successful_result,
-    session_input_summary_for_tool, validation_output_summary_for_tool_result,
-    SessionToolClassification,
+    persistent_shell_event_evidence_for_tool_result, session_input_summary_for_tool,
+    validation_output_summary_for_tool_result, SessionToolClassification,
 };
 use super::model::{
     CodingSessionError, CodingSessionOutcome, CodingSessionRequest, CurrentSessionKey,
     DurableCurrentBinding, ListSessionMessagesFilter, PersistedCurrentBinding,
     PersistedCurrentBindings, PersistedSessionLedger, PersistedSessionRecord,
-    PostSessionMessageInput, SessionCloseError, SessionCloseOutcome, SessionCounts,
-    SessionCreateOptions, SessionDiscussionSummary, SessionEvent, SessionExecutionContext,
-    SessionExecutionContextUpdateError, SessionExecutionContextUpdateOutcome, SessionGuardDenial,
-    SessionGuards, SessionInboxHint, SessionLifecycle, SessionLifecycleDenial, SessionMessage,
-    SessionMessageError, SessionMessageStatus, SessionRecord, SessionStoreStatus, SessionSummary,
-    SessionTransport, ToolCallRecorderMetadata, ToolCallStart, DEFAULT_MAX_EVENTS_PER_SESSION,
+    PersistentShellEventEvidence, PostSessionMessageInput, SessionCloseError, SessionCloseOutcome,
+    SessionCounts, SessionCreateOptions, SessionDiscussionSummary, SessionEvent,
+    SessionExecutionContext, SessionExecutionContextUpdateError,
+    SessionExecutionContextUpdateOutcome, SessionGuardDenial, SessionGuards, SessionInboxHint,
+    SessionLifecycle, SessionLifecycleDenial, SessionMessage, SessionMessageError,
+    SessionMessageStatus, SessionRecord, SessionStoreStatus, SessionSummary, SessionTransport,
+    ToolCallRecorderMetadata, ToolCallStart, DEFAULT_MAX_EVENTS_PER_SESSION,
     DEFAULT_MAX_MESSAGES_PER_SESSION, DEFAULT_MAX_SESSIONS, DEFAULT_MESSAGE_LIST_LIMIT,
     DEFAULT_SUMMARY_LIMIT, DURABLE_CURRENT_BINDINGS_PER_SESSION, EVENT_ID_PREFIX,
     MAX_CODING_INSTRUCTION_CHARS, MAX_MESSAGE_LIST_LIMIT, MAX_SUMMARY_LIMIT, MESSAGE_ID_PREFIX,
@@ -927,6 +928,14 @@ impl SessionStore {
     ) -> Option<SessionGuardDenial> {
         let (mode, guards) = self.guard_state(session_id)?;
         let classification = SessionToolClassification::for_tool(tool_name);
+        if mode == SessionMode::Inspect
+            && matches!(tool_name, "open_session_shell" | "session_shell_exec")
+        {
+            return Some(SessionGuardDenial {
+                mode,
+                guard: "persistent_shell_mode_unsupported",
+            });
+        }
         if guards.deny_write_tools && classification.write_like {
             return Some(SessionGuardDenial {
                 mode,
@@ -1056,6 +1065,7 @@ impl SessionStore {
             changed_paths,
             observed_paths,
             job_id: None,
+            persistent_shell: None,
             input_summary,
             validation_output_summary: None,
             permission: None,
@@ -1082,6 +1092,42 @@ impl SessionStore {
         let persisted = {
             let mut inner = self.inner.lock().expect("session store mutex poisoned");
             inner.set_event_permission(&start.session_id, &start.event_id, permission)
+        };
+        if persisted {
+            self.persist_after_mutation();
+        }
+    }
+
+    /// Attach the bounded outcome of automatic persistent-shell cleanup to the
+    /// single `session_closed` system event. Phase one permits at most one
+    /// active shell per Session, so this remains a scalar evidence record.
+    pub(crate) fn record_session_close_persistent_shell_evidence(
+        &self,
+        session_id: &str,
+        shell_id: &str,
+        shell_state: &str,
+        execution_state: &str,
+        error_code: Option<&str>,
+        already_closed: bool,
+    ) {
+        let evidence = persistent_shell_event_evidence_for_tool_result(
+            "close_session",
+            &serde_json::json!({
+                "shell_id": shell_id,
+                "shell_state": shell_state,
+                "execution_state": execution_state,
+                "error_code": error_code,
+                "command_started": false,
+                "command_completed": false,
+                "already_closed": already_closed,
+            }),
+        );
+        let Some(evidence) = evidence else {
+            return;
+        };
+        let persisted = {
+            let mut inner = self.inner.lock().expect("session store mutex poisoned");
+            inner.set_session_close_persistent_shell_evidence(session_id, evidence)
         };
         if persisted {
             self.persist_after_mutation();
@@ -1151,6 +1197,8 @@ impl SessionStore {
         } else {
             Vec::new()
         };
+        let persistent_shell =
+            persistent_shell_event_evidence_for_tool_result(&start.tool_name, output);
         self.push_event(SessionEvent {
             event_id: event_id.clone(),
             session_id: start.session_id,
@@ -1188,6 +1236,7 @@ impl SessionStore {
             changed_paths: start.changed_paths,
             observed_paths,
             job_id: extract_job_id(output),
+            persistent_shell,
             input_summary: None,
             validation_output_summary,
             permission: start.permission,
@@ -1345,6 +1394,7 @@ fn coding_instruction_event(
         changed_paths: Vec::new(),
         observed_paths: Vec::new(),
         job_id: None,
+        persistent_shell: None,
         input_summary: Some(redact_and_bound_value(&serde_json::json!({
             "requested_mode": requested_mode.as_str(),
             "requested_guards": requested_guards,
@@ -1411,6 +1461,7 @@ fn session_closed_system_event(session_id: &str, now: i64) -> SessionEvent {
         changed_paths: Vec::new(),
         observed_paths: Vec::new(),
         job_id: None,
+        persistent_shell: None,
         input_summary: None,
         validation_output_summary: None,
         permission: None,
@@ -1473,6 +1524,7 @@ fn session_execution_context_updated_event(
         changed_paths: Vec::new(),
         observed_paths: Vec::new(),
         job_id: None,
+        persistent_shell: None,
         input_summary: Some(redact_and_bound_value(&serde_json::json!({
             "execution_context": execution_context,
             "previous_execution_context": previous_execution_context,
@@ -1859,6 +1911,27 @@ impl SessionStoreInner {
         } else {
             false
         }
+    }
+
+    pub(super) fn set_session_close_persistent_shell_evidence(
+        &mut self,
+        session_id: &str,
+        evidence: PersistentShellEventEvidence,
+    ) -> bool {
+        let Some(record) = self.sessions.get_mut(session_id) else {
+            return false;
+        };
+        let Some(event) = record
+            .events
+            .iter_mut()
+            .rev()
+            .find(|event| event.kind == "session_closed" && event.tool_name == "close_session")
+        else {
+            return false;
+        };
+        event.persistent_shell = Some(evidence);
+        record.updated_at = now_ts();
+        true
     }
 
     // --- reads / housekeeping ---

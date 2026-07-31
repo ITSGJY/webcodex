@@ -202,6 +202,9 @@ pub fn generated_agent_config_toml(opts: &AgentInitOptions) -> Result<String, St
             // The Runner performs the executable probe at registration time.
             // A generated static file never claims SSH support on its own.
             ssh_shell: false,
+            // The running binary advertises process-lifetime capabilities
+            // after it has installed the persistent-shell manager.
+            persistent_shell: false,
             structured_validation_argv: true,
             lsp_read_only_navigation: true,
             sandbox_inspect_commands: false,

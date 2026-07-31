@@ -138,9 +138,11 @@ ledger is then queued to the existing background writer. Persistence failures
 are reported through existing status and logs, and success does not mean a
 synchronous disk flush or promise rollback on a later writer failure.
 
-Only `run_shell` and `run_job` inherit these defaults. When an SSH resource is
-selected, only those two tools execute remotely; file, Git, LSP, and checkpoint
-tools remain bound to the registered Runner project. Remote cwd precedence is:
+`run_shell`, `run_job`, and `open_session_shell` inherit these defaults.
+`run_shell` and `run_job` remain independent-process tools. When an SSH
+resource is selected, only those two tools execute remotely; file, Git, LSP,
+checkpoint, and persistent-shell tools remain bound to the registered project
+host. Remote cwd precedence for one-shot SSH commands is:
 
 ```text
 per-call cwd
@@ -152,13 +154,69 @@ per-call cwd
 Each SSH `run_shell` / `run_job` command gets an independent remote exec
 channel. The Runner may reuse the authenticated transport for the same
 Session/resource pair, but it does not preserve `cd`, exports, aliases,
-functions, umask, or shell-process state between commands. Persistent
-interactive Shell sessions are a later capability.
+functions, umask, or shell-process state between commands.
 
 A missing Session leaves execution unchanged. A mismatched Session fails or,
 on an explicitly authorized cross-project escape path, executes without
-inheriting its context. Commands remain independent processes: the runtime
-does not parse or persist `cd`, shell variables, aliases, or process state.
+inheriting its context.
+
+### Explicit persistent shell
+
+The full operator runtime has a separate, command-oriented `PersistentShell`
+model:
+
+```text
+open_session_shell
+session_shell_exec
+session_shell_status
+close_session_shell
+```
+
+Opening creates one real long-lived `sh` or `bash` process, at most one active
+shell per Workflow Session. For an `agent:<client>:<project>` it is owned by
+that project's Runner process. The process manager also has a Server-owned
+executor branch for a hosting surface that supplies a Server-local project,
+although the current built-in public project registry advertises Agent projects
+only. It never executes through
+`execution_context.resource`: an SSH resource is rejected with
+`persistent_shell_ssh_resource_unsupported` rather than falling back locally.
+`inspect` and `read_only` Sessions cannot open or execute a persistent shell.
+
+Open resolution is explicit `cwd`/`shell`, then the exact Session's
+`default_cwd`/`default_shell`, then the project/Runner defaults. Profile
+environment and initialization run once at open. Later commands retain the
+same process's cwd, exports, unset state, umask, functions, and ordinary shell
+variables. Updating Session execution context never moves, restarts, or
+changes an already-open shell; close and reopen it to apply new defaults.
+`run_shell` and `run_job` never reuse this process.
+
+The random `shell_id` is bound to the exact Session, runtime project, executor,
+Runner client when applicable, dialect/profile, initial cwd, and timestamps.
+Every operation rechecks caller authorization and active Session/project
+identity; before exec/status the Runner also rechecks its current project,
+raw-shell, cwd, allowed-root, profile, and shell policy. Close remains available
+for cleanup after an execution-policy change. A closed id remains terminal and
+cannot address a subsequently opened shell. Explicit close is idempotent.
+Session close, project disable/unregister, idle expiry, shell exit, Runner
+disconnect/shutdown, and detected process/control-channel damage release the
+process group and its pipes.
+
+Commands are serialized; a concurrent command receives `shell_busy`. Output is
+bounded independently for stdout and stderr. Completion uses a dedicated
+control file descriptor with a high-entropy per-command token, not a marker in
+ordinary output. On timeout, the owner interrupts the shell process group and
+waits for a bounded synchronization frame. If synchronization cannot be
+proved, it kills the group, marks the shell poisoned/lost, returns
+`shell_reset_required`, and never writes another command to that process.
+
+Persistent shells are process-local and are not durable Job records. Neither a
+Server nor Runner restart claims to recover or reattach one from ledger data.
+There is no SSH persistent shell, PTY, raw keystroke/input stream, terminal
+resize, WebSocket terminal UI, or full-screen terminal application support.
+The Session ledger stores bounded lifecycle and permission evidence
+(`shell_id`, action, shell/execution state, error code, and completion flags),
+never command text, stdout/stderr, the complete environment, internal shell
+state, credentials, or unbounded command output.
 
 The context is an additive serde-defaulted ledger-version-1 field, so older
 ledgers load it as `{}` without a version bump. Startup and Session summaries

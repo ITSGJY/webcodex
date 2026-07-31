@@ -159,6 +159,36 @@ Runner 可以按 Session/resource/config generation 复用已认证 transport，
 会标记为不确定，绝不自动重试。`run_shell`、`run_job`、`stop_job`、`job_status` 和
 `job_log` 保持原有接口；本轮不会把 file、Git、LSP 或 checkpoint 请求重定向到 SSH。
 
+## Workflow Session 持久 Shell
+
+当前 Runner 会声明带 serde 默认值的 `persistent_shell` capability。旧 Runner
+缺少该字段时仍可兼容运行，但 Server 会返回明确的
+`agent_capability_unavailable`，绝不会转换为 `run_shell`。它是独立生命周期协议，
+不是 Job：
+
+```text
+open -> exec/status -> close
+```
+
+Server 在现有 agent request envelope 中发送 typed `PersistentShellRequest`。
+Polling 通过 `/api/shell/agent/persistent_shell_result` 返回 typed result；
+WebSocket 与 QUIC 使用 payload 相同的 `PersistentShellResult` envelope。请求和
+结果都携带精确的 `shell_id`、Workflow Session id 与 runtime project id；完成时
+还会校验当前 Runner instance、client、request、Session、project 和 shell 身份，
+再释放 waiter。
+
+Runner 在已注册项目所属主机上拥有长生命周期 `sh`/`bash` 进程。打开时校验项目
+可执行性、raw-shell policy、cwd/allowed roots、dialect 和 profile；后续 exec/status
+操作前再次校验当前边界。Close 作为清理操作，在执行 policy 改变后仍然可用。Profile
+环境和初始化脚本只在 open 时运行一次。命令串行执行，输出有界；完成状态走独立
+control descriptor，不与普通 stdout/stderr marker 混在一起。
+
+该协议不使用 Session SSH resource，也不会从 SSH resource 静默回退；本轮不支持
+SSH persistent shell。它也不提供 PTY、原始字节流、terminal resize 或 terminal
+UI。Runner 断连或正常退出会关闭其 Shell；Runner result 不可用或状态不确定时，
+Server 将记录视为 lost，不会根据 Session/Server 记录假装进程仍存活。Server 或
+Runner 进程重启后必须重新 open，本轮不提供重新附着或 restart recovery。
+
 ## LSP 只读导航
 
 支持只读 LSP intelligence 的 agent 会注册

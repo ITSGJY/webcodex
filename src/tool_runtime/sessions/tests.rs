@@ -321,6 +321,21 @@ fn exploration_input_audit_omits_queries_and_shell_commands() {
     assert_eq!(shell["command_present"], true);
     assert!(shell.get("command").is_none());
     assert!(shell.get("command_summary").is_none());
+
+    let persistent = session_input_summary_for_tool(
+        "session_shell_exec",
+        &json!({
+            "project": "demo",
+            "session_id": "wc_sess_demo",
+            "shell_id": "wc_shell_demo",
+            "command": "export PRIVATE_TOKEN=secret",
+            "command_summary": "export PRIVATE_TOKEN=secret",
+            "command_present": true
+        }),
+    );
+    assert_eq!(persistent["command_present"], true);
+    assert!(persistent.get("command").is_none());
+    assert!(persistent.get("command_summary").is_none());
 }
 
 #[test]
@@ -795,6 +810,58 @@ fn session_events_survive_restore() {
     assert_eq!(summary.counts.succeeded, 1);
     assert_eq!(summary.counts.git_like, 1);
     assert_eq!(summary.events[1].tool_name, "git_log");
+}
+
+#[test]
+fn persistent_shell_evidence_survives_restore_without_command_or_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("sessions.json");
+    let store = persistent_store(ledger.clone());
+    let session = store.start_session(None, Some("persistent shell evidence".to_string()));
+    let start = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "session_shell_exec",
+        &json!({
+            "project": "agent:oe:private-drop",
+            "session_id": session.session_id.clone(),
+            "shell_id": "wc_shell_evidence",
+            "command": "export PRIVATE_LEDGER_VALUE=secret",
+            "command_summary": "export PRIVATE_LEDGER_VALUE=secret",
+            "command_present": true
+        }),
+    );
+    store.record_tool_call_finished(
+        start,
+        true,
+        &json!({
+            "shell_id": "wc_shell_evidence",
+            "shell_state": "running",
+            "execution_state": "completed",
+            "command_started": true,
+            "command_completed": true,
+            "exit_code": 0,
+            "stdout": "PRIVATE_LEDGER_VALUE=secret",
+            "stderr": ""
+        }),
+        None,
+        None,
+    );
+    store.flush_persistence();
+    let persisted = std::fs::read_to_string(&ledger).unwrap();
+    assert!(!persisted.contains("PRIVATE_LEDGER_VALUE"));
+    assert!(!persisted.contains("\"stdout\""));
+    assert!(!persisted.contains("\"stderr\""));
+
+    let restored = SessionStore::with_persistence(ledger, 10, 10);
+    let summary = restored.summary(&session.session_id, Some(10)).unwrap();
+    let evidence = summary.events[1].persistent_shell.as_ref().unwrap();
+    assert_eq!(evidence.action, "exec");
+    assert_eq!(evidence.shell_id.as_deref(), Some("wc_shell_evidence"));
+    assert_eq!(evidence.shell_state.as_deref(), Some("running"));
+    assert_eq!(evidence.execution_state.as_deref(), Some("completed"));
+    assert_eq!(evidence.command_started, Some(true));
+    assert_eq!(evidence.command_completed, Some(true));
 }
 
 #[test]

@@ -59,11 +59,14 @@ fn user_token_auth_context_does_not_get_agent_kind() {
 }
 
 #[test]
-fn is_agent_transport_path_allows_only_the_five_exact_paths() {
-    // The five agent transport endpoints an agent token may call.
+fn is_agent_transport_path_allows_only_the_six_exact_paths() {
+    // The six agent transport endpoints an agent token may call.
     assert!(is_agent_transport_path("/api/shell/agent/register"));
     assert!(is_agent_transport_path("/api/shell/agent/poll"));
     assert!(is_agent_transport_path("/api/shell/agent/result"));
+    assert!(is_agent_transport_path(
+        "/api/shell/agent/persistent_shell_result"
+    ));
     assert!(is_agent_transport_path("/api/shell/agent/job_update"));
     assert!(is_agent_transport_path("/api/agents/ws"));
 
@@ -296,6 +299,7 @@ fn gate_router(config: Arc<crate::Config>, db: Arc<crate::Database>) -> Router {
                 .push(Router::with_path("shell/agent/register").post(echo_ok))
                 .push(Router::with_path("shell/agent/poll").post(echo_ok))
                 .push(Router::with_path("shell/agent/result").post(echo_ok))
+                .push(Router::with_path("shell/agent/persistent_shell_result").post(echo_ok))
                 .push(Router::with_path("shell/agent/job_update").post(echo_ok))
                 .push(Router::with_path("agents/ws").get(echo_ok)),
         )
@@ -1155,6 +1159,7 @@ fn enforce_token_surface_matrix() {
         "/api/shell/agent/register",
         "/api/shell/agent/poll",
         "/api/shell/agent/result",
+        "/api/shell/agent/persistent_shell_result",
         "/api/shell/agent/job_update",
         "/api/agents/ws",
     ];

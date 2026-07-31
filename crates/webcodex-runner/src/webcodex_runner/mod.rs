@@ -7,6 +7,7 @@ pub(crate) mod files;
 pub(crate) mod lsp;
 pub(crate) mod output;
 pub(crate) mod patches;
+pub(crate) mod persistent_shell;
 pub(crate) mod projects;
 pub(crate) mod shell;
 pub(crate) mod shutdown;
@@ -42,6 +43,7 @@ pub(crate) use patches::{
     handle_replace_in_file_request, handle_write_project_file_request, is_line_edit_request_kind,
     validate_line_edit_agent_path,
 };
+pub(crate) use persistent_shell::PersistentShellManager;
 #[cfg(test)]
 pub(crate) use projects::handle_project_op;
 #[cfg(test)]

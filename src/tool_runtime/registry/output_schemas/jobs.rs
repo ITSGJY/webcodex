@@ -101,6 +101,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ),
             ),
         ])),
+        "open_session_shell"
+        | "session_shell_exec"
+        | "session_shell_status"
+        | "close_session_shell" => Some(persistent_shell_output_schema()),
         "run_job" => Some(wrapped_output_schema(vec![
             ("job_id", schema_type("string", "Runtime job id.")),
             ("kind", schema_type("string", "Job kind.")),
@@ -429,6 +433,128 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
         ])),
         _ => None,
     }
+}
+
+fn persistent_shell_output_schema() -> Value {
+    wrapped_output_schema(vec![
+        (
+            "shell_id",
+            schema_type("string", "Opaque persistent shell id."),
+        ),
+        (
+            "project",
+            schema_type("string", "Exact runtime project id."),
+        ),
+        (
+            "session_id",
+            schema_type("string", "Owning Workflow Session id."),
+        ),
+        (
+            "executor",
+            schema_type("string", "Process host class: local or agent."),
+        ),
+        (
+            "shell",
+            nullable_schema("string", "Long-lived shell dialect: sh or bash."),
+        ),
+        (
+            "profile",
+            nullable_schema("string", "Runner shell profile applied once at open."),
+        ),
+        (
+            "initial_cwd",
+            nullable_schema("string", "Project-relative cwd selected at open."),
+        ),
+        (
+            "cwd",
+            nullable_schema("string", "Safely observed current project-relative cwd."),
+        ),
+        (
+            "created_at",
+            nullable_schema("integer", "Shell creation timestamp."),
+        ),
+        (
+            "last_activity_at",
+            nullable_schema("integer", "Last shell activity timestamp."),
+        ),
+        (
+            "shell_state",
+            schema_type(
+                "string",
+                "opening, running, exited, closed, poisoned, lost, or unknown.",
+            ),
+        ),
+        (
+            "execution_state",
+            schema_type("string", "Lifecycle or command execution state."),
+        ),
+        (
+            "command_started",
+            schema_type(
+                "boolean",
+                "Whether this exec command was written to the shell.",
+            ),
+        ),
+        (
+            "command_completed",
+            schema_type(
+                "boolean",
+                "Whether command completion was established by a verified frame or authoritative shell exit.",
+            ),
+        ),
+        (
+            "command_ok",
+            schema_type("boolean", "Whether a completed command exited with code 0."),
+        ),
+        (
+            "exit_code",
+            nullable_schema("integer", "Command or shell exit code, when known."),
+        ),
+        ("stdout", schema_type("string", "Bounded command stdout.")),
+        ("stderr", schema_type("string", "Bounded command stderr.")),
+        (
+            "stdout_truncated",
+            schema_type("boolean", "Whether command stdout exceeded the bound."),
+        ),
+        (
+            "stderr_truncated",
+            schema_type("boolean", "Whether command stderr exceeded the bound."),
+        ),
+        (
+            "duration_ms",
+            schema_type("integer", "Command duration in milliseconds."),
+        ),
+        (
+            "busy",
+            schema_type("boolean", "Whether a command is in flight."),
+        ),
+        (
+            "already_closed",
+            schema_type(
+                "boolean",
+                "Whether close observed an already-terminal shell.",
+            ),
+        ),
+        (
+            "close_reason",
+            nullable_schema("string", "Bounded terminal reason."),
+        ),
+        (
+            "purpose",
+            nullable_schema("string", "Declared execution intent for this command."),
+        ),
+        (
+            "error_code",
+            nullable_schema("string", "Structured persistent-shell error code."),
+        ),
+        (
+            "tool_failure",
+            schema_type(
+                "boolean",
+                "Whether WebCodex rejected or lost the operation.",
+            ),
+        ),
+    ])
 }
 
 fn job_summary_schema() -> Value {

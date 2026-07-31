@@ -1,7 +1,8 @@
 use super::auth::ShellClientAuthGroup;
 use crate::shell_protocol::{
-    AgentBuildInfo, AgentPolicySummary, ShellAgentProjectSummary, ShellAgentShellRequest,
-    ShellClientCapabilities, ShellJobCodexMetadata, ShellJobValidationProgress, ShellRunResponse,
+    AgentBuildInfo, AgentPolicySummary, PersistentShellResult, ShellAgentProjectSummary,
+    ShellAgentShellRequest, ShellClientCapabilities, ShellJobCodexMetadata,
+    ShellJobValidationProgress, ShellRunResponse,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -119,6 +120,10 @@ impl Default for ShellJobLogState {
 pub(super) struct ShellClientRegistryInner {
     pub(super) clients: HashMap<String, ShellClientRecord>,
     pub(super) pending_by_id: HashMap<String, PendingShellRequest>,
+    /// Waiters for explicit persistent-shell lifecycle results. Kept separate
+    /// from synchronous `ShellRunResponse` waiters so PersistentShell never
+    /// enters the Job/run_shell model.
+    pub(super) persistent_waiters: HashMap<String, oneshot::Sender<PersistentShellResult>>,
     pub(super) queues_by_client: HashMap<String, VecDeque<String>>,
     pub(super) jobs_by_id: HashMap<String, ShellJobRecord>,
     pub(super) request_to_job: HashMap<String, String>,

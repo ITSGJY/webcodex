@@ -4,12 +4,15 @@ use super::jobs::{
 };
 use super::projects::ShellClientLookupError;
 use super::state::{PendingShellRequest, ShellClientRegistryInner};
-use super::validation::{validate_file_request, validate_id, validate_run_request};
+use super::validation::{
+    validate_file_request, validate_id, validate_run_request, MAX_COMMAND_LEN,
+};
 use super::{now_ts, ShellClientRegistry, CLIENT_ONLINE_WINDOW_SECS};
 use crate::lsp_bridge::{AgentLspPayload, AGENT_LSP_REQUEST_KIND};
 use crate::shell_protocol::{
-    ShellAgentShellRequest, ShellFileOpRequest, ShellJobContext, ShellRunRequest, ShellRunResponse,
-    SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
+    PersistentShellRequest, PersistentShellResult, ShellAgentShellRequest, ShellFileOpRequest,
+    ShellJobContext, ShellRunRequest, ShellRunResponse,
+    SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION, SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL,
     SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS,
 };
 use std::fmt;
@@ -184,6 +187,7 @@ pub(super) fn resolve_disconnected_sync_requests_locked(
             // a failed send is expected and safe to ignore.
             let _ = waiter.send(response);
         }
+        inner.persistent_waiters.remove(&request_id);
     }
 }
 
@@ -223,6 +227,7 @@ impl ShellClientRegistry {
             lsp: None,
             sandbox: None,
             job_context: None,
+            persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
         enqueue_pending_request_locked(
@@ -314,6 +319,7 @@ impl ShellClientRegistry {
             lsp: None,
             sandbox: sandbox.clone(),
             job_context: ssh_context,
+            persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
         if request
@@ -362,8 +368,100 @@ impl ShellClientRegistry {
     /// from an actually started command without retaining expired requests.
     pub async fn cancel_request(&self, request_id: &str) -> bool {
         let mut inner = self.inner.lock().await;
+        inner.persistent_waiters.remove(request_id);
         remove_pending_request_locked(&mut inner, request_id)
             .is_some_and(|pending| pending.dispatched)
+    }
+
+    /// Enqueue one explicit persistent-shell lifecycle operation. Capability
+    /// absence is a hard failure; there is no fallback to `run_shell`.
+    pub(crate) async fn enqueue_persistent_shell(
+        &self,
+        client_id: String,
+        request: PersistentShellRequest,
+        requested_by: String,
+    ) -> Result<(String, oneshot::Receiver<PersistentShellResult>), String> {
+        validate_id(&client_id, "client_id")?;
+        validate_id(&request.shell_id, "shell_id")?;
+        validate_id(&request.workflow_session_id, "workflow_session_id")?;
+        if request.runtime_project_id.trim().is_empty() {
+            return Err("runtime_project_id is required".to_string());
+        }
+        if !matches!(
+            request.action.as_str(),
+            "open" | "exec" | "status" | "close"
+        ) {
+            return Err(format!(
+                "unsupported persistent shell action: {}",
+                request.action
+            ));
+        }
+        if request
+            .command
+            .as_deref()
+            .is_some_and(|command| command.contains('\0'))
+        {
+            return Err("persistent shell command cannot contain NUL".to_string());
+        }
+        if request
+            .command
+            .as_deref()
+            .is_some_and(|command| command.len() > MAX_COMMAND_LEN)
+        {
+            return Err(format!(
+                "persistent shell command too long (max {MAX_COMMAND_LEN} bytes)"
+            ));
+        }
+        let request_id = next_request_id();
+        let (tx, rx) = oneshot::channel();
+        let wire_request = ShellAgentShellRequest {
+            request_id: request_id.clone(),
+            client_id: client_id.clone(),
+            kind: "persistent_shell".to_string(),
+            job_id: None,
+            cwd: request.cwd.clone(),
+            path: None,
+            content: None,
+            max_bytes: None,
+            old_text: None,
+            pattern: None,
+            expected_sha256: None,
+            expected_prefix: None,
+            start_line: None,
+            end_line: None,
+            line: None,
+            create_dirs: false,
+            command: request.command.clone().unwrap_or_default(),
+            stdin: None,
+            timeout_secs: request.timeout_secs.unwrap_or(30),
+            requested_by,
+            created_at: now_ts(),
+            validation: None,
+            lsp: None,
+            sandbox: None,
+            job_context: None,
+            persistent_shell: Some(request),
+        };
+        let mut inner = self.inner.lock().await;
+        let Some(client) = inner.clients.get(&client_id) else {
+            return Err(format!("unknown shell client: {client_id}"));
+        };
+        if !client.capabilities.persistent_shell {
+            return Err(format!(
+                "agent_capability_unavailable: agent client {client_id} does not support {SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL}"
+            ));
+        }
+        enqueue_pending_request_locked(
+            &mut inner,
+            &client_id,
+            request_id.clone(),
+            wire_request,
+            None,
+            None,
+        )?;
+        inner.persistent_waiters.insert(request_id.clone(), tx);
+        notify_client_locked(&inner, &client_id);
+        Ok((request_id, rx))
     }
 
     /// Enqueue a project-management agent request (`register_project` or
@@ -421,6 +519,7 @@ impl ShellClientRegistry {
             lsp: None,
             sandbox: None,
             job_context: None,
+            persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
         enqueue_pending_request_locked(
@@ -484,6 +583,7 @@ impl ShellClientRegistry {
             lsp: Some(payload),
             sandbox: None,
             job_context: None,
+            persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
         enqueue_pending_request_locked(

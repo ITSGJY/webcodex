@@ -325,6 +325,44 @@ pub enum ToolCall {
         shell: Option<ExecutionShell>,
     },
 
+    /// Open one explicit command-oriented persistent shell for this Workflow
+    /// Session. It is not shared with run_shell/run_job and is not a Job.
+    OpenSessionShell {
+        project: String,
+        session_id: String,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        shell: Option<ExecutionShell>,
+    },
+
+    /// Execute one framed command in an already-open persistent shell.
+    SessionShellExec {
+        project: String,
+        session_id: String,
+        shell_id: String,
+        command: String,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+        #[serde(default)]
+        purpose: Option<ExecutionPurpose>,
+    },
+
+    /// Read Runner-authoritative lifecycle state for a persistent shell.
+    SessionShellStatus {
+        project: String,
+        session_id: String,
+        shell_id: String,
+    },
+
+    /// Close a persistent shell and its complete process group. Idempotent for
+    /// an already-closed shell retained by the current Server process.
+    CloseSessionShell {
+        project: String,
+        session_id: String,
+        shell_id: String,
+    },
+
     /// Apply a unified diff patch to a project.
     ApplyPatch {
         project: String,
@@ -1179,7 +1217,9 @@ impl ToolCall {
     /// the operator's preview config switch — it is never logged verbatim.
     pub(crate) fn command_text(&self) -> Option<&str> {
         match self {
-            Self::RunShell { command, .. } | Self::RunJob { command, .. } => Some(command),
+            Self::RunShell { command, .. }
+            | Self::SessionShellExec { command, .. }
+            | Self::RunJob { command, .. } => Some(command),
             _ => None,
         }
     }
@@ -1208,6 +1248,10 @@ impl ToolCall {
             Self::WorkspaceCheckpointRestore { .. } => "workspace_checkpoint_restore",
             Self::WorkspaceCheckpointDelete { .. } => "workspace_checkpoint_delete",
             Self::RunShell { .. } => "run_shell",
+            Self::OpenSessionShell { .. } => "open_session_shell",
+            Self::SessionShellExec { .. } => "session_shell_exec",
+            Self::SessionShellStatus { .. } => "session_shell_status",
+            Self::CloseSessionShell { .. } => "close_session_shell",
             Self::ApplyPatch { .. } => "apply_patch",
             Self::ApplyPatchChecked { .. } => "apply_patch_checked",
             Self::DeleteProjectFiles { .. } => "delete_project_files",
@@ -1322,6 +1366,10 @@ impl ToolCall {
             | Self::GotoDefinition { session_id, .. }
             | Self::FindReferences { session_id, .. } => session_id.as_deref(),
             Self::SessionHandoffSummary { session_id, .. } => Some(session_id.as_str()),
+            Self::OpenSessionShell { session_id, .. }
+            | Self::SessionShellExec { session_id, .. }
+            | Self::SessionShellStatus { session_id, .. }
+            | Self::CloseSessionShell { session_id, .. } => Some(session_id.as_str()),
             _ => None,
         }
     }
@@ -1396,7 +1444,9 @@ impl ToolCall {
         execution_context: &SessionExecutionContext,
     ) -> Self {
         match &mut self {
-            Self::RunShell { cwd, shell, .. } | Self::RunJob { cwd, shell, .. } => {
+            Self::RunShell { cwd, shell, .. }
+            | Self::RunJob { cwd, shell, .. }
+            | Self::OpenSessionShell { cwd, shell, .. } => {
                 if cwd.is_none() {
                     *cwd = execution_context.default_cwd.clone();
                 }
@@ -1412,6 +1462,10 @@ impl ToolCall {
     pub(crate) fn project(&self) -> Option<&str> {
         match self {
             Self::RunShell { project, .. }
+            | Self::OpenSessionShell { project, .. }
+            | Self::SessionShellExec { project, .. }
+            | Self::SessionShellStatus { project, .. }
+            | Self::CloseSessionShell { project, .. }
             | Self::ApplyPatch { project, .. }
             | Self::ApplyPatchChecked { project, .. }
             | Self::DeleteProjectFiles { project, .. }

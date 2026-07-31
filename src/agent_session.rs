@@ -3,11 +3,12 @@
 //! Both long-lived agent transports — WebSocket (`agent_ws`) and custom QUIC
 //! (`agent_quic`) — run the *same* session once a connection is registered:
 //! a request pump that drains the shared registry queue and pushes `Request`
-//! envelopes, a reader loop that dispatches `Result`/`JobUpdate`/`Ping`/`Pong`/
-//! `RuntimeMetadata`/`Goodbye` envelopes into the connection-scoped registry
-//! lease, and a teardown that stops the pump, joins the writer, and reconciles
-//! the disconnect. The only differences are the wire I/O (how a frame is read
-//! or written) and a log label. This module owns that shared loop; the two
+//! envelopes, a reader loop that dispatches `Result`/`PersistentShellResult`/
+//! `JobUpdate`/`Ping`/`Pong`/`RuntimeMetadata`/`Goodbye` envelopes into the
+//! connection-scoped registry lease, and a teardown that stops the pump, joins
+//! the writer, and reconciles the disconnect. The only differences are the
+//! wire I/O (how a frame is read or written) and a log label. This module owns
+//! that shared loop; the two
 //! transport modules own transport-specific registration, auth, and I/O.
 //!
 //! Connection-lease scoping: every registry call below takes the
@@ -276,6 +277,19 @@ async fn dispatch_inbound(
                     client_id = client_id,
                     error = %e,
                     "agent {} result rejected",
+                    transport_label
+                );
+            }
+        }
+        AgentEnvelope::PersistentShellResult { payload } => {
+            if let Err(e) = registry
+                .complete_persistent_shell_for_connection(payload, connection_id)
+                .await
+            {
+                tracing::warn!(
+                    client_id = client_id,
+                    error = %e,
+                    "agent {} persistent shell result rejected",
                     transport_label
                 );
             }

@@ -7,6 +7,7 @@ edition.workspace = true
 [dependencies]
 webcodex-agent-config = { path = "../webcodex-agent-config" }
 webcodex-core = { path = "../webcodex-core" }
+webcodex-persistent-shell = { path = "../webcodex-persistent-shell" }
 webcodex-sandbox = { path = "../webcodex-sandbox" }
 webcodex-workspace = { path = "../webcodex-workspace" }
 base64 = "0.22"

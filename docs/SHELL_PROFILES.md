@@ -2,10 +2,12 @@
 
 [English](SHELL_PROFILES.md) | [简体中文](SHELL_PROFILES.zh-CN.md)
 
-WebCodex does **not** keep a persistent shell session. It prepares an
-environment snapshot **once per project/profile** and then runs each command as
-an independent process with that snapshot. This page describes how shell
-profiles work, how to configure them, and the safety boundaries.
+By default, `run_shell` and `run_job` do **not** keep a persistent shell
+session. They prepare an environment snapshot **once per project/profile** and
+then run each command as an independent process with that snapshot. The
+explicit Workflow Session persistent-shell tools described in section 9 are
+the only long-lived exception. This page describes how both paths apply shell
+profiles and their safety boundaries.
 
 > Applies to `webcodex-runner` (the host agent that executes shell commands).
 > The server never reads or stores shell env values, init_script bodies, or
@@ -144,9 +146,9 @@ have to guess the remote shell:
 On the full operator runtime, a registered-project-bound Workflow Session can
 store an optional project-relative `default_cwd` and an optional
 `default_shell` (`sh` or `bash`). These are execution defaults, not a prepared
-environment snapshot and not a persistent shell.
+environment snapshot or implicit process reuse.
 
-For `run_shell` and `run_job`, resolution is:
+For `run_shell`, `run_job`, and `open_session_shell`, resolution is:
 
 1. explicit per-call `cwd` / `shell`;
 2. the exact active project-matched Workflow Session defaults;
@@ -155,8 +157,8 @@ For `run_shell` and `run_job`, resolution is:
 Omitting a Session keeps the existing behavior. A Session from another project
 never contributes defaults. Invalid, missing, or outside-root directories fail
 through the existing cwd safety checks without silently retrying at the project
-root. Each command is still an independent process; a command such as `cd sub`
-does not affect later calls.
+root. `run_shell` and `run_job` remain independent processes; a command such as
+`cd sub` does not affect later one-shot calls.
 
 `start_coding_task(execution_context=...)` can set or replace the context.
 Omission during continuation preserves it, while `{}` clears it.
@@ -167,17 +169,31 @@ event commit together in memory, while the JSON ledger is queued to the
 background writer, so success is not a synchronous durability guarantee. The
 context cannot store env values, tokens, arbitrary options, or shell state.
 
-## 10. Changing config requires restarting the agent
+`open_session_shell` is the explicit exception: it creates one real
+long-lived `sh`/`bash` process for that Workflow Session. The selected profile
+environment and initialization execute once at open, so later
+`session_shell_exec` calls retain cwd, exports, functions, umask, and shell
+variables. Profile `args` remain the one-shot command invocation contract and
+are not reused for the long-lived process; persistent `bash` starts with
+`--noprofile --norc`, while persistent `sh` starts without command-mode
+arguments. Updating Session context does not alter an already-open process;
+close and reopen it to apply a changed cwd, dialect, or profile default.
+Persistent shells are rejected for `read_only`/`inspect` Sessions and for a
+Session with an SSH resource.
 
-There is **no reload API** in this phase. Changing a shell profile config
-requires restarting the agent so the in-memory snapshot cache is rebuilt:
+## 10. Changing config
 
-> Changing shell profile config requires restarting the agent so the
-> in-memory snapshot cache is rebuilt.
+After editing `agent.toml`, reload the Runner service. A valid hot reload moves
+new one-shot commands to a new profile-cache generation, so their snapshots are
+prepared lazily again. Project TOML changes are refreshed independently.
 
-After editing `agent.toml` or a project TOML, restart the `webcodex-runner`
-service. Existing snapshots are dropped on restart and re-prepared lazily on
-the next command.
+An already-open persistent shell is never silently restarted or rewritten by a
+reload. Current policy and project/profile selection are rechecked before later
+exec/status operations, but the environment and initialization already inside
+that process remain unchanged. Explicitly close and reopen it to apply changed
+profile contents, cwd, or dialect defaults. Configuration fields outside the
+documented hot-reload boundary still require a Runner restart; see
+[DEPLOYMENT.md](DEPLOYMENT.md#agent-configuration).
 
 ## 11. Security notes
 

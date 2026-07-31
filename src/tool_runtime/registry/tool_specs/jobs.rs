@@ -1,6 +1,7 @@
 use super::super::input_schemas::{
-    job_log_input_schema, job_status_input_schema, list_jobs_input_schema, run_job_input_schema,
-    run_shell_input_schema, stop_job_input_schema,
+    job_log_input_schema, job_status_input_schema, list_jobs_input_schema,
+    open_session_shell_input_schema, run_job_input_schema, run_shell_input_schema,
+    session_shell_exec_input_schema, session_shell_identity_input_schema, stop_job_input_schema,
 };
 use super::tool_spec;
 use crate::tool_runtime::tool_spec::ToolSpec;
@@ -11,6 +12,26 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
             "run_shell",
             "Bounded command escape hatch for validation, builds, tests, or diagnostics only. Do not use as the primary file editing path; prefer cargo_* / validate_patch for common checks and structured line edit tools for source edits.",
             run_shell_input_schema(),
+        ),
+        tool_spec(
+            "open_session_shell",
+            "Explicitly open one bounded, long-lived sh/bash process for an active Workflow Session. State is isolated from run_shell/run_job and from every other Session.",
+            open_session_shell_input_schema(),
+        ),
+        tool_spec(
+            "session_shell_exec",
+            "Execute one framed command in an existing Session persistent shell. Commands are serialized; cwd, variables, exports, functions, and umask remain in that shell process.",
+            session_shell_exec_input_schema(),
+        ),
+        tool_spec(
+            "session_shell_status",
+            "Read Runner-authoritative state for an explicit Session persistent shell. This never sends input to the process.",
+            session_shell_identity_input_schema(),
+        ),
+        tool_spec(
+            "close_session_shell",
+            "Idempotently close an explicit Session persistent shell and terminate its complete process group.",
+            session_shell_identity_input_schema(),
         ),
         tool_spec(
             "run_job",

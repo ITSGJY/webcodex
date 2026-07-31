@@ -1200,6 +1200,9 @@ fn agent_register_capabilities(cfg: &AgentConfig) -> ShellClientCapabilities {
     // SSH support intentionally depends on the local OpenSSH executable.
     // Authentication and Host aliases remain entirely Runner-local.
     capabilities.ssh_shell = SshConnectionPool::is_available();
+    // This binary installs the bounded, process-local persistent-shell
+    // manager. Older binaries omit this field and therefore fail closed.
+    capabilities.persistent_shell = cfg!(unix);
     capabilities.structured_validation_argv = true;
     capabilities.project_lifecycle = true;
     // `job_state_reconciliation` is on by default. A hidden, test/ops-only env
@@ -3631,11 +3634,13 @@ fn handle_one_poll(
     cfg: &AgentConfig,
     runtime: &Arc<ReloadableAgentConfig>,
     jobs: &JobManager,
+    persistent_shells: &webcodex_runner::PersistentShellManager,
     project_cache: &mut AgentProjectCache,
     agent_instance_id: &str,
     lsp: &webcodex_runner::LspSupervisor,
     shutdown: &Arc<AtomicBool>,
     dispatches: &ActivityTracker,
+    once: bool,
 ) -> Result<bool, PollError> {
     let metadata_config = runtime.snapshot();
     let provider_update =
@@ -3697,15 +3702,33 @@ fn handle_one_poll(
     let hot = runtime.snapshot();
     let runtime = Arc::clone(runtime);
     let jobs = jobs.clone();
+    let persistent_shells = persistent_shells.clone();
     let projects_dir = projects_dir(cfg);
     let lsp = lsp.clone();
     let dispatch_guard = dispatches.enter();
+    let persistent_shell_background = request.kind == "persistent_shell" && !once;
     let (result_tx, result_rx) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
         let _dispatch_guard = dispatch_guard;
-        let result = dispatch_request(&sink, &hot, &runtime, &jobs, &projects_dir, &lsp, request);
+        let result = dispatch_request(
+            &sink,
+            &hot,
+            &runtime,
+            &jobs,
+            &persistent_shells,
+            &projects_dir,
+            &lsp,
+            request,
+        );
         let _ = result_tx.send(result);
     });
+    // Persistent-shell operations must not pin the polling loop behind a
+    // long-running command. A later close request needs its own poll turn so
+    // it can terminate the process group; the dispatch tracker keeps the
+    // worker accounted for during normal shutdown.
+    if persistent_shell_background {
+        return Ok(true);
+    }
     let result = loop {
         match result_rx.recv_timeout(Duration::from_millis(25)) {
             Ok(result) => break result,

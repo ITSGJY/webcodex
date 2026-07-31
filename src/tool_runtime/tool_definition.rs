@@ -61,7 +61,7 @@ use crate::shell_protocol::{
     SHELL_CLIENT_CAPABILITY_ASYNC_JOBS, SHELL_CLIENT_CAPABILITY_ASYNC_SHELL_JOBS,
     SHELL_CLIENT_CAPABILITY_FILE_READ, SHELL_CLIENT_CAPABILITY_FILE_WRITE,
     SHELL_CLIENT_CAPABILITY_GIT, SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
-    SHELL_CLIENT_CAPABILITY_SHELL,
+    SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL, SHELL_CLIENT_CAPABILITY_SHELL,
 };
 
 /// Capability an agent-backed tool requires before dispatch can reach an
@@ -82,6 +82,8 @@ pub(crate) enum AgentCapability {
     GitOrShell,
     /// `run_job` (agent path starts an async job).
     AsyncJobs,
+    /// Explicit process-local Workflow Session persistent shells.
+    PersistentShell,
     /// Read-only agent-side rust-analyzer navigation tools.
     LspReadOnlyNavigation,
 }
@@ -95,6 +97,7 @@ impl AgentCapability {
             Self::FileWrite => SHELL_CLIENT_CAPABILITY_FILE_WRITE,
             Self::GitOrShell => "shell or git",
             Self::AsyncJobs => "async shell jobs",
+            Self::PersistentShell => SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL,
             Self::LspReadOnlyNavigation => SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
         }
     }
@@ -110,6 +113,7 @@ impl AgentCapability {
                 SHELL_CLIENT_CAPABILITY_ASYNC_JOBS,
                 SHELL_CLIENT_CAPABILITY_ASYNC_SHELL_JOBS,
             ],
+            Self::PersistentShell => &[SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL],
             Self::LspReadOnlyNavigation => &[SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION],
         }
     }

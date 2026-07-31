@@ -24,6 +24,7 @@ mod metadata;
 mod permission_gate;
 mod reconnect;
 mod schema;
+mod session_shells;
 mod sessions;
 mod sessions_current;
 mod sessions_git;

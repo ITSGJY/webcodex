@@ -125,7 +125,34 @@ status and logs; success does not claim a synchronous disk flush.
 `run_shell`/`run_job` resolve explicit per-call
 arguments first, then exact project-matched Session defaults, then their
 existing root/configured-shell behavior. No env, credential, arbitrary option,
-or persistent shell state is stored.
+or persistent shell state is stored in the execution context.
+
+The full operator surface exposes persistent process state only through four
+explicit tools:
+
+```text
+open_session_shell(project, session_id, cwd?, shell?)
+session_shell_exec(project, session_id, shell_id, command, timeout_secs?, purpose?)
+session_shell_status(project, session_id, shell_id)
+close_session_shell(project, session_id, shell_id)
+```
+
+Open returns a new unpredictable `shell_id`; at most one shell may be active
+per Workflow Session. `session_shell_exec` returns
+`command_started`, `command_completed`, `exit_code`, bounded `stdout`/`stderr`
+with truncation flags, `duration_ms`, `execution_state`, `shell_state`, and the
+observable cwd. Status/close also report the bound dialect/profile, initial
+cwd, timestamps, busy/terminal state, and close reason when available. Close
+is idempotent, but a closed id cannot operate a later replacement shell.
+
+Agent projects execute the process on their owning Runner. The process engine
+uses the Server host only for a Server-local project when that project type is
+available. Every operation requires the exact active Session/project and
+normal caller authorization; `read_only`, `inspect`, old Runners without the
+`persistent_shell` capability, and Sessions selecting an SSH resource fail
+closed. `run_shell` and `run_job` remain independent processes and never reuse
+the persistent shell. This is command execution, not a PTY or terminal stream,
+and it does not recover across Server or Runner restart.
 
 For an explicit cross-window or human handoff on this surface, call
 `session_handoff_summary` with the old `wc_sess_*` id. It and

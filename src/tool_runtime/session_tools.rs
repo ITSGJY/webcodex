@@ -55,7 +55,7 @@ impl ToolRuntime {
                 )
                 .await
             }
-            ToolCall::CloseSession { session_id } => self.close_session_tool(session_id),
+            ToolCall::CloseSession { session_id } => self.close_session_tool(session_id).await,
             ToolCall::ValidationSummary {
                 project,
                 session_id,
@@ -273,15 +273,22 @@ impl ToolRuntime {
         }
     }
 
-    pub(crate) fn close_session_tool(&self, session_id: String) -> ToolResult {
+    pub(crate) async fn close_session_tool(&self, session_id: String) -> ToolResult {
         match self.sessions.close_session(&session_id) {
-            Ok(outcome) => ToolResult::ok(json!({
-                "success": true,
-                "session_id": outcome.summary.session_id,
-                "lifecycle": outcome.summary.lifecycle,
-                "already_closed": outcome.already_closed,
-                "updated_at": outcome.summary.updated_at,
-            })),
+            Ok(outcome) => {
+                // Commit the lifecycle transition first so an in-flight open
+                // cannot escape cleanup by reserving after the initial scan.
+                let persistent_shells_closed =
+                    self.close_persistent_shells_for_session(&session_id).await;
+                ToolResult::ok(json!({
+                    "success": true,
+                    "session_id": outcome.summary.session_id,
+                    "lifecycle": outcome.summary.lifecycle,
+                    "already_closed": outcome.already_closed,
+                    "persistent_shells_closed": persistent_shells_closed,
+                    "updated_at": outcome.summary.updated_at,
+                }))
+            }
             Err(sessions::SessionCloseError::UnknownSession) => unknown_session_result(&session_id),
         }
     }

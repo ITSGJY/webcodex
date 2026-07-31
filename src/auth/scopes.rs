@@ -251,6 +251,7 @@ pub(crate) fn oauth_route_scope_policy_for_path_method(
         | ("POST", "/api/shell/agent/register")
         | ("POST", "/api/shell/agent/poll")
         | ("POST", "/api/shell/agent/result")
+        | ("POST", "/api/shell/agent/persistent_shell_result")
         | ("POST", "/api/shell/agent/job_update")
         | ("GET", "/api/agents/ws") => OAuthRouteScopePolicy::AgentSurface,
         _ => OAuthRouteScopePolicy::Unknown,
@@ -414,6 +415,7 @@ mod tests {
             ("POST", "/api/shell/agent/register"),
             ("POST", "/api/shell/agent/poll"),
             ("POST", "/api/shell/agent/result"),
+            ("POST", "/api/shell/agent/persistent_shell_result"),
             ("POST", "/api/shell/agent/job_update"),
             ("GET", "/api/agents/ws"),
         ] {
@@ -561,6 +563,7 @@ mod tests {
             ("POST", "/api/shell/agent/register"),
             ("POST", "/api/shell/agent/poll"),
             ("POST", "/api/shell/agent/result"),
+            ("POST", "/api/shell/agent/persistent_shell_result"),
             ("POST", "/api/shell/agent/job_update"),
             ("GET", "/api/agents/ws"),
             ("POST", "/api/pairing/enroll"),

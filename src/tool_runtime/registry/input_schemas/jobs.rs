@@ -96,6 +96,101 @@ pub(crate) fn run_job_input_schema() -> Value {
     schema
 }
 
+pub(crate) fn open_session_shell_input_schema() -> Value {
+    let mut schema = object_schema(vec![
+        ("project", "string", "Exact Workflow Session project id.", true),
+        (
+            "session_id",
+            "string",
+            "Explicit active Workflow Session id. Current-session fallback is not used.",
+            true,
+        ),
+        (
+            "cwd",
+            "string",
+            "Optional project-relative initial cwd. Omission uses the Session execution context and then the project default.",
+            false,
+        ),
+        (
+            "shell",
+            "string",
+            "Optional long-lived shell dialect: sh or bash.",
+            false,
+        ),
+    ]);
+    schema["properties"]["shell"]["enum"] = json!(["sh", "bash"]);
+    schema
+}
+
+pub(crate) fn session_shell_exec_input_schema() -> Value {
+    let mut schema = object_schema(vec![
+        ("project", "string", "Exact Workflow Session project id.", true),
+        ("session_id", "string", "Explicit active Workflow Session id.", true),
+        (
+            "shell_id",
+            "string",
+            "Opaque id returned by open_session_shell.",
+            true,
+        ),
+        (
+            "command",
+            "string",
+            "One command evaluated by the existing long-lived shell.",
+            true,
+        ),
+        (
+            "timeout_secs",
+            "integer",
+            "Command timeout in seconds (1..=3600, default 60). A timeout interrupts the process group and requires verified resynchronization.",
+            false,
+        ),
+        (
+            "purpose",
+            "string",
+            "Declared execution intent recorded as evidence.",
+            false,
+        ),
+    ]);
+    schema["properties"]["timeout_secs"]["minimum"] = json!(1);
+    schema["properties"]["timeout_secs"]["maximum"] = json!(3600);
+    schema["properties"]["timeout_secs"]["default"] = json!(60);
+    schema["properties"]["command"]["maxLength"] = json!(8000);
+    schema["properties"]["purpose"]["enum"] = json!([
+        "validation",
+        "test",
+        "build",
+        "format",
+        "release",
+        "diagnostic",
+        "operation",
+        "other"
+    ]);
+    schema
+}
+
+pub(crate) fn session_shell_identity_input_schema() -> Value {
+    object_schema(vec![
+        (
+            "project",
+            "string",
+            "Exact Workflow Session project id.",
+            true,
+        ),
+        (
+            "session_id",
+            "string",
+            "Explicit active Workflow Session id.",
+            true,
+        ),
+        (
+            "shell_id",
+            "string",
+            "Opaque id returned by open_session_shell.",
+            true,
+        ),
+    ])
+}
+
 pub(crate) fn stop_job_input_schema() -> Value {
     object_schema(with_optional_session_id(vec![
         (

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use super::events::{
     exploration_tool_kind, is_valid_session_id, sanitize_failure_expectation_result,
     sanitize_observed_paths, sanitize_persisted_validation_output_summary,
-    session_input_summary_for_tool,
+    sanitize_persistent_shell_event_evidence, session_input_summary_for_tool,
 };
 use super::model::{
     DurableCurrentBinding, PersistedSessionLedger, PersistedSessionRecord, SessionEvent,
@@ -339,6 +339,9 @@ pub(super) fn sanitize_persisted_event(
         Vec::new()
     };
     event.job_id = event.job_id.map(|value| bound_summary_string(value.trim()));
+    event.persistent_shell = event
+        .persistent_shell
+        .and_then(|evidence| sanitize_persistent_shell_event_evidence(&event.tool_name, evidence));
     event.instruction = event
         .instruction
         .map(|value| redact_and_bound_instruction(value.trim(), MAX_CODING_INSTRUCTION_CHARS))

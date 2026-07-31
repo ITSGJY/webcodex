@@ -38,7 +38,7 @@ pub(crate) struct PreparedShellProfileCache {
     profiles: Arc<Mutex<HashMap<PreparedShellProfileKey, Arc<PreparedShellProfile>>>>,
 }
 
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
@@ -186,7 +186,7 @@ fn configure_direct_process_group(command: &mut Command) {
     }
 }
 
-fn base_shell_env(
+pub(crate) fn base_shell_env(
     shell: &ShellConfig,
     profile: &ShellProfileConfig,
 ) -> Result<HashMap<String, String>, String> {

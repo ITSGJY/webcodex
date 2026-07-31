@@ -318,6 +318,10 @@ fn expected_cross_listed_discovery_groups(tool: &str) -> Option<&'static [&'stat
         "list_tools" => Some(&["inspect", "runtime"]),
         "run_job" => Some(&["jobs", "shell"]),
         "run_shell" => Some(&["inspect", "shell"]),
+        "open_session_shell"
+        | "session_shell_exec"
+        | "session_shell_status"
+        | "close_session_shell" => Some(&["jobs", "shell"]),
         "runtime_status" => Some(&["inspect", "runtime"]),
         "show_changes" => Some(&["git", "inspect", "review"]),
         "start_coding_task" => Some(&["inspect", "runtime"]),

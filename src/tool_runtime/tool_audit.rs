@@ -13,18 +13,27 @@ pub(crate) fn session_log_arguments_for_tool_request(tool_name: &str, arguments:
         out.insert("project".to_string(), project);
     }
     match tool_name {
-        "run_shell" | "run_job" => {
+        "run_shell" | "run_job" | "session_shell_exec" => {
             out.insert(
                 "command_present".to_string(),
                 Value::Bool(obj.contains_key("command")),
             );
             copy_keys(obj, &mut out, &["timeout_secs", "cwd", "purpose", "shell"]);
+            if tool_name == "session_shell_exec" {
+                copy_keys(obj, &mut out, &["session_id", "shell_id"]);
+            }
             if let Some(command) = obj.get("command").and_then(Value::as_str) {
                 out.insert(
                     "command_summary".to_string(),
                     Value::String(crate::shell_client::command_preview(command)),
                 );
             }
+        }
+        "open_session_shell" => {
+            copy_keys(obj, &mut out, &["session_id", "cwd", "shell"]);
+        }
+        "session_shell_status" | "close_session_shell" => {
+            copy_keys(obj, &mut out, &["session_id", "shell_id"]);
         }
         "start_session" | "start_coding_task" | "update_session_context" => {
             copy_keys(
@@ -326,6 +335,47 @@ impl ToolCall {
                 "cwd": cwd,
                 "purpose": purpose,
                 "shell": shell,
+            }),
+            Self::OpenSessionShell {
+                project,
+                session_id,
+                cwd,
+                shell,
+            } => serde_json::json!({
+                "project": project,
+                "session_id": session_id,
+                "cwd": cwd,
+                "shell": shell,
+            }),
+            Self::SessionShellExec {
+                project,
+                session_id,
+                shell_id,
+                command,
+                timeout_secs,
+                purpose,
+            } => serde_json::json!({
+                "project": project,
+                "session_id": session_id,
+                "shell_id": shell_id,
+                "command_present": true,
+                "command_summary": crate::shell_client::command_preview(command),
+                "timeout_secs": timeout_secs,
+                "purpose": purpose,
+            }),
+            Self::SessionShellStatus {
+                project,
+                session_id,
+                shell_id,
+            }
+            | Self::CloseSessionShell {
+                project,
+                session_id,
+                shell_id,
+            } => serde_json::json!({
+                "project": project,
+                "session_id": session_id,
+                "shell_id": shell_id,
             }),
             Self::StopJob {
                 project,

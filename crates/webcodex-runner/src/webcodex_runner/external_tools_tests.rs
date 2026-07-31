@@ -206,6 +206,7 @@ fn agent_request(
         lsp: None,
         sandbox: None,
         job_context: None,
+        persistent_shell: None,
     }
 }
 

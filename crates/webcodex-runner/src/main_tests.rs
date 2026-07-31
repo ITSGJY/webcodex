@@ -1,4 +1,5 @@
 use super::*;
+use crate::webcodex_runner::config::validate_shell_config;
 use crate::webcodex_runner::{
     handle_project_lifecycle_op, handle_project_op_with_temporary_projects_root,
 };
@@ -857,6 +858,33 @@ allow_cwd_anywhere = true
 
     let cfg = load_config(&path).unwrap();
     assert_eq!(cfg.shell, ShellConfig::default());
+    assert_eq!(cfg.shell.max_persistent_shells, 8);
+    assert_eq!(cfg.shell.persistent_shell_idle_timeout_secs, 30 * 60);
+}
+
+#[test]
+fn agent_config_persistent_shell_limits_are_validated() {
+    let mut shell = ShellConfig::default();
+    shell.max_persistent_shells = 0;
+    assert!(validate_shell_config(&shell)
+        .unwrap_err()
+        .contains("max_persistent_shells"));
+
+    shell.max_persistent_shells = 65;
+    assert!(validate_shell_config(&shell)
+        .unwrap_err()
+        .contains("max_persistent_shells"));
+
+    shell.max_persistent_shells = 8;
+    shell.persistent_shell_idle_timeout_secs = 0;
+    assert!(validate_shell_config(&shell)
+        .unwrap_err()
+        .contains("persistent_shell_idle_timeout_secs"));
+
+    shell.persistent_shell_idle_timeout_secs = 86_401;
+    assert!(validate_shell_config(&shell)
+        .unwrap_err()
+        .contains("persistent_shell_idle_timeout_secs"));
 }
 
 #[test]
@@ -1614,6 +1642,7 @@ fn shell_job_request(cwd: &Path, command: &str) -> ShellAgentShellRequest {
         lsp: None,
         sandbox: None,
         job_context: Some(test_job_context(cwd, Vec::new())),
+        persistent_shell: None,
     }
 }
 
@@ -1679,6 +1708,7 @@ fn line_edit_request(
         lsp: None,
         sandbox: None,
         job_context: None,
+        persistent_shell: None,
     }
 }
 
@@ -1717,6 +1747,7 @@ fn anchor_edit_request(
         lsp: None,
         sandbox: None,
         job_context: None,
+        persistent_shell: None,
     }
 }
 
@@ -1753,6 +1784,7 @@ fn file_read_request(
         lsp: None,
         sandbox: None,
         job_context: None,
+        persistent_shell: None,
     }
 }
 
@@ -2272,6 +2304,7 @@ fn apply_text_edits_request(
         lsp: None,
         sandbox: None,
         job_context: None,
+        persistent_shell: None,
     }
 }
 
@@ -2307,6 +2340,7 @@ fn json_file_op_request(
         lsp: None,
         sandbox: None,
         job_context: None,
+        persistent_shell: None,
     }
 }
 
@@ -4301,11 +4335,13 @@ fn prepared_profile_run_shell_and_run_job_see_same_env() {
     let mut cfg = test_config(projects_dir.clone());
     cfg.shell = shell.clone();
     let hot = runtime_config(&cfg);
+    let persistent_shells = webcodex_runner::PersistentShellManager::new(&cfg.shell);
     dispatch_request(
         &sink,
         &hot.snapshot(),
         &hot,
         &jobs,
+        &persistent_shells,
         &projects_dir,
         &lsp,
         shell_job_request(&project_dir, "printf %s \"$WEBCODEX_TEST_PROFILE\""),
@@ -5357,6 +5393,7 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
         lsp: None,
         sandbox: None,
         job_context: Some(test_job_context(tmp.path(), Vec::new())),
+        persistent_shell: None,
     };
     let mut rejected_request = request.clone();
     rejected_request.request_id = "req-after-shutdown".to_string();
@@ -5499,11 +5536,23 @@ fn dispatch_request_anchor_edit_routes_to_file_handler() {
         lsp: None,
         sandbox: None,
         job_context: None,
+        persistent_shell: None,
     };
     let pdir = projects_dir(&cfg);
     let lsp = webcodex_runner::LspSupervisor::default();
     let hot = runtime_config(&cfg);
-    let ran = dispatch_request(&sink, &hot.snapshot(), &hot, &jobs, &pdir, &lsp, request).unwrap();
+    let persistent_shells = webcodex_runner::PersistentShellManager::new(&cfg.shell);
+    let ran = dispatch_request(
+        &sink,
+        &hot.snapshot(),
+        &hot,
+        &jobs,
+        &persistent_shells,
+        &pdir,
+        &lsp,
+        request,
+    )
+    .unwrap();
     assert!(ran);
     let env = rx.try_recv().expect("result envelope was sent");
     match env {
@@ -5528,6 +5577,7 @@ fn dispatch_request_run_shell_sends_result_over_sink() {
     let jobs = JobManager::new(max_concurrent_jobs(&cfg));
     let pdir = projects_dir(&cfg);
     let hot = runtime_config(&cfg);
+    let persistent_shells = webcodex_runner::PersistentShellManager::new(&cfg.shell);
 
     type SinkFactory = fn(&str) -> (AgentSink, tokio::sync::mpsc::Receiver<AgentEnvelope>);
     for (label, make_sink, client_id, cmd) in [
@@ -5566,12 +5616,14 @@ fn dispatch_request_run_shell_sends_result_over_sink() {
             lsp: None,
             sandbox: None,
             job_context: None,
+            persistent_shell: None,
         };
         let ran = dispatch_request(
             &sink,
             &hot.snapshot(),
             &hot,
             &jobs,
+            &persistent_shells,
             &pdir,
             &webcodex_runner::LspSupervisor::default(),
             request,
@@ -5628,6 +5680,7 @@ fn project_request(kind: &str, payload: serde_json::Value) -> ShellAgentShellReq
         lsp: None,
         sandbox: None,
         job_context: None,
+        persistent_shell: None,
     }
 }
 

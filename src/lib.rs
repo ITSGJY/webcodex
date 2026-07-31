@@ -63,9 +63,9 @@ pub use db::{Database, RotateResult};
 pub use models::{ActionEventRecord, ActionSessionRecord};
 pub(crate) use openapi::openapi_json;
 pub(crate) use shell_client::{
-    shell_agent_job_update, shell_agent_poll, shell_agent_register, shell_agent_result,
-    shell_file_op, shell_job, shell_job_log, shell_job_status, shell_job_stop, shell_jobs_list,
-    shell_run, ShellClientRegistry,
+    shell_agent_job_update, shell_agent_persistent_shell_result, shell_agent_poll,
+    shell_agent_register, shell_agent_result, shell_file_op, shell_job, shell_job_log,
+    shell_job_status, shell_job_stop, shell_jobs_list, shell_run, ShellClientRegistry,
 };
 pub use startup::{is_project_command, run_project_command, CliCommandOutput};
 
@@ -352,6 +352,10 @@ only for local/trusted-network demos."
         .push(Router::with_path("shell/agent/register").post(shell_agent_register))
         .push(Router::with_path("shell/agent/poll").post(shell_agent_poll))
         .push(Router::with_path("shell/agent/result").post(shell_agent_result))
+        .push(
+            Router::with_path("shell/agent/persistent_shell_result")
+                .post(shell_agent_persistent_shell_result),
+        )
         .push(Router::with_path("shell/agent/job_update").post(shell_agent_job_update))
         // WebSocket agent transport (preferred long-lived connection).
         // Polling endpoints above remain as fallback. Bearer auth is

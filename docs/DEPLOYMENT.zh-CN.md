@@ -339,7 +339,7 @@ webcodex-runner --profile workstation
 | `projects_dir` | 项目注册文件目录。 |
 | `temporary_projects_root` | 可选的、已存在的 Runner 托管临时项目根目录；它会按 effective Runner path policy 校验（收窄部署时必须位于 `allowed_roots` 内）。 |
 | `[policy]` | 本地执行边界。 |
-| `[shell]` | 可选 shell profile 定义，用于项目开发环境。 |
+| `[shell]` | 可选 shell profile 定义和有界 persistent-shell 限额。 |
 
 Policy 行为：
 
@@ -358,9 +358,33 @@ max_timeout_secs = 3600
 max_output_bytes = 262144
 ```
 
+Persistent-shell 配置可省略，旧配置文件继续使用默认值：
+
+```toml
+[shell]
+# 当前 Runner 进程拥有的活动长生命周期 Shell 数量，范围 1..64。
+max_persistent_shells = 8
+# 空闲回收秒数，范围 1..86400。
+persistent_shell_idle_timeout_secs = 1800
+```
+
+空闲回收不会中断正在执行的命令。显式 close、Workflow Session close、项目
+disable/unregister、Shell 自行退出、Runner 断连/退出或命令失去同步时也会释放
+进程；Server 或 Runner 重启后不会恢复这些 Shell。
+
 `projects_dir` 中的 agent project files 可以设置 `shell_profile = "rust"`，把项目绑定到已配置 profile。
 
-Shell profiles 会为每个 project/profile 准备一次性 environment snapshot；它不是持久 shell，默认不会 source `.bashrc` 或 `.profile`。Rust/Cargo、Python venv、Conda 示例、解析规则和安全边界见 [SHELL_PROFILES.md](SHELL_PROFILES.md)。修改 profile 后需要重启 `webcodex-runner`，当前没有 reload API。
+Shell profiles 会为一次性命令准备 environment snapshot。显式 Session
+persistent shell 则只在打开长生命周期进程时应用一次所选 profile，后续命令使用
+该进程状态；两条路径默认都不会 source `.bashrc` 或 `.profile`。Rust/Cargo、
+Python venv、Conda 示例、解析规则和安全边界见
+[SHELL_PROFILES.md](SHELL_PROFILES.md)。修改配置不会静默移动、重启或改变已打开
+Shell；需要显式 close/reopen 才应用新默认值。当前 policy 会在后续 exec/status
+操作前重检，而 close 仍可用于清理。
+修改 `agent.toml` 后，`sudo systemctl reload webcodex-runner` 会把新的 policy、
+shell、SSH resource 和 tool-provider generation 应用于后续请求；已打开的
+persistent shell 仍保持原进程状态。无效 reload 保留当前 generation，
+`projects.d` 继续独立刷新。
 
 `runtime_status` 和 `listAgents` 会暴露 redacted policy summary，以及经过清理的 `shell_profiles` 摘要，包括 profile names、`has_init_script`、`env_keys_count`、`program`、`args_count`。`listProjects` 会暴露 `shell_profile`、`resolved_shell_profile` 和 `shell_profile_status`（`configured` / `missing` / `not_configured` / `unknown`）。这些接口不会暴露 tokens、env values、`Authorization` headers、完整 `agent.toml`、完整 env snapshot 或 shell profile `init_script` bodies。
 

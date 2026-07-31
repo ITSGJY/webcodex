@@ -269,7 +269,12 @@ impl ToolRuntime {
                     .sessions
                     .execution_context_for_project(session_id, &resolved.resolved_id)
                 {
-                    if matches!(&call, ToolCall::RunShell { .. } | ToolCall::RunJob { .. }) {
+                    if matches!(
+                        &call,
+                        ToolCall::RunShell { .. }
+                            | ToolCall::RunJob { .. }
+                            | ToolCall::OpenSessionShell { .. }
+                    ) {
                         ssh_resource = execution_context.resource.clone();
                     }
                     call = call.with_session_execution_context(&execution_context);
@@ -542,6 +547,13 @@ impl ToolRuntime {
             call @ ToolCall::RunShell { .. } => {
                 self.dispatch_shell_tool(call, execution_sandbox, ssh_resource)
                     .await
+            }
+
+            call @ (ToolCall::OpenSessionShell { .. }
+            | ToolCall::SessionShellExec { .. }
+            | ToolCall::SessionShellStatus { .. }
+            | ToolCall::CloseSessionShell { .. }) => {
+                self.dispatch_session_shell_tool(call, ssh_resource).await
             }
 
             call @ (ToolCall::ApplyPatch { .. }

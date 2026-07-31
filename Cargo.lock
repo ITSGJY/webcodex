@@ -3551,6 +3551,7 @@ dependencies = [
  "webcodex-admin",
  "webcodex-agent-config",
  "webcodex-core",
+ "webcodex-persistent-shell",
  "webcodex-sandbox",
  "webcodex-workspace",
 ]
@@ -3605,6 +3606,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "webcodex-persistent-shell"
+version = "0.3.0"
+dependencies = [
+ "libc",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "webcodex-runner"
 version = "0.3.0"
 dependencies = [
@@ -3628,6 +3638,7 @@ dependencies = [
  "uuid",
  "webcodex-agent-config",
  "webcodex-core",
+ "webcodex-persistent-shell",
  "webcodex-sandbox",
  "webcodex-workspace",
  "webpki-roots 0.26.11",

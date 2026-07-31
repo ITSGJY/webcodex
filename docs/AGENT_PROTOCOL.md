@@ -185,6 +185,42 @@ automatically retried. `run_shell`, `run_job`, `stop_job`, `job_status`, and
 `job_log` retain their normal interfaces; file, Git, LSP, and checkpoint
 requests are not redirected to SSH in this phase.
 
+## Workflow Session persistent shells
+
+Current Runners advertise the serde-defaulted `persistent_shell` capability.
+Older Runners omit it and remain compatible, but the Server returns
+`agent_capability_unavailable`; it never converts the request into
+`run_shell`. The feature is a separate lifecycle protocol, not a Job:
+
+```text
+open -> exec/status -> close
+```
+
+The Server sends a typed `PersistentShellRequest` inside the existing agent
+request envelope. Polling returns a typed result through
+`/api/shell/agent/persistent_shell_result`; WebSocket and QUIC use the
+`PersistentShellResult` envelope with the same payload. Requests and results
+carry exact `shell_id`, Workflow Session id, and runtime project id. Result
+completion additionally validates the current Runner instance, client,
+request, Session, project, and shell identities before releasing the waiter.
+
+The Runner owns the long-lived `sh`/`bash` process on the registered project's
+host. It validates project availability, raw-shell policy, cwd/allowed roots,
+shell dialect, and profile at open and revalidates the current boundary before
+later exec/status operations. Close remains available as a cleanup operation
+even after execution policy changes. Profile environment and initialization
+run only at open. Commands are serialized, output is bounded, and completion
+travels over a dedicated control descriptor rather than ordinary
+stdout/stderr.
+
+This protocol does not use a Session SSH resource and does not fall back from
+one; SSH persistent shells are unsupported. It also has no PTY, raw byte
+stream, terminal resize, or terminal UI. A Runner disconnect or normal exit
+closes its shells. The Server treats an unavailable or uncertain Runner result
+as lost and does not reconstruct a live shell from Session/Server records.
+Server or Runner process restarts require a newly opened shell; there is no
+reattachment or restart recovery in this phase.
+
 ## LSP read-only navigation
 
 Agents that support read-only LSP intelligence register the

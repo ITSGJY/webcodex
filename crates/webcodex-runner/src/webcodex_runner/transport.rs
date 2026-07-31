@@ -10,10 +10,12 @@ use super::shutdown::{
     LSP_SHUTDOWN_BUDGET, PROVIDER_SHUTDOWN_BUDGET,
 };
 use super::util::contains_any;
+use super::PersistentShellManager;
 use crate::agent_init::{TRANSPORT_AUTO, TRANSPORT_POLLING, TRANSPORT_QUIC, TRANSPORT_WEBSOCKET};
 use crate::shell_protocol::{
     read_quic_frame, write_quic_frame, AgentEnvelope, QuicFrameError, ShellAgentJobUpdateRequest,
-    ShellAgentJobUpdateResponse, ShellAgentProjectSummary, ShellAgentResultRequest,
+    ShellAgentJobUpdateResponse, ShellAgentPersistentShellResultRequest,
+    ShellAgentPersistentShellResultResponse, ShellAgentProjectSummary, ShellAgentResultRequest,
     ShellAgentResultResponse, AGENT_PROTOCOL_VERSION_QUIC_V1, AGENT_PROTOCOL_VERSION_WEBSOCKET_V1,
 };
 use crate::{
@@ -83,6 +85,7 @@ const POLLING_RECOVERY_BACKOFF_STEPS: [Duration; 5] = [
 const POLLING_LEASE_CONFLICT_MAX_WAIT: Duration = Duration::from_secs(75);
 /// Result submission endpoint used by the polling transport sink.
 const AGENT_RESULT_PATH: &str = "/api/shell/agent/result";
+const AGENT_PERSISTENT_SHELL_RESULT_PATH: &str = "/api/shell/agent/persistent_shell_result";
 /// Bounded same-payload retry backoff for transient result submission
 /// failures over the polling transport. After the last step the payload is
 /// released with an explicit dropped outcome, so a single result can never
@@ -124,6 +127,7 @@ pub(crate) struct AgentRuntimeState {
     lsp: LspSupervisor,
     config: Arc<ReloadableAgentConfig>,
     jobs: JobManager,
+    persistent_shells: PersistentShellManager,
     coordinator: Arc<ShutdownCoordinator>,
     reload_threads: Arc<BackgroundThreads>,
     background_threads: Arc<BackgroundThreads>,
@@ -140,6 +144,7 @@ impl AgentRuntimeState {
             lsp: LspSupervisor::default(),
             config: Arc::new(ReloadableAgentConfig::new(cfg.clone(), path)),
             jobs: JobManager::new(max_concurrent_jobs(cfg)),
+            persistent_shells: PersistentShellManager::new(&cfg.shell),
             coordinator: Arc::new(ShutdownCoordinator::new(budget)),
             reload_threads: Arc::new(BackgroundThreads::default()),
             background_threads: Arc::new(BackgroundThreads::default()),
@@ -152,6 +157,7 @@ impl AgentRuntimeState {
         let deadline = self.coordinator.deadline().instant();
         self.config.begin_shutdown();
         self.jobs.stop_accepting_work();
+        self.persistent_shells.close_all("runner_shutdown");
         self.lsp.begin_shutdown_until(deadline);
     }
 
@@ -216,6 +222,7 @@ impl AgentRuntimeState {
         let started = Instant::now();
         self.config.begin_shutdown();
         self.jobs.stop_accepting_work();
+        self.persistent_shells.close_all("runner_shutdown");
         self.lsp.begin_shutdown_until(deadline.instant());
         phases.push(ShutdownPhaseResult::completed(
             "stop_accepting_work",
@@ -925,6 +932,34 @@ impl AgentSink {
         submitted
     }
 
+    /// Submit one Runner-authoritative persistent-shell lifecycle result. It
+    /// has its own envelope and HTTP endpoint because PersistentShell is not a
+    /// synchronous one-shot shell result and is never represented as a Job.
+    pub(crate) fn submit_persistent_shell_result(
+        &self,
+        request_id: String,
+        result: crate::shell_protocol::PersistentShellResult,
+    ) -> Result<ResultSubmission, SubmitResultError> {
+        let body = ShellAgentPersistentShellResultRequest {
+            client_id: self.client_id().to_string(),
+            agent_instance_id: self.agent_instance_id().to_string(),
+            request_id,
+            result,
+        };
+        match self {
+            AgentSink::Http(h) => submit_persistent_shell_result_http(h, &body),
+            AgentSink::WebSocket { tx, .. } | AgentSink::Quic { tx, .. } => {
+                tx.blocking_send(AgentEnvelope::PersistentShellResult { payload: body })
+                    .map_err(|_| {
+                        SubmitResultError::TransportClosed(
+                            "agent transport persistent shell result channel closed".to_string(),
+                        )
+                    })?;
+                Ok(ResultSubmission::Accepted)
+            }
+        }
+    }
+
     fn send_provider_metadata_best_effort(&self, generation: u64, runtime: &ReloadableAgentConfig) {
         let (AgentSink::WebSocket { tx, .. } | AgentSink::Quic { tx, .. }) = self else {
             return;
@@ -960,6 +995,77 @@ impl AgentSink {
                 };
                 tx.blocking_send(env)
                     .map_err(|_| "agent transport send failed".to_string())
+            }
+        }
+    }
+}
+
+fn submit_persistent_shell_result_http(
+    h: &HttpSendConfig,
+    body: &ShellAgentPersistentShellResultRequest,
+) -> Result<ResultSubmission, SubmitResultError> {
+    let mut attempt = 0usize;
+    loop {
+        let error = match post_json_raw::<_, ShellAgentPersistentShellResultResponse>(
+            &h.client,
+            &h.server_url,
+            &h.token,
+            AGENT_PERSISTENT_SHELL_RESULT_PATH,
+            body,
+        ) {
+            Ok(response) if response.success => return Ok(ResultSubmission::Accepted),
+            Ok(response) => {
+                let reason = response.error.unwrap_or_else(|| {
+                    "persistent shell result submission failed without error".to_string()
+                });
+                eprintln!(
+                    "{}",
+                    permanent_result_rejection_log_line(&body.request_id, &reason, &h.token)
+                );
+                return Ok(ResultSubmission::RejectedPermanent);
+            }
+            Err(error) => error,
+        };
+        match result_http_error_disposition(&error.kind) {
+            ResultHttpErrorDisposition::RejectPermanent => {
+                eprintln!(
+                    "{}",
+                    permanent_result_rejection_log_line(
+                        &body.request_id,
+                        &error.to_string(),
+                        &h.token,
+                    )
+                );
+                return Ok(ResultSubmission::RejectedPermanent);
+            }
+            ResultHttpErrorDisposition::FatalAuth => {
+                return Err(SubmitResultError::FatalAuth(error.to_string()));
+            }
+            ResultHttpErrorDisposition::FatalProtocol => {
+                return Err(SubmitResultError::FatalProtocol(error.to_string()));
+            }
+            ResultHttpErrorDisposition::FatalConfig => {
+                return Err(SubmitResultError::FatalConfig(error.to_string()));
+            }
+            ResultHttpErrorDisposition::RetryTransient => {
+                let Some(delay) = RESULT_SUBMIT_RETRY_BACKOFF.get(attempt).copied() else {
+                    eprintln!(
+                        "{}",
+                        dropped_result_log_line(
+                            &body.request_id,
+                            attempt + 1,
+                            &error.to_string(),
+                            &h.token,
+                        )
+                    );
+                    return Ok(ResultSubmission::DroppedAfterRetryExhaustion);
+                };
+                attempt += 1;
+                if sleep_or_shutdown(delay, h.shutdown.as_ref()) {
+                    return Err(SubmitResultError::Shutdown(
+                        "persistent shell result retry interrupted by process shutdown".to_string(),
+                    ));
+                }
             }
         }
     }
@@ -1358,11 +1464,13 @@ fn run_polling_agent_with_shutdown(
             &cfg,
             &runtime.config,
             &jobs,
+            &runtime.persistent_shells,
             &mut project_cache,
             agent_instance_id,
             &runtime.lsp,
             &shutdown,
             &runtime.dispatches,
+            once,
         ) {
             Ok(ran_request) => {
                 recovery_backoff.reset();
@@ -1396,6 +1504,13 @@ fn run_polling_agent_with_shutdown(
                 }
             }
             Err(e) => {
+                // Polling has no durable transport lease to prove a Server
+                // still knows these process handles. Fail closed at the first
+                // recovery boundary instead of advertising false survival
+                // after a Server restart or lost registration.
+                runtime
+                    .persistent_shells
+                    .close_all("runner_transport_disconnected");
                 match e.recovery_action() {
                     PollingRecoveryAction::Shutdown => {
                         return complete_polling_shutdown(runtime);
@@ -1901,6 +2016,7 @@ async fn quic_session(
                         let config = Arc::clone(&runtime.config);
                         let hot = config.snapshot();
                         let jobs = jobs.clone();
+                        let persistent_shells = runtime.persistent_shells.clone();
                         let projects_dir = projects_dir(cfg);
                         let lsp = runtime.lsp.clone();
                         let dispatch_guard = runtime.dispatches.enter();
@@ -1911,6 +2027,7 @@ async fn quic_session(
                                 &hot,
                                 &config,
                                 &jobs,
+                                &persistent_shells,
                                 &projects_dir,
                                 &lsp,
                                 request,
@@ -1965,6 +2082,11 @@ async fn quic_session(
             transport = "quic",
             "webcodex-runner quic disconnected with active jobs; reconnecting without waiting"
         );
+    }
+    if !shutdown_requested {
+        runtime
+            .persistent_shells
+            .close_all("runner_transport_disconnected");
     }
     if shutdown_requested {
         conn.close(quinn::VarInt::from_u32(0), b"process shutdown");
@@ -2362,6 +2484,7 @@ where
                         let config = Arc::clone(&runtime.config);
                         let hot = config.snapshot();
                         let jobs = jobs.clone();
+                        let persistent_shells = runtime.persistent_shells.clone();
                         let projects_dir = projects_dir(&cfg);
                         let lsp = runtime.lsp.clone();
                         let dispatch_guard = runtime.dispatches.enter();
@@ -2375,6 +2498,7 @@ where
                                 &hot,
                                 &config,
                                 &jobs,
+                                &persistent_shells,
                                 &projects_dir,
                                 &lsp,
                                 request,
@@ -2481,6 +2605,11 @@ where
         writer_task.abort();
     }
     drop(stream);
+    if !quit_after_session {
+        runtime
+            .persistent_shells
+            .close_all("runner_transport_disconnected");
+    }
     if let Some(error) = session_error {
         return Err(error);
     }

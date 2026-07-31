@@ -1,6 +1,9 @@
-use super::AgentCapability::{AsyncJobs, Shell};
+use super::AgentCapability::{AsyncJobs, PersistentShell, Shell};
 use super::ToolVisibility::{ModelHidden, ModelVisible};
-use super::{def, permission_risk, ToolDefinition, PERMISSION_RISK_JOB, TOOL_CATEGORY_JOB};
+use super::{
+    def, permission_risk, requires_explicit_business_session, ToolDefinition, PERMISSION_RISK_JOB,
+    TOOL_CATEGORY_JOB,
+};
 use crate::tool_runtime::metadata::{
     ToolPathHint::None as NoPath,
     ToolRisk::{JobRun, ReadOnly},
@@ -21,6 +24,61 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
         true,
         true,
     ),
+    requires_explicit_business_session(def(
+        "open_session_shell",
+        ModelVisible,
+        TOOL_CATEGORY_JOB,
+        Some(PersistentShell),
+        TOOL_PROVIDER_AGENT,
+        JobRun,
+        Some(JOB_RUN),
+        true,
+        NoPath,
+        true,
+        true,
+    )),
+    requires_explicit_business_session(def(
+        "session_shell_exec",
+        ModelVisible,
+        TOOL_CATEGORY_JOB,
+        Some(PersistentShell),
+        TOOL_PROVIDER_AGENT,
+        JobRun,
+        Some(JOB_RUN),
+        true,
+        NoPath,
+        true,
+        true,
+    )),
+    requires_explicit_business_session(def(
+        "session_shell_status",
+        ModelVisible,
+        TOOL_CATEGORY_JOB,
+        Some(PersistentShell),
+        TOOL_PROVIDER_AGENT,
+        ReadOnly,
+        Some(RUNTIME_READ),
+        true,
+        NoPath,
+        false,
+        false,
+    )),
+    requires_explicit_business_session(permission_risk(
+        def(
+            "close_session_shell",
+            ModelVisible,
+            TOOL_CATEGORY_JOB,
+            Some(PersistentShell),
+            TOOL_PROVIDER_AGENT,
+            JobRun,
+            Some(JOB_RUN),
+            true,
+            NoPath,
+            true,
+            false,
+        ),
+        PERMISSION_RISK_JOB,
+    )),
     permission_risk(
         def(
             "run_job",

@@ -199,6 +199,18 @@ pub(crate) fn find_project_shell_context(
         .map(|(_, project)| project)
 }
 
+/// Resolve one enabled project by its Runner-local id. Persistent shells use
+/// the id from the authenticated runtime-project binding rather than choosing
+/// a project solely from a caller-controlled cwd.
+pub(crate) fn find_project_shell_context_by_id(
+    projects_dir: &Path,
+    project_id: &str,
+) -> Option<AgentProjectShellContext> {
+    load_agent_project_shell_contexts_from_dir(projects_dir)
+        .into_iter()
+        .find(|project| project.id == project_id)
+}
+
 struct BoundedGitOutput {
     status: std::process::ExitStatus,
     stdout: Vec<u8>,

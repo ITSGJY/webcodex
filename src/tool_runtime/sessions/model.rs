@@ -617,6 +617,29 @@ impl SessionTransport {
     }
 }
 
+/// Bounded, non-secret persistent-shell evidence retained in the Session
+/// ledger. Command text, output, environment, and internal shell state are
+/// deliberately excluded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PersistentShellEventEvidence {
+    pub(crate) action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) shell_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) shell_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) execution_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) command_started: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) command_completed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) already_closed: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SessionEvent {
     pub(crate) event_id: String,
@@ -671,6 +694,8 @@ pub(crate) struct SessionEvent {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) observed_paths: Vec<String>,
     pub(crate) job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) persistent_shell: Option<PersistentShellEventEvidence>,
     pub(crate) input_summary: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) validation_output_summary: Option<Value>,

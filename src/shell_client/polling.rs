@@ -2,11 +2,12 @@ use super::jobs::{
     assert_active_instance_locked, command_preview, replace_log_limited, truncate_output,
     truncate_output_to,
 };
-use super::requests::take_pending_request_locked;
+use super::requests::{remove_pending_request_locked, take_pending_request_locked};
 use super::validation::{normalize_project_summaries, validate_agent_instance_id, validate_id};
 use super::{now_ts, ShellClientRegistry};
 use crate::shell_protocol::{
-    ShellAgentPollRequest, ShellAgentResultRequest, ShellAgentShellRequest, ShellRunResponse,
+    ShellAgentPersistentShellResultRequest, ShellAgentPollRequest, ShellAgentResultRequest,
+    ShellAgentShellRequest, ShellRunResponse,
 };
 
 impl ShellClientRegistry {
@@ -209,6 +210,127 @@ impl ShellClientRegistry {
         }
         Ok(())
     }
+
+    pub async fn complete_persistent_shell(
+        &self,
+        body: ShellAgentPersistentShellResultRequest,
+    ) -> Result<(), String> {
+        self.complete_persistent_shell_checked(body, None).await
+    }
+
+    pub(crate) async fn complete_persistent_shell_for_connection(
+        &self,
+        body: ShellAgentPersistentShellResultRequest,
+        connection_id: &str,
+    ) -> Result<(), String> {
+        self.complete_persistent_shell_checked(body, Some(connection_id))
+            .await
+    }
+
+    async fn complete_persistent_shell_checked(
+        &self,
+        mut body: ShellAgentPersistentShellResultRequest,
+        expected_connection_id: Option<&str>,
+    ) -> Result<(), String> {
+        validate_id(&body.client_id, "client_id")?;
+        validate_id(&body.request_id, "request_id")?;
+        validate_agent_instance_id(&body.agent_instance_id)?;
+        normalize_persistent_shell_result(&mut body.result)?;
+        let mut inner = self.inner.lock().await;
+        assert_active_instance_locked(&inner, &body.client_id, &body.agent_instance_id)?;
+        if expected_connection_id.is_none()
+            || inner
+                .clients
+                .get(&body.client_id)
+                .is_some_and(|client| client.connection_id.as_deref() == expected_connection_id)
+        {
+            if let Some(client) = inner.clients.get_mut(&body.client_id) {
+                client.last_seen = now_ts();
+            }
+        }
+        let Some(pending) = inner.pending_by_id.get(&body.request_id) else {
+            return Err(format!(
+                "unknown or expired persistent shell request: {}",
+                body.request_id
+            ));
+        };
+        if pending.request.client_id != body.client_id {
+            return Err("request_id does not belong to client_id".to_string());
+        }
+        let expected = pending.request.persistent_shell.as_ref().ok_or_else(|| {
+            "request_id does not belong to a persistent shell request".to_string()
+        })?;
+        if expected.shell_id != body.result.shell_id
+            || expected.workflow_session_id != body.result.workflow_session_id
+            || expected.runtime_project_id != body.result.runtime_project_id
+        {
+            remove_pending_request_locked(&mut inner, &body.request_id);
+            inner.persistent_waiters.remove(&body.request_id);
+            return Err("persistent shell result identity mismatch".to_string());
+        }
+        take_pending_request_locked(&mut inner, &body.request_id)
+            .expect("persistent shell request remained present after identity validation");
+        let waiter = inner.persistent_waiters.remove(&body.request_id);
+        if let Some(waiter) = waiter {
+            let _ = waiter.send(body.result);
+        }
+        Ok(())
+    }
+}
+
+fn normalize_persistent_shell_result(
+    result: &mut crate::shell_protocol::PersistentShellResult,
+) -> Result<(), String> {
+    validate_id(&result.shell_id, "shell_id")?;
+    validate_id(&result.workflow_session_id, "workflow_session_id")?;
+    if result.runtime_project_id.is_empty()
+        || result.runtime_project_id.len() > 1024
+        || result.runtime_project_id.chars().any(char::is_control)
+    {
+        return Err("invalid runtime_project_id in persistent shell result".to_string());
+    }
+    if !matches!(
+        result.shell_state.as_str(),
+        "opening" | "running" | "exited" | "closed" | "poisoned" | "lost" | "unknown"
+    ) {
+        return Err("invalid shell_state in persistent shell result".to_string());
+    }
+    const MAX_METADATA_BYTES: usize = 8 * 1024;
+    for (name, value) in [
+        ("execution_state", Some(&result.execution_state)),
+        ("cwd", result.cwd.as_ref()),
+        ("initial_cwd", result.initial_cwd.as_ref()),
+        ("shell", result.shell.as_ref()),
+        ("profile", result.profile.as_ref()),
+        ("close_reason", result.close_reason.as_ref()),
+        ("error_code", result.error_code.as_ref()),
+        ("error", result.error.as_ref()),
+    ] {
+        if value.is_some_and(|value| value.len() > MAX_METADATA_BYTES) {
+            return Err(format!(
+                "{name} exceeds persistent shell result metadata limit"
+            ));
+        }
+    }
+    if truncate_persistent_shell_stream(&mut result.stdout) {
+        result.stdout_truncated = true;
+    }
+    if truncate_persistent_shell_stream(&mut result.stderr) {
+        result.stderr_truncated = true;
+    }
+    Ok(())
+}
+
+fn truncate_persistent_shell_stream(value: &mut String) -> bool {
+    if value.len() <= super::MAX_OUTPUT_BYTES {
+        return false;
+    }
+    let mut start = value.len() - super::MAX_OUTPUT_BYTES;
+    while start < value.len() && !value.is_char_boundary(start) {
+        start += 1;
+    }
+    *value = value[start..].to_string();
+    true
 }
 
 fn is_mcp_image_artifact_request(request: &ShellAgentShellRequest) -> bool {

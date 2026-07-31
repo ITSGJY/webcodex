@@ -346,7 +346,7 @@ Important agent settings:
 | `projects_dir` | Directory of project registry files. |
 | `temporary_projects_root` | Optional existing Runner-owned root for managed temporary projects; it is validated against the effective Runner path policy (and must be inside `allowed_roots` in narrowed deployments). |
 | `[policy]` | Local execution boundary. |
-| `[shell]` | Optional shell profile definitions for project development environments. |
+| `[shell]` | Optional shell profile definitions and bounded persistent-shell limits. |
 | `[ssh.resources.<name>]` | Optional named SSH target for Session-bound `run_shell` / `run_job`; contains only `host` (including a normal OpenSSH Host alias) and optional remote `default_cwd`. |
 
 Policy behavior:
@@ -366,6 +366,23 @@ max_timeout_secs = 3600
 max_output_bytes = 262144
 ```
 
+Persistent-shell settings are optional and preserve compatibility with older
+configuration files. Defaults and accepted ranges are:
+
+```toml
+[shell]
+# Live long-running shells owned by this Runner process: 1..64.
+max_persistent_shells = 8
+# Reclaim an idle shell after this many seconds: 1..86400.
+persistent_shell_idle_timeout_secs = 1800
+```
+
+Idle collection never interrupts an executing command. A shell is also
+released on explicit close, Workflow Session close, project
+disable/unregister, process exit, Runner disconnect/shutdown, or loss of
+command synchronization. These processes are not recovered across Runner or
+Server restart.
+
 Agent project files in `projects_dir` may set `shell_profile = "rust"` to bind a project to a configured profile.
 
 SSH resources are Runner-local. For example:
@@ -384,7 +401,22 @@ tool input. A Session's `execution_context.resource = "tmp"` changes only
 `run_shell` and `run_job`; other project tools remain local. The Runner
 advertises `ssh_shell` only when its OpenSSH client is available.
 
-Shell profiles prepare a one-time environment snapshot per project/profile (no persistent shell, no `.bashrc`/`.profile` sourced by default). See [SHELL_PROFILES.md](SHELL_PROFILES.md) for Rust/Cargo, Python venv, Conda examples, resolution rules, and safety boundaries. After editing `agent.toml`, `sudo systemctl reload webcodex-runner` atomically applies policy, shell, SSH-resource, and tool-provider settings to new requests. Identity, server/auth, project source, concurrency, capabilities, and transport changes still require a restart. Invalid reloads keep the active generation; `projects.d` continues to refresh independently. Provider lifecycle and the exact field boundary are documented in [agent/claude-code-mcp-provider.md](agent/claude-code-mcp-provider.md#explicit-agent-config-reload).
+Shell profiles prepare a one-time environment snapshot for one-shot commands.
+An explicit Session persistent shell instead applies the selected profile once
+when its long-lived process opens; later commands use that process state.
+Neither path sources `.bashrc`/`.profile` by default. See
+[SHELL_PROFILES.md](SHELL_PROFILES.md) for Rust/Cargo, Python venv, Conda
+examples, resolution rules, and safety boundaries. After editing `agent.toml`,
+`sudo systemctl reload webcodex-runner` atomically applies policy, shell,
+SSH-resource, and tool-provider settings to new requests. An already-open
+persistent shell is not silently restarted or moved; current policy is still
+rechecked before later exec/status operations, while close remains available
+for cleanup; close/reopen applies new defaults. Identity, server/auth,
+project source, concurrency, capabilities, and transport changes still require
+a restart. Invalid reloads keep the active generation; `projects.d` continues
+to refresh independently. Provider lifecycle and the exact field boundary are
+documented in
+[agent/claude-code-mcp-provider.md](agent/claude-code-mcp-provider.md#explicit-agent-config-reload).
 
 `runtime_status` and `listAgents` expose a redacted policy summary plus a sanitized `shell_profiles` summary (profile names, `has_init_script`, `env_keys_count`, `program`, `args_count`). `listProjects` exposes `shell_profile`, `resolved_shell_profile`, and `shell_profile_status` (`configured` / `missing` / `not_configured` / `unknown`). They do not expose tokens, env values, `Authorization` headers, full `agent.toml`, the full env snapshot, or shell profile `init_script` bodies.
 

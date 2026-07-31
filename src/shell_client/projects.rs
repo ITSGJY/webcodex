@@ -6,9 +6,10 @@ use crate::shell_protocol::{
     SHELL_CLIENT_CAPABILITY_ASYNC_SHELL_JOBS, SHELL_CLIENT_CAPABILITY_FILE_READ,
     SHELL_CLIENT_CAPABILITY_FILE_WRITE, SHELL_CLIENT_CAPABILITY_GIT, SHELL_CLIENT_CAPABILITY_JOBS,
     SHELL_CLIENT_CAPABILITY_JOB_STATE_RECONCILIATION,
-    SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION, SHELL_CLIENT_CAPABILITY_PROJECT_LIFECYCLE,
-    SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS, SHELL_CLIENT_CAPABILITY_SHELL,
-    SHELL_CLIENT_CAPABILITY_SSH_SHELL, SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV,
+    SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION, SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL,
+    SHELL_CLIENT_CAPABILITY_PROJECT_LIFECYCLE, SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS,
+    SHELL_CLIENT_CAPABILITY_SHELL, SHELL_CLIENT_CAPABILITY_SSH_SHELL,
+    SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV,
 };
 use std::fmt;
 
@@ -39,6 +40,7 @@ fn capability_enabled(caps: &ShellClientCapabilities, capability: &str) -> bool 
         SHELL_CLIENT_CAPABILITY_ASYNC_JOBS => caps.async_jobs,
         SHELL_CLIENT_CAPABILITY_ASYNC_SHELL_JOBS => caps.async_shell_jobs,
         SHELL_CLIENT_CAPABILITY_SSH_SHELL => caps.ssh_shell,
+        SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL => caps.persistent_shell,
         SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV => caps.structured_validation_argv,
         SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION => caps.lsp_read_only_navigation,
         SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS => caps.sandbox_inspect_commands,
@@ -82,7 +84,7 @@ impl ShellClientRegistry {
     /// Check whether a registered agent client supports a named capability.
     /// Recognized capability names: `shell`, `file_read`, `file_write`,
     /// `git`, `jobs`, `async_jobs`, `async_shell_jobs`,
-    /// `ssh_shell`, `structured_validation_argv`, `lsp_read_only_navigation`,
+    /// `ssh_shell`, `persistent_shell`, `structured_validation_argv`, `lsp_read_only_navigation`,
     /// `sandbox_inspect_commands`, `project_lifecycle`,
     /// `job_state_reconciliation`. Unknown capability
     /// names return `false`.

@@ -13,12 +13,13 @@ use crate::lsp_bridge::{
 use serde_json::{json, Value};
 
 use super::model::{
-    SessionEvent, ToolCallExpectation, ToolCallRecorderMetadata, MAX_OBSERVED_PATHS_PER_EVENT,
-    MAX_VALIDATION_EXCERPT_CHARS, SESSION_ID_PREFIX, TOOL_ASSERTION_NAME_FIELD,
-    TOOL_CALL_EXPECTATION_METADATA_FIELDS, TOOL_EXPECTATION_RESULT_MATCHED,
-    TOOL_EXPECTATION_RESULT_MISMATCH, TOOL_EXPECTATION_RESULT_NONE,
-    TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE, TOOL_EXPECTATION_RESULT_UNEXPECTED_SUCCESS,
-    TOOL_EXPECTED_FAILURE_FIELD, TOOL_EXPECTED_FAILURE_KIND_FIELD,
+    PersistentShellEventEvidence, SessionEvent, ToolCallExpectation, ToolCallRecorderMetadata,
+    MAX_OBSERVED_PATHS_PER_EVENT, MAX_VALIDATION_EXCERPT_CHARS, SESSION_ID_PREFIX,
+    TOOL_ASSERTION_NAME_FIELD, TOOL_CALL_EXPECTATION_METADATA_FIELDS,
+    TOOL_EXPECTATION_RESULT_MATCHED, TOOL_EXPECTATION_RESULT_MISMATCH,
+    TOOL_EXPECTATION_RESULT_NONE, TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE,
+    TOOL_EXPECTATION_RESULT_UNEXPECTED_SUCCESS, TOOL_EXPECTED_FAILURE_FIELD,
+    TOOL_EXPECTED_FAILURE_KIND_FIELD,
 };
 use super::util::redact_and_bound_value;
 use super::util::{bound_summary_string, validation_excerpt};
@@ -388,13 +389,90 @@ pub(crate) fn session_input_summary_for_tool(tool_name: &str, arguments: &Value)
         "workspace_symbols" => {
             object.remove("query");
         }
-        "run_shell" | "run_job" => {
+        "run_shell" | "run_job" | "session_shell_exec" => {
             object.remove("command");
             object.remove("command_summary");
         }
         _ => {}
     }
     summary
+}
+
+pub(crate) fn persistent_shell_event_evidence_for_tool_result(
+    tool_name: &str,
+    output: &Value,
+) -> Option<PersistentShellEventEvidence> {
+    let action = persistent_shell_action(tool_name)?;
+    sanitize_persistent_shell_event_evidence(
+        tool_name,
+        PersistentShellEventEvidence {
+            action: action.to_string(),
+            shell_id: output
+                .get("shell_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            shell_state: output
+                .get("shell_state")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            execution_state: output
+                .get("execution_state")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            error_code: output
+                .get("error_code")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            command_started: output.get("command_started").and_then(Value::as_bool),
+            command_completed: output.get("command_completed").and_then(Value::as_bool),
+            already_closed: output.get("already_closed").and_then(Value::as_bool),
+        },
+    )
+}
+
+pub(crate) fn sanitize_persistent_shell_event_evidence(
+    tool_name: &str,
+    mut evidence: PersistentShellEventEvidence,
+) -> Option<PersistentShellEventEvidence> {
+    evidence.action = persistent_shell_action(tool_name)?.to_string();
+    evidence.shell_id = evidence.shell_id.filter(|value| {
+        value.starts_with("wc_shell_")
+            && value.len() <= 96
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    });
+    evidence.shell_state = evidence.shell_state.and_then(sanitize_shell_evidence_atom);
+    evidence.execution_state = evidence
+        .execution_state
+        .and_then(sanitize_shell_evidence_atom);
+    evidence.error_code = evidence.error_code.and_then(sanitize_shell_evidence_atom);
+    Some(evidence)
+}
+
+fn persistent_shell_action(tool_name: &str) -> Option<&'static str> {
+    match tool_name {
+        "open_session_shell" => Some("open"),
+        "session_shell_exec" => Some("exec"),
+        "session_shell_status" => Some("status"),
+        "close_session_shell" => Some("close"),
+        "close_session" => Some("close"),
+        _ => None,
+    }
+}
+
+fn sanitize_shell_evidence_atom(value: String) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 80
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 /// Add paths from a successful structured tool result. Every branch follows a

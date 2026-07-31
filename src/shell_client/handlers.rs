@@ -3,9 +3,10 @@ use super::{
     require_agent_transport_scope,
 };
 use crate::shell_protocol::{
-    ShellAgentJobUpdateRequest, ShellAgentJobUpdateResponse, ShellAgentPollPayload,
-    ShellAgentPollResponse, ShellAgentResultRequest, ShellAgentResultResponse,
-    ShellClientRegisterRequest, ShellClientRegisterResponse,
+    ShellAgentJobUpdateRequest, ShellAgentJobUpdateResponse,
+    ShellAgentPersistentShellResultRequest, ShellAgentPersistentShellResultResponse,
+    ShellAgentPollPayload, ShellAgentPollResponse, ShellAgentResultRequest,
+    ShellAgentResultResponse, ShellClientRegisterRequest, ShellClientRegisterResponse,
 };
 use salvo::prelude::*;
 
@@ -212,6 +213,76 @@ pub async fn shell_agent_result(req: &mut Request, depot: &mut Depot, res: &mut 
             res.render(Json(ShellAgentResultResponse {
                 success: false,
                 error: Some(e),
+            }));
+        }
+    }
+}
+
+#[handler]
+pub async fn shell_agent_persistent_shell_result(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) {
+    let Some(registry) = get_registry(depot) else {
+        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+        res.render(Json(ShellAgentPersistentShellResultResponse {
+            success: false,
+            error: Some("Shell client registry not configured".to_string()),
+        }));
+        return;
+    };
+    let body: ShellAgentPersistentShellResultRequest = match req.parse_json().await {
+        Ok(body) => body,
+        Err(error) => {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(ShellAgentPersistentShellResultResponse {
+                success: false,
+                error: Some(format!("Invalid JSON: {error}")),
+            }));
+            return;
+        }
+    };
+    let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
+    if let Err(error) =
+        require_agent_transport_scope(auth.as_ref(), crate::auth::SCOPE_AGENT_RESULT)
+    {
+        res.status_code(StatusCode::FORBIDDEN);
+        res.render(Json(ShellAgentPersistentShellResultResponse {
+            success: false,
+            error: Some(error),
+        }));
+        return;
+    }
+    if let Err(error) = enforce_agent_transport(auth.as_ref(), &body.client_id) {
+        res.status_code(StatusCode::FORBIDDEN);
+        res.render(Json(ShellAgentPersistentShellResultResponse {
+            success: false,
+            error: Some(error),
+        }));
+        return;
+    }
+    if let Err(error) = registry
+        .assert_client_access(auth.as_ref(), &body.client_id)
+        .await
+    {
+        res.status_code(StatusCode::FORBIDDEN);
+        res.render(Json(ShellAgentPersistentShellResultResponse {
+            success: false,
+            error: Some(error),
+        }));
+        return;
+    }
+    match registry.complete_persistent_shell(body).await {
+        Ok(()) => res.render(Json(ShellAgentPersistentShellResultResponse {
+            success: true,
+            error: None,
+        })),
+        Err(error) => {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(ShellAgentPersistentShellResultResponse {
+                success: false,
+                error: Some(error),
             }));
         }
     }

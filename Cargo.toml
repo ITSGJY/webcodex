@@ -4,6 +4,7 @@ members = [
     "crates/webcodex-agent-config",
     "crates/webcodex-cli",
     "crates/webcodex-core",
+    "crates/webcodex-persistent-shell",
     "crates/webcodex-runner",
     "crates/webcodex-sandbox",
     "crates/webcodex-workspace",
@@ -29,6 +30,7 @@ path = "src/bin/webcodex-server.rs"
 webcodex-admin = { path = "crates/webcodex-admin" }
 webcodex-agent-config = { path = "crates/webcodex-agent-config" }
 webcodex-core = { path = "crates/webcodex-core" }
+webcodex-persistent-shell = { path = "crates/webcodex-persistent-shell" }
 webcodex-sandbox = { path = "crates/webcodex-sandbox" }
 webcodex-workspace = { path = "crates/webcodex-workspace" }
 salvo = { version = "0.93", features = ["oapi", "cors", "affix-state", "websocket", "timeout"] }

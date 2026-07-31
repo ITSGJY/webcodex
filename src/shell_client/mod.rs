@@ -45,7 +45,8 @@ pub(crate) use auth::{
     requested_by_from_auth, require_agent_transport_scope,
 };
 pub use handlers::{
-    shell_agent_job_update, shell_agent_poll, shell_agent_register, shell_agent_result,
+    shell_agent_job_update, shell_agent_persistent_shell_result, shell_agent_poll,
+    shell_agent_register, shell_agent_result,
 };
 pub(crate) use job_updates::ShellJobStartMetadata;
 pub(crate) use jobs::{command_preview, COMMAND_PREVIEW_MAX_CHARS};

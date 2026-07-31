@@ -165,7 +165,10 @@ impl ShellClientRegistry {
         let request_id = next_request_id();
         let job_id = Uuid::new_v4().to_string();
         let created_at = now_ts();
-        if metadata.ssh_resource.is_some() != metadata.session_id.is_some() {
+        // Ordinary Session-scoped jobs retain their Session id even without an
+        // SSH resource. Only the inverse is invalid: remote execution without
+        // the Workflow Session that owns the SSH context.
+        if metadata.ssh_resource.is_some() && metadata.session_id.is_none() {
             return Err(
                 "ssh_session_required: an SSH resource requires a Workflow Session id".to_string(),
             );
@@ -251,6 +254,7 @@ impl ShellClientRegistry {
             lsp: None,
             sandbox,
             job_context: Some(job_context),
+            persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
         let Some(client) = inner.clients.get(&client_id) else {
@@ -596,6 +600,7 @@ impl ShellClientRegistry {
                     lsp: None,
                     sandbox: None,
                     job_context: None,
+                    persistent_shell: None,
                 };
                 enqueue_pending_request_locked(
                     &mut inner,

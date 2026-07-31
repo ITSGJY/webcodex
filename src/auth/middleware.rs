@@ -105,6 +105,7 @@ pub(crate) const AGENT_TRANSPORT_PATHS: &[&str] = &[
     "/api/shell/agent/register",
     "/api/shell/agent/poll",
     "/api/shell/agent/result",
+    "/api/shell/agent/persistent_shell_result",
     "/api/shell/agent/job_update",
     "/api/agents/ws",
 ];

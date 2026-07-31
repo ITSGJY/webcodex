@@ -24,6 +24,18 @@ impl ToolRuntime {
         ssh_resource: Option<&str>,
         auth: Option<&AuthContext>,
     ) -> Result<(), ToolResult> {
+        if ssh_resource.is_some() && matches!(call, ToolCall::OpenSessionShell { .. }) {
+            return Err(ToolResult::err_with_output(
+                "persistent_shell_ssh_resource_unsupported: Session persistent shells execute only on the project host"
+                    .to_string(),
+                serde_json::json!({
+                    "error_code": "persistent_shell_ssh_resource_unsupported",
+                    "command_started": false,
+                    "command_completed": false,
+                    "tool_failure": true,
+                }),
+            ));
+        }
         let Some(project) = call.project() else {
             return Ok(());
         };
@@ -86,6 +98,12 @@ impl ToolRuntime {
                         return Err(ToolResult::err(format!(
                             "{}: {}",
                             crate::lsp_bridge::error_codes::AGENT_CAPABILITY_UNAVAILABLE,
+                            message
+                        )));
+                    }
+                    if matches!(required, AgentCapability::PersistentShell) {
+                        return Err(ToolResult::err(format!(
+                            "agent_capability_unavailable: {}",
                             message
                         )));
                     }

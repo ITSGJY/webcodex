@@ -5,6 +5,7 @@ use super::observations::RuntimeObservations;
 use super::permissions::PermissionEvaluator;
 use super::runtime_info::RuntimeInfo;
 use super::sessions;
+use super::SessionShellRegistry;
 use crate::config::CodexConfig;
 use crate::shell_client::ShellClientRegistry;
 use std::collections::HashMap;
@@ -21,6 +22,7 @@ pub struct ToolRuntime {
     pub runtime_info: Arc<RuntimeInfo>,
     pub(crate) checkpoint_store: checkpoint::CheckpointStore,
     pub(crate) sessions: sessions::SessionStore,
+    pub(crate) session_shells: SessionShellRegistry,
     pub(crate) local_jobs: Arc<Mutex<HashMap<String, LocalJobRecord>>>,
     pub(crate) job_killer: Arc<dyn LocalJobKiller>,
     pub(crate) semantic_navigation_probe_timeout: Duration,
@@ -49,6 +51,7 @@ impl ToolRuntime {
             runtime_info,
             checkpoint_store: checkpoint::CheckpointStore::default(),
             sessions: sessions::SessionStore::default(),
+            session_shells: SessionShellRegistry::default(),
             local_jobs: Arc::new(Mutex::new(HashMap::new())),
             job_killer: Arc::new(SystemJobKiller),
             semantic_navigation_probe_timeout:

@@ -102,6 +102,9 @@ pub const SHELL_CLIENT_CAPABILITY_ASYNC_SHELL_JOBS: &str = "async_shell_jobs";
 /// must reject a Session-bound SSH request rather than silently running it on
 /// their local project checkout.
 pub const SHELL_CLIENT_CAPABILITY_SSH_SHELL: &str = "ssh_shell";
+/// Command-oriented, long-lived local shell processes owned by one Workflow
+/// Session. Missing on older runners and therefore fails closed.
+pub const SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL: &str = "persistent_shell";
 pub const SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV: &str = "structured_validation_argv";
 /// Explicit capability for agent-side read-only LSP navigation. Missing on
 /// older agents and defaults to `false` so the server never dispatches typed
@@ -122,6 +125,7 @@ pub const SHELL_CLIENT_CAPABILITY_NAMES: &[&str] = &[
     SHELL_CLIENT_CAPABILITY_ASYNC_JOBS,
     SHELL_CLIENT_CAPABILITY_ASYNC_SHELL_JOBS,
     SHELL_CLIENT_CAPABILITY_SSH_SHELL,
+    SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV,
     SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
     SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS,
@@ -167,6 +171,10 @@ pub struct ShellClientCapabilities {
     /// Missing on older runners and therefore fails closed.
     #[serde(default)]
     pub ssh_shell: bool,
+    /// The Runner supports explicit Workflow Session persistent shells on its
+    /// own host. This does not imply SSH or PTY support.
+    #[serde(default)]
+    pub persistent_shell: bool,
     /// Validation plans use a fixed executable plus argv, never shell text.
     /// Missing on older agents and therefore fail-closed.
     #[serde(default)]
@@ -224,6 +232,7 @@ impl Default for ShellClientCapabilities {
             async_jobs: false,
             async_shell_jobs: false,
             ssh_shell: false,
+            persistent_shell: false,
             structured_validation_argv: false,
             lsp_read_only_navigation: false,
             sandbox_inspect_commands: false,
@@ -669,6 +678,10 @@ pub struct ShellAgentShellRequest {
     /// stdin, environment, SSH host/configuration, or credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_context: Option<ShellJobContext>,
+    /// Explicit persistent-shell lifecycle request. It is independent from
+    /// `job_id`/Job state and absent on all legacy request kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_shell: Option<PersistentShellRequest>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -703,6 +716,89 @@ pub struct ShellAgentResultRequest {
 pub struct ShellAgentResultResponse {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Server-to-Runner request for one explicit persistent-shell lifecycle
+/// operation. The Runner revalidates the project, policy, cwd, and profile on
+/// every request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistentShellRequest {
+    pub action: String,
+    pub shell_id: String,
+    pub workflow_session_id: String,
+    pub runtime_project_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+}
+
+/// Runner-authoritative result for a persistent-shell lifecycle operation.
+/// Output is bounded on the Runner before this value crosses the protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistentShellResult {
+    pub shell_id: String,
+    pub workflow_session_id: String,
+    pub runtime_project_id: String,
+    pub shell_state: String,
+    pub execution_state: String,
+    pub command_started: bool,
+    pub command_completed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub stdout: String,
+    #[serde(default)]
+    pub stderr: String,
+    #[serde(default)]
+    pub stdout_truncated: bool,
+    #[serde(default)]
+    pub stderr_truncated: bool,
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_at: Option<i64>,
+    #[serde(default)]
+    pub busy: bool,
+    #[serde(default)]
+    pub already_closed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellAgentPersistentShellResultRequest {
+    pub client_id: String,
+    pub agent_instance_id: String,
+    pub request_id: String,
+    pub result: PersistentShellResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellAgentPersistentShellResultResponse {
+    pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
@@ -1293,6 +1389,11 @@ pub enum AgentEnvelope {
         #[serde(flatten)]
         payload: ShellAgentJobUpdateRequest,
     },
+    /// Agent -> server result for a persistent-shell lifecycle request.
+    PersistentShellResult {
+        #[serde(flatten)]
+        payload: ShellAgentPersistentShellResultRequest,
+    },
     /// Either direction. Liveness keepalive.
     Ping { ts: i64 },
     /// Agent -> server changed-only sanitized runtime metadata. It reuses the
@@ -1320,6 +1421,7 @@ impl AgentEnvelope {
             AgentEnvelope::Request { .. } => "request",
             AgentEnvelope::Result { .. } => "result",
             AgentEnvelope::JobUpdate { .. } => "job_update",
+            AgentEnvelope::PersistentShellResult { .. } => "persistent_shell_result",
             AgentEnvelope::Ping { .. } => "ping",
             AgentEnvelope::RuntimeMetadata { .. } => "runtime_metadata",
             AgentEnvelope::Pong { .. } => "pong",
@@ -1478,6 +1580,7 @@ mod envelope_tests {
                 async_jobs: true,
                 async_shell_jobs: true,
                 ssh_shell: true,
+                persistent_shell: true,
                 structured_validation_argv: true,
                 lsp_read_only_navigation: false,
                 sandbox_inspect_commands: false,
@@ -1534,9 +1637,19 @@ mod envelope_tests {
                 let caps = payload.capabilities.expect("capabilities");
                 assert!(caps.shell);
                 assert!(!caps.file_write);
+                assert!(caps.persistent_shell);
             }
             other => panic!("expected register, got {:?}", other.kind()),
         }
+    }
+
+    #[test]
+    fn legacy_capabilities_default_persistent_shell_to_false() {
+        let capabilities: ShellClientCapabilities =
+            serde_json::from_str(r#"{"shell":true,"jobs":true}"#).unwrap();
+        assert!(capabilities.shell);
+        assert!(capabilities.jobs);
+        assert!(!capabilities.persistent_shell);
     }
 
     fn reconciliation_inventory() -> ShellJobInventory {
@@ -1652,6 +1765,7 @@ mod envelope_tests {
             lsp: None,
             sandbox: None,
             job_context: None,
+            persistent_shell: None,
         };
         let env = AgentEnvelope::Request { request };
         let json = env.to_json().unwrap();
@@ -1667,6 +1781,84 @@ mod envelope_tests {
                 assert_eq!(request.command, "echo hi");
             }
             other => panic!("expected request, got {:?}", other.kind()),
+        }
+    }
+
+    #[test]
+    fn persistent_shell_request_and_result_envelopes_round_trip() {
+        let request: ShellAgentShellRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req-shell-1",
+            "client_id": "ws-1",
+            "kind": "persistent_shell",
+            "command": "",
+            "timeout_secs": 35,
+            "requested_by": "tester",
+            "created_at": 123,
+            "persistent_shell": {
+                "action": "exec",
+                "shell_id": "wc_shell_1234",
+                "workflow_session_id": "wc_sess_1234",
+                "runtime_project_id": "agent:ws-1:demo",
+                "command": "printf ready",
+                "timeout_secs": 30,
+                "purpose": "test"
+            }
+        }))
+        .unwrap();
+        let request_json = AgentEnvelope::Request { request }.to_json().unwrap();
+        match AgentEnvelope::from_slice(request_json.as_bytes()).unwrap() {
+            AgentEnvelope::Request { request } => {
+                let operation = request.persistent_shell.unwrap();
+                assert_eq!(operation.action, "exec");
+                assert_eq!(operation.shell_id, "wc_shell_1234");
+                assert_eq!(operation.command.as_deref(), Some("printf ready"));
+            }
+            other => panic!("expected request, got {:?}", other.kind()),
+        }
+
+        let result = PersistentShellResult {
+            shell_id: "wc_shell_1234".to_string(),
+            workflow_session_id: "wc_sess_1234".to_string(),
+            runtime_project_id: "agent:ws-1:demo".to_string(),
+            shell_state: "running".to_string(),
+            execution_state: "completed".to_string(),
+            command_started: true,
+            command_completed: true,
+            exit_code: Some(0),
+            stdout: "ready".to_string(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            duration_ms: 4,
+            cwd: Some("/srv/demo".to_string()),
+            initial_cwd: None,
+            shell: None,
+            profile: None,
+            created_at: None,
+            last_activity_at: Some(124),
+            busy: false,
+            already_closed: false,
+            close_reason: None,
+            error_code: None,
+            error: None,
+        };
+        let result_json = AgentEnvelope::PersistentShellResult {
+            payload: ShellAgentPersistentShellResultRequest {
+                client_id: "ws-1".to_string(),
+                agent_instance_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                request_id: "req-shell-1".to_string(),
+                result: result.clone(),
+            },
+        }
+        .to_json()
+        .unwrap();
+        assert!(result_json.contains(r#""type":"persistent_shell_result""#));
+        match AgentEnvelope::from_slice(result_json.as_bytes()).unwrap() {
+            AgentEnvelope::PersistentShellResult { payload } => {
+                assert_eq!(payload.request_id, "req-shell-1");
+                assert_eq!(payload.result, result);
+            }
+            other => panic!("expected persistent shell result, got {:?}", other.kind()),
         }
     }
 

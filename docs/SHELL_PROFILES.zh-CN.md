@@ -2,7 +2,9 @@
 
 [English](SHELL_PROFILES.md) | [简体中文](SHELL_PROFILES.zh-CN.md)
 
-WebCodex **不会**保持一个持久 shell session。它会为每个 project/profile 准备一次 environment snapshot，然后每次命令都作为独立进程运行，并应用该 snapshot。
+默认情况下，`run_shell` 和 `run_job` **不会**保持持久 shell session。它们会为每个
+project/profile 准备一次 environment snapshot，然后将每次命令作为独立进程运行。
+第 9 节的显式 Workflow Session persistent-shell 工具是唯一的长生命周期例外。
 
 本文档说明 shell profiles 的工作方式、配置方法和安全边界。
 
@@ -112,17 +114,18 @@ runner 注册时会上报 shell dialect 事实，server 与 agent 永远不需�
 
 在 full operator runtime 上，绑定已注册项目的 Workflow Session 可以保存可选的
 project-relative `default_cwd` 和可选的 `default_shell`（`sh` 或 `bash`）。
-它们只是执行默认值，不是 prepared environment snapshot，也不会创建持久 shell。
+它们只是执行默认值，不是 prepared environment snapshot，也不会隐式复用进程。
 
-`run_shell` 和 `run_job` 按以下优先级解析：
+`run_shell`、`run_job` 和 `open_session_shell` 按以下优先级解析：
 
 1. 单次调用显式传入的 `cwd` / `shell`；
 2. 与项目精确匹配且仍为 active 的 Workflow Session 默认值；
 3. 现有的项目根目录 / configured shell-profile 行为。
 
 不传 Session 时行为不变；其他项目的 Session 永远不会提供默认值。无效、不存在或
-越出项目根目录的 cwd 会沿用现有安全检查并失败，不会静默退回项目根目录。每条命令
-仍是独立进程，某次命令中的 `cd sub` 不会影响后续调用。
+越出项目根目录的 cwd 会沿用现有安全检查并失败，不会静默退回项目根目录。
+`run_shell` 和 `run_job` 仍是独立进程，某次命令中的 `cd sub` 不会影响后续
+一次性调用。
 
 `start_coding_task(execution_context=...)` 可以设置或替换该上下文；续接时省略会保留，
 显式 `{}` 会清空。`update_session_context` 仅在必填 project 已授权且精确匹配
@@ -130,9 +133,26 @@ Session project 时，针对显式 active Workflow Session 执行完整替换；
 逃逸。context 与 event 在内存中共同提交，JSON ledger 由后台 writer 异步写入，
 所以成功不表示同步落盘。上下文不能保存 env values、tokens、任意 options 或 shell state。
 
-## 10. 修改配置需要重启 agent
+`open_session_shell` 是显式例外：它为该 Workflow Session 创建一个真正的长生命周期
+`sh`/`bash` 进程。所选 profile 的环境和初始化脚本只在 open 时执行一次，因此后续
+`session_shell_exec` 会保留 cwd、export、函数、umask 和 shell variable。Profile
+的 `args` 仍是一种一次性命令调用约定，不会传给长生命周期进程；persistent `bash`
+使用 `--noprofile --norc`，persistent `sh` 不使用 command-mode 参数。更新 Session
+context 不会改变已经打开的进程；需要 close/reopen 才应用新的 cwd、dialect 或
+profile 默认值。`read_only`/`inspect` Session 以及设置了 SSH resource 的 Session
+会拒绝 persistent shell。
 
-当前没有 reload API。修改 `agent.toml` 或 project TOML 后，需要重启 `webcodex-runner`。重启会丢弃已有 snapshots，并在下一次命令时 lazy re-prepare。
+## 10. 修改配置
+
+修改 `agent.toml` 后 reload Runner service。有效的 hot reload 会让新的一次性命令进入
+新的 profile-cache generation，并在下一次使用时 lazy re-prepare；project TOML
+独立刷新。
+
+已经打开的 persistent shell 不会因 reload 被静默重启或改写。后续 exec/status 前
+仍会重检当前 policy 与 project/profile 选择，但进程内已有的环境和初始化结果不变。
+需要显式 close/reopen 才能应用 profile 内容、cwd 或 dialect 默认值的变化。Hot
+reload 边界之外的配置仍需重启 Runner，详见
+[DEPLOYMENT.zh-CN.md](DEPLOYMENT.zh-CN.md#agent-配置)。
 
 ## 11. 安全提示
 

@@ -1502,6 +1502,7 @@ mod tests {
             lsp: None,
             sandbox: None,
             job_context: None,
+            persistent_shell: None,
         }
     }
 

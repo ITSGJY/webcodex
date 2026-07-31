@@ -108,8 +108,31 @@ execution_context)` 要求调用者有权访问解析后的项目，并拒绝任
 ledger 随后交给现有后台 writer 异步写入，失败仍通过 runtime status 与日志报告，
 不表示已经同步落盘。`run_shell`/`run_job` 先采用单次调用参数，再采用项目精确匹配的 Session 默认值，
 最后才使用现有项目根目录和 configured shell；不跨项目继承。上下文不保存 env、
-凭据、任意 options 或 shell 状态。每条命令仍启动 fresh shell，`cd`/`export`
-不会隐式写回 Session；SSH 与 persistent shell 属于后续阶段。
+凭据、任意 options 或 shell 状态。`run_shell`/`run_job` 每次仍启动 fresh shell，
+`cd`/`export` 不会隐式写回 Session。
+
+Full operator surface 只通过四个显式工具提供持久进程状态：
+
+```text
+open_session_shell(project, session_id, cwd?, shell?)
+session_shell_exec(project, session_id, shell_id, command, timeout_secs?, purpose?)
+session_shell_status(project, session_id, shell_id)
+close_session_shell(project, session_id, shell_id)
+```
+
+Open 返回不可预测的新 `shell_id`；每个 Workflow Session 最多一个活动 Shell。
+`session_shell_exec` 返回 `command_started`、`command_completed`、`exit_code`、有界
+`stdout`/`stderr` 及截断标志、`duration_ms`、`execution_state`、`shell_state`
+和可观察 cwd。Status/close 还会在可用时报告绑定的 dialect/profile、initial cwd、
+时间戳、busy/terminal 状态和 close reason。Close 幂等，但已关闭 id 不能操作之后
+重新打开的 Shell。
+
+Agent 项目在所属 Runner 上执行该进程；只有项目类型可用时，Server-local 项目才在
+Server 主机使用同一进程引擎。每次操作都要求精确匹配的 active Session/project 和
+正常调用者授权；`read_only`、`inspect`、缺少 `persistent_shell` capability 的旧
+Runner，以及选择 SSH resource 的 Session 都会安全失败。`run_shell` 和 `run_job`
+仍是独立进程，绝不复用 persistent shell。该功能是命令执行，不是 PTY 或 terminal
+stream，也不能跨 Server/Runner 重启恢复。
 
 在该 surface 上进行显式跨窗口或人工交接时，使用旧 `wc_sess_*` id 调用
 `session_handoff_summary`。它与 `finish_coding_task` 返回同一份 strict
