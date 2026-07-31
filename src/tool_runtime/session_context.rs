@@ -51,6 +51,33 @@ pub(crate) fn session_project_mismatch_result(
     )
 }
 
+/// Project mismatch for a tool whose contract never permits cross-project
+/// Session escape. Keep this distinct from the generic mismatch response so
+/// callers are not told to supply an unsupported argument.
+pub(crate) fn session_project_mismatch_no_escape_result(
+    session_id: &str,
+    tool_name: &str,
+    mismatch: &SessionProjectMismatch,
+) -> ToolResult {
+    ToolResult::err_with_output(
+        format!(
+            "session_project_mismatch: session {} is scoped to project {} but {} requested project {}; cross-project escape is not supported",
+            session_id, mismatch.session_project, tool_name, mismatch.request_project
+        ),
+        json!({
+            "error_kind": SESSION_PROJECT_MISMATCH_KIND,
+            "failure_kind": SESSION_PROJECT_MISMATCH_KIND,
+            "session_id": session_id,
+            "tool_name": tool_name,
+            "session_project": mismatch.session_project,
+            "request_project": mismatch.request_project,
+            "cross_project_escape_supported": false,
+            "command_started": false,
+            "state_changed": false,
+        }),
+    )
+}
+
 pub(crate) fn session_project_mismatch_warning(
     mismatch: &SessionProjectMismatch,
     allow_cross_project_session: bool,

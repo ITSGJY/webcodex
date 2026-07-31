@@ -2,8 +2,8 @@
 
 use super::session_context::{
     current_session_key, current_session_unavailable_result, session_lifecycle_denied_result,
-    session_message_error_result, session_project_mismatch_result, unknown_session_result,
-    SessionProjectMismatch,
+    session_message_error_result, session_project_mismatch_no_escape_result,
+    unknown_session_result, SessionProjectMismatch,
 };
 use super::tool_inputs::SessionMode;
 use super::{sessions, ToolCall, ToolResult, ToolRuntime};
@@ -199,7 +199,7 @@ impl ToolRuntime {
                 session_project: summary.project.unwrap_or_else(|| "<unscoped>".to_string()),
                 request_project: resolved.resolved_id,
             };
-            return session_project_mismatch_result(
+            return session_project_mismatch_no_escape_result(
                 &session_id,
                 "update_session_context",
                 &mismatch,

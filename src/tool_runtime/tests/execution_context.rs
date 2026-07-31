@@ -449,7 +449,21 @@ async fn update_session_context_requires_authorized_exact_project_and_preserves_
         )
         .await;
     assert!(!mismatch.success);
+    assert_eq!(mismatch.output["error_kind"], "session_project_mismatch");
     assert_eq!(mismatch.output["failure_kind"], "session_project_mismatch");
+    assert_eq!(mismatch.output["command_started"], false);
+    assert_eq!(mismatch.output["state_changed"], false);
+    assert_eq!(mismatch.output["cross_project_escape_supported"], false);
+    assert!(mismatch
+        .output
+        .get("allow_cross_project_session_required")
+        .is_none());
+    assert!(mismatch.output.get("allow_cross_project_session").is_none());
+    assert!(!mismatch
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("allow_cross_project_session"));
     let after_mismatch = runtime.sessions.summary(&session.session_id, None).unwrap();
     assert_eq!(
         after_mismatch.execution_context,
