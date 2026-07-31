@@ -35,6 +35,12 @@ fn session_tool_specs_describe_ledger_vs_current_binding() {
         update.input_schema["properties"]["execution_context"]["additionalProperties"],
         false
     );
+    assert!(
+        update.input_schema["properties"]["execution_context"]["properties"]
+            .get("resource")
+            .is_some(),
+        "update_session_context must expose the named SSH resource field"
+    );
     let update_desc = update.description.to_lowercase();
     for phrase in [
         "authorized project",

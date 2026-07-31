@@ -201,6 +201,8 @@ pub(crate) fn agent_job_summary_value(job: &ShellJobInfo) -> Value {
         "kind": job.kind,
         "status": job.status,
         "project": job.project_id,
+        "session_id": job.session_id,
+        "ssh_resource": job.ssh_resource,
         "executor": "agent",
         "client_id": job.client_id,
         "created_at": job.created_at,
@@ -826,6 +828,37 @@ impl ToolRuntime {
         purpose: Option<ExecutionPurpose>,
         shell: Option<ExecutionShell>,
     ) -> ToolResult {
+        self.run_job_for_auth_with_contract_with_ssh_resource(
+            project,
+            command,
+            session_id,
+            timeout_secs,
+            cwd,
+            validation_steps,
+            sandbox,
+            auth,
+            purpose,
+            shell,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_job_for_auth_with_contract_with_ssh_resource(
+        &self,
+        project: String,
+        command: String,
+        session_id: Option<String>,
+        timeout_secs: Option<i64>,
+        cwd: Option<String>,
+        validation_steps: Vec<ShellJobValidationStep>,
+        sandbox: Option<String>,
+        auth: Option<&AuthContext>,
+        purpose: Option<ExecutionPurpose>,
+        shell: Option<ExecutionShell>,
+        ssh_resource: Option<&str>,
+    ) -> ToolResult {
         let resolved = match self.resolve_project_input_for_auth(&project, auth).await {
             Ok(resolved) => resolved,
             Err(e) => return ToolResult::err(command_rejected_message(
@@ -835,6 +868,12 @@ impl ToolRuntime {
         };
         let project_id = resolved.resolved_id.clone();
         let proj = resolved.config;
+        if ssh_resource.is_some() && !proj.is_agent() {
+            return ToolResult::err(
+                "ssh_resource_requires_agent_project: SSH resources require a project owned by a connected Runner"
+                    .to_string(),
+            );
+        }
         let max_runtime = timeout_secs.unwrap_or(3600).clamp(1, 604800);
         let declared_purpose = purpose.unwrap_or_default();
         let command_summary = command_preview(&command);
@@ -848,18 +887,55 @@ impl ToolRuntime {
                     ))
                 }
             };
-            let effective_cwd = match resolve_agent_cwd(&proj, cwd.as_deref()) {
-                Ok(cwd) => cwd,
-                Err(error) => {
+            let remote = ssh_resource.is_some();
+            if remote && !validation_steps.is_empty() {
+                return ToolResult::err(
+                    "ssh_resource_unsupported_for_request: SSH resources do not support structured validation jobs"
+                        .to_string(),
+                );
+            }
+            if remote && session_id.is_none() {
+                return ToolResult::err(
+                    "ssh_session_required: an SSH resource requires a Workflow Session id; command was not started"
+                        .to_string(),
+                );
+            }
+            let (effective_cwd, resolved_cwd) = if remote {
+                let remote_cwd = cwd
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|cwd| !cwd.is_empty())
+                    .map(str::to_string);
+                if remote_cwd
+                    .as_deref()
+                    .is_some_and(|cwd| cwd.len() > 4096 || cwd.chars().any(char::is_control))
+                {
                     return ToolResult::err(command_rejected_message(
-                        error,
-                        "choose '.', an existing project-relative cwd, or a path inside the registered project root.",
-                    ))
+                        "ssh_remote_cwd_invalid: cwd must be a bounded remote path without control characters",
+                        "choose a valid remote path, or omit cwd to use the SSH resource default.",
+                    ));
                 }
+                let display = remote_cwd.clone().unwrap_or_else(|| ".".to_string());
+                (remote_cwd, display)
+            } else {
+                let cwd = match resolve_agent_cwd(&proj, cwd.as_deref()) {
+                    Ok(cwd) => cwd,
+                    Err(error) => {
+                        return ToolResult::err(command_rejected_message(
+                            error,
+                            "choose '.', an existing project-relative cwd, or a path inside the registered project root.",
+                        ))
+                    }
+                };
+                let display =
+                    project_relative_agent_cwd(&proj, &cwd).unwrap_or_else(|_| ".".to_string());
+                (Some(cwd), display)
             };
-            let resolved_cwd = project_relative_agent_cwd(&proj, &effective_cwd)
-                .unwrap_or_else(|_| ".".to_string());
-            let actual_shell = shell.map(ExecutionShell::as_str).unwrap_or("configured");
+            let actual_shell = shell.map(ExecutionShell::as_str).unwrap_or(if remote {
+                "remote"
+            } else {
+                "configured"
+            });
             let dispatched_command = shell
                 .map(|shell| {
                     format!(
@@ -875,7 +951,7 @@ impl ToolRuntime {
                     ShellJobOpRequest {
                         op: "start".to_string(),
                         client_id: Some(client_id),
-                        cwd: Some(effective_cwd),
+                        cwd: effective_cwd,
                         command: Some(dispatched_command),
                         timeout_secs: Some(max_runtime as u64),
                         job_id: None,
@@ -889,6 +965,7 @@ impl ToolRuntime {
                     ShellJobStartMetadata {
                         project_id: Some(project_id.clone()),
                         session_id: session_id.clone(),
+                        ssh_resource: ssh_resource.map(str::to_string),
                         project_cwd: Some(resolved_cwd.clone()),
                         purpose: Some(declared_purpose.as_str().to_string()),
                         shell: Some(actual_shell.to_string()),
@@ -910,6 +987,7 @@ impl ToolRuntime {
                     "cwd": resolved_cwd,
                     "shell": actual_shell,
                     "executor": "agent",
+                    "ssh_resource": ssh_resource,
                     "execution_state": "started",
                     "created_at": job.created_at,
                     "stdout_tail": "",
@@ -1120,6 +1198,8 @@ impl ToolRuntime {
                 let mut output = json!({
                     "job_id": job.job_id,
                     "project": job.project_id,
+                    "session_id": job.session_id,
+                    "ssh_resource": job.ssh_resource,
                     "status": job.status,
                     "exit_code": job.exit_code,
                     "started_at": job.started_at,
@@ -1253,6 +1333,8 @@ impl ToolRuntime {
                         "stderr": next_stderr_line,
                     },
                     "executor": "agent",
+                    "session_id": job.session_id,
+                    "ssh_resource": job.ssh_resource,
                     "cwd": job.project_cwd,
                     "shell": job.shell,
                     "purpose": purpose,
@@ -1786,6 +1868,7 @@ mod recovery_projection_tests {
             kind: "shell".to_string(),
             project_id: None,
             session_id: None,
+            ssh_resource: None,
             cwd: None,
             project_cwd: None,
             purpose: None,

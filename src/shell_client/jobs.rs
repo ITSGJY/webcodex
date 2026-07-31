@@ -193,6 +193,7 @@ pub(super) fn job_view(job: &ShellJobRecord) -> ShellJobInfo {
         kind: job.kind.clone(),
         project_id: job.project_id.clone(),
         session_id: job.session_id.clone(),
+        ssh_resource: job.ssh_resource.clone(),
         cwd: job.cwd.clone(),
         project_cwd: job.project_cwd.clone(),
         purpose: job.purpose.clone(),

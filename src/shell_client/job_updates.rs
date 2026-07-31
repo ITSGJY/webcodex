@@ -110,6 +110,7 @@ fn validate_validation_progress(
 pub(crate) struct ShellJobStartMetadata {
     pub(crate) project_id: Option<String>,
     pub(crate) session_id: Option<String>,
+    pub(crate) ssh_resource: Option<String>,
     pub(crate) project_cwd: Option<String>,
     pub(crate) purpose: Option<String>,
     pub(crate) shell: Option<String>,
@@ -164,6 +165,21 @@ impl ShellClientRegistry {
         let request_id = next_request_id();
         let job_id = Uuid::new_v4().to_string();
         let created_at = now_ts();
+        if metadata.ssh_resource.is_some() != metadata.session_id.is_some() {
+            return Err(
+                "ssh_session_required: an SSH resource requires a Workflow Session id".to_string(),
+            );
+        }
+        if metadata.ssh_resource.as_deref().is_some_and(|resource| {
+            resource.is_empty()
+                || resource.len() > 80
+                || resource.contains("..")
+                || !resource.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+                })
+        }) {
+            return Err("ssh_resource_invalid: resource name is invalid".to_string());
+        }
         let sandbox = metadata.sandbox;
         let validation_steps = metadata.validation_steps;
         if validation_steps.len() > 3
@@ -201,6 +217,7 @@ impl ShellClientRegistry {
         let job_context = ShellJobContext {
             runtime_project_id: metadata.project_id.clone(),
             workflow_session_id: metadata.session_id.clone(),
+            ssh_resource: metadata.ssh_resource.clone(),
             project_cwd: metadata.project_cwd.clone(),
             cwd: normalized_job_cwd.clone(),
             purpose: metadata.purpose.clone(),
@@ -248,6 +265,12 @@ impl ShellClientRegistry {
                 client_id
             ));
         }
+        if metadata.ssh_resource.is_some() && !client.capabilities.ssh_shell {
+            return Err(format!(
+                "agent_capability_unavailable: agent client {} does not support ssh_shell",
+                client_id
+            ));
+        }
         if let Some(mode) = request.sandbox.as_deref() {
             if mode != crate::command_sandbox::INSPECT_SANDBOX_MODE {
                 return Err(format!("unknown sandbox mode '{mode}'"));
@@ -290,6 +313,7 @@ impl ShellClientRegistry {
             kind: "shell".to_string(),
             project_id: metadata.project_id,
             session_id: metadata.session_id,
+            ssh_resource: metadata.ssh_resource,
             cwd: normalized_job_cwd,
             project_cwd: metadata.project_cwd,
             purpose: metadata.purpose,

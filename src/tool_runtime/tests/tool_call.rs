@@ -620,9 +620,34 @@ fn session_execution_context_parses_as_strongly_typed_replacement() {
             execution_context: Some(sessions::SessionExecutionContext {
                 default_cwd: Some(ref cwd),
                 default_shell: Some(ExecutionShell::Bash),
+                ..
             }),
             ..
         } if cwd == "frontend"
+    ));
+
+    let ssh = ToolCall::from_tool_name(
+        "update_session_context",
+        json!({
+            "project": "agent:oe:demo",
+            "session_id": "wc_sess_context01",
+            "execution_context": {
+                "default_cwd": "/opt/webcodex-edge",
+                "resource": "tmp"
+            }
+        }),
+    )
+    .unwrap();
+    assert!(matches!(
+        ssh,
+        ToolCall::UpdateSessionContext {
+            execution_context: sessions::SessionExecutionContext {
+                default_cwd: Some(ref cwd),
+                resource: Some(ref resource),
+                ..
+            },
+            ..
+        } if cwd == "/opt/webcodex-edge" && resource == "tmp"
     ));
 
     let clear = ToolCall::from_tool_name(
@@ -642,6 +667,7 @@ fn session_execution_context_parses_as_strongly_typed_replacement() {
             execution_context: sessions::SessionExecutionContext {
                 default_cwd: None,
                 default_shell: None,
+                ..
             },
         } if project == "agent:oe:demo" && session_id == "wc_sess_context01"
     ));

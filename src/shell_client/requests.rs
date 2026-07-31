@@ -8,7 +8,7 @@ use super::validation::{validate_file_request, validate_id, validate_run_request
 use super::{now_ts, ShellClientRegistry, CLIENT_ONLINE_WINDOW_SECS};
 use crate::lsp_bridge::{AgentLspPayload, AGENT_LSP_REQUEST_KIND};
 use crate::shell_protocol::{
-    ShellAgentShellRequest, ShellFileOpRequest, ShellRunRequest, ShellRunResponse,
+    ShellAgentShellRequest, ShellFileOpRequest, ShellJobContext, ShellRunRequest, ShellRunResponse,
     SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
     SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS,
 };
@@ -252,7 +252,40 @@ impl ShellClientRegistry {
         requested_by: String,
         sandbox: Option<String>,
     ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+        self.enqueue_run_with_sandbox_and_ssh(body, requested_by, sandbox, None, None)
+            .await
+    }
+
+    /// Internal Session execution context for a named Runner-local SSH
+    /// resource. Public shell endpoints do not accept this field directly.
+    pub(crate) async fn enqueue_run_with_sandbox_and_ssh(
+        &self,
+        body: ShellRunRequest,
+        requested_by: String,
+        sandbox: Option<String>,
+        ssh_resource: Option<String>,
+        ssh_session_id: Option<String>,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
         validate_run_request(&body)?;
+        if ssh_resource.is_some() != ssh_session_id.is_some() {
+            return Err(
+                "ssh_session_required: an SSH resource requires a Workflow Session id".to_string(),
+            );
+        }
+        let normalized_cwd = body.cwd.clone().map(|cwd| cwd.trim().to_string());
+        let ssh_context = ssh_resource
+            .zip(ssh_session_id)
+            .map(|(resource, session_id)| ShellJobContext {
+                runtime_project_id: None,
+                workflow_session_id: Some(session_id),
+                ssh_resource: Some(resource),
+                project_cwd: None,
+                cwd: normalized_cwd.clone(),
+                purpose: None,
+                shell: None,
+                command_preview: command_preview(&body.command),
+                validation_steps: Vec::new(),
+            });
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
         let request = ShellAgentShellRequest {
@@ -260,7 +293,7 @@ impl ShellClientRegistry {
             client_id: body.client_id.clone(),
             kind: "run_shell".to_string(),
             job_id: None,
-            cwd: body.cwd.clone().map(|cwd| cwd.trim().to_string()),
+            cwd: normalized_cwd,
             path: None,
             content: None,
             max_bytes: None,
@@ -280,9 +313,24 @@ impl ShellClientRegistry {
             validation: None,
             lsp: None,
             sandbox: sandbox.clone(),
-            job_context: None,
+            job_context: ssh_context,
         };
         let mut inner = self.inner.lock().await;
+        if request
+            .job_context
+            .as_ref()
+            .is_some_and(|context| context.ssh_resource.is_some())
+        {
+            let Some(client) = inner.clients.get(&body.client_id) else {
+                return Err(format!("unknown shell client: {}", body.client_id));
+            };
+            if !client.capabilities.ssh_shell {
+                return Err(format!(
+                    "agent_capability_unavailable: agent client {} does not support ssh_shell",
+                    body.client_id
+                ));
+            }
+        }
         if let Some(mode) = sandbox.as_deref() {
             if mode != crate::command_sandbox::INSPECT_SANDBOX_MODE {
                 return Err(format!("unknown sandbox mode '{mode}'"));

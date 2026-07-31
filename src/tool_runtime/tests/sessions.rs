@@ -414,6 +414,7 @@ async fn start_session_valid_full_id_stores_resolved_project() {
                 execution_context: Some(sessions::SessionExecutionContext {
                     default_cwd: Some("frontend/./src".to_string()),
                     default_shell: Some(ExecutionShell::Bash),
+                    resource: None,
                 }),
             },
             None,

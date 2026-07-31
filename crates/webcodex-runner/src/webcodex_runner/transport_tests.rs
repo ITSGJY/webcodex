@@ -41,6 +41,7 @@ fn test_agent_config(server_url: String) -> AgentConfig {
             crate::webcodex_runner::default_websocket_connect_timeout_secs(),
         quic: None,
         shell: ShellConfig::default(),
+        ssh: Default::default(),
         tool_providers: Default::default(),
     }
 }

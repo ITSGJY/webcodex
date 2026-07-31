@@ -69,6 +69,7 @@ pub(super) struct ShellJobRecord {
     pub(super) kind: String,
     pub(super) project_id: Option<String>,
     pub(super) session_id: Option<String>,
+    pub(super) ssh_resource: Option<String>,
     pub(super) cwd: Option<String>,
     pub(super) project_cwd: Option<String>,
     pub(super) purpose: Option<String>,

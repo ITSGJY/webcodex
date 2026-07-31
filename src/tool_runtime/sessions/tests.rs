@@ -431,6 +431,7 @@ fn session_execution_context_persists_and_legacy_ledgers_default_empty() {
     let expected = SessionExecutionContext {
         default_cwd: Some("frontend/./src".to_string()),
         default_shell: Some(ExecutionShell::Bash),
+        resource: None,
     };
     let session = store
         .start_session_with_options(
@@ -448,6 +449,7 @@ fn session_execution_context_persists_and_legacy_ledgers_default_empty() {
         SessionExecutionContext {
             default_cwd: Some("frontend/src".to_string()),
             default_shell: Some(ExecutionShell::Bash),
+            resource: None,
         }
     );
 
@@ -483,6 +485,44 @@ fn session_execution_context_persists_and_legacy_ledgers_default_empty() {
 }
 
 #[test]
+fn session_ssh_resource_and_remote_default_cwd_persist_without_connection_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("sessions.json");
+    let store = persistent_store(ledger.clone());
+    let context = SessionExecutionContext {
+        default_cwd: Some("/opt/webcodex-edge".to_string()),
+        default_shell: None,
+        resource: Some("tmp".to_string()),
+    };
+    let session = store
+        .start_session_with_options(
+            SessionCreateOptions::new(
+                Some("agent:oe:private-drop".to_string()),
+                Some("remote context".to_string()),
+                SessionMode::Normal,
+                SessionGuards::default(),
+            )
+            .with_execution_context(context.clone()),
+        )
+        .unwrap();
+    assert_eq!(session.execution_context, context);
+    store.flush_persistence();
+    let value: Value = serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+    assert_eq!(
+        value["sessions"][0]["execution_context"],
+        json!({"default_cwd": "/opt/webcodex-edge", "resource": "tmp"})
+    );
+    let restored = SessionStore::with_persistence(ledger, 10, 10);
+    assert_eq!(
+        restored
+            .summary(&session.session_id, None)
+            .unwrap()
+            .execution_context,
+        context
+    );
+}
+
+#[test]
 fn coding_session_context_precommit_failure_leaves_memory_unchanged() {
     fn request(
         resume_session_id: Option<String>,
@@ -509,6 +549,7 @@ fn coding_session_context_precommit_failure_leaves_memory_unchanged() {
     let initial = SessionExecutionContext {
         default_cwd: Some("frontend".to_string()),
         default_shell: Some(ExecutionShell::Bash),
+        resource: None,
     };
     let created = store
         .ensure_coding_session(request(None, Some(initial.clone())))
@@ -528,6 +569,7 @@ fn coding_session_context_precommit_failure_leaves_memory_unchanged() {
     let replacement = SessionExecutionContext {
         default_cwd: Some("backend".to_string()),
         default_shell: Some(ExecutionShell::Sh),
+        resource: None,
     };
     let replaced = store
         .ensure_coding_session(request(Some(session_id.clone()), Some(replacement.clone())))
@@ -562,6 +604,7 @@ fn update_session_execution_context_sets_clears_and_rejects_invalid_states() {
     let replacement = SessionExecutionContext {
         default_cwd: Some("frontend".to_string()),
         default_shell: Some(ExecutionShell::Bash),
+        resource: None,
     };
     let set = store
         .update_execution_context(
@@ -601,6 +644,7 @@ fn update_session_execution_context_sets_clears_and_rejects_invalid_states() {
             SessionExecutionContext {
                 default_cwd: Some("../outside".to_string()),
                 default_shell: None,
+                resource: None,
             },
             SessionTransport::Api,
         )

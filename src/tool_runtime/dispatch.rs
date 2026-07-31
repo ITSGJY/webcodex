@@ -260,6 +260,7 @@ impl ToolRuntime {
         // Inherit execution defaults only after exact project matching has
         // been established. Explicit per-call cwd/shell fields remain
         // authoritative; cross-project escape never carries Session context.
+        let mut ssh_resource = None;
         if session_project_mismatch.is_none() {
             if let (Some(session_id), Some(resolved)) =
                 (session_id.as_deref(), resolved_project.as_ref())
@@ -268,6 +269,9 @@ impl ToolRuntime {
                     .sessions
                     .execution_context_for_project(session_id, &resolved.resolved_id)
                 {
+                    if matches!(&call, ToolCall::RunShell { .. } | ToolCall::RunJob { .. }) {
+                        ssh_resource = execution_context.resource.clone();
+                    }
                     call = call.with_session_execution_context(&execution_context);
                 }
             }
@@ -355,7 +359,10 @@ impl ToolRuntime {
         } else {
             None
         };
-        if let Err(err) = self.authorize_agent_tool(&call, auth).await {
+        if let Err(err) = self
+            .authorize_agent_tool(&call, ssh_resource.as_deref(), auth)
+            .await
+        {
             let mut err = err;
             if let Some(session_id) = session_id.as_deref() {
                 let event_id = self.sessions.record_tool_call_finished(
@@ -408,7 +415,14 @@ impl ToolRuntime {
             Self::capture_workspace_activity_context(&call, activity_project.as_deref());
         let tool_name = call.tool_name();
         let mut result = self
-            .dispatch_authorized_inner(call, auth, transport, execution_sandbox, window)
+            .dispatch_authorized_inner(
+                call,
+                auth,
+                transport,
+                execution_sandbox,
+                window,
+                ssh_resource.as_deref(),
+            )
             .await;
         let permission = permission.filter(|_| {
             !permissions::is_hard_denied_output(&result.output, result.error.as_deref())
@@ -480,6 +494,7 @@ impl ToolRuntime {
         transport: sessions::SessionTransport,
         execution_sandbox: Option<&'static str>,
         window: Option<&crate::client_window::ClientWindow>,
+        ssh_resource: Option<&str>,
     ) -> ToolResult {
         match call {
             call @ (ToolCall::ListTools { .. }
@@ -525,7 +540,8 @@ impl ToolRuntime {
             | ToolCall::CreateProject { .. }) => self.dispatch_project_tool(call, auth).await,
 
             call @ ToolCall::RunShell { .. } => {
-                self.dispatch_shell_tool(call, execution_sandbox).await
+                self.dispatch_shell_tool(call, execution_sandbox, ssh_resource)
+                    .await
             }
 
             call @ (ToolCall::ApplyPatch { .. }
@@ -576,7 +592,8 @@ impl ToolRuntime {
             | ToolCall::JobLog { .. }
             | ToolCall::ListJobs { .. }
             | ToolCall::JobTail { .. }) => {
-                self.dispatch_job_tool(call, auth, execution_sandbox).await
+                self.dispatch_job_tool(call, auth, execution_sandbox, ssh_resource)
+                    .await
             }
 
             call @ ToolCall::WorkspaceHygieneCheck { .. } => self.dispatch_hygiene_tool(call).await,

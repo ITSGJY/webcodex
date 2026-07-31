@@ -7,12 +7,13 @@ impl ToolRuntime {
         &self,
         call: ToolCall,
         sandbox: Option<&str>,
+        ssh_resource: Option<&str>,
     ) -> ToolResult {
         match call {
             ToolCall::RunShell {
                 project,
                 command,
-                session_id: _,
+                session_id,
                 timeout_secs,
                 cwd,
                 purpose,
@@ -26,6 +27,8 @@ impl ToolRuntime {
                     purpose,
                     shell,
                     sandbox,
+                    ssh_resource,
+                    session_id.as_deref(),
                 )
                 .await
             }

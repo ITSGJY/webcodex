@@ -617,6 +617,7 @@ fn inspect_job_manager_path_landlocks_commands_and_descendants() {
             ..AgentPolicy::default()
         },
         ShellConfig::default(),
+        SshConfig::default(),
         temp.path().join("projects.d"),
         serde_json::from_value(json!({
             "request_id": "inspect-job-request",
@@ -720,6 +721,7 @@ fn run_fail_fast_validation_job(attempt: usize) -> FailFastAttempt {
             ..AgentPolicy::default()
         },
         shell,
+        SshConfig::default(),
         temp.path().join("projects.d"),
         serde_json::from_value(json!({
             "request_id": format!("validation-request-{attempt}"),
@@ -856,6 +858,7 @@ fn validation_spawn_failure_is_infrastructure_without_failed_assertion() {
             ..AgentPolicy::default()
         },
         shell,
+        SshConfig::default(),
         temp.path().join("projects.d"),
         serde_json::from_value(json!({
             "request_id": "spawn-failure-request",

@@ -165,6 +165,26 @@ agent:<client_id>:<project_id>
 
 The server routes project tool calls to the owning connected agent.
 
+## Session SSH resources
+
+Runners that can invoke local OpenSSH advertise the `ssh_shell` capability.
+An old Runner that lacks it continues to serve ordinary local projects, while
+a Session that selects an SSH resource receives a clear capability-unavailable
+error rather than a local fallback.
+
+The Server sends only the Session id and a named Runner-local resource in safe
+execution metadata; it never sends an SSH host, SSH configuration, key,
+password, agent socket, or connection object. The Runner resolves the name
+from `[ssh.resources.<name>]` and invokes its own OpenSSH client, so Host
+aliases and authentication remain local to that Runner.
+
+The Runner may multiplex one authenticated transport per Session/resource/config
+generation, but every `run_shell` and `run_job` uses a fresh remote exec
+channel. A transport failure after dispatch is marked uncertain and is never
+automatically retried. `run_shell`, `run_job`, `stop_job`, `job_status`, and
+`job_log` retain their normal interfaces; file, Git, LSP, and checkpoint
+requests are not redirected to SSH in this phase.
+
 ## LSP read-only navigation
 
 Agents that support read-only LSP intelligence register the

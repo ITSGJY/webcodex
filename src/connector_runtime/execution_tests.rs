@@ -1681,6 +1681,7 @@ async fn structured_progress_rejects_invalid_order_and_preserves_fail_fast_plan(
     let plan = || ShellJobStartMetadata {
         project_id: None,
         session_id: None,
+        ssh_resource: None,
         project_cwd: None,
         purpose: Some("validation".into()),
         shell: Some("configured".into()),

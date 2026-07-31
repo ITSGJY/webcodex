@@ -57,8 +57,8 @@ pub(crate) const TOOL_CALL_EXPECTATION_METADATA_FIELDS: &[&str] = &[
 /// project-scoped Workflow Session.
 ///
 /// This intentionally contains no environment, credential, connection, or
-/// arbitrary option bag. `default_cwd` is always a project-relative path and
-/// `default_shell` reuses the runtime's existing explicit shell dialect.
+/// arbitrary option bag. `resource` is only a named Runner-local SSH resource;
+/// it never stores an SSH host, config, key, password, or transport.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionExecutionContext {
@@ -66,34 +66,62 @@ pub(crate) struct SessionExecutionContext {
     pub(crate) default_cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) default_shell: Option<ExecutionShell>,
+    /// Optional named SSH resource on the Runner that owns this Session's
+    /// project. It changes only `run_shell` and `run_job` execution location.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resource: Option<String>,
 }
 
 impl SessionExecutionContext {
     pub(crate) fn is_empty(&self) -> bool {
-        self.default_cwd.is_none() && self.default_shell.is_none()
+        self.default_cwd.is_none() && self.default_shell.is_none() && self.resource.is_none()
     }
 
-    /// Validate and normalize the only persisted cwd representation.
+    /// Validate and normalize persisted execution-context fields.
     ///
-    /// Filesystem existence and symlink/allowed-root checks remain in the
-    /// existing shell/job execution path. This lexical gate prevents absolute
-    /// host paths, traversal, URI forms, controls, and unbounded strings from
-    /// entering the Session ledger.
+    /// Without an SSH resource, `default_cwd` remains project-relative and
+    /// follows the existing project-bound validation. With one, it is a remote
+    /// path instead and never reaches Runner-local project path validation.
     pub(crate) fn validated(mut self) -> Result<Self, String> {
+        if let Some(raw_resource) = self.resource.take() {
+            let resource = raw_resource.trim();
+            if resource.is_empty()
+                || resource.len() > 80
+                || resource.contains("..")
+                || !resource
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+            {
+                return Err(
+                    "execution_context.resource must be a safe named SSH resource".to_string(),
+                );
+            }
+            self.resource = Some(resource.to_string());
+        }
         if let Some(raw_cwd) = self.default_cwd.take() {
             let cwd = raw_cwd.trim();
-            crate::validation_bridge::validate_project_relative_path(cwd)
-                .map_err(|error| format!("execution_context.default_cwd {error}"))?;
-            let normalized = cwd
-                .split(['/', '\\'])
-                .filter(|component| !component.is_empty() && *component != ".")
-                .collect::<Vec<_>>()
-                .join("/");
-            self.default_cwd = Some(if normalized.is_empty() {
-                ".".to_string()
+            if self.resource.is_some() {
+                if cwd.is_empty() || cwd.len() > 4096 || cwd.chars().any(char::is_control) {
+                    return Err(
+                        "execution_context.default_cwd must be a bounded remote path without control characters"
+                            .to_string(),
+                    );
+                }
+                self.default_cwd = Some(cwd.to_string());
             } else {
-                normalized
-            });
+                crate::validation_bridge::validate_project_relative_path(cwd)
+                    .map_err(|error| format!("execution_context.default_cwd {error}"))?;
+                let normalized = cwd
+                    .split(['/', '\\'])
+                    .filter(|component| !component.is_empty() && *component != ".")
+                    .collect::<Vec<_>>()
+                    .join("/");
+                self.default_cwd = Some(if normalized.is_empty() {
+                    ".".to_string()
+                } else {
+                    normalized
+                });
+            }
         }
         Ok(self)
     }
@@ -101,10 +129,21 @@ impl SessionExecutionContext {
     /// Restore valid fields independently so a malformed persisted cwd cannot
     /// bypass the project boundary or erase a valid explicit shell choice.
     pub(super) fn sanitized_for_restore(mut self) -> Self {
+        self.resource = self.resource.take().and_then(|raw_resource| {
+            Self {
+                default_cwd: None,
+                default_shell: None,
+                resource: Some(raw_resource),
+            }
+            .validated()
+            .ok()
+            .and_then(|context| context.resource)
+        });
         if let Some(raw_cwd) = self.default_cwd.take() {
             let cwd_only = Self {
                 default_cwd: Some(raw_cwd),
                 default_shell: None,
+                resource: self.resource.clone(),
             };
             self.default_cwd = cwd_only
                 .validated()
@@ -117,16 +156,30 @@ impl SessionExecutionContext {
     /// Audit-safe form for pre-validation request logging. Invalid cwd text is
     /// represented only by booleans and never copied into evidence.
     pub(crate) fn audit_summary(&self) -> Value {
-        let cwd = self
-            .clone()
-            .validated()
-            .ok()
-            .and_then(|context| context.default_cwd);
+        let resource = Self {
+            default_cwd: None,
+            default_shell: None,
+            resource: self.resource.clone(),
+        }
+        .validated()
+        .ok()
+        .and_then(|context| context.resource);
+        let cwd = Self {
+            default_cwd: self.default_cwd.clone(),
+            default_shell: None,
+            resource: resource.clone(),
+        }
+        .validated()
+        .ok()
+        .and_then(|context| context.default_cwd);
         serde_json::json!({
             "default_cwd": cwd,
             "default_cwd_present": self.default_cwd.is_some(),
             "default_cwd_valid": self.default_cwd.is_none() || cwd.is_some(),
             "default_shell": self.default_shell,
+            "resource": resource,
+            "resource_present": self.resource.is_some(),
+            "resource_valid": self.resource.is_none() || resource.is_some(),
         })
     }
 }

@@ -199,6 +199,9 @@ pub fn generated_agent_config_toml(opts: &AgentInitOptions) -> Result<String, St
             jobs: true,
             async_jobs: true,
             async_shell_jobs: true,
+            // The Runner performs the executable probe at registration time.
+            // A generated static file never claims SSH support on its own.
+            ssh_shell: false,
             structured_validation_argv: true,
             lsp_read_only_navigation: true,
             sandbox_inspect_commands: false,

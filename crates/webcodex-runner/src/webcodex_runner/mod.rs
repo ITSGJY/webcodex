@@ -10,12 +10,14 @@ pub(crate) mod patches;
 pub(crate) mod projects;
 pub(crate) mod shell;
 pub(crate) mod shutdown;
+pub(crate) mod ssh;
 pub(crate) mod transport;
 pub(crate) mod util;
 pub(crate) mod validation;
 
 pub(crate) use artifacts::{handle_artifact_file_request, is_artifact_request_kind};
 pub(crate) use checkpoints::{handle_checkpoint_file_request, is_checkpoint_request_kind};
+pub(crate) use config::SshConfig;
 pub(crate) use config::{
     client_profile_agent_config, default_config_path, hostname, load_config, projects_dir,
     validate_client_profile, AgentConfig, AgentPolicy, HotAgentConfig, ReloadableAgentConfig,
@@ -60,6 +62,7 @@ pub(crate) use shell::{
     configured_validation_job_command, cwd_allowed, resolve_prepared_shell_profile,
     run_shell_with_profiles_in_sandbox, PreparedShellProfile, PreparedShellProfileCache,
 };
+pub(crate) use ssh::{is_transport_failure, run_ssh_shell, SshConnectionPool};
 #[cfg(test)]
 pub(crate) use transport::{
     auto_transport_plan, build_ws_request, effective_transport, non_empty_token,

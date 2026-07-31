@@ -58,6 +58,10 @@ pub(crate) struct AgentConfig {
     pub(crate) quic: Option<QuicClientConfig>,
     #[serde(default)]
     pub(crate) shell: ShellConfig,
+    /// Named remote SSH execution resources. Credentials remain entirely in
+    /// the Runner host's OpenSSH configuration, keys, or ssh-agent.
+    #[serde(default)]
+    pub(crate) ssh: SshConfig,
     #[serde(default)]
     pub(crate) tool_providers: ToolProvidersConfig,
 }
@@ -199,6 +203,26 @@ impl Default for ShellConfig {
     }
 }
 
+/// Runner-local named SSH resources (`[ssh.resources.<name>]`).
+///
+/// Only a Host/Host-alias and an optional default remote cwd are retained
+/// here. Authentication material is intentionally not modeled or serialized
+/// through the WebCodex protocol.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+pub(crate) struct SshConfig {
+    #[serde(default)]
+    pub(crate) resources: BTreeMap<String, SshResourceConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub(crate) struct SshResourceConfig {
+    /// Passed to the Runner host's `ssh` command, so an OpenSSH `Host` alias
+    /// in the normal user/system config works without copying its details.
+    pub(crate) host: String,
+    #[serde(default)]
+    pub(crate) default_cwd: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
 pub(crate) struct ShellProfileConfig {
     #[serde(default)]
@@ -217,6 +241,7 @@ pub(crate) struct HotAgentConfig {
     pub(crate) generation: u64,
     pub(crate) policy: AgentPolicy,
     pub(crate) shell: ShellConfig,
+    pub(crate) ssh: SshConfig,
     pub(crate) external_tools: Arc<ExternalToolRouter>,
     reload_status: Mutex<AgentConfigReloadStatus>,
 }
@@ -227,6 +252,7 @@ impl HotAgentConfig {
             generation,
             policy: cfg.policy.clone(),
             shell: cfg.shell.clone(),
+            ssh: cfg.ssh.clone(),
             external_tools: Arc::new(ExternalToolRouter::new(&cfg.tool_providers)),
             reload_status: Mutex::new(status),
         }
@@ -370,7 +396,7 @@ pub(crate) fn restart_required_fields(
     macro_rules! classify {
         ($($field:ident),+ $(,)?) => {{
             let AgentConfig {
-                policy: _, shell: _, tool_providers: _, $($field: _),+
+                policy: _, shell: _, ssh: _, tool_providers: _, $($field: _),+
             } = candidate;
             [$((stringify!($field), startup.$field != candidate.$field)),+]
                 .into_iter()
@@ -574,6 +600,58 @@ fn validate_shell_profile_config(name: &str, profile: &ShellProfileConfig) -> Re
     Ok(())
 }
 
+fn validate_ssh_resource_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 80 {
+        return Err("ssh resource name must contain 1..=80 characters".to_string());
+    }
+    if name.contains("..") || name.contains('/') || name.contains('\\') {
+        return Err(format!(
+            "ssh.resources.{} is not a safe resource name",
+            name
+        ));
+    }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.')
+    {
+        return Err(format!(
+            "ssh resource name '{}' may only contain ASCII letters, digits, '_', '-', and '.'",
+            name
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ssh_config(ssh: &mut SshConfig) -> Result<(), String> {
+    for (name, resource) in &mut ssh.resources {
+        validate_ssh_resource_name(name)?;
+        resource.host = resource.host.trim().to_string();
+        if resource.host.is_empty()
+            || resource.host.starts_with('-')
+            || resource.host.len() > 512
+            || resource.host.chars().any(char::is_control)
+        {
+            return Err(format!(
+                "ssh.resources.{}.host must be a non-empty safe host name",
+                name
+            ));
+        }
+        if let Some(default_cwd) = resource.default_cwd.as_mut() {
+            *default_cwd = default_cwd.trim().to_string();
+            if default_cwd.is_empty()
+                || default_cwd.len() > 4096
+                || default_cwd.chars().any(char::is_control)
+            {
+                return Err(format!(
+                    "ssh.resources.{}.default_cwd must be a non-empty remote path without control characters",
+                    name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_shell_config(shell: &ShellConfig) -> Result<(), String> {
     if let Some(default_profile) = &shell.default_profile {
         validate_shell_profile_name("shell.default_profile", default_profile)?;
@@ -762,6 +840,7 @@ pub(crate) fn load_config(path: &Path) -> Result<AgentConfig, String> {
         effective_allowed_roots(&cfg.policy.allowed_roots, cfg.policy.allow_cwd_anywhere)?;
     cfg.policy.allowed_roots = effective;
     validate_shell_config(&cfg.shell)?;
+    validate_ssh_config(&mut cfg.ssh)?;
     if let Some(quic) = &cfg.quic {
         validate_quic_config(quic)?;
     } else if cfg.transport.as_deref().map(str::trim) == Some(TRANSPORT_QUIC) {

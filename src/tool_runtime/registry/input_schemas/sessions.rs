@@ -50,13 +50,20 @@ pub(crate) fn session_execution_context_schema(description: &str) -> Value {
             "default_cwd": {
                 "type": "string",
                 "minLength": 1,
-                "maxLength": 512,
-                "description": "Optional project-relative cwd inherited by run_shell and run_job. Absolute paths, URI forms, controls, and parent traversal are rejected. Filesystem and allowed-root checks remain fail-closed in the existing execution path."
+                "maxLength": 4096,
+                "description": "Optional cwd inherited by run_shell and run_job. Without resource it is project-relative; with a named SSH resource it is a remote path. Remote cwd is not checked against the Runner project root and is verified by the remote shell when used."
             },
             "default_shell": {
                 "type": "string",
                 "enum": ["sh", "bash"],
                 "description": "Optional explicit shell dialect inherited by run_shell and run_job."
+            },
+            "resource": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 80,
+                "pattern": "^[A-Za-z0-9_.-]+$",
+                "description": "Optional named SSH resource configured only on the Runner that owns this Session project. It changes run_shell and run_job execution location only; it never contains a host, SSH configuration, key, password, or connection."
             }
         }
     })
@@ -205,7 +212,7 @@ pub(crate) fn update_session_context_input_schema() -> Value {
                 "description": "Required explicit active, project-scoped Workflow Session id. Never falls back to a current binding and never creates an unknown Session."
             },
             "execution_context": session_execution_context_schema(
-                "Complete replacement execution context. `{}` clears both defaults. The context cannot store environment variables, credentials, or arbitrary options."
+                "Complete replacement execution context. `{}` clears all defaults. The context cannot store environment variables, credentials, SSH host/configuration, keys, passwords, connections, or arbitrary options."
             )
         },
         "required": ["project", "session_id", "execution_context"],

@@ -31,6 +31,7 @@ fn test_config(projects_dir: PathBuf) -> AgentConfig {
         max_concurrent_jobs: None,
         policy: unrestricted_test_policy(),
         shell: ShellConfig::default(),
+        ssh: SshConfig::default(),
         transport: None,
         websocket_connect_timeout_secs: default_websocket_connect_timeout_secs(),
         quic: None,
@@ -856,6 +857,40 @@ allow_cwd_anywhere = true
 
     let cfg = load_config(&path).unwrap();
     assert_eq!(cfg.shell, ShellConfig::default());
+}
+
+#[test]
+fn agent_config_loads_named_ssh_resources_without_authentication_material() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("agent.toml");
+    std::fs::write(
+        &path,
+        r#"
+server_url = "http://127.0.0.1:8000"
+token = "test-token"
+client_id = "agent-1"
+
+[ssh.resources.tmp]
+host = "tmp"
+default_cwd = "/opt/webcodex-edge"
+
+[ssh.resources.no_default]
+host = "ops-alias"
+"#,
+    )
+    .unwrap();
+
+    let cfg = load_config(&path).unwrap();
+    let tmp = cfg.ssh.resources.get("tmp").unwrap();
+    assert_eq!(tmp.host, "tmp");
+    assert_eq!(tmp.default_cwd.as_deref(), Some("/opt/webcodex-edge"));
+    assert_eq!(
+        cfg.ssh
+            .resources
+            .get("no_default")
+            .and_then(|resource| resource.default_cwd.as_deref()),
+        None
+    );
 }
 
 #[test]
@@ -5332,6 +5367,7 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
         1,
         cfg.policy.clone(),
         cfg.shell.clone(),
+        cfg.ssh.clone(),
         projects_dir(&cfg),
         request,
     );
@@ -5361,6 +5397,7 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
         1,
         cfg.policy.clone(),
         cfg.shell.clone(),
+        cfg.ssh.clone(),
         projects_dir(&cfg),
         rejected_request,
     );

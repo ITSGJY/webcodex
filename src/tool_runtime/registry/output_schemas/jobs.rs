@@ -73,16 +73,32 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "cwd",
-                schema_type("string", "Resolved project-relative cwd; project root is '.'."),
+                schema_type(
+                    "string",
+                    "Resolved project-relative cwd, or the selected SSH resource's remote cwd.",
+                ),
             ),
             (
                 "shell",
-                schema_type("string", "Actual selected shell or configured executor shell."),
+                schema_type(
+                    "string",
+                    "Actual selected shell, configured executor shell, or remote SSH executor.",
+                ),
             ),
             ("executor", schema_type("string", "Executor type: local or agent.")),
             (
+                "ssh_resource",
+                nullable_schema(
+                    "string",
+                    "Named Runner-local SSH resource used for this command, when any.",
+                ),
+            ),
+            (
                 "execution_state",
-                schema_type("string", "Terminal execution state."),
+                schema_type(
+                    "string",
+                    "Execution state; started can mean a remote SSH transport failed after dispatch, leaving the final outcome unknown.",
+                ),
             ),
         ])),
         "run_job" => Some(wrapped_output_schema(vec![
@@ -97,13 +113,26 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "cwd",
-                schema_type("string", "Resolved project-relative cwd; project root is '.'."),
+                schema_type(
+                    "string",
+                    "Resolved project-relative cwd, or the selected SSH resource's remote cwd.",
+                ),
             ),
             (
                 "shell",
-                schema_type("string", "Selected or configured executor shell."),
+                schema_type(
+                    "string",
+                    "Selected shell, configured executor shell, or remote SSH executor.",
+                ),
             ),
             ("executor", schema_type("string", "Executor type: local or agent.")),
+            (
+                "ssh_resource",
+                nullable_schema(
+                    "string",
+                    "Named Runner-local SSH resource used for this job, when any.",
+                ),
+            ),
             (
                 "execution_state",
                 schema_type("string", "Initial execution state; started after acceptance."),
@@ -185,6 +214,17 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
         "job_status" => Some(wrapped_output_schema(vec![
             ("job_id", schema_type("string", "Runtime job id.")),
             ("project", nullable_schema("string", "Project id, when known.")),
+            (
+                "session_id",
+                nullable_schema("string", "Workflow Session that owns this job, when recorded."),
+            ),
+            (
+                "ssh_resource",
+                nullable_schema(
+                    "string",
+                    "Named Runner-local SSH resource used for this job, when any.",
+                ),
+            ),
             ("status", schema_type("string", "Current job status.")),
             (
                 "exit_code",
@@ -278,6 +318,17 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
         "job_log" | "job_tail" => Some(wrapped_output_schema(vec![
             ("job_id", schema_type("string", "Runtime job id.")),
             (
+                "session_id",
+                nullable_schema("string", "Workflow Session that owns this job, when recorded."),
+            ),
+            (
+                "ssh_resource",
+                nullable_schema(
+                    "string",
+                    "Named Runner-local SSH resource used for this job, when any.",
+                ),
+            ),
+            (
                 "exit_code",
                 nullable_schema("integer", "Process exit code, when available."),
             ),
@@ -349,11 +400,17 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "cwd",
-                nullable_schema("string", "Resolved project-relative cwd, when recorded."),
+                nullable_schema(
+                    "string",
+                    "Resolved project-relative cwd or remote SSH cwd, when recorded.",
+                ),
             ),
             (
                 "shell",
-                nullable_schema("string", "Selected or configured shell, when recorded."),
+                nullable_schema(
+                    "string",
+                    "Selected shell, configured executor shell, or remote SSH executor.",
+                ),
             ),
             (
                 "purpose",
@@ -383,6 +440,8 @@ fn job_summary_schema() -> Value {
             "kind": schema_type("string", "Job kind."),
             "status": schema_type("string", "Current job status."),
             "project": nullable_schema("string", "Project id, when known."),
+            "session_id": nullable_schema("string", "Workflow Session that owns this job, when recorded."),
+            "ssh_resource": nullable_schema("string", "Named Runner-local SSH resource used for this job, when any."),
             "executor": schema_type("string", "Executor backing this job, such as agent or local."),
             "client_id": nullable_schema("string", "Agent client id for agent-backed jobs, when available."),
             "created_at": schema_type("integer", "Job creation timestamp."),

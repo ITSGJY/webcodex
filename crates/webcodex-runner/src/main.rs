@@ -74,6 +74,7 @@ use webcodex_runner::{
     HttpSendConfig, PreparedShellProfile, PreparedShellProfileCache, ReloadableAgentConfig,
     ShellConfig, SubmitResultError,
 };
+use webcodex_runner::{is_transport_failure, SshConfig, SshConnectionPool};
 
 const JOB_UPDATE_INTERVAL_MS: u64 = 250;
 const AGENT_REGISTER_PATH: &str = "/api/shell/agent/register";
@@ -94,12 +95,14 @@ struct JobManager {
                 u64,
                 AgentPolicy,
                 ShellConfig,
+                SshConfig,
                 PathBuf,
                 ShellAgentShellRequest,
             )>,
         >,
     >,
     prepared_profiles: PreparedShellProfileCache,
+    ssh_pool: SshConnectionPool,
     lifecycle: Arc<Mutex<()>>,
     shutting_down: Arc<AtomicBool>,
     workers: ActivityTracker,
@@ -113,6 +116,7 @@ impl JobManager {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             queued: Arc::new(Mutex::new(VecDeque::new())),
             prepared_profiles: PreparedShellProfileCache::default(),
+            ssh_pool: SshConnectionPool::default(),
             lifecycle: Arc::new(Mutex::new(())),
             shutting_down: Arc::new(AtomicBool::new(false)),
             workers: ActivityTracker::default(),
@@ -148,6 +152,7 @@ fn test_job_snapshot(job_id: &str) -> ShellJobSnapshot {
         context: shell_protocol::ShellJobContext {
             runtime_project_id: None,
             workflow_session_id: None,
+            ssh_resource: None,
             project_cwd: None,
             cwd: None,
             purpose: Some("other".to_string()),
@@ -166,6 +171,7 @@ fn test_job_context(cwd: &Path, validation_steps: Vec<String>) -> shell_protocol
     shell_protocol::ShellJobContext {
         runtime_project_id: None,
         workflow_session_id: None,
+        ssh_resource: None,
         project_cwd: None,
         cwd: Some(cwd.to_string_lossy().into_owned()),
         purpose: Some("other".to_string()),
@@ -1191,6 +1197,9 @@ fn agent_register_capabilities(cfg: &AgentConfig) -> ShellClientCapabilities {
     capabilities.file_write = true;
     capabilities.async_jobs = true;
     capabilities.async_shell_jobs = true;
+    // SSH support intentionally depends on the local OpenSSH executable.
+    // Authentication and Host aliases remain entirely Runner-local.
+    capabilities.ssh_shell = SshConnectionPool::is_available();
     capabilities.structured_validation_argv = true;
     capabilities.project_lifecycle = true;
     // `job_state_reconciliation` is on by default. A hidden, test/ops-only env
@@ -2016,6 +2025,20 @@ fn bounded_runner_error(error: Option<String>) -> Option<String> {
     error.map(|error| error.chars().take(4_096).collect())
 }
 
+/// Retain enough SSH diagnostic output to classify an uncertain transport
+/// failure without allowing a chatty remote command to grow worker memory.
+fn append_bounded_tail(target: &mut String, next: &str, max_bytes: usize) {
+    target.push_str(next);
+    if target.len() <= max_bytes {
+        return;
+    }
+    let mut start = target.len().saturating_sub(max_bytes);
+    while start < target.len() && !target.is_char_boundary(start) {
+        start += 1;
+    }
+    target.drain(..start);
+}
+
 fn validate_runner_job_context(
     context: &ShellJobContext,
     request: &ShellAgentShellRequest,
@@ -2031,6 +2054,7 @@ fn validate_runner_job_context(
         return Err("job recovery context command_preview is invalid or oversized".to_string());
     }
     for (name, value) in [
+        ("ssh_resource", context.ssh_resource.as_deref()),
         ("project_cwd", context.project_cwd.as_deref()),
         ("cwd", context.cwd.as_deref()),
         ("purpose", context.purpose.as_deref()),
@@ -2044,6 +2068,9 @@ fn validate_runner_job_context(
     }
     if context.cwd != request.cwd {
         return Err("job recovery context cwd does not match the execution request".to_string());
+    }
+    if context.ssh_resource.is_some() && context.workflow_session_id.is_none() {
+        return Err("job recovery context SSH resource requires a Workflow Session".to_string());
     }
     if context.purpose.as_deref().is_some_and(|purpose| {
         !matches!(
@@ -2063,7 +2090,7 @@ fn validate_runner_job_context(
     if context
         .shell
         .as_deref()
-        .is_some_and(|shell| !matches!(shell, "sh" | "bash" | "configured" | "custom"))
+        .is_some_and(|shell| !matches!(shell, "sh" | "bash" | "configured" | "custom" | "remote"))
     {
         return Err("job recovery context shell is invalid".to_string());
     }
@@ -2496,6 +2523,7 @@ impl JobManager {
         generation: u64,
         policy: AgentPolicy,
         shell: ShellConfig,
+        ssh: SshConfig,
         projects_dir: PathBuf,
         request: ShellAgentShellRequest,
     ) {
@@ -2619,6 +2647,7 @@ impl JobManager {
                     generation,
                     policy.clone(),
                     shell.clone(),
+                    ssh.clone(),
                     projects_dir.clone(),
                     request.clone(),
                 ));
@@ -2641,7 +2670,7 @@ impl JobManager {
         if queue_locally {
             return;
         }
-        self.start_now(sink, generation, policy, shell, projects_dir, request);
+        self.start_now(sink, generation, policy, shell, ssh, projects_dir, request);
     }
 
     fn start_now(
@@ -2650,6 +2679,7 @@ impl JobManager {
         generation: u64,
         policy: AgentPolicy,
         shell: ShellConfig,
+        ssh: SshConfig,
         projects_dir: PathBuf,
         request: ShellAgentShellRequest,
     ) {
@@ -2657,7 +2687,7 @@ impl JobManager {
             self.shutdown_rejection(&request);
             return;
         }
-        self.start_shell_job(sink, generation, policy, shell, projects_dir, request);
+        self.start_shell_job(sink, generation, policy, shell, ssh, projects_dir, request);
     }
 
     fn start_available_queued(&self) {
@@ -2675,7 +2705,7 @@ impl JobManager {
                 let mut jobs = lock_unpoison(&self.jobs);
                 let mut queued = lock_unpoison(&self.queued);
                 let mut selected = None;
-                for (idx, (_, _, _policy, _shell, _projects_dir, request)) in
+                for (idx, (_, _, _policy, _shell, _ssh, _projects_dir, request)) in
                     queued.iter().enumerate()
                 {
                     let reserved = jobs
@@ -2692,7 +2722,7 @@ impl JobManager {
                     }
                 }
                 if let Some(idx) = selected {
-                    if let Some(job_id) = queued[idx].5.job_id.as_deref() {
+                    if let Some(job_id) = queued[idx].6.job_id.as_deref() {
                         if let Some(job) = jobs.get_mut(job_id) {
                             job.slot_reserved = true;
                         }
@@ -2702,10 +2732,10 @@ impl JobManager {
                     None
                 }
             };
-            let Some((sink, generation, policy, shell, projects_dir, request)) = next else {
+            let Some((sink, generation, policy, shell, ssh, projects_dir, request)) = next else {
                 return;
             };
-            self.start_now(sink, generation, policy, shell, projects_dir, request);
+            self.start_now(sink, generation, policy, shell, ssh, projects_dir, request);
         }
     }
 
@@ -2715,6 +2745,7 @@ impl JobManager {
         generation: u64,
         policy: AgentPolicy,
         shell: ShellConfig,
+        ssh: SshConfig,
         projects_dir: PathBuf,
         request: ShellAgentShellRequest,
     ) {
@@ -2727,6 +2758,14 @@ impl JobManager {
                 "raw shell is disabled by local agent policy".to_string(),
                 None,
             );
+            return;
+        }
+        if request
+            .job_context
+            .as_ref()
+            .is_some_and(|context| context.ssh_resource.is_some())
+        {
+            self.start_ssh_shell_job(generation, policy, ssh, request);
             return;
         }
         let cwd_path = request
@@ -3259,20 +3298,287 @@ impl JobManager {
         });
     }
 
+    /// Start one remote SSH command as a normal runner job. The transport is
+    /// established before this child is spawned, so a preparation failure is
+    /// unambiguously a command-not-started error. Once `ssh` is running, we
+    /// never retry because remote delivery may already have happened.
+    fn start_ssh_shell_job(
+        &self,
+        generation: u64,
+        policy: AgentPolicy,
+        ssh: SshConfig,
+        request: ShellAgentShellRequest,
+    ) {
+        let Some(job_id) = request.job_id.clone() else {
+            return;
+        };
+        let Some(resource_name) = request
+            .job_context
+            .as_ref()
+            .and_then(|context| context.ssh_resource.as_deref())
+        else {
+            return;
+        };
+        let Some(session_id) = request
+            .job_context
+            .as_ref()
+            .and_then(|context| context.workflow_session_id.as_deref())
+        else {
+            self.fail_job(
+                &request,
+                "ssh_session_required: an SSH resource requires a Workflow Session id; command was not started".to_string(),
+                None,
+            );
+            return;
+        };
+        if request.kind != "start_job" {
+            self.fail_job(
+                &request,
+                "ssh_resource_unsupported_for_request: SSH resources do not support structured validation jobs; command was not started".to_string(),
+                None,
+            );
+            return;
+        }
+        if request.sandbox.is_some() {
+            self.fail_job(
+                &request,
+                "ssh_sandbox_unavailable: SSH resources cannot run in the local inspect sandbox; command was not started".to_string(),
+                None,
+            );
+            return;
+        }
+        let prepared = match self.ssh_pool.prepare_command(
+            generation,
+            &ssh,
+            resource_name,
+            session_id,
+            request.cwd.as_deref(),
+            &request.command,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.fail_job(&request, error, None);
+                return;
+            }
+        };
+        let connection_key = prepared.key.clone();
+        let mut command = prepared.command;
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let stop_requested = {
+            let _lifecycle = lock_unpoison(&self.lifecycle);
+            if self.shutting_down.load(Ordering::SeqCst) {
+                None
+            } else {
+                let mut jobs = lock_unpoison(&self.jobs);
+                let Some(job) = jobs.get_mut(&job_id) else {
+                    return;
+                };
+                job.slot_reserved = true;
+                Some(Arc::clone(&job.stop_requested))
+            }
+        };
+        let Some(stop_requested) = stop_requested else {
+            self.shutdown_rejection(&request);
+            return;
+        };
+        let start = Instant::now();
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                self.fail_job(
+                    &request,
+                    format!(
+                        "ssh_command_spawn_failed: could not start local ssh client: {error}; command was not started"
+                    ),
+                    None,
+                );
+                return;
+            }
+        };
+        let process_group_id = child.id();
+        let mut stdout = child.stdout.take();
+        let mut stderr = child.stderr.take();
+        let child = Arc::new(Mutex::new(child));
+        let reject_for_shutdown = {
+            let _lifecycle = lock_unpoison(&self.lifecycle);
+            if self.shutting_down.load(Ordering::SeqCst) || stop_requested.load(Ordering::SeqCst) {
+                true
+            } else if let Some(job) = lock_unpoison(&self.jobs).get_mut(&job_id) {
+                job.child = Some(Arc::clone(&child));
+                job.process_group_id = Some(process_group_id);
+                false
+            } else {
+                true
+            }
+        };
+        if reject_for_shutdown {
+            let _ = kill_child_group(&child);
+            self.shutdown_rejection(&request);
+            return;
+        }
+        self.update_and_send(
+            &job_id,
+            RunnerJobDelta {
+                status: "running".to_string(),
+                ..Default::default()
+            },
+        );
+        let manager = self.clone();
+        let ssh_pool = self.ssh_pool.clone();
+        let worker_guard = self.workers.enter();
+        std::thread::spawn(move || {
+            let _worker_guard = worker_guard;
+            const OUTPUT_CHANNEL_CAPACITY: usize = 64;
+            let (tx, rx) = mpsc::sync_channel::<OutputChunk>(OUTPUT_CHANNEL_CAPACITY);
+            let mut readers = Vec::new();
+            if let Some(stdout) = stdout.take() {
+                readers.push(spawn_reader(stdout, tx.clone(), true));
+            }
+            if let Some(stderr) = stderr.take() {
+                readers.push(spawn_reader(stderr, tx.clone(), false));
+            }
+            drop(tx);
+            let timeout_secs = request.timeout_secs.min(policy.max_timeout_secs).max(1);
+            let mut transport_stderr = String::new();
+            let (mut status, exit_code, mut error) = loop {
+                let mut out = String::new();
+                let mut err = String::new();
+                while let Ok(chunk) = rx.try_recv() {
+                    match chunk {
+                        OutputChunk::Stdout(text) => out.push_str(&text),
+                        OutputChunk::Stderr(text) => err.push_str(&text),
+                    }
+                }
+                if !err.is_empty() {
+                    append_bounded_tail(&mut transport_stderr, &err, 16 * 1024);
+                }
+                if !out.is_empty() || !err.is_empty() {
+                    manager.update_and_send(
+                        &job_id,
+                        RunnerJobDelta {
+                            status: "running".to_string(),
+                            stdout_chunk: (!out.is_empty()).then_some(out),
+                            stderr_chunk: (!err.is_empty()).then_some(err),
+                            ..Default::default()
+                        },
+                    );
+                }
+                let wait_result = {
+                    let mut child = lock_unpoison(&child);
+                    child.try_wait()
+                };
+                match wait_result {
+                    Ok(Some(status)) => {
+                        if stop_requested.load(Ordering::SeqCst) {
+                            break (
+                                "stopped".to_string(),
+                                Some(-1),
+                                Some("job stopped by request".to_string()),
+                            );
+                        }
+                        if status.success() {
+                            break ("completed".to_string(), Some(0), None);
+                        }
+                        break ("failed".to_string(), status.code(), None);
+                    }
+                    Ok(None) => {
+                        if stop_requested.load(Ordering::SeqCst) {
+                            let _ = kill_child_group(&child);
+                            break (
+                                "stopped".to_string(),
+                                Some(-1),
+                                Some("job stopped by request".to_string()),
+                            );
+                        }
+                        if start.elapsed() >= Duration::from_secs(timeout_secs) {
+                            stop_requested.store(true, Ordering::SeqCst);
+                            let _ = kill_child_group(&child);
+                            break (
+                                "timeout".to_string(),
+                                Some(-1),
+                                Some(format!("job timed out after {timeout_secs} seconds")),
+                            );
+                        }
+                    }
+                    Err(wait_error) => {
+                        break (
+                            "failed".to_string(),
+                            None,
+                            Some(format!(
+                                "ssh_command_wait_failed: command may have started and was not retried: {wait_error}"
+                            )),
+                        );
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(JOB_UPDATE_INTERVAL_MS));
+            };
+            // The SSH client is a private process-group leader. Ensure a
+            // background child holding either pipe cannot delay the terminal
+            // update indefinitely.
+            let _ = kill_child_group(&child);
+            join_reader_threads_until(readers, Instant::now() + Duration::from_secs(1));
+            let mut final_out = String::new();
+            let mut final_err = String::new();
+            while let Ok(chunk) = rx.try_recv() {
+                match chunk {
+                    OutputChunk::Stdout(text) => final_out.push_str(&text),
+                    OutputChunk::Stderr(text) => final_err.push_str(&text),
+                }
+            }
+            if !final_err.is_empty() {
+                append_bounded_tail(&mut transport_stderr, &final_err, 16 * 1024);
+            }
+            if is_transport_failure(exit_code, Some(&transport_stderr)) {
+                ssh_pool.invalidate_after_transport_failure(&connection_key);
+                status = "failed".to_string();
+                error = Some(
+                    "ssh_transport_failed: command may have started and was not retried"
+                        .to_string(),
+                );
+                if !final_err.is_empty() && !final_err.ends_with('\n') {
+                    final_err.push('\n');
+                }
+                final_err.push_str(
+                    "webcodex: SSH transport ended after dispatch; the command may have started and was not retried\n",
+                );
+            }
+            manager.update_and_send(
+                &job_id,
+                RunnerJobDelta {
+                    status,
+                    stdout_chunk: (!final_out.is_empty()).then_some(final_out),
+                    stderr_chunk: (!final_err.is_empty()).then_some(final_err),
+                    exit_code,
+                    duration_ms: Some(start.elapsed().as_millis() as u64),
+                    error,
+                    finished: true,
+                    ..Default::default()
+                },
+            );
+            manager.start_available_queued();
+        });
+    }
+
     fn stop(&self, job_id: &str) -> Result<(), String> {
         let queued_job = {
             let _lifecycle = lock_unpoison(&self.lifecycle);
             let mut queued = lock_unpoison(&self.queued);
             if let Some(pos) = queued
                 .iter()
-                .position(|(_, _, _, _, _, request)| request.job_id.as_deref() == Some(job_id))
+                .position(|(_, _, _, _, _, _, request)| request.job_id.as_deref() == Some(job_id))
             {
                 queued.remove(pos)
             } else {
                 None
             }
         };
-        if let Some((_sink, _generation, _policy, _shell, _projects_dir, _request)) = queued_job {
+        if let Some((_sink, _generation, _policy, _shell, _ssh, _projects_dir, _request)) =
+            queued_job
+        {
             self.update_and_send(
                 job_id,
                 RunnerJobDelta {

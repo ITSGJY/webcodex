@@ -8,6 +8,15 @@ fn context(cwd: Option<&str>, shell: Option<ExecutionShell>) -> sessions::Sessio
     sessions::SessionExecutionContext {
         default_cwd: cwd.map(str::to_string),
         default_shell: shell,
+        resource: None,
+    }
+}
+
+fn ssh_context(resource: &str, cwd: Option<&str>) -> sessions::SessionExecutionContext {
+    sessions::SessionExecutionContext {
+        default_cwd: cwd.map(str::to_string),
+        default_shell: None,
+        resource: Some(resource.to_string()),
     }
 }
 
@@ -226,6 +235,269 @@ async fn run_job_inherits_session_cwd_and_shell() {
         Some(frontend.to_string_lossy().as_ref())
     );
     assert!(request.command.starts_with("exec bash -c "));
+}
+
+#[tokio::test]
+async fn session_ssh_resource_uses_remote_cwd_and_safe_agent_context_for_shell_and_jobs() {
+    let runtime = test_runtime();
+    let auth = open_auth_context();
+    let mut capabilities = ShellClientCapabilities::default();
+    capabilities.ssh_shell = true;
+    capabilities.jobs = true;
+    capabilities.async_jobs = true;
+    capabilities.async_shell_jobs = true;
+    register_agent_projects_for_auth(
+        &runtime,
+        "context-ssh",
+        &auth,
+        capabilities,
+        vec![registered_project("demo", "/runner-local-project")],
+    )
+    .await;
+    let project = "agent:context-ssh:demo".to_string();
+    let session = runtime
+        .sessions
+        .start_session_with_options(
+            sessions::SessionCreateOptions::new(
+                Some(project.clone()),
+                Some("SSH context".to_string()),
+                SessionMode::Normal,
+                sessions::SessionGuards::default(),
+            )
+            .with_execution_context(ssh_context("tmp", Some("/remote/default"))),
+        )
+        .unwrap();
+
+    let shell_task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        let session_id = session.session_id.clone();
+        let auth = auth.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::RunShell {
+                        project,
+                        command: "pwd".to_string(),
+                        session_id: Some(session_id),
+                        timeout_secs: Some(30),
+                        cwd: Some("/remote/override".to_string()),
+                        purpose: None,
+                        shell: None,
+                    },
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    let shell_request = next_agent_request_for_client(&runtime, "context-ssh")
+        .await
+        .expect("SSH shell should enqueue");
+    assert_eq!(shell_request.cwd.as_deref(), Some("/remote/override"));
+    let shell_context = shell_request
+        .job_context
+        .as_ref()
+        .expect("SSH shell gets safe execution context");
+    assert_eq!(
+        shell_context.workflow_session_id.as_deref(),
+        Some(session.session_id.as_str())
+    );
+    assert_eq!(shell_context.ssh_resource.as_deref(), Some("tmp"));
+    assert!(shell_context.runtime_project_id.is_none());
+    complete_patch_agent_request_for_instance(
+        &runtime,
+        "context-ssh",
+        "inst-context-ssh",
+        &shell_request.request_id,
+        0,
+        "/remote/override\n",
+        "",
+    )
+    .await;
+    let shell_result = shell_task.await.unwrap();
+    assert!(shell_result.success, "{:?}", shell_result.error);
+    assert_eq!(shell_result.output["ssh_resource"], "tmp");
+    assert_eq!(shell_result.output["cwd"], "/remote/override");
+
+    let job = runtime
+        .dispatch_with_auth(
+            ToolCall::RunJob {
+                project: project.clone(),
+                command: "printf queued".to_string(),
+                session_id: Some(session.session_id.clone()),
+                timeout_secs: Some(30),
+                cwd: None,
+                purpose: None,
+                shell: None,
+            },
+            Some(&auth),
+        )
+        .await;
+    assert!(job.success, "{:?}", job.error);
+    assert_eq!(job.output["ssh_resource"], "tmp");
+    assert_eq!(job.output["cwd"], "/remote/default");
+    let job_id = job.output["job_id"].as_str().unwrap().to_string();
+    let job_request = next_agent_request_for_client(&runtime, "context-ssh")
+        .await
+        .expect("SSH job should enqueue");
+    assert_eq!(job_request.kind, "start_job");
+    assert_eq!(job_request.cwd.as_deref(), Some("/remote/default"));
+    assert_eq!(
+        job_request
+            .job_context
+            .as_ref()
+            .and_then(|context| context.ssh_resource.as_deref()),
+        Some("tmp")
+    );
+    let status = runtime
+        .job_status_for_auth(job_id.clone(), false, Some(&auth))
+        .await;
+    assert!(status.success, "{:?}", status.error);
+    assert_eq!(status.output["ssh_resource"], "tmp");
+    let log = runtime
+        .job_log_for_auth(job_id.clone(), None, Some(20), Some(&auth))
+        .await;
+    assert!(log.success, "{:?}", log.error);
+    assert_eq!(log.output["ssh_resource"], "tmp");
+    let stopped = runtime
+        .dispatch_with_auth(
+            ToolCall::StopJob {
+                project,
+                job_id,
+                session_id: Some(session.session_id),
+                confirm: true,
+            },
+            Some(&auth),
+        )
+        .await;
+    assert!(stopped.success, "{:?}", stopped.error);
+}
+
+#[tokio::test]
+async fn session_ssh_resource_requires_runner_ssh_shell_capability() {
+    let runtime = test_runtime();
+    let auth = open_auth_context();
+    register_agent_projects_for_auth(
+        &runtime,
+        "context-ssh-legacy",
+        &auth,
+        ShellClientCapabilities::default(),
+        vec![registered_project("demo", "/runner-local-project")],
+    )
+    .await;
+    let project = "agent:context-ssh-legacy:demo".to_string();
+    let session = runtime
+        .sessions
+        .start_session_with_options(
+            sessions::SessionCreateOptions::new(
+                Some(project.clone()),
+                Some("legacy SSH context".to_string()),
+                SessionMode::Normal,
+                sessions::SessionGuards::default(),
+            )
+            .with_execution_context(ssh_context("tmp", None)),
+        )
+        .unwrap();
+    let result = runtime
+        .dispatch_with_auth(
+            ToolCall::RunShell {
+                project,
+                command: "pwd".to_string(),
+                session_id: Some(session.session_id),
+                timeout_secs: Some(30),
+                cwd: None,
+                purpose: None,
+                shell: None,
+            },
+            Some(&auth),
+        )
+        .await;
+    assert!(!result.success);
+    assert!(result
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("agent_capability_unavailable")));
+    assert!(
+        next_agent_request_for_client(&runtime, "context-ssh-legacy")
+            .await
+            .is_none(),
+        "an old Runner must not receive an SSH resource request"
+    );
+}
+
+#[tokio::test]
+async fn session_ssh_transport_failure_marks_remote_delivery_uncertain() {
+    let runtime = test_runtime();
+    let auth = open_auth_context();
+    let mut capabilities = ShellClientCapabilities::default();
+    capabilities.ssh_shell = true;
+    register_agent_projects_for_auth(
+        &runtime,
+        "context-ssh-transport",
+        &auth,
+        capabilities,
+        vec![registered_project("demo", "/runner-local-project")],
+    )
+    .await;
+    let project = "agent:context-ssh-transport:demo".to_string();
+    let session = runtime
+        .sessions
+        .start_session_with_options(
+            sessions::SessionCreateOptions::new(
+                Some(project.clone()),
+                Some("transport outcome".to_string()),
+                SessionMode::Normal,
+                sessions::SessionGuards::default(),
+            )
+            .with_execution_context(ssh_context("tmp", None)),
+        )
+        .unwrap();
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        let session_id = session.session_id.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::RunShell {
+                        project,
+                        command: "printf uncertain".to_string(),
+                        session_id: Some(session_id),
+                        timeout_secs: Some(30),
+                        cwd: None,
+                        purpose: None,
+                        shell: None,
+                    },
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    let request = next_agent_request_for_client(&runtime, "context-ssh-transport")
+        .await
+        .expect("SSH shell should enqueue");
+    runtime
+        .shell_clients
+        .complete(ShellAgentResultRequest {
+            client_id: "context-ssh-transport".to_string(),
+            agent_instance_id: "inst-context-ssh-transport".to_string(),
+            request_id: request.request_id,
+            exit_code: Some(255),
+            stdout: Some(String::new()),
+            stderr: Some("connection reset".to_string()),
+            duration_ms: Some(1),
+            error: Some(
+                "ssh_transport_failed: command may have started and was not retried".to_string(),
+            ),
+        })
+        .await
+        .unwrap();
+    let result = task.await.unwrap();
+    assert!(!result.success);
+    assert_eq!(result.output["command_started"], true);
+    assert_eq!(result.output["command_completed"], false);
+    assert_eq!(result.output["execution_state"], "started");
+    assert_eq!(result.output["ssh_resource"], "tmp");
 }
 
 #[tokio::test]

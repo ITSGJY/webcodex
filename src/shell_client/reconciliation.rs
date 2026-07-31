@@ -326,6 +326,7 @@ fn same_context(job: &ShellJobRecord, snapshot: &ShellJobSnapshot) -> bool {
     job.request_id.as_deref() == Some(snapshot.request_id.as_str())
         && job.project_id == context.runtime_project_id
         && job.session_id == context.workflow_session_id
+        && job.ssh_resource == context.ssh_resource
         && job.cwd == context.cwd
         && job.project_cwd == context.project_cwd
         && job.purpose == context.purpose
@@ -456,6 +457,7 @@ fn record_from_snapshot(
         kind: "shell".to_string(),
         project_id: context.runtime_project_id.clone(),
         session_id: context.workflow_session_id.clone(),
+        ssh_resource: context.ssh_resource.clone(),
         cwd: context.cwd.clone(),
         project_cwd: context.project_cwd.clone(),
         purpose: context.purpose.clone(),

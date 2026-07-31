@@ -3,8 +3,8 @@ use super::lsp::{handle_lsp_request, is_lsp_request_kind, LspSupervisor};
 use super::validation::{handle_validation_request, is_validation_request_kind};
 use super::{
     handle_project_lifecycle_op, handle_project_op_with_temporary_projects_root,
-    run_shell_with_profiles_in_sandbox, AgentSink, HotAgentConfig, ReloadableAgentConfig,
-    SubmitResultError,
+    run_shell_with_profiles_in_sandbox, run_ssh_shell, AgentSink, CommandResult, HotAgentConfig,
+    ReloadableAgentConfig, SubmitResultError,
 };
 use crate::shell_protocol::ShellAgentShellRequest;
 use crate::{handle_file_request, is_file_request_kind, JobManager};
@@ -30,10 +30,37 @@ pub(crate) fn dispatch_request(
     let policy = &config.policy;
     let shell = &config.shell;
     let external_tools = &config.external_tools;
+    let ssh_resource = request
+        .job_context
+        .as_ref()
+        .and_then(|context| context.ssh_resource.as_deref());
+    let ssh_session_id = request
+        .job_context
+        .as_ref()
+        .and_then(|context| context.workflow_session_id.as_deref());
     // Inspect requests must stay on the native execution path where Landlock
     // is applied in pre_exec. External providers are not an equivalent local
     // filesystem write boundary.
-    let external_route = if request.sandbox.is_some() {
+    if ssh_resource.is_some()
+        && !matches!(
+            request.kind.as_str(),
+            "run_shell" | "start_job" | "start_validation_job"
+        )
+    {
+        let result = CommandResult {
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            duration_ms: Some(0),
+            error: Some(
+                "ssh_resource_unsupported_for_request: SSH resources are only available to run_shell and run_job; command was not started".to_string(),
+            ),
+        };
+        return sink
+            .submit_result_with_metadata(request.request_id, result, config, runtime)
+            .map(|_| true);
+    }
+    let external_route = if request.sandbox.is_some() || ssh_resource.is_some() {
         ExternalRoute::Native
     } else {
         external_tools.route_with_shutdown(policy, &request, Some(runtime.shutdown_flag()))
@@ -77,6 +104,7 @@ pub(crate) fn dispatch_request(
                 config.generation,
                 policy.clone(),
                 shell.clone(),
+                config.ssh.clone(),
                 projects_dir.to_path_buf(),
                 request,
             );
@@ -137,19 +165,47 @@ pub(crate) fn dispatch_request(
         }
         _ => {
             let request_id = request.request_id.clone();
-            let result = run_shell_with_profiles_in_sandbox(
-                config.generation,
-                policy,
-                shell,
-                projects_dir,
-                &jobs.prepared_profiles,
-                request.cwd.as_deref(),
-                &request.command,
-                request.stdin.as_deref(),
-                request.timeout_secs,
-                Some(runtime.shutdown_flag()),
-                request.sandbox.as_deref(),
-            );
+            let result = match (
+                ssh_resource,
+                ssh_session_id,
+            ) {
+                (Some(resource), Some(session_id)) => run_ssh_shell(
+                    &jobs.ssh_pool,
+                    config.generation,
+                    &config.ssh,
+                    policy,
+                    resource,
+                    session_id,
+                    request.cwd.as_deref(),
+                    &request.command,
+                    request.stdin.as_deref(),
+                    request.timeout_secs,
+                    Some(runtime.shutdown_flag()),
+                    request.sandbox.as_deref(),
+                ),
+                (Some(_), None) => CommandResult {
+                    exit_code: None,
+                    stdout: None,
+                    stderr: None,
+                    duration_ms: Some(0),
+                    error: Some(
+                        "ssh_session_required: an SSH resource requires a Workflow Session id; command was not started".to_string(),
+                    ),
+                },
+                (None, _) => run_shell_with_profiles_in_sandbox(
+                    config.generation,
+                    policy,
+                    shell,
+                    projects_dir,
+                    &jobs.prepared_profiles,
+                    request.cwd.as_deref(),
+                    &request.command,
+                    request.stdin.as_deref(),
+                    request.timeout_secs,
+                    Some(runtime.shutdown_flag()),
+                    request.sandbox.as_deref(),
+                ),
+            };
             sink.submit_result_with_metadata(request_id, result, config, runtime)
                 .map(|_| true)
         }

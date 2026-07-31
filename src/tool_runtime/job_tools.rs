@@ -9,6 +9,7 @@ impl ToolRuntime {
         call: ToolCall,
         auth: Option<&AuthContext>,
         sandbox: Option<&str>,
+        ssh_resource: Option<&str>,
     ) -> ToolResult {
         match call {
             ToolCall::RunJob {
@@ -20,7 +21,7 @@ impl ToolRuntime {
                 purpose,
                 shell,
             } => {
-                self.run_job_for_auth_with_contract(
+                self.run_job_for_auth_with_contract_with_ssh_resource(
                     project,
                     command,
                     session_id,
@@ -31,6 +32,7 @@ impl ToolRuntime {
                     auth,
                     purpose,
                     shell,
+                    ssh_resource,
                 )
                 .await
             }

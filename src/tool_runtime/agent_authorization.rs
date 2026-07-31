@@ -1,6 +1,7 @@
 use super::tool_definition::{runtime_tool_agent_capability, AgentCapability};
 use super::{ProjectResolverError, ToolCall, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
+use crate::shell_protocol::SHELL_CLIENT_CAPABILITY_SSH_SHELL;
 
 /// The capability an agent-backed tool variant requires from the agent
 /// client. Non-agent tools (and tools without a project) require nothing.
@@ -20,20 +21,27 @@ impl ToolRuntime {
     pub(crate) async fn authorize_agent_tool(
         &self,
         call: &ToolCall,
+        ssh_resource: Option<&str>,
         auth: Option<&AuthContext>,
     ) -> Result<(), ToolResult> {
         let Some(project) = call.project() else {
             return Ok(());
         };
-        let required = match required_agent_capability(call) {
-            Some(cap) => cap,
-            None => return Ok(()),
-        };
+        let required = required_agent_capability(call);
+        if required.is_none() && ssh_resource.is_none() {
+            return Ok(());
+        }
         let proj = self
             .resolve_project_for_auth(project, auth)
             .await
             .map_err(ProjectResolverError::into_tool_result)?;
         if !proj.is_agent() {
+            if ssh_resource.is_some() {
+                return Err(ToolResult::err(
+                    "ssh_resource_requires_agent_project: SSH resources require a project owned by a connected Runner"
+                        .to_string(),
+                ));
+            }
             return Ok(());
         }
         let client_id = proj.agent_client_id().map_err(ToolResult::err)?.to_string();
@@ -52,37 +60,50 @@ impl ToolRuntime {
             .assert_client_access(auth, &client_id)
             .await
             .map_err(ToolResult::err)?;
-        if required.is_owner_only() {
-            return Ok(());
+        if let Some(required) = required {
+            if !required.is_owner_only() {
+                // Capability check via the registry helper so the requirement is
+                // expressed as a named capability, not a raw struct field access.
+                let mut supported = false;
+                for capability in required.registry_capabilities() {
+                    if self
+                        .shell_clients
+                        .client_supports_for_auth(&client_id, capability, auth)
+                        .await
+                        .map_err(ToolResult::err)?
+                    {
+                        supported = true;
+                        break;
+                    }
+                }
+                if !supported {
+                    let message = format!(
+                        "agent client {} does not support {}",
+                        client_id,
+                        required.label()
+                    );
+                    if matches!(required, AgentCapability::LspReadOnlyNavigation) {
+                        return Err(ToolResult::err(format!(
+                            "{}: {}",
+                            crate::lsp_bridge::error_codes::AGENT_CAPABILITY_UNAVAILABLE,
+                            message
+                        )));
+                    }
+                    return Err(ToolResult::err(message));
+                }
+            }
         }
-        // Capability check via the registry helper so the requirement is
-        // expressed as a named capability, not a raw struct field access.
-        let mut supported = false;
-        for capability in required.registry_capabilities() {
-            if self
+        if ssh_resource.is_some()
+            && !self
                 .shell_clients
-                .client_supports_for_auth(&client_id, capability, auth)
+                .client_supports_for_auth(&client_id, SHELL_CLIENT_CAPABILITY_SSH_SHELL, auth)
                 .await
                 .map_err(ToolResult::err)?
-            {
-                supported = true;
-                break;
-            }
-        }
-        if !supported {
-            let message = format!(
-                "agent client {} does not support {}",
-                client_id,
-                required.label()
-            );
-            if matches!(required, AgentCapability::LspReadOnlyNavigation) {
-                return Err(ToolResult::err(format!(
-                    "{}: {}",
-                    crate::lsp_bridge::error_codes::AGENT_CAPABILITY_UNAVAILABLE,
-                    message
-                )));
-            }
-            return Err(ToolResult::err(message));
+        {
+            return Err(ToolResult::err(format!(
+                "agent_capability_unavailable: agent client {} does not support {}",
+                client_id, SHELL_CLIENT_CAPABILITY_SSH_SHELL
+            )));
         }
         Ok(())
     }

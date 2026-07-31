@@ -269,6 +269,8 @@ impl ToolRuntime {
             purpose,
             shell,
             None,
+            None,
+            None,
         )
         .await
     }
@@ -283,6 +285,8 @@ impl ToolRuntime {
         purpose: Option<ExecutionPurpose>,
         shell: Option<ExecutionShell>,
         sandbox: Option<&str>,
+        ssh_resource: Option<&str>,
+        ssh_session_id: Option<&str>,
     ) -> ToolResult {
         let timeout = match resolve_sync_timeout_secs(timeout_secs, DEFAULT_RUN_SHELL_TIMEOUT_SECS)
         {
@@ -310,6 +314,17 @@ impl ToolRuntime {
         };
         let declared_purpose = purpose.unwrap_or_default();
         let command_summary = command_preview(&command);
+        if ssh_resource.is_some() && !proj.is_agent() {
+            return Self::run_shell_tool_failure_result(
+                command_rejected_message(
+                    "ssh_resource_requires_agent_project: SSH resources require a project owned by a connected Runner",
+                    "start or update a Session for an agent-backed project, then retry.",
+                ),
+                "runtime_error",
+                false,
+                false,
+            );
+        }
         if proj.is_agent() {
             let client_id =
                 match proj.agent_client_id() {
@@ -324,23 +339,63 @@ impl ToolRuntime {
                         false,
                     ),
                 };
-            let effective_cwd = match resolve_agent_cwd(&proj, cwd.as_deref()) {
-                Ok(cwd) => cwd,
-                Err(e) => {
+            let (effective_cwd, resolved_cwd) = if ssh_resource.is_some() {
+                let remote_cwd = cwd.as_deref().map(str::trim).filter(|cwd| !cwd.is_empty());
+                if remote_cwd
+                    .is_some_and(|cwd| cwd.len() > 4096 || cwd.chars().any(char::is_control))
+                {
                     return Self::run_shell_tool_failure_result(
                         command_rejected_message(
-                            e,
-                            "choose '.', an existing project-relative cwd, or an absolute path inside the registered project root.",
+                            "ssh_remote_cwd_invalid: cwd must be a bounded remote path without control characters",
+                            "choose a valid remote cwd or omit it to use the Session/resource default.",
                         ),
-                        "permission_denied",
+                        "runtime_error",
                         false,
                         false,
-                    )
+                    );
                 }
+                (
+                    remote_cwd.map(str::to_string),
+                    remote_cwd.unwrap_or(".").to_string(),
+                )
+            } else {
+                let effective_cwd = match resolve_agent_cwd(&proj, cwd.as_deref()) {
+                    Ok(cwd) => cwd,
+                    Err(e) => {
+                        return Self::run_shell_tool_failure_result(
+                            command_rejected_message(
+                                e,
+                                "choose '.', an existing project-relative cwd, or an absolute path inside the registered project root.",
+                            ),
+                            "permission_denied",
+                            false,
+                            false,
+                        )
+                    }
+                };
+                let resolved_cwd = project_relative_agent_cwd(&proj, &effective_cwd)
+                    .unwrap_or_else(|_| ".".to_string());
+                (Some(effective_cwd), resolved_cwd)
             };
-            let resolved_cwd = project_relative_agent_cwd(&proj, &effective_cwd)
-                .unwrap_or_else(|_| ".".to_string());
-            let actual_shell = shell.map(ExecutionShell::as_str).unwrap_or("configured");
+            if ssh_resource.is_some() && ssh_session_id.is_none() {
+                return Self::run_shell_tool_failure_result(
+                    command_rejected_message(
+                        "ssh_session_required: an SSH resource requires a Workflow Session id",
+                        "start or resume the Session, then retry without automatic command retry.",
+                    ),
+                    "runtime_error",
+                    false,
+                    false,
+                );
+            }
+            let actual_shell =
+                shell
+                    .map(ExecutionShell::as_str)
+                    .unwrap_or(if ssh_resource.is_some() {
+                        "remote"
+                    } else {
+                        "configured"
+                    });
             let dispatched_command = shell
                 .map(|shell| {
                     format!(
@@ -353,10 +408,10 @@ impl ToolRuntime {
             let wait_timeout = timeout;
             let (request_id, rx) = match self
                 .shell_clients
-                .enqueue_run_with_sandbox(
+                .enqueue_run_with_sandbox_and_ssh(
                     ShellRunRequest {
                         client_id,
-                        cwd: Some(effective_cwd),
+                        cwd: effective_cwd,
                         command: dispatched_command,
                         stdin: None,
                         timeout_secs: timeout,
@@ -364,6 +419,10 @@ impl ToolRuntime {
                     },
                     "tool_runtime".to_string(),
                     sandbox.map(str::to_string),
+                    ssh_resource.map(str::to_string),
+                    ssh_resource
+                        .zip(ssh_session_id)
+                        .map(|(_, session_id)| session_id.to_string()),
                 )
                 .await
             {
@@ -392,13 +451,21 @@ impl ToolRuntime {
                             response.duration_ms,
                         ))
                     } else if let Some(error) = response.error {
+                        // A remote transport can disappear only after the
+                        // Runner has handed the command to its local SSH
+                        // client. Keep that distinction visible to callers:
+                        // the remote command may be running, and must never
+                        // be automatically retried as though it were a
+                        // pre-dispatch rejection.
+                        let command_may_have_started = response.exit_code.is_some()
+                            || error.contains("command may have started");
                         Self::run_shell_tool_failure_result(
                             command_rejected_message(
                                 &error,
                                 "inspect the rejection reason, adjust the cwd/command/project, then retry.",
                             ),
                             Self::classify_run_shell_enqueue_failure(&error),
-                            false,
+                            command_may_have_started,
                             false,
                         )
                     } else {
@@ -418,6 +485,9 @@ impl ToolRuntime {
                         actual_shell,
                         "agent",
                     );
+                    if let Some(resource) = ssh_resource {
+                        result.output["ssh_resource"] = json!(resource);
+                    }
                     result
                 }
                 Ok(Err(_)) => {
@@ -544,6 +614,18 @@ fn decorate_execution_output(
         == Some("timeout")
     {
         "timed_out"
+    } else if output
+        .get("command_started")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && output
+            .get("command_completed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+    {
+        // `started` means the final remote outcome is unknown rather than
+        // that a persistent Shell is active.
+        "started"
     } else {
         "completed"
     });

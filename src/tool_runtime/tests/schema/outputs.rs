@@ -104,6 +104,7 @@ fn key_tool_output_schemas_include_expected_fields() {
         "cwd",
         "shell",
         "executor",
+        "ssh_resource",
         "execution_state",
     ] {
         assert!(
@@ -277,7 +278,7 @@ fn key_tool_output_schemas_include_expected_fields() {
             "list_project_files entry missing {field}"
         );
     }
-    for field in ["job_id", "kind", "status", "project"] {
+    for field in ["job_id", "kind", "status", "project", "ssh_resource"] {
         assert!(
             has_output_field("run_job", field),
             "run_job missing {field}"
@@ -307,6 +308,8 @@ fn key_tool_output_schemas_include_expected_fields() {
     for field in [
         "job_id",
         "project",
+        "session_id",
+        "ssh_resource",
         "status",
         "exit_code",
         "started_at",
@@ -329,6 +332,8 @@ fn key_tool_output_schemas_include_expected_fields() {
     }
     for field in [
         "job_id",
+        "session_id",
+        "ssh_resource",
         "exit_code",
         "stdout_tail",
         "stderr_tail",
@@ -373,6 +378,8 @@ fn key_tool_output_schemas_include_expected_fields() {
         "kind",
         "status",
         "project",
+        "session_id",
+        "ssh_resource",
         "executor",
         "created_at",
         "started_at",
@@ -392,6 +399,8 @@ fn key_tool_output_schemas_include_expected_fields() {
     }
     for field in [
         "job_id",
+        "session_id",
+        "ssh_resource",
         "exit_code",
         "stdout_tail",
         "stderr_tail",

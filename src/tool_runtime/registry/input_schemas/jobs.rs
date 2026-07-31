@@ -15,7 +15,7 @@ pub(crate) fn run_shell_input_schema() -> Value {
         (
             "cwd",
             "string",
-            "Working directory contract: omit, empty string, or '.' selects the project root; any other value is project-relative and may not escape the project root.",
+            "Working directory contract: without a Session SSH resource, omit, empty string, or '.' selects the project root and any other value is project-relative. With a named Session SSH resource, cwd is a remote path checked by the remote shell instead of the Runner project-root policy.",
             false,
         ),
         (
@@ -27,7 +27,7 @@ pub(crate) fn run_shell_input_schema() -> Value {
         (
             "shell",
             "string",
-            "Optional explicit command language: sh or bash. When omitted, local run_shell uses sh and an agent-backed run_shell uses that Agent's configured shell. The response always records the actual selection.",
+            "Optional explicit command language: sh or bash. When omitted, local run_shell uses sh, an agent-backed run_shell uses that Agent's configured shell, and a named Session SSH resource uses the remote login shell. The response always records the actual selection.",
             false,
         ),
     ]));
@@ -66,7 +66,7 @@ pub(crate) fn run_job_input_schema() -> Value {
         (
             "cwd",
             "string",
-            "Working directory contract: omit, empty string, or '.' selects the project root; any other value is project-relative and may not escape the project root.",
+            "Working directory contract: without a Session SSH resource, omit, empty string, or '.' selects the project root and any other value is project-relative. With a named Session SSH resource, cwd is a remote path checked by the remote shell instead of the Runner project-root policy.",
             false,
         ),
         (
@@ -78,7 +78,7 @@ pub(crate) fn run_job_input_schema() -> Value {
         (
             "shell",
             "string",
-            "Optional explicit command language: sh or bash. When omitted, local run_job preserves its existing bash contract and an agent-backed run_job uses that Agent's configured shell. The response always records the actual selection.",
+            "Optional explicit command language: sh or bash. When omitted, local run_job preserves its existing bash contract, an agent-backed run_job uses that Agent's configured shell, and a named Session SSH resource uses the remote login shell. The response always records the actual selection.",
             false,
         ),
     ]));

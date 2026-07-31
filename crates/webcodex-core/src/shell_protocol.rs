@@ -97,6 +97,11 @@ pub const SHELL_CLIENT_CAPABILITY_GIT: &str = "git";
 pub const SHELL_CLIENT_CAPABILITY_JOBS: &str = "jobs";
 pub const SHELL_CLIENT_CAPABILITY_ASYNC_JOBS: &str = "async_jobs";
 pub const SHELL_CLIENT_CAPABILITY_ASYNC_SHELL_JOBS: &str = "async_shell_jobs";
+/// Runner-side SSH shell execution for Workflow Session resources. This is
+/// deliberately separate from ordinary local shell support: older runners
+/// must reject a Session-bound SSH request rather than silently running it on
+/// their local project checkout.
+pub const SHELL_CLIENT_CAPABILITY_SSH_SHELL: &str = "ssh_shell";
 pub const SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV: &str = "structured_validation_argv";
 /// Explicit capability for agent-side read-only LSP navigation. Missing on
 /// older agents and defaults to `false` so the server never dispatches typed
@@ -116,6 +121,7 @@ pub const SHELL_CLIENT_CAPABILITY_NAMES: &[&str] = &[
     SHELL_CLIENT_CAPABILITY_JOBS,
     SHELL_CLIENT_CAPABILITY_ASYNC_JOBS,
     SHELL_CLIENT_CAPABILITY_ASYNC_SHELL_JOBS,
+    SHELL_CLIENT_CAPABILITY_SSH_SHELL,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV,
     SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
     SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS,
@@ -157,6 +163,10 @@ pub struct ShellClientCapabilities {
     pub async_jobs: bool,
     #[serde(default)]
     pub async_shell_jobs: bool,
+    /// The Runner can execute a Workflow Session's configured SSH resource.
+    /// Missing on older runners and therefore fails closed.
+    #[serde(default)]
+    pub ssh_shell: bool,
     /// Validation plans use a fixed executable plus argv, never shell text.
     /// Missing on older agents and therefore fail-closed.
     #[serde(default)]
@@ -213,6 +223,7 @@ impl Default for ShellClientCapabilities {
             jobs: false,
             async_jobs: false,
             async_shell_jobs: false,
+            ssh_shell: false,
             structured_validation_argv: false,
             lsp_read_only_navigation: false,
             sandbox_inspect_commands: false,
@@ -652,9 +663,10 @@ pub struct ShellAgentShellRequest {
     /// Absent on the wire when unset so older agents continue to deserialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<String>,
-    /// Server-derived safe ownership and display metadata retained by the
-    /// runner for same-process recovery. Present only for async job starts and
-    /// never contains raw command text, stdin, environment, or credentials.
+    /// Server-derived safe execution metadata. Async jobs retain it for
+    /// same-process recovery; Session-bound SSH shell requests use only the
+    /// workflow session/resource fields. It never contains raw command text,
+    /// stdin, environment, SSH host/configuration, or credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_context: Option<ShellJobContext>,
 }
@@ -944,6 +956,10 @@ pub struct ShellJobContext {
     pub runtime_project_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_session_id: Option<String>,
+    /// Named Runner-local SSH resource. It is safe recovery metadata, unlike
+    /// an SSH host/configuration/key, which never crosses this protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_resource: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1068,6 +1084,9 @@ pub struct ShellJobInfo {
     pub project_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Named Runner-local SSH resource used by this job, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_resource: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1458,6 +1477,7 @@ mod envelope_tests {
                 jobs: true,
                 async_jobs: true,
                 async_shell_jobs: true,
+                ssh_shell: true,
                 structured_validation_argv: true,
                 lsp_read_only_navigation: false,
                 sandbox_inspect_commands: false,
@@ -1536,6 +1556,7 @@ mod envelope_tests {
                 context: ShellJobContext {
                     runtime_project_id: Some("agent:oe:demo".to_string()),
                     workflow_session_id: Some("wc_sess_reconcile".to_string()),
+                    ssh_resource: None,
                     project_cwd: Some("/srv/demo".to_string()),
                     cwd: Some("/srv/demo".to_string()),
                     purpose: Some("test".to_string()),

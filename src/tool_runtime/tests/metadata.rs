@@ -112,6 +112,7 @@ async fn register_agent_projects_for_auth(
                     jobs: true,
                     async_jobs: true,
                     async_shell_jobs: true,
+                    ssh_shell: false,
                     structured_validation_argv: true,
                     lsp_read_only_navigation: false,
                     sandbox_inspect_commands: false,

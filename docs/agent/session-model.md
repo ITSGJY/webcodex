@@ -103,18 +103,26 @@ strongly typed execution context:
 
 ```text
 SessionExecutionContext {
-  default_cwd: project-relative path?,
-  default_shell: sh | bash?
+  default_cwd: project-relative path? | remote path?,
+  default_shell: sh | bash?,
+  resource: named Runner SSH resource?
 }
 ```
 
 It is not an arbitrary context bag. It cannot contain environment variables,
-credentials, SSH state, shell input, connection data, or custom options.
-`default_cwd` is validated and normalized before entering the ledger; absolute
-paths, URI forms, control characters, and parent traversal fail without
-changing Session state. Filesystem existence, canonicalization, symlink, and
-allowed-root checks remain in the normal Runner execution path and fail closed
-there without retrying from the project root.
+credentials, SSH host/configuration, keys, passwords, SSH state, shell input,
+connection data, or custom options. `resource` is only a safe named resource
+configured on the Runner that owns the Session project. It is persisted as a
+name, never as an SSH transport or authentication material.
+
+Without `resource`, `default_cwd` is validated and normalized as a
+project-relative path: absolute paths, URI forms, control characters, and
+parent traversal fail without changing Session state. Filesystem existence,
+canonicalization, symlink, and allowed-root checks remain in the normal Runner
+execution path and fail closed there without retrying from the project root.
+With `resource`, `default_cwd` is instead a bounded remote path; it is not
+checked against the Runner project root, and the remote shell reports an
+unenterable cwd explicitly.
 
 `start_session` can set the initial context. `start_coding_task` also sets it
 when creating a Session; on automatic continuation or explicit resume,
@@ -130,13 +138,22 @@ ledger is then queued to the existing background writer. Persistence failures
 are reported through existing status and logs, and success does not mean a
 synchronous disk flush or promise rollback on a later writer failure.
 
-Only `run_shell` and `run_job` inherit these defaults, with this precedence:
+Only `run_shell` and `run_job` inherit these defaults. When an SSH resource is
+selected, only those two tools execute remotely; file, Git, LSP, and checkpoint
+tools remain bound to the registered Runner project. Remote cwd precedence is:
 
 ```text
-per-call cwd/shell
-> exact active project-matched Workflow Session default
-> existing project-root/configured-shell behavior
+per-call cwd
+> exact active project-matched Workflow Session default_cwd
+> SSH resource default_cwd
+> remote login default directory
 ```
+
+Each SSH `run_shell` / `run_job` command gets an independent remote exec
+channel. The Runner may reuse the authenticated transport for the same
+Session/resource pair, but it does not preserve `cd`, exports, aliases,
+functions, umask, or shell-process state between commands. Persistent
+interactive Shell sessions are a later capability.
 
 A missing Session leaves execution unchanged. A mismatched Session fails or,
 on an explicitly authorized cross-project escape path, executes without

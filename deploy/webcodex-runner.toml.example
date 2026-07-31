@@ -62,6 +62,14 @@ source /opt/miniconda3/etc/profile.d/conda.sh
 conda activate ml
 '''
 
+# Optional named remote Shell/Job targets for Session-bound SSH execution.
+# `host` is passed to this Runner's OpenSSH client, so it may be a Host alias
+# from ~/.ssh/config or /etc/ssh/ssh_config. Keep keys, passwords, ProxyJump,
+# and agent setup in the Runner host's SSH configuration; never put them here.
+# [ssh.resources.tmp]
+# host = "tmp"
+# default_cwd = "/opt/webcodex-edge"
+
 [capabilities]
 file_read = true
 file_write = true
@@ -70,6 +78,7 @@ shell = true
 jobs = true
 async_jobs = true
 async_shell_jobs = true
+# ssh_shell is detected from the local OpenSSH executable at Runner startup.
 
 [policy]
 # Missing or empty allowed_roots defaults to $HOME.

@@ -143,6 +143,22 @@ agent:<client_id>:<project_id>
 
 Server 会把 project tool calls 路由到拥有该项目的 connected agent。
 
+## Session SSH 资源
+
+能够调用本机 OpenSSH 的 Runner 会注册 `ssh_shell` capability。旧 Runner 未声明该
+能力时仍可执行普通本机项目；选择了 SSH 资源的 Session 会收到明确的
+capability-unavailable 错误，绝不会静默回退到 Runner 本机执行。
+
+Server 只在安全执行元数据中发送 Workflow Session id 和 Runner 本地资源名；不会发送
+SSH host、完整 SSH 配置、私钥、密码、agent socket 或连接对象。Runner 从
+`[ssh.resources.<name>]` 解析资源，并调用自身 OpenSSH client，因此 Host alias 和认证
+始终留在该 Runner 机器上。
+
+Runner 可以按 Session/resource/config generation 复用已认证 transport，但每个
+`run_shell` 和 `run_job` 都会创建新的远程 exec channel。派发后的 transport failure
+会标记为不确定，绝不自动重试。`run_shell`、`run_job`、`stop_job`、`job_status` 和
+`job_log` 保持原有接口；本轮不会把 file、Git、LSP 或 checkpoint 请求重定向到 SSH。
+
 ## LSP 只读导航
 
 支持只读 LSP intelligence 的 agent 会注册

@@ -721,6 +721,7 @@ fn standalone_snapshot(job_id: &str, status: &str) -> ShellJobSnapshot {
         context: ShellJobContext {
             runtime_project_id: None,
             workflow_session_id: None,
+            ssh_resource: None,
             project_cwd: None,
             cwd: Some("/tmp".to_string()),
             purpose: Some("test".to_string()),
