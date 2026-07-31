@@ -916,7 +916,7 @@ async fn explicit_resume_fault_rolls_back_session_event_and_both_binding_layers(
 
     runtime
         .sessions
-        .fail_next_coding_continuity_commit_for_test();
+        .fail_next_coding_continuity_precommit_for_test();
     let failed = dispatch_start_coding_task_in_window(
         &runtime,
         "explicit-fault",

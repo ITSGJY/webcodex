@@ -17,7 +17,7 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
         ),
         tool_spec(
             "update_session_context",
-            "Atomically replace the complete run_shell/run_job execution defaults for one explicit active project-scoped Workflow Session. An empty object clears both defaults. Never falls back to current-session binding and never creates an unknown Session.",
+            "Update Session defaults. Requires an authorized project matching the exact Session project; cross-project escape is not supported. Context and event commit under the store lock; the background writer persists, so success does not mean disk flush. Never falls back and never creates unknown Sessions.",
             update_session_context_input_schema(),
         ),
         tool_spec(

@@ -64,7 +64,11 @@ The same generic path exposes a strict flattened `execution_context` object
 with only `default_cwd` (project-relative) and `default_shell` (`sh` or
 `bash`). `start_coding_task` can set or replace it and
 `update_session_context` can replace or clear it for an explicit active
-Workflow Session. It affects only `run_shell`/`run_job`; per-call arguments
+Workflow Session only when its required `project` resolves to the exact Session
+project and the caller is authorized for it. Cross-project escape is rejected.
+Success reports the in-memory context/event commit; JSON ledger persistence is
+queued to the background writer and may still be pending. It affects only
+`run_shell`/`run_job`; per-call arguments
 remain authoritative, and no environment, credential, or persistent shell
 state is accepted.
 

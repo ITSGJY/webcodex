@@ -1390,7 +1390,7 @@ async fn durable_current_binding_failed_continuity_commit_is_fully_atomic() {
 
     runtime
         .sessions
-        .fail_next_coding_continuity_commit_for_test();
+        .fail_next_coding_continuity_precommit_for_test();
     let failed = dispatch_start_coding_task_in_window(
         &runtime,
         "fault-agent",

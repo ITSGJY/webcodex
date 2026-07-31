@@ -521,9 +521,13 @@ a process-local cache plus a bounded hashed durable projection.
 For a registered-project Workflow Session, `start_coding_task` may also accept
 `execution_context = {default_cwd?, default_shell?}`. This is durable Session
 metadata, not an environment snapshot: continuation/resume omission preserves
-it, an explicit object replaces it atomically, and `{}` clears it.
-`update_session_context` performs the same complete replacement for one
-explicit active Session. The context cannot contain environment values,
+it, and an explicit object commits with the instruction update under the
+in-memory store lock; `{}` clears it. `update_session_context` requires an
+authorized project that exactly matches one explicit active Session and rejects
+cross-project escape. Its successful response means the in-memory context/event
+commit completed; the JSON ledger is queued to the background writer, and any
+persistence failure is reported through existing status and logs rather than
+rolling back that memory commit. The context cannot contain environment values,
 credentials, arbitrary options, SSH state, or persistent shell state.
 
 `continuation.exploration` is the bounded startup projection of the previous

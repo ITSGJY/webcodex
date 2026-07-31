@@ -125,8 +125,10 @@ project-relative `default_cwd` 和可选的 `default_shell`（`sh` 或 `bash`）
 仍是独立进程，某次命令中的 `cd sub` 不会影响后续调用。
 
 `start_coding_task(execution_context=...)` 可以设置或替换该上下文；续接时省略会保留，
-显式 `{}` 会清空。`update_session_context` 针对一个显式 active Workflow Session
-执行完整替换。上下文不能保存 env values、tokens、任意 options 或 shell state。
+显式 `{}` 会清空。`update_session_context` 仅在必填 project 已授权且精确匹配
+Session project 时，针对显式 active Workflow Session 执行完整替换；不允许跨项目
+逃逸。context 与 event 在内存中共同提交，JSON ledger 由后台 writer 异步写入，
+所以成功不表示同步落盘。上下文不能保存 env values、tokens、任意 options 或 shell state。
 
 ## 10. 修改配置需要重启 agent
 

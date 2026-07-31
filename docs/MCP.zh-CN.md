@@ -101,9 +101,12 @@ startup core 中 `minimal` 最多 3 条路径，`standard` 及 `full` 内嵌 cor
 
 该 surface 还支持已注册项目 Workflow Session 的有界持久化执行上下文：
 `execution_context = {default_cwd?, default_shell?}`。创建时会保存它；
-continuation/resume 时省略会保留原值，显式对象会原子替换，`{}` 会清空。
-`update_session_context` 可针对一个显式 active Session 再次完整替换。
-`run_shell`/`run_job` 先采用单次调用参数，再采用项目精确匹配的 Session 默认值，
+continuation/resume 时省略会保留原值；显式对象与 instruction update 在内存
+store lock 下共同提交，`{}` 会清空。`update_session_context(project, session_id,
+execution_context)` 要求调用者有权访问解析后的项目，并拒绝任何 Session-project
+不匹配，不提供跨项目逃逸。成功响应仅表示内存 context 与 event 已共同提交；JSON
+ledger 随后交给现有后台 writer 异步写入，失败仍通过 runtime status 与日志报告，
+不表示已经同步落盘。`run_shell`/`run_job` 先采用单次调用参数，再采用项目精确匹配的 Session 默认值，
 最后才使用现有项目根目录和 configured shell；不跨项目继承。上下文不保存 env、
 凭据、任意 options 或 shell 状态。每条命令仍启动 fresh shell，`cd`/`export`
 不会隐式写回 Session；SSH 与 persistent shell 属于后续阶段。

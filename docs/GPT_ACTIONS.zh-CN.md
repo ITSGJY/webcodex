@@ -59,7 +59,9 @@ continuation 数据。该 core 的 attempt-scoped exploration workset 只包含�
 已注册项目内的 project-relative `default_cwd` 和 `default_shell`
 （`sh`/`bash`）。`start_coding_task` 可设置或替换它，
 `update_session_context` 可针对显式 active Workflow Session 完整替换或以 `{}`
-清空。`run_shell`/`run_job` 的单次 `cwd`/`shell` 始终优先；上下文不保存 env、
+清空，但必填 `project` 必须解析为该 Session 的精确项目，且调用者必须有权访问；
+跨项目逃逸会被拒绝。成功仅表示内存 context/event 已提交，JSON ledger 仍由后台
+writer 异步持久化。`run_shell`/`run_job` 的单次 `cwd`/`shell` 始终优先；上下文不保存 env、
 凭据或持久 shell 状态。每条命令仍是 fresh process，`cd`/`export` 不会写回
 Session；SSH 与 persistent shell 不在本轮范围内。
 

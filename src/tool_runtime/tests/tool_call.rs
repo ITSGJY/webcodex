@@ -599,6 +599,7 @@ fn session_execution_context_parses_as_strongly_typed_replacement() {
     let clear = ToolCall::from_tool_name(
         "update_session_context",
         json!({
+            "project": "agent:oe:demo",
             "session_id": "wc_sess_context01",
             "execution_context": {}
         }),
@@ -607,20 +608,23 @@ fn session_execution_context_parses_as_strongly_typed_replacement() {
     assert!(matches!(
         clear,
         ToolCall::UpdateSessionContext {
+            ref project,
             ref session_id,
             execution_context: sessions::SessionExecutionContext {
                 default_cwd: None,
                 default_shell: None,
             },
-        } if session_id == "wc_sess_context01"
+        } if project == "agent:oe:demo" && session_id == "wc_sess_context01"
     ));
 
     for invalid in [
         json!({
+            "project": "agent:oe:demo",
             "session_id": "wc_sess_context01",
             "execution_context": {"env": {"TOKEN": "secret"}}
         }),
         json!({
+            "project": "agent:oe:demo",
             "session_id": "wc_sess_context01",
             "execution_context": {"default_shell": "zsh"}
         }),

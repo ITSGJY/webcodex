@@ -245,7 +245,7 @@ async fn mismatch_and_invalid_context_fail_closed_without_root_fallback() {
         .sessions
         .start_session_with_options(
             sessions::SessionCreateOptions::new(
-                Some(first_project),
+                Some(first_project.clone()),
                 Some("fail closed".to_string()),
                 SessionMode::Normal,
                 sessions::SessionGuards::default(),
@@ -279,10 +279,14 @@ async fn mismatch_and_invalid_context_fail_closed_without_root_fallback() {
 
     let before = runtime.sessions.summary(&session.session_id, None).unwrap();
     let invalid = runtime
-        .dispatch(ToolCall::UpdateSessionContext {
-            session_id: session.session_id.clone(),
-            execution_context: context(Some("../outside"), None),
-        })
+        .dispatch_with_auth(
+            ToolCall::UpdateSessionContext {
+                project: first_project,
+                session_id: session.session_id.clone(),
+                execution_context: context(Some("../outside"), None),
+            },
+            Some(&auth),
+        )
         .await;
     assert!(!invalid.success);
     assert_eq!(invalid.output["error_kind"], "invalid_execution_context");
@@ -368,19 +372,44 @@ async fn nonexistent_inherited_cwd_is_not_retried_at_project_root() {
 }
 
 #[tokio::test]
-async fn update_session_context_tool_replaces_clears_and_rejects_closed_or_unknown_sessions() {
+async fn update_session_context_requires_authorized_exact_project_and_preserves_state_on_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let first_root = temp.path().join("first");
+    let second_root = temp.path().join("second");
+    std::fs::create_dir_all(&first_root).unwrap();
+    std::fs::create_dir_all(&second_root).unwrap();
     let runtime = test_runtime();
-    let session = runtime.sessions.start_session(
-        Some("agent:context:demo".to_string()),
-        Some("update tool".to_string()),
-    );
+    let owner = shared_key_auth_context("context-owner-group");
+    let intruder = shared_key_auth_context("context-intruder-group");
+    register_agent_projects_for_auth(
+        &runtime,
+        "context-owner",
+        &owner,
+        ShellClientCapabilities::default(),
+        vec![
+            registered_project("first", &first_root.to_string_lossy()),
+            registered_project("second", &second_root.to_string_lossy()),
+        ],
+    )
+    .await;
+    let first_project = "agent:context-owner:first".to_string();
+    let second_project = "agent:context-owner:second".to_string();
+    let session = runtime
+        .sessions
+        .start_session(Some(first_project.clone()), Some("update tool".to_string()));
+
     let set = runtime
-        .dispatch(ToolCall::UpdateSessionContext {
-            session_id: session.session_id.clone(),
-            execution_context: context(Some("frontend"), Some(ExecutionShell::Bash)),
-        })
+        .dispatch_with_auth(
+            ToolCall::UpdateSessionContext {
+                project: first_project.clone(),
+                session_id: session.session_id.clone(),
+                execution_context: context(Some("frontend"), Some(ExecutionShell::Bash)),
+            },
+            Some(&owner),
+        )
         .await;
     assert!(set.success, "{:?}", set.error);
+    assert_eq!(set.output["project"], first_project);
     assert_eq!(set.output["execution_context"]["default_cwd"], "frontend");
     assert_eq!(set.output["execution_context"]["default_shell"], "bash");
     assert_eq!(
@@ -389,30 +418,88 @@ async fn update_session_context_tool_replaces_clears_and_rejects_closed_or_unkno
     );
     assert_eq!(set.output["changed"], true);
 
+    let before_denied = runtime.sessions.summary(&session.session_id, None).unwrap();
+    let denied = runtime
+        .dispatch_with_auth(
+            ToolCall::UpdateSessionContext {
+                project: first_project.clone(),
+                session_id: session.session_id.clone(),
+                execution_context: sessions::SessionExecutionContext::default(),
+            },
+            Some(&intruder),
+        )
+        .await;
+    assert!(!denied.success);
+    let after_denied = runtime.sessions.summary(&session.session_id, None).unwrap();
+    assert_eq!(
+        after_denied.execution_context,
+        before_denied.execution_context
+    );
+    assert_eq!(after_denied.events_total, before_denied.events_total);
+
+    let before_mismatch = after_denied;
+    let mismatch = runtime
+        .dispatch_with_auth(
+            ToolCall::UpdateSessionContext {
+                project: second_project,
+                session_id: session.session_id.clone(),
+                execution_context: sessions::SessionExecutionContext::default(),
+            },
+            Some(&owner),
+        )
+        .await;
+    assert!(!mismatch.success);
+    assert_eq!(mismatch.output["failure_kind"], "session_project_mismatch");
+    let after_mismatch = runtime.sessions.summary(&session.session_id, None).unwrap();
+    assert_eq!(
+        after_mismatch.execution_context,
+        before_mismatch.execution_context
+    );
+    assert_eq!(after_mismatch.events_total, before_mismatch.events_total);
+
     let clear = runtime
-        .dispatch(ToolCall::UpdateSessionContext {
-            session_id: session.session_id.clone(),
-            execution_context: sessions::SessionExecutionContext::default(),
-        })
+        .dispatch_with_auth(
+            ToolCall::UpdateSessionContext {
+                project: first_project.clone(),
+                session_id: session.session_id.clone(),
+                execution_context: sessions::SessionExecutionContext::default(),
+            },
+            Some(&owner),
+        )
         .await;
     assert!(clear.success, "{:?}", clear.error);
     assert_eq!(clear.output["execution_context"], serde_json::json!({}));
 
     runtime.sessions.close_session(&session.session_id).unwrap();
+    let before_closed = runtime.sessions.summary(&session.session_id, None).unwrap();
     let closed = runtime
-        .dispatch(ToolCall::UpdateSessionContext {
-            session_id: session.session_id,
-            execution_context: sessions::SessionExecutionContext::default(),
-        })
+        .dispatch_with_auth(
+            ToolCall::UpdateSessionContext {
+                project: first_project.clone(),
+                session_id: session.session_id.clone(),
+                execution_context: context(Some("frontend"), None),
+            },
+            Some(&owner),
+        )
         .await;
     assert!(!closed.success);
     assert_eq!(closed.output["error_kind"], "session_closed");
+    let after_closed = runtime.sessions.summary(&session.session_id, None).unwrap();
+    assert_eq!(
+        after_closed.execution_context,
+        before_closed.execution_context
+    );
+    assert_eq!(after_closed.events_total, before_closed.events_total);
 
     let unknown = runtime
-        .dispatch(ToolCall::UpdateSessionContext {
-            session_id: "wc_sess_unknowncontext01".to_string(),
-            execution_context: sessions::SessionExecutionContext::default(),
-        })
+        .dispatch_with_auth(
+            ToolCall::UpdateSessionContext {
+                project: first_project,
+                session_id: "wc_sess_unknowncontext01".to_string(),
+                execution_context: sessions::SessionExecutionContext::default(),
+            },
+            Some(&owner),
+        )
         .await;
     assert!(!unknown.success);
     assert_eq!(unknown.output["error_kind"], "unknown_session_id");

@@ -602,7 +602,7 @@ mod tests {
             ),
             (
                 "update_session_context",
-                OAuthToolScopePolicy::Require(SCOPE_RUNTIME_READ),
+                OAuthToolScopePolicy::Require(SCOPE_PROJECT_READ),
             ),
             (
                 "post_session_message",

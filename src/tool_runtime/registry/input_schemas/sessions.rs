@@ -194,6 +194,11 @@ pub(crate) fn update_session_context_input_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
+            "project": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Required complete runtime project id or unambiguous project input. The caller must be authorized for the resolved project, and it must exactly match the Session project."
+            },
             "session_id": {
                 "type": "string",
                 "pattern": "^wc_sess_[A-Za-z0-9_]+$",
@@ -203,7 +208,7 @@ pub(crate) fn update_session_context_input_schema() -> Value {
                 "Complete replacement execution context. `{}` clears both defaults. The context cannot store environment variables, credentials, or arbitrary options."
             )
         },
-        "required": ["session_id", "execution_context"],
+        "required": ["project", "session_id", "execution_context"],
         "additionalProperties": false
     })
 }

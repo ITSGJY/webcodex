@@ -483,7 +483,7 @@ fn session_execution_context_persists_and_legacy_ledgers_default_empty() {
 }
 
 #[test]
-fn coding_session_context_creation_preserve_replace_and_failed_commit_are_atomic() {
+fn coding_session_context_precommit_failure_leaves_memory_unchanged() {
     fn request(
         resume_session_id: Option<String>,
         execution_context: Option<SessionExecutionContext>,
@@ -539,7 +539,7 @@ fn coding_session_context_creation_preserve_replace_and_failed_commit_are_atomic
     assert_eq!(event.previous_execution_context, Some(initial.clone()));
 
     let event_count = replaced.summary.events_total;
-    store.fail_next_coding_continuity_commit_for_test();
+    store.fail_next_coding_continuity_precommit_for_test();
     let error = store
         .ensure_coding_session(request(
             Some(session_id.clone()),

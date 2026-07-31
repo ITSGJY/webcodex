@@ -28,7 +28,7 @@ fn session_tool_specs_describe_ledger_vs_current_binding() {
     let update = spec_named(&specs, "update_session_context");
     assert_eq!(
         update.input_schema["required"],
-        serde_json::json!(["session_id", "execution_context"])
+        serde_json::json!(["project", "session_id", "execution_context"])
     );
     assert_eq!(update.input_schema["additionalProperties"], false);
     assert_eq!(
@@ -37,8 +37,12 @@ fn session_tool_specs_describe_ledger_vs_current_binding() {
     );
     let update_desc = update.description.to_lowercase();
     for phrase in [
-        "atomically replace",
-        "active project-scoped",
+        "authorized project",
+        "exact session project",
+        "cross-project escape is not supported",
+        "store lock",
+        "background writer",
+        "success does not mean",
         "never falls back",
         "never creates",
     ] {

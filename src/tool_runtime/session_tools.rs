@@ -2,7 +2,8 @@
 
 use super::session_context::{
     current_session_key, current_session_unavailable_result, session_lifecycle_denied_result,
-    session_message_error_result, unknown_session_result,
+    session_message_error_result, session_project_mismatch_result, unknown_session_result,
+    SessionProjectMismatch,
 };
 use super::tool_inputs::SessionMode;
 use super::{sessions, ToolCall, ToolResult, ToolRuntime};
@@ -41,9 +42,19 @@ impl ToolRuntime {
                 self.session_summary_tool(session_id, limit)
             }
             ToolCall::UpdateSessionContext {
+                project,
                 session_id,
                 execution_context,
-            } => self.update_session_context_tool(session_id, execution_context, transport),
+            } => {
+                self.update_session_context_tool(
+                    project,
+                    session_id,
+                    execution_context,
+                    auth,
+                    transport,
+                )
+                .await
+            }
             ToolCall::CloseSession { session_id } => self.close_session_tool(session_id),
             ToolCall::ValidationSummary {
                 project,
@@ -168,12 +179,41 @@ impl ToolRuntime {
         }))
     }
 
-    pub(crate) fn update_session_context_tool(
+    pub(crate) async fn update_session_context_tool(
         &self,
+        project: String,
         session_id: String,
         execution_context: sessions::SessionExecutionContext,
+        auth: Option<&AuthContext>,
         transport: sessions::SessionTransport,
     ) -> ToolResult {
+        let resolved = match self.resolve_project_input_for_auth(&project, auth).await {
+            Ok(resolved) => resolved,
+            Err(err) => return err.into_tool_result(),
+        };
+        let Some(summary) = self.sessions.summary(&session_id, None) else {
+            return unknown_session_result(&session_id);
+        };
+        if summary.project.as_deref() != Some(resolved.resolved_id.as_str()) {
+            let mismatch = SessionProjectMismatch {
+                session_project: summary.project.unwrap_or_else(|| "<unscoped>".to_string()),
+                request_project: resolved.resolved_id,
+            };
+            return session_project_mismatch_result(
+                &session_id,
+                "update_session_context",
+                &mismatch,
+            );
+        }
+        if !summary.lifecycle.allows_mutation() {
+            return session_lifecycle_denied_result(
+                &session_id,
+                "update_session_context",
+                sessions::SessionLifecycleDenial {
+                    lifecycle: summary.lifecycle,
+                },
+            );
+        }
         match self
             .sessions
             .update_execution_context(&session_id, execution_context, transport)

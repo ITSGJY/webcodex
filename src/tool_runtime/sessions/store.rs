@@ -55,7 +55,7 @@ pub(crate) struct SessionStore {
     /// fall back to the synchronous write path).
     writer: Option<Arc<LedgerWriterGuard>>,
     #[cfg(test)]
-    fail_next_coding_continuity_commit: Arc<std::sync::atomic::AtomicBool>,
+    fail_next_coding_continuity_precommit: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Coordinates a dedicated OS thread that owns session-ledger serialize +
@@ -315,7 +315,9 @@ impl SessionStore {
             persistence_write_mutex: Arc::new(Mutex::new(())),
             writer: None,
             #[cfg(test)]
-            fail_next_coding_continuity_commit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail_next_coding_continuity_precommit: Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
         }
     }
 
@@ -359,7 +361,9 @@ impl SessionStore {
             persistence_write_mutex,
             writer,
             #[cfg(test)]
-            fail_next_coding_continuity_commit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail_next_coding_continuity_precommit: Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
         }
     }
 
@@ -490,8 +494,9 @@ impl SessionStore {
         Ok(summary)
     }
 
-    /// Atomically ensure the window/project coding context and append the
-    /// accepted instruction to the durable Workflow Session ledger.
+    /// Commit the coding context, accepted instruction, and binding together
+    /// under the in-memory store lock. Persistent stores then queue the updated
+    /// JSON ledger to the background writer; success does not imply disk flush.
     ///
     /// Every fallible check happens before the in-memory commit. Once mutation
     /// begins, session creation or capability update, the instruction event,
@@ -736,14 +741,16 @@ impl SessionStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn fail_next_coding_continuity_commit_for_test(&self) {
-        self.fail_next_coding_continuity_commit
+    /// Inject a failure before any in-memory continuity mutation. This does
+    /// not model background ledger persistence failure or rollback.
+    pub(crate) fn fail_next_coding_continuity_precommit_for_test(&self) {
+        self.fail_next_coding_continuity_precommit
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(test)]
     fn take_coding_continuity_fault(&self) -> bool {
-        self.fail_next_coding_continuity_commit
+        self.fail_next_coding_continuity_precommit
             .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -818,8 +825,9 @@ impl SessionStore {
         Ok(outcome)
     }
 
-    /// Atomically replace the complete execution context and append one safe
-    /// metadata event. `{}` clears both defaults.
+    /// Replace the complete execution context and append one safe metadata
+    /// event together under the in-memory store lock. Persistent stores then
+    /// queue the JSON ledger to the background writer. `{}` clears both defaults.
     pub(crate) fn update_execution_context(
         &self,
         session_id: &str,

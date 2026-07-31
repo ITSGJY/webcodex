@@ -131,9 +131,11 @@ pub enum ToolCall {
         limit: Option<usize>,
     },
 
-    /// Atomically replace the complete execution defaults of one known active,
-    /// project-scoped Workflow Session. `{}` clears both defaults.
+    /// Replace the complete execution defaults of one known active Workflow
+    /// Session after resolving and authorizing its exact project. The
+    /// in-memory context/event commit is atomic; ledger persistence is queued.
     UpdateSessionContext {
+        project: String,
         session_id: String,
         execution_context: SessionExecutionContext,
     },
@@ -1455,7 +1457,8 @@ impl ToolCall {
             Self::StartCodingTask { project, .. } | Self::FinishCodingTask { project, .. } => {
                 Some(project.as_str())
             }
-            Self::ValidationSummary { project, .. } => Some(project.as_str()),
+            Self::UpdateSessionContext { project, .. }
+            | Self::ValidationSummary { project, .. } => Some(project.as_str()),
             Self::SessionHandoffSummary { project, .. } => project.as_deref(),
             _ => None,
         }

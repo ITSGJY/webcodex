@@ -584,7 +584,9 @@ async fn session_tools_exposed_in_registry_and_mcp() {
             .to_lowercase()
     };
     assert!(tool_description("session_summary").contains("session ledger"));
-    assert!(tool_description("update_session_context").contains("atomically replace"));
+    assert!(tool_description("update_session_context").contains("authorized project"));
+    assert!(tool_description("update_session_context").contains("background writer"));
+    assert!(tool_description("update_session_context").contains("success does not mean"));
     assert!(tool_description("validation_summary").contains("does not run cargo"));
     assert!(tool_description("session_handoff_summary")
         .contains("does not depend on current-session binding"));
@@ -2109,7 +2111,7 @@ async fn mcp_tools_list_exposes_coding_task_and_runtime_status_ux_flags() {
     let update = tool("update_session_context");
     assert_eq!(
         update["inputSchema"]["required"],
-        json!(["session_id", "execution_context"])
+        json!(["project", "session_id", "execution_context"])
     );
     assert_eq!(update["inputSchema"]["additionalProperties"], false);
     assert_eq!(

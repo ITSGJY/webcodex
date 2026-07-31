@@ -14,7 +14,13 @@ use super::common::{
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
         "start_session" => Some(wrapped_output_schema(vec![
-            ("success", schema_type("boolean", "Always true on success.")),
+            (
+                "success",
+                schema_type(
+                    "boolean",
+                    "True after the in-memory Session context/event commit. JSON ledger persistence may still be pending in the background writer.",
+                ),
+            ),
             ("session_id", schema_type("string", "Opaque session id.")),
             (
                 "project",
@@ -124,7 +130,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "project",
-                schema_type("string", "Project scoped to this Workflow Session."),
+                schema_type("string", "Canonical authorized project scoped to this Workflow Session."),
             ),
             (
                 "title",
@@ -142,13 +148,13 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             (
                 "execution_context",
                 session_execution_context_schema(
-                    "Complete current execution defaults after replacement.",
+                    "Complete current in-memory execution defaults after replacement.",
                 ),
             ),
             (
                 "previous_execution_context",
                 session_execution_context_schema(
-                    "Complete execution defaults immediately before replacement.",
+                    "Complete in-memory execution defaults immediately before replacement.",
                 ),
             ),
             (

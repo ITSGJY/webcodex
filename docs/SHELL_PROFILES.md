@@ -161,8 +161,11 @@ does not affect later calls.
 `start_coding_task(execution_context=...)` can set or replace the context.
 Omission during continuation preserves it, while `{}` clears it.
 `update_session_context` performs a full replacement for an explicit active
-Workflow Session. The context cannot store env values, tokens, arbitrary
-options, or shell state.
+Workflow Session only after its required project is authorized and resolves to
+the exact Session project; cross-project escape is rejected. The context and
+event commit together in memory, while the JSON ledger is queued to the
+background writer, so success is not a synchronous durability guarantee. The
+context cannot store env values, tokens, arbitrary options, or shell state.
 
 ## 10. Changing config requires restarting the agent
 

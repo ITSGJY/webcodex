@@ -965,9 +965,11 @@ impl ToolCall {
                     .map(super::sessions::SessionExecutionContext::audit_summary),
             }),
             Self::UpdateSessionContext {
+                project,
                 session_id,
                 execution_context,
             } => serde_json::json!({
+                "project": project,
                 "session_id": session_id,
                 "execution_context": execution_context.audit_summary(),
             }),

@@ -119,11 +119,16 @@ there without retrying from the project root.
 `start_session` can set the initial context. `start_coding_task` also sets it
 when creating a Session; on automatic continuation or explicit resume,
 omitting `execution_context` preserves the stored value, while an explicit
-object replaces it atomically with the instruction/capability/binding update.
-An explicit `{}` clears both defaults. `update_session_context` performs the
-same full replacement for one explicit known active project-scoped
-`session_id`; it never uses current-session fallback, never creates an unknown
-Session, and rejects closed, archived, or project-less Sessions.
+object commits with the instruction/capability/binding update under the
+in-memory store lock. An explicit `{}` clears both defaults.
+`update_session_context` requires a project input that the caller may access and
+that resolves exactly to the explicit known active Session project. It never
+uses current-session fallback, never creates an unknown Session, rejects closed,
+archived, project-less, unauthorized, and mismatched Sessions, and has no
+cross-project escape. The context and event commit together in memory; the JSON
+ledger is then queued to the existing background writer. Persistence failures
+are reported through existing status and logs, and success does not mean a
+synchronous disk flush or promise rollback on a later writer failure.
 
 Only `run_shell` and `run_job` inherit these defaults, with this precedence:
 
