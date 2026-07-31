@@ -272,7 +272,10 @@ impl ShellClientRegistry {
         ssh_session_id: Option<String>,
     ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
         validate_run_request(&body)?;
-        if ssh_resource.is_some() != ssh_session_id.is_some() {
+        // A Workflow Session may execute locally without an SSH resource.
+        // Only remote execution without the Session that owns the resource is
+        // invalid.
+        if ssh_resource.is_some() && ssh_session_id.is_none() {
             return Err(
                 "ssh_session_required: an SSH resource requires a Workflow Session id".to_string(),
             );

@@ -31,7 +31,7 @@ fn openapi_flattened_execution_context_is_strongly_typed() {
     );
     assert_eq!(
         execution_context["properties"]["default_cwd"]["maxLength"],
-        512
+        4096
     );
 }
 

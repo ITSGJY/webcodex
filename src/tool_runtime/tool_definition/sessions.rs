@@ -33,7 +33,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             TOOL_PROVIDER_CONTROL,
             ReadOnly,
             Some(RUNTIME_READ),
-            true,
+            false,
             NoPath,
             false,
             false,
