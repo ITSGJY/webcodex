@@ -572,6 +572,8 @@ pub struct ShellRunRequest {
     pub wait_timeout_secs: u64,
 }
 
+pub const REMOTE_WORKSPACE_READ_RESULT_FORMAT: &str = "webcodex.remote_workspace_read_result.v1";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShellRunResponse {
     pub success: bool,
@@ -590,6 +592,8 @@ pub struct ShellRunResponse {
     pub duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_workspace: Option<RemoteWorkspaceReadResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -770,6 +774,35 @@ pub struct RemoteWorkspaceReadRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip: Option<usize>,
     pub timeout_secs: u64,
+}
+
+/// Versioned Runner-to-Server result for a structured SSH workspace read.
+/// Generic stdout/stderr are not the protocol for this request kind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteWorkspaceReadResponse {
+    pub format: String,
+    pub operation: String,
+    #[serde(flatten)]
+    pub outcome: RemoteWorkspaceReadOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RemoteWorkspaceReadOutcome {
+    Success {
+        exit_code: i32,
+        stdout: String,
+        #[serde(default)]
+        stdout_truncated: bool,
+    },
+    Failure {
+        error_kind: String,
+        message: String,
+        command_started: bool,
+        command_completed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

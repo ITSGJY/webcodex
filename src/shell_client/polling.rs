@@ -193,6 +193,14 @@ impl ShellClientRegistry {
                 job.error = error.clone();
             }
         }
+        let remote_workspace =
+            if pending.request.kind == crate::shell_protocol::SSH_WORKSPACE_READ_REQUEST_KIND {
+                stdout
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str(raw).ok())
+            } else {
+                None
+            };
         let response = ShellRunResponse {
             success: error.is_none() && body.exit_code == Some(0),
             request_id,
@@ -204,6 +212,7 @@ impl ShellClientRegistry {
             stderr,
             duration_ms: body.duration_ms,
             error,
+            remote_workspace,
         };
         if let Some(waiter) = pending.waiter.take() {
             let _ = waiter.send(response);

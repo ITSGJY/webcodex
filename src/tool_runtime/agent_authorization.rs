@@ -51,7 +51,12 @@ impl ToolRuntime {
         // Resource-bound operations this round does not support fail closed
         // before any agent capability check or enqueue: the Runner-local
         // project must never be touched.
-        if ssh_resource.is_some() && super::ssh_workspace::is_ssh_workspace_fail_closed_call(call) {
+        if ssh_resource.is_some()
+            && matches!(
+                super::ssh_workspace::ssh_resource_routing(call),
+                super::ssh_workspace::SshResourceRouting::UnsupportedProjectOperation
+            )
+        {
             return Err(super::ssh_workspace::ssh_resource_unsupported_result(call));
         }
         if self
@@ -114,7 +119,10 @@ impl ToolRuntime {
             // `ssh_shell` + `file_read`/`git` locally must fail closed here
             // (before enqueue) rather than running the read on its local
             // project checkout.
-            if super::ssh_workspace::is_ssh_workspace_read_call(call) {
+            if matches!(
+                super::ssh_workspace::ssh_resource_routing(call),
+                super::ssh_workspace::SshResourceRouting::SupportedWorkspaceRead
+            ) {
                 if !self
                     .shell_clients
                     .client_supports_for_auth(

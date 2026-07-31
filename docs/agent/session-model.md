@@ -190,22 +190,40 @@ exact Session default_cwd
 > remote login default directory
 ```
 
+The Server copies the exact Session's `default_cwd` into the structured wire
+request. The Runner resolves that request, the resource configuration, and its
+configuration generation as one snapshot. A supplied Session cwd that cannot
+be entered fails closed; it never falls back to the resource or login cwd.
+
 The Runner enters the effective root and pins the authoritative physical path
 via `pwd -P`; if the root cannot be entered or observed the request fails
 closed (`ssh_workspace_root_unavailable`). Tool paths are project-relative:
 absolute paths, URI forms, NUL/control characters, parent traversal, Windows
 drive/UNC forms, and overlong paths are rejected
-(`ssh_workspace_path_invalid`). A symlink resolving outside the root fails
-closed.
+(`ssh_workspace_path_invalid`). Before file-tree reads, `realpath` resolves the
+requested target and the result must equal the authoritative root or be a
+component-boundary descendant. Missing canonicalization support, unresolved
+targets, and relative or absolute symlink escapes fail closed; recursive tools
+do not switch to a looser mode.
 
 Each structured read is a fixed, validated command executed on an independent
-SSH exec channel that reuses the existing authenticated transport. It never
-reuses an SSH persistent shell process: variables, functions, cwd, umask, and
-redirections set in a persistent shell cannot influence structured tools.
-Unsupported resource-bound operations (writes, edits, patches, artifact
-writes, checkpoints, structured validation, LSP, project lifecycle) fail
-closed with `ssh_resource_unsupported_for_request`, `command_started=false`,
-and no Agent request enqueued.
+SSH exec channel that reuses the existing authenticated transport. Runner
+results use the versioned `webcodex.remote_workspace_read_result.v1` envelope;
+the Server validates its operation and outcome before applying the same
+read/search/Git parsers used by local tools. Malformed envelopes, nonzero
+operation exits, containment failures, and timeouts are tool failures rather
+than successful raw stdout. Search exclusion arguments come from the same
+shared protected-path policy as local search, so include globs cannot re-enable
+credential or bulk paths.
+
+Structured reads never reuse an SSH persistent shell process: variables,
+functions, cwd, umask, and redirections set in a persistent shell cannot
+influence structured tools. Resource routing is exhaustively classified by
+`ToolCall`: the ten reads above are supported; shell/job operations keep their
+existing resource-aware or stored-identity behavior; Session metadata and
+global operations remain local metadata operations; every other project-bound
+operation fails closed with `ssh_resource_unsupported_for_request`,
+`command_started=false`, and no Agent request enqueued.
 
 A missing Session leaves execution unchanged. A mismatched Session fails or,
 on an explicitly authorized cross-project escape path, executes without

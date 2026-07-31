@@ -183,6 +183,7 @@ pub(super) fn resolve_disconnected_sync_requests_locked(
                 stderr: None,
                 duration_ms: None,
                 error: Some(error.to_string()),
+                remote_workspace: None,
             };
             // The receiver may already be gone if the caller timed out first;
             // a failed send is expected and safe to ignore.
@@ -641,6 +642,7 @@ impl ShellClientRegistry {
         read: RemoteWorkspaceReadRequest,
         ssh_resource: String,
         ssh_session_id: String,
+        session_cwd: Option<String>,
         requested_by: String,
     ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
         validate_id(&client_id, "client_id")?;
@@ -684,8 +686,8 @@ impl ShellClientRegistry {
             runtime_project_id: None,
             workflow_session_id: Some(ssh_session_id),
             ssh_resource: Some(ssh_resource),
-            project_cwd: None,
-            cwd: None,
+            project_cwd: session_cwd.clone(),
+            cwd: session_cwd.clone(),
             purpose: None,
             shell: None,
             command_preview: String::new(),
@@ -696,7 +698,7 @@ impl ShellClientRegistry {
             client_id: client_id.clone(),
             kind: SSH_WORKSPACE_READ_REQUEST_KIND.to_string(),
             job_id: None,
-            cwd: None,
+            cwd: session_cwd,
             path: None,
             content: None,
             max_bytes: None,

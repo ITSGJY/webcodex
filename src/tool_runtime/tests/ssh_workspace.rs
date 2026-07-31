@@ -2,7 +2,10 @@
 
 use super::super::*;
 use super::support::*;
-use crate::shell_protocol::{ShellAgentShellRequest, ShellClientCapabilities};
+use crate::shell_protocol::{
+    RemoteWorkspaceReadOutcome, RemoteWorkspaceReadResponse, ShellAgentShellRequest,
+    ShellClientCapabilities, REMOTE_WORKSPACE_READ_RESULT_FORMAT,
+};
 
 /// A Runner that declares the SSH workspace-read capability.
 async fn register_ssh_workspace_runner(runtime: &ToolRuntime, client_id: &str, project_id: &str) {
@@ -243,19 +246,31 @@ async fn resource_bound_read_routes_to_ssh_workspace_read_request() {
         Some(session.session_id.as_str())
     );
     assert_eq!(context.ssh_resource.as_deref(), Some("tmp"));
+    assert_eq!(request.cwd.as_deref(), Some("/remote/root"));
+    assert_eq!(context.cwd.as_deref(), Some("/remote/root"));
+    assert_eq!(context.project_cwd.as_deref(), Some("/remote/root"));
     assert!(request.remote_workspace.is_some(), "typed payload present");
     let read = request.remote_workspace.as_ref().unwrap();
     assert_eq!(read.operation, "read_file");
     assert_eq!(read.path, "src/main.rs");
 
-    // Complete the request with remote content.
+    // Complete the request with the exact versioned envelope produced by the Runner.
+    let remote = RemoteWorkspaceReadResponse {
+        format: REMOTE_WORKSPACE_READ_RESULT_FORMAT.to_string(),
+        operation: "read_file".to_string(),
+        outcome: RemoteWorkspaceReadOutcome::Success {
+            exit_code: 0,
+            stdout: "{\"format\":\"webcodex.file_read_range.v1\",\"content\":\"remote main\\n\",\"sha256\":\"abc\",\"total_lines\":1,\"start_line\":1,\"limit\":10}".to_string(),
+            stdout_truncated: false,
+        },
+    };
     complete_patch_agent_request_for_instance(
         &runtime,
         "ws",
         "inst-ws",
         &request.request_id,
         0,
-        "{\"format\":\"webcodex.file_read_range.v1\",\"content\":\"remote main\\n\",\"sha256\":\"abc\",\"total_lines\":1,\"start_line\":1,\"limit\":10}",
+        &serde_json::to_string(&remote).unwrap(),
         "",
     )
     .await;
@@ -263,6 +278,7 @@ async fn resource_bound_read_routes_to_ssh_workspace_read_request() {
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["path"], "src/main.rs");
     assert_eq!(result.output["executor"], "ssh");
+    assert_eq!(result.output["resource"], "tmp");
 }
 
 #[tokio::test]

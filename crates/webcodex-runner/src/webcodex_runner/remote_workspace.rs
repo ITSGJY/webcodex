@@ -30,7 +30,10 @@ use super::config::SshConfig;
 use super::output::{err_cmd, CommandResult};
 use super::ssh::SshConnectionPool;
 use super::AgentPolicy;
-use crate::shell_protocol::RemoteWorkspaceReadRequest;
+use crate::shell_protocol::{
+    RemoteWorkspaceReadOutcome, RemoteWorkspaceReadRequest, RemoteWorkspaceReadResponse,
+    REMOTE_WORKSPACE_READ_RESULT_FORMAT,
+};
 use std::time::Instant;
 
 /// Upper bound for one structured remote read result.
@@ -38,7 +41,6 @@ const REMOTE_READ_MAX_OUTPUT_BYTES: usize = 256 * 1024;
 /// Longest accepted project-relative path.
 const MAX_REMOTE_PATH_BYTES: usize = 4096;
 /// `rg`/grep fallback budget used by the bounded search wrapper.
-const REMOTE_SEARCH_HEAD_LINES: usize = 4096;
 
 /// Execute one structured read-only operation against the Workflow Session's
 /// SSH resource and return the bounded raw stdout/stderr plus exit code.
@@ -46,6 +48,113 @@ const REMOTE_SEARCH_HEAD_LINES: usize = 4096;
 /// that value, else the resource's `default_cwd`, else the remote login
 /// directory.
 pub(crate) fn run_remote_workspace_read(
+    pool: &SshConnectionPool,
+    generation: u64,
+    config: &SshConfig,
+    policy: &AgentPolicy,
+    resource_name: &str,
+    session_id: &str,
+    session_cwd: Option<&str>,
+    read: &RemoteWorkspaceReadRequest,
+) -> CommandResult {
+    let start = Instant::now();
+    let raw = run_remote_workspace_read_inner(
+        pool,
+        generation,
+        config,
+        policy,
+        resource_name,
+        session_id,
+        session_cwd,
+        read,
+    );
+    let outcome = if let Some(error) = raw.error {
+        RemoteWorkspaceReadOutcome::Failure {
+            error_kind: remote_error_kind(&error).to_string(),
+            message: sanitize_remote_error(&error),
+            command_started: raw.exit_code.is_some(),
+            command_completed: raw.exit_code.is_some(),
+            exit_code: raw.exit_code,
+        }
+    } else if raw.exit_code == Some(0)
+        || (read.operation == "search_project_text" && raw.exit_code == Some(1))
+    {
+        RemoteWorkspaceReadOutcome::Success {
+            exit_code: raw.exit_code.unwrap_or(0),
+            stdout: raw.stdout.unwrap_or_default(),
+            stdout_truncated: false,
+        }
+    } else {
+        RemoteWorkspaceReadOutcome::Failure {
+            error_kind: operation_error_kind(read, raw.exit_code).to_string(),
+            message: operation_failure_message(read),
+            command_started: true,
+            command_completed: true,
+            exit_code: raw.exit_code,
+        }
+    };
+    let response = RemoteWorkspaceReadResponse {
+        format: REMOTE_WORKSPACE_READ_RESULT_FORMAT.to_string(),
+        operation: read.operation.clone(),
+        outcome,
+    };
+    super::output::ok_cmd(
+        start,
+        serde_json::to_value(response).unwrap_or_else(|_| {
+            serde_json::json!({
+                "format": REMOTE_WORKSPACE_READ_RESULT_FORMAT,
+                "operation": read.operation,
+                "status": "failure",
+                "error_kind": "ssh_workspace_protocol_failure",
+                "message": "failed to serialize SSH workspace response",
+                "command_started": false,
+                "command_completed": false
+            })
+        }),
+    )
+}
+
+fn remote_error_kind(error: &str) -> &str {
+    error
+        .split(':')
+        .next()
+        .unwrap_or("ssh_workspace_transport_failure")
+}
+
+fn sanitize_remote_error(error: &str) -> String {
+    let kind = remote_error_kind(error);
+    match kind {
+        "ssh_workspace_root_unavailable" => "remote workspace root is unavailable".to_string(),
+        "ssh_workspace_root_invalid" => "remote workspace root is invalid".to_string(),
+        "ssh_workspace_path_invalid" => "remote workspace path is invalid".to_string(),
+        "ssh_command_spawn_failed" | "ssh_command_wait_failed" => {
+            "SSH workspace transport failed".to_string()
+        }
+        _ if error.to_ascii_lowercase().contains("timed out") => {
+            "SSH workspace operation timed out".to_string()
+        }
+        _ => "SSH workspace operation failed".to_string(),
+    }
+}
+
+fn operation_error_kind(read: &RemoteWorkspaceReadRequest, exit_code: Option<i32>) -> &str {
+    match exit_code {
+        Some(120) => "ssh_workspace_containment_unavailable",
+        Some(121) => "ssh_workspace_containment_denied",
+        Some(122) => "ssh_workspace_target_unavailable",
+        Some(123) => "ssh_workspace_file_not_text",
+        Some(124) => "ssh_workspace_output_limit_exceeded",
+        Some(125) => "ssh_workspace_read_capability_unavailable",
+        Some(3) if read.operation.starts_with("git_") => "ssh_workspace_not_git_repository",
+        _ => "ssh_workspace_operation_failed",
+    }
+}
+
+fn operation_failure_message(read: &RemoteWorkspaceReadRequest) -> String {
+    format!("SSH workspace {} failed", read.operation)
+}
+
+fn run_remote_workspace_read_inner(
     pool: &SshConnectionPool,
     generation: u64,
     config: &SshConfig,
@@ -219,23 +328,28 @@ fn build_remote_read_command(
     match read.operation.as_str() {
         "read_file" => Ok(read_file_command(read, relative)),
         "list_project_files" => {
-            let escaped = super::shell::shell_quote(relative);
             Ok(format!(
-                "printf '%s\\n' {escaped}/*/ 2>/dev/null; printf '%s\\n' {escaped}/* 2>/dev/null"
+                "{guard}cd -- \"$target\" || exit 122; find . -mindepth 1 -maxdepth 1 -printf '%f\\t%y\\n' | awk -F '\\t' '{{print $1 ($2 == \"d\" ? \"/\" : \"\")}}' | sort | head -n {limit}",
+                guard = physical_containment_guard(relative),
+                limit = read.limit.unwrap_or(200).clamp(1, 500).saturating_add(1),
             ))
         }
         "project_overview" => {
             // Bounded directory scan: enumerate the whole tree as `%y %p`
             // records with a shallow max depth, never file contents. The Server
             // parses these into the overview shape.
-            let escaped = super::shell::shell_quote(relative);
             Ok(format!(
-                "find {escaped} -mindepth 1 -maxdepth {} \\( -type f -o -type d \\) -printf '%y %p\\n' 2>/dev/null | head -n {}",
-                project_overview_depth(read),
-                project_overview_limit(read)
+                "{guard}cd -- \"$target\" || exit 122; find . -mindepth 1 -maxdepth {depth} \\( -type f -o -type d \\) -printf '%y %p\\n' 2>/dev/null | head -n {limit}",
+                guard = physical_containment_guard(relative),
+                depth = project_overview_depth(read),
+                limit = project_overview_limit(read).saturating_add(1),
             ))
         }
-        "search_project_text" => Ok(search_command(read)),
+        "search_project_text" => Ok(format!(
+            "{}{}",
+            physical_containment_guard(relative),
+            search_command(read)
+        )),
         "list_project_tracked_files" => {
             let pathspec = if relative == "." {
                 String::new()
@@ -252,7 +366,8 @@ fn build_remote_read_command(
                 "if git rev-parse --git-dir >/dev/null 2>&1; then git ls-files -z --cached{pathspec} | head -z -c 1048576 2>/dev/null; else exit 3; fi"
             ))
         }
-        "git_status" | "git_diff_summary" => Ok(git_status_command().to_string()),
+        "git_status" => Ok(git_status_command().to_string()),
+        "git_diff_summary" => Ok(git_diff_summary_command()),
         "git_diff" => Ok(git_diff_command(read)),
         "git_diff_hunks" => Ok(git_diff_hunks_command(read, relative)),
         "git_log" => Ok(git_log_command(read)),
@@ -263,23 +378,32 @@ fn build_remote_read_command(
 }
 
 fn read_file_command(read: &RemoteWorkspaceReadRequest, relative: &str) -> String {
-    let escaped = super::shell::shell_quote(relative);
+    let start = read.start_line.unwrap_or(1).max(1);
+    let end = read.end_line.unwrap_or(start.saturating_add(1999));
     let max = read.max_bytes.unwrap_or(REMOTE_READ_MAX_OUTPUT_BYTES);
-    if let (Some(start), Some(end)) = (read.start_line, read.end_line) {
-        if start == 0 || end < start {
-            return "exit 2".to_string();
-        }
-        let limit = end.saturating_sub(start).saturating_add(1);
-        format!(
-            "{containment}awk 'NR >= {start} && NR <= {end}' {escaped} 2>/dev/null | head -n {limit}",
-            containment = read_containment_guard(relative),
-        )
-    } else {
-        format!(
-            "{containment}head -c {max} {escaped} 2>/dev/null",
-            containment = read_containment_guard(relative),
-        )
+    if end < start {
+        return "exit 2".to_string();
     }
+    let script = r#"import hashlib,json,sys
+p=sys.argv[1]; start=int(sys.argv[2]); end=int(sys.argv[3]); maxb=int(sys.argv[4])
+try:
+ data=open(p,'rb').read()
+except OSError:
+ sys.exit(122)
+if b'\\x00' in data: sys.exit(123)
+try:
+ text=data.decode('utf-8')
+except UnicodeDecodeError:
+ sys.exit(123)
+lines=text.splitlines(keepends=True); selected=''.join(lines[start-1:end]) if start <= len(lines) else ''
+if len(selected.encode('utf-8')) > maxb: sys.exit(124)
+print(json.dumps({'format':'webcodex.file_read_range.v1','content':selected,'sha256':hashlib.sha256(data).hexdigest(),'total_lines':len(lines),'start_line':start,'limit':end-start+1},separators=(',',':')))
+"#;
+    format!(
+        "{guard}command -v python3 >/dev/null 2>&1 || exit 125; python3 -c {script} \"$target\" {start} {end} {max}",
+        guard = physical_containment_guard(relative),
+        script = super::shell::shell_quote(script),
+    )
 }
 
 /// POSIX guard that refuses a read target whose physical path escapes the
@@ -288,86 +412,102 @@ fn read_file_command(read: &RemoteWorkspaceReadRequest, relative: &str) -> Strin
 /// fails closed (no loose fallback). `relative` is the already-validated
 /// project-relative path (no `..`, no absolute, no NUL/control).
 ///
-/// The guard is intentionally conservative: it uses `cd` + `pwd -P` to obtain
-/// the physical parent, verifies it stays under `$PWD`, and rejects a link
-/// whose resolved target escapes `$PWD`. A missing/relative `readlink` failure
-/// is a fail-closed rejection, never a fallback to a loose read.
-fn read_containment_guard(relative: &str) -> String {
+/// The guard is intentionally conservative: remote `realpath` resolves the
+/// complete target and the component-boundary check accepts only the physical
+/// root itself or one of its descendants. Missing `realpath`, an unresolved
+/// target, or any symlink escape is a fail-closed rejection.
+fn physical_containment_guard(relative: &str) -> String {
     let safe = super::shell::shell_quote(relative);
     format!(
-        r#"rel={safe}
-case "$rel" in
-  */*) parent=${{rel%/*}} ;;
-  *) parent=. ;;
+        r#"root=$PWD
+command -v realpath >/dev/null 2>&1 || exit 120
+target=$(realpath -- {safe} 2>/dev/null) || exit 122
+case "$target" in
+  "$root"|"$root"/*) : ;;
+  *) exit 121 ;;
 esac
-base=${{rel##*/}}
-[ -n "$base" ] || exit 2
-# Physical parent, resolved without following the final component.
-pp=$(cd -- "$parent" 2>/dev/null && pwd -P 2>/dev/null) || exit 2
-case "$pp" in
-  "$PWD"|"$PWD"/*) : ;;
-  *) exit 2 ;;
-esac
-if [ -L "$pp/$base" ]; then
-  rt=$(readlink -- "$pp/$base" 2>/dev/null) || exit 2
-  case "$rt" in
-    /*) rp=$rt ;;
-    *) rp="$pp/$rt" ;;
-  esac
-  case "$rp" in
-    "$PWD"|"$PWD"/*) : ;;
-    *) exit 2 ;;
-  esac
-fi
 "#
     )
 }
 
 fn search_command(read: &RemoteWorkspaceReadRequest) -> String {
-    let pattern = read.pattern.as_deref().unwrap_or("");
+    let pattern = super::shell::shell_quote(read.pattern.as_deref().unwrap_or(""));
     let relative = read.path.trim();
     let target = super::shell::shell_quote(if relative.is_empty() || relative == "." {
         "."
     } else {
         relative
     });
-    let pattern = super::shell::shell_quote(pattern);
     let mode = read.result_mode.as_deref().unwrap_or("matches");
-    // Only the fixed, validated result modes are honored. Anything else fails
-    // closed rather than being passed to a remote backend.
+    let before = read.context_before.unwrap_or(0).min(20);
+    let after = read.context_after.unwrap_or(0).min(20);
+    let limit = read.limit.unwrap_or(50).clamp(1, 200);
     let mode_args = match mode {
-        "matches" => "--with-filename --null --line-number --no-heading -B 2 -A 2".to_string(),
+        "matches" => {
+            format!("--with-filename --null --line-number --no-heading -B {before} -A {after}")
+        }
         "files_with_matches" => "--files-with-matches".to_string(),
         "count" => "--count --null".to_string(),
         _ => return "exit 2".to_string(),
     };
-    let mut extra = String::new();
-    for glob in read
-        .include_globs
-        .iter()
-        .flatten()
-        .chain(read.exclude_globs.iter().flatten())
-    {
-        let negated = read
-            .exclude_globs
-            .as_ref()
-            .is_some_and(|globs| globs.contains(glob));
-        let prefix = if negated { "!" } else { "" };
-        extra.push_str(" --glob ");
-        extra.push_str(&super::shell::shell_quote(&format!("{prefix}{glob}")));
+    let head = if mode == "matches" && (before > 0 || after > 0) {
+        limit
+            .saturating_add(1)
+            .saturating_mul(before.saturating_add(after).saturating_add(2))
+            .saturating_add(1)
+    } else {
+        limit.saturating_add(1)
+    };
+    let mut globs = String::new();
+    for glob in read.include_globs.iter().flatten() {
+        globs.push_str(" --glob ");
+        globs.push_str(&super::shell::shell_quote(glob));
     }
+    for glob in read.exclude_globs.iter().flatten() {
+        globs.push_str(" --glob ");
+        globs.push_str(&super::shell::shell_quote(&format!("!{glob}")));
+    }
+    for glob in protected_rg_globs() {
+        globs.push_str(" --glob ");
+        globs.push_str(&super::shell::shell_quote(glob));
+    }
+    let grep_excludes = protected_grep_excludes().join(" ");
+    let requires_rg = mode != "matches"
+        || read.include_globs.as_ref().is_some_and(|v| !v.is_empty())
+        || read.exclude_globs.as_ref().is_some_and(|v| !v.is_empty());
+    let fallback = if requires_rg {
+        "printf '%s\\n' '{\"webcodex_search\":{\"backend\":\"grep\",\"feature_unavailable\":true}}'; exit 0".to_string()
+    } else {
+        format!(
+            "status_file=${{TMPDIR:-/tmp}}/webcodex-search-$$; trap 'rm -f -- \"$status_file\"' EXIT HUP INT TERM; {{ grep -rnI --null {grep_excludes} -B {before} -A {after} -e {pattern} -- {target} 2>/dev/null; echo $? > \"$status_file\"; }} | head -n {head}; status=2; [ -f \"$status_file\" ] && read -r status < \"$status_file\"; printf '%s\\n' '{{\"webcodex_search\":{{\"backend\":\"grep\",\"feature_unavailable\":false}}}}'; exit \"$status\""
+        )
+    };
     format!(
-        "if command -v rg >/dev/null 2>&1; then rg {mode_args} --color never --hidden --sort path{extra} -e {pattern} -- {target} 2>/dev/null | head -n {head}; else grep -rnI --exclude-dir=.git --exclude-dir=target --exclude-dir=node_modules --exclude-dir=.venv --exclude-dir=venv --exclude-dir=__pycache__ -e {pattern} -- {target} 2>/dev/null | head -n {head}; fi",
-        head = REMOTE_SEARCH_HEAD_LINES,
+        "if command -v rg >/dev/null 2>&1; then status_file=${{TMPDIR:-/tmp}}/webcodex-search-$$; trap 'rm -f -- \"$status_file\"' EXIT HUP INT TERM; {{ rg {mode_args} --color never --hidden --sort path{globs} -e {pattern} -- {target} 2>/dev/null; echo $? > \"$status_file\"; }} | head -n {head}; status=2; [ -f \"$status_file\" ] && read -r status < \"$status_file\"; printf '%s\\n' '{{\"webcodex_search\":{{\"backend\":\"rg\",\"feature_unavailable\":false}}}}'; exit \"$status\"; else {fallback}; fi"
     )
 }
 
+fn protected_rg_globs() -> &'static [&'static str] {
+    webcodex_core::sensitive_paths::SEARCH_RG_EXCLUDE_GLOBS
+}
+
+fn protected_grep_excludes() -> &'static [&'static str] {
+    webcodex_core::sensitive_paths::SEARCH_GREP_EXCLUDES
+}
+
 fn git_status_command() -> &'static str {
-    "export GIT_PAGER=cat; git --no-pager status --porcelain"
+    "export GIT_PAGER=cat; git rev-parse --git-dir >/dev/null 2>&1 || exit 3; git --no-pager status --porcelain"
+}
+
+fn git_diff_summary_command() -> String {
+    format!(
+        "export GIT_PAGER=cat; git rev-parse --git-dir >/dev/null 2>&1 || exit 3; git status --porcelain; printf '\\n{}\\n'; git diff --stat",
+        "@@WEBCODEX_DIFF_SUMMARY_SEP@@"
+    )
 }
 
 fn git_diff_command(read: &RemoteWorkspaceReadRequest) -> String {
-    let mut parts = vec!["export GIT_PAGER=cat; git --no-pager diff".to_string()];
+    let mut parts = vec!["export GIT_PAGER=cat; git rev-parse --git-dir >/dev/null 2>&1 || exit 3; git --no-pager diff".to_string()];
     if read.cached == Some(true) {
         parts.push("--cached".to_string());
     }
@@ -382,18 +522,20 @@ fn git_diff_command(read: &RemoteWorkspaceReadRequest) -> String {
     parts.join(" ")
 }
 
-fn git_diff_hunks_command(read: &RemoteWorkspaceReadRequest, relative: &str) -> String {
+fn git_diff_hunks_command(read: &RemoteWorkspaceReadRequest, _relative: &str) -> String {
     let mut parts = vec![
         "export GIT_PAGER=cat".to_string(),
-        "git --no-pager diff".to_string(),
+        "git rev-parse --git-dir >/dev/null 2>&1 || exit 3; git --no-pager diff".to_string(),
     ];
     if read.cached == Some(true) {
         parts.push("--cached".to_string());
     }
     parts.push("--unified=80".to_string());
-    if relative != "." {
-        parts.push("--".to_string());
-        parts.push(super::shell::shell_quote(relative));
+    if let Some(paths) = read.paths.as_deref() {
+        if !paths.is_empty() {
+            parts.push("--".to_string());
+            parts.extend(paths.iter().map(|path| super::shell::shell_quote(path)));
+        }
     }
     parts.join(" ")
 }
@@ -406,7 +548,7 @@ fn git_log_command(read: &RemoteWorkspaceReadRequest) -> String {
         .saturating_add(1);
     let skip = read.skip.unwrap_or(0).min(10_000);
     format!(
-        "export GIT_PAGER=cat; git --no-pager log --decorate=short --date=iso-strict --pretty=format:'%H%x1f%h%x1f%D%x1f%an%x1f%ae%x1f%aI%x1f%s%x1e' -n {limit} --skip {skip}"
+        "export GIT_PAGER=cat; git rev-parse --git-dir >/dev/null 2>&1 || exit 3; git --no-pager log --decorate=short --date=iso-strict --pretty=format:'%H%x1f%h%x1f%D%x1f%an%x1f%ae%x1f%aI%x1f%s%x1e' -n {limit} --skip {skip}"
     )
 }
 
@@ -601,7 +743,10 @@ mod tests {
 mod ssh_integration {
     use super::super::config::{AgentPolicy, SshConfig, SshResourceConfig};
     use super::super::ssh::SshConnectionPool;
-    use super::{run_remote_workspace_read, RemoteWorkspaceReadRequest};
+    use super::{
+        run_remote_workspace_read, RemoteWorkspaceReadOutcome, RemoteWorkspaceReadRequest,
+        RemoteWorkspaceReadResponse,
+    };
     use std::collections::BTreeMap;
     use std::net::{TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
@@ -806,6 +951,20 @@ mod ssh_integration {
         )
     }
 
+    fn parsed_response(
+        result: &super::super::output::CommandResult,
+    ) -> RemoteWorkspaceReadResponse {
+        serde_json::from_str(result.stdout.as_deref().expect("typed response stdout"))
+            .expect("valid typed remote workspace response")
+    }
+
+    fn success_stdout(result: &super::super::output::CommandResult) -> String {
+        match parsed_response(result).outcome {
+            RemoteWorkspaceReadOutcome::Success { stdout, .. } => stdout,
+            other => panic!("expected success outcome, got {other:?}"),
+        }
+    }
+
     fn git_init(path: &Path) {
         let status = Command::new("git")
             .args(["init", "-q"])
@@ -988,14 +1147,12 @@ mod ssh_integration {
         let read = read_request("read_file", "README.md");
         let missing = server.remote_cwd.join("does-not-exist");
         let result = run_read(&pool, &config, Some(&missing.to_string_lossy()), &read);
-        assert!(result.exit_code.is_none(), "{result:?}");
-        assert!(
-            result
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("ssh_workspace_root_unavailable")),
-            "{result:?}"
-        );
+        assert_eq!(result.exit_code, Some(0), "{result:?}");
+        assert!(matches!(
+            parsed_response(&result).outcome,
+            RemoteWorkspaceReadOutcome::Failure { ref error_kind, command_started: false, .. }
+                if error_kind == "ssh_workspace_root_unavailable"
+        ));
 
         // Absolute and `..` paths rejected before any exec.
         for bad in ["/etc/passwd", "../escape", "a/../../b", "C:\\Windows"] {
@@ -1006,12 +1163,17 @@ mod ssh_integration {
                 Some(&server.remote_cwd.to_string_lossy()),
                 &read,
             );
-            assert!(result.error.is_some(), "{bad:?} should fail: {result:?}");
+            assert_eq!(
+                result.exit_code,
+                Some(0),
+                "{bad:?} should return typed failure: {result:?}"
+            );
             assert!(
-                result
-                    .error
-                    .as_deref()
-                    .is_some_and(|error| error.contains("ssh_workspace_path_invalid")),
+                matches!(
+                    parsed_response(&result).outcome,
+                    RemoteWorkspaceReadOutcome::Failure { ref error_kind, command_started: false, .. }
+                        if error_kind == "ssh_workspace_path_invalid"
+                ),
                 "{bad:?} → {result:?}"
             );
         }
@@ -1035,6 +1197,111 @@ mod ssh_integration {
                 .is_some_and(|out| out.contains("safe")),
             "{result:?}"
         );
+    }
+
+    #[test]
+    fn directory_symlinks_and_protected_search_fail_closed() {
+        let Some(server) = TestSshServer::start() else {
+            eprintln!("skipping SSH integration test because sshd is unavailable");
+            return;
+        };
+        let config = config_for(&server);
+        let pool = SshConnectionPool::with_test_config(server.client_config.clone());
+        let outside = server._temp.path().join("outside-tree");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("outside.txt"), "OUTSIDE_TREE_MARKER\n").unwrap();
+        std::os::unix::fs::symlink("../outside-tree", server.remote_cwd.join("relative-out"))
+            .unwrap();
+        std::os::unix::fs::symlink(&outside, server.remote_cwd.join("absolute-out")).unwrap();
+
+        for operation in [
+            "list_project_files",
+            "project_overview",
+            "search_project_text",
+        ] {
+            for path in ["relative-out", "absolute-out"] {
+                let mut read = read_request(operation, path);
+                if operation == "search_project_text" {
+                    read.pattern = Some("OUTSIDE_TREE_MARKER".to_string());
+                }
+                let result = run_read(
+                    &pool,
+                    &config,
+                    Some(&server.remote_cwd.to_string_lossy()),
+                    &read,
+                );
+                assert!(
+                    matches!(
+                        parsed_response(&result).outcome,
+                        RemoteWorkspaceReadOutcome::Failure { ref error_kind, exit_code: Some(121), .. }
+                            if error_kind == "ssh_workspace_containment_denied"
+                    ),
+                    "{operation} {path}: {result:?}"
+                );
+                assert!(!result
+                    .stdout
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("OUTSIDE_TREE_MARKER"));
+            }
+        }
+
+        std::fs::write(server.remote_cwd.join("inside.txt"), "inside remote\n").unwrap();
+        std::os::unix::fs::symlink("inside.txt", server.remote_cwd.join("inside-link")).unwrap();
+        let result = run_read(
+            &pool,
+            &config,
+            Some(&server.remote_cwd.to_string_lossy()),
+            &read_request("read_file", "inside-link"),
+        );
+        assert!(
+            success_stdout(&result).contains("inside remote"),
+            "{result:?}"
+        );
+
+        let marker = "PROTECTED_SEARCH_UNIQUE_MARKER";
+        for (path, is_dir) in [
+            (".env", false),
+            (".env.local", false),
+            ("private.pem", false),
+            ("agent.toml", false),
+            ("webcodex.env", false),
+            ("secrets/token.txt", true),
+            ("tokens/token.txt", true),
+        ] {
+            let target = server.remote_cwd.join(path);
+            if is_dir {
+                std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            }
+            std::fs::write(target, format!("{marker}\n")).unwrap();
+        }
+        let mut search = read_request("search_project_text", ".");
+        search.pattern = Some(marker.to_string());
+        search.include_globs = Some(vec!["**/*".to_string(), "**/.env*".to_string()]);
+        let result = run_read(
+            &pool,
+            &config,
+            Some(&server.remote_cwd.to_string_lossy()),
+            &search,
+        );
+        let output = success_stdout(&result);
+        assert!(
+            !output.contains(marker),
+            "protected marker leaked: {output:?}"
+        );
+        for protected in [
+            ".env",
+            "secrets/",
+            "tokens/",
+            "private.pem",
+            "agent.toml",
+            "webcodex.env",
+        ] {
+            assert!(
+                !output.contains(protected),
+                "protected path leaked: {output:?}"
+            );
+        }
     }
 
     #[test]
@@ -1064,10 +1331,15 @@ mod ssh_integration {
             !stdout.contains("outside secret"),
             "symlink read escaped the remote root: {result:?}"
         );
-        assert_ne!(
+        assert_eq!(
             result.exit_code,
             Some(0),
-            "escaping symlink must fail closed: {result:?}"
+            "typed failure must cross transport: {result:?}"
         );
+        assert!(matches!(
+            parsed_response(&result).outcome,
+            RemoteWorkspaceReadOutcome::Failure { ref error_kind, exit_code: Some(121), .. }
+                if error_kind == "ssh_workspace_containment_denied"
+        ));
     }
 }

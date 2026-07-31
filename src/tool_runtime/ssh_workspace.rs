@@ -20,61 +20,121 @@
 //! Agent request enqueued.
 
 use super::{ToolCall, ToolResult, ToolRuntime};
-use crate::shell_protocol::{RemoteWorkspaceReadRequest, ShellRunResponse};
+use crate::shell_protocol::{
+    RemoteWorkspaceReadOutcome, RemoteWorkspaceReadRequest, ShellRunResponse,
+    REMOTE_WORKSPACE_READ_RESULT_FORMAT,
+};
 use serde_json::{json, Value};
 use std::time::Duration;
 
 /// Timeout budget for one structured remote read.
 const SSH_WORKSPACE_READ_TIMEOUT_SECS: u64 = 30;
 
-/// The set of resource-bound project/Git read tools supported this round.
-pub(crate) fn is_ssh_workspace_read_call(call: &ToolCall) -> bool {
-    matches!(
-        call,
-        ToolCall::ReadFile { .. }
-            | ToolCall::ListProjectFiles { .. }
-            | ToolCall::ListProjectTrackedFiles { .. }
-            | ToolCall::ProjectOverview { .. }
-            | ToolCall::SearchProjectText { .. }
-            | ToolCall::GitStatus { .. }
-            | ToolCall::GitDiff { .. }
-            | ToolCall::GitDiffHunks { .. }
-            | ToolCall::GitLog { .. }
-            | ToolCall::GitDiffSummary { .. }
-    )
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SshResourceRouting {
+    SupportedWorkspaceRead,
+    ExistingResourceAware,
+    StoredIdentityOperation,
+    SessionMetadataOnly,
+    UnsupportedProjectOperation,
+    UnrelatedGlobalOperation,
 }
 
-/// The set of resource-bound project/Git operations that are NOT supported
-/// this round and must fail closed rather than touching the Runner's local
-/// project checkout.
-pub(crate) fn is_ssh_workspace_fail_closed_call(call: &ToolCall) -> bool {
-    matches!(
-        call,
-        ToolCall::WriteProjectFile { .. }
-            | ToolCall::ReplaceInFile { .. }
-            | ToolCall::ReplaceExactBlock { .. }
-            | ToolCall::InsertBeforePattern { .. }
-            | ToolCall::InsertAfterPattern { .. }
-            | ToolCall::ReplaceLineRange { .. }
-            | ToolCall::InsertAtLine { .. }
-            | ToolCall::DeleteLineRange { .. }
-            | ToolCall::ApplyTextEdits { .. }
-            | ToolCall::SaveProjectArtifact { .. }
-            | ToolCall::ArtifactUploadBegin { .. }
-            | ToolCall::ArtifactUploadChunk { .. }
-            | ToolCall::ArtifactUploadFinish { .. }
-            | ToolCall::ArtifactUploadAbort { .. }
-            | ToolCall::WorkspaceCheckpointCreate { .. }
-            | ToolCall::WorkspaceCheckpointRestore { .. }
-            | ToolCall::WorkspaceCheckpointDelete { .. }
-            | ToolCall::ApplyPatch { .. }
-            | ToolCall::ApplyPatchChecked { .. }
-            | ToolCall::ValidatePatch { .. }
-            | ToolCall::GitRestorePaths { .. }
-            | ToolCall::DiscardUntracked { .. }
-            | ToolCall::RegisterProject { .. }
-            | ToolCall::CreateProject { .. }
-    )
+/// Exhaustive routing policy for a ToolCall executed in an exact Session/project
+/// binding that has an SSH resource. New ToolCall variants must be classified
+/// here before they can compile, so project operations cannot silently fall
+/// through to the Runner-local checkout.
+pub(crate) fn ssh_resource_routing(call: &ToolCall) -> SshResourceRouting {
+    use SshResourceRouting::*;
+    match call {
+        ToolCall::ReadFile { .. }
+        | ToolCall::ListProjectFiles { .. }
+        | ToolCall::ListProjectTrackedFiles { .. }
+        | ToolCall::ProjectOverview { .. }
+        | ToolCall::SearchProjectText { .. }
+        | ToolCall::GitStatus { .. }
+        | ToolCall::GitDiff { .. }
+        | ToolCall::GitDiffHunks { .. }
+        | ToolCall::GitLog { .. }
+        | ToolCall::GitDiffSummary { .. } => SupportedWorkspaceRead,
+
+        ToolCall::RunShell { .. } | ToolCall::RunJob { .. } | ToolCall::OpenSessionShell { .. } => {
+            ExistingResourceAware
+        }
+
+        ToolCall::StopJob { .. }
+        | ToolCall::JobStatus { .. }
+        | ToolCall::JobLog { .. }
+        | ToolCall::ListJobs { .. }
+        | ToolCall::JobTail { .. }
+        | ToolCall::SessionShellExec { .. }
+        | ToolCall::SessionShellStatus { .. }
+        | ToolCall::CloseSessionShell { .. } => StoredIdentityOperation,
+
+        ToolCall::StartSession { .. }
+        | ToolCall::SessionSummary { .. }
+        | ToolCall::UpdateSessionContext { .. }
+        | ToolCall::CloseSession { .. }
+        | ToolCall::ValidationSummary { .. }
+        | ToolCall::PostSessionMessage { .. }
+        | ToolCall::ListSessionMessages { .. }
+        | ToolCall::ResolveSessionMessage { .. }
+        | ToolCall::SessionDiscussionSummary { .. }
+        | ToolCall::BindCurrentSession { .. }
+        | ToolCall::CurrentSession { .. }
+        | ToolCall::UnbindCurrentSession { .. } => SessionMetadataOnly,
+
+        ToolCall::ListTools { .. }
+        | ToolCall::ListProjects
+        | ToolCall::ListAgents
+        | ToolCall::RuntimeStatus { .. }
+        | ToolCall::ToolManifest { .. } => UnrelatedGlobalOperation,
+
+        ToolCall::StartCodingTask { .. }
+        | ToolCall::FinishCodingTask { .. }
+        | ToolCall::SessionHandoffSummary { .. }
+        | ToolCall::WorkspaceCheckpointCreate { .. }
+        | ToolCall::WorkspaceCheckpointList { .. }
+        | ToolCall::WorkspaceCheckpointShow { .. }
+        | ToolCall::WorkspaceCheckpointRestore { .. }
+        | ToolCall::WorkspaceCheckpointDelete { .. }
+        | ToolCall::ApplyPatch { .. }
+        | ToolCall::ApplyPatchChecked { .. }
+        | ToolCall::DeleteProjectFiles { .. }
+        | ToolCall::GitRestorePaths { .. }
+        | ToolCall::DiscardUntracked { .. }
+        | ToolCall::ValidatePatch { .. }
+        | ToolCall::CargoFmt { .. }
+        | ToolCall::CargoCheck { .. }
+        | ToolCall::CargoTest { .. }
+        | ToolCall::ShowChanges { .. }
+        | ToolCall::ReplaceInFile { .. }
+        | ToolCall::ReplaceExactBlock { .. }
+        | ToolCall::InsertBeforePattern { .. }
+        | ToolCall::InsertAfterPattern { .. }
+        | ToolCall::WriteProjectFile { .. }
+        | ToolCall::SaveProjectArtifact { .. }
+        | ToolCall::ReadProjectArtifactMetadata { .. }
+        | ToolCall::ReadProjectArtifact { .. }
+        | ToolCall::ArtifactUploadBegin { .. }
+        | ToolCall::ArtifactUploadChunk { .. }
+        | ToolCall::ArtifactUploadFinish { .. }
+        | ToolCall::ArtifactUploadAbort { .. }
+        | ToolCall::ReplaceLineRange { .. }
+        | ToolCall::InsertAtLine { .. }
+        | ToolCall::DeleteLineRange { .. }
+        | ToolCall::ApplyTextEdits { .. }
+        | ToolCall::WorkspaceHygieneCheck { .. }
+        | ToolCall::LspStatus { .. }
+        | ToolCall::DocumentSymbols { .. }
+        | ToolCall::DocumentDiagnostics { .. }
+        | ToolCall::Hover { .. }
+        | ToolCall::WorkspaceSymbols { .. }
+        | ToolCall::GotoDefinition { .. }
+        | ToolCall::FindReferences { .. }
+        | ToolCall::RegisterProject { .. }
+        | ToolCall::CreateProject { .. } => UnsupportedProjectOperation,
+    }
 }
 
 /// Fail-closed result for a resource-bound operation this round does not
@@ -308,8 +368,47 @@ impl ToolRuntime {
         call: ToolCall,
         ssh_resource: &str,
         ssh_session_id: &str,
+        ssh_session_cwd: Option<&str>,
         auth: Option<&crate::auth::AuthContext>,
     ) -> ToolResult {
+        if let ToolCall::SearchProjectText {
+            pattern,
+            path,
+            limit,
+            context_before,
+            context_after,
+            include_globs,
+            exclude_globs,
+            result_mode,
+            timeout_secs,
+            ..
+        } = &call
+        {
+            let options =
+                match super::files::SearchOptions::normalize(super::files::SearchRequest {
+                    pattern: pattern.clone(),
+                    path: path.clone(),
+                    limit: *limit,
+                    context_before: *context_before,
+                    context_after: *context_after,
+                    include_globs: include_globs.clone(),
+                    exclude_globs: exclude_globs.clone(),
+                    result_mode: *result_mode,
+                    timeout_secs: *timeout_secs,
+                }) {
+                    Ok(options) => options,
+                    Err(error) => return error.into_tool_result(),
+                };
+            if super::files::is_search_project_text_excluded_path(&options.path) {
+                let mut result = super::files::empty_search_project_text_output(
+                    call.project().unwrap_or(""),
+                    &options,
+                );
+                result.output["executor"] = json!("ssh");
+                result.output["resource"] = json!(ssh_resource);
+                return result;
+            }
+        }
         let project = match call.project() {
             Some(project) => project.to_string(),
             None => return ssh_resource_unsupported_result(&call),
@@ -333,6 +432,7 @@ impl ToolRuntime {
                 read,
                 ssh_resource.to_string(),
                 ssh_session_id.to_string(),
+                ssh_session_cwd.map(str::to_string),
                 "tool_runtime".to_string(),
             )
             .await
@@ -354,7 +454,7 @@ impl ToolRuntime {
         };
         let wait_timeout = SSH_WORKSPACE_READ_TIMEOUT_SECS + 4;
         match tokio::time::timeout(Duration::from_secs(wait_timeout), rx).await {
-            Ok(Ok(resp)) => self.parse_remote_read_response(&call, resp),
+            Ok(Ok(resp)) => self.parse_remote_read_response(&call, ssh_resource, resp),
             Ok(Err(_)) => {
                 self.shell_clients.cancel_request(&request_id).await;
                 ToolResult::err("ssh workspace read request was dropped")
@@ -368,44 +468,114 @@ impl ToolRuntime {
 
     /// Convert the Runner's bounded raw response into the existing local tool
     /// output shape, plus a safe execution-target summary.
-    fn parse_remote_read_response(&self, call: &ToolCall, resp: ShellRunResponse) -> ToolResult {
-        let resource = call.tool_name().to_string();
-        let _ = resource;
-        // The resource name is recovered from the enqueued request metadata via
-        // the job_context on the wire; the response itself carries only safe
-        // fields, so the executor summary here is derived from the ToolCall.
+    fn parse_remote_read_response(
+        &self,
+        call: &ToolCall,
+        resource: &str,
+        resp: ShellRunResponse,
+    ) -> ToolResult {
+        // The resource name comes from the already-validated exact Session
+        // binding. The response itself never supplies routing identity.
         let executor = json!({
             "executor": "ssh",
+            "resource": resource,
         });
-        let stderr = resp.stderr.unwrap_or_default();
-        let stdout = resp.stdout.unwrap_or_default();
         if resp.error.is_some() {
-            let error = resp.error.unwrap_or_default();
             return ToolResult::err_with_output(
-                error.clone(),
+                "SSH workspace transport failed",
                 json!({
-                    "error_kind": "ssh_workspace_read_failed",
+                    "error_kind": "ssh_workspace_transport_failure",
                     "command_started": resp.exit_code.is_some(),
                     "command_completed": false,
                     "command_ok": false,
-                    "exit_code": null,
+                    "exit_code": resp.exit_code,
                     "tool_failure": true,
-                    "stderr": stderr,
                     "executor": executor["executor"],
+                    "resource": executor["resource"],
                 }),
             );
         }
-        if resp.exit_code == Some(-1) && stderr.contains("command timed out") {
-            return ToolResult::err("ssh workspace read timed out");
+        let Some(remote) = resp.remote_workspace else {
+            return ToolResult::err_with_output(
+                "malformed SSH workspace response",
+                json!({
+                    "error_kind": "ssh_workspace_protocol_failure",
+                    "command_started": resp.exit_code.is_some(),
+                    "command_completed": resp.exit_code.is_some(),
+                    "command_ok": false,
+                    "exit_code": resp.exit_code,
+                    "tool_failure": true,
+                    "executor": executor["executor"],
+                    "resource": executor["resource"],
+                }),
+            );
+        };
+        let expected_operation = build_remote_read_request(call, "")
+            .ok()
+            .map(|(_, read)| read.operation)
+            .unwrap_or_default();
+        if remote.format != REMOTE_WORKSPACE_READ_RESULT_FORMAT
+            || remote.operation != expected_operation
+        {
+            return ToolResult::err_with_output(
+                "malformed SSH workspace response",
+                json!({
+                    "error_kind": "ssh_workspace_protocol_failure",
+                    "command_started": true,
+                    "command_completed": true,
+                    "command_ok": false,
+                    "exit_code": null,
+                    "tool_failure": true,
+                    "executor": executor["executor"],
+                    "resource": executor["resource"],
+                }),
+            );
         }
+        let (stdout, exit_code) = match remote.outcome {
+            RemoteWorkspaceReadOutcome::Success {
+                exit_code, stdout, ..
+            } => (stdout, Some(exit_code)),
+            RemoteWorkspaceReadOutcome::Failure {
+                error_kind,
+                message,
+                command_started,
+                command_completed,
+                exit_code,
+            } => {
+                return ToolResult::err_with_output(
+                    message,
+                    json!({
+                        "error_kind": error_kind,
+                        "command_started": command_started,
+                        "command_completed": command_completed,
+                        "command_ok": false,
+                        "exit_code": exit_code,
+                        "tool_failure": true,
+                        "executor": executor["executor"],
+                        "resource": executor["resource"],
+                    }),
+                );
+            }
+        };
+        let stderr = String::new();
         match call {
-            ToolCall::ReadFile { path, .. } => {
+            ToolCall::ReadFile {
+                path,
+                start_line,
+                limit,
+                with_line_numbers,
+                ..
+            } => {
                 let mut result = super::files::read_file_agent_stdout_result_with_options(
-                    stdout, None, None, false,
+                    stdout,
+                    *start_line,
+                    *limit,
+                    with_line_numbers.unwrap_or(false),
                 );
                 if result.success {
                     result.output["path"] = json!(path);
                     result.output["executor"] = executor["executor"].clone();
+                    result.output["resource"] = executor["resource"].clone();
                 }
                 result
             }
@@ -414,16 +584,16 @@ impl ToolRuntime {
                 let max_entries = limit.unwrap_or(200).clamp(1, 500);
                 let (entries, truncated) =
                     super::files::parse_file_list_entries(&stdout, &rel_path, max_entries);
-                let mut out = json!({
+                ToolResult::ok(json!({
                     "path": rel_path,
                     "entries": entries,
                     "truncated": truncated,
                     "executor": executor["executor"],
-                });
-                let _ = &mut out;
-                ToolResult::ok(out)
+                    "resource": executor["resource"],
+                }))
             }
             ToolCall::ListProjectTrackedFiles {
+                path,
                 globs,
                 depth,
                 limit,
@@ -431,7 +601,7 @@ impl ToolRuntime {
                 ..
             } => {
                 let (paths, list_truncated) = super::file_listing::parse_nul_separated(&stdout);
-                let scope = super::file_listing::normalize_scope(None);
+                let scope = super::file_listing::normalize_scope(path.as_deref());
                 let listing = super::file_listing::build_listing(
                     &paths,
                     &scope,
@@ -443,6 +613,7 @@ impl ToolRuntime {
                 let mut payload =
                     listing.to_json(call.project().unwrap_or(""), &scope, list_truncated);
                 payload["executor"] = executor["executor"].clone();
+                payload["resource"] = executor["resource"].clone();
                 ToolResult::ok(payload)
             }
             ToolCall::ProjectOverview {
@@ -454,49 +625,118 @@ impl ToolRuntime {
                 let _ = (max_depth, limit);
                 let rel_path = path.clone().unwrap_or_else(|| ".".to_string());
                 let (entries, warnings) = parse_overview_entries(&stdout, &rel_path);
-                let mut out = json!({
+                ToolResult::ok(json!({
                     "schema_version": 1,
                     "path": rel_path,
                     "deterministic": true,
                     "entries": entries,
                     "warnings": warnings,
                     "executor": executor["executor"],
-                });
-                let _ = &mut out;
-                ToolResult::ok(out)
+                    "resource": executor["resource"],
+                }))
             }
-            ToolCall::SearchProjectText { .. } => {
-                let mut out = json!({
-                    "backend": "rg",
-                    "raw": stdout,
+            ToolCall::SearchProjectText {
+                pattern,
+                path,
+                limit,
+                context_before,
+                context_after,
+                include_globs,
+                exclude_globs,
+                result_mode,
+                timeout_secs,
+                ..
+            } => {
+                let options =
+                    match super::files::SearchOptions::normalize(super::files::SearchRequest {
+                        pattern: pattern.clone(),
+                        path: path.clone(),
+                        limit: *limit,
+                        context_before: *context_before,
+                        context_after: *context_after,
+                        include_globs: include_globs.clone(),
+                        exclude_globs: exclude_globs.clone(),
+                        result_mode: *result_mode,
+                        timeout_secs: *timeout_secs,
+                    }) {
+                        Ok(options) => options,
+                        Err(error) => return error.into_tool_result(),
+                    };
+                let mut result = super::files::search_project_text_output(
+                    call.project().unwrap_or(""),
+                    &options,
+                    &stdout,
+                    exit_code,
+                    &stderr,
+                );
+                result.output["executor"] = executor["executor"].clone();
+                result.output["resource"] = executor["resource"].clone();
+                result
+            }
+            ToolCall::GitDiffSummary { .. } => {
+                let (porcelain, diff_stat) = super::git::split_diff_summary(&stdout);
+                let summary = super::git::parse_porcelain_summary(&porcelain);
+                ToolResult::ok(json!({
+                    "porcelain": porcelain,
+                    "diff_stat": diff_stat,
+                    "changed_files": summary.changed_files,
+                    "changed_files_count": summary.changed_files_count,
+                    "tracked_changed_files": summary.tracked_changed_files,
+                    "untracked_files": summary.untracked_files,
+                    "ignored_files": summary.ignored_files,
+                    "exit_code": exit_code,
+                    "executor": executor["executor"],
+                    "resource": executor["resource"],
+                }))
+            }
+            ToolCall::GitDiffHunks {
+                paths,
+                max_hunks,
+                max_hunk_lines,
+                cached,
+                ..
+            } => {
+                let max_hunks = max_hunks.unwrap_or(30).clamp(1, 100);
+                let max_hunk_lines = max_hunk_lines.unwrap_or(160).clamp(1, 400);
+                let (files, hunk_count, truncated) =
+                    super::git::parse_git_diff_hunks(&stdout, max_hunks, max_hunk_lines);
+                ToolResult::ok(json!({
+                    "project": call.project().unwrap_or(""),
+                    "paths": paths.clone().unwrap_or_default(),
+                    "cached": cached.unwrap_or(false),
+                    "files": files,
+                    "hunk_count": hunk_count,
+                    "max_hunks": max_hunks,
+                    "max_hunk_lines": max_hunk_lines,
+                    "truncated": truncated,
+                    "exit_code": exit_code,
                     "stderr": stderr,
                     "executor": executor["executor"],
-                });
-                let _ = &mut out;
-                ToolResult::ok(out)
+                    "resource": executor["resource"],
+                }))
             }
-            ToolCall::GitStatus { .. }
-            | ToolCall::GitDiff { .. }
-            | ToolCall::GitDiffSummary { .. } => {
-                let mut out = json!({
-                    "stdout": stdout,
-                    "stderr": stderr,
-                    "exit_code": resp.exit_code,
+            ToolCall::GitLog { limit, skip, .. } => {
+                let limit = super::git::normalize_git_log_limit(*limit);
+                let skip = super::git::normalize_git_log_skip(*skip);
+                let (commits, truncated) = super::git::parse_git_log_commits(&stdout, limit);
+                ToolResult::ok(json!({
+                    "project": call.project().unwrap_or(""),
+                    "limit": limit,
+                    "skip": skip,
+                    "count": commits.len(),
+                    "truncated": truncated,
+                    "commits": commits,
                     "executor": executor["executor"],
-                });
-                let _ = &mut out;
-                ToolResult::ok(out)
+                    "resource": executor["resource"],
+                }))
             }
-            ToolCall::GitDiffHunks { .. } | ToolCall::GitLog { .. } => {
-                let mut out = json!({
-                    "raw": stdout,
-                    "exit_code": resp.exit_code,
-                    "stderr": stderr,
-                    "executor": executor["executor"],
-                });
-                let _ = &mut out;
-                ToolResult::ok(out)
-            }
+            ToolCall::GitStatus { .. } | ToolCall::GitDiff { .. } => ToolResult::ok(json!({
+                "stdout": stdout,
+                "stderr": stderr,
+                "exit_code": exit_code,
+                "executor": executor["executor"],
+                "resource": executor["resource"],
+            })),
             _ => ssh_resource_unsupported_result(call),
         }
     }

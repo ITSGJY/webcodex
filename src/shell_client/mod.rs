@@ -397,6 +397,7 @@ pub async fn shell_run(req: &mut Request, depot: &mut Depot, res: &mut Response)
                 stderr: None,
                 duration_ms: None,
                 error: Some("Shell client registry not configured".to_string()),
+                remote_workspace: None,
             },
         );
         return;
@@ -419,6 +420,7 @@ pub async fn shell_run(req: &mut Request, depot: &mut Depot, res: &mut Response)
                     stderr: None,
                     duration_ms: None,
                     error: Some(format!("Invalid JSON: {}", e)),
+                    remote_workspace: None,
                 },
             );
             return;
@@ -446,6 +448,7 @@ pub async fn shell_run(req: &mut Request, depot: &mut Depot, res: &mut Response)
                 stderr: None,
                 duration_ms: None,
                 error: Some(e),
+                remote_workspace: None,
             },
         );
         return;
@@ -469,6 +472,7 @@ pub async fn shell_run(req: &mut Request, depot: &mut Depot, res: &mut Response)
                     stderr: None,
                     duration_ms: None,
                     error: Some(e),
+                    remote_workspace: None,
                 },
             );
             return;
@@ -491,6 +495,7 @@ pub async fn shell_run(req: &mut Request, depot: &mut Depot, res: &mut Response)
                 stderr: None,
                 duration_ms: None,
                 error: Some("shell request waiter was dropped".to_string()),
+                remote_workspace: None,
             },
         ),
         Err(_elapsed) => {
@@ -513,6 +518,7 @@ pub async fn shell_run(req: &mut Request, depot: &mut Depot, res: &mut Response)
                         "timed out waiting {} seconds for shell client result",
                         wait_timeout_secs
                     )),
+                    remote_workspace: None,
                 },
             );
         }

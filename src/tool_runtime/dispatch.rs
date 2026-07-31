@@ -261,6 +261,7 @@ impl ToolRuntime {
         // been established. Explicit per-call cwd/shell fields remain
         // authoritative; cross-project escape never carries Session context.
         let mut ssh_resource = None;
+        let mut ssh_session_cwd = None;
         if session_project_mismatch.is_none() {
             if let (Some(session_id), Some(resolved)) =
                 (session_id.as_deref(), resolved_project.as_ref())
@@ -270,14 +271,13 @@ impl ToolRuntime {
                     .execution_context_for_project(session_id, &resolved.resolved_id);
                 if let Some(execution_context) = ctx {
                     if matches!(
-                        &call,
-                        ToolCall::RunShell { .. }
-                            | ToolCall::RunJob { .. }
-                            | ToolCall::OpenSessionShell { .. }
-                    ) || super::ssh_workspace::is_ssh_workspace_read_call(&call)
-                        || super::ssh_workspace::is_ssh_workspace_fail_closed_call(&call)
-                    {
+                        super::ssh_workspace::ssh_resource_routing(&call),
+                        super::ssh_workspace::SshResourceRouting::SupportedWorkspaceRead
+                            | super::ssh_workspace::SshResourceRouting::ExistingResourceAware
+                            | super::ssh_workspace::SshResourceRouting::UnsupportedProjectOperation
+                    ) {
                         ssh_resource = execution_context.resource.clone();
+                        ssh_session_cwd = execution_context.default_cwd.clone();
                     }
                     call = call.with_session_execution_context(&execution_context);
                 }
@@ -430,6 +430,7 @@ impl ToolRuntime {
                 window,
                 ssh_resource.as_deref(),
                 session_id.as_deref(),
+                ssh_session_cwd.as_deref(),
             )
             .await;
         let permission = permission.filter(|_| {
@@ -504,19 +505,29 @@ impl ToolRuntime {
         window: Option<&crate::client_window::ClientWindow>,
         ssh_resource: Option<&str>,
         ssh_session_id: Option<&str>,
+        ssh_session_cwd: Option<&str>,
     ) -> ToolResult {
         // A resource-bound read tool executes against the SSH workspace, never
         // the Runner-local project. A resource-bound operation this round does
         // not support fails closed (no local access, no Agent request).
         if let Some(resource) = ssh_resource {
-            if super::ssh_workspace::is_ssh_workspace_read_call(&call) {
-                let session_id = ssh_session_id.unwrap_or("");
-                return self
-                    .dispatch_ssh_workspace_read(call, resource, session_id, auth)
-                    .await;
-            }
-            if super::ssh_workspace::is_ssh_workspace_fail_closed_call(&call) {
-                return super::ssh_workspace::ssh_resource_unsupported_result(&call);
+            match super::ssh_workspace::ssh_resource_routing(&call) {
+                super::ssh_workspace::SshResourceRouting::SupportedWorkspaceRead => {
+                    let session_id = ssh_session_id.unwrap_or("");
+                    return self
+                        .dispatch_ssh_workspace_read(
+                            call,
+                            resource,
+                            session_id,
+                            ssh_session_cwd,
+                            auth,
+                        )
+                        .await;
+                }
+                super::ssh_workspace::SshResourceRouting::UnsupportedProjectOperation => {
+                    return super::ssh_workspace::ssh_resource_unsupported_result(&call);
+                }
+                _ => {}
             }
         }
         match call {

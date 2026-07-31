@@ -314,70 +314,9 @@ pub(crate) fn parse_file_list_entries(
     (all, truncated)
 }
 
-const SEARCH_PROJECT_TEXT_EXCLUDES: &[&str] = &[
-    "--exclude-dir=.git",
-    "--exclude-dir=target",
-    "--exclude-dir=node_modules",
-    "--exclude-dir=.venv",
-    "--exclude-dir=venv",
-    "--exclude-dir=__pycache__",
-    "--exclude-dir=.pytest_cache",
-    "--exclude-dir=.mypy_cache",
-    "--exclude-dir=.ruff_cache",
-    "--exclude-dir=.tox",
-    "--exclude-dir=site-packages",
-    "--exclude-dir=.ipynb_checkpoints",
-    "--exclude-dir=dist",
-    "--exclude-dir=build",
-    "--exclude-dir=coverage",
-    "--exclude-dir=.next",
-    "--exclude-dir=secrets",
-    "--exclude-dir=tokens",
-    "--exclude=.env",
-    "--exclude=.env.*",
-    "--exclude=agent.toml",
-    "--exclude=webcodex.env",
-    "--exclude=*.pem",
-    "--exclude=*.key",
-];
-
-const SEARCH_PROJECT_TEXT_RG_EXCLUDE_GLOBS: &[&str] = &[
-    "!.git/**",
-    "!**/.git/**",
-    "!target/**",
-    "!**/target/**",
-    "!node_modules/**",
-    "!**/node_modules/**",
-    "!**/.venv/**",
-    "!**/venv/**",
-    "!**/__pycache__/**",
-    "!**/.pytest_cache/**",
-    "!**/.mypy_cache/**",
-    "!**/.ruff_cache/**",
-    "!**/.tox/**",
-    "!**/site-packages/**",
-    "!**/.ipynb_checkpoints/**",
-    "!**/dist/**",
-    "!**/build/**",
-    "!**/coverage/**",
-    "!**/.next/**",
-    "!secrets/**",
-    "!**/secrets/**",
-    "!tokens/**",
-    "!**/tokens/**",
-    "!.env",
-    "!**/.env",
-    "!.env.*",
-    "!**/.env.*",
-    "!agent.toml",
-    "!**/agent.toml",
-    "!webcodex.env",
-    "!**/webcodex.env",
-    "!*.pem",
-    "!**/*.pem",
-    "!*.key",
-    "!**/*.key",
-];
+const SEARCH_PROJECT_TEXT_EXCLUDES: &[&str] = crate::sensitive_paths::SEARCH_GREP_EXCLUDES;
+const SEARCH_PROJECT_TEXT_RG_EXCLUDE_GLOBS: &[&str] =
+    crate::sensitive_paths::SEARCH_RG_EXCLUDE_GLOBS;
 
 pub(crate) const MAX_SEARCH_CONTEXT_LINES: usize = 20;
 pub(crate) const MAX_SEARCH_GLOBS: usize = 32;
@@ -1039,7 +978,7 @@ fn search_timeout_tool_result(options: &SearchOptions, backend: Option<&str>) ->
     ToolResult::err_with_output(message, output)
 }
 
-fn is_search_project_text_excluded_path(path: &str) -> bool {
+pub(crate) fn is_search_project_text_excluded_path(path: &str) -> bool {
     // Search skips credentials and the bulk trees alike: the first for
     // confidentiality, the second for cost and noise.
     crate::sensitive_paths::is_bulk_skipped_path(path)
@@ -1436,7 +1375,10 @@ pub(crate) fn search_project_text_output_with_agent_error(
     ToolResult::ok(output)
 }
 
-fn empty_search_project_text_output(project: &str, options: &SearchOptions) -> ToolResult {
+pub(crate) fn empty_search_project_text_output(
+    project: &str,
+    options: &SearchOptions,
+) -> ToolResult {
     let marker = json!({
         "webcodex_search": {
             "backend": "native",

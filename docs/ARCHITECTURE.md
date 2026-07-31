@@ -160,11 +160,26 @@ routes the read-only workspace tools (`read_file`, `list_project_files`,
 `list_project_tracked_files`, `project_overview`, `search_project_text`,
 `git_status`, `git_diff_summary`, `git_diff`, `git_diff_hunks`, `git_log`) to
 the remote workspace behind an explicit `ssh_workspace_read` capability.
-Unsupported resource-bound operations (writes, edits, patches, artifacts,
-checkpoints, structured validation, LSP, lifecycle) fail closed with
-`ssh_resource_unsupported_for_request` and never touch the Runner-local
-project or enqueue an Agent request. Structured reads run as fixed commands on
-independent exec channels and never reuse a persistent shell process.
+The exact Session `default_cwd` is carried in the structured request and is the
+first root seed; an invalid Session cwd fails closed instead of falling back.
+The Runner pins `pwd -P`, resolves file-tree targets with remote `realpath`, and
+accepts only the root or component-boundary descendants. Relative/absolute
+symlink escapes and unavailable canonicalization are denied.
+
+Runner responses are versioned `webcodex.remote_workspace_read_result.v1`
+envelopes with an explicit operation and success/failure outcome. The Server
+strictly validates the envelope and reuses local read/search/Git parsers rather
+than treating arbitrary stdout or stderr as success. Local and SSH search
+builders consume one shared protected-path exclusion policy.
+
+Resource routing uses an exhaustive `ToolCall` classification. Unsupported
+project-bound operations (writes, edits, patches, artifacts, checkpoints,
+structured validation, LSP, lifecycle, build/check/hygiene) fail closed with
+`ssh_resource_unsupported_for_request` and never touch the Runner-local project
+or enqueue an Agent request. Stored job/shell identity operations, Session
+metadata/control, and unrelated global operations keep their existing routes.
+Structured reads run as fixed commands on independent exec channels and never
+reuse a persistent shell process.
 The Connector Task ledger and Workflow Session ledger remain separate internal
 models; neither is copied into the other.
 

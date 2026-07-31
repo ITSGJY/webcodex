@@ -33,6 +33,74 @@ const SECRET_SUFFIXES: &[&str] = &[".pem", ".key", ".env", ".toml.bak"];
 /// High-volume trees that search and listing skip. Not secret.
 const BULK_COMPONENTS: &[&str] = &[".git", "target", "node_modules"];
 
+/// Canonical grep exclusions for project text search. Local and SSH search
+/// command builders consume this exact list so protection cannot drift.
+pub const SEARCH_GREP_EXCLUDES: &[&str] = &[
+    "--exclude-dir=.git",
+    "--exclude-dir=target",
+    "--exclude-dir=node_modules",
+    "--exclude-dir=.venv",
+    "--exclude-dir=venv",
+    "--exclude-dir=__pycache__",
+    "--exclude-dir=.pytest_cache",
+    "--exclude-dir=.mypy_cache",
+    "--exclude-dir=.ruff_cache",
+    "--exclude-dir=.tox",
+    "--exclude-dir=site-packages",
+    "--exclude-dir=.ipynb_checkpoints",
+    "--exclude-dir=dist",
+    "--exclude-dir=build",
+    "--exclude-dir=coverage",
+    "--exclude-dir=.next",
+    "--exclude-dir=secrets",
+    "--exclude-dir=tokens",
+    "--exclude=.env",
+    "--exclude=.env.*",
+    "--exclude=agent.toml",
+    "--exclude=webcodex.env",
+    "--exclude=*.pem",
+    "--exclude=*.key",
+];
+
+/// Canonical ripgrep exclusions equivalent to [`SEARCH_GREP_EXCLUDES`].
+pub const SEARCH_RG_EXCLUDE_GLOBS: &[&str] = &[
+    "!.git/**",
+    "!**/.git/**",
+    "!target/**",
+    "!**/target/**",
+    "!node_modules/**",
+    "!**/node_modules/**",
+    "!**/.venv/**",
+    "!**/venv/**",
+    "!**/__pycache__/**",
+    "!**/.pytest_cache/**",
+    "!**/.mypy_cache/**",
+    "!**/.ruff_cache/**",
+    "!**/.tox/**",
+    "!**/site-packages/**",
+    "!**/.ipynb_checkpoints/**",
+    "!**/dist/**",
+    "!**/build/**",
+    "!**/coverage/**",
+    "!**/.next/**",
+    "!secrets/**",
+    "!**/secrets/**",
+    "!tokens/**",
+    "!**/tokens/**",
+    "!.env",
+    "!**/.env",
+    "!.env.*",
+    "!**/.env.*",
+    "!agent.toml",
+    "!**/agent.toml",
+    "!webcodex.env",
+    "!**/webcodex.env",
+    "!*.pem",
+    "!**/*.pem",
+    "!*.key",
+    "!**/*.key",
+];
+
 /// True when any component of `path` names credentials, key material, or agent
 /// configuration. Deny both reads and writes for these.
 pub fn is_secret_path(path: &str) -> bool {
