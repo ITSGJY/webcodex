@@ -7,7 +7,54 @@ use base64::{engine::general_purpose, Engine as _};
 use sha2::{Digest, Sha256};
 
 fn test_runtime() -> ToolRuntime {
-    ToolRuntime::new_for_tests()
+    let model_surface = crate::model_surface::resolve_model_surface(None)
+        .expect("test model surface configuration");
+    test_runtime_with_surface(model_surface)
+}
+
+fn test_runtime_with_surface(model_surface: ModelSurface) -> ToolRuntime {
+    ToolRuntime::new_for_tests().with_model_surface(model_surface)
+}
+
+/// Lock the shared env lock and select the full operator runtime MCP surface
+/// for the duration of a test. Restores the env on drop. Used by tests whose
+/// assertions target the full operator surface, which is no longer the
+/// default (the default is `local_coding`).
+///
+/// The env var is set only AFTER the lock is acquired so a concurrently
+/// running test that holds the lock cannot clear it between the set and the
+/// lock; on drop the var is removed before the guard is released.
+fn full_operator_mcp_env() -> impl Drop {
+    struct Cleanup {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var(crate::model_surface::MCP_MODEL_SURFACE_ENV);
+        }
+    }
+    let guard = crate::admin_cli::TEST_ENV_LOCK.lock().unwrap();
+    std::env::set_var(
+        crate::model_surface::MCP_MODEL_SURFACE_ENV,
+        crate::model_surface::MCP_MODEL_SURFACE_FULL_OPERATOR_V1,
+    );
+    Cleanup { _guard: guard }
+}
+
+/// Variant for callers that already hold `TEST_ENV_LOCK`: only sets/removes
+/// the surface env var.
+fn full_operator_mcp_env_locked() -> impl Drop {
+    struct SurfaceEnvCleanup;
+    impl Drop for SurfaceEnvCleanup {
+        fn drop(&mut self) {
+            std::env::remove_var(crate::model_surface::MCP_MODEL_SURFACE_ENV);
+        }
+    }
+    std::env::set_var(
+        crate::model_surface::MCP_MODEL_SURFACE_ENV,
+        crate::model_surface::MCP_MODEL_SURFACE_FULL_OPERATOR_V1,
+    );
+    SurfaceEnvCleanup
 }
 
 fn rpc(method: &str, id: Option<Value>, params: Value) -> JsonRpcRequest {
@@ -38,6 +85,7 @@ fn rpc_error_envelope_carries_code_and_message() {
 
 #[tokio::test]
 async fn mcp_initialize_returns_protocol_and_server_info() {
+    let _guard = full_operator_mcp_env();
     let runtime = test_runtime();
     let outcome = handle_mcp_request(
         &runtime,
@@ -110,6 +158,7 @@ async fn mcp_tools_list_returns_same_names_as_runtime() {
     // `mcp_tools_list_default_retains_output_schema` and
     // `mcp_tools_list_compact_omits_output_schema_only`.
     let _guard = crate::admin_cli::TEST_ENV_LOCK.lock().unwrap();
+    let _full = full_operator_mcp_env_locked();
     let runtime = test_runtime();
     let runtime_names: Vec<String> = registered_tool_specs()
         .iter()
@@ -153,7 +202,8 @@ async fn mcp_tools_list_returns_same_names_as_runtime() {
 
 #[test]
 fn mcp_tools_list_adds_image_mode_without_changing_generic_artifact_schema() {
-    let payload = mcp_tools_list_payload();
+    let _guard = full_operator_mcp_env();
+    let payload = mcp_tools_list_payload(ModelSurface::FullOperatorRuntime);
     let mcp_tool = payload["tools"]
         .as_array()
         .unwrap()
@@ -213,6 +263,9 @@ fn ordinary_artifact_result_keeps_existing_text_and_structured_base64_shape() {
 
 #[tokio::test]
 async fn mcp_image_call_returns_native_image_for_remote_agent_project() {
+    // read_project_artifact is an artifact tool outside the local_coding
+    // surface; select the full operator surface for this call.
+    let _full = full_operator_mcp_env();
     let runtime = test_runtime();
     let client_id = "mcp-vision-agent";
     let agent_instance_id = "inst-mcp-vision";
@@ -383,7 +436,7 @@ async fn mcp_image_call_returns_native_image_for_remote_agent_project() {
 fn project_connector_tools_list_is_exact_canonical_surface() {
     let _guard = crate::admin_cli::TEST_ENV_LOCK.lock().unwrap();
     std::env::remove_var("WEBCODEX_MCP_COMPACT_SCHEMAS");
-    let payload = mcp_tools_list_payload_for_connector(true);
+    let payload = mcp_tools_list_payload(ModelSurface::CanonicalConnector);
     let tools = payload["tools"].as_array().expect("tools array");
     let names = tools
         .iter()
@@ -426,8 +479,9 @@ async fn mcp_tools_list_default_retains_output_schema() {
 #[test]
 fn explicit_resume_mcp_schema_and_metadata_are_exposed() {
     let _guard = crate::admin_cli::TEST_ENV_LOCK.lock().unwrap();
+    let _full = full_operator_mcp_env_locked();
     std::env::remove_var("WEBCODEX_MCP_COMPACT_SCHEMAS");
-    let payload = mcp_tools_list_payload();
+    let payload = mcp_tools_list_payload(ModelSurface::FullOperatorRuntime);
     let tool = payload["tools"]
         .as_array()
         .unwrap()
@@ -486,9 +540,11 @@ async fn mcp_tools_list_compact_omits_output_schema_only() {
 async fn mcp_tools_list_compact_is_smaller_than_full_serialized() {
     let _guard = crate::admin_cli::TEST_ENV_LOCK.lock().unwrap();
     std::env::remove_var("WEBCODEX_MCP_COMPACT_SCHEMAS");
-    let full = serde_json::to_vec(&mcp_tools_list_payload()).expect("full serialize");
+    let full = serde_json::to_vec(&mcp_tools_list_payload(ModelSurface::FullOperatorRuntime))
+        .expect("full serialize");
     std::env::set_var("WEBCODEX_MCP_COMPACT_SCHEMAS", "true");
-    let compact = serde_json::to_vec(&mcp_tools_list_payload()).expect("compact serialize");
+    let compact = serde_json::to_vec(&mcp_tools_list_payload(ModelSurface::FullOperatorRuntime))
+        .expect("compact serialize");
     std::env::remove_var("WEBCODEX_MCP_COMPACT_SCHEMAS");
     assert!(
         compact.len() < full.len(),
@@ -532,7 +588,9 @@ async fn mcp_tools_call_still_returns_structured_content_under_compact_flag() {
 async fn session_tools_exposed_in_registry_and_mcp() {
     // tools/list outputSchema depends on WEBCODEX_MCP_COMPACT_SCHEMAS; take
     // the shared env lock so parallel compact-schema tests cannot strip it.
+    // The session tools live on the full operator surface, not local_coding.
     let _guard = crate::admin_cli::TEST_ENV_LOCK.lock().unwrap();
+    let _full = full_operator_mcp_env_locked();
     std::env::remove_var("WEBCODEX_MCP_COMPACT_SCHEMAS");
     let runtime = test_runtime();
     let specs = registered_tool_specs();
@@ -1004,7 +1062,8 @@ async fn mcp_notifications_initialized_with_id_returns_result() {
 #[tokio::test]
 async fn mcp_tools_list_parity_with_rest_tools_list() {
     // MCP tools/list and REST /api/tools/list both expose the exact same
-    // registry-backed tool names.
+    // registry-backed tool names on the full operator surface.
+    let _full = full_operator_mcp_env();
     let runtime = test_runtime();
     let mcp_outcome = handle_mcp_request(
         &runtime,
@@ -1068,6 +1127,9 @@ fn seed_oauth_access_token(
 
 #[tokio::test]
 async fn mcp_tools_call_writes_a_summary_action_audit_row() {
+    // list_tools is a full-operator-only tool; select that surface so the
+    // call dispatches and lands an action audit row.
+    let _full = full_operator_mcp_env();
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
     let runtime = Arc::new(test_runtime());
@@ -1158,6 +1220,9 @@ fn build_test_router(
         .hoop(affix_state::inject(config))
         .hoop(affix_state::inject(db))
         .hoop(affix_state::inject(runtime))
+        .hoop(affix_state::inject(
+            crate::connector_runtime::ConnectorRuntimeSlot::default(),
+        ))
         .push(
             Router::with_path("mcp")
                 .hoop(crate::AuthMiddleware)
@@ -1234,6 +1299,7 @@ fn effective_status(resp: &Response) -> StatusCode {
 
 #[tokio::test]
 async fn http_mcp_initialize_success() {
+    let _full = full_operator_mcp_env();
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
     let runtime = Arc::new(test_runtime());
@@ -1310,12 +1376,16 @@ async fn http_mcp_tools_list_success() {
 
 #[tokio::test]
 async fn http_project_connector_lists_and_dispatches_only_canonical_capabilities() {
+    // A Connector test must not observe a concurrent local_coding/full-operator
+    // test's WEBCODEX_MCP_MODEL_SURFACE value; hold the env lock and clear it.
+    let _guard = crate::admin_cli::TEST_ENV_LOCK.lock().unwrap();
+    std::env::remove_var(crate::model_surface::MCP_MODEL_SURFACE_ENV);
     let config = test_config(Some("secret"));
     let (tmp, db) = test_db();
     let project = tmp.path().join("connector-project");
     crate::connector_runtime::tests::init_repo(&project);
     let user_token = "webcodex_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let runtime = Arc::new(test_runtime());
+    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::CanonicalConnector));
     let service = Service::new(build_connector_test_router(config, db, runtime, &project));
 
     let mut discovery = TestClient::get("http://localhost/mcp")
@@ -1848,6 +1918,10 @@ async fn oauth2_mcp_tool_call_requires_project_read_for_read_file() {
 
 #[tokio::test]
 async fn oauth2_mcp_tool_call_requires_project_write_for_anchor_edit_tools() {
+    // The anchor/line compatibility tools are ModelHidden and only reachable
+    // on the explicit full operator surface; select it so the scope gate
+    // (not the local_coding boundary) decides this call.
+    let _full = full_operator_mcp_env();
     let (_tmp, service, token) = oauth_mcp_service("project:write");
     let (status, body, _) = oauth_mcp_request(
         &service,
@@ -1920,6 +1994,7 @@ async fn oauth2_mcp_tool_call_requires_job_run_for_run_shell() {
 
 #[tokio::test]
 async fn oauth2_mcp_unknown_tool_fails_closed() {
+    let _full = full_operator_mcp_env();
     let (_tmp, service, token) = oauth_mcp_service("runtime:read project:read");
     let (status, body, challenge) = oauth_mcp_request(
         &service,
@@ -1978,6 +2053,7 @@ async fn http_mcp_notification_returns_accepted_with_empty_body() {
 
 #[tokio::test]
 async fn http_mcp_get_discovery_returns_metadata() {
+    let _full = full_operator_mcp_env();
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
     let runtime = Arc::new(test_runtime());
@@ -2029,6 +2105,7 @@ async fn http_mcp_get_discovery_returns_metadata() {
 
 #[tokio::test]
 async fn mcp_tools_list_includes_runtime_status() {
+    let _full = full_operator_mcp_env();
     let runtime = test_runtime();
     let outcome = handle_mcp_request(
         &runtime,
@@ -2054,6 +2131,7 @@ async fn mcp_tools_list_includes_runtime_status() {
 
 #[tokio::test]
 async fn mcp_tools_list_exposes_coding_task_and_runtime_status_ux_flags() {
+    let _full = full_operator_mcp_env();
     let runtime = test_runtime();
     let outcome = handle_mcp_request(
         &runtime,
@@ -2155,6 +2233,7 @@ async fn mcp_tools_list_exposes_coding_task_and_runtime_status_ux_flags() {
 async fn mcp_tools_list_includes_validate_patch() {
     // validate_patch is a patch preflight / dry-run tool exposed via MCP
     // tools/list (and a thin REST wrapper), but NOT via GPT Actions.
+    let _full = full_operator_mcp_env();
     let runtime = test_runtime();
     let outcome = handle_mcp_request(
         &runtime,
@@ -2210,6 +2289,9 @@ async fn mcp_tools_list_includes_show_changes() {
 
 #[tokio::test]
 async fn mcp_tools_call_runtime_status_returns_content() {
+    // runtime_status is not part of the local_coding surface; select the full
+    // operator surface so the call reaches dispatch.
+    let _full = full_operator_mcp_env();
     let runtime = test_runtime();
     let outcome = handle_mcp_request(
         &runtime,
@@ -2272,6 +2354,7 @@ async fn mcp_tools_call_show_changes_returns_structured_tool_error() {
 
 #[tokio::test]
 async fn mcp_tools_list_includes_project_management_tools() {
+    let _full = full_operator_mcp_env();
     let runtime = test_runtime();
     let outcome = handle_mcp_request(
         &runtime,
@@ -2294,5 +2377,371 @@ async fn mcp_tools_list_includes_project_management_tools() {
         names.contains(&"create_project"),
         "MCP tools/list must include create_project: {:?}",
         names
+    );
+}
+
+// =========================================================================
+// local_coding model surface
+// =========================================================================
+
+#[tokio::test]
+async fn local_coding_tools_list_returns_exact_ordered_surface() {
+    let _guard = crate::admin_cli::TEST_ENV_LOCK.lock().unwrap();
+    std::env::remove_var(crate::model_surface::MCP_MODEL_SURFACE_ENV);
+    std::env::remove_var("WEBCODEX_MCP_COMPACT_SCHEMAS");
+    let runtime = test_runtime();
+    let outcome = handle_mcp_request(
+        &runtime,
+        rpc("tools/list", Some(Value::from(60)), json!({})),
+        None,
+    )
+    .await;
+    let value = match outcome {
+        McpOutcome::Ok(v) => v,
+        other => panic!("expected Ok, got {:?}", other),
+    };
+    let tools = value["result"]["tools"].as_array().unwrap();
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(
+        names,
+        crate::tool_runtime::tool_definition::LOCAL_CODING_TOOL_NAMES,
+        "local_coding tools/list must be the exact ordered surface"
+    );
+    // Focused, not the full runtime surface.
+    assert!(
+        names.len() < registered_tool_specs().len(),
+        "local_coding must expose fewer tools than the full runtime"
+    );
+    for required in [
+        "work_on_project",
+        "read_file",
+        "apply_text_edits",
+        "finish_coding_task",
+    ] {
+        assert!(names.contains(&required), "missing {required}: {names:?}");
+    }
+    for forbidden in [
+        "start_coding_task",
+        "register_project",
+        "create_project",
+        "start_session",
+        "current_session",
+        "open_session_shell",
+        "session_shell_exec",
+        "close_session_shell",
+        "runtime_status",
+        "tool_manifest",
+        "workspace_checkpoint_create",
+        "delete_project_files",
+        "git_restore_paths",
+        "discard_untracked",
+    ] {
+        assert!(
+            !names.contains(&forbidden),
+            "local_coding must not expose {forbidden}: {names:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn local_coding_default_initialize_and_discovery_report_local_coding() {
+    let _guard = crate::admin_cli::TEST_ENV_LOCK.lock().unwrap();
+    std::env::remove_var(crate::model_surface::MCP_MODEL_SURFACE_ENV);
+    let runtime = test_runtime();
+    let outcome = handle_mcp_request(
+        &runtime,
+        rpc("initialize", Some(Value::from(61)), json!({})),
+        None,
+    )
+    .await;
+    let value = match outcome {
+        McpOutcome::Ok(v) => v,
+        other => panic!("expected Ok, got {:?}", other),
+    };
+    assert_eq!(
+        value["result"]["serverInfo"]["modelSurface"],
+        crate::model_surface::MODEL_SURFACE_LOCAL_CODING
+    );
+}
+
+#[tokio::test]
+async fn local_coding_rejects_non_surface_tools_at_mcp_boundary() {
+    let _guard = crate::admin_cli::TEST_ENV_LOCK.lock().unwrap();
+    std::env::remove_var(crate::model_surface::MCP_MODEL_SURFACE_ENV);
+    let runtime = test_runtime();
+    for denied in [
+        "start_coding_task",
+        "register_project",
+        "create_project",
+        "start_session",
+        "open_session_shell",
+        "runtime_status",
+        "tool_manifest",
+        "workspace_checkpoint_create",
+    ] {
+        let outcome = handle_mcp_request(
+            &runtime,
+            rpc(
+                "tools/call",
+                Some(json!(70)),
+                json!({"name": denied, "arguments": {}}),
+            ),
+            None,
+        )
+        .await;
+        match outcome {
+            McpOutcome::BadRequest(value) => {
+                assert_eq!(value["error"]["code"], -32602);
+                assert!(
+                    value["error"]["message"].as_str().unwrap().contains(denied),
+                    "denial message must name the tool: {:?}",
+                    value
+                );
+                assert!(
+                    value["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("local_coding"),
+                    "denial message must name the surface: {:?}",
+                    value
+                );
+            }
+            other => panic!("{denied} must be rejected, got {:?}", other),
+        }
+    }
+}
+
+#[tokio::test]
+async fn local_coding_allows_surface_tools_to_dispatch() {
+    let _guard = crate::admin_cli::TEST_ENV_LOCK.lock().unwrap();
+    std::env::remove_var(crate::model_surface::MCP_MODEL_SURFACE_ENV);
+    let runtime = test_runtime();
+    // list_projects and work_on_project resolve to the runtime registry; they
+    // must reach dispatch (not be rejected at the MCP boundary).
+    let outcome = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(71)),
+            json!({"name": "list_projects", "arguments": {}}),
+        ),
+        None,
+    )
+    .await;
+    match outcome {
+        McpOutcome::Ok(value) => {
+            assert_eq!(value["result"]["structuredContent"]["success"], true);
+        }
+        other => panic!("list_projects must dispatch, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn full_operator_explicit_surface_lists_full_runtime_and_dispatches() {
+    let _full = full_operator_mcp_env();
+    let runtime = test_runtime();
+    let listed = handle_mcp_request(
+        &runtime,
+        rpc("tools/list", Some(Value::from(72)), json!({})),
+        None,
+    )
+    .await;
+    let value = match listed {
+        McpOutcome::Ok(v) => v,
+        other => panic!("expected Ok, got {:?}", other),
+    };
+    let names: Vec<String> = value["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    let registry_names: Vec<String> = registered_tool_specs()
+        .iter()
+        .map(|s| s.name.clone())
+        .collect();
+    assert_eq!(
+        names, registry_names,
+        "full operator lists the full runtime"
+    );
+
+    // start_coding_task (a non-local_coding tool) dispatches on full operator.
+    let called = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(73)),
+            json!({"name": "start_coding_task", "arguments": {}}),
+        ),
+        None,
+    )
+    .await;
+    assert!(
+        !matches!(&called, McpOutcome::BadRequest(value) if value["error"]["message"].as_str().unwrap().contains("local_coding")),
+        "start_coding_task must not be rejected by the local_coding boundary"
+    );
+}
+
+#[tokio::test]
+async fn explicit_local_coding_v1_selects_local_coding() {
+    let _guard = crate::admin_cli::TEST_ENV_LOCK.lock().unwrap();
+    std::env::set_var(
+        crate::model_surface::MCP_MODEL_SURFACE_ENV,
+        crate::model_surface::MCP_MODEL_SURFACE_LOCAL_CODING_V1,
+    );
+    let runtime = test_runtime();
+    let outcome = handle_mcp_request(
+        &runtime,
+        rpc("tools/list", Some(Value::from(74)), json!({})),
+        None,
+    )
+    .await;
+    let value = match outcome {
+        McpOutcome::Ok(v) => v,
+        other => panic!("expected Ok, got {:?}", other),
+    };
+    let names: Vec<&str> = value["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        crate::tool_runtime::tool_definition::LOCAL_CODING_TOOL_NAMES
+    );
+    std::env::remove_var(crate::model_surface::MCP_MODEL_SURFACE_ENV);
+}
+
+#[tokio::test]
+async fn explicit_full_operator_v1_reports_full_operator_surface() {
+    let _full = full_operator_mcp_env();
+    let runtime = test_runtime();
+    let outcome = handle_mcp_request(
+        &runtime,
+        rpc("initialize", Some(Value::from(75)), json!({})),
+        None,
+    )
+    .await;
+    let value = match outcome {
+        McpOutcome::Ok(v) => v,
+        other => panic!("expected Ok, got {:?}", other),
+    };
+    assert_eq!(
+        value["result"]["serverInfo"]["modelSurface"],
+        crate::model_surface::MODEL_SURFACE_FULL_OPERATOR_RUNTIME
+    );
+}
+
+#[tokio::test]
+async fn selected_surface_is_immutable_after_environment_changes() {
+    let _guard = crate::admin_cli::TEST_ENV_LOCK.lock().unwrap();
+    std::env::remove_var(crate::model_surface::MCP_MODEL_SURFACE_ENV);
+    let local = test_runtime();
+    std::env::set_var(
+        crate::model_surface::MCP_MODEL_SURFACE_ENV,
+        crate::model_surface::MCP_MODEL_SURFACE_FULL_OPERATOR_V1,
+    );
+    for method in ["initialize", "tools/list"] {
+        let outcome =
+            handle_mcp_request(&local, rpc(method, Some(json!(80)), json!({})), None).await;
+        let McpOutcome::Ok(value) = outcome else {
+            panic!("{method} must succeed");
+        };
+        if method == "initialize" {
+            assert_eq!(
+                value["result"]["serverInfo"]["modelSurface"],
+                crate::model_surface::MODEL_SURFACE_LOCAL_CODING
+            );
+        } else {
+            let names: Vec<&str> = value["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                names,
+                crate::tool_runtime::tool_definition::LOCAL_CODING_TOOL_NAMES
+            );
+        }
+    }
+    let denied = handle_mcp_request(
+        &local,
+        rpc(
+            "tools/call",
+            Some(json!(81)),
+            json!({"name": "start_coding_task", "arguments": {}}),
+        ),
+        None,
+    )
+    .await;
+    assert!(matches!(denied, McpOutcome::BadRequest(_)));
+    let status = local.runtime_status(None).await;
+    assert_eq!(
+        status.output["model_surface"],
+        crate::model_surface::MODEL_SURFACE_LOCAL_CODING
+    );
+
+    let full = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
+    std::env::set_var(
+        crate::model_surface::MCP_MODEL_SURFACE_ENV,
+        "broken-after-startup",
+    );
+    let listed =
+        handle_mcp_request(&full, rpc("tools/list", Some(json!(82)), json!({})), None).await;
+    let McpOutcome::Ok(value) = listed else {
+        panic!("full operator tools/list must remain available");
+    };
+    assert_eq!(
+        value["result"]["tools"].as_array().unwrap().len(),
+        registered_tool_specs().len()
+    );
+    assert_eq!(
+        full.runtime_status(None).await.output["model_surface"],
+        crate::model_surface::MODEL_SURFACE_FULL_OPERATOR_RUNTIME
+    );
+    std::env::remove_var(crate::model_surface::MCP_MODEL_SURFACE_ENV);
+}
+
+#[tokio::test]
+async fn local_coding_list_manifest_and_catalog_are_identical() {
+    let runtime = test_runtime_with_surface(ModelSurface::LocalCoding);
+    let listed = handle_mcp_request(
+        &runtime,
+        rpc("tools/list", Some(json!(83)), json!({})),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(value) = listed else {
+        panic!("tools/list must succeed");
+    };
+    let listed_names: Vec<&str> = value["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    let manifest = runtime
+        .dispatch(crate::tool_runtime::ToolCall::ToolManifest {
+            category: None,
+            intent: Some("coding".to_string()),
+            include_recommended_flows: false,
+            include_risk_summary: false,
+        })
+        .await;
+    let manifest_names: Vec<&str> = manifest.output["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        listed_names,
+        crate::tool_runtime::tool_definition::LOCAL_CODING_TOOL_NAMES
+    );
+    assert_eq!(
+        manifest_names,
+        crate::tool_runtime::tool_definition::LOCAL_CODING_TOOL_NAMES
     );
 }

@@ -2,7 +2,7 @@
 //!
 //! `ConnectorContext` is the resolved set of environment-supplied identity
 //! and path fields that bind the runtime to a single project/workspace. It is
-//! read once at construction (`ConnectorRuntime::from_env`) and thereafter
+//! read once during server startup and thereafter
 //! treated as immutable by every capability method via `self.context`. The
 //! `required_env` / `nonempty_env` helpers and the surface-name constants live
 //! here so the rest of the runtime module reads as orchestration rather than
@@ -13,6 +13,23 @@ use std::path::Path;
 
 pub(crate) const CONNECTOR_SURFACE_ENV: &str = "WEBCODEX_CONNECTOR_SURFACE";
 pub(crate) const CONNECTOR_SURFACE_TASK_V1: &str = "task-v1";
+pub(crate) const PROJECT_CREDENTIAL_FILE_ENV: &str = "WEBCODEX_PROJECT_CREDENTIAL_FILE";
+pub(crate) const PROJECT_AGENT_TOKEN_FILE_ENV: &str = "WEBCODEX_PROJECT_AGENT_TOKEN_FILE";
+
+const CONNECTOR_CONFIGURATION_ENV_NAMES: &[&str] = &[
+    "WEBCODEX_CONNECTOR_PROJECT_ID",
+    "WEBCODEX_CONNECTOR_PROJECT_NAME",
+    "WEBCODEX_CONNECTOR_WORKSPACE_ID",
+    "WEBCODEX_CONNECTOR_EXECUTOR_PROJECT",
+    "WEBCODEX_CONNECTOR_EXECUTOR_ROOT",
+    "WEBCODEX_CONNECTOR_RUNS_ROOT",
+    "WEBCODEX_CONNECTOR_RESULTS_ROOT",
+    "WEBCODEX_CONNECTOR_PROJECTS_DIR",
+    "WEBCODEX_CONNECTOR_PROFILE",
+    "WEBCODEX_CONNECTOR_PROJECT_GRANT_ID",
+    PROJECT_CREDENTIAL_FILE_ENV,
+    PROJECT_AGENT_TOKEN_FILE_ENV,
+];
 
 pub(crate) fn required_env(name: &str) -> Result<String, String> {
     nonempty_env(name)
@@ -42,7 +59,17 @@ pub(crate) struct ConnectorContext {
 
 impl ConnectorContext {
     pub(crate) fn from_env() -> Result<Option<Self>, String> {
-        let Some(surface) = nonempty_env(CONNECTOR_SURFACE_ENV) else {
+        let surface = nonempty_env(CONNECTOR_SURFACE_ENV);
+        let Some(surface) = surface else {
+            if let Some(name) = CONNECTOR_CONFIGURATION_ENV_NAMES
+                .iter()
+                .copied()
+                .find(|name| nonempty_env(name).is_some())
+            {
+                return Err(format!(
+                    "{name} is set but {CONNECTOR_SURFACE_ENV} is not configured"
+                ));
+            }
             return Ok(None);
         };
         if surface != CONNECTOR_SURFACE_TASK_V1 {

@@ -35,17 +35,21 @@ MCP exposes one model surface selected at server startup:
 - `WEBCODEX_CONNECTOR_SURFACE=task-v1`, together with the complete Connector
   project configuration written by `webcodex setup`, selects
   `canonical_connector` and the twelve project-bound capabilities below.
-- If that variable is absent, `/mcp` exposes `full_operator_runtime`. The
-  server emits a startup warning; this is an operator/debug surface, not an
-  implicit Connector with Connector continuity claims.
-- An unsupported surface value or incomplete Connector configuration is a
-  startup configuration error; it does not fall through to another surface.
+- Without Connector configuration, an unset `WEBCODEX_MCP_MODEL_SURFACE`
+  selects the focused `local_coding` surface (the default ordinary-user
+  surface; its tool set is listed below).
+- `WEBCODEX_MCP_MODEL_SURFACE=local-coding-v1` selects `local_coding`
+  explicitly; `WEBCODEX_MCP_MODEL_SURFACE=full-operator-v1` selects the
+  explicit `full_operator_runtime` operator/debug surface.
+- Setting Connector configuration and `WEBCODEX_MCP_MODEL_SURFACE` together,
+  or using an unsupported `WEBCODEX_MCP_MODEL_SURFACE` value, is a startup
+  configuration error; it does not fall through to another surface.
 
-`GET /mcp` and MCP `initialize.serverInfo` report the selection as
-`modelSurface`. On the full operator surface, `runtime_status.model_surface`
-reports the same fact. The standard ordinary-user setup selects
-`canonical_connector`; the full runtime remains available only when an
-operator deliberately runs without Connector configuration.
+`GET /mcp`, MCP `initialize.serverInfo`, and `runtime_status.model_surface`
+all report the same selected `modelSurface`. The standard ordinary-user setup
+selects `canonical_connector`; without it, the default is `local_coding`. The
+full operator runtime is served only when an operator explicitly selects it
+with `WEBCODEX_MCP_MODEL_SURFACE=full-operator-v1`.
 
 ## Project-Bound Surface
 
@@ -86,6 +90,53 @@ prove a slice complete, the response marks it partial/unknown and includes a
 compact warning instead of claiming reuse. `task_list` and `task_resume` are
 explicit recovery tools for a client that lost its MCP transport session, not
 steps in the ordinary loop.
+
+On `local_coding`, MCP `tools/list` contains exactly the focused coding tool
+set, in this order:
+
+```text
+work_on_project
+list_projects
+project_overview
+list_project_tracked_files
+list_project_files
+search_project_text
+read_file
+lsp_status
+document_symbols
+document_diagnostics
+hover
+workspace_symbols
+goto_definition
+find_references
+apply_text_edits
+apply_patch_checked
+run_shell
+run_job
+job_status
+job_log
+list_jobs
+stop_job
+cargo_fmt
+cargo_check
+cargo_test
+validation_summary
+git_status
+git_log
+git_diff
+git_diff_hunks
+show_changes
+workspace_hygiene_check
+finish_coding_task
+```
+
+The same list is the single source of truth for
+`tool_manifest(intent="coding")`. Session management (`start_session`,
+`current_session`, persistent shells), project registration/lifecycle
+(`register_project`, `create_project`), artifact/checkpoint tools, cleanup
+tools, and runtime/operator management (`runtime_status`, `tool_manifest`)
+are not part of this surface: `tools/call` rejects them at the MCP boundary
+before ToolRuntime dispatch, and `tools/list` never advertises them.
 
 On `full_operator_runtime`, ordinary coding starts or continues with
 `start_coding_task`. A stable window continues the same repository by default;

@@ -1,13 +1,15 @@
 use crate::action_audit::{ActionAudit, ActionAuditRecord};
 use crate::auth::AuthContext;
-use crate::connector_runtime::{ConnectorRuntime, ConnectorTransport};
+use crate::connector_runtime::{ConnectorRuntime, ConnectorRuntimeSlot, ConnectorTransport};
 use crate::json_error;
+use crate::model_surface::ModelSurface;
 use crate::tool_request_trace::{
     estimate_json_bytes, jsonrpc_id_safe, new_trace_id, ToolRequestLifecycle,
 };
 use crate::tool_runtime::kernel::{
     ToolCallContext, ToolCallErrorStatus, ToolCallRequest as KernelToolCallRequest, ToolTransport,
 };
+use crate::tool_runtime::tool_definition::LOCAL_CODING_TOOL_NAMES;
 use crate::tool_runtime::{registered_tool_specs, ToolResult, ToolRuntime, ToolSpec};
 use salvo::prelude::*;
 use serde::Deserialize;
@@ -59,6 +61,31 @@ fn runtime(depot: &Depot) -> Option<Arc<ToolRuntime>> {
     depot.obtain::<Arc<ToolRuntime>>().ok().cloned()
 }
 
+fn connector_runtime_slot(depot: &Depot) -> Option<ConnectorRuntimeSlot> {
+    depot.obtain::<ConnectorRuntimeSlot>().ok().cloned()
+}
+
+fn validate_model_surface_state(
+    model_surface: ModelSurface,
+    connector_present: bool,
+) -> Result<(), String> {
+    match (model_surface, connector_present) {
+        (ModelSurface::CanonicalConnector, true)
+        | (ModelSurface::LocalCoding, false)
+        | (ModelSurface::FullOperatorRuntime, false) => Ok(()),
+        (ModelSurface::CanonicalConnector, false) => Err(
+            "canonical_connector surface selected but Connector runtime state is missing"
+                .to_string(),
+        ),
+        (ModelSurface::LocalCoding, true) | (ModelSurface::FullOperatorRuntime, true) => {
+            Err(format!(
+                "{} surface selected but Connector runtime state is present",
+                model_surface.name()
+            ))
+        }
+    }
+}
+
 fn tool_name_from_params(params: &Value) -> Option<String> {
     params
         .get("name")
@@ -70,20 +97,13 @@ fn project_from_tool_call_params(params: &Value) -> Option<String> {
     params["arguments"]["project"].as_str().map(str::to_string)
 }
 
-/// MCP tools/list payload. When `WEBCODEX_MCP_COMPACT_SCHEMAS=true`, omit
-/// `outputSchema` only (name/description/inputSchema/annotations retained).
-/// This is an A/B compatibility experiment — not a permanent API change.
-#[cfg_attr(not(test), allow(dead_code))]
-fn mcp_tools_list_payload() -> Value {
-    mcp_tools_list_payload_for_connector(false)
-}
-
-fn mcp_tools_list_payload_for_connector(connector_enabled: bool) -> Value {
+/// MCP tools/list payload for the immutable startup-selected model surface.
+fn mcp_tools_list_payload(model_surface: ModelSurface) -> Value {
     let compact = crate::config::mcp_compact_schemas_enabled();
-    let specs = if connector_enabled {
-        crate::connector_runtime::surface::capability_specs()
-    } else {
-        registered_tool_specs()
+    let specs = match model_surface {
+        ModelSurface::CanonicalConnector => crate::connector_runtime::surface::capability_specs(),
+        ModelSurface::LocalCoding => crate::model_surface::local_coding_tool_specs(),
+        ModelSurface::FullOperatorRuntime => registered_tool_specs(),
     };
     let tools: Vec<Value> = specs
         .into_iter()
@@ -252,15 +272,33 @@ pub async fn mcp_info(depot: &mut Depot, res: &mut Response) {
     let auth_required = crate::auth::get_config(depot)
         .map(|c| c.is_auth_enabled())
         .unwrap_or(false);
-    let connector_configured = depot
-        .obtain::<crate::connector_runtime::ConnectorRuntimeSlot>()
-        .ok()
-        .and_then(|slot| slot.0.as_ref())
-        .is_some();
+    let Some(runtime) = runtime(depot) else {
+        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+        res.render(json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Tool runtime not configured",
+        ));
+        return;
+    };
+    let Some(connector_slot) = connector_runtime_slot(depot) else {
+        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+        res.render(json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MCP model surface state not configured",
+        ));
+        return;
+    };
+    let model_surface = runtime.model_surface();
+    if let Err(error) = validate_model_surface_state(model_surface, connector_slot.0.is_some()) {
+        tracing::error!(%error, "MCP model surface state mismatch");
+        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+        res.render(json_error(StatusCode::INTERNAL_SERVER_ERROR, error));
+        return;
+    }
     res.render(Json(json!({
         "name": "webcodex",
         "version": env!("CARGO_PKG_VERSION"),
-        "modelSurface": crate::connector_runtime::model_surface_name(connector_configured),
+        "modelSurface": model_surface.name(),
         "protocol": "mcp",
         "protocolVersion": MCP_PROTOCOL_VERSION,
         "transport": "streamable-http-jsonrpc",
@@ -290,6 +328,25 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
         guard.handler_returned(500, None, Some(false), None, "error_runtime_missing");
         return;
     };
+    let Some(connector_slot) = connector_runtime_slot(depot) else {
+        guard.response_serialized(500, None, Some(false), None, "error_surface_state_missing");
+        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+        res.render(json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MCP model surface state not configured",
+        ));
+        guard.handler_returned(500, None, Some(false), None, "error_surface_state_missing");
+        return;
+    };
+    let connector = connector_slot.0;
+    if let Err(error) = validate_model_surface_state(runtime.model_surface(), connector.is_some()) {
+        tracing::error!(%error, "MCP model surface state mismatch");
+        guard.response_serialized(500, None, Some(false), None, "error_surface_state_mismatch");
+        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+        res.render(json_error(StatusCode::INTERNAL_SERVER_ERROR, error));
+        guard.handler_returned(500, None, Some(false), None, "error_surface_state_mismatch");
+        return;
+    }
     let request: JsonRpcRequest = match req.parse_json().await {
         Ok(request) => request,
         Err(e) => {
@@ -341,7 +398,6 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
     };
 
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
-    let connector = crate::connector_runtime::http::runtime(depot);
     // Defense-in-depth backstop: every tool bounds its own agent/subprocess
     // waits at <= 124s, so this outer limit never preempts a legitimate inner
     // timeout. It only fires if a dispatch path hangs without a bound (the
@@ -519,6 +575,10 @@ async fn handle_mcp_request_with_lifecycle(
         return McpOutcome::BadRequest(rpc_error(request.id, -32600, "jsonrpc must be '2.0'"));
     }
 
+    if let Err(error) = validate_model_surface_state(runtime.model_surface(), connector.is_some()) {
+        return McpOutcome::BadRequest(rpc_error(request.id, -32603, error));
+    }
+
     let id = request.id.clone();
     let response = match request.method.as_str() {
         "initialize" => rpc_result(
@@ -533,17 +593,12 @@ async fn handle_mcp_request_with_lifecycle(
                 "serverInfo": {
                     "name": "webcodex",
                     "version": env!("CARGO_PKG_VERSION"),
-                    "modelSurface": crate::connector_runtime::model_surface_name(
-                        connector.is_some()
-                    )
+                    "modelSurface": runtime.model_surface().name()
                 }
             }),
         ),
         "ping" => rpc_result(id, json!({})),
-        "tools/list" => rpc_result(
-            id,
-            mcp_tools_list_payload_for_connector(connector.is_some()),
-        ),
+        "tools/list" => rpc_result(id, mcp_tools_list_payload(runtime.model_surface())),
         "tools/call" => {
             let mut params: McpToolCallParams = match serde_json::from_value(request.params) {
                 Ok(params) => params,
@@ -561,7 +616,28 @@ async fn handle_mcp_request_with_lifecycle(
                 lc.set_tool_name(Some(params.name.clone()));
                 lc.dispatch_started();
             }
-            if let Some(connector) = connector {
+            // The local_coding model surface rejects tools it does not
+            // advertise at the MCP boundary, before ToolRuntime dispatch. The
+            // full operator runtime and the canonical Connector keep their
+            // existing behavior unchanged.
+            if runtime.model_surface() == ModelSurface::LocalCoding
+                && !LOCAL_CODING_TOOL_NAMES.contains(&params.name.as_str())
+            {
+                if let Some(lc) = lifecycle.as_deref() {
+                    lc.dispatch_failed("surface_denied");
+                    lc.dispatch_finished(false, Some(false), "surface_denied");
+                }
+                return McpOutcome::BadRequest(rpc_error(
+                    id,
+                    -32602,
+                    format!(
+                        "tool '{}' is not available on the local_coding MCP surface; the full operator runtime must be selected explicitly with WEBCODEX_MCP_MODEL_SURFACE=full-operator-v1",
+                        params.name
+                    ),
+                ));
+            }
+            if runtime.model_surface() == ModelSurface::CanonicalConnector {
+                let connector = connector.expect("validated canonical Connector state");
                 if params.name == "task_start" && window.is_none() {
                     if let Some(lc) = lifecycle.as_deref() {
                         lc.dispatch_failed("window_identity_unavailable");

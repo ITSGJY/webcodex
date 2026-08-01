@@ -20,6 +20,7 @@ pub struct ToolRuntime {
     #[allow(dead_code)]
     pub codex: Arc<CodexConfig>,
     pub runtime_info: Arc<RuntimeInfo>,
+    model_surface: crate::model_surface::ModelSurface,
     pub(crate) checkpoint_store: checkpoint::CheckpointStore,
     pub(crate) sessions: sessions::SessionStore,
     pub(crate) session_shells: SessionShellRegistry,
@@ -49,6 +50,7 @@ impl ToolRuntime {
             shell_clients,
             codex,
             runtime_info,
+            model_surface: crate::model_surface::ModelSurface::LocalCoding,
             checkpoint_store: checkpoint::CheckpointStore::default(),
             sessions: sessions::SessionStore::default(),
             session_shells: SessionShellRegistry::default(),
@@ -60,6 +62,18 @@ impl ToolRuntime {
             activity: Arc::new(NoopActivityRecorder),
             observations: Arc::new(RuntimeObservations::default()),
         }
+    }
+
+    pub(crate) fn with_model_surface(
+        mut self,
+        model_surface: crate::model_surface::ModelSurface,
+    ) -> Self {
+        self.model_surface = model_surface;
+        self
+    }
+
+    pub(crate) fn model_surface(&self) -> crate::model_surface::ModelSurface {
+        self.model_surface
     }
 
     /// Attach a durable workspace-activity recorder (server wiring).

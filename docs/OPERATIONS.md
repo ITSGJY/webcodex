@@ -167,12 +167,15 @@ full-runtime binding from its durable projection. If the transport no longer
 provides that identity, continue with the explicit durable `wc_sess_*` session
 id; do not restart the runner to "fix" a `not_bound` binding.
 
-`runtime_status.model_surface` reports `canonical_connector` or
-`full_operator_runtime`. MCP GET and initialize expose the same selection as
-`modelSurface`. Complete `WEBCODEX_CONNECTOR_SURFACE=task-v1` configuration
-selects the Connector; an absent variable intentionally exposes the full
-operator MCP surface and emits a startup warning. Invalid or incomplete
-Connector configuration fails startup instead of falling through.
+`runtime_status.model_surface` reports `canonical_connector`, `local_coding`,
+or `full_operator_runtime`. MCP GET and initialize expose the same selection
+as `modelSurface`. Complete `WEBCODEX_CONNECTOR_SURFACE=task-v1` configuration
+selects `canonical_connector`; without it, an unset
+`WEBCODEX_MCP_MODEL_SURFACE` selects the focused `local_coding` surface, and
+the explicit `full-operator-v1` value selects `full_operator_runtime`.
+Invalid `WEBCODEX_MCP_MODEL_SURFACE` values, a Connector +
+`WEBCODEX_MCP_MODEL_SURFACE` conflict, or incomplete Connector configuration
+fails startup instead of falling through.
 
 `runtime_status` also reports `version_compatibility`:
 

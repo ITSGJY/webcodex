@@ -260,6 +260,53 @@ pub(crate) const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
     },
 ];
 
+/// Single ordered, unique source of truth for the `local_coding` MCP surface
+/// and `tool_manifest(intent="coding")`. The order is both the MCP tools/list
+/// order and the coding manifest ranking.
+pub(crate) const LOCAL_CODING_TOOL_NAMES: &[&str] = &[
+    // entry
+    "work_on_project",
+    "list_projects",
+    // project discovery + read
+    "project_overview",
+    "list_project_tracked_files",
+    "list_project_files",
+    "search_project_text",
+    "read_file",
+    // LSP navigation
+    "lsp_status",
+    "document_symbols",
+    "document_diagnostics",
+    "hover",
+    "workspace_symbols",
+    "goto_definition",
+    "find_references",
+    // guarded edits
+    "apply_text_edits",
+    "apply_patch_checked",
+    // shell and jobs
+    "run_shell",
+    "run_job",
+    "job_status",
+    "job_log",
+    "list_jobs",
+    "stop_job",
+    // validation
+    "cargo_fmt",
+    "cargo_check",
+    "cargo_test",
+    "validation_summary",
+    // git review
+    "git_status",
+    "git_log",
+    "git_diff",
+    "git_diff_hunks",
+    "show_changes",
+    "workspace_hygiene_check",
+    // finish
+    "finish_coding_task",
+];
+
 /// Stable task-intent views for `tool_manifest(intent=...)`.
 /// Ordered lists are ranked for model selection; not a substitute for category.
 /// Intent views only filter and rank discovery output; they do not change tool
@@ -268,37 +315,7 @@ pub(crate) const TOOL_MANIFEST_INTENTS: &[ToolManifestIntent] = &[
     ToolManifestIntent {
         name: "coding",
         purpose: "Default coding loop: start, inspect, structured edit, validate, review, report.",
-        tools: &[
-            // start
-            "work_on_project",
-            // project discovery
-            "project_overview",
-            "list_project_tracked_files",
-            // inspect
-            "read_file",
-            "search_project_text",
-            "list_project_files",
-            // canonical precise edit
-            "apply_text_edits",
-            // canonical checked multi-file patch
-            "apply_patch_checked",
-            // validation
-            "validate_patch",
-            "cargo_fmt",
-            "cargo_check",
-            "cargo_test",
-            "validation_summary",
-            // review
-            "show_changes",
-            "git_diff_hunks",
-            "workspace_hygiene_check",
-            // git / cleanup
-            "git_status",
-            "git_restore_paths",
-            "discard_untracked",
-            // optional evidence snapshot
-            "finish_coding_task",
-        ],
+        tools: LOCAL_CODING_TOOL_NAMES,
     },
     ToolManifestIntent {
         name: "audit",

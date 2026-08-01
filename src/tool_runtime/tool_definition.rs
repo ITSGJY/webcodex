@@ -26,8 +26,8 @@ use super::metadata::{
 #[cfg(test)]
 pub(crate) use super::tool_catalog::TOOL_MANIFEST_INTENTS;
 pub(crate) use super::tool_catalog::{
-    available_tool_manifest_intent_names, resolve_tool_manifest_intent, TOOL_DISCOVERY_GROUPS,
-    TOOL_RECOMMENDED_FLOWS,
+    available_tool_manifest_intent_names, resolve_tool_manifest_intent, LOCAL_CODING_TOOL_NAMES,
+    TOOL_DISCOVERY_GROUPS, TOOL_RECOMMENDED_FLOWS,
 };
 #[cfg(test)]
 pub(crate) use super::tool_catalog::{

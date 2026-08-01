@@ -82,12 +82,15 @@ The protocol adapters translate incoming requests into runtime tool calls. The T
 ## Runtime Surfaces
 
 - `runtime_http` exposes REST runtime routes, including generic runtime tool calls and dedicated project/file wrappers.
-- `mcp` exposes exactly one startup-selected model surface. Complete
-  `WEBCODEX_CONNECTOR_SURFACE=task-v1` configuration selects the twelve-tool
-  Canonical Connector. An absent surface variable explicitly selects the full
-  operator registry and emits a startup warning; invalid or incomplete
-  Connector configuration fails startup. MCP discovery/initialize and runtime
-  status report the active surface.
+- `mcp` exposes exactly one immutable, startup-selected model surface. Complete
+  `WEBCODEX_CONNECTOR_SURFACE=task-v1` configuration selects
+  `canonical_connector`. Without Connector configuration, an unset
+  `WEBCODEX_MCP_MODEL_SURFACE` selects `local_coding`; `local-coding-v1` selects
+  it explicitly, while `full-operator-v1` is the only way to select
+  `full_operator_runtime`. Unsupported values, Connector/surface conflicts, and
+  partial Connector configuration fail startup. MCP GET/initialize,
+  tools/list, tools/call, runtime status, and startup logging all use the same
+  parsed state.
 - `openapi` builds the GPT Actions schema for the focused public operation surface.
 - `connector_runtime` owns the canonical project-bound coding path. It maps one
   transport window and exact repository identity to an existing durable

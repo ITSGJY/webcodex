@@ -26,6 +26,7 @@ mod console_web;
 mod db;
 mod host_console_http;
 mod mcp;
+mod model_surface;
 mod models;
 mod oauth_http;
 mod openapi;
@@ -181,6 +182,13 @@ only for local/trusted-network demos."
     let authorize_session_store = Arc::new(oauth_http::AuthorizeSessionStore::new());
     let shell_registry = Arc::new(ShellClientRegistry::default());
     let quic_cfg = config::QuicServerConfig::from_env();
+    let connector_context =
+        connector_runtime::ConnectorContext::from_env().map_err(std::io::Error::other)?;
+    // Resolve the model surface exactly once at startup, after Connector
+    // configuration has been parsed and validated. Every request-time
+    // projection reads this immutable enum from ToolRuntime.
+    let model_surface = model_surface::resolve_model_surface(connector_context.as_ref())
+        .map_err(std::io::Error::other)?;
     let runtime_info = Arc::new(tool_runtime::RuntimeInfo::from_env_with_quic_config(
         &quic_cfg,
     ));
@@ -189,6 +197,7 @@ only for local/trusted-network demos."
         Arc::new(config.codex.clone()),
         runtime_info.clone(),
     )
+    .with_model_surface(model_surface)
     .with_checkpoint_state_dir(config.runtime_state_dir())
     .with_session_ledger(config.session_ledger_path());
     if let Some(activity_store) = db::WorkspaceActivityStore::from_env(db.clone()) {
@@ -196,22 +205,25 @@ only for local/trusted-network demos."
             tool_runtime_builder.with_activity_recorder(Arc::new(activity_store));
     }
     let tool_runtime = Arc::new(tool_runtime_builder);
-    let connector_runtime =
-        connector_runtime::ConnectorRuntime::from_env(tool_runtime.clone(), db.clone())
-            .map_err(std::io::Error::other)?;
+    let connector_runtime = connector_runtime::ConnectorRuntime::from_context(
+        tool_runtime.clone(),
+        db.clone(),
+        connector_context,
+    )
+    .map_err(std::io::Error::other)?;
     if let Some(runtime) = connector_runtime.0.as_ref() {
         tracing::info!(
             project_id = %runtime.context().project_id,
             profile = %runtime.context().profile,
             capabilities = connector_runtime::surface::CAPABILITY_NAMES.len(),
-            model_surface = connector_runtime::MODEL_SURFACE_CANONICAL_CONNECTOR,
+            model_surface = model_surface.name(),
             "Project-bound connector surface enabled"
         );
     } else {
-        tracing::warn!(
-            model_surface = connector_runtime::MODEL_SURFACE_FULL_OPERATOR_RUNTIME,
-            config = "WEBCODEX_CONNECTOR_SURFACE=task-v1",
-            "Canonical Connector is not configured; /mcp explicitly exposes the full operator runtime"
+        tracing::info!(
+            model_surface = model_surface.name(),
+            config = "WEBCODEX_MCP_MODEL_SURFACE",
+            "MCP model surface enabled"
         );
     }
 

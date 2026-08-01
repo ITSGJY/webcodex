@@ -1092,12 +1092,12 @@ fn tool_manifest_intents_reference_only_known_model_visible_tools() {
                 intent.name,
                 tool
             );
-            assert_ne!(
-                *tool, "run_shell",
-                "{} intent must not default to run_shell",
-                intent.name
-            );
             if matches!(intent.name, "audit" | "exploration" | "release") {
+                assert_ne!(
+                    *tool, "run_shell",
+                    "{} intent must not default to run_shell",
+                    intent.name
+                );
                 assert_ne!(
                     *tool, "run_job",
                     "{} intent must not default to run_job",
@@ -1218,12 +1218,11 @@ async fn tool_manifest_intent_coding_returns_ranked_compact_tools() {
     );
     assert!(result.output.get("recommended_flows").is_none());
     assert!(result.output["risk_summary"].is_object());
-    for forbidden in ["run_shell", "run_job"] {
-        assert!(
-            !names.contains(&forbidden),
-            "coding intent should not include {forbidden}"
-        );
-    }
+    assert_eq!(
+        names,
+        crate::tool_runtime::tool_definition::LOCAL_CODING_TOOL_NAMES,
+        "coding manifest must use the canonical local_coding order"
+    );
 }
 
 #[tokio::test]
@@ -1446,48 +1445,18 @@ fn project_overview_manifest_profiles_match_intended_workflows() {
 }
 
 #[test]
-fn coding_intent_includes_canonical_edit_and_cleanup_tools() {
-    use crate::tool_runtime::tool_definition::TOOL_MANIFEST_INTENTS;
+fn coding_intent_matches_local_coding_canonical_tools() {
+    use crate::tool_runtime::tool_definition::{LOCAL_CODING_TOOL_NAMES, TOOL_MANIFEST_INTENTS};
 
     let coding = TOOL_MANIFEST_INTENTS
         .iter()
         .find(|intent| intent.name == "coding")
         .expect("coding intent");
-    for required in [
-        "apply_text_edits",
-        "apply_patch_checked",
-        "git_status",
-        "git_restore_paths",
-        "discard_untracked",
-        "finish_coding_task",
-    ] {
-        assert!(
-            coding.tools.contains(&required),
-            "coding intent must include {required}: {:?}",
-            coding.tools
-        );
-    }
-    // Compatibility line/pattern tools remain registered, but coding intent
-    // ranks only the canonical edit paths to reduce model selection noise.
-    for compat in [
-        "replace_line_range",
-        "insert_at_line",
-        "delete_line_range",
-        "replace_in_file",
-        "write_project_file",
-        "apply_patch",
-    ] {
-        assert!(
-            !coding.tools.contains(&compat),
-            "coding intent should not rank compatibility/advanced edit tool {compat}"
-        );
-    }
-    for forbidden in ["run_shell", "run_job"] {
-        assert!(
-            !coding.tools.contains(&forbidden),
-            "coding intent must exclude {forbidden}"
-        );
-    }
+    assert_eq!(coding.tools, LOCAL_CODING_TOOL_NAMES);
+    assert!(coding.tools.contains(&"run_shell"));
+    assert!(coding.tools.contains(&"run_job"));
+    assert!(!coding.tools.contains(&"git_restore_paths"));
+    assert!(!coding.tools.contains(&"discard_untracked"));
 }
 
 fn assert_recommended_flows_subset_of_manifest_tools(manifest: &Value, context: &str) {

@@ -1472,12 +1472,13 @@ async fn runtime_status_uses_agent_projects_as_effective() {
 
 #[tokio::test]
 async fn runtime_status_includes_build_metadata() {
-    let runtime = test_runtime();
+    let runtime =
+        test_runtime().with_model_surface(crate::model_surface::ModelSurface::FullOperatorRuntime);
     let result = runtime.dispatch(runtime_status_call()).await;
     assert!(result.success, "{:?}", result.error);
     assert_eq!(
         result.output["model_surface"],
-        crate::connector_runtime::MODEL_SURFACE_FULL_OPERATOR_RUNTIME
+        crate::model_surface::MODEL_SURFACE_FULL_OPERATOR_RUNTIME
     );
     let build = &result.output["build"];
     assert!(build.is_object());
@@ -1487,9 +1488,22 @@ async fn runtime_status_includes_build_metadata() {
 }
 
 #[tokio::test]
-async fn runtime_status_reports_canonical_connector_surface_when_configured() {
+async fn runtime_status_defaults_to_local_coding_surface() {
+    let _guard = crate::admin_cli::TEST_ENV_LOCK.lock().unwrap();
+    std::env::remove_var(crate::model_surface::MCP_MODEL_SURFACE_ENV);
     let runtime = test_runtime();
-    runtime.observations.set_connector_configured();
+    let result = runtime.dispatch(runtime_status_call()).await;
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(
+        result.output["model_surface"],
+        crate::model_surface::MODEL_SURFACE_LOCAL_CODING
+    );
+}
+
+#[tokio::test]
+async fn runtime_status_reports_canonical_connector_surface_when_configured() {
+    let runtime =
+        test_runtime().with_model_surface(crate::model_surface::ModelSurface::CanonicalConnector);
     let full = runtime.dispatch(runtime_status_call()).await;
     assert_eq!(
         full.output["model_surface"],

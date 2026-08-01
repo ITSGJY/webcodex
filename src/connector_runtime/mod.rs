@@ -19,7 +19,9 @@ pub(crate) mod workspace;
 
 // Re-export `ConnectorContext` and the env helpers so existing call sites in
 // this module (and `host_tests`) keep resolving through `super::`.
-pub(crate) use context::{required_env, ConnectorContext};
+pub(crate) use context::{
+    required_env, ConnectorContext, PROJECT_AGENT_TOKEN_FILE_ENV, PROJECT_CREDENTIAL_FILE_ENV,
+};
 
 #[allow(unused_imports)]
 use projections::*;
@@ -29,9 +31,13 @@ use wire_models::*;
 // Re-export the symbols host_console_http and other modules reference through
 // `crate::connector_runtime::`. They moved into the projections / wire_models
 // submodules above but keep their `pub(crate)` visibility here for callers.
+#[cfg(test)]
+pub(crate) use crate::model_surface::{
+    MODEL_SURFACE_CANONICAL_CONNECTOR, MODEL_SURFACE_FULL_OPERATOR_RUNTIME,
+};
 pub(crate) use projections::{
-    approval_projection, durable_task_review_projection, model_surface_name, result_projection,
-    store_error_outcome, validate_opaque_id,
+    approval_projection, durable_task_review_projection, result_projection, store_error_outcome,
+    validate_opaque_id,
 };
 pub(crate) use wire_models::{TaskCancelInput, TaskReviewInput};
 
@@ -79,8 +85,6 @@ use crate::tool_runtime::validation_profile::{RecipeId, SemanticCheck};
 #[cfg(test)]
 use crate::tool_runtime::ApplyFileChangeInput;
 
-pub(crate) const MODEL_SURFACE_CANONICAL_CONNECTOR: &str = "canonical_connector";
-pub(crate) const MODEL_SURFACE_FULL_OPERATOR_RUNTIME: &str = "full_operator_runtime";
 const MAX_EVENT_COUNT: usize = 50;
 /// Guidance messages delivered in one capability response. Bounded so a burst
 /// cannot bloat a response; the rest is claimed by the next one.
@@ -202,19 +206,31 @@ impl ConnectorRuntime {
         self
     }
 
-    pub(crate) fn from_env(
+    pub(crate) fn from_context(
         tools: Arc<ToolRuntime>,
         db: Arc<Database>,
+        context: Option<ConnectorContext>,
     ) -> Result<ConnectorRuntimeSlot, String> {
-        let Some(context) = ConnectorContext::from_env()? else {
+        match (tools.model_surface(), context.is_some()) {
+            (crate::model_surface::ModelSurface::CanonicalConnector, true)
+            | (crate::model_surface::ModelSurface::LocalCoding, false)
+            | (crate::model_surface::ModelSurface::FullOperatorRuntime, false) => {}
+            (surface, connector_present) => {
+                return Err(format!(
+                    "model surface '{}' is inconsistent with Connector runtime state (present={connector_present})",
+                    surface.name()
+                ));
+            }
+        }
+        let Some(context) = context else {
             return Ok(ConnectorRuntimeSlot::default());
         };
-        let credential_path = required_env("WEBCODEX_PROJECT_CREDENTIAL_FILE")?;
+        let credential_path = required_env(PROJECT_CREDENTIAL_FILE_ENV)?;
         let credential = ProjectCredentialVerifier::from_file(
             context.project_grant_id.clone(),
             Path::new(&credential_path),
         )?;
-        let agent_token_path = required_env("WEBCODEX_PROJECT_AGENT_TOKEN_FILE")?;
+        let agent_token_path = required_env(PROJECT_AGENT_TOKEN_FILE_ENV)?;
         let agent_token = ProjectAgentTokenVerifier::from_file(
             context.project_grant_id.clone(),
             context.executor_client_id()?.to_string(),

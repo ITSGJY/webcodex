@@ -9,10 +9,7 @@
 //! the runtime module reads as orchestration rather than a wall of formatting.
 
 use super::wire_models::FilesSearchInput;
-use super::{
-    execution, ConnectorCallOutcome, CONNECTOR_SEARCH_WINDOW, MODEL_SURFACE_CANONICAL_CONNECTOR,
-    MODEL_SURFACE_FULL_OPERATOR_RUNTIME,
-};
+use super::{execution, ConnectorCallOutcome, CONNECTOR_SEARCH_WINDOW};
 use crate::auth::{
     AuthContext, AuthKind, SCOPE_JOB_RUN, SCOPE_PROJECT_READ, SCOPE_PROJECT_WRITE,
     SCOPE_RUNTIME_READ,
@@ -28,14 +25,6 @@ use crate::tool_runtime::{ApplyFileChangeInput, SearchResultMode, ToolResult};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-
-pub(crate) fn model_surface_name(connector_configured: bool) -> &'static str {
-    if connector_configured {
-        MODEL_SURFACE_CANONICAL_CONNECTOR
-    } else {
-        MODEL_SURFACE_FULL_OPERATOR_RUNTIME
-    }
-}
 
 // NOTE: The subject is intentionally passed explicitly rather than stored as
 // current connector state. Two devices for one user share a subject; two users

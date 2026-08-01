@@ -185,11 +185,13 @@ registration calls.
 
 `webcodex setup` selects this ordinary-user surface with
 `WEBCODEX_CONNECTOR_SURFACE=task-v1`. A server started without Connector
-configuration exposes the full operator runtime on `/mcp` and logs an explicit
-warning; `GET /mcp` and MCP initialize identify the active surface. The full
-runtime's `start_coding_task` has the same window/repository start-or-continue
-semantics, but its current binding is process-local and its broader tool set is
-intended for operator and debugging workflows.
+configuration serves the focused `local_coding` surface on `/mcp` by default;
+the explicit `WEBCODEX_MCP_MODEL_SURFACE=full-operator-v1` selects the full
+operator runtime. `GET /mcp`, MCP initialize, and `runtime_status.model_surface`
+all identify the active surface. The full runtime's `start_coding_task` has the
+same window/repository start-or-continue semantics, but its current binding is
+process-local and its broader tool set is intended for operator and debugging
+workflows.
 
 Normal writable tasks must run structured checks before `task_finish`. The
 result remains isolated until a human reviews and accepts it locally. The same
