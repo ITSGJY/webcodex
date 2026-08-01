@@ -305,6 +305,71 @@ prompt 中不需要 project discovery 或 runtime identifier。
 
 短答案使用 `webcodex status`，完整只读 findings 使用 `webcodex doctor`。
 
+## 有界源码阅读（`read_file`）
+
+`read_file` 是针对 agent 注册项目的有界、流式 UTF-8 范围读取。本地项目与
+agent 项目复用同一套范围算法，因此除解析出的 project id 和传输方式外，
+模型侧输出完全一致。
+
+输入保持不变：`project`、`path`、可选 `session_id`、可选 `start_line`
+（默认 1，最小 1）、可选 `limit`（默认 2000，clamp 到 `1..=2000`）、可选
+`with_line_numbers`。未新增任何输入字段、批量模式或配置项。
+
+成功读取会顺序扫描文件一次——流式计算完整文件 SHA-256 与总行数，仅保留
+所请求范围——返回：
+
+```text
+text              # 选中范围的正文，plain 或 numbered，行以 \n 连接
+format            # "plain" | "numbered"
+path              # 项目相对输入路径
+sha256            # 完整文件的 64 位小写十六进制摘要
+start_line        # 有效起始行（>= 1）
+limit             # 有效行数上限（1..=2000）
+total_lines       # 完整文件行数（>= 0）
+returned_lines    # 实际返回的原始文件行数（>= 0，<= limit）
+end_line          # start_line + returned_lines - 1；无返回时为 null
+has_more          # 仅当返回范围之后仍有文件行时为 true
+next_start_line   # 续读起始行 end_line + 1；到文件末尾为 null
+```
+
+`with_line_numbers=true` 只改变 `text` 和 `format`，绝不改变
+`returned_lines`、`end_line`、`has_more`、`next_start_line`。
+
+使用 `next_start_line` 续读：
+
+```jsonc
+// 第一次
+{ "project": "demo", "path": "src/main.rs", "limit": 40 }
+// -> next_start_line: 41, has_more: true
+// 从上一次停止处继续
+{ "project": "demo", "path": "src/main.rs", "start_line": 41, "limit": 40 }
+```
+
+边界由代码直接保证，不依赖 transport 尾部截断。选中原始正文有独立的
+192 KiB 预算；Runner 在发送前序列化完整的
+`webcodex.file_read_range.v1` envelope，并按有效 transport cap 与 256 KiB
+两者中的较小值复检。ToolRuntime 随后还会在添加行号和 JSON 转义后复检
+最终模型输出。任一层超出预算都稳定返回 `reason_code: range_too_large`——
+请缩小 `limit` 或缩窄范围后重试；绝不返回半行，也不返回与 SHA/行数元数据
+不一致的正文。
+
+失败返回小而稳定、有 schema 的对象——绝不包含绝对路径、原始 OS 错误、
+命令或 Runner stdout/stderr：
+
+```text
+error_kind:   "read_file_failed"
+reason_code:  invalid_path | sensitive_path | not_found | not_file |
+              permission_denied | invalid_utf8 | range_too_large |
+              agent_unavailable | timeout | malformed_agent_response | io_error
+path:         项目相对输入路径（仅用于定位）
+state_changed: false
+```
+
+Agent 的 `file_read_range.v1` 响应被视为不可信输入：每个正式字段都会被
+严格验证，模型输出仅由这些字段重建。未知字段、padding、与请求不一致的范围
+元数据、错误 SHA、或 content/行数不一致都会被剥离或拒绝
+（`malformed_agent_response`），绝不透传到模型。
+
 ## Advanced runtime surface
 
 WebCodex 也可以作为 multi-project management ToolRuntime 运行。其 discovery、

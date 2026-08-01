@@ -131,7 +131,7 @@ pub(in crate::tool_runtime::tests) fn run_agent_shell_request_locally(
 }
 
 fn run_agent_file_read_request_locally(req: &ShellAgentShellRequest) -> (i32, String, String) {
-    use sha2::{Digest, Sha256};
+    use webcodex_workspace::file_read_range::{self, EffectiveRange};
 
     let Some(cwd) = req.cwd.as_deref() else {
         return (-1, String::new(), "file_read missing cwd".to_string());
@@ -140,39 +140,25 @@ fn run_agent_file_read_request_locally(req: &ShellAgentShellRequest) -> (i32, St
         return (-1, String::new(), "file_read missing path".to_string());
     };
     let target = Path::new(cwd).join(path);
-    let content = match std::fs::read_to_string(&target) {
-        Ok(content) => content,
-        Err(error) => return (-1, String::new(), error.to_string()),
-    };
+    // Reconstruct the shared effective range from the runner's inclusive window.
     let start_line = req.start_line.unwrap_or(1).max(1);
-    let end_line = req.end_line.unwrap_or(usize::MAX);
-    let lines: Vec<&str> = content.lines().collect();
-    let selected = lines
-        .iter()
-        .skip(start_line.saturating_sub(1))
-        .take(end_line.saturating_sub(start_line).saturating_add(1))
-        .copied()
-        .collect::<Vec<_>>()
-        .join("\n");
-    if req
-        .max_bytes
-        .is_some_and(|max_bytes| selected.len() > max_bytes)
-    {
-        return (
-            -1,
-            String::new(),
-            "range output exceeds max_bytes".to_string(),
-        );
+    let end_line = req.end_line.unwrap_or(start_line);
+    let limit = end_line.saturating_sub(start_line).saturating_add(1);
+    let range = EffectiveRange::new(Some(start_line), Some(limit));
+    match file_read_range::read_range(&target, range) {
+        Ok(result) => {
+            let output = json!({
+                "format": "webcodex.file_read_range.v1",
+                "content": result.content,
+                "sha256": result.sha256,
+                "total_lines": result.total_lines,
+                "start_line": result.start_line,
+                "limit": result.limit,
+            });
+            (0, output.to_string(), String::new())
+        }
+        Err(error) => (-1, String::new(), error.to_string()),
     }
-    let output = json!({
-        "format": "webcodex.file_read_range.v1",
-        "content": selected,
-        "sha256": format!("{:x}", Sha256::digest(content.as_bytes())),
-        "total_lines": lines.len(),
-        "start_line": start_line,
-        "limit": end_line.saturating_sub(start_line).saturating_add(1),
-    });
-    (0, output.to_string(), String::new())
 }
 
 fn run_agent_project_overview_request_locally(
@@ -702,17 +688,40 @@ pub(in crate::tool_runtime::tests) async fn register_agent_with_shell_profiles(
         .unwrap();
 }
 
+/// Build a canonical `webcodex.file_read_range.v1` envelope for the full file
+/// `content` under the ToolRuntime default effective range (start_line=1,
+/// limit=2000). The selected window, SHA-256, total line count, and range
+/// fields are all derived through the shared range reader so the envelope is
+/// exactly what a real agent produces and passes the ToolRuntime strict
+/// validation. `total_lines` is ignored in favor of the shared reader's count;
+/// it is kept only for call-site compatibility.
 pub(in crate::tool_runtime::tests) fn canonical_agent_file_read_output(
     content: &str,
-    total_lines: usize,
+    _total_lines: usize,
 ) -> String {
+    canonical_agent_file_read_range(content, 1, 2000)
+}
+
+/// Build a canonical `webcodex.file_read_range.v1` envelope for the full file
+/// `content` under an explicit effective request range. The selected window is
+/// computed by the shared range reader so content, total_lines, start_line,
+/// and limit are internally consistent and match the ToolRuntime validation.
+pub(in crate::tool_runtime::tests) fn canonical_agent_file_read_range(
+    content: &str,
+    start_line: usize,
+    limit: usize,
+) -> String {
+    use webcodex_workspace::file_read_range::{self, EffectiveRange};
+    let range = EffectiveRange::new(Some(start_line), Some(limit));
+    let result = file_read_range::read_range_from(content.as_bytes(), range)
+        .expect("canonical agent file read fixture range fits budget");
     serde_json::json!({
         "format": "webcodex.file_read_range.v1",
-        "content": content,
-        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "total_lines": total_lines,
-        "start_line": 1,
-        "limit": total_lines.max(1),
+        "content": result.content,
+        "sha256": result.sha256,
+        "total_lines": result.total_lines,
+        "start_line": result.start_line,
+        "limit": result.limit,
     })
     .to_string()
 }

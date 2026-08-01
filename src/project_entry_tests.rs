@@ -618,8 +618,10 @@ async fn run_authenticated_golden_path(recipe: &str) -> GoldenPathEvidence {
         let stdout = serde_json::json!({
             "format": "webcodex.file_read_range.v1",
             "path": "README.md",
-            "content": "fixture\n",
+            "content": "fixture",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "start_line": 1,
+            "limit": 200,
             "total_lines": 1,
             "truncated": false
         })

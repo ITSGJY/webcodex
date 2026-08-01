@@ -4,11 +4,11 @@ use super::shell::cwd_allowed;
 use crate::agent_init::DEFAULT_MAX_OUTPUT_BYTES;
 use crate::project_overview::build_project_overview;
 use crate::shell_protocol::ShellAgentShellRequest;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use webcodex_workspace::file_read_range::{self, ReadFileReason};
 
 pub(crate) fn sha256_hex_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -139,22 +139,35 @@ fn handle_project_overview_request(
     }
 }
 
+fn read_file_reason_from_io(error: &std::io::Error) -> ReadFileReason {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => ReadFileReason::NotFound,
+        std::io::ErrorKind::PermissionDenied => ReadFileReason::PermissionDenied,
+        std::io::ErrorKind::InvalidData => ReadFileReason::InvalidUtf8,
+        _ => ReadFileReason::IoError,
+    }
+}
+
+fn read_file_reason_message(reason: ReadFileReason) -> String {
+    format!("read_file failed: {}", reason.as_str())
+}
+
 fn ensure_file_read_target_in_project(
     request: &ShellAgentShellRequest,
     resolved: &Path,
-) -> Result<(), String> {
-    let project_root = request
-        .cwd
-        .as_deref()
-        .ok_or_else(|| "file_read requires a project root".to_string())?;
+) -> Result<(), ReadFileReason> {
+    let project_root = request.cwd.as_deref().ok_or(ReadFileReason::InvalidPath)?;
     let project_root = Path::new(project_root)
         .canonicalize()
-        .map_err(|_| "file_read project root is unavailable".to_string())?;
+        .map_err(|error| read_file_reason_from_io(&error))?;
     let target = resolved
         .canonicalize()
-        .map_err(|_| "file_read target is unavailable".to_string())?;
+        .map_err(|error| read_file_reason_from_io(&error))?;
     if !target.starts_with(&project_root) {
-        return Err("file_read path escapes project root".to_string());
+        return Err(ReadFileReason::InvalidPath);
+    }
+    if !target.is_file() {
+        return Err(ReadFileReason::NotFile);
     }
     Ok(())
 }
@@ -165,15 +178,19 @@ fn handle_file_read_request(
     resolved: &Path,
     start: Instant,
 ) -> CommandResult {
-    if let Err(error) = ensure_file_read_target_in_project(request, resolved) {
+    if let Err(reason) = ensure_file_read_target_in_project(request, resolved) {
         return CommandResult {
             exit_code: None,
             stdout: None,
             stderr: None,
             duration_ms: Some(start.elapsed().as_millis() as u64),
-            error: Some(error),
+            error: Some(read_file_reason_message(reason)),
         };
     }
+    // The transport cap (`max_bytes`) is clamped to the shared content budget so
+    // the runner never emits a range the server's model output limit cannot
+    // hold. The server always sends an explicit `start_line`/`end_line` for
+    // `read_file`, so this branch returns the canonical v1 envelope.
     let max = request
         .max_bytes
         .unwrap_or(DEFAULT_MAX_OUTPUT_BYTES)
@@ -182,6 +199,10 @@ fn handle_file_read_request(
         return handle_file_read_range_request(resolved, start_line, end_line, max, start);
     }
 
+    // Legacy non-range path: read the whole file under the transport cap. This
+    // is only reached by older callers that omit the line range; the server's
+    // read_file tool always requests a range. No absolute path leaks: the error
+    // carries a stable code, not `resolved.display()`.
     match std::fs::read(resolved) {
         Ok(bytes) => {
             if bytes.len() > max {
@@ -211,9 +232,19 @@ fn handle_file_read_request(
             stdout: None,
             stderr: None,
             duration_ms: Some(start.elapsed().as_millis() as u64),
-            error: Some(format!("failed to read {}: {}", resolved.display(), e)),
+            error: Some(file_read_error_message(&e)),
         },
     }
+}
+
+#[derive(Serialize)]
+struct FileReadRangeEnvelope<'a> {
+    format: &'static str,
+    content: &'a str,
+    sha256: &'a str,
+    total_lines: usize,
+    start_line: usize,
+    limit: usize,
 }
 
 fn handle_file_read_range_request(
@@ -233,90 +264,67 @@ fn handle_file_read_range_request(
         };
     }
 
-    let file = match std::fs::File::open(resolved) {
-        Ok(file) => file,
-        Err(e) => {
-            return CommandResult {
-                exit_code: None,
-                stdout: None,
-                stderr: None,
-                duration_ms: Some(start.elapsed().as_millis() as u64),
-                error: Some(format!("failed to read {}: {}", resolved.display(), e)),
-            };
-        }
-    };
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
-    let mut content = String::new();
-    let mut total_lines = 0usize;
-    let mut wrote_any_line = false;
-    let mut hasher = Sha256::new();
-
-    loop {
-        line.clear();
-        let bytes_read = match reader.read_line(&mut line) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                return CommandResult {
-                    exit_code: None,
-                    stdout: None,
-                    stderr: None,
-                    duration_ms: Some(start.elapsed().as_millis() as u64),
-                    error: Some(format!(
-                        "failed to read UTF-8 text {}: {}",
-                        resolved.display(),
-                        e
-                    )),
-                };
-            }
-        };
-        if bytes_read == 0 {
-            break;
-        }
-        hasher.update(line.as_bytes());
-        total_lines = total_lines.saturating_add(1);
-        if total_lines >= start_line && total_lines <= end_line {
-            let line_content = line.strip_suffix('\n').unwrap_or(&line);
-            let line_content = line_content.strip_suffix('\r').unwrap_or(line_content);
-            let additional_len = line_content.len() + usize::from(wrote_any_line);
-            if content.len().saturating_add(additional_len) > max {
-                return CommandResult {
-                    exit_code: None,
-                    stdout: None,
-                    stderr: None,
-                    duration_ms: Some(start.elapsed().as_millis() as u64),
-                    error: Some(format!(
-                        "range output too large: {} bytes exceeds max_bytes {}",
-                        content.len().saturating_add(additional_len),
-                        max
-                    )),
-                };
-            }
-            if wrote_any_line {
-                content.push('\n');
-            }
-            content.push_str(line_content);
-            wrote_any_line = true;
-        }
-    }
-
+    // Reconstruct the shared effective range from the runner's inclusive
+    // 1-based line window. The shared core owns line-counting, full-file
+    // SHA-256, empty-line semantics, and content-budget enforcement, so the
+    // runner no longer maintains its own range algorithm.
     let limit = end_line.saturating_sub(start_line).saturating_add(1);
-    let sha256 = format!("{:x}", hasher.finalize());
-    let out = serde_json::json!({
-        "format": "webcodex.file_read_range.v1",
-        "content": content,
-        "sha256": sha256,
-        "total_lines": total_lines,
-        "start_line": start_line,
-        "limit": limit,
-    });
-    CommandResult {
-        exit_code: Some(0),
-        stdout: Some(out.to_string()),
-        stderr: Some(String::new()),
-        duration_ms: Some(start.elapsed().as_millis() as u64),
-        error: None,
+    let range =
+        webcodex_workspace::file_read_range::EffectiveRange::new(Some(start_line), Some(limit));
+    match file_read_range::read_range_with_budget(resolved, range, max) {
+        Ok(result) => {
+            let envelope = FileReadRangeEnvelope {
+                format: "webcodex.file_read_range.v1",
+                content: &result.content,
+                sha256: &result.sha256,
+                total_lines: result.total_lines,
+                start_line: result.start_line,
+                limit: result.limit,
+            };
+            let serialized = match serde_json::to_vec(&envelope) {
+                Ok(serialized) => serialized,
+                Err(_) => {
+                    return CommandResult {
+                        exit_code: None,
+                        stdout: None,
+                        stderr: None,
+                        duration_ms: Some(start.elapsed().as_millis() as u64),
+                        error: Some(read_file_reason_message(ReadFileReason::IoError)),
+                    }
+                }
+            };
+            let output_cap = max.min(file_read_range::MAX_SERIALIZED_OUTPUT_BYTES);
+            if serialized.len() > output_cap {
+                return CommandResult {
+                    exit_code: None,
+                    stdout: None,
+                    stderr: None,
+                    duration_ms: Some(start.elapsed().as_millis() as u64),
+                    error: Some("range output too large".to_string()),
+                };
+            }
+            CommandResult {
+                exit_code: Some(0),
+                stdout: Some(String::from_utf8(serialized).expect("JSON serialization is UTF-8")),
+                stderr: Some(String::new()),
+                duration_ms: Some(start.elapsed().as_millis() as u64),
+                error: None,
+            }
+        }
+        Err(error) => CommandResult {
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            duration_ms: Some(start.elapsed().as_millis() as u64),
+            error: Some(read_file_reason_message(error.reason)),
+        },
     }
+}
+
+/// Map a raw IO error from the legacy whole-file read path to a stable
+/// path-free message.
+fn file_read_error_message(error: &std::io::Error) -> String {
+    read_file_reason_message(read_file_reason_from_io(error))
 }
 
 fn handle_file_write_request(

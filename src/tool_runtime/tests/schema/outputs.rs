@@ -206,7 +206,18 @@ fn key_tool_output_schemas_include_expected_fields() {
             "cargo_test diagnostics.test_summary missing {field}"
         );
     }
-    for field in ["text", "format", "start_line", "limit", "total_lines"] {
+    for field in [
+        "text",
+        "format",
+        "start_line",
+        "limit",
+        "total_lines",
+        "returned_lines",
+        "end_line",
+        "has_more",
+        "next_start_line",
+        "sha256",
+    ] {
         assert!(
             has_output_field("read_file", field),
             "read_file missing {field}"
@@ -821,6 +832,110 @@ fn cleanup_and_compatibility_write_output_schemas_do_not_advertise_broad_exfiltr
     }
 }
 
+#[test]
+fn read_file_output_schema_matches_real_results_and_strict_tool_payloads() {
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("read_file");
+    let validate = |value: &Value| {
+        crate::tool_runtime::startup_brief::validate_schema_instance_for_test(value, &schema)
+    };
+    let success = serde_json::to_value(crate::tool_runtime::tool_result::ToolResult::ok(json!({
+        "text": "hello",
+        "format": "plain",
+        "path": "src/lib.rs",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "start_line": 1,
+        "limit": 2,
+        "total_lines": 3,
+        "returned_lines": 1,
+        "end_line": 1,
+        "has_more": true,
+        "next_start_line": 2
+    })))
+    .unwrap();
+    assert!(
+        success.get("error").is_none(),
+        "successful ToolResult omits error"
+    );
+    validate(&success).unwrap();
+    assert!(
+        success["output"]["returned_lines"].as_u64().unwrap()
+            <= success["output"]["limit"].as_u64().unwrap()
+    );
+
+    let failure = serde_json::to_value(
+        crate::tool_runtime::tool_result::ToolResult::err_with_output(
+            "read_file failed: not_found",
+            json!({
+                "error_kind": "read_file_failed",
+                "reason_code": "not_found",
+                "path": "missing.rs",
+                "state_changed": false
+            }),
+        ),
+    )
+    .unwrap();
+    validate(&failure).unwrap();
+
+    // Failures produced before the read implementation runs retain the runtime's
+    // generic null/object payloads and must still match the advertised envelope.
+    let generic_null = serde_json::to_value(crate::tool_runtime::tool_result::ToolResult::err(
+        "unknown project",
+    ))
+    .unwrap();
+    validate(&generic_null).unwrap();
+    let generic_object = serde_json::to_value(
+        crate::tool_runtime::tool_result::ToolResult::err_with_output(
+            "session guard denied",
+            json!({"error_kind": "session_guard_denied", "state_changed": false}),
+        ),
+    )
+    .unwrap();
+    validate(&generic_object).unwrap();
+
+    let mut telemetry = success.clone();
+    telemetry["output"]["session_recorded"] = json!(true);
+    telemetry["output"]["session_id"] = json!("wc_sess_test");
+    telemetry["output"]["session_event_id"] = json!("evt_test");
+    validate(&telemetry).unwrap();
+
+    for missing in ["next_start_line", "sha256"] {
+        let mut value = success.clone();
+        value["output"].as_object_mut().unwrap().remove(missing);
+        assert!(validate(&value).is_err(), "missing {missing} was accepted");
+    }
+
+    let mut bad_sha = success.clone();
+    bad_sha["output"]["sha256"] = json!("ABC");
+    assert!(validate(&bad_sha).is_err());
+
+    let mut zero_limit = success.clone();
+    zero_limit["output"]["limit"] = json!(0);
+    assert!(validate(&zero_limit).is_err());
+
+    let mut impossible_count = success.clone();
+    impossible_count["output"]["returned_lines"] = json!(2001);
+    assert!(validate(&impossible_count).is_err());
+
+    let mut missing_reason = failure.clone();
+    missing_reason["output"]
+        .as_object_mut()
+        .unwrap()
+        .remove("reason_code");
+    assert!(validate(&missing_reason).is_err());
+
+    let mut unknown_failure = failure.clone();
+    unknown_failure["output"]["runner_secret"] = json!("hidden");
+    assert!(validate(&unknown_failure).is_err());
+
+    let mut unknown_output = success.clone();
+    unknown_output["output"]["runner_secret"] = json!("hidden");
+    assert!(validate(&unknown_output).is_err());
+
+    let mut unknown_top = success;
+    unknown_top["runner_secret"] = json!("hidden");
+    assert!(validate(&unknown_top).is_err());
+}
+
 fn default_output_schema_field_names() -> BTreeSet<&'static str> {
     BTreeSet::from([
         "session_recorded",
@@ -832,22 +947,49 @@ fn default_output_schema_field_names() -> BTreeSet<&'static str> {
 }
 
 fn output_schema_field_names(spec: &ToolSpec) -> BTreeSet<&str> {
-    let output = &spec.output_schema["properties"]["output"];
-    if let Some(properties) = output["properties"].as_object() {
-        return properties.keys().map(String::as_str).collect();
+    let mut fields = BTreeSet::new();
+    collect_envelope_output_fields(&spec.output_schema, &mut fields);
+    assert!(
+        !fields.is_empty(),
+        "{} output schema properties or variants",
+        spec.name
+    );
+    fields
+}
+
+fn collect_envelope_output_fields<'a>(schema: &'a Value, fields: &mut BTreeSet<&'a str>) {
+    if let Some(output) = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get("output"))
+    {
+        collect_output_variant_fields(output, fields);
     }
-    output["oneOf"]
-        .as_array()
-        .unwrap_or_else(|| panic!("{} output schema properties or variants", spec.name))
-        .iter()
-        .flat_map(|variant| {
-            variant["properties"]
-                .as_object()
-                .unwrap_or_else(|| panic!("{} output variant properties", spec.name))
-                .keys()
-                .map(String::as_str)
-        })
-        .collect()
+    for keyword in ["oneOf", "anyOf", "allOf"] {
+        if let Some(variants) = schema.get(keyword).and_then(Value::as_array) {
+            for variant in variants {
+                collect_envelope_output_fields(variant, fields);
+            }
+        }
+    }
+}
+
+fn collect_output_variant_fields<'a>(schema: &'a Value, fields: &mut BTreeSet<&'a str>) {
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        fields.extend(properties.keys().map(String::as_str));
+    }
+    for keyword in ["oneOf", "anyOf", "allOf"] {
+        if let Some(variants) = schema.get(keyword).and_then(Value::as_array) {
+            for variant in variants {
+                collect_output_variant_fields(variant, fields);
+            }
+        }
+    }
+    for keyword in ["then", "else"] {
+        if let Some(branch) = schema.get(keyword) {
+            collect_output_variant_fields(branch, fields);
+        }
+    }
 }
 
 fn output_schema_properties<'a>(

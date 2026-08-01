@@ -296,7 +296,7 @@ async fn read_only_tool_skips_permission_decision() {
                         path: "README.md".to_string(),
                         session_id: None,
                         start_line: None,
-                        limit: Some(1),
+                        limit: None,
                         with_line_numbers: None,
                     },
                     Some(&bootstrap),

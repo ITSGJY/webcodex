@@ -1840,10 +1840,7 @@ fn agent_file_read_rejects_symlink_escape_even_when_policy_allows_target() {
     );
 
     assert_eq!(out.exit_code, None);
-    assert_eq!(
-        out.error.as_deref(),
-        Some("file_read path escapes project root")
-    );
+    assert_eq!(out.error.as_deref(), Some("read_file failed: invalid_path"));
     assert!(!out.stdout.unwrap_or_default().contains("outside-secret"));
 }
 
@@ -1860,7 +1857,7 @@ fn agent_file_read_range_reads_large_file_subset_under_max_bytes() {
 
     let out = file_read_json(handle_file_request(
         &policy,
-        &file_read_request(tmp.path(), "large.txt", Some(250), Some(252), Some(128)),
+        &file_read_request(tmp.path(), "large.txt", Some(250), Some(252), Some(1024)),
     ));
 
     assert_eq!(out["format"], "webcodex.file_read_range.v1");
@@ -1879,7 +1876,7 @@ fn agent_file_read_range_beyond_total_lines_returns_empty_content() {
 
     let out = file_read_json(handle_file_request(
         &policy,
-        &file_read_request(tmp.path(), "short.txt", Some(10), Some(12), Some(128)),
+        &file_read_request(tmp.path(), "short.txt", Some(10), Some(12), Some(1024)),
     ));
 
     assert_eq!(out["format"], "webcodex.file_read_range.v1");
@@ -1897,7 +1894,7 @@ fn agent_file_read_range_preserves_empty_selected_lines() {
 
     let out = file_read_json(handle_file_request(
         &policy,
-        &file_read_request(tmp.path(), "blank.txt", Some(1), Some(2), Some(128)),
+        &file_read_request(tmp.path(), "blank.txt", Some(1), Some(2), Some(1024)),
     ));
 
     assert_eq!(out["format"], "webcodex.file_read_range.v1");
@@ -1919,7 +1916,121 @@ fn agent_file_read_range_output_obeys_max_bytes() {
     );
 
     assert!(out.exit_code.is_none(), "unexpected success: {out:?}");
-    assert!(out.error.expect("error").contains("exceeds max_bytes"));
+    assert_eq!(
+        out.error.as_deref(),
+        Some("read_file failed: range_too_large")
+    );
+    assert!(out.stdout.is_none());
+}
+
+#[test]
+fn agent_file_read_range_rejects_serialized_envelope_expansion_before_stdout() {
+    for (name, byte, len) in [
+        ("nul.txt", 0x00, 48 * 1024),
+        ("quote.txt", b'\"', 140 * 1024),
+        ("backslash.txt", b'\\', 140 * 1024),
+        ("control.txt", 0x01, 48 * 1024),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = project_policy(tmp.path());
+        std::fs::write(tmp.path().join(name), vec![byte; len]).unwrap();
+        let out = handle_file_request(
+            &policy,
+            &file_read_request(tmp.path(), name, Some(1), Some(1), Some(512 * 1024)),
+        );
+        assert!(
+            out.exit_code.is_none(),
+            "unexpected success for {name}: {out:?}"
+        );
+        assert_eq!(out.error.as_deref(), Some("range output too large"));
+        assert!(
+            out.stdout.is_none(),
+            "oversized envelope reached stdout for {name}"
+        );
+    }
+}
+
+#[test]
+fn agent_file_read_precheck_distinguishes_missing_and_non_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    std::fs::create_dir(tmp.path().join("directory")).unwrap();
+
+    let missing = handle_file_request(
+        &policy,
+        &file_read_request(tmp.path(), "missing.txt", Some(1), Some(1), Some(1024)),
+    );
+    assert_eq!(
+        missing.error.as_deref(),
+        Some("read_file failed: not_found")
+    );
+    assert!(missing.stdout.is_none());
+
+    let directory = handle_file_request(
+        &policy,
+        &file_read_request(tmp.path(), "directory", Some(1), Some(1), Some(1024)),
+    );
+    assert_eq!(
+        directory.error.as_deref(),
+        Some("read_file failed: not_file")
+    );
+    assert!(directory.stdout.is_none());
+}
+
+#[test]
+fn agent_file_read_range_large_file_small_range_uses_shared_core() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    let line = "x".repeat(64);
+    let body = (0..300_000)
+        .map(|_| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let expected_sha = sha256_hex_bytes(body.as_bytes());
+    std::fs::write(tmp.path().join("big.txt"), body).unwrap();
+
+    let out = file_read_json(handle_file_request(
+        &policy,
+        &file_read_request(
+            tmp.path(),
+            "big.txt",
+            Some(150_000),
+            Some(150_002),
+            Some(512 * 1024),
+        ),
+    ));
+    assert_eq!(out["format"], "webcodex.file_read_range.v1");
+    assert_eq!(
+        out["content"],
+        [line.as_str(), line.as_str(), line.as_str()].join("\n")
+    );
+    assert_eq!(out["total_lines"], 300_000);
+    assert_eq!(out["start_line"], 150_000);
+    assert_eq!(out["limit"], 3);
+    assert_eq!(out["sha256"], expected_sha);
+}
+
+#[test]
+fn agent_file_read_range_errors_never_include_absolute_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+
+    // Missing target: the error must be a stable message, not the resolved
+    // absolute path (`resolved.display()`).
+    let missing = handle_file_request(
+        &policy,
+        &file_read_request(tmp.path(), "absent.txt", Some(1), Some(1), Some(128)),
+    );
+    assert!(missing.exit_code.is_none());
+    assert_eq!(
+        missing.error.as_deref(),
+        Some("read_file failed: not_found")
+    );
+    let err = missing.error.expect("error");
+    assert!(
+        !err.contains(tmp.path().to_string_lossy().as_ref()),
+        "error leaked absolute path: {err}"
+    );
 }
 
 #[test]

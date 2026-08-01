@@ -351,6 +351,76 @@ No project discovery or runtime identifier belongs in this prompt.
 Run `webcodex status` for the short answer and `webcodex doctor` for full
 read-only findings.
 
+## Bounded source reads (`read_file`)
+
+`read_file` is a bounded, streaming UTF-8 range reader over an
+agent-registered project. The same range algorithm backs both local and agent
+projects, so the model-facing output is identical apart from the resolved
+project id and transport.
+
+Inputs stay unchanged: `project`, `path`, optional `session_id`, optional
+`start_line` (default 1, min 1), optional `limit` (default 2000, clamped to
+`1..=2000`), and optional `with_line_numbers`. No new input fields, batch mode,
+or config were added.
+
+A successful read streams the file exactly once — computing the complete-file
+SHA-256 and total line count while retaining only the requested range — and
+returns:
+
+```text
+text              # plain or numbered selected range, lines joined with \n
+format            # "plain" | "numbered"
+path              # project-relative input path
+sha256            # 64 lowercase hex digits of the COMPLETE file
+start_line        # effective 1-based start (>= 1)
+limit             # effective line cap (1..=2000)
+total_lines       # complete file line count (>= 0)
+returned_lines    # original file lines actually returned (>= 0, <= limit)
+end_line          # start_line + returned_lines - 1, or null when nothing returned
+has_more          # true only when file lines remain after the returned range
+next_start_line   # end_line + 1 to continue, or null at end of file
+```
+
+`with_line_numbers=true` only changes `text` and `format`; it never changes
+`returned_lines`, `end_line`, `has_more`, or `next_start_line`.
+
+Continue reading with `next_start_line`:
+
+```jsonc
+// first call
+{ "project": "demo", "path": "src/main.rs", "limit": 40 }
+// -> next_start_line: 41, has_more: true
+// continue from where it stopped
+{ "project": "demo", "path": "src/main.rs", "start_line": 41, "limit": 40 }
+```
+
+Bounds are enforced directly, not by transport tail truncation. Raw selected
+content has an independent 192 KiB budget. Before sending, the Runner serializes
+the complete `webcodex.file_read_range.v1` envelope and rejects it when it
+exceeds the smaller of the effective transport cap and 256 KiB. ToolRuntime
+then re-checks the final model output after line numbering and JSON escaping.
+Any layer that exceeds its budget fails with `reason_code: range_too_large` —
+shrink `limit` or narrow the range and retry; no partial line or content
+inconsistent with the SHA/line metadata is ever returned.
+
+Failures return a small, stable, schema-backed object — never an absolute
+path, raw OS error, command, or Runner stdout/stderr:
+
+```text
+error_kind:   "read_file_failed"
+reason_code:  one of invalid_path | sensitive_path | not_found | not_file |
+              permission_denied | invalid_utf8 | range_too_large |
+              agent_unavailable | timeout | malformed_agent_response | io_error
+path:         project-relative input path (for navigation only)
+state_changed: false
+```
+
+Agent `file_read_range.v1` envelopes are treated as untrusted: every formal
+field is strictly validated and the model output is reconstructed from those
+fields alone, so unknown fields, padding, mismatched range metadata, wrong
+SHA, or inconsistent content/line counts are stripped or rejected
+(`malformed_agent_response`) and never leak to the model.
+
 ## Advanced Runtime Surface
 
 WebCodex can also run as a multi-project management ToolRuntime. Its discovery,

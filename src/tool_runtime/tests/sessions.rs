@@ -45,7 +45,7 @@ async fn read_agent_file_for_session(
                         path: "README.md".to_string(),
                         session_id,
                         start_line: None,
-                        limit: Some(1),
+                        limit: None,
                         with_line_numbers: None,
                     },
                     Some(&bootstrap),
@@ -98,7 +98,7 @@ async fn read_file_with_session_id_records_event_without_content() {
                         path: "README.md".to_string(),
                         session_id: Some(session_id),
                         start_line: None,
-                        limit: Some(1),
+                        limit: None,
                         with_line_numbers: Some(true),
                     },
                     Some(&bootstrap),
@@ -192,7 +192,7 @@ async fn read_file_without_session_id_omits_session_telemetry() {
     let result = task.await.unwrap();
 
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["text"], "hello\n");
+    assert_eq!(result.output["text"], "hello");
     assert_eq!(result.output["format"], "plain");
     assert!(result.output.get("session_recorded").is_none());
     assert!(result.output.get("session_hint").is_none());

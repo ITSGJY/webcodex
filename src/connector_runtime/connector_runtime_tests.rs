@@ -1343,8 +1343,10 @@ async fn canonical_read_reaches_bound_executor_and_advances_event_cursor() {
                             json!({
                                 "format": "webcodex.file_read_range.v1",
                                 "path": "src/lib.rs",
-                                "content": "fn entry() {}\n",
+                                "content": "fn entry() {}",
+                                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                                 "start_line": 1,
+                                "limit": 50,
                                 "total_lines": 1,
                                 "truncated": false
                             })

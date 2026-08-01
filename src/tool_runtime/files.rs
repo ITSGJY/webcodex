@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
+use webcodex_workspace::file_read_range::{self, EffectiveRange, FileReadRange, ReadFileReason};
 
 #[cfg(test)]
 use super::helpers::run_command_sync;
@@ -26,7 +27,9 @@ use crate::project_overview::{
     normalize_project_overview_path,
 };
 use crate::projects::ProjectConfig;
-use crate::shell_protocol::{ShellFileOpRequest, ShellRunRequest, EXTERNAL_SEARCH_REQUEST_PREFIX};
+use crate::shell_protocol::{
+    ShellFileOpRequest, ShellRunRequest, ShellRunResponse, EXTERNAL_SEARCH_REQUEST_PREFIX,
+};
 
 #[cfg(test)]
 pub(crate) fn read_file_content_result(
@@ -37,47 +40,22 @@ pub(crate) fn read_file_content_result(
     read_file_content_result_with_options(content, start_line, limit, false)
 }
 
+#[cfg(test)]
 pub(crate) fn read_file_content_result_with_options(
     content: String,
     start_line: Option<usize>,
     limit: Option<usize>,
     with_line_numbers: bool,
 ) -> ToolResult {
-    let sha256 = sha256_hex_bytes(content.as_bytes());
-    let all_lines: Vec<&str> = content.lines().collect();
-    let total_lines = all_lines.len();
-    let eff_start = start_line.unwrap_or(1).max(1);
-    let eff_limit = limit.unwrap_or(2000).clamp(1, 2000);
-    if eff_start > total_lines {
-        let mut output = json!({
-            "text": "",
-            "format": if with_line_numbers { "numbered" } else { "plain" },
-            "sha256": sha256,
-            "total_lines": total_lines,
-            "start_line": eff_start,
-            "limit": eff_limit,
-        });
-        if with_line_numbers {
-            add_line_number_fields(&mut output, eff_start, &Vec::<&str>::new());
-        }
-        return ToolResult::ok(output);
+    // The local path previously kept the entire file body in `content` and then
+    // sliced it. It now feeds the bytes through the shared streaming range
+    // reader so only the selected window is retained, and the model output is
+    // built by the shared normalizer shared with the agent path.
+    let range = EffectiveRange::new(start_line, limit);
+    match file_read_range::read_range_from(content.as_bytes(), range) {
+        Ok(result) => build_read_file_success(&result, with_line_numbers, None),
+        Err(error) => read_file_failure(error.reason, None),
     }
-    let start_idx = eff_start - 1;
-    let end_idx = (start_idx + eff_limit).min(total_lines);
-    let selected_lines = &all_lines[start_idx..end_idx];
-    let slice = selected_lines.join("\n");
-    let mut output = json!({
-        "text": slice,
-        "format": if with_line_numbers { "numbered" } else { "plain" },
-        "sha256": sha256,
-        "total_lines": total_lines,
-        "start_line": eff_start,
-        "limit": eff_limit,
-    });
-    if with_line_numbers {
-        add_line_number_fields(&mut output, eff_start, selected_lines);
-    }
-    ToolResult::ok(output)
 }
 
 #[cfg(test)]
@@ -95,40 +73,220 @@ pub(crate) fn read_file_agent_stdout_result_with_options(
     limit: Option<usize>,
     with_line_numbers: bool,
 ) -> ToolResult {
-    let trimmed = stdout.trim();
-    if let Ok(mut value) = serde_json::from_str::<Value>(trimmed) {
-        if value.get("format").and_then(|format| format.as_str())
-            == Some("webcodex.file_read_range.v1")
-        {
-            let content = value
-                .as_object_mut()
-                .and_then(|object| object.remove("content"))
-                .unwrap_or_else(|| Value::String(String::new()));
-            value["text"] = content;
-            value["format"] = json!(if with_line_numbers {
-                "numbered"
-            } else {
-                "plain"
-            });
-            if with_line_numbers {
-                add_agent_read_file_line_number_fields(&mut value, start_line, limit);
-            }
-            return ToolResult::ok(value);
-        }
+    // The runner stdout is untrusted input. The shared v1 envelope is accepted,
+    // but every formal field is strictly validated and the model output is
+    // reconstructed from those fields alone — no envelope extras, padding, or
+    // absolute paths are passed through.
+    match parse_agent_file_read_range(&stdout, start_line, limit) {
+        Ok(result) => build_read_file_success(&result, with_line_numbers, None),
+        Err(reason) => read_file_failure(reason, None),
     }
-    ToolResult::err(
-        "agent read_file returned an unsupported response envelope; expected webcodex.file_read_range.v1",
-    )
 }
 
 pub(crate) fn effective_read_file_range(
     start_line: Option<usize>,
     limit: Option<usize>,
 ) -> (usize, usize, usize) {
-    let eff_start = start_line.unwrap_or(1).max(1);
-    let eff_limit = limit.unwrap_or(2000).clamp(1, 2000);
-    let eff_end = eff_start.saturating_add(eff_limit).saturating_sub(1);
-    (eff_start, eff_limit, eff_end)
+    let range = EffectiveRange::new(start_line, limit);
+    (range.start_line, range.limit, range.end_line())
+}
+
+/// Build the unified `read_file` success [`ToolResult`] from a shared range
+/// result, enforcing the final serialized-output hard limit after JSON
+/// escaping and (optional) line numbering. The model output is reconstructed
+/// from the canonical fields only; no agent envelope extras survive.
+///
+/// `path` is the project-relative input path to attach for model navigation.
+fn build_read_file_success(
+    result: &FileReadRange,
+    with_line_numbers: bool,
+    path: Option<&str>,
+) -> ToolResult {
+    let mut output =
+        webcodex_workspace::file_read_normalize::success_output(result, with_line_numbers);
+    if let Some(path) = path {
+        output["path"] = json!(path);
+    }
+    // Re-check the hard serialized limit after numbering and JSON escaping.
+    // The content budget already bounds the raw range, but a heavily escaped or
+    // numbered payload could still grow; fail closed rather than truncate.
+    if !webcodex_workspace::file_read_normalize::serialized_fits(&output) {
+        return read_file_failure(ReadFileReason::RangeTooLarge, path);
+    }
+    ToolResult::ok(output)
+}
+
+/// Stable, schema-backed failure output for `read_file`. Carries only the
+/// project-relative input path and a stable reason code — never absolute paths,
+/// raw OS error text, or runner stdout/stderr.
+fn read_file_failure(reason: ReadFileReason, path: Option<&str>) -> ToolResult {
+    let output = json!({
+        "error_kind": "read_file_failed",
+        "reason_code": reason.as_str(),
+        "path": path.unwrap_or(""),
+        "state_changed": false,
+    });
+    ToolResult::err_with_output(format!("read_file failed: {}", reason.as_str()), output)
+}
+
+fn io_error_reason(error: &std::io::Error) -> ReadFileReason {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => ReadFileReason::NotFound,
+        std::io::ErrorKind::PermissionDenied => ReadFileReason::PermissionDenied,
+        _ => ReadFileReason::IoError,
+    }
+}
+
+/// Map a non-zero agent execution response to a stable reason code. Current
+/// Runners emit `read_file failed: <reason_code>`; only a narrow set of legacy
+/// path-free phrases is retained for rolling upgrades. Unrecognized text fails
+/// closed as `io_error` and is never returned to the model.
+fn map_agent_read_error(resp: &ShellRunResponse) -> ReadFileReason {
+    for text in [resp.error.as_deref(), resp.stderr.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        for line in text.lines() {
+            if let Some(code) = line.trim().strip_prefix("read_file failed: ") {
+                if let Some(reason) = ReadFileReason::from_code(code.trim()) {
+                    return reason;
+                }
+            }
+        }
+    }
+
+    let text = resp
+        .error
+        .as_deref()
+        .or_else(|| resp.stderr.as_deref())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match text.as_str() {
+        "file_read target not found" | "file_read target is unavailable" => {
+            ReadFileReason::NotFound
+        }
+        "file_read permission denied" | "permission denied" => ReadFileReason::PermissionDenied,
+        "file is not valid utf-8" | "file is not valid utf8" => ReadFileReason::InvalidUtf8,
+        "range output too large" => ReadFileReason::RangeTooLarge,
+        "file_read path escapes project root" | "invalid line range for file_read" => {
+            ReadFileReason::InvalidPath
+        }
+        "file_read target is not a file" | "not a regular file" => ReadFileReason::NotFile,
+        "file_read io error" | "file_read project root is unavailable" => ReadFileReason::IoError,
+        _ if text.starts_with("range output too large:") => ReadFileReason::RangeTooLarge,
+        _ => ReadFileReason::IoError,
+    }
+}
+
+/// Strictly validate an agent `webcodex.file_read_range.v1` stdout envelope and
+/// return a shared [`FileReadRange`] reconstructed from its formal fields alone.
+/// Returns a stable [`ReadFileReason`] for any malformed, mistyped, inconsistent,
+/// or oversized response so the caller can fail closed without leaking runner
+/// internals.
+fn parse_agent_file_read_range(
+    stdout: &str,
+    request_start_line: Option<usize>,
+    request_limit: Option<usize>,
+) -> Result<FileReadRange, ReadFileReason> {
+    let effective = EffectiveRange::new(request_start_line, request_limit);
+    let trimmed = stdout.trim();
+    let value = serde_json::from_str::<Value>(trimmed)
+        .map_err(|_| ReadFileReason::MalformedAgentResponse)?;
+    if value.get("format").and_then(|f| f.as_str()) != Some("webcodex.file_read_range.v1") {
+        return Err(ReadFileReason::MalformedAgentResponse);
+    }
+
+    let content = value
+        .get("content")
+        .and_then(|c| c.as_str())
+        .ok_or(ReadFileReason::MalformedAgentResponse)?
+        .to_string();
+    let sha256 = value
+        .get("sha256")
+        .and_then(Value::as_str)
+        .filter(|s| file_read_range::is_valid_sha256_hex(s))
+        .ok_or(ReadFileReason::MalformedAgentResponse)?
+        .to_string();
+    let total_lines = value
+        .get("total_lines")
+        .and_then(Value::as_u64)
+        .filter(|t| *t <= usize::MAX as u64)
+        .map(|t| t as usize)
+        .ok_or(ReadFileReason::MalformedAgentResponse)?;
+    let resp_start_line = value
+        .get("start_line")
+        .and_then(Value::as_u64)
+        .filter(|l| *l >= 1 && *l <= usize::MAX as u64)
+        .map(|l| l as usize)
+        .ok_or(ReadFileReason::MalformedAgentResponse)?;
+    let resp_limit = value
+        .get("limit")
+        .and_then(Value::as_u64)
+        .filter(|l| *l >= 1 && *l <= usize::MAX as u64)
+        .map(|l| l as usize)
+        .ok_or(ReadFileReason::MalformedAgentResponse)?;
+
+    // The response must match the effective request range the server sent.
+    if resp_start_line != effective.start_line || resp_limit != effective.limit {
+        return Err(ReadFileReason::MalformedAgentResponse);
+    }
+
+    // Compute the expected returned line count from the range and total, then
+    // verify the content's segment count matches exactly. `split('\n')`
+    // preserves empty segments so a single blank line is one segment, not zero.
+    let expected_returned = if effective.start_line > total_lines {
+        0
+    } else {
+        total_lines
+            .saturating_sub(effective.start_line)
+            .saturating_add(1)
+            .min(effective.limit)
+    };
+    let content_segments = content.split('\n').count();
+    let content_returned = if content.is_empty() {
+        // Disambiguate: empty content is 0 segments for an empty file or
+        // overflow, but 1 segment for a single selected blank line.
+        if expected_returned == 1 {
+            1
+        } else {
+            0
+        }
+    } else {
+        content_segments
+    };
+    if content_returned != expected_returned {
+        return Err(ReadFileReason::MalformedAgentResponse);
+    }
+
+    // Reject oversized agent content before it can reach the model output.
+    if content.len() > file_read_range::MAX_RANGE_CONTENT_BYTES {
+        return Err(ReadFileReason::RangeTooLarge);
+    }
+
+    let end_line = if content_returned > 0 {
+        Some(effective.start_line + content_returned - 1)
+    } else {
+        None
+    };
+    let has_more = end_line.is_some_and(|end| end < total_lines);
+    let next_start_line = if has_more {
+        end_line.map(|e| e + 1)
+    } else {
+        None
+    };
+
+    Ok(FileReadRange {
+        content,
+        sha256,
+        total_lines,
+        start_line: effective.start_line,
+        limit: effective.limit,
+        returned_lines: content_returned,
+        end_line,
+        has_more,
+        next_start_line,
+    })
 }
 
 /// Parse the stdout of a best-effort agent `file_read` for an instruction
@@ -188,76 +346,9 @@ fn instruction_candidate_missing(error: &Option<String>, stderr: &Option<String>
         .any(|value| {
             value.contains("no such file")
                 || value.contains("not found")
+                || value.contains("not_found")
                 || value.contains("cannot find the file")
         })
-}
-
-fn add_line_number_fields<T: AsRef<str>>(output: &mut Value, start_line: usize, texts: &[T]) {
-    let numbered_text = texts
-        .iter()
-        .enumerate()
-        .map(|(idx, text)| format!("{} | {}", start_line.saturating_add(idx), text.as_ref()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    if let Some(obj) = output.as_object_mut() {
-        obj.insert("text".to_string(), Value::String(numbered_text));
-        obj.insert("format".to_string(), Value::String("numbered".to_string()));
-    }
-}
-
-fn add_agent_read_file_line_number_fields(
-    output: &mut Value,
-    request_start_line: Option<usize>,
-    request_limit: Option<usize>,
-) {
-    let content = output
-        .get("text")
-        .and_then(|content| content.as_str())
-        .unwrap_or("");
-    let start_line = output
-        .get("start_line")
-        .and_then(|line| line.as_u64())
-        .and_then(|line| usize::try_from(line).ok())
-        .or(request_start_line)
-        .unwrap_or(1)
-        .max(1);
-    let limit = output
-        .get("limit")
-        .and_then(|limit| limit.as_u64())
-        .and_then(|limit| usize::try_from(limit).ok())
-        .or(request_limit)
-        .unwrap_or(2000)
-        .clamp(1, 2000);
-    let selected_count = output
-        .get("total_lines")
-        .and_then(|total| total.as_u64())
-        .and_then(|total| usize::try_from(total).ok())
-        .map(|total_lines| {
-            if start_line > total_lines {
-                0
-            } else {
-                total_lines
-                    .saturating_sub(start_line)
-                    .saturating_add(1)
-                    .min(limit)
-            }
-        });
-    let texts = line_texts_from_content(content, selected_count);
-    add_line_number_fields(output, start_line, &texts);
-}
-
-fn line_texts_from_content(content: &str, selected_count: Option<usize>) -> Vec<String> {
-    match selected_count {
-        Some(0) => Vec::new(),
-        Some(count) => {
-            let mut texts: Vec<String> = content.split('\n').map(str::to_string).collect();
-            texts.resize(count, String::new());
-            texts.truncate(count);
-            texts
-        }
-        None if content.is_empty() => Vec::new(),
-        None => content.lines().map(str::to_string).collect(),
-    }
 }
 
 // =============================================================================
@@ -3543,8 +3634,8 @@ impl ToolRuntime {
         // file ops to `allowed_roots` — which is broader than the project — so
         // the project boundary has to be enforced here, as `list_project_files`
         // and `project_overview` already do.
-        if let Err(e) = validate_project_relative_path(&path) {
-            return ToolResult::err(e);
+        if let Err(_) = validate_project_relative_path(&path) {
+            return read_file_failure(ReadFileReason::InvalidPath, Some(&path));
         }
         // Every other surface already refuses credentials: search excludes
         // them, artifacts and edits reject them. Reading was the one way left
@@ -3552,7 +3643,7 @@ impl ToolRuntime {
         // secret policy applies here — reading `.git/HEAD` or a file under
         // `target/` by explicit path stays allowed.
         if crate::sensitive_paths::is_secret_path(&path) {
-            return ToolResult::err("refusing to read sensitive path");
+            return read_file_failure(ReadFileReason::SensitivePath, Some(&path));
         }
         let proj = match self.resolve_project(&project).await {
             Ok(p) => p,
@@ -3574,6 +3665,10 @@ impl ToolRuntime {
                         path: path.clone(),
                         cwd: Some(proj.path.clone()),
                         content: None,
+                        // The shared scanner bounds raw content. The Runner
+                        // preflights the complete v1 envelope against this cap,
+                        // and ToolRuntime separately checks the final model
+                        // output after numbering and JSON escaping.
                         max_bytes: Some(512 * 1024),
                         old_text: None,
                         pattern: None,
@@ -3590,7 +3685,7 @@ impl ToolRuntime {
                 .await
             {
                 Ok(r) => r,
-                Err(e) => return ToolResult::err(e),
+                Err(_) => return read_file_failure(ReadFileReason::AgentUnavailable, Some(&path)),
             };
             return match tokio::time::timeout(Duration::from_secs(wait_timeout + 2), rx).await {
                 Ok(Ok(resp)) if resp.exit_code == Some(0) && resp.error.is_none() => {
@@ -3602,49 +3697,59 @@ impl ToolRuntime {
                     );
                     if result.success {
                         result.output["path"] = json!(path);
+                        result
+                    } else {
+                        // The agent response failed validation; surface a stable
+                        // structured error using the project-relative path.
+                        result.output["path"] = json!(path);
+                        result
                     }
-                    result
                 }
-                Ok(Ok(resp)) => ToolResult::err(
-                    resp.error
-                        .or(resp.stderr)
-                        .unwrap_or_else(|| "agent read_file failed".to_string()),
-                ),
+                // Map agent execution failures to stable reason codes. The
+                // raw `resp.error`/`resp.stderr` (which may carry the runner's
+                // absolute path) is never forwarded to the model.
+                Ok(Ok(resp)) => {
+                    let reason = map_agent_read_error(&resp);
+                    read_file_failure(reason, Some(&path))
+                }
                 Ok(Err(_)) => {
                     self.shell_clients.cancel_request(&request_id).await;
-                    ToolResult::err("agent read_file waiter was dropped")
+                    read_file_failure(ReadFileReason::AgentUnavailable, Some(&path))
                 }
                 Err(_) => {
                     self.shell_clients.cancel_request(&request_id).await;
-                    ToolResult::err("timed out waiting for agent read_file")
+                    read_file_failure(ReadFileReason::Timeout, Some(&path))
                 }
             };
         }
+        // Local branch: stream the file through the shared range reader instead
+        // of `std::fs::read_to_string`. The canonicalize/starts_with checks
+        // stay as the project-boundary guard; failures map to stable reason
+        // codes rather than OS error text.
         let file_path = proj.root().join(&path);
         let canonical_root = match proj.root().canonicalize() {
             Ok(p) => p,
-            Err(e) => return ToolResult::err(format!("Project root does not exist: {}", e)),
+            Err(error) => {
+                return read_file_failure(io_error_reason(&error), Some(&path));
+            }
         };
         let canonical = match file_path.canonicalize() {
             Ok(p) => p,
-            Err(e) => return ToolResult::err(format!("Path does not exist: {}", e)),
+            Err(error) => {
+                return read_file_failure(io_error_reason(&error), Some(&path));
+            }
         };
         if !canonical.starts_with(&canonical_root) {
-            return ToolResult::err("Path is outside project directory");
+            return read_file_failure(ReadFileReason::InvalidPath, Some(&path));
         }
         if !canonical.is_file() {
-            return ToolResult::err("Path is not a file");
+            return read_file_failure(ReadFileReason::NotFile, Some(&path));
         }
-        let content = match std::fs::read_to_string(&canonical) {
-            Ok(c) => c,
-            Err(e) => return ToolResult::err(format!("Failed to read file: {}", e)),
-        };
-        let mut result =
-            read_file_content_result_with_options(content, start_line, limit, with_line_numbers);
-        if result.success {
-            result.output["path"] = json!(path);
+        let range = EffectiveRange::new(start_line, limit);
+        match file_read_range::read_range(&canonical, range) {
+            Ok(result) => build_read_file_success(&result, with_line_numbers, Some(&path)),
+            Err(error) => read_file_failure(error.reason, Some(&path)),
         }
-        result
     }
 
     // -------------------------------------------------------------------------
@@ -4364,6 +4469,10 @@ mod tests {
             result.output["sha256"],
             sha256_hex_bytes(b"one\ntwo\nthree")
         );
+        assert_eq!(result.output["returned_lines"], 1);
+        assert_eq!(result.output["end_line"], 2);
+        assert!(result.output["has_more"].as_bool().unwrap());
+        assert_eq!(result.output["next_start_line"], 3);
         assert!(result.output.get("content").is_none());
         assert!(result.output.get("lines").is_none());
     }
@@ -4393,8 +4502,8 @@ mod tests {
                 "limit": 2,
             })
             .to_string(),
-            Some(1),
-            Some(1),
+            Some(560),
+            Some(2),
         );
 
         assert!(result.success);
@@ -4406,6 +4515,13 @@ mod tests {
         assert_eq!(result.output["total_lines"], 7348);
         assert_eq!(result.output["start_line"], 560);
         assert_eq!(result.output["limit"], 2);
+        // Continuation cursor metadata is always present.
+        assert_eq!(result.output["returned_lines"], 2);
+        assert_eq!(result.output["end_line"], 561);
+        assert!(result.output["has_more"].as_bool().unwrap());
+        assert_eq!(result.output["next_start_line"], 562);
+        // No envelope extras are passed through.
+        assert!(result.output.get("content").is_none());
     }
 
     #[test]
@@ -4418,15 +4534,14 @@ mod tests {
                 "limit": 2,
             })
             .to_string(),
-            Some(1),
-            Some(1),
+            Some(560),
+            Some(2),
         );
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap()
-            .contains("unsupported response envelope"));
+        // Malformed envelope surfaces a stable reason code, never raw stdout.
+        assert_eq!(result.output["reason_code"], "malformed_agent_response");
+        assert!(result.error.unwrap().contains("malformed_agent_response"));
     }
 
     #[test]
@@ -4435,10 +4550,7 @@ mod tests {
             read_file_agent_stdout_result("one\ntwo\nthree\n".to_string(), Some(2), Some(1));
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap()
-            .contains("unsupported response envelope"));
+        assert_eq!(result.output["reason_code"], "malformed_agent_response");
     }
 
     #[test]
@@ -4492,6 +4604,7 @@ mod tests {
             serde_json::json!({
                 "format": "webcodex.file_read_range.v1",
                 "content": "\nsecond",
+                "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 "total_lines": 3,
                 "start_line": 1,
                 "limit": 2,
@@ -4505,6 +4618,11 @@ mod tests {
         assert!(result.success);
         assert_eq!(result.output["text"], "1 | \n2 | second");
         assert_eq!(result.output["format"], "numbered");
+        // Numbering does not change range cursor metadata.
+        assert_eq!(result.output["returned_lines"], 2);
+        assert_eq!(result.output["end_line"], 2);
+        assert!(result.output["has_more"].as_bool().unwrap());
+        assert_eq!(result.output["next_start_line"], 3);
     }
 
     #[test]
@@ -4651,5 +4769,401 @@ mod tests {
         assert!(err.contains("empty stdout"), "{err}");
         assert!(err.contains("replace_exact_block"), "{err}");
         assert!(err.contains("transport dispatch"), "{err}");
+    }
+
+    // -------------------------------------------------------------------------
+    // Bounded source reads: local/agent parity, strict validation, budgets.
+    // -------------------------------------------------------------------------
+
+    /// Build a local result from full file content and a request range.
+    fn local_read(
+        content: &str,
+        start: Option<usize>,
+        limit: Option<usize>,
+        numbered: bool,
+    ) -> Value {
+        read_file_content_result_with_options(content.to_string(), start, limit, numbered).output
+    }
+
+    /// Build an agent result from a synthesized v1 envelope derived from the
+    /// same full content and range, so local and agent outputs can be compared
+    /// field-by-field.
+    fn agent_read(
+        content: &str,
+        start: Option<usize>,
+        limit: Option<usize>,
+        numbered: bool,
+    ) -> Value {
+        use webcodex_workspace::file_read_range::{self, EffectiveRange};
+        let range = EffectiveRange::new(start, limit);
+        let result = file_read_range::read_range_from(content.as_bytes(), range).unwrap();
+        let envelope = serde_json::json!({
+            "format": "webcodex.file_read_range.v1",
+            "content": result.content,
+            "sha256": result.sha256,
+            "total_lines": result.total_lines,
+            "start_line": result.start_line,
+            "limit": result.limit,
+            "padding": "x".repeat(8192),
+        })
+        .to_string();
+        read_file_agent_stdout_result_with_options(envelope, start, limit, numbered).output
+    }
+
+    fn assert_parity(content: &str, start: Option<usize>, limit: Option<usize>, numbered: bool) {
+        let local = local_read(content, start, limit, numbered);
+        let agent = agent_read(content, start, limit, numbered);
+        for field in [
+            "text",
+            "format",
+            "sha256",
+            "start_line",
+            "limit",
+            "total_lines",
+            "returned_lines",
+            "end_line",
+            "has_more",
+            "next_start_line",
+        ] {
+            assert_eq!(
+                local.get(field),
+                agent.get(field),
+                "parity mismatch on {field} for content={content:?} start={start:?} limit={limit:?} numbered={numbered}"
+            );
+        }
+        // Agent envelope padding never reaches the model output.
+        assert!(agent.get("padding").is_none());
+        assert!(agent.get("content").is_none());
+    }
+
+    #[test]
+    fn read_file_local_agent_parity_across_ranges() {
+        assert_parity("one\ntwo\nthree\nfour\nfive", Some(2), Some(2), false);
+        assert_parity("one\ntwo\nthree\nfour\nfive", Some(2), Some(2), true);
+        assert_parity("one\ntwo\nthree", Some(1), Some(100), false);
+        assert_parity("a\n\nb\nc", Some(2), Some(2), false);
+        assert_parity("\nsecond\nthird", Some(1), Some(2), true);
+        assert_parity("only", None, None, false);
+    }
+
+    #[test]
+    fn read_file_parity_empty_file_and_overflow() {
+        assert_parity("", Some(1), Some(5), false);
+        assert_parity("a\nb\nc", Some(10), Some(5), false);
+    }
+
+    #[test]
+    fn read_file_parity_no_trailing_newline() {
+        assert_parity("one\ntwo", Some(2), Some(5), false);
+        assert_parity("one\ntwo", Some(2), Some(5), true);
+    }
+
+    #[test]
+    fn read_file_parity_clamps() {
+        assert_parity("x\ny\nz", Some(0), Some(0), false);
+        assert_parity("x\ny\nz", Some(1), Some(5000), false);
+    }
+
+    #[test]
+    fn read_file_agent_rejects_bad_sha256() {
+        let envelope = serde_json::json!({
+            "format": "webcodex.file_read_range.v1",
+            "content": "x",
+            "sha256": "too-short",
+            "total_lines": 1,
+            "start_line": 1,
+            "limit": 2000,
+        })
+        .to_string();
+        let result = read_file_agent_stdout_result_with_options(envelope, None, None, false);
+        assert!(!result.success);
+        assert_eq!(result.output["reason_code"], "malformed_agent_response");
+    }
+
+    #[test]
+    fn read_file_agent_rejects_wrong_start_line() {
+        let envelope = serde_json::json!({
+            "format": "webcodex.file_read_range.v1",
+            "content": "x\ny",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "total_lines": 2,
+            "start_line": 5,
+            "limit": 2000,
+        })
+        .to_string();
+        let result = read_file_agent_stdout_result_with_options(envelope, None, None, false);
+        assert!(!result.success);
+        assert_eq!(result.output["reason_code"], "malformed_agent_response");
+    }
+
+    #[test]
+    fn read_file_agent_rejects_inconsistent_content_lines() {
+        // content has 2 segments but total_lines/start/limit imply 3 returned.
+        let envelope = serde_json::json!({
+            "format": "webcodex.file_read_range.v1",
+            "content": "a\nb",
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "total_lines": 4,
+            "start_line": 1,
+            "limit": 3,
+        })
+        .to_string();
+        let result = read_file_agent_stdout_result_with_options(envelope, Some(1), Some(3), false);
+        assert!(!result.success);
+        assert_eq!(result.output["reason_code"], "malformed_agent_response");
+    }
+
+    #[test]
+    fn read_file_agent_rejects_wrong_field_types() {
+        let envelope = serde_json::json!({
+            "format": "webcodex.file_read_range.v1",
+            "content": 7,
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "total_lines": "1",
+            "start_line": 1,
+            "limit": 2000,
+        })
+        .to_string();
+        let result = read_file_agent_stdout_result_with_options(envelope, None, None, false);
+        assert!(!result.success);
+        assert_eq!(result.output["reason_code"], "malformed_agent_response");
+    }
+
+    #[test]
+    fn read_file_agent_rejects_malformed_json() {
+        let result = read_file_agent_stdout_result_with_options(
+            "{ not valid json ".to_string(),
+            None,
+            None,
+            false,
+        );
+        assert!(!result.success);
+        assert_eq!(result.output["reason_code"], "malformed_agent_response");
+    }
+
+    #[test]
+    fn read_file_agent_rejects_oversized_formal_content() {
+        let big = "x".repeat(webcodex_workspace::file_read_range::MAX_RANGE_CONTENT_BYTES + 1);
+        let envelope = serde_json::json!({
+            "format": "webcodex.file_read_range.v1",
+            "content": big,
+            "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "total_lines": 1,
+            "start_line": 1,
+            "limit": 2000,
+        })
+        .to_string();
+        let result = read_file_agent_stdout_result_with_options(envelope, None, None, false);
+        assert!(!result.success);
+        assert_eq!(result.output["reason_code"], "range_too_large");
+    }
+
+    #[test]
+    fn read_file_agent_strips_huge_padding() {
+        let envelope = serde_json::json!({
+            "format": "webcodex.file_read_range.v1",
+            "content": "hello",
+            "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "total_lines": 1,
+            "start_line": 1,
+            "limit": 2000,
+            "runner_secret": "S".repeat(64_000),
+            "canonical_root": "/abs/leak/path",
+            "cwd": "/abs/cwd/leak",
+        })
+        .to_string();
+        let result = read_file_agent_stdout_result_with_options(envelope, None, None, false);
+        assert!(result.success, "{:?}", result.error);
+        // No envelope extras, absolute paths, or secrets leak.
+        assert!(result.output.get("runner_secret").is_none());
+        assert!(result.output.get("canonical_root").is_none());
+        assert!(result.output.get("cwd").is_none());
+        let serialized = serde_json::to_string(&result.output).unwrap();
+        assert!(!serialized.contains("leak"));
+        assert!(!serialized.contains("runner_secret"));
+        assert!(
+            serialized.len() < webcodex_workspace::file_read_range::MAX_SERIALIZED_OUTPUT_BYTES
+        );
+    }
+
+    #[test]
+    fn read_file_error_no_absolute_path_or_os_text() {
+        let result = read_file_failure(
+            webcodex_workspace::file_read_range::ReadFileReason::NotFound,
+            Some("README.md"),
+        );
+        assert!(!result.success);
+        assert_eq!(result.output["reason_code"], "not_found");
+        assert_eq!(result.output["path"], "README.md");
+        assert_eq!(result.output["state_changed"], false);
+        let serialized = serde_json::to_string(&result.output).unwrap();
+        assert!(!serialized.contains("/"));
+        assert!(!serialized.contains("os error"));
+    }
+
+    #[test]
+    fn read_file_large_file_small_range_small_output() {
+        let line = "x".repeat(64);
+        let body = (0..200_000)
+            .map(|_| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = local_read(&body, Some(100_000), Some(3), false);
+        assert_eq!(out["returned_lines"], 3);
+        assert!(out["has_more"].as_bool().unwrap());
+        assert_eq!(out["next_start_line"], 100_003);
+        let text = out["text"].as_str().unwrap();
+        assert!(text.len() < 256);
+        let serialized = serde_json::to_string(&out).unwrap();
+        assert!(
+            serialized.len() < webcodex_workspace::file_read_range::MAX_SERIALIZED_OUTPUT_BYTES
+        );
+    }
+
+    #[test]
+    fn read_file_range_exceeding_budget_fails_with_reason_code() {
+        let line = "x".repeat(1024);
+        let body = (0..512)
+            .map(|_| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = local_read(&body, Some(1), Some(2000), false);
+        assert_eq!(out["reason_code"], "range_too_large");
+    }
+
+    #[test]
+    fn read_file_local_io_errors_keep_stable_reason_codes() {
+        assert_eq!(
+            io_error_reason(&std::io::Error::from(std::io::ErrorKind::NotFound)),
+            ReadFileReason::NotFound
+        );
+        assert_eq!(
+            io_error_reason(&std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            ReadFileReason::PermissionDenied
+        );
+        assert_eq!(
+            io_error_reason(&std::io::Error::from(std::io::ErrorKind::Other)),
+            ReadFileReason::IoError
+        );
+    }
+
+    fn agent_error_response(message: &str) -> ShellRunResponse {
+        ShellRunResponse {
+            success: false,
+            request_id: "req-read".to_string(),
+            client_id: "agent".to_string(),
+            cwd: None,
+            command_preview: String::new(),
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            duration_ms: Some(1),
+            error: Some(message.to_string()),
+        }
+    }
+
+    #[test]
+    fn read_file_agent_error_mapping_prefers_formal_reason_codes() {
+        for reason in [
+            ReadFileReason::InvalidPath,
+            ReadFileReason::SensitivePath,
+            ReadFileReason::NotFound,
+            ReadFileReason::NotFile,
+            ReadFileReason::PermissionDenied,
+            ReadFileReason::InvalidUtf8,
+            ReadFileReason::RangeTooLarge,
+            ReadFileReason::AgentUnavailable,
+            ReadFileReason::Timeout,
+            ReadFileReason::MalformedAgentResponse,
+            ReadFileReason::IoError,
+        ] {
+            let response = agent_error_response(&format!("read_file failed: {}", reason.as_str()));
+            assert_eq!(map_agent_read_error(&response), reason);
+        }
+        assert_eq!(
+            map_agent_read_error(&agent_error_response("range output too large")),
+            ReadFileReason::RangeTooLarge
+        );
+        assert_eq!(
+            map_agent_read_error(&agent_error_response("file_read target is not a file")),
+            ReadFileReason::NotFile
+        );
+        assert_eq!(
+            map_agent_read_error(&agent_error_response("invalid unrelated runner detail")),
+            ReadFileReason::IoError
+        );
+    }
+
+    #[test]
+    fn read_file_payload_reserves_final_result_and_session_telemetry_budget() {
+        fn result_for(content_len: usize) -> ToolResult {
+            let range = FileReadRange {
+                content: "\0".repeat(content_len),
+                sha256: "a".repeat(64),
+                total_lines: 1,
+                start_line: 1,
+                limit: 1,
+                returned_lines: 1,
+                end_line: Some(1),
+                has_more: false,
+                next_start_line: None,
+            };
+            build_read_file_success(&range, false, Some("src/lib.rs"))
+        }
+
+        let mut accepted = 0usize;
+        let mut rejected = file_read_range::MAX_RANGE_CONTENT_BYTES.saturating_add(1);
+        while accepted.saturating_add(1) < rejected {
+            let candidate = accepted + (rejected - accepted) / 2;
+            if result_for(candidate).success {
+                accepted = candidate;
+            } else {
+                rejected = candidate;
+            }
+        }
+        let rejected_result = result_for(rejected);
+        assert!(!rejected_result.success);
+        assert_eq!(rejected_result.output["reason_code"], "range_too_large");
+
+        let mut result = result_for(accepted);
+        assert!(result.success);
+        result.output["session_recorded"] = json!(true);
+        result.output["session_id"] = json!(format!("wc_sess_{}", "s".repeat(64)));
+        result.output["session_event_id"] = json!(format!("evt_{}", "e".repeat(64)));
+        result.output["session_hint"] = json!({
+            "has_open_messages": true,
+            "open_counts": {
+                "guidance": u64::MAX,
+                "question": u64::MAX,
+                "todo": u64::MAX,
+                "risk": u64::MAX
+            },
+            "highest_priority": "high",
+            "suggested_next_tool": "session_discussion_summary"
+        });
+        let serialized = serde_json::to_vec(&result).unwrap();
+        assert!(
+            serialized.len() <= file_read_range::MAX_SERIALIZED_OUTPUT_BYTES,
+            "final serialized result {} exceeds hard limit",
+            serialized.len()
+        );
+    }
+
+    #[test]
+    fn read_file_json_escaping_stays_under_hard_limit() {
+        // A range that fits the content budget but is full of quote/backslash
+        // characters must not escape past the serialized hard limit.
+        let line = "\\\"\\\n".repeat(8);
+        let body = line.repeat(2000);
+        let out = local_read(&body, Some(1), Some(2), true);
+        if out.get("reason_code").and_then(|v| v.as_str()) == Some("range_too_large") {
+            return;
+        }
+        let serialized = serde_json::to_string(&out).unwrap();
+        assert!(
+            serialized.len() <= webcodex_workspace::file_read_range::MAX_SERIALIZED_OUTPUT_BYTES,
+            "serialized output {} exceeds hard limit",
+            serialized.len()
+        );
     }
 }

@@ -1,7 +1,8 @@
 use serde_json::{json, Value};
 
 use super::common::{
-    array_schema, nullable_schema, schema_type, search_match_schema, wrapped_output_schema,
+    array_schema, nullable_schema, permission_decision_schema, schema_type, search_match_schema,
+    session_hint_schema, wrapped_output_schema,
 };
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
@@ -102,36 +103,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             ("message", schema_type("string", "Structured failure message.")),
         ])),
-        "read_file" => Some(wrapped_output_schema(vec![
-            (
-                "text",
-                schema_type(
-                    "string",
-                    "The single primary text representation: plain content or numbered text according to format.",
-                ),
-            ),
-            (
-                "format",
-                schema_type("string", "Primary text format: plain or numbered."),
-            ),
-            ("path", schema_type("string", "Project-relative path.")),
-            (
-                "sha256",
-                schema_type("string", "sha256 of the complete file, independent of the returned line range."),
-            ),
-            (
-                "start_line",
-                schema_type("integer", "1-based starting line."),
-            ),
-            (
-                "limit",
-                schema_type("integer", "Maximum requested line count."),
-            ),
-            (
-                "total_lines",
-                schema_type("integer", "Total line count, when available."),
-            ),
-        ])),
+        "read_file" => Some(read_file_output_schema()),
         "search_project_text" => {
             Some(wrapped_output_schema(vec![
             ("project", schema_type("string", "Resolved project id.")),
@@ -262,6 +234,153 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
         }
         _ => None,
     }
+}
+
+fn read_file_output_schema() -> Value {
+    let success_properties = json!({
+        "text": schema_type("string", "The single primary text representation: plain content or numbered text according to format."),
+        "format": {
+            "type": "string",
+            "enum": ["plain", "numbered"],
+            "description": "Primary text format: plain or numbered."
+        },
+        "path": schema_type("string", "Project-relative path."),
+        "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "sha256 of the complete file, independent of the returned line range."
+        },
+        "start_line": {"type": "integer", "minimum": 1},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 2000},
+        "total_lines": {"type": "integer", "minimum": 0},
+        "returned_lines": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2000,
+            "description": "Returned source-line count. Runtime cursor construction guarantees this does not exceed limit."
+        },
+        "end_line": {
+            "anyOf": [
+                {"type": "integer", "minimum": 1},
+                {"type": "null"}
+            ]
+        },
+        "has_more": {"type": "boolean"},
+        "next_start_line": {
+            "anyOf": [
+                {"type": "integer", "minimum": 1},
+                {"type": "null"}
+            ]
+        },
+        "session_recorded": schema_type("boolean", "True when this call was recorded in a provided session_id."),
+        "session_id": schema_type("string", "Session id used for telemetry recording."),
+        "session_event_id": schema_type("string", "Session event id for the recorded call."),
+        "session_hint": session_hint_schema(),
+        "permission": permission_decision_schema()
+    });
+    let failure_properties = json!({
+        "error_kind": {"type": "string", "const": "read_file_failed"},
+        "reason_code": {
+            "type": "string",
+            "enum": [
+                "invalid_path", "sensitive_path", "not_found", "not_file",
+                "permission_denied", "invalid_utf8", "range_too_large",
+                "agent_unavailable", "timeout", "malformed_agent_response", "io_error"
+            ]
+        },
+        "path": schema_type("string", "Project-relative input path."),
+        "state_changed": {"type": "boolean", "const": false},
+        "session_recorded": schema_type("boolean", "True when this call was recorded in a provided session_id."),
+        "session_id": schema_type("string", "Session id used for telemetry recording."),
+        "session_event_id": schema_type("string", "Session event id for the recorded call."),
+        "session_hint": session_hint_schema(),
+        "permission": permission_decision_schema()
+    });
+    let success_output = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": success_properties.clone(),
+        "required": [
+            "text", "format", "path", "sha256", "start_line", "limit",
+            "total_lines", "returned_lines", "end_line", "has_more", "next_start_line"
+        ]
+    });
+    let read_failure_output = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": failure_properties.clone(),
+        "required": ["error_kind", "reason_code", "path", "state_changed"]
+    });
+    let failure_output = json!({
+        "anyOf": [
+            {"type": "null"},
+            {
+                "type": "object",
+                "additionalProperties": true,
+                "allOf": [
+                    {
+                        "if": {
+                            "properties": {"error_kind": {"const": "read_file_failed"}},
+                            "required": ["error_kind"]
+                        },
+                        "then": read_failure_output
+                    }
+                ]
+            }
+        ]
+    });
+    let mut discovery_properties = success_properties
+        .as_object()
+        .expect("read_file success properties")
+        .clone();
+    discovery_properties.extend(
+        failure_properties
+            .as_object()
+            .expect("read_file failure properties")
+            .clone(),
+    );
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "success": {"type": "boolean"},
+            "output": {
+                "properties": discovery_properties,
+                "anyOf": [
+                    {"type": "object"},
+                    {"type": "null"}
+                ]
+            },
+            "error": {
+                "anyOf": [
+                    {"type": "string"},
+                    {"type": "null"}
+                ]
+            }
+        },
+        "required": ["success", "output"],
+        "allOf": [
+            {
+                "if": {
+                    "properties": {"success": {"const": true}},
+                    "required": ["success"]
+                },
+                "then": {
+                    "properties": {
+                        "output": success_output,
+                        "error": {"type": "null"}
+                    }
+                },
+                "else": {
+                    "required": ["error"],
+                    "properties": {
+                        "output": failure_output,
+                        "error": {"type": "string"}
+                    }
+                }
+            }
+        ]
+    })
 }
 
 pub(super) fn project_type_schema() -> Value {

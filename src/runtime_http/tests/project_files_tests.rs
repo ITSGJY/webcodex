@@ -84,7 +84,7 @@ async fn dedicated_read_project_file_with_session_id_records_event() {
     };
     let file_output = json!({
         "format": "webcodex.file_read_range.v1",
-        "content": "secret read body\n",
+        "content": "secret read body",
         "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "total_lines": 1,
         "start_line": 1,
@@ -137,7 +137,7 @@ async fn dedicated_read_project_file_without_session_id_succeeds() {
     };
     let file_output = json!({
         "format": "webcodex.file_read_range.v1",
-        "content": "hello\n",
+        "content": "hello",
         "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "total_lines": 1,
         "start_line": 1,
@@ -149,7 +149,7 @@ async fn dedicated_read_project_file_without_session_id_succeeds() {
     assert_eq!(super::effective_status(&resp), StatusCode::OK);
     let body: Value = resp.take_json().await.unwrap();
     assert_eq!(body["success"], true);
-    assert_eq!(body["output"]["text"], "hello\n");
+    assert_eq!(body["output"]["text"], "hello");
     assert_eq!(body["output"]["format"], "plain");
     assert!(body["output"].get("session_recorded").is_none());
 }

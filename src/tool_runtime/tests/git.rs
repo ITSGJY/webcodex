@@ -773,7 +773,7 @@ async fn show_changes_with_session_id_returns_session_block_and_records_call() {
         "telemetry-show",
         &req.request_id,
         0,
-        &canonical_agent_file_read_output("hello\n", 1),
+        &canonical_agent_file_read_range("hello\n", 1, 1),
         "",
     )
     .await;
