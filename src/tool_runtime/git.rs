@@ -17,6 +17,8 @@ use crate::tool_runtime::sessions::{SessionEvent, SessionSummary};
 /// to appear in real git output.
 pub(crate) const DIFF_SUMMARY_SENTINEL: &str = "@@WEBCODEX_DIFF_SUMMARY_SEP@@";
 pub(crate) const SHOW_CHANGES_SENTINEL: &str = "@@WEBCODEX_SHOW_CHANGES_SEP@@";
+const SHOW_CHANGES_BLOCK_TRAILER_BYTES: usize = 30;
+const SHOW_CHANGES_BLOCK_MAGIC: &[u8; 6] = b"WCSF1:";
 const DEFAULT_MAX_HUNKS: usize = 30;
 const MAX_MAX_HUNKS: usize = 100;
 const DEFAULT_MAX_HUNK_LINES: usize = 160;
@@ -27,6 +29,40 @@ const SHOW_CHANGES_DEFAULT_MAX_HUNK_LINES: usize = 80;
 const SHOW_CHANGES_MAX_HUNK_LINES: usize = 240;
 const SHOW_CHANGES_DEFAULT_SESSION_EVENT_LIMIT: usize = 30;
 const SHOW_CHANGES_MAX_SESSION_EVENT_LIMIT: usize = 200;
+/// Maximum number of changed-file records `show_changes` emits on the
+/// production side. The total count stays exact (all entries are counted); only
+/// the returned records are bounded so a multi-thousand-file status never
+/// overflows the transport tail-retention window.
+pub(crate) const SHOW_CHANGES_MAX_STATUS_FILES: usize = 200;
+/// Production-side stdout budget for the whole `show_changes` command. The
+/// command is constructed so its worst-case raw stdout stays under this value,
+/// which is itself well under the Runner/Shell transport default of 256 KiB
+/// with room for protocol framing and error text. Bounding happens in the
+/// command itself, never by relying on the transport tail.
+pub(crate) const SHOW_CHANGES_OUTPUT_BUDGET_BYTES: usize = 192 * 1024;
+/// Reserved protocol space inside the output budget. The observation/result
+/// metadata frames and the diff metadata frame must always remain complete even
+/// when an individual segment overflows its own budget, so the script carves
+/// this many bytes out of [`SHOW_CHANGES_OUTPUT_BUDGET_BYTES`] before splitting
+/// the rest across the status records, HEAD metadata, diff stat, and diff
+/// hunks. Sized to comfortably cover all metadata bodies, fixed-length trailers,
+/// and `printf` overhead in the worst case.
+const SHOW_CHANGES_PROTOCOL_RESERVE_BYTES: usize = 8 * 1024;
+/// Independent byte budget for the emitted status records (file entries only;
+/// the branch header and the status result frame are always preserved). The
+/// status byte budget is enforced *in addition to* [`SHOW_CHANGES_MAX_STATUS_FILES`]:
+/// a record is only returned when both the count limit and the byte budget have
+/// room, and an overlong path skips its record and reports a structured reason.
+pub(crate) const SHOW_CHANGES_STATUS_BYTES: usize = 96 * 1024;
+/// Byte budget for the `git diff --stat` segment.
+pub(crate) const SHOW_CHANGES_DIFF_STAT_BYTES: usize = 24 * 1024;
+/// Byte budget for the HEAD metadata segment (`git log -1`).
+pub(crate) const SHOW_CHANGES_HEAD_BYTES: usize = 8 * 1024;
+/// Byte budget for the emitted diff hunks segment (hunk bodies, file headers,
+/// and preambles). Hunks are additionally bounded by `max_hunks` and
+/// `max_hunk_lines`; this byte budget guarantees a single pathological diff
+/// line cannot overflow the global budget.
+pub(crate) const SHOW_CHANGES_DIFF_BYTES: usize = 48 * 1024;
 const DEFAULT_GIT_LOG_LIMIT: usize = 20;
 const MAX_GIT_LOG_LIMIT: usize = 100;
 const MAX_GIT_LOG_SKIP: usize = 10_000;
@@ -35,6 +71,22 @@ const GIT_LOG_UNIT_SEP: char = '\u{1f}';
 const SHOW_CHANGES_UNTRACKED_PREVIEW_MAX_FILES: usize = 5;
 const SHOW_CHANGES_UNTRACKED_PREVIEW_MAX_BYTES: u64 = 8192;
 const SHOW_CHANGES_UNTRACKED_PREVIEW_MAX_LINES: usize = 40;
+
+// The per-segment byte budgets are each independently bounded in the
+// production script; their sum plus the fixed protocol reserve must fit within
+// the transport output budget, so the script's raw stdout is provably at or
+// under `SHOW_CHANGES_OUTPUT_BUDGET_BYTES` whenever every segment's metadata
+// frame is present. This compile-time check pins that invariant: changing any
+// segment budget (or the reserve) without shrinking the sum below the budget
+// fails to build, rather than silently overflowing transport.
+const _: () = assert!(
+    SHOW_CHANGES_STATUS_BYTES
+        + SHOW_CHANGES_HEAD_BYTES
+        + SHOW_CHANGES_DIFF_STAT_BYTES
+        + SHOW_CHANGES_DIFF_BYTES
+        + SHOW_CHANGES_PROTOCOL_RESERVE_BYTES
+        <= SHOW_CHANGES_OUTPUT_BUDGET_BYTES
+);
 
 /// Build the read-only `git_diff_summary` command. Runs `git status
 /// --porcelain` and `git diff --stat` separated by a unique sentinel. No
@@ -139,7 +191,7 @@ impl ShowChangesStatusObservationKind {
 pub(crate) struct ShowChangesStatusObservation {
     kind: ShowChangesStatusObservationKind,
     reason_code: Option<&'static str>,
-    exit_code: Option<i32>,
+    pub(crate) exit_code: Option<i32>,
     repository_probe: &'static str,
     repository_probe_exit_code: Option<i32>,
     git_available: bool,
@@ -157,7 +209,7 @@ impl ShowChangesStatusObservation {
         }
     }
 
-    fn status_observed(&self) -> bool {
+    pub(crate) fn status_observed(&self) -> bool {
         self.kind == ShowChangesStatusObservationKind::Observed
     }
 
@@ -323,7 +375,22 @@ fn non_git_show_changes_payload_with_observation(
             "unstaged": 0,
         },
         "files": [],
+        "files_total": null,
+        "files_returned": 0,
+        "files_truncated": false,
+        "files_limit": SHOW_CHANGES_MAX_STATUS_FILES,
+        "transport_safe": false,
+        "output_budget_bytes": SHOW_CHANGES_OUTPUT_BUDGET_BYTES,
+        "output_truncated": false,
+        "truncation_reasons": [],
         "diff_stat": "",
+        "diff_exit": null,
+        "diff_status": diff_status_json(None),
+        "diff_stat_exit": null,
+        "diff_stat_status": {
+            "status": "output_unavailable", "exit_code": null, "reason_code": "git_unavailable",
+        },
+        "head_exit": null,
         "warnings": [],
         "suggested_next_actions": [
             "git-backed status/diff unavailable; project is not a git repository",
@@ -340,114 +407,529 @@ fn non_git_show_changes_payload_with_observation(
     payload
 }
 
-/// Build the read-only `show_changes` command. It combines the minimal git
-/// inspections needed for a model-facing worktree summary. The optional full
-/// diff is only emitted when the caller asks for bounded hunks.
-pub(crate) fn show_changes_command(include_diff: bool) -> String {
+/// Build the read-only, production-bounded `show_changes` command.
+///
+/// Unlike an unbounded `git status` capture, the status is *streamed* line by
+/// line through a POSIX `while read` loop that:
+///   * passes the branch header (`## ...`) through verbatim,
+///   * emits at most `status_files_limit` changed-file records,
+///   * counts every entry and classifies every entry by porcelain XY code so
+///     `files_total` and all per-category counts stay exact even when the
+///     returned records are truncated,
+///   * captures the real `git status` exit code from the final producer line,
+///   * runs the explicit repository probe only when status failed.
+///
+/// Each data/metadata pair ends in a fixed 30-byte `WCSF1` trailer containing
+/// the pair kind and exact wire lengths. The parser walks backward by those
+/// lengths, so frame bodies are never scanned for delimiter text. The status
+/// metadata carries `status_exit`, `repository_probe`, `repository_probe_exit`, the
+/// `files_total/files_returned/files_truncated/files_limit` metadata, and the
+/// exact per-category counts
+/// (`modified/added/deleted/renamed/copied/untracked/conflicted/staged/unstaged`).
+///
+/// When `include_diff` is set, the `git diff` is likewise bounded in the command
+/// by `max_hunks` hunks and `max_hunk_lines` lines per hunk before it ever
+/// reaches the transport, so transport tail-retention cannot drop the first
+/// selected hunks. A trailing diff metadata frame reports the returned count,
+/// emitted bytes, and independent count/line/byte truncation flags.
+///
+/// The shell script is held in a raw string with literal placeholders and
+/// interpolated with `str::replace`, so nested `${...}` expansions stay
+/// literal and never collide with Rust `format!` brace escaping.
+///
+/// No Python/Node helper or external temp script is used; only POSIX `sh`,
+/// `git`, `printf`, and `grep`. No project worktree is mutated.
+pub(crate) fn show_changes_command(
+    include_diff: bool,
+    max_hunks: usize,
+    max_hunk_lines: usize,
+) -> String {
+    let status_files_limit = SHOW_CHANGES_MAX_STATUS_FILES;
     let diff_part = if include_diff {
-        format!(
-            "; printf '\\n{sentinel}\\n'; \
-             git diff --unified=80",
-            sentinel = SHOW_CHANGES_SENTINEL,
-        )
+        r#"; {
+               git diff --unified=80; printf 'diff_exit=%s\n' "$?";
+             } | {
+               hc=0; in_hunk=0; lc=0; diff_exit_raw=; diff_bytes=0; file_buf=; stop_emit=0;
+               trunc_count=0; trunc_lines=0; trunc_bytes=0; have=0; pending=;
+               while IFS= read -r dl; do
+                 next=$dl; dl=$pending; pending=$next;
+                 if [ "$have" = 0 ]; then have=1; continue; fi;
+                 case "$dl" in
+                   '@@ '*)
+                     if [ "$stop_emit" = 1 ]; then in_hunk=0; file_buf=; continue; fi;
+                     if [ "$hc" -ge __HUNK_LIMIT__ ]; then trunc_count=1; stop_emit=1; in_hunk=0; file_buf=; continue; fi;
+                     preamble_len=${#file_buf}; header_len=$((${#dl}+1)); candidate_len=$((preamble_len+header_len));
+                     if [ "$((diff_bytes + candidate_len))" -gt __DIFF_BYTE_BUDGET__ ]; then trunc_bytes=1; stop_emit=1; in_hunk=0; file_buf=; continue; fi;
+                     if [ -n "$file_buf" ]; then printf '%s' "$file_buf"; file_buf=; fi;
+                     hc=$((hc+1)); lc=1; in_hunk=1; printf '%s\n' "$dl"; diff_bytes=$((diff_bytes+candidate_len)) ;;
+                   *)
+                     case "$dl" in
+                       'diff --git '*)
+                         in_hunk=0; file_buf=;
+                         if [ "$stop_emit" = 0 ]; then
+                           line_len=$((${#dl}+1));
+                           if [ "$((diff_bytes + line_len))" -gt __DIFF_BYTE_BUDGET__ ]; then trunc_bytes=1; stop_emit=1; else file_buf="$dl
+"; fi;
+                         fi;
+                         continue ;;
+                     esac;
+                     if [ "$in_hunk" = 1 ]; then
+                       if [ "$stop_emit" = 1 ]; then continue; fi;
+                       if [ "$lc" -ge __LINE_LIMIT__ ]; then trunc_lines=1;
+                       else
+                         line_len=$((${#dl}+1));
+                         if [ "$((diff_bytes + line_len))" -gt __DIFF_BYTE_BUDGET__ ]; then trunc_bytes=1; stop_emit=1;
+                         else printf '%s\n' "$dl"; lc=$((lc+1)); diff_bytes=$((diff_bytes+line_len)); fi;
+                       fi;
+                     elif [ "$stop_emit" = 0 ]; then
+                       line_len=$((${#dl}+1)); file_len=${#file_buf};
+                       if [ "$((diff_bytes + file_len + line_len))" -gt __DIFF_BYTE_BUDGET__ ]; then trunc_bytes=1; stop_emit=1; file_buf=;
+                       else file_buf="$file_buf$dl
+"; fi;
+                     fi ;;
+                 esac;
+               done;
+               case "$pending" in diff_exit=*) diff_exit_raw=${pending#diff_exit=} ;; *) diff_exit_raw= ;; esac;
+               if [ "$stop_emit" = 0 ] && [ -n "$file_buf" ]; then printf '%s' "$file_buf"; diff_bytes=$((diff_bytes+${#file_buf})); fi;
+               diff_wire_bytes=$diff_bytes; diff_frame_bytes=$diff_wire_bytes;
+               if [ "$diff_frame_bytes" -gt 0 ]; then diff_frame_bytes=$((diff_frame_bytes-1)); fi;
+               dm=$(printf 'diff_exit=%s\ndiff_hunks_returned=%s\ndiff_hunks_truncated=%s\ndiff_trunc_hunk_count=%s\ndiff_trunc_hunk_lines=%s\ndiff_trunc_bytes=%s\ndiff_bytes=%s' \
+                 "$diff_exit_raw" "$hc" "$((trunc_count || trunc_lines || trunc_bytes))" "$trunc_count" "$trunc_lines" "$trunc_bytes" "$diff_frame_bytes");
+               printf '%s\n' "$dm"; printf 'WCSF1:D:%010d:%010d\n' "$diff_wire_bytes" "$(( ${#dm}+1 ))";
+             }"#
+        .replace("__HUNK_LIMIT__", &max_hunks.to_string())
+        .replace("__LINE_LIMIT__", &max_hunk_lines.to_string())
+        .replace("__DIFF_BYTE_BUDGET__", &SHOW_CHANGES_DIFF_BYTES.to_string())
     } else {
         String::new()
     };
-    format!(
-        "status_stdout=$(git status --porcelain=v1 -b); \
-         status_exit=$?; \
-         if [ \"$status_exit\" -eq 0 ]; then \
-           repository_probe=inside_worktree; repository_probe_exit=0; \
-         else \
-           repository_probe_stdout=$(LC_ALL=C git rev-parse --is-inside-work-tree 2>&1); \
-           repository_probe_exit=$?; \
-           if [ \"$repository_probe_exit\" -eq 0 ] && [ \"$repository_probe_stdout\" = true ]; then \
-             repository_probe=inside_worktree; \
-           elif printf '%s\\n' \"$repository_probe_stdout\" | grep -Fq 'not a git repository'; then \
-             repository_probe=outside_worktree; \
-           else \
-             repository_probe=unavailable; \
-           fi; \
-         fi; \
-         printf '%s' \"$status_stdout\"; \
-         printf '\\n{sentinel}\\n'; \
-         printf 'status_exit=%s\\nrepository_probe=%s\\nrepository_probe_exit=%s\\n' \
-           \"$status_exit\" \"$repository_probe\" \"$repository_probe_exit\"; \
-         printf '\\n{sentinel}\\n'; \
-         {{ git log -1 --format='%H%x00%h%x00%s' || true; }}; \
-         printf '\\n{sentinel}\\n'; \
-         git diff --stat{diff_part}; \
-         final_exit=$?; \
-         if [ \"$status_exit\" -ne 0 ]; then exit \"$status_exit\"; else exit \"$final_exit\"; fi",
-        sentinel = SHOW_CHANGES_SENTINEL,
-        diff_part = diff_part,
-    )
+
+    let script = r#"{ LC_ALL=C; export LC_ALL;
+         { git status --porcelain=v1 -b; printf 'status_exit=%s\n' "$?"; } | {
+           n=0; total=0; trunc=0; trunc_count=0; trunc_bytes=0; trunc_path=0; exit_raw=; status_bytes=0;
+           c_mod=0; c_add=0; c_del=0; c_ren=0; c_cop=0; c_unt=0; c_conf=0; c_stg=0; c_uns=0; have=0; pending=;
+           while IFS= read -r line; do
+             next=$line; line=$pending; pending=$next;
+             if [ "$have" = 0 ]; then have=1; continue; fi;
+             case "$line" in
+               '## '*) printf '%s\n' "$line"; status_bytes=$((status_bytes+${#line}+1)) ;;
+               *)
+                 total=$((total+1)); xc=${line%"${line#?}"}; yc=${line#?}; yc=${yc%"${yc#?}"};
+                 case "$xc$yc" in
+                   '??') c_unt=$((c_unt+1)); label=untracked ;;
+                   UU|AA|DD|AU|UA|DU|UD) c_conf=$((c_conf+1)); label=conflicted ;;
+                   *R*) c_ren=$((c_ren+1)); label=renamed ;;
+                   *C*) c_cop=$((c_cop+1)); label=copied ;;
+                   *D*) c_del=$((c_del+1)); label=deleted ;;
+                   *A*) c_add=$((c_add+1)); label=added ;;
+                   *) c_mod=$((c_mod+1)); label=modified ;;
+                 esac;
+                 if [ "$label" != untracked ] && [ "$label" != conflicted ]; then
+                   if [ "$xc" != ' ' ] && [ "$xc" != '?' ]; then c_stg=$((c_stg+1)); fi;
+                   if [ "$yc" != ' ' ] && [ "$yc" != '?' ]; then c_uns=$((c_uns+1)); fi;
+                 fi;
+                 rec_len=$((${#line}+1));
+                 if [ "$n" -ge __STATUS_LIMIT__ ]; then trunc=1; trunc_count=1;
+                 elif [ "$((status_bytes + rec_len))" -gt __STATUS_BYTE_BUDGET__ ]; then trunc=1; trunc_bytes=1;
+                 elif [ "$rec_len" -gt __STATUS_MAX_RECORD_BYTES__ ]; then trunc=1; trunc_path=1;
+                 else printf '%s\n' "$line"; n=$((n+1)); status_bytes=$((status_bytes+rec_len)); fi ;;
+             esac;
+           done;
+           case "$pending" in status_exit=*) exit_raw=${pending#status_exit=} ;; *) exit_raw= ;; esac;
+           status_wire_bytes=$status_bytes; if [ "$status_bytes" -gt 0 ]; then status_bytes=$((status_bytes-1)); fi;
+           if [ -z "$exit_raw" ]; then exit_raw=0; fi;
+           if [ "$exit_raw" -eq 0 ] 2>/dev/null; then repo_probe=inside_worktree; repo_probe_exit=0;
+           else
+             repo_probe_stdout=$(LC_ALL=C git rev-parse --is-inside-work-tree 2>&1); repo_probe_exit=$?;
+             if [ "$repo_probe_exit" -eq 0 ] && [ "$repo_probe_stdout" = true ]; then repo_probe=inside_worktree;
+             elif printf '%s\n' "$repo_probe_stdout" | grep -Fq 'not a git repository'; then repo_probe=outside_worktree;
+             else repo_probe=unavailable; fi;
+           fi;
+           sm=$(printf 'status_exit=%s\nrepository_probe=%s\nrepository_probe_exit=%s\nfiles_total=%s\nfiles_returned=%s\nfiles_truncated=%s\nfiles_limit=%s\nstatus_bytes=%s\nstatus_trunc_count=%s\nstatus_trunc_bytes=%s\nstatus_trunc_path=%s\nmodified=%s\nadded=%s\ndeleted=%s\nrenamed=%s\ncopied=%s\nuntracked=%s\nconflicted=%s\nstaged=%s\nunstaged=%s' \
+             "$exit_raw" "$repo_probe" "$repo_probe_exit" "$total" "$n" "$trunc" __STATUS_LIMIT__ "$status_bytes" "$trunc_count" "$trunc_bytes" "$trunc_path" \
+             "$c_mod" "$c_add" "$c_del" "$c_ren" "$c_cop" "$c_unt" "$c_conf" "$c_stg" "$c_uns");
+           printf '%s\n' "$sm"; printf 'WCSF1:S:%010d:%010d\n' "$status_wire_bytes" "$(( ${#sm}+1 ))";
+           head_exit_raw=; he=0; head_frame_bytes=0; head_commit=; head_short=; head_subject=;
+           git log -1 --format=%s >/dev/null 2>&1; head_exit_raw=$?;
+           if [ "$head_exit_raw" -eq 0 ] 2>/dev/null; then
+             head_commit=$(git rev-parse --verify HEAD 2>/dev/null); head_short=$(git rev-parse --short "$head_commit" 2>/dev/null);
+             if [ -n "$head_commit" ] && [ -n "$head_short" ]; then
+               head_prefix=$(printf 'commit=%s\nshort=%s\nsummary=' "$head_commit" "$head_short"); head_prefix_bytes=${#head_prefix};
+               head_subject_limit=$((__HEAD_BYTE_BUDGET__-head_prefix_bytes));
+               if [ "$head_subject_limit" -lt 0 ]; then he=1;
+               else
+                 head_subject=$(git log -1 --format=%s "$head_commit" 2>/dev/null | dd bs=1 count=$((head_subject_limit+1)) 2>/dev/null);
+                 git log -1 --format=%s "$head_commit" >/dev/null 2>&1; head_exit_raw=$?; head_subject_bytes=${#head_subject};
+                 if [ "$head_subject_bytes" -gt "$head_subject_limit" ]; then he=1;
+                 elif [ "$head_exit_raw" -eq 0 ] 2>/dev/null; then printf '%s%s' "$head_prefix" "$head_subject"; head_frame_bytes=$((head_prefix_bytes+head_subject_bytes)); fi;
+               fi;
+             fi;
+           fi;
+           hm=$(printf 'head_exit=%s\nhead_truncated=%s\nhead_bytes=%s' "$head_exit_raw" "$he" "$head_frame_bytes");
+           printf '%s\n' "$hm"; printf 'WCSF1:H:%010d:%010d\n' "$head_frame_bytes" "$(( ${#hm}+1 ))";
+           { git diff --stat 2>/dev/null; printf '__WEBCODEX_STAT_EXIT__=%s\n' "$?"; } | {
+             sb=0; se=0; stat_exit_raw=; have=0; pending=;
+             while IFS= read -r sline; do
+               next=$sline; sline=$pending; pending=$next;
+               if [ "$have" = 0 ]; then have=1; continue; fi;
+               ll=$((${#sline}+1));
+               if [ "$((sb + ll))" -gt __DIFF_STAT_BUDGET__ ]; then se=1; else printf '%s\n' "$sline"; sb=$((sb+ll)); fi;
+             done;
+             case "$pending" in __WEBCODEX_STAT_EXIT__=*) stat_exit_raw=${pending#__WEBCODEX_STAT_EXIT__=} ;; *) stat_exit_raw= ;; esac;
+             stat_wire_bytes=$sb; if [ "$sb" -gt 0 ]; then sb=$((sb-1)); fi;
+             tm=$(printf 'diff_stat_exit=%s\ndiff_stat_truncated=%s\ndiff_stat_bytes=%s' "$stat_exit_raw" "$se" "$sb");
+             printf '%s\n' "$tm"; printf 'WCSF1:T:%010d:%010d\n' "$stat_wire_bytes" "$(( ${#tm}+1 ))";
+           }__DIFF_PART__;
+           final_exit=$?;
+           if [ "$exit_raw" -ne 0 ] && [ "$exit_raw" -ge 0 ] 2>/dev/null; then exit "$exit_raw"; else exit "$final_exit"; fi;
+         }; }"#;
+
+    let command = script
+        .replace("__STATUS_LIMIT__", &status_files_limit.to_string())
+        .replace(
+            "__STATUS_BYTE_BUDGET__",
+            &SHOW_CHANGES_STATUS_BYTES.to_string(),
+        )
+        .replace("__STATUS_MAX_RECORD_BYTES__", &(4 * 1024).to_string())
+        .replace(
+            "__DIFF_STAT_BUDGET__",
+            &SHOW_CHANGES_DIFF_STAT_BYTES.to_string(),
+        )
+        .replace("__HEAD_BYTE_BUDGET__", &SHOW_CHANGES_HEAD_BYTES.to_string())
+        .replace("__DIFF_PART__", &diff_part);
+    command
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-pub(crate) fn split_show_changes_stdout(
-    stdout: &str,
-    include_diff: bool,
-) -> (String, String, String, String, String, String) {
-    let mut parts = stdout.split(SHOW_CHANGES_SENTINEL);
-    let status = parts
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches(['\n', '\r'])
-        .to_string();
-    let first_after_status = parts
-        .next()
-        .unwrap_or_default()
-        .trim_matches(['\n', '\r'])
-        .to_string();
-    let (status_result, head) = if first_after_status.starts_with("status_exit=") {
-        let head = parts
-            .next()
-            .unwrap_or_default()
-            .trim_matches(['\n', '\r'])
-            .to_string();
-        (first_after_status, head)
+/// Parsed, production-bounded `show_changes` stdout frames. The status result
+/// frame carries the authoritative `files_*` and per-category counts reported
+/// by the command's streaming loop, so totals stay exact even when the
+/// returned file records were truncated by the production-side limit.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ShowChangesStdout {
+    pub(crate) framing_valid: bool,
+    pub(crate) status: String,
+    pub(crate) status_result: String,
+    pub(crate) head: String,
+    pub(crate) stat: String,
+    pub(crate) diff: String,
+    /// Authoritative status metadata parsed from the result frame. `None`
+    /// when a field is absent (e.g. a legacy/compat frame).
+    pub(crate) files_total: Option<usize>,
+    pub(crate) files_returned: Option<usize>,
+    pub(crate) files_truncated: Option<bool>,
+    pub(crate) files_limit: Option<usize>,
+    pub(crate) counts_modified: Option<usize>,
+    pub(crate) counts_added: Option<usize>,
+    pub(crate) counts_deleted: Option<usize>,
+    pub(crate) counts_renamed: Option<usize>,
+    pub(crate) counts_copied: Option<usize>,
+    pub(crate) counts_untracked: Option<usize>,
+    pub(crate) counts_conflicted: Option<usize>,
+    pub(crate) counts_staged: Option<usize>,
+    pub(crate) counts_unstaged: Option<usize>,
+    /// Per-segment byte-budget truncation flags parsed from the status result
+    /// frame. `None` when absent (legacy/compat frame).
+    pub(crate) status_trunc_count: Option<bool>,
+    pub(crate) status_trunc_bytes: Option<bool>,
+    pub(crate) status_trunc_path: Option<bool>,
+    /// Exact bytes in the parsed status frame.
+    pub(crate) status_bytes: Option<usize>,
+    /// HEAD metadata frame: real `git log -1` exit code and whether HEAD data
+    /// was emitted. `None` when the frame is absent.
+    pub(crate) head_exit: Option<i32>,
+    /// Whether the HEAD metadata segment was dropped for overflowing its byte
+    /// budget (a pathological commit subject). `None` when the frame is absent.
+    pub(crate) head_truncated: Option<bool>,
+    /// Exact bytes in the parsed HEAD frame.
+    pub(crate) head_bytes: Option<usize>,
+    /// `git diff --stat` metadata frame. `None` when the frame is absent.
+    pub(crate) diff_stat_exit: Option<i32>,
+    pub(crate) diff_stat_truncated: Option<bool>,
+    /// Exact bytes in the parsed diff-stat frame.
+    pub(crate) diff_stat_bytes: Option<usize>,
+    /// Number of diff hunks the production-side loop returned, parsed from the
+    /// trailing diff metadata frame. `None` when `include_diff` is false or the
+    /// frame is absent.
+    pub(crate) diff_hunks_returned: Option<usize>,
+    /// Whether the production-side loop dropped any diff data.
+    pub(crate) diff_hunks_truncated: Option<bool>,
+    /// Independent production-side diff truncation flags.
+    pub(crate) diff_trunc_hunk_count: Option<bool>,
+    pub(crate) diff_trunc_hunk_lines: Option<bool>,
+    pub(crate) diff_trunc_bytes: Option<bool>,
+    /// Real full `git diff` exit code parsed from the diff metadata frame.
+    pub(crate) diff_exit: Option<i32>,
+    /// Bytes emitted in the bounded diff segment, parsed from the diff metadata
+    /// frame.
+    pub(crate) diff_bytes: Option<usize>,
+}
+
+fn parse_optional_usize(result: &str, key: &str) -> Option<usize> {
+    parse_status_result_field(result, key).and_then(|v| v.parse::<usize>().ok())
+}
+
+fn parse_optional_bool(result: &str, key: &str) -> Option<bool> {
+    parse_status_result_field(result, key).and_then(|v| match v {
+        "0" | "false" => Some(false),
+        "1" | "true" => Some(true),
+        _ => None,
+    })
+}
+
+fn parse_fixed_decimal(bytes: &[u8]) -> Option<usize> {
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(bytes).ok()?.parse().ok()
+}
+
+fn parse_show_changes_wire_block<'a>(
+    stdout: &'a str,
+    end: usize,
+    kind: u8,
+) -> Option<(&'a str, &'a str, usize)> {
+    let bytes = stdout.as_bytes();
+    let trailer_start = end.checked_sub(SHOW_CHANGES_BLOCK_TRAILER_BYTES)?;
+    let trailer = bytes.get(trailer_start..end)?;
+    if trailer.get(..6)? != SHOW_CHANGES_BLOCK_MAGIC
+        || trailer.get(6).copied()? != kind
+        || trailer.get(7).copied()? != b':'
+        || trailer.get(18).copied()? != b':'
+        || trailer.get(29).copied()? != b'\n'
+    {
+        return None;
+    }
+    let data_wire_bytes = parse_fixed_decimal(trailer.get(8..18)?)?;
+    let meta_wire_bytes = parse_fixed_decimal(trailer.get(19..29)?)?;
+    let meta_start = trailer_start.checked_sub(meta_wire_bytes)?;
+    let data_start = meta_start.checked_sub(data_wire_bytes)?;
+    let data = std::str::from_utf8(bytes.get(data_start..meta_start)?).ok()?;
+    let meta = std::str::from_utf8(bytes.get(meta_start..trailer_start)?).ok()?;
+    Some((data, meta, data_start))
+}
+
+fn strip_wire_lf(value: &str) -> Option<String> {
+    if value.is_empty() {
+        Some(String::new())
     } else {
-        // Compatibility for already-enqueued requests created before the
-        // structured status-result frame was added. A reliable header is the
-        // only legacy shape that can be treated as observed.
-        let status_result = if status
-            .lines()
-            .any(|line| parse_status_header(line).is_some())
+        value.strip_suffix('\n').map(ToOwned::to_owned)
+    }
+}
+
+fn parse_framed_show_changes_stdout(stdout: &str, include_diff: bool) -> Option<ShowChangesStdout> {
+    let mut cursor = stdout.len();
+    let (diff, diff_meta) = if include_diff {
+        let (body, meta, start) = parse_show_changes_wire_block(stdout, cursor, b'D')?;
+        cursor = start;
+        (strip_wire_lf(body)?, strip_wire_lf(meta)?)
+    } else {
+        (String::new(), String::new())
+    };
+    let (stat, stat_meta, start) = parse_show_changes_wire_block(stdout, cursor, b'T')?;
+    cursor = start;
+    let (head, head_meta, start) = parse_show_changes_wire_block(stdout, cursor, b'H')?;
+    cursor = start;
+    let (status, status_result, start) = parse_show_changes_wire_block(stdout, cursor, b'S')?;
+    if start != 0 {
+        return None;
+    }
+    let status = strip_wire_lf(status)?;
+    let status_result = strip_wire_lf(status_result)?;
+    let stat = strip_wire_lf(stat)?;
+    let stat_meta = strip_wire_lf(stat_meta)?;
+    let head_meta = strip_wire_lf(head_meta)?;
+
+    Some(ShowChangesStdout {
+        framing_valid: true,
+        files_total: parse_optional_usize(&status_result, "files_total"),
+        files_returned: parse_optional_usize(&status_result, "files_returned"),
+        files_truncated: parse_optional_bool(&status_result, "files_truncated"),
+        files_limit: parse_optional_usize(&status_result, "files_limit"),
+        counts_modified: parse_optional_usize(&status_result, "modified"),
+        counts_added: parse_optional_usize(&status_result, "added"),
+        counts_deleted: parse_optional_usize(&status_result, "deleted"),
+        counts_renamed: parse_optional_usize(&status_result, "renamed"),
+        counts_copied: parse_optional_usize(&status_result, "copied"),
+        counts_untracked: parse_optional_usize(&status_result, "untracked"),
+        counts_conflicted: parse_optional_usize(&status_result, "conflicted"),
+        counts_staged: parse_optional_usize(&status_result, "staged"),
+        counts_unstaged: parse_optional_usize(&status_result, "unstaged"),
+        status_trunc_count: parse_optional_bool(&status_result, "status_trunc_count"),
+        status_trunc_bytes: parse_optional_bool(&status_result, "status_trunc_bytes"),
+        status_trunc_path: parse_optional_bool(&status_result, "status_trunc_path"),
+        status_bytes: parse_optional_usize(&status_result, "status_bytes"),
+        head_exit: parse_status_result_field(&head_meta, "head_exit")
+            .and_then(|value| value.parse().ok()),
+        head_truncated: parse_optional_bool(&head_meta, "head_truncated"),
+        head_bytes: parse_optional_usize(&head_meta, "head_bytes"),
+        diff_stat_exit: parse_status_result_field(&stat_meta, "diff_stat_exit")
+            .and_then(|value| value.parse().ok()),
+        diff_stat_truncated: parse_optional_bool(&stat_meta, "diff_stat_truncated"),
+        diff_stat_bytes: parse_optional_usize(&stat_meta, "diff_stat_bytes"),
+        diff_hunks_returned: parse_optional_usize(&diff_meta, "diff_hunks_returned"),
+        diff_hunks_truncated: parse_optional_bool(&diff_meta, "diff_hunks_truncated"),
+        diff_trunc_hunk_count: parse_optional_bool(&diff_meta, "diff_trunc_hunk_count"),
+        diff_trunc_hunk_lines: parse_optional_bool(&diff_meta, "diff_trunc_hunk_lines"),
+        diff_trunc_bytes: parse_optional_bool(&diff_meta, "diff_trunc_bytes"),
+        diff_exit: parse_status_result_field(&diff_meta, "diff_exit")
+            .and_then(|value| value.parse().ok()),
+        diff_bytes: parse_optional_usize(&diff_meta, "diff_bytes"),
+        status,
+        status_result,
+        head: head.to_string(),
+        stat,
+        diff,
+    })
+}
+
+pub(crate) fn split_show_changes_stdout(stdout: &str, include_diff: bool) -> ShowChangesStdout {
+    if let Some(frames) = parse_framed_show_changes_stdout(stdout, include_diff) {
+        return frames;
+    }
+
+    // Legacy delimiter framing remains readable for graceful degradation only.
+    // It can never prove transport safety because Git data may contain the delimiter.
+    let frames: Vec<String> = stdout
+        .split(SHOW_CHANGES_SENTINEL)
+        .map(|part| part.trim_matches('\n').to_string())
+        .collect();
+    let status = frames.first().cloned().unwrap_or_default();
+    let second = frames.get(1).cloned().unwrap_or_default();
+    let mut head_exit = None;
+    let mut head_truncated = None;
+    let mut head_bytes = None;
+    let mut diff_stat_exit = None;
+    let mut diff_stat_truncated = None;
+    let mut diff_stat_bytes = None;
+    let mut diff_meta = String::new();
+    let head;
+    let stat;
+    let mut diff = String::new();
+
+    if second.starts_with("status_exit=") {
+        let status_result = second;
+        head = frames.get(2).cloned().unwrap_or_default();
+        if let Some(meta) = frames.get(3).filter(|meta| meta.starts_with("head_exit=")) {
+            head_exit = parse_status_result_field(meta, "head_exit").and_then(|v| v.parse().ok());
+            head_truncated = parse_optional_bool(meta, "head_truncated");
+            head_bytes = parse_optional_usize(meta, "head_bytes");
+        }
+        stat = frames.get(4).cloned().unwrap_or_default();
+        if let Some(meta) = frames
+            .get(5)
+            .filter(|meta| meta.starts_with("diff_stat_exit="))
         {
-            "status_exit=0\nrepository_probe=inside_worktree\nrepository_probe_exit=0".to_string()
-        } else {
-            String::new()
+            diff_stat_exit =
+                parse_status_result_field(meta, "diff_stat_exit").and_then(|v| v.parse().ok());
+            diff_stat_truncated = parse_optional_bool(meta, "diff_stat_truncated");
+            diff_stat_bytes = parse_optional_usize(meta, "diff_stat_bytes");
+        }
+        if include_diff {
+            diff = frames.get(6).cloned().unwrap_or_default();
+            diff_meta = frames.get(7).cloned().unwrap_or_default();
+        }
+        return ShowChangesStdout {
+            framing_valid: false,
+            files_total: parse_optional_usize(&status_result, "files_total"),
+            files_returned: parse_optional_usize(&status_result, "files_returned"),
+            files_truncated: parse_optional_bool(&status_result, "files_truncated"),
+            files_limit: parse_optional_usize(&status_result, "files_limit"),
+            counts_modified: parse_optional_usize(&status_result, "modified"),
+            counts_added: parse_optional_usize(&status_result, "added"),
+            counts_deleted: parse_optional_usize(&status_result, "deleted"),
+            counts_renamed: parse_optional_usize(&status_result, "renamed"),
+            counts_copied: parse_optional_usize(&status_result, "copied"),
+            counts_untracked: parse_optional_usize(&status_result, "untracked"),
+            counts_conflicted: parse_optional_usize(&status_result, "conflicted"),
+            counts_staged: parse_optional_usize(&status_result, "staged"),
+            counts_unstaged: parse_optional_usize(&status_result, "unstaged"),
+            status_trunc_count: parse_optional_bool(&status_result, "status_trunc_count"),
+            status_trunc_bytes: parse_optional_bool(&status_result, "status_trunc_bytes"),
+            status_trunc_path: parse_optional_bool(&status_result, "status_trunc_path"),
+            status_bytes: parse_optional_usize(&status_result, "status_bytes"),
+            head_exit,
+            head_truncated,
+            head_bytes,
+            diff_stat_exit,
+            diff_stat_truncated,
+            diff_stat_bytes,
+            diff_hunks_returned: parse_optional_usize(&diff_meta, "diff_hunks_returned"),
+            diff_hunks_truncated: parse_optional_bool(&diff_meta, "diff_hunks_truncated"),
+            diff_trunc_hunk_count: parse_optional_bool(&diff_meta, "diff_trunc_hunk_count"),
+            diff_trunc_hunk_lines: parse_optional_bool(&diff_meta, "diff_trunc_hunk_lines"),
+            diff_trunc_bytes: parse_optional_bool(&diff_meta, "diff_trunc_bytes"),
+            diff_exit: parse_status_result_field(&diff_meta, "diff_exit")
+                .and_then(|v| v.parse().ok()),
+            diff_bytes: parse_optional_usize(&diff_meta, "diff_bytes"),
+            status,
+            status_result,
+            head,
+            stat,
+            diff,
         };
-        (status_result, first_after_status)
-    };
-    let stat = parts
-        .next()
-        .unwrap_or_default()
-        .trim_matches(['\n', '\r'])
-        .to_string();
-    let diff = if include_diff {
-        parts
-            .next()
-            .unwrap_or_default()
-            .trim_start_matches(['\n', '\r'])
-            .to_string()
+    }
+
+    let status_result = if status
+        .lines()
+        .any(|line| parse_status_header(line).is_some())
+    {
+        "status_exit=0\nrepository_probe=inside_worktree\nrepository_probe_exit=0".to_string()
     } else {
         String::new()
     };
-    let untracked_preview = if include_diff {
-        parts
-            .next()
-            .unwrap_or_default()
-            .trim_matches(['\n', '\r'])
-            .to_string()
-    } else {
-        String::new()
-    };
-    (status, status_result, head, stat, diff, untracked_preview)
+    head = second;
+    stat = frames.get(2).cloned().unwrap_or_default();
+    if include_diff {
+        diff = frames.get(3).cloned().unwrap_or_default();
+        diff_meta = frames.get(4).cloned().unwrap_or_default();
+    }
+    ShowChangesStdout {
+        framing_valid: false,
+        files_total: parse_optional_usize(&status_result, "files_total"),
+        files_returned: parse_optional_usize(&status_result, "files_returned"),
+        files_truncated: parse_optional_bool(&status_result, "files_truncated"),
+        files_limit: parse_optional_usize(&status_result, "files_limit"),
+        counts_modified: parse_optional_usize(&status_result, "modified"),
+        counts_added: parse_optional_usize(&status_result, "added"),
+        counts_deleted: parse_optional_usize(&status_result, "deleted"),
+        counts_renamed: parse_optional_usize(&status_result, "renamed"),
+        counts_copied: parse_optional_usize(&status_result, "copied"),
+        counts_untracked: parse_optional_usize(&status_result, "untracked"),
+        counts_conflicted: parse_optional_usize(&status_result, "conflicted"),
+        counts_staged: parse_optional_usize(&status_result, "staged"),
+        counts_unstaged: parse_optional_usize(&status_result, "unstaged"),
+        status_trunc_count: None,
+        status_trunc_bytes: None,
+        status_trunc_path: None,
+        status_bytes: None,
+        head_exit,
+        head_truncated,
+        head_bytes,
+        diff_stat_exit,
+        diff_stat_truncated,
+        diff_stat_bytes,
+        diff_hunks_returned: parse_optional_usize(&diff_meta, "diff_hunks_returned"),
+        diff_hunks_truncated: parse_optional_bool(&diff_meta, "diff_hunks_truncated"),
+        diff_trunc_hunk_count: parse_optional_bool(&diff_meta, "diff_trunc_hunk_count"),
+        diff_trunc_hunk_lines: parse_optional_bool(&diff_meta, "diff_trunc_hunk_lines"),
+        diff_trunc_bytes: parse_optional_bool(&diff_meta, "diff_trunc_bytes"),
+        diff_exit: parse_status_result_field(&diff_meta, "diff_exit").and_then(|v| v.parse().ok()),
+        diff_bytes: parse_optional_usize(&diff_meta, "diff_bytes"),
+        status,
+        status_result,
+        head,
+        stat,
+        diff,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedStatusHeader {
+pub(crate) struct ParsedStatusHeader {
     branch: Option<String>,
     upstream_status: &'static str,
     upstream_reason_code: Option<&'static str>,
@@ -465,7 +947,7 @@ fn parsed_branch_name(raw: &str) -> Option<String> {
     }
 }
 
-fn parse_status_header(line: &str) -> Option<ParsedStatusHeader> {
+pub(crate) fn parse_status_header(line: &str) -> Option<ParsedStatusHeader> {
     let rest = line.strip_prefix("## ")?;
 
     for prefix in ["No commits yet on ", "Initial commit on "] {
@@ -550,7 +1032,28 @@ fn parse_status_header(line: &str) -> Option<ParsedStatusHeader> {
     })
 }
 
+fn parse_show_changes_head_frame(head: &str) -> Option<(&str, &str, &str)> {
+    let mut lines = head.split('\n');
+    let commit = lines.next()?.strip_prefix("commit=")?;
+    let short = lines.next()?.strip_prefix("short=")?;
+    let summary = lines.next()?.strip_prefix("summary=")?;
+    if commit.is_empty() || short.is_empty() || lines.next().is_some() {
+        return None;
+    }
+    Some((commit, short, summary))
+}
+
 fn parse_show_changes_head(head: &str) -> serde_json::Value {
+    if let Some((commit, short, summary)) = parse_show_changes_head_frame(head) {
+        return json!({
+            "commit": commit,
+            "short": short,
+            "summary": summary,
+        });
+    }
+
+    // Compatibility with legacy/in-flight output produced before the
+    // newline-labelled HEAD frame replaced the NUL-separated record.
     let mut parts = head.splitn(3, '\0');
     let commit = parts.next().unwrap_or_default().trim();
     let short = parts.next().unwrap_or_default().trim();
@@ -568,6 +1071,138 @@ fn parse_show_changes_head(head: &str) -> serde_json::Value {
             "summary": summary,
         })
     }
+}
+
+fn frame_bytes_match(value: &str, reported: Option<usize>, budget: usize) -> bool {
+    let actual = value.as_bytes().len();
+    actual <= budget && reported == Some(actual)
+}
+
+fn show_changes_transport_safe(
+    frames: &ShowChangesStdout,
+    include_diff: bool,
+    max_hunks: usize,
+) -> bool {
+    if !frames.framing_valid {
+        return false;
+    }
+    let status_exit = parse_status_result_field(&frames.status_result, "status_exit")
+        .and_then(|value| value.parse::<i32>().ok());
+    let repository_probe = parse_status_result_field(&frames.status_result, "repository_probe");
+    let repository_probe_exit =
+        parse_status_result_field(&frames.status_result, "repository_probe_exit")
+            .and_then(|value| value.parse::<i32>().ok());
+    let (
+        Some(_),
+        Some("inside_worktree" | "outside_worktree" | "unavailable"),
+        Some(_),
+        Some(files_total),
+        Some(files_returned),
+        Some(files_truncated),
+        Some(files_limit),
+        Some(status_trunc_count),
+        Some(status_trunc_bytes),
+        Some(status_trunc_path),
+    ) = (
+        status_exit,
+        repository_probe,
+        repository_probe_exit,
+        frames.files_total,
+        frames.files_returned,
+        frames.files_truncated,
+        frames.files_limit,
+        frames.status_trunc_count,
+        frames.status_trunc_bytes,
+        frames.status_trunc_path,
+    )
+    else {
+        return false;
+    };
+
+    let category_total = [
+        frames.counts_modified,
+        frames.counts_added,
+        frames.counts_deleted,
+        frames.counts_renamed,
+        frames.counts_copied,
+        frames.counts_untracked,
+        frames.counts_conflicted,
+    ]
+    .into_iter()
+    .try_fold(0usize, |sum, value| sum.checked_add(value?));
+    let status_records = frames
+        .status
+        .lines()
+        .filter(|line| !line.starts_with("## "))
+        .count();
+    let status_truncated_by_reason = status_trunc_count || status_trunc_bytes || status_trunc_path;
+    let status_valid = frame_bytes_match(
+        &frames.status,
+        frames.status_bytes,
+        SHOW_CHANGES_STATUS_BYTES,
+    ) && frames.counts_staged.is_some()
+        && frames.counts_unstaged.is_some()
+        && files_limit == SHOW_CHANGES_MAX_STATUS_FILES
+        && files_returned == status_records
+        && files_total >= files_returned
+        && files_truncated == (files_total > files_returned)
+        && files_truncated == status_truncated_by_reason
+        && category_total == Some(files_total);
+
+    let (Some(head_exit), Some(head_truncated)) = (frames.head_exit, frames.head_truncated) else {
+        return false;
+    };
+    let head_shape_valid = if head_truncated {
+        frames.head.is_empty() && frames.head_bytes == Some(0)
+    } else if head_exit == 0 {
+        parse_show_changes_head_frame(&frames.head).is_some()
+    } else {
+        frames.head.is_empty() && frames.head_bytes == Some(0)
+    };
+    let head_valid = frame_bytes_match(&frames.head, frames.head_bytes, SHOW_CHANGES_HEAD_BYTES)
+        && head_shape_valid;
+
+    let stat_valid = frames.diff_stat_exit.is_some()
+        && frames.diff_stat_truncated.is_some()
+        && frame_bytes_match(
+            &frames.stat,
+            frames.diff_stat_bytes,
+            SHOW_CHANGES_DIFF_STAT_BYTES,
+        );
+
+    let diff_valid = if include_diff {
+        let (
+            Some(_),
+            Some(hunks_returned),
+            Some(hunks_truncated),
+            Some(trunc_count),
+            Some(trunc_lines),
+            Some(trunc_bytes),
+        ) = (
+            frames.diff_exit,
+            frames.diff_hunks_returned,
+            frames.diff_hunks_truncated,
+            frames.diff_trunc_hunk_count,
+            frames.diff_trunc_hunk_lines,
+            frames.diff_trunc_bytes,
+        )
+        else {
+            return false;
+        };
+        let actual_hunks = frames
+            .diff
+            .lines()
+            .filter(|line| line.starts_with("@@ "))
+            .count();
+        frame_bytes_match(&frames.diff, frames.diff_bytes, SHOW_CHANGES_DIFF_BYTES)
+            && hunks_returned == actual_hunks
+            && hunks_returned <= max_hunks
+            && hunks_truncated == (trunc_count || trunc_lines || trunc_bytes)
+    } else {
+        true
+    };
+
+    status_valid && head_valid && stat_valid && diff_valid
 }
 
 fn porcelain_path(path_part: &str) -> (String, Option<String>) {
@@ -655,22 +1290,68 @@ pub(crate) fn parse_show_changes_output(
             git_available: has_reliable_header,
         }
     };
+    let frames = ShowChangesStdout {
+        status: status_stdout.to_string(),
+        head: head_stdout.to_string(),
+        stat: diff_stat.to_string(),
+        diff: diff_stdout.unwrap_or_default().to_string(),
+        ..ShowChangesStdout::default()
+    };
+    let diff_for_parse = if diff_stdout.is_some() {
+        Some(frames.diff.as_str())
+    } else {
+        None
+    };
     parse_show_changes_output_with_observation(
         project,
-        status_stdout,
-        head_stdout,
-        diff_stat,
-        diff_stdout,
+        &frames.status,
+        &frames.head,
+        &frames.stat,
+        diff_for_parse,
         max_hunks,
         max_hunk_lines,
         exit_code,
         stderr,
         observation,
+        &frames,
     )
 }
 
+/// Map a full `git diff` exit code to the structured `diff_status` object
+/// reported by `show_changes`. `observed` means the diff exit code was
+/// captured (0 = clean diff, non-zero = command failure); `command_failed`
+/// means a non-zero exit was observed; `output_unavailable` means the exit
+/// code could not be captured by the production-side loop.
+fn diff_status_json(diff_exit: Option<i32>) -> serde_json::Value {
+    match diff_exit {
+        Some(0) => json!({"status": "observed", "exit_code": 0}),
+        Some(code) => json!({"status": "command_failed", "exit_code": code}),
+        None => json!({"status": "output_unavailable", "exit_code": null}),
+    }
+}
+
+/// Map the independently captured `git diff --stat` exit code to a strict
+/// observation object. Unlike `transport_safe`, this status describes whether
+/// the inspection itself succeeded and therefore participates in ToolResult
+/// success for confirmed Git worktrees.
+fn diff_stat_status_json(diff_stat_exit: Option<i32>) -> serde_json::Value {
+    match diff_stat_exit {
+        Some(0) => json!({
+            "status": "observed", "exit_code": 0, "reason_code": null,
+        }),
+        Some(code) => json!({
+            "status": "command_failed", "exit_code": code,
+            "reason_code": "git_diff_stat_command_failed",
+        }),
+        None => json!({
+            "status": "output_unavailable", "exit_code": null,
+            "reason_code": "git_diff_stat_result_unavailable",
+        }),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn parse_show_changes_output_with_observation(
+pub(crate) fn parse_show_changes_output_with_observation(
     project: &str,
     status_stdout: &str,
     head_stdout: &str,
@@ -681,6 +1362,7 @@ fn parse_show_changes_output_with_observation(
     exit_code: Option<i32>,
     stderr: &str,
     observation: ShowChangesStatusObservation,
+    frames: &ShowChangesStdout,
 ) -> serde_json::Value {
     let mut branch = None;
     let mut upstream_status = "unobserved";
@@ -769,7 +1451,52 @@ fn parse_show_changes_output_with_observation(
         }
     }
 
-    let clean = status_observed.then_some(files.is_empty());
+    // When the production-side status loop truncated the returned file
+    // records, the per-category counts parsed above only cover the returned
+    // subset. The command's streaming loop counted and classified *every*
+    // entry, so prefer those authoritative counts whenever they are present.
+    // `files_truncated` is true when the production-side limit dropped records
+    // by either the count cap *or* the independent status byte budget; the
+    // exact totals stay authoritative either way.
+    let status_trunc_count = frames.status_trunc_count.unwrap_or(false);
+    let status_trunc_bytes = frames.status_trunc_bytes.unwrap_or(false);
+    let status_trunc_path = frames.status_trunc_path.unwrap_or(false);
+    let files_truncated =
+        frames.files_truncated.unwrap_or(false) || status_trunc_count || status_trunc_bytes;
+    let files_total = frames.files_total;
+    let files_returned = frames.files_returned.unwrap_or(files.len());
+    let files_limit = frames.files_limit.unwrap_or(SHOW_CHANGES_MAX_STATUS_FILES);
+    if files_truncated {
+        if let Some(value) = frames.counts_modified {
+            modified = value;
+        }
+        if let Some(value) = frames.counts_added {
+            added = value;
+        }
+        if let Some(value) = frames.counts_deleted {
+            deleted = value;
+        }
+        if let Some(value) = frames.counts_renamed {
+            renamed = value;
+        }
+        if let Some(value) = frames.counts_copied {
+            copied = value;
+        }
+        if let Some(value) = frames.counts_untracked {
+            untracked = value;
+        }
+        if let Some(value) = frames.counts_conflicted {
+            conflicted = value;
+        }
+        if let Some(value) = frames.counts_staged {
+            staged_count = value;
+        }
+        if let Some(value) = frames.counts_unstaged {
+            unstaged_count = value;
+        }
+    }
+
+    let clean = status_observed.then_some(files_total.map_or(files.is_empty(), |total| total == 0));
     let mut warnings = Vec::new();
     if !status_observed {
         let reason_code = observation_reason_code.unwrap_or("git_status_result_unavailable");
@@ -834,6 +1561,49 @@ fn parse_show_changes_output_with_observation(
         vec!["inspect git status failure before relying on worktree cleanliness".to_string()]
     };
 
+    // Parse the (already production-bounded) diff hunks with the Rust-side
+    // parser. The parser's `truncated` flag captures a line-level bound on the
+    // final returned hunk, distinct from the production-side hunk-count bound,
+    // so both reasons can be surfaced.
+    let (diff_hunks, parser_hunk_count, parser_truncated) = match diff_stdout {
+        Some(diff) => parse_git_diff_hunks(diff, max_hunks, max_hunk_lines),
+        None => (Vec::new(), 0, false),
+    };
+
+    // Collect stable truncation reason codes from the per-segment metadata
+    // frames the production-side command emits. Each reason corresponds to a
+    // concrete production-side bound that fired, never a transport tail marker.
+    let mut truncation_reasons: Vec<&'static str> = Vec::new();
+    if status_trunc_count {
+        truncation_reasons.push("status_file_count_limit");
+    }
+    if status_trunc_bytes {
+        truncation_reasons.push("status_byte_budget");
+    }
+    if status_trunc_path {
+        truncation_reasons.push("status_path_overlong");
+    }
+    if frames.head_truncated == Some(true) {
+        truncation_reasons.push("head_metadata_byte_budget");
+    }
+    if frames.diff_stat_truncated == Some(true) {
+        truncation_reasons.push("diff_stat_byte_budget");
+    }
+    if frames.diff_trunc_hunk_count == Some(true) {
+        truncation_reasons.push("diff_hunk_count_limit");
+    }
+    if frames.diff_trunc_hunk_lines == Some(true) || parser_truncated {
+        truncation_reasons.push("diff_hunk_line_limit");
+    }
+    if frames.diff_trunc_bytes == Some(true) {
+        truncation_reasons.push("diff_byte_budget");
+    }
+    let output_truncated = !truncation_reasons.is_empty();
+    // Every segment must fit its independent production budget and match its
+    // exact byte metadata. Missing, malformed, or internally inconsistent
+    // metadata cannot prove transport safety.
+    let transport_safe = show_changes_transport_safe(frames, diff_stdout.is_some(), max_hunks);
+
     let mut output = json!({
         "project": project,
         "git_available": observation.git_available,
@@ -868,7 +1638,20 @@ fn parse_show_changes_output_with_observation(
             "unstaged": unstaged_count,
         },
         "files": files,
+        "files_total": files_total,
+        "files_returned": files_returned,
+        "files_truncated": files_truncated,
+        "files_limit": files_limit,
+        "transport_safe": transport_safe,
+        "output_budget_bytes": SHOW_CHANGES_OUTPUT_BUDGET_BYTES,
+        "output_truncated": output_truncated,
+        "truncation_reasons": truncation_reasons,
         "diff_stat": diff_stat,
+        "diff_exit": frames.diff_exit,
+        "diff_status": diff_status_json(frames.diff_exit),
+        "diff_stat_exit": frames.diff_stat_exit,
+        "diff_stat_status": diff_stat_status_json(frames.diff_stat_exit),
+        "head_exit": frames.head_exit,
         "warnings": warnings,
         "suggested_next_actions": suggested_next_actions,
         "session": null,
@@ -876,17 +1659,28 @@ fn parse_show_changes_output_with_observation(
         "stderr": stderr,
     });
 
-    if let Some(diff) = diff_stdout {
-        let (hunks, hunk_count, truncated) = parse_git_diff_hunks(diff, max_hunks, max_hunk_lines);
-        output["hunks"] = json!(hunks);
+    if diff_stdout.is_some() {
+        // The production-side diff loop already bounded the raw diff to at
+        // most `max_hunks` hunks and `max_hunk_lines` lines per hunk before
+        // transport. Its reported counts are authoritative for dropped hunks;
+        // the parser's `truncated` still captures the final returned hunk being
+        // line-bounded. Combine both.
+        let hunk_count = frames.diff_hunks_returned.unwrap_or(parser_hunk_count);
+        let hunks_truncated =
+            frames.diff_hunks_truncated.unwrap_or(parser_truncated) || parser_truncated;
+        output["hunks"] = json!(diff_hunks);
         output["hunk_count"] = json!(hunk_count);
-        output["hunks_truncated"] = json!(truncated);
+        output["hunks_truncated"] = json!(hunks_truncated);
     }
 
     set_show_changes_verdict(&mut output);
     output
 }
 
+/// Parse a transport-side untracked-preview JSON frame. Retained for
+/// backward compatibility with already-enqueued requests; the production path
+/// now collects previews via the local/agent probe helpers above.
+#[allow(dead_code)]
 fn parse_untracked_previews_stdout(preview_stdout: &str) -> Result<(Vec<Value>, bool), String> {
     let preview_stdout = preview_stdout.trim();
     if preview_stdout.is_empty() {
@@ -914,6 +1708,10 @@ fn parse_untracked_previews_stdout(preview_stdout: &str) -> Result<(Vec<Value>, 
     }
 }
 
+/// Layer a transport-side untracked-preview frame onto an output payload.
+/// Retained for backward compatibility; the production path collects previews
+/// via the local/agent probe helpers instead of a transport frame.
+#[allow(dead_code)]
 pub(crate) fn apply_show_changes_untracked_previews(output: &mut Value, preview_stdout: &str) {
     match parse_untracked_previews_stdout(preview_stdout) {
         Ok((previews, truncated)) => {
@@ -1104,7 +1902,7 @@ pub(crate) fn collect_show_changes_untracked_previews_for_root(
     (previews, truncated)
 }
 
-fn show_changes_untracked_paths(output: &Value) -> Vec<String> {
+pub(crate) fn show_changes_untracked_paths(output: &Value) -> Vec<String> {
     output["files"]
         .as_array()
         .into_iter()
@@ -2172,7 +2970,7 @@ impl ToolRuntime {
             .filter(|n| *n > 0)
             .unwrap_or(SHOW_CHANGES_DEFAULT_SESSION_EVENT_LIMIT)
             .min(SHOW_CHANGES_MAX_SESSION_EVENT_LIMIT);
-        let command = show_changes_command(include_diff);
+        let command = show_changes_command(include_diff, max_hunks, max_hunk_lines);
         let output = match self
             .run_project_command_capture(&project, command, 30, None)
             .await
@@ -2180,17 +2978,10 @@ impl ToolRuntime {
             Ok(output) => output,
             Err(e) => return ToolResult::err(e),
         };
-        let (
-            status_stdout,
-            status_result_stdout,
-            head_stdout,
-            diff_stat,
-            diff_stdout,
-            untracked_preview_stdout,
-        ) = split_show_changes_stdout(&output.stdout, include_diff);
+        let frames = split_show_changes_stdout(&output.stdout, include_diff);
         let status_observation = parse_show_changes_status_observation(
-            &status_stdout,
-            &status_result_stdout,
+            &frames.status,
+            &frames.status_result,
             &output.stderr,
         );
         let effective_exit_code = if status_observation.exit_code != Some(0) {
@@ -2216,15 +3007,16 @@ impl ToolRuntime {
         let status_observed = status_observation.status_observed();
         let mut payload = parse_show_changes_output_with_observation(
             &project,
-            &status_stdout,
-            &head_stdout,
-            &diff_stat,
-            include_diff.then_some(diff_stdout.as_str()),
+            &frames.status,
+            &frames.head,
+            &frames.stat,
+            include_diff.then_some(frames.diff.as_str()),
             max_hunks,
             max_hunk_lines,
             effective_exit_code,
             &output.stderr,
             status_observation,
+            &frames,
         );
         if include_diff {
             let untracked_paths = show_changes_untracked_paths(&payload);
@@ -2233,25 +3025,49 @@ impl ToolRuntime {
                 .await;
             payload["untracked_previews"] = json!(previews);
             payload["untracked_previews_truncated"] = json!(truncated);
-            if !untracked_preview_stdout.trim().is_empty() {
-                apply_show_changes_untracked_previews(&mut payload, &untracked_preview_stdout);
-            }
         }
         let session_summary = session_id
             .as_deref()
             .and_then(|id| self.sessions.summary(id, Some(session_event_limit)));
         apply_show_changes_session(&mut payload, session_id.as_deref(), session_summary);
-        if status_observed && output.exit_code == Some(0) {
+        // Success requires the command/result envelope, status, diff-stat, and
+        // (when requested) full diff inspections all to be proven successful.
+        // `transport_safe` only describes bounded transport integrity and must
+        // never mask an observed or unavailable inspection failure.
+        let diff_stat_ok = frames.diff_stat_exit == Some(0);
+        let diff_ok = if include_diff {
+            // `diff_exit == None` means the exit code could not be captured
+            // (e.g. legacy/transport-truncated stdout); treat as not proven-ok.
+            frames.diff_exit == Some(0)
+        } else {
+            true
+        };
+        if status_observed && output.exit_code == Some(0) && diff_stat_ok && diff_ok {
             ToolResult::ok(payload)
         } else {
+            let error = if !status_observed {
+                "show_changes git status unavailable".to_string()
+            } else if !diff_stat_ok {
+                match frames.diff_stat_exit {
+                    Some(code) => format!(
+                        "show_changes git diff-stat inspection failed with exit code {code}"
+                    ),
+                    None => "show_changes git diff-stat inspection unavailable".to_string(),
+                }
+            } else if include_diff && !diff_ok {
+                match frames.diff_exit {
+                    Some(code) => {
+                        format!("show_changes git diff inspection failed with exit code {code}")
+                    }
+                    None => "show_changes git diff inspection unavailable".to_string(),
+                }
+            } else {
+                "show_changes git inspection failed".to_string()
+            };
             ToolResult {
                 success: false,
                 output: payload,
-                error: Some(if status_observed {
-                    "show_changes git inspection failed".to_string()
-                } else {
-                    "show_changes git status unavailable".to_string()
-                }),
+                error: Some(error),
             }
         }
     }
