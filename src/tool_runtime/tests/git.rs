@@ -6,7 +6,7 @@ use super::super::*;
 use super::support::*;
 use crate::shell_protocol::{ShellAgentResultRequest, ShellClientCapabilities};
 use crate::tool_runtime::ToolRuntime;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::fs;
 
 #[tokio::test]
@@ -1009,42 +1009,58 @@ async fn git_or_shell_tools_rejected_without_git_or_shell_capability() {
 }
 
 #[test]
-fn is_non_git_project_inspection_detects_english_and_localized_fatal() {
-    // English git fatal message.
-    assert!(is_non_git_project_inspection(
-        Some(128),
-        "fatal: not a git repository (or any of the parent directories): .git",
+fn show_changes_status_observation_distinguishes_failure_classes() {
+    let observed = parse_show_changes_status_observation(
+        "## main",
+        "status_exit=0\nrepository_probe=inside_worktree\nrepository_probe_exit=0",
         "",
-    ));
-    // Localized git fatal message (no English substring) — caught by the
-    // locale-independent structural signal.
-    assert!(is_non_git_project_inspection(
-        Some(128),
-        "fatal: 不是 git 仓库（或者任何父目录）：.git",
+    );
+    assert_eq!(observed.as_json()["status"], "observed");
+
+    let non_git = parse_show_changes_status_observation(
         "",
-    ));
-    // Locale-independent structural signal: non-zero exit and no `## ` branch
-    // header in the porcelain status output.
-    assert!(is_non_git_project_inspection(
-        Some(129),
-        "usage: git diff --no-index ...",
+        "status_exit=128\nrepository_probe=outside_worktree\nrepository_probe_exit=128",
+        "fatal: not a git repository",
+    );
+    assert_eq!(non_git.as_json()["status"], "non_git");
+    assert_eq!(non_git.as_json()["reason_code"], "not_a_git_repository");
+
+    let config_failure = parse_show_changes_status_observation(
         "",
-    ));
-    // Real git repo: exit 0 (not flagged regardless of stderr).
-    assert!(!is_non_git_project_inspection(Some(0), "", "## main"));
-    // Real git repo with no commits still emits a `## ` header.
-    assert!(!is_non_git_project_inspection(
-        Some(0),
+        "status_exit=128\nrepository_probe=inside_worktree\nrepository_probe_exit=0",
+        "fatal: bad config variable 'status.showuntrackedfiles'",
+    );
+    assert_eq!(config_failure.as_json()["status"], "command_failed");
+    assert_eq!(
+        config_failure.as_json()["reason_code"],
+        "git_status_config_error"
+    );
+    assert_eq!(
+        config_failure.as_json()["repository_probe"],
+        "inside_worktree"
+    );
+
+    let permission_failure = parse_show_changes_status_observation(
         "",
-        "## No commits yet on main",
-    ));
-    // Non-zero exit but a real repo produced a branch header (some other git
-    // issue): not classified as non-git.
-    assert!(!is_non_git_project_inspection(
-        Some(1),
-        "some other error",
-        "## main\n M src/lib.rs",
-    ));
+        "status_exit=128\nrepository_probe=unavailable\nrepository_probe_exit=128",
+        "fatal: Permission denied",
+    );
+    assert_eq!(permission_failure.as_json()["status"], "command_failed");
+    assert_eq!(
+        permission_failure.as_json()["reason_code"],
+        "git_status_permission_denied"
+    );
+
+    let unavailable = parse_show_changes_status_observation(
+        "",
+        "status_exit=0\nrepository_probe=inside_worktree\nrepository_probe_exit=0",
+        "",
+    );
+    assert_eq!(unavailable.as_json()["status"], "output_unavailable");
+    assert_eq!(
+        unavailable.as_json()["reason_code"],
+        "git_status_header_unavailable"
+    );
 }
 
 async fn run_show_changes_via_agent(
@@ -1052,11 +1068,12 @@ async fn run_show_changes_via_agent(
     client_id: &str,
     project: String,
     session_id: Option<String>,
+    include_diff: bool,
 ) -> ToolResult {
     let runtime_for_task = runtime.clone();
     let task = tokio::spawn(async move {
         runtime_for_task
-            .show_changes(project, session_id, None, None, None, None)
+            .show_changes(project, session_id, Some(include_diff), None, None, None)
             .await
     });
     let req = next_patch_agent_request(runtime, client_id)
@@ -1066,13 +1083,26 @@ async fn run_show_changes_via_agent(
     task.await.unwrap()
 }
 
+fn assert_show_changes_envelope_matches_schema(label: &str, result: &ToolResult) {
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("show_changes");
+    let envelope = json!({
+        "success": result.success,
+        "output": result.output,
+        "error": result.error,
+    });
+    crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&envelope, &schema)
+        .unwrap_or_else(|error| {
+            panic!("{label} show_changes schema mismatch: {error}\n{envelope}")
+        });
+}
+
 #[tokio::test]
 async fn show_changes_degrades_gracefully_for_non_git_project() {
     let tmp = tempfile::tempdir().unwrap();
     // Intentionally do NOT init a git repo.
     let runtime = test_runtime();
     let project = register_agent_project_at_path(&runtime, "ng", "demo", tmp.path()).await;
-    let result = run_show_changes_via_agent(&runtime, "ng", project, None).await;
+    let result = run_show_changes_via_agent(&runtime, "ng", project, None, false).await;
     assert!(
         result.success,
         "non-git project must not be a runtime failure: {:?}",
@@ -1110,6 +1140,16 @@ async fn show_changes_degrades_gracefully_for_non_git_project() {
     assert!(actions
         .iter()
         .any(|a| a.as_str().unwrap().contains("unavailable")));
+    assert_eq!(result.output["status_observation"]["status"], "non_git");
+    assert_eq!(
+        result.output["head"],
+        json!({
+            "commit": null,
+            "short": null,
+            "summary": null,
+        })
+    );
+    assert_show_changes_envelope_matches_schema("non-git", &result);
 }
 
 #[tokio::test]
@@ -1131,9 +1171,14 @@ async fn show_changes_non_git_project_still_returns_session_summary() {
         .sessions
         .record_tool_call_finished(start, true, &json!({}), None, None);
 
-    let result =
-        run_show_changes_via_agent(&runtime, "ngs", project, Some(session.session_id.clone()))
-            .await;
+    let result = run_show_changes_via_agent(
+        &runtime,
+        "ngs",
+        project,
+        Some(session.session_id.clone()),
+        false,
+    )
+    .await;
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["non_git_project"], true);
     assert_eq!(result.output["git_available"], false);
@@ -1167,7 +1212,7 @@ async fn show_changes_real_git_repo_marks_git_available_and_reports_status() {
     commit_file(tmp.path(), "README.md", "hello\n", "initial");
     let runtime = test_runtime();
     let project = register_agent_project_at_path(&runtime, "gr", "demo", tmp.path()).await;
-    let result = run_show_changes_via_agent(&runtime, "gr", project, None).await;
+    let result = run_show_changes_via_agent(&runtime, "gr", project, None, false).await;
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["non_git_project"], false);
     assert_eq!(result.output["git_available"], true);
@@ -1185,6 +1230,197 @@ async fn show_changes_real_git_repo_marks_git_available_and_reports_status() {
     assert!(!actions
         .iter()
         .any(|a| a.as_str().unwrap().contains("unavailable")));
+    assert_eq!(result.output["status_observation"]["status"], "observed");
+    assert_show_changes_envelope_matches_schema("git include_diff=false", &result);
+}
+
+#[tokio::test]
+async fn show_changes_real_git_repo_include_diff_true_matches_schema() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "hello\n", "initial");
+    std::fs::write(tmp.path().join("README.md"), "hello\nchanged\n").unwrap();
+    let runtime = test_runtime();
+    let project = register_agent_project_at_path(&runtime, "grd", "demo", tmp.path()).await;
+    let result = run_show_changes_via_agent(&runtime, "grd", project, None, true).await;
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["status_observation"]["status"], "observed");
+    assert_eq!(result.output["clean"], false);
+    assert!(result.output["hunk_count"].as_u64().unwrap_or(0) > 0);
+    assert_show_changes_envelope_matches_schema("git include_diff=true", &result);
+}
+
+#[tokio::test]
+async fn show_changes_status_failure_is_not_masked_by_successful_diff() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "hello\n", "initial");
+    std::fs::write(tmp.path().join("README.md"), "hello\nchanged\n").unwrap();
+    let (config_exit, _, config_stderr, _) = run_command_sync(
+        "git config status.showUntrackedFiles invalid",
+        tmp.path(),
+        30,
+    );
+    assert_eq!(
+        config_exit, 0,
+        "failed to set regression config: {config_stderr}"
+    );
+
+    let runtime = test_runtime();
+    let project = register_agent_project_at_path(&runtime, "gsf", "demo", tmp.path()).await;
+    let result = run_show_changes_via_agent(&runtime, "gsf", project, None, false).await;
+    assert!(!result.success, "status failure must fail show_changes");
+    assert_eq!(
+        result.output["status_observation"]["status"],
+        "command_failed"
+    );
+    assert_eq!(
+        result.output["status_observation"]["reason_code"],
+        "git_status_config_error"
+    );
+    assert_eq!(
+        result.output["status_observation"]["repository_probe"],
+        "inside_worktree"
+    );
+    assert_eq!(result.output["git_available"], true);
+    assert_eq!(result.output["non_git_project"], false);
+    assert_eq!(result.output["clean"], Value::Null);
+    assert_eq!(result.output["counts"]["conflicted"], Value::Null);
+    assert!(
+        result.output["diff_stat"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("README.md"),
+        "successful diff output should remain available: {}",
+        result.output
+    );
+    assert!(result.output["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning["reason_code"] == "git_status_config_error"));
+    assert_show_changes_envelope_matches_schema("status command failure", &result);
+}
+
+#[test]
+fn show_changes_parses_upstream_observation_states() {
+    let parse = |status: &str| {
+        parse_show_changes_output(
+            "agent:oe:webcodex",
+            status,
+            "b47e4fb000000000000000000000000000000000\0b47e4fb\0head",
+            "",
+            None,
+            20,
+            80,
+            Some(0),
+            "",
+        )
+    };
+
+    let synced = parse("## main...origin/main");
+    assert_eq!(synced["upstream_status"], "available");
+    assert_eq!(synced["upstream_reason_code"], Value::Null);
+    assert_eq!(synced["upstream"], "origin/main");
+    assert_eq!(synced["ahead"], 0);
+    assert_eq!(synced["behind"], 0);
+
+    let diverged = parse("## main...origin/main [ahead 3, behind 2]");
+    assert_eq!(diverged["upstream_status"], "available");
+    assert_eq!(diverged["ahead"], 3);
+    assert_eq!(diverged["behind"], 2);
+
+    let gone = parse("## main...origin/main [gone]");
+    assert_eq!(gone["upstream_status"], "gone");
+    assert_eq!(gone["upstream_reason_code"], "upstream_gone");
+    assert_eq!(gone["upstream"], "origin/main");
+    assert_eq!(gone["ahead"], Value::Null);
+    assert_eq!(gone["behind"], Value::Null);
+
+    let absent = parse("## main");
+    assert_eq!(absent["upstream_status"], "absent");
+    assert_eq!(absent["upstream_reason_code"], Value::Null);
+    assert_eq!(absent["upstream"], Value::Null);
+    assert_eq!(absent["ahead"], Value::Null);
+    assert_eq!(absent["behind"], Value::Null);
+}
+
+#[test]
+fn show_changes_parses_unborn_and_detached_branch_headers() {
+    for status in ["## No commits yet on main", "## Initial commit on main"] {
+        let output = parse_show_changes_output(
+            "agent:oe:webcodex",
+            status,
+            "",
+            "",
+            None,
+            20,
+            80,
+            Some(0),
+            "",
+        );
+        assert_eq!(output["branch"], "main", "status: {status}");
+        assert_eq!(output["head"]["commit"], Value::Null);
+        assert_eq!(output["upstream_status"], "absent");
+    }
+
+    for status in ["## HEAD (no branch)", "## HEAD (detached at b47e4fb)"] {
+        let output = parse_show_changes_output(
+            "agent:oe:webcodex",
+            status,
+            "b47e4fb000000000000000000000000000000000\0b47e4fb\0head",
+            "",
+            None,
+            20,
+            80,
+            Some(0),
+            "",
+        );
+        assert_eq!(output["branch"], Value::Null, "status: {status}");
+        assert_eq!(output["upstream_status"], "absent");
+    }
+}
+
+#[test]
+fn non_git_show_changes_preserves_unobserved_state() {
+    let output = non_git_show_changes_payload("agent:oe:plain", Some(128), false);
+    assert_eq!(output["git_available"], false);
+    assert_eq!(output["clean"], Value::Null);
+    assert_eq!(output["counts"]["conflicted"], Value::Null);
+    assert_eq!(output["upstream_status"], "unobserved");
+    assert_eq!(output["upstream_reason_code"], "git_unavailable");
+    assert_eq!(output["upstream"], Value::Null);
+    assert_eq!(output["ahead"], Value::Null);
+    assert_eq!(output["behind"], Value::Null);
+    assert_reason_list_contains(&output["verdict"], "warning_reasons", "git_unavailable");
+}
+
+#[test]
+fn show_changes_schema_explicitly_models_upstream_and_nullable_observation() {
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("show_changes");
+    let properties = schema["properties"]["output"]["properties"]
+        .as_object()
+        .expect("show_changes output properties");
+    for field in [
+        "upstream_status",
+        "upstream_reason_code",
+        "upstream",
+        "ahead",
+        "behind",
+    ] {
+        assert!(
+            properties.contains_key(field),
+            "missing explicit field {field}"
+        );
+    }
+    assert_eq!(
+        properties["upstream_status"]["enum"],
+        json!(["available", "absent", "gone", "unobserved"])
+    );
+    assert_eq!(properties["head"]["additionalProperties"], false);
+    assert_eq!(properties["counts"]["additionalProperties"], false);
+    assert!(properties["clean"]["anyOf"].is_array());
+    assert!(properties["counts"]["properties"]["conflicted"]["anyOf"].is_array());
 }
 
 fn assert_review_verdict_shape(verdict: &serde_json::Value) {

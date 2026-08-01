@@ -70,8 +70,14 @@ pub(in crate::tool_runtime::tests) fn show_changes_output_from_command(
         exit_code, 0,
         "show_changes command failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let (status_stdout, head_stdout, diff_stat, diff_stdout, _untracked_preview_stdout) =
-        split_show_changes_stdout(&stdout, include_diff);
+    let (
+        status_stdout,
+        _status_result_stdout,
+        head_stdout,
+        diff_stat,
+        diff_stdout,
+        _untracked_preview_stdout,
+    ) = split_show_changes_stdout(&stdout, include_diff);
     let mut output = parse_show_changes_output(
         "demo",
         &status_stdout,
