@@ -62,6 +62,16 @@ pub(crate) fn session_log_arguments_for_tool_request(tool_name: &str, arguments:
                 .unwrap_or(Value::Null);
             out.insert("execution_context".to_string(), context);
         }
+        "work_on_project" => {
+            copy_keys(obj, &mut out, &["project", "session_id"]);
+            if let Some(instruction) = obj.get("instruction").and_then(Value::as_str) {
+                out.insert(
+                    "instruction_summary".to_string(),
+                    Value::String(crate::shell_client::command_preview(instruction)),
+                );
+                out.insert("instruction_present".to_string(), Value::Bool(true));
+            }
+        }
         "search_project_text" => {
             copy_keys(
                 obj,
@@ -1017,6 +1027,16 @@ impl ToolCall {
                 "execution_context": execution_context
                     .as_ref()
                     .map(super::sessions::SessionExecutionContext::audit_summary),
+            }),
+            Self::WorkOnProject {
+                project,
+                instruction,
+                session_id,
+            } => serde_json::json!({
+                "project": project,
+                "instruction_present": true,
+                "instruction_summary": crate::shell_client::command_preview(instruction),
+                "session_id": session_id,
             }),
             Self::UpdateSessionContext {
                 project,

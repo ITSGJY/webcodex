@@ -84,6 +84,7 @@ pub(crate) const ACCEPTED_FLATTENED_ARG_PREFERRED_ORDER: &[&str] = &[
     "project",
     "path",
     "title",
+    "instruction",
     "resume_session_id",
     "session_id",
     "mode",

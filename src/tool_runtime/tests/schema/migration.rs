@@ -39,6 +39,7 @@ fn tool_definition_runtime_tool_policy_inventory_is_stable() {
         ("list_tools", "runtime", "none"),
         ("start_session", "session", "creates_or_binds"),
         ("start_coding_task", "workflow", "creates_or_binds"),
+        ("work_on_project", "workflow", "creates_or_binds"),
         (
             "finish_coding_task",
             "workflow",

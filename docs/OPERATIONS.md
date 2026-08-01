@@ -478,10 +478,38 @@ For static-token MCP clients:
 
 ## Coding And Session Workflow
 
-For coding tasks, prefer the deterministic coding-task aggregate tools. They
-create and close out a session while keeping all continuity explicit.
+For coding tasks, prefer the deterministic coding-task aggregate tools.
+`work_on_project` creates or continues a Workflow Session with explicit
+continuity. The optional `finish_coding_task` call returns an advisory evidence
+snapshot; it does not close the Session or change its lifecycle.
 
-### 1. Start a coding task
+For ordinary daily coding, `work_on_project` is the default entry point: pass an
+existing project and an instruction, plus `session_id` only when continuing one
+exact Workflow Session. It returns a compact startup projection and never
+depends on or creates a chat-window binding.
+
+### 1. Start ordinary coding work
+
+```json
+{
+  "tool": "work_on_project",
+  "params": {
+    "project": "agent:workstation:my-repo",
+    "instruction": "fix authentication bug"
+  }
+}
+```
+
+Without `session_id`, the call explicitly creates a new Workflow Session. Its
+compact response returns the durable id in `output.session_id`; pass that id in
+a later `work_on_project` call to continue the same Session. This default flow
+does not infer continuity from a window or a credential-wide recent Session.
+
+#### Advanced startup controls
+
+Use `start_coding_task` only when the task needs advanced modes, guards,
+execution context, managed temporary projects, startup detail, or explicit
+binding controls:
 
 ```json
 {
@@ -501,10 +529,11 @@ back restores the earlier one. Use `new_session=true` only for an explicitly
 isolated task; title differences do not create sessions. Use
 `bind_current=false` only to opt out of automatic continuation.
 
-The call returns a `wc_sess_*` session id in `output.session.session_id`. Keep
-that id for tools that require explicit business input and as a recovery fallback
-when stable transport identity is unavailable. The automatic exact binding uses
-a process-local cache plus a bounded hashed durable projection.
+The advanced call returns a `wc_sess_*` session id in
+`output.session.session_id`. Keep that id for tools that require explicit
+business input and as a recovery fallback when stable transport identity is
+unavailable. The automatic exact binding uses a process-local cache plus a
+bounded hashed durable projection.
 `detail` is the canonical startup projection:
 
 - `minimal`: the strict model-facing session and repository identity,
@@ -808,14 +837,22 @@ For final Agent reporting, use `finish_coding_task.facts`,
 nested component verdicts. These are a compact fact package; the Agent still
 decides test sufficiency and the task-specific engineering conclusion.
 
-Discovery taxonomy is intentional: `start_coding_task` and
-`finish_coding_task` are `workflow` category tools for the coding lifecycle.
+Discovery taxonomy is intentional: `work_on_project`, `start_coding_task`, and
+`finish_coding_task` are `workflow` category tools for the coding workflow.
 `start_session`, `bind_current_session`, `session_summary`, and
 `session_handoff_summary` are `session` category tools for raw ledger and
 session-control workflows. Use `category=workflow` for lifecycle discovery and
 `category=session` for session ledger/control discovery.
 
-### 6. Finish or hand off
+### 6. Optional finish or hand off
+
+`finish_coding_task` is an optional, advisory evidence snapshot. It never
+decides whether a task is complete, never replaces direct diff or test review,
+and never generates the user-facing final report — that report is written by
+the model from the actual work results. It also does not close, archive, or
+otherwise change the Workflow Session lifecycle; use `close_session` explicitly
+when lifecycle closure is intended. An ordinary task can be completed without
+calling `finish_coding_task` at all.
 
 ```json
 {

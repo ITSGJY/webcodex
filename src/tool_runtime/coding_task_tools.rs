@@ -45,6 +45,14 @@ impl ToolRuntime {
                 )
                 .await
             }
+            ToolCall::WorkOnProject {
+                project,
+                instruction,
+                session_id,
+            } => {
+                self.work_on_project(project, instruction, session_id, auth, transport, window)
+                    .await
+            }
             ToolCall::FinishCodingTask {
                 project,
                 session_id,

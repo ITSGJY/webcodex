@@ -65,6 +65,7 @@ pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
         "pattern" => json!("fn main"),
         "text" => json!("// hi\n"),
         "content" => json!("fn main() {}\n"),
+        "instruction" => json!("implement the requested change"),
         "content_base64" => json!("AA=="),
         "start_line" | "end_line" | "line" | "column" | "offset" => json!(1),
         "upload_id" => json!("wc_upload_test_1"),

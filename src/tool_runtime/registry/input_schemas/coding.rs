@@ -86,6 +86,32 @@ pub(crate) fn start_coding_task_input_schema() -> Value {
     })
 }
 
+pub(crate) fn work_on_project_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "project": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Required existing runtime project id, such as agent:<client_id>:<project_id>."
+            },
+            "instruction": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4000,
+                "description": "Required current user instruction. On a new task it becomes the root task title; when session_id is provided it is appended to the existing Workflow Session ledger and never overwrites the root title."
+            },
+            "session_id": {
+                "type": "string",
+                "pattern": "^wc_sess_[A-Za-z0-9_]+$",
+                "description": "Optional explicit Workflow Session to continue exactly. It must match the project and be active and accessible; failure never falls back, guesses, or creates a new Session. This is explicit business input, distinct from wrapper recording_session_id and never a current-session fallback."
+            }
+        },
+        "required": ["project", "instruction"],
+        "additionalProperties": false,
+    })
+}
+
 pub(crate) fn finish_coding_task_input_schema() -> Value {
     json!({
         "type": "object",

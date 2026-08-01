@@ -5,6 +5,7 @@
 //! generate prose summaries, parse validation output, or hide underlying tool
 //! payloads.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::continuation_feedback::{
@@ -27,7 +28,7 @@ use super::session_context::{
 };
 use super::sessions::tool_failure_summary_from_events;
 use super::sessions::{self, SessionTransport, TOOL_CALL_RECORDING_SESSION_ID_FIELD};
-use super::startup_brief::{build_startup_brief, StartupBriefInput};
+use super::startup_brief::{build_startup_brief, startup_brief_from_output, StartupBriefInput};
 use super::tool_catalog::TOOL_RECOMMENDED_FLOWS;
 use super::tool_inputs::{SessionMode, StartupDetail};
 use super::tool_result::ToolResult;
@@ -701,6 +702,104 @@ impl ToolRuntime {
         }
     }
 
+    /// Thin `start_coding_task` wrapper for the daily model coding loop.
+    ///
+    /// The wrapper validates only its three simple inputs, maps them onto
+    /// normal coding-task defaults, delegates the entire business implementation
+    /// to `start_coding_task`, and projects a compact startup result. It never
+    /// reads the current window, binds a current Session, guesses a recent
+    /// Session, or falls back to a credential-wide Session. With `session_id`
+    /// present, it exactly resumes that one Workflow Session after the existing
+    /// project/lifecycle/access/capability checks and never creates or falls
+    /// back on failure.
+    pub(crate) async fn work_on_project(
+        &self,
+        project: String,
+        instruction: String,
+        session_id: Option<String>,
+        auth: Option<&AuthContext>,
+        transport: SessionTransport,
+        window: Option<&crate::client_window::ClientWindow>,
+    ) -> ToolResult {
+        let project = project.trim().to_string();
+        if project.is_empty() {
+            return ToolResult::err_with_output(
+                "project must be a non-empty existing runtime project id",
+                json!({
+                    "error_kind": "invalid_arguments",
+                    "failure_kind": "invalid_arguments",
+                    "field": "project",
+                    "state_changed": false,
+                }),
+            );
+        }
+        let instruction = instruction.trim().to_string();
+        if instruction.is_empty()
+            || instruction.chars().count() > sessions::MAX_CODING_INSTRUCTION_CHARS
+        {
+            return ToolResult::err_with_output(
+                format!(
+                    "instruction must contain 1..={} characters",
+                    sessions::MAX_CODING_INSTRUCTION_CHARS
+                ),
+                json!({
+                    "error_kind": "invalid_coding_instruction",
+                    "field": "instruction",
+                    "max_chars": sessions::MAX_CODING_INSTRUCTION_CHARS,
+                    "state_changed": false,
+                }),
+            );
+        }
+        let session_id = match session_id {
+            Some(session_id)
+                if session_id != session_id.trim()
+                    || !sessions::is_valid_session_id(&session_id) =>
+            {
+                return ToolResult::err_with_output(
+                    "session_id must be a valid wc_sess_* Workflow Session id",
+                    json!({
+                        "error_kind": "invalid_session_id",
+                        "failure_kind": "invalid_arguments",
+                        "field": "session_id",
+                        "expected_format": "wc_sess_*",
+                        "state_changed": false,
+                    }),
+                );
+            }
+            Some(session_id) => Some(session_id),
+            None => None,
+        };
+        // Map onto the existing coding-task business implementation. Detail is
+        // always minimal: the wrapper returns only the compact startup
+        // projection and never the full diagnostics, tool manifest, or binding
+        // internals. bind_current=false keeps the wrapper window-agnostic; it
+        // never establishes a current-window binding or guesses an old Session.
+        let new_session = session_id.is_none();
+        let result = self
+            .start_coding_task(
+                project.clone(),
+                None,
+                None,
+                Some(instruction.clone()),
+                SessionMode::Normal,
+                false,
+                false,
+                StartupDetail::Minimal,
+                session_id.clone(),
+                false,
+                new_session,
+                None,
+                auth,
+                transport,
+                window,
+            )
+            .await;
+        if !result.success {
+            return result;
+        }
+        project_work_on_project_output(project, result.output)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn finish_coding_task(
         &self,
@@ -1150,6 +1249,206 @@ impl ToolRuntime {
 
         output
     }
+}
+
+#[derive(Deserialize)]
+struct WorkOnProjectBriefProjection {
+    session: WorkOnProjectSessionProjection,
+    workspace: WorkOnProjectWorkspaceProjection,
+    instructions: WorkOnProjectInstructionsProjection,
+    continuation: WorkOnProjectContinuationProjection,
+    blockers: Vec<String>,
+    warnings: Vec<String>,
+    startup_verdict: WorkOnProjectStartupVerdictProjection,
+}
+
+#[derive(Deserialize)]
+struct WorkOnProjectSessionProjection {
+    session_id: String,
+    continuation: String,
+    execution_context: sessions::SessionExecutionContext,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(transparent)]
+struct WorkOnProjectRequiredNullable<T>(Option<T>);
+
+#[derive(Deserialize)]
+struct WorkOnProjectWorkspaceProjection {
+    status: String,
+    git_available: WorkOnProjectRequiredNullable<bool>,
+    branch: WorkOnProjectRequiredNullable<String>,
+    head: WorkOnProjectRequiredNullable<String>,
+    clean: WorkOnProjectRequiredNullable<bool>,
+    conflicts: u64,
+}
+
+#[derive(Deserialize)]
+struct WorkOnProjectInstructionsProjection {
+    status: String,
+    sources: Vec<WorkOnProjectInstructionSourceProjection>,
+    #[serde(default)]
+    changed_sources: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct WorkOnProjectInstructionSourceProjection {
+    path: String,
+    fingerprint: String,
+    truncated: bool,
+    headings: Vec<String>,
+    content: WorkOnProjectRequiredNullable<String>,
+    read_more: WorkOnProjectRequiredNullable<WorkOnProjectReadMoreProjection>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct WorkOnProjectReadMoreProjection {
+    path: String,
+    start_line: u64,
+    limit: u64,
+}
+
+#[derive(Deserialize)]
+struct WorkOnProjectContinuationProjection {
+    suggested_next_actions: WorkOnProjectActionItemsProjection,
+}
+
+#[derive(Deserialize)]
+struct WorkOnProjectActionItemsProjection {
+    items: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct WorkOnProjectStartupVerdictProjection {
+    suggested_next_actions: Vec<String>,
+}
+
+/// Convert a successful `start_coding_task` result into the compact
+/// `work_on_project` contract. The delegated call may already have changed
+/// Session state, so protocol drift fails closed with `state_changed=true`.
+pub(crate) fn project_work_on_project_output(project: String, output: Value) -> ToolResult {
+    let Some(brief) = startup_brief_from_output(&output) else {
+        return work_on_project_projection_failed(
+            "output",
+            "complete startup brief object",
+            "non-object",
+            None,
+        );
+    };
+    let projection = match serde_json::from_value::<WorkOnProjectBriefProjection>(brief.clone()) {
+        Ok(projection) => projection,
+        Err(error) => {
+            return work_on_project_projection_failed(
+                "output",
+                "complete typed startup brief",
+                "missing or wrongly typed field",
+                Some(error.to_string()),
+            )
+        }
+    };
+    if !sessions::is_valid_session_id(&projection.session.session_id) {
+        return work_on_project_projection_failed(
+            "session.session_id",
+            "valid wc_sess_* string",
+            "invalid string",
+            None,
+        );
+    }
+    if !matches!(
+        projection.session.continuation.as_str(),
+        "created" | "continued" | "resumed_explicitly"
+    ) {
+        return work_on_project_projection_failed(
+            "session.continuation",
+            "created, continued, or resumed_explicitly",
+            "unsupported string",
+            None,
+        );
+    }
+    if !matches!(
+        projection.workspace.status.as_str(),
+        "clean" | "dirty" | "blocked" | "unavailable"
+    ) {
+        return work_on_project_projection_failed(
+            "workspace.status",
+            "clean, dirty, blocked, or unavailable",
+            "unsupported string",
+            None,
+        );
+    }
+    if !matches!(
+        projection.instructions.status.as_str(),
+        "loaded" | "reused" | "changed" | "not_found" | "unavailable"
+    ) {
+        return work_on_project_projection_failed(
+            "instructions.status",
+            "loaded, reused, changed, not_found, or unavailable",
+            "unsupported string",
+            None,
+        );
+    }
+    if projection.instructions.sources.len() > 5 {
+        return work_on_project_projection_failed(
+            "instructions.sources",
+            "at most 5 source objects",
+            "invalid array contents",
+            None,
+        );
+    }
+
+    let suggested_next_actions = if projection.startup_verdict.suggested_next_actions.is_empty() {
+        projection.continuation.suggested_next_actions.items
+    } else {
+        projection.startup_verdict.suggested_next_actions
+    };
+    let mut instructions = json!({
+        "status": projection.instructions.status,
+        "sources": projection.instructions.sources,
+    });
+    if let Some(changed_sources) = projection.instructions.changed_sources {
+        instructions["changed_sources"] = json!(changed_sources);
+    }
+    ToolResult::ok(json!({
+        "session_id": projection.session.session_id,
+        "project": project,
+        "continuation": projection.session.continuation,
+        "execution_context": projection.session.execution_context,
+        "workspace": {
+            "status": projection.workspace.status,
+            "git_available": projection.workspace.git_available,
+            "branch": projection.workspace.branch,
+            "head": projection.workspace.head,
+            "clean": projection.workspace.clean,
+            "conflicts": projection.workspace.conflicts,
+        },
+        "instructions": instructions,
+        "blockers": projection.blockers,
+        "warnings": projection.warnings,
+        "suggested_next_actions": suggested_next_actions,
+        "deterministic": true,
+        "llm_summary": false,
+    }))
+}
+
+fn work_on_project_projection_failed(
+    field: &str,
+    expected: &str,
+    actual: &str,
+    detail: Option<String>,
+) -> ToolResult {
+    ToolResult::err_with_output(
+        format!("work_on_project projection failed: {field} expected {expected}, got {actual}"),
+        json!({
+            "error_kind": "work_on_project_projection_failed",
+            "failure_kind": "work_on_project_projection_failed",
+            "underlying_tool": "start_coding_task",
+            "field": field,
+            "expected": expected,
+            "actual": actual,
+            "detail": detail,
+            "state_changed": true,
+        }),
+    )
 }
 
 fn resolved_project_payload(resolved: &ResolvedProject) -> Value {

@@ -12,6 +12,7 @@ use super::common::{
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
         "start_coding_task" => Some(start_coding_task_output_schema()),
+        "work_on_project" => Some(work_on_project_output_schema()),
         "finish_coding_task" => Some(wrapped_output_schema(vec![
             (
                 "summary_only",
@@ -838,6 +839,119 @@ fn semantic_navigation_schema() -> Value {
             "reason_code"
         ]
     })
+}
+
+/// Compact startup projection for `work_on_project`. Carries only the fields a
+/// coding model immediately needs after starting or continuing a task. It never
+/// returns the full runtime/connection/authority/binding/manifest diagnostics
+/// and never fabricates empty state when the underlying startup result omitted
+/// a field.
+fn work_on_project_output_schema() -> Value {
+    let compact_workspace = json!({
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "enum": ["clean", "dirty", "blocked", "unavailable"]},
+            "git_available": nullable_schema("boolean", "Whether bounded Git inspection was available."),
+            "branch": nullable_schema("string", "Current branch when observed."),
+            "head": nullable_schema("string", "Current full HEAD commit when observed."),
+            "clean": nullable_schema("boolean", "Whether the worktree is clean when observed."),
+            "conflicts": {"type": "integer", "minimum": 0}
+        },
+        "required": ["status", "git_available", "branch", "head", "clean", "conflicts"],
+        "additionalProperties": true
+    });
+    let compact_instructions = json!({
+        "type": "object",
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["loaded", "reused", "changed", "not_found", "unavailable"]
+            },
+            "sources": {
+                "type": "array",
+                "maxItems": 5,
+                "items": startup_instruction_source_schema(),
+                "description": "Fixed, ordered repository-rule sources."
+            },
+            "changed_sources": {
+                "type": "array",
+                "uniqueItems": true,
+                "maxItems": 5,
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "AGENTS.md",
+                        "agents.md",
+                        "CLAUDE.md",
+                        ".codex/AGENTS.md",
+                        ".github/copilot-instructions.md"
+                    ]
+                }
+            }
+        },
+        "required": ["status", "sources"],
+        "additionalProperties": true
+    });
+    let output_properties = vec![
+        (
+            "session_id",
+            schema_type("string", "Workflow Session id to use for later project tools when no current binding exists."),
+        ),
+        (
+            "project",
+            schema_type("string", "Original project input."),
+        ),
+        (
+            "continuation",
+            schema_type("string", "created, continued, or resumed_explicitly."),
+        ),
+        (
+            "execution_context",
+            session_execution_context_schema("Persistent run_shell/run_job defaults currently stored for this Workflow Session."),
+        ),
+        (
+            "workspace",
+            compact_workspace,
+        ),
+        ("instructions", compact_instructions),
+        (
+            "blockers",
+            startup_issue_list_schema(true),
+        ),
+        (
+            "warnings",
+            startup_issue_list_schema(false),
+        ),
+        (
+            "suggested_next_actions",
+            array_schema(schema_type("string", "Short suggested action."), "Bounded suggested next actions."),
+        ),
+    ];
+    let mut schema = wrapped_output_schema(output_properties);
+    add_compact_work_metadata(&mut schema);
+    schema
+}
+
+fn add_compact_work_metadata(schema: &mut Value) {
+    let output = schema
+        .get_mut("properties")
+        .and_then(|properties| properties.get_mut("output"))
+        .and_then(|output| output.get_mut("properties"))
+        .expect("work_on_project output schema properties");
+    let output = output
+        .as_object_mut()
+        .expect("work_on_project output properties");
+    output.insert(
+        "deterministic".to_string(),
+        schema_type(
+            "boolean",
+            "True: the projection derives only from existing runtime state.",
+        ),
+    );
+    output.insert(
+        "llm_summary".to_string(),
+        schema_type("boolean", "Always false; never an LLM summary."),
+    );
 }
 
 fn review_evidence_schema(description: &str) -> Value {

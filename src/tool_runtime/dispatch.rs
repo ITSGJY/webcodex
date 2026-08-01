@@ -203,7 +203,12 @@ impl ToolRuntime {
         }
         let session_id = call.session_id().map(str::to_string);
         if let Some(session_id) = session_id.as_deref() {
-            if !self.sessions.contains_session(session_id) {
+            // `work_on_project` owns validation of its public `session_id`
+            // argument so malformed ids retain the stable invalid_session_id
+            // error instead of being rewritten by the generic lookup guard.
+            let malformed_work_on_project_session = matches!(&call, ToolCall::WorkOnProject { .. })
+                && !sessions::is_valid_session_id(session_id);
+            if !malformed_work_on_project_session && !self.sessions.contains_session(session_id) {
                 return unknown_session_result(session_id);
             }
         }
@@ -523,7 +528,9 @@ impl ToolRuntime {
                     .await
             }
 
-            call @ (ToolCall::StartCodingTask { .. } | ToolCall::FinishCodingTask { .. }) => {
+            call @ (ToolCall::StartCodingTask { .. }
+            | ToolCall::WorkOnProject { .. }
+            | ToolCall::FinishCodingTask { .. }) => {
                 self.dispatch_coding_task_tool(call, auth, transport, window)
                     .await
             }

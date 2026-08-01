@@ -23,6 +23,7 @@ pub(crate) const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "list_projects",
             "list_agents",
             "runtime_status",
+            "work_on_project",
             "start_coding_task",
             "project_overview",
             "list_project_tracked_files",
@@ -143,6 +144,7 @@ pub(crate) const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
         name: TOOL_DISCOVERY_GROUP_RUNTIME,
         tools: &[
             "list_tools",
+            "work_on_project",
             "start_coding_task",
             "finish_coding_task",
             "session_summary",
@@ -265,10 +267,10 @@ pub(crate) const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
 pub(crate) const TOOL_MANIFEST_INTENTS: &[ToolManifestIntent] = &[
     ToolManifestIntent {
         name: "coding",
-        purpose: "Default coding loop: start, inspect, structured edit, validate, review, finish.",
+        purpose: "Default coding loop: start, inspect, structured edit, validate, review, report.",
         tools: &[
             // start
-            "start_coding_task",
+            "work_on_project",
             // project discovery
             "project_overview",
             "list_project_tracked_files",
@@ -294,7 +296,7 @@ pub(crate) const TOOL_MANIFEST_INTENTS: &[ToolManifestIntent] = &[
             "git_status",
             "git_restore_paths",
             "discard_untracked",
-            // finish
+            // optional evidence snapshot
             "finish_coding_task",
         ],
     },

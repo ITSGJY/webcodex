@@ -113,6 +113,19 @@ pub enum ToolCall {
         execution_context: Option<SessionExecutionContext>,
     },
 
+    /// Start a normal coding task with practical defaults, or continue one by
+    /// `session_id`. Thin wrapper over `start_coding_task` that never binds a
+    /// current window, never creates a temporary project, and returns only a
+    /// compact startup projection. `session_id` is explicit business input for
+    /// the exact Workflow Session to continue; it is distinct from wrapper
+    /// `recording_session_id` metadata and never a current-session fallback.
+    WorkOnProject {
+        project: String,
+        instruction: String,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+
     /// Return deterministic finish context for an explicit task session:
     /// changes, workspace hygiene, session/handoff summaries, and bounded
     /// validation-like ledger events. Never calls an LLM.
@@ -1229,6 +1242,7 @@ impl ToolCall {
             Self::ListTools { .. } => "list_tools",
             Self::StartSession { .. } => "start_session",
             Self::StartCodingTask { .. } => "start_coding_task",
+            Self::WorkOnProject { .. } => "work_on_project",
             Self::FinishCodingTask { .. } => "finish_coding_task",
             Self::SessionSummary { .. } => "session_summary",
             Self::UpdateSessionContext { .. } => "update_session_context",
@@ -1366,6 +1380,7 @@ impl ToolCall {
             | Self::GotoDefinition { session_id, .. }
             | Self::FindReferences { session_id, .. } => session_id.as_deref(),
             Self::SessionHandoffSummary { session_id, .. } => Some(session_id.as_str()),
+            Self::WorkOnProject { session_id, .. } => session_id.as_deref(),
             Self::OpenSessionShell { session_id, .. }
             | Self::SessionShellExec { session_id, .. }
             | Self::SessionShellStatus { session_id, .. }
@@ -1523,6 +1538,7 @@ impl ToolCall {
             Self::StartCodingTask { project, .. } if !project.trim().is_empty() => {
                 Some(project.as_str())
             }
+            Self::WorkOnProject { project, .. } => Some(project.as_str()),
             Self::FinishCodingTask { project, .. } => Some(project.as_str()),
             Self::UpdateSessionContext { project, .. }
             | Self::ValidationSummary { project, .. } => Some(project.as_str()),

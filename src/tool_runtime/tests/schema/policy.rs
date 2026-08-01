@@ -229,7 +229,12 @@ fn tool_definitions_drive_session_and_permission_policy() {
         .collect::<Vec<_>>();
     assert_eq!(
         creates_or_binds_session_tools,
-        vec!["start_session", "start_coding_task", "bind_current_session"]
+        vec![
+            "start_session",
+            "start_coding_task",
+            "work_on_project",
+            "bind_current_session"
+        ]
     );
 
     let disabled_tools = tool_definitions()

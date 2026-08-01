@@ -1,5 +1,5 @@
 use super::super::input_schemas::{
-    finish_coding_task_input_schema, start_coding_task_input_schema,
+    finish_coding_task_input_schema, start_coding_task_input_schema, work_on_project_input_schema,
 };
 use super::tool_spec;
 use crate::tool_runtime::tool_spec::ToolSpec;
@@ -12,8 +12,13 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
             start_coding_task_input_schema(),
         ),
         tool_spec(
+            "work_on_project",
+            "Start a normal coding task with practical defaults, or continue one by session_id. Returns compact startup context. Use start_coding_task for advanced modes, guards, execution context, temporary projects, or binding controls.",
+            work_on_project_input_schema(),
+        ),
+        tool_spec(
             "finish_coding_task",
-            "Deterministic coding-task finish aggregate for an explicit session_id. Returns show_changes, optional hygiene and handoff, validation-like ledger events, workspace warnings, and dirty-state signals. Never calls an LLM, emits raw stdout/stderr, or infers validation root causes.",
+            "Return an optional deterministic evidence snapshot for model review, including workspace, validation, jobs, and recorded tool events. The result is advisory: it does not decide task completion, replace direct diff or test review, or generate the user-facing final report.",
             finish_coding_task_input_schema(),
         ),
     ]
