@@ -188,8 +188,17 @@ registration calls.
 configuration serves the focused `local_coding` surface on `/mcp` by default;
 the explicit `WEBCODEX_MCP_MODEL_SURFACE=full-operator-v1` selects the full
 operator runtime. `GET /mcp`, MCP initialize, and `runtime_status.model_surface`
-all identify the active surface. The full runtime's `start_coding_task` has the
-same window/repository start-or-continue semantics, but its current binding is
+all identify the active surface. On `local_coding`, `work_on_project` is the
+ordinary entry point: one call returns the repository rules, a deterministic
+repository structure overview (project types, manifests, key files, roots, and
+project-relative suggested reads — metadata only, never file bodies), Git
+state, LSP readiness, jobs, and blockers so the model can start targeted
+inspection immediately. It creates a new Workflow Session or exactly resumes the
+given one, never binds a current window, and never falls back to a guessed
+Session. The added context is informational: it modifies or executes nothing,
+and the model still uses `read_file`, search, edits, and validation tools as
+needed. The full runtime's `start_coding_task` has the same
+window/repository start-or-continue semantics, but its current binding is
 process-local and its broader tool set is intended for operator and debugging
 workflows.
 

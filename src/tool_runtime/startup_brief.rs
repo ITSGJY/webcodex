@@ -36,6 +36,18 @@ const MAX_FAILURE_FILE_JSON_BYTES: usize = 160;
 const MAX_ACTION_JSON_BYTES: usize = 384;
 const MAX_INSTRUCTION_EXCERPT_JSON_BYTES: usize = 768;
 
+// Model-side caps for the deterministic repository overview projected into the
+// shared startup brief. Lists are stable-sorted and record truncation; a list
+// that exceeds its cap is never silently presented as complete.
+pub(crate) const REPOSITORY_MAX_PROJECT_TYPES: usize = 8;
+pub(crate) const REPOSITORY_MAX_MANIFESTS: usize = 12;
+pub(crate) const REPOSITORY_MAX_KEY_FILES: usize = 16;
+pub(crate) const REPOSITORY_MAX_TOP_LEVEL: usize = 24;
+pub(crate) const REPOSITORY_MAX_SUGGESTED_READS: usize = 8;
+pub(crate) const REPOSITORY_MAX_ROOTS_PER_CLASS: usize = 8;
+pub(crate) const REPOSITORY_MAX_WARNINGS: usize = 8;
+pub(crate) const REPOSITORY_MAX_PROJECT_TYPE_EVIDENCE: usize = 4;
+
 pub(crate) struct StartupBriefInput<'a> {
     pub(crate) detail: StartupDetail,
     pub(crate) requested_project: &'a str,
@@ -51,6 +63,7 @@ pub(crate) struct StartupBriefInput<'a> {
     pub(crate) force_instruction_load: bool,
     pub(crate) git: &'a Value,
     pub(crate) semantic_navigation: &'a Value,
+    pub(crate) repository: &'a Value,
     pub(crate) continuation_feedback: &'a Value,
     pub(crate) active_jobs: &'a Value,
     pub(crate) owning_runner_available: Option<bool>,
@@ -76,6 +89,7 @@ pub(crate) fn build_startup_brief(input: StartupBriefInput<'_>) -> Value {
     );
     let workspace = workspace_projection(input.git);
     let semantic_navigation = semantic_navigation_projection(input.semantic_navigation);
+    let repository = repository_projection(input.repository);
     let (blockers, warnings) = startup_issues(
         &input,
         &instruction_projection,
@@ -118,6 +132,7 @@ pub(crate) fn build_startup_brief(input: StartupBriefInput<'_>) -> Value {
         "instructions": instruction_projection,
         "continuation": continuation,
         "semantic_navigation": semantic_navigation,
+        "repository": repository,
         "blockers": blockers,
         "warnings": warnings,
         "startup_verdict": startup_verdict,
@@ -246,6 +261,10 @@ fn count(value: &Value, field: &str) -> u64 {
 
 fn semantic_navigation_projection(value: &Value) -> Value {
     json!({
+        "supported": value
+            .get("supported")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         "status": value
             .get("status")
             .cloned()
@@ -266,6 +285,186 @@ fn semantic_navigation_projection(value: &Value) -> Value {
         },
         "reason_code": value.get("reason_code").cloned().unwrap_or(Value::Null),
     })
+}
+
+/// Deterministic repository overview for the startup brief. `source` is the
+/// already-built overview (available) or an unavailable marker. Lists are
+/// stable-sorted and bounded; a list that exceeds its cap records the original
+/// total and flips truncated instead of silently presenting as complete.
+pub(crate) fn repository_projection(source: &Value) -> Value {
+    if source.get("status").and_then(Value::as_str) != Some("available") {
+        return json!({
+            "status": "unavailable",
+            "reason_code": "unsupported_or_unavailable",
+        });
+    }
+    json!({
+        "status": "available",
+        "reason_code": Value::Null,
+        "project_types": bounded_list(
+            source.get("project_types"),
+            source
+                .get("project_types")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            false,
+            REPOSITORY_MAX_PROJECT_TYPES,
+            project_type_item,
+        ),
+        "manifests": bounded_list(
+            source.get("manifests"),
+            source.get("manifests").and_then(Value::as_array).map(Vec::len),
+            false,
+            REPOSITORY_MAX_MANIFESTS,
+            manifest_item,
+        ),
+        "key_files": bounded_list(
+            source.get("key_files"),
+            source.get("key_files").and_then(Value::as_array).map(Vec::len),
+            false,
+            REPOSITORY_MAX_KEY_FILES,
+            key_file_item,
+        ),
+        "roots": roots_projection(source.get("roots").unwrap_or(&Value::Null)),
+        "top_level": bounded_list(
+            source.get("top_level"),
+            source.get("top_level").and_then(Value::as_array).map(Vec::len),
+            false,
+            REPOSITORY_MAX_TOP_LEVEL,
+            top_level_item,
+        ),
+        "suggested_next_reads": bounded_list(
+            source.get("suggested_next_reads"),
+            source
+                .get("suggested_next_reads")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            false,
+            REPOSITORY_MAX_SUGGESTED_READS,
+            suggested_read_item,
+        ),
+        "scan": scan_projection(source.get("scan").unwrap_or(&Value::Null)),
+        "warnings": bounded_string_items(source.get("warnings"), REPOSITORY_MAX_WARNINGS, 96)
+            .into_iter()
+            .map(Value::String)
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Project the fixed `scan` fields only. Never clone an arbitrary Runner
+/// `scan` object: a malformed payload cannot smuggle extra fields into the
+/// startup brief through this subobject. Missing or non-conforming fields
+/// fall back to safe defaults rather than transparently echoing the source.
+fn scan_projection(source: &Value) -> Value {
+    let empty = serde_json::Map::new();
+    let scan = source.as_object().unwrap_or(&empty);
+    json!({
+        "max_depth": scan.get("max_depth").and_then(Value::as_u64).unwrap_or(0),
+        "limit": scan.get("limit").and_then(Value::as_u64).unwrap_or(0),
+        "returned_entry_count": scan
+            .get("returned_entry_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        "truncated": scan.get("truncated").and_then(Value::as_bool).unwrap_or(false),
+        "truncation_reason": scan
+            .get("truncation_reason")
+            .cloned()
+            .filter(|value| value.is_string() || value.is_null())
+            .unwrap_or(Value::Null),
+    })
+}
+
+fn project_type_item(value: &Value) -> Option<Value> {
+    let kind = value.get("kind").and_then(Value::as_str)?;
+    let evidence = value.get("evidence").and_then(Value::as_array);
+    let evidence_total = evidence.map(Vec::len).unwrap_or(0);
+    let items = evidence
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .take(REPOSITORY_MAX_PROJECT_TYPE_EVIDENCE)
+        .map(|path| json!(bounded_json_string(path, MAX_PATH_JSON_BYTES).0))
+        .collect::<Vec<_>>();
+    Some(json!({
+        "kind": kind,
+        "evidence": items,
+        "evidence_total": evidence_total,
+        "evidence_truncated": evidence_total > items.len(),
+    }))
+}
+
+fn manifest_item(value: &Value) -> Option<Value> {
+    let path = value.get("path").and_then(Value::as_str)?;
+    let kind = value
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("manifest");
+    Some(json!({
+        "path": bounded_json_string(path, MAX_PATH_JSON_BYTES).0,
+        "kind": kind,
+    }))
+}
+
+fn key_file_item(value: &Value) -> Option<Value> {
+    let path = value.get("path").and_then(Value::as_str)?;
+    let kind = value
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("key_file");
+    let reason = value
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Some(json!({
+        "path": bounded_json_string(path, MAX_PATH_JSON_BYTES).0,
+        "kind": kind,
+        "reason": bounded_json_string(reason, 160).0,
+    }))
+}
+
+fn top_level_item(value: &Value) -> Option<Value> {
+    let path = value.get("path").and_then(Value::as_str)?;
+    let kind = value.get("kind").and_then(Value::as_str).unwrap_or("file");
+    Some(json!({
+        "path": bounded_json_string(path, MAX_PATH_JSON_BYTES).0,
+        "kind": kind,
+    }))
+}
+
+fn suggested_read_item(value: &Value) -> Option<Value> {
+    let path = value.get("path").and_then(Value::as_str)?;
+    let reason = value
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Some(json!({
+        "path": bounded_json_string(path, MAX_PATH_JSON_BYTES).0,
+        "reason": bounded_json_string(reason, 160).0,
+    }))
+}
+
+fn roots_projection(source: &Value) -> Value {
+    let mut projected = serde_json::Map::new();
+    for class in ["source", "tests", "docs", "examples", "scripts", "ci"] {
+        projected.insert(
+            class.to_string(),
+            bounded_list(
+                source.get(class),
+                source.get(class).and_then(Value::as_array).map(Vec::len),
+                false,
+                REPOSITORY_MAX_ROOTS_PER_CLASS,
+                project_path_item,
+            ),
+        );
+    }
+    projected.insert(
+        "classification_basis".to_string(),
+        source
+            .get("classification_basis")
+            .cloned()
+            .unwrap_or_else(|| json!("conventional_directory_name")),
+    );
+    Value::Object(projected)
 }
 
 fn instructions_projection(
@@ -800,6 +999,9 @@ fn startup_issues(
     if instructions.get("status").and_then(Value::as_str) == Some("unavailable") {
         push_unique(&mut warnings, "rules_unavailable");
     }
+    if input.repository.get("status").and_then(Value::as_str) == Some("unavailable") {
+        push_unique(&mut warnings, "repository_overview_unavailable");
+    }
     let semantic_status = semantic_navigation.get("status").and_then(Value::as_str);
     if semantic_navigation
         .get("available")
@@ -955,6 +1157,72 @@ fn json_string_payload_len(value: &str) -> usize {
 fn enforce_hard_size_limit(brief: &mut Value) {
     if serialized_len(brief) <= STANDARD_STARTUP_HARD_MAX_BYTES {
         return;
+    }
+
+    // Repository metadata is lower priority than rule prose: drop optional
+    // repository list items (top_level, key_files, manifests, project-type
+    // evidence, suggested reads, and per-class roots) before touching rule
+    // content. Every list keeps its required fields and truncation metadata.
+    const REPOSITORY_LIST_POINTERS: &[&str] = &[
+        "/repository/top_level",
+        "/repository/key_files",
+        "/repository/manifests",
+        "/repository/suggested_next_reads",
+        "/repository/roots/source",
+        "/repository/roots/tests",
+        "/repository/roots/docs",
+        "/repository/roots/examples",
+        "/repository/roots/scripts",
+        "/repository/roots/ci",
+    ];
+    loop {
+        if serialized_len(brief) <= STANDARD_STARTUP_HARD_MAX_BYTES {
+            return;
+        }
+        let mut removed = false;
+        for pointer in REPOSITORY_LIST_POINTERS {
+            let Some(list) = brief.pointer_mut(pointer) else {
+                continue;
+            };
+            let Some(items) = list.get_mut("items").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            if items.len() > 1 {
+                items.pop();
+                list["returned"] = json!(items.len());
+                list["truncated"] = json!(true);
+                removed = true;
+                break;
+            }
+        }
+        // Shrink project-type evidence before its entries when all list
+        // items are already at their floor.
+        if !removed {
+            let Some(types) = brief
+                .pointer_mut("/repository/project_types/items")
+                .and_then(Value::as_array_mut)
+            else {
+                break;
+            };
+            let mut shrank = false;
+            for project_type in types.iter_mut().rev() {
+                let Some(evidence) = project_type
+                    .get_mut("evidence")
+                    .and_then(Value::as_array_mut)
+                else {
+                    continue;
+                };
+                if evidence.len() > 1 {
+                    evidence.pop();
+                    project_type["evidence_truncated"] = json!(true);
+                    shrank = true;
+                    break;
+                }
+            }
+            if !shrank {
+                break;
+            }
+        }
     }
 
     // Rules content is the largest prose block. Shrink each source only to a
@@ -1329,6 +1597,74 @@ mod tests {
     use crate::tool_runtime::sessions::SessionGuards;
     use crate::tool_runtime::{SessionMode, ToolRuntime};
 
+    #[test]
+    fn repository_scan_projection_keeps_only_fixed_fields() {
+        // A malicious available overview smuggles oversized extras inside the
+        // `scan` object. The projection must keep only the five fixed fields.
+        let source = json!({
+            "status": "available",
+            "reason_code": Value::Null,
+            "scan": {
+                "max_depth": 2,
+                "limit": 120,
+                "returned_entry_count": 7,
+                "truncated": true,
+                "truncation_reason": "max_depth",
+                "padding": "X".repeat(20_000),
+                "nested": {"deep": "Y".repeat(10_000)},
+            },
+            "runner_secret": "/absolute/leak",
+        });
+        let projection = repository_projection(&source);
+        let scan = &projection["scan"];
+        assert!(scan.is_object());
+        let mut keys: Vec<&str> = scan
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "limit",
+                "max_depth",
+                "returned_entry_count",
+                "truncated",
+                "truncation_reason"
+            ]
+        );
+        let serialized = projection.to_string();
+        assert!(!serialized.contains("padding"));
+        assert!(!serialized.contains("runner_secret"));
+        assert!(!serialized.contains("/absolute/leak"));
+        assert!(
+            serialized.len() <= STANDARD_STARTUP_HARD_MAX_BYTES,
+            "scan projection exceeded hard limit: {}",
+            serialized.len()
+        );
+    }
+
+    #[test]
+    fn repository_scan_projection_falls_back_safely_on_malformed_scan() {
+        // A scan that is not an object, or whose typed fields are wrong, must
+        // still project to the fixed shape with safe defaults rather than echo
+        // the malformed source.
+        let source = json!({
+            "status": "available",
+            "reason_code": Value::Null,
+            "scan": "not-an-object",
+        });
+        let scan = &repository_projection(&source)["scan"];
+        assert!(scan.is_object());
+        assert_eq!(scan["max_depth"], 0);
+        assert_eq!(scan["limit"], 0);
+        assert_eq!(scan["returned_entry_count"], 0);
+        assert_eq!(scan["truncated"], false);
+        assert_eq!(scan["truncation_reason"], Value::Null);
+    }
+
     fn failure(index: usize) -> Value {
         json!({
             "kind": if index % 2 == 0 { "test" } else { "diagnostic" },
@@ -1465,6 +1801,83 @@ mod tests {
             "recovering_count": 0,
             "terminal_pending_count": 0,
             "recent": [],
+        })
+    }
+
+    fn large_repository() -> Value {
+        let types = (0..12)
+            .map(|index| {
+                json!({
+                    "kind": format!("kind_{index}"),
+                    "evidence": (0..6)
+                        .map(|j| format!("src/generated/{index}/{j}.rs"))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let manifests = (0..40)
+            .map(|index| {
+                json!({
+                    "path": format!("crates/generated-{index}/Cargo.toml"),
+                    "kind": "rust_manifest",
+                })
+            })
+            .collect::<Vec<_>>();
+        let key_files = (0..60)
+            .map(|index| {
+                json!({
+                    "path": format!("generated/key_{index}.md"),
+                    "kind": "documentation",
+                    "reason": format!("generated key file {index} {}", "r".repeat(200)),
+                })
+            })
+            .collect::<Vec<_>>();
+        let top_level = (0..80)
+            .map(|index| {
+                json!({
+                    "path": format!("generated/top_level_{index}.rs"),
+                    "kind": "file",
+                })
+            })
+            .collect::<Vec<_>>();
+        let suggested = (0..20)
+            .map(|index| {
+                json!({
+                    "path": format!("generated/read_{index}.rs"),
+                    "reason": format!("generated read reason {index}"),
+                })
+            })
+            .collect::<Vec<_>>();
+        let roots = |prefix: &str| {
+            (0..30)
+                .map(|index| json!(format!("{prefix}/generated-{index}")))
+                .collect::<Vec<_>>()
+        };
+        json!({
+            "status": "available",
+            "reason_code": Value::Null,
+            "project_types": types,
+            "manifests": manifests,
+            "key_files": key_files,
+            "roots": {
+                "source": roots("src"),
+                "tests": roots("tests"),
+                "docs": roots("docs"),
+                "examples": roots("examples"),
+                "scripts": roots("scripts"),
+                "ci": roots(".github"),
+                "classification_basis": "conventional_directory_name",
+            },
+            "top_level": top_level,
+            "suggested_next_reads": suggested,
+            "scan": {
+                "max_depth": 2,
+                "limit": 120,
+                "returned_entry_count": 200,
+                "truncated": true,
+                "truncation_reason": "limit",
+            },
+            "warnings": ["symlinks_skipped", "non_utf8_paths_skipped"],
         })
     }
 
@@ -1615,6 +2028,7 @@ mod tests {
                 force_instruction_load: true,
                 git: &git,
                 semantic_navigation: &semantic_navigation,
+                repository: &large_repository(),
                 continuation_feedback: &feedback,
                 active_jobs: &active_jobs,
                 owning_runner_available: Some(true),

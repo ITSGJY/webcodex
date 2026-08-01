@@ -264,19 +264,21 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     }
 }
 
-fn project_type_schema() -> Value {
+pub(super) fn project_type_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
             "kind": schema_type("string", "Stable project type identifier."),
             "evidence": array_schema(schema_type("string", "Project-relative evidence path."), "Sorted evidence paths."),
+            "evidence_total": schema_type("integer", "Real evidence path count before bounding."),
+            "evidence_truncated": schema_type("boolean", "True when evidence was capped."),
         },
         "required": ["kind", "evidence"],
         "additionalProperties": false,
     })
 }
 
-fn path_kind_schema(description: &str) -> Value {
+pub(super) fn path_kind_schema(description: &str) -> Value {
     json!({
         "type": "object",
         "description": description,
@@ -289,7 +291,7 @@ fn path_kind_schema(description: &str) -> Value {
     })
 }
 
-fn key_file_schema() -> Value {
+pub(super) fn key_file_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
@@ -302,7 +304,7 @@ fn key_file_schema() -> Value {
     })
 }
 
-fn roots_schema() -> Value {
+pub(super) fn roots_schema() -> Value {
     let paths = || {
         array_schema(
             schema_type("string", "Project-relative conventional root."),
@@ -325,7 +327,7 @@ fn roots_schema() -> Value {
     })
 }
 
-fn top_level_entry_schema() -> Value {
+pub(super) fn top_level_entry_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
@@ -337,7 +339,7 @@ fn top_level_entry_schema() -> Value {
     })
 }
 
-fn suggested_read_schema() -> Value {
+pub(super) fn suggested_read_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
@@ -349,7 +351,7 @@ fn suggested_read_schema() -> Value {
     })
 }
 
-fn scan_schema() -> Value {
+pub(super) fn scan_schema() -> Value {
     json!({
         "type": "object",
         "properties": {

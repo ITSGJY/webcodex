@@ -355,7 +355,7 @@ async fn repository_rule_truncation_state_change_invalidates_the_snapshot() {
 }
 
 #[tokio::test]
-async fn explicit_resume_reloads_repository_rules_even_when_fingerprints_match() {
+async fn explicit_resume_reuses_unchanged_rules_without_repeating_body() {
     let root = tempfile::tempdir().unwrap();
     seed_rules(root.path());
     let runtime = ToolRuntime::new_for_tests();
@@ -399,9 +399,80 @@ async fn explicit_resume_reloads_repository_rules_even_when_fingerprints_match()
         resumed.output["project"]["canonical_repository_root_matches"],
         Value::Null
     );
-    assert_eq!(resumed.output["instructions"]["status"], "loaded");
-    assert_eq!(resumed.output["instructions"]["content_included"], true);
+    // Exact resume with unchanged rules reports reuse and does not repeat the
+    // rule body, while retaining source identity metadata.
+    assert_eq!(resumed.output["instructions"]["status"], "reused");
+    assert_eq!(resumed.output["instructions"]["content_included"], false);
     assert_eq!(resumed.output["instructions"]["changed_sources"], json!([]));
+    for source in resumed.output["instructions"]["sources"]
+        .as_array()
+        .unwrap()
+    {
+        assert_eq!(source["content"], Value::Null);
+        assert!(source["fingerprint"].is_string());
+        assert!(source["headings"].is_array());
+        assert!(source["read_more"].is_null() || source["read_more"].is_object());
+    }
+}
+
+#[tokio::test]
+async fn explicit_resume_reports_changed_rules_with_new_bounded_body() {
+    let root = tempfile::tempdir().unwrap();
+    seed_rules(root.path());
+    let runtime = ToolRuntime::new_for_tests();
+    let project =
+        register_agent_project_at_path(&runtime, "rules-explicit-change", "demo", root.path())
+            .await;
+    let first = start(
+        &runtime,
+        "rules-explicit-change",
+        &project,
+        "rules-explicit-change-window",
+        StartupDetail::Standard,
+        "first",
+        None,
+        false,
+    )
+    .await;
+    let session_id = first.output["session"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let first_agents_fingerprint =
+        instruction_source(&first.output, "AGENTS.md")["fingerprint"].clone();
+
+    fs::write(
+        root.path().join("AGENTS.md"),
+        "# Repository rules\n\n- Use the new focused target first.\n",
+    )
+    .unwrap();
+    let resumed = start(
+        &runtime,
+        "rules-explicit-change",
+        &project,
+        "rules-explicit-change-window",
+        StartupDetail::Standard,
+        "resume after rule change",
+        Some(&session_id),
+        false,
+    )
+    .await;
+
+    assert!(resumed.success, "{:?}", resumed.error);
+    assert_eq!(resumed.output["instructions"]["status"], "changed");
+    assert_eq!(resumed.output["instructions"]["content_included"], true);
+    assert_eq!(
+        resumed.output["instructions"]["changed_sources"],
+        json!(["AGENTS.md"])
+    );
+    assert_ne!(
+        instruction_source(&resumed.output, "AGENTS.md")["fingerprint"],
+        first_agents_fingerprint
+    );
+    assert!(instruction_source(&resumed.output, "AGENTS.md")["content"]
+        .as_str()
+        .unwrap()
+        .contains("new focused target"));
 }
 
 #[tokio::test]
@@ -1133,4 +1204,91 @@ async fn minimal_standard_and_full_coding_task_outputs_validate_against_strict_s
         validate_schema_instance_for_test(&unknown, &schema).is_err(),
         "strict exploration schema must reject unknown fields"
     );
+}
+
+#[tokio::test]
+async fn worst_case_startup_with_huge_repository_stays_below_hard_limit() {
+    let root = tempfile::tempdir().unwrap();
+    seed_rules(root.path());
+    let runtime = ToolRuntime::new_for_tests();
+    let project =
+        register_agent_project_at_path(&runtime, "rules-worst", "demo", root.path()).await;
+
+    // A worst-case repository: many tracked manifests, key files, top-level
+    // entries, and per-class roots, all with long names, alongside a large
+    // rule body. The shared brief must remain below the hard limit and keep a
+    // valid schema.
+    for index in 0..120 {
+        let dir = root
+            .path()
+            .join(format!("crates/package-{index:03}-{}", "p".repeat(80)));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("Cargo.toml-{index:03}-{}", "m".repeat(90))),
+            b"manifest metadata",
+        )
+        .unwrap();
+    }
+    for index in 0..60 {
+        std::fs::write(
+            root.path()
+                .join(format!("generated-doc-{index:03}-{}.md", "d".repeat(120))),
+            b"doc",
+        )
+        .unwrap();
+    }
+    for cmd in ["git add -A", "git commit -m 'seed worst-case repo'"] {
+        let (exit_code, stdout, stderr, _) =
+            crate::tool_runtime::helpers::run_command_sync(cmd, root.path(), 30);
+        assert_eq!(exit_code, 0, "{stdout}{stderr}");
+    }
+
+    let result = start(
+        &runtime,
+        "rules-worst",
+        &project,
+        "rules-worst-window",
+        StartupDetail::Standard,
+        "worst case",
+        None,
+        false,
+    )
+    .await;
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["repository"]["status"], "available");
+
+    let schema = registry::output_schema_for_tool("start_coding_task");
+    let value = json!({
+        "success": result.success,
+        "output": result.output,
+        "error": result.error,
+    });
+    validate_schema_instance_for_test(&value, &schema)
+        .unwrap_or_else(|error| panic!("worst-case startup schema mismatch: {error}"));
+
+    let bytes = startup_brief_size(&result.output);
+    eprintln!("worst_case_huge_repository_startup_bytes={bytes}");
+    assert!(
+        bytes <= STANDARD_STARTUP_HARD_MAX_BYTES,
+        "shared startup brief exceeded hard limit: {bytes}"
+    );
+
+    // Bounded repository lists record truncation metadata honestly.
+    let top_level = &result.output["repository"]["top_level"];
+    assert!(top_level["returned"].as_u64().unwrap() <= 24);
+    assert!(
+        top_level["truncated"] == Value::Bool(true) || top_level["truncated"] == Value::Bool(false)
+    );
+    let manifests = &result.output["repository"]["manifests"];
+    assert!(manifests["returned"].as_u64().unwrap() <= 12);
+
+    // Rule prose outranks repository entries: rule sources still carry content.
+    for source in result.output["instructions"]["sources"].as_array().unwrap() {
+        assert!(
+            source["content"]
+                .as_str()
+                .is_some_and(|content| !content.is_empty()),
+            "each loaded rule source must retain a usable bounded excerpt"
+        );
+    }
 }

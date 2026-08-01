@@ -130,6 +130,25 @@ finish_coding_task
 `tools/call` 会在 MCP 边界、进入 ToolRuntime dispatch 之前明确拒绝它们，
 `tools/list` 也绝不公布它们。
 
+在 `local_coding` 上，`work_on_project(project, instruction, session_id?)` 是
+普通入口：一次调用即可返回规则、仓库结构、Git 状态、LSP 就绪度、jobs 与
+blockers，让模型可以立即开始或继续聚焦工作。没有 `session_id` 时创建新的
+Workflow Session；有 `session_id` 时只精确继续该 Session（绝不猜测最近 Session，
+也绝不 credential-wide fallback），且从不建立 current-window binding。成功调用
+返回 `session_id`、解析后的项目 id、`readiness` verdict、`workspace` Git 投影、
+`repository` 概览、有界的 `rules`（`status` 为 loaded/reused/changed/not_found/
+unavailable，含每个 source 的 fingerprint、headings、有界正文与 `read_more`
+提示）、`semantic_navigation` 就绪度、紧凑 `jobs` 计数，以及 `blockers`/
+`warnings`/`suggested_next_actions`。返回的 `repository` block 是确定性的
+元数据扫描：只读取目录项、文件类型和 Git tracked index（project types、
+manifests、key files、roots、top-level 项以及带原因的项目相对 suggested
+reads）；绝不读取普通文件正文、执行项目代码、跟随符号链接或扫描
+protected/sensitive/build/cache 路径。每个列表都有界，并各自记录
+total/returned/truncated 元数据。概览不可用时，Session 仍正常启动，
+`repository.status=unavailable` 并带有 `repository_overview_unavailable` warning；
+原始错误、绝对路径或 Runner 输出永不返回。这些新增信息仅用于参考：不会自动
+修改或自动执行任何内容，模型仍需按需使用 `read_file`、搜索、编辑与验证工具。
+
 在 `full_operator_runtime` 上，普通 coding 使用 `start_coding_task` 开始或继续。
 稳定窗口默认继续同一仓库；切换仓库会切换上下文，切回会恢复此前 Workflow
 Session。`new_session=true` 是显式的高级隔离请求。current binding 同时保留在

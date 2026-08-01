@@ -91,6 +91,9 @@ pub(in crate::tool_runtime::tests) fn run_agent_shell_request_locally(
     if req.kind == "file_read" {
         return run_agent_file_read_request_locally(req);
     }
+    if req.kind == "file_project_overview" {
+        return run_agent_project_overview_request_locally(req);
+    }
     let mut command = std::process::Command::new("sh");
     command.arg("-c").arg(&req.command);
     if let Some(cwd) = req.cwd.as_deref() {
@@ -170,6 +173,33 @@ fn run_agent_file_read_request_locally(req: &ShellAgentShellRequest) -> (i32, St
         "limit": end_line.saturating_sub(start_line).saturating_add(1),
     });
     (0, output.to_string(), String::new())
+}
+
+fn run_agent_project_overview_request_locally(
+    req: &ShellAgentShellRequest,
+) -> (i32, String, String) {
+    let Some(cwd) = req.cwd.as_deref() else {
+        return (
+            -1,
+            String::new(),
+            "project_overview missing cwd".to_string(),
+        );
+    };
+    let requested_path = req.path.as_deref().unwrap_or(".");
+    let options = req
+        .content
+        .as_deref()
+        .and_then(|content| serde_json::from_str::<Value>(content).ok())
+        .unwrap_or_else(|| json!({}));
+    match crate::project_overview::build_project_overview(
+        Path::new(cwd),
+        requested_path,
+        options["max_depth"].as_u64().map(|value| value as usize),
+        options["limit"].as_u64().map(|value| value as usize),
+    ) {
+        Ok(output) => (0, output.to_string(), String::new()),
+        Err(error) => (-1, String::new(), error),
+    }
 }
 
 pub(in crate::tool_runtime::tests) async fn complete_agent_request_by_running_locally(

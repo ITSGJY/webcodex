@@ -36,13 +36,22 @@ use super::validation_events::skipped_validation_summary;
 use super::{current_session_key, unknown_session_result};
 use super::{ToolCall, ToolRuntime};
 use crate::auth::AuthContext;
-use crate::shell_protocol::{SHELL_CLIENT_CAPABILITY_GIT, SHELL_CLIENT_CAPABILITY_SHELL};
+use crate::shell_protocol::{
+    ShellFileOpRequest, SHELL_CLIENT_CAPABILITY_FILE_READ, SHELL_CLIENT_CAPABILITY_GIT,
+    SHELL_CLIENT_CAPABILITY_SHELL,
+};
 use std::collections::HashSet;
+use std::path::Path;
+use std::time::Duration;
 
 const RULES_MAX_HEADINGS: usize = 8;
 const RULES_MAX_FIRST_LINES: usize = 5;
 const RULES_MAX_LINE_CHARS: usize = 180;
 const FINISH_SESSION_EVENT_LIMIT: usize = 200;
+/// Short startup probe budget for the repository overview, much tighter than
+/// the standalone `project_overview` tool's 30s wait. An optional overview
+/// failure must not block the coding task, so it fails over quickly.
+pub(crate) const DEFAULT_REPOSITORY_OVERVIEW_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
 
 impl ToolRuntime {
     #[allow(clippy::too_many_arguments)]
@@ -269,23 +278,36 @@ impl ToolRuntime {
             Ok(resolved) => resolved,
             Err(err) => return err.into_tool_result(),
         };
-        let semantic_navigation =
-            serde_json::to_value(self.probe_semantic_navigation_for_startup(&resolved).await)
-                .unwrap_or_else(|_| {
-                    json!({
-                        "supported": false,
-                        "available": false,
-                        "status": "probe_failed",
-                        "reason_code": "status_probe_failed",
-                    })
-                });
+        // The semantic-navigation probe, the fixed project-instruction load,
+        // and the repository overview are independent read-only startup
+        // probes. They run concurrently so the overview never adds serial
+        // startup latency; each fails independently to a deterministic state
+        // without blocking the coding task.
+        let (semantic_navigation, project_instructions, repository_overview) =
+            futures_util::future::join3(
+                self.probe_semantic_navigation_for_startup(&resolved),
+                self.load_coding_project_instructions(&resolved.config),
+                self.repository_overview_for_startup(&resolved, auth),
+            )
+            .await;
+        let semantic_navigation = serde_json::to_value(semantic_navigation).unwrap_or_else(|_| {
+            json!({
+                "supported": false,
+                "available": false,
+                "status": "probe_failed",
+                "reason_code": "status_probe_failed",
+            })
+        });
         // Coding startup always observes every fixed repository-rule
         // candidate. The complete bounded body remains only in the in-memory
         // Workflow Session; the ledger persistence path omits it.
-        let project_instructions = self
-            .load_coding_project_instructions(&resolved.config)
-            .await;
         let mut warnings = Vec::new();
+        if repository_overview.get("status").and_then(Value::as_str) == Some("unavailable") {
+            warnings.push(json!({
+                "kind": "repository_overview_unavailable",
+                "message": "repository structure overview was unavailable during startup",
+            }));
+        }
         let continuity_key = if bind_current {
             match current_session_key(
                 auth,
@@ -652,8 +674,13 @@ impl ToolRuntime {
             .pre_instruction_summary
             .as_ref()
             .and_then(|summary| summary.project_instructions.as_ref());
-        let force_instruction_load =
-            !session_outcome.reused || resume_requested || previous_instructions.is_none();
+        // Reload rule bodies only when there is no prior snapshot to compare
+        // against (fresh session, or a session whose rules were never
+        // persisted, e.g. restored after a restart). Otherwise the shared
+        // brief compares fingerprints and reports reused/changed: an exact
+        // resume with unchanged rules returns `reused` without repeating the
+        // body, and changed rules return `changed` with the new bounded body.
+        let force_instruction_load = previous_instructions.is_none();
         let binding_reason_code = if binding_available {
             None
         } else if bind_current {
@@ -688,6 +715,7 @@ impl ToolRuntime {
             force_instruction_load,
             git: &git,
             semantic_navigation: &semantic_navigation,
+            repository: &repository_overview,
             continuation_feedback: &continuation_feedback,
             active_jobs: &active_jobs,
             owning_runner_available,
@@ -770,10 +798,12 @@ impl ToolRuntime {
             None => None,
         };
         // Map onto the existing coding-task business implementation. Detail is
-        // always minimal: the wrapper returns only the compact startup
-        // projection and never the full diagnostics, tool manifest, or binding
-        // internals. bind_current=false keeps the wrapper window-agnostic; it
-        // never establishes a current-window binding or guesses an old Session.
+        // standard: the shared compact brief includes rule bodies, headings,
+        // repository structure, semantic navigation, and job metadata, while
+        // the wrapper still projects only its own compact result and never the
+        // full diagnostics, tool manifest, or binding internals.
+        // bind_current=false keeps the wrapper window-agnostic; it never
+        // establishes a current-window binding or guesses an old Session.
         let new_session = session_id.is_none();
         let result = self
             .start_coding_task(
@@ -784,7 +814,7 @@ impl ToolRuntime {
                 SessionMode::Normal,
                 false,
                 false,
-                StartupDetail::Minimal,
+                StartupDetail::Standard,
                 session_id.clone(),
                 false,
                 new_session,
@@ -1249,13 +1279,186 @@ impl ToolRuntime {
 
         output
     }
+
+    /// Deterministic repository structure overview for the coding startup
+    /// brief. Reuses the existing `project_overview` implementation and keeps
+    /// every safety property: directory entries, file types, and the git
+    /// tracked index only; no file bodies, no project code execution, no
+    /// symlink following, no protected/sensitive/build/cache paths, and only
+    /// project-relative paths are returned.
+    ///
+    /// For agent-backed projects the overview is routed to the owning Runner
+    /// via the `file_project_overview` op with a short startup probe timeout.
+    /// On timeout the request is cancelled. An optional overview failure never
+    /// fails the already-legal coding task: it returns a deterministic
+    /// unavailable marker and the caller surfaces a
+    /// `repository_overview_unavailable` warning without leaking raw errors,
+    /// absolute paths, or Runner output.
+    async fn repository_overview_for_startup(
+        &self,
+        resolved: &ResolvedProject,
+        auth: Option<&AuthContext>,
+    ) -> Value {
+        if !resolved.config.is_agent() {
+            return repository_overview_local(&resolved.config.path);
+        }
+        let client_id = match resolved.config.agent_client_id() {
+            Ok(client_id) => client_id,
+            Err(_) => return repository_overview_unavailable(),
+        };
+        // The owning runner must support the structured file capability.
+        if !self
+            .shell_clients
+            .client_supports_for_auth(&client_id, SHELL_CLIENT_CAPABILITY_FILE_READ, auth)
+            .await
+            .unwrap_or(false)
+        {
+            return repository_overview_unavailable();
+        }
+        // Short startup probe budget, much tighter than the standalone
+        // `project_overview` tool's 30s wait.
+        let probe_wait_timeout = self.repository_overview_probe_timeout.as_secs().max(1);
+        let (request_id, receiver) = match self
+            .shell_clients
+            .enqueue_file_op(
+                ShellFileOpRequest {
+                    op: "project_overview".to_string(),
+                    client_id: client_id.to_string(),
+                    path: ".".to_string(),
+                    cwd: Some(resolved.config.path.clone()),
+                    content: Some(
+                        json!({
+                            "max_depth": STARTUP_OVERVIEW_REQUEST_MAX_DEPTH,
+                            "limit": STARTUP_OVERVIEW_REQUEST_LIMIT,
+                        })
+                        .to_string(),
+                    ),
+                    max_bytes: None,
+                    old_text: None,
+                    pattern: None,
+                    expected_sha256: None,
+                    expected_prefix: None,
+                    start_line: None,
+                    end_line: None,
+                    line: None,
+                    create_dirs: false,
+                    wait_timeout_secs: probe_wait_timeout,
+                },
+                "coding_startup".to_string(),
+            )
+            .await
+        {
+            Ok(enqueued) => enqueued,
+            Err(_) => return repository_overview_unavailable(),
+        };
+        match tokio::time::timeout(
+            Duration::from_secs(probe_wait_timeout.saturating_add(2)),
+            receiver,
+        )
+        .await
+        {
+            Ok(Ok(response)) if response.exit_code == Some(0) && response.error.is_none() => {
+                // The Runner response is untrusted: it must parse and pass the
+                // shared project-overview contract validation against the fixed
+                // request bounds (root / depth 2 / limit 120). A malformed,
+                // boundary-mismatched, or schema-violating payload fails closed
+                // to an unavailable marker without leaking raw stdout, errors,
+                // or absolute paths. The normalized result keeps only the
+                // formal contract fields.
+                match serde_json::from_str::<Value>(response.stdout.as_deref().unwrap_or_default())
+                {
+                    Ok(parsed) => match validate_project_overview_for_startup(&parsed) {
+                        Ok(mut overview) => {
+                            if let Some(object) = overview.as_object_mut() {
+                                object.insert("status".to_string(), json!("available"));
+                                object.insert("reason_code".to_string(), Value::Null);
+                                object.insert(
+                                    "project".to_string(),
+                                    json!(resolved.resolved_id.clone()),
+                                );
+                            }
+                            overview
+                        }
+                        Err(_) => repository_overview_unavailable(),
+                    },
+                    Err(_) => repository_overview_unavailable(),
+                }
+            }
+            Ok(Ok(_)) => repository_overview_unavailable(),
+            Ok(Err(_)) => {
+                self.shell_clients.cancel_request(&request_id).await;
+                repository_overview_unavailable()
+            }
+            Err(_) => {
+                self.shell_clients.cancel_request(&request_id).await;
+                repository_overview_unavailable()
+            }
+        }
+    }
+}
+
+/// Deterministic unavailable marker for the startup repository overview. Never
+/// carries raw errors, absolute paths, or Runner output.
+fn repository_overview_unavailable() -> Value {
+    json!({
+        "status": "unavailable",
+        "reason_code": "unsupported_or_unavailable",
+    })
+}
+
+/// Fixed startup overview request bounds. The overview is always scoped to the
+/// project root with depth 2 and limit 120; a Runner response that reports a
+/// different `path`, `max_depth`, or `limit` is malformed and fails closed.
+const STARTUP_OVERVIEW_REQUEST_PATH: &str = "";
+const STARTUP_OVERVIEW_REQUEST_MAX_DEPTH: usize = 2;
+const STARTUP_OVERVIEW_REQUEST_LIMIT: usize = 120;
+
+/// Validate a startup overview payload against the fixed request bounds using
+/// the shared contract entry. Returns the normalized formal-contract payload
+/// on success. Used for both agent-backed Runner responses and the local
+/// builder so the two paths cannot drift.
+fn validate_project_overview_for_startup(payload: &Value) -> Result<Value, String> {
+    crate::project_overview::validate_project_overview(
+        payload,
+        STARTUP_OVERVIEW_REQUEST_PATH,
+        STARTUP_OVERVIEW_REQUEST_MAX_DEPTH,
+        STARTUP_OVERVIEW_REQUEST_LIMIT,
+    )
+}
+
+/// Build the repository overview locally for a non-agent project. Mirrors the
+/// `project_overview` bounds and safety contract without a shell. The output
+/// is normalized through the same shared contract entry used for Runner
+/// responses, so extra fields can never reach the startup brief.
+fn repository_overview_local(project_root: &str) -> Value {
+    match crate::project_overview::build_project_overview(
+        Path::new(project_root),
+        ".",
+        Some(STARTUP_OVERVIEW_REQUEST_MAX_DEPTH),
+        Some(STARTUP_OVERVIEW_REQUEST_LIMIT),
+    ) {
+        Ok(overview) => match validate_project_overview_for_startup(&overview) {
+            Ok(mut normalized) => {
+                if let Some(object) = normalized.as_object_mut() {
+                    object.insert("status".to_string(), json!("available"));
+                    object.insert("reason_code".to_string(), Value::Null);
+                }
+                normalized
+            }
+            Err(_) => repository_overview_unavailable(),
+        },
+        Err(_) => repository_overview_unavailable(),
+    }
 }
 
 #[derive(Deserialize)]
 struct WorkOnProjectBriefProjection {
     session: WorkOnProjectSessionProjection,
+    project: WorkOnProjectProjectProjection,
     workspace: WorkOnProjectWorkspaceProjection,
     instructions: WorkOnProjectInstructionsProjection,
+    semantic_navigation: WorkOnProjectSemanticNavigationProjection,
+    repository: Value,
     continuation: WorkOnProjectContinuationProjection,
     blockers: Vec<String>,
     warnings: Vec<String>,
@@ -1267,6 +1470,31 @@ struct WorkOnProjectSessionProjection {
     session_id: String,
     continuation: String,
     execution_context: sessions::SessionExecutionContext,
+}
+
+#[derive(Deserialize)]
+struct WorkOnProjectProjectProjection {
+    resolved_id: String,
+}
+
+#[derive(Deserialize)]
+struct WorkOnProjectSemanticNavigationProjection {
+    #[serde(default)]
+    supported: bool,
+    available: bool,
+    status: String,
+    capability: WorkOnProjectRequiredNullable<String>,
+    reason_code: WorkOnProjectRequiredNullable<String>,
+}
+
+#[derive(Deserialize)]
+struct WorkOnProjectJobsProjection {
+    active_count: u64,
+    blocking_active_count: u64,
+    nonblocking_active_count: u64,
+    recovering_count: u64,
+    terminal_pending_count: u64,
+    latest_status: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1289,6 +1517,12 @@ struct WorkOnProjectInstructionsProjection {
     sources: Vec<WorkOnProjectInstructionSourceProjection>,
     #[serde(default)]
     changed_sources: Option<Vec<String>>,
+    #[serde(default)]
+    content_included: bool,
+    #[serde(default)]
+    truncated: bool,
+    #[serde(default)]
+    total_chars: u64,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1311,6 +1545,7 @@ struct WorkOnProjectReadMoreProjection {
 #[derive(Deserialize)]
 struct WorkOnProjectContinuationProjection {
     suggested_next_actions: WorkOnProjectActionItemsProjection,
+    jobs: WorkOnProjectJobsProjection,
 }
 
 #[derive(Deserialize)]
@@ -1320,6 +1555,8 @@ struct WorkOnProjectActionItemsProjection {
 
 #[derive(Deserialize)]
 struct WorkOnProjectStartupVerdictProjection {
+    status: String,
+    blocking: bool,
     suggested_next_actions: Vec<String>,
 }
 
@@ -1404,15 +1641,30 @@ pub(crate) fn project_work_on_project_output(project: String, output: Value) -> 
     let mut instructions = json!({
         "status": projection.instructions.status,
         "sources": projection.instructions.sources,
+        "content_included": projection.instructions.content_included,
+        "truncated": projection.instructions.truncated,
+        "total_chars": projection.instructions.total_chars,
     });
     if let Some(changed_sources) = projection.instructions.changed_sources {
         instructions["changed_sources"] = json!(changed_sources);
     }
+    let semantic_navigation = json!({
+        "supported": projection.semantic_navigation.supported,
+        "available": projection.semantic_navigation.available,
+        "status": projection.semantic_navigation.status,
+        "capability": projection.semantic_navigation.capability,
+        "reason_code": projection.semantic_navigation.reason_code,
+    });
     ToolResult::ok(json!({
         "session_id": projection.session.session_id,
         "project": project,
+        "resolved_project": projection.project.resolved_id,
         "continuation": projection.session.continuation,
         "execution_context": projection.session.execution_context,
+        "readiness": {
+            "status": projection.startup_verdict.status,
+            "blocking": projection.startup_verdict.blocking,
+        },
         "workspace": {
             "status": projection.workspace.status,
             "git_available": projection.workspace.git_available,
@@ -1421,7 +1673,17 @@ pub(crate) fn project_work_on_project_output(project: String, output: Value) -> 
             "clean": projection.workspace.clean,
             "conflicts": projection.workspace.conflicts,
         },
+        "repository": projection.repository,
         "instructions": instructions,
+        "semantic_navigation": semantic_navigation,
+        "jobs": {
+            "active_count": projection.continuation.jobs.active_count,
+            "blocking_active_count": projection.continuation.jobs.blocking_active_count,
+            "nonblocking_active_count": projection.continuation.jobs.nonblocking_active_count,
+            "recovering_count": projection.continuation.jobs.recovering_count,
+            "terminal_pending_count": projection.continuation.jobs.terminal_pending_count,
+            "latest_status": projection.continuation.jobs.latest_status,
+        },
         "blockers": projection.blockers,
         "warnings": projection.warnings,
         "suggested_next_actions": suggested_next_actions,

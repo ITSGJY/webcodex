@@ -512,7 +512,8 @@ async fn coding_task_semantic_navigation_read_only_keeps_compact_shape() {
     .await;
     let result = finish_start_servicing_locally(&runtime, "compact-agent", task).await;
     let semantic = &result.output["semantic_navigation"];
-    assert_eq!(semantic.as_object().unwrap().len(), 5);
+    assert_eq!(semantic.as_object().unwrap().len(), 6);
+    assert_eq!(semantic["supported"], true);
     assert_eq!(semantic["status"], "available");
     assert_eq!(semantic["provider"], "rust-analyzer");
     assert_eq!(semantic["capability"], "lsp_read_only_navigation");

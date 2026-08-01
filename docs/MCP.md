@@ -138,6 +138,30 @@ tools, and runtime/operator management (`runtime_status`, `tool_manifest`)
 are not part of this surface: `tools/call` rejects them at the MCP boundary
 before ToolRuntime dispatch, and `tools/list` never advertises them.
 
+On `local_coding`, `work_on_project(project, instruction, session_id?)` is the
+ordinary entry point: one call returns the rules, repository structure, Git
+state, LSP readiness, jobs, and blockers a coding model needs to start or
+continue focused work. It creates a new Workflow Session when `session_id` is
+absent, and exactly resumes the given Session when present (never a guess or a
+credential-wide fallback); it never binds a current window. A successful call
+returns `session_id`, the resolved project id, a `readiness` verdict, the
+`workspace` Git projection, the `repository` overview, the bounded `rules`
+(`status` loaded/reused/changed/not_found/unavailable, per-source fingerprint,
+headings, bounded content, and `read_more` hints), `semantic_navigation`
+readiness, the compact `jobs` counts, and `blockers`/`warnings`/
+`suggested_next_actions`. The returned `repository` block is a deterministic
+metadata scan of directory entries, file types, and the Git tracked index
+(project types, manifests, key files, roots, top level entries, and
+project-relative suggested reads with reasons); it never reads ordinary file
+bodies, executes project code, follows symlinks, or scans
+protected/sensitive/build/cache paths. Every list is bounded and records its
+own total/returned/truncated metadata. If the overview is unavailable, the
+session still starts and `repository.status=unavailable` with a
+`repository_overview_unavailable` warning; raw errors, absolute paths, or
+Runner output are never returned. The extra context is informational only: it
+does not modify anything or execute anything, and the model still uses
+`read_file`, search, edits, and validation tools as needed.
+
 On `full_operator_runtime`, ordinary coding starts or continues with
 `start_coding_task`. A stable window continues the same repository by default;
 switching repositories changes context and switching back restores the prior

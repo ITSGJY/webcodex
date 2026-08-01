@@ -8,6 +8,10 @@ use super::common::{
     permission_summary_schema, schema_type, session_hint_schema, task_outcome_schema,
     wrapped_output_schema,
 };
+use super::files::{
+    key_file_schema, path_kind_schema, project_type_schema, scan_schema, suggested_read_schema,
+    top_level_entry_schema,
+};
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
@@ -197,6 +201,7 @@ fn startup_brief_schema(detail: &str) -> Value {
             "instructions": startup_instructions_schema(),
             "continuation": startup_continuation_schema(detail),
             "semantic_navigation": startup_semantic_navigation_schema(),
+            "repository": startup_repository_schema(),
             "blockers": startup_issue_list_schema(true),
             "warnings": startup_issue_list_schema(false),
             "startup_verdict": startup_verdict_schema(),
@@ -211,6 +216,7 @@ fn startup_brief_schema(detail: &str) -> Value {
             "instructions",
             "continuation",
             "semantic_navigation",
+            "repository",
             "blockers",
             "warnings",
             "startup_verdict",
@@ -665,6 +671,7 @@ fn startup_semantic_navigation_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
+            "supported": {"type": "boolean", "description": "Whether LSP read-only navigation is advertised for this project."},
             "status": {
                 "type": "string",
                 "enum": [
@@ -685,7 +692,84 @@ fn startup_semantic_navigation_schema() -> Value {
             "capability": nullable_schema("string", "Bounded advertised capability summary."),
             "reason_code": nullable_schema("string", "Stable semantic-navigation reason.")
         },
-        "required": ["status", "available", "provider", "capability", "reason_code"],
+        "required": ["supported", "status", "available", "provider", "capability", "reason_code"],
+        "additionalProperties": false
+    })
+}
+
+fn startup_repository_schema() -> Value {
+    let bounded_repository_list = |items: Value, max_items: usize| {
+        json!({
+            "type": "object",
+            "properties": {
+                "items": {"type": "array", "maxItems": max_items, "items": items},
+                "total": {"type": "integer", "minimum": 0},
+                "returned": {"type": "integer", "minimum": 0, "maximum": max_items},
+                "truncated": {"type": "boolean"}
+            },
+            "required": ["items", "total", "returned", "truncated"],
+            "additionalProperties": false
+        })
+    };
+    let bounded_roots = json!({
+        "type": "object",
+        "properties": {
+            "source": bounded_repository_list(json!({"type": "string", "maxLength": 192}), 8),
+            "tests": bounded_repository_list(json!({"type": "string", "maxLength": 192}), 8),
+            "docs": bounded_repository_list(json!({"type": "string", "maxLength": 192}), 8),
+            "examples": bounded_repository_list(json!({"type": "string", "maxLength": 192}), 8),
+            "scripts": bounded_repository_list(json!({"type": "string", "maxLength": 192}), 8),
+            "ci": bounded_repository_list(json!({"type": "string", "maxLength": 192}), 8),
+            "classification_basis": schema_type("string", "Classification basis; conventional_directory_name.")
+        },
+        "required": ["source", "tests", "docs", "examples", "scripts", "ci", "classification_basis"],
+        "additionalProperties": false
+    });
+    let scan = scan_schema();
+    json!({
+        "type": "object",
+        "description": "Deterministic repository structure metadata. Reads directory entries, file types, and the git tracked index only; never reads ordinary file bodies, executes project code, follows symlinks, scans protected/sensitive/build/cache paths, or returns absolute roots or shell output.",
+        "properties": {
+            "status": {"type": "string", "enum": ["available", "unavailable"]},
+            "reason_code": nullable_schema("string", "Stable reason when unavailable."),
+            "project_types": bounded_repository_list(project_type_schema(), 8),
+            "manifests": bounded_repository_list(path_kind_schema("Detected build or package manifest."), 12),
+            "key_files": bounded_repository_list(key_file_schema(), 16),
+            "roots": bounded_roots,
+            "top_level": bounded_repository_list(top_level_entry_schema(), 24),
+            "suggested_next_reads": bounded_repository_list(suggested_read_schema(), 8),
+            "scan": scan,
+            "warnings": {
+                "type": "array",
+                "uniqueItems": true,
+                "maxItems": 8,
+                "items": {
+                    "type": "string",
+                    "enum": ["symlinks_skipped", "unreadable_entries_skipped", "non_utf8_paths_skipped"]
+                }
+            }
+        },
+        "required": ["status", "reason_code"],
+        "allOf": [
+            {
+                "if": {
+                    "properties": {"status": {"const": "available"}},
+                    "required": ["status"]
+                },
+                "then": {
+                    "required": [
+                        "project_types",
+                        "manifests",
+                        "key_files",
+                        "roots",
+                        "top_level",
+                        "suggested_next_reads",
+                        "scan",
+                        "warnings"
+                    ]
+                }
+            }
+        ],
         "additionalProperties": false
     })
 }
@@ -707,6 +791,7 @@ fn startup_issue_list_schema(blockers: bool) -> Value {
             "semantic_navigation_unavailable",
             "current_binding_unavailable",
             "rules_unavailable",
+            "repository_overview_unavailable",
             "runtime_status_unavailable",
             "active_jobs_present"
         ])
@@ -887,11 +972,61 @@ fn work_on_project_output_schema() -> Value {
                         ".github/copilot-instructions.md"
                     ]
                 }
-            }
+            },
+            "content_included": {"type": "boolean"},
+            "truncated": {"type": "boolean"},
+            "total_chars": {"type": "integer", "minimum": 0, "maximum": 32768}
         },
         "required": ["status", "sources"],
         "additionalProperties": true
     });
+    let compact_semantic_navigation = json!({
+        "type": "object",
+        "properties": {
+            "supported": {"type": "boolean"},
+            "available": {"type": "boolean"},
+            "status": {
+                "type": "string",
+                "enum": [
+                    "running",
+                    "available",
+                    "initializing",
+                    "crashed",
+                    "unavailable",
+                    "not_applicable",
+                    "agent_unavailable",
+                    "agent_capability_unavailable",
+                    "probe_timeout",
+                    "probe_failed"
+                ]
+            },
+            "capability": nullable_schema("string", "Bounded advertised capability summary."),
+            "reason_code": nullable_schema("string", "Stable semantic-navigation reason.")
+        },
+        "required": ["supported", "available", "status", "capability", "reason_code"],
+        "additionalProperties": true
+    });
+    let compact_jobs = json!({
+        "type": "object",
+        "properties": {
+            "active_count": {"type": "integer", "minimum": 0},
+            "blocking_active_count": {"type": "integer", "minimum": 0},
+            "nonblocking_active_count": {"type": "integer", "minimum": 0},
+            "recovering_count": {"type": "integer", "minimum": 0},
+            "terminal_pending_count": {"type": "integer", "minimum": 0},
+            "latest_status": {"type": "string"}
+        },
+        "required": [
+            "active_count",
+            "blocking_active_count",
+            "nonblocking_active_count",
+            "recovering_count",
+            "terminal_pending_count",
+            "latest_status"
+        ],
+        "additionalProperties": true
+    });
+    let compact_repository = startup_repository_schema();
     let output_properties = vec![
         (
             "session_id",
@@ -902,6 +1037,10 @@ fn work_on_project_output_schema() -> Value {
             schema_type("string", "Original project input."),
         ),
         (
+            "resolved_project",
+            schema_type("string", "Resolved full runtime project id from the permission check and exact project resolution."),
+        ),
+        (
             "continuation",
             schema_type("string", "created, continued, or resumed_explicitly."),
         ),
@@ -910,10 +1049,25 @@ fn work_on_project_output_schema() -> Value {
             session_execution_context_schema("Persistent run_shell/run_job defaults currently stored for this Workflow Session."),
         ),
         (
+            "readiness",
+            json!({
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["pass", "warn", "fail"]},
+                    "blocking": {"type": "boolean"}
+                },
+                "required": ["status", "blocking"],
+                "additionalProperties": false
+            }),
+        ),
+        (
             "workspace",
             compact_workspace,
         ),
+        ("repository", compact_repository),
         ("instructions", compact_instructions),
+        ("semantic_navigation", compact_semantic_navigation),
+        ("jobs", compact_jobs),
         (
             "blockers",
             startup_issue_list_schema(true),
