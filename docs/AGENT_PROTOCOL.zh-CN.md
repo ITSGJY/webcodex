@@ -6,13 +6,13 @@ WebCodex agents 连接 server，并执行已注册项目上的 tools。新部署
 
 ## Authentication
 
-Agents 应使用 client enrollment 期间创建的 agent tokens：
+Agents 应使用 client enrollment 期间创建的 agent tokens（`webcodex login` 是主入口；`webcodex client enroll` 是高级替代）：
 
 ```bash
-webcodex client enroll --server-url URL --pairing-code CODE --client-id CLIENT_ID
+webcodex login URL --code CODE
 ```
 
-Server/admin 侧用 `webcodex pairing create` 创建临时代码。Agent token 在 client enroll 期间返回给 client，并写入生成的 `agent.toml`；不要从 server 复制 agent token files。二进制部署时，使用 `webcodex agent install` 安装 client-side service，并用 `webcodex agent status` 检查。
+Server/admin 侧用 `webcodex pairing create` 创建临时代码。Agent token 在 login 期间返回给 client，并写入生成的 `agent.toml`；不要从 server 复制 agent token files。二进制部署时，使用 `webcodex agent install --config <path>` 安装 client-side service，并用 `webcodex agent status` 检查。
 
 Transport auth rules：
 

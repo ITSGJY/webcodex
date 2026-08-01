@@ -260,3 +260,92 @@ fn usage_lists_one_canonical_spelling_per_group() {
         other => panic!("expected help exit, got {other:?}"),
     }
 }
+
+#[test]
+fn help_moves_client_enroll_to_advanced_and_keeps_login_as_the_primary_entry() {
+    match cli_action(["--help"]) {
+        CliAction::Exit { stdout, .. } => {
+            assert!(stdout.contains("login"), "help missing login: {stdout}");
+            assert!(
+                stdout.contains("client enroll"),
+                "help missing client enroll: {stdout}"
+            );
+            assert!(
+                stdout.contains("Advanced / Compatibility"),
+                "help missing Advanced section: {stdout}"
+            );
+            // client enroll must sit under the advanced section, after it.
+            let advanced = stdout.find("Advanced / Compatibility").unwrap();
+            let enroll = stdout.find("client enroll").unwrap();
+            assert!(
+                enroll > advanced,
+                "client enroll is not under Advanced: {stdout}"
+            );
+        }
+        other => panic!("expected help exit, got {other:?}"),
+    }
+}
+
+#[test]
+fn pairing_create_help_marks_client_id_optional_and_explains_matching_device() {
+    match cli_action(["pairing", "create", "--help"]) {
+        CliAction::Exit { code, stdout, .. } => {
+            assert_eq!(code, 0);
+            assert!(
+                stdout.contains("[--client-id CLIENT_ID]"),
+                "optional client id is missing from synopsis: {stdout}"
+            );
+            assert!(stdout.contains("let the login device claim it"), "{stdout}");
+            assert!(stdout.contains("same --device value"), "{stdout}");
+        }
+        other => panic!("expected help exit, got {other:?}"),
+    }
+}
+
+#[test]
+fn login_help_describes_root_and_non_root_default_directories() {
+    match cli_action(["login", "--help"]) {
+        CliAction::Exit { code, stdout, .. } => {
+            assert_eq!(code, 0);
+            assert!(stdout.contains("root /etc/webcodex"), "{stdout}");
+            assert!(stdout.contains("non-root ~/.config/webcodex"), "{stdout}");
+        }
+        other => panic!("expected help exit, got {other:?}"),
+    }
+}
+
+#[test]
+fn login_print_mcp_config_and_json_are_mutually_exclusive() {
+    // `--json --print-mcp-config` together is a parse-time error.
+    match cli_action([
+        "login",
+        "https://example.com",
+        "--code",
+        "wc_pair_x",
+        "--json",
+        "--print-mcp-config",
+    ]) {
+        CliAction::Exit { code, stderr, .. } => {
+            assert_eq!(code, 2);
+            assert!(
+                stderr.contains("mutually exclusive"),
+                "expected mutual-exclusion error, got {stderr}"
+            );
+        }
+        other => panic!("expected a parse error, got {other:?}"),
+    }
+    // `--print-mcp-config` alone dispatches to Login with the flag set.
+    match cli_action([
+        "login",
+        "https://example.com",
+        "--code",
+        "wc_pair_x",
+        "--print-mcp-config",
+    ]) {
+        CliAction::Login(opts) => {
+            assert!(opts.print_mcp_config);
+            assert!(!opts.json);
+        }
+        other => panic!("expected Login dispatch, got {other:?}"),
+    }
+}

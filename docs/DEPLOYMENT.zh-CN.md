@@ -19,7 +19,7 @@
    `webcodex-server` service。
 3. 配置 reverse proxy，并把 `WEBCODEX_PUBLIC_URL` 设为准确的公网 HTTPS origin。
 4. 在 server 上创建短期 pairing code，在持有代码仓库的机器上运行
-   `webcodex client enroll`。
+   `webcodex login <server-url> --code <code>`（高级替代：`webcodex client enroll`）。
 5. 在该代码机器上安装 `webcodex-runner` service。
 6. 执行 `webcodex ops status --strict`；通过后再导入 GPT Actions schema 或添加
    MCP connector。
@@ -166,8 +166,8 @@ Server/admin：
 Client：
 
 8. 安装公开 `webcodex` CLI 和 `webcodex-runner` binary。
-9. 运行 `webcodex client enroll`。
-10. 运行 `webcodex agent install`。
+9. 运行 `webcodex login <server-url> --code <code>`（高级替代：`webcodex client enroll`）。
+10. 运行 `webcodex agent install --config <login 报告的 agent config 路径>`。
 11. 运行 `sudo systemctl daemon-reload`。
 12. 运行 `sudo systemctl enable --now webcodex-runner`。
 13. 运行 `webcodex agent status`。
@@ -198,39 +198,31 @@ webcodex pairing create \
   --server-url https://your-domain.example \
   --env-file /etc/webcodex/webcodex.env \
   --username friendname \
-  --client-id friend-laptop \
   --display-name "Friend Name" \
   --ttl-secs 600
 ```
 
-`pairing create` 是 server/admin 侧操作。`/etc/webcodex/webcodex.env` 只属于 server 侧。只把短期 `wc_pair_*` code 发给对方。
+`pairing create` 是 server/admin 侧操作。这个普通流程创建未绑定 code，由执行 `login` 的设备使用自动生成的 id 认领。`/etc/webcodex/webcodex.env` 只属于 server 侧。只把短期 `wc_pair_*` code 发给对方。
 
 Client/friend 侧：
 
 ```bash
-webcodex client enroll \
-  --server-url https://your-domain.example \
-  --pairing-code <wc_pair_...> \
-  --client-id friend-laptop \
-  --display-name "Friend Name" \
-  --profile workstation \
+webcodex login https://your-domain.example --code <wc_pair_...> \
   --allowed-root /home/friend/git
 
-webcodex agent install \
-  --profile workstation \
-  --bin /opt/webcodex/bin/webcodex-runner \
+webcodex agent install --config /etc/webcodex/https_your-domain.example/friendname/agent.toml \
   --overwrite
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now webcodex-runner-workstation
+sudo systemctl enable --now webcodex-runner
 
 webcodex ops status \
   --server-url https://your-domain.example \
-  --token-file /etc/webcodex/clients/workstation/webcodex-user-token \
+  --token-file /etc/webcodex/https_your-domain.example/friendname/webcodex-user-token \
   --strict
 ```
 
-`client enroll` 是 client/friend 侧操作。GPT Actions 应使用 client 侧的 `webcodex-user-token`；生成的 agent config 使用 client 侧 agent token 连接 `webcodex-runner`。不要在机器之间复制 `WEBCODEX_TOKEN`、`wc_pat_*`、`wc_agent_*`、完整 env files 或完整 `agent.toml` files。每个 friend 都应使用唯一的 `username` 和 `client_id`。
+`webcodex login` 是 client/friend 侧入口：自动生成唯一设备名、兑换 pairing code，并在 `<dir>/<server>/<user>/`（root：`/etc/webcodex/...`，普通用户：`~/.config/webcodex/...`）下写入 client 侧 `webcodex-user-token` 和 `agent.toml`。login 会打印确切的 agent config 路径和要使用的 `webcodex agent install --config <path>` 命令。GPT Actions 应使用 client 侧的 `webcodex-user-token`；生成的 agent config 使用 client 侧 agent token 连接 `webcodex-runner`。不要在机器之间复制 `WEBCODEX_TOKEN`、`wc_pat_*`、`wc_agent_*`、完整 env files 或完整 `agent.toml` files。每个 friend 都应使用唯一的 `username`；设备名会自动唯一。如需显式 client id 或自定义输出目录，高级的 `webcodex client enroll` 流程仍可用。
 
 ## Runtime console
 
@@ -305,17 +297,13 @@ server {
 
 ## Agent 配置
 
-`client enroll` 会生成 agent config。使用下面命令安装 systemd unit：
+`login` / `client enroll` 会生成 agent config。使用下面命令安装 systemd unit（`login` 会打印确切的 config 路径）：
 
 ```bash
-sudo webcodex agent install \
-  --profile workstation \
-  --bin /opt/webcodex/bin/webcodex-runner
+sudo webcodex agent install --config /etc/webcodex/https_your-domain.example/friendname/agent.toml
 sudo systemctl daemon-reload
-sudo systemctl enable --now webcodex-runner-workstation
-webcodex agent status \
-  --profile workstation \
-  --server-url https://your-domain.example
+sudo systemctl enable --now webcodex-runner
+webcodex agent status --server-url https://your-domain.example
 ```
 
 前台测试可直接启动 agent：

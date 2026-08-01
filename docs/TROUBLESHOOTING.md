@@ -62,7 +62,7 @@ Use the actual install path for your host.
 
 ### Client accidentally runs `pairing create` and `/etc/webcodex/webcodex.env` is missing
 
-`webcodex pairing create` is server/admin-side and uses the server bootstrap env file. A friend/client machine should run `webcodex client enroll` with the short-lived `wc_pair_*` code from the server owner.
+`webcodex pairing create` is server/admin-side and uses the server bootstrap env file. A friend/client machine should run `webcodex login <server-url> --code <wc_pair_...>` (advanced: `webcodex client enroll`) with the short-lived `wc_pair_*` code from the server owner.
 
 Copy only the `wc_pair_*` code between machines. Do not copy `WEBCODEX_TOKEN`, user API tokens, agent tokens, env files, or complete `agent.toml` files.
 

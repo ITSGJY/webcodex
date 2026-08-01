@@ -61,7 +61,7 @@ sudo ln -s /opt/webcodex/bin/webcodex /usr/local/bin/webcodex
 
 ### Client 误运行 `pairing create`，且 `/etc/webcodex/webcodex.env` 缺失
 
-`webcodex pairing create` 是 server/admin-side 命令，需要 server bootstrap env file。朋友或 client 机器应运行 `webcodex client enroll`，并使用 server owner 发来的短期 `wc_pair_*` code。
+`webcodex pairing create` 是 server/admin-side 命令，需要 server bootstrap env file。朋友或 client 机器应运行 `webcodex login <server-url> --code <wc_pair_...>`（高级替代：`webcodex client enroll`），并使用 server owner 发来的短期 `wc_pair_*` code。
 
 机器之间只复制 `wc_pair_*` code。不要复制 `WEBCODEX_TOKEN`、user API tokens、agent tokens、env files 或完整 `agent.toml` files。
 

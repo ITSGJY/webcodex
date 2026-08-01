@@ -34,8 +34,9 @@ The examples in this guide were checked against the current help output from `we
 | Admin-created account credential | `webcodex users create --server-url ... --token ... --username ... --issue-credential` |
 | User-created PAT | `webcodex token create-local --server ... --user ... --credential ... --scopes ...` |
 | User-created agent token | `webcodex agent-token create-local --server ... --user ... --credential ... --client-id ...` |
-| Pairing code | `webcodex pairing create --server-url ... --username ... --client-id ...` |
-| Client enrollment | `webcodex client enroll --server-url ... --pairing-code ... --client-id ...` |
+| Pairing code | `webcodex pairing create --server-url ... --username ... [--client-id ...]` |
+| Client enrollment (primary) | `webcodex login <server-url> --code <pairing-code>` |
+| Client enrollment (advanced) | `webcodex client enroll --server-url ... --pairing-code ... --client-id ...` |
 | Agent foreground run | `webcodex-runner --profile ...` |
 | Agent service | `webcodex agent install --profile ... --bin ...` |
 
@@ -109,12 +110,11 @@ webcodex pairing create \
   --server-url https://your-domain.example \
   --env-file /etc/webcodex/webcodex.env \
   --username friendname \
-  --client-id friend-laptop \
   --display-name "Friend Name" \
   --ttl-secs 600
 ```
 
-`pairing create` is a server/admin-side command. It needs server bootstrap/admin auth. Copy only the short-lived `wc_pair_*` code to the client; do not copy `WEBCODEX_TOKEN`, `wc_pat_*`, `wc_agent_*`, complete env files, or complete `agent.toml` files. Each friend should use a unique `username` and `client_id`.
+`pairing create` is a server/admin-side command. It needs server bootstrap/admin auth. This ordinary flow leaves the code unbound so the device running `login` can claim its automatically generated id. Copy only the short-lived `wc_pair_*` code to the client; do not copy `WEBCODEX_TOKEN`, `wc_pat_*`, `wc_agent_*`, complete env files, or complete `agent.toml` files. Each friend should use a unique `username`.
 
 Client:
 
@@ -122,31 +122,26 @@ Client:
 7. Exchange the pairing code over HTTPS and write client-side credentials/config:
 
 ```bash
-sudo webcodex client enroll \
-  --server-url https://your-domain.example \
-  --pairing-code <wc_pair_...> \
-  --client-id friend-laptop \
-  --profile workstation \
+sudo webcodex login https://your-domain.example --code <wc_pair_...> \
   --allowed-root /home/friend/git
 ```
 
-Client enroll creates the `wc_pat_*` user token, `wc_agent_*` agent token, and `/etc/webcodex/clients/workstation/agent.toml` locally with `0600` permissions on Unix. `/etc/webcodex/webcodex.env` is server-side only; isolate client-side token/config files under `/etc/webcodex/clients/<profile>/` when multiple users or clients share one machine.
+Login derives a unique device name automatically (hostname + local suffix), redeems the pairing code, writes the `wc_pat_*` user token to `webcodex-user-token`, and stores the `wc_agent_*` agent token inside the generated `agent.toml`; both files use `0600` permissions on Unix. `/etc/webcodex/webcodex.env` is server-side only. For an explicit client id or a custom output directory, the advanced `webcodex client enroll` flow still works with its existing flags.
 
-8. Install and start the agent service, then validate:
+8. Install and start the agent service, then validate. Login prints the exact
+   `webcodex agent install --config <agent-config-path>` command for the config
+   it wrote; it is the equivalent of the profile-based form below. The agent
+   config path is the one login reported (for example under
+   `/etc/webcodex/<server>/<user>/agent.toml` as root):
 
 ```bash
-sudo webcodex agent install \
-  --profile workstation \
-  --bin /opt/webcodex/bin/webcodex-runner \
-  --overwrite
+sudo webcodex agent install --config /path/to/login/wrote/agent.toml --overwrite
 sudo systemctl daemon-reload
-sudo systemctl enable --now webcodex-runner-workstation
-webcodex agent status \
-  --profile workstation \
-  --server-url https://your-domain.example
+sudo systemctl enable --now webcodex-runner
+webcodex agent status --server-url https://your-domain.example
 webcodex ops status \
   --server-url https://your-domain.example \
-  --token-file /etc/webcodex/clients/workstation/webcodex-user-token
+  --token-file /path/to/login/wrote/webcodex-user-token
 ```
 
 GPT Actions should use the generated client-side user-token file. GPT Actions require a public HTTPS URL; WebCodex CLI does not automate reverse proxies or tunnels.

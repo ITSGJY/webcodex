@@ -6,13 +6,13 @@ WebCodex agents connect to the server and execute registered project tools. New 
 
 ## Authentication
 
-Agents should use agent tokens created during client enrollment:
+Agents should use agent tokens created during client enrollment (`webcodex login` is the primary entry; `webcodex client enroll` is the advanced alternative):
 
 ```bash
-webcodex client enroll --server-url URL --pairing-code CODE --client-id CLIENT_ID
+webcodex login URL --code CODE
 ```
 
-The server/admin side creates the temporary code with `webcodex pairing create`. The agent token is returned to the client during enroll and written into the generated `agent.toml`; do not copy agent token files from the server. For binary deployments, install the client-side service with `webcodex agent install` and inspect it with `webcodex agent status`.
+The server/admin side creates the temporary code with `webcodex pairing create`. The agent token is returned to the client during login and written into the generated `agent.toml`; do not copy agent token files from the server. For binary deployments, install the client-side service with `webcodex agent install --config <path>` and inspect it with `webcodex agent status`.
 
 Transport auth rules:
 

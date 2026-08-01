@@ -17,6 +17,51 @@ pub(crate) mod token_commands;
 pub(crate) mod tokens;
 pub(crate) mod usage;
 
+/// Quote one argument for display as a copyable POSIX shell command.
+///
+/// Keep common inert characters readable and single-quote everything else.
+/// Embedded single quotes use the standard close/escape/reopen form. This is
+/// display-only: actual child processes continue to receive argv directly.
+pub(crate) fn shell_quote_arg(value: &str) -> String {
+    let safe = !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'_' | b'@' | b'%' | b'+' | b'=' | b':' | b',' | b'.' | b'/' | b'-'
+                )
+        });
+    if safe {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+pub(crate) fn shell_command(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| shell_quote_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+mod shell_command_tests {
+    use super::shell_quote_arg;
+
+    #[test]
+    fn shell_quote_arg_handles_shell_metacharacters() {
+        assert_eq!(shell_quote_arg("webcodex-runner"), "webcodex-runner");
+        assert_eq!(shell_quote_arg("/tmp/agent.toml"), "/tmp/agent.toml");
+        assert_eq!(shell_quote_arg(""), "''");
+        assert_eq!(shell_quote_arg("path with spaces"), "'path with spaces'");
+        assert_eq!(shell_quote_arg("it's"), "'it'\\''s'");
+        assert_eq!(shell_quote_arg("$HOME"), "'$HOME'");
+        assert_eq!(shell_quote_arg("`id`"), "'`id`'");
+        assert_eq!(shell_quote_arg("one;two"), "'one;two'");
+    }
+}
+
 #[cfg(test)]
 pub(crate) use agent_service::render_agent_systemd_unit;
 pub(crate) use agent_service::{run_agent_install_service, run_agent_service, run_agent_status};

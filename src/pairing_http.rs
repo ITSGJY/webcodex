@@ -85,6 +85,19 @@ fn clean_display_name(value: Option<String>) -> Result<Option<String>, String> {
     Ok(value)
 }
 
+fn resolve_pairing_agent_token_name(
+    value: Option<String>,
+    client_id: &str,
+) -> Result<Option<String>, String> {
+    // For an unbound code, defer the default until enrollment knows the claimed
+    // client_id. Otherwise the stored fallback would be the meaningless string
+    // " agent". Explicit names and bound-code defaults remain unchanged.
+    if client_id.is_empty() && value.as_deref().is_none_or(|name| name.trim().is_empty()) {
+        return Ok(None);
+    }
+    clean_token_name(value, &format!("{} agent", client_id)).map(Some)
+}
+
 fn generate_pairing_code() -> String {
     format!(
         "wc_pair_{}{}",
@@ -185,15 +198,15 @@ pub(crate) async fn pairing_create(req: &mut Request, depot: &mut Depot, res: &m
             return;
         }
     };
-    let agent_token_name =
-        match clean_token_name(body.agent_token_name, &format!("{} agent", client_id)) {
-            Ok(v) => v,
-            Err(e) => {
-                res.status_code(StatusCode::BAD_REQUEST);
-                res.render(json_error(StatusCode::BAD_REQUEST, e));
-                return;
-            }
-        };
+    let agent_token_name = match resolve_pairing_agent_token_name(body.agent_token_name, &client_id)
+    {
+        Ok(v) => v,
+        Err(e) => {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(json_error(StatusCode::BAD_REQUEST, e));
+            return;
+        }
+    };
 
     let Some(db) = crate::get_db(depot) else {
         res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
@@ -252,7 +265,7 @@ pub(crate) async fn pairing_create(req: &mut Request, depot: &mut Depot, res: &m
         expires_at,
         used_at: None,
         user_token_name: Some(user_token_name),
-        agent_token_name: Some(agent_token_name),
+        agent_token_name,
     };
     if let Err(e) = db.insert_pairing_code(&record) {
         res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
@@ -763,6 +776,23 @@ mod tests {
         assert_eq!(user_key.kind(), TOKEN_KIND_USER);
         assert_eq!(agent_key.kind(), TOKEN_KIND_AGENT);
         assert_eq!(agent_key.allowed_client_id(), Some("alice-laptop"));
+    }
+
+    #[test]
+    fn unbound_pairing_defers_the_default_agent_token_name_until_claim() {
+        assert_eq!(resolve_pairing_agent_token_name(None, "").unwrap(), None);
+        assert_eq!(
+            resolve_pairing_agent_token_name(Some("  ".to_string()), "").unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_pairing_agent_token_name(Some("custom".to_string()), "").unwrap(),
+            Some("custom".to_string())
+        );
+        assert_eq!(
+            resolve_pairing_agent_token_name(None, "alice-laptop").unwrap(),
+            Some("alice-laptop agent".to_string())
+        );
     }
 
     #[test]

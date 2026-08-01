@@ -64,14 +64,14 @@ Prefer:
 webcodex server init
 webcodex server install
 webcodex server status
-webcodex pairing create --server-url URL --username alice --client-id alice-laptop
-webcodex client enroll --server-url URL --pairing-code CODE --client-id alice-laptop
-webcodex agent install --profile workstation --bin /opt/webcodex/bin/webcodex-runner
-webcodex agent status --profile workstation --server-url URL
+webcodex pairing create --server-url URL --username alice
+webcodex login URL --code CODE --allowed-root /home/alice/git
+webcodex agent install --config PATH_FROM_LOGIN
+webcodex agent status --server-url URL
 webcodex ops status --strict --server-url URL --token-file PATH
 ```
 
-`pairing create` is server/admin-side. `client enroll`, `agent install`, and `agent status` are client-side for the machine running `webcodex-runner`. Do not copy server tokens to the client; copy only the short-lived pairing code.
+`pairing create` is server/admin-side. `login`, `agent install`, and `agent status` are client-side for the machine running `webcodex-runner`. Do not copy server tokens to the client; copy only the short-lived pairing code. `webcodex login` is the primary client entry; `webcodex client enroll` remains the advanced alternative.
 ## Binary help validation
 
 Before release or large documentation changes, verify the command examples against the binaries:

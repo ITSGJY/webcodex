@@ -22,7 +22,8 @@ workflow. The minimum production path is:
 3. Configure the reverse proxy and set `WEBCODEX_PUBLIC_URL` to the exact public
    HTTPS origin.
 4. Create a short-lived pairing code on the server and run
-   `webcodex client enroll` on the machine that owns the repositories.
+   `webcodex login <server-url> --code <code>` on the machine that owns the
+   repositories (`webcodex client enroll` remains the advanced alternative).
 5. Install the `webcodex-runner` service on that repository machine.
 6. Run `webcodex ops status --strict`; only then import the GPT Actions
    schema or add the MCP connector.
@@ -171,8 +172,8 @@ Server/admin:
 Client:
 
 8. Install the public `webcodex` CLI and the `webcodex-runner` binary.
-9. Run `webcodex client enroll`.
-10. Run `webcodex agent install`.
+9. Run `webcodex login <server-url> --code <code>` (advanced: `webcodex client enroll`).
+10. Run `webcodex agent install --config <login-reported-agent-config>`.
 11. Run `sudo systemctl daemon-reload`.
 12. Run `sudo systemctl enable --now webcodex-runner`.
 13. Run `webcodex agent status`.
@@ -203,39 +204,41 @@ webcodex pairing create \
   --server-url https://your-domain.example \
   --env-file /etc/webcodex/webcodex.env \
   --username friendname \
-  --client-id friend-laptop \
   --display-name "Friend Name" \
   --ttl-secs 600
 ```
 
-`pairing create` is server/admin-side. `/etc/webcodex/webcodex.env` is server-side only. Send only the short-lived `wc_pair_*` code to the friend.
+`pairing create` is server/admin-side. This ordinary flow creates an unbound code, so the device running `login` claims its automatically generated id. `/etc/webcodex/webcodex.env` is server-side only. Send only the short-lived `wc_pair_*` code to the friend.
 
 Client/friend side:
 
 ```bash
-webcodex client enroll \
-  --server-url https://your-domain.example \
-  --pairing-code <wc_pair_...> \
-  --client-id friend-laptop \
-  --display-name "Friend Name" \
-  --profile workstation \
+webcodex login https://your-domain.example --code <wc_pair_...> \
   --allowed-root /home/friend/git
 
-webcodex agent install \
-  --profile workstation \
-  --bin /opt/webcodex/bin/webcodex-runner \
+webcodex agent install --config /etc/webcodex/https_your-domain.example/friendname/agent.toml \
   --overwrite
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now webcodex-runner-workstation
+sudo systemctl enable --now webcodex-runner
 
 webcodex ops status \
   --server-url https://your-domain.example \
-  --token-file /etc/webcodex/clients/workstation/webcodex-user-token \
+  --token-file /etc/webcodex/https_your-domain.example/friendname/webcodex-user-token \
   --strict
 ```
 
-`client enroll` is client/friend-side. GPT Actions should use the client-side `webcodex-user-token`; the generated agent config uses the client-side agent token for `webcodex-runner`. Do not copy `WEBCODEX_TOKEN`, `wc_pat_*`, `wc_agent_*`, complete env files, or complete `agent.toml` files between machines. Each friend should use a unique `username` and `client_id`.
+`webcodex login` is the client/friend-side entry: it derives a unique device
+name, redeems the pairing code, and writes the client-side `webcodex-user-token`
+and an `agent.toml` under `<dir>/<server>/<user>/` (root: `/etc/webcodex/...`,
+user: `~/.config/webcodex/...`). Login prints the exact agent config path and
+the `webcodex agent install --config <path>` command to use. GPT Actions should
+use the client-side `webcodex-user-token`; the generated agent config uses the
+client-side agent token for `webcodex-runner`. Do not copy `WEBCODEX_TOKEN`,
+`wc_pat_*`, `wc_agent_*`, complete env files, or complete `agent.toml` files
+between machines. Each friend should use a unique `username`; the device name is
+made unique automatically. The advanced `webcodex client enroll` flow is still
+available for an explicit client id or custom output directory.
 
 ## Runtime console
 

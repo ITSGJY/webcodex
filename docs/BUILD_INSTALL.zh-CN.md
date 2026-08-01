@@ -34,8 +34,9 @@ binary、npm 命令、systemd unit 与 QUIC ALPN（`webcodex-runner/1`）统一�
 | 管理员创建账户凭据 | `webcodex users create --server-url ... --token ... --username ... --issue-credential` |
 | 用户创建 PAT | `webcodex token create-local --server ... --user ... --credential ... --scopes ...` |
 | 用户创建 agent token | `webcodex agent-token create-local --server ... --user ... --credential ... --client-id ...` |
-| 创建 pairing code | `webcodex pairing create --server-url ... --username ... --client-id ...` |
-| 客户端 enrollment | `webcodex client enroll --server-url ... --pairing-code ... --client-id ...` |
+| 创建 pairing code | `webcodex pairing create --server-url ... --username ... [--client-id ...]` |
+| 客户端 enrollment（主入口） | `webcodex login <server-url> --code <pairing-code>` |
+| 客户端 enrollment（高级） | `webcodex client enroll --server-url ... --pairing-code ... --client-id ...` |
 | 前台运行 agent | `webcodex-runner --profile ...` |
 | 安装 agent service | `webcodex agent install --profile ... --bin ...` |
 
@@ -110,12 +111,11 @@ webcodex pairing create \
   --server-url https://your-domain.example \
   --env-file /etc/webcodex/webcodex.env \
   --username friendname \
-  --client-id friend-laptop \
   --display-name "Friend Name" \
   --ttl-secs 600
 ```
 
-`pairing create` 是 server/admin-side 命令。只复制短期 `wc_pair_*` code 给 client；不要复制 `WEBCODEX_TOKEN`、`wc_pat_*`、`wc_agent_*`、完整 env files 或完整 `agent.toml` files。
+`pairing create` 是 server/admin-side 命令。这个普通流程创建未绑定 code，由执行 `login` 的设备使用自动生成的 id 认领。只复制短期 `wc_pair_*` code 给 client；不要复制 `WEBCODEX_TOKEN`、`wc_pat_*`、`wc_agent_*`、完整 env files 或完整 `agent.toml` files。
 
 Client：
 
@@ -123,41 +123,32 @@ Client：
 7. 通过 HTTPS 交换 pairing code，并写入 client-side credentials/config：
 
 ```bash
-sudo webcodex client enroll \
-  --server-url https://your-domain.example \
-  --pairing-code <wc_pair_...> \
-  --client-id friend-laptop \
-  --profile workstation \
+sudo webcodex login https://your-domain.example --code <wc_pair_...> \
   --allowed-root /home/friend/git
 ```
 
-`client enroll` 会在本地创建 `wc_pat_*` user token、`wc_agent_*` agent token 和 `/etc/webcodex/clients/workstation/agent.toml`，Unix 上权限为 `0600`。`/etc/webcodex/webcodex.env` 只属于 server 侧；多用户或多个 client 共用一台机器时，client-side token/config 文件应隔离在 `/etc/webcodex/clients/<profile>/` 下。
+`login` 会自动生成唯一设备名（hostname + 本地后缀），兑换 pairing code，把 `wc_pat_*` user token 写入 `webcodex-user-token`，并把 `wc_agent_*` agent token 存入生成的 `agent.toml`；两个文件在 Unix 上均使用 `0600` 权限。`/etc/webcodex/webcodex.env` 只属于 server 侧。如需显式 client id 或自定义输出目录，高级的 `webcodex client enroll` 流程仍支持原有参数。
 
 8. 安装并启动 agent service，然后验证：
 
 ```bash
-sudo webcodex agent install \
-  --profile workstation \
-  --bin /opt/webcodex/bin/webcodex-runner \
-  --overwrite
+sudo webcodex agent install --config /path/to/login/wrote/agent.toml --overwrite
 sudo systemctl daemon-reload
-sudo systemctl enable --now webcodex-runner-workstation
-webcodex agent status \
-  --profile workstation \
-  --server-url https://your-domain.example
+sudo systemctl enable --now webcodex-runner
+webcodex agent status --server-url https://your-domain.example
 webcodex ops status \
   --server-url https://your-domain.example \
-  --token-file /etc/webcodex/clients/workstation/webcodex-user-token
+  --token-file /path/to/login/wrote/webcodex-user-token
 ```
 
 GPT Actions 应使用生成的 client-side user-token file。GPT Actions 需要 public HTTPS URL；WebCodex CLI 不会自动配置 reverse proxies 或 tunnels。
 
 ## Agent config
 
-`client enroll` 会写入 `agent.toml`。systemd service 使用 `webcodex agent install`；前台测试可运行：
+`login` / `client enroll` 会写入 `agent.toml`。systemd service 使用 `webcodex agent install --config <path>`；前台测试可运行：
 
 ```bash
-webcodex-runner --profile workstation
+webcodex-runner --config /path/to/login/wrote/agent.toml
 ```
 
 高级手工生成只保留低层入口 `webcodex agent init`；

@@ -23,6 +23,7 @@ use super::connections::{
     list_connections, resolve_connection_parent, user_slug, Connection, ConnectionPaths,
     INTERNAL_DIR_PREFIX,
 };
+use super::shell_command;
 
 /// Device name reported to the server. The hostname is what a person would call
 /// this machine; `--device` overrides it.
@@ -60,16 +61,217 @@ fn sanitize_device_name(raw: &str) -> String {
     }
 }
 
+/// Name of the per-machine identity file holding the local random suffix.
+const DEVICE_ID_FILE: &str = ".device-id";
+/// The suffix is 16 lowercase hex characters (>= 12, the required minimum).
+const DEVICE_SUFFIX_HEX_LEN: usize = 16;
+/// A bounded read cap for the identity file so a corrupt file cannot force an
+/// unbounded allocation. 16 hex + one newline, with headroom.
+const DEVICE_ID_MAX_BYTES: usize = 64;
+/// Bounded wait for the narrow window where another login has created the
+/// identity file but has not finished writing its 16-byte value yet.
+const DEVICE_ID_CREATE_RETRY_ATTEMPTS: usize = 20;
+const DEVICE_ID_CREATE_RETRY_DELAY_MS: u64 = 5;
+
+/// Validate a `client_id` with the same rules the server enforces
+/// (`validate_allowed_client_id` in `src/auth/pat.rs`): non-empty, at most 80
+/// characters, and only ASCII letters, digits, `-`, `_`, and `.`. The CLI
+/// keeps its own copy so a bad explicit `--device` fails locally before the
+/// one-time pairing code is spent, instead of round-tripping to the server.
+pub(crate) fn validate_client_id(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("client_id cannot be empty".to_string());
+    }
+    if value.chars().count() > 80 {
+        return Err("client_id is too long; maximum is 80 characters".to_string());
+    }
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(
+            "client_id may only contain ASCII letters, digits, '-', '_', and '.'".to_string(),
+        );
+    }
+    Ok(value.to_string())
+}
+
+/// Read the persistent local device suffix, or create it first.
+///
+/// The suffix is what makes two machines with the same hostname distinct: it is
+/// generated once per machine, kept under `base`, and reused on every login, so
+/// an overwrite on the same machine mints the same `client_id` and the bound
+/// agent token stays usable.
+///
+/// `base` must already be a verified real directory tree (login resolves it
+/// through `resolve_connection_parent` before calling this). The file is
+/// created atomically with `create_new` so concurrent logins race cleanly:
+/// whoever wins, the loser re-reads the winner's value. Every failure mode —
+/// a symlink, a non-regular file, loose permissions, empty or malformed
+/// content — fails before the pairing code is spent.
+fn device_suffix(base: &Path) -> Result<String, String> {
+    let path = base.join(DEVICE_ID_FILE);
+    // Already present: read-and-validate it, surfacing the concrete reason if
+    // it is a symlink, non-regular file, loose, empty, or malformed.
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => return read_device_suffix_after_concurrent_create(&path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("failed to inspect {}: {error}", path.display())),
+    }
+
+    // Absent: create it atomically. `create_new` makes concurrent logins race
+    // cleanly — whoever wins, the loser re-reads the winner's value.
+    let suffix = generate_device_suffix();
+    match write_device_suffix_new(&path, &suffix) {
+        Ok(()) => Ok(suffix),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            read_device_suffix_after_concurrent_create(&path)
+        }
+        Err(error) => Err(format!("failed to create {}: {error}", path.display())),
+    }
+}
+
+fn generate_device_suffix() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..DEVICE_SUFFIX_HEX_LEN].to_string()
+}
+
+/// Atomically create `path` with `content`; fails if `path` already exists.
+fn write_device_suffix_new(path: &Path, content: &str) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    std::io::Write::write_all(&mut file, content.as_bytes())?;
+    std::io::Write::write_all(&mut file, b"\n")?;
+    Ok(())
+}
+
+/// Read a file that may have just won a concurrent `create_new` race.
+///
+/// `create_new` publishes the directory entry before the winner writes the
+/// contents. A loser can therefore observe a valid 0600 regular file at length
+/// zero. Retry only while that file is shorter than the complete 16-byte value;
+/// planted symlinks, non-regular files, loose permissions, and complete but
+/// malformed values still fail immediately.
+fn read_device_suffix_after_concurrent_create(path: &Path) -> Result<String, String> {
+    for attempt in 0..DEVICE_ID_CREATE_RETRY_ATTEMPTS {
+        match read_device_suffix(path) {
+            Ok(suffix) => return Ok(suffix),
+            Err(error) => {
+                let incomplete_regular_file = std::fs::symlink_metadata(path)
+                    .is_ok_and(|meta| meta.is_file() && meta.len() < DEVICE_SUFFIX_HEX_LEN as u64);
+                if !incomplete_regular_file || attempt + 1 == DEVICE_ID_CREATE_RETRY_ATTEMPTS {
+                    return Err(error);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(
+                    DEVICE_ID_CREATE_RETRY_DELAY_MS,
+                ));
+            }
+        }
+    }
+    unreachable!("bounded device identity retry loop must return")
+}
+
+/// Validate and read the device suffix file. Enforces everything an attacker
+/// could otherwise plant before we trust it: the path must be a regular file,
+/// not a symlink, with no group/other permissions on Unix, bounded size, and
+/// exactly 16 lowercase hex characters.
+fn read_device_suffix(path: &Path) -> Result<String, String> {
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+    if meta.is_symlink() {
+        return Err(format!(
+            "{} is a symlink; refusing to read a device identity through it",
+            path.display()
+        ));
+    }
+    if !meta.is_file() {
+        return Err(format!(
+            "{} is not a regular file; refusing to use it as a device identity",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "{} has group/other permissions ({mode:o}); refusing to read a device identity from it",
+                path.display()
+            ));
+        }
+    }
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
+    let mut bytes = Vec::new();
+    use std::io::Read;
+    file.take(DEVICE_ID_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    if bytes.len() > DEVICE_ID_MAX_BYTES {
+        return Err(format!(
+            "{} is unexpectedly large; refusing to use it as a device identity",
+            path.display()
+        ));
+    }
+    let content = String::from_utf8_lossy(&bytes);
+    let suffix = content.trim().to_string();
+    let valid = suffix.len() == DEVICE_SUFFIX_HEX_LEN
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !valid {
+        return Err(format!(
+            "{} does not contain exactly {DEVICE_SUFFIX_HEX_LEN} lowercase hex characters; refusing to use it as a device identity",
+            path.display()
+        ));
+    }
+    Ok(suffix)
+}
+
+/// Resolve the device name a login will report to the server.
+///
+/// An explicit `--device` wins verbatim (validated against the server's
+/// `client_id` rules). Otherwise the readable hostname is combined with the
+/// persistent local suffix, truncating the hostname side so the total stays
+/// within the server's 80-character cap — the suffix is what guarantees
+/// uniqueness, so it is never the part that gets cut.
+pub(crate) fn resolve_device_name(base: &Path, opts: &LoginOptions) -> Result<String, String> {
+    if opts.device_explicit {
+        return validate_client_id(&opts.device);
+    }
+    let suffix = device_suffix(base)?;
+    let hostname = sanitize_device_name(&opts.device);
+    // Reserve room for the separator and the suffix.
+    let budget = 80usize.saturating_sub(suffix.len() + 1);
+    let head: String = hostname.chars().take(budget).collect();
+    let head = if head.is_empty() {
+        "device".to_string()
+    } else {
+        head
+    };
+    let combined = format!("{head}-{suffix}");
+    validate_client_id(&combined)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LoginOptions {
     pub(crate) server_url: String,
     pub(crate) code: String,
     pub(crate) device: String,
+    pub(crate) device_explicit: bool,
     pub(crate) base_dir: PathBuf,
     pub(crate) transport: String,
     pub(crate) allowed_roots: Vec<PathBuf>,
     pub(crate) overwrite: bool,
     pub(crate) json: bool,
+    pub(crate) print_mcp_config: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -309,6 +511,7 @@ pub(crate) fn stage_connection(
     opts: &LoginOptions,
     server_url: &str,
     identity: &EnrolledIdentity,
+    device: &str,
     now: &str,
 ) -> Result<(), String> {
     let paths = ConnectionPaths::new(staging.to_path_buf());
@@ -326,7 +529,7 @@ pub(crate) fn stage_connection(
         server_url: server_url.to_string(),
         token: Some(identity.agent_token.clone()),
         token_file: None,
-        client_id: opts.device.clone(),
+        client_id: device.to_string(),
         owner: identity.username.clone(),
         display_name: None,
         transport: opts.transport.clone(),
@@ -339,7 +542,7 @@ pub(crate) fn stage_connection(
     })?;
     harden_secret_file(&paths.agent_config)?;
 
-    write_descriptor(&paths, server_url, &identity.username, &opts.device, now)
+    write_descriptor(&paths, server_url, &identity.username, device, now)
 }
 
 pub(crate) fn render_login_result(
@@ -348,22 +551,72 @@ pub(crate) fn render_login_result(
     username: &str,
     device: &str,
     json: bool,
+    print_mcp_config: bool,
 ) -> Result<String, String> {
+    let foreground_argv = vec![
+        "webcodex-runner".to_string(),
+        "--config".to_string(),
+        paths.agent_config.to_string_lossy().into_owned(),
+    ];
+    let agent_install_argv = vec![
+        "webcodex".to_string(),
+        "agent".to_string(),
+        "install".to_string(),
+        "--config".to_string(),
+        paths.agent_config.to_string_lossy().into_owned(),
+    ];
+    let foreground_command = shell_command(&foreground_argv);
+    let agent_install_command = shell_command(&agent_install_argv);
+
+    // JSON output carries only safe metadata; never a full token. The
+    // `--print-mcp-config` path is text-only and mutually exclusive with `--json`
+    // (enforced at parse time), so the two cannot both apply here.
     if json {
         let summary = serde_json::json!({
             "server_url": server_url,
             "username": username,
             "device": device,
+            "mcp_url": format!("{server_url}/mcp"),
             "dir": paths.dir.to_string_lossy(),
+            "user_token_file": paths.user_token.to_string_lossy(),
             "agent_config": paths.agent_config.to_string_lossy(),
+            "foreground_argv": &foreground_argv,
+            "agent_install_argv": &agent_install_argv,
+            "next_steps": [&foreground_command, &agent_install_command],
         });
         return serde_json::to_string_pretty(&summary).map_err(|error| error.to_string());
     }
+
+    if print_mcp_config {
+        let token = std::fs::read_to_string(&paths.user_token)
+            .map_err(|error| {
+                format!(
+                    "cannot read user token {} for MCP config: {error}",
+                    paths.user_token.display()
+                )
+            })?
+            .trim()
+            .to_string();
+        return Ok(format!(
+            "Sensitive HTTP MCP connection details\n\
+             ======================================\n\
+             These connection details include a credential. Store them privately.\n\n\
+             MCP URL: {server_url}/mcp\n\
+             Authorization: Bearer {token}\n"
+        ));
+    }
+
     Ok(format!(
         "Logged in to {server_url} as {username} ({device}).\n\n  \
-         config: {}\n\nStart the agent:\n  webcodex-runner --config {}\n",
-        paths.dir.display(),
+         MCP endpoint: {server_url}/mcp\n  \
+         user token file: {}\n  \
+         agent config:   {}\n\n\
+         Start the agent in the foreground:\n  {}\n\n\
+         Or install it as a service:\n  {}\n",
+        paths.user_token.display(),
         paths.agent_config.display(),
+        foreground_command,
+        agent_install_command,
     ))
 }
 
@@ -514,10 +767,11 @@ pub(crate) fn base_dir_or_default(explicit: Option<PathBuf>) -> PathBuf {
 pub(crate) async fn redeem_pairing_code(
     server_url: &str,
     opts: &LoginOptions,
+    device: &str,
 ) -> Result<EnrolledIdentity, String> {
     let mut body = serde_json::json!({
         "pairing_code": opts.code,
-        "client_id": opts.device,
+        "client_id": device,
         "transport": opts.transport,
         "allow_cwd_anywhere": false,
     });
@@ -555,13 +809,23 @@ pub(crate) async fn run_login(opts: LoginOptions) -> Result<String, String> {
     let server_url = canonical.url.clone();
     let parent = resolve_connection_parent(&opts.base_dir, &canonical)?;
 
-    let identity = redeem_pairing_code(&server_url, &opts).await?;
+    // The device name is settled here, after the target directory has been
+    // verified but before the one-time code is spent: `resolve_device_name`
+    // generates and validates the client_id, and creates `.device-id` in the
+    // verified base (the server directory's parent). Every local problem —
+    // an invalid explicit `--device`, a planted `.device-id` — fails now.
+    let base = parent
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", parent.display()))?;
+    let device = resolve_device_name(base, &opts)?;
+
+    let identity = redeem_pairing_code(&server_url, &opts, &device).await?;
     let user = user_slug(&identity.username)?;
     let paths = ConnectionPaths::new(parent.join(user));
 
     let staging = create_staging_dir(&parent)?;
     let now = chrono::Utc::now().to_rfc3339();
-    if let Err(error) = stage_connection(&staging, &opts, &server_url, &identity, &now) {
+    if let Err(error) = stage_connection(&staging, &opts, &server_url, &identity, &device, &now) {
         let residue = discard_internal_dir(&staging);
         return Err(note_residue(error, residue));
     }
@@ -571,9 +835,14 @@ pub(crate) async fn run_login(opts: LoginOptions) -> Result<String, String> {
             &paths,
             &server_url,
             &identity.username,
-            &opts.device,
+            &device,
             opts.json,
+            opts.print_mcp_config,
         ),
+        // The pairing code was spent but the destination was taken; the fresh
+        // credentials are real and are parked for recovery. Never emit a token
+        // here, even with `--print-mcp-config` — there is no published
+        // connection to print for.
         PublishOutcome::SavedForRecovery { path } => Err(render_recovery_error(
             &paths.dir,
             &path,
@@ -666,11 +935,13 @@ mod tests {
             server_url: server_url.to_string(),
             code: CODE.to_string(),
             device: "laptop".to_string(),
+            device_explicit: false,
             base_dir: base.to_path_buf(),
             transport: "websocket".to_string(),
             allowed_roots: Vec::new(),
             overwrite,
             json: false,
+            print_mcp_config: false,
         }
     }
 
@@ -694,7 +965,14 @@ mod tests {
         let parent = resolve_connection_parent(base, &canonical)?;
         let paths = ConnectionPaths::new(parent.join(user_slug(&identity.username).unwrap()));
         let staging = create_staging_dir(&parent)?;
-        if let Err(error) = stage_connection(&staging, &opts, &canonical.url, &identity, "t") {
+        if let Err(error) = stage_connection(
+            &staging,
+            &opts,
+            &canonical.url,
+            &identity,
+            &opts.device,
+            "t",
+        ) {
             let _ = discard_internal_dir(&staging);
             return Err(error);
         }
@@ -808,7 +1086,14 @@ mod tests {
 
         // Make agent.toml impossible to create by putting a directory there.
         std::fs::create_dir_all(staging.join("agent.toml")).unwrap();
-        let result = stage_connection(&staging, &opts, "https://api.example.com", &identity, "t");
+        let result = stage_connection(
+            &staging,
+            &opts,
+            "https://api.example.com",
+            &identity,
+            &opts.device,
+            "t",
+        );
         assert!(result.is_err(), "staging should have failed");
         let _ = discard_internal_dir(&staging);
 
@@ -1384,7 +1669,15 @@ mod tests {
 
         let opts = login_opts(base, "https://api.example.com", false);
         let staging = create_staging_dir(&parent).unwrap();
-        stage_connection(&staging, &opts, &canonical.url, &identity(), "t").unwrap();
+        stage_connection(
+            &staging,
+            &opts,
+            &canonical.url,
+            &identity(),
+            &opts.device,
+            "t",
+        )
+        .unwrap();
         std::fs::create_dir_all(&final_dir).unwrap();
         let residue = with_failing_removal(|| discard_internal_dir(&staging));
         messages.push(note_residue("staging failed".to_string(), residue));
@@ -1413,6 +1706,435 @@ mod tests {
                 .unwrap_err();
             assert!(!error.contains(CODE), "error leaked the pairing code");
             assert!(all_connections(temp.path()).is_empty());
+        }
+    }
+
+    // --- device identity -----------------------------------------------------
+
+    fn explicit_device_opts(base: &Path, server_url: &str, device: &str) -> LoginOptions {
+        LoginOptions {
+            device: device.to_string(),
+            device_explicit: true,
+            ..login_opts(base, server_url, false)
+        }
+    }
+
+    #[test]
+    fn explicit_device_is_validated_locally_with_the_server_rules() {
+        for bad in [
+            "",              // empty
+            "bad/client",    // slash
+            "bad client",    // whitespace
+            &"x".repeat(81), // too long
+        ] {
+            assert!(validate_client_id(bad).is_err(), "{bad:?} accepted");
+        }
+        for good in ["alice-laptop", "alice_macbook", "ci.runner-1", "UPPER"] {
+            assert_eq!(validate_client_id(good).unwrap(), good);
+        }
+    }
+
+    #[test]
+    fn resolved_default_device_combines_hostname_and_persistent_suffix() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path();
+        let opts = login_opts(base, "https://api.example.com", false);
+        let first = resolve_device_name(base, &opts).unwrap();
+        // hostname + "-" + 16 hex.
+        assert_eq!(first.len(), opts.device.len() + 1 + 16, "{first}");
+        assert!(first.starts_with(&opts.device));
+        let (head, suffix) = first.split_once('-').unwrap();
+        assert_eq!(head, opts.device);
+        assert_eq!(suffix.len(), 16, "{suffix}");
+        assert!(suffix
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert!(first
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')));
+
+        // The suffix is stable across calls.
+        let second = resolve_device_name(base, &opts).unwrap();
+        assert_eq!(first, second);
+        // Two different bases get different suffixes.
+        let other = tempfile::TempDir::new().unwrap();
+        let third = resolve_device_name(other.path(), &opts).unwrap();
+        assert_ne!(first, third);
+    }
+
+    #[tokio::test]
+    async fn default_login_device_redeems_an_unbound_code() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 16384];
+            let length = stream.read(&mut request).unwrap();
+            request_tx
+                .send(String::from_utf8_lossy(&request[..length]).to_string())
+                .unwrap();
+            let body = serde_json::json!({
+                "username": "alice",
+                "user_token": USER_TOKEN,
+                "agent_token": AGENT_TOKEN,
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path().join("config root");
+        let opts = LoginOptions {
+            server_url: format!("http://{address}"),
+            code: CODE.to_string(),
+            device: "shared-host".to_string(),
+            device_explicit: false,
+            base_dir: base.clone(),
+            transport: "websocket".to_string(),
+            allowed_roots: Vec::new(),
+            overwrite: false,
+            json: false,
+            print_mcp_config: false,
+        };
+        let output = run_login(opts).await.unwrap();
+        server.join().unwrap();
+
+        let request = request_rx.recv().unwrap();
+        let body = request.split("\r\n\r\n").nth(1).unwrap();
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        let device = value["client_id"].as_str().unwrap();
+        assert!(device.starts_with("shared-host-"), "{device}");
+        assert_eq!(device.len(), "shared-host-".len() + DEVICE_SUFFIX_HEX_LEN);
+        assert_eq!(value["pairing_code"], CODE);
+        assert!(output.contains(device), "{output}");
+        assert!(base.join(DEVICE_ID_FILE).is_file());
+    }
+
+    #[test]
+    fn explicit_device_wins_verbatim_without_a_suffix() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path();
+        let opts = explicit_device_opts(base, "https://api.example.com", "my-rig");
+        assert_eq!(resolve_device_name(base, &opts).unwrap(), "my-rig");
+        // No `.device-id` is created when the device is explicit.
+        assert!(!base.join(DEVICE_ID_FILE).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn device_suffix_file_is_created_with_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path();
+        std::fs::create_dir_all(base).unwrap();
+        let opts = login_opts(base, "https://api.example.com", false);
+        resolve_device_name(base, &opts).unwrap();
+
+        let mode = std::fs::metadata(base.join(DEVICE_ID_FILE))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn device_suffix_is_not_listed_as_a_connection() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path();
+        publish_login(base, "https://api.example.com", false).unwrap();
+        std::fs::write(base.join(DEVICE_ID_FILE), "aabbccddeeff0011\n").unwrap();
+        let listed = all_connections(base);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+    }
+
+    #[test]
+    fn device_suffix_race_reuses_the_winner() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path();
+        let path = base.join(DEVICE_ID_FILE);
+        std::fs::create_dir_all(base).unwrap();
+        // Plant a winner using `create_new` semantics.
+        write_device_suffix_new(&path, "feedfacecafe0001").unwrap();
+        assert_eq!(device_suffix(base).unwrap(), "feedfacecafe0001");
+    }
+
+    #[test]
+    fn device_suffix_waits_for_a_concurrent_creator_to_finish() {
+        use std::io::Write;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join(DEVICE_ID_FILE);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path).unwrap();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            file.write_all(b"feedfacecafe0001\n").unwrap();
+        });
+
+        assert_eq!(
+            read_device_suffix_after_concurrent_create(&path).unwrap(),
+            "feedfacecafe0001"
+        );
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn device_suffix_rejects_malformed_or_planted_files_before_redeem() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path();
+        std::fs::create_dir_all(base).unwrap();
+
+        // Empty.
+        std::fs::write(base.join(DEVICE_ID_FILE), "").unwrap();
+        assert!(device_suffix(base).is_err());
+
+        // Not hex / wrong length.
+        std::fs::write(base.join(DEVICE_ID_FILE), "not-hex-at-all\n").unwrap();
+        assert!(device_suffix(base).is_err());
+        std::fs::write(base.join(DEVICE_ID_FILE), "aabb\n").unwrap();
+        assert!(device_suffix(base).is_err());
+
+        // Uppercase hex is rejected (must be lowercase).
+        std::fs::write(base.join(DEVICE_ID_FILE), "AABBCCDDEEFF0011\n").unwrap();
+        assert!(device_suffix(base).is_err());
+
+        // A directory is not a regular file.
+        std::fs::remove_file(base.join(DEVICE_ID_FILE)).unwrap();
+        std::fs::create_dir(base.join(DEVICE_ID_FILE)).unwrap();
+        assert!(device_suffix(base).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn device_suffix_rejects_a_symlink() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(base).unwrap();
+        std::fs::write(&outside, "feedfacecafe0001\n").unwrap();
+        std::os::unix::fs::symlink(&outside, base.join(DEVICE_ID_FILE)).unwrap();
+        let error = device_suffix(base).unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn device_suffix_rejects_group_or_other_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path();
+        std::fs::create_dir_all(base).unwrap();
+        let path = base.join(DEVICE_ID_FILE);
+        std::fs::write(&path, "feedfacecafe0001\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = device_suffix(base).unwrap_err();
+        assert!(error.contains("permissions"), "{error}");
+    }
+
+    #[test]
+    fn a_hostname_near_the_cap_is_truncated_so_the_suffix_survives() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path();
+        // 80-char hostname plus suffix would exceed the server's 80 cap; the
+        // head must be truncated to make room for `-` + 16 hex.
+        let opts = LoginOptions {
+            device: "x".repeat(80),
+            ..login_opts(base, "https://api.example.com", false)
+        };
+        let resolved = resolve_device_name(base, &opts).unwrap();
+        assert!(resolved.len() <= 80, "{resolved}");
+        let suffix = resolved.rsplit_once('-').unwrap().1;
+        assert_eq!(suffix.len(), 16, "{suffix}");
+        assert!(resolved
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')));
+    }
+
+    #[test]
+    fn render_login_result_includes_safe_metadata_and_no_tokens_by_default() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path();
+        publish_login(base, "https://api.example.com", false).unwrap();
+        let paths = all_connections(base)[0].paths.clone();
+        let text = render_login_result(
+            &paths,
+            "https://api.example.com",
+            "alice",
+            "laptop",
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(text.contains("https://api.example.com/mcp"), "{text}");
+        assert!(
+            text.contains(&paths.user_token.display().to_string()),
+            "{text}"
+        );
+        assert!(
+            text.contains(&paths.agent_config.display().to_string()),
+            "{text}"
+        );
+        assert!(text.contains("webcodex-runner --config"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "webcodex agent install --config {}",
+                paths.agent_config.display()
+            )),
+            "{text}"
+        );
+        assert!(!text.contains(USER_TOKEN), "default text leaked a token");
+        assert!(!text.contains(AGENT_TOKEN), "default text leaked a token");
+
+        let json = render_login_result(
+            &paths,
+            "https://api.example.com",
+            "alice",
+            "laptop",
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(json.contains("mcp_url"), "{json}");
+        assert!(
+            json.contains(&paths.user_token.display().to_string()),
+            "{json}"
+        );
+        assert!(!json.contains(USER_TOKEN), "json leaked a token");
+        assert!(!json.contains(AGENT_TOKEN), "json leaked a token");
+    }
+
+    #[test]
+    fn render_login_result_quotes_config_paths_and_exposes_argv() {
+        let paths = ConnectionPaths::new(PathBuf::from("/tmp/path with 'quote/$value/`tick`;semi"));
+        let foreground_argv = vec![
+            "webcodex-runner".to_string(),
+            "--config".to_string(),
+            paths.agent_config.to_string_lossy().into_owned(),
+        ];
+        let install_argv = vec![
+            "webcodex".to_string(),
+            "agent".to_string(),
+            "install".to_string(),
+            "--config".to_string(),
+            paths.agent_config.to_string_lossy().into_owned(),
+        ];
+
+        let text = render_login_result(
+            &paths,
+            "https://api.example.com",
+            "alice",
+            "laptop",
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(text.contains(&shell_command(&foreground_argv)), "{text}");
+        assert!(text.contains(&shell_command(&install_argv)), "{text}");
+
+        let json_text = render_login_result(
+            &paths,
+            "https://api.example.com",
+            "alice",
+            "laptop",
+            true,
+            false,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json_text).unwrap();
+        assert_eq!(value["foreground_argv"], serde_json::json!(foreground_argv));
+        assert_eq!(value["agent_install_argv"], serde_json::json!(install_argv));
+        assert_eq!(
+            value["next_steps"][0].as_str().unwrap(),
+            shell_command(&foreground_argv)
+        );
+        assert_eq!(
+            value["next_steps"][1].as_str().unwrap(),
+            shell_command(&install_argv)
+        );
+        assert!(!json_text.contains(USER_TOKEN));
+        assert!(!json_text.contains(AGENT_TOKEN));
+    }
+
+    #[test]
+    fn print_mcp_config_emits_the_bearer_block_and_marks_it_sensitive() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path();
+        publish_login(base, "https://api.example.com", false).unwrap();
+        let paths = all_connections(base)[0].paths.clone();
+        let text = render_login_result(
+            &paths,
+            "https://api.example.com",
+            "alice",
+            "laptop",
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(
+            text.contains("Sensitive HTTP MCP connection details"),
+            "{text}"
+        );
+        assert!(text.contains("https://api.example.com/mcp"), "{text}");
+        assert!(
+            text.contains(&format!("Authorization: Bearer {USER_TOKEN}")),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn print_mcp_config_never_touches_the_recovery_path() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path();
+        publish_login(base, "https://api.example.com", false).unwrap();
+        let paths = all_connections(base)[0].paths.clone();
+        std::fs::write(paths.dir.join("marker"), "old").unwrap();
+        // A second login without --overwrite parks a recovery directory; the
+        // recovery error must not contain a token even when print_mcp_config
+        // was requested (the connection was not published cleanly).
+        let opts = LoginOptions {
+            overwrite: false,
+            print_mcp_config: true,
+            ..login_opts(base, "https://api.example.com", false)
+        };
+        let canonical = canonical_server_url("https://api.example.com").unwrap();
+        let identity = identity();
+        let parent = resolve_connection_parent(base, &canonical).unwrap();
+        let paths = ConnectionPaths::new(parent.join(user_slug(&identity.username).unwrap()));
+        let staging = create_staging_dir(&parent).unwrap();
+        stage_connection(
+            &staging,
+            &opts,
+            &canonical.url,
+            &identity,
+            &opts.device,
+            "t",
+        )
+        .unwrap();
+        match publish_connection(&staging, &paths.dir, false).unwrap() {
+            PublishOutcome::SavedForRecovery { path } => {
+                let message =
+                    render_recovery_error(&paths.dir, &path, "https://api.example.com", "alice");
+                assert!(!message.contains(USER_TOKEN), "{message}");
+                assert!(!message.contains(AGENT_TOKEN), "{message}");
+            }
+            other => panic!("expected recovery, got {other:?}"),
         }
     }
 }

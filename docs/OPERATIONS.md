@@ -204,7 +204,14 @@ upgrade; there are no compatibility fallback shims. Runners also report
 
 ## Client enrollment
 
-### Profile-based config (recommended)
+`webcodex login <server-url> --code <wc_pair_...>` is the primary client
+entry: it derives a unique device name, redeems the pairing code, and writes
+the user token and `agent.toml` under `<dir>/<server>/<user>/`. The
+profile-based flow below (`webcodex client enroll`) is the advanced alternative
+when you need an explicit client id or a profile directory shared by several
+clients on one machine.
+
+### Profile-based config (advanced)
 
 Each client or user profile gets its own directory under `/etc/webcodex/clients/`:
 
@@ -288,7 +295,7 @@ This returns a `wc_pair_*` code. Send only this code to the client user.
 - Do not copy `wc_agent_*` tokens between machines.
 - Do not copy `wc_pat_*` tokens between machines.
 - Do not put the bootstrap token in agent config or GPT Action config.
-- Each client should generate its own tokens through `client enroll` or `token create-local`.
+- Each client should generate its own tokens through `webcodex login`, `client enroll`, or `token create-local`.
 
 ## Project registration
 

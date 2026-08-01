@@ -63,14 +63,14 @@ WebCodex 不再暴露 `run_codex` 或 legacy `/api/codex/*` routes。GPT Actions
 webcodex server init
 webcodex server install
 webcodex server status
-webcodex pairing create --server-url URL --username alice --client-id alice-laptop
-webcodex client enroll --server-url URL --pairing-code CODE --client-id alice-laptop
-webcodex agent install --profile workstation --bin /opt/webcodex/bin/webcodex-runner
-webcodex agent status --profile workstation --server-url URL
+webcodex pairing create --server-url URL --username alice
+webcodex login URL --code CODE --allowed-root /home/alice/git
+webcodex agent install --config PATH_FROM_LOGIN
+webcodex agent status --server-url URL
 webcodex ops status --strict --server-url URL --token-file PATH
 ```
 
-`pairing create` 是 server/admin-side。`client enroll`、`agent install` 和 `agent status` 是运行 `webcodex-runner` 的 client-side 操作。不要把 server tokens 复制到 client；只复制短期 pairing code。
+`pairing create` 是 server/admin-side。`login`、`agent install` 和 `agent status` 是运行 `webcodex-runner` 的 client-side 操作。不要把 server tokens 复制到 client；只复制短期 pairing code。`webcodex login` 是主 client 入口；`webcodex client enroll` 仍作为高级替代。
 ## 二进制 help 校验
 
 发布前或大规模修改文档后，应对照实际二进制 help 检查命令示例：

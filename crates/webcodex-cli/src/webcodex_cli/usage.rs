@@ -6,8 +6,8 @@ Project:\n\
   doctor                        Diagnose project readiness\n\
   status                        Show concise project coding readiness\n\
   run                           Run the current project runtime and local Agent\n\n\
-Account:\n\
-  login                         Log this device into a server\n\
+Account (quick start):\n\
+  login                         Log this device into a server (one-time pairing code)\n\
   logout                        Remove this device's credentials\n\
   auth status                   Show login status\n\n\
 Server:\n\
@@ -19,9 +19,10 @@ Agent:\n\
 Operations:\n\
   task                          Review tasks and make host-local decisions\n\
   ops status|agents|projects|smoke-preflight\n\
-                                Read-only operator workflow checks\n\
+                                Read-only operator workflow checks\n\n\
+Advanced / Compatibility:\n\
   pairing create                Create a client enrollment code\n\
-  client enroll                 Enroll this machine\n\
+  client enroll                 Enroll this machine (advanced; prefer `webcodex login`)\n\
   users create|list             Manage users\n\
   tokens create|create-local|generate|register-hash|list|revoke\n\
                                 Manage personal API tokens\n\
@@ -40,14 +41,15 @@ pub(crate) fn pairing_usage() -> &'static str {
 }
 
 pub(crate) fn pairing_create_usage() -> &'static str {
-    "Usage: webcodex pairing create --server-url URL --username USER --client-id CLIENT_ID [OPTIONS]\n\n\
+    "Usage: webcodex pairing create --server-url URL --username USER [--client-id CLIENT_ID] [OPTIONS]\n\n\
      Options:\n\
        --server-url URL          WebCodex server URL\n\
        --env-file PATH           Read WEBCODEX_TOKEN from env file\n\
        --token-file PATH         Read bootstrap/admin bearer token from file\n\
        --token TOKEN             Bootstrap/admin bearer token (discouraged in shell history)\n\
        --username USER           User to ensure/create for enrollment\n\
-       --client-id CLIENT_ID     Bind the code to one device [default: any device may claim it]\n\
+       --client-id CLIENT_ID     Optional device binding; omit to let the login device claim it.\n\
+                                 When set, login must use the same --device value.\n\
        --display-name NAME       Optional display name for a newly created user\n\
        --ttl-secs SECS           Pairing code lifetime [default: 600; range: 60..3600]\n\
        --user-token-name NAME    Name for the user API token created during enroll\n\
@@ -57,7 +59,10 @@ pub(crate) fn pairing_create_usage() -> &'static str {
      Server/admin-side command:\n\
        pairing create needs server bootstrap/admin auth. The default server\n\
        bootstrap env file lives on the server, not the client.\n\
-       On the client, use: webcodex client enroll\n\n\
+       On the client, redeem the code with: webcodex login <server-url> --code <code>\n\
+       If --client-id was specified, append the matching\n\
+       --device <client-id> to that login command.\n\
+       (advanced clients may use: webcodex client enroll)\n\n\
      Copy only the short-lived wc_pair_* code to the client. Do not copy\n\
      WEBCODEX_TOKEN, wc_pat_*, or wc_agent_* values from server to client.\n\
      This command does not create wc_pat_* or wc_agent_* token files on the\n\
@@ -72,6 +77,9 @@ pub(crate) fn client_usage() -> &'static str {
 
 pub(crate) fn client_enroll_usage() -> &'static str {
     "Usage: webcodex client enroll --server-url URL --pairing-code CODE --client-id CLIENT_ID [OPTIONS]\n\n\
+     Advanced / compatibility entry. Ordinary users should use\n\
+     `webcodex login <server-url> --code <code>`, which derives the client id\n\
+     and writes the same token files in one step.\n\n\
      Options:\n\
        --server-url URL              WebCodex server URL\n\
        --pairing-code CODE           Temporary one-time pairing code\n\
@@ -304,17 +312,22 @@ pub(crate) fn agent_status_usage() -> &'static str {
 pub(crate) fn login_usage() -> &'static str {
     "Usage: webcodex login <SERVER-URL> --code <PAIRING-CODE> [OPTIONS]\n\n\
      Log this device into a WebCodex server. Ask whoever runs the server for a\n\
-     pairing code (`webcodex pairing create`), then run this.\n\n\
+     pairing code (`webcodex pairing create`), then run this. This is the\n\
+     primary way to connect a machine.\n\n\
      Options:\n\
      \x20\x20--code CODE          Pairing code from the server (required)\n\
-     \x20\x20--device NAME        Name for this device [default: hostname]\n\
+     \x20\x20--device NAME        Name for this device [default: hostname + local suffix]\n\
      \x20\x20--allowed-root PATH  Repeatable project root the agent may touch\n\
      \x20\x20--transport NAME     websocket|polling|quic|auto [default: websocket]\n\
-     \x20\x20--dir PATH           Where connections are stored [default: ~/.config/webcodex]\n\
+     \x20\x20--dir PATH           Where connections are stored [default: root /etc/webcodex;\n\
+     \x20\x20                       non-root ~/.config/webcodex]\n\
      \x20\x20--overwrite          Replace an existing login for this server and user\n\
-     \x20\x20--json               Print machine-readable output\n\
+     \x20\x20--json               Print machine-readable output (no credentials)\n\
+     \x20\x20--print-mcp-config   Print a Bearer MCP connection block (includes a\n\
+     \x20\x20                       credential); mutually exclusive with --json\n\
      \x20\x20-h, --help           Print help and exit\n\n\
-     Credentials are written to <dir>/<server>/<user>/ with 0600 permissions.\n\
+     Credentials are written to <dir>/<server>/<user>/ with restrictive\n\
+     permissions (0600 on Unix).\n\
      The same user can be logged in on several servers, and several users can\n\
      be logged in on one server; each is a separate directory.\n"
 }

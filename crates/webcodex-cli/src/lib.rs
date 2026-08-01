@@ -330,11 +330,13 @@ fn parse_login(args: &[String]) -> CliAction {
     let mut server_url: Option<String> = None;
     let mut code: Option<String> = None;
     let mut device: Option<String> = None;
+    let mut device_explicit = false;
     let mut base_dir: Option<PathBuf> = None;
     let mut transport = TRANSPORT_WEBSOCKET.to_string();
     let mut allowed_roots: Vec<PathBuf> = Vec::new();
     let mut overwrite = false;
     let mut json = false;
+    let mut print_mcp_config = false;
     let mut index = 0;
     while index < args.len() {
         let arg = args[index].clone();
@@ -348,7 +350,10 @@ fn parse_login(args: &[String]) -> CliAction {
                 None => return cli_parse_error(format!("{arg} requires a value")),
             },
             "--device" | "--device-name" => match take(&mut index) {
-                Some(value) => device = Some(value),
+                Some(value) => {
+                    device = Some(value);
+                    device_explicit = true;
+                }
                 None => return cli_parse_error(format!("{arg} requires a value")),
             },
             "--dir" => match take(&mut index) {
@@ -365,6 +370,7 @@ fn parse_login(args: &[String]) -> CliAction {
             },
             "--overwrite" => overwrite = true,
             "--json" => json = true,
+            "--print-mcp-config" => print_mcp_config = true,
             other if other.starts_with('-') => {
                 return cli_parse_error(format!("unknown flag {other}"))
             }
@@ -376,6 +382,12 @@ fn parse_login(args: &[String]) -> CliAction {
             }
         }
         index += 1;
+    }
+    if json && print_mcp_config {
+        return cli_parse_error(
+            "--json and --print-mcp-config are mutually exclusive; --print-mcp-config emits a credential"
+                .to_string(),
+        );
     }
     let Some(server_url) = server_url else {
         return cli_parse_error(
@@ -390,11 +402,13 @@ fn parse_login(args: &[String]) -> CliAction {
         server_url,
         code,
         device: device.unwrap_or_else(default_device_name),
+        device_explicit,
         base_dir: base_dir_or_default(base_dir),
         transport,
         allowed_roots,
         overwrite,
         json,
+        print_mcp_config,
     })
 }
 

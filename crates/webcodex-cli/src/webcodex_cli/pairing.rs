@@ -6,7 +6,8 @@ use crate::{
 };
 
 use super::{
-    post_json_authed, post_json_unauthed, read_pairing_server_env_file_value, token_prefix, ApiCall,
+    post_json_authed, post_json_unauthed, read_pairing_server_env_file_value, shell_command,
+    token_prefix, ApiCall,
 };
 
 pub(crate) fn resolve_pairing_create_token(opts: &PairingCreateOptions) -> Result<String, String> {
@@ -52,6 +53,72 @@ pub(crate) fn resolve_pairing_create_token(opts: &PairingCreateOptions) -> Resul
     Ok(token)
 }
 
+fn pairing_login_argv(opts: &PairingCreateOptions, value: &Value) -> Vec<String> {
+    let mut argv = vec![
+        "webcodex".to_string(),
+        "login".to_string(),
+        opts.server_url.clone(),
+        "--code".to_string(),
+        value["pairing_code"].as_str().unwrap_or("").to_string(),
+    ];
+    if let Some(client_id) = value
+        .get("client_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|client_id| !client_id.is_empty())
+    {
+        argv.push("--device".to_string());
+        argv.push(client_id.to_string());
+    }
+    argv
+}
+
+fn render_pairing_create_result(
+    opts: &PairingCreateOptions,
+    value: &Value,
+) -> Result<String, String> {
+    let login_argv = pairing_login_argv(opts, value);
+    if opts.json {
+        let summary = json!({
+            "pairing_code": value["pairing_code"],
+            "expires_at": value["expires_at"],
+            "username": value["username"],
+            "client_id": value["client_id"],
+            "login_argv": &login_argv,
+        });
+        serde_json::to_string_pretty(&summary).map_err(|e| e.to_string())
+    } else {
+        let client_id = value["client_id"]
+            .as_str()
+            .filter(|client_id| !client_id.is_empty())
+            .unwrap_or("(unbound; claimed by the login device)");
+        let mut out = String::new();
+        out.push_str("Pairing code created.\n\n");
+        out.push_str(&format!(
+            "  username:     {}\n",
+            value["username"].as_str().unwrap_or("unknown")
+        ));
+        out.push_str(&format!("  client_id:    {client_id}\n"));
+        out.push_str(&format!(
+            "  expires_at:   {}\n",
+            value["expires_at"]
+                .as_i64()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ));
+        out.push_str(&format!(
+            "  pairing code: {}\n",
+            value["pairing_code"].as_str().unwrap_or("")
+        ));
+        out.push_str(&format!(
+            "\nOn the client, run: {}\n",
+            shell_command(&login_argv)
+        ));
+        out.push_str("No wc_pat_* or wc_agent_* token files were created on the server.\n");
+        Ok(out)
+    }
+}
+
 pub(crate) async fn run_pairing_create(opts: PairingCreateOptions) -> Result<String, String> {
     let token = resolve_pairing_create_token(&opts)?;
     let mut body = json!({
@@ -76,40 +143,7 @@ pub(crate) async fn run_pairing_create(opts: PairingCreateOptions) -> Result<Str
     })
     .await
     .map_err(|e| e.replace(&token, "[redacted]"))?;
-    if opts.json {
-        let summary = json!({
-            "pairing_code": value["pairing_code"],
-            "expires_at": value["expires_at"],
-            "username": value["username"],
-            "client_id": value["client_id"],
-        });
-        serde_json::to_string_pretty(&summary).map_err(|e| e.to_string())
-    } else {
-        let mut out = String::new();
-        out.push_str("Pairing code created.\n\n");
-        out.push_str(&format!(
-            "  username:     {}\n",
-            value["username"].as_str().unwrap_or("unknown")
-        ));
-        out.push_str(&format!(
-            "  client_id:    {}\n",
-            value["client_id"].as_str().unwrap_or("unknown")
-        ));
-        out.push_str(&format!(
-            "  expires_at:   {}\n",
-            value["expires_at"]
-                .as_i64()
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "unknown".to_string())
-        ));
-        out.push_str(&format!(
-            "  pairing code: {}\n",
-            value["pairing_code"].as_str().unwrap_or("")
-        ));
-        out.push_str("\nCopy the pairing code to the client and run `webcodex client enroll`.\n");
-        out.push_str("No wc_pat_* or wc_agent_* token files were created on the server.\n");
-        Ok(out)
-    }
+    render_pairing_create_result(&opts, &value)
 }
 
 pub(crate) fn ensure_enroll_outputs_available(opts: &ClientEnrollOptions) -> Result<(), String> {
@@ -244,14 +278,103 @@ pub(crate) async fn run_client_enroll(opts: ClientEnrollOptions) -> Result<Strin
             opts.agent_config.display()
         ));
         out.push_str("\nNext steps:\n");
-        out.push_str(&format!(
-            "  - Start the agent: `webcodex-runner --config {}`\n",
-            opts.agent_config.display()
-        ));
+        let foreground_command = shell_command(&[
+            "webcodex-runner".to_string(),
+            "--config".to_string(),
+            opts.agent_config.to_string_lossy().into_owned(),
+        ]);
+        out.push_str(&format!("  - Start the agent: `{foreground_command}`\n"));
         out.push_str(&format!(
             "  - GPT Actions should use the user-token file: {}\n",
             user_token_path.display()
         ));
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts(client_id: &str, json: bool) -> PairingCreateOptions {
+        PairingCreateOptions {
+            server_url: "https://example.test".to_string(),
+            username: "alice".to_string(),
+            client_id: client_id.to_string(),
+            ttl_secs: 600,
+            json,
+            ..PairingCreateOptions::default()
+        }
+    }
+
+    fn response(client_id: &str) -> Value {
+        serde_json::json!({
+            "pairing_code": "wc_pair_example",
+            "expires_at": 1234,
+            "username": "alice",
+            "client_id": client_id,
+        })
+    }
+
+    #[test]
+    fn unbound_pairing_output_uses_login_without_device() {
+        let output = render_pairing_create_result(&opts("", false), &response("")).unwrap();
+        assert!(
+            output.contains(
+                "On the client, run: webcodex login https://example.test --code wc_pair_example"
+            ),
+            "{output}"
+        );
+        assert!(!output.contains("--device"), "{output}");
+    }
+
+    #[test]
+    fn bound_pairing_output_uses_the_same_device() {
+        let output =
+            render_pairing_create_result(&opts("alice-laptop", false), &response("alice-laptop"))
+                .unwrap();
+        assert!(
+            output.contains(
+                "On the client, run: webcodex login https://example.test --code wc_pair_example --device alice-laptop"
+            ),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn pairing_login_command_quotes_dynamic_arguments() {
+        let mut opts = opts("alice-laptop", false);
+        opts.server_url = "https://example.test/path with space;$value".to_string();
+        let value = serde_json::json!({
+            "pairing_code": "wc_pair_a'b`c;d",
+            "expires_at": 1234,
+            "username": "alice",
+            "client_id": "alice-laptop",
+        });
+        let argv = pairing_login_argv(&opts, &value);
+        let output = render_pairing_create_result(&opts, &value).unwrap();
+        assert!(output.contains(&shell_command(&argv)), "{output}");
+        assert!(output.contains("'https://example.test/path with space;$value'"));
+        assert!(output.contains("'wc_pair_a'\\''b`c;d'"));
+    }
+
+    #[test]
+    fn pairing_json_exposes_structured_login_argv() {
+        let output =
+            render_pairing_create_result(&opts("alice-laptop", true), &response("alice-laptop"))
+                .unwrap();
+        let value: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(
+            value["login_argv"],
+            serde_json::json!([
+                "webcodex",
+                "login",
+                "https://example.test",
+                "--code",
+                "wc_pair_example",
+                "--device",
+                "alice-laptop"
+            ])
+        );
     }
 }
