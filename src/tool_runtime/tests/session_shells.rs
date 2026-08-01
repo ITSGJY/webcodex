@@ -726,9 +726,11 @@ async fn capability_modes_and_ssh_resource_fail_closed_without_enqueue() {
             .await
     };
     assert!(!ssh.success);
-    // An SSH persistent shell requires ssh_shell + persistent_shell +
-    // ssh_persistent_shell. The default test agent advertises only
-    // persistent_shell, so the request fails closed without enqueuing.
+    // An SSH persistent shell routes through the SSH connection pool and the
+    // persistent-shell manager, so it requires ssh_shell + ssh_persistent_shell
+    // (persistent_shell is enforced through the PersistentShell tool
+    // capability). The default test agent advertises only persistent_shell, so
+    // the request fails closed without enqueuing.
     assert!(ssh
         .error
         .as_deref()

@@ -2,14 +2,26 @@ use super::tool_definition::{runtime_tool_agent_capability, AgentCapability};
 use super::{ProjectResolverError, ToolCall, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
 use crate::shell_protocol::{
-    SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL, SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL,
-    SHELL_CLIENT_CAPABILITY_SSH_SHELL,
+    SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL, SHELL_CLIENT_CAPABILITY_SSH_SHELL,
 };
 
 /// The capability an agent-backed tool variant requires from the agent
 /// client. Non-agent tools (and tools without a project) require nothing.
 pub(crate) fn required_agent_capability(call: &ToolCall) -> Option<AgentCapability> {
     runtime_tool_agent_capability(call.tool_name())
+}
+
+/// True when a tool call routes through the persistent-shell manager. These
+/// are the SSH-capable Session shell operations; one-shot `run_shell` /
+/// `run_job` over an SSH resource use the Runner SSH connection pool instead.
+fn is_ssh_persistent_shell_call(call: &ToolCall) -> bool {
+    matches!(
+        call,
+        ToolCall::OpenSessionShell { .. }
+            | ToolCall::SessionShellExec { .. }
+            | ToolCall::SessionShellStatus { .. }
+            | ToolCall::CloseSessionShell { .. }
+    )
 }
 
 impl ToolRuntime {
@@ -103,27 +115,30 @@ impl ToolRuntime {
             }
         }
         if ssh_resource.is_some() {
-            // An SSH persistent shell requires all three capabilities. A legacy
-            // runner that predates ssh_persistent_shell must fail closed here
-            // (before enqueue) rather than silently opening a local shell.
-            let is_session_shell_open = matches!(call, ToolCall::OpenSessionShell { .. });
-            for capability in [
-                SHELL_CLIENT_CAPABILITY_SSH_SHELL,
-                SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL,
-            ] {
-                if !self
-                    .shell_clients
-                    .client_supports_for_auth(&client_id, capability, auth)
-                    .await
-                    .map_err(ToolResult::err)?
-                {
-                    return Err(ToolResult::err(format!(
-                        "agent_capability_unavailable: agent client {} does not support {}",
-                        client_id, capability
-                    )));
-                }
+            // Every SSH-resource request routes to a Runner-local SSH
+            // connection pool (`run_ssh_shell` / `start_ssh_shell_job`).
+            // `ssh_shell` was introduced together with SSH resource routing in
+            // the same change, so it is both necessary and sufficient to
+            // guarantee a legacy Runner understands SSH resources instead of
+            // silently executing the command on the Runner host.
+            if !self
+                .shell_clients
+                .client_supports_for_auth(&client_id, SHELL_CLIENT_CAPABILITY_SSH_SHELL, auth)
+                .await
+                .map_err(ToolResult::err)?
+            {
+                return Err(ToolResult::err(format!(
+                    "agent_capability_unavailable: agent client {} does not support {}",
+                    client_id, SHELL_CLIENT_CAPABILITY_SSH_SHELL
+                )));
             }
-            if is_session_shell_open
+            // Persistent-shell operations additionally route through the
+            // process-local persistent shell manager. `persistent_shell` is
+            // already enforced for these tools through the required
+            // `AgentCapability::PersistentShell`; the SSH-specific variant is
+            // the extra gate that fails closed for a Runner predating
+            // `ssh_persistent_shell` instead of opening a local shell.
+            if is_ssh_persistent_shell_call(call)
                 && !self
                     .shell_clients
                     .client_supports_for_auth(
