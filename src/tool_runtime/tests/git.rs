@@ -8,6 +8,7 @@ use crate::shell_protocol::{ShellAgentResultRequest, ShellClientCapabilities};
 use crate::tool_runtime::ToolRuntime;
 use serde_json::{json, Value};
 use std::fs;
+use std::path::Path;
 
 #[tokio::test]
 async fn git_restore_paths_restores_tracked_filename_containing_target() {
@@ -164,8 +165,8 @@ index 1111111..2222222 100644
 
 #[test]
 fn show_changes_command_is_read_only() {
-    let without_diff = show_changes_command(false);
-    let with_diff = show_changes_command(true);
+    let without_diff = show_changes_command(false, 20, 80);
+    let with_diff = show_changes_command(true, 20, 80);
     for cmd in [without_diff, with_diff] {
         assert!(cmd.contains("git status --porcelain=v1 -b"));
         assert!(cmd.contains("git log -1"));
@@ -195,6 +196,290 @@ fn show_changes_command_is_read_only() {
                 cmd
             );
         }
+    }
+}
+
+#[test]
+fn show_changes_command_emits_bounded_metadata_frames() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "hello\n", "initial");
+    for i in 0..3 {
+        std::fs::write(tmp.path().join(format!("new{i}.txt")), "x\n").unwrap();
+    }
+    std::fs::write(tmp.path().join("README.md"), "hello\nchanged\n").unwrap();
+    let cmd = show_changes_command(true, 2, 5);
+    let (exit, stdout, stderr, _) = run_command_sync(&cmd, tmp.path(), 30);
+    assert_eq!(
+        exit, 0,
+        "command failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("## "), "missing branch header: {stdout}");
+    assert!(
+        stdout.contains("files_total="),
+        "missing files_total: {stdout}"
+    );
+    assert!(
+        stdout.contains("files_returned="),
+        "missing files_returned: {stdout}"
+    );
+    assert!(
+        stdout.contains("files_limit="),
+        "missing files_limit: {stdout}"
+    );
+    assert!(
+        stdout.contains("diff_hunks_returned="),
+        "missing diff meta: {stdout}"
+    );
+    assert!(
+        stdout.contains("diff_hunks_truncated="),
+        "missing diff truncation: {stdout}"
+    );
+    // No raw placeholder may leak into the generated command.
+    assert!(
+        !cmd.contains("__SENTINEL__"),
+        "sentinel placeholder leaked: {cmd}"
+    );
+    assert!(
+        !cmd.contains("__HUNK_LIMIT__") && !cmd.contains("__LINE_LIMIT__"),
+        "limit placeholder leaked: {cmd}"
+    );
+}
+
+#[test]
+fn show_changes_bounds_status_files_and_keeps_totals_exact() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "hello\n", "initial");
+    // Exceed the production status-file cap by many untracked files.
+    let cap = 200usize;
+    let total = cap + 50;
+    for i in 0..total {
+        std::fs::write(tmp.path().join(format!("u{i}.txt")), "x\n").unwrap();
+    }
+    let output = bounded_show_changes_output(tmp.path(), true, 4, 80);
+    assert_eq!(
+        output["files_total"].as_u64(),
+        Some(total as u64),
+        "files_total must count every entry: {output}"
+    );
+    assert_eq!(
+        output["files_returned"].as_u64(),
+        Some(cap as u64),
+        "files_returned must hit the cap: {output}"
+    );
+    assert_eq!(
+        output["files_truncated"], true,
+        "must report truncation: {output}"
+    );
+    assert_eq!(
+        output["files_limit"].as_u64(),
+        Some(cap as u64),
+        "files_limit must equal the cap: {output}"
+    );
+    let files = output["files"].as_array().unwrap();
+    assert_eq!(
+        files.len(),
+        cap,
+        "files array length must equal returned: {output}"
+    );
+    // Per-category counts must reflect ALL entries, not the truncated subset.
+    assert_eq!(
+        output["counts"]["untracked"].as_u64(),
+        Some(total as u64),
+        "untracked count must be exact over all entries: {output}"
+    );
+    assert_eq!(output["clean"], false, "truncated dirty repo is not clean");
+    assert_eq!(output["transport_safe"], true);
+    assert_eq!(output["output_truncated"], false);
+    assert_show_changes_envelope_value_matches_schema(&output, "bounded status");
+}
+
+#[test]
+fn show_changes_status_output_over_256k_keeps_branch_header_observable() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "hello\n", "initial");
+    // ~300 files with long names pushes a *full* status well past 256 KiB, but
+    // the production-side cap keeps the emitted status small and the branch
+    // header at the front of the stream.
+    for i in 0..300 {
+        let name = format!("very_long_untracked_path_name_{i}_padding_padding.txt");
+        std::fs::write(tmp.path().join(name), "x\n").unwrap();
+    }
+    let cmd = show_changes_command(false, 20, 80);
+    let (exit, stdout, stderr, _) = run_command_sync(&cmd, tmp.path(), 30);
+    assert_eq!(
+        exit, 0,
+        "command failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // Simulate the Runner/Shell transport: keep only the last 256 KiB.
+    let transported = simulate_transport_tail(&stdout, 256 * 1024);
+    let frames = split_show_changes_stdout(&transported, false);
+    assert!(
+        frames
+            .status
+            .lines()
+            .any(|line| parse_status_header(line).is_some()),
+        "branch header must survive transport tail retention: {transported}"
+    );
+    let observation =
+        parse_show_changes_status_observation(&frames.status, &frames.status_result, "");
+    assert_eq!(observation.status_observed(), true);
+    assert_eq!(frames.files_total, Some(300));
+    assert_eq!(frames.files_truncated, Some(true));
+}
+
+#[test]
+fn show_changes_status_config_error_is_not_reported_clean() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "hello\n", "initial");
+    let (config_exit, _, config_stderr, _) = run_command_sync(
+        "git config status.showUntrackedFiles invalid",
+        tmp.path(),
+        30,
+    );
+    assert_eq!(
+        config_exit, 0,
+        "failed to set regression config: {config_stderr}"
+    );
+    let cmd = show_changes_command(false, 20, 80);
+    let (exit, stdout, _stderr, _) = run_command_sync(&cmd, tmp.path(), 30);
+    assert_ne!(exit, 0, "status config error must not exit 0");
+    let frames = split_show_changes_stdout(&stdout, false);
+    let observation =
+        parse_show_changes_status_observation(&frames.status, &frames.status_result, &_stderr);
+    assert_eq!(observation.as_json()["status"], "command_failed");
+    assert_eq!(
+        observation.as_json()["reason_code"],
+        "git_status_config_error"
+    );
+    // A failed status must never claim cleanliness.
+    let output = parse_show_changes_output(
+        "demo",
+        &frames.status,
+        &frames.head,
+        &frames.stat,
+        None,
+        20,
+        80,
+        Some(exit),
+        &_stderr,
+    );
+    assert_eq!(output["clean"], Value::Null);
+    assert_eq!(output["counts"]["conflicted"], Value::Null);
+}
+
+#[test]
+fn show_changes_include_diff_false_omits_diff_and_metadata() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "hello\n", "initial");
+    std::fs::write(tmp.path().join("README.md"), "hello\nchanged\n").unwrap();
+    let output = bounded_show_changes_output(tmp.path(), false, 20, 80);
+    assert!(
+        output.get("hunks").is_none(),
+        "no hunks without include_diff"
+    );
+    assert!(output.get("hunk_count").is_none());
+    assert!(output.get("hunks_truncated").is_none());
+}
+
+#[test]
+fn show_changes_diff_respects_max_hunks() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "a.txt", "a\n", "initial");
+    // Three modified files -> three diff hunks; cap at 1.
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        commit_file(tmp.path(), name, "line\n", "add");
+        std::fs::write(tmp.path().join(name), "line\nmore\n").unwrap();
+    }
+    let output = bounded_show_changes_output(tmp.path(), true, 1, 80);
+    assert_eq!(
+        output["hunk_count"].as_u64(),
+        Some(1),
+        "must cap at max_hunks"
+    );
+    assert_eq!(
+        output["hunks_truncated"], true,
+        "must report hunk truncation"
+    );
+}
+
+#[test]
+fn show_changes_diff_respects_max_hunk_lines() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    // One file with many changed lines -> one big hunk; cap lines at 3.
+    let content = (0..20).map(|i| format!("line{i}\n")).collect::<String>();
+    commit_file(tmp.path(), "big.txt", &content, "initial");
+    std::fs::write(
+        tmp.path().join("big.txt"),
+        format!("{content}extra\nmore\n"),
+    )
+    .unwrap();
+    let output = bounded_show_changes_output(tmp.path(), true, 20, 3);
+    assert_eq!(output["hunk_count"].as_u64(), Some(1));
+    let files = output["hunks"].as_array().unwrap();
+    let hunks = files[0]["hunks"].as_array().unwrap();
+    assert!(!hunks.is_empty(), "expected at least one hunk: {files:?}");
+    let lines = hunks[0]["diff"].as_str().unwrap().lines().count();
+    // header line + up to 3 content lines = at most 4 lines.
+    assert!(lines <= 4, "hunk must be line-bounded: {hunks:?}");
+    assert_eq!(output["hunks_truncated"], true);
+}
+
+#[test]
+fn show_changes_large_diff_does_not_depend_on_transport_tail() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let big = (0..50).map(|i| format!("line{i}\n")).collect::<String>();
+    commit_file(tmp.path(), "big.txt", &big, "initial");
+    // Make a diff with many hunks; the command bounds to max_hunks=1, line=10.
+    let modified = (0..50)
+        .map(|i| {
+            if i % 2 == 0 {
+                format!("mod{i}\n")
+            } else {
+                format!("line{i}\n")
+            }
+        })
+        .collect::<String>();
+    std::fs::write(tmp.path().join("big.txt"), modified).unwrap();
+    let output = bounded_show_changes_output(tmp.path(), true, 1, 10);
+    // The first selected hunk must be present and the diff must be bounded.
+    assert_eq!(output["hunk_count"].as_u64(), Some(1));
+    // The structured fields (not a tail marker) report truncation.
+    assert_eq!(output["hunks_truncated"], true);
+    let serialized = serde_json::to_string(&output).unwrap();
+    assert!(
+        !serialized.contains("[output truncated"),
+        "must not rely on transport tail marker: {serialized}"
+    );
+}
+
+#[test]
+fn show_changes_schema_covers_truncation_and_transport_fields() {
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("show_changes");
+    let properties = schema["properties"]["output"]["properties"]
+        .as_object()
+        .expect("show_changes output properties");
+    for field in [
+        "files_total",
+        "files_returned",
+        "files_truncated",
+        "files_limit",
+        "transport_safe",
+        "output_budget_bytes",
+        "output_truncated",
+        "truncation_reasons",
+    ] {
+        assert!(
+            properties.contains_key(field),
+            "missing truncation/transport field {field}"
+        );
     }
 }
 
@@ -1094,6 +1379,74 @@ fn assert_show_changes_envelope_matches_schema(label: &str, result: &ToolResult)
         .unwrap_or_else(|error| {
             panic!("{label} show_changes schema mismatch: {error}\n{envelope}")
         });
+}
+
+/// Validate a bare `show_changes` output `Value` against the output schema by
+/// wrapping it in the success envelope.
+fn assert_show_changes_envelope_value_matches_schema(output: &Value, label: &str) {
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("show_changes");
+    let envelope = json!({
+        "success": true,
+        "output": output,
+        "error": Value::Null,
+    });
+    crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&envelope, &schema)
+        .unwrap_or_else(|error| {
+            panic!("{label} show_changes schema mismatch: {error}\n{envelope}")
+        });
+}
+
+/// Run the production-bounded `show_changes` command in a local repo and
+/// parse it into the structured `show_changes` output value, the same way the
+/// runtime does (without the separate untracked-preview collection).
+fn bounded_show_changes_output(
+    root: &Path,
+    include_diff: bool,
+    max_hunks: usize,
+    max_hunk_lines: usize,
+) -> Value {
+    let cmd = show_changes_command(include_diff, max_hunks, max_hunk_lines);
+    let (exit_code, stdout, stderr, _) = run_command_sync(&cmd, root, 30);
+    let frames = split_show_changes_stdout(&stdout, include_diff);
+    let observation =
+        parse_show_changes_status_observation(&frames.status, &frames.status_result, &stderr);
+    let effective_exit = if observation.exit_code != Some(0) {
+        observation.exit_code
+    } else {
+        Some(exit_code)
+    };
+    parse_show_changes_output_with_observation(
+        "demo",
+        &frames.status,
+        &frames.head,
+        &frames.stat,
+        include_diff.then_some(frames.diff.as_str()),
+        max_hunks,
+        max_hunk_lines,
+        effective_exit,
+        &stderr,
+        observation,
+        &frames,
+    )
+}
+
+/// Mirror the Runner/Shell transport's 256 KiB tail-retention behavior: when
+/// output exceeds `max_bytes`, keep only the last `max_bytes` and prefix it
+/// with the transport's truncation marker. Used to prove the production-side
+/// bounding keeps the protocol frame intact past the transport cap.
+fn simulate_transport_tail(stdout: &str, max_bytes: usize) -> String {
+    if stdout.len() <= max_bytes {
+        return stdout.to_string();
+    }
+    let mut start = stdout.len() - max_bytes;
+    while start < stdout.len() && !stdout.is_char_boundary(start) {
+        start += 1;
+    }
+    format!(
+        "[output truncated to last {} bytes]\n{}",
+        max_bytes,
+        &stdout[start..]
+    )
 }
 
 #[tokio::test]

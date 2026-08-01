@@ -64,33 +64,26 @@ pub(in crate::tool_runtime::tests) fn show_changes_output_from_command(
     root: &Path,
     include_diff: bool,
 ) -> Value {
-    let command = show_changes_command(include_diff);
+    let command = show_changes_command(include_diff, 20, 80);
     let (exit_code, stdout, stderr, _) = run_command_sync(&command, root, 30);
     assert_eq!(
         exit_code, 0,
         "show_changes command failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let (
-        status_stdout,
-        _status_result_stdout,
-        head_stdout,
-        diff_stat,
-        diff_stdout,
-        _untracked_preview_stdout,
-    ) = split_show_changes_stdout(&stdout, include_diff);
+    let frames = split_show_changes_stdout(&stdout, include_diff);
     let mut output = parse_show_changes_output(
         "demo",
-        &status_stdout,
-        &head_stdout,
-        &diff_stat,
-        include_diff.then_some(diff_stdout.as_str()),
+        &frames.status,
+        &frames.head,
+        &frames.stat,
+        include_diff.then_some(frames.diff.as_str()),
         20,
         80,
         Some(exit_code),
         &stderr,
     );
     if include_diff {
-        let untracked_paths = parse_porcelain_summary(&status_stdout).untracked_files;
+        let untracked_paths = parse_porcelain_summary(&frames.status).untracked_files;
         let (previews, truncated) =
             collect_show_changes_untracked_previews_for_root(root, &untracked_paths);
         output["untracked_previews"] = json!(previews);

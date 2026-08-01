@@ -27,6 +27,17 @@ const SHOW_CHANGES_DEFAULT_MAX_HUNK_LINES: usize = 80;
 const SHOW_CHANGES_MAX_HUNK_LINES: usize = 240;
 const SHOW_CHANGES_DEFAULT_SESSION_EVENT_LIMIT: usize = 30;
 const SHOW_CHANGES_MAX_SESSION_EVENT_LIMIT: usize = 200;
+/// Maximum number of changed-file records `show_changes` emits on the
+/// production side. The total count stays exact (all entries are counted); only
+/// the returned records are bounded so a multi-thousand-file status never
+/// overflows the transport tail-retention window.
+const SHOW_CHANGES_MAX_STATUS_FILES: usize = 200;
+/// Production-side stdout budget for the whole `show_changes` command. The
+/// command is constructed so its worst-case raw stdout stays well under the
+/// Runner/Shell transport default of 256 KiB with room for protocol framing and
+/// error text. Bounding happens in the command itself, never by relying on the
+/// transport tail.
+const SHOW_CHANGES_OUTPUT_BUDGET_BYTES: usize = 192 * 1024;
 const DEFAULT_GIT_LOG_LIMIT: usize = 20;
 const MAX_GIT_LOG_LIMIT: usize = 100;
 const MAX_GIT_LOG_SKIP: usize = 10_000;
@@ -139,7 +150,7 @@ impl ShowChangesStatusObservationKind {
 pub(crate) struct ShowChangesStatusObservation {
     kind: ShowChangesStatusObservationKind,
     reason_code: Option<&'static str>,
-    exit_code: Option<i32>,
+    pub(crate) exit_code: Option<i32>,
     repository_probe: &'static str,
     repository_probe_exit_code: Option<i32>,
     git_available: bool,
@@ -157,7 +168,7 @@ impl ShowChangesStatusObservation {
         }
     }
 
-    fn status_observed(&self) -> bool {
+    pub(crate) fn status_observed(&self) -> bool {
         self.kind == ShowChangesStatusObservationKind::Observed
     }
 
@@ -323,6 +334,14 @@ fn non_git_show_changes_payload_with_observation(
             "unstaged": 0,
         },
         "files": [],
+        "files_total": null,
+        "files_returned": 0,
+        "files_truncated": false,
+        "files_limit": SHOW_CHANGES_MAX_STATUS_FILES,
+        "transport_safe": true,
+        "output_budget_bytes": SHOW_CHANGES_OUTPUT_BUDGET_BYTES,
+        "output_truncated": false,
+        "truncation_reasons": [],
         "diff_stat": "",
         "warnings": [],
         "suggested_next_actions": [
@@ -340,54 +359,176 @@ fn non_git_show_changes_payload_with_observation(
     payload
 }
 
-/// Build the read-only `show_changes` command. It combines the minimal git
-/// inspections needed for a model-facing worktree summary. The optional full
-/// diff is only emitted when the caller asks for bounded hunks.
-pub(crate) fn show_changes_command(include_diff: bool) -> String {
+/// Build the read-only, production-bounded `show_changes` command.
+///
+/// Unlike an unbounded `git status` capture, the status is *streamed* line by
+/// line through a POSIX `while read` loop that:
+///   * passes the branch header (`## ...`) through verbatim,
+///   * emits at most `status_files_limit` changed-file records,
+///   * counts every entry and classifies every entry by porcelain XY code so
+///     `files_total` and all per-category counts stay exact even when the
+///     returned records are truncated,
+///   * captures the real `git status` exit code via an emitted marker line,
+///   * runs the explicit repository probe only when status failed.
+///
+/// The result frame (between the first two sentinels) carries `status_exit`,
+/// `repository_probe`, `repository_probe_exit`, the
+/// `files_total/files_returned/files_truncated/files_limit` metadata, and the
+/// exact per-category counts
+/// (`modified/added/deleted/renamed/copied/untracked/conflicted/staged/unstaged`).
+///
+/// When `include_diff` is set, the `git diff` is likewise bounded in the command
+/// by `max_hunks` hunks and `max_hunk_lines` lines per hunk before it ever
+/// reaches the transport, so transport tail-retention cannot drop the first
+/// selected hunks. A trailing diff metadata frame reports
+/// `diff_hunks_returned`/`diff_hunks_truncated`.
+///
+/// The shell script is held in a raw string with literal placeholders and
+/// interpolated with `str::replace`, so nested `${...}` expansions stay
+/// literal and never collide with Rust `format!` brace escaping.
+///
+/// No Python/Node helper or external temp script is used; only POSIX `sh`,
+/// `git`, `printf`, and `grep`. No project worktree is mutated.
+pub(crate) fn show_changes_command(
+    include_diff: bool,
+    max_hunks: usize,
+    max_hunk_lines: usize,
+) -> String {
+    let status_files_limit = SHOW_CHANGES_MAX_STATUS_FILES;
     let diff_part = if include_diff {
-        format!(
-            "; printf '\\n{sentinel}\\n'; \
-             git diff --unified=80",
-            sentinel = SHOW_CHANGES_SENTINEL,
-        )
+        r#"; printf '\n__SENTINEL__\n'; { git diff --unified=80; printf 'diff_exit=%s\n' "$?"; } | {
+               hc=0; ht=0; in_hunk=0; lc=0; diff_exit_raw=;
+               while IFS= read -r dl; do
+                 case "$dl" in
+                   diff_exit=*) diff_exit_raw=${dl#diff_exit=} ;;
+                   '@@ '*)
+                     if [ "$hc" -ge __HUNK_LIMIT__ ]; then ht=1; in_hunk=0; continue; fi;
+                     hc=$((hc+1)); lc=1; in_hunk=1; printf '%s\n' "$dl" ;;
+                   *)
+                     if [ "$in_hunk" = 1 ]; then
+                       if [ "$lc" -ge __LINE_LIMIT__ ]; then ht=1;
+                       else printf '%s\n' "$dl"; lc=$((lc+1)); fi;
+                     else printf '%s\n' "$dl"; fi ;;
+                 esac;
+               done;
+               printf '\n__SENTINEL__\n';
+               printf 'diff_hunks_returned=%s\ndiff_hunks_truncated=%s\n' "$hc" "$ht";
+             }"#
+        .replace("__SENTINEL__", SHOW_CHANGES_SENTINEL)
+        .replace("__HUNK_LIMIT__", &max_hunks.to_string())
+        .replace("__LINE_LIMIT__", &max_hunk_lines.to_string())
     } else {
         String::new()
     };
-    format!(
-        "status_stdout=$(git status --porcelain=v1 -b); \
-         status_exit=$?; \
-         if [ \"$status_exit\" -eq 0 ]; then \
-           repository_probe=inside_worktree; repository_probe_exit=0; \
-         else \
-           repository_probe_stdout=$(LC_ALL=C git rev-parse --is-inside-work-tree 2>&1); \
-           repository_probe_exit=$?; \
-           if [ \"$repository_probe_exit\" -eq 0 ] && [ \"$repository_probe_stdout\" = true ]; then \
-             repository_probe=inside_worktree; \
-           elif printf '%s\\n' \"$repository_probe_stdout\" | grep -Fq 'not a git repository'; then \
-             repository_probe=outside_worktree; \
-           else \
-             repository_probe=unavailable; \
-           fi; \
-         fi; \
-         printf '%s' \"$status_stdout\"; \
-         printf '\\n{sentinel}\\n'; \
-         printf 'status_exit=%s\\nrepository_probe=%s\\nrepository_probe_exit=%s\\n' \
-           \"$status_exit\" \"$repository_probe\" \"$repository_probe_exit\"; \
-         printf '\\n{sentinel}\\n'; \
-         {{ git log -1 --format='%H%x00%h%x00%s' || true; }}; \
-         printf '\\n{sentinel}\\n'; \
-         git diff --stat{diff_part}; \
-         final_exit=$?; \
-         if [ \"$status_exit\" -ne 0 ]; then exit \"$status_exit\"; else exit \"$final_exit\"; fi",
-        sentinel = SHOW_CHANGES_SENTINEL,
-        diff_part = diff_part,
-    )
+
+    let script = r#"{ git status --porcelain=v1 -b; printf 'status_exit=%s\n' "$?"; } | {
+           n=0; total=0; trunc=0; exit_raw=;
+           c_mod=0; c_add=0; c_del=0; c_ren=0; c_cop=0; c_unt=0; c_conf=0; c_stg=0; c_uns=0;
+           while IFS= read -r line; do
+             case "$line" in
+               status_exit=*) exit_raw=${line#status_exit=} ;;
+               '## '*) printf '%s\n' "$line" ;;
+               *)
+                 total=$((total+1));
+                 xc=${line%"${line#?}"};
+                 yc=${line#?};
+                 yc=${yc%"${yc#?}"};
+                 case "$xc$yc" in
+                   '??') c_unt=$((c_unt+1)); label=untracked ;;
+                   UU|AA|DD|AU|UA|DU|UD) c_conf=$((c_conf+1)); label=conflicted ;;
+                   *R*) c_ren=$((c_ren+1)); label=renamed ;;
+                   *C*) c_cop=$((c_cop+1)); label=copied ;;
+                   *D*) c_del=$((c_del+1)); label=deleted ;;
+                   *A*) c_add=$((c_add+1)); label=added ;;
+                   *) c_mod=$((c_mod+1)); label=modified ;;
+                 esac;
+                 if [ "$label" != untracked ] && [ "$label" != conflicted ]; then
+                   if [ "$xc" != ' ' ] && [ "$xc" != '?' ]; then c_stg=$((c_stg+1)); fi;
+                   if [ "$yc" != ' ' ] && [ "$yc" != '?' ]; then c_uns=$((c_uns+1)); fi;
+                 fi;
+                 if [ "$n" -lt __STATUS_LIMIT__ ]; then printf '%s\n' "$line"; n=$((n+1));
+                 else trunc=1; fi ;;
+             esac;
+           done;
+           if [ -z "$exit_raw" ]; then exit_raw=0; fi;
+           if [ "$exit_raw" -eq 0 ] 2>/dev/null; then
+             repo_probe=inside_worktree; repo_probe_exit=0;
+           else
+             repo_probe_stdout=$(LC_ALL=C git rev-parse --is-inside-work-tree 2>&1);
+             repo_probe_exit=$?;
+             if [ "$repo_probe_exit" -eq 0 ] && [ "$repo_probe_stdout" = true ]; then
+               repo_probe=inside_worktree;
+             elif printf '%s\n' "$repo_probe_stdout" | grep -Fq 'not a git repository'; then
+               repo_probe=outside_worktree;
+             else
+               repo_probe=unavailable;
+             fi;
+           fi;
+           printf '\n__SENTINEL__\n';
+           printf 'status_exit=%s\nrepository_probe=%s\nrepository_probe_exit=%s\nfiles_total=%s\nfiles_returned=%s\nfiles_truncated=%s\nfiles_limit=%s\nmodified=%s\nadded=%s\ndeleted=%s\nrenamed=%s\ncopied=%s\nuntracked=%s\nconflicted=%s\nstaged=%s\nunstaged=%s\n' \
+             "$exit_raw" "$repo_probe" "$repo_probe_exit" "$total" "$n" "$trunc" __STATUS_LIMIT__ \
+             "$c_mod" "$c_add" "$c_del" "$c_ren" "$c_cop" "$c_unt" "$c_conf" "$c_stg" "$c_uns";
+           printf '\n__SENTINEL__\n';
+           { git log -1 --format='%H%x00%h%x00%s' || true; };
+           printf '\n__SENTINEL__\n';
+           git diff --stat__DIFF_PART__;
+           final_exit=$?;
+           if [ "$exit_raw" -ne 0 ] && [ "$exit_raw" -ge 0 ] 2>/dev/null; then exit "$exit_raw"; else exit "$final_exit"; fi;
+         }"#;
+
+    script
+        .replace("__SENTINEL__", SHOW_CHANGES_SENTINEL)
+        .replace("__STATUS_LIMIT__", &status_files_limit.to_string())
+        .replace("__DIFF_PART__", &diff_part)
 }
 
-pub(crate) fn split_show_changes_stdout(
-    stdout: &str,
-    include_diff: bool,
-) -> (String, String, String, String, String, String) {
+/// Parsed, production-bounded `show_changes` stdout frames. The status result
+/// frame carries the authoritative `files_*` and per-category counts reported
+/// by the command's streaming loop, so totals stay exact even when the
+/// returned file records were truncated by the production-side limit.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ShowChangesStdout {
+    pub(crate) status: String,
+    pub(crate) status_result: String,
+    pub(crate) head: String,
+    pub(crate) stat: String,
+    pub(crate) diff: String,
+    /// Authoritative status metadata parsed from the result frame. `None`
+    /// when a field is absent (e.g. a legacy/compat frame).
+    pub(crate) files_total: Option<usize>,
+    pub(crate) files_returned: Option<usize>,
+    pub(crate) files_truncated: Option<bool>,
+    pub(crate) files_limit: Option<usize>,
+    pub(crate) counts_modified: Option<usize>,
+    pub(crate) counts_added: Option<usize>,
+    pub(crate) counts_deleted: Option<usize>,
+    pub(crate) counts_renamed: Option<usize>,
+    pub(crate) counts_copied: Option<usize>,
+    pub(crate) counts_untracked: Option<usize>,
+    pub(crate) counts_conflicted: Option<usize>,
+    pub(crate) counts_staged: Option<usize>,
+    pub(crate) counts_unstaged: Option<usize>,
+    /// Number of diff hunks the production-side loop returned, parsed from the
+    /// trailing diff metadata frame. `None` when `include_diff` is false or the
+    /// frame is absent.
+    pub(crate) diff_hunks_returned: Option<usize>,
+    /// Whether the production-side loop dropped hunks/lines beyond the limit.
+    pub(crate) diff_hunks_truncated: Option<bool>,
+}
+
+fn parse_optional_usize(result: &str, key: &str) -> Option<usize> {
+    parse_status_result_field(result, key).and_then(|v| v.parse::<usize>().ok())
+}
+
+fn parse_optional_bool(result: &str, key: &str) -> Option<bool> {
+    parse_status_result_field(result, key).and_then(|v| match v {
+        "0" | "false" => Some(false),
+        "1" | "true" => Some(true),
+        _ => None,
+    })
+}
+
+pub(crate) fn split_show_changes_stdout(stdout: &str, include_diff: bool) -> ShowChangesStdout {
     let mut parts = stdout.split(SHOW_CHANGES_SENTINEL);
     let status = parts
         .next()
@@ -425,29 +566,53 @@ pub(crate) fn split_show_changes_stdout(
         .unwrap_or_default()
         .trim_matches(['\n', '\r'])
         .to_string();
-    let diff = if include_diff {
-        parts
+    let (diff, diff_meta) = if include_diff {
+        let diff = parts
             .next()
             .unwrap_or_default()
             .trim_start_matches(['\n', '\r'])
-            .to_string()
-    } else {
-        String::new()
-    };
-    let untracked_preview = if include_diff {
-        parts
+            .to_string();
+        let diff_meta = parts
             .next()
             .unwrap_or_default()
             .trim_matches(['\n', '\r'])
-            .to_string()
+            .to_string();
+        (diff, diff_meta)
     } else {
-        String::new()
+        (String::new(), String::new())
     };
-    (status, status_result, head, stat, diff, untracked_preview)
+    let files_total = parse_optional_usize(&status_result, "files_total");
+    let files_returned = parse_optional_usize(&status_result, "files_returned");
+    let files_truncated = parse_optional_bool(&status_result, "files_truncated");
+    let files_limit = parse_optional_usize(&status_result, "files_limit");
+    let diff_hunks_returned = parse_optional_usize(&diff_meta, "diff_hunks_returned");
+    let diff_hunks_truncated = parse_optional_bool(&diff_meta, "diff_hunks_truncated");
+    ShowChangesStdout {
+        files_total,
+        files_returned,
+        files_truncated,
+        files_limit,
+        counts_modified: parse_optional_usize(&status_result, "modified"),
+        counts_added: parse_optional_usize(&status_result, "added"),
+        counts_deleted: parse_optional_usize(&status_result, "deleted"),
+        counts_renamed: parse_optional_usize(&status_result, "renamed"),
+        counts_copied: parse_optional_usize(&status_result, "copied"),
+        counts_untracked: parse_optional_usize(&status_result, "untracked"),
+        counts_conflicted: parse_optional_usize(&status_result, "conflicted"),
+        counts_staged: parse_optional_usize(&status_result, "staged"),
+        counts_unstaged: parse_optional_usize(&status_result, "unstaged"),
+        diff_hunks_returned,
+        diff_hunks_truncated,
+        status,
+        status_result,
+        head,
+        stat,
+        diff,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedStatusHeader {
+pub(crate) struct ParsedStatusHeader {
     branch: Option<String>,
     upstream_status: &'static str,
     upstream_reason_code: Option<&'static str>,
@@ -465,7 +630,7 @@ fn parsed_branch_name(raw: &str) -> Option<String> {
     }
 }
 
-fn parse_status_header(line: &str) -> Option<ParsedStatusHeader> {
+pub(crate) fn parse_status_header(line: &str) -> Option<ParsedStatusHeader> {
     let rest = line.strip_prefix("## ")?;
 
     for prefix in ["No commits yet on ", "Initial commit on "] {
@@ -655,22 +820,35 @@ pub(crate) fn parse_show_changes_output(
             git_available: has_reliable_header,
         }
     };
+    let frames = ShowChangesStdout {
+        status: status_stdout.to_string(),
+        head: head_stdout.to_string(),
+        stat: diff_stat.to_string(),
+        diff: diff_stdout.unwrap_or_default().to_string(),
+        ..ShowChangesStdout::default()
+    };
+    let diff_for_parse = if diff_stdout.is_some() {
+        Some(frames.diff.as_str())
+    } else {
+        None
+    };
     parse_show_changes_output_with_observation(
         project,
-        status_stdout,
-        head_stdout,
-        diff_stat,
-        diff_stdout,
+        &frames.status,
+        &frames.head,
+        &frames.stat,
+        diff_for_parse,
         max_hunks,
         max_hunk_lines,
         exit_code,
         stderr,
         observation,
+        &frames,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn parse_show_changes_output_with_observation(
+pub(crate) fn parse_show_changes_output_with_observation(
     project: &str,
     status_stdout: &str,
     head_stdout: &str,
@@ -681,6 +859,7 @@ fn parse_show_changes_output_with_observation(
     exit_code: Option<i32>,
     stderr: &str,
     observation: ShowChangesStatusObservation,
+    frames: &ShowChangesStdout,
 ) -> serde_json::Value {
     let mut branch = None;
     let mut upstream_status = "unobserved";
@@ -769,7 +948,45 @@ fn parse_show_changes_output_with_observation(
         }
     }
 
-    let clean = status_observed.then_some(files.is_empty());
+    // When the production-side status loop truncated the returned file
+    // records, the per-category counts parsed above only cover the returned
+    // subset. The command's streaming loop counted and classified *every*
+    // entry, so prefer those authoritative counts whenever they are present.
+    let files_truncated = frames.files_truncated.unwrap_or(false);
+    let files_total = frames.files_total;
+    let files_returned = frames.files_returned.unwrap_or(files.len());
+    let files_limit = frames.files_limit.unwrap_or(SHOW_CHANGES_MAX_STATUS_FILES);
+    if files_truncated {
+        if let Some(value) = frames.counts_modified {
+            modified = value;
+        }
+        if let Some(value) = frames.counts_added {
+            added = value;
+        }
+        if let Some(value) = frames.counts_deleted {
+            deleted = value;
+        }
+        if let Some(value) = frames.counts_renamed {
+            renamed = value;
+        }
+        if let Some(value) = frames.counts_copied {
+            copied = value;
+        }
+        if let Some(value) = frames.counts_untracked {
+            untracked = value;
+        }
+        if let Some(value) = frames.counts_conflicted {
+            conflicted = value;
+        }
+        if let Some(value) = frames.counts_staged {
+            staged_count = value;
+        }
+        if let Some(value) = frames.counts_unstaged {
+            unstaged_count = value;
+        }
+    }
+
+    let clean = status_observed.then_some(files_total.map_or(files.is_empty(), |total| total == 0));
     let mut warnings = Vec::new();
     if !status_observed {
         let reason_code = observation_reason_code.unwrap_or("git_status_result_unavailable");
@@ -868,6 +1085,14 @@ fn parse_show_changes_output_with_observation(
             "unstaged": unstaged_count,
         },
         "files": files,
+        "files_total": files_total,
+        "files_returned": files_returned,
+        "files_truncated": files_truncated,
+        "files_limit": files_limit,
+        "transport_safe": true,
+        "output_budget_bytes": SHOW_CHANGES_OUTPUT_BUDGET_BYTES,
+        "output_truncated": false,
+        "truncation_reasons": [],
         "diff_stat": diff_stat,
         "warnings": warnings,
         "suggested_next_actions": suggested_next_actions,
@@ -877,16 +1102,29 @@ fn parse_show_changes_output_with_observation(
     });
 
     if let Some(diff) = diff_stdout {
-        let (hunks, hunk_count, truncated) = parse_git_diff_hunks(diff, max_hunks, max_hunk_lines);
+        let (hunks, parser_hunk_count, parser_truncated) =
+            parse_git_diff_hunks(diff, max_hunks, max_hunk_lines);
+        // The production-side diff loop already bounded the raw diff to at
+        // most `max_hunks` hunks and `max_hunk_lines` lines per hunk before
+        // transport. Its reported counts are authoritative for dropped hunks;
+        // the parser's `truncated` still captures the final returned hunk being
+        // line-bounded. Combine both.
+        let hunk_count = frames.diff_hunks_returned.unwrap_or(parser_hunk_count);
+        let hunks_truncated =
+            frames.diff_hunks_truncated.unwrap_or(parser_truncated) || parser_truncated;
         output["hunks"] = json!(hunks);
         output["hunk_count"] = json!(hunk_count);
-        output["hunks_truncated"] = json!(truncated);
+        output["hunks_truncated"] = json!(hunks_truncated);
     }
 
     set_show_changes_verdict(&mut output);
     output
 }
 
+/// Parse a transport-side untracked-preview JSON frame. Retained for
+/// backward compatibility with already-enqueued requests; the production path
+/// now collects previews via the local/agent probe helpers above.
+#[allow(dead_code)]
 fn parse_untracked_previews_stdout(preview_stdout: &str) -> Result<(Vec<Value>, bool), String> {
     let preview_stdout = preview_stdout.trim();
     if preview_stdout.is_empty() {
@@ -914,6 +1152,10 @@ fn parse_untracked_previews_stdout(preview_stdout: &str) -> Result<(Vec<Value>, 
     }
 }
 
+/// Layer a transport-side untracked-preview frame onto an output payload.
+/// Retained for backward compatibility; the production path collects previews
+/// via the local/agent probe helpers instead of a transport frame.
+#[allow(dead_code)]
 pub(crate) fn apply_show_changes_untracked_previews(output: &mut Value, preview_stdout: &str) {
     match parse_untracked_previews_stdout(preview_stdout) {
         Ok((previews, truncated)) => {
@@ -2172,7 +2414,7 @@ impl ToolRuntime {
             .filter(|n| *n > 0)
             .unwrap_or(SHOW_CHANGES_DEFAULT_SESSION_EVENT_LIMIT)
             .min(SHOW_CHANGES_MAX_SESSION_EVENT_LIMIT);
-        let command = show_changes_command(include_diff);
+        let command = show_changes_command(include_diff, max_hunks, max_hunk_lines);
         let output = match self
             .run_project_command_capture(&project, command, 30, None)
             .await
@@ -2180,17 +2422,10 @@ impl ToolRuntime {
             Ok(output) => output,
             Err(e) => return ToolResult::err(e),
         };
-        let (
-            status_stdout,
-            status_result_stdout,
-            head_stdout,
-            diff_stat,
-            diff_stdout,
-            untracked_preview_stdout,
-        ) = split_show_changes_stdout(&output.stdout, include_diff);
+        let frames = split_show_changes_stdout(&output.stdout, include_diff);
         let status_observation = parse_show_changes_status_observation(
-            &status_stdout,
-            &status_result_stdout,
+            &frames.status,
+            &frames.status_result,
             &output.stderr,
         );
         let effective_exit_code = if status_observation.exit_code != Some(0) {
@@ -2216,15 +2451,16 @@ impl ToolRuntime {
         let status_observed = status_observation.status_observed();
         let mut payload = parse_show_changes_output_with_observation(
             &project,
-            &status_stdout,
-            &head_stdout,
-            &diff_stat,
-            include_diff.then_some(diff_stdout.as_str()),
+            &frames.status,
+            &frames.head,
+            &frames.stat,
+            include_diff.then_some(frames.diff.as_str()),
             max_hunks,
             max_hunk_lines,
             effective_exit_code,
             &output.stderr,
             status_observation,
+            &frames,
         );
         if include_diff {
             let untracked_paths = show_changes_untracked_paths(&payload);
@@ -2233,9 +2469,6 @@ impl ToolRuntime {
                 .await;
             payload["untracked_previews"] = json!(previews);
             payload["untracked_previews_truncated"] = json!(truncated);
-            if !untracked_preview_stdout.trim().is_empty() {
-                apply_show_changes_untracked_previews(&mut payload, &untracked_preview_stdout);
-            }
         }
         let session_summary = session_id
             .as_deref()
