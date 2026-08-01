@@ -27,6 +27,11 @@ use crate::shell_protocol::{
 use serde_json::{json, Value};
 use std::time::Duration;
 
+use crate::project_overview::{
+    build_project_overview_from_metadata, ProjectOverviewEntryKind, ProjectOverviewMetadataEntry,
+    ProjectOverviewScanState,
+};
+
 /// Timeout budget for one structured remote read.
 const SSH_WORKSPACE_READ_TIMEOUT_SECS: u64 = 30;
 
@@ -243,27 +248,33 @@ fn build_remote_read_request(
             }),
         ),
         ToolCall::GitStatus { .. } => ("git_status".to_string(), ".".to_string(), json!({})),
-        ToolCall::GitDiff { args, .. } => (
-            "git_diff".to_string(),
-            ".".to_string(),
-            json!({ "paths": args }),
-        ),
+        ToolCall::GitDiff { args, .. } => {
+            let paths = normalize_ssh_git_paths(args.clone().unwrap_or_default(), false)?;
+            (
+                "git_diff".to_string(),
+                ".".to_string(),
+                json!({ "paths": paths }),
+            )
+        }
         ToolCall::GitDiffHunks {
             paths,
             max_hunks,
             max_hunk_lines,
             cached,
             ..
-        } => (
-            "git_diff_hunks".to_string(),
-            ".".to_string(),
-            json!({
-                "paths": paths,
-                "limit": max_hunks,
-                "context_after": max_hunk_lines,
-                "cached": cached,
-            }),
-        ),
+        } => {
+            let paths = normalize_ssh_git_paths(paths.clone().unwrap_or_default(), true)?;
+            (
+                "git_diff_hunks".to_string(),
+                ".".to_string(),
+                json!({
+                    "paths": paths,
+                    "limit": max_hunks,
+                    "context_after": max_hunk_lines,
+                    "cached": cached,
+                }),
+            )
+        }
         ToolCall::GitLog { limit, skip, .. } => (
             "git_log".to_string(),
             ".".to_string(),
@@ -357,6 +368,58 @@ fn build_remote_read_request(
         timeout_secs,
     };
     Ok((ssh_session_id.to_string(), read))
+}
+
+fn normalize_ssh_git_paths(
+    paths: Vec<String>,
+    reject_root: bool,
+) -> Result<Vec<String>, ToolResult> {
+    let mut normalized = Vec::new();
+    for raw in paths {
+        let trimmed = raw.trim();
+        let windows_drive = trimmed.as_bytes().get(1) == Some(&b':')
+            && trimmed
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphabetic);
+        let invalid = trimmed.is_empty()
+            || trimmed.starts_with('/')
+            || trimmed.starts_with("\\\\")
+            || trimmed.contains("\\")
+            || trimmed.contains("://")
+            || windows_drive
+            || trimmed.chars().any(char::is_control)
+            || trimmed.split('/').any(|part| part == "..");
+        if invalid {
+            return Err(invalid_ssh_git_path_result());
+        }
+        let path = trimmed
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+            .collect::<Vec<_>>()
+            .join("/");
+        if reject_root && path.is_empty() {
+            return Err(invalid_ssh_git_path_result());
+        }
+        if !path.is_empty() && !normalized.iter().any(|existing| existing == &path) {
+            normalized.push(path);
+        }
+    }
+    Ok(normalized)
+}
+
+fn invalid_ssh_git_path_result() -> ToolResult {
+    ToolResult::err_with_output(
+        "invalid project-relative git path",
+        json!({
+            "error_kind": "ssh_workspace_path_invalid",
+            "command_started": false,
+            "command_completed": false,
+            "command_ok": false,
+            "exit_code": null,
+            "tool_failure": true,
+        }),
+    )
 }
 
 impl ToolRuntime {
@@ -531,10 +594,12 @@ impl ToolRuntime {
                 }),
             );
         }
-        let (stdout, exit_code) = match remote.outcome {
+        let (stdout, exit_code, stdout_truncated) = match remote.outcome {
             RemoteWorkspaceReadOutcome::Success {
-                exit_code, stdout, ..
-            } => (stdout, Some(exit_code)),
+                exit_code,
+                stdout,
+                stdout_truncated,
+            } => (stdout, Some(exit_code), stdout_truncated),
             RemoteWorkspaceReadOutcome::Failure {
                 error_kind,
                 message,
@@ -585,9 +650,10 @@ impl ToolRuntime {
                 let (entries, truncated) =
                     super::files::parse_file_list_entries(&stdout, &rel_path, max_entries);
                 ToolResult::ok(json!({
+                    "project": call.project().unwrap_or(""),
                     "path": rel_path,
                     "entries": entries,
-                    "truncated": truncated,
+                    "truncated": truncated || stdout_truncated,
                     "executor": executor["executor"],
                     "resource": executor["resource"],
                 }))
@@ -610,8 +676,11 @@ impl ToolRuntime {
                     limit.unwrap_or(200).clamp(1, 1000),
                     offset.unwrap_or(0),
                 );
-                let mut payload =
-                    listing.to_json(call.project().unwrap_or(""), &scope, list_truncated);
+                let mut payload = listing.to_json(
+                    call.project().unwrap_or(""),
+                    &scope,
+                    list_truncated || stdout_truncated,
+                );
                 payload["executor"] = executor["executor"].clone();
                 payload["resource"] = executor["resource"].clone();
                 ToolResult::ok(payload)
@@ -622,18 +691,20 @@ impl ToolRuntime {
                 limit,
                 ..
             } => {
-                let _ = (max_depth, limit);
                 let rel_path = path.clone().unwrap_or_else(|| ".".to_string());
-                let (entries, warnings) = parse_overview_entries(&stdout, &rel_path);
-                ToolResult::ok(json!({
-                    "schema_version": 1,
-                    "path": rel_path,
-                    "deterministic": true,
-                    "entries": entries,
-                    "warnings": warnings,
-                    "executor": executor["executor"],
-                    "resource": executor["resource"],
-                }))
+                let (entries, mut scan_state) = parse_overview_metadata(&stdout, &rel_path);
+                scan_state.transport_truncated = stdout_truncated;
+                match build_project_overview_from_metadata(
+                    &rel_path, *max_depth, *limit, entries, scan_state,
+                ) {
+                    Ok(mut payload) => {
+                        payload["project"] = json!(call.project().unwrap_or(""));
+                        payload["executor"] = executor["executor"].clone();
+                        payload["resource"] = executor["resource"].clone();
+                        ToolResult::ok(payload)
+                    }
+                    Err(error) => ToolResult::err(error),
+                }
             }
             ToolCall::SearchProjectText {
                 pattern,
@@ -662,13 +733,22 @@ impl ToolRuntime {
                         Ok(options) => options,
                         Err(error) => return error.into_tool_result(),
                     };
+                let search_stdout = if stdout_truncated {
+                    format!("[output truncated to last 0 bytes]\n{stdout}")
+                } else {
+                    stdout
+                };
                 let mut result = super::files::search_project_text_output(
                     call.project().unwrap_or(""),
                     &options,
-                    &stdout,
+                    &search_stdout,
                     exit_code,
                     &stderr,
                 );
+                if result.success && exit_code == Some(141) {
+                    result.output["truncated"] = json!(true);
+                    result.output["truncation_reason"] = json!("limit");
+                }
                 result.output["executor"] = executor["executor"].clone();
                 result.output["resource"] = executor["resource"].clone();
                 result
@@ -677,7 +757,7 @@ impl ToolRuntime {
                 let (porcelain, diff_stat) = super::git::split_diff_summary(&stdout);
                 let summary = super::git::parse_porcelain_summary(&porcelain);
                 ToolResult::ok(json!({
-                    "porcelain": porcelain,
+                    "status": porcelain,
                     "diff_stat": diff_stat,
                     "changed_files": summary.changed_files,
                     "changed_files_count": summary.changed_files_count,
@@ -708,7 +788,7 @@ impl ToolRuntime {
                     "hunk_count": hunk_count,
                     "max_hunks": max_hunks,
                     "max_hunk_lines": max_hunk_lines,
-                    "truncated": truncated,
+                    "truncated": truncated || stdout_truncated,
                     "exit_code": exit_code,
                     "stderr": stderr,
                     "executor": executor["executor"],
@@ -724,7 +804,7 @@ impl ToolRuntime {
                     "limit": limit,
                     "skip": skip,
                     "count": commits.len(),
-                    "truncated": truncated,
+                    "truncated": truncated || stdout_truncated,
                     "commits": commits,
                     "executor": executor["executor"],
                     "resource": executor["resource"],
@@ -734,6 +814,7 @@ impl ToolRuntime {
                 "stdout": stdout,
                 "stderr": stderr,
                 "exit_code": exit_code,
+                "stdout_truncated": stdout_truncated,
                 "executor": executor["executor"],
                 "resource": executor["resource"],
             })),
@@ -742,25 +823,32 @@ impl ToolRuntime {
     }
 }
 
-/// Parse `find -printf '%y %p\n'` output into the project-overview entry
-/// shape. `f ./src/main.rs` → file, `d ./src` → directory.
-pub(crate) fn parse_overview_entries(stdout: &str, relative: &str) -> (Vec<Value>, Vec<Value>) {
+/// Parse metadata-only `find -printf '%y %p\n'` output into canonical
+/// project-relative records for the shared overview builder.
+pub(crate) fn parse_overview_metadata(
+    stdout: &str,
+    relative: &str,
+) -> (Vec<ProjectOverviewMetadataEntry>, ProjectOverviewScanState) {
     let mut entries = Vec::new();
-    let mut warnings = Vec::new();
+    let mut state = ProjectOverviewScanState::default();
     for line in stdout.lines() {
         let line = line.trim_end_matches('\r');
         if line.is_empty() {
             continue;
         }
         let (kind, path) = match line.split_once(' ') {
-            Some((kind, path)) => (kind, path),
-            None => continue,
+            Some(pair) => pair,
+            None => {
+                state.skipped_unreadable = true;
+                continue;
+            }
         };
-        let is_dir = match kind {
-            "d" => true,
-            "f" => false,
+        let kind = match kind {
+            "d" => ProjectOverviewEntryKind::Directory,
+            "f" => ProjectOverviewEntryKind::File,
+            "l" => ProjectOverviewEntryKind::Symlink,
             _ => {
-                warnings.push(json!("unreadable_entries_skipped"));
+                state.skipped_unreadable = true;
                 continue;
             }
         };
@@ -768,22 +856,15 @@ pub(crate) fn parse_overview_entries(stdout: &str, relative: &str) -> (Vec<Value
         if path.is_empty() {
             continue;
         }
-        let scoped = if relative == "." {
+        let project_path = if relative == "." || relative.is_empty() {
             path.to_string()
         } else {
             format!("{relative}/{path}")
         };
-        entries.push(json!({
-            "path": scoped,
-            "kind": if is_dir { "directory" } else { "file" },
-            "depth": 1,
-        }));
+        entries.push(ProjectOverviewMetadataEntry {
+            path: project_path,
+            kind,
+        });
     }
-    entries.sort_by(|left, right| {
-        left["path"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(right["path"].as_str().unwrap_or(""))
-    });
-    (entries, warnings)
+    (entries, state)
 }

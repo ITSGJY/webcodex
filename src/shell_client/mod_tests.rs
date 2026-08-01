@@ -891,6 +891,7 @@ async fn registry_enqueues_polls_and_completes_shell_request() {
             stderr: Some(String::new()),
             duration_ms: Some(12),
             error: None,
+            remote_workspace: None,
         })
         .await
         .unwrap();
@@ -1440,6 +1441,7 @@ async fn registry_shell_job_start_poll_complete_and_log() {
             stderr: Some(String::new()),
             duration_ms: Some(20),
             error: None,
+            remote_workspace: None,
         })
         .await
         .unwrap();
@@ -2432,6 +2434,7 @@ async fn lease_stale_instance_result_rejected() {
             stderr: None,
             duration_ms: Some(1),
             error: None,
+            remote_workspace: None,
         })
         .await
         .unwrap_err();
@@ -2451,6 +2454,7 @@ async fn lease_stale_instance_result_rejected() {
             stderr: None,
             duration_ms: Some(1),
             error: None,
+            remote_workspace: None,
         })
         .await
         .expect("active instance must submit result");
@@ -3327,6 +3331,7 @@ async fn late_result_on_stale_connection_is_accepted_without_refreshing_liveness
                 stderr: None,
                 duration_ms: Some(1),
                 error: None,
+                remote_workspace: None,
             },
             "conn-a",
         )

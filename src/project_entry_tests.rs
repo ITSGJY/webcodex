@@ -488,6 +488,7 @@ async fn complete_project_agent_request(
             stderr: Some(stderr),
             duration_ms: Some(1),
             error: None,
+            remote_workspace: None,
         })
         .await
         .unwrap();

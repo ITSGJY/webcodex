@@ -493,6 +493,7 @@ async fn cargo_test_agent_timeout_is_not_validation_failed() {
             stderr: Some("Command timed out after 60 seconds".to_string()),
             duration_ms: Some(60_000),
             error: Some("command timed out".to_string()),
+            remote_workspace: None,
         })
         .await
         .unwrap();
@@ -613,6 +614,7 @@ new file mode 100644\n\
             stderr: Some(String::new()),
             duration_ms: Some(1),
             error: None,
+            remote_workspace: None,
         })
         .await
         .unwrap();
@@ -651,6 +653,7 @@ new file mode 100644\n\
             stderr: Some(String::new()),
             duration_ms: Some(1),
             error: None,
+            remote_workspace: None,
         })
         .await
         .unwrap();

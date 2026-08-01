@@ -167,10 +167,15 @@ accepts only the root or component-boundary descendants. Relative/absolute
 symlink escapes and unavailable canonicalization are denied.
 
 Runner responses are versioned `webcodex.remote_workspace_read_result.v1`
-envelopes with an explicit operation and success/failure outcome. The Server
-strictly validates the envelope and reuses local read/search/Git parsers rather
-than treating arbitrary stdout or stderr as success. Local and SSH search
-builders consume one shared protected-path exclusion policy.
+envelopes with an explicit operation and success/failure outcome. They travel in
+a dedicated result field rather than generic stdout, remain below the protocol
+cap, and carry an authoritative `stdout_truncated` bit for the bounded operation
+prefix. The Server rejects missing, malformed, oversized, or partial envelopes
+and then reuses local read/search/Git parsers. Remote project-overview metadata is fed into a pure canonical builder that
+reuses the local scan's classification and result-construction helpers; remote
+file reads stream and normalize text exactly like local reads. Search treats 0/1/141 as success, and a
+valid empty Git repository produces an empty log. Local and SSH search builders
+consume one shared protected-path exclusion policy.
 
 Resource routing uses an exhaustive `ToolCall` classification. Unsupported
 project-bound operations (writes, edits, patches, artifacts, checkpoints,

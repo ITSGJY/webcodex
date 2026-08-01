@@ -264,21 +264,200 @@ async fn resource_bound_read_routes_to_ssh_workspace_read_request() {
             stdout_truncated: false,
         },
     };
-    complete_patch_agent_request_for_instance(
-        &runtime,
-        "ws",
-        "inst-ws",
-        &request.request_id,
-        0,
-        &serde_json::to_string(&remote).unwrap(),
-        "",
-    )
-    .await;
+    runtime
+        .shell_clients
+        .complete(crate::shell_protocol::ShellAgentResultRequest {
+            client_id: "ws".to_string(),
+            agent_instance_id: "inst-ws".to_string(),
+            request_id: request.request_id.clone(),
+            exit_code: Some(0),
+            stdout: None,
+            stderr: None,
+            duration_ms: Some(1),
+            error: None,
+            remote_workspace: Some(remote),
+        })
+        .await
+        .unwrap();
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["path"], "src/main.rs");
     assert_eq!(result.output["executor"], "ssh");
     assert_eq!(result.output["resource"], "tmp");
+}
+
+#[tokio::test]
+async fn ssh_workspace_contract_matrix_covers_all_ten_tools() {
+    let runtime = test_runtime();
+    register_ssh_workspace_runner(&runtime, "contract", "demo").await;
+    let project = "agent:contract:demo".to_string();
+    let session = ssh_session(&runtime, &project, "tmp");
+    let sid = Some(session.session_id.clone());
+    let auth = open_auth_context();
+    let cases: Vec<(ToolCall, &str, Vec<&str>)> = vec![
+        (ToolCall::ProjectOverview { project: project.clone(), session_id: sid.clone(), path: None, max_depth: Some(2), limit: Some(50) }, "d ./src\nf ./Cargo.toml\nf ./README.md\n", vec!["schema_version","project","path","deterministic","project_types","manifests","key_files","roots","top_level","suggested_next_reads","scan","warnings"]),
+        (ToolCall::ListProjectFiles { project: project.clone(), session_id: sid.clone(), path: None, limit: Some(20) }, "d ./src\nf ./README.md\n", vec!["project","path","entries","truncated"]),
+        (ToolCall::ListProjectTrackedFiles { project: project.clone(), session_id: sid.clone(), path: None, globs: None, depth: None, limit: Some(20), offset: None }, "Cargo.toml\0src/lib.rs\0", vec!["project","path","entries","returned","total_files","total_entries","depth","depth_auto","truncated","next_offset","list_truncated","source"]),
+        (ToolCall::ReadFile { project: project.clone(), path: "README.md".to_string(), session_id: sid.clone(), start_line: Some(1), limit: Some(10), with_line_numbers: Some(false) }, r#"{"format":"webcodex.file_read_range.v1","content":"remote","sha256":"abc","total_lines":1,"start_line":1,"limit":10}"#, vec!["text","format","path","sha256","total_lines","start_line","limit"]),
+        (ToolCall::SearchProjectText { project: project.clone(), pattern: "needle".to_string(), session_id: sid.clone(), path: None, limit: Some(10), context_before: None, context_after: None, include_globs: None, exclude_globs: None, result_mode: None, timeout_secs: None }, "{\"webcodex_search\":{\"backend\":\"grep\",\"feature_unavailable\":false}}\nREADME.md:1:needle\n", vec!["project","pattern","path","backend","result_mode","effective_timeout_secs","matches","count","truncated","truncation_reason","exit_code","context_before","context_after"]),
+        (ToolCall::GitStatus { project: project.clone(), session_id: sid.clone() }, "", vec!["exit_code","stdout","stderr"]),
+        (ToolCall::GitDiffSummary { project: project.clone(), session_id: sid.clone() }, "", vec!["status","diff_stat","changed_files"]),
+        (ToolCall::GitDiff { project: project.clone(), session_id: sid.clone(), args: None }, "diff --git a/a b/a\n", vec!["exit_code","stdout","stderr"]),
+        (ToolCall::GitDiffHunks { project: project.clone(), session_id: sid.clone(), paths: Some(vec!["src/lib.rs".to_string()]), max_hunks: Some(10), max_hunk_lines: Some(20), cached: Some(false) }, "", vec!["files","hunk_count","truncated","exit_code","stderr"]),
+        (ToolCall::GitLog { project: project.clone(), limit: Some(10), skip: Some(0), session_id: sid }, "", vec!["project","commits","count","limit","skip","truncated"]),
+    ];
+    for (call, stdout, required) in cases {
+        let task = tokio::spawn({
+            let runtime = runtime.clone();
+            let auth = auth.clone();
+            async move { runtime.dispatch_with_auth(call, Some(&auth)).await }
+        });
+        let request = next_agent_request_for_client(&runtime, "contract")
+            .await
+            .expect("contract request");
+        let operation = request.remote_workspace.as_ref().unwrap().operation.clone();
+        runtime
+            .shell_clients
+            .complete(crate::shell_protocol::ShellAgentResultRequest {
+                client_id: "contract".to_string(),
+                agent_instance_id: "inst-contract".to_string(),
+                request_id: request.request_id,
+                exit_code: Some(0),
+                stdout: None,
+                stderr: None,
+                duration_ms: Some(1),
+                error: None,
+                remote_workspace: Some(RemoteWorkspaceReadResponse {
+                    format: REMOTE_WORKSPACE_READ_RESULT_FORMAT.to_string(),
+                    operation,
+                    outcome: RemoteWorkspaceReadOutcome::Success {
+                        exit_code: 0,
+                        stdout: stdout.to_string(),
+                        stdout_truncated: false,
+                    },
+                }),
+            })
+            .await
+            .unwrap();
+        let result = task.await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        for field in required {
+            assert!(
+                result.output.get(field).is_some(),
+                "missing {field}: {}",
+                result.output
+            );
+        }
+        assert_eq!(result.output["executor"], "ssh");
+        assert_eq!(result.output["resource"], "tmp");
+        let encoded = result.output.to_string();
+        assert!(!encoded.contains("/remote/root"));
+        assert!(!encoded.contains("HostName"));
+        assert!(!encoded.contains("ControlPath"));
+    }
+}
+
+#[tokio::test]
+async fn ssh_workspace_git_paths_fail_before_enqueue() {
+    let runtime = test_runtime();
+    register_ssh_workspace_runner(&runtime, "paths", "demo").await;
+    let project = "agent:paths:demo".to_string();
+    let session = ssh_session(&runtime, &project, "tmp");
+    let auth = open_auth_context();
+    for bad in [
+        "/etc/passwd",
+        "../escape",
+        "file://host/path",
+        "C:\\temp",
+        "\\\\server\\share",
+        "a\tb",
+    ] {
+        let result = runtime
+            .dispatch_with_auth(
+                ToolCall::GitDiffHunks {
+                    project: project.clone(),
+                    session_id: Some(session.session_id.clone()),
+                    paths: Some(vec![bad.to_string()]),
+                    max_hunks: None,
+                    max_hunk_lines: None,
+                    cached: None,
+                },
+                Some(&auth),
+            )
+            .await;
+        assert!(!result.success, "accepted {bad:?}");
+        assert_eq!(result.output["command_started"], false);
+        assert!(next_agent_request_for_client(&runtime, "paths")
+            .await
+            .is_none());
+    }
+    let root = runtime
+        .dispatch_with_auth(
+            ToolCall::GitDiffHunks {
+                project,
+                session_id: Some(session.session_id),
+                paths: Some(vec![".".to_string()]),
+                max_hunks: None,
+                max_hunk_lines: None,
+                cached: None,
+            },
+            Some(&auth),
+        )
+        .await;
+    assert!(!root.success);
+    assert_eq!(root.output["command_started"], false);
+}
+
+#[tokio::test]
+async fn ssh_workspace_missing_typed_envelope_is_protocol_failure() {
+    let runtime = test_runtime();
+    register_ssh_workspace_runner(&runtime, "protocol", "demo").await;
+    let project = "agent:protocol:demo".to_string();
+    let session = ssh_session(&runtime, &project, "tmp");
+    let auth = open_auth_context();
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::ReadFile {
+                        project,
+                        path: "README.md".to_string(),
+                        session_id: Some(session.session_id),
+                        start_line: None,
+                        limit: None,
+                        with_line_numbers: None,
+                    },
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    let request = next_agent_request_for_client(&runtime, "protocol")
+        .await
+        .unwrap();
+    runtime
+        .shell_clients
+        .complete(crate::shell_protocol::ShellAgentResultRequest {
+            client_id: "protocol".to_string(),
+            agent_instance_id: "inst-protocol".to_string(),
+            request_id: request.request_id,
+            exit_code: Some(0),
+            stdout: Some("{partial".to_string()),
+            stderr: None,
+            duration_ms: Some(1),
+            error: None,
+            remote_workspace: None,
+        })
+        .await
+        .unwrap();
+    let result = task.await.unwrap();
+    assert!(!result.success);
+    assert_eq!(
+        result.output["error_kind"],
+        "ssh_workspace_protocol_failure"
+    );
 }
 
 #[tokio::test]

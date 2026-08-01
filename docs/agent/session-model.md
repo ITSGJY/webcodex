@@ -208,13 +208,24 @@ do not switch to a looser mode.
 
 Each structured read is a fixed, validated command executed on an independent
 SSH exec channel that reuses the existing authenticated transport. Runner
-results use the versioned `webcodex.remote_workspace_read_result.v1` envelope;
-the Server validates its operation and outcome before applying the same
-read/search/Git parsers used by local tools. Malformed envelopes, nonzero
-operation exits, containment failures, and timeouts are tool failures rather
-than successful raw stdout. Search exclusion arguments come from the same
-shared protected-path policy as local search, so include globs cannot re-enable
-credential or bulk paths.
+results use the versioned `webcodex.remote_workspace_read_result.v1` envelope
+in a dedicated result field, so generic stdout tail truncation never edits the
+typed JSON. Operation stdout is retained as a bounded prefix; the Runner records
+`stdout_truncated`, reserves envelope metadata space, and guarantees the
+serialized envelope stays within the protocol cap. The Server rejects missing,
+malformed, oversized, or partial envelopes as protocol failures.
+
+`project_overview` consumes metadata-only project-relative records through a
+pure canonical builder that reuses the local scan's classification, ordering,
+limits, and result-construction helpers, producing project types, manifests, key
+files, roots, top-level entries, suggested reads, scan bounds, and warnings. `read_file` streams raw bytes once while hashing the
+whole file, validating UTF-8 and NUL absence, and retaining only the requested
+line range with the local LF/CRLF normalization. Search exits 0, 1, and 141 are
+success outcomes; 141 preserves the captured prefix and reports truncation. An
+empty but valid Git repository returns an empty `git_log`; non-repositories and
+other Git failures remain failures. Search exclusion arguments come from the
+same shared protected-path policy as local search, so include globs cannot
+re-enable credential or bulk paths.
 
 Structured reads never reuse an SSH persistent shell process: variables,
 functions, cwd, umask, and redirections set in a persistent shell cannot

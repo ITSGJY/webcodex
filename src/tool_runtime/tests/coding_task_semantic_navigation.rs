@@ -412,6 +412,7 @@ async fn coding_task_semantic_navigation_timeout_uses_one_budget_and_cancels_wai
             stderr: None,
             duration_ms: Some(1),
             error: None,
+            remote_workspace: None,
         })
         .await
         .expect_err("timed-out startup probe must remove pending waiter");

@@ -611,6 +611,7 @@ pub(in crate::tool_runtime::tests) async fn complete_patch_agent_request_for_ins
             stderr: Some(stderr.to_string()),
             duration_ms: Some(1),
             error: None,
+            remote_workspace: None,
         })
         .await
         .unwrap();

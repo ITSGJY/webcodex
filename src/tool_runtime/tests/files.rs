@@ -1687,6 +1687,7 @@ async fn search_agent_command_timeout_returns_search_timeout() {
             stderr: Some("command timed out after 1 seconds".to_string()),
             duration_ms: Some(1000),
             error: Some("command timed out".to_string()),
+            remote_workspace: None,
         })
         .await
         .unwrap();
@@ -1754,6 +1755,7 @@ async fn search_agent_outer_timeout_returns_search_timeout_and_cancels() {
             stderr: Some(String::new()),
             duration_ms: Some(1),
             error: None,
+            remote_workspace: None,
         })
         .await;
     assert!(
@@ -2982,6 +2984,7 @@ async fn replace_in_file_routes_to_owning_agent_file_op() {
             stderr: Some(String::new()),
             duration_ms: Some(1),
             error: None,
+            remote_workspace: None,
         })
         .await
         .unwrap();

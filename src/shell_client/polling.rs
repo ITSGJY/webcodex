@@ -168,7 +168,21 @@ impl ShellClientRegistry {
         let request_id = body.request_id.clone();
         let client_id = body.client_id.clone();
         let error = body.error.clone();
-        let stdout = if is_mcp_image_artifact_request(&pending.request) {
+        let is_remote_workspace =
+            pending.request.kind == crate::shell_protocol::SSH_WORKSPACE_READ_REQUEST_KIND;
+        let remote_workspace = if is_remote_workspace {
+            body.remote_workspace.clone().and_then(|response| {
+                serde_json::to_vec(&response)
+                    .ok()
+                    .filter(|encoded| encoded.len() <= super::MAX_OUTPUT_BYTES)
+                    .map(|_| response)
+            })
+        } else {
+            None
+        };
+        let stdout = if is_remote_workspace {
+            None
+        } else if is_mcp_image_artifact_request(&pending.request) {
             truncate_output_to(
                 body.stdout,
                 crate::artifact_policy::MAX_MCP_IMAGE_RESPONSE_BYTES,
@@ -176,7 +190,11 @@ impl ShellClientRegistry {
         } else {
             truncate_output(body.stdout)
         };
-        let stderr = truncate_output(body.stderr);
+        let stderr = if is_remote_workspace {
+            None
+        } else {
+            truncate_output(body.stderr)
+        };
         if let Some(job_id) = pending.job_id.clone() {
             inner.request_to_job.remove(&request_id);
             if let Some(job) = inner.jobs_by_id.get_mut(&job_id) {
@@ -193,14 +211,6 @@ impl ShellClientRegistry {
                 job.error = error.clone();
             }
         }
-        let remote_workspace =
-            if pending.request.kind == crate::shell_protocol::SSH_WORKSPACE_READ_REQUEST_KIND {
-                stdout
-                    .as_deref()
-                    .and_then(|raw| serde_json::from_str(raw).ok())
-            } else {
-                None
-            };
         let response = ShellRunResponse {
             success: error.is_none() && body.exit_code == Some(0),
             request_id,

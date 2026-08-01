@@ -128,6 +128,7 @@ async fn complete_one_save_artifact_request(
             stderr: None,
             duration_ms: Some(1),
             error: None,
+            remote_workspace: None,
         })
         .await
         .unwrap();

@@ -37,7 +37,10 @@ use crate::shell_protocol::{
 use std::time::Instant;
 
 /// Upper bound for one structured remote read result.
-const REMOTE_READ_MAX_OUTPUT_BYTES: usize = 256 * 1024;
+const REMOTE_READ_MAX_OUTPUT_BYTES: usize = 240 * 1024;
+const REMOTE_READ_ENVELOPE_MAX_BYTES: usize = 256 * 1024;
+const REMOTE_READ_FILE_MAX_BYTES: usize = 48 * 1024;
+const STDOUT_TRUNCATED_SENTINEL: &str = "\0webcodex_stdout_truncated";
 /// Longest accepted project-relative path.
 const MAX_REMOTE_PATH_BYTES: usize = 4096;
 /// `rg`/grep fallback budget used by the bounded search wrapper.
@@ -68,6 +71,15 @@ pub(crate) fn run_remote_workspace_read(
         session_cwd,
         read,
     );
+    let mut raw = raw;
+    let stdout_truncated = raw.stderr.as_mut().is_some_and(|stderr| {
+        if let Some(index) = stderr.find(STDOUT_TRUNCATED_SENTINEL) {
+            stderr.truncate(index);
+            true
+        } else {
+            false
+        }
+    });
     let outcome = if let Some(error) = raw.error {
         RemoteWorkspaceReadOutcome::Failure {
             error_kind: remote_error_kind(&error).to_string(),
@@ -77,12 +89,12 @@ pub(crate) fn run_remote_workspace_read(
             exit_code: raw.exit_code,
         }
     } else if raw.exit_code == Some(0)
-        || (read.operation == "search_project_text" && raw.exit_code == Some(1))
+        || (read.operation == "search_project_text" && matches!(raw.exit_code, Some(1 | 141)))
     {
         RemoteWorkspaceReadOutcome::Success {
             exit_code: raw.exit_code.unwrap_or(0),
             stdout: raw.stdout.unwrap_or_default(),
-            stdout_truncated: false,
+            stdout_truncated,
         }
     } else {
         RemoteWorkspaceReadOutcome::Failure {
@@ -93,11 +105,11 @@ pub(crate) fn run_remote_workspace_read(
             exit_code: raw.exit_code,
         }
     };
-    let response = RemoteWorkspaceReadResponse {
+    let response = bound_remote_workspace_response(RemoteWorkspaceReadResponse {
         format: REMOTE_WORKSPACE_READ_RESULT_FORMAT.to_string(),
         operation: read.operation.clone(),
         outcome,
-    };
+    });
     super::output::ok_cmd(
         start,
         serde_json::to_value(response).unwrap_or_else(|_| {
@@ -112,6 +124,54 @@ pub(crate) fn run_remote_workspace_read(
             })
         }),
     )
+}
+
+fn bound_remote_workspace_response(
+    mut response: RemoteWorkspaceReadResponse,
+) -> RemoteWorkspaceReadResponse {
+    loop {
+        let size = serde_json::to_vec(&response)
+            .map(|v| v.len())
+            .unwrap_or(usize::MAX);
+        if size <= REMOTE_READ_ENVELOPE_MAX_BYTES {
+            return response;
+        }
+        let RemoteWorkspaceReadOutcome::Success {
+            stdout,
+            stdout_truncated,
+            ..
+        } = &mut response.outcome
+        else {
+            return protocol_oversize_failure(response.operation);
+        };
+        if stdout.is_empty() {
+            return protocol_oversize_failure(response.operation);
+        }
+        let remove = size
+            .saturating_sub(REMOTE_READ_ENVELOPE_MAX_BYTES)
+            .saturating_add(1024)
+            .min(stdout.len());
+        let mut keep = stdout.len().saturating_sub(remove);
+        while keep > 0 && !stdout.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        stdout.truncate(keep);
+        *stdout_truncated = true;
+    }
+}
+
+fn protocol_oversize_failure(operation: String) -> RemoteWorkspaceReadResponse {
+    RemoteWorkspaceReadResponse {
+        format: REMOTE_WORKSPACE_READ_RESULT_FORMAT.to_string(),
+        operation,
+        outcome: RemoteWorkspaceReadOutcome::Failure {
+            error_kind: "ssh_workspace_protocol_failure".to_string(),
+            message: "SSH workspace result envelope exceeded its protocol limit".to_string(),
+            command_started: true,
+            command_completed: true,
+            exit_code: None,
+        },
+    }
 }
 
 fn remote_error_kind(error: &str) -> &str {
@@ -201,6 +261,21 @@ fn run_remote_workspace_read_inner(
         Ok(relative) => relative,
         Err(error) => return err_cmd(start, error),
     };
+
+    if let Some(paths) = read.paths.as_ref() {
+        for path in paths {
+            let normalized = match validate_remote_relative_path(path) {
+                Ok(path) => path,
+                Err(error) => return err_cmd(start, error),
+            };
+            if read.operation == "git_diff_hunks" && normalized == "." {
+                return err_cmd(
+                    start,
+                    "ssh_workspace_path_invalid: git_diff_hunks requires a concrete project-relative path; command was not started".to_string(),
+                );
+            }
+        }
+    }
 
     let body = match build_remote_read_command(read, &relative) {
         Ok(body) => body,
@@ -380,24 +455,35 @@ fn build_remote_read_command(
 fn read_file_command(read: &RemoteWorkspaceReadRequest, relative: &str) -> String {
     let start = read.start_line.unwrap_or(1).max(1);
     let end = read.end_line.unwrap_or(start.saturating_add(1999));
-    let max = read.max_bytes.unwrap_or(REMOTE_READ_MAX_OUTPUT_BYTES);
+    let max = read
+        .max_bytes
+        .unwrap_or(REMOTE_READ_FILE_MAX_BYTES)
+        .min(REMOTE_READ_FILE_MAX_BYTES);
     if end < start {
         return "exit 2".to_string();
     }
     let script = r#"import hashlib,json,sys
 p=sys.argv[1]; start=int(sys.argv[2]); end=int(sys.argv[3]); maxb=int(sys.argv[4])
+h=hashlib.sha256(); total=0; selected=[]; selected_bytes=0
 try:
- data=open(p,'rb').read()
+ f=open(p,'rb')
 except OSError:
  sys.exit(122)
-if b'\\x00' in data: sys.exit(123)
 try:
- text=data.decode('utf-8')
-except UnicodeDecodeError:
- sys.exit(123)
-lines=text.splitlines(keepends=True); selected=''.join(lines[start-1:end]) if start <= len(lines) else ''
-if len(selected.encode('utf-8')) > maxb: sys.exit(124)
-print(json.dumps({'format':'webcodex.file_read_range.v1','content':selected,'sha256':hashlib.sha256(data).hexdigest(),'total_lines':len(lines),'start_line':start,'limit':end-start+1},separators=(',',':')))
+ for raw in f:
+  h.update(raw); total += 1
+  if b'\x00' in raw: sys.exit(123)
+  try: line=raw.decode('utf-8')
+  except UnicodeDecodeError: sys.exit(123)
+  if start <= total <= end:
+   if line.endswith('\n'): line=line[:-1]
+   if line.endswith('\r'): line=line[:-1]
+   extra=len(line.encode('utf-8')) + (1 if selected else 0)
+   if selected_bytes + extra > maxb: sys.exit(124)
+   selected.append(line); selected_bytes += extra
+except OSError:
+ sys.exit(122)
+print(json.dumps({'format':'webcodex.file_read_range.v1','content':'\n'.join(selected),'sha256':h.hexdigest(),'total_lines':total,'start_line':start,'limit':end-start+1},separators=(',',':')))
 "#;
     format!(
         "{guard}command -v python3 >/dev/null 2>&1 || exit 125; python3 -c {script} \"$target\" {start} {end} {max}",
@@ -548,7 +634,7 @@ fn git_log_command(read: &RemoteWorkspaceReadRequest) -> String {
         .saturating_add(1);
     let skip = read.skip.unwrap_or(0).min(10_000);
     format!(
-        "export GIT_PAGER=cat; git rev-parse --git-dir >/dev/null 2>&1 || exit 3; git --no-pager log --decorate=short --date=iso-strict --pretty=format:'%H%x1f%h%x1f%D%x1f%an%x1f%ae%x1f%aI%x1f%s%x1e' -n {limit} --skip {skip}"
+        "export GIT_PAGER=cat; git rev-parse --git-dir >/dev/null 2>&1 || exit 3; if git rev-parse --verify HEAD >/dev/null 2>&1; then git --no-pager log --decorate=short --date=iso-strict --pretty=format:'%H%x1f%h%x1f%D%x1f%an%x1f%ae%x1f%aI%x1f%s%x1e' -n {limit} --skip {skip}; else exit 0; fi"
     )
 }
 
@@ -589,14 +675,14 @@ fn run_single_remote_exec(
     let (stderr_tx, stderr_rx) = std::sync::mpsc::sync_channel(1);
     if let Some(stdout) = stdout {
         std::thread::spawn(move || {
-            let _ = stdout_tx.send(read_bounded_tail(stdout, max_output_bytes));
+            let _ = stdout_tx.send(read_bounded_prefix(stdout, max_output_bytes));
         });
     } else {
         drop(stdout_tx);
     }
     if let Some(stderr) = stderr {
         std::thread::spawn(move || {
-            let _ = stderr_tx.send(read_bounded_tail(stderr, max_output_bytes));
+            let _ = stderr_tx.send(read_bounded_prefix(stderr, max_output_bytes));
         });
     } else {
         drop(stderr_tx);
@@ -616,7 +702,7 @@ fn run_single_remote_exec(
                         .unwrap_or_default();
                     return CommandResult {
                         exit_code: Some(-1),
-                        stdout: Some(String::from_utf8_lossy(&stdout).into_owned()),
+                        stdout: Some(String::from_utf8_lossy(&stdout.0).into_owned()),
                         stderr: Some(stderr),
                         duration_ms: Some(start.elapsed().as_millis() as u64),
                         error: Some("command timed out".to_string()),
@@ -647,13 +733,17 @@ fn run_single_remote_exec(
         .and_then(Result::ok)
         .unwrap_or_default();
     let exit_code = status.and_then(|status| status.code());
-    if super::ssh::is_transport_failure(exit_code, Some(&String::from_utf8_lossy(&stderr))) {
+    if super::ssh::is_transport_failure(exit_code, Some(&String::from_utf8_lossy(&stderr.0))) {
         pool.invalidate_after_transport_failure(key);
+    }
+    let mut stderr_text = String::from_utf8_lossy(&stderr.0).into_owned();
+    if stdout.1 {
+        stderr_text.push_str(STDOUT_TRUNCATED_SENTINEL);
     }
     CommandResult {
         exit_code,
-        stdout: Some(String::from_utf8_lossy(&stdout).into_owned()),
-        stderr: Some(String::from_utf8_lossy(&stderr).into_owned()),
+        stdout: Some(String::from_utf8_lossy(&stdout.0).into_owned()),
+        stderr: Some(stderr_text),
         duration_ms: Some(start.elapsed().as_millis() as u64),
         error: None,
     }
@@ -686,18 +776,24 @@ fn terminate_child(child: &mut std::process::Child) -> Result<std::process::Exit
     }
 }
 
-fn read_bounded_tail(mut pipe: impl std::io::Read, max_bytes: usize) -> Result<Vec<u8>, String> {
+fn read_bounded_prefix(
+    mut pipe: impl std::io::Read,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, bool), String> {
     let mut output = Vec::with_capacity(max_bytes.min(64 * 1024));
     let mut chunk = [0_u8; 8192];
+    let mut truncated = false;
     loop {
         let read = pipe.read(&mut chunk).map_err(|error| error.to_string())?;
         if read == 0 {
-            return Ok(output);
+            return Ok((output, truncated));
         }
-        output.extend_from_slice(&chunk[..read]);
-        if output.len() > max_bytes {
-            let discard = output.len() - max_bytes;
-            output.drain(..discard);
+        let remaining = max_bytes.saturating_sub(output.len());
+        if remaining > 0 {
+            output.extend_from_slice(&chunk[..read.min(remaining)]);
+        }
+        if read > remaining {
+            truncated = true;
         }
     }
 }
@@ -745,8 +841,10 @@ mod ssh_integration {
     use super::super::ssh::SshConnectionPool;
     use super::{
         run_remote_workspace_read, RemoteWorkspaceReadOutcome, RemoteWorkspaceReadRequest,
-        RemoteWorkspaceReadResponse,
+        RemoteWorkspaceReadResponse, REMOTE_READ_ENVELOPE_MAX_BYTES, REMOTE_READ_FILE_MAX_BYTES,
+        REMOTE_READ_MAX_OUTPUT_BYTES,
     };
+    use sha2::Digest;
     use std::collections::BTreeMap;
     use std::net::{TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
@@ -1340,6 +1438,111 @@ mod ssh_integration {
             parsed_response(&result).outcome,
             RemoteWorkspaceReadOutcome::Failure { ref error_kind, exit_code: Some(121), .. }
                 if error_kind == "ssh_workspace_containment_denied"
+        ));
+    }
+
+    #[test]
+    fn read_file_streaming_text_contract_covers_line_endings_and_unicode() {
+        let Some(server) = TestSshServer::start() else {
+            return;
+        };
+        let config = config_for(&server);
+        let pool = SshConnectionPool::with_test_config(server.client_config.clone());
+        let fixtures: &[(&str, &[u8], usize, usize, &str, usize)] = &[
+            ("lf.txt", b"a\n\nb\n", 1, 10, "a\n\nb", 3),
+            ("crlf.txt", b"a\r\n\r\nb\r\n", 1, 10, "a\n\nb", 3),
+            ("no-final.txt", b"a\nb", 2, 5, "b", 2),
+            ("past-end.txt", b"a\n", 9, 2, "", 1),
+            ("unicode.txt", "猫\n雪".as_bytes(), 1, 2, "猫\n雪", 2),
+        ];
+        for (name, bytes, start, limit, expected, total) in fixtures {
+            std::fs::write(server.remote_cwd.join(name), bytes).unwrap();
+            let mut read = read_request("read_file", name);
+            read.start_line = Some(*start);
+            read.end_line = Some(start.saturating_add(*limit).saturating_sub(1));
+            read.max_bytes = Some(REMOTE_READ_FILE_MAX_BYTES);
+            let payload: serde_json::Value = serde_json::from_str(&success_stdout(&run_read(
+                &pool,
+                &config,
+                Some(&server.remote_cwd.to_string_lossy()),
+                &read,
+            )))
+            .unwrap();
+            assert_eq!(payload["content"], *expected, "fixture {name}");
+            assert_eq!(payload["total_lines"], *total, "fixture {name}");
+            assert_eq!(payload["start_line"], *start, "fixture {name}");
+            assert_eq!(payload["limit"], *limit, "fixture {name}");
+            assert_eq!(
+                payload["sha256"],
+                format!("{:x}", sha2::Sha256::digest(bytes))
+            );
+        }
+        for (name, bytes) in [
+            ("nul.bin", b"a\0b".as_slice()),
+            ("invalid.bin", &[0xff, 0xfe][..]),
+        ] {
+            std::fs::write(server.remote_cwd.join(name), bytes).unwrap();
+            let response = parsed_response(&run_read(
+                &pool,
+                &config,
+                Some(&server.remote_cwd.to_string_lossy()),
+                &read_request("read_file", name),
+            ));
+            assert!(
+                matches!(response.outcome, RemoteWorkspaceReadOutcome::Failure { ref error_kind, .. } if error_kind == "ssh_workspace_file_not_text")
+            );
+        }
+    }
+
+    #[test]
+    fn empty_git_repository_returns_successful_empty_log() {
+        let Some(server) = TestSshServer::start() else {
+            return;
+        };
+        git_init(&server.remote_cwd);
+        let config = config_for(&server);
+        let pool = SshConnectionPool::with_test_config(server.client_config.clone());
+        let response = parsed_response(&run_read(
+            &pool,
+            &config,
+            Some(&server.remote_cwd.to_string_lossy()),
+            &read_request("git_log", "."),
+        ));
+        assert!(
+            matches!(response.outcome, RemoteWorkspaceReadOutcome::Success { exit_code: 0, ref stdout, stdout_truncated: false } if stdout.is_empty())
+        );
+    }
+
+    #[test]
+    fn large_git_diff_keeps_parseable_bounded_envelope_and_prefix() {
+        let Some(server) = TestSshServer::start() else {
+            return;
+        };
+        git_init(&server.remote_cwd);
+        std::fs::write(server.remote_cwd.join("large.txt"), "base\n").unwrap();
+        git_commit_all(&server.remote_cwd, "base");
+        let secret_tail = "SHOULD_NOT_APPEAR_AFTER_PREFIX";
+        let mut content = "x".repeat(REMOTE_READ_MAX_OUTPUT_BYTES * 2);
+        content.push_str(secret_tail);
+        std::fs::write(server.remote_cwd.join("large.txt"), content).unwrap();
+        let config = config_for(&server);
+        let pool = SshConnectionPool::with_test_config(server.client_config.clone());
+        let result = run_read(
+            &pool,
+            &config,
+            Some(&server.remote_cwd.to_string_lossy()),
+            &read_request("git_diff", "."),
+        );
+        let raw = result.stdout.as_deref().unwrap();
+        assert!(raw.len() < REMOTE_READ_ENVELOPE_MAX_BYTES);
+        assert!(!raw.contains("[output truncated"));
+        assert!(!raw.contains(secret_tail));
+        assert!(matches!(
+            parsed_response(&result).outcome,
+            RemoteWorkspaceReadOutcome::Success {
+                stdout_truncated: true,
+                ..
+            }
         ));
     }
 }

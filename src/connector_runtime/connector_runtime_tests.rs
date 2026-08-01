@@ -717,6 +717,7 @@ async fn inspect_to_write_keeps_task_and_rechecks_write_authority() {
                         stderr: Some(String::new()),
                         duration_ms: Some(1),
                         error: None,
+                        remote_workspace: None,
                     })
                     .await
                     .unwrap();
@@ -938,6 +939,7 @@ async fn writable_start_registers_and_releases_a_reusable_git_worktree() {
                         stderr: Some(String::new()),
                         duration_ms: Some(1),
                         error: None,
+                        remote_workspace: None,
                     })
                     .await
                     .unwrap();
@@ -1215,6 +1217,7 @@ async fn failed_task_binding_releases_prepared_workspace_for_retry() {
                         stderr: Some(String::new()),
                         duration_ms: Some(1),
                         error: None,
+                        remote_workspace: None,
                     })
                     .await
                     .unwrap();
@@ -1354,6 +1357,7 @@ async fn canonical_read_reaches_bound_executor_and_advances_event_cursor() {
                         stderr: Some(String::new()),
                         duration_ms: Some(1),
                         error: None,
+                        remote_workspace: None,
                     })
                     .await
                     .unwrap();

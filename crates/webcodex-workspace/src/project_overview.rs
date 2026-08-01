@@ -16,9 +16,26 @@ pub const PROJECT_OVERVIEW_MIN_LIMIT: usize = 20;
 pub const PROJECT_OVERVIEW_MAX_LIMIT: usize = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EntryKind {
+pub enum ProjectOverviewEntryKind {
     File,
     Directory,
+    Symlink,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectOverviewMetadataEntry {
+    pub path: String,
+    pub kind: ProjectOverviewEntryKind,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectOverviewScanState {
+    pub limit_truncated: bool,
+    pub depth_truncated: bool,
+    pub transport_truncated: bool,
+    pub skipped_symlink: bool,
+    pub skipped_unreadable: bool,
+    pub skipped_non_utf8: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -26,7 +43,7 @@ struct ScanEntry {
     path: String,
     scoped_path: String,
     depth: usize,
-    kind: EntryKind,
+    kind: ProjectOverviewEntryKind,
 }
 
 #[derive(Debug)]
@@ -93,6 +110,144 @@ pub fn effective_project_overview_limit(value: Option<usize>) -> usize {
     value
         .unwrap_or(PROJECT_OVERVIEW_DEFAULT_LIMIT)
         .clamp(PROJECT_OVERVIEW_MIN_LIMIT, PROJECT_OVERVIEW_MAX_LIMIT)
+}
+
+/// Build the canonical project-overview payload from metadata-only,
+/// project-relative records. This pure stage is shared by local and SSH scans.
+pub fn build_project_overview_from_metadata(
+    requested_path: &str,
+    max_depth: Option<usize>,
+    limit: Option<usize>,
+    metadata: Vec<ProjectOverviewMetadataEntry>,
+    mut scan_state: ProjectOverviewScanState,
+) -> Result<Value, String> {
+    let path = normalize_project_overview_path(requested_path)?;
+    let max_depth = effective_project_overview_max_depth(max_depth);
+    let limit = effective_project_overview_limit(limit);
+    let prefix = if path.is_empty() {
+        String::new()
+    } else {
+        format!("{path}/")
+    };
+    let mut entries = Vec::new();
+    for record in metadata {
+        let Some(project_path) = normalize_metadata_path(&record.path) else {
+            scan_state.skipped_unreadable = true;
+            continue;
+        };
+        if is_project_overview_excluded_path(&project_path) {
+            continue;
+        }
+        let scoped_path = if path.is_empty() {
+            project_path.clone()
+        } else if let Some(scoped) = project_path.strip_prefix(&prefix) {
+            scoped.to_string()
+        } else {
+            continue;
+        };
+        if scoped_path.is_empty() {
+            continue;
+        }
+        let depth = scoped_path.split('/').count();
+        if depth > max_depth {
+            scan_state.depth_truncated = true;
+            continue;
+        }
+        let kind = match record.kind {
+            ProjectOverviewEntryKind::Symlink => {
+                scan_state.skipped_symlink = true;
+                continue;
+            }
+            kind => kind,
+        };
+        entries.push(ScanEntry {
+            path: project_path,
+            scoped_path,
+            depth,
+            kind,
+        });
+    }
+    entries.sort_by(|a, b| {
+        a.depth
+            .cmp(&b.depth)
+            .then_with(|| a.scoped_path.cmp(&b.scoped_path))
+    });
+    entries.dedup_by(|a, b| a.path == b.path && a.kind == b.kind);
+    if entries.len() > limit {
+        entries.truncate(limit);
+        scan_state.limit_truncated = true;
+    }
+    let project_types = project_types(&entries);
+    let manifests = manifests(&entries);
+    let key_files = key_files(&entries);
+    let suggested_next_reads = suggested_next_reads(&key_files);
+    let roots = roots(&entries);
+    let top_level = top_level(&entries);
+    let truncation_reason = match (
+        scan_state.limit_truncated,
+        scan_state.depth_truncated,
+        scan_state.transport_truncated,
+    ) {
+        (false, false, false) => None,
+        (true, false, false) => Some("limit"),
+        (false, true, false) => Some("max_depth"),
+        (true, true, false) => Some("limit_and_max_depth"),
+        (false, false, true) => Some("transport"),
+        (true, false, true) => Some("limit_and_transport"),
+        (false, true, true) => Some("max_depth_and_transport"),
+        (true, true, true) => Some("limit_max_depth_and_transport"),
+    };
+    let mut warnings = Vec::new();
+    if scan_state.skipped_symlink {
+        warnings.push("symlinks_skipped");
+    }
+    if scan_state.skipped_unreadable {
+        warnings.push("unreadable_entries_skipped");
+    }
+    if scan_state.skipped_non_utf8 {
+        warnings.push("non_utf8_paths_skipped");
+    }
+    if scan_state.transport_truncated {
+        warnings.push("transport_output_truncated");
+    }
+    Ok(json!({
+        "schema_version": 1,
+        "path": path,
+        "deterministic": true,
+        "project_types": project_types,
+        "manifests": manifests,
+        "key_files": key_files_to_json(&key_files),
+        "roots": roots,
+        "top_level": top_level,
+        "suggested_next_reads": suggested_next_reads,
+        "scan": {
+            "max_depth": max_depth,
+            "limit": limit,
+            "returned_entry_count": entries.len(),
+            "truncated": scan_state.limit_truncated || scan_state.depth_truncated || scan_state.transport_truncated,
+            "truncation_reason": truncation_reason,
+        },
+        "warnings": warnings,
+    }))
+}
+
+fn normalize_metadata_path(path: &str) -> Option<String> {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains('\0')
+        || path.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => return None,
+            part => parts.push(part),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
 /// Scan `requested_path` under `project_root` and build the agent-owned
@@ -191,16 +346,17 @@ pub fn build_project_overview(
                 continue;
             }
             let kind = if file_type.is_dir() {
-                EntryKind::Directory
+                ProjectOverviewEntryKind::Directory
             } else if file_type.is_file() {
-                EntryKind::File
+                ProjectOverviewEntryKind::File
             } else {
                 continue;
             };
             if let Some((tracked_files, tracked_dirs)) = tracked.as_ref() {
                 let known = match kind {
-                    EntryKind::File => tracked_files.contains(&project_path),
-                    EntryKind::Directory => tracked_dirs.contains(&project_path),
+                    ProjectOverviewEntryKind::File => tracked_files.contains(&project_path),
+                    ProjectOverviewEntryKind::Directory => tracked_dirs.contains(&project_path),
+                    ProjectOverviewEntryKind::Symlink => false,
                 };
                 if !known {
                     continue;
@@ -217,7 +373,7 @@ pub fn build_project_overview(
                 depth,
                 kind,
             });
-            if kind == EntryKind::Directory {
+            if kind == ProjectOverviewEntryKind::Directory {
                 if depth < max_depth {
                     queue.push_back(PendingDirectory {
                         absolute_path: child.path(),
@@ -386,7 +542,10 @@ fn git_tracked_index(
 
 fn project_types(entries: &[ScanEntry]) -> Vec<Value> {
     let mut evidence: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
-    for entry in entries.iter().filter(|entry| entry.kind == EntryKind::File) {
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.kind == ProjectOverviewEntryKind::File)
+    {
         if let Some((kind, _)) = manifest_kind(&entry.path) {
             evidence.entry(kind).or_default().push(entry.path.clone());
         }
@@ -409,7 +568,7 @@ fn project_types(entries: &[ScanEntry]) -> Vec<Value> {
 fn manifests(entries: &[ScanEntry]) -> Vec<Value> {
     let mut values = entries
         .iter()
-        .filter(|entry| entry.kind == EntryKind::File)
+        .filter(|entry| entry.kind == ProjectOverviewEntryKind::File)
         .filter_map(|entry| {
             manifest_kind(&entry.path).map(|(_, kind)| {
                 json!({
@@ -464,8 +623,8 @@ fn classify_key_file(entry: &ScanEntry) -> Option<KeyFile> {
     let name = basename(&entry.path);
     let lower_name = name.to_ascii_lowercase();
     let lower_scoped = entry.scoped_path.to_ascii_lowercase();
-    let file = entry.kind == EntryKind::File;
-    let directory = entry.kind == EntryKind::Directory;
+    let file = entry.kind == ProjectOverviewEntryKind::File;
+    let directory = entry.kind == ProjectOverviewEntryKind::Directory;
 
     if file
         && (lower_name == "agents.md"
@@ -643,7 +802,7 @@ fn roots(entries: &[ScanEntry]) -> Value {
     let mut ci = Vec::new();
     for entry in entries
         .iter()
-        .filter(|entry| entry.kind == EntryKind::Directory && entry.depth == 1)
+        .filter(|entry| entry.kind == ProjectOverviewEntryKind::Directory && entry.depth == 1)
     {
         let name = basename(&entry.path).to_ascii_lowercase();
         let target = match name.as_str() {
@@ -686,13 +845,14 @@ fn roots(entries: &[ScanEntry]) -> Value {
 fn top_level(entries: &[ScanEntry]) -> Vec<Value> {
     let mut values = entries
         .iter()
-        .filter(|entry| entry.depth == 1)
+        .filter(|entry| entry.depth == 1 && entry.kind != ProjectOverviewEntryKind::Symlink)
         .map(|entry| {
             json!({
                 "path": entry.path,
                 "kind": match entry.kind {
-                    EntryKind::File => "file",
-                    EntryKind::Directory => "directory",
+                    ProjectOverviewEntryKind::File => "file",
+                    ProjectOverviewEntryKind::Directory => "directory",
+                    ProjectOverviewEntryKind::Symlink => unreachable!("symlinks are filtered"),
                 },
             })
         })

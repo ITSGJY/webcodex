@@ -867,6 +867,7 @@ async fn show_changes_accepts_unique_short_id() {
             stderr: Some(String::new()),
             duration_ms: Some(1),
             error: None,
+            remote_workspace: None,
         })
         .await
         .unwrap();

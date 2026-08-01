@@ -109,8 +109,28 @@ pub(crate) fn dispatch_request(
                 ),
             },
         };
+        let duration_ms = result.duration_ms;
+        let response = result
+            .stdout
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_else(|| crate::shell_protocol::RemoteWorkspaceReadResponse {
+                format: crate::shell_protocol::REMOTE_WORKSPACE_READ_RESULT_FORMAT.to_string(),
+                operation: request
+                    .remote_workspace
+                    .as_ref()
+                    .map(|read| read.operation.clone())
+                    .unwrap_or_default(),
+                outcome: crate::shell_protocol::RemoteWorkspaceReadOutcome::Failure {
+                    error_kind: "ssh_workspace_protocol_failure".to_string(),
+                    message: "malformed SSH workspace result".to_string(),
+                    command_started: result.exit_code.is_some(),
+                    command_completed: result.exit_code.is_some(),
+                    exit_code: result.exit_code,
+                },
+            });
         return sink
-            .submit_result_with_metadata(request.request_id, result, config, runtime)
+            .submit_remote_workspace_result(request.request_id, response, duration_ms)
             .map(|_| true);
     }
     // Inspect requests must stay on the native execution path where Landlock

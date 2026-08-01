@@ -316,6 +316,7 @@ async fn line_edit_dispatch_uses_agent_native_file_op_not_python_helper() {
             stderr: Some(String::new()),
             duration_ms: Some(1),
             error: None,
+            remote_workspace: None,
         })
         .await
         .unwrap();

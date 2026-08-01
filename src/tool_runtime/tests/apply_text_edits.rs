@@ -268,6 +268,7 @@ async fn apply_text_edits_dry_run_does_not_write() {
             stderr: Some(String::new()),
             duration_ms: Some(1),
             error: None,
+            remote_workspace: None,
         })
         .await
         .unwrap();
@@ -406,6 +407,7 @@ async fn apply_text_edits_session_event_summary() {
             stderr: Some(String::new()),
             duration_ms: Some(1),
             error: None,
+        remote_workspace: None,
         })
         .await
         .unwrap();

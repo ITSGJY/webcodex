@@ -692,6 +692,7 @@ async fn unique_short_agent_project_id_is_resolved_by_runtime_surface() {
             stderr: Some(String::new()),
             duration_ms: Some(1),
             error: None,
+            remote_workspace: None,
         })
         .await
         .unwrap();

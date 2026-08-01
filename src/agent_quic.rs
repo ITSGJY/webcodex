@@ -898,6 +898,7 @@ mod tests {
                     stderr: Some(String::new()),
                     duration_ms: Some(2),
                     error: None,
+                    remote_workspace: None,
                 },
             },
         )

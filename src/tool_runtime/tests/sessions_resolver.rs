@@ -106,6 +106,7 @@ async fn read_file_accepts_unique_short_id() {
             stderr: None,
             duration_ms: Some(1),
             error: None,
+            remote_workspace: None,
         })
         .await
         .unwrap();
@@ -146,6 +147,7 @@ async fn git_status_accepts_unique_short_id() {
             stderr: Some(String::new()),
             duration_ms: Some(1),
             error: None,
+            remote_workspace: None,
         })
         .await
         .unwrap();
@@ -212,6 +214,7 @@ async fn full_id_remains_compatible_for_project_tools() {
             stderr: None,
             duration_ms: Some(1),
             error: None,
+            remote_workspace: None,
         })
         .await
         .unwrap();

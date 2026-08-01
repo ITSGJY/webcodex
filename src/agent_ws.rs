@@ -531,6 +531,7 @@ mod tests {
                 stderr: None,
                 duration_ms: Some(1),
                 error: None,
+                remote_workspace: None,
             },
         };
         ws.send(TungsteniteMessage::Text(
@@ -904,6 +905,7 @@ mod tests {
                     stderr: None,
                     duration_ms: Some(1),
                     error: None,
+                    remote_workspace: None,
                 },
             }
             .to_json()

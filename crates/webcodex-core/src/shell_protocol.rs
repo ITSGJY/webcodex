@@ -831,6 +831,10 @@ pub struct ShellAgentResultRequest {
     pub duration_ms: Option<u64>,
     #[serde(default)]
     pub error: Option<String>,
+    /// Dedicated typed result for `ssh_workspace_read`. It bypasses generic
+    /// stdout truncation and is validated as one complete bounded envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_workspace: Option<RemoteWorkspaceReadResponse>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

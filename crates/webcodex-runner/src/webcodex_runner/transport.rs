@@ -905,6 +905,7 @@ impl AgentSink {
             stderr: result.stderr,
             duration_ms: result.duration_ms,
             error: result.error,
+            remote_workspace: None,
         };
         match self {
             AgentSink::Http(h) => submit_result_http(h, &body),
@@ -915,6 +916,37 @@ impl AgentSink {
                         "agent transport result channel closed".to_string(),
                     )
                 })?;
+                Ok(ResultSubmission::Accepted)
+            }
+        }
+    }
+
+    pub(crate) fn submit_remote_workspace_result(
+        &self,
+        request_id: String,
+        result: crate::shell_protocol::RemoteWorkspaceReadResponse,
+        duration_ms: Option<u64>,
+    ) -> Result<ResultSubmission, SubmitResultError> {
+        let body = ShellAgentResultRequest {
+            client_id: self.client_id().to_string(),
+            agent_instance_id: self.agent_instance_id().to_string(),
+            request_id,
+            exit_code: Some(0),
+            stdout: None,
+            stderr: None,
+            duration_ms,
+            error: None,
+            remote_workspace: Some(result),
+        };
+        match self {
+            AgentSink::Http(h) => submit_result_http(h, &body),
+            AgentSink::WebSocket { tx, .. } | AgentSink::Quic { tx, .. } => {
+                tx.blocking_send(AgentEnvelope::Result { payload: body })
+                    .map_err(|_| {
+                        SubmitResultError::TransportClosed(
+                            "agent transport result channel closed".to_string(),
+                        )
+                    })?;
                 Ok(ResultSubmission::Accepted)
             }
         }

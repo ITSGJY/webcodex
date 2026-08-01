@@ -230,6 +230,7 @@ async fn complete_one_agent_request(
             stderr: Some(stderr.into()),
             duration_ms: Some(1),
             error: None,
+            remote_workspace: None,
         })
         .await
         .unwrap();
@@ -280,6 +281,7 @@ fn spawn_startup_agent_executor(registry: Arc<ShellClientRegistry>) -> tokio::ta
                         stderr: Some(stderr),
                         duration_ms: Some(1),
                         error: None,
+                        remote_workspace: None,
                     })
                     .await
                     .unwrap();
@@ -1702,6 +1704,7 @@ async fn api_show_changes_with_session_id() {
                 stderr: Some(String::new()),
                 duration_ms: Some(1),
                 error: None,
+                remote_workspace: None,
             })
             .await
             .unwrap();

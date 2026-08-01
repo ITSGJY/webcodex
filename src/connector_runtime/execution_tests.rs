@@ -236,6 +236,7 @@ async fn fixture_built(
                 stderr: Some(String::new()),
                 duration_ms: Some(1),
                 error: None,
+                remote_workspace: None,
             })
             .await
             .unwrap();
@@ -512,6 +513,7 @@ async fn complete_create_edit(
             stderr: Some(String::new()),
             duration_ms: Some(1),
             error: None,
+            remote_workspace: None,
         })
         .await
         .unwrap();
@@ -3046,6 +3048,7 @@ async fn read_only_files_list_reaches_the_agent_as_a_git_index_listing() {
             stderr: None,
             duration_ms: Some(2),
             error: None,
+            remote_workspace: None,
         })
         .await
         .unwrap();
@@ -3736,6 +3739,7 @@ async fn manifestless_python_unittest_checks_finish_with_clean_result() {
             stderr: Some(String::new()),
             duration_ms: Some(1),
             error: None,
+            remote_workspace: None,
         })
         .await
         .unwrap();
@@ -4192,6 +4196,7 @@ async fn provenance_mismatch_fails_honestly_with_evidence() {
             stderr: Some("fatal: unable to read tree".into()),
             duration_ms: Some(1),
             error: None,
+            remote_workspace: None,
         })
         .await
         .unwrap();
@@ -4367,6 +4372,7 @@ async fn scan_failure_review_caps_applied_paths_and_reports_the_true_total() {
             stderr: Some("fatal: unable to read tree".into()),
             duration_ms: Some(1),
             error: None,
+            remote_workspace: None,
         })
         .await
         .unwrap();

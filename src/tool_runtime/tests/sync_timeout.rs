@@ -231,6 +231,7 @@ async fn full_cargo_test_timeout_reports_dispatched_state_and_cleans_request() {
             stderr: Some(String::new()),
             duration_ms: Some(3_000),
             error: None,
+            remote_workspace: None,
         })
         .await
         .unwrap_err();

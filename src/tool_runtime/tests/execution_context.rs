@@ -489,6 +489,7 @@ async fn session_ssh_transport_failure_marks_remote_delivery_uncertain() {
             error: Some(
                 "ssh_transport_failed: command may have started and was not retried".to_string(),
             ),
+            remote_workspace: None,
         })
         .await
         .unwrap();
@@ -625,6 +626,7 @@ async fn nonexistent_inherited_cwd_is_not_retried_at_project_root() {
             stderr: None,
             duration_ms: Some(1),
             error: Some("cwd does not exist".to_string()),
+            remote_workspace: None,
         })
         .await
         .unwrap();

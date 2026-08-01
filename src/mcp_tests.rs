@@ -354,6 +354,7 @@ async fn mcp_image_call_returns_native_image_for_remote_agent_project() {
             stderr: Some(String::new()),
             duration_ms: Some(1),
             error: None,
+            remote_workspace: None,
         })
         .await
         .unwrap();
@@ -857,6 +858,7 @@ async fn mcp_show_changes_distinguishes_reserved_session_id_from_query_session_i
                 stderr: Some(String::new()),
                 duration_ms: Some(1),
                 error: None,
+                remote_workspace: None,
             })
             .await
             .unwrap();
