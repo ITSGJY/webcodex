@@ -192,26 +192,26 @@ pub(crate) const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
 pub(crate) const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
     ToolRecommendedFlow {
         name: "discovery",
-        summary: "Discovery: list_projects, project_overview, and read_file; prefer run_shell with rg or git grep for code search. search_project_text remains a compatibility path.",
+        summary: "Discovery: list_projects, project_overview, and read_file; use search_project_text for bounded code search. run_shell with rg or git grep remains the diagnostic escape hatch.",
         manifest_purpose:
-            "Resolve the project, inspect bounded structure, then search code with run_shell and rg or git grep.",
+            "Resolve the project, inspect bounded structure, then search code with search_project_text.",
         tools: &[
             "list_projects",
             "project_overview",
             "read_file",
-            "run_shell",
             "search_project_text",
+            "run_shell",
         ],
     },
     ToolRecommendedFlow {
         name: "inspect",
-        summary: "Inspect: use read_file and run_shell with rg or git grep before editing; search_project_text remains compatible, and show_changes reviews the worktree.",
+        summary: "Inspect: use search_project_text and read_file before editing; run_shell with rg or git grep is the diagnostic escape hatch, and show_changes reviews the worktree.",
         manifest_purpose:
-            "Prefer run_shell with rg or git grep for code inspection, then review the worktree.",
+            "Use bounded structured search and file reads for code inspection, then review the worktree.",
         tools: &[
+            "search_project_text",
             "read_file",
             "run_shell",
-            "search_project_text",
             "show_changes",
         ],
     },

@@ -421,6 +421,34 @@ fields alone, so unknown fields, padding, mismatched range metadata, wrong
 SHA, or inconsistent content/line counts are stripped or rejected
 (`malformed_agent_response`) and never leak to the model.
 
+## Bounded project text search (`search_project_text`)
+
+`search_project_text` is the default inspect/search tool. It uses ripgrep first
+with a basic grep fallback, and it is bounded in both work and bytes:
+
+- **Early stop.** The search emits records in traversal order (no global
+  path sort) and the command pipeline closes as soon as the requested record
+  budget is met, so a small `limit` search returns promptly instead of waiting
+  for a full-repository scan. Match order is therefore not deterministic; the
+  result set is bounded and timely.
+- **Byte budget.** A second pipeline stage emits the formal search budget plus
+  one bounded probe byte. The server consumes that probe only to prove the cap
+  fired, including when it landed exactly after a newline, and reports
+  `truncation_reason = "output_bytes"`. A single over-long match or context line
+  cannot blow past the Runner transport cap; only complete records are returned.
+- **Timeout partial success.** If the effective timeout fires after complete
+  records were collected, the tool still returns them with
+  `truncated = true` and `truncation_reason = "timeout"` instead of discarding
+  them. `count` mode never presents a partial count as a complete total:
+  `count_complete` stays false and `total_matches` stays null. If nothing
+  complete was collected, the structured `search_timeout` failure is returned.
+- **Trusted paths.** Returned paths are project-relative and validated;
+  absolute paths, parent traversal, temp-file paths, Shell commands, and
+  Runner stderr are never surfaced.
+
+Truncation metadata is stable: `truncated` with `truncation_reason` one of
+`limit | output_bytes | timeout | transport`, or `null` when complete.
+
 ## Advanced Runtime Surface
 
 WebCodex can also run as a multi-project management ToolRuntime. Its discovery,

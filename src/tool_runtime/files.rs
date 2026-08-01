@@ -870,24 +870,31 @@ fi
 }
 
 /// Wrap a backend search invocation so POSIX `sh` preserves the backend exit
-/// status even when output is bounded by `head`. Status files live only under
-/// a safe absolute temp dir (never the project worktree) and are cleaned up via
-/// trap + explicit removal.
+/// status even when output is bounded. Two `head` stages bound the work and
+/// bytes: `head -n` closes the pipe once the record budget is satisfied (which
+/// SIGPIPEs the backend and stops the scan early), and `head -c` emits at most
+/// the formal byte budget plus one probe byte. That probe lets the Rust parser
+/// prove the byte cap fired even when the formal boundary lands exactly after a
+/// newline; the parser never exposes the probe byte. The backend status is
+/// captured via a side-channel file so the pipeline cannot mask exit >= 2.
+/// SIGPIPE (141) may occur when a bounder closes early on a large successful
+/// result set and is treated as success by the Rust layer. Head's own non-zero
+/// exit is never treated as success.
 ///
-/// Uses pure shell noclobber file creation instead of `mktemp` so the command
-/// still works when PATH is restricted to a tool sandbox without coreutils.
+/// Status files live only under a safe absolute temp dir (never the project
+/// worktree) and are cleaned up via trap + explicit removal. Uses pure shell
+/// noclobber file creation instead of `mktemp` so the command still works when
+/// PATH is restricted to a tool sandbox without coreutils.
 ///
 /// Caller must ensure `head_cmd` is set (see `search_head_resolution_shell`).
 fn wrap_search_project_text_backend_command(
     backend: &str,
     backend_cmd: &str,
     head_lines: usize,
+    head_bytes: usize,
 ) -> String {
+    let head_probe_bytes = head_bytes.saturating_add(1);
     let marker = search_project_text_marker_command(backend, false);
-    // Capture backend status via a side-channel file so `head` cannot mask
-    // exit >= 2. SIGPIPE (141) may occur when head closes early on large
-    // successful result sets and is treated as success by the Rust layer.
-    // Head's own non-zero exit is never treated as success.
     format!(
         r#"{marker}
 {tmpdir}
@@ -914,7 +921,7 @@ done
 {{
   {backend_cmd}
   echo $? > "$status_file"
-}} | "$head_cmd" -n {head_lines}
+}} | "$head_cmd" -n {head_lines} | "$head_cmd" -c {head_probe_bytes}
 head_status=$?
 status=2
 # read is a shell builtin so this works even when PATH lacks coreutils.
@@ -931,14 +938,30 @@ esac
 if [ "$head_status" -ne 0 ]; then
   status=2
 fi
-{marker}
 exit "$status""#,
         marker = marker,
         tmpdir = search_status_tmpdir_shell(),
         backend_cmd = backend_cmd,
         head_lines = head_lines,
+        head_probe_bytes = head_probe_bytes,
     )
 }
+
+/// Formal cap on search output bytes, applied by a second `head -c` stage in
+/// the command (shared by local and agent paths) so no single over-long match
+/// line, context line, or path can push the output past the Runner transport
+/// cap (default 256 KiB) before the Rust layer ever sees it. The command emits
+/// at most one probe byte beyond this formal budget; the parser consumes that
+/// byte only as proof of truncation and never exposes it. A record cut mid-line
+/// is dropped and reports `truncation_reason = "output_bytes"`.
+///
+/// Kept at 32 KiB, not larger: the local path executes the command through
+/// [`run_command_sync`](crate::tool_runtime::helpers::run_command_sync), whose
+/// polling loop does not drain stdout while waiting. Output over the ~64 KiB
+/// Linux pipe buffer would block the producer until the hard timeout. 32 KiB
+/// plus the backend marker stays comfortably under that buffer while still
+/// bounding any single over-long record well below the transport cap.
+pub(crate) const SEARCH_OUTPUT_BYTE_BUDGET: usize = 32 * 1024;
 
 fn search_output_line_budget(options: &SearchOptions) -> usize {
     let result_budget = options.limit.saturating_add(1);
@@ -969,9 +992,14 @@ fn ripgrep_search_command(options: &SearchOptions) -> String {
         SearchResultMode::FilesWithMatches => "--files-with-matches".to_string(),
         SearchResultMode::Count => "--count --null".to_string(),
     };
-    format!(
-        "rg {mode_args} --color never --hidden --sort path {globs} -e {pattern} -- {target} 2>/dev/null"
-    )
+    // Deliberately no `--sort path`: a global sort forces ripgrep to scan and
+    // buffer the whole search space before emitting anything, so a small
+    // `limit` request still waits for a full-repo walk. Without it, matches
+    // stream in traversal order and `head -n` closes the pipe as soon as the
+    // record budget is satisfied, which SIGPIPEs the backend and stops the
+    // work early. Match order is not stable, but the result is bounded and
+    // timely, which matters more for this tool.
+    format!("rg {mode_args} --color never --hidden {globs} -e {pattern} -- {target} 2>/dev/null")
 }
 
 fn grep_search_command(options: &SearchOptions) -> String {
@@ -1065,11 +1093,22 @@ pub(crate) fn search_project_text_command_with_head_fallbacks(
 ) -> String {
     let head = search_output_line_budget(options);
     let head_setup = search_head_resolution_shell(absolute_head_candidates);
-    let rg = wrap_search_project_text_backend_command("rg", &ripgrep_search_command(options), head);
+    let head_bytes = SEARCH_OUTPUT_BYTE_BUDGET;
+    let rg = wrap_search_project_text_backend_command(
+        "rg",
+        &ripgrep_search_command(options),
+        head,
+        head_bytes,
+    );
     let fallback = if options.requires_ripgrep() {
         search_project_text_marker_command("grep", true)
     } else {
-        wrap_search_project_text_backend_command("grep", &grep_search_command(options), head)
+        wrap_search_project_text_backend_command(
+            "grep",
+            &grep_search_command(options),
+            head,
+            head_bytes,
+        )
     };
     format!("{head_setup}if command -v rg >/dev/null 2>&1; then\n{rg}\nelse\n{fallback}\nfi")
 }
@@ -1181,12 +1220,41 @@ enum SearchResultData {
     },
 }
 
+/// Why a search result is incomplete. Distinct from "backend execution
+/// failed": every variant below still returns complete, trusted records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchTruncation {
+    /// The caller's `limit` was reached (the backend may have been stopped
+    /// early by `head -n` closing the pipe).
+    Limit,
+    /// The `head -c` byte budget cut the stream, possibly mid-record; the
+    /// parser drops the partial tail so only complete records are returned.
+    OutputBytes,
+    /// stdout was transport-truncated (the Runner keeps a tail of the output);
+    /// the kept tail is honored but the prefix marks it incomplete.
+    Transport,
+    /// The search did not finish within the effective timeout; records
+    /// collected before the timeout are still complete and trusted.
+    Timeout,
+}
+
+impl SearchTruncation {
+    fn reason(self) -> &'static str {
+        match self {
+            SearchTruncation::Limit => "limit",
+            SearchTruncation::OutputBytes => "output_bytes",
+            SearchTruncation::Transport => "transport",
+            SearchTruncation::Timeout => "timeout",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SearchResult {
     backend: String,
     data: SearchResultData,
     truncated: bool,
-    truncation_reason: Option<&'static str>,
+    truncation_reason: Option<SearchTruncation>,
 }
 
 #[derive(Debug)]
@@ -1236,6 +1304,34 @@ fn external_provider_error_result(stdout: &str) -> Option<ToolResult> {
     })
 }
 
+/// A path parsed out of search stdout is only trusted when it is a plain
+/// project-relative path: not absolute, no parent traversal, and not a
+/// sensitive/bulk-skipped path. Anything else (a broken or hostile backend
+/// emitting an absolute path or temp-file path) is dropped rather than
+/// surfaced to the model.
+fn is_trusted_search_record_path(path: &str) -> bool {
+    let path = path.strip_prefix("./").unwrap_or(path);
+    if path.is_empty() {
+        return false;
+    }
+    let p = Path::new(path);
+    if p.is_absolute()
+        || p.components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    !is_search_project_text_excluded_path(path)
+}
+
+fn normalize_search_record_path(path: &str) -> Option<String> {
+    let path = path.strip_prefix("./").unwrap_or(path);
+    if !is_trusted_search_record_path(path) {
+        return None;
+    }
+    Some(path.to_string())
+}
+
 fn parse_search_line_record(line: &str) -> Option<SearchLineRecord> {
     let (path, line_no, separator, text) = if let Some((path, rest)) = line.split_once('\0') {
         let digits_end = rest
@@ -1253,10 +1349,7 @@ fn parse_search_line_record(line: &str) -> Option<SearchLineRecord> {
         let mut parts = line.splitn(3, ':');
         (parts.next()?, parts.next()?, ':', parts.next()?)
     };
-    let path = path.strip_prefix("./").unwrap_or(path).to_string();
-    if is_search_project_text_excluded_path(&path) {
-        return None;
-    }
+    let path = normalize_search_record_path(path)?;
     Some(SearchLineRecord {
         path,
         line: line_no.parse().ok()?,
@@ -1265,11 +1358,69 @@ fn parse_search_line_record(line: &str) -> Option<SearchLineRecord> {
     })
 }
 
-fn parse_search_line_records(stdout: &str) -> Vec<SearchLineRecord> {
-    stdout
-        .lines()
-        .filter_map(parse_search_line_record)
-        .collect()
+/// Return the byte offset immediately after the leading trusted backend marker,
+/// when present. The command always emits this marker outside the bounded search
+/// payload. Parser-only tests and legacy/transport-truncated responses may omit
+/// it, in which case the whole stdout string is treated as payload.
+fn search_payload_start(stdout: &str) -> usize {
+    let Some(newline) = stdout.find('\n') else {
+        return 0;
+    };
+    let line = &stdout[..newline];
+    let Some(()) = serde_json::from_str::<Value>(line).ok().and_then(|value| {
+        let marker = value.get("webcodex_search").unwrap_or(&value);
+        let backend = marker.get("backend").and_then(Value::as_str)?;
+        matches!(backend, "rg" | "grep" | "native" | "claude_code").then_some(())
+    }) else {
+        return 0;
+    };
+    newline + 1
+}
+
+/// Enforce the formal search payload budget in Rust and retain the shell's
+/// single probe byte only long enough to prove that `head -c` hit the cap. This
+/// remains correct when the formal byte boundary lands exactly after a newline,
+/// where an unterminated-tail heuristic alone cannot distinguish truncation
+/// from a naturally complete stream.
+fn bounded_search_stdout(stdout: &str) -> (&str, bool) {
+    let payload_start = search_payload_start(stdout);
+    let payload = &stdout[payload_start..];
+    if payload.len() <= SEARCH_OUTPUT_BYTE_BUDGET {
+        return (stdout, false);
+    }
+    let mut payload_end = SEARCH_OUTPUT_BYTE_BUDGET;
+    while payload_end > 0 && !payload.is_char_boundary(payload_end) {
+        payload_end -= 1;
+    }
+    (&stdout[..payload_start + payload_end], true)
+}
+
+/// Split stdout into its complete newline-terminated lines plus a flag that is
+/// true when either the explicit byte-cap probe proved truncation or the raw
+/// output ended mid-record. The partial final segment is never a complete
+/// record and is dropped. The unterminated-tail rule also guards timeout
+/// truncation on the local path.
+fn split_complete_search_lines(stdout: &str) -> (Vec<&str>, bool) {
+    let (stdout, byte_cap_hit) = bounded_search_stdout(stdout);
+    let unterminated = !stdout.is_empty() && !stdout.ends_with('\n');
+    let cut = if unterminated {
+        stdout.rfind('\n').map(|index| index + 1).unwrap_or(0)
+    } else {
+        stdout.len()
+    };
+    (
+        stdout[..cut].lines().collect(),
+        byte_cap_hit || unterminated,
+    )
+}
+
+fn parse_search_line_records(stdout: &str) -> (Vec<SearchLineRecord>, bool) {
+    let (lines, bytes_truncated) = split_complete_search_lines(stdout);
+    let records = lines
+        .iter()
+        .filter_map(|line| parse_search_line_record(line))
+        .collect();
+    (records, bytes_truncated)
 }
 
 fn search_matches_from_records(
@@ -1325,9 +1476,10 @@ fn search_matches_from_records(
     (matches, truncated)
 }
 
-fn parse_file_paths(stdout: &str, limit: usize) -> (Vec<SearchFile>, bool) {
+fn parse_file_paths(stdout: &str, limit: usize) -> (Vec<SearchFile>, bool, bool) {
+    let (lines, bytes_truncated) = split_complete_search_lines(stdout);
     let mut paths = Vec::<String>::new();
-    for line in stdout.lines() {
+    for line in lines {
         if line.starts_with("[output truncated to last ") {
             continue;
         }
@@ -1335,26 +1487,27 @@ fn parse_file_paths(stdout: &str, limit: usize) -> (Vec<SearchFile>, bool) {
             continue;
         }
         let path = line.trim_end_matches('\r');
-        let path = path.strip_prefix("./").unwrap_or(path);
-        if path.is_empty()
-            || is_search_project_text_excluded_path(path)
-            || paths.iter().any(|existing| existing == path)
-        {
+        let Some(path) = normalize_search_record_path(path) else {
+            continue;
+        };
+        if paths.iter().any(|existing| existing == &path) {
             continue;
         }
-        paths.push(path.to_string());
+        paths.push(path);
     }
-    let truncated = paths.len() > limit;
+    let limit_truncated = paths.len() > limit;
     paths.truncate(limit);
     (
         paths.into_iter().map(|path| SearchFile { path }).collect(),
-        truncated,
+        limit_truncated,
+        bytes_truncated,
     )
 }
 
-fn parse_file_counts(stdout: &str, limit: usize) -> (Vec<SearchFileCount>, u64, bool) {
+fn parse_file_counts(stdout: &str, limit: usize) -> (Vec<SearchFileCount>, u64, bool, bool) {
+    let (lines, bytes_truncated) = split_complete_search_lines(stdout);
     let mut counts = Vec::<(String, u64)>::new();
-    for line in stdout.lines() {
+    for line in lines {
         if serde_json::from_str::<Value>(line).is_ok() {
             continue;
         }
@@ -1367,17 +1520,16 @@ fn parse_file_counts(stdout: &str, limit: usize) -> (Vec<SearchFileCount>, u64, 
         let Some((path, count)) = parsed else {
             continue;
         };
-        let path = path.strip_prefix("./").unwrap_or(path);
-        if is_search_project_text_excluded_path(path) {
+        let Some(path) = normalize_search_record_path(path) else {
             continue;
-        }
-        if let Some((_, existing)) = counts.iter_mut().find(|(existing, _)| existing == path) {
+        };
+        if let Some((_, existing)) = counts.iter_mut().find(|(existing, _)| existing == &path) {
             *existing = existing.saturating_add(count);
         } else {
-            counts.push((path.to_string(), count));
+            counts.push((path, count));
         }
     }
-    let truncated = counts.len() > limit;
+    let limit_truncated = counts.len() > limit;
     counts.truncate(limit);
     let returned_match_count = counts.iter().map(|(_, count)| *count).sum();
     (
@@ -1386,7 +1538,8 @@ fn parse_file_counts(stdout: &str, limit: usize) -> (Vec<SearchFileCount>, u64, 
             .map(|(path, match_count)| SearchFileCount { path, match_count })
             .collect(),
         returned_match_count,
-        truncated,
+        limit_truncated,
+        bytes_truncated,
     )
 }
 
@@ -1396,40 +1549,52 @@ fn search_stdout_was_transport_truncated(stdout: &str) -> bool {
 
 fn parse_search_result(stdout: &str, options: &SearchOptions, backend: String) -> SearchResult {
     let transport_truncated = search_stdout_was_transport_truncated(stdout);
-    let (data, limit_truncated) = match options.result_mode {
+    let (data, limit_truncated, bytes_truncated) = match options.result_mode {
         SearchResultMode::Matches => {
-            let records = parse_search_line_records(stdout);
+            let (records, bytes_truncated) = parse_search_line_records(stdout);
             let (matches, truncated) = search_matches_from_records(&records, options);
-            (SearchResultData::Matches(matches), truncated)
+            (
+                SearchResultData::Matches(matches),
+                truncated,
+                bytes_truncated,
+            )
         }
         SearchResultMode::FilesWithMatches => {
-            let (files, truncated) = parse_file_paths(stdout, options.limit);
-            (SearchResultData::FilesWithMatches(files), truncated)
+            let (files, limit_truncated, bytes_truncated) = parse_file_paths(stdout, options.limit);
+            (
+                SearchResultData::FilesWithMatches(files),
+                limit_truncated,
+                bytes_truncated,
+            )
         }
         SearchResultMode::Count => {
-            let (files, returned_match_count, truncated) = parse_file_counts(stdout, options.limit);
+            let (files, returned_match_count, limit_truncated, bytes_truncated) =
+                parse_file_counts(stdout, options.limit);
             (
                 SearchResultData::Count {
                     files,
                     returned_match_count,
-                    count_complete: !truncated && !transport_truncated,
+                    count_complete: !limit_truncated && !bytes_truncated && !transport_truncated,
                 },
-                truncated,
+                limit_truncated,
+                bytes_truncated,
             )
         }
     };
-    let truncated = limit_truncated || transport_truncated;
+    let truncation = if transport_truncated {
+        Some(SearchTruncation::Transport)
+    } else if limit_truncated {
+        Some(SearchTruncation::Limit)
+    } else if bytes_truncated {
+        Some(SearchTruncation::OutputBytes)
+    } else {
+        None
+    };
     SearchResult {
         backend,
         data,
-        truncated,
-        truncation_reason: if transport_truncated {
-            Some("transport")
-        } else if limit_truncated {
-            Some("limit")
-        } else {
-            None
-        },
+        truncated: truncation.is_some(),
+        truncation_reason: truncation,
     }
 }
 
@@ -1467,7 +1632,17 @@ pub(crate) fn search_project_text_output_with_agent_error(
         );
     }
     if looks_like_search_timeout(exit_code, stderr, agent_error, options.timeout_secs) {
-        return search_timeout_tool_result(options, Some(backend_status.backend.as_str()));
+        // Timeout after a timeout can still have collected complete, trusted
+        // records: return them as a partial success rather than discarding
+        // them. Only when nothing complete was collected do we fall back to
+        // the structured `search_timeout` failure.
+        return search_timeout_tool_result_with_records(
+            project,
+            options,
+            stdout,
+            Some(backend_status.backend.as_str()),
+            exit_code,
+        );
     }
     // 0 = matches, 1 = no matches (success empty), 141 = SIGPIPE after head bound.
     // exit >= 2 (other) is a real backend execution failure.
@@ -1486,6 +1661,18 @@ pub(crate) fn search_project_text_output_with_agent_error(
     }
 
     let result = parse_search_result(stdout, options, backend_status.backend);
+    ToolResult::ok(search_result_json(project, options, result, exit_code))
+}
+
+/// Serialize a parsed [`SearchResult`] into the public `search_project_text`
+/// output object. Shared by the normal success path and the timeout
+/// partial-success path so both emit identical field semantics.
+fn search_result_json(
+    project: &str,
+    options: &SearchOptions,
+    result: SearchResult,
+    exit_code: Option<i32>,
+) -> Value {
     let mut output = json!({
         "project": project,
         "pattern": options.pattern,
@@ -1523,7 +1710,45 @@ pub(crate) fn search_project_text_output_with_agent_error(
         }
     }
     output["truncated"] = json!(result.truncated);
-    output["truncation_reason"] = result.truncation_reason.map_or(Value::Null, Value::from);
+    output["truncation_reason"] = result
+        .truncation_reason
+        .map_or(Value::Null, |reason| json!(reason.reason()));
+    output
+}
+
+/// A search timed out but may have collected complete records before the
+/// backend was stopped. Return those records as a partial success
+/// (`success = true`, `truncated = true`, `truncation_reason = "timeout"`).
+/// Only complete records are trusted; a mid-record tail is dropped. When
+/// nothing complete was collected, fall back to the structured
+/// `search_timeout` failure. Count mode never presents a partial count as a
+/// complete total (`count_complete` stays false, `total_matches` stays null).
+fn search_timeout_tool_result_with_records(
+    project: &str,
+    options: &SearchOptions,
+    stdout: &str,
+    backend: Option<&str>,
+    exit_code: Option<i32>,
+) -> ToolResult {
+    let backend_name = backend.unwrap_or("grep").to_string();
+    let mut result = parse_search_result(stdout, options, backend_name);
+    let has_records = match &result.data {
+        SearchResultData::Matches(matches) => !matches.is_empty(),
+        SearchResultData::FilesWithMatches(files) => !files.is_empty(),
+        SearchResultData::Count { files, .. } => !files.is_empty(),
+    };
+    if !has_records {
+        return search_timeout_tool_result(options, backend);
+    }
+    // The scan did not complete, so the result is truncated by timeout no
+    // matter what the parsed state suggested.
+    result.truncated = true;
+    result.truncation_reason = Some(SearchTruncation::Timeout);
+    let mut output = search_result_json(project, options, result, exit_code);
+    if options.result_mode == SearchResultMode::Count {
+        output["count_complete"] = json!(false);
+        output["total_matches"] = Value::Null;
+    }
     ToolResult::ok(output)
 }
 
@@ -4381,7 +4606,13 @@ impl ToolRuntime {
                         } else {
                             None
                         };
-                        return search_timeout_tool_result(&options, backend.as_deref());
+                        return search_timeout_tool_result_with_records(
+                            &project,
+                            &options,
+                            &stdout,
+                            backend.as_deref(),
+                            resp.exit_code,
+                        );
                     }
                     if agent_error.is_some() {
                         let message = "search_project_text agent execution failed";
@@ -4694,6 +4925,476 @@ mod tests {
                 {"line": 5, "text": "five"},
             ])
         );
+    }
+
+    #[test]
+    fn search_matches_byte_budget_drops_partial_tail_record() {
+        // A `head -c` cut stops mid-record: the last line has no trailing
+        // newline. Only complete records are returned and the partial tail is
+        // reported as an output_bytes truncation, never surfaced as a record.
+        let options = SearchOptions::normalize(SearchRequest {
+            pattern: "needle".to_string(),
+            path: None,
+            limit: Some(10),
+            context_before: None,
+            context_after: None,
+            include_globs: None,
+            exclude_globs: None,
+            result_mode: None,
+            timeout_secs: None,
+        })
+        .unwrap();
+        let stdout = "src/a.rs:1:needle one\nsrc/b.rs:2:needle tw";
+        let result = search_project_text_output("demo", &options, stdout, Some(0), "");
+        let matches = result.output["matches"].as_array().unwrap();
+
+        assert!(result.success);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["path"], "src/a.rs");
+        assert_eq!(result.output["truncated"], true);
+        assert_eq!(result.output["truncation_reason"], "output_bytes");
+    }
+
+    #[test]
+    fn search_complete_output_under_budget_is_not_truncated() {
+        // A naturally complete stream below the formal byte budget is not
+        // truncated merely because its final record ends with a newline.
+        let options = SearchOptions::normalize(SearchRequest {
+            pattern: "needle".to_string(),
+            path: None,
+            limit: Some(50),
+            context_before: None,
+            context_after: None,
+            include_globs: None,
+            exclude_globs: None,
+            result_mode: None,
+            timeout_secs: None,
+        })
+        .unwrap();
+        let stdout = "src/a.rs:1:needle one\n";
+        let result = search_project_text_output("demo", &options, stdout, Some(0), "");
+        assert!(result.success);
+        assert_eq!(result.output["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(result.output["truncated"], false);
+        assert_eq!(result.output["truncation_reason"], Value::Null);
+    }
+
+    #[test]
+    fn search_byte_probe_detects_exact_newline_boundary_truncation() {
+        let options = SearchOptions::normalize(SearchRequest {
+            pattern: "needle".to_string(),
+            path: None,
+            limit: Some(50),
+            context_before: None,
+            context_after: None,
+            include_globs: None,
+            exclude_globs: None,
+            result_mode: None,
+            timeout_secs: None,
+        })
+        .unwrap();
+        let prefix = "src/a.rs:1:";
+        let text_len = SEARCH_OUTPUT_BYTE_BUDGET - prefix.len() - 1;
+        let stdout = format!(
+            "{{\"webcodex_search\":{{\"backend\":\"rg\"}}}}\n{prefix}{}\nX",
+            "x".repeat(text_len)
+        );
+        let result = search_project_text_output("demo", &options, &stdout, Some(141), "");
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.output["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(result.output["truncated"], true);
+        assert_eq!(result.output["truncation_reason"], "output_bytes");
+    }
+
+    #[test]
+    fn search_files_with_matches_reports_output_byte_truncation() {
+        let options = SearchOptions::normalize(SearchRequest {
+            pattern: "needle".to_string(),
+            path: None,
+            limit: Some(50),
+            context_before: None,
+            context_after: None,
+            include_globs: None,
+            exclude_globs: None,
+            result_mode: Some(SearchResultMode::FilesWithMatches),
+            timeout_secs: None,
+        })
+        .unwrap();
+        let suffix = ".rs\n";
+        let path = format!(
+            "src/{}{}",
+            "a".repeat(SEARCH_OUTPUT_BYTE_BUDGET - "src/".len() - suffix.len()),
+            suffix
+        );
+        let stdout = format!("{{\"webcodex_search\":{{\"backend\":\"rg\"}}}}\n{path}X");
+        let result = search_project_text_output("demo", &options, &stdout, Some(141), "");
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.output["returned_file_count"], 1);
+        assert_eq!(result.output["truncated"], true);
+        assert_eq!(result.output["truncation_reason"], "output_bytes");
+    }
+
+    #[test]
+    fn search_count_reports_output_byte_truncation_and_incomplete_total() {
+        let options = SearchOptions::normalize(SearchRequest {
+            pattern: "needle".to_string(),
+            path: None,
+            limit: Some(50),
+            context_before: None,
+            context_after: None,
+            include_globs: None,
+            exclude_globs: None,
+            result_mode: Some(SearchResultMode::Count),
+            timeout_secs: None,
+        })
+        .unwrap();
+        let count_suffix = "\02\n";
+        let path = format!(
+            "src/{}",
+            "a".repeat(SEARCH_OUTPUT_BYTE_BUDGET - "src/".len() - count_suffix.len())
+        );
+        let stdout =
+            format!("{{\"webcodex_search\":{{\"backend\":\"rg\"}}}}\n{path}{count_suffix}X");
+        let result = search_project_text_output("demo", &options, &stdout, Some(141), "");
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.output["returned_file_count"], 1);
+        assert_eq!(result.output["returned_match_count"], 2);
+        assert_eq!(result.output["count_complete"], false);
+        assert_eq!(result.output["total_matches"], Value::Null);
+        assert_eq!(result.output["truncated"], true);
+        assert_eq!(result.output["truncation_reason"], "output_bytes");
+    }
+
+    #[test]
+    fn search_limit_stops_early_and_is_a_success_not_failure() {
+        // `head -n` closes the pipe once the record budget is met, which
+        // SIGPIPEs the backend (141). That is an intentional early stop, not a
+        // backend failure, and the collected records are returned with
+        // truncation_reason = "limit".
+        let options = SearchOptions::normalize(SearchRequest {
+            pattern: "needle".to_string(),
+            path: None,
+            limit: Some(2),
+            context_before: None,
+            context_after: None,
+            include_globs: None,
+            exclude_globs: None,
+            result_mode: None,
+            timeout_secs: None,
+        })
+        .unwrap();
+        let stdout = "src/a.rs:1:one\nsrc/b.rs:2:two\nsrc/c.rs:3:three\n";
+        let result = search_project_text_output("demo", &options, stdout, Some(141), "");
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.output["matches"].as_array().unwrap().len(), 2);
+        assert_eq!(result.output["truncated"], true);
+        assert_eq!(result.output["truncation_reason"], "limit");
+    }
+
+    #[test]
+    fn search_normal_no_matches_is_success_empty() {
+        // Exit 1 (no matches) is a successful empty result, never an error.
+        let options = SearchOptions::normalize(SearchRequest {
+            pattern: "needle".to_string(),
+            path: None,
+            limit: Some(5),
+            context_before: None,
+            context_after: None,
+            include_globs: None,
+            exclude_globs: None,
+            result_mode: None,
+            timeout_secs: None,
+        })
+        .unwrap();
+        let stdout = "{\"webcodex_search\":{\"backend\":\"rg\"}}\n";
+        let result = search_project_text_output("demo", &options, stdout, Some(1), "");
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.output["matches"], json!([]));
+        assert_eq!(result.output["count"], 0);
+        assert_eq!(result.output["truncated"], false);
+        assert_eq!(result.output["truncation_reason"], Value::Null);
+    }
+
+    #[test]
+    fn search_timeout_with_complete_records_returns_partial_success() {
+        // The backend timed out but had already emitted complete records. They
+        // are returned as a partial success, not discarded.
+        let options = SearchOptions::normalize(SearchRequest {
+            pattern: "needle".to_string(),
+            path: None,
+            limit: Some(10),
+            context_before: None,
+            context_after: None,
+            include_globs: None,
+            exclude_globs: None,
+            result_mode: None,
+            timeout_secs: Some(0),
+        })
+        .unwrap();
+        let stdout = concat!(
+            "{\"webcodex_search\":{\"backend\":\"rg\"}}\n",
+            "src/a.rs:1:needle one\n",
+            "src/b.rs:2:needle tw",
+        );
+        let result = search_project_text_output_with_agent_error(
+            "demo",
+            &options,
+            stdout,
+            Some(-1),
+            "Command timed out after 1 seconds",
+            Some("command timed out"),
+        );
+
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.output["truncated"], true);
+        assert_eq!(result.output["truncation_reason"], "timeout");
+        assert_eq!(result.output["backend"], "rg");
+        assert_eq!(result.output["effective_timeout_secs"], 1);
+        let matches = result.output["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["path"], "src/a.rs");
+        // The partial tail (src/b.rs record without trailing newline) is never
+        // surfaced.
+        assert!(
+            matches
+                .iter()
+                .all(|m| m["path"].as_str() != Some("src/b.rs")),
+            "partial tail record must not be returned"
+        );
+    }
+
+    #[test]
+    fn search_timeout_without_complete_records_returns_structured_failure() {
+        let options = SearchOptions::normalize(SearchRequest {
+            pattern: "needle".to_string(),
+            path: None,
+            limit: Some(10),
+            context_before: None,
+            context_after: None,
+            include_globs: None,
+            exclude_globs: None,
+            result_mode: None,
+            timeout_secs: Some(0),
+        })
+        .unwrap();
+        let stdout = "{\"webcodex_search\":{\"backend\":\"rg\"}}\n";
+        let result = search_project_text_output(
+            "demo",
+            &options,
+            stdout,
+            Some(-1),
+            "Command timed out after 1 seconds",
+        );
+
+        assert!(!result.success);
+        assert_eq!(result.output["code"], "search_timeout");
+        assert_eq!(result.output["effective_timeout_secs"], 1);
+        // The structured failure carries no matches array at all.
+        assert!(result.output.get("matches").is_none());
+    }
+
+    #[test]
+    fn search_count_timeout_never_claims_complete_total() {
+        let options = SearchOptions::normalize(SearchRequest {
+            pattern: "needle".to_string(),
+            path: None,
+            limit: Some(10),
+            context_before: None,
+            context_after: None,
+            include_globs: None,
+            exclude_globs: None,
+            result_mode: Some(SearchResultMode::Count),
+            timeout_secs: Some(0),
+        })
+        .unwrap();
+        // Count mode: one complete file record followed by a partial tail.
+        let stdout = concat!(
+            "{\"webcodex_search\":{\"backend\":\"rg\"}}\n",
+            "src/a.rs:2\n",
+            "src/partial.rs:1",
+        );
+        let result = search_project_text_output(
+            "demo",
+            &options,
+            stdout,
+            Some(-1),
+            "Command timed out after 1 seconds",
+        );
+
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.output["truncated"], true);
+        assert_eq!(result.output["truncation_reason"], "timeout");
+        assert_eq!(result.output["count_complete"], false);
+        assert_eq!(result.output["total_matches"], Value::Null);
+        assert_eq!(result.output["returned_file_count"], 1);
+        assert_eq!(result.output["returned_match_count"], 2);
+    }
+
+    #[test]
+    fn search_files_with_matches_timeout_returns_complete_files_truncated() {
+        let options = SearchOptions::normalize(SearchRequest {
+            pattern: "needle".to_string(),
+            path: None,
+            limit: Some(10),
+            context_before: None,
+            context_after: None,
+            include_globs: None,
+            exclude_globs: None,
+            result_mode: Some(SearchResultMode::FilesWithMatches),
+            timeout_secs: Some(0),
+        })
+        .unwrap();
+        let stdout = concat!(
+            "{\"webcodex_search\":{\"backend\":\"rg\"}}\n",
+            "src/a.rs\n",
+            "src/b.rs",
+        );
+        let result = search_project_text_output(
+            "demo",
+            &options,
+            stdout,
+            Some(-1),
+            "Command timed out after 1 seconds",
+        );
+
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.output["truncated"], true);
+        assert_eq!(result.output["truncation_reason"], "timeout");
+        let files = result.output["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["path"], "src/a.rs");
+        assert_eq!(result.output["returned_file_count"], 1);
+    }
+
+    #[test]
+    fn search_backend_real_failure_not_masked_by_early_stop() {
+        // A backend exit >= 2 is a real failure even when the pipeline produced
+        // some output before it died; it is never reported as an early-stop
+        // partial success.
+        let options = SearchOptions::normalize(SearchRequest {
+            pattern: "needle".to_string(),
+            path: None,
+            limit: Some(5),
+            context_before: None,
+            context_after: None,
+            include_globs: None,
+            exclude_globs: None,
+            result_mode: None,
+            timeout_secs: None,
+        })
+        .unwrap();
+        let stdout = "src/a.rs:1:needle\n";
+        let result = search_project_text_output("demo", &options, stdout, Some(2), "");
+        assert!(!result.success);
+        assert_eq!(result.output["code"], "search_execution_failed");
+    }
+
+    #[test]
+    fn search_rejects_absolute_and_temp_paths_in_output() {
+        let options = SearchOptions::normalize(SearchRequest {
+            pattern: "needle".to_string(),
+            path: None,
+            limit: Some(10),
+            context_before: None,
+            context_after: None,
+            include_globs: None,
+            exclude_globs: None,
+            result_mode: None,
+            timeout_secs: None,
+        })
+        .unwrap();
+        // Absolute path, parent traversal, and a temp-file path must be
+        // dropped; only the trusted relative record survives.
+        let stdout = concat!(
+            "/tmp/webcodex-x:1:secret\n",
+            "src/../../etc/passwd:1:secret\n",
+            "src/a.rs:1:needle\n",
+        );
+        let result = search_project_text_output("demo", &options, stdout, Some(0), "");
+        assert!(result.success, "{:?}", result.error);
+        let matches = result.output["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["path"], "src/a.rs");
+    }
+
+    #[test]
+    fn search_transport_truncated_stdout_is_not_mistaken_for_complete() {
+        // The Runner keeps a tail of oversized output prefixed with a marker;
+        // that marker proves the output was truncated and must be reported as
+        // transport truncation, not a complete result.
+        let options = SearchOptions::normalize(SearchRequest {
+            pattern: "needle".to_string(),
+            path: None,
+            limit: Some(10),
+            context_before: None,
+            context_after: None,
+            include_globs: None,
+            exclude_globs: None,
+            result_mode: None,
+            timeout_secs: None,
+        })
+        .unwrap();
+        let stdout = concat!(
+            "[output truncated to last 12000 bytes]\n",
+            "src/z.rs:1:needle tail\n",
+            "{\"webcodex_search\":{\"backend\":\"rg\"}}\n",
+        );
+        let result = search_project_text_output("demo", &options, stdout, Some(0), "");
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.output["truncated"], true);
+        assert_eq!(result.output["truncation_reason"], "transport");
+        let matches = result.output["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["path"], "src/z.rs");
+    }
+
+    #[test]
+    fn search_local_and_agent_parse_same_stdout_identically() {
+        // The agent path parses the runner's stdout with the same function as
+        // the local path, so the exact same stdout string must yield identical
+        // field semantics in both. This pins that parity for the record fields
+        // the task lists: backend, result_mode, matches, count, truncated,
+        // truncation_reason, effective_timeout_secs.
+        let options = SearchOptions::normalize(SearchRequest {
+            pattern: "needle".to_string(),
+            path: None,
+            limit: Some(2),
+            context_before: Some(1),
+            context_after: Some(1),
+            include_globs: None,
+            exclude_globs: None,
+            result_mode: None,
+            timeout_secs: Some(5),
+        })
+        .unwrap();
+        let stdout = concat!(
+            "{\"webcodex_search\":{\"backend\":\"rg\"}}\n",
+            "src/a.rs\01-one\n",
+            "src/a.rs\02:needle\n",
+            "src/a.rs\03-three\n",
+        );
+        let local = search_project_text_output("demo", &options, stdout, Some(0), "");
+        let agent = search_project_text_output_with_agent_error(
+            "demo",
+            &options,
+            stdout,
+            Some(0),
+            "",
+            None,
+        );
+        for field in [
+            "backend",
+            "result_mode",
+            "effective_timeout_secs",
+            "count",
+            "truncated",
+            "truncation_reason",
+            "matches",
+            "exit_code",
+        ] {
+            assert_eq!(local.output[field], agent.output[field], "field {field}");
+        }
+        assert!(local.success == agent.success);
     }
 
     #[test]

@@ -987,10 +987,10 @@ fn tool_categories_and_recommended_flows_are_well_formed() {
     }
     let joined_flows = flows.join("\n").to_lowercase();
     for phrase in [
-        "prefer run_shell with rg or git grep for code search",
-        "search_project_text remains a compatibility path",
-        "inspect: use read_file and run_shell with rg or git grep before editing",
-        "search_project_text remains compatible",
+        "use search_project_text for bounded code search",
+        "run_shell with rg or git grep remains the diagnostic escape hatch",
+        "inspect: use search_project_text and read_file before editing",
+        "run_shell with rg or git grep is the diagnostic escape hatch",
         "edit: prefer apply_text_edits for transactional guarded file changes",
         "apply_patch_checked for complex unified diffs",
         "write_project_file only for intentional full rewrites",

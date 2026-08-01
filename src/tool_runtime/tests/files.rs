@@ -708,6 +708,18 @@ fn search_project_text_command_excludes_sensitive_dirs_and_bounds_output() {
     assert!(cmd.contains("grep -rnI"));
     assert!(cmd.contains("command -v head"));
     assert!(cmd.contains("/usr/bin/head") || cmd.contains("/bin/head"));
+    // No global path sort: matches must stream in traversal order so a small
+    // limit can stop the backend early instead of buffering the whole repo.
+    assert!(
+        !cmd.contains("--sort"),
+        "search command must not globally sort: {cmd}"
+    );
+    // A second head stage emits one probe byte beyond the formal budget; the
+    // parser consumes the probe only to prove truncation and never exposes it.
+    assert!(
+        cmd.contains(&format!("-c {}", SEARCH_OUTPUT_BYTE_BUDGET + 1)),
+        "search command must cap output bytes with one probe byte: {cmd}"
+    );
 }
 
 #[cfg(unix)]
@@ -1380,6 +1392,50 @@ fn search_status_file_is_removed_after_successful_run() {
 
 #[cfg(unix)]
 #[test]
+fn search_early_stop_reaps_process_group_and_status_files() {
+    // An infinite fake rg is stopped early by the head budget. The whole
+    // wrapper process group (rg + the two head stages + the wrapper shell)
+    // must be reaped and the status file removed — nothing is left behind to
+    // be cleaned up by a later request.
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    let root = tmp.path().join("project");
+    let safe_tmp = tmp.path().join("safe-tmp");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&safe_tmp).unwrap();
+    write_executable_script(
+        &bin.join("rg"),
+        "#!/bin/sh\ni=0\nwhile :; do\n  printf 'src/f%d.rs:%d:needle line\\n' \"$i\" \"$i\"\n  i=$((i + 1))\ndone\n",
+    );
+    write_executable_script(&bin.join("head"), truncating_fake_head_script());
+    let options = SearchOptions::normalize(SearchRequest {
+        limit: Some(3),
+        ..raw_search_request()
+    })
+    .unwrap();
+    let cmd = format!(
+        "PATH={}; export PATH\nTMPDIR={}; export TMPDIR\n{}",
+        shell_escape_simple(&bin.to_string_lossy()),
+        shell_escape_simple(&safe_tmp.to_string_lossy()),
+        search_project_text_command(&options)
+    );
+    let before = count_webcodex_search_status_files(&safe_tmp);
+    let (exit_code, stdout, stderr, _) = run_command_sync(&cmd, &root, 10);
+    let after = count_webcodex_search_status_files(&safe_tmp);
+    assert_eq!(before, 0);
+    assert_eq!(after, 0, "status files must be cleaned after early stop");
+    // Exit 141 = the backend was SIGPIPEd by the head budget, an intentional
+    // early stop, not a failure.
+    assert_eq!(exit_code, 141, "stderr={stderr} stdout={stdout}");
+    let result = search_project_text_output("demo", &options, &stdout, Some(exit_code), &stderr);
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["matches"].as_array().unwrap().len(), 3);
+    assert_eq!(result.output["truncation_reason"], "limit");
+}
+
+#[cfg(unix)]
+#[test]
 fn search_status_cleanup_trap_removes_file_on_term() {
     // Mirrors production cleanup_search_status + signal trap; verifies TERM path
     // without a long sleep. File removal is the contract.
@@ -1525,6 +1581,148 @@ fn search_command_keeps_success_when_head_is_available() {
     let result = search_project_text_output("demo", &options, &stdout, Some(exit_code), &stderr);
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["matches"].as_array().unwrap().len(), 1);
+}
+
+#[cfg(unix)]
+/// A `head` that actually bounds output: stops after `-n <count>` lines or
+/// `-c <count>` bytes. The shared `fake_head_script()` is a passthrough that
+/// never closes the pipe, which is exactly what the early-stop tests must not
+/// use — they need the pipe to close so the backend is SIGPIPEd.
+fn truncating_fake_head_script() -> &'static str {
+    r#"#!/bin/sh
+n=1000000
+c=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -n) n=$2; shift 2 ;;
+    -c) c=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+count=0
+bytes=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  bytes=$((bytes + ${#line} + 1))
+  if [ "$c" -gt 0 ] && [ "$bytes" -gt "$c" ]; then
+    exit 0
+  fi
+  printf '%s\n' "$line"
+  if [ "$count" -ge "$n" ]; then
+    exit 0
+  fi
+done
+"#
+}
+
+#[cfg(unix)]
+#[test]
+fn search_small_limit_stops_unbounded_backend_early() {
+    // Fake rg emits a never-ending stream of matches and never exits on its
+    // own. A small limit must close the pipe and return promptly with exactly
+    // the requested records; without early stop this would run until the
+    // command timeout. Deterministic: no reliance on machine speed — the fake
+    // either keeps streaming (and the truncating head closes it) or the test
+    // times out.
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    let root = tmp.path().join("project");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    write_executable_script(
+        &bin.join("rg"),
+        r#"#!/bin/sh
+i=0
+while :; do
+  printf 'src/file%d.rs:%d:needle line\n' "$i" "$i"
+  i=$((i + 1))
+done
+"#,
+    );
+    write_executable_script(&bin.join("head"), truncating_fake_head_script());
+    let options = SearchOptions::normalize(SearchRequest {
+        limit: Some(3),
+        ..raw_search_request()
+    })
+    .unwrap();
+    let cmd = format!(
+        "PATH={}; export PATH\n{}",
+        shell_escape_simple(&bin.to_string_lossy()),
+        search_project_text_command(&options)
+    );
+    let (exit_code, stdout, stderr, _) = run_command_sync(&cmd, &root, 10);
+    assert_eq!(exit_code, 141, "stderr={stderr} stdout={stdout}");
+    let result = search_project_text_output("demo", &options, &stdout, Some(exit_code), &stderr);
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["matches"].as_array().unwrap().len(), 3);
+    assert_eq!(result.output["truncated"], true);
+    assert_eq!(result.output["truncation_reason"], "limit");
+    // The fake backend was stopped early: the output is bounded even though
+    // the producer was infinite.
+    assert!(
+        stdout.len() < 4096,
+        "stdout unexpectedly large: {}",
+        stdout.len()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn search_overlong_match_line_does_not_overflow_byte_budget() {
+    // A single match line far longer than the byte budget must be truncated by
+    // the `head -c` stage, and the parser must return only complete records
+    // with truncation_reason = "output_bytes" instead of surfacing a half
+    // record. The fake `head` delegates to the real system head so the byte
+    // boundary cut is byte-accurate and deterministic.
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    let root = tmp.path().join("project");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    // Fake rg emits one small complete match followed by a single enormous
+    // match line that itself exceeds the byte budget; it then exits cleanly.
+    // Pure shell so it needs nothing from the restricted PATH.
+    write_executable_script(
+        &bin.join("rg"),
+        "#!/bin/sh\n\
+         printf 'src/small.rs:1:needle ok\\n'\n\
+         printf 'src/big.rs:2:'\n\
+         i=0\n\
+         while [ \"$i\" -lt 200000 ]; do printf 'x'; i=$((i + 1)); done\n\
+         printf '\\n'\n\
+         exit 0\n",
+    );
+    // Real-head semantics: byte-accurate -n/-c truncation. The restricted PATH
+    // contains only this delegating head plus the fake rg.
+    write_executable_script(&bin.join("head"), "#!/bin/sh\nexec /usr/bin/head \"$@\"\n");
+    let options = SearchOptions::normalize(SearchRequest {
+        limit: Some(5),
+        ..raw_search_request()
+    })
+    .unwrap();
+    let cmd = format!(
+        "PATH={}; export PATH\n{}",
+        shell_escape_simple(&bin.to_string_lossy()),
+        search_project_text_command(&options)
+    );
+    let (exit_code, stdout, stderr, _) = run_command_sync(&cmd, &root, 10);
+    let result = search_project_text_output("demo", &options, &stdout, Some(exit_code), &stderr);
+
+    assert!(result.success, "{:?}", result.error);
+    // The small complete record survived; the over-long record was cut by the
+    // byte budget and its partial tail dropped.
+    let matches = result.output["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0]["path"], "src/small.rs");
+    assert_eq!(result.output["truncated"], true);
+    assert_eq!(result.output["truncation_reason"], "output_bytes");
+    // No half record is surfaced, and the raw stdout (marker + budget) stays
+    // bounded: the budget bytes plus the small leading marker.
+    assert!(
+        stdout.len() <= SEARCH_OUTPUT_BYTE_BUDGET + 256,
+        "stdout={} exceeds byte budget",
+        stdout.len()
+    );
 }
 
 #[test]
@@ -1697,6 +1895,70 @@ async fn search_agent_command_timeout_returns_search_timeout() {
     assert_eq!(result.output["result_mode"], "matches");
     assert_eq!(result.output["effective_timeout_secs"], 1);
     assert_eq!(result.output["backend"], "rg");
+}
+
+#[tokio::test]
+async fn search_agent_timeout_with_complete_records_returns_partial_success() {
+    // Local and agent paths share the same parser, so an agent-reported
+    // timeout that arrived with complete records returns the same partial
+    // success semantics as the local path.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.rs"), "needle\n").unwrap();
+    let runtime = test_runtime();
+    let project =
+        register_agent_project_at_path(&runtime, "search-ptimeout", "demo", tmp.path()).await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            let bootstrap = auth_context(None, true);
+            runtime
+                .dispatch_with_auth(
+                    search_call(
+                        project,
+                        SearchRequest {
+                            timeout_secs: Some(1),
+                            ..raw_search_request()
+                        },
+                    ),
+                    Some(&bootstrap),
+                )
+                .await
+        }
+    });
+    let req = next_patch_agent_request(&runtime, "search-ptimeout")
+        .await
+        .expect("search request");
+    runtime
+        .shell_clients
+        .complete(ShellAgentResultRequest {
+            client_id: "search-ptimeout".to_string(),
+            agent_instance_id: "inst".to_string(),
+            request_id: req.request_id,
+            exit_code: Some(-1),
+            stdout: Some(
+                "{\"webcodex_search\":{\"backend\":\"rg\",\"feature_unavailable\":false}}\n\
+                 src/a.rs:1:needle\n"
+                    .to_string(),
+            ),
+            stderr: Some("command timed out after 1 seconds".to_string()),
+            duration_ms: Some(1000),
+            error: Some("command timed out".to_string()),
+        })
+        .await
+        .unwrap();
+    let result = task.await.unwrap();
+    assert!(result.success, "{:?}", result.error);
+    assert_search_output_keys_are_declared(&result.output);
+    assert_eq!(result.output["backend"], "rg");
+    assert_eq!(result.output["result_mode"], "matches");
+    assert_eq!(result.output["effective_timeout_secs"], 1);
+    assert_eq!(result.output["truncated"], true);
+    assert_eq!(result.output["truncation_reason"], "timeout");
+    let matches = result.output["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0]["path"], "src/a.rs");
+    assert_eq!(matches[0]["line"], 1);
+    assert_eq!(matches[0]["preview"], "needle");
 }
 
 #[tokio::test]
@@ -2055,13 +2317,20 @@ async fn search_project_text_include_and_exclude_globs_are_additive() {
     .await;
 
     assert!(result.success, "{:?}", result.error);
-    let paths = result.output["matches"]
+    // Result order is not deterministic (the search stops as soon as the
+    // budget is met rather than sorting the whole repository), so compare as a
+    // set.
+    let mut paths = result.output["matches"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|item| item["path"].as_str().unwrap())
+        .map(|item| item["path"].as_str().unwrap().to_string())
         .collect::<Vec<_>>();
-    assert_eq!(paths, vec!["docs/guide.md", "src/lib.rs"]);
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec!["docs/guide.md".to_string(), "src/lib.rs".to_string()]
+    );
     assert_eq!(result.output["result_mode"], "matches");
 }
 
@@ -2097,7 +2366,15 @@ async fn search_project_text_files_with_matches_is_unique_stable_and_bounded() {
 
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["result_mode"], "files_with_matches");
-    assert_eq!(result.output["files"], json!([{"path": "a.rs"}]));
+    // Either file may be the one reported when limit=1 stops the scan early.
+    let files = result.output["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file["path"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(files.len(), 1);
+    assert!(matches!(files[0], "a.rs" | "b.rs"));
     assert_eq!(result.output["returned_file_count"], 1);
     assert_eq!(result.output["truncated"], true);
     assert_eq!(result.output["truncation_reason"], "limit");
@@ -2133,15 +2410,24 @@ async fn search_project_text_count_distinguishes_complete_and_truncated_totals()
     )
     .await;
     assert!(truncated.success, "{:?}", truncated.error);
-    assert_eq!(
-        truncated.output["files"],
-        json!([{"path": "a.rs", "match_count": 2}])
-    );
+    // The truncated count run may stop at whichever file rg happens to reach
+    // first, so accept either file as the sole returned record.
+    let truncated_files = truncated.output["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file["path"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(truncated_files.len(), 1);
+    assert!(matches!(truncated_files[0].as_str(), "a.rs" | "b.rs"));
     assert_eq!(truncated.output["returned_file_count"], 1);
-    assert_eq!(truncated.output["returned_match_count"], 2);
     assert_eq!(truncated.output["count_complete"], false);
     assert_eq!(truncated.output["total_matches"], Value::Null);
     assert_eq!(truncated.output["truncated"], true);
+    // The single returned file's count is the match count rg reported for it
+    // (a.rs=2 or b.rs=1), never a claimed total.
+    let returned_match_count = truncated.output["returned_match_count"].as_u64().unwrap();
+    assert!(matches!(returned_match_count, 1 | 2));
 
     let (complete, _) = execute_agent_search(
         &runtime,
@@ -2161,6 +2447,23 @@ async fn search_project_text_count_distinguishes_complete_and_truncated_totals()
     assert_eq!(complete.output["count_complete"], true);
     assert_eq!(complete.output["total_matches"], 3);
     assert_eq!(complete.output["truncated"], false);
+    // Both files are present regardless of traversal order.
+    let mut complete_files = complete.output["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| {
+            (
+                file["path"].as_str().unwrap().to_string(),
+                file["match_count"].as_u64().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    complete_files.sort();
+    assert_eq!(
+        complete_files,
+        vec![("a.rs".to_string(), 2), ("b.rs".to_string(), 1),]
+    );
 }
 
 #[tokio::test]

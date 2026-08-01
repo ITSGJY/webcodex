@@ -28,7 +28,7 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
         ),
         tool_spec(
             "search_project_text",
-            "Default inspect/search tool for project text. Uses rg-first with grep fallback. Supports include/exclude globs, matches/files_with_matches/count, context, bounded timeouts, and protected-path exclusions. Returns structured output with backend and truncated metadata.",
+            "Default inspect/search tool for project text. Uses rg-first with grep fallback. Supports matches/files_with_matches/count modes, context, and bounded timeouts. Stops early when the result budget and byte cap are met. Returns structured output with backend and truncated metadata.",
             search_project_text_input_schema(),
         ),
         tool_spec(

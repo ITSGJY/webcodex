@@ -177,10 +177,16 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "truncation_reason",
-                nullable_schema(
-                    "string",
-                    "Truncation reason: limit or transport; null when complete.",
-                ),
+                json!({
+                    "anyOf": [
+                        {
+                            "type": "string",
+                            "enum": ["limit", "output_bytes", "timeout", "transport"],
+                        },
+                        { "type": "null" }
+                    ],
+                    "description": "Truncation reason: limit, output_bytes (the search byte budget cut the stream, complete records only), timeout (the effective timeout fired; records collected before it are complete), or transport; null when complete."
+                }),
             ),
             (
                 "exit_code",

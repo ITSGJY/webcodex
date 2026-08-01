@@ -370,6 +370,30 @@ Agent 的 `file_read_range.v1` 响应被视为不可信输入：每个正式字�
 元数据、错误 SHA、或 content/行数不一致都会被剥离或拒绝
 （`malformed_agent_response`），绝不透传到模型。
 
+## 有界项目文本搜索（`search_project_text`）
+
+`search_project_text` 是默认的 inspect/search 工具。它优先使用 ripgrep，
+在基本 matches 请求上保留 grep fallback，并且在“工作量”和“字节”两个维度
+都有界：
+
+- **尽早停止。** 搜索结果按遍历顺序输出（不做全局路径排序），当请求的
+  记录预算满足时，命令管道立即关闭，因此小 `limit` 搜索会快速返回，而不会
+  等待整仓库扫描完成。因此匹配顺序不确定，但结果有界且及时。
+- **字节预算。** 管道中第二级 cap 只比正式搜索预算多输出一个有界 probe
+  byte；服务端仅用该字节证明 cap 已触发，包括边界恰好落在换行之后的情况，
+  并返回 `truncation_reason = "output_bytes"`。单个超长匹配行或上下文行不会
+  突破 Runner transport cap，且只返回完整记录。
+- **超时部分成功。** 若有效超时在已收集到完整记录后才触发，工具仍返回这些
+  记录，并标注 `truncated = true` 与 `truncation_reason = "timeout"`，而不是
+  丢弃它们。`count` 模式绝不把部分计数冒充完整总数：`count_complete` 保持
+  false，`total_matches` 保持 null。若超时前没有完整记录，则返回结构化
+  `search_timeout` 失败。
+- **可信路径。** 返回的路径均为项目相对路径且经过校验；绝对路径、父目录
+  遍历、临时文件路径、Shell 命令和 Runner stderr 一律不返回。
+
+截断元数据稳定：`truncated` 配 `truncation_reason`（`limit | output_bytes |
+timeout | transport` 之一），完整时为 `null`。
+
 ## Advanced runtime surface
 
 WebCodex 也可以作为 multi-project management ToolRuntime 运行。其 discovery、
