@@ -192,8 +192,124 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 array_schema(open_object_schema("Changed file status."), "Changed files."),
             ),
             (
+                "files_total",
+                nullable_schema(
+                    "integer",
+                    "Exact count of all status entries, even when the returned file records were bounded by the production-side limit. Null when status was not observed.",
+                ),
+            ),
+            (
+                "files_returned",
+                schema_type(
+                    "integer",
+                    "Number of changed-file records actually returned (files.len()).",
+                ),
+            ),
+            (
+                "files_truncated",
+                schema_type(
+                    "boolean",
+                    "Whether the returned file records were bounded by the production-side limit.",
+                ),
+            ),
+            (
+                "files_limit",
+                schema_type(
+                    "integer",
+                    "Production-side cap on returned changed-file records.",
+                ),
+            ),
+            (
+                "transport_safe",
+                schema_type(
+                    "boolean",
+                    "Whether the production-side output stayed within the transport budget so no tail-retention truncation occurred.",
+                ),
+            ),
+            (
+                "output_budget_bytes",
+                schema_type(
+                    "integer",
+                    "Production-side stdout budget in bytes the command is constructed to stay under.",
+                ),
+            ),
+            (
+                "output_truncated",
+                schema_type(
+                    "boolean",
+                    "Whether the final output was truncated by the output budget (reported via this structured field, never inferred from a truncation marker string).",
+                ),
+            ),
+            (
+                "truncation_reasons",
+                array_schema(
+                    schema_type("string", "Stable reason code for an output truncation."),
+                    "Reasons the production-side output was bounded/truncated.",
+                ),
+            ),
+            (
                 "diff_stat",
                 schema_type("string", "Git diff --stat output."),
+            ),
+            (
+                "diff_exit",
+                nullable_schema(
+                    "integer",
+                    "Real full `git diff` exit code captured by the production-side loop; null when unavailable.",
+                ),
+            ),
+            (
+                "diff_status",
+                json!({
+                    "type": "object",
+                    "description": "Structured full `git diff` observation: observed (exit captured), command_failed (non-zero exit), or output_unavailable.",
+                    "properties": {
+                        "status": {
+                            "type": "string",
+                            "enum": ["observed", "command_failed", "output_unavailable"]
+                        },
+                        "exit_code": nullable_schema("integer", "Full git diff exit code when observed.")
+                    },
+                    "required": ["status", "exit_code"],
+                    "additionalProperties": false
+                }),
+            ),
+            (
+                "diff_stat_exit",
+                nullable_schema(
+                    "integer",
+                    "Real `git diff --stat` exit code; null when unavailable.",
+                ),
+            ),
+            (
+                "diff_stat_status",
+                json!({
+                    "type": "object",
+                    "description": "Structured `git diff --stat` observation. This inspection status is independent from transport_safe and participates in tool success for confirmed Git worktrees.",
+                    "properties": {
+                        "status": {
+                            "type": "string",
+                            "enum": ["observed", "command_failed", "output_unavailable"]
+                        },
+                        "exit_code": nullable_schema(
+                            "integer",
+                            "Real git diff --stat exit code when observed."
+                        ),
+                        "reason_code": nullable_schema(
+                            "string",
+                            "Stable reason code when diff-stat did not succeed."
+                        )
+                    },
+                    "required": ["status", "exit_code", "reason_code"],
+                    "additionalProperties": false
+                }),
+            ),
+            (
+                "head_exit",
+                nullable_schema(
+                    "integer",
+                    "Real `git log -1` HEAD metadata exit code; null when unavailable.",
+                ),
             ),
             (
                 "hunks",
