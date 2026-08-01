@@ -1,4 +1,4 @@
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::common::{
     array_schema, nullable_schema, open_object_schema, schema_type, wrapped_output_schema,
@@ -86,14 +86,107 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "branch",
-                nullable_schema("string", "Current git branch from porcelain status."),
+                nullable_schema(
+                    "string",
+                    "Current git branch from porcelain status; null for detached or unavailable Git state.",
+                ),
             ),
-            ("head", open_object_schema("Current HEAD commit metadata.")),
+            (
+                "upstream_status",
+                json!({
+                    "type": "string",
+                    "enum": ["available", "absent", "gone", "unobserved"],
+                    "description": "Whether a tracking branch is available, absent, gone, or unobserved."
+                }),
+            ),
+            (
+                "upstream_reason_code",
+                nullable_schema(
+                    "string",
+                    "Stable reason code for gone or unobserved upstream state.",
+                ),
+            ),
+            (
+                "upstream",
+                nullable_schema("string", "Configured upstream tracking branch when observed."),
+            ),
+            (
+                "ahead",
+                nullable_schema("integer", "Commits ahead of an available upstream."),
+            ),
+            (
+                "behind",
+                nullable_schema("integer", "Commits behind an available upstream."),
+            ),
+            (
+                "head",
+                json!({
+                    "type": "object",
+                    "description": "Current HEAD commit metadata.",
+                    "properties": {
+                        "commit": nullable_schema("string", "Full HEAD commit hash when observed."),
+                        "short": nullable_schema("string", "Short HEAD commit hash when observed."),
+                        "summary": nullable_schema("string", "HEAD commit subject when observed.")
+                    },
+                    "required": ["commit", "short", "summary"],
+                    "additionalProperties": false
+                }),
+            ),
+            (
+                "status_observation",
+                json!({
+                    "type": "object",
+                    "description": "Independent git status execution and repository-probe result.",
+                    "properties": {
+                        "status": {
+                            "type": "string",
+                            "enum": ["observed", "non_git", "command_failed", "output_unavailable"]
+                        },
+                        "reason_code": nullable_schema("string", "Stable reason code when status was not observed."),
+                        "exit_code": nullable_schema("integer", "Exit code from git status itself."),
+                        "repository_probe": {
+                            "type": "string",
+                            "enum": ["inside_worktree", "outside_worktree", "unavailable"]
+                        },
+                        "repository_probe_exit_code": nullable_schema("integer", "Exit code from the explicit repository probe.")
+                    },
+                    "required": [
+                        "status", "reason_code", "exit_code", "repository_probe",
+                        "repository_probe_exit_code"
+                    ],
+                    "additionalProperties": false
+                }),
+            ),
             (
                 "clean",
-                schema_type("boolean", "Whether the worktree is clean."),
+                nullable_schema(
+                    "boolean",
+                    "Whether the worktree is clean when Git was observed; null otherwise.",
+                ),
             ),
-            ("counts", open_object_schema("Parsed status counts.")),
+            (
+                "counts",
+                json!({
+                    "type": "object",
+                    "description": "Parsed status counts. conflicted is null when Git status was not observed.",
+                    "properties": {
+                        "modified": schema_type("integer", "Modified file count."),
+                        "added": schema_type("integer", "Added file count."),
+                        "deleted": schema_type("integer", "Deleted file count."),
+                        "renamed": schema_type("integer", "Renamed file count."),
+                        "copied": schema_type("integer", "Copied file count."),
+                        "untracked": schema_type("integer", "Untracked file count."),
+                        "conflicted": nullable_schema("integer", "Conflict count when observed; null otherwise."),
+                        "staged": schema_type("integer", "Staged file count."),
+                        "unstaged": schema_type("integer", "Unstaged file count.")
+                    },
+                    "required": [
+                        "modified", "added", "deleted", "renamed", "copied",
+                        "untracked", "conflicted", "staged", "unstaged"
+                    ],
+                    "additionalProperties": false
+                }),
+            ),
             (
                 "files",
                 array_schema(open_object_schema("Changed file status."), "Changed files."),
@@ -108,6 +201,14 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                     open_object_schema("Bounded file diff hunks."),
                     "Diff hunks.",
                 ),
+            ),
+            (
+                "hunk_count",
+                schema_type("integer", "Returned bounded diff hunk count."),
+            ),
+            (
+                "hunks_truncated",
+                schema_type("boolean", "Whether diff hunks were truncated by limits."),
             ),
             (
                 "untracked_previews",
@@ -142,6 +243,11 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "session",
                 nullable_schema("object", "Optional session activity summary."),
             ),
+            (
+                "exit_code",
+                nullable_schema("integer", "Git inspection command exit code."),
+            ),
+            ("stderr", schema_type("string", "Bounded Git inspection stderr.")),
         ])),
         _ => None,
     }

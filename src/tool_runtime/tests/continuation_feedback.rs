@@ -2203,21 +2203,23 @@ async fn finish_coding_task_continuation_matches_handoff_attempt_without_rerunni
     // finish_coding_task with summary_only=false exposes continuation_feedback,
     // reuses the same closeout helper as handoff (same attempt boundary), and
     // must not re-run validation.
-    let finish = runtime
-        .dispatch_with_auth(
-            ToolCall::FinishCodingTask {
-                project: project.clone(),
-                session_id: session_id.clone(),
-                summary_only: false,
-                include_diff: Some(false),
-                include_workspace: Some(false),
-                include_hygiene: Some(false),
-                include_handoff: Some(false),
-                include_validation_summary: Some(false),
-            },
-            Some(&auth),
-        )
-        .await;
+    let finish = dispatch_start_coding_task_in_window(
+        &runtime,
+        "finish-agent",
+        ToolCall::FinishCodingTask {
+            project: project.clone(),
+            session_id: session_id.clone(),
+            summary_only: false,
+            include_diff: Some(false),
+            include_workspace: Some(false),
+            include_hygiene: Some(false),
+            include_handoff: Some(false),
+            include_validation_summary: Some(false),
+        },
+        Some(&auth),
+        "finish-window",
+    )
+    .await;
     assert!(finish.success, "{:?}", finish.error);
 
     let feedback = &finish.output["continuation_feedback"];
@@ -2246,21 +2248,23 @@ async fn finish_coding_task_continuation_matches_handoff_attempt_without_rerunni
     );
 
     // A separate summary_only=true call must not surface raw output fields.
-    let finish_summary = runtime
-        .dispatch_with_auth(
-            ToolCall::FinishCodingTask {
-                project: project.clone(),
-                session_id: session_id.clone(),
-                summary_only: true,
-                include_diff: Some(false),
-                include_workspace: Some(false),
-                include_hygiene: Some(false),
-                include_handoff: Some(false),
-                include_validation_summary: Some(false),
-            },
-            Some(&auth),
-        )
-        .await;
+    let finish_summary = dispatch_start_coding_task_in_window(
+        &runtime,
+        "finish-agent",
+        ToolCall::FinishCodingTask {
+            project: project.clone(),
+            session_id: session_id.clone(),
+            summary_only: true,
+            include_diff: Some(false),
+            include_workspace: Some(false),
+            include_hygiene: Some(false),
+            include_handoff: Some(false),
+            include_validation_summary: Some(false),
+        },
+        Some(&auth),
+        "finish-window",
+    )
+    .await;
     assert!(finish_summary.success, "{:?}", finish_summary.error);
     let summary_serialized = serde_json::to_string(&finish_summary.output).unwrap();
     assert!(

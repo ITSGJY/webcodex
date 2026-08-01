@@ -116,30 +116,151 @@ fn git_log_empty_repo(stderr: &str) -> bool {
     lower.contains("does not have any commits") || lower.contains("no commits yet")
 }
 
-/// Classify whether a failed `show_changes` git inspection is due to the
-/// project directory not being inside a git repository.
-///
-/// Robust across git locales: the English `fatal: not a git repository`
-/// message is matched directly, and a locale-independent structural signal
-/// (non-zero exit with no porcelain branch header) covers localized git
-/// builds where the fatal message is translated (e.g. `不是 git 仓库`). In a
-/// real repository `git status --porcelain=v1 -b` always emits a `## `
-/// branch header — even for a repo with no commits — so its absence combined
-/// with a non-zero exit means git could not inspect the worktree, the common
-/// case being a non-git project directory.
-pub(crate) fn is_non_git_project_inspection(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShowChangesStatusObservationKind {
+    Observed,
+    NonGit,
+    CommandFailed,
+    OutputUnavailable,
+}
+
+impl ShowChangesStatusObservationKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Observed => "observed",
+            Self::NonGit => "non_git",
+            Self::CommandFailed => "command_failed",
+            Self::OutputUnavailable => "output_unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShowChangesStatusObservation {
+    kind: ShowChangesStatusObservationKind,
+    reason_code: Option<&'static str>,
     exit_code: Option<i32>,
-    stderr: &str,
-    status_stdout: &str,
-) -> bool {
+    repository_probe: &'static str,
+    repository_probe_exit_code: Option<i32>,
+    git_available: bool,
+}
+
+impl ShowChangesStatusObservation {
+    fn observed(exit_code: Option<i32>) -> Self {
+        Self {
+            kind: ShowChangesStatusObservationKind::Observed,
+            reason_code: None,
+            exit_code,
+            repository_probe: "inside_worktree",
+            repository_probe_exit_code: Some(0),
+            git_available: true,
+        }
+    }
+
+    fn status_observed(&self) -> bool {
+        self.kind == ShowChangesStatusObservationKind::Observed
+    }
+
+    fn non_git(&self) -> bool {
+        self.kind == ShowChangesStatusObservationKind::NonGit
+    }
+
+    pub(crate) fn as_json(&self) -> Value {
+        json!({
+            "status": self.kind.as_str(),
+            "reason_code": self.reason_code,
+            "exit_code": self.exit_code,
+            "repository_probe": self.repository_probe,
+            "repository_probe_exit_code": self.repository_probe_exit_code,
+        })
+    }
+}
+
+fn parse_status_result_field<'a>(result: &'a str, key: &str) -> Option<&'a str> {
+    result.lines().find_map(|line| {
+        let (field, value) = line.split_once('=')?;
+        (field == key).then_some(value.trim())
+    })
+}
+
+fn git_status_failure_reason(stderr: &str) -> &'static str {
     let lower = stderr.to_ascii_lowercase();
-    if lower.contains("not a git repository") {
-        return true;
+    if lower.contains("bad config")
+        || lower.contains("invalid untracked files mode")
+        || lower.contains("invalid value for") && lower.contains("config")
+    {
+        "git_status_config_error"
+    } else if lower.contains("permission denied")
+        || lower.contains("operation not permitted")
+        || lower.contains("access is denied")
+    {
+        "git_status_permission_denied"
+    } else {
+        "git_status_command_failed"
     }
-    if exit_code != Some(0) && !status_stdout.lines().any(|line| line.starts_with("## ")) {
-        return true;
+}
+
+pub(crate) fn parse_show_changes_status_observation(
+    status_stdout: &str,
+    status_result_stdout: &str,
+    stderr: &str,
+) -> ShowChangesStatusObservation {
+    let exit_code = parse_status_result_field(status_result_stdout, "status_exit")
+        .and_then(|value| value.parse::<i32>().ok());
+    let repository_probe = parse_status_result_field(status_result_stdout, "repository_probe");
+    let repository_probe_exit_code =
+        parse_status_result_field(status_result_stdout, "repository_probe_exit")
+            .and_then(|value| value.parse::<i32>().ok());
+    let has_reliable_header = status_stdout
+        .lines()
+        .any(|line| parse_status_header(line).is_some());
+    let command_failure_reason = git_status_failure_reason(stderr);
+
+    match (exit_code, repository_probe) {
+        (Some(0), Some("inside_worktree")) if has_reliable_header => {
+            ShowChangesStatusObservation::observed(Some(0))
+        }
+        (Some(0), Some("inside_worktree")) => ShowChangesStatusObservation {
+            kind: ShowChangesStatusObservationKind::OutputUnavailable,
+            reason_code: Some("git_status_header_unavailable"),
+            exit_code: Some(0),
+            repository_probe: "inside_worktree",
+            repository_probe_exit_code,
+            git_available: true,
+        },
+        (Some(code), Some("outside_worktree")) if code != 0 => ShowChangesStatusObservation {
+            kind: ShowChangesStatusObservationKind::NonGit,
+            reason_code: Some("not_a_git_repository"),
+            exit_code: Some(code),
+            repository_probe: "outside_worktree",
+            repository_probe_exit_code,
+            git_available: false,
+        },
+        (Some(code), Some("inside_worktree")) if code != 0 => ShowChangesStatusObservation {
+            kind: ShowChangesStatusObservationKind::CommandFailed,
+            reason_code: Some(command_failure_reason),
+            exit_code: Some(code),
+            repository_probe: "inside_worktree",
+            repository_probe_exit_code,
+            git_available: true,
+        },
+        (Some(code), Some("unavailable")) if code != 0 => ShowChangesStatusObservation {
+            kind: ShowChangesStatusObservationKind::CommandFailed,
+            reason_code: Some(command_failure_reason),
+            exit_code: Some(code),
+            repository_probe: "unavailable",
+            repository_probe_exit_code,
+            git_available: false,
+        },
+        _ => ShowChangesStatusObservation {
+            kind: ShowChangesStatusObservationKind::OutputUnavailable,
+            reason_code: Some("git_status_result_unavailable"),
+            exit_code,
+            repository_probe: "unavailable",
+            repository_probe_exit_code,
+            git_available: false,
+        },
     }
-    false
 }
 
 /// Build the graceful-degradation payload returned by `show_changes` when the
@@ -147,10 +268,30 @@ pub(crate) fn is_non_git_project_inspection(
 /// unavailable without dumping git's noisy stderr/usage; the session
 /// sub-summary is still layered on by the caller via
 /// `apply_show_changes_session`.
+#[cfg(test)]
 pub(crate) fn non_git_show_changes_payload(
     project: &str,
     exit_code: Option<i32>,
     include_diff: bool,
+) -> serde_json::Value {
+    non_git_show_changes_payload_with_observation(
+        project,
+        include_diff,
+        ShowChangesStatusObservation {
+            kind: ShowChangesStatusObservationKind::NonGit,
+            reason_code: Some("not_a_git_repository"),
+            exit_code,
+            repository_probe: "outside_worktree",
+            repository_probe_exit_code: exit_code,
+            git_available: false,
+        },
+    )
+}
+
+fn non_git_show_changes_payload_with_observation(
+    project: &str,
+    include_diff: bool,
+    observation: ShowChangesStatusObservation,
 ) -> serde_json::Value {
     let mut payload = json!({
         "project": project,
@@ -158,8 +299,18 @@ pub(crate) fn non_git_show_changes_payload(
         "non_git_project": true,
         "git_error": "not a git repository; git-backed diff unavailable",
         "branch": null,
-        "head": null,
-        "clean": true,
+        "upstream_status": "unobserved",
+        "upstream_reason_code": "git_unavailable",
+        "upstream": null,
+        "ahead": null,
+        "behind": null,
+        "head": {
+            "commit": null,
+            "short": null,
+            "summary": null,
+        },
+        "status_observation": observation.as_json(),
+        "clean": null,
         "counts": {
             "modified": 0,
             "added": 0,
@@ -167,7 +318,7 @@ pub(crate) fn non_git_show_changes_payload(
             "renamed": 0,
             "copied": 0,
             "untracked": 0,
-            "conflicted": 0,
+            "conflicted": null,
             "staged": 0,
             "unstaged": 0,
         },
@@ -178,7 +329,7 @@ pub(crate) fn non_git_show_changes_payload(
             "git-backed status/diff unavailable; project is not a git repository",
         ],
         "session": null,
-        "exit_code": exit_code,
+        "exit_code": observation.exit_code,
         "stderr": "",
     });
     if include_diff {
@@ -203,11 +354,31 @@ pub(crate) fn show_changes_command(include_diff: bool) -> String {
         String::new()
     };
     format!(
-        "git status --porcelain=v1 -b; \
+        "status_stdout=$(git status --porcelain=v1 -b); \
+         status_exit=$?; \
+         if [ \"$status_exit\" -eq 0 ]; then \
+           repository_probe=inside_worktree; repository_probe_exit=0; \
+         else \
+           repository_probe_stdout=$(LC_ALL=C git rev-parse --is-inside-work-tree 2>&1); \
+           repository_probe_exit=$?; \
+           if [ \"$repository_probe_exit\" -eq 0 ] && [ \"$repository_probe_stdout\" = true ]; then \
+             repository_probe=inside_worktree; \
+           elif printf '%s\\n' \"$repository_probe_stdout\" | grep -Fq 'not a git repository'; then \
+             repository_probe=outside_worktree; \
+           else \
+             repository_probe=unavailable; \
+           fi; \
+         fi; \
+         printf '%s' \"$status_stdout\"; \
+         printf '\\n{sentinel}\\n'; \
+         printf 'status_exit=%s\\nrepository_probe=%s\\nrepository_probe_exit=%s\\n' \
+           \"$status_exit\" \"$repository_probe\" \"$repository_probe_exit\"; \
          printf '\\n{sentinel}\\n'; \
          {{ git log -1 --format='%H%x00%h%x00%s' || true; }}; \
          printf '\\n{sentinel}\\n'; \
-         git diff --stat{diff_part}",
+         git diff --stat{diff_part}; \
+         final_exit=$?; \
+         if [ \"$status_exit\" -ne 0 ]; then exit \"$status_exit\"; else exit \"$final_exit\"; fi",
         sentinel = SHOW_CHANGES_SENTINEL,
         diff_part = diff_part,
     )
@@ -216,18 +387,39 @@ pub(crate) fn show_changes_command(include_diff: bool) -> String {
 pub(crate) fn split_show_changes_stdout(
     stdout: &str,
     include_diff: bool,
-) -> (String, String, String, String, String) {
+) -> (String, String, String, String, String, String) {
     let mut parts = stdout.split(SHOW_CHANGES_SENTINEL);
     let status = parts
         .next()
         .unwrap_or_default()
         .trim_end_matches(['\n', '\r'])
         .to_string();
-    let head = parts
+    let first_after_status = parts
         .next()
         .unwrap_or_default()
         .trim_matches(['\n', '\r'])
         .to_string();
+    let (status_result, head) = if first_after_status.starts_with("status_exit=") {
+        let head = parts
+            .next()
+            .unwrap_or_default()
+            .trim_matches(['\n', '\r'])
+            .to_string();
+        (first_after_status, head)
+    } else {
+        // Compatibility for already-enqueued requests created before the
+        // structured status-result frame was added. A reliable header is the
+        // only legacy shape that can be treated as observed.
+        let status_result = if status
+            .lines()
+            .any(|line| parse_status_header(line).is_some())
+        {
+            "status_exit=0\nrepository_probe=inside_worktree\nrepository_probe_exit=0".to_string()
+        } else {
+            String::new()
+        };
+        (status_result, first_after_status)
+    };
     let stat = parts
         .next()
         .unwrap_or_default()
@@ -251,22 +443,111 @@ pub(crate) fn split_show_changes_stdout(
     } else {
         String::new()
     };
-    (status, head, stat, diff, untracked_preview)
+    (status, status_result, head, stat, diff, untracked_preview)
 }
 
-fn parse_status_branch(line: &str) -> Option<String> {
-    let rest = line.strip_prefix("## ")?;
-    let branch = rest
-        .split("...")
-        .next()
-        .unwrap_or(rest)
-        .trim()
-        .trim_matches('"');
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedStatusHeader {
+    branch: Option<String>,
+    upstream_status: &'static str,
+    upstream_reason_code: Option<&'static str>,
+    upstream: Option<String>,
+    ahead: Option<u64>,
+    behind: Option<u64>,
+}
+
+fn parsed_branch_name(raw: &str) -> Option<String> {
+    let branch = raw.trim().trim_matches('"');
     if branch.is_empty() {
         None
     } else {
         Some(branch.to_string())
     }
+}
+
+fn parse_status_header(line: &str) -> Option<ParsedStatusHeader> {
+    let rest = line.strip_prefix("## ")?;
+
+    for prefix in ["No commits yet on ", "Initial commit on "] {
+        if let Some(branch) = rest.strip_prefix(prefix) {
+            return Some(ParsedStatusHeader {
+                branch: parsed_branch_name(branch),
+                upstream_status: "absent",
+                upstream_reason_code: None,
+                upstream: None,
+                ahead: None,
+                behind: None,
+            });
+        }
+    }
+
+    if rest == "HEAD" || rest == "HEAD (no branch)" || rest.starts_with("HEAD (detached ") {
+        return Some(ParsedStatusHeader {
+            branch: None,
+            upstream_status: "absent",
+            upstream_reason_code: None,
+            upstream: None,
+            ahead: None,
+            behind: None,
+        });
+    }
+
+    let Some((local, tracking)) = rest.split_once("...") else {
+        return Some(ParsedStatusHeader {
+            branch: parsed_branch_name(rest.split(" [").next().unwrap_or(rest)),
+            upstream_status: "absent",
+            upstream_reason_code: None,
+            upstream: None,
+            ahead: None,
+            behind: None,
+        });
+    };
+
+    let (upstream, counts) = tracking
+        .split_once(" [")
+        .map_or((tracking, None), |(upstream, counts)| {
+            (upstream, Some(counts))
+        });
+    let upstream = parsed_branch_name(upstream);
+    let mut ahead = None;
+    let mut behind = None;
+    let mut gone = false;
+    if let Some(counts) = counts {
+        for item in counts.trim_end_matches(']').split(',') {
+            let item = item.trim();
+            if item == "gone" {
+                gone = true;
+            } else if let Some(value) = item.strip_prefix("ahead ") {
+                ahead = value.parse().ok();
+            } else if let Some(value) = item.strip_prefix("behind ") {
+                behind = value.parse().ok();
+            }
+        }
+    }
+
+    if gone {
+        return Some(ParsedStatusHeader {
+            branch: parsed_branch_name(local),
+            upstream_status: "gone",
+            upstream_reason_code: Some("upstream_gone"),
+            upstream,
+            ahead: None,
+            behind: None,
+        });
+    }
+
+    if upstream.is_some() {
+        ahead.get_or_insert(0);
+        behind.get_or_insert(0);
+    }
+    Some(ParsedStatusHeader {
+        branch: parsed_branch_name(local),
+        upstream_status: "available",
+        upstream_reason_code: None,
+        upstream,
+        ahead,
+        behind,
+    })
 }
 
 fn parse_show_changes_head(head: &str) -> serde_json::Value {
@@ -334,6 +615,7 @@ fn looks_like_smoke_path(path: &str) -> bool {
         || lower.contains("anchor")
 }
 
+#[cfg(test)]
 pub(crate) fn parse_show_changes_output(
     project: &str,
     status_stdout: &str,
@@ -345,7 +627,67 @@ pub(crate) fn parse_show_changes_output(
     exit_code: Option<i32>,
     stderr: &str,
 ) -> serde_json::Value {
+    let has_reliable_header = status_stdout
+        .lines()
+        .any(|line| parse_status_header(line).is_some());
+    let observation = if exit_code == Some(0) && has_reliable_header {
+        ShowChangesStatusObservation::observed(exit_code)
+    } else if exit_code == Some(0) {
+        ShowChangesStatusObservation {
+            kind: ShowChangesStatusObservationKind::OutputUnavailable,
+            reason_code: Some("git_status_header_unavailable"),
+            exit_code,
+            repository_probe: "inside_worktree",
+            repository_probe_exit_code: Some(0),
+            git_available: true,
+        }
+    } else {
+        ShowChangesStatusObservation {
+            kind: ShowChangesStatusObservationKind::CommandFailed,
+            reason_code: Some("git_status_command_failed"),
+            exit_code,
+            repository_probe: if has_reliable_header {
+                "inside_worktree"
+            } else {
+                "unavailable"
+            },
+            repository_probe_exit_code: None,
+            git_available: has_reliable_header,
+        }
+    };
+    parse_show_changes_output_with_observation(
+        project,
+        status_stdout,
+        head_stdout,
+        diff_stat,
+        diff_stdout,
+        max_hunks,
+        max_hunk_lines,
+        exit_code,
+        stderr,
+        observation,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_show_changes_output_with_observation(
+    project: &str,
+    status_stdout: &str,
+    head_stdout: &str,
+    diff_stat: &str,
+    diff_stdout: Option<&str>,
+    max_hunks: usize,
+    max_hunk_lines: usize,
+    exit_code: Option<i32>,
+    stderr: &str,
+    observation: ShowChangesStatusObservation,
+) -> serde_json::Value {
     let mut branch = None;
+    let mut upstream_status = "unobserved";
+    let mut upstream_reason_code = observation.reason_code.or(Some("git_status_unobserved"));
+    let mut upstream = None;
+    let mut ahead = None;
+    let mut behind = None;
     let mut files = Vec::new();
     let mut modified = 0usize;
     let mut added = 0usize;
@@ -356,70 +698,104 @@ pub(crate) fn parse_show_changes_output(
     let mut conflicted = 0usize;
     let mut staged_count = 0usize;
     let mut unstaged_count = 0usize;
+    let status_observed = observation.status_observed();
+    let observation_reason_code = observation.reason_code;
 
-    for line in status_stdout.lines() {
-        if let Some(parsed) = parse_status_branch(line) {
-            branch = Some(parsed);
-            continue;
+    if status_observed {
+        for line in status_stdout.lines() {
+            if let Some(parsed) = parse_status_header(line) {
+                branch = parsed.branch;
+                upstream_status = parsed.upstream_status;
+                upstream_reason_code = parsed.upstream_reason_code;
+                upstream = parsed.upstream;
+                ahead = parsed.ahead;
+                behind = parsed.behind;
+                continue;
+            }
+            if line.len() < 3 {
+                continue;
+            }
+            let mut chars = line.chars();
+            let x = chars.next().unwrap_or(' ');
+            let y = chars.next().unwrap_or(' ');
+            if x == '!' && y == '!' {
+                continue;
+            }
+            let path_part = line.get(3..).unwrap_or_default();
+            let (path, old_path) = porcelain_path(path_part);
+            if path.is_empty() {
+                continue;
+            }
+            let status = status_label(x, y);
+            let is_untracked = status == "untracked";
+            let is_conflicted = status == "conflicted";
+            let staged = !is_untracked && !is_conflicted && x != ' ' && x != '?';
+            let unstaged = !is_untracked && !is_conflicted && y != ' ' && y != '?';
+            match status {
+                "modified" => modified += 1,
+                "added" => added += 1,
+                "deleted" => deleted += 1,
+                "renamed" => renamed += 1,
+                "copied" => copied += 1,
+                "untracked" => untracked += 1,
+                "conflicted" => conflicted += 1,
+                _ => {}
+            }
+            if staged {
+                staged_count += 1;
+            }
+            if unstaged {
+                unstaged_count += 1;
+            }
+            let mut file = serde_json::Map::new();
+            file.insert("path".to_string(), json!(path));
+            file.insert("status".to_string(), json!(status));
+            file.insert("staged".to_string(), json!(staged));
+            file.insert("unstaged".to_string(), json!(unstaged));
+            file.insert(
+                "kind".to_string(),
+                json!(if is_untracked {
+                    "untracked"
+                } else if is_conflicted {
+                    "conflicted"
+                } else {
+                    "tracked"
+                }),
+            );
+            if let Some(old_path) = old_path {
+                file.insert("old_path".to_string(), json!(old_path));
+            }
+            files.push(json!(file));
         }
-        if line.len() < 3 {
-            continue;
-        }
-        let mut chars = line.chars();
-        let x = chars.next().unwrap_or(' ');
-        let y = chars.next().unwrap_or(' ');
-        if x == '!' && y == '!' {
-            continue;
-        }
-        let path_part = line.get(3..).unwrap_or_default();
-        let (path, old_path) = porcelain_path(path_part);
-        if path.is_empty() {
-            continue;
-        }
-        let status = status_label(x, y);
-        let is_untracked = status == "untracked";
-        let is_conflicted = status == "conflicted";
-        let staged = !is_untracked && !is_conflicted && x != ' ' && x != '?';
-        let unstaged = !is_untracked && !is_conflicted && y != ' ' && y != '?';
-        match status {
-            "modified" => modified += 1,
-            "added" => added += 1,
-            "deleted" => deleted += 1,
-            "renamed" => renamed += 1,
-            "copied" => copied += 1,
-            "untracked" => untracked += 1,
-            "conflicted" => conflicted += 1,
-            _ => {}
-        }
-        if staged {
-            staged_count += 1;
-        }
-        if unstaged {
-            unstaged_count += 1;
-        }
-        let mut file = serde_json::Map::new();
-        file.insert("path".to_string(), json!(path));
-        file.insert("status".to_string(), json!(status));
-        file.insert("staged".to_string(), json!(staged));
-        file.insert("unstaged".to_string(), json!(unstaged));
-        file.insert(
-            "kind".to_string(),
-            json!(if is_untracked {
-                "untracked"
-            } else if is_conflicted {
-                "conflicted"
-            } else {
-                "tracked"
-            }),
-        );
-        if let Some(old_path) = old_path {
-            file.insert("old_path".to_string(), json!(old_path));
-        }
-        files.push(json!(file));
     }
 
-    let clean = files.is_empty();
+    let clean = status_observed.then_some(files.is_empty());
     let mut warnings = Vec::new();
+    if !status_observed {
+        let reason_code = observation_reason_code.unwrap_or("git_status_result_unavailable");
+        let message = match observation.kind {
+            ShowChangesStatusObservationKind::CommandFailed => {
+                "git status command failed; worktree state is unavailable"
+            }
+            ShowChangesStatusObservationKind::OutputUnavailable => {
+                "git status did not produce a reliable porcelain branch header"
+            }
+            ShowChangesStatusObservationKind::NonGit => "project is not a git repository",
+            ShowChangesStatusObservationKind::Observed => "git status was observed",
+        };
+        warnings.push(json!({
+            "kind": reason_code,
+            "reason_code": reason_code,
+            "message": message,
+        }));
+    }
+    if upstream_status == "gone" {
+        warnings.push(json!({
+            "kind": "upstream_gone",
+            "reason_code": "upstream_gone",
+            "message": "configured upstream tracking branch is gone",
+        }));
+    }
     if conflicted > 0 {
         warnings.push(json!({
             "kind": "workspace_conflicts",
@@ -447,16 +823,38 @@ pub(crate) fn parse_show_changes_output(
         }
     }
 
-    let suggested_next_actions =
-        suggested_next_actions_for(clean, untracked > 0, has_smoke_warning(&warnings), None);
+    let suggested_next_actions = if status_observed {
+        suggested_next_actions_for(
+            clean.unwrap_or(false),
+            untracked > 0,
+            has_smoke_warning(&warnings),
+            None,
+        )
+    } else {
+        vec!["inspect git status failure before relying on worktree cleanliness".to_string()]
+    };
 
     let mut output = json!({
         "project": project,
-        "git_available": true,
-        "non_git_project": false,
-        "git_error": null,
+        "git_available": observation.git_available,
+        "non_git_project": observation.non_git(),
+        "git_error": observation_reason_code.map(|reason| match reason {
+            "git_status_config_error" => "git status configuration is invalid",
+            "git_status_permission_denied" => "git status permission denied",
+            "git_status_command_failed" => "git status command failed",
+            "git_status_header_unavailable" => "git status output unavailable",
+            "git_status_result_unavailable" => "git status execution result unavailable",
+            "not_a_git_repository" => "not a git repository",
+            _ => "git status unavailable",
+        }),
         "branch": branch,
+        "upstream_status": upstream_status,
+        "upstream_reason_code": upstream_reason_code,
+        "upstream": upstream,
+        "ahead": ahead,
+        "behind": behind,
         "head": parse_show_changes_head(head_stdout),
+        "status_observation": observation.as_json(),
         "clean": clean,
         "counts": {
             "modified": modified,
@@ -465,7 +863,7 @@ pub(crate) fn parse_show_changes_output(
             "renamed": renamed,
             "copied": copied,
             "untracked": untracked,
-            "conflicted": conflicted,
+            "conflicted": status_observed.then_some(conflicted),
             "staged": staged_count,
             "unstaged": unstaged_count,
         },
@@ -880,14 +1278,20 @@ pub(crate) fn apply_show_changes_session(
 }
 
 fn refresh_show_changes_suggestions(output: &mut Value, session: Option<SessionActionSignals>) {
-    // Non-git projects: keep the git-unavailable message as the primary
-    // suggestion and only append session-signal suggestions. The normal
-    // clean/dirty review suggestions do not apply when git inspection is
-    // unavailable.
-    if output["non_git_project"].as_bool().unwrap_or(false) {
+    // Any unobserved status keeps an unavailable message as the primary
+    // suggestion. Clean/dirty review actions only apply to a reliable
+    // porcelain branch header.
+    let status_observation = output
+        .pointer("/status_observation/status")
+        .and_then(Value::as_str)
+        .unwrap_or("output_unavailable");
+    if status_observation != "observed" {
         let session = session.unwrap_or_default();
-        let mut actions =
-            vec!["git-backed status/diff unavailable; project is not a git repository".to_string()];
+        let mut actions = vec![if status_observation == "non_git" {
+            "git-backed status/diff unavailable; project is not a git repository".to_string()
+        } else {
+            "git status unavailable; inspect the status failure before relying on worktree cleanliness".to_string()
+        }];
         if session.failed {
             push_unique_action(&mut actions, "review failed tool calls in session_summary");
         }
@@ -928,6 +1332,29 @@ fn set_show_changes_verdict(output: &mut Value) {
         .get("non_git_project")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let status_observation = output
+        .pointer("/status_observation/status")
+        .and_then(Value::as_str)
+        .unwrap_or("output_unavailable");
+    let status_reason_code = output
+        .pointer("/status_observation/reason_code")
+        .and_then(Value::as_str);
+    match status_observation {
+        "command_failed" => {
+            push_unique_reason(
+                &mut warning_reasons,
+                match status_reason_code {
+                    Some("git_status_config_error") => "git_status_config_error",
+                    Some("git_status_permission_denied") => "git_status_permission_denied",
+                    _ => "git_status_command_failed",
+                },
+            );
+        }
+        "output_unavailable" => {
+            push_unique_reason(&mut warning_reasons, "git_status_output_unavailable");
+        }
+        _ => {}
+    }
     if !git_available || non_git_project {
         push_unique_reason(&mut warning_reasons, "git_unavailable");
         push_unique_action(
@@ -953,11 +1380,12 @@ fn set_show_changes_verdict(output: &mut Value) {
         push_unique_action(&mut actions, "resolve workspace conflicts before closeout");
     }
 
-    if git_available
-        && output
-            .get("exit_code")
-            .and_then(Value::as_i64)
-            .is_some_and(|exit_code| exit_code != 0)
+    if status_observation == "command_failed"
+        || (git_available
+            && output
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .is_some_and(|exit_code| exit_code != 0))
     {
         push_unique_reason(&mut blocking_reasons, "git_inspection_failed");
         push_unique_action(
@@ -1752,25 +2180,41 @@ impl ToolRuntime {
             Ok(output) => output,
             Err(e) => return ToolResult::err(e),
         };
-        let (status_stdout, head_stdout, diff_stat, diff_stdout, untracked_preview_stdout) =
-            split_show_changes_stdout(&output.stdout, include_diff);
-        // Graceful degradation for non-git projects: when the project directory
-        // is not inside a git repository, git prints a noisy fatal (and
-        // `git diff` dumps its full --no-index usage) once per subcommand and
-        // exits non-zero. Rather than surfacing that as a runtime failure with
-        // full stderr, return a structured success payload that marks
-        // git-backed inspection as unavailable while still reporting the
-        // session sub-summary. Real git repositories are unaffected.
-        if is_non_git_project_inspection(output.exit_code, &output.stderr, &status_stdout) {
-            let mut payload =
-                non_git_show_changes_payload(&project, output.exit_code, include_diff);
+        let (
+            status_stdout,
+            status_result_stdout,
+            head_stdout,
+            diff_stat,
+            diff_stdout,
+            untracked_preview_stdout,
+        ) = split_show_changes_stdout(&output.stdout, include_diff);
+        let status_observation = parse_show_changes_status_observation(
+            &status_stdout,
+            &status_result_stdout,
+            &output.stderr,
+        );
+        let effective_exit_code = if status_observation.exit_code != Some(0) {
+            status_observation.exit_code
+        } else {
+            output.exit_code
+        };
+        // Graceful degradation is reserved for a dedicated repository probe
+        // that explicitly reports an outside-worktree directory. Status
+        // configuration, permission, or execution failures remain distinct.
+        if status_observation.non_git() {
+            let mut payload = non_git_show_changes_payload_with_observation(
+                &project,
+                include_diff,
+                status_observation,
+            );
             let session_summary = session_id
                 .as_deref()
                 .and_then(|id| self.sessions.summary(id, Some(session_event_limit)));
             apply_show_changes_session(&mut payload, session_id.as_deref(), session_summary);
             return ToolResult::ok(payload);
         }
-        let mut payload = parse_show_changes_output(
+        let status_observed = status_observation.status_observed();
+        let mut payload = parse_show_changes_output_with_observation(
             &project,
             &status_stdout,
             &head_stdout,
@@ -1778,8 +2222,9 @@ impl ToolRuntime {
             include_diff.then_some(diff_stdout.as_str()),
             max_hunks,
             max_hunk_lines,
-            output.exit_code,
+            effective_exit_code,
             &output.stderr,
+            status_observation,
         );
         if include_diff {
             let untracked_paths = show_changes_untracked_paths(&payload);
@@ -1796,13 +2241,17 @@ impl ToolRuntime {
             .as_deref()
             .and_then(|id| self.sessions.summary(id, Some(session_event_limit)));
         apply_show_changes_session(&mut payload, session_id.as_deref(), session_summary);
-        if output.exit_code == Some(0) {
+        if status_observed && output.exit_code == Some(0) {
             ToolResult::ok(payload)
         } else {
             ToolResult {
                 success: false,
                 output: payload,
-                error: Some("show_changes git inspection failed".to_string()),
+                error: Some(if status_observed {
+                    "show_changes git inspection failed".to_string()
+                } else {
+                    "show_changes git status unavailable".to_string()
+                }),
             }
         }
     }
