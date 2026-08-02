@@ -1787,7 +1787,7 @@ fn start_job_request(cwd: &Path, command: &str) -> ShellAgentShellRequest {
 
 #[test]
 fn reconnect_backoff_is_bounded_exponential() {
-    let mut backoff = ReconnectBackoff::new();
+    let mut backoff = RetryBackoff::new(&RECONNECT_BACKOFF_STEPS);
     assert_eq!(backoff.next_delay(), Duration::from_secs(1));
     assert_eq!(backoff.next_delay(), Duration::from_secs(2));
     assert_eq!(backoff.next_delay(), Duration::from_secs(5));
@@ -1800,7 +1800,7 @@ fn reconnect_backoff_is_bounded_exponential() {
 
 #[test]
 fn polling_recovery_backoff_is_bounded_and_resets() {
-    let mut backoff = PollingRecoveryBackoff::new();
+    let mut backoff = RetryBackoff::new(&POLLING_RECOVERY_BACKOFF_STEPS);
     assert_eq!(backoff.next_delay(), Duration::from_millis(500));
     assert_eq!(backoff.next_delay(), Duration::from_secs(1));
     assert_eq!(backoff.next_delay(), Duration::from_secs(2));
@@ -1813,7 +1813,7 @@ fn polling_recovery_backoff_is_bounded_and_resets() {
 
 #[test]
 fn polling_lease_conflict_retry_has_a_finite_total_wait() {
-    let mut backoff = PollingRecoveryBackoff::new();
+    let mut backoff = RetryBackoff::new(&POLLING_RECOVERY_BACKOFF_STEPS);
     assert_eq!(
         next_lease_conflict_delay(
             &mut backoff,
@@ -1838,6 +1838,118 @@ fn transport_error_classification_separates_transient_and_fatal() {
     let fatal =
         classify_session_error("quic connect failed: certificate verify failed; check server_name");
     assert!(fatal.is_fatal(), "{fatal}");
+}
+
+#[test]
+fn stream_supervisor_once_semantics_are_explicit_and_shared() {
+    for (mode, transport) in [
+        (
+            StreamSupervisorMode::Strict(StreamTransport::WebSocket),
+            StreamTransport::WebSocket,
+        ),
+        (
+            StreamSupervisorMode::Strict(StreamTransport::Quic),
+            StreamTransport::Quic,
+        ),
+        (StreamSupervisorMode::Auto, StreamTransport::WebSocket),
+        (StreamSupervisorMode::Auto, StreamTransport::Quic),
+    ] {
+        assert_eq!(
+            decide_stream_session(
+                mode,
+                transport,
+                true,
+                Ok(AgentSessionExit::TransportDisconnected)
+            ),
+            StreamSessionDecision::Complete { shutdown: false },
+            "{mode:?} {transport:?} must stop after a completed once session"
+        );
+    }
+
+    for transport in [StreamTransport::WebSocket, StreamTransport::Quic] {
+        assert!(matches!(
+            decide_stream_session(
+                StreamSupervisorMode::Strict(transport),
+                transport,
+                true,
+                Err("connection refused".to_string()),
+            ),
+            StreamSessionDecision::Fatal(error) if error == "connection refused"
+        ));
+    }
+
+    assert!(matches!(
+        decide_stream_session(
+            StreamSupervisorMode::Auto,
+            StreamTransport::Quic,
+            true,
+            Err("connection refused".to_string()),
+        ),
+        StreamSessionDecision::TryNext(AgentTransportError::Transient(error))
+            if error == "connection refused"
+    ));
+    assert!(matches!(
+        decide_stream_session(
+            StreamSupervisorMode::Auto,
+            StreamTransport::WebSocket,
+            true,
+            Err("connection refused".to_string()),
+        ),
+        StreamSessionDecision::Fatal(error) if error == "connection refused"
+    ));
+}
+
+#[test]
+fn stream_supervisor_reconnect_and_auto_fallback_semantics_are_shared() {
+    for transport in [StreamTransport::WebSocket, StreamTransport::Quic] {
+        assert!(matches!(
+            decide_stream_session(
+                StreamSupervisorMode::Strict(transport),
+                transport,
+                false,
+                Ok(AgentSessionExit::TransportDisconnected),
+            ),
+            StreamSessionDecision::Reconnect(None)
+        ));
+        assert!(matches!(
+            decide_stream_session(
+                StreamSupervisorMode::Strict(transport),
+                transport,
+                false,
+                Err("connection refused".to_string()),
+            ),
+            StreamSessionDecision::Reconnect(Some(AgentTransportError::Transient(error)))
+                if error == "connection refused"
+        ));
+        assert!(matches!(
+            decide_stream_session(
+                StreamSupervisorMode::Auto,
+                transport,
+                false,
+                Ok(AgentSessionExit::TransportDisconnected),
+            ),
+            StreamSessionDecision::Reconnect(None)
+        ));
+        assert!(matches!(
+            decide_stream_session(
+                StreamSupervisorMode::Auto,
+                transport,
+                false,
+                Err("connection refused".to_string()),
+            ),
+            StreamSessionDecision::TryNext(AgentTransportError::Transient(error))
+                if error == "connection refused"
+        ));
+        assert!(matches!(
+            decide_stream_session(
+                StreamSupervisorMode::Auto,
+                transport,
+                false,
+                Err("register rejected by server: unauthorized".to_string()),
+            ),
+            StreamSessionDecision::Fatal(error) if error.contains("register rejected")
+        ));
+    }
 }
 
 #[test]
@@ -2173,6 +2285,37 @@ async fn strict_websocket_transient_connect_failure_reconnects() {
         "strict websocket did not wait for reconnect backoff after transient connect failure"
     );
     assert!(error.contains("register rejected"), "{error}");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn strict_websocket_once_stops_after_first_registered_disconnect() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let _register = read_register(&mut ws).await;
+        send_registered_ack(&mut ws).await;
+        ws.send(WsMessage::Close(None)).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1_500), listener.accept())
+                .await
+                .is_err(),
+            "--once must not open a reconnecting websocket session"
+        );
+    });
+
+    let cfg = test_agent_config(format!("http://{}", addr));
+    let runtime = test_runtime(&cfg);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || run_websocket_agent(cfg, true, "inst-once", &runtime)),
+    )
+    .await
+    .expect("websocket --once did not stop after the first disconnect")
+    .unwrap()
+    .expect("registered websocket --once disconnect should be successful");
     server.await.unwrap();
 }
 
