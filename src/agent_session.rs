@@ -61,11 +61,12 @@ impl RegisterPreludeError {
 /// This is the transport-neutral half of registration: it mirrors the polling
 /// register handler's checks — bootstrap may register any owner, an agent
 /// token may register only when its `allowed_client_id` matches and its owner
-/// matches the requested owner (or fills it in when absent), and user tokens
-/// are rejected. It stops **before** any wire I/O: on failure it returns the
-/// reason and lets the caller send its transport-specific error envelope and
-/// log the cause. On success `register_payload.owner` is set to the effective
-/// owner and the caller proceeds to mutate the registry.
+/// matches the requested owner (or fills it in when absent), a direct shared
+/// key registers into its hash group with no trusted owner, and other user
+/// tokens are rejected. It stops **before** any wire I/O: on failure it returns
+/// the reason and lets the caller send its transport-specific error envelope
+/// and log the cause. On success `register_payload.owner` is set to the
+/// effective owner and the caller proceeds to mutate the registry.
 pub(crate) fn register_session_prelude(
     auth: Option<&AuthContext>,
     register_payload: &mut ShellClientRegisterRequest,
@@ -265,6 +266,14 @@ async fn dispatch_inbound(
 ) {
     match env {
         AgentEnvelope::Result { payload } => {
+            if payload.client_id != client_id || payload.agent_instance_id != agent_instance_id {
+                tracing::warn!(
+                    client_id = client_id,
+                    "agent {} result rejected: envelope identity does not match registered connection",
+                    transport_label
+                );
+                return;
+            }
             // `complete_for_connection` refreshes `last_seen` internally only
             // when this connection still holds the lease; a late result on a
             // stale same-instance connection is still applied but does not
@@ -282,6 +291,14 @@ async fn dispatch_inbound(
             }
         }
         AgentEnvelope::PersistentShellResult { payload } => {
+            if payload.client_id != client_id || payload.agent_instance_id != agent_instance_id {
+                tracing::warn!(
+                    client_id = client_id,
+                    "agent {} persistent shell result rejected: envelope identity does not match registered connection",
+                    transport_label
+                );
+                return;
+            }
             if let Err(e) = registry
                 .complete_persistent_shell_for_connection(payload, connection_id)
                 .await
@@ -295,6 +312,14 @@ async fn dispatch_inbound(
             }
         }
         AgentEnvelope::JobUpdate { payload } => {
+            if payload.client_id != client_id || payload.agent_instance_id != agent_instance_id {
+                tracing::warn!(
+                    client_id = client_id,
+                    "agent {} job_update rejected: envelope identity does not match registered connection",
+                    transport_label
+                );
+                return;
+            }
             if let Err(e) = registry
                 .update_job_for_connection(payload, connection_id)
                 .await

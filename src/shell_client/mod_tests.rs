@@ -416,6 +416,119 @@ async fn same_client_id_in_different_project_grants_is_isolated() {
         .is_none());
 }
 
+#[tokio::test]
+async fn shared_key_client_id_collision_cannot_cross_group_or_revive_old_connection() {
+    let registry = ShellClientRegistry::default();
+    let shared_a = crate::auth::shared_key::shared_key_context("shared-a");
+    let shared_b = crate::auth::shared_key::shared_key_context("shared-b");
+    let managed = agent_auth_context(
+        "managed",
+        "managed-client",
+        vec![
+            "agent:register",
+            "agent:poll",
+            "agent:result",
+            "agent:job_update",
+        ],
+    );
+    let bootstrap = auth_context(None, true);
+    let registration = |client_id: &str, instance: &str, hostname: &str, owner: Option<&str>| {
+        ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
+            job_inventory: None,
+            client_id: client_id.to_string(),
+            agent_instance_id: instance.to_string(),
+            display_name: None,
+            owner: owner.map(str::to_string),
+            hostname: Some(hostname.to_string()),
+            capabilities: Some(async_job_capabilities()),
+            projects: Some(vec![project_summary("project", "/tmp/project")]),
+            agent_protocol_version: None,
+            policy: None,
+        }
+    };
+
+    registry
+        .register_with_auth_connection(
+            registration("shared-client", "shared-instance", "host-a", None),
+            Some(&shared_a),
+            Some("connection-a"),
+        )
+        .await
+        .unwrap();
+    registry
+        .register_with_auth_connection(
+            registration(
+                "managed-client",
+                "managed-instance",
+                "managed-host",
+                Some("managed"),
+            ),
+            Some(&managed),
+            Some("managed-connection"),
+        )
+        .await
+        .unwrap();
+
+    let collision = registry
+        .register_with_auth_connection(
+            registration("shared-client", "shared-instance", "host-b", None),
+            Some(&shared_b),
+            Some("connection-b"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(collision, "agent client identity is unavailable");
+    assert!(!collision.contains("host-a"));
+    assert_eq!(
+        registry
+            .get_client_view_for_auth("shared-client", Some(&shared_a))
+            .await
+            .unwrap()
+            .hostname
+            .as_deref(),
+        Some("host-a"),
+        "cross-group collision must not refresh or replace the original record"
+    );
+    assert!(registry
+        .get_client_view_for_auth("shared-client", Some(&shared_b))
+        .await
+        .is_none());
+    assert!(registry
+        .get_client_view_for_auth("shared-client", Some(&managed))
+        .await
+        .is_none());
+    assert!(registry
+        .get_client_view_for_auth("managed-client", Some(&shared_a))
+        .await
+        .is_none());
+    assert!(registry
+        .get_client_view_for_auth("shared-client", Some(&bootstrap))
+        .await
+        .is_some());
+
+    // Same key + same process identity is a legitimate reconnect and replaces
+    // only the concrete connection lease.
+    registry
+        .register_with_auth_connection(
+            registration("shared-client", "shared-instance", "host-a-new", None),
+            Some(&shared_a),
+            Some("connection-new"),
+        )
+        .await
+        .unwrap();
+    let old_connection = registry
+        .touch_client_for_connection("shared-client", "shared-instance", "connection-a")
+        .await
+        .unwrap_err();
+    assert!(old_connection.contains("transport connection is no longer active"));
+    registry
+        .touch_client_for_connection("shared-client", "shared-instance", "connection-new")
+        .await
+        .unwrap();
+}
+
 #[test]
 fn requested_by_from_auth_uses_bootstrap_username_or_anonymous() {
     let bootstrap = auth_context(None, true);
@@ -1786,6 +1899,7 @@ async fn touch_client_rejects_stale_instance_and_accepts_active() {
 fn enforce_register_owner_cases() {
     let bootstrap = auth_context(None, true);
     let user_alice = auth_context(Some("alice"), false);
+    let shared = crate::auth::shared_key::shared_key_context("shared-a");
     let agent_alice = agent_auth_context(
         "alice",
         "alice-laptop",
@@ -1830,6 +1944,20 @@ fn enforce_register_owner_cases() {
             Some(&bootstrap),
             "client-1",
             Some("bob"),
+            Ok(()),
+        ),
+        (
+            "shared key ignores missing owner",
+            Some(&shared),
+            "client-1",
+            None,
+            Ok(()),
+        ),
+        (
+            "shared key ignores untrusted owner",
+            Some(&shared),
+            "client-1",
+            Some("forged-owner"),
             Ok(()),
         ),
         // Phase 3: user tokens (Phase 2 personal API tokens) are no longer
@@ -1911,6 +2039,12 @@ fn effective_register_owner_agent_token_fills_username() {
         effective_register_owner(Some(&bootstrap), Some("bob")),
         Some("bob".to_string())
     );
+    let shared = crate::auth::shared_key::shared_key_context("shared-a");
+    assert_eq!(
+        effective_register_owner(Some(&shared), Some("forged-owner")),
+        None,
+        "shared-key owner must not become an authorization input"
+    );
 }
 
 #[test]
@@ -1932,6 +2066,22 @@ fn enforce_agent_transport_agent_token_matching_client_succeeds() {
 fn enforce_agent_transport_bootstrap_succeeds() {
     let bootstrap = auth_context(None, true);
     assert!(enforce_agent_transport(Some(&bootstrap), "any-client").is_ok());
+}
+
+#[test]
+fn enforce_agent_transport_direct_shared_key_succeeds() {
+    let shared = crate::auth::shared_key::shared_key_context("shared-a");
+    assert!(enforce_agent_transport(Some(&shared), "any-client").is_ok());
+    for scope in crate::auth::AGENT_SCOPES {
+        assert!(require_agent_transport_scope(Some(&shared), scope).is_ok());
+    }
+}
+
+#[test]
+fn enforce_agent_transport_open_anonymous_is_rejected() {
+    let open = open_auth_context();
+    assert!(enforce_agent_transport(Some(&open), "client-a").is_err());
+    assert!(require_agent_transport_scope(Some(&open), "agent:register").is_err());
 }
 
 #[test]

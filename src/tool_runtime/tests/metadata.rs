@@ -215,7 +215,7 @@ async fn list_projects_reports_smoke_selection_capabilities() {
 }
 
 #[tokio::test]
-async fn list_projects_and_dispatch_are_filtered_by_lightweight_auth_group() {
+async fn shared_key_list_projects_and_dispatch_are_filtered_by_auth_group() {
     let runtime = test_runtime();
     let shared_a = shared_key_auth("hash-a");
     let shared_b = shared_key_auth("hash-b");

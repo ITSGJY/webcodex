@@ -58,13 +58,23 @@ A shared key is a quick-start secret supplied to `connect --key <KEY>` and to GP
 Authorization: Bearer <KEY>
 ```
 
-When `WEBCODEX_SHARED_KEY_ENABLED=true`, an unknown non-`wc_` Bearer value is accepted as a shared-key principal. The plaintext value is not enrolled as a server-side allowlist entry; WebCodex groups callers by `shared_key_hash`. Different values create different lightweight groups.
+When `WEBCODEX_SHARED_KEY_ENABLED=true`, an unknown non-`wc_` Bearer value is accepted as a shared-key principal. The same trimmed key may authenticate both the MCP/runtime client and a local Runner. The plaintext value is not enrolled as a server-side allowlist entry; WebCodex groups both sides by `shared_key_hash = SHA-256(trimmed key)`. The same value sees its own Runners, projects, and Jobs. Different values create isolated lightweight groups and cannot discover or operate on each other's objects.
 
 This fallback belongs only to an explicitly configured ordinary server
 quick-start. A project-bound setup sets it to false and uses the exact Project
 Credential verifier above; the two paths do not fall back to each other.
 
-A shared key is not an admin credential, not a managed user identity, and not production IAM.
+A shared key gets runtime read, project read/write, job run, and Agent transport
+inside its own hash group. It does not get user/token/pairing/account
+management, service control, bootstrap, or admin access. A shared-key Runner's
+reported `owner` is ignored; authorization uses only the server-derived hash
+group. A globally colliding `client_id` cannot replace a Runner registered by a
+different group.
+
+A shared key is not an admin credential, not a managed user identity, and not
+production IAM. It has no independent per-device revocation or fine-grained
+identity audit: rotate the shared secret for the whole group, or use managed
+credentials when those properties matter.
 
 Static bearer/API-key host auth can be used with either a shared key for quick start or a `wc_pat_xxx` token for managed mode. OAuth is a separate flow; blank OAuth client fields do not become no-auth or static bearer.
 
@@ -78,7 +88,8 @@ also rejected.
 `WEBCODEX_SHARED_KEY_ENABLED`. The bridge flag enables shared-key entry on the
 OAuth authorization page for OAuth-only hosts; it does not enable direct Bearer
 shared-key fallback. Enabling direct Bearer shared-key fallback does not enable
-the OAuth bridge.
+the OAuth bridge. An OAuth shared-key subject does not gain Agent transport;
+Runner pairing in this quick-start path requires the direct Bearer shared key.
 
 ## `wc_acct_xxx`
 
@@ -92,6 +103,14 @@ webcodex agent-token create-local
 ```
 
 Those commands generate plaintext tokens locally and register only token hashes with the server.
+
+`webcodex token generate --kind api|agent` is an offline primitive: it prints a
+token and hash but does not register either with a remote Server. Its output
+cannot authenticate until the hash is registered through the managed
+credential flow. Do not use an offline-generated `wc_pat_*` or `wc_agent_*` as
+an arbitrary shared key. Use `webcodex connect` with a non-`wc_` key for the
+hosted quick start, or use `webcodex login`, pairing, or an account credential
+for managed mode.
 
 Do not use `wc_acct_xxx` as a GPT Action token, MCP token, runtime API token, or agent connection token.
 

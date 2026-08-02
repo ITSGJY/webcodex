@@ -62,6 +62,8 @@ fn token_generate_api_prints_token_hash_and_prefix() {
             assert!(out.contains("Token:\nwc_pat_"));
             assert!(out.contains("\nHash:\nsha256:"));
             assert!(out.contains("\nPrefix:\nwc_pat_"));
+            assert!(out.contains("generated offline and is not registered"));
+            assert!(out.contains("use `webcodex connect`"));
         }
         other => panic!("expected TokenGenerate, got {other:?}"),
     }
@@ -76,6 +78,8 @@ fn token_generate_agent_prints_token_hash_and_prefix() {
             assert!(out.contains("Token:\nwc_agent_"));
             assert!(out.contains("\nHash:\nsha256:"));
             assert!(out.contains("\nPrefix:\nwc_agent_"));
+            assert!(out.contains("generated offline and is not registered"));
+            assert!(out.contains("use `webcodex connect`"));
         }
         other => panic!("expected TokenGenerate, got {other:?}"),
     }

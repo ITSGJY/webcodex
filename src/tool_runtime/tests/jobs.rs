@@ -1671,7 +1671,7 @@ fn assert_unknown_job(result: ToolResult) {
 }
 
 #[tokio::test]
-async fn runtime_job_tools_filter_agent_jobs_by_auth_group() {
+async fn shared_key_runtime_job_tools_filter_agent_jobs_by_auth_group() {
     let runtime = test_runtime();
     let shared_a = shared_key_auth_context("hash-a");
     let shared_b = shared_key_auth_context("hash-b");

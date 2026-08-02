@@ -6,7 +6,7 @@ WebCodex agents connect to the server and execute registered project tools. New 
 
 ## Authentication
 
-Agents should use agent tokens created during client enrollment (`webcodex login` is the primary entry; `webcodex client enroll` is the advanced alternative):
+Managed agents use agent tokens created during client enrollment (`webcodex login` is the primary entry; `webcodex client enroll` is the advanced alternative):
 
 ```bash
 webcodex login URL --code CODE
@@ -14,12 +14,20 @@ webcodex login URL --code CODE
 
 The server/admin side creates the temporary code with `webcodex pairing create`. The agent token is returned to the client during login and written into the generated `agent.toml`; do not copy agent token files from the server. For binary deployments, install the client-side service with `webcodex agent install --config <path>` and inspect it with `webcodex agent status`.
 
+On a Server with `WEBCODEX_SHARED_KEY_ENABLED=true`, the hosted quick-start is
+the other supported mode: a Runner may present the exact same direct,
+non-`wc_` shared key used by MCP. Server and Runner independently derive
+`SHA-256(trimmed key)` and the registry stores that non-secret auth group.
+Different keys, managed identities, and open-anonymous callers cannot register
+into or operate on that group. OAuth shared-key bridge tokens remain excluded
+from Agent transport.
+
 Transport auth rules:
 
-- QUIC: the agent token stays in the top-level agent config and is sent inside the agent registration envelope over the QUIC stream.
-- WebSocket: `Authorization: Bearer <agent-token>` in the handshake headers is preferred.
+- QUIC: the Agent token or direct shared key stays in the top-level agent config and is sent inside the agent registration envelope over the QUIC stream.
+- WebSocket: `Authorization: Bearer <agent-token-or-shared-key>` in the handshake headers is preferred.
 - WebSocket compatibility: `/api/agents/ws?token=...` is accepted for handshake compatibility only.
-- Polling: every request must use `Authorization: Bearer <agent-token>`.
+- Polling: every request must use `Authorization: Bearer <agent-token-or-shared-key>`.
 - REST, MCP, and GPT Actions ordinary APIs must use `Authorization: Bearer ...`.
 
 Do not use query-string tokens outside `/api/agents/ws`.
@@ -37,6 +45,12 @@ Agents register with:
 - redacted policy summary
 
 `agent_instance_id` identifies a running agent instance separately from the stable `client_id`.
+Managed Agent tokens bind `client_id` and owner. Direct shared-key registrations
+ignore the submitted owner and bind the record to the derived hash group. A
+cross-group `client_id` collision fails without revealing or replacing the
+existing record. Same-group reconnects preserve the normal instance and
+connection-lease rules; an older connection cannot refresh or submit on behalf
+of the newer lease.
 
 ## Same-process job state reconciliation
 

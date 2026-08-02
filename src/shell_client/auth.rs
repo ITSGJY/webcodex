@@ -114,6 +114,7 @@ pub(super) fn shell_job_visible_to_auth(
 ///
 /// Rules:
 /// - bootstrap token (or auth disabled) may register any owner;
+/// - a direct shared key is authorized by its hash group and ignores owner;
 /// - a normal API key may only register `owner == username`;
 /// - a normal API key with a missing/empty owner is rejected, matching the
 ///   existing owner boundary enforced on later operations.
@@ -140,6 +141,12 @@ pub(crate) fn enforce_register_owner(
     };
     // Bootstrap may register any owner.
     if auth.is_bootstrap {
+        return Ok(());
+    }
+    // Direct shared-key runners are authorized exclusively by the non-secret
+    // hash captured in `ShellClientAuthGroup`. The request owner is
+    // intentionally ignored so it cannot become an authorization input.
+    if auth.is_shared_key() {
         return Ok(());
     }
     // Phase 3: agent tokens are bound to an allowed_client_id and an owner.
@@ -170,15 +177,17 @@ pub(crate) fn enforce_register_owner(
         }
         return Ok(());
     }
-    // Phase 2 user token: rejected from agent transport endpoints. Only
-    // bootstrap or agent tokens may register.
+    // Phase 2 user tokens and every other identity kind are rejected from
+    // agent transport endpoints.
     Err("user tokens are not allowed on agent transport endpoints".to_string())
 }
 
 /// Resolve the effective owner for an agent register request. When the caller
 /// is an agent token, the owner is the token's username regardless of the
-/// request body. When the caller is bootstrap, the request body owner is used
-/// (or `None` when absent). Returns the owner to store on the registry record.
+/// request body. A direct shared key stores no owner because authorization is
+/// hash-group based. When the caller is bootstrap, the request body owner is
+/// used (or `None` when absent). Returns the owner to store on the registry
+/// record.
 pub(crate) fn effective_register_owner(
     auth: Option<&crate::auth::AuthContext>,
     owner: Option<&str>,
@@ -189,12 +198,16 @@ pub(crate) fn effective_register_owner(
     if auth.is_agent_token() {
         return auth.username.clone();
     }
+    if auth.is_shared_key() {
+        return None;
+    }
     owner.filter(|o| !o.trim().is_empty()).map(str::to_string)
 }
 
 /// Enforce the agent transport boundary for poll/result/job_update endpoints.
-/// These endpoints must only accept bootstrap or agent tokens, and an agent
-/// token must be bound to the request's `client_id`. User tokens are rejected.
+/// These endpoints accept bootstrap, direct shared keys, or agent tokens. An
+/// agent token must be bound to the request's `client_id`; shared keys are
+/// subsequently bound by the registry's `ShellClientAuthGroup` check.
 ///
 /// This complements [`enforce_register_owner`] which handles the register
 /// endpoint. Poll/result/job_update do not carry an owner field; the registry
@@ -208,6 +221,9 @@ pub(crate) fn enforce_agent_transport(
         return Ok(());
     };
     if auth.is_bootstrap {
+        return Ok(());
+    }
+    if auth.is_shared_key() {
         return Ok(());
     }
     if auth.is_agent_token() {
@@ -236,7 +252,7 @@ pub(crate) fn require_agent_transport_scope(
     if auth.is_admin() {
         return Ok(());
     }
-    if auth.is_agent_token() && auth.scopes.iter().any(|s| s == scope) {
+    if (auth.is_agent_token() || auth.is_shared_key()) && auth.scopes.iter().any(|s| s == scope) {
         Ok(())
     } else {
         Err(format!("missing required scope: {}", scope))

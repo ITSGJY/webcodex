@@ -130,9 +130,10 @@ pub(crate) fn is_account_control_path(path: &str) -> bool {
 
 /// Enforce that the token kind is permitted on the requested HTTP path.
 ///
-/// Agent tokens are only allowed on agent transport endpoints. Account
-/// credentials are only allowed on account control endpoints. All other
-/// token kinds (bootstrap, user PAT) are allowed on any authenticated path.
+/// Agent tokens are only allowed on agent transport endpoints. Direct
+/// shared-key principals may also use those endpoints when shared-key auth
+/// produced their context. Account credentials are only allowed on account
+/// control endpoints. Other token kinds retain their normal surfaces.
 ///
 /// Returns `Ok(())` when the token is permitted, `Err((status, message))`
 /// when it should be rejected.
@@ -162,18 +163,23 @@ pub(crate) fn enforce_token_surface(
             "account credentials may only access account control endpoints",
         ));
     }
-    // OAuth2 access tokens are not permitted on agent transport endpoints.
-    // Agent endpoints require agent tokens or bootstrap auth.
+    // OAuth2 access tokens are not permitted on agent transport endpoints,
+    // including the shared-key OAuth bridge. Only a direct bearer shared key
+    // may pair a lightweight Runner.
     if ctx.is_oauth_token() && is_agent_transport_path(path) {
         return Err((
             StatusCode::FORBIDDEN,
             "OAuth2 tokens are not allowed on agent transport endpoints",
         ));
     }
-    if is_agent_transport_path(path) && !ctx.is_bootstrap() && !ctx.is_agent_token() {
+    if is_agent_transport_path(path)
+        && !ctx.is_bootstrap()
+        && !ctx.is_agent_token()
+        && !ctx.is_shared_key()
+    {
         return Err((
             StatusCode::FORBIDDEN,
-            "agent transport endpoints require bootstrap or a bound Agent Token",
+            "agent transport endpoints require bootstrap, a bound Agent Token, or a direct shared key",
         ));
     }
     Ok(())

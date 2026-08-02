@@ -3,7 +3,10 @@
 use sha2::{Digest, Sha256};
 
 use super::context::{AuthContext, AuthKind};
-use super::scopes::{SCOPE_JOB_RUN, SCOPE_PROJECT_READ, SCOPE_PROJECT_WRITE, SCOPE_RUNTIME_READ};
+use super::scopes::{
+    SCOPE_AGENT_JOB_UPDATE, SCOPE_AGENT_POLL, SCOPE_AGENT_REGISTER, SCOPE_AGENT_RESULT,
+    SCOPE_JOB_RUN, SCOPE_PROJECT_READ, SCOPE_PROJECT_WRITE, SCOPE_RUNTIME_READ,
+};
 
 /// Read the explicit-anonymous (`--open`) flag from the environment. When true,
 /// the server allows anonymous GPT/MCP and anonymous client access under the
@@ -40,9 +43,26 @@ pub(crate) fn shared_key_hash_of(token: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Scopes granted to shared-key and open-anonymous callers. Agent transport is
-/// deliberately absent: only bootstrap or a bound Agent Token may use it.
-fn interactive_scopes() -> Vec<String> {
+/// Scopes granted to interactive shared-key callers. These include the Agent
+/// transport needed by a local Runner, but remain intentionally below account
+/// management and admin. The transport surface still admits only direct
+/// `AuthKind::SharedKey`, never open-anonymous or OAuth bridge identities.
+fn shared_key_scopes() -> Vec<String> {
+    vec![
+        SCOPE_RUNTIME_READ.to_string(),
+        SCOPE_PROJECT_READ.to_string(),
+        SCOPE_PROJECT_WRITE.to_string(),
+        SCOPE_JOB_RUN.to_string(),
+        SCOPE_AGENT_REGISTER.to_string(),
+        SCOPE_AGENT_POLL.to_string(),
+        SCOPE_AGENT_RESULT.to_string(),
+        SCOPE_AGENT_JOB_UPDATE.to_string(),
+    ]
+}
+
+/// Open-anonymous callers retain interactive runtime/project access but may
+/// never register or drive a Runner.
+fn open_anonymous_scopes() -> Vec<String> {
     vec![
         SCOPE_RUNTIME_READ.to_string(),
         SCOPE_PROJECT_READ.to_string(),
@@ -67,7 +87,7 @@ fn project_connector_scopes() -> Vec<String> {
 pub(crate) fn shared_key_context(token: &str) -> AuthContext {
     AuthContext {
         role: Some("shared-key".to_string()),
-        scopes: interactive_scopes(),
+        scopes: shared_key_scopes(),
         token_kind: Some("shared-key".to_string()),
         shared_key_hash: Some(shared_key_hash_of(token)),
         ..AuthContext::new(AuthKind::SharedKey)
@@ -89,7 +109,7 @@ pub(crate) fn project_credential_context(grant_id: &str) -> AuthContext {
 pub(crate) fn open_anonymous_context() -> AuthContext {
     AuthContext {
         role: Some("open".to_string()),
-        scopes: interactive_scopes(),
+        scopes: open_anonymous_scopes(),
         token_kind: Some("open".to_string()),
         ..AuthContext::new(AuthKind::OpenAnonymous)
     }

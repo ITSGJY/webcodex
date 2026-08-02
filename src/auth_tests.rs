@@ -1169,8 +1169,9 @@ fn enforce_token_surface_matrix() {
         "/api/projects/list",
         "/mcp",
     ];
-    let mut lightweight_rejected: Vec<&str> = ACCOUNT_CONTROL_PATHS.to_vec();
-    lightweight_rejected.extend(AGENT_TRANSPORT_PATHS);
+    let lightweight_account_rejected: Vec<&str> = ACCOUNT_CONTROL_PATHS.to_vec();
+    let mut open_rejected = lightweight_account_rejected.clone();
+    open_rejected.extend(AGENT_TRANSPORT_PATHS);
 
     // Rows: (label, ctx, allowed paths, rejected paths, rejection message
     // substring; "" skips the message check). Every rejection must be
@@ -1195,7 +1196,7 @@ fn enforce_token_surface_matrix() {
                 "/api/tools/list",
                 "/api/projects/list",
             ],
-            vec![],
+            agent_transport.to_vec(),
             "",
         ),
         (
@@ -1214,15 +1215,19 @@ fn enforce_token_surface_matrix() {
         (
             "shared key",
             shared_key_context("k"),
-            runtime_paths.to_vec(),
-            lightweight_rejected.clone(),
+            runtime_paths
+                .iter()
+                .chain(agent_transport.iter())
+                .copied()
+                .collect(),
+            lightweight_account_rejected,
             "",
         ),
         (
             "open anonymous",
             open_anonymous_context(),
             runtime_paths.to_vec(),
-            lightweight_rejected,
+            open_rejected,
             "",
         ),
         (
@@ -1314,11 +1319,14 @@ fn lightweight_contexts_have_no_admin_scope() {
     assert!(!sk.scopes.iter().any(|s| s == SCOPE_ADMIN));
     let open = open_anonymous_context();
     assert!(!open.scopes.iter().any(|s| s == SCOPE_ADMIN));
-    // They retain interactive runtime/project access but never Agent
-    // transport scopes.
+    // A direct shared key retains interactive runtime/project access and gets
+    // only the four narrow Agent transport scopes needed by its Runner.
     assert!(sk.scopes.contains(&SCOPE_RUNTIME_READ.to_string()));
     assert!(sk.scopes.contains(&SCOPE_PROJECT_WRITE.to_string()));
-    assert!(!sk.scopes.contains(&SCOPE_AGENT_REGISTER.to_string()));
+    for scope in AGENT_SCOPES {
+        assert!(sk.scopes.contains(&scope.to_string()));
+    }
+    // Open anonymous and project credentials never gain Agent transport.
     assert!(!open.scopes.contains(&SCOPE_AGENT_REGISTER.to_string()));
 
     let project = crate::auth::shared_key::project_credential_context("wc_pgrant_1111111111111111");
@@ -1368,9 +1376,17 @@ async fn shared_key_fallback_gated_by_env_and_prefix() {
     assert!(ctx.is_shared_key());
     assert!(!ctx.is_admin());
 
-    // Shared-key enabled but wc_-prefixed invalid token → None (reject).
-    let r = authenticate_bearer(&config, None, Some("wc_pat_invalid")).await;
-    assert!(r.is_none(), "wc_ prefix invalid token must be rejected");
+    // Shared-key enabled but any wc_-prefixed invalid managed credential →
+    // None (reject), never a shared-key downgrade.
+    for token in [
+        "wc_pat_invalid",
+        "wc_agent_invalid",
+        "wc_acct_invalid",
+        "wc_oat_invalid",
+    ] {
+        let r = authenticate_bearer(&config, None, Some(token)).await;
+        assert!(r.is_none(), "{token} must not fall back to shared-key");
+    }
 
     // Empty or whitespace-only bearer values must not become sha256("")
     // shared-key groups.
@@ -2014,11 +2030,26 @@ async fn auth_middleware_lightweight_empty_and_open_paths() {
     let (_tmp, db) = gate_test_db();
     let service = salvo::Service::new(gate_router(config.clone(), db.clone()));
 
+    let (status, body) = gate_send(&service, "/api/shell/agent/register", Some("my-key")).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "shared-key disabled must reject Agent transport: {body:?}"
+    );
+
     env.enable_direct_shared_key();
     env.disable_open_anonymous();
 
     let (status, body) = gate_send(&service, "/api/runtime/status", Some("my-key")).await;
     assert_eq!(status, StatusCode::OK, "body: {:?}", body);
+    for path in AGENT_TRANSPORT_PATHS {
+        let (status, body) = gate_send(&service, path, Some("my-key")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "direct shared key should reach Agent transport {path}: {body:?}"
+        );
+    }
 
     let resp = salvo::test::TestClient::post("http://localhost/api/runtime/status")
         .add_header("authorization", "Bearer ", true)
@@ -2050,6 +2081,14 @@ async fn auth_middleware_lightweight_empty_and_open_paths() {
         .send(&service)
         .await;
     assert_eq!(resp.status_code, Some(StatusCode::OK));
+    let resp = salvo::test::TestClient::post("http://localhost/api/shell/agent/register")
+        .send(&service)
+        .await;
+    assert_eq!(
+        resp.status_code,
+        Some(StatusCode::FORBIDDEN),
+        "open-anonymous must not register a Runner"
+    );
 }
 
 #[tokio::test]

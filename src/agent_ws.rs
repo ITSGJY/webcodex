@@ -346,6 +346,8 @@ mod tests {
     use salvo::conn::{Acceptor, Listener};
     use std::net::SocketAddr;
     use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::HeaderValue;
     use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 
     fn register_envelope(client_id: &str) -> AgentEnvelope {
@@ -460,6 +462,220 @@ mod tests {
             Server::new(acceptor).serve(router).await;
         });
         addr
+    }
+
+    async fn start_authenticated_server(
+        registry: Arc<ShellClientRegistry>,
+    ) -> (SocketAddr, tempfile::TempDir) {
+        let config = crate::test_support::test_config(Some("bootstrap-secret"));
+        let (tmp, db) = crate::test_support::test_db();
+        let acceptor = TcpListener::new("127.0.0.1:0").bind().await;
+        let addr = acceptor.holdings()[0]
+            .local_addr
+            .clone()
+            .into_std()
+            .unwrap();
+        let router = Router::new()
+            .hoop(affix_state::inject(config))
+            .hoop(affix_state::inject(db))
+            .hoop(affix_state::inject(registry))
+            .push(
+                Router::with_path("api/agents/ws")
+                    .hoop(crate::auth::AuthMiddleware)
+                    .goal(agent_ws),
+            );
+        tokio::spawn(async move {
+            Server::new(acceptor).serve(router).await;
+        });
+        (addr, tmp)
+    }
+
+    async fn connect_with_bearer(
+        url: &str,
+        token: &str,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        connect_async(request).await.expect("ws connect").0
+    }
+
+    fn shared_key_register_envelope(
+        client_id: &str,
+        instance_id: &str,
+        project_id: &str,
+    ) -> AgentEnvelope {
+        let AgentEnvelope::Register { mut payload, .. } =
+            register_envelope_with_instance(client_id, instance_id)
+        else {
+            unreachable!()
+        };
+        payload.owner = Some("untrusted-owner".to_string());
+        payload.projects = Some(vec![crate::shell_protocol::ShellAgentProjectSummary {
+            id: project_id.to_string(),
+            name: Some(project_id.to_string()),
+            path: format!("/tmp/{project_id}"),
+            allow_patch: true,
+            kind: None,
+            description: None,
+            hooks: Vec::new(),
+            disabled: false,
+            revision: None,
+            git_branch: None,
+            git_head: None,
+            git_dirty: None,
+            updated_at: chrono::Utc::now().timestamp(),
+            shell_profile: None,
+        }]);
+        AgentEnvelope::Register {
+            payload,
+            auth_token: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn ws_direct_shared_keys_register_by_group_and_cannot_spoof_results() {
+        let env = crate::auth::AuthEnvGuard::auth_required();
+        env.enable_direct_shared_key();
+        let registry = Arc::new(ShellClientRegistry::default());
+        let (addr, _tmp) = start_authenticated_server(registry.clone()).await;
+        let url = format!("ws://{addr}/api/agents/ws");
+
+        let mut ws_a = connect_with_bearer(&url, "shared-key-a").await;
+        ws_a.send(TungsteniteMessage::Text(
+            shared_key_register_envelope("shared-a", "instance-a", "project-a")
+                .to_json()
+                .unwrap()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let AgentEnvelope::Registered {
+            success: true,
+            client: Some(client_a),
+            ..
+        } = recv_envelope(&mut ws_a).await
+        else {
+            panic!("shared key A should register")
+        };
+        assert_eq!(client_a.client_id, "shared-a");
+        assert_eq!(client_a.owner, None, "shared-key owner must be ignored");
+
+        let auth_a = crate::auth::shared_key::shared_key_context("shared-key-a");
+        let auth_b = crate::auth::shared_key::shared_key_context("shared-key-b");
+        assert!(registry
+            .get_client_view_for_auth("shared-a", Some(&auth_a))
+            .await
+            .is_some());
+        assert!(registry
+            .get_client_view_for_auth("shared-a", Some(&auth_b))
+            .await
+            .is_none());
+
+        let mut ws_collision = connect_with_bearer(&url, "shared-key-b").await;
+        ws_collision
+            .send(TungsteniteMessage::Text(
+                shared_key_register_envelope("shared-a", "instance-a", "project-b")
+                    .to_json()
+                    .unwrap()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let AgentEnvelope::Error { code, message } = recv_envelope(&mut ws_collision).await else {
+            panic!("cross-group client_id collision should fail")
+        };
+        assert_eq!(code, "register_failed");
+        assert_eq!(message, "agent client identity is unavailable");
+
+        let mut ws_b = connect_with_bearer(&url, "shared-key-b").await;
+        ws_b.send(TungsteniteMessage::Text(
+            shared_key_register_envelope("shared-b", "instance-b", "project-b")
+                .to_json()
+                .unwrap()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        assert!(matches!(
+            recv_envelope(&mut ws_b).await,
+            AgentEnvelope::Registered { success: true, .. }
+        ));
+
+        let (request_id, mut result_rx) = registry
+            .enqueue_run(
+                ShellRunRequest {
+                    client_id: "shared-a".to_string(),
+                    cwd: None,
+                    command: "echo shared-a".to_string(),
+                    stdin: None,
+                    timeout_secs: 5,
+                    wait_timeout_secs: 0,
+                },
+                "anonymous".to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            recv_envelope(&mut ws_a).await,
+            AgentEnvelope::Request { .. }
+        ));
+
+        // Key B knows the public ids but its registered connection identity
+        // must not be able to submit Key A's result.
+        ws_b.send(TungsteniteMessage::Text(
+            AgentEnvelope::Result {
+                payload: ShellAgentResultRequest {
+                    client_id: "shared-a".to_string(),
+                    agent_instance_id: "instance-a".to_string(),
+                    request_id: request_id.clone(),
+                    exit_code: Some(0),
+                    stdout: Some("spoofed".to_string()),
+                    stderr: None,
+                    duration_ms: Some(1),
+                    error: None,
+                },
+            }
+            .to_json()
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut result_rx)
+                .await
+                .is_err(),
+            "cross-group result must not resolve Key A's request"
+        );
+
+        ws_a.send(TungsteniteMessage::Text(
+            AgentEnvelope::Result {
+                payload: ShellAgentResultRequest {
+                    client_id: "shared-a".to_string(),
+                    agent_instance_id: "instance-a".to_string(),
+                    request_id,
+                    exit_code: Some(0),
+                    stdout: Some("authentic".to_string()),
+                    stderr: None,
+                    duration_ms: Some(1),
+                    error: None,
+                },
+            }
+            .to_json()
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(3), result_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.stdout.as_deref(), Some("authentic"));
     }
 
     #[tokio::test]

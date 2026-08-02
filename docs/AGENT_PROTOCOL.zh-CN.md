@@ -6,7 +6,7 @@ WebCodex agents 连接 server，并执行已注册项目上的 tools。新部署
 
 ## Authentication
 
-Agents 应使用 client enrollment 期间创建的 agent tokens（`webcodex login` 是主入口；`webcodex client enroll` 是高级替代）：
+Managed Agent 应使用 client enrollment 期间创建的 agent tokens（`webcodex login` 是主入口；`webcodex client enroll` 是高级替代）：
 
 ```bash
 webcodex login URL --code CODE
@@ -14,12 +14,18 @@ webcodex login URL --code CODE
 
 Server/admin 侧用 `webcodex pairing create` 创建临时代码。Agent token 在 login 期间返回给 client，并写入生成的 `agent.toml`；不要从 server 复制 agent token files。二进制部署时，使用 `webcodex agent install --config <path>` 安装 client-side service，并用 `webcodex agent status` 检查。
 
+当 Server 开启 `WEBCODEX_SHARED_KEY_ENABLED=true` 时，hosted quick-start 是另一种受支持
+模式：Runner 可以提交与 MCP 完全相同的 direct、非 `wc_` shared key。Server 与
+Runner 两侧统一派生 `SHA-256(trimmed key)`，registry 只保存这个非秘密 auth group。
+不同 key、managed identity 和 open-anonymous caller 不能注册进或操作该 group。
+OAuth shared-key bridge token 仍不能使用 Agent transport。
+
 Transport auth rules：
 
-- QUIC：agent token 保留在顶层 agent config 中，并通过 QUIC stream 内的 agent registration envelope 发送。
-- WebSocket：优先在 handshake headers 中使用 `Authorization: Bearer <agent-token>`。
+- QUIC：Agent token 或 direct shared key 保留在顶层 agent config 中，并通过 QUIC stream 内的 agent registration envelope 发送。
+- WebSocket：优先在 handshake headers 中使用 `Authorization: Bearer <agent-token-or-shared-key>`。
 - WebSocket compatibility：`/api/agents/ws?token=...` 只用于 handshake 兼容。
-- Polling：每个 request 都必须使用 `Authorization: Bearer <agent-token>`。
+- Polling：每个 request 都必须使用 `Authorization: Bearer <agent-token-or-shared-key>`。
 - REST、MCP 和 GPT Actions ordinary APIs 必须使用 `Authorization: Bearer ...`。
 
 不要在 `/api/agents/ws` 之外使用 query-string tokens。
@@ -37,6 +43,10 @@ Agents 注册时提交：
 - redacted policy summary
 
 `agent_instance_id` 标识一个正在运行的 agent instance，区别于稳定的 `client_id`。
+Managed Agent token 会绑定 `client_id` 与 owner。Direct shared-key registration 会
+忽略上报的 owner，并把记录绑定到派生 hash group。跨 group 的 `client_id` 碰撞会以
+不泄露既有记录的方式失败，也不会替换原记录。同 group 重连继续沿用 instance 与
+connection lease 规则；旧连接不能刷新或代替新 lease 提交结果。
 
 ## 同一进程内的 Job 状态协调
 

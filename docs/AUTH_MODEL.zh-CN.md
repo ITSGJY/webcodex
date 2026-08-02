@@ -52,15 +52,27 @@ shared key 是 quick-start secret：agent 通过 `connect --key <KEY>` 使用它
 Authorization: Bearer <KEY>
 ```
 
-当 `WEBCODEX_SHARED_KEY_ENABLED=true` 时，未知且非 `wc_` 开头的 Bearer 值会被接受为 shared-key principal。该明文值不会作为 server-side allowlist entry 预先登记；WebCodex 按 `shared_key_hash` 对调用者分组。不同值会形成不同的轻量 group。
+当 `WEBCODEX_SHARED_KEY_ENABLED=true` 时，未知且非 `wc_` 开头的 Bearer 值会被接受为 shared-key principal。同一个 trim 后的 key 可以同时认证 MCP/runtime client 和本地 Runner。该明文值不会作为 server-side allowlist entry 预先登记；两侧统一按 `shared_key_hash = SHA-256(trimmed key)` 分组。同 key 可以看到自己 group 内的 Runner、project 和 Job；不同 key 的轻量 group 相互隔离，不能发现或操作对方对象。
 
 这个 fallback 只属于显式配置的普通 server quick-start。project-bound setup 会把
 它设为 false，并使用上面的精确 Project Credential verifier；两条路径不会互相
 fallback。
 
-shared key 不是 admin credential，不是 managed user identity，也不是 production IAM。
+shared key 在自身 hash group 内获得 runtime read、project read/write、job run 和 Agent
+transport，但不获得用户/token/pairing/account 管理、service control、bootstrap 或
+admin 权限。shared-key Runner 上报的 `owner` 会被忽略，授权只依据 server 派生的
+hash group。不同 group 即使碰撞到同一个全局 `client_id`，也不能替换已有 Runner。
+
+shared key 不是 admin credential，不是 managed user identity，也不是 production
+IAM。它不支持独立设备撤销或精细身份审计；需要这些能力时应使用 managed
+credential，而不是继续共享同一个 secret。
 
 静态 Bearer/API-key 认证既可以承载 shared key，也可以承载 managed mode 的 `wc_pat_xxx`。OAuth 是独立 flow；OAuth client 字段留空不会变成 no-auth，也不会变成静态 Bearer。
+
+Direct Bearer fallback 由 `WEBCODEX_SHARED_KEY_ENABLED` 控制。未知、撤销或拼错的
+`wc_*` managed token 永远不会降级成 shared key。OAuth shared-key bridge 是独立
+入口，也不会隐式获得 Agent transport；quick-start Runner pairing 必须使用 direct
+Bearer shared key。
 
 ## `wc_acct_xxx`
 
@@ -74,6 +86,12 @@ webcodex agent-token create-local
 ```
 
 这些命令在本地生成 plaintext tokens，并只把 token hashes 注册到 server。
+
+`webcodex token generate --kind api|agent` 只是离线 primitive：它会打印 token 与
+hash，但不会向任何远程 Server 注册。只有通过 managed credential flow 注册 hash
+后，输出才可用于认证。不要把离线生成的 `wc_pat_*` 或 `wc_agent_*` 当成任意 shared
+key。Hosted quick-start 应通过 `webcodex connect` 使用非 `wc_` key；managed mode
+则使用 `webcodex login`、pairing 或 account credential。
 
 不要把 `wc_acct_xxx` 用作 GPT Action token、MCP token、runtime API token 或 agent connection token。
 
