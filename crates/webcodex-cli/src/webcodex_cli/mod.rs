@@ -1,4 +1,5 @@
 pub(crate) mod agent_service;
+pub(crate) mod connect;
 pub(crate) mod connections;
 pub(crate) mod env;
 pub(crate) mod http;
@@ -65,6 +66,10 @@ mod shell_command_tests {
 #[cfg(test)]
 pub(crate) use agent_service::render_agent_systemd_unit;
 pub(crate) use agent_service::{run_agent_install_service, run_agent_service, run_agent_status};
+pub(crate) use connect::{
+    local_runner_profile_marker, local_runner_state_summary, run_connect, run_local_runner_logs,
+    run_local_runner_service, ConnectOptions, LocalRunnerServiceAction,
+};
 #[cfg(test)]
 pub(crate) use env::is_effective_root;
 #[cfg(test)]
@@ -96,7 +101,7 @@ pub(crate) use pairing::{run_client_enroll, run_pairing_create};
 pub(crate) use profiles::{client_output_dir_for_profile, CLIENT_PROFILE_ERROR};
 pub(crate) use profiles::{
     client_profile_agent_config, client_profile_agent_token_file, client_profile_projects_dir,
-    client_profile_service_file, client_profile_user_token_file,
+    client_profile_service_file, client_profile_state_dir, client_profile_user_token_file,
     default_client_output_dir_for_profile, validate_client_profile,
 };
 pub(crate) use server::{
@@ -123,7 +128,7 @@ pub(crate) use tokens::{
 };
 pub(crate) use usage::{
     agent_init_usage, agent_install_service_usage, agent_status_usage, agent_usage,
-    client_enroll_usage, client_usage, login_usage, logout_usage, ops_agents_usage,
+    client_enroll_usage, client_usage, connect_usage, login_usage, logout_usage, ops_agents_usage,
     ops_projects_usage, ops_smoke_preflight_usage, ops_status_usage, ops_usage,
     pairing_create_usage, pairing_usage, server_init_usage, server_install_service_usage,
     server_status_usage, server_usage, status_usage, usage,

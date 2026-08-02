@@ -7,6 +7,7 @@ Project:\n\
   status                        Show concise project coding readiness\n\
   run                           Run the current project runtime and local Agent\n\n\
 Account (quick start):\n\
+  connect                       Connect a local project to a hosted Server\n\
   login                         Log this device into a server (one-time pairing code)\n\
   logout                        Remove this device's credentials\n\
   auth status                   Show login status\n\n\
@@ -32,6 +33,24 @@ Advanced / Compatibility:\n\
 Options:\n\
   -h, --help                    Print help and exit\n\
   -V, --version                 Print version and exit\n"
+}
+
+pub(crate) fn connect_usage() -> &'static str {
+    "Usage: webcodex connect <SERVER_URL> [OPTIONS]\n\n\
+Connect a local project to a hosted WebCodex Server with one shared key.\n\
+The command writes a reusable local profile, starts one background Runner,\n\
+and waits until the Runner and project are visible through the Server.\n\n\
+Options:\n\
+  --key KEY                  Shared key (use --key-file to avoid shell history)\n\
+  --key-file PATH            Read the shared key from a file\n\
+  --project PATH             Local project directory [default: .]\n\
+  --profile NAME             Override the derived local profile name\n\
+  --client-id ID             Override the persistent Runner client id\n\
+  --project-id ID            Override the derived project id\n\
+  -h, --help                 Print help and exit\n\n\
+When neither --key nor --key-file is supplied, a strong key is generated and\n\
+printed once. Hosted shared keys must not start with wc_; managed credentials\n\
+use `webcodex login` instead.\n"
 }
 
 pub(crate) fn pairing_usage() -> &'static str {
@@ -242,11 +261,11 @@ Commands:\n\
   init        Generate an agent.toml config\n\
   install     Install, enable, and start the webcodex-runner service\n\
   run         Run webcodex-runner directly in the foreground\n\
-  start       Start the installed profile service\n\
-  stop        Stop the installed profile service\n\
-  restart     Restart and verify the installed profile service\n\
-  status      Check systemd, safe config metadata, and Server connectivity\n\
-  logs        Read bounded journal logs or explicitly follow them\n\
+  start       Start a hosted background Runner or installed profile service\n\
+  stop        Stop a hosted background Runner or installed profile service\n\
+  restart     Restart a hosted background Runner or installed profile service\n\
+  status      Check Runner lifecycle, safe config metadata, and connectivity\n\
+  logs        Read hosted Runner logs or the installed service journal\n\
   uninstall   Remove only the systemd unit; requires --confirm\n\n\
 `webcodex run` is the current-project runtime coordinator. `webcodex agent run` directly executes the standalone Runner.\n"
 }
@@ -305,7 +324,9 @@ pub(crate) fn agent_status_usage() -> &'static str {
      With --profile, missing config and token paths are derived under\n\
      /etc/webcodex/clients/<profile> for root or\n\
      ~/.config/webcodex/clients/<profile> for non-root users. Explicit path\n\
-     flags override profile-derived defaults. Status prints safe metadata only:\n\
+     flags override profile-derived defaults. Profiles created by `connect`\n\
+     report their user-level background process, PID, and log path instead of\n\
+     systemd state. Status prints safe metadata only:\n\
      no tokens, Authorization headers, full agent.toml, env files, or secrets.\n"
 }
 

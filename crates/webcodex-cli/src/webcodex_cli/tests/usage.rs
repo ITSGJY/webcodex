@@ -38,17 +38,15 @@ fn cli_version_output_includes_build_metadata() {
 }
 
 #[test]
-fn project_doctor_dispatches_and_removed_connect_does_not() {
+fn project_doctor_and_hosted_connect_dispatch() {
     assert!(matches!(
         cli_action(["doctor"]),
         CliAction::Project(args) if args == ["doctor"]
     ));
-    match cli_action(["connect"]) {
-        CliAction::Exit {
-            code: 2, stderr, ..
-        } => assert!(stderr.contains("unknown command"), "{stderr}"),
-        other => panic!("connect unexpectedly dispatched: {other:?}"),
-    }
+    assert!(matches!(
+        cli_action(["connect", "https://example.test", "--key", "shared-secret"]),
+        CliAction::Connect(_)
+    ));
 }
 
 #[test]

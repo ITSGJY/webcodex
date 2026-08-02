@@ -5,6 +5,7 @@
 ## Getting Started
 
 - [README](../README.md) / [中文 README](../README.zh-CN.md)
+- [AI Coding Agent Onboarding](AI_ONBOARDING.md) / [AI 接入指南](AI_ONBOARDING.zh-CN.md)
 - [Quick Start](QUICK_START.md) / [快速开始](QUICK_START.zh-CN.md)
 - [Build and Install](BUILD_INSTALL.md) / [构建与安装](BUILD_INSTALL.zh-CN.md)
 - [Demo](DEMO.md) / [演示](DEMO.zh-CN.md)

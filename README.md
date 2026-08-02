@@ -72,16 +72,51 @@ export PATH="$PWD/target/release:$PATH"
 
 See [docs/BUILD_INSTALL.md](docs/BUILD_INSTALL.md) for installation details.
 
+## Hosted Quick Start
+
+The lowest-cost path uses the official hosted Server and one background Runner
+on the machine that owns your code. You do not deploy a Server, database,
+HTTPS, reverse proxy, OAuth, or systemd service:
+
+```bash
+webcodex connect https://sg4.yyjeqhc.cn \
+  --key '<a-random-key-that-does-not-start-with-wc_>' \
+  --project .
+```
+
+Then configure the MCP client with:
+
+```text
+MCP URL: https://sg4.yyjeqhc.cn/mcp
+Authentication: Bearer token
+Token: exactly the same key passed to webcodex connect
+```
+
+Omit `--key` to have `connect` generate a strong key and print it once:
+
+```bash
+webcodex connect https://sg4.yyjeqhc.cn --project .
+```
+
+`connect` creates or reuses a local profile and client ID, registers the
+project outside the checkout, starts one detached Runner, and waits until the
+same key can see both the Runner and project. Re-running the command reuses the
+profile and running process. Keep the key out of Git. See
+[AI Onboarding](docs/AI_ONBOARDING.md) for the hosted/managed/self-hosted
+decision tree.
+
 ## Choose a Setup Path
 
 | Goal | Recommended path |
 | --- | --- |
-| Try WebCodex with one local project | Use the three project commands below. This path needs no systemd service, database setup, or public port. Add a trusted HTTPS tunnel only when connecting a hosted chat. |
-| Keep WebCodex online or connect another machine | Use the long-running self-hosting path. It adds a Linux service, public HTTPS, and pairing/enrollment; OAuth is optional, not a first-deployment prerequisite. |
+| Connect one local project to ChatGPT/Claude now | Use `webcodex connect` with the official hosted Server. |
+| Need user identity, device authorization, revocation, or audit | Use the managed `webcodex login` flow. |
+| Need full infrastructure and identity-system control | Follow the self-hosting path in [DEPLOYMENT.md](docs/DEPLOYMENT.md). |
+| Keep everything loopback-only | Use the three local project commands below. |
 
-The packaged 0.3.0 path currently assumes Linux x64. A production installation
-also assumes systemd, `sudo`, and an HTTPS domain or trusted tunnel; v0.3.0 does
-not include a Docker Compose deployment or managed cloud service.
+The packaged 0.3.0 path currently assumes Linux x64. Full self-hosting also
+assumes systemd, `sudo`, and an HTTPS domain or trusted tunnel; the hosted
+`connect` path does not.
 
 ## One Project, One Entry
 

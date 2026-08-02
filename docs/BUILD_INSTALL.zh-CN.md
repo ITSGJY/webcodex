@@ -4,6 +4,24 @@
 
 这是构建和安装的快速参考。生产部署细节见 [DEPLOYMENT.md](DEPLOYMENT.md) / [DEPLOYMENT.zh-CN.md](DEPLOYMENT.zh-CN.md)。
 
+## 最快 hosted 安装
+
+官方 hosted shared-key 路径只需在持有项目的机器上安装 CLI/Runner package，并
+执行一条命令：
+
+```bash
+npm install -g @yyjeqhc/webcodex
+
+webcodex connect https://sg4.yyjeqhc.cn \
+  --key '<不以 wc_ 开头的随机 key>' \
+  --project .
+```
+
+MCP URL 使用 `https://sg4.yyjeqhc.cn/mcp`，Bearer token 使用完全相同的 key。
+省略 `--key` 时，`connect` 会生成强随机 key，并且只完整显示一次。这条路径不需要
+本地 Server、数据库、反向代理、systemd unit 或 sudo。Runner 配置沿用现有
+WebCodex client profile 配置目录；后台 PID state 与日志存放在用户 state 目录。
+
 ## 构建 binaries
 
 为当前 host 构建三个 binaries：
@@ -26,6 +44,7 @@ binary、npm 命令、systemd unit 与 QUIC ALPN（`webcodex-runner/1`）统一�
 
 | 任务 | 推荐命令形态 |
 | --- | --- |
+| Hosted 项目连接 | `webcodex connect <server-url> [--key ...] --project ...` |
 | 普通项目 onboarding | `webcodex setup` |
 | 项目诊断/readiness | `webcodex doctor` / `webcodex status` |
 | 初始化服务器 env | `webcodex server init --listen ... --data-dir ... --env-file ...` |
@@ -71,6 +90,8 @@ bash scripts/npm_package_smoke.sh
 nginx 文件只是示例。WebCodex CLI 不会自动配置 reverse proxy。
 
 ## Binary deployment flow
+
+本节剩余流程用于完整自托管；使用官方 hosted `connect` 路径时不需要执行。
 
 Server：
 

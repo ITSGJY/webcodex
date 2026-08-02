@@ -4,6 +4,26 @@
 
 This is the short install path. See [DEPLOYMENT.md](DEPLOYMENT.md) for production details.
 
+## Fastest hosted install
+
+For the official hosted shared-key path, install the CLI/Runner package on the
+machine that owns the project and run one command:
+
+```bash
+npm install -g @yyjeqhc/webcodex
+
+webcodex connect https://sg4.yyjeqhc.cn \
+  --key '<a-random-key-that-does-not-start-with-wc_>' \
+  --project .
+```
+
+Use `https://sg4.yyjeqhc.cn/mcp` as the MCP URL and the exact same key as its
+Bearer token. If `--key` is omitted, `connect` generates a strong key and
+prints it once. This path needs no local Server, database, reverse proxy,
+systemd unit, or sudo. The Runner configuration is stored under the existing
+WebCodex client-profile config directory; background PID state and logs use
+the user state directory.
+
 ## Build binaries
 
 Build the three current binaries for your host:
@@ -26,6 +46,7 @@ The examples in this guide were checked against the current help output from `we
 
 | Task | Preferred command shape |
 | --- | --- |
+| Hosted project connection | `webcodex connect <server-url> [--key ...] --project ...` |
 | Ordinary project onboarding | `webcodex setup` |
 | Project diagnostics/readiness | `webcodex doctor` / `webcodex status` |
 | Server env bootstrap | `webcodex server init --listen ... --data-dir ... --env-file ...` |
@@ -70,6 +91,9 @@ The `deploy/` directory contains short examples you can adapt:
 The nginx file is only an example. WebCodex CLI does not automate reverse proxy setup.
 
 ## Binary deployment flow
+
+The remaining flow in this section is for full self-hosting. It is not
+required when using the official hosted `connect` path.
 
 Server:
 

@@ -64,15 +64,47 @@ export PATH="$PWD/target/release:$PATH"
 
 安装细节见 [docs/BUILD_INSTALL.zh-CN.md](docs/BUILD_INSTALL.zh-CN.md)。
 
+## Hosted 最快接入
+
+最低成本路径使用官方托管 Server，只在持有代码的机器上运行一个后台 Runner。
+无需部署 Server、数据库、HTTPS、反向代理、OAuth 或 systemd service：
+
+```bash
+webcodex connect https://sg4.yyjeqhc.cn \
+  --key '<不以 wc_ 开头的随机 key>' \
+  --project .
+```
+
+然后在 MCP client 中配置：
+
+```text
+MCP URL: https://sg4.yyjeqhc.cn/mcp
+Authentication: Bearer token
+Token: 与 webcodex connect 完全相同的 key
+```
+
+省略 `--key` 时，`connect` 会生成强随机 key，并且只在首次创建时完整显示：
+
+```bash
+webcodex connect https://sg4.yyjeqhc.cn --project .
+```
+
+`connect` 会创建或复用本地 profile 与 client ID，在 checkout 外注册项目，启动
+唯一的后台 Runner，并等待同一个 key 确实能看到 Runner 和项目。重复执行会复用
+profile 与现有进程。不要把 key 提交进 Git。Hosted、managed、自托管的选择见
+[AI 接入指南](docs/AI_ONBOARDING.zh-CN.md)。
+
 ## 先选部署方式
 
 | 目标 | 推荐路径 |
 | --- | --- |
-| 先在本机体验一个项目 | 使用下面三条项目命令。不需要 systemd service、数据库初始化或公网端口；只有接入托管聊天窗口时，才增加一个可信 HTTPS 隧道。 |
-| 长期在线，或连接另一台代码机器 | 使用长期自托管路径。它会增加 Linux service、公开 HTTPS 和 pairing/enrollment；OAuth 是可选增强，不是首次部署前置条件。 |
+| 立即把一个本地项目接入 ChatGPT/Claude | 使用官方 hosted Server 和 `webcodex connect`。 |
+| 需要独立用户身份、设备授权、撤销或审计 | 使用 managed `webcodex login` 流程。 |
+| 需要完全控制基础设施与身份系统 | 阅读 [DEPLOYMENT.zh-CN.md](docs/DEPLOYMENT.zh-CN.md) 走完整自托管。 |
+| 只在本机 loopback 使用 | 使用下面三条本地项目命令。 |
 
-0.3.0 的 package 路径目前只支持 Linux x64。生产安装还要求 systemd、`sudo`
-以及 HTTPS 域名或可信隧道；v0.3.0 暂不提供 Docker Compose 部署或托管云服务。
+0.3.0 的 package 路径目前只支持 Linux x64。完整自托管仍要求 systemd、`sudo`
+以及 HTTPS 域名或可信隧道；hosted `connect` 路径不需要这些运维步骤。
 
 ## 一个项目，一个入口
 

@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 use super::http::{fetch_runtime_status, http_post_json_status, HttpStatusSummary};
 use super::{
     control_service, encode_exec_argument, encode_exec_path_argument, encode_exec_program,
-    encode_unit_path_value, install_unit, query_systemd_service_status, read_optional_token,
-    run_logs, service_unit_name, uninstall_unit, validate_systemd_identity, AGENT_SERVICE_UNIT,
+    encode_unit_path_value, install_unit, local_runner_profile_marker, local_runner_state_summary,
+    query_systemd_service_status, read_optional_token, run_local_runner_logs,
+    run_local_runner_service, run_logs, service_unit_name, uninstall_unit,
+    validate_systemd_identity, LocalRunnerServiceAction, AGENT_SERVICE_UNIT,
 };
 use crate::{
     AgentInstallServiceOptions, AgentStatusOptions, ServiceActionKind, ServiceActionOptions,
@@ -102,6 +104,36 @@ pub(crate) fn run_agent_install_service(
 }
 
 pub(crate) fn run_agent_service(opts: ServiceActionOptions) -> Result<String, String> {
+    if let Some(local) = &opts.local_profile {
+        if local_runner_profile_marker(&local.state_dir).is_file() {
+            return match &opts.kind {
+                ServiceActionKind::Control(control) => run_local_runner_service(
+                    match control {
+                        super::ServiceControl::Start => LocalRunnerServiceAction::Start,
+                        super::ServiceControl::Stop => LocalRunnerServiceAction::Stop,
+                        super::ServiceControl::Restart => LocalRunnerServiceAction::Restart,
+                    },
+                    &local.config,
+                    &local.state_dir,
+                    None,
+                ),
+                ServiceActionKind::Logs {
+                    lines,
+                    since,
+                    follow,
+                } => run_local_runner_logs(
+                    &local.state_dir,
+                    *lines,
+                    since.as_deref(),
+                    *follow,
+                ),
+                ServiceActionKind::Uninstall { .. } => Err(
+                    "hosted connect profiles are not system services; use `webcodex agent stop --profile <name>` and remove local profile files explicitly if desired"
+                        .to_string(),
+                ),
+            };
+        }
+    }
     match opts.kind {
         ServiceActionKind::Control(control) => {
             control_service(&opts.unit, control)?;
@@ -134,6 +166,8 @@ struct AgentStatusConfig {
     #[serde(default)]
     server_url: String,
     #[serde(default)]
+    token: String,
+    #[serde(default)]
     client_id: String,
     #[serde(default)]
     owner: Option<String>,
@@ -163,6 +197,7 @@ struct AgentConfigMetadata {
     projects_dir: Option<PathBuf>,
     allowed_roots: Vec<PathBuf>,
     server_url: String,
+    token: String,
 }
 
 fn read_agent_config_metadata(path: &Path) -> Result<AgentConfigMetadata, String> {
@@ -179,6 +214,7 @@ fn read_agent_config_metadata(path: &Path) -> Result<AgentConfigMetadata, String
         projects_dir: cfg.projects_dir,
         allowed_roots: cfg.policy.allowed_roots,
         server_url: cfg.server_url,
+        token: cfg.token,
     })
 }
 
@@ -223,6 +259,12 @@ pub(crate) async fn run_agent_status(opts: AgentStatusOptions) -> Result<String,
     let service_unit = service_unit_name(&opts.service_file, AGENT_SERVICE_UNIT);
     let systemd = query_systemd_service_status(&service_unit);
     let metadata = read_agent_config_metadata(&opts.config)?;
+    let local = opts
+        .local_state_dir
+        .as_ref()
+        .filter(|dir| local_runner_profile_marker(dir).is_file())
+        .map(|dir| local_runner_state_summary(dir))
+        .transpose()?;
     let effective_server_url = opts.server_url.clone().or_else(|| {
         let url = metadata.server_url.trim().to_string();
         if url.is_empty() {
@@ -231,8 +273,20 @@ pub(crate) async fn run_agent_status(opts: AgentStatusOptions) -> Result<String,
             Some(url)
         }
     });
-    let user_token = read_optional_token(&opts.user_token_file, "--user-token-file")?;
-    let agent_token = read_optional_token(&opts.agent_token_file, "--agent-token-file")?;
+    let user_token = if local.is_some() {
+        let key = metadata.token.trim();
+        if key.is_empty() {
+            return Err("hosted Runner config has an empty shared key".to_string());
+        }
+        Some(key.to_string())
+    } else {
+        read_optional_token(&opts.user_token_file, "--user-token-file")?
+    };
+    let agent_token = if local.is_some() {
+        None
+    } else {
+        read_optional_token(&opts.agent_token_file, "--agent-token-file")?
+    };
 
     let mut runtime_http: Option<HttpStatusSummary> = None;
     let mut client_online: Option<bool> = None;
@@ -278,9 +332,12 @@ pub(crate) async fn run_agent_status(opts: AgentStatusOptions) -> Result<String,
     if opts.json {
         let summary = json!({
             "service": {
+                "mode": if local.is_some() { "hosted_local" } else { "systemd" },
                 "unit": service_unit,
-                "active": systemd.active,
-                "enabled": systemd.enabled,
+                "active": local.as_ref().map(|state| json!(state.running)).unwrap_or_else(|| json!(systemd.active)),
+                "enabled": local.as_ref().map(|state| json!(state.managed)).unwrap_or_else(|| json!(systemd.enabled)),
+                "pid": local.as_ref().and_then(|state| state.pid),
+                "logs": local.as_ref().map(|state| state.log_path.to_string_lossy().to_string()),
             },
             "config": {
                 "path": metadata.path.to_string_lossy(),
@@ -321,9 +378,25 @@ pub(crate) async fn run_agent_status(opts: AgentStatusOptions) -> Result<String,
 
     let mut out = String::new();
     out.push_str("Agent status:\n\n");
-    out.push_str(&format!("  service unit:         {service_unit}\n"));
-    out.push_str(&format!("  service active:       {}\n", systemd.active));
-    out.push_str(&format!("  service enabled:      {}\n", systemd.enabled));
+    if let Some(local) = &local {
+        out.push_str("  runner mode:          hosted local process\n");
+        out.push_str(&format!("  runner active:        {}\n", local.running));
+        out.push_str(&format!(
+            "  runner pid:           {}\n",
+            local
+                .pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ));
+        out.push_str(&format!(
+            "  runner logs:          {}\n",
+            local.log_path.display()
+        ));
+    } else {
+        out.push_str(&format!("  service unit:         {service_unit}\n"));
+        out.push_str(&format!("  service active:       {}\n", systemd.active));
+        out.push_str(&format!("  service enabled:      {}\n", systemd.enabled));
+    }
     out.push_str(&format!(
         "  config:               {}\n",
         metadata.path.display()

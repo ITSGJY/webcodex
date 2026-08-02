@@ -34,18 +34,19 @@ use webcodex_cli::{
     agent_init_usage, agent_install_service_usage, agent_status_usage, agent_usage,
     base_dir_or_default, client_enroll_usage, client_profile_agent_config,
     client_profile_agent_token_file, client_profile_projects_dir, client_profile_service_file,
-    client_profile_user_token_file, client_usage, default_client_output_dir_for_profile,
-    default_device_name, default_server_paths, discover_internal_binary, login_usage, logout_usage,
-    ops_agents_usage, ops_projects_usage, ops_smoke_preflight_usage, ops_status_usage, ops_usage,
-    pairing_create_usage, pairing_usage, render_token_generate, run_agent_install_service,
-    run_agent_service, run_agent_status, run_agent_token_create_local, run_client_enroll,
-    run_internal_binary, run_login, run_logout, run_ops_command, run_pairing_create,
-    run_server_init, run_server_install_service, run_server_service, run_server_status,
-    run_setup_single_user, run_status, run_token_create_local, server_init_usage,
-    server_install_service_usage, server_status_usage, server_usage, status_usage, usage,
-    validate_client_profile, write_secret_file, write_text_file, LoginOptions, LogoutOptions,
-    OpsCommand, OpsCommonOptions, OpsSmokePreflightOptions, ServerStatusOptions, ServiceControl,
-    StatusOptions, AGENT_SERVICE_FILE, AGENT_SERVICE_UNIT, DEFAULT_LOG_LINES, SERVER_SERVICE_FILE,
+    client_profile_state_dir, client_profile_user_token_file, client_usage, connect_usage,
+    default_client_output_dir_for_profile, default_device_name, default_server_paths,
+    discover_internal_binary, login_usage, logout_usage, ops_agents_usage, ops_projects_usage,
+    ops_smoke_preflight_usage, ops_status_usage, ops_usage, pairing_create_usage, pairing_usage,
+    render_token_generate, run_agent_install_service, run_agent_service, run_agent_status,
+    run_agent_token_create_local, run_client_enroll, run_connect, run_internal_binary, run_login,
+    run_logout, run_ops_command, run_pairing_create, run_server_init, run_server_install_service,
+    run_server_service, run_server_status, run_setup_single_user, run_status,
+    run_token_create_local, server_init_usage, server_install_service_usage, server_status_usage,
+    server_usage, status_usage, usage, validate_client_profile, write_secret_file, write_text_file,
+    ConnectOptions, LoginOptions, LogoutOptions, OpsCommand, OpsCommonOptions,
+    OpsSmokePreflightOptions, ServerStatusOptions, ServiceControl, StatusOptions,
+    AGENT_SERVICE_FILE, AGENT_SERVICE_UNIT, DEFAULT_LOG_LINES, SERVER_SERVICE_FILE,
     SERVER_SERVICE_UNIT,
 };
 const SETUP_GPT_SCOPES: &[&str] = &["runtime:read", "project:read", "project:write", "job:run"];
@@ -59,6 +60,7 @@ const SETUP_AGENT_SCOPES: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliAction {
     Project(Vec<String>),
+    Connect(ConnectOptions),
     Admin(AdminCliCommand),
     TokenGenerate(TokenGenerateOptions),
     TokenCreateLocal(TokenCreateLocalOptions),
@@ -223,12 +225,20 @@ struct ServiceActionOptions {
     service_file: PathBuf,
     unit: String,
     kind: ServiceActionKind,
+    local_profile: Option<LocalProfileOptions>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalProfileOptions {
+    config: PathBuf,
+    state_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AgentStatusOptions {
     config: PathBuf,
     service_file: PathBuf,
+    local_state_dir: Option<PathBuf>,
     server_url: Option<String>,
     user_token_file: Option<PathBuf>,
     agent_token_file: Option<PathBuf>,
@@ -263,6 +273,7 @@ where
         "setup" if args.get(1).map(String::as_str) != Some("single-user") => {
             CliAction::Project(args)
         }
+        "connect" => parse_connect(&args[1..]),
         "server" => parse_server_subcommand(&args[1..]),
         "pairing" => parse_pairing_subcommand(&args[1..]),
         "client" => parse_client_subcommand(&args[1..]),
@@ -293,6 +304,97 @@ where
             stderr: format!("unknown command: {command}\n\n{}", usage()),
         },
     }
+}
+
+fn parse_connect(args: &[String]) -> CliAction {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        return CliAction::Exit {
+            code: 0,
+            stdout: connect_usage().to_string(),
+            stderr: String::new(),
+        };
+    }
+    let mut server_url = None;
+    let mut key = None;
+    let mut key_file = None;
+    let mut project = PathBuf::from(".");
+    let mut profile = None;
+    let mut client_id = None;
+    let mut project_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let take = |index: &mut usize| -> Option<String> {
+            *index += 1;
+            args.get(*index).cloned()
+        };
+        match arg.as_str() {
+            "--key" => match take(&mut index) {
+                Some(value) => key = Some(value),
+                None => return cli_parse_error("--key requires a value".to_string()),
+            },
+            "--key-file" => match take(&mut index) {
+                Some(value) => key_file = Some(PathBuf::from(value)),
+                None => return cli_parse_error("--key-file requires a value".to_string()),
+            },
+            "--project" => match take(&mut index) {
+                Some(value) => project = PathBuf::from(value),
+                None => return cli_parse_error("--project requires a value".to_string()),
+            },
+            "--profile" => match take(&mut index) {
+                Some(value) => profile = Some(value),
+                None => return cli_parse_error("--profile requires a value".to_string()),
+            },
+            "--client-id" => match take(&mut index) {
+                Some(value) => client_id = Some(value),
+                None => return cli_parse_error("--client-id requires a value".to_string()),
+            },
+            "--project-id" => match take(&mut index) {
+                Some(value) => project_id = Some(value),
+                None => return cli_parse_error("--project-id requires a value".to_string()),
+            },
+            other if other.starts_with('-') => {
+                return cli_parse_error(format!("unknown connect option: {other}"))
+            }
+            other => {
+                if server_url.is_some() {
+                    return cli_parse_error(format!("unexpected connect argument: {other}"));
+                }
+                server_url = Some(other.to_string());
+            }
+        }
+        index += 1;
+    }
+    if key.is_some() && key_file.is_some() {
+        return cli_parse_error("--key and --key-file are mutually exclusive".to_string());
+    }
+    let Some(server_url) = server_url else {
+        return cli_parse_error(
+            "connect needs a Server URL, e.g. `webcodex connect https://example.com --project .`"
+                .to_string(),
+        );
+    };
+    if let Some(value) = profile.as_deref() {
+        if let Err(error) = validate_client_profile(value) {
+            return cli_parse_error(error);
+        }
+    }
+    CliAction::Connect(ConnectOptions {
+        server_url,
+        key,
+        key_file,
+        project,
+        profile,
+        client_id,
+        project_id,
+        config_base: None,
+        state_base: None,
+        runner_bin: None,
+        wait_timeout_ms: 15_000,
+    })
 }
 
 fn parse_auth_subcommand(args: &[String]) -> CliAction {
@@ -738,7 +840,7 @@ fn parse_agent_subcommand(args: &[String]) -> CliAction {
             "init" => agent_init_usage(),
             "install" => agent_install_service_usage(),
             "run" => "Usage: webcodex agent run [--profile NAME|--config PATH]\n\nRun webcodex-runner directly in the foreground.\n",
-            "start" | "stop" | "restart" => "Usage: webcodex agent <start|stop|restart> [--profile NAME]\n",
+            "start" | "stop" | "restart" => "Usage: webcodex agent <start|stop|restart> [--profile NAME]\n\nWith a profile created by `webcodex connect`, manage its user-level background Runner. Other profiles use the installed systemd service.\n",
             "status" => agent_status_usage(),
             "logs" => "Usage: webcodex agent logs [--profile NAME] [--lines N] [--since VALUE] [--follow]\n",
             "uninstall" => "Usage: webcodex agent uninstall [--profile NAME] --confirm\n",
@@ -1170,6 +1272,7 @@ fn parse_server_service_action(
         service_file: PathBuf::from(SERVER_SERVICE_FILE),
         unit: SERVER_SERVICE_UNIT.to_string(),
         kind: parse_service_kind(command, args)?,
+        local_profile: None,
     })
 }
 
@@ -1204,6 +1307,10 @@ fn parse_agent_service_action(
         service_file,
         unit,
         kind: parse_service_kind(command, &remaining)?,
+        local_profile: profile.as_deref().map(|profile| LocalProfileOptions {
+            config: client_profile_agent_config(profile),
+            state_dir: client_profile_state_dir(profile),
+        }),
     })
 }
 
@@ -1342,6 +1449,7 @@ fn parse_agent_status(args: &[String]) -> Result<AgentStatusOptions, String> {
     let mut opts = AgentStatusOptions {
         config: PathBuf::new(),
         service_file: PathBuf::from("/etc/systemd/system/webcodex-runner.service"),
+        local_state_dir: None,
         server_url: None,
         user_token_file: None,
         agent_token_file: None,
@@ -1370,6 +1478,7 @@ fn parse_agent_status(args: &[String]) -> Result<AgentStatusOptions, String> {
     {
         opts.config = config.unwrap_or_else(|| client_profile_agent_config(&profile));
         opts.service_file = client_profile_service_file(&profile);
+        opts.local_state_dir = Some(client_profile_state_dir(&profile));
         opts.user_token_file = opts
             .user_token_file
             .or_else(|| Some(client_profile_user_token_file(&profile)));
@@ -1811,6 +1920,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             std::process::exit(output.code);
         }
+        CliAction::Connect(opts) => match run_connect(opts).await {
+            Ok(stdout) => {
+                print!("{}", stdout);
+                std::process::exit(0);
+            }
+            Err(stderr) => {
+                eprintln!("{}", stderr);
+                std::process::exit(1);
+            }
+        },
         CliAction::Admin(cmd) => match run_admin_command(cmd).await {
             Ok(stdout) => {
                 println!("{}", stdout);

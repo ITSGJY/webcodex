@@ -16,6 +16,9 @@ Server:
 Client:
 
 - `webcodex-runner --version` prints a version.
+- For hosted quick-start, `webcodex agent status --profile <profile-from-connect>`
+  reports `runner mode: hosted local process`, `runner active: true`, and
+  `client online: yes`.
 - `webcodex agent status --profile workstation` can read the local agent config.
 - `webcodex doctor` passes for a canonical project, or advanced
   `webcodex ops status --strict --server-url https://your-domain.example`
@@ -23,6 +26,48 @@ Client:
 - `listAgents` / `runtime_status` shows the agent online.
 
 ## Common issues
+
+### `webcodex connect` cannot finish
+
+`connect` waits up to 15 seconds for the complete path: Server reachable,
+Runner visible, and target project visible to the same key. Its error includes
+the profile Runner log path. Check:
+
+```bash
+webcodex agent status --profile <profile-from-connect>
+webcodex agent logs --profile <profile-from-connect> --lines 100
+```
+
+Confirm that the Server URL points to the root origin, the Server enables
+shared-key mode, and MCP and Runner use exactly the same trimmed key. A
+different key intentionally sees no Runner or project. If this invocation
+started a Runner that could not register, `connect` stops it; the local config
+is retained so the command can be retried.
+
+### `connect` rejects a `wc_*` value
+
+This is deliberate. `wc_pat_*`, `wc_agent_*`, `wc_acct_*`, and other `wc_*`
+values are managed credentials and never fall back to shared-key auth. Use a
+different random key for the hosted shared-key flow, or use `webcodex login`
+for managed identity.
+
+`webcodex token generate` is offline material generation only. It does not
+register the generated credential with a remote Server, so do not use its
+output as a hosted shared key.
+
+### A hosted Runner stopped or its PID is stale
+
+Re-run the same `webcodex connect` command. The profile lock prevents duplicate
+starts; a live Runner with the same config is reused, while stale or
+non-Runner PID state is discarded before one replacement Runner starts. To
+stop it explicitly:
+
+```bash
+webcodex agent stop --profile <profile-from-connect>
+```
+
+The key is stored only in the protected profile config and is not printed by
+status or written to the project checkout.
 
 ### `webcodex server install` says the service already exists
 
@@ -72,7 +117,9 @@ That can be acceptable on agent-only client machines. Agent-only clients need th
 
 ### `client online: no`
 
-Check the agent service and its connection details:
+For a hosted `connect` profile, use the profile-specific status and log path
+shown above. For a systemd-managed deployment, check the agent service and its
+connection details:
 
 ```bash
 systemctl status webcodex-runner
@@ -115,8 +162,9 @@ Confirm the agent server URL, token file, service user, and `allowed_roots`.
 
 ### Wrong token type
 
-GPT Actions and MCP should use a managed `wc_pat_*` token or a
-deployment-allowed shared key. `wc_agent_*` is only for `webcodex-runner`.
+In the hosted quick-start, MCP and Runner use the same non-`wc_` shared key.
+In managed mode, GPT Actions and MCP use a `wc_pat_*`, while `wc_agent_*` is
+only for `webcodex-runner`.
 `WEBCODEX_TOKEN` is bootstrap/admin-oriented and should not be copied into GPT
 Actions, MCP, or agent config.
 

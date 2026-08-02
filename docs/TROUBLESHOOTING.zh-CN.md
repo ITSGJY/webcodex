@@ -16,12 +16,51 @@ Server：
 Client：
 
 - `webcodex-runner --version` 能打印版本。
+- Hosted quick-start 使用
+  `webcodex agent status --profile <connect 输出的 profile>`，应显示
+  `runner mode: hosted local process`、`runner active: true` 和
+  `client online: yes`。
 - `webcodex agent status --profile workstation` 能读取本地 agent config。
 - canonical project 的 `webcodex doctor` 通过；managed deployment 则使用
   `webcodex ops status --strict --server-url https://your-domain.example`。
 - `listAgents` / `runtime_status` 显示 agent online。
 
 ## 常见问题
+
+### `webcodex connect` 无法完成
+
+`connect` 最多等待 15 秒来确认完整链路：Server 可访问、同 key 能看到 Runner、
+同 key 能看到目标项目。错误信息会给出该 profile 的 Runner 日志路径。先检查：
+
+```bash
+webcodex agent status --profile <connect 输出的 profile>
+webcodex agent logs --profile <connect 输出的 profile> --lines 100
+```
+
+确认 Server URL 指向 origin 根路径、Server 已启用 shared-key，并且 MCP 与 Runner
+使用 trim 后完全相同的 key。不同 key 按设计看不到该 Runner 和项目。如果本次
+命令启动的 Runner 无法注册，`connect` 会停止它；本地配置会保留，修复后可重试。
+
+### `connect` 拒绝 `wc_*`
+
+这是预期边界。`wc_pat_*`、`wc_agent_*`、`wc_acct_*` 和其他 `wc_*` 都是 managed
+credentials，绝不会 fallback 成 shared key。Hosted shared-key 流程请使用另一个
+随机 key；需要 managed identity 时使用 `webcodex login`。
+
+`webcodex token generate` 只进行离线材料生成，不会向远程 Server 注册生成的
+credential，因此不要把其输出当成 hosted shared key。
+
+### Hosted Runner 已退出或 PID state 过期
+
+重新执行相同的 `webcodex connect`。Profile lock 会阻止并发启动重复进程；配置
+相同且仍存活的 Runner 会被复用，stale PID 或指向非 Runner 的 PID state 会先被
+丢弃，再启动唯一的替代 Runner。显式停止：
+
+```bash
+webcodex agent stop --profile <connect 输出的 profile>
+```
+
+Key 只保存在受保护的 profile 配置中，status 不会打印，也不会写入项目 checkout。
 
 ### `webcodex server install` 提示 service already exists
 
@@ -71,7 +110,8 @@ sudo ln -s /opt/webcodex/bin/webcodex /usr/local/bin/webcodex
 
 ### `client online: no`
 
-检查 agent service 和连接详情：
+Hosted `connect` profile 使用上面的 profile-specific status 和日志路径。
+systemd-managed deployment 则检查 agent service 和连接详情：
 
 ```bash
 systemctl status webcodex-runner
@@ -114,8 +154,9 @@ journalctl -u webcodex-runner
 
 ### Token type 错误
 
-GPT Actions 和 MCP 应使用 managed `wc_pat_*` token，或部署允许的 shared key。
-`wc_agent_*` 只给 `webcodex-runner` 使用。`WEBCODEX_TOKEN` 面向 bootstrap/admin，
+Hosted quick-start 中，MCP 与 Runner 使用同一个非 `wc_` shared key。Managed
+mode 中，GPT Actions 和 MCP 使用 `wc_pat_*`，`wc_agent_*` 只给
+`webcodex-runner` 使用。`WEBCODEX_TOKEN` 面向 bootstrap/admin，
 不应复制到 GPT Actions、MCP 或 agent config。
 
 ### 非 git smoke workspace 不能运行 `git_status`
