@@ -581,13 +581,21 @@ pub enum ToolCall {
         include_command_preview: bool,
     },
 
-    /// Retrieve stdout/stderr log of a job.
+    /// Retrieve stdout/stderr log of a job. When `after_observation_token` and
+    /// `wait_secs` are both supplied, this is a single bounded wait (up to
+    /// `wait_secs`, 1..=60) until the current opaque Job observation token
+    /// differs or the Job becomes terminal; it is never a subscription or
+    /// streaming connection.
     JobLog {
         job_id: String,
         #[serde(default)]
         offset: Option<usize>,
         #[serde(default)]
         tail_lines: Option<usize>,
+        #[serde(default)]
+        after_observation_token: Option<String>,
+        #[serde(default)]
+        wait_secs: Option<u64>,
     },
 
     /// List files in an agent-registered project directory (bounded, read-only).
@@ -705,11 +713,19 @@ pub enum ToolCall {
     },
 
     /// Return bounded stdout/stderr tails for a job. Defaults to a bounded tail
-    /// so the console never reads full logs by default.
+    /// so the console never reads full logs by default. When `after_observation_token`
+    /// and `wait_secs` are both supplied, this is a single bounded wait (up to
+    /// `wait_secs`, 1..=60) until the current opaque Job observation token
+    /// differs or the Job becomes terminal; it is never a subscription or streaming
+    /// connection.
     JobTail {
         job_id: String,
         #[serde(default)]
         tail_lines: Option<usize>,
+        #[serde(default)]
+        after_observation_token: Option<String>,
+        #[serde(default)]
+        wait_secs: Option<u64>,
     },
 
     /// Replace a (unique) substring in a project file via the owning agent.

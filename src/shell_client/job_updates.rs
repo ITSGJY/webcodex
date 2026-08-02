@@ -1,7 +1,7 @@
 use super::auth::{assert_shell_client_access, shell_job_visible_to_auth};
 use super::jobs::{
     append_log_limited, assert_active_instance_locked, command_preview, is_final_job_status,
-    job_view, refresh_job_status_locked, replace_log_limited, select_log_lines,
+    job_view, notify_job_update, refresh_job_status_locked, replace_log_limited, select_log_lines,
 };
 use super::reconciliation::validate_stream_snapshot;
 use super::requests::{
@@ -16,10 +16,99 @@ use crate::shell_protocol::{
     ShellJobContext, ShellJobInfo, ShellJobOpRequest, ShellJobValidationStep, ShellRunRequest,
 };
 use std::collections::HashSet;
+use std::sync::atomic::Ordering;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 #[derive(Clone, Copy)]
 struct ValidationProtocolError(&'static str);
+
+/// Outcome of a bounded `job_log`/`job_tail` wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub(crate) enum JobLogWaitOutcome {
+    /// No wait was performed, or a returnable new state already existed at
+    /// call time (a job advanced past `after_observation_token`).
+    Immediate,
+    /// A non-terminal update was observed after waiting.
+    Updated,
+    /// The job was (or became) terminal during the call.
+    Terminal,
+    /// The wait deadline elapsed with no observable change. This is a normal
+    /// successful result, not a timeout failure.
+    Timeout,
+}
+
+impl JobLogWaitOutcome {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Immediate => "immediate",
+            Self::Updated => "updated",
+            Self::Terminal => "terminal",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
+/// Wait metadata returned by a bounded `job_log`/`job_tail` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JobLogWait {
+    pub(crate) wait_outcome: JobLogWaitOutcome,
+    pub(crate) waited_ms: u64,
+    /// Whether the job changed relative to the supplied `after_observation_token`.
+    /// Always false when no `after_observation_token` was provided.
+    pub(crate) changed: bool,
+    /// Whether the job is terminal per the canonical job terminal definition.
+    pub(crate) terminal: bool,
+}
+
+impl Default for JobLogWait {
+    fn default() -> Self {
+        Self {
+            wait_outcome: JobLogWaitOutcome::Immediate,
+            waited_ms: 0,
+            changed: false,
+            terminal: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JobPublicMutationSignature {
+    status: String,
+    recovery_state: Option<String>,
+    recovery_reason_code: Option<String>,
+    last_update_seq: u64,
+    stdout: super::state::ShellJobLogState,
+    stderr: super::state::ShellJobLogState,
+    error: Option<String>,
+    started_at: Option<i64>,
+    ended_at: Option<i64>,
+    exit_code: Option<i32>,
+    duration_ms: Option<u64>,
+    validation_progress: Option<crate::shell_protocol::ShellJobValidationProgress>,
+    recovered_after_server_restart: bool,
+    reconciled_at: Option<i64>,
+}
+
+fn public_mutation_signature(job: &ShellJobRecord) -> JobPublicMutationSignature {
+    JobPublicMutationSignature {
+        status: job.status.clone(),
+        recovery_state: job.recovery_state.clone(),
+        recovery_reason_code: job.recovery_reason_code.clone(),
+        last_update_seq: job.last_update_seq,
+        stdout: job.stdout.clone(),
+        stderr: job.stderr.clone(),
+        error: job.error.clone(),
+        started_at: job.started_at,
+        ended_at: job.ended_at,
+        exit_code: job.exit_code,
+        duration_ms: job.duration_ms,
+        validation_progress: job.validation_progress.clone(),
+        recovered_after_server_restart: job.recovered_after_server_restart,
+        reconciled_at: job.reconciled_at,
+    }
+}
 
 fn invalid_progress(code: &'static str) -> Result<(), ValidationProtocolError> {
     Err(ValidationProtocolError(code))
@@ -342,6 +431,9 @@ impl ShellClientRegistry {
             recovery_reason_code: None,
             recovering_since: None,
             recovery_original_status: None,
+            observation_epoch: self.observation_epoch.clone(),
+            public_revision: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            update_notify: std::sync::Arc::new(Notify::new()),
         };
         inner.request_to_job.insert(request_id, job_id.clone());
         inner.jobs_by_id.insert(job_id.clone(), job);
@@ -489,6 +581,9 @@ impl ShellClientRegistry {
             .collect())
     }
 
+    /// Legacy immediate `job_log`: no wait parameters, returns the current
+    /// snapshot and log segment without waiting. The wait outcome is
+    /// `immediate`.
     pub async fn job_log(
         &self,
         job_id: &str,
@@ -496,16 +591,22 @@ impl ShellClientRegistry {
         since_stderr_line: Option<usize>,
         tail_lines: Option<usize>,
     ) -> Result<(ShellJobInfo, Option<String>, Option<String>, usize, usize), String> {
-        self.job_log_for_auth(
-            None,
-            job_id,
-            since_stdout_line,
-            since_stderr_line,
-            tail_lines,
-        )
-        .await
+        let (job, stdout, stderr, next_stdout_line, next_stderr_line, _wait) = self
+            .job_log_for_auth(
+                None,
+                job_id,
+                since_stdout_line,
+                since_stderr_line,
+                tail_lines,
+                None,
+                None,
+            )
+            .await?;
+        Ok((job, stdout, stderr, next_stdout_line, next_stderr_line))
     }
 
+    /// Read bounded stdout/stderr for a job, optionally waiting once for the
+    /// opaque observation token to change or for the job to become terminal.
     pub(crate) async fn job_log_for_auth(
         &self,
         auth: Option<&crate::auth::AuthContext>,
@@ -513,27 +614,171 @@ impl ShellClientRegistry {
         since_stdout_line: Option<usize>,
         since_stderr_line: Option<usize>,
         tail_lines: Option<usize>,
-    ) -> Result<(ShellJobInfo, Option<String>, Option<String>, usize, usize), String> {
+        after_observation_token: Option<&str>,
+        wait_secs: Option<u64>,
+    ) -> Result<
+        (
+            ShellJobInfo,
+            Option<String>,
+            Option<String>,
+            usize,
+            usize,
+            JobLogWait,
+        ),
+        String,
+    > {
         validate_id(job_id, "job_id")?;
+        let after = after_observation_token
+            .map(|value| {
+                crate::job_observation::JobObservationToken::parse_bound(
+                    value,
+                    crate::job_observation::JobObservationExecutor::Agent,
+                    job_id,
+                )
+                .map_err(|error| error.to_string())
+            })
+            .transpose()?;
+        let deadline = wait_secs
+            .map(|secs| tokio::time::Instant::now() + tokio::time::Duration::from_secs(secs));
+        let mut waited_ms = 0u64;
+        let mut waited = false;
         let mut inner = self.inner.lock().await;
         refresh_job_status_locked(&mut inner, job_id);
-        let Some(job) = inner.jobs_by_id.get(job_id) else {
-            return Err(format!("unknown shell job: {}", job_id));
-        };
-        if !shell_job_visible_to_auth(auth, &inner, &job.client_id) {
-            return Err(format!("unknown shell job: {}", job_id));
+        loop {
+            let Some(job) = inner.jobs_by_id.get(job_id) else {
+                return Err(format!("unknown shell job: {}", job_id));
+            };
+            if !shell_job_visible_to_auth(auth, &inner, &job.client_id) {
+                return Err(format!("unknown shell job: {}", job_id));
+            }
+            let revision = job.public_revision.load(Ordering::Relaxed);
+            let changed = after.as_ref().is_some_and(|token| {
+                token.epoch != job.observation_epoch.as_ref() || token.revision != revision
+            });
+            let terminal = is_final_job_status(&job.status);
+            if wait_secs.is_none() || after.is_none() || changed || terminal {
+                let wait_outcome = if changed {
+                    if waited {
+                        JobLogWaitOutcome::Updated
+                    } else {
+                        JobLogWaitOutcome::Immediate
+                    }
+                } else if terminal {
+                    JobLogWaitOutcome::Terminal
+                } else {
+                    JobLogWaitOutcome::Immediate
+                };
+                let wait = JobLogWait {
+                    wait_outcome,
+                    waited_ms,
+                    changed,
+                    terminal,
+                };
+                let (stdout, next_stdout_line, _, _) =
+                    select_log_lines(&job.stdout, since_stdout_line, tail_lines);
+                let (stderr, next_stderr_line, _, _) =
+                    select_log_lines(&job.stderr, since_stderr_line, tail_lines);
+                return Ok((
+                    job_view(job),
+                    stdout,
+                    stderr,
+                    next_stdout_line,
+                    next_stderr_line,
+                    wait,
+                ));
+            }
+
+            let update_notify = job.update_notify.clone();
+            let notified = update_notify.notified();
+            drop(inner);
+
+            inner = self.inner.lock().await;
+            refresh_job_status_locked(&mut inner, job_id);
+            let Some(job) = inner.jobs_by_id.get(job_id) else {
+                return Err(format!("unknown shell job: {}", job_id));
+            };
+            if !shell_job_visible_to_auth(auth, &inner, &job.client_id) {
+                return Err(format!("unknown shell job: {}", job_id));
+            }
+            let revision = job.public_revision.load(Ordering::Relaxed);
+            let changed = after.as_ref().is_some_and(|token| {
+                token.epoch != job.observation_epoch.as_ref() || token.revision != revision
+            });
+            let terminal = is_final_job_status(&job.status);
+            if changed || terminal {
+                let wait = JobLogWait {
+                    wait_outcome: if terminal {
+                        JobLogWaitOutcome::Terminal
+                    } else {
+                        JobLogWaitOutcome::Updated
+                    },
+                    waited_ms,
+                    changed,
+                    terminal,
+                };
+                let (stdout, next_stdout_line, _, _) =
+                    select_log_lines(&job.stdout, since_stdout_line, tail_lines);
+                let (stderr, next_stderr_line, _, _) =
+                    select_log_lines(&job.stderr, since_stderr_line, tail_lines);
+                return Ok((
+                    job_view(job),
+                    stdout,
+                    stderr,
+                    next_stdout_line,
+                    next_stderr_line,
+                    wait,
+                ));
+            }
+            drop(inner);
+
+            let wait_started = tokio::time::Instant::now();
+            let wake = tokio::time::timeout_at(
+                deadline.expect("bounded wait requires a deadline"),
+                notified,
+            )
+            .await;
+            waited = true;
+            waited_ms = waited_ms.saturating_add(wait_started.elapsed().as_millis() as u64);
+            inner = self.inner.lock().await;
+            refresh_job_status_locked(&mut inner, job_id);
+            if wake.is_err() {
+                let Some(job) = inner.jobs_by_id.get(job_id) else {
+                    return Err(format!("unknown shell job: {}", job_id));
+                };
+                if !shell_job_visible_to_auth(auth, &inner, &job.client_id) {
+                    return Err(format!("unknown shell job: {}", job_id));
+                }
+                let revision = job.public_revision.load(Ordering::Relaxed);
+                let changed = after.as_ref().is_some_and(|token| {
+                    token.epoch != job.observation_epoch.as_ref() || token.revision != revision
+                });
+                let terminal = is_final_job_status(&job.status);
+                let wait = JobLogWait {
+                    wait_outcome: if terminal {
+                        JobLogWaitOutcome::Terminal
+                    } else if changed {
+                        JobLogWaitOutcome::Updated
+                    } else {
+                        JobLogWaitOutcome::Timeout
+                    },
+                    waited_ms,
+                    changed,
+                    terminal,
+                };
+                let (stdout, next_stdout_line, _, _) =
+                    select_log_lines(&job.stdout, since_stdout_line, tail_lines);
+                let (stderr, next_stderr_line, _, _) =
+                    select_log_lines(&job.stderr, since_stderr_line, tail_lines);
+                return Ok((
+                    job_view(job),
+                    stdout,
+                    stderr,
+                    next_stdout_line,
+                    next_stderr_line,
+                    wait,
+                ));
+            }
         }
-        let (stdout, next_stdout_line, _, _) =
-            select_log_lines(&job.stdout, since_stdout_line, tail_lines);
-        let (stderr, next_stderr_line, _, _) =
-            select_log_lines(&job.stderr, since_stderr_line, tail_lines);
-        Ok((
-            job_view(job),
-            stdout,
-            stderr,
-            next_stdout_line,
-            next_stderr_line,
-        ))
     }
 
     pub async fn stop_job(
@@ -569,6 +814,7 @@ impl ShellClientRegistry {
                 job.status = "stopped".to_string();
                 job.ended_at = Some(now_ts());
                 job.error = Some("job stopped before agent picked it up".to_string());
+                notify_job_update(job);
                 Ok(job_view(job))
             }
             "agent_queued" | "running" | "stop_requested" => {
@@ -613,6 +859,7 @@ impl ShellClientRegistry {
                 let job = inner.jobs_by_id.get_mut(job_id).expect("job exists");
                 job.status = "stop_requested".to_string();
                 job.error = Some("stop requested".to_string());
+                notify_job_update(job);
                 let notify_client_id = job.client_id.clone();
                 notify_client_locked(&inner, &notify_client_id);
                 Ok(job_view(inner.jobs_by_id.get(job_id).expect("job exists")))
@@ -780,6 +1027,7 @@ impl ShellClientRegistry {
                         .to_string(),
                 );
             }
+            let before = public_mutation_signature(job);
             if sequenced && incoming_seq.is_some_and(|sequence| sequence <= job.last_update_seq) {
                 return Ok(job_view(job));
             }
@@ -866,6 +1114,9 @@ impl ShellClientRegistry {
             }
             if let Some(sequence) = incoming_seq {
                 job.last_update_seq = sequence;
+            }
+            if public_mutation_signature(job) != before {
+                notify_job_update(job);
             }
             job_view(job)
         };

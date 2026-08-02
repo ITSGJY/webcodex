@@ -289,7 +289,14 @@ fn key_tool_output_schemas_include_expected_fields() {
             "list_project_files entry missing {field}"
         );
     }
-    for field in ["job_id", "kind", "status", "project", "ssh_resource"] {
+    for field in [
+        "job_id",
+        "kind",
+        "status",
+        "project",
+        "ssh_resource",
+        "last_update_seq",
+    ] {
         assert!(
             has_output_field("run_job", field),
             "run_job missing {field}"
@@ -360,6 +367,10 @@ fn key_tool_output_schemas_include_expected_fields() {
         "purpose",
         "command_summary",
         "detected_summary",
+        "wait_outcome",
+        "waited_ms",
+        "changed",
+        "terminal",
     ] {
         assert!(
             has_output_field("job_log", field),
@@ -427,6 +438,10 @@ fn key_tool_output_schemas_include_expected_fields() {
         "purpose",
         "command_summary",
         "detected_summary",
+        "wait_outcome",
+        "waited_ms",
+        "changed",
+        "terminal",
     ] {
         assert!(
             has_output_field("job_log", field),

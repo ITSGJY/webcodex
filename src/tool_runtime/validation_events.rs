@@ -215,7 +215,7 @@ impl ToolRuntime {
                 continue;
             }
             let log = self
-                .job_log_for_auth(job_id.clone(), None, Some(200), auth)
+                .job_log_for_auth(job_id.clone(), None, Some(200), auth, None, None)
                 .await;
             let Some(accepted) = summary.events.iter().find(|event| {
                 event.kind == "tool_call_finished"

@@ -355,7 +355,7 @@ async fn session_ssh_resource_uses_remote_cwd_and_safe_agent_context_for_shell_a
     assert!(status.success, "{:?}", status.error);
     assert_eq!(status.output["ssh_resource"], "tmp");
     let log = runtime
-        .job_log_for_auth(job_id.clone(), None, Some(20), Some(&auth))
+        .job_log_for_auth(job_id.clone(), None, Some(20), Some(&auth), None, None)
         .await;
     assert!(log.success, "{:?}", log.error);
     assert_eq!(log.output["ssh_resource"], "tmp");

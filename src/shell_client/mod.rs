@@ -48,6 +48,8 @@ pub use handlers::{
     shell_agent_job_update, shell_agent_persistent_shell_result, shell_agent_poll,
     shell_agent_register, shell_agent_result,
 };
+#[cfg(test)]
+pub(crate) use job_updates::JobLogWaitOutcome;
 pub(crate) use job_updates::ShellJobStartMetadata;
 pub(crate) use jobs::{command_preview, COMMAND_PREVIEW_MAX_CHARS};
 #[cfg(test)]
@@ -131,9 +133,19 @@ pub const TRANSPORT_WEBSOCKET: &str = "websocket";
 /// with `[quic]` configured so QUIC is attempted before fallback transports.
 pub const TRANSPORT_QUIC: &str = "quic";
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 pub struct ShellClientRegistry {
-    inner: Mutex<ShellClientRegistryInner>,
+    inner: Arc<Mutex<ShellClientRegistryInner>>,
+    observation_epoch: Arc<str>,
+}
+
+impl Default for ShellClientRegistry {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ShellClientRegistryInner::default())),
+            observation_epoch: Arc::from(crate::job_observation::new_epoch()),
+        }
+    }
 }
 
 fn now_ts() -> i64 {

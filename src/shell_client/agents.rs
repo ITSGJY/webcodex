@@ -193,7 +193,14 @@ impl ShellClientRegistry {
         inner.notifiers.remove(&client_id);
         inner.clients.insert(client_id.clone(), record);
         if let Some(inventory) = job_inventory.as_ref() {
-            reconcile_inventory_locked(&mut inner, &client_id, &agent_instance_id, inventory, now);
+            reconcile_inventory_locked(
+                &mut inner,
+                &client_id,
+                &agent_instance_id,
+                self.observation_epoch.clone(),
+                inventory,
+                now,
+            );
         }
         Ok(Self::client_view_locked(&inner, &client_id).expect("client just inserted"))
     }

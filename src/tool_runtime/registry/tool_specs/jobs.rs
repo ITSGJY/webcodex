@@ -50,7 +50,7 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
         ),
         tool_spec(
             "job_log",
-            "Read stdout/stderr for a runtime job.",
+            "Read stdout/stderr for a runtime job. With after_observation_token and wait_secs (1..=60), waits once for progress or a terminal state; never a subscription.",
             job_log_input_schema(),
         ),
         tool_spec(
