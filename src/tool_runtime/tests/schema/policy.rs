@@ -488,6 +488,7 @@ fn required_agent_capability_matches_metadata_risk_table() {
         ("cargo_check", ToolRisk::JobRun, AgentCapability::Shell),
         ("cargo_test", ToolRisk::JobRun, AgentCapability::Shell),
         ("read_file", ToolRisk::ReadOnly, AgentCapability::FileRead),
+        ("read_files", ToolRisk::ReadOnly, AgentCapability::FileRead),
         (
             "lsp_status",
             ToolRisk::ReadOnly,

@@ -644,6 +644,10 @@ mod tests {
                 OAuthToolScopePolicy::Require(SCOPE_PROJECT_READ),
             ),
             (
+                "read_files",
+                OAuthToolScopePolicy::Require(SCOPE_PROJECT_READ),
+            ),
+            (
                 "show_changes",
                 OAuthToolScopePolicy::Require(SCOPE_PROJECT_READ),
             ),
@@ -718,6 +722,7 @@ mod tests {
             "hover",
             "workspace_symbols",
             "read_file",
+            "read_files",
             "write_project_file",
             "artifact_upload_begin",
             "artifact_upload_chunk",

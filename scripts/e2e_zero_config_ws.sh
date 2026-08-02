@@ -520,7 +520,7 @@ fi
 # ----------------------------------------------------------------------------
 
 # The model surface is startup-selected and immutable. The default local_coding
-# surface is the intentional 33-tool canonical coding loop; the explicit
+# surface is the intentional 34-tool canonical coding loop; the explicit
 # full-operator-v1 surface exposes the complete operator tool set. Neither
 # surface re-exposes the ModelHidden compatibility tools (replace_in_file,
 # job_tail) to the model via MCP tools/list; write_project_file is ModelVisible
@@ -586,7 +586,7 @@ mcp_tool_present() {
 if [ "$EXPECTED_SURFACE" = "local_coding" ]; then
     # The local_coding canonical coding loop must expose its key tools.
     mcp_canonical_present=1
-    for tname in work_on_project list_projects project_overview read_file \
+    for tname in work_on_project list_projects project_overview read_file read_files \
         search_project_text apply_text_edits apply_patch_checked run_shell \
         run_job job_status job_log list_jobs stop_job cargo_fmt cargo_check \
         cargo_test validation_summary git_status git_diff show_changes \
@@ -617,7 +617,7 @@ else
     # full_operator_runtime: the complete operator tool surface.
     mcp_operator_present=1
     for tname in list_tools start_coding_task work_on_project finish_coding_task \
-        git_diff_summary validate_patch apply_patch apply_patch_checked read_file \
+        git_diff_summary validate_patch apply_patch apply_patch_checked read_file read_files \
         run_shell run_job job_status job_log list_jobs show_changes; do
         if mcp_tool_present "$tname"; then
             :
@@ -658,6 +658,27 @@ if echo "$sc_output" | grep -q "$RUNTIME_PROJECT_ID"; then
     pass "MCP list_projects sees agent project $RUNTIME_PROJECT_ID"
 else
     fail "MCP list_projects did not see $RUNTIME_PROJECT_ID (got: ${sc_output:0:200})"
+fi
+
+# tools/call read_files — exercise the real bounded batch path through MCP and
+# verify order, per-item success, and project-relative output only.
+body="$(api_post /mcp "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"read_files\",\"arguments\":{\"project\":\"$RUNTIME_PROJECT_ID\",\"items\":[{\"path\":\"README.md\",\"limit\":20},{\"path\":\"src.rs\",\"limit\":20}]}}}")"
+sc="$(json_get "$body" result.structuredContent)"
+if [ "$(json_get "$sc" success)" = "True" ] \
+    && [ "$(json_get "$sc" output.requested_count)" = "2" ] \
+    && [ "$(json_get "$sc" output.returned_count)" = "2" ] \
+    && [ "$(json_get "$sc" output.items.0.path)" = "README.md" ] \
+    && [ "$(json_get "$sc" output.items.0.success)" = "True" ] \
+    && [ "$(json_get "$sc" output.items.1.path)" = "src.rs" ] \
+    && [ "$(json_get "$sc" output.items.1.success)" = "True" ]; then
+    pass "MCP tools/call(read_files) returns two ordered successful items"
+else
+    fail "MCP tools/call(read_files) contract mismatch (body: ${body:0:400})"
+fi
+if echo "$sc" | grep -Fq "$TEST_REPO"; then
+    fail "MCP tools/call(read_files) leaked an absolute project path"
+else
+    pass "MCP tools/call(read_files) keeps paths project-relative"
 fi
 
 # ----------------------------------------------------------------------------

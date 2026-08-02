@@ -59,6 +59,7 @@ pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
         "command" => json!("true"),
         "patch" => json!("diff --git a/a b/a\n"),
         "paths" => json!(["old.txt"]),
+        "items" => json!([{"path": "src/lib.rs"}]),
         "path" => json!("src/lib.rs"),
         "old" | "old_text" => json!("a"),
         "new" | "new_text" => json!("b"),
@@ -118,8 +119,31 @@ pub(in crate::tool_runtime::tests) fn placeholder_from_prop(prop: &Value) -> Val
     let kind = prop["type"].as_str().unwrap_or("string");
     match kind {
         "integer" => json!(1),
-        "array" => json!([]),
-        "object" => json!({}),
+        "array" => {
+            let minimum = prop["minItems"].as_u64().unwrap_or(0) as usize;
+            let item = prop.get("items").unwrap_or(&Value::Null);
+            Value::Array(
+                std::iter::repeat_with(|| placeholder_from_prop(item))
+                    .take(minimum)
+                    .collect(),
+            )
+        }
+        "object" => {
+            let properties = prop["properties"].as_object();
+            let fields = prop["required"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(|field| {
+                    let child = properties
+                        .and_then(|properties| properties.get(field))
+                        .unwrap_or(&Value::Null);
+                    (field.to_string(), placeholder_from_prop(child))
+                })
+                .collect();
+            Value::Object(fields)
+        }
         "boolean" => json!(true),
         _ => json!("value"),
     }

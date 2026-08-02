@@ -1,6 +1,7 @@
 use super::super::input_schemas::{
     list_project_files_input_schema, list_project_tracked_files_input_schema,
-    project_overview_input_schema, read_file_input_schema, search_project_text_input_schema,
+    project_overview_input_schema, read_file_input_schema, read_files_input_schema,
+    search_project_text_input_schema,
 };
 use super::tool_spec;
 use crate::tool_runtime::tool_spec::ToolSpec;
@@ -35,6 +36,11 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
             "read_file",
             "Default inspect tool for targeted source reading. Bounded UTF-8 range read with full-file sha256 and a continuation cursor (next_start_line); line numbers only change text. Oversized ranges fail range_too_large: shrink limit or narrow the range.",
             read_file_input_schema(),
+        ),
+        tool_spec(
+            "read_files",
+            "Read 1 to 8 targeted UTF-8 project files or ranges in request order. Item failures are isolated. Runner reads have true four-request concurrency, one 30-second batch deadline, and a 256 KiB serialized-result cap with next_index continuation.",
+            read_files_input_schema(),
         ),
     ]
 }

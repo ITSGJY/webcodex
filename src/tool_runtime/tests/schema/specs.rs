@@ -463,6 +463,12 @@ fn tool_specs_optional_fields_are_not_required() {
     assert!(required.contains(&"path".to_string()));
     assert!(!required.contains(&"with_line_numbers".to_string()));
 
+    let read_files = specs.iter().find(|s| s.name == "read_files").unwrap();
+    let required = required_fields(read_files);
+    assert!(required.contains(&"project".to_string()));
+    assert!(required.contains(&"items".to_string()));
+    assert!(!required.contains(&"with_line_numbers".to_string()));
+
     let search_project_text = specs
         .iter()
         .find(|s| s.name == "search_project_text")
@@ -488,6 +494,7 @@ fn tool_specs_covers_expected_tool_set() {
         "job_status",
         "job_log",
         "read_file",
+        "read_files",
         "git_status",
         "git_diff",
         "git_diff_summary",

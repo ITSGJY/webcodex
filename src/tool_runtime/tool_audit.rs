@@ -524,6 +524,16 @@ impl ToolCall {
                 "limit": limit,
                 "with_line_numbers": with_line_numbers,
             }),
+            Self::ReadFiles {
+                project,
+                items,
+                with_line_numbers,
+                ..
+            } => serde_json::json!({
+                "project": project,
+                "items": items,
+                "with_line_numbers": with_line_numbers,
+            }),
             Self::ListProjectFiles {
                 project,
                 path,

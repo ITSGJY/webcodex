@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
+use tokio::time::Instant;
 use webcodex_workspace::file_read_range::{self, EffectiveRange, FileReadRange, ReadFileReason};
 
 #[cfg(test)]
@@ -127,6 +128,16 @@ fn read_file_failure(reason: ReadFileReason, path: Option<&str>) -> ToolResult {
         "state_changed": false,
     });
     ToolResult::err_with_output(format!("read_file failed: {}", reason.as_str()), output)
+}
+
+fn validate_read_file_path(path: &str) -> Option<ToolResult> {
+    if validate_project_relative_path(path).is_err() {
+        return Some(read_file_failure(ReadFileReason::InvalidPath, Some(path)));
+    }
+    if crate::sensitive_paths::is_secret_path(path) {
+        return Some(read_file_failure(ReadFileReason::SensitivePath, Some(path)));
+    }
+    None
 }
 
 fn io_error_reason(error: &std::io::Error) -> ReadFileReason {
@@ -3859,21 +3870,64 @@ impl ToolRuntime {
         // file ops to `allowed_roots` — which is broader than the project — so
         // the project boundary has to be enforced here, as `list_project_files`
         // and `project_overview` already do.
-        if let Err(_) = validate_project_relative_path(&path) {
-            return read_file_failure(ReadFileReason::InvalidPath, Some(&path));
+        if let Some(failure) = validate_read_file_path(&path) {
+            return failure;
         }
         // Every other surface already refuses credentials: search excludes
         // them, artifacts and edits reject them. Reading was the one way left
         // to get a `.env` or a private key back verbatim. Only the narrow
         // secret policy applies here — reading `.git/HEAD` or a file under
         // `target/` by explicit path stays allowed.
-        if crate::sensitive_paths::is_secret_path(&path) {
-            return read_file_failure(ReadFileReason::SensitivePath, Some(&path));
-        }
         let proj = match self.resolve_project(&project).await {
             Ok(p) => p,
             Err(e) => return ToolResult::err(e),
         };
+        self.read_one_validated_project_file(
+            &proj,
+            path,
+            start_line,
+            limit,
+            with_line_numbers,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn read_one_resolved_project_file(
+        &self,
+        project: &ProjectConfig,
+        path: String,
+        start_line: Option<usize>,
+        limit: Option<usize>,
+        with_line_numbers: bool,
+        deadline: Instant,
+    ) -> ToolResult {
+        if Instant::now() >= deadline {
+            return read_file_failure(ReadFileReason::Timeout, Some(&path));
+        }
+        if let Some(failure) = validate_read_file_path(&path) {
+            return failure;
+        }
+        self.read_one_validated_project_file(
+            project,
+            path,
+            start_line,
+            limit,
+            with_line_numbers,
+            Some(deadline),
+        )
+        .await
+    }
+
+    async fn read_one_validated_project_file(
+        &self,
+        proj: &ProjectConfig,
+        path: String,
+        start_line: Option<usize>,
+        limit: Option<usize>,
+        with_line_numbers: bool,
+        deadline: Option<Instant>,
+    ) -> ToolResult {
         if proj.is_agent() {
             let client_id = match proj.agent_client_id() {
                 Ok(id) => id.to_string(),
@@ -3912,7 +3966,11 @@ impl ToolRuntime {
                 Ok(r) => r,
                 Err(_) => return read_file_failure(ReadFileReason::AgentUnavailable, Some(&path)),
             };
-            return match tokio::time::timeout(Duration::from_secs(wait_timeout + 2), rx).await {
+            let response = match deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline, rx).await,
+                None => tokio::time::timeout(Duration::from_secs(wait_timeout + 2), rx).await,
+            };
+            return match response {
                 Ok(Ok(resp)) if resp.exit_code == Some(0) && resp.error.is_none() => {
                     let mut result = read_file_agent_stdout_result_with_options(
                         resp.stdout.unwrap_or_default(),

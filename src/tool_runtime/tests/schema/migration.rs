@@ -141,6 +141,7 @@ fn tool_definition_runtime_tool_policy_inventory_is_stable() {
         ("cargo_check", "validation", "current_session_fallback"),
         ("cargo_test", "validation", "current_session_fallback"),
         ("read_file", "file", "current_session_fallback"),
+        ("read_files", "file", "current_session_fallback"),
         ("lsp_status", "lsp", "current_session_fallback"),
         ("document_symbols", "lsp", "current_session_fallback"),
         ("document_diagnostics", "lsp", "current_session_fallback"),

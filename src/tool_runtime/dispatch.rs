@@ -12,6 +12,7 @@ use super::{
     ToolResult, ToolRuntime,
 };
 use crate::auth::AuthContext;
+use crate::tool_runtime::project_resolution::{ProjectResolverError, ResolvedProject};
 
 /// Snapshot of the activity-relevant request facts, captured before the
 /// `ToolCall` is moved into execution.
@@ -169,13 +170,13 @@ impl ToolRuntime {
         inherited_sandbox: Option<&'static str>,
         window: Option<&crate::client_window::ClientWindow>,
     ) -> ToolResult {
-        let mut resolved_project = match call.project() {
-            Some(project) => self
-                .resolve_project_input_for_auth(project, auth)
-                .await
-                .ok(),
+        let project_resolution = match call.project() {
+            Some(project) => Some(self.resolve_project_input_for_auth(project, auth).await),
             None => None,
         };
+        let resolved_project = project_resolution
+            .as_ref()
+            .and_then(|resolution| resolution.as_ref().ok());
         // Preserve the canonical project for activity attribution before the
         // session recorder consumes the resolved value below. Short aliases
         // must not turn a real agent execution into a client-less row.
@@ -360,7 +361,7 @@ impl ToolRuntime {
             }
         }
         let mut session_start = if session_id.is_some() {
-            let resolved_project = resolved_project.take().map(|resolved| resolved.resolved_id);
+            let resolved_project = resolved_project.map(|resolved| resolved.resolved_id.clone());
             self.sessions.record_tool_call_started_with_metadata(
                 session_id.as_deref(),
                 transport,
@@ -373,7 +374,12 @@ impl ToolRuntime {
             None
         };
         if let Err(err) = self
-            .authorize_agent_tool(&call, ssh_resource.as_deref(), auth)
+            .authorize_agent_tool(
+                &call,
+                ssh_resource.as_deref(),
+                auth,
+                project_resolution.as_ref(),
+            )
             .await
         {
             let mut err = err;
@@ -435,6 +441,7 @@ impl ToolRuntime {
                 execution_sandbox,
                 window,
                 ssh_resource.as_deref(),
+                project_resolution,
             )
             .await;
         let permission = permission.filter(|_| {
@@ -508,6 +515,7 @@ impl ToolRuntime {
         execution_sandbox: Option<&'static str>,
         window: Option<&crate::client_window::ClientWindow>,
         ssh_resource: Option<&str>,
+        project_resolution: Option<Result<ResolvedProject, ProjectResolverError>>,
     ) -> ToolResult {
         match call {
             call @ (ToolCall::ListTools { .. }
@@ -572,6 +580,7 @@ impl ToolRuntime {
 
             call @ (ToolCall::DeleteProjectFiles { .. }
             | ToolCall::ReadFile { .. }
+            | ToolCall::ReadFiles { .. }
             | ToolCall::ListProjectFiles { .. }
             | ToolCall::ListProjectTrackedFiles { .. }
             | ToolCall::ProjectOverview { .. }
@@ -591,7 +600,10 @@ impl ToolRuntime {
             | ToolCall::ReplaceLineRange { .. }
             | ToolCall::InsertAtLine { .. }
             | ToolCall::DeleteLineRange { .. }
-            | ToolCall::ApplyTextEdits { .. }) => self.dispatch_file_tool(call, transport).await,
+            | ToolCall::ApplyTextEdits { .. }) => {
+                self.dispatch_file_tool(call, transport, project_resolution)
+                    .await
+            }
 
             call @ (ToolCall::GitRestorePaths { .. }
             | ToolCall::DiscardUntracked { .. }

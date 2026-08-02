@@ -24,11 +24,7 @@ fn flattened_tool_arg_schema(schema_type: &str) -> Value {
 
 fn flattened_tool_arg_schema_from_input(input_schema: &Value) -> Option<Value> {
     let supported = match input_schema.get("type").and_then(Value::as_str) {
-        Some("array")
-            if input_schema.pointer("/items/type").and_then(Value::as_str) == Some("string") =>
-        {
-            true
-        }
+        Some("array") => true,
         Some("string" | "boolean" | "integer" | "number") => true,
         _ => false,
     };
@@ -749,6 +745,18 @@ pub(crate) fn build_openapi_spec() -> Value {
                                 "tool": "read_file",
                                 "project": "webcodex",
                                 "path": "README.md",
+                                "with_line_numbers": true
+                            }
+                        },
+                        "readFiles": {
+                            "summary": "Read several files with one bounded call",
+                            "value": {
+                                "tool": "read_files",
+                                "project": "webcodex",
+                                "items": [
+                                    {"path": "src/lib.rs", "start_line": 1, "limit": 120},
+                                    {"path": "src/main.rs", "limit": 80}
+                                ],
                                 "with_line_numbers": true
                             }
                         },

@@ -64,16 +64,31 @@ pub(super) const SEARCH_DEFINITIONS: &[ToolDefinition] = &[
     ),
 ];
 
-pub(super) const READ_DEFINITIONS: &[ToolDefinition] = &[def(
-    "read_file",
-    ModelVisible,
-    TOOL_CATEGORY_FILE,
-    Some(FileRead),
-    TOOL_PROVIDER_AGENT,
-    ReadOnly,
-    Some(PROJECT_READ),
-    true,
-    SinglePath,
-    false,
-    false,
-)];
+pub(super) const READ_DEFINITIONS: &[ToolDefinition] = &[
+    def(
+        "read_file",
+        ModelVisible,
+        TOOL_CATEGORY_FILE,
+        Some(FileRead),
+        TOOL_PROVIDER_AGENT,
+        ReadOnly,
+        Some(PROJECT_READ),
+        true,
+        SinglePath,
+        false,
+        false,
+    ),
+    def(
+        "read_files",
+        ModelVisible,
+        TOOL_CATEGORY_FILE,
+        Some(FileRead),
+        TOOL_PROVIDER_AGENT,
+        ReadOnly,
+        Some(PROJECT_READ),
+        true,
+        NoPath,
+        false,
+        false,
+    ),
+];

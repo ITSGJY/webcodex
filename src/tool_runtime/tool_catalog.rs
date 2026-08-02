@@ -28,6 +28,7 @@ pub(crate) const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "project_overview",
             "list_project_tracked_files",
             "read_file",
+            "read_files",
             "run_shell",
             "search_project_text",
             "document_symbols",
@@ -192,25 +193,27 @@ pub(crate) const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
 pub(crate) const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
     ToolRecommendedFlow {
         name: "discovery",
-        summary: "Discovery: list_projects, project_overview, and read_file; use search_project_text for bounded code search. run_shell with rg or git grep remains the diagnostic escape hatch.",
+        summary: "Discovery: list_projects, project_overview, and read_file/read_files; use search_project_text for bounded code search. run_shell with rg or git grep remains the diagnostic escape hatch.",
         manifest_purpose:
             "Resolve the project, inspect bounded structure, then search code with search_project_text.",
         tools: &[
             "list_projects",
             "project_overview",
             "read_file",
+            "read_files",
             "search_project_text",
             "run_shell",
         ],
     },
     ToolRecommendedFlow {
         name: "inspect",
-        summary: "Inspect: use search_project_text and read_file before editing; run_shell with rg or git grep is the diagnostic escape hatch, and show_changes reviews the worktree.",
+        summary: "Inspect: use search_project_text and read_file before editing; use read_files for bounded multi-file reads. run_shell with rg or git grep is the diagnostic escape hatch, and show_changes reviews the worktree.",
         manifest_purpose:
             "Use bounded structured search and file reads for code inspection, then review the worktree.",
         tools: &[
             "search_project_text",
             "read_file",
+            "read_files",
             "run_shell",
             "show_changes",
         ],
@@ -274,6 +277,7 @@ pub(crate) const LOCAL_CODING_TOOL_NAMES: &[&str] = &[
     "list_project_files",
     "search_project_text",
     "read_file",
+    "read_files",
     // LSP navigation
     "lsp_status",
     "document_symbols",
@@ -326,6 +330,7 @@ pub(crate) const TOOL_MANIFEST_INTENTS: &[ToolManifestIntent] = &[
             "project_overview",
             "list_project_tracked_files",
             "read_file",
+            "read_files",
             "search_project_text",
             "list_project_files",
             "git_status",
@@ -351,6 +356,7 @@ pub(crate) const TOOL_MANIFEST_INTENTS: &[ToolManifestIntent] = &[
             "list_project_files",
             "search_project_text",
             "read_file",
+            "read_files",
             "git_status",
             "git_log",
             "tool_manifest",

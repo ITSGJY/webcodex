@@ -33,6 +33,41 @@ pub enum SearchResultMode {
     Count,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadFilesItem {
+    #[serde(deserialize_with = "deserialize_non_empty_read_path")]
+    pub path: String,
+    #[serde(default)]
+    pub start_line: Option<usize>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+fn deserialize_non_empty_read_path<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let path = String::deserialize(deserializer)?;
+    if path.trim().is_empty() {
+        return Err(serde::de::Error::custom("path must not be empty"));
+    }
+    Ok(path)
+}
+
+fn deserialize_read_files_items<'de, D>(deserializer: D) -> Result<Vec<ReadFilesItem>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let items = Vec::<ReadFilesItem>::deserialize(deserializer)?;
+    if !(1..=8).contains(&items.len()) {
+        return Err(serde::de::Error::custom(
+            "items must contain between 1 and 8 entries",
+        ));
+    }
+    Ok(items)
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "tool", content = "params", rename_all = "snake_case")]
 pub enum ToolCall {
@@ -544,6 +579,17 @@ pub enum ToolCall {
         start_line: Option<usize>,
         #[serde(default)]
         limit: Option<usize>,
+        #[serde(default)]
+        with_line_numbers: Option<bool>,
+    },
+
+    /// Read up to eight UTF-8 files or file ranges under one bounded call.
+    ReadFiles {
+        project: String,
+        #[serde(deserialize_with = "deserialize_read_files_items")]
+        items: Vec<ReadFilesItem>,
+        #[serde(default)]
+        session_id: Option<String>,
         #[serde(default)]
         with_line_numbers: Option<bool>,
     },
@@ -1174,6 +1220,34 @@ fn reject_unknown_start_coding_task_fields(arguments: &Value) -> Result<(), Stri
     ))
 }
 
+fn reject_unknown_read_files_fields(arguments: &Value) -> Result<(), String> {
+    const ALLOWED: &[&str] = &[
+        "project",
+        "items",
+        "session_id",
+        "with_line_numbers",
+        // Wrapper/session metadata that transports may leave in params.
+        "allow_cross_project_session",
+        "recording_session_id",
+        "_session_id",
+    ];
+    let Some(object) = arguments.as_object() else {
+        return Ok(());
+    };
+    let unknown: Vec<&str> = object
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !ALLOWED.contains(key))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "invalid arguments for tool 'read_files': unknown field(s) {}",
+        unknown.join(", ")
+    ))
+}
+
 impl ToolCall {
     pub fn from_tool_name(name: &str, arguments: Value) -> Result<Self, String> {
         Self::from_tool_name_with_recorder_metadata(name, arguments).map(|(call, _)| call)
@@ -1202,6 +1276,9 @@ impl ToolCall {
             if let Err(message) = reject_unknown_start_coding_task_fields(&arguments) {
                 return Err(message);
             }
+        }
+        if name == "read_files" {
+            reject_unknown_read_files_fields(&arguments)?;
         }
         let mut wrapped = serde_json::Map::new();
         wrapped.insert(
@@ -1296,6 +1373,7 @@ impl ToolCall {
             Self::CargoCheck { .. } => "cargo_check",
             Self::CargoTest { .. } => "cargo_test",
             Self::ReadFile { .. } => "read_file",
+            Self::ReadFiles { .. } => "read_files",
             Self::RunJob { .. } => "run_job",
             Self::StopJob { .. } => "stop_job",
             Self::JobStatus { .. } => "job_status",
@@ -1358,6 +1436,7 @@ impl ToolCall {
             | Self::CargoCheck { session_id, .. }
             | Self::CargoTest { session_id, .. }
             | Self::ReadFile { session_id, .. }
+            | Self::ReadFiles { session_id, .. }
             | Self::RunJob { session_id, .. }
             | Self::StopJob { session_id, .. }
             | Self::ListProjectFiles { session_id, .. }
@@ -1422,6 +1501,7 @@ impl ToolCall {
             | Self::CargoCheck { session_id, .. }
             | Self::CargoTest { session_id, .. }
             | Self::ReadFile { session_id, .. }
+            | Self::ReadFiles { session_id, .. }
             | Self::RunJob { session_id, .. }
             | Self::StopJob { session_id, .. }
             | Self::ListProjectFiles { session_id, .. }
@@ -1511,6 +1591,7 @@ impl ToolCall {
             | Self::CargoCheck { project, .. }
             | Self::CargoTest { project, .. }
             | Self::ReadFile { project, .. }
+            | Self::ReadFiles { project, .. }
             | Self::RunJob { project, .. }
             | Self::StopJob { project, .. }
             | Self::ListProjectFiles { project, .. }

@@ -102,6 +102,7 @@ list_project_tracked_files
 list_project_files
 search_project_text
 read_file
+read_files
 lsp_status
 document_symbols
 document_diagnostics
@@ -443,6 +444,31 @@ field is strictly validated and the model output is reconstructed from those
 fields alone, so unknown fields, padding, mismatched range metadata, wrong
 SHA, or inconsistent content/line counts are stripped or rejected
 (`malformed_agent_response`) and never leak to the model.
+
+### Bounded batch reads (`read_files`)
+
+`read_files` is a separate tool; it does not change `read_file`. It accepts a
+required `project`, `items` with 1 to 8 `{path, start_line?, limit?}` entries,
+and one optional batch-wide `with_line_numbers` value. Paths use the same
+project-relative and sensitive-path checks as `read_file`.
+
+The project is resolved once for the batch. Each item then uses the same
+single-file normalization, UTF-8 validation, SHA-256, numbering, Runner
+response parsing, stable errors, and serialization checks as `read_file`.
+Items execute independently and results are restored to input order. Up to
+four item futures cover validation, Runner enqueue, and response waiting, so
+no fifth read is enqueued until a slot opens.
+
+One 30-second deadline covers the whole batch. Completed results remain intact;
+unfinished reads become `timeout`, and already-enqueued unfinished requests are
+cancelled individually. One failed item never cancels another item.
+
+The final serialized result has a 256 KiB budget. Complete result items are
+added in input order; an item is never partially serialized. If the next item
+does not fit, `output_truncated=true` and `next_index` identifies the first
+omitted input item. The caller can retry from that position in its original
+`items` list. Session and permission metadata belong only to the outer batch
+result, and the top-level `project` is the resolved runtime project id.
 
 ## Bounded project text search (`search_project_text`)
 

@@ -39,6 +39,7 @@ pub(crate) mod project_instructions;
 mod project_resolution;
 mod project_tools;
 mod projects;
+mod read_files;
 mod registry;
 mod runtime;
 mod runtime_info;
@@ -76,7 +77,7 @@ pub use runtime::ToolRuntime;
 #[allow(unused_imports)]
 pub use runtime_info::RuntimeInfo;
 #[allow(unused_imports)]
-pub use tool_call::{SearchResultMode, ToolCall};
+pub use tool_call::{ReadFilesItem, SearchResultMode, ToolCall};
 pub(crate) use tool_call::{
     TOOL_CALL_ARGUMENTS_FIELD, TOOL_CALL_PARAMS_FIELD, TOOL_CALL_TOOL_FIELD,
     TOOL_CALL_WRAPPER_FIELDS,

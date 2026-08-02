@@ -28,6 +28,8 @@ pub struct ToolRuntime {
     pub(crate) job_killer: Arc<dyn LocalJobKiller>,
     pub(crate) semantic_navigation_probe_timeout: Duration,
     pub(crate) repository_overview_probe_timeout: Duration,
+    /// One deadline shared by every item in a `read_files` batch.
+    pub(crate) read_files_deadline: Duration,
     /// Internal synchronous wait window for a read-only structured validation
     /// before it promotes to a Job. Defaults to `SYNC_VALIDATION_WAIT_SECS`;
     /// tests shrink it so the handoff path can be exercised without sleeping.
@@ -65,6 +67,7 @@ impl ToolRuntime {
                 super::semantic_navigation::DEFAULT_SEMANTIC_NAVIGATION_PROBE_TIMEOUT,
             repository_overview_probe_timeout:
                 super::coding_task::DEFAULT_REPOSITORY_OVERVIEW_PROBE_TIMEOUT,
+            read_files_deadline: super::read_files::DEFAULT_READ_FILES_DEADLINE,
             validation_sync_wait: Duration::from_secs(super::helpers::SYNC_VALIDATION_WAIT_SECS),
             permission_evaluator: PermissionEvaluator::from_env(),
             activity: Arc::new(NoopActivityRecorder),
@@ -124,6 +127,12 @@ impl ToolRuntime {
     #[cfg(test)]
     pub(crate) fn with_repository_overview_probe_timeout(mut self, timeout: Duration) -> Self {
         self.repository_overview_probe_timeout = timeout;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_read_files_deadline(mut self, deadline: Duration) -> Self {
+        self.read_files_deadline = deadline;
         self
     }
 

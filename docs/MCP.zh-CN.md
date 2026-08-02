@@ -95,6 +95,7 @@ list_project_tracked_files
 list_project_files
 search_project_text
 read_file
+read_files
 lsp_status
 document_symbols
 document_diagnostics
@@ -387,6 +388,26 @@ Agent 的 `file_read_range.v1` 响应被视为不可信输入：每个正式字�
 严格验证，模型输出仅由这些字段重建。未知字段、padding、与请求不一致的范围
 元数据、错误 SHA、或 content/行数不一致都会被剥离或拒绝
 （`malformed_agent_response`），绝不透传到模型。
+
+### 有界批量读取（`read_files`）
+
+`read_files` 是独立工具，不改变 `read_file`。它接收必填 `project`、包含
+1 到 8 个 `{path, start_line?, limit?}` 的 `items`，以及批次共享的可选
+`with_line_numbers`。路径复用 `read_file` 的项目相对路径和敏感路径校验。
+
+每个批次只解析一次项目；随后各项复用单文件读取的范围规范化、UTF-8 校验、
+SHA-256、行号格式、Runner 响应解析、稳定错误码和序列化安全检查。各项独立
+执行，最终按输入顺序恢复结果。最多四个 future 同时覆盖校验、Runner enqueue
+和等待响应，所以并发槽位释放前，第五个读取不会进入 Runner 队列。
+
+整个批次共享 30 秒 deadline。已完成结果保持不变；未完成项变为 `timeout`，
+已 enqueue 的未完成请求会逐项取消。一个普通文件失败不会取消其他项。
+
+最终序列化结果固定为 256 KiB 预算。工具按输入顺序加入完整 item，绝不截断
+单个 item；下一个 item 放不下时返回 `output_truncated=true`，并用
+`next_index` 指向第一个未返回的原始输入项。调用方可从原 `items` 的该位置
+重试。Session 与 permission 元数据只附加到批次外层；顶层 `project` 是解析后
+的 runtime project id。
 
 ## 有界项目文本搜索（`search_project_text`）
 

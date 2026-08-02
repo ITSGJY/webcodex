@@ -179,3 +179,48 @@ pub(crate) fn read_file_input_schema() -> Value {
         ),
     ]))
 }
+
+pub(crate) fn read_files_input_schema() -> Value {
+    let mut schema = object_schema(with_optional_session_id(vec![
+        ("project", "string", "Configured project id.", true),
+        (
+            "items",
+            "array",
+            "One to eight project-relative UTF-8 file ranges, returned in request order.",
+            true,
+        ),
+        (
+            "with_line_numbers",
+            "boolean",
+            "When true, every successful item returns numbered text instead of plain text.",
+            false,
+        ),
+    ]));
+    schema["properties"]["items"] = json!({
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 8,
+        "description": "One to eight project-relative UTF-8 file ranges, returned in request order.",
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path"],
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Non-empty project-relative file path."
+                },
+                "start_line": {
+                    "type": "integer",
+                    "description": "Optional 1-based line offset; normalized exactly like read_file."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Optional maximum line count; normalized exactly like read_file."
+                }
+            }
+        }
+    });
+    schema
+}

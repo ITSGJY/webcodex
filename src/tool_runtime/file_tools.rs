@@ -1,5 +1,6 @@
 //! Runtime dispatch adapters for file, artifact, and text-edit tool calls.
 
+use super::project_resolution::{ProjectResolverError, ResolvedProject};
 use super::{sessions::SessionTransport, ToolCall, ToolResult, ToolRuntime};
 
 impl ToolRuntime {
@@ -7,6 +8,7 @@ impl ToolRuntime {
         &self,
         call: ToolCall,
         transport: SessionTransport,
+        project_resolution: Option<Result<ResolvedProject, ProjectResolverError>>,
     ) -> ToolResult {
         match call {
             ToolCall::DeleteProjectFiles {
@@ -25,6 +27,19 @@ impl ToolRuntime {
                 self.read_file(project, path, start_line, limit, with_line_numbers)
                     .await
             }
+            ToolCall::ReadFiles {
+                project,
+                items,
+                session_id: _,
+                with_line_numbers,
+            } => match project_resolution {
+                Some(Ok(resolved)) => {
+                    self.read_files_resolved(&resolved, items, with_line_numbers)
+                        .await
+                }
+                Some(Err(error)) => error.into_tool_result(),
+                None => self.read_files(project, items, with_line_numbers).await,
+            },
             ToolCall::ListProjectFiles {
                 project,
                 session_id: _,

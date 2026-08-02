@@ -2415,6 +2415,7 @@ async fn local_coding_tools_list_returns_exact_ordered_surface() {
     for required in [
         "work_on_project",
         "read_file",
+        "read_files",
         "apply_text_edits",
         "finish_coding_task",
     ] {
@@ -2564,6 +2565,7 @@ async fn full_operator_explicit_surface_lists_full_runtime_and_dispatches() {
         names, registry_names,
         "full operator lists the full runtime"
     );
+    assert!(names.iter().any(|name| name == "read_files"));
 
     // start_coding_task (a non-local_coding tool) dispatches on full operator.
     let called = handle_mcp_request(

@@ -1,3 +1,4 @@
+use super::project_resolution::ResolvedProject;
 use super::tool_definition::{runtime_tool_agent_capability, AgentCapability};
 use super::{ProjectResolverError, ToolCall, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
@@ -25,6 +26,7 @@ impl ToolRuntime {
         call: &ToolCall,
         ssh_resource: Option<&str>,
         auth: Option<&AuthContext>,
+        project_resolution: Option<&Result<ResolvedProject, ProjectResolverError>>,
     ) -> Result<(), ToolResult> {
         let Some(project) = call.project() else {
             return Ok(());
@@ -33,10 +35,18 @@ impl ToolRuntime {
         if required.is_none() && ssh_resource.is_none() {
             return Ok(());
         }
-        let proj = self
-            .resolve_project_for_auth(project, auth)
-            .await
-            .map_err(ProjectResolverError::into_tool_result)?;
+        let resolved;
+        let proj = match project_resolution {
+            Some(Ok(project)) => &project.config,
+            Some(Err(error)) => return Err(error.clone().into_tool_result()),
+            None => {
+                resolved = self
+                    .resolve_project_for_auth(project, auth)
+                    .await
+                    .map_err(ProjectResolverError::into_tool_result)?;
+                &resolved
+            }
+        };
         if !proj.is_agent() {
             if ssh_resource.is_some() {
                 return Err(ToolResult::err(

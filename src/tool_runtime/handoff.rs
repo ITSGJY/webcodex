@@ -759,7 +759,7 @@ enum ReviewEvidenceKind {
 
 fn review_evidence_kind(tool_name: &str) -> Option<ReviewEvidenceKind> {
     match tool_name {
-        "read_file" | "list_project_files" | "project_overview" => {
+        "read_file" | "read_files" | "list_project_files" | "project_overview" => {
             Some(ReviewEvidenceKind::ReadOnlyInspection)
         }
         "search_project_text" => Some(ReviewEvidenceKind::Search),

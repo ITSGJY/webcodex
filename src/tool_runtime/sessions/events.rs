@@ -330,6 +330,7 @@ pub(crate) enum ExplorationToolKind {
 
 pub(crate) const EXPLORATION_TOOL_NAMES: &[&str] = &[
     "read_file",
+    "read_files",
     "search_project_text",
     "document_symbols",
     "document_diagnostics",
@@ -344,7 +345,7 @@ pub(crate) fn exploration_tool_kind(tool_name: &str) -> Option<ExplorationToolKi
         return None;
     }
     match tool_name {
-        "read_file" => Some(ExplorationToolKind::Read),
+        "read_file" | "read_files" => Some(ExplorationToolKind::Read),
         "search_project_text" => Some(ExplorationToolKind::Search),
         _ if runtime_tool_category(tool_name) == TOOL_CATEGORY_LSP => {
             Some(ExplorationToolKind::Navigation)
@@ -363,11 +364,23 @@ pub(crate) fn observed_input_paths_for_tool(tool_name: &str, arguments: &Value) 
     if kind == ExplorationToolKind::Search {
         return Vec::new();
     }
+
+    let mut paths = Vec::new();
+    if tool_name == "read_files" {
+        if let Some(items) = arguments.get("items").and_then(Value::as_array) {
+            for item in items.iter().filter_map(Value::as_object) {
+                if let Some(path) = item.get("path").and_then(Value::as_str) {
+                    push_observed_path(&mut paths, path);
+                }
+            }
+        }
+        return paths;
+    }
+
     let metadata = runtime_tool_metadata(tool_name);
     if metadata.path_hint != ToolPathHint::SinglePath {
         return Vec::new();
     }
-    let mut paths = Vec::new();
     if let Some(path) = arguments.get("path").and_then(Value::as_str) {
         push_observed_path(&mut paths, path);
     }

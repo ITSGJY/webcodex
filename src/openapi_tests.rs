@@ -494,6 +494,36 @@ fn openapi_call_runtime_tool_lists_accepted_tool_names() {
 }
 
 #[test]
+fn openapi_read_files_is_available_through_strict_flattened_runtime_fields() {
+    let spec = build_openapi_spec();
+    let tool_call = &spec["components"]["schemas"]["ToolCallRequest"];
+    let description = tool_call["properties"][TOOL_CALL_TOOL_FIELD]["description"]
+        .as_str()
+        .unwrap();
+    assert!(description.contains("read_file"));
+    assert!(description.contains("read_files"));
+
+    let items = &tool_call["properties"]["items"];
+    assert_eq!(items["type"], "array");
+    assert_eq!(items["minItems"], 1);
+    assert_eq!(items["maxItems"], 8);
+    assert_eq!(items["items"]["additionalProperties"], false);
+    assert_eq!(items["items"]["required"], json!(["path"]));
+    assert_eq!(tool_call["additionalProperties"], false);
+
+    let examples = &spec["paths"]["/api/tools/call"]["post"]["requestBody"]["content"]
+        ["application/json"]["examples"];
+    assert_eq!(examples["readFiles"]["value"]["tool"], "read_files");
+    assert_eq!(
+        examples["readFiles"]["value"]["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
 fn openapi_key_actions_have_examples() {
     let spec = build_openapi_spec();
     // getRuntimeJobStatus, getRuntimeJobLog, and callRuntimeTool must ship

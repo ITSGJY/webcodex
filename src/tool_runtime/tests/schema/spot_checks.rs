@@ -124,6 +124,11 @@ fn tool_specs_schema_spot_checks() {
             vec!["project", "path"],
             vec!["with_line_numbers"],
         ),
+        (
+            "read_files",
+            vec!["project", "items"],
+            vec!["with_line_numbers"],
+        ),
         ("list_jobs", vec![], vec![]),
         (
             "stop_job",
@@ -174,5 +179,10 @@ fn tool_specs_schema_spot_checks() {
 
     let spec = spec_named(&specs, "read_file");
     let props = spec.input_schema["properties"].as_object().unwrap();
+    assert!(props.contains_key("with_line_numbers"));
+
+    let spec = spec_named(&specs, "read_files");
+    let props = spec.input_schema["properties"].as_object().unwrap();
+    assert!(props.contains_key("items"));
     assert!(props.contains_key("with_line_numbers"));
 }
