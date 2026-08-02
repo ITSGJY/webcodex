@@ -4,6 +4,7 @@ use std::path::Path;
 use super::helpers::{
     command_rejected_message, is_safe_job_id, normalize_local_status, project_relative_agent_cwd,
     project_relative_cwd, resolve_agent_cwd, resolve_local_cwd, shell_escape_simple,
+    MAX_LOCAL_LOG_LINES,
 };
 use super::local_jobs::{
     retain_inspect_job_until_terminal, LocalJobKiller, LocalJobRecord, TerminateOutcome,
@@ -86,6 +87,156 @@ fn detected_job_summary(
         detected["tests_failed"] = json!(failed);
     }
     detected
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StructuredValidationEvidence {
+    pub(crate) diagnostics: Option<super::validation_parser::ValidationDiagnostics>,
+    pub(crate) tests_detected: Option<bool>,
+    pub(crate) tests_run_count: Option<u64>,
+    pub(crate) tests_passed: Option<u64>,
+    pub(crate) tests_failed: Option<u64>,
+    pub(crate) zero_tests_run: Option<bool>,
+    pub(crate) warnings_count: Option<u64>,
+    pub(crate) errors_count: Option<u64>,
+}
+
+pub(crate) fn structured_validation_evidence(
+    tool: &str,
+    kind: &str,
+    stdout: &str,
+    stderr: &str,
+    truncated: bool,
+) -> StructuredValidationEvidence {
+    let combined = format!("{stdout}\n{stderr}");
+    let diagnostics = matches!(kind, "check" | "test")
+        .then(|| super::validation_profile::validation_adapter_for_tool(tool))
+        .flatten()
+        .map(|adapter| adapter.parse(stdout, stderr, truncated));
+    let mut evidence = StructuredValidationEvidence {
+        diagnostics,
+        tests_detected: None,
+        tests_run_count: None,
+        tests_passed: None,
+        tests_failed: None,
+        zero_tests_run: None,
+        warnings_count: None,
+        errors_count: None,
+    };
+    match kind {
+        "test" => {
+            let metadata = super::cargo::parse_cargo_test_run_metadata(&combined);
+            let (tests_passed, tests_failed) = super::cargo::parse_cargo_test_counts(&combined);
+            evidence.tests_detected = Some(metadata.tests_detected);
+            if !truncated {
+                evidence.tests_run_count = metadata.tests_run_count;
+                evidence.tests_passed = tests_passed;
+                evidence.tests_failed = tests_failed;
+                evidence.zero_tests_run = metadata.zero_tests_run;
+            }
+        }
+        "check" if !truncated => {
+            evidence.warnings_count =
+                Some(super::cargo::count_rustc_diagnostics(&combined, "warning:") as u64);
+            evidence.errors_count =
+                Some(super::cargo::count_rustc_diagnostics(&combined, "error:") as u64);
+        }
+        _ => {}
+    }
+    evidence
+}
+
+pub(crate) fn validation_job_projection(
+    tool: Option<&str>,
+    kind: Option<&str>,
+    status: &str,
+    exit_code: Option<i64>,
+    stdout: &str,
+    stderr: &str,
+    truncated: bool,
+) -> Option<Value> {
+    let tool = tool?;
+    let kind = kind.unwrap_or_else(|| match tool {
+        "cargo_test" => "test",
+        "cargo_fmt" => "format",
+        _ => "check",
+    });
+    if !is_terminal_job_status(status) {
+        return Some(json!({
+            "tool": tool,
+            "kind": kind,
+            "state": if status == "queued" || status == "agent_queued" { "pending" } else { "running" },
+        }));
+    }
+    if matches!(
+        status,
+        "timeout" | "timed_out" | "stopped" | "cancelled" | "lost"
+    ) {
+        let evidence = structured_validation_evidence(tool, kind, stdout, stderr, true);
+        let mut value = json!({
+            "tool": tool,
+            "kind": kind,
+            "state": match status {
+                "timeout" | "timed_out" => "timed_out",
+                "stopped" | "cancelled" => "cancelled",
+                _ => "lost",
+            },
+            "passed": Value::Null,
+            "truncated": true,
+        });
+        if let Some(diagnostics) = evidence.diagnostics {
+            value["diagnostics"] = json!(diagnostics);
+        }
+        match kind {
+            "test" => {
+                value["tests_detected"] = json!(evidence.tests_detected);
+                value["tests_run_count"] = Value::Null;
+                value["tests_passed"] = Value::Null;
+                value["tests_failed"] = Value::Null;
+                value["zero_tests_run"] = Value::Null;
+            }
+            "check" => {
+                value["warnings_count"] = Value::Null;
+                value["errors_count"] = Value::Null;
+            }
+            _ => {}
+        }
+        return Some(value);
+    }
+    let passed = status == "completed" && exit_code == Some(0);
+    let evidence = structured_validation_evidence(tool, kind, stdout, stderr, truncated);
+    let mut value = json!({
+        "tool": tool,
+        "kind": kind,
+        "state": "completed",
+        "passed": passed,
+        "truncated": truncated,
+    });
+    if let Some(diagnostics) = evidence.diagnostics {
+        value["diagnostics"] = json!(diagnostics);
+    }
+    match kind {
+        "test" => {
+            value["tests_detected"] = json!(evidence.tests_detected);
+            value["tests_run_count"] = json!(evidence.tests_run_count);
+            value["tests_passed"] = json!(evidence.tests_passed);
+            value["tests_failed"] = json!(evidence.tests_failed);
+            value["zero_tests_run"] = json!(evidence.zero_tests_run);
+        }
+        "check" => {
+            value["warnings_count"] = json!(evidence.warnings_count);
+            value["errors_count"] = json!(evidence.errors_count);
+        }
+        _ => {}
+    }
+    Some(value)
+}
+
+fn local_validation_identity(meta: &Value) -> (Option<&str>, Option<&str>) {
+    (
+        meta.get("validation_tool").and_then(Value::as_str),
+        meta.get("validation_kind").and_then(Value::as_str),
+    )
 }
 
 fn is_lifecycle_active_status(status: &str) -> bool {
@@ -191,6 +342,17 @@ fn local_read_lines(
     tail_lines: Option<usize>,
 ) -> (String, usize, usize, bool) {
     record.read_log_lines(name, offset, tail_lines)
+}
+
+fn agent_log_stream_incomplete(
+    runner_truncated: bool,
+    retained_from_line: Option<usize>,
+    returned_lines: usize,
+    next_line: usize,
+) -> bool {
+    runner_truncated
+        || retained_from_line.is_some_and(|line| line > 1)
+        || returned_lines < next_line.saturating_sub(1)
 }
 
 /// Build a bounded job summary `Value` for an agent-known job. Never includes
@@ -304,6 +466,20 @@ pub(crate) fn local_job_status(
         "kind": meta.get("kind").cloned().unwrap_or_else(|| Value::String("shell".to_string())),
         "command_preview_included": include_command_preview,
     });
+    let (validation_tool, validation_kind) = local_validation_identity(&meta);
+    let stdout = local_read_lines(record, "stdout.log", None, Some(MAX_LOCAL_LOG_LINES));
+    let stderr = local_read_lines(record, "stderr.log", None, Some(MAX_LOCAL_LOG_LINES));
+    if let Some(validation) = validation_job_projection(
+        validation_tool,
+        validation_kind,
+        &status,
+        exit_code.map(i64::from),
+        &stdout.0,
+        &stderr.0,
+        stdout.3 || stderr.3,
+    ) {
+        output["validation"] = validation;
+    }
     add_job_lifecycle_fields(&mut output, &status, None, None);
     if let Some(note) = timeout_note {
         output["note"] = Value::String(note);
@@ -349,6 +525,16 @@ pub(crate) fn local_job_log(
         &stdout.0,
         &stderr.0,
     );
+    let (validation_tool, validation_kind) = local_validation_identity(&meta);
+    let validation = validation_job_projection(
+        validation_tool,
+        validation_kind,
+        &status,
+        exit_code.map(i64::from),
+        &stdout.0,
+        &stderr.0,
+        stdout.3 || stderr.3,
+    );
     let mut output = json!({
         "job_id": job_id,
         "status": status,
@@ -369,6 +555,7 @@ pub(crate) fn local_job_log(
         "purpose": purpose,
         "command_summary": command_summary,
         "detected_summary": detected_summary,
+        "validation": validation,
     });
     if let Some(note) = timeout_note {
         output["note"] = Value::String(note);
@@ -970,6 +1157,8 @@ impl ToolRuntime {
                         purpose: Some(declared_purpose.as_str().to_string()),
                         shell: Some(actual_shell.to_string()),
                         validation_steps,
+                        validation: None,
+                        visibility: crate::shell_client::ShellJobVisibility::Public,
                         sandbox,
                     },
                     auth,
@@ -1171,7 +1360,7 @@ impl ToolRuntime {
     ) -> ToolResult {
         let killer = self.job_killer.as_ref();
         if let Some(record) = self.local_jobs.lock().await.get(&job_id).cloned() {
-            if !local_jobs_visible_to_auth(auth) {
+            if !record.is_public() || !local_jobs_visible_to_auth(auth) {
                 return ToolResult::err(format!("unknown job: {}", job_id));
             }
             return local_job_status(&job_id, &record, killer, include_command_preview);
@@ -1227,7 +1416,46 @@ impl ToolRuntime {
                     job.recovery_reason_code.as_deref(),
                 );
                 if include_command_preview {
-                    add_command_preview_metadata(&mut output, job.command_preview);
+                    add_command_preview_metadata(&mut output, job.command_preview.clone());
+                }
+                let validation_metadata = job.validation.as_ref();
+                let tool = validation_metadata.map(|metadata| metadata.tool.as_str());
+                let kind = validation_metadata.map(|metadata| metadata.kind.as_str());
+                if tool.is_some() {
+                    let logs = self
+                        .shell_clients
+                        .job_log_for_auth(auth, &job_id, None, None, Some(500))
+                        .await;
+                    let (stdout, stderr, truncated) = match logs {
+                        Ok((logged_job, stdout, stderr, next_stdout_line, next_stderr_line)) => {
+                            let stdout = stdout.unwrap_or_default();
+                            let stderr = stderr.unwrap_or_default();
+                            let truncated = agent_log_stream_incomplete(
+                                logged_job.stdout_log_truncated,
+                                logged_job.stdout_retained_from_line,
+                                stdout.lines().count(),
+                                next_stdout_line,
+                            ) || agent_log_stream_incomplete(
+                                logged_job.stderr_log_truncated,
+                                logged_job.stderr_retained_from_line,
+                                stderr.lines().count(),
+                                next_stderr_line,
+                            );
+                            (stdout, stderr, truncated)
+                        }
+                        Err(_) => (String::new(), String::new(), true),
+                    };
+                    if let Some(validation) = validation_job_projection(
+                        tool,
+                        kind,
+                        &status,
+                        job.exit_code.map(i64::from),
+                        &stdout,
+                        &stderr,
+                        truncated,
+                    ) {
+                        output["validation"] = validation;
+                    }
                 }
                 ToolResult::ok(output)
             }
@@ -1260,7 +1488,7 @@ impl ToolRuntime {
         };
         let killer = self.job_killer.as_ref();
         if let Some(record) = self.local_jobs.lock().await.get(&job_id).cloned() {
-            if !local_jobs_visible_to_auth(auth) {
+            if !record.is_public() || !local_jobs_visible_to_auth(auth) {
                 return ToolResult::err(format!("unknown job: {}", job_id));
             }
             return local_job_log(&job_id, &record, killer, offset, tail_lines);
@@ -1299,6 +1527,35 @@ impl ToolRuntime {
                     &stdout,
                     &stderr,
                 );
+                let validation_tool = job
+                    .validation
+                    .as_ref()
+                    .map(|metadata| metadata.tool.as_str());
+                let validation_kind = job
+                    .validation
+                    .as_ref()
+                    .map(|metadata| metadata.kind.as_str());
+                let stdout_incomplete = agent_log_stream_incomplete(
+                    job.stdout_log_truncated,
+                    job.stdout_retained_from_line,
+                    stdout_lines,
+                    next_stdout_line,
+                );
+                let stderr_incomplete = agent_log_stream_incomplete(
+                    job.stderr_log_truncated,
+                    job.stderr_retained_from_line,
+                    stderr_lines,
+                    next_stderr_line,
+                );
+                let validation = validation_job_projection(
+                    validation_tool,
+                    validation_kind,
+                    &job.status,
+                    job.exit_code.map(i64::from),
+                    &stdout,
+                    &stderr,
+                    stdout_incomplete || stderr_incomplete,
+                );
                 ToolResult::ok(json!({
                     "job_id": job.job_id,
                     "status": job.status,
@@ -1309,8 +1566,8 @@ impl ToolRuntime {
                     "stderr_lines": next_stderr_line.saturating_sub(1),
                     "stdout_returned_lines": stdout_lines,
                     "stderr_returned_lines": stderr_lines,
-                    "stdout_truncated": stdout_lines < next_stdout_line.saturating_sub(1),
-                    "stderr_truncated": stderr_lines < next_stderr_line.saturating_sub(1),
+                    "stdout_truncated": stdout_incomplete,
+                    "stderr_truncated": stderr_incomplete,
                     "stdout_retained_from_line": job.stdout_retained_from_line,
                     "stderr_retained_from_line": job.stderr_retained_from_line,
                     "earlier_stdout_unavailable": job
@@ -1340,6 +1597,7 @@ impl ToolRuntime {
                     "purpose": purpose,
                     "command_summary": command_summary,
                     "detected_summary": detected_summary,
+                    "validation": validation,
                 }))
             }
             Err(_) => ToolResult::err(format!("unknown job: {}", job_id)),
@@ -1385,6 +1643,7 @@ impl ToolRuntime {
             let local_jobs_map = self.local_jobs.lock().await;
             local_jobs_map
                 .iter()
+                .filter(|(_, record)| record.is_public())
                 .map(|(job_id, record)| (job_id.clone(), record.clone()))
                 .collect()
         } else {
@@ -1453,7 +1712,7 @@ impl ToolRuntime {
             Some(record) => Some(record),
             None => self.recover_local_job(&job_id).await,
         } {
-            if !local_jobs_visible_to_auth(auth) {
+            if !record.is_public() || !local_jobs_visible_to_auth(auth) {
                 return job_not_found_result(&project, &job_id);
             }
             let request_project = self
@@ -1776,7 +2035,7 @@ impl ToolRuntime {
 
 #[cfg(test)]
 mod recovery_projection_tests {
-    use super::recovery_reason_text;
+    use super::{recovery_reason_text, validation_job_projection};
     use serde_json::json;
 
     #[test]
@@ -1859,6 +2118,109 @@ mod recovery_projection_tests {
     }
 
     #[test]
+    fn validation_projection_reports_terminal_cargo_test_counts_and_diagnostics() {
+        let success = validation_job_projection(
+            Some("cargo_test"),
+            Some("test"),
+            "completed",
+            Some(0),
+            "running 3 tests\n\ntest result: ok. 3 passed; 0 failed; 0 ignored\n",
+            "",
+            false,
+        )
+        .unwrap();
+        assert_eq!(success["passed"], true);
+        assert_eq!(success["tests_detected"], true);
+        assert_eq!(success["tests_run_count"], 3);
+        assert_eq!(success["tests_passed"], 3);
+        assert_eq!(success["tests_failed"], 0);
+        assert_eq!(success["diagnostics"]["truncated"], false);
+
+        let compile_error = validation_job_projection(
+            Some("cargo_test"),
+            Some("test"),
+            "failed",
+            Some(101),
+            "",
+            "error[E0308]: mismatched types\n --> src/lib.rs:1:1\n",
+            false,
+        )
+        .unwrap();
+        assert_eq!(compile_error["passed"], false);
+        assert_eq!(compile_error["tests_detected"], false);
+        assert!(compile_error["tests_run_count"].is_null());
+        assert_eq!(compile_error["diagnostics"]["available"], true);
+    }
+
+    #[test]
+    fn validation_projection_reports_check_counts_and_never_fakes_truncated_counts() {
+        let complete = validation_job_projection(
+            Some("cargo_check"),
+            Some("check"),
+            "failed",
+            Some(101),
+            "",
+            "warning: unused import\nerror[E0308]: mismatched types\n",
+            false,
+        )
+        .unwrap();
+        assert_eq!(complete["warnings_count"], 1);
+        assert_eq!(complete["errors_count"], 1);
+
+        let truncated = validation_job_projection(
+            Some("cargo_check"),
+            Some("check"),
+            "failed",
+            Some(101),
+            "",
+            "error[E0308]: mismatched types\n",
+            true,
+        )
+        .unwrap();
+        assert!(truncated["warnings_count"].is_null());
+        assert!(truncated["errors_count"].is_null());
+        assert_eq!(truncated["diagnostics"]["truncated"], true);
+    }
+
+    #[test]
+    fn validation_projection_keeps_lifecycle_terminals_distinct_from_validation_failure() {
+        let fmt = validation_job_projection(
+            Some("cargo_fmt"),
+            Some("format"),
+            "failed",
+            Some(1),
+            "Diff in src/lib.rs\n",
+            "",
+            false,
+        )
+        .unwrap();
+        assert_eq!(fmt["passed"], false);
+        assert!(fmt.get("diagnostics").is_none());
+
+        for (status, state) in [
+            ("timeout", "timed_out"),
+            ("stopped", "cancelled"),
+            ("lost", "lost"),
+        ] {
+            let value = validation_job_projection(
+                Some("cargo_test"),
+                Some("test"),
+                status,
+                None,
+                "running 1 test\n",
+                "",
+                false,
+            )
+            .unwrap();
+            assert_eq!(value["state"], state);
+            assert!(value["passed"].is_null());
+            assert!(value["tests_run_count"].is_null());
+            assert!(value["tests_passed"].is_null());
+            assert!(value["tests_failed"].is_null());
+        }
+    }
+
+    #[test]
     fn agent_job_summary_includes_recovery_reason() {
         use crate::shell_protocol::ShellJobInfo;
         let job = ShellJobInfo {
@@ -1885,6 +2247,7 @@ mod recovery_projection_tests {
             codex: None,
             result: None,
             validation_progress: None,
+            validation: None,
             recovery_state: Some("lost_after_reconcile".to_string()),
             recovered_after_server_restart: true,
             reconciled_at: Some(3),

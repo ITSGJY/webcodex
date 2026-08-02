@@ -230,12 +230,13 @@ pub(crate) const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
     ToolRecommendedFlow {
         name: "validate",
         summary:
-            "Validate: use cargo_check / cargo_test / validate_patch when applicable. raw run_shell is a bounded escape hatch, not the primary editing or validation path.",
+            "Validate: use cargo_check / cargo_test / validate_patch. A long validation continues as a Job — poll job_status / validation_summary instead of re-running. raw run_shell is a bounded escape hatch, not the primary editing or validation path.",
         manifest_purpose:
-            "Use structured validation; run_shell is a bounded diagnostics escape hatch, not the primary validation path.",
+            "Use structured validation; a long check/test continues as a queryable Job instead of blocking or re-running. run_shell is a bounded diagnostics escape hatch, not the primary validation path.",
         tools: &[
             "cargo_check",
             "cargo_test",
+            "job_status",
             "validation_summary",
             "validate_patch",
             "run_shell",

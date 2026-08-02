@@ -263,7 +263,25 @@ identity。recipe 永远不会新增 MCP tool；MCP、OpenAPI 与 capability reg
 同一份 capability 清单。finish 时会排除 untracked interpreter/test cache、coverage
 output 和 `node_modules` 并返回 bounded warning；tracked 路径始终保留。
 
-review 后由人类在 host 上接受或拒绝：
+### 长时间结构化验证自动继续为 Job
+
+`cargo_check`、`cargo_test` 与 `cargo_fmt(check=true)` 只运行命令一次。
+`timeout_secs` 是命令的总运行预算（1..=3600；默认值：check 600、test 1800、
+fmt check 120），与工具调用自身阻塞多久无关。短验证在进程内直接完成并返回
+既有的终端结果；长验证（预算超过内部同步等待窗口）把同一次执行提升为可查询
+的 Job 并返回 `job_id`、`promoted_to_job=true`、`execution_state=queued/running`
+与 `effective_timeout_secs`，且 handoff 时绝不报告 `failure_kind=timeout`。
+用 `job_status` / `job_log` 轮询，或读取 `validation_summary`——Job 的终端状态会
+汇入 summary；不要为了找结果而重跑命令。`cargo_fmt` 的 `check=false` 会修改源码，
+绝不自动提升。handoff/cancel 竞态是安全的：被 cancel 的 handoff 不会遗留孤儿进程，
+`stop_job(confirm=true)` 可以停止已提升的 Job。
+
+旧 Runner 兼容路径有明确边界。如果 Runner 具备基础 shell 执行，但不支持 async
+validation Job 和 structured validation argv：省略 `timeout_secs` 时只同步执行一次，
+有效预算为 120 秒，并报告 `async_handoff_available=false`；显式预算不超过 120 秒时
+同样同步执行一次；显式预算超过 120 秒时，会在命令启动前以
+`failure_kind=capability_unavailable` 拒绝，不会静默截短，也不会再次启动命令。
+升级 Runner 后才能恢复长验证 Job handoff。
 
 ```bash
 webcodex task show <task-id>

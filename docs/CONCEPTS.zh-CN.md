@@ -128,6 +128,11 @@ validation 是变更已被检查的证据。WebCodex 提供 `validate_patch`、`
 
 应选择与变更匹配的验证。docs-only edit 可能只需要 WebCodex 外部的 `git diff --check` 或定向 review；Rust 行为变更应运行 Cargo check 或 tests。
 
+`cargo_check`、`cargo_test` 与 `cargo_fmt(check=true)` 只运行命令一次，
+`timeout_secs` 是总运行预算（1..=3600）。短验证立即返回；长验证继续为可查询的
+Job 并返回 `job_id`——轮询 `job_status` / `validation_summary`，不要重跑命令。
+`cargo_fmt(check=false)` 会修改源码，绝不自动提升。
+
 ### Review / Hygiene
 
 review tools 在用户接受结果前展示变更。`show_changes` 用于查看文件列表、状态、diff stat 和可选有界 hunks。`workspace_hygiene_check` 用于发现 untracked smoke files、临时文件、blocking jobs 和其他收口风险。

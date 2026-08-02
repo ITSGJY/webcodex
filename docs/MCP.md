@@ -308,7 +308,30 @@ OpenAPI, and the capability registry all share one capability list.
 At finish, untracked interpreter/test caches, coverage output, and
 `node_modules` are omitted with bounded warnings; tracked paths are retained.
 
-After review, the human accepts or rejects on the host:
+### Long structured validation continues as a Job
+
+`cargo_check`, `cargo_test`, and `cargo_fmt(check=true)` run the command exactly
+once. `timeout_secs` is the total runtime budget of the command (1..=3600;
+defaults: check 600, test 1800, fmt check 120), independent of how long the tool
+call blocks. A short validation finishes in-process and returns the existing
+terminal result. A long one (budget above the internal sync wait) promotes the
+same single execution to a queryable Job and returns `job_id`,
+`promoted_to_job=true`, `execution_state=queued/running`, and
+`effective_timeout_secs` without ever reporting `failure_kind=timeout` at
+handoff. Poll `job_status` / `job_log`, or read `validation_summary` — the Job's
+terminal state feeds the summary; do not re-run the command to find the answer.
+`cargo_fmt` with `check=false` mutates source and never auto-promotes.
+Handoff/cancel races are safe: a cancelled handoff never orphans a process, and
+`stop_job(confirm=true)` stops a promoted job.
+
+Compatibility with an older Runner is intentionally bounded. If the Runner has
+basic shell execution but lacks both async validation Jobs and structured
+validation argv, an omitted `timeout_secs` uses one legacy synchronous execution
+with an effective 120-second budget and reports `async_handoff_available=false`.
+An explicit budget up to 120 seconds also runs synchronously. An explicit budget
+above 120 seconds is rejected before command start with
+`failure_kind=capability_unavailable`; it is never silently shortened and never
+starts a second execution. Upgrade the Runner to regain long Job handoff.
 
 ```bash
 webcodex task show <task-id>

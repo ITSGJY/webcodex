@@ -159,6 +159,7 @@ fn test_job_snapshot(job_id: &str) -> ShellJobSnapshot {
             shell: Some("configured".to_string()),
             command_preview: "test job".to_string(),
             validation_steps: Vec::new(),
+            validation: None,
         },
         stdout: ShellJobStreamSnapshot::default(),
         stderr: ShellJobStreamSnapshot::default(),
@@ -178,6 +179,7 @@ fn test_job_context(cwd: &Path, validation_steps: Vec<String>) -> shell_protocol
         shell: Some("configured".to_string()),
         command_preview: "test command".to_string(),
         validation_steps,
+        validation: None,
     }
 }
 
@@ -2116,6 +2118,18 @@ fn validate_runner_job_context(
             .any(|step| !matches!(step.as_str(), "format" | "check" | "test"))
     {
         return Err("job recovery context validation_steps are invalid".to_string());
+    }
+    if context.validation.as_ref().is_some_and(|metadata| {
+        !validation_context
+            || !metadata.is_valid()
+            || metadata
+                .steps
+                .iter()
+                .map(|step| step.name.clone())
+                .collect::<Vec<_>>()
+                != context.validation_steps
+    }) {
+        return Err("job recovery context validation metadata is invalid".to_string());
     }
     if let Some(project_id) = context.runtime_project_id.as_deref() {
         let prefix = format!("agent:{client_id}:");

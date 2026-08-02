@@ -2,6 +2,7 @@ use super::job_updates::ShellJobStartMetadata;
 use super::reconciliation::{
     recovery_timeout_sweep, validate_job_inventory, RECOVERY_SWEEP_PASS_CAP,
 };
+use super::state::ShellJobVisibility;
 use super::{
     clamp_grace, job_recovery_grace_secs, now_ts, ShellClientRegistry, JOB_RECOVERY_GRACE_SECS,
     MAX_OUTPUT_BYTES,
@@ -728,6 +729,7 @@ fn standalone_snapshot(job_id: &str, status: &str) -> ShellJobSnapshot {
             shell: Some("bash".to_string()),
             command_preview: "safe preview".to_string(),
             validation_steps: Vec::new(),
+            validation: None,
         },
         stdout: ShellJobStreamSnapshot::default(),
         stderr: ShellJobStreamSnapshot::default(),
@@ -1039,6 +1041,46 @@ async fn recovery_sweep_transitions_expired_recovering_job_to_lost() {
         Some("runner_recovery_deadline_exceeded")
     );
     assert!(lost.ended_at.is_some(), "expired job records ended_at");
+}
+
+#[tokio::test]
+async fn cleanup_pending_recovering_job_stays_tracked_until_lost_then_is_removed() {
+    let registry = ShellClientRegistry::default();
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let (job, _) = start_and_take_over(&registry, INSTANCE_A).await;
+    drive_into_recovering(&registry, &job.job_id, INSTANCE_A).await;
+    {
+        let mut inner = registry.inner.lock().await;
+        inner
+            .jobs_by_id
+            .get_mut(&job.job_id)
+            .expect("job exists")
+            .visibility = ShellJobVisibility::HiddenUntilHandoff;
+    }
+
+    assert!(!registry
+        .cancel_hidden_job_for_auth(None, &job.job_id)
+        .await
+        .unwrap());
+    {
+        let inner = registry.inner.lock().await;
+        let retained = inner.jobs_by_id.get(&job.job_id).expect("job retained");
+        assert_eq!(retained.status, "recovering");
+        assert_eq!(retained.visibility, ShellJobVisibility::CleanupPending);
+    }
+    assert!(registry.get_job(&job.job_id).await.is_err());
+
+    age_recovering_since(&registry, &job.job_id, job_recovery_grace_secs() + 1).await;
+    recovery_timeout_sweep(&registry).await;
+    assert!(
+        !registry
+            .inner
+            .lock()
+            .await
+            .jobs_by_id
+            .contains_key(&job.job_id),
+        "cleanup-pending record must only disappear after the lost terminal transition"
+    );
 }
 
 #[tokio::test]

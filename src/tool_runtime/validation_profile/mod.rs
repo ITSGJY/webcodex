@@ -10,7 +10,7 @@ use super::validation_parser::ValidationDiagnostics;
 
 pub(crate) use recipe::{resolve_validation_recipe, RecipeError, RecipeId, SemanticCheck};
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ValidationCommandOptions {
     pub(crate) check: bool,
     pub(crate) filter: Option<String>,

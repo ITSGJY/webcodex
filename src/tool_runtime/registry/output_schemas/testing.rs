@@ -1,19 +1,22 @@
 use serde_json::{json, Value};
 
-use super::common::{nullable_schema, schema_type, wrapped_output_schema};
+use super::common::{
+    nullable_schema, permission_decision_schema, schema_type, session_hint_schema,
+};
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
-        "cargo_fmt" | "cargo_check" => Some(cargo_output_schema(false)),
-        "cargo_test" => Some(cargo_output_schema(true)),
+        "cargo_fmt" | "cargo_check" | "cargo_test" => Some(cargo_output_schema(name)),
         _ => None,
     }
 }
 
-fn cargo_output_schema(include_zero_tests_metadata: bool) -> Value {
+fn cargo_output_schema(tool_name: &str) -> Value {
     let mut fields = vec![
             ("project", schema_type("string", "Runtime project id.")),
-            ("command", schema_type("string", "Cargo command executed.")),
+            ("command_summary", schema_type("string", "Bounded Cargo command summary.")),
+            ("shell", schema_type("string", "Executor command mode.")),
+            ("executor", schema_type("string", "local or agent executor.")),
             (
                 "cwd",
                 schema_type("string", "Project-relative working directory."),
@@ -24,10 +27,12 @@ fn cargo_output_schema(include_zero_tests_metadata: bool) -> Value {
             ),
             (
                 "duration_ms",
-                schema_type("integer", "Command duration in milliseconds."),
+                nullable_schema("integer", "Command duration in milliseconds."),
             ),
             ("stdout_tail", schema_type("string", "Bounded stdout tail.")),
             ("stderr_tail", schema_type("string", "Bounded stderr tail.")),
+            ("stdout_lines", schema_type("integer", "Observed stdout line count.")),
+            ("stderr_lines", schema_type("integer", "Observed stderr line count.")),
             (
                 "stdout_truncated",
                 schema_type("boolean", "Whether stdout was truncated."),
@@ -38,7 +43,7 @@ fn cargo_output_schema(include_zero_tests_metadata: bool) -> Value {
             ),
             (
                 "passed",
-                schema_type("boolean", "Whether exit_code was zero."),
+                nullable_schema("boolean", "Whether exit_code was zero. Absent when the command is still running after promotion to a Job."),
             ),
             (
                 "command_started",
@@ -46,7 +51,7 @@ fn cargo_output_schema(include_zero_tests_metadata: bool) -> Value {
             ),
             (
                 "command_completed",
-                schema_type("boolean", "Whether the command reached a terminal executor result."),
+                schema_type("boolean", "Whether the command reached a terminal executor result. False when the validation continues as a Job."),
             ),
             (
                 "failure_kind",
@@ -71,8 +76,60 @@ fn cargo_output_schema(include_zero_tests_metadata: bool) -> Value {
                 "tests_failed",
                 nullable_schema("integer", "Parsed failed test count for cargo_test."),
             ),
+            (
+                "execution_source",
+                schema_type("string", "Structured validation tool that owns this execution."),
+            ),
+            (
+                "purpose",
+                schema_type("string", "Declared execution purpose (test, format, or validation)."),
+            ),
+            (
+                "execution_state",
+                schema_type("string", "completed, timed_out, queued, or running. queued/running indicate the validation was promoted to a Job."),
+            ),
+            (
+                "job_id",
+                nullable_schema("string", "Runtime job id when the validation continues as a Job."),
+            ),
+            (
+                "job_status",
+                nullable_schema("string", "Job status when the validation continues as a Job."),
+            ),
+            (
+                "promoted_to_job",
+                schema_type("boolean", "True only when the validation was promoted to a Job and the same command continues running."),
+            ),
+            (
+                "effective_timeout_secs",
+                schema_type("integer", "Effective total runtime budget of the command in seconds."),
+            ),
+            (
+                "sync_wait_secs",
+                schema_type("integer", "Internal synchronous wait window before promotion, in seconds."),
+            ),
+            (
+                "terminal",
+                schema_type("boolean", "True when the validation reached a terminal result."),
+            ),
+            ("command_ok", schema_type("boolean", "Whether execution completed successfully.")),
+            ("tool_failure", schema_type("boolean", "Whether rejection happened before execution.")),
+            ("async_handoff_available", schema_type("boolean", "Whether this Runner supports validation Job handoff.")),
+            ("session_recorded", schema_type("boolean", "Whether the call was recorded in a Workflow Session.")),
+            ("session_id", schema_type("string", "Workflow Session id.")),
+            ("session_event_id", schema_type("string", "Workflow Session event id.")),
+            ("session_hint", session_hint_schema()),
+            ("permission", permission_decision_schema()),
     ];
-    if include_zero_tests_metadata {
+    if matches!(tool_name, "cargo_check" | "cargo_test") {
+        fields.push((
+            "diagnostics",
+            cargo_test_diagnostics_schema(
+                "Deterministic structured validation evidence extracted from bounded Cargo output.",
+            ),
+        ));
+    }
+    if tool_name == "cargo_test" {
         fields.extend([
             (
                 "tests_detected",
@@ -95,15 +152,203 @@ fn cargo_output_schema(include_zero_tests_metadata: bool) -> Value {
                     "True when cargo_test parsed test harness sections and their summed tests_run_count is zero.",
                 ),
             ),
-            (
-                "diagnostics",
-                cargo_test_diagnostics_schema(
-                    "Structured validation parser v3 evidence extracted deterministically from bounded cargo_test stdout/stderr metadata. Includes at most 20 diagnostics, failed_test_details, test_summary counts, and explicit omission/truncation metadata. Never includes panic bodies, assertion values, backtraces, source bodies, absolute paths, tokens, secrets, root-cause inference, or fix recommendations.",
-                ),
-            ),
         ]);
     }
-    wrapped_output_schema(fields)
+    let properties = fields
+        .into_iter()
+        .map(|(name, schema)| (name.to_string(), schema))
+        .collect::<serde_json::Map<_, _>>();
+    let mut terminal_required = vec![
+        "project",
+        "command_summary",
+        "cwd",
+        "shell",
+        "executor",
+        "execution_source",
+        "purpose",
+        "execution_state",
+        "exit_code",
+        "duration_ms",
+        "stdout_tail",
+        "stderr_tail",
+        "stdout_lines",
+        "stderr_lines",
+        "stdout_truncated",
+        "stderr_truncated",
+        "promoted_to_job",
+        "terminal",
+        "command_started",
+        "command_completed",
+        "passed",
+        "effective_timeout_secs",
+        "sync_wait_secs",
+    ];
+    match tool_name {
+        "cargo_check" => {
+            terminal_required.extend(["warnings_count", "errors_count", "diagnostics"])
+        }
+        "cargo_test" => terminal_required.extend([
+            "tests_detected",
+            "tests_run_count",
+            "tests_passed",
+            "tests_failed",
+            "zero_tests_run",
+            "diagnostics",
+        ]),
+        _ => {}
+    }
+    let terminal_required = terminal_required
+        .into_iter()
+        .map(Value::from)
+        .collect::<Vec<_>>();
+    let mut terminal_failure_required = terminal_required.clone();
+    terminal_failure_required.push(Value::from("failure_kind"));
+    let output = json!({
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": false
+    });
+    json!({
+        "type": "object",
+        "properties": {
+            "success": { "type": "boolean" },
+            "output": output.clone(),
+            "error": { "anyOf": [{"type": "string"}, {"type": "null"}] }
+        },
+        "required": ["success"],
+        "allOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "success": { "type": "boolean" },
+                    "output": output,
+                    "error": { "anyOf": [{"type": "string"}, {"type": "null"}] }
+                },
+                "required": ["success", "output"],
+                "additionalProperties": false
+            },
+            {
+                "oneOf": [
+            {
+                "properties": {
+                    "success": {"const": true},
+                    "error": {"type": "null"},
+                    "output": {
+                        "required": [
+                            "project", "command_summary", "cwd", "shell", "executor",
+                            "execution_source", "purpose", "promoted_to_job", "terminal",
+                            "command_started", "command_completed", "execution_state", "job_id",
+                            "job_status", "effective_timeout_secs", "sync_wait_secs",
+                            "stdout_tail", "stderr_tail", "stdout_lines", "stderr_lines",
+                            "stdout_truncated", "stderr_truncated"
+                        ],
+                        "properties": {
+                            "promoted_to_job": {"const": true},
+                            "terminal": {"const": false},
+                            "command_completed": {"const": false},
+                            "execution_state": {"enum": ["queued", "running"]},
+                            "job_id": {"type": "string", "minLength": 1},
+                            "job_status": {"type": "string", "minLength": 1},
+                            "passed": {"enum": []},
+                            "failure_kind": {"enum": []},
+                            "warnings_count": {"enum": []},
+                            "errors_count": {"enum": []},
+                            "tests_detected": {"enum": []},
+                            "tests_run_count": {"enum": []},
+                            "tests_passed": {"enum": []},
+                            "tests_failed": {"enum": []},
+                            "zero_tests_run": {"enum": []},
+                            "diagnostics": {"enum": []}
+                        }
+                    }
+                }
+            },
+            {
+                "properties": {
+                    "success": {"const": true},
+                    "error": {"type": "null"},
+                    "output": {
+                        "required": terminal_required.clone(),
+                        "properties": {
+                            "promoted_to_job": {"const": false},
+                            "terminal": {"const": true},
+                            "command_started": {"const": true},
+                            "command_completed": {"const": true},
+                            "execution_state": {"const": "completed"},
+                            "passed": {"const": true},
+                            "failure_kind": {"enum": []},
+                            "job_id": {"enum": []},
+                            "job_status": {"enum": []}
+                        }
+                    }
+                }
+            },
+            {
+                "required": ["error"],
+                "properties": {
+                    "success": {"const": false},
+                    "error": {"type": "string", "minLength": 1},
+                    "output": {
+                        "required": terminal_failure_required.clone(),
+                        "properties": {
+                            "promoted_to_job": {"const": false},
+                            "terminal": {"const": true},
+                            "command_started": {"const": true},
+                            "command_completed": {"const": true},
+                            "execution_state": {"const": "timed_out"},
+                            "passed": {"const": false},
+                            "failure_kind": {"const": "timeout"},
+                            "job_id": {"enum": []},
+                            "job_status": {"enum": []}
+                        }
+                    }
+                }
+            },
+            {
+                "required": ["error"],
+                "properties": {
+                    "success": {"const": false},
+                    "error": {"type": "string", "minLength": 1},
+                    "output": {
+                        "required": terminal_failure_required,
+                        "properties": {
+                            "promoted_to_job": {"const": false},
+                            "terminal": {"const": true},
+                            "command_started": {"const": true},
+                            "command_completed": {"const": true},
+                            "execution_state": {"const": "completed"},
+                            "passed": {"const": false},
+                            "failure_kind": {"enum": ["validation_failed", "process_exit"]},
+                            "job_id": {"enum": []},
+                            "job_status": {"enum": []}
+                        }
+                    }
+                }
+            },
+            {
+                "required": ["error"],
+                "properties": {
+                    "success": {"const": false},
+                    "error": {"type": "string", "minLength": 1},
+                    "output": {
+                        "required": ["execution_source", "command_started", "command_completed", "failure_kind"],
+                        "properties": {
+                            "command_started": {"const": false},
+                            "command_completed": {"const": false},
+                            "failure_kind": {"enum": ["invalid_arguments", "capability_unavailable", "permission_denied", "project_not_found", "cwd_invalid", "sandbox_unavailable", "executor_unavailable"]},
+                            "job_id": {"enum": []},
+                            "job_status": {"enum": []},
+                            "passed": {"enum": []},
+                            "promoted_to_job": {"enum": []},
+                            "terminal": {"enum": []}
+                        }
+                    }
+                }
+            }
+                ]
+            }
+        ]
+    })
 }
 
 fn cargo_test_diagnostics_schema(description: &str) -> Value {

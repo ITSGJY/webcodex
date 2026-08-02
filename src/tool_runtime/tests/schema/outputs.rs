@@ -125,12 +125,7 @@ fn key_tool_output_schemas_include_expected_fields() {
             "{name} failure_kind description should mention validation_failed: {description}"
         );
     }
-    for field in [
-        "tests_detected",
-        "tests_run_count",
-        "zero_tests_run",
-        "diagnostics",
-    ] {
+    for field in ["tests_detected", "tests_run_count", "zero_tests_run"] {
         assert!(
             has_output_field("cargo_test", field),
             "cargo_test missing {field}"
@@ -144,6 +139,9 @@ fn key_tool_output_schemas_include_expected_fields() {
             "cargo_check should not expose cargo_test zero-tests metadata field {field}"
         );
     }
+    assert!(has_output_field("cargo_test", "diagnostics"));
+    assert!(has_output_field("cargo_check", "diagnostics"));
+    assert!(!has_output_field("cargo_fmt", "diagnostics"));
     let diagnostics_schema = output_schema_property(&specs, "cargo_test", "diagnostics");
     assert_eq!(diagnostics_schema["type"], "object");
     let diagnostics_props = diagnostics_schema["properties"]

@@ -8,12 +8,13 @@ use super::requests::{
     enqueue_pending_request_locked, next_request_id, notify_client_locked,
     remove_pending_request_locked,
 };
-use super::state::ShellJobRecord;
+use super::state::{ShellJobRecord, ShellJobVisibility};
 use super::validation::{validate_agent_instance_id, validate_id, validate_run_request};
 use super::{now_ts, ShellClientRegistry};
 use crate::shell_protocol::{
     validation_infrastructure_failure_code, ShellAgentJobUpdateRequest, ShellAgentShellRequest,
-    ShellJobContext, ShellJobInfo, ShellJobOpRequest, ShellJobValidationStep, ShellRunRequest,
+    ShellJobContext, ShellJobInfo, ShellJobOpRequest, ShellJobValidationMetadata,
+    ShellJobValidationStep, ShellRunRequest,
 };
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -115,6 +116,8 @@ pub(crate) struct ShellJobStartMetadata {
     pub(crate) purpose: Option<String>,
     pub(crate) shell: Option<String>,
     pub(crate) validation_steps: Vec<ShellJobValidationStep>,
+    pub(crate) validation: Option<ShellJobValidationMetadata>,
+    pub(crate) visibility: ShellJobVisibility,
     pub(crate) sandbox: Option<String>,
 }
 
@@ -185,6 +188,7 @@ impl ShellClientRegistry {
         }
         let sandbox = metadata.sandbox;
         let validation_steps = metadata.validation_steps;
+        let validation = metadata.validation;
         if validation_steps.len() > 3
             || validation_steps.iter().any(|step| !step.is_canonical())
             || validation_steps
@@ -195,6 +199,12 @@ impl ShellClientRegistry {
                 != validation_steps.len()
         {
             return Err("invalid structured validation plan".to_string());
+        }
+        if validation
+            .as_ref()
+            .is_some_and(|metadata| !metadata.is_valid() || metadata.steps != validation_steps)
+        {
+            return Err("invalid structured validation metadata".to_string());
         }
         let request_kind = if validation_steps.is_empty() {
             "start_job"
@@ -227,6 +237,7 @@ impl ShellClientRegistry {
             shell: metadata.shell.clone(),
             command_preview: safe_command_preview.clone(),
             validation_steps: validation_step_names.clone(),
+            validation: validation.clone(),
         };
         let request = ShellAgentShellRequest {
             request_id: request_id.clone(),
@@ -334,8 +345,11 @@ impl ShellClientRegistry {
             error: None,
             codex: body.codex.clone(),
             validation_steps: validation_step_names,
+            validation,
             validation_progress: None,
             last_update_seq: 0,
+            visibility: metadata.visibility,
+
             recovery_state: None,
             recovered_after_server_restart: false,
             reconciled_at: None,
@@ -349,6 +363,243 @@ impl ShellClientRegistry {
         Ok(job_view(
             inner.jobs_by_id.get(&job_id).expect("job just inserted"),
         ))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hidden_job_ids_for_test(&self) -> Vec<String> {
+        let inner = self.inner.lock().await;
+        let mut ids = inner
+            .jobs_by_id
+            .values()
+            .filter(|job| job.visibility != ShellJobVisibility::Public)
+            .map(|job| job.job_id.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    pub(crate) async fn promote_hidden_job(&self, job_id: &str) -> Result<ShellJobInfo, String> {
+        let mut inner = self.inner.lock().await;
+        refresh_job_status_locked(&mut inner, job_id);
+        let job = inner
+            .jobs_by_id
+            .get_mut(job_id)
+            .ok_or_else(|| format!("unknown shell job: {job_id}"))?;
+        if job.visibility == ShellJobVisibility::CleanupPending {
+            return Err(format!("validation job cleanup is pending: {job_id}"));
+        }
+        // A terminal update may race the sync-wait deadline. Keep terminal
+        // records hidden so the original cargo call returns its structured
+        // terminal result instead of handing off an already-finished Job.
+        if !is_final_job_status(&job.status) {
+            job.visibility = ShellJobVisibility::Public;
+        }
+        Ok(job_view(job))
+    }
+
+    pub(crate) async fn get_hidden_job_for_auth(
+        &self,
+        auth: Option<&crate::auth::AuthContext>,
+        job_id: &str,
+    ) -> Result<ShellJobInfo, String> {
+        validate_id(job_id, "job_id")?;
+        let mut inner = self.inner.lock().await;
+        refresh_job_status_locked(&mut inner, job_id);
+        let job = inner
+            .jobs_by_id
+            .get(job_id)
+            .ok_or_else(|| format!("unknown shell job: {job_id}"))?;
+        if !shell_job_visible_to_auth(auth, &inner, &job.client_id) {
+            return Err(format!("unknown shell job: {job_id}"));
+        }
+        Ok(job_view(job))
+    }
+
+    pub(crate) async fn hidden_job_log_for_auth(
+        &self,
+        auth: Option<&crate::auth::AuthContext>,
+        job_id: &str,
+        tail_lines: Option<usize>,
+    ) -> Result<(ShellJobInfo, Option<String>, Option<String>, usize, usize), String> {
+        validate_id(job_id, "job_id")?;
+        let mut inner = self.inner.lock().await;
+        refresh_job_status_locked(&mut inner, job_id);
+        let job = inner
+            .jobs_by_id
+            .get(job_id)
+            .ok_or_else(|| format!("unknown shell job: {job_id}"))?;
+        if !shell_job_visible_to_auth(auth, &inner, &job.client_id) {
+            return Err(format!("unknown shell job: {job_id}"));
+        }
+        let (stdout, next_stdout_line, _, _) = select_log_lines(&job.stdout, None, tail_lines);
+        let (stderr, next_stderr_line, _, _) = select_log_lines(&job.stderr, None, tail_lines);
+        Ok((
+            job_view(job),
+            stdout,
+            stderr,
+            next_stdout_line,
+            next_stderr_line,
+        ))
+    }
+
+    /// Record validation cleanup synchronously. This is safe to call from a
+    /// future's Drop implementation and is deliberately separate from stop
+    /// delivery: the periodic registry lifecycle will retry any intent whose
+    /// immediate asynchronous processor is delayed or unavailable.
+    pub(crate) fn record_hidden_cleanup_intent(
+        &self,
+        job_id: String,
+        auth: Option<crate::auth::AuthContext>,
+    ) {
+        self.cleanup_intents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(job_id, auth);
+    }
+
+    pub(crate) async fn process_hidden_cleanup_intents(&self) {
+        let intents = {
+            let mut intents = self
+                .cleanup_intents
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *intents)
+        };
+        let mut retry = Vec::new();
+        for (job_id, auth) in intents {
+            match self
+                .cancel_hidden_job_for_auth(auth.as_ref(), &job_id)
+                .await
+            {
+                Ok(_) => {}
+                Err(error) if error.starts_with("unknown shell job:") => {}
+                Err(_) => retry.push((job_id, auth)),
+            }
+        }
+        if !retry.is_empty() {
+            let mut intents = self
+                .cleanup_intents
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            intents.extend(retry);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_hidden_cleanup_intent_for_test(&self, job_id: &str) -> bool {
+        self.cleanup_intents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(job_id)
+    }
+
+    pub(crate) async fn cancel_hidden_job_for_auth(
+        &self,
+        auth: Option<&crate::auth::AuthContext>,
+        job_id: &str,
+    ) -> Result<bool, String> {
+        validate_id(job_id, "job_id")?;
+        let mut inner = self.inner.lock().await;
+        refresh_job_status_locked(&mut inner, job_id);
+        let job = inner
+            .jobs_by_id
+            .get(job_id)
+            .cloned()
+            .ok_or_else(|| format!("unknown shell job: {job_id}"))?;
+        if job.visibility == ShellJobVisibility::Public
+            || !shell_job_visible_to_auth(auth, &inner, &job.client_id)
+        {
+            return Err(format!("unknown shell job: {job_id}"));
+        }
+        if job.status == "queued" {
+            if let Some(request_id) = job.request_id.as_deref() {
+                remove_pending_request_locked(&mut inner, request_id);
+                inner.request_to_job.remove(request_id);
+            }
+            inner.jobs_by_id.remove(job_id);
+            return Ok(true);
+        }
+        if is_final_job_status(&job.status) {
+            inner.jobs_by_id.remove(job_id);
+            return Ok(true);
+        }
+        inner
+            .jobs_by_id
+            .get_mut(job_id)
+            .expect("job exists")
+            .visibility = ShellJobVisibility::CleanupPending;
+        if matches!(
+            job.status.as_str(),
+            "agent_queued" | "running" | "stop_requested"
+        ) {
+            if job.status != "stop_requested" {
+                let stop_request_id = next_request_id();
+                let request = ShellAgentShellRequest {
+                    request_id: stop_request_id.clone(),
+                    client_id: job.client_id.clone(),
+                    kind: "stop_job".to_string(),
+                    job_id: Some(job_id.to_string()),
+                    cwd: None,
+                    path: None,
+                    content: None,
+                    max_bytes: None,
+                    old_text: None,
+                    pattern: None,
+                    expected_sha256: None,
+                    expected_prefix: None,
+                    start_line: None,
+                    end_line: None,
+                    line: None,
+                    create_dirs: false,
+                    command: String::new(),
+                    stdin: None,
+                    timeout_secs: 1,
+                    requested_by: "tool_runtime_cleanup".to_string(),
+                    created_at: now_ts(),
+                    validation: None,
+                    lsp: None,
+                    sandbox: None,
+                    job_context: None,
+                    persistent_shell: None,
+                };
+                enqueue_pending_request_locked(
+                    &mut inner,
+                    &job.client_id,
+                    stop_request_id,
+                    request,
+                    None,
+                    Some(job_id.to_string()),
+                )?;
+                let record = inner.jobs_by_id.get_mut(job_id).expect("job exists");
+                record.status = "stop_requested".to_string();
+                record.error = Some("internal validation cleanup requested".to_string());
+                notify_client_locked(&inner, &job.client_id);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Remove a job record entirely (agent-backed). Used by the structured
+    /// validation path when a validation completes inside its synchronous wait
+    /// window: the job is discarded rather than left as user-visible history.
+    /// The caller must ensure the job is terminal or stopped first; removing a
+    /// still-active record would orphan the runner process (its later updates
+    /// then fail harmlessly as "unknown shell job"). Also drops any still
+    /// pending start request so a queued-but-never-run job leaves no request
+    /// behind.
+    pub(crate) async fn remove_job_record(&self, job_id: &str) -> bool {
+        let mut inner = self.inner.lock().await;
+        let Some(job) = inner.jobs_by_id.remove(job_id) else {
+            return false;
+        };
+        if let Some(request_id) = job.request_id {
+            inner.request_to_job.remove(&request_id);
+            inner.pending_by_id.remove(&request_id);
+            if let Some(queue) = inner.queues_by_client.get_mut(&job.client_id) {
+                queue.retain(|id| id != &request_id);
+            }
+        }
+        true
     }
 
     pub async fn get_job(&self, job_id: &str) -> Result<ShellJobInfo, String> {
@@ -366,7 +617,9 @@ impl ShellClientRegistry {
         let Some(job) = inner.jobs_by_id.get(job_id) else {
             return Err(format!("unknown shell job: {}", job_id));
         };
-        if !shell_job_visible_to_auth(auth, &inner, &job.client_id) {
+        if job.visibility != ShellJobVisibility::Public
+            || !shell_job_visible_to_auth(auth, &inner, &job.client_id)
+        {
             return Err(format!("unknown shell job: {}", job_id));
         }
         Ok(job_view(job))
@@ -389,6 +642,7 @@ impl ShellClientRegistry {
         let mut jobs = inner
             .jobs_by_id
             .values()
+            .filter(|job| job.visibility == ShellJobVisibility::Public)
             .filter(|job| shell_job_visible_to_auth(auth, &inner, &job.client_id))
             .cloned()
             .collect::<Vec<_>>();
@@ -415,6 +669,7 @@ impl ShellClientRegistry {
         inner
             .jobs_by_id
             .values()
+            .filter(|job| job.visibility == ShellJobVisibility::Public)
             .filter(|job| shell_job_visible_to_auth(auth, &inner, &job.client_id))
             .filter(|job| job.project_id.as_deref() == Some(runtime_project_id))
             .filter(|job| crate::tool_runtime::ACTIVE_JOB_STATUSES.contains(&job.status.as_str()))
@@ -520,7 +775,9 @@ impl ShellClientRegistry {
         let Some(job) = inner.jobs_by_id.get(job_id) else {
             return Err(format!("unknown shell job: {}", job_id));
         };
-        if !shell_job_visible_to_auth(auth, &inner, &job.client_id) {
+        if job.visibility != ShellJobVisibility::Public
+            || !shell_job_visible_to_auth(auth, &inner, &job.client_id)
+        {
             return Err(format!("unknown shell job: {}", job_id));
         }
         let (stdout, next_stdout_line, _, _) =
@@ -556,7 +813,9 @@ impl ShellClientRegistry {
         let Some(job) = inner.jobs_by_id.get(job_id).cloned() else {
             return Err(format!("unknown shell job: {}", job_id));
         };
-        if !shell_job_visible_to_auth(auth, &inner, &job.client_id) {
+        if job.visibility != ShellJobVisibility::Public
+            || !shell_job_visible_to_auth(auth, &inner, &job.client_id)
+        {
             return Err(format!("unknown shell job: {}", job_id));
         }
         match job.status.as_str() {
@@ -751,6 +1010,7 @@ impl ShellClientRegistry {
             }
         }
         let mut request_id_to_remove = None;
+        let remove_cleanup_terminal;
         let view = {
             let Some(job) = inner.jobs_by_id.get_mut(&body.job_id) else {
                 return Err(format!("unknown shell job: {}", body.job_id));
@@ -867,11 +1127,16 @@ impl ShellClientRegistry {
             if let Some(sequence) = incoming_seq {
                 job.last_update_seq = sequence;
             }
+            remove_cleanup_terminal = job.visibility == ShellJobVisibility::CleanupPending
+                && is_final_job_status(&job.status);
             job_view(job)
         };
         if let Some(request_id) = request_id_to_remove {
             inner.pending_by_id.remove(&request_id);
             inner.request_to_job.remove(&request_id);
+        }
+        if remove_cleanup_terminal {
+            inner.jobs_by_id.remove(&body.job_id);
         }
         Ok(view)
     }

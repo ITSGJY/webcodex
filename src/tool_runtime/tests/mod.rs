@@ -36,6 +36,7 @@ mod sync_timeout;
 mod tool_call;
 mod trusted_smoke;
 mod validation_events;
+mod validation_handoff;
 mod validation_parser;
 mod validation_profile;
 mod validation_summary;

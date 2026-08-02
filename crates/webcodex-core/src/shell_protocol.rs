@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 pub const EXTERNAL_SEARCH_REQUEST_PREFIX: &str = "# webcodex:search_project_text:v1";
@@ -997,27 +997,81 @@ impl ShellJobValidationStep {
             return false;
         }
         let args = self.args.iter().map(String::as_str).collect::<Vec<_>>();
-        match (self.name.as_str(), self.program.as_str(), args.as_slice()) {
-            ("format", "cargo", ["fmt", "--", "--check"])
-            | ("check", "cargo", ["check", "--all-targets"])
-            | ("check", "go", ["vet", "./..."])
-            | ("test", "go", ["test", "./..."])
-            | ("test", "cargo", ["test"])
-            | ("format", "python", ["-m", "ruff", "format", "--check"])
-            | ("format", "python", ["-m", "black", "--check"])
-            | ("check", "python", ["-m", "ruff", "check"])
-            | ("check", "python", ["-m", "mypy"])
-            | ("test", "python", ["-m", "pytest"])
-            | ("test", "python", ["-B", "-m", "unittest", "discover", "-v"]) => true,
-            ("test", "cargo", ["test", filter]) => valid_rust_test_filter(filter),
-            (kind, manager, ["run", "--silent", script])
-                if matches!(manager, "npm" | "pnpm" | "yarn" | "bun") =>
-            {
-                node_script_allowed(kind, script)
+        match (self.name.as_str(), self.program.as_str()) {
+            ("format", "cargo") => args == ["fmt", "--", "--check"],
+            ("check", "cargo") => is_canonical_cargo_check_args(&args),
+            ("test", "cargo") => is_canonical_cargo_test_args(&args),
+            ("check", "go") => args == ["vet", "./..."],
+            ("test", "go") => args == ["test", "./..."],
+            ("format", "python") => {
+                args == ["-m", "ruff", "format", "--check"] || args == ["-m", "black", "--check"]
+            }
+            ("check", "python") => args == ["-m", "ruff", "check"] || args == ["-m", "mypy"],
+            ("test", "python") => {
+                args == ["-m", "pytest"] || args == ["-B", "-m", "unittest", "discover", "-v"]
+            }
+            (kind, manager) if matches!(manager, "npm" | "pnpm" | "yarn" | "bun") => {
+                args.len() == 3
+                    && args[0] == "run"
+                    && args[1] == "--silent"
+                    && node_script_allowed(kind, args[2])
             }
             _ => false,
         }
     }
+}
+
+/// Canonical `cargo check` argv: `check` followed by zero or more distinct
+/// read-only flags (`--all-targets`, `--all-features`,
+/// `--no-default-features`) and `--features <value>` / `-p <value>` pairs.
+fn is_canonical_cargo_check_args(args: &[&str]) -> bool {
+    args.first() == Some(&"check") && is_canonical_cargo_flags(&args[1..], false)
+}
+
+/// Canonical `cargo test` argv: the `test` subcommand, an optional libtest
+/// filter (never a Cargo option), then zero or more distinct read-only flags
+/// and `--features <value>` / `-p <value>` pairs, optionally `--no-run`.
+fn is_canonical_cargo_test_args(args: &[&str]) -> bool {
+    if args.first() != Some(&"test") {
+        return false;
+    }
+    let flags_start = match args.get(1) {
+        Some(filter) if valid_rust_test_filter(filter) => 2,
+        _ => 1,
+    };
+    is_canonical_cargo_flags(&args[flags_start..], true)
+}
+
+/// Validate the read-only Cargo flag tail shared by `cargo check` and
+/// `cargo test` validation steps. Each single flag and each value-taking flag
+/// appears at most once; the value must be non-empty, bounded, and NUL-free.
+/// `--no-run` is accepted only for `cargo test`.
+fn is_canonical_cargo_flags(args: &[&str], allow_no_run: bool) -> bool {
+    let mut seen = HashSet::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let key = match *arg {
+            "--all-targets" | "--all-features" | "--no-default-features" => *arg,
+            "--no-run" if allow_no_run => "--no-run",
+            "--features" | "-p" => {
+                if !seen.insert(*arg) {
+                    return false;
+                }
+                let Some(value) = iter.next() else {
+                    return false;
+                };
+                if value.is_empty() || value.contains('\0') || value.len() > 500 {
+                    return false;
+                }
+                continue;
+            }
+            _ => return false,
+        };
+        if !seen.insert(key) {
+            return false;
+        }
+    }
+    true
 }
 
 fn node_script_allowed(kind: &str, script: &str) -> bool {
@@ -1055,6 +1109,34 @@ pub struct ShellJobValidationProgress {
     pub failed_step: Option<String>,
 }
 
+/// Stable structured-validation identity retained for Job handoff, status,
+/// terminal projection, and server restart reconciliation. This is internal
+/// protocol metadata; it is not a model input and never contains shell text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellJobValidationMetadata {
+    pub tool: String,
+    pub kind: String,
+    pub steps: Vec<ShellJobValidationStep>,
+    pub effective_timeout_secs: u64,
+    pub sync_wait_secs: u64,
+    pub adapter: String,
+}
+
+impl ShellJobValidationMetadata {
+    pub fn is_valid(&self) -> bool {
+        matches!(
+            self.tool.as_str(),
+            "cargo_fmt" | "cargo_check" | "cargo_test"
+        ) && matches!(self.kind.as_str(), "format" | "check" | "test")
+            && self.adapter == self.tool
+            && self.steps.len() == 1
+            && self.steps.iter().all(ShellJobValidationStep::is_canonical)
+            && self.steps[0].name == self.kind
+            && self.effective_timeout_secs >= 1
+            && self.sync_wait_secs <= self.effective_timeout_secs
+    }
+}
+
 /// Safe server-derived metadata needed to reconstruct a job record after a
 /// server restart. This is an internal agent protocol model, not a public
 /// `run_job` input.
@@ -1079,6 +1161,8 @@ pub struct ShellJobContext {
     pub command_preview: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub validation_steps: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation: Option<ShellJobValidationMetadata>,
 }
 
 /// One bounded stream tail plus absolute line range. `next_line` is the
@@ -1224,6 +1308,8 @@ pub struct ShellJobInfo {
     pub result: Option<ShellAgentJobResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation_progress: Option<ShellJobValidationProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation: Option<ShellJobValidationMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_state: Option<String>,
     #[serde(default)]
@@ -1694,6 +1780,7 @@ mod envelope_tests {
                     shell: Some("bash".to_string()),
                     command_preview: "cargo test focused".to_string(),
                     validation_steps: Vec::new(),
+                    validation: None,
                 },
                 stdout: ShellJobStreamSnapshot {
                     tail: "one\n".to_string(),
@@ -2251,6 +2338,95 @@ mod filter_canonical_tests {
             !step.is_canonical(),
             "non-allowlisted env keys must break canonicality"
         );
+    }
+
+    #[test]
+    fn canonical_cargo_check_argv_accepts_read_only_flags_only() {
+        let step = |args: Vec<&str>| ShellJobValidationStep {
+            name: "check".to_string(),
+            program: "cargo".to_string(),
+            args: args.into_iter().map(str::to_string).collect(),
+            env: Vec::new(),
+        };
+        let accepted = [
+            vec!["check"],
+            vec!["check", "--all-targets"],
+            vec!["check", "--all-features"],
+            vec!["check", "--no-default-features"],
+            vec!["check", "--all-targets", "--all-features"],
+            vec!["check", "--features", "serde"],
+            vec!["check", "--features", "a b"],
+            vec!["check", "-p", "my-crate"],
+            vec![
+                "check",
+                "--all-targets",
+                "-p",
+                "my-crate",
+                "--features",
+                "x",
+            ],
+        ];
+        for args in accepted {
+            assert!(
+                step(args.clone()).is_canonical(),
+                "expected canonical for {args:?}"
+            );
+        }
+        let rejected = [
+            vec!["check", "--all-targets", "--all-targets"],
+            vec!["check", "--no-run"],
+            vec!["check", "--features"],
+            vec!["check", "--features", ""],
+            vec!["check", "--manifest-path", "/tmp/Cargo.toml"],
+            vec!["check", "--locked"],
+            vec!["check", "--", "--all-targets"],
+        ];
+        for args in rejected {
+            assert!(
+                !step(args.clone()).is_canonical(),
+                "expected non-canonical for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_cargo_test_argv_accepts_filter_and_read_only_flags() {
+        let step = |args: Vec<&str>| ShellJobValidationStep {
+            name: "test".to_string(),
+            program: "cargo".to_string(),
+            args: args.into_iter().map(str::to_string).collect(),
+            env: Vec::new(),
+        };
+        let accepted = [
+            vec!["test"],
+            vec!["test", "focused"],
+            vec!["test", "--all-targets"],
+            vec!["test", "--no-run"],
+            vec!["test", "focused", "--all-features"],
+            vec!["test", "--features", "serde", "--no-run"],
+            vec!["test", "-p", "my-crate", "--no-default-features"],
+        ];
+        for args in accepted {
+            assert!(
+                step(args.clone()).is_canonical(),
+                "expected canonical for {args:?}"
+            );
+        }
+        let rejected = [
+            vec!["test", "--no-run", "--no-run"],
+            vec!["test", "--no-run", "--all-targets", "--all-targets"],
+            vec!["test", "--no-default-features", "--no-default-features"],
+            vec!["test", "--all-features", "--all-features"],
+            vec!["test", "--features", "--no-run"],
+            vec!["test", "--manifest-path", "/tmp/Cargo.toml"],
+            vec!["test", "--", "--all-targets"],
+        ];
+        for args in rejected {
+            assert!(
+                !step(args.clone()).is_canonical(),
+                "expected non-canonical for {args:?}"
+            );
+        }
     }
 
     #[test]

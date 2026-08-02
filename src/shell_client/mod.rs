@@ -55,6 +55,7 @@ pub(crate) use projects::ShellClientLookupError;
 pub(crate) use reconciliation::recovery_timeout_sweep;
 pub(crate) use requests::EnqueueLspError;
 use state::ShellClientRegistryInner;
+pub(crate) use state::ShellJobVisibility;
 use validation::sha256_hex;
 #[cfg(test)]
 use validation::{
@@ -134,6 +135,11 @@ pub const TRANSPORT_QUIC: &str = "quic";
 #[derive(Debug, Default)]
 pub struct ShellClientRegistry {
     inner: Mutex<ShellClientRegistryInner>,
+    /// Cancellation intents recorded synchronously by Drop guards before any
+    /// asynchronous stop delivery. The periodic registry lifecycle drains this
+    /// map, so cleanup does not depend on one detached task getting polled.
+    cleanup_intents:
+        std::sync::Mutex<std::collections::HashMap<String, Option<crate::auth::AuthContext>>>,
 }
 
 fn now_ts() -> i64 {

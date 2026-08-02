@@ -136,6 +136,12 @@ Validation is evidence that the change was checked. WebCodex provides structured
 
 Choose validation that fits the change. A docs-only edit may need `git diff --check` outside WebCodex or a focused review; a Rust behavior change should run Cargo checks or tests.
 
+`cargo_check`, `cargo_test`, and `cargo_fmt(check=true)` run the command exactly
+once with `timeout_secs` as the total runtime budget (1..=3600). A short
+validation returns immediately; a long one continues as a queryable Job and
+returns `job_id` — poll `job_status` / `validation_summary` rather than re-running.
+`cargo_fmt(check=false)` mutates source and never auto-promotes.
+
 ### Review / Hygiene
 
 Review tools show what changed before the user accepts it. Use `show_changes` for file lists, status, diff stats, and optional bounded hunks. Use `workspace_hygiene_check` to detect untracked smoke files, temporary files, blocking jobs, and other closeout risks.

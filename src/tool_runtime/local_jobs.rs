@@ -5,6 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -18,6 +19,8 @@ pub(crate) struct LocalJobRecord {
     pub(crate) project: String,
     pub(crate) dir: PathBuf,
     terminal_snapshot: Arc<Mutex<Option<LocalJobTerminalSnapshot>>>,
+    visibility: Arc<AtomicU8>,
+    terminal: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,7 +43,55 @@ impl LocalJobRecord {
             project,
             dir,
             terminal_snapshot: Arc::new(Mutex::new(None)),
+            visibility: Arc::new(AtomicU8::new(0)),
+            terminal: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub(crate) fn new_hidden(project: String, dir: PathBuf) -> Self {
+        let record = Self::new(project, dir);
+        record.visibility.store(1, Ordering::Release);
+        record
+    }
+
+    pub(crate) fn is_public(&self) -> bool {
+        self.visibility.load(Ordering::Acquire) == 0
+    }
+
+    pub(crate) fn promote_if_active(&self) -> bool {
+        if self.terminal.load(Ordering::Acquire) {
+            return false;
+        }
+        if self
+            .visibility
+            .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        if self.terminal.load(Ordering::Acquire) {
+            let _ = self
+                .visibility
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn mark_terminal(&self) {
+        self.terminal.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.terminal.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_cleanup_pending(&self) {
+        self.visibility.store(2, Ordering::Release);
+    }
+
+    pub(crate) fn cleanup_pending(&self) -> bool {
+        self.visibility.load(Ordering::Acquire) == 2
     }
 
     pub(crate) fn terminal_snapshot_handle(&self) -> Arc<Mutex<Option<LocalJobTerminalSnapshot>>> {
@@ -385,6 +436,19 @@ impl SystemJobKiller {
             .unwrap_or(false)
     }
 
+    /// True while any process remains in the owned process group. This is
+    /// stronger than checking only the leader: the leader may exit after TERM
+    /// while a descendant still needs escalation or reaping.
+    fn group_is_alive(pgid: i64) -> bool {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg("--")
+            .arg(format!("-{pgid}"))
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
     /// Send `signal` (e.g. `-TERM`/`-KILL`) to the whole process group `pgid`
     /// (negative pid). Failures are swallowed: a non-existent group yields a
     /// non-zero exit which we treat as nothing left to signal.
@@ -418,13 +482,13 @@ impl SystemJobKiller {
 
 impl LocalJobKiller for SystemJobKiller {
     fn terminate_group(&self, pid: i64, pgid: i64) -> TerminateOutcome {
-        if !Self::is_alive(pid) {
+        if !Self::is_alive(pid) && !Self::group_is_alive(pgid) {
             return TerminateOutcome::AlreadyGone;
         }
         Self::signal_group(pgid, "-TERM");
         let deadline = Instant::now() + Duration::from_millis(300);
         while Instant::now() < deadline {
-            if !Self::is_alive(pid) {
+            if !Self::group_is_alive(pgid) {
                 return TerminateOutcome::Terminated {
                     pgid,
                     escalated_to_kill: false,
@@ -432,9 +496,13 @@ impl LocalJobKiller for SystemJobKiller {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        let escalated = Self::is_alive(pid);
+        let escalated = Self::group_is_alive(pgid);
         if escalated {
             Self::signal_group(pgid, "-KILL");
+            let reap_deadline = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < reap_deadline && Self::group_is_alive(pgid) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
         TerminateOutcome::Terminated {
             pgid,
