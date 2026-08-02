@@ -125,3 +125,117 @@ pub(crate) fn seed_oauth_client_named(
 ) -> (crate::models::OAuthClientRecord, String) {
     seed_oauth_client_record(db, user, name, "runtime:read project:read")
 }
+
+/// Single source of truth for the bounded `show_changes` framing wire format.
+///
+/// This is the only place a `WCSF1` trailer is constructed for tests. The
+/// trailer carries the exact wire byte lengths of the body and metadata so the
+/// production parser can walk backward over them without scanning for the
+/// legacy delimiter; hand-writing a second copy of this format is exactly what
+/// this helper exists to prevent. All fixture content is ASCII, so
+/// `as_bytes().len()` matches both the production byte lengths and the
+/// byte-based walk-back in `parse_show_changes_wire_block`.
+///
+/// The layout mirrors the production command exactly: the metadata region is
+/// emitted with a trailing `\n` (the production `printf '%s\n' "$sm"`) and the
+/// declared metadata byte count includes it, because the parser's
+/// `strip_wire_lf` requires a trailing newline before it will accept a frame.
+/// `body` is passed through verbatim as the wire body.
+pub(crate) fn framed_show_changes_block(kind: char, body: &str, metadata: &str) -> String {
+    format!(
+        "{body}{metadata}\nWCSF1:{kind}:{:010}:{:010}\n",
+        body.as_bytes().len(),
+        metadata.as_bytes().len() + 1,
+    )
+}
+
+/// Build a valid production `show_changes` stdout payload for an
+/// `include_diff=false` run.
+///
+/// The three frames (status `S`, head `H`, diff-stat `T`) are emitted in wire
+/// order and their metadata is derived from the given bodies, so the result is
+/// genuinely `transport_safe` rather than merely frame-decodable: per-category
+/// counts and `files_*` come from the status body, and every frame's byte
+/// metadata matches its body. `files_limit` mirrors the production constant
+/// `SHOW_CHANGES_MAX_STATUS_FILES` (200).
+///
+/// `status_body` must end in `\n` (as the production streaming loop always
+/// emits, so the parser can strip its wire newline); `head_body` is emitted
+/// without a trailing newline to match the production `printf '%s%s'` head
+/// frame.
+pub(crate) fn framed_show_changes_stdout(
+    status_body: &str,
+    head_body: &str,
+    stat_body: &str,
+) -> String {
+    let status = status_body.strip_suffix('\n').unwrap_or(status_body);
+    let mut records = 0usize;
+    let mut modified = 0usize;
+    let mut added = 0usize;
+    let mut deleted = 0usize;
+    let mut renamed = 0usize;
+    let mut copied = 0usize;
+    let mut untracked = 0usize;
+    let mut conflicted = 0usize;
+    let mut staged = 0usize;
+    let mut unstaged = 0usize;
+    for line in status.lines().filter(|line| !line.starts_with("## ")) {
+        if line.len() < 3 {
+            continue;
+        }
+        let mut chars = line.chars();
+        let x = chars.next().unwrap_or(' ');
+        let y = chars.next().unwrap_or(' ');
+        records += 1;
+        if x == '?' && y == '?' {
+            untracked += 1;
+        } else if x == 'U' || y == 'U' || (x == 'A' && y == 'A') || (x == 'D' && y == 'D') {
+            conflicted += 1;
+        } else if x == 'R' || y == 'R' {
+            renamed += 1;
+        } else if x == 'C' || y == 'C' {
+            copied += 1;
+        } else if x == 'D' || y == 'D' {
+            deleted += 1;
+        } else if x == 'A' || y == 'A' {
+            added += 1;
+        } else {
+            modified += 1;
+        }
+        if !(x == '?' && y == '?')
+            && !(x == 'U' || y == 'U' || (x == 'A' && y == 'A') || (x == 'D' && y == 'D'))
+        {
+            if x != ' ' && x != '?' {
+                staged += 1;
+            }
+            if y != ' ' && y != '?' {
+                unstaged += 1;
+            }
+        }
+    }
+    let status_meta = format!(
+        "status_exit=0\nrepository_probe=inside_worktree\nrepository_probe_exit=0\n\
+         files_total={records}\nfiles_returned={records}\nfiles_truncated=0\nfiles_limit=200\n\
+         status_bytes={}\nstatus_trunc_count=0\nstatus_trunc_bytes=0\nstatus_trunc_path=0\n\
+         modified={modified}\nadded={added}\ndeleted={deleted}\nrenamed={renamed}\n\
+         copied={copied}\nuntracked={untracked}\nconflicted={conflicted}\n\
+         staged={staged}\nunstaged={unstaged}",
+        status.as_bytes().len(),
+    );
+    // The head frame body has no trailing newline (production `printf '%s%s'`);
+    // the head metadata's `head_bytes` counts exactly that wire body so the
+    // `frame_bytes_match` validation holds.
+    let head = head_body.strip_suffix('\n').unwrap_or(head_body);
+    let head_meta = format!("head_exit=0\nhead_truncated=0\nhead_bytes={}", head.len());
+    let stat = stat_body.strip_suffix('\n').unwrap_or(stat_body);
+    let stat_meta = format!(
+        "diff_stat_exit=0\ndiff_stat_truncated=0\ndiff_stat_bytes={}",
+        stat.as_bytes().len()
+    );
+    format!(
+        "{}{}{}",
+        framed_show_changes_block('S', status_body, &status_meta),
+        framed_show_changes_block('H', head, &head_meta),
+        framed_show_changes_block('T', stat, &stat_meta),
+    )
+}

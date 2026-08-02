@@ -1691,7 +1691,11 @@ async fn api_show_changes_with_session_id() {
             tokio::task::yield_now().await;
         }
         let req = req.expect("show_changes should enqueue an agent shell request");
-        let stdout = "## main\n?? README.md\n@@WEBCODEX_SHOW_CHANGES_SEP@@\nabc123\0abc123\0test head\n@@WEBCODEX_SHOW_CHANGES_SEP@@\n";
+        let stdout = crate::test_support::framed_show_changes_stdout(
+            "## main\n?? README.md\n",
+            "commit=abc123\nshort=abc123\nsummary=test head\n",
+            "",
+        );
         registry
             .complete(ShellAgentResultRequest {
                 client_id: "importer".to_string(),
