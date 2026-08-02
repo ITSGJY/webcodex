@@ -2173,6 +2173,46 @@ mod tests {
     use super::*;
     use std::sync::Barrier;
 
+    /// Whether `pid` is effectively terminated: it no longer exists (`ESRCH`),
+    /// or it has become a zombie (`Z` / dead `X`) in `/proc/<pid>/stat` and will
+    /// never execute again.
+    ///
+    /// This cannot rely on `kill(pid, 0)` alone: in containers whose PID 1 does
+    /// not reap orphaned children, a terminated background process lingers in
+    /// the process table as a zombie and `kill(pid, 0)` keeps returning 0. A
+    /// process that is still running or sleeping (states such as `R`, `S`, `D`)
+    /// is reported as alive, so a shutdown that failed to terminate its
+    /// descendants still fails the test.
+    fn process_is_effectively_terminated(pid: i32) -> bool {
+        // SAFETY: signal 0 performs an existence check without delivering a
+        // signal. The pid came from the test itself.
+        if unsafe { libc::kill(pid, 0) } == -1 {
+            // ESRCH (or EPERM against another user's process, which cannot
+            // happen here) means the process is gone.
+            return true;
+        }
+        // The process still exists in the table. Read its state and treat a
+        // zombie/dead state as terminated.
+        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Reaped between the kill probe and the read.
+                return true;
+            }
+            Err(_) => {
+                // Cannot determine; fall back to the kill probe (still exists).
+                return false;
+            }
+        };
+        // `/proc/<pid>/stat` is `pid (comm) state ...`; `comm` may contain
+        // spaces and parentheses, so take the first token after the last `)`.
+        let state = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .unwrap_or("");
+        state == "Z" || state == "X"
+    }
+
     fn launch(root: &Path, shell_id: &str, session_id: &str) -> ShellLaunch {
         ShellLaunch {
             identity: ShellIdentity {
@@ -2551,20 +2591,18 @@ mod tests {
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
         while Instant::now() < deadline {
-            // SAFETY: signal 0 performs an existence check without delivering
-            // a signal. The pid came from the test shell itself.
-            if unsafe { libc::kill(background_pid, 0) } == -1
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-            {
+            if process_is_effectively_terminated(background_pid) {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
         }
-        // SAFETY: as above, signal 0 does not mutate the process.
-        assert_eq!(unsafe { libc::kill(background_pid, 0) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
+        // The background child must be terminated: gone from the process table
+        // (ESRCH) or reduced to a zombie that will never run again. The
+        // container's PID 1 does not reap orphans, so a lingering zombie is
+        // still a successful shutdown.
+        assert!(
+            process_is_effectively_terminated(background_pid),
+            "background child {background_pid} must be terminated"
         );
     }
 
