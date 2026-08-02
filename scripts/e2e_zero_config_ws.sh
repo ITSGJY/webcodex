@@ -566,8 +566,21 @@ if [ "${tools_count:-0}" -ge 30 ]; then
 else
     fail "MCP tools/list returned too few tools (got $tools_count; body: ${body:0:300})"
 fi
+# Extract the exact tool names from MCP tools/list (never grep the raw body:
+# descriptions and schemas may legitimately mention other tool names).
+mcp_tool_names() {
+    echo "$TOOLS_LIST_BODY" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for tool in data.get("result", {}).get("tools", []):
+    print(tool.get("name", ""))
+'
+}
 mcp_tool_present() {
-    echo "$TOOLS_LIST_BODY" | grep -q "\"$1\""
+    mcp_tool_names | grep -qx "$1"
 }
 
 if [ "$EXPECTED_SURFACE" = "local_coding" ]; then
@@ -1080,10 +1093,9 @@ fi
 # correct content type, no token/credential material) rather than any specific
 # JavaScript implementation text, which may be refactored. The console page is
 # already verified above to reference the bundle and embed no token literal.
-console_js="$(curl -sS -D /tmp/console_js_headers.$$ --max-time 10 "http://127.0.0.1:${PORT}/console/app.js" 2>/dev/null)"
+console_js="$(curl -sS --max-time 10 "http://127.0.0.1:${PORT}/console/app.js")"
 js_bytes="${#console_js}"
-js_type="$(awk 'BEGIN{IGNORECASE=1} /^Content-Type:/{gsub("\r",""); print substr($0, index($0,":")+2)}' /tmp/console_js_headers.$$ 2>/dev/null)"
-rm -f /tmp/console_js_headers.$$
+js_type="$(curl -sS -o /dev/null -w '%{content_type}' --max-time 10 "http://127.0.0.1:${PORT}/console/app.js")"
 console_js_ok=1
 if [ "$js_bytes" -le 0 ]; then
     console_js_ok=0
