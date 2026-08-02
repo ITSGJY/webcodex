@@ -184,13 +184,30 @@ fn local_read_trim(record: &LocalJobRecord, name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn local_read_lines(
-    record: &LocalJobRecord,
-    name: &str,
+async fn local_read_log_pair(
+    record: LocalJobRecord,
     offset: Option<usize>,
     tail_lines: Option<usize>,
-) -> (String, usize, usize, bool) {
-    record.read_log_lines(name, offset, tail_lines)
+    stdout_len: u64,
+    stderr_len: u64,
+) -> ((String, usize, usize, bool), (String, usize, usize, bool)) {
+    tokio::task::spawn_blocking(move || {
+        (
+            record.read_log_lines_at("stdout.log", offset, tail_lines, stdout_len),
+            record.read_log_lines_at("stderr.log", offset, tail_lines, stderr_len),
+        )
+    })
+    .await
+    .unwrap_or_else(|_| ((String::new(), 1, 0, false), (String::new(), 1, 0, false)))
+}
+
+fn local_runtime_deadline(meta: &Value) -> Option<tokio::time::Instant> {
+    let started_at = meta.get("started_at").and_then(Value::as_i64)?;
+    let max_runtime_secs = meta.get("max_runtime_secs").and_then(Value::as_i64)?;
+    let remaining = started_at
+        .saturating_add(max_runtime_secs)
+        .saturating_sub(chrono::Utc::now().timestamp());
+    Some(tokio::time::Instant::now() + tokio::time::Duration::from_secs(remaining.max(0) as u64))
 }
 
 /// Build a bounded job summary `Value` for an agent-known job. Never includes
@@ -274,16 +291,31 @@ pub(crate) fn local_job_status(
     // `lost` status (and terminates the process group) so callers see a
     // consistent terminal state and we don't leak processes.
     let timeout_note = enforce_local_job_timeout(record, killer);
+    let observation = match record.observe() {
+        Ok(observation) => observation,
+        Err(error) => return ToolResult::err(error),
+    };
+    let observation_token = match observation.token(job_id) {
+        Ok(token) => token,
+        Err(error) => return ToolResult::err(error),
+    };
     let meta = record.read_json("metadata.json");
-    let raw_status = local_read_trim(record, "status").unwrap_or_default();
-    let status = normalize_local_status(&raw_status);
-    let exit_code = local_read_trim(record, "exit_code").and_then(|v| v.parse::<i32>().ok());
+    let status = normalize_local_status(&observation.status);
+    let exit_code = if observation.terminal() {
+        local_read_trim(record, "exit_code").and_then(|value| value.parse::<i32>().ok())
+    } else {
+        None
+    };
     let created_at = meta
         .get("created_at")
         .and_then(Value::as_i64)
         .unwrap_or_default();
     let started_at = meta.get("started_at").and_then(Value::as_i64);
-    let finished_at = local_read_trim(record, "finished_at").and_then(|v| v.parse::<i64>().ok());
+    let finished_at = if observation.terminal() {
+        local_read_trim(record, "finished_at").and_then(|value| value.parse::<i64>().ok())
+    } else {
+        None
+    };
     let max_runtime_secs = meta.get("max_runtime_secs").and_then(Value::as_i64);
     let elapsed_secs = started_at.map(|started| {
         finished_at
@@ -301,6 +333,7 @@ pub(crate) fn local_job_status(
         "elapsed_secs": elapsed_secs,
         "max_runtime_secs": max_runtime_secs,
         "executor": "local",
+        "observation_token": observation_token,
         "kind": meta.get("kind").cloned().unwrap_or_else(|| Value::String("shell".to_string())),
         "command_preview_included": include_command_preview,
     });
@@ -316,22 +349,116 @@ pub(crate) fn local_job_status(
     ToolResult::ok(output)
 }
 
-pub(crate) fn local_job_log(
+pub(crate) async fn local_job_log(
     job_id: &str,
     record: &LocalJobRecord,
     killer: &dyn LocalJobKiller,
     offset: Option<usize>,
     tail_lines: Option<usize>,
+    after_observation_token: Option<String>,
+    wait_secs: Option<u64>,
 ) -> ToolResult {
-    // A log query on an overtime job also reclaims it so the reported status
-    // is terminal and the process group is not leaked.
-    let timeout_note = enforce_local_job_timeout(record, killer);
-    let stdout = local_read_lines(record, "stdout.log", offset, tail_lines);
-    let stderr = local_read_lines(record, "stderr.log", offset, tail_lines);
-    let raw_status = local_read_trim(record, "status").unwrap_or_default();
-    let status = normalize_local_status(&raw_status);
-    let exit_code = local_read_trim(record, "exit_code").and_then(|v| v.parse::<i32>().ok());
+    let after = match after_observation_token
+        .as_deref()
+        .map(|value| {
+            crate::job_observation::JobObservationToken::parse_bound(
+                value,
+                crate::job_observation::JobObservationExecutor::Local,
+                job_id,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .transpose()
+    {
+        Ok(token) => token,
+        Err(error) => return ToolResult::err(error),
+    };
+    let mut timeout_note = enforce_local_job_timeout(record, killer);
     let meta = record.read_json("metadata.json");
+    let mut observation = match record.observe() {
+        Ok(observation) => observation,
+        Err(error) => return ToolResult::err(error),
+    };
+    let wait_deadline =
+        wait_secs.map(|secs| tokio::time::Instant::now() + tokio::time::Duration::from_secs(secs));
+    let runtime_deadline = local_runtime_deadline(&meta);
+    let changed_now = after.as_ref().is_some_and(|token| {
+        token.epoch != observation.epoch || token.revision != observation.revision
+    });
+    let mut wait_outcome = if changed_now {
+        "immediate"
+    } else if observation.terminal() {
+        "terminal"
+    } else {
+        "immediate"
+    };
+    let mut changed = changed_now;
+    let mut waited_ms = 0u64;
+
+    if wait_secs.is_some() && after.is_some() && !observation.terminal() && !changed {
+        loop {
+            let now = tokio::time::Instant::now();
+            let poll_deadline = now + tokio::time::Duration::from_millis(200);
+            let next_deadline = [wait_deadline, runtime_deadline, Some(poll_deadline)]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap();
+            let wait_started = tokio::time::Instant::now();
+            tokio::time::sleep_until(next_deadline).await;
+            waited_ms = waited_ms.saturating_add(wait_started.elapsed().as_millis() as u64);
+            let now = tokio::time::Instant::now();
+            if runtime_deadline.is_some_and(|deadline| now >= deadline) {
+                timeout_note = enforce_local_job_timeout(record, killer).or(timeout_note);
+            }
+            observation = match record.observe() {
+                Ok(observation) => observation,
+                Err(error) => return ToolResult::err(error),
+            };
+            changed = after.as_ref().is_some_and(|token| {
+                token.epoch != observation.epoch || token.revision != observation.revision
+            });
+            if observation.terminal() {
+                wait_outcome = "terminal";
+                break;
+            }
+            if changed {
+                wait_outcome = "updated";
+                break;
+            }
+            if wait_deadline.is_some_and(|deadline| now >= deadline) {
+                wait_outcome = "timeout";
+                break;
+            }
+        }
+    }
+    let final_status = normalize_local_status(&observation.status);
+    let final_terminal = observation.terminal();
+    if final_terminal && !changed_now && wait_outcome != "updated" {
+        wait_outcome = "terminal";
+    }
+    if wait_outcome == "timeout" {
+        changed = false;
+    }
+    let observation_token = match observation.token(job_id) {
+        Ok(token) => token,
+        Err(error) => return ToolResult::err(error),
+    };
+    let frozen_stdout_len = observation.stdout_len;
+    let frozen_stderr_len = observation.stderr_len;
+    let final_exit_code = if final_terminal {
+        local_read_trim(record, "exit_code").and_then(|value| value.parse::<i32>().ok())
+    } else {
+        None
+    };
+    let (stdout, stderr) = local_read_log_pair(
+        record.clone(),
+        offset,
+        tail_lines,
+        frozen_stdout_len,
+        frozen_stderr_len,
+    )
+    .await;
     let purpose = meta
         .get("purpose")
         .and_then(Value::as_str)
@@ -341,34 +468,19 @@ pub(crate) fn local_job_log(
         .and_then(Value::as_str)
         .map(command_preview)
         .unwrap_or_default();
-    let detected_summary = detected_job_summary(
-        Some(&command_summary),
-        Some(purpose),
-        &status,
-        exit_code.map(i64::from),
-        &stdout.0,
-        &stderr.0,
-    );
     let mut output = json!({
-        "job_id": job_id,
-        "status": status,
-        "exit_code": exit_code,
-        "stdout_tail": stdout.0,
-        "stderr_tail": stderr.0,
-        "stdout_lines": stdout.2,
-        "stderr_lines": stderr.2,
-        "stdout_truncated": stdout.3,
-        "stderr_truncated": stderr.3,
-        "cursor": {
-            "stdout": stdout.1,
-            "stderr": stderr.1,
-        },
-        "executor": "local",
+        "job_id": job_id, "status": final_status, "exit_code": final_exit_code,
+        "stdout_tail": stdout.0, "stderr_tail": stderr.0,
+        "stdout_lines": stdout.2, "stderr_lines": stderr.2,
+        "stdout_truncated": stdout.3, "stderr_truncated": stderr.3,
+        "cursor": { "stdout": stdout.1, "stderr": stderr.1 },
+        "observation_token": observation_token,
+        "wait_outcome": wait_outcome, "waited_ms": waited_ms,
+        "changed": changed, "terminal": final_terminal, "executor": "local",
         "cwd": meta.get("cwd").cloned().unwrap_or_else(|| json!(".")),
         "shell": meta.get("shell").cloned().unwrap_or_else(|| json!("bash")),
-        "purpose": purpose,
-        "command_summary": command_summary,
-        "detected_summary": detected_summary,
+        "purpose": purpose, "command_summary": command_summary,
+        "detected_summary": detected_job_summary(Some(&command_summary), Some(purpose), &final_status, final_exit_code.map(i64::from), &stdout.0, &stderr.0),
     });
     if let Some(note) = timeout_note {
         output["note"] = Value::String(note);
@@ -413,7 +525,7 @@ pub(crate) fn enforce_local_job_timeout(
         return None;
     }
     let now = chrono::Utc::now().timestamp();
-    if now.saturating_sub(started_at) <= max_runtime_secs {
+    if now < started_at.saturating_add(max_runtime_secs) {
         return None;
     }
     // Over time. Reclaim the process group if we recorded one.
@@ -990,6 +1102,8 @@ impl ToolRuntime {
                     "ssh_resource": ssh_resource,
                     "execution_state": "started",
                     "created_at": job.created_at,
+                    "observation_token": job.observation_token,
+                    "last_update_seq": job.last_update_seq,
                     "stdout_tail": "",
                     "stderr_tail": "",
                     "stdout_lines": 0,
@@ -1073,12 +1187,24 @@ impl ToolRuntime {
                 return ToolResult::err(format!("Failed to write command.sh: {}", e));
             }
             if let Err(e) = std::fs::write(dir.join("status"), "running") {
-                tracing::warn!(
-                    job_id = %job_id,
-                    error = %e,
-                    "failed to write initial local job status"
-                );
+                return ToolResult::err(format!("Failed to write initial status: {e}"));
             }
+            if let Err(e) = std::fs::write(dir.join("stdout.log"), b"") {
+                return ToolResult::err(format!("Failed to create stdout.log: {e}"));
+            }
+            if let Err(e) = std::fs::write(dir.join("stderr.log"), b"") {
+                return ToolResult::err(format!("Failed to create stderr.log: {e}"));
+            }
+            let (record, initial_observation) =
+                match LocalJobRecord::initialize(project_id.clone(), dir.clone()) {
+                    Ok(value) => value,
+                    Err(error) => return ToolResult::err(error),
+                };
+            let initial_observation_token = match initial_observation.token(&job_id) {
+                Ok(token) => token,
+                Err(error) => return ToolResult::err(error),
+            };
+            let terminal_snapshot = record.terminal_snapshot_handle();
             let dir_s = dir.to_string_lossy().to_string();
             let wrapper = format!(
                 "{1} {0}/command.sh > {0}/stdout.log 2> {0}/stderr.log; code=$?; echo $code > {0}/exit_code; finished=$(date +%s); echo $finished > {0}/finished_at; if [ $code -eq 0 ]; then echo completed > {0}/status; else echo failed > {0}/status; fi",
@@ -1126,8 +1252,6 @@ impl ToolRuntime {
                             "failed to update local job metadata with process group"
                         );
                     }
-                    let record = LocalJobRecord::new(project_id.clone(), dir.clone());
-                    let terminal_snapshot = record.terminal_snapshot_handle();
                     self.local_jobs.lock().await.insert(job_id.clone(), record);
                     if let Some(scratch) = inspect_scratch {
                         retain_inspect_job_until_terminal(dir, terminal_snapshot, scratch, child);
@@ -1144,6 +1268,7 @@ impl ToolRuntime {
                         "shell": actual_shell,
                         "executor": "local",
                         "execution_state": "started",
+                        "observation_token": initial_observation_token,
                         "created_at": now,
                         "stdout_tail": "",
                         "stderr_tail": "",
@@ -1212,6 +1337,7 @@ impl ToolRuntime {
                     "recovered_after_server_restart": job.recovered_after_server_restart,
                     "reconciled_at": job.reconciled_at,
                     "recovery_reason_code": job.recovery_reason_code,
+                    "observation_token": job.observation_token,
                     "last_update_seq": job.last_update_seq,
                     "stdout_retained_from_line": job.stdout_retained_from_line,
                     "stderr_retained_from_line": job.stderr_retained_from_line,
@@ -1242,8 +1368,23 @@ impl ToolRuntime {
         offset: Option<usize>,
         tail_lines: Option<usize>,
     ) -> ToolResult {
-        self.job_log_for_auth(job_id, offset, tail_lines, None)
+        self.job_log_for_auth(job_id, offset, tail_lines, None, None, None)
             .await
+    }
+
+    /// Validate the bounded-wait arguments before any execution. Rejects
+    /// out-of-range `wait_secs` up front. Observation-token syntax and Job
+    /// binding are validated before execution or waiting by the selected executor.
+    fn validate_job_log_wait(wait_secs: Option<u64>) -> Result<(), String> {
+        if let Some(secs) = wait_secs {
+            if secs == 0 || secs > 60 {
+                return Err(format!(
+                    "invalid wait_secs: must be between 1 and 60, got {}",
+                    secs
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn job_log_for_auth(
@@ -1252,7 +1393,12 @@ impl ToolRuntime {
         offset: Option<usize>,
         tail_lines: Option<usize>,
         auth: Option<&AuthContext>,
+        after_observation_token: Option<String>,
+        wait_secs: Option<u64>,
     ) -> ToolResult {
+        if let Err(message) = Self::validate_job_log_wait(wait_secs) {
+            return ToolResult::err(message);
+        }
         let tail_lines = if offset.is_none() && tail_lines.is_none() {
             Some(super::helpers::DEFAULT_JOB_LOG_TAIL_LINES)
         } else {
@@ -1263,7 +1409,16 @@ impl ToolRuntime {
             if !local_jobs_visible_to_auth(auth) {
                 return ToolResult::err(format!("unknown job: {}", job_id));
             }
-            return local_job_log(&job_id, &record, killer, offset, tail_lines);
+            return local_job_log(
+                &job_id,
+                &record,
+                killer,
+                offset,
+                tail_lines,
+                after_observation_token,
+                wait_secs,
+            )
+            .await;
         }
         if self
             .shell_clients
@@ -1275,16 +1430,33 @@ impl ToolRuntime {
                 if !local_jobs_visible_to_auth(auth) {
                     return ToolResult::err(format!("unknown job: {}", job_id));
                 }
-                return local_job_log(&job_id, &record, killer, offset, tail_lines);
+                return local_job_log(
+                    &job_id,
+                    &record,
+                    killer,
+                    offset,
+                    tail_lines,
+                    after_observation_token,
+                    wait_secs,
+                )
+                .await;
             }
             return ToolResult::err(format!("unknown job: {}", job_id));
         }
         match self
             .shell_clients
-            .job_log_for_auth(auth, &job_id, offset, None, tail_lines)
+            .job_log_for_auth(
+                auth,
+                &job_id,
+                offset,
+                None,
+                tail_lines,
+                after_observation_token.as_deref(),
+                wait_secs,
+            )
             .await
         {
-            Ok((job, stdout, stderr, next_stdout_line, next_stderr_line)) => {
+            Ok((job, stdout, stderr, next_stdout_line, next_stderr_line, wait)) => {
                 let stdout = stdout.unwrap_or_default();
                 let stderr = stderr.unwrap_or_default();
                 let stdout_lines = stdout.lines().count();
@@ -1327,11 +1499,16 @@ impl ToolRuntime {
                         job.recovery_state.as_deref(),
                         job.recovery_reason_code.as_deref(),
                     ),
+                    "observation_token": job.observation_token,
                     "last_update_seq": job.last_update_seq,
                     "cursor": {
                         "stdout": next_stdout_line,
                         "stderr": next_stderr_line,
                     },
+                    "wait_outcome": wait.wait_outcome.as_str(),
+                    "waited_ms": wait.waited_ms,
+                    "changed": wait.changed,
+                    "terminal": wait.terminal,
                     "executor": "agent",
                     "session_id": job.session_id,
                     "ssh_resource": job.ssh_resource,
@@ -1415,7 +1592,8 @@ impl ToolRuntime {
     /// full logs by default.
     #[allow(dead_code)]
     pub(crate) async fn job_tail(&self, job_id: String, tail_lines: Option<usize>) -> ToolResult {
-        self.job_tail_for_auth(job_id, tail_lines, None).await
+        self.job_tail_for_auth(job_id, tail_lines, None, None, None)
+            .await
     }
 
     pub(crate) async fn job_tail_for_auth(
@@ -1423,9 +1601,19 @@ impl ToolRuntime {
         job_id: String,
         tail_lines: Option<usize>,
         auth: Option<&AuthContext>,
+        after_observation_token: Option<String>,
+        wait_secs: Option<u64>,
     ) -> ToolResult {
         let tail = tail_lines.unwrap_or(200).clamp(1, 500);
-        self.job_log_for_auth(job_id, None, Some(tail), auth).await
+        self.job_log_for_auth(
+            job_id,
+            None,
+            Some(tail),
+            auth,
+            after_observation_token,
+            wait_secs,
+        )
+        .await
     }
 
     /// Model-facing `stop_job`: requires confirm=true, verifies project/session
@@ -1889,6 +2077,7 @@ mod recovery_projection_tests {
             recovered_after_server_restart: true,
             reconciled_at: Some(3),
             recovery_reason_code: Some("runner_recovery_deadline_exceeded".to_string()),
+            observation_token: Some("wjob1:a:job-1:0123456789abcdef:4".to_string()),
             last_update_seq: Some(4),
             stdout_retained_from_line: Some(1),
             stderr_retained_from_line: Some(1),

@@ -1,6 +1,6 @@
 use super::jobs::{
     command_preview, is_final_job_status, is_runner_active_job_status, mark_job_lost,
-    replace_log_from_snapshot, COMMAND_PREVIEW_MAX_CHARS,
+    notify_job_update, replace_log_from_snapshot, COMMAND_PREVIEW_MAX_CHARS,
 };
 use super::state::{ShellClientRegistryInner, ShellJobLogState, ShellJobRecord};
 use super::validation::validate_id;
@@ -445,6 +445,7 @@ fn remove_job_control_requests(
 fn record_from_snapshot(
     client_id: &str,
     agent_instance_id: &str,
+    observation_epoch: std::sync::Arc<str>,
     snapshot: &ShellJobSnapshot,
     now: i64,
 ) -> ShellJobRecord {
@@ -482,6 +483,9 @@ fn record_from_snapshot(
         recovery_reason_code: Some("server_restart_reconciliation".to_string()),
         recovering_since: None,
         recovery_original_status: None,
+        observation_epoch,
+        public_revision: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        update_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
     }
 }
 
@@ -501,6 +505,7 @@ fn apply_snapshot(job: &mut ShellJobRecord, snapshot: &ShellJobSnapshot, now: i6
     job.recovery_reason_code = Some("same_instance_reconciliation".to_string());
     job.recovering_since = None;
     job.recovery_original_status = None;
+    notify_job_update(job);
 }
 
 /// Maximum number of recovering jobs transitioned to lost in a single
@@ -607,6 +612,7 @@ pub(super) fn reconcile_inventory_locked(
     inner: &mut ShellClientRegistryInner,
     client_id: &str,
     agent_instance_id: &str,
+    observation_epoch: std::sync::Arc<str>,
     inventory: &ShellJobInventory,
     now: i64,
 ) {
@@ -661,9 +667,16 @@ pub(super) fn reconcile_inventory_locked(
             }
             apply_snapshot(existing, snapshot, now);
         } else {
-            let mut record = record_from_snapshot(client_id, agent_instance_id, snapshot, now);
+            let mut record = record_from_snapshot(
+                client_id,
+                agent_instance_id,
+                observation_epoch.clone(),
+                snapshot,
+                now,
+            );
             replace_log_from_snapshot(&mut record.stdout, &snapshot.stdout);
             replace_log_from_snapshot(&mut record.stderr, &snapshot.stderr);
+            notify_job_update(&record);
             inner.jobs_by_id.insert(snapshot.job_id.clone(), record);
         }
         if is_final_job_status(&snapshot.status) {

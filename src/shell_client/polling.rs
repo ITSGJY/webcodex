@@ -100,6 +100,7 @@ impl ShellClientRegistry {
                     if job.status == "queued" {
                         job.status = "agent_queued".to_string();
                         job.started_at = Some(now_ts());
+                        super::jobs::notify_job_update(job);
                     }
                 }
             }
@@ -191,6 +192,7 @@ impl ShellClientRegistry {
                 replace_log_limited(&mut job.stdout, stdout.clone());
                 replace_log_limited(&mut job.stderr, stderr.clone());
                 job.error = error.clone();
+                super::jobs::notify_job_update(job);
             }
         }
         let response = ShellRunResponse {

@@ -5,6 +5,7 @@ use crate::shell_protocol::{
     ShellJobValidationProgress, ShellRunResponse,
 };
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Notify};
 
@@ -95,9 +96,25 @@ pub(super) struct ShellJobRecord {
     pub(super) recovery_reason_code: Option<String>,
     pub(super) recovering_since: Option<i64>,
     pub(super) recovery_original_status: Option<String>,
+    /// Server-owned generation for the complete public Job snapshot. Unlike
+    /// `last_update_seq`, this also advances for accepted legacy/unsequenced
+    /// updates and server-side recovery/status changes. It is intentionally
+    /// process-local: waiters use it only while this record is alive, while the
+    /// Runner-owned sequence retains its protocol and restart semantics.
+    /// Process-local server epoch used to invalidate observation tokens after restart.
+    pub(super) observation_epoch: Arc<str>,
+    pub(super) public_revision: Arc<AtomicU64>,
+    /// Observer update notifier. Shared with every snapshot of the record and
+    /// notified (broadcast) whenever anything that changes the public Job
+    /// snapshot or `last_update_seq` happens: an accepted `agent:job_update`,
+    /// log/validation progress, terminal transitions, disconnect/recovery,
+    /// reconciliation, or a stop request that changed status. Bounded
+    /// `job_log`/`job_tail` waiters re-check the authoritative snapshot after
+    /// every wake, so spurious wakes are harmless. Never persisted.
+    pub(super) update_notify: Arc<Notify>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ShellJobLogState {
     pub(super) tail: String,
     pub(super) first_retained_line: usize,

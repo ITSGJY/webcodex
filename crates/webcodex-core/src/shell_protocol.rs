@@ -1233,6 +1233,8 @@ pub struct ShellJobInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_reason_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_update_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stdout_retained_from_line: Option<usize>,

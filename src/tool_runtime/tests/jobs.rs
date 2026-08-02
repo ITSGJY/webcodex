@@ -8,6 +8,7 @@ use super::support::*;
 use crate::shell_protocol::{ShellClientCapabilities, ShellClientRegisterRequest};
 use serde_json::json;
 use std::fs;
+use std::io::Write;
 
 async fn seed_local_job(
     runtime: &ToolRuntime,
@@ -15,10 +16,14 @@ async fn seed_local_job(
     project: &str,
     dir: std::path::PathBuf,
 ) {
-    runtime.local_jobs.lock().await.insert(
-        job_id.to_string(),
-        LocalJobRecord::new(project.to_string(), dir),
-    );
+    let record = LocalJobRecord::initialize(project.to_string(), dir)
+        .map(|(record, _)| record)
+        .unwrap();
+    runtime
+        .local_jobs
+        .lock()
+        .await
+        .insert(job_id.to_string(), record);
 }
 
 #[tokio::test]
@@ -1490,14 +1495,17 @@ async fn inspect_job_log_and_tail_use_terminal_snapshot_global_cursors() {
         .unwrap(),
     )
     .unwrap();
+    fs::write(dir.join("status"), "running").unwrap();
+    fs::write(dir.join("stdout.log"), b"").unwrap();
+    fs::write(dir.join("stderr.log"), b"").unwrap();
+
+    let job_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let (record, _) = LocalJobRecord::initialize("demo".to_string(), dir.clone()).unwrap();
+    fs::write(dir.join("stdout.log"), stdout).unwrap();
+    fs::write(dir.join("stderr.log"), stderr).unwrap();
     fs::write(dir.join("status"), "completed").unwrap();
     fs::write(dir.join("exit_code"), "0").unwrap();
     fs::write(dir.join("finished_at"), "100").unwrap();
-    fs::write(dir.join("stdout.log"), stdout).unwrap();
-    fs::write(dir.join("stderr.log"), stderr).unwrap();
-
-    let job_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-    let record = LocalJobRecord::new("demo".to_string(), dir.clone());
     let snapshot = record.terminal_snapshot_handle();
     runtime
         .local_jobs
@@ -1561,6 +1569,28 @@ async fn inspect_job_log_and_tail_use_terminal_snapshot_global_cursors() {
         tail.output["stderr_tail"].as_str().unwrap(),
         "stderr 696\nstderr 697\nstderr 698\nstderr 699\nstderr 700"
     );
+    assert_eq!(tail.output["status"], "completed");
+    assert_eq!(tail.output["terminal"], true);
+    assert_eq!(tail.output["exit_code"], 0);
+    let terminal_token = tail.output["observation_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let again = runtime
+        .job_log_for_auth(
+            job_id.to_string(),
+            None,
+            Some(5),
+            None,
+            Some(terminal_token.clone()),
+            Some(1),
+        )
+        .await;
+    assert!(again.success, "{:?}", again.error);
+    assert_eq!(again.output["wait_outcome"], "terminal");
+    assert_eq!(again.output["observation_token"], terminal_token);
+    assert_eq!(again.output["status"], "completed");
+    assert_eq!(again.output["exit_code"], 0);
     assert!(!scratch_path.exists());
 }
 
@@ -1762,6 +1792,8 @@ async fn runtime_job_tools_filter_agent_jobs_by_auth_group() {
                     job_id: job_b.clone(),
                     offset: None,
                     tail_lines: None,
+                    after_observation_token: None,
+                    wait_secs: None,
                 },
                 Some(&shared_a),
             )
@@ -1773,6 +1805,8 @@ async fn runtime_job_tools_filter_agent_jobs_by_auth_group() {
                 ToolCall::JobTail {
                     job_id: job_b.clone(),
                     tail_lines: None,
+                    after_observation_token: None,
+                    wait_secs: None,
                 },
                 Some(&shared_a),
             )
@@ -1813,6 +1847,8 @@ async fn runtime_job_tools_filter_agent_jobs_by_auth_group() {
                 job_id: job_b.clone(),
                 offset: None,
                 tail_lines: None,
+                after_observation_token: None,
+                wait_secs: None,
             },
             Some(&shared_b),
         )
@@ -1825,6 +1861,8 @@ async fn runtime_job_tools_filter_agent_jobs_by_auth_group() {
             ToolCall::JobTail {
                 job_id: job_b,
                 tail_lines: Some(10),
+                after_observation_token: None,
+                wait_secs: None,
             },
             Some(&shared_b),
         )
@@ -1848,10 +1886,14 @@ async fn lightweight_auth_cannot_enumerate_unrelated_local_jobs() {
         "local-err",
         json!({}),
     );
-    runtime.local_jobs.lock().await.insert(
-        "job-local".to_string(),
-        LocalJobRecord::new("demo".to_string(), dir),
-    );
+    let record = LocalJobRecord::initialize("demo".to_string(), dir)
+        .map(|(record, _)| record)
+        .unwrap();
+    runtime
+        .local_jobs
+        .lock()
+        .await
+        .insert("job-local".to_string(), record);
     let shared = shared_key_auth_context("hash-local");
     let bridge = oauth_bridge_auth_context("hash-local", &[crate::auth::SCOPE_JOB_RUN]);
     let open = open_auth_context();
@@ -2086,6 +2128,8 @@ async fn job_tail_reaches_job_logic_without_agent_auth() {
         .dispatch(ToolCall::JobTail {
             job_id: "no-such-job".to_string(),
             tail_lines: None,
+            after_observation_token: None,
+            wait_secs: None,
         })
         .await;
     assert!(!result.success);
@@ -2093,4 +2137,383 @@ async fn job_tail_reaches_job_logic_without_agent_auth() {
         result.error.unwrap().contains("unknown job"),
         "job_tail should report unknown job"
     );
+}
+
+// ============================================================================
+// Bounded `job_log`/`job_tail` waits — observation tokens and local jobs
+// ============================================================================
+
+fn make_local_record(
+    job_id: &str,
+) -> (
+    tempfile::TempDir,
+    LocalJobRecord,
+    super::super::local_jobs::LocalJobObservation,
+) {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join(job_id);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("status"), "running").unwrap();
+    fs::write(dir.join("stdout.log"), b"").unwrap();
+    fs::write(dir.join("stderr.log"), b"").unwrap();
+    let now = chrono::Utc::now().timestamp();
+    fs::write(dir.join("metadata.json"), serde_json::to_vec(&json!({"created_at":now,"started_at":now,"max_runtime_secs":3600,"kind":"shell","purpose":"test","command":"printf test","cwd":".","shell":"bash"})).unwrap()).unwrap();
+    let (record, observation) = LocalJobRecord::initialize("project".to_string(), dir).unwrap();
+    (temp, record, observation)
+}
+
+#[tokio::test]
+async fn job_log_wait_rejects_invalid_wait_secs_before_execution() {
+    let runtime = test_runtime();
+    for invalid in [0u64, 61u64] {
+        let result = runtime
+            .dispatch_with_auth(
+                ToolCall::JobLog {
+                    job_id: "11111111-2222-3333-4444-555555555555".to_string(),
+                    offset: None,
+                    tail_lines: None,
+                    after_observation_token: Some("bad".to_string()),
+                    wait_secs: Some(invalid),
+                },
+                None,
+            )
+            .await;
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("wait_secs"));
+    }
+}
+
+#[test]
+fn local_noop_observation_does_not_rewrite_file() {
+    let (_temp, record, initial) = make_local_record("job-noop");
+    let path = record.dir.join("observation.json");
+    let before = fs::metadata(&path).unwrap();
+    let first = record.observe().unwrap();
+    let second = record.observe().unwrap();
+    let after = fs::metadata(&path).unwrap();
+    assert_eq!(initial, first);
+    assert_eq!(first, second);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(before.ino(), after.ino());
+        assert_eq!(before.mtime_nsec(), after.mtime_nsec());
+    }
+}
+
+#[tokio::test]
+async fn local_log_growth_changes_token_and_freezes_snapshot_length() {
+    let (_temp, record, initial) = make_local_record("job-growth");
+    fs::write(record.dir.join("stdout.log"), b"one\n").unwrap();
+    let observed = record.observe().unwrap();
+    assert_eq!(observed.revision, initial.revision + 1);
+    let token0 = initial.token("job-growth").unwrap();
+    let result = super::super::jobs::local_job_log(
+        "job-growth",
+        &record,
+        &SystemJobKiller,
+        None,
+        None,
+        Some(token0),
+        Some(5),
+    )
+    .await;
+    assert!(result.success);
+    assert_eq!(result.output["wait_outcome"], "immediate");
+    assert_eq!(result.output["changed"], true);
+    assert_eq!(result.output["stdout_tail"], "one");
+    assert_ne!(
+        result.output["observation_token"],
+        initial.token("job-growth").unwrap()
+    );
+}
+
+#[test]
+fn local_reconstructed_record_keeps_epoch_and_revision() {
+    let (_temp, record, _) = make_local_record("job-reconstruct");
+    fs::write(record.dir.join("stdout.log"), b"one\n").unwrap();
+    let advanced = record.observe().unwrap();
+    let reconstructed = LocalJobRecord::new("project".to_string(), record.dir.clone());
+    let observed = reconstructed.observe().unwrap();
+    assert_eq!(observed.epoch, advanced.epoch);
+    assert_eq!(observed.revision, advanced.revision);
+}
+
+#[test]
+fn local_persistence_failure_does_not_publish_new_revision() {
+    let (_temp, record, initial) = make_local_record("job-persist-fail");
+    fs::write(record.dir.join("stdout.log"), b"change\n").unwrap();
+    let observation_path = record.dir.join("observation.json");
+    fs::remove_file(&observation_path).unwrap();
+    fs::create_dir(&observation_path).unwrap();
+    let error = record.observe().unwrap_err();
+    assert!(error.contains("persist_failed"));
+    fs::remove_dir(&observation_path).unwrap();
+    fs::write(&observation_path, serde_json::to_vec(&initial).unwrap()).unwrap();
+    let recovered = LocalJobRecord::new("project".to_string(), record.dir.clone());
+    assert_eq!(recovered.observe().unwrap().revision, initial.revision + 1);
+}
+
+#[test]
+fn job_log_parses_opaque_observation_token_and_rejects_non_string_values() {
+    let token = crate::job_observation::JobObservationToken::new(
+        crate::job_observation::JobObservationExecutor::Local,
+        "abc",
+        "0123456789abcdef",
+        7,
+    )
+    .unwrap()
+    .encode();
+    let parsed = ToolCall::from_tool_name(
+        "job_log",
+        json!({"job_id": "abc", "after_observation_token": token, "wait_secs": 5}),
+    )
+    .unwrap();
+    match parsed {
+        ToolCall::JobLog {
+            after_observation_token,
+            wait_secs,
+            ..
+        } => {
+            assert_eq!(after_observation_token.as_deref(), Some(token.as_str()));
+            assert_eq!(wait_secs, Some(5));
+        }
+        other => panic!("expected JobLog, got {other:?}"),
+    }
+
+    let result = ToolCall::from_tool_name(
+        "job_log",
+        json!({"job_id": "abc", "after_observation_token": 1, "wait_secs": 5}),
+    );
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn local_fast_output_after_initial_handoff_is_immediately_visible() {
+    let (_temp, record, initial) = make_local_record("job-fast-output");
+    let token0 = initial.token("job-fast-output").unwrap();
+    let stdout = record.dir.join("stdout.log");
+    let status = record.dir.join("status");
+    let exit_code = record.dir.join("exit_code");
+    let command = format!(
+        "printf 'fast output\\n' > {}; printf 0 > {}; printf completed > {}",
+        shell_escape_simple(&stdout.to_string_lossy()),
+        shell_escape_simple(&exit_code.to_string_lossy()),
+        shell_escape_simple(&status.to_string_lossy()),
+    );
+    let child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .spawn()
+        .unwrap();
+    child.wait_with_output().unwrap();
+
+    let result = super::super::jobs::local_job_log(
+        "job-fast-output",
+        &record,
+        &SystemJobKiller,
+        None,
+        None,
+        Some(token0.clone()),
+        Some(5),
+    )
+    .await;
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["wait_outcome"], "immediate");
+    assert_eq!(result.output["changed"], true);
+    assert_eq!(result.output["terminal"], true);
+    assert_eq!(result.output["stdout_tail"], "fast output");
+    assert_ne!(result.output["observation_token"], token0);
+}
+
+#[test]
+fn local_status_and_terminal_transitions_advance_once_without_logs() {
+    let (_temp, record, initial) = make_local_record("job-status-only");
+    fs::write(record.dir.join("status"), "stop_requested").unwrap();
+    let stopped = record.observe().unwrap();
+    assert_eq!(stopped.revision, initial.revision + 1);
+    assert_eq!(record.observe().unwrap().revision, stopped.revision);
+
+    fs::write(record.dir.join("status"), "completed").unwrap();
+    fs::write(record.dir.join("exit_code"), "0").unwrap();
+    let terminal = record.observe().unwrap();
+    assert_eq!(terminal.revision, stopped.revision + 1);
+    assert!(terminal.terminal());
+    assert_eq!(terminal.stdout_len, 0);
+    assert_eq!(terminal.stderr_len, 0);
+}
+
+#[test]
+fn local_concurrent_observers_publish_one_revision() {
+    let (_temp, record, initial) = make_local_record("job-concurrent-observe");
+    fs::write(record.dir.join("stdout.log"), b"one\n").unwrap();
+    let record = std::sync::Arc::new(record);
+    let threads = (0..8)
+        .map(|_| {
+            let record = record.clone();
+            std::thread::spawn(move || record.observe().unwrap().revision)
+        })
+        .collect::<Vec<_>>();
+    let revisions = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect::<Vec<_>>();
+    assert!(revisions
+        .iter()
+        .all(|revision| *revision == initial.revision + 1));
+}
+
+#[test]
+fn local_fixed_length_snapshot_defers_append_to_next_observation() {
+    let (_temp, record, initial) = make_local_record("job-fixed-length");
+    fs::write(record.dir.join("stdout.log"), b"one\n").unwrap();
+    let first = record.observe().unwrap();
+    assert_eq!(first.revision, initial.revision + 1);
+    fs::OpenOptions::new()
+        .append(true)
+        .open(record.dir.join("stdout.log"))
+        .unwrap()
+        .write_all(b"two\n")
+        .unwrap();
+    let frozen = record.read_log_lines_at("stdout.log", None, None, first.stdout_len);
+    assert_eq!(frozen.0, "one");
+    let second = record.observe().unwrap();
+    assert_eq!(second.revision, first.revision + 1);
+    assert!(second.stdout_len > first.stdout_len);
+    assert_ne!(
+        first.token("job-fixed-length").unwrap(),
+        second.token("job-fixed-length").unwrap()
+    );
+}
+
+#[tokio::test]
+async fn local_append_during_read_is_visible_on_next_call_and_excluded_from_waited_ms() {
+    let (_temp, record, _) = make_local_record("job-append-during-read");
+    let stdout_path = record.dir.join("stdout.log");
+    fs::write(&stdout_path, b"one\n").unwrap();
+    let first = record.observe().unwrap();
+    let token1 = first.token("job-append-during-read").unwrap();
+
+    super::super::local_jobs::reset_bounded_log_read_count(&stdout_path);
+    super::super::local_jobs::set_bounded_log_read_delay(
+        &stdout_path,
+        Some(std::time::Duration::from_millis(250)),
+    );
+    let started = std::time::Instant::now();
+    let task = tokio::spawn({
+        let record = record.clone();
+        let token1 = token1.clone();
+        async move {
+            let killer = SystemJobKiller;
+            super::super::jobs::local_job_log(
+                "job-append-during-read",
+                &record,
+                &killer,
+                None,
+                None,
+                Some(token1),
+                None,
+            )
+            .await
+        }
+    });
+
+    let read_started_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while super::super::local_jobs::bounded_log_read_count(&stdout_path) == 0 {
+        assert!(
+            std::time::Instant::now() < read_started_deadline,
+            "bounded stdout scan did not start"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&stdout_path)
+        .unwrap()
+        .write_all(b"two\n")
+        .unwrap();
+    fs::write(record.dir.join("exit_code"), "0").unwrap();
+    fs::write(record.dir.join("status"), "completed").unwrap();
+
+    let first_response = task.await.unwrap();
+    super::super::local_jobs::set_bounded_log_read_delay(&stdout_path, None);
+    assert!(first_response.success, "{:?}", first_response.error);
+    assert!(started.elapsed() >= std::time::Duration::from_millis(200));
+    assert_eq!(first_response.output["wait_outcome"], "immediate");
+    assert_eq!(first_response.output["waited_ms"], 0);
+    assert_eq!(first_response.output["changed"], false);
+    assert_eq!(first_response.output["terminal"], false);
+    assert_eq!(first_response.output["status"], "running");
+    assert!(first_response.output["exit_code"].is_null());
+    assert_eq!(first_response.output["stdout_tail"], "one");
+    assert_eq!(first_response.output["observation_token"], token1);
+
+    let second_response = super::super::jobs::local_job_log(
+        "job-append-during-read",
+        &record,
+        &SystemJobKiller,
+        None,
+        None,
+        Some(token1.clone()),
+        Some(5),
+    )
+    .await;
+    assert!(second_response.success, "{:?}", second_response.error);
+    assert_eq!(second_response.output["wait_outcome"], "immediate");
+    assert_eq!(second_response.output["changed"], true);
+    assert_eq!(second_response.output["terminal"], true);
+    assert_eq!(second_response.output["status"], "completed");
+    assert_eq!(second_response.output["exit_code"], 0);
+    assert_eq!(second_response.output["stdout_tail"], "one\ntwo");
+    assert_ne!(second_response.output["observation_token"], token1);
+}
+
+#[tokio::test]
+async fn local_runtime_deadline_crossing_preempts_longer_update_wait() {
+    let (_temp, record, initial) = make_local_record("job-runtime-deadline");
+    let started_at = chrono::Utc::now().timestamp();
+    fs::write(
+        record.dir.join("metadata.json"),
+        serde_json::to_vec(&json!({
+            "created_at": started_at,
+            "started_at": started_at,
+            "max_runtime_secs": 2,
+            "process_group_id": 4242,
+            "kind": "shell",
+            "purpose": "test",
+            "command": "sleep 30",
+            "cwd": ".",
+            "shell": "bash"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(record.dir.join("pid"), "4242").unwrap();
+    let token0 = initial.token("job-runtime-deadline").unwrap();
+    let killer = FakeJobKiller::default();
+    let started = std::time::Instant::now();
+
+    let response = super::super::jobs::local_job_log(
+        "job-runtime-deadline",
+        &record,
+        &killer,
+        None,
+        None,
+        Some(token0.clone()),
+        Some(5),
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    assert!(response.success, "{:?}", response.error);
+    assert!(
+        elapsed < std::time::Duration::from_secs(4),
+        "elapsed={elapsed:?}"
+    );
+    assert_eq!(response.output["wait_outcome"], "terminal");
+    assert_eq!(response.output["changed"], true);
+    assert_eq!(response.output["terminal"], true);
+    assert_eq!(response.output["status"], "lost");
+    assert_ne!(response.output["observation_token"], token0);
+    assert_eq!(killer.calls(), vec![(4242, 4242)]);
 }

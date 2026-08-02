@@ -25,6 +25,7 @@ mod connector_runtime;
 mod console_web;
 mod db;
 mod host_console_http;
+mod job_observation;
 mod mcp;
 mod model_surface;
 mod models;

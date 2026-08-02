@@ -226,10 +226,14 @@ fn from_tool_name_parses_job_status_and_job_log() {
             job_id,
             offset,
             tail_lines,
+            after_observation_token,
+            wait_secs,
         } => {
             assert_eq!(job_id, "abc");
             assert_eq!(offset, Some(10));
             assert_eq!(tail_lines, None);
+            assert_eq!(after_observation_token, None);
+            assert_eq!(wait_secs, None);
         }
         other => panic!("expected JobLog, got {:?}", other),
     }
@@ -886,9 +890,16 @@ fn from_tool_name_parses_phase_a_tools() {
     let call =
         ToolCall::from_tool_name("job_tail", json!({"job_id": "abc", "tail_lines": 10})).unwrap();
     match call {
-        ToolCall::JobTail { job_id, tail_lines } => {
+        ToolCall::JobTail {
+            job_id,
+            tail_lines,
+            after_observation_token,
+            wait_secs,
+        } => {
             assert_eq!(job_id, "abc");
             assert_eq!(tail_lines, Some(10));
+            assert_eq!(after_observation_token, None);
+            assert_eq!(wait_secs, None);
         }
         other => panic!("expected JobTail, got {:?}", other),
     }

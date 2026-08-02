@@ -16,6 +16,10 @@ struct JobLogRequest {
     pub offset: Option<usize>,
     #[serde(default)]
     pub tail_lines: Option<usize>,
+    #[serde(default)]
+    pub after_observation_token: Option<String>,
+    #[serde(default)]
+    pub wait_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +71,10 @@ struct JobTailRequest {
     pub job_id: String,
     #[serde(default)]
     pub tail_lines: Option<usize>,
+    #[serde(default)]
+    pub after_observation_token: Option<String>,
+    #[serde(default)]
+    pub wait_secs: Option<u64>,
 }
 
 #[handler]
@@ -107,6 +115,8 @@ pub async fn job_log(req: &mut Request, depot: &mut Depot, res: &mut Response) {
                 job_id: body.job_id,
                 offset: body.offset,
                 tail_lines: body.tail_lines,
+                after_observation_token: body.after_observation_token,
+                wait_secs: body.wait_secs,
             },
             auth.as_ref(),
         )
@@ -239,6 +249,8 @@ pub async fn job_tail(req: &mut Request, depot: &mut Depot, res: &mut Response) 
             ToolCall::JobTail {
                 job_id: body.job_id,
                 tail_lines: body.tail_lines,
+                after_observation_token: body.after_observation_token,
+                wait_secs: body.wait_secs,
             },
             auth.as_ref(),
         )

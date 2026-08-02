@@ -145,6 +145,14 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "created_at",
                 schema_type("integer", "Job creation timestamp."),
             ),
+            (
+                "observation_token",
+                schema_type("string", "Opaque Job-bound observation token. Return it unchanged as after_observation_token for one bounded wait."),
+            ),
+            (
+                "last_update_seq",
+                nullable_schema("integer", "Agent Runner protocol diagnostic sequence; not a bounded-wait token. Omitted for local jobs."),
+            ),
         ])),
         "list_jobs" => Some(wrapped_output_schema(vec![
             (
@@ -260,8 +268,12 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 nullable_schema("string", "Structured bounded recovery reason code."),
             ),
             (
+                "observation_token",
+                schema_type("string", "Opaque Job-bound observation token for the current public snapshot."),
+            ),
+            (
                 "last_update_seq",
-                nullable_schema("integer", "Latest accepted runner-owned monotonic update sequence."),
+                nullable_schema("integer", "Agent Runner protocol diagnostic sequence; not a bounded-wait token. Omitted for local jobs."),
             ),
             (
                 "stdout_retained_from_line",
@@ -333,6 +345,25 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ),
             ),
             (
+                "wait_outcome",
+                schema_type(
+                    "string",
+                    "Bounded wait outcome: immediate (no wait or state already available), updated (non-terminal update after waiting), terminal (job terminal), or timeout (wait elapsed with no observable change; a normal result, not an error).",
+                ),
+            ),
+            (
+                "waited_ms",
+                schema_type("integer", "Milliseconds actually spent waiting, when a bounded wait was requested."),
+            ),
+            (
+                "changed",
+                schema_type("boolean", "Whether the current observation_token differs from the supplied after_observation_token."),
+            ),
+            (
+                "terminal",
+                schema_type("boolean", "Whether the job is in a terminal state per the canonical job terminal definition."),
+            ),
+            (
                 "exit_code",
                 nullable_schema("integer", "Process exit code, when available."),
             ),
@@ -385,8 +416,12 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 nullable_schema("string", "Structured bounded recovery reason code."),
             ),
             (
+                "observation_token",
+                schema_type("string", "Opaque Job-bound observation token for the returned status and frozen log snapshot."),
+            ),
+            (
                 "last_update_seq",
-                nullable_schema("integer", "Latest accepted runner-owned monotonic update sequence."),
+                nullable_schema("integer", "Agent Runner protocol diagnostic sequence; not a bounded-wait token. Omitted for local jobs."),
             ),
             (
                 "cursor",

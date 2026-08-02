@@ -222,7 +222,7 @@ pub(crate) fn job_status_input_schema() -> Value {
 }
 
 pub(crate) fn job_log_input_schema() -> Value {
-    object_schema(vec![
+    let mut schema = object_schema(vec![
         ("job_id", "string", "Job id.", true),
         (
             "offset",
@@ -236,7 +236,23 @@ pub(crate) fn job_log_input_schema() -> Value {
             "Optional number of trailing lines per stream. Defaults to 200 and is capped at 500.",
             false,
         ),
-    ])
+        (
+            "after_observation_token",
+            "string",
+            "Opaque observation token returned by run_job, job_status, job_log, or job_tail. Return it unchanged. The token is bound to one Job; a server epoch change causes an immediate refresh.",
+            false,
+        ),
+        (
+            "wait_secs",
+            "integer",
+            "Optional bounded wait in seconds (1..=60). When both after_observation_token and wait_secs are supplied, this is a single bounded wait, not a subscription or streaming connection.",
+            false,
+        ),
+    ]);
+    schema["properties"]["after_observation_token"]["maxLength"] = json!(192);
+    schema["properties"]["wait_secs"]["minimum"] = json!(1);
+    schema["properties"]["wait_secs"]["maximum"] = json!(60);
+    schema
 }
 
 pub(crate) fn list_jobs_input_schema() -> Value {

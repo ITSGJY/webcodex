@@ -744,6 +744,20 @@ Use `run_job` for async diagnostics/build/test work, then supervise it with
 200 bounded lines per stream (maximum 500) and return status, exit code, total
 line counts, bounded tails, truncation flags, detected summary, and `cursor`;
 continue with `offset=cursor.stdout`. They never return an unbounded full log.
+
+`job_log`/`job_tail` also support a single bounded wait for new progress: supply
+`after_observation_token` (the opaque `observation_token` from a previous response) and
+`wait_secs` (1–60). The token is opaque, Job-bound, and must be returned
+unchanged. The call compares it with the current observation token and waits only
+when they match and the Job is active, returning `wait_outcome`
+(`immediate`/`updated`/`terminal`/`timeout`), `waited_ms`, `changed`, and
+`terminal`. This is a one-shot wait — not a subscription, streaming connection,
+or background callback — so an idle wait that reaches its limit returns normally
+with `wait_outcome=timeout` and `changed=false`; the caller decides whether to
+wait again. A Server epoch change invalidates an old token and causes an immediate
+`changed=true` refresh rather than a timeout. `last_update_seq` remains an Agent
+Runner protocol diagnostic field and must never be used as a wait token; local Jobs
+do not synthesize it.
 To stop a WebCodex-started job, call `stop_job` with the same project, job id,
 explicit session id when available, and `confirm=true`.
 
@@ -783,8 +797,8 @@ Useful bounded fields are:
 - job outputs: `recovery_state`, `recovered_after_server_restart`,
   `reconciled_at`, `recovery_reason_code`, `recovery_reason` (a stable
   human-readable summary derived from the bounded reason code, never from raw
-  error strings, tokens, commands, or connection identifiers), `last_update_seq`,
-  and `stdout_retained_from_line` / `stderr_retained_from_line`;
+  error strings, tokens, commands, or connection identifiers), `observation_token`,
+  Agent-only diagnostic `last_update_seq`, and `stdout_retained_from_line` / `stderr_retained_from_line`;
 - log outputs: `earlier_stdout_unavailable` /
   `earlier_stderr_unavailable`;
 - `runtime_status.jobs`: `recovering_count`, `reconciled_count`, and
@@ -1181,7 +1195,7 @@ bash scripts/e2e_job_reconciliation_ws.sh
 
 This verifies a running async job survives a server restart with the same
 runner instance (original `job_id`, preserved ownership, non-regressing
-`last_update_seq`, non-duplicating logs, `stop_job` of the original process
+`observation_token`, non-duplicating logs, `stop_job` of the original process
 group) and that a job completing while the server is offline reconciles to
 `completed`. The runner process must stay alive; it cannot recover a child
 handle across its own restart, and `run_job` call-level idempotency remains

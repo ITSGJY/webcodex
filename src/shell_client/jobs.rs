@@ -214,7 +214,16 @@ pub(super) fn job_view(job: &ShellJobRecord) -> ShellJobInfo {
         recovered_after_server_restart: job.recovered_after_server_restart,
         reconciled_at: job.reconciled_at,
         recovery_reason_code: job.recovery_reason_code.clone(),
-        last_update_seq: (job.last_update_seq > 0).then_some(job.last_update_seq),
+        observation_token: crate::job_observation::JobObservationToken::new(
+            crate::job_observation::JobObservationExecutor::Agent,
+            job.job_id.clone(),
+            job.observation_epoch.to_string(),
+            job.public_revision
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+        .ok()
+        .map(|token| token.encode()),
+        last_update_seq: Some(job.last_update_seq),
         stdout_retained_from_line: Some(job.stdout.first_retained_line),
         stderr_retained_from_line: Some(job.stderr.first_retained_line),
         stdout_log_truncated: job.stdout.truncated,
@@ -368,6 +377,18 @@ pub(super) fn is_final_job_status(status: &str) -> bool {
     )
 }
 
+/// Broadcast an observable update for a job. Any mutation to a job's public
+/// snapshot or `last_update_seq` must call this while holding the registry
+/// mutex, so bounded `job_log`/`job_tail` waiters are woken to re-read the
+/// authoritative snapshot. `notify_waiters` (not `notify_one`) so that every
+/// concurrent waiter observes the update; waiters re-check the snapshot after
+/// every wake, so spurious broadcasts are harmless.
+pub(super) fn notify_job_update(job: &ShellJobRecord) {
+    use std::sync::atomic::Ordering;
+    job.public_revision.fetch_add(1, Ordering::Relaxed);
+    job.update_notify.notify_waiters();
+}
+
 pub(super) fn is_runner_active_job_status(status: &str) -> bool {
     matches!(
         status,
@@ -387,6 +408,7 @@ pub(super) fn begin_job_recovery(job: &mut ShellJobRecord, now: i64, reason_code
     job.recovery_state = Some("recovering".to_string());
     job.recovery_reason_code = Some(reason_code.to_string());
     job.ended_at = None;
+    notify_job_update(job);
 }
 
 pub(super) fn mark_job_lost(job: &mut ShellJobRecord, now: i64, reason_code: &str, message: &str) {
@@ -408,6 +430,7 @@ pub(super) fn mark_job_lost(job: &mut ShellJobRecord, now: i64, reason_code: &st
     job.recovery_reason_code = Some(reason_code.to_string());
     job.recovering_since = None;
     job.recovery_original_status = None;
+    notify_job_update(job);
 }
 
 fn client_is_connected_locked(inner: &ShellClientRegistryInner, client_id: &str) -> bool {

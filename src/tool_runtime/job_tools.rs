@@ -56,15 +56,30 @@ impl ToolRuntime {
                 job_id,
                 offset,
                 tail_lines,
+                after_observation_token,
+                wait_secs,
             } => {
-                self.job_log_for_auth(job_id, offset, tail_lines, auth)
-                    .await
+                self.job_log_for_auth(
+                    job_id,
+                    offset,
+                    tail_lines,
+                    auth,
+                    after_observation_token,
+                    wait_secs,
+                )
+                .await
             }
             ToolCall::ListJobs { limit, status } => {
                 self.list_jobs_for_auth(limit, status, auth).await
             }
-            ToolCall::JobTail { job_id, tail_lines } => {
-                self.job_tail_for_auth(job_id, tail_lines, auth).await
+            ToolCall::JobTail {
+                job_id,
+                tail_lines,
+                after_observation_token,
+                wait_secs,
+            } => {
+                self.job_tail_for_auth(job_id, tail_lines, auth, after_observation_token, wait_secs)
+                    .await
             }
             _ => unreachable!("non-job tool routed to job dispatcher"),
         }

@@ -433,10 +433,10 @@ impl ExecutionService {
             (true, Some(job_id)) => self
                 .tools
                 .shell_clients
-                .job_log_for_auth(Some(auth), job_id, None, None, Some(200))
+                .job_log_for_auth(Some(auth), job_id, None, None, Some(200), None, None)
                 .await
                 .ok()
-                .map(|(_, stdout, stderr, _, _)| {
+                .map(|(_, stdout, stderr, _, _, _)| {
                     json!({
                         "stdout": stdout.unwrap_or_default(),
                         "stderr": stderr.unwrap_or_default(),

@@ -177,7 +177,7 @@ impl ExecutionService {
                 "execution has no executor reference".to_string(),
             )
         })?;
-        let (job, _, _, stdout_cursor, stderr_cursor) = self
+        let (job, _, _, stdout_cursor, stderr_cursor, _wait) = self
             .tools
             .shell_clients
             .job_log_for_auth(
@@ -185,6 +185,8 @@ impl ExecutionService {
                 job_id,
                 Some(execution.stdout_cursor),
                 Some(execution.stderr_cursor),
+                None,
+                None,
                 None,
             )
             .await
@@ -207,12 +209,12 @@ impl ExecutionService {
         let failed_check = progress.and_then(|progress| progress.failed_step.as_deref());
         let executor_failure_code = job.error.as_deref().and_then(executor_failure_code);
         let assertion_evidence = if execution.kind == "check" && failed_check.is_some() {
-            let (_, full_stdout, full_stderr, _, _) = self
+            let (_, full_stdout, full_stderr, _, _, _) = self
                 .tools
                 .shell_clients
-                .job_log_for_auth(Some(auth), job_id, None, None, None)
+                .job_log_for_auth(Some(auth), job_id, None, None, None, None, None)
                 .await
-                .unwrap_or_else(|_| (job.clone(), None, None, 1, 1));
+                .unwrap_or_else(|_| (job.clone(), None, None, 1, 1, Default::default()));
             failed_check.map(|check| {
                 durable_assertion_evidence(
                     check,
