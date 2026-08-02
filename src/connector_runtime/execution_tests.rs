@@ -1,3 +1,4 @@
+use super::wire_models::sanitize_value;
 use super::*;
 use crate::db::{ConnectorExecutionFailure, ConnectorExecutionObservation};
 use crate::shell_client::{ShellClientRegistry, ShellJobStartMetadata};
@@ -7,6 +8,8 @@ use crate::shell_protocol::{
     ShellClientRegisterRequest, ShellJobOpRequest, ShellJobValidationProgress,
     ShellJobValidationStep, VALIDATION_STEP_WAIT_FAILED_CODE,
 };
+use crate::tool_runtime::validation_profile::{RecipeId, SemanticCheck};
+use crate::tool_runtime::ApplyFileChangeInput;
 use std::time::{Duration, Instant};
 
 #[tokio::test]

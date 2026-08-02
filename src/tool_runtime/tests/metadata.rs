@@ -1507,14 +1507,14 @@ async fn runtime_status_reports_canonical_connector_surface_when_configured() {
     let full = runtime.dispatch(runtime_status_call()).await;
     assert_eq!(
         full.output["model_surface"],
-        crate::connector_runtime::MODEL_SURFACE_CANONICAL_CONNECTOR
+        crate::model_surface::MODEL_SURFACE_CANONICAL_CONNECTOR
     );
     let compact = runtime
         .dispatch(ToolCall::from_tool_name("runtime_status", json!({"compact": true})).unwrap())
         .await;
     assert_eq!(
         compact.output["model_surface"],
-        crate::connector_runtime::MODEL_SURFACE_CANONICAL_CONNECTOR
+        crate::model_surface::MODEL_SURFACE_CANONICAL_CONNECTOR
     );
 }
 

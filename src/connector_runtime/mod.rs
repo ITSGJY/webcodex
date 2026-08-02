@@ -17,24 +17,29 @@ pub(crate) mod surface;
 mod wire_models;
 pub(crate) mod workspace;
 
-// Re-export `ConnectorContext` and the env helpers so existing call sites in
-// this module (and `host_tests`) keep resolving through `super::`.
-pub(crate) use context::{
-    required_env, ConnectorContext, PROJECT_AGENT_TOKEN_FILE_ENV, PROJECT_CREDENTIAL_FILE_ENV,
+// `ConnectorContext` is the crate-visible entry point for connector runtime
+// construction; the env helpers stay private to the context module.
+pub(crate) use context::ConnectorContext;
+
+use context::{required_env, PROJECT_AGENT_TOKEN_FILE_ENV, PROJECT_CREDENTIAL_FILE_ENV};
+use projections::{
+    approval_gate_outcome, bounded_goal, check_request_hash, checks_stale_outcome,
+    command_action_hash, command_request_hash, connector_window_binding, context_refresh_payload,
+    edit_operation_hash, host_review_projection, invalid_input, kernel_failure_may_have_applied,
+    model_next_action, navigation_payload, paginate_search_output, parse_input,
+    parse_search_cursor, project_brief, project_brief_from_fingerprint, required_scope,
+    search_cursor_signature, short_oid, stable_subject_id, validate_operation_id, validate_path,
+    validate_task_id, validation_projection, validation_recipe_error, KernelFailure,
+    DEFAULT_TASK_LIST_LIMIT, MAX_TASK_LIST_LIMIT,
+};
+use wire_models::{
+    sanitize_value, ChecksRunInput, CommandsRunInput, EditsApplyInput, FilesListInput,
+    FilesReadInput, FilesSearchInput, TaskFinishInput, TaskListInput, TaskResumeInput,
+    TaskStartInput,
 };
 
-#[allow(unused_imports)]
-use projections::*;
-#[allow(unused_imports)]
-use wire_models::*;
-
-// Re-export the symbols host_console_http and other modules reference through
-// `crate::connector_runtime::`. They moved into the projections / wire_models
-// submodules above but keep their `pub(crate)` visibility here for callers.
-#[cfg(test)]
-pub(crate) use crate::model_surface::{
-    MODEL_SURFACE_CANONICAL_CONNECTOR, MODEL_SURFACE_FULL_OPERATOR_RUNTIME,
-};
+// Crate-visible API re-exported for the HTTP/MCP layers and the CLI. The
+// symbols live in the projections / wire_models submodules.
 pub(crate) use projections::{
     approval_projection, durable_task_review_projection, result_projection, store_error_outcome,
     validate_opaque_id,
@@ -72,18 +77,6 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex, Weak};
-
-// Symbols the externalized test modules (`connector_runtime_tests.rs`,
-// `execution_tests.rs`) reach via `use super::*`. They live in the auth /
-// tool_runtime crates and in the projections / wire_models submodules; these
-// test-only imports re-surface them in this module's namespace so `super::*`
-// still resolves. Kept under `#[cfg(test)]` so production builds stay warning-free.
-#[cfg(test)]
-use crate::auth::{AuthKind, SCOPE_JOB_RUN, SCOPE_PROJECT_READ, SCOPE_RUNTIME_READ};
-#[cfg(test)]
-use crate::tool_runtime::validation_profile::{RecipeId, SemanticCheck};
-#[cfg(test)]
-use crate::tool_runtime::ApplyFileChangeInput;
 
 const MAX_EVENT_COUNT: usize = 50;
 /// Guidance messages delivered in one capability response. Bounded so a burst
