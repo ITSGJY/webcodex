@@ -94,6 +94,7 @@ project_overview
 list_project_tracked_files
 list_project_files
 search_project_text
+search_project_texts
 read_file
 read_files
 lsp_status
@@ -408,6 +409,34 @@ SHA-256、行号格式、Runner 响应解析、稳定错误码和序列化安全
 `next_index` 指向第一个未返回的原始输入项。调用方可从原 `items` 的该位置
 重试。Session 与 permission 元数据只附加到批次外层；顶层 `project` 是解析后
 的 runtime project id。
+
+### 有界批量文本搜索（`search_project_texts`）
+
+`search_project_texts` 是独立的只读工具，不改变 `search_project_text` 契约。
+它接收一个必填 `project`、1 到 8 个独立 `queries`，以及可选的外层 Workflow
+`session_id`。每个 query 复用现有的 `pattern`、`path`、`result_mode`、`limit`、
+上下文、glob 和超时字段。它不会合并 pattern、读取命中文件、调用 LSP，也不会
+进行语义或模型分析。
+
+项目只解析和授权一次。各 query 随后复用单查询的校验、受保护路径排除、
+rg-first/grep fallback、超时规范化、结果解析、路径过滤、截断和错误映射。
+校验、Runner enqueue 与等待响应全部占用同一个二并发槽；槽位释放前第三个搜索
+不能进入 Runner。结果最终恢复输入顺序；某个普通失败、无匹配或超时 query
+不会取消其他槽位的工作。无匹配继续保持单查询的成功语义。
+
+整个批次由一个精确的 30 秒 deadline 约束。query 的命令超时取规范化超时与
+剩余批次预算的较小值（Runner 协议以整秒表示），精确的外层 deadline 始终
+有效。已完成 item 保留，未完成的 Runner 请求会取消，只有未完成 item 变为
+`timeout`。
+
+最终 `ToolResult` 按真实 JSON 序列化大小计入 256 KiB 预算，并为外层 Session
+元数据预留空间。工具按输入顺序只加入完整 item；下一个 item 放不下时，返回
+`output_truncated=true`，`next_index` 指向调用方可从原列表重新提交的第一个
+query。解析后的 runtime project id 与 Session/permission 元数据只位于外层；
+item 使用 `index` 对应输入，因此不会重复原始 pattern。一个批次只记录一个
+read-like search event，exploration `search_count` 只增加一次。只有成功且已返回
+item 中去重后的项目相对路径进入探索证据；`queries[*].pattern` 会从所有
+Workflow Session ledger 投影与持久化数据中移除。
 
 ## 有界项目文本搜索（`search_project_text`）
 

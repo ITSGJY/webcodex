@@ -31,6 +31,7 @@ pub(crate) const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "read_files",
             "run_shell",
             "search_project_text",
+            "search_project_texts",
             "document_symbols",
             "document_diagnostics",
             "hover",
@@ -193,25 +194,27 @@ pub(crate) const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
 pub(crate) const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
     ToolRecommendedFlow {
         name: "discovery",
-        summary: "Discovery: list_projects, project_overview, and read_file/read_files; use search_project_text for bounded code search. run_shell with rg or git grep remains the diagnostic escape hatch.",
+        summary: "Discovery: list_projects, project_overview, and read_file/read_files; use search_project_text for bounded code search and search_project_texts for independent batches. run_shell with rg or git grep remains the diagnostic escape hatch.",
         manifest_purpose:
-            "Resolve the project, inspect bounded structure, then search code with search_project_text.",
+            "Resolve the project, inspect bounded structure, then search code with search_project_text or search_project_texts.",
         tools: &[
             "list_projects",
             "project_overview",
             "read_file",
             "read_files",
             "search_project_text",
+            "search_project_texts",
             "run_shell",
         ],
     },
     ToolRecommendedFlow {
         name: "inspect",
-        summary: "Inspect: use search_project_text and read_file before editing; use read_files for bounded multi-file reads. run_shell with rg or git grep is the diagnostic escape hatch, and show_changes reviews the worktree.",
+        summary: "Inspect: use search_project_text and read_file before editing; use search_project_texts and read_files for bounded batches. run_shell with rg or git grep is the diagnostic escape hatch, and show_changes reviews the worktree.",
         manifest_purpose:
             "Use bounded structured search and file reads for code inspection, then review the worktree.",
         tools: &[
             "search_project_text",
+            "search_project_texts",
             "read_file",
             "read_files",
             "run_shell",
@@ -276,6 +279,7 @@ pub(crate) const LOCAL_CODING_TOOL_NAMES: &[&str] = &[
     "list_project_tracked_files",
     "list_project_files",
     "search_project_text",
+    "search_project_texts",
     "read_file",
     "read_files",
     // LSP navigation
@@ -332,6 +336,7 @@ pub(crate) const TOOL_MANIFEST_INTENTS: &[ToolManifestIntent] = &[
             "read_file",
             "read_files",
             "search_project_text",
+            "search_project_texts",
             "list_project_files",
             "git_status",
             "git_log",
@@ -355,6 +360,7 @@ pub(crate) const TOOL_MANIFEST_INTENTS: &[ToolManifestIntent] = &[
             "list_project_tracked_files",
             "list_project_files",
             "search_project_text",
+            "search_project_texts",
             "read_file",
             "read_files",
             "git_status",

@@ -3327,6 +3327,7 @@ fn assert_review_evidence_tools_safe(review_evidence: &Value) {
                 "read_file"
                     | "list_project_files"
                     | "search_project_text"
+                    | "search_project_texts"
                     | "git_diff"
                     | "git_diff_summary"
                     | "git_diff_hunks"

@@ -165,6 +165,43 @@ pub(crate) fn search_project_text_input_schema() -> Value {
     schema
 }
 
+pub(crate) fn search_project_texts_input_schema() -> Value {
+    let single = search_project_text_input_schema();
+    let mut query_properties = single["properties"]
+        .as_object()
+        .expect("search_project_text properties")
+        .clone();
+    for outer_field in ["project", "session_id", "allow_cross_project_session"] {
+        query_properties.remove(outer_field);
+    }
+    query_properties
+        .get_mut("pattern")
+        .expect("search pattern schema")["minLength"] = json!(1);
+
+    let mut schema = object_schema(with_optional_session_id(vec![
+        ("project", "string", "Agent-registered project id.", true),
+        (
+            "queries",
+            "array",
+            "One to eight independent bounded text-search queries, returned in request order.",
+            true,
+        ),
+    ]));
+    schema["properties"]["queries"] = json!({
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 8,
+        "description": "One to eight independent bounded text-search queries, returned in request order.",
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["pattern"],
+            "properties": query_properties,
+        }
+    });
+    schema
+}
+
 pub(crate) fn read_file_input_schema() -> Value {
     object_schema(with_optional_session_id(vec![
         ("project", "string", "Configured project id.", true),

@@ -161,6 +161,7 @@ fn tool_definition_runtime_tool_policy_inventory_is_stable() {
             "current_session_fallback",
         ),
         ("search_project_text", "file", "current_session_fallback"),
+        ("search_project_texts", "file", "current_session_fallback"),
         ("git_diff_summary", "git", "current_session_fallback"),
         ("show_changes", "git", "current_session_fallback"),
         (

@@ -762,7 +762,7 @@ fn review_evidence_kind(tool_name: &str) -> Option<ReviewEvidenceKind> {
         "read_file" | "read_files" | "list_project_files" | "project_overview" => {
             Some(ReviewEvidenceKind::ReadOnlyInspection)
         }
-        "search_project_text" => Some(ReviewEvidenceKind::Search),
+        "search_project_text" | "search_project_texts" => Some(ReviewEvidenceKind::Search),
         "git_diff" | "git_diff_summary" | "git_diff_hunks" => Some(ReviewEvidenceKind::DiffReview),
         "show_changes" | "git_status" => Some(ReviewEvidenceKind::WorkspaceReview),
         "workspace_hygiene_check" => Some(ReviewEvidenceKind::HygieneReview),

@@ -62,6 +62,19 @@ pub(super) const SEARCH_DEFINITIONS: &[ToolDefinition] = &[
         false,
         false,
     ),
+    def(
+        "search_project_texts",
+        ModelVisible,
+        TOOL_CATEGORY_FILE,
+        Some(Shell),
+        TOOL_PROVIDER_AGENT,
+        ReadOnly,
+        Some(PROJECT_READ),
+        true,
+        NoPath,
+        false,
+        false,
+    ),
 ];
 
 pub(super) const READ_DEFINITIONS: &[ToolDefinition] = &[

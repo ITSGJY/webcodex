@@ -1,7 +1,7 @@
 use super::super::input_schemas::{
     list_project_files_input_schema, list_project_tracked_files_input_schema,
     project_overview_input_schema, read_file_input_schema, read_files_input_schema,
-    search_project_text_input_schema,
+    search_project_text_input_schema, search_project_texts_input_schema,
 };
 use super::tool_spec;
 use crate::tool_runtime::tool_spec::ToolSpec;
@@ -31,6 +31,11 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
             "search_project_text",
             "Default inspect/search tool for project text. Uses rg-first with grep fallback. Supports matches/files_with_matches/count modes, context, and bounded timeouts. Stops early when the result budget and byte cap are met. Returns structured output with backend and truncated metadata.",
             search_project_text_input_schema(),
+        ),
+        tool_spec(
+            "search_project_texts",
+            "Run 1 to 8 independent bounded project-text searches in request order. Query failures are isolated. Runner searches have true two-request concurrency, one 30-second batch deadline, and a 256 KiB serialized-result cap with next_index continuation. Results never trigger automatic file reads.",
+            search_project_texts_input_schema(),
         ),
         tool_spec(
             "read_file",

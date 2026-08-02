@@ -25,6 +25,7 @@ mod permission_gate;
 mod read_files;
 mod reconnect;
 mod schema;
+mod search_project_texts;
 mod session_shells;
 mod sessions;
 mod sessions_current;

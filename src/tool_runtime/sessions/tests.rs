@@ -1317,6 +1317,36 @@ fn exploration_ledger_persists_only_bounded_relative_paths_and_safe_metadata() {
 }
 
 #[test]
+fn search_project_texts_nested_patterns_are_removed_from_session_input_summary() {
+    let summary = super::events::session_input_summary_for_tool(
+        "search_project_texts",
+        &json!({
+            "project": "agent:oe:demo",
+            "queries": [
+                {
+                    "pattern": "RAW_BATCH_PATTERN_ALPHA wc_pat_PRIVATE_TOKEN",
+                    "path": "src",
+                    "result_mode": "matches"
+                },
+                {
+                    "pattern": "RAW_BATCH_PATTERN_BETA Authorization: Bearer PRIVATE",
+                    "path": "tests",
+                    "result_mode": "files_with_matches"
+                }
+            ]
+        }),
+    );
+    assert_eq!(summary["queries"][0]["path"], "src");
+    assert_eq!(summary["queries"][1]["path"], "tests");
+    assert!(summary["queries"][0].get("pattern").is_none());
+    assert!(summary["queries"][1].get("pattern").is_none());
+    let serialized = serde_json::to_string(&summary).unwrap();
+    assert!(!serialized.contains("RAW_BATCH_PATTERN_ALPHA"));
+    assert!(!serialized.contains("RAW_BATCH_PATTERN_BETA"));
+    assert!(!serialized.contains("PRIVATE_TOKEN"));
+}
+
+#[test]
 fn resolved_message_survives_restore() {
     let tmp = tempfile::tempdir().unwrap();
     let ledger = tmp.path().join("sessions.json");

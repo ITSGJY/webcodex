@@ -101,6 +101,26 @@ pub(crate) fn session_log_arguments_for_tool_request(tool_name: &str, arguments:
                 out.insert(summary_field.to_string(), serde_json::json!(count));
             }
         }
+        "search_project_texts" => {
+            out.insert(
+                "query_count".to_string(),
+                serde_json::json!(obj
+                    .get("queries")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0)),
+            );
+            out.insert(
+                "patterns_present".to_string(),
+                Value::Bool(
+                    obj.get("queries")
+                        .and_then(Value::as_array)
+                        .is_some_and(|queries| {
+                            queries.iter().any(|query| query.get("pattern").is_some())
+                        }),
+                ),
+            );
+        }
         "write_project_file" => {
             copy_keys(
                 obj,
@@ -578,6 +598,13 @@ impl ToolCall {
                 "exclude_glob_count": exclude_globs.as_ref().map(Vec::len).unwrap_or(0),
                 "result_mode": result_mode,
                 "timeout_secs": timeout_secs,
+            }),
+            Self::SearchProjectTexts {
+                project, queries, ..
+            } => serde_json::json!({
+                "project": project,
+                "query_count": queries.len(),
+                "patterns_present": !queries.is_empty(),
             }),
             Self::LspStatus { project, .. } => serde_json::json!({
                 "project": project,

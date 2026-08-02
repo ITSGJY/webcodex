@@ -524,6 +524,43 @@ fn openapi_read_files_is_available_through_strict_flattened_runtime_fields() {
 }
 
 #[test]
+fn openapi_search_project_texts_is_available_through_strict_flattened_runtime_fields() {
+    let spec = build_openapi_spec();
+    let tool_call = &spec["components"]["schemas"]["ToolCallRequest"];
+    let description = tool_call["properties"][TOOL_CALL_TOOL_FIELD]["description"]
+        .as_str()
+        .unwrap();
+    assert!(description.contains("search_project_text"));
+    assert!(description.contains("search_project_texts"));
+
+    let queries = &tool_call["properties"]["queries"];
+    assert_eq!(queries["type"], "array");
+    assert_eq!(queries["minItems"], 1);
+    assert_eq!(queries["maxItems"], 8);
+    assert_eq!(queries["items"]["additionalProperties"], false);
+    assert_eq!(queries["items"]["required"], json!(["pattern"]));
+    assert_eq!(
+        queries["items"]["properties"]["result_mode"]["enum"],
+        json!(["matches", "files_with_matches", "count"])
+    );
+    assert_eq!(tool_call["additionalProperties"], false);
+
+    let examples = &spec["paths"]["/api/tools/call"]["post"]["requestBody"]["content"]
+        ["application/json"]["examples"];
+    assert_eq!(
+        examples["searchProjectTexts"]["value"]["tool"],
+        "search_project_texts"
+    );
+    assert_eq!(
+        examples["searchProjectTexts"]["value"]["queries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
 fn openapi_key_actions_have_examples() {
     let spec = build_openapi_spec();
     // getRuntimeJobStatus, getRuntimeJobLog, and callRuntimeTool must ship

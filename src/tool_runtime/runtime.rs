@@ -30,6 +30,8 @@ pub struct ToolRuntime {
     pub(crate) repository_overview_probe_timeout: Duration,
     /// One deadline shared by every item in a `read_files` batch.
     pub(crate) read_files_deadline: Duration,
+    /// One deadline shared by every query in a `search_project_texts` batch.
+    pub(crate) search_project_texts_deadline: Duration,
     /// Internal synchronous wait window for a read-only structured validation
     /// before it promotes to a Job. Defaults to `SYNC_VALIDATION_WAIT_SECS`;
     /// tests shrink it so the handoff path can be exercised without sleeping.
@@ -68,6 +70,8 @@ impl ToolRuntime {
             repository_overview_probe_timeout:
                 super::coding_task::DEFAULT_REPOSITORY_OVERVIEW_PROBE_TIMEOUT,
             read_files_deadline: super::read_files::DEFAULT_READ_FILES_DEADLINE,
+            search_project_texts_deadline:
+                super::search_project_texts::DEFAULT_SEARCH_PROJECT_TEXTS_DEADLINE,
             validation_sync_wait: Duration::from_secs(super::helpers::SYNC_VALIDATION_WAIT_SECS),
             permission_evaluator: PermissionEvaluator::from_env(),
             activity: Arc::new(NoopActivityRecorder),
@@ -133,6 +137,12 @@ impl ToolRuntime {
     #[cfg(test)]
     pub(crate) fn with_read_files_deadline(mut self, deadline: Duration) -> Self {
         self.read_files_deadline = deadline;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_search_project_texts_deadline(mut self, deadline: Duration) -> Self {
+        self.search_project_texts_deadline = deadline;
         self
     }
 

@@ -760,6 +760,29 @@ pub(crate) fn build_openapi_spec() -> Value {
                                 "with_line_numbers": true
                             }
                         },
+                        "searchProjectTexts": {
+                            "summary": "Run several independent bounded text searches",
+                            "value": {
+                                "tool": "search_project_texts",
+                                "project": "webcodex",
+                                "queries": [
+                                    {
+                                        "pattern": "ResolvedProject",
+                                        "path": "src",
+                                        "result_mode": "matches",
+                                        "limit": 20,
+                                        "context_before": 2,
+                                        "context_after": 4
+                                    },
+                                    {
+                                        "pattern": "read_files",
+                                        "path": "src/tool_runtime/tests",
+                                        "result_mode": "files_with_matches",
+                                        "limit": 20
+                                    }
+                                ]
+                            }
+                        },
                         "checkpointRestore": {
                             "summary": "Restore a checkpoint via flattened GPT Action fields",
                             "value": {

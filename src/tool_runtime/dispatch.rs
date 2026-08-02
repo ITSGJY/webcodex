@@ -585,6 +585,7 @@ impl ToolRuntime {
             | ToolCall::ListProjectTrackedFiles { .. }
             | ToolCall::ProjectOverview { .. }
             | ToolCall::SearchProjectText { .. }
+            | ToolCall::SearchProjectTexts { .. }
             | ToolCall::ReplaceInFile { .. }
             | ToolCall::ReplaceExactBlock { .. }
             | ToolCall::InsertBeforePattern { .. }

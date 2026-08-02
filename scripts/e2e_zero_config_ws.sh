@@ -520,7 +520,7 @@ fi
 # ----------------------------------------------------------------------------
 
 # The model surface is startup-selected and immutable. The default local_coding
-# surface is the intentional 34-tool canonical coding loop; the explicit
+# surface is the intentional 35-tool canonical coding loop; the explicit
 # full-operator-v1 surface exposes the complete operator tool set. Neither
 # surface re-exposes the ModelHidden compatibility tools (replace_in_file,
 # job_tail) to the model via MCP tools/list; write_project_file is ModelVisible
@@ -587,7 +587,7 @@ if [ "$EXPECTED_SURFACE" = "local_coding" ]; then
     # The local_coding canonical coding loop must expose its key tools.
     mcp_canonical_present=1
     for tname in work_on_project list_projects project_overview read_file read_files \
-        search_project_text apply_text_edits apply_patch_checked run_shell \
+        search_project_text search_project_texts apply_text_edits apply_patch_checked run_shell \
         run_job job_status job_log list_jobs stop_job cargo_fmt cargo_check \
         cargo_test validation_summary git_status git_diff show_changes \
         finish_coding_task; do
@@ -618,7 +618,7 @@ else
     mcp_operator_present=1
     for tname in list_tools start_coding_task work_on_project finish_coding_task \
         git_diff_summary validate_patch apply_patch apply_patch_checked read_file read_files \
-        run_shell run_job job_status job_log list_jobs show_changes; do
+        search_project_texts run_shell run_job job_status job_log list_jobs show_changes; do
         if mcp_tool_present "$tname"; then
             :
         else
@@ -679,6 +679,31 @@ if echo "$sc" | grep -Fq "$TEST_REPO"; then
     fail "MCP tools/call(read_files) leaked an absolute project path"
 else
     pass "MCP tools/call(read_files) keeps paths project-relative"
+fi
+
+# tools/call search_project_texts — exercise two independent result modes
+# through the real MCP/Runner path and verify ordered project-relative output.
+body="$(api_post /mcp "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"search_project_texts\",\"arguments\":{\"project\":\"$RUNTIME_PROJECT_ID\",\"queries\":[{\"pattern\":\"Smoke Project\",\"path\":\"README.md\",\"result_mode\":\"matches\",\"limit\":10},{\"pattern\":\"println!\",\"path\":\"src.rs\",\"result_mode\":\"files_with_matches\",\"limit\":10}]}}}")"
+sc="$(json_get "$body" result.structuredContent)"
+if [ "$(json_get "$sc" success)" = "True" ] \
+    && [ "$(json_get "$sc" output.requested_count)" = "2" ] \
+    && [ "$(json_get "$sc" output.returned_count)" = "2" ] \
+    && [ "$(json_get "$sc" output.items.0.index)" = "0" ] \
+    && [ "$(json_get "$sc" output.items.0.success)" = "True" ] \
+    && [ "$(json_get "$sc" output.items.0.output.result_mode)" = "matches" ] \
+    && [ "$(json_get "$sc" output.items.0.output.matches.0.path)" = "README.md" ] \
+    && [ "$(json_get "$sc" output.items.1.index)" = "1" ] \
+    && [ "$(json_get "$sc" output.items.1.success)" = "True" ] \
+    && [ "$(json_get "$sc" output.items.1.output.result_mode)" = "files_with_matches" ] \
+    && [ "$(json_get "$sc" output.items.1.output.files.0.path)" = "src.rs" ]; then
+    pass "MCP tools/call(search_project_texts) returns two ordered successful result modes"
+else
+    fail "MCP tools/call(search_project_texts) contract mismatch (body: ${body:0:500})"
+fi
+if echo "$sc" | grep -Fq "$TEST_REPO"; then
+    fail "MCP tools/call(search_project_texts) leaked an absolute project path"
+else
+    pass "MCP tools/call(search_project_texts) keeps paths project-relative"
 fi
 
 # ----------------------------------------------------------------------------

@@ -546,6 +546,11 @@ fn required_agent_capability_matches_metadata_risk_table() {
             AgentCapability::Shell,
         ),
         (
+            "search_project_texts",
+            ToolRisk::ReadOnly,
+            AgentCapability::Shell,
+        ),
+        (
             "git_diff_summary",
             ToolRisk::ReadOnly,
             AgentCapability::GitOrShell,

@@ -14,6 +14,7 @@ use super::helpers::{
     looks_like_command_timeout, run_command_sync_bounded, shell_escape_simple, shell_join_paths,
     validate_limited_cleanup_paths, validate_project_relative_path, LocalRunFailure,
 };
+use super::project_resolution::ResolvedProject;
 use super::tool_inputs::{
     ApplyFileChangeInput, ApplyFileChangeKind, ApplyTextEditInput, ApplyTextEditKind,
 };
@@ -4585,7 +4586,7 @@ impl ToolRuntime {
         result_mode: Option<SearchResultMode>,
         timeout_secs: Option<i64>,
     ) -> ToolResult {
-        let options = match SearchOptions::normalize(SearchRequest {
+        let request = SearchRequest {
             pattern,
             path,
             limit,
@@ -4595,7 +4596,9 @@ impl ToolRuntime {
             exclude_globs,
             result_mode,
             timeout_secs,
-        }) {
+        };
+        // Preserve the single-query validation-before-resolution ordering.
+        let options = match SearchOptions::normalize(request) {
             Ok(options) => options,
             Err(error) => return error.into_tool_result(),
         };
@@ -4603,8 +4606,45 @@ impl ToolRuntime {
             Ok(p) => p,
             Err(e) => return ToolResult::err(e),
         };
+        self.search_one_resolved_project_text(&proj, &project, options, None)
+            .await
+    }
+
+    pub(crate) async fn search_project_text_resolved(
+        &self,
+        resolved: &ResolvedProject,
+        output_project: &str,
+        request: SearchRequest,
+    ) -> ToolResult {
+        let options = match SearchOptions::normalize(request) {
+            Ok(options) => options,
+            Err(error) => return error.into_tool_result(),
+        };
+        self.search_one_resolved_project_text(&resolved.config, output_project, options, None)
+            .await
+    }
+
+    pub(crate) async fn search_one_resolved_project_text(
+        &self,
+        proj: &ProjectConfig,
+        output_project: &str,
+        mut options: SearchOptions,
+        batch_deadline: Option<Instant>,
+    ) -> ToolResult {
+        if let Some(deadline) = batch_deadline {
+            let now = Instant::now();
+            if now >= deadline {
+                return search_timeout_tool_result(&options, None);
+            }
+            // The Runner protocol expresses command timeouts in whole seconds;
+            // the outer `timeout_at` below still enforces the exact subsecond
+            // remainder when tests or a nearly exhausted batch have less than
+            // one second left.
+            let remaining_secs = deadline.duration_since(now).as_secs().max(1);
+            options.timeout_secs = options.timeout_secs.min(remaining_secs);
+        }
         if is_search_project_text_excluded_path(&options.path) {
-            return empty_search_project_text_output(&project, &options);
+            return empty_search_project_text_output(output_project, &options);
         }
         let cmd = search_project_text_command(&options);
         let effective_timeout_secs = options.timeout_secs;
@@ -4644,7 +4684,11 @@ impl ToolRuntime {
                 Ok(r) => r,
                 Err(e) => return ToolResult::err(e),
             };
-            return match tokio::time::timeout(Duration::from_secs(outer_timeout), rx).await {
+            let wait_deadline = Instant::now() + Duration::from_secs(outer_timeout);
+            let wait_deadline = batch_deadline.map_or(wait_deadline, |deadline| {
+                std::cmp::min(deadline, wait_deadline)
+            });
+            return match tokio::time::timeout_at(wait_deadline, rx).await {
                 Ok(Ok(resp)) => {
                     let raw_stdout = resp.stdout.unwrap_or_default();
                     if let Some(result) = external_provider_error_result(&raw_stdout) {
@@ -4665,7 +4709,7 @@ impl ToolRuntime {
                             None
                         };
                         return search_timeout_tool_result_with_records(
-                            &project,
+                            output_project,
                             &options,
                             &stdout,
                             backend.as_deref(),
@@ -4684,7 +4728,13 @@ impl ToolRuntime {
                             }),
                         );
                     }
-                    search_project_text_output(&project, &options, &stdout, resp.exit_code, &stderr)
+                    search_project_text_output(
+                        output_project,
+                        &options,
+                        &stdout,
+                        resp.exit_code,
+                        &stderr,
+                    )
                 }
                 Ok(Err(_)) => {
                     self.shell_clients.cancel_request(&req_id).await;
@@ -4700,10 +4750,22 @@ impl ToolRuntime {
             };
         }
         let root = proj.root();
-        match run_command_sync_bounded(cmd, root, effective_timeout_secs).await {
-            Ok((exit_code, stdout, stderr, _)) => {
-                search_project_text_output(&project, &options, &stdout, Some(exit_code), &stderr)
-            }
+        let local = run_command_sync_bounded(cmd, root, effective_timeout_secs);
+        let local = match batch_deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline, local).await {
+                Ok(result) => result,
+                Err(_) => return search_timeout_tool_result(&options, Some("local_hard_bound")),
+            },
+            None => local.await,
+        };
+        match local {
+            Ok((exit_code, stdout, stderr, _)) => search_project_text_output(
+                output_project,
+                &options,
+                &stdout,
+                Some(exit_code),
+                &stderr,
+            ),
             // Outer hard bound (command timeout + grace) fired: treat as a
             // search timeout so the MCP request still returns a structured error
             // instead of parking forever on a wedged output drain.

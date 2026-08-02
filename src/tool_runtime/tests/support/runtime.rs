@@ -60,6 +60,7 @@ pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
         "patch" => json!("diff --git a/a b/a\n"),
         "paths" => json!(["old.txt"]),
         "items" => json!([{"path": "src/lib.rs"}]),
+        "queries" => json!([{"pattern": "fn main"}]),
         "path" => json!("src/lib.rs"),
         "old" | "old_text" => json!("a"),
         "new" | "new_text" => json!("b"),

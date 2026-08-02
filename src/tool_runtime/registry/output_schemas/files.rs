@@ -105,6 +105,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
         ])),
         "read_file" => Some(read_file_output_schema()),
         "read_files" => Some(read_files_output_schema()),
+        "search_project_texts" => Some(search_project_texts_output_schema()),
         "search_project_text" => {
             Some(wrapped_output_schema(vec![
             ("project", schema_type("string", "Resolved project id.")),
@@ -241,6 +242,111 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
         }
         _ => None,
     }
+}
+
+fn search_project_texts_output_schema() -> Value {
+    let search_success = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "path": schema_type("string", "Effective project-relative search root."),
+            "backend": nullable_schema("string", "Search backend: rg, grep, native, or null when unknown."),
+            "result_mode": {"type": "string", "enum": ["matches", "files_with_matches", "count"]},
+            "effective_timeout_secs": {"type": "integer", "minimum": 1, "maximum": 120},
+            "exit_code": nullable_schema("integer", "Search command exit code, when available."),
+            "context_before": {"type": "integer", "minimum": 0, "maximum": 20},
+            "context_after": {"type": "integer", "minimum": 0, "maximum": 20},
+            "matches": {"type": "array", "items": search_match_schema()},
+            "count": {"type": "integer", "minimum": 0},
+            "files": {"type": "array", "items": search_file_result_schema()},
+            "returned_file_count": {"type": "integer", "minimum": 0},
+            "returned_match_count": {"type": "integer", "minimum": 0},
+            "count_complete": {"type": "boolean"},
+            "total_matches": nullable_schema("integer", "Complete total in count mode; null when incomplete."),
+            "truncated": {"type": "boolean"},
+            "truncation_reason": {
+                "anyOf": [
+                    {"type": "string", "enum": ["limit", "output_bytes", "timeout", "transport"]},
+                    {"type": "null"}
+                ]
+            }
+        },
+        "required": [
+            "path", "backend", "result_mode", "effective_timeout_secs", "exit_code",
+            "context_before", "context_after", "truncated", "truncation_reason"
+        ]
+    });
+    let search_failure = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "error_kind": {"type": "string", "const": "search_project_text_failed"},
+            "reason_code": {
+                "type": "string",
+                "enum": [
+                    "invalid_pattern", "invalid_path", "invalid_glob", "invalid_search_request",
+                    "search_backend_feature_unavailable", "search_execution_failed", "timeout",
+                    "search_request_dropped", "external_provider_error", "agent_unavailable"
+                ]
+            },
+            "state_changed": {"type": "boolean", "const": false}
+        },
+        "required": ["error_kind", "reason_code", "state_changed"]
+    });
+    let item_schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "index": {"type": "integer", "minimum": 0, "maximum": 7},
+            "success": {"type": "boolean"},
+            "output": {"anyOf": [search_success.clone(), search_failure.clone()]},
+            "error": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+        },
+        "required": ["index", "success", "output", "error"],
+        "allOf": [{
+            "if": {"properties": {"success": {"const": true}}, "required": ["success"]},
+            "then": {"properties": {"output": search_success, "error": {"type": "null"}}},
+            "else": {"properties": {"output": search_failure, "error": {"type": "string"}}}
+        }]
+    });
+    let batch_output = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "project": schema_type("string", "Resolved runtime project id."),
+            "requested_count": {"type": "integer", "minimum": 1, "maximum": 8},
+            "returned_count": {"type": "integer", "minimum": 0, "maximum": 8},
+            "succeeded_count": {"type": "integer", "minimum": 0, "maximum": 8},
+            "failed_count": {"type": "integer", "minimum": 0, "maximum": 8},
+            "items": {"type": "array", "maxItems": 8, "items": item_schema},
+            "output_truncated": {"type": "boolean"},
+            "next_index": {"anyOf": [{"type": "integer", "minimum": 0, "maximum": 7}, {"type": "null"}]},
+            "session_recorded": schema_type("boolean", "True when this batch call was recorded."),
+            "session_id": schema_type("string", "Session id used for outer batch telemetry."),
+            "session_event_id": schema_type("string", "Outer batch Session event id."),
+            "session_hint": session_hint_schema(),
+            "permission": permission_decision_schema()
+        },
+        "required": [
+            "project", "requested_count", "returned_count", "succeeded_count",
+            "failed_count", "items", "output_truncated", "next_index"
+        ]
+    });
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "success": {"type": "boolean"},
+            "output": {"anyOf": [batch_output.clone(), {"type": "object", "additionalProperties": true}, {"type": "null"}]},
+            "error": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+        },
+        "required": ["success", "output"],
+        "allOf": [{
+            "if": {"properties": {"success": {"const": true}}, "required": ["success"]},
+            "then": {"properties": {"output": batch_output, "error": {"type": "null"}}},
+            "else": {"required": ["error"], "properties": {"error": {"type": "string"}}}
+        }]
+    })
 }
 
 fn read_file_output_schema() -> Value {

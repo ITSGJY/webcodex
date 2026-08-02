@@ -1,5 +1,6 @@
 //! Runtime dispatch adapters for file, artifact, and text-edit tool calls.
 
+use super::files::SearchRequest;
 use super::project_resolution::{ProjectResolverError, ResolvedProject};
 use super::{sessions::SessionTransport, ToolCall, ToolResult, ToolRuntime};
 
@@ -77,21 +78,51 @@ impl ToolRuntime {
                 exclude_globs,
                 result_mode,
                 timeout_secs,
-            } => {
-                self.search_project_text(
-                    project,
-                    pattern,
-                    path,
-                    limit,
-                    context_before,
-                    context_after,
-                    include_globs,
-                    exclude_globs,
-                    result_mode,
-                    timeout_secs,
-                )
-                .await
-            }
+            } => match project_resolution {
+                Some(Ok(resolved)) => {
+                    self.search_project_text_resolved(
+                        &resolved,
+                        &project,
+                        SearchRequest {
+                            pattern,
+                            path,
+                            limit,
+                            context_before,
+                            context_after,
+                            include_globs,
+                            exclude_globs,
+                            result_mode,
+                            timeout_secs,
+                        },
+                    )
+                    .await
+                }
+                Some(Err(error)) => error.into_tool_result(),
+                None => {
+                    self.search_project_text(
+                        project,
+                        pattern,
+                        path,
+                        limit,
+                        context_before,
+                        context_after,
+                        include_globs,
+                        exclude_globs,
+                        result_mode,
+                        timeout_secs,
+                    )
+                    .await
+                }
+            },
+            ToolCall::SearchProjectTexts {
+                project,
+                queries,
+                session_id: _,
+            } => match project_resolution {
+                Some(Ok(resolved)) => self.search_project_texts_resolved(&resolved, queries).await,
+                Some(Err(error)) => error.into_tool_result(),
+                None => self.search_project_texts(project, queries).await,
+            },
             ToolCall::ReplaceInFile {
                 project,
                 path,

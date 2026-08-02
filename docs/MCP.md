@@ -101,6 +101,7 @@ project_overview
 list_project_tracked_files
 list_project_files
 search_project_text
+search_project_texts
 read_file
 read_files
 lsp_status
@@ -469,6 +470,42 @@ does not fit, `output_truncated=true` and `next_index` identifies the first
 omitted input item. The caller can retry from that position in its original
 `items` list. Session and permission metadata belong only to the outer batch
 result, and the top-level `project` is the resolved runtime project id.
+
+### Bounded batch text search (`search_project_texts`)
+
+`search_project_texts` is a separate read-only tool and does not change the
+`search_project_text` contract. It accepts one required `project`, 1 to 8
+independent `queries`, and an optional outer Workflow `session_id`. Each query
+uses the existing `pattern`, `path`, `result_mode`, `limit`, context, glob, and
+timeout fields. It never combines patterns, reads matching files, calls LSP, or
+performs semantic/model analysis.
+
+The project is resolved and authorized once. Each query then reuses the
+single-search validation, protected-path exclusions, rg-first/grep fallback,
+timeout normalization, parsing, path filtering, truncation, and error mapping.
+Validation, Runner enqueue, and response waiting all occupy one of two
+concurrency slots; a third search cannot reach the Runner until a slot opens.
+Results are restored to input order and one failed/no-match/timed-out query
+does not cancel ordinary work in other slots. No-match keeps the single-query
+success semantics.
+
+One exact 30-second batch deadline bounds all queries. A query's command
+timeout is the smaller of its normalized timeout and the remaining batch
+budget (with the Runner protocol's whole-second granularity); the exact outer
+deadline remains authoritative. Completed items are retained, unfinished
+Runner requests are cancelled, and only unfinished items become `timeout`.
+
+The final `ToolResult` is measured by actual JSON serialization against a
+256 KiB budget with space reserved for outer Session metadata. Only complete
+items are appended in input order. If the next item does not fit,
+`output_truncated=true` and `next_index` points to the first query the caller
+can resubmit from its original list. The resolved runtime project id and any
+Session/permission metadata occur only on the outer result; item `index`
+identifies the input query, so raw patterns are not repeated in item output.
+One batch records one read-like search event and increments exploration
+`search_count` once. Only deduplicated project-relative paths from successful
+returned items enter exploration evidence; `queries[*].pattern` is removed
+from all Workflow Session ledger projections and persistence.
 
 ## Bounded project text search (`search_project_text`)
 

@@ -332,6 +332,7 @@ pub(crate) const EXPLORATION_TOOL_NAMES: &[&str] = &[
     "read_file",
     "read_files",
     "search_project_text",
+    "search_project_texts",
     "document_symbols",
     "document_diagnostics",
     "hover",
@@ -346,7 +347,7 @@ pub(crate) fn exploration_tool_kind(tool_name: &str) -> Option<ExplorationToolKi
     }
     match tool_name {
         "read_file" | "read_files" => Some(ExplorationToolKind::Read),
-        "search_project_text" => Some(ExplorationToolKind::Search),
+        "search_project_text" | "search_project_texts" => Some(ExplorationToolKind::Search),
         _ if runtime_tool_category(tool_name) == TOOL_CATEGORY_LSP => {
             Some(ExplorationToolKind::Navigation)
         }
@@ -398,6 +399,13 @@ pub(crate) fn session_input_summary_for_tool(tool_name: &str, arguments: &Value)
     match tool_name {
         "search_project_text" => {
             object.remove("pattern");
+        }
+        "search_project_texts" => {
+            if let Some(queries) = object.get_mut("queries").and_then(Value::as_array_mut) {
+                for query in queries.iter_mut().filter_map(Value::as_object_mut) {
+                    query.remove("pattern");
+                }
+            }
         }
         "workspace_symbols" => {
             object.remove("query");
@@ -503,15 +511,29 @@ pub(crate) fn observed_paths_for_successful_result(
     match kind {
         ExplorationToolKind::Read => {}
         ExplorationToolKind::Search => {
-            for key in ["matches", "files"] {
-                for record in output
-                    .get(key)
+            let search_outputs: Vec<&Value> = if tool_name == "search_project_texts" {
+                output
+                    .get("items")
                     .and_then(Value::as_array)
                     .into_iter()
                     .flatten()
-                {
-                    if let Some(path) = record.get("path").and_then(Value::as_str) {
-                        push_observed_path(&mut paths, path);
+                    .filter(|item| item.get("success").and_then(Value::as_bool) == Some(true))
+                    .filter_map(|item| item.get("output"))
+                    .collect()
+            } else {
+                vec![output]
+            };
+            for search_output in search_outputs {
+                for key in ["matches", "files"] {
+                    for record in search_output
+                        .get(key)
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let Some(path) = record.get("path").and_then(Value::as_str) {
+                            push_observed_path(&mut paths, path);
+                        }
                     }
                 }
             }

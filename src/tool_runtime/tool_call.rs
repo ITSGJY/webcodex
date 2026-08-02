@@ -44,6 +44,28 @@ pub struct ReadFilesItem {
     pub limit: Option<usize>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchProjectTextsQuery {
+    pub pattern: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub context_before: Option<usize>,
+    #[serde(default)]
+    pub context_after: Option<usize>,
+    #[serde(default)]
+    pub include_globs: Option<Vec<String>>,
+    #[serde(default)]
+    pub exclude_globs: Option<Vec<String>>,
+    #[serde(default)]
+    pub result_mode: Option<SearchResultMode>,
+    #[serde(default)]
+    pub timeout_secs: Option<i64>,
+}
+
 fn deserialize_non_empty_read_path<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -66,6 +88,21 @@ where
         ));
     }
     Ok(items)
+}
+
+fn deserialize_search_project_texts_queries<'de, D>(
+    deserializer: D,
+) -> Result<Vec<SearchProjectTextsQuery>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let queries = Vec::<SearchProjectTextsQuery>::deserialize(deserializer)?;
+    if !(1..=8).contains(&queries.len()) {
+        return Err(serde::de::Error::custom(
+            "queries must contain between 1 and 8 entries",
+        ));
+    }
+    Ok(queries)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -721,6 +758,16 @@ pub enum ToolCall {
         timeout_secs: Option<i64>,
     },
 
+    /// Run up to eight independent bounded project-text searches under one
+    /// project authorization and outer Session event.
+    SearchProjectTexts {
+        project: String,
+        #[serde(deserialize_with = "deserialize_search_project_texts_queries")]
+        queries: Vec<SearchProjectTextsQuery>,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+
     /// Read-only git diff summary for a project: `git status --porcelain`,
     /// `git diff --stat`, and a parsed changed-file list. Does not modify the
     /// worktree. Routed to the owning agent.
@@ -1248,6 +1295,33 @@ fn reject_unknown_read_files_fields(arguments: &Value) -> Result<(), String> {
     ))
 }
 
+fn reject_unknown_search_project_texts_fields(arguments: &Value) -> Result<(), String> {
+    const ALLOWED: &[&str] = &[
+        "project",
+        "queries",
+        "session_id",
+        // Wrapper/session metadata that transports may leave in params.
+        "allow_cross_project_session",
+        "recording_session_id",
+        "_session_id",
+    ];
+    let Some(object) = arguments.as_object() else {
+        return Ok(());
+    };
+    let unknown: Vec<&str> = object
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !ALLOWED.contains(key))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "invalid arguments for tool 'search_project_texts': unknown field(s) {}",
+        unknown.join(", ")
+    ))
+}
+
 impl ToolCall {
     pub fn from_tool_name(name: &str, arguments: Value) -> Result<Self, String> {
         Self::from_tool_name_with_recorder_metadata(name, arguments).map(|(call, _)| call)
@@ -1279,6 +1353,9 @@ impl ToolCall {
         }
         if name == "read_files" {
             reject_unknown_read_files_fields(&arguments)?;
+        }
+        if name == "search_project_texts" {
+            reject_unknown_search_project_texts_fields(&arguments)?;
         }
         let mut wrapped = serde_json::Map::new();
         wrapped.insert(
@@ -1382,6 +1459,7 @@ impl ToolCall {
             Self::ListProjectTrackedFiles { .. } => "list_project_tracked_files",
             Self::ProjectOverview { .. } => "project_overview",
             Self::SearchProjectText { .. } => "search_project_text",
+            Self::SearchProjectTexts { .. } => "search_project_texts",
             Self::GitDiffSummary { .. } => "git_diff_summary",
             Self::ShowChanges { .. } => "show_changes",
             Self::WorkspaceHygieneCheck { .. } => "workspace_hygiene_check",
@@ -1443,6 +1521,7 @@ impl ToolCall {
             | Self::ListProjectTrackedFiles { session_id, .. }
             | Self::ProjectOverview { session_id, .. }
             | Self::SearchProjectText { session_id, .. }
+            | Self::SearchProjectTexts { session_id, .. }
             | Self::GitDiffSummary { session_id, .. }
             | Self::ShowChanges { session_id, .. }
             | Self::ReplaceInFile { session_id, .. }
@@ -1508,6 +1587,7 @@ impl ToolCall {
             | Self::ListProjectTrackedFiles { session_id, .. }
             | Self::ProjectOverview { session_id, .. }
             | Self::SearchProjectText { session_id, .. }
+            | Self::SearchProjectTexts { session_id, .. }
             | Self::GitDiffSummary { session_id, .. }
             | Self::ShowChanges { session_id, .. }
             | Self::ReplaceInFile { session_id, .. }
@@ -1598,6 +1678,7 @@ impl ToolCall {
             | Self::ListProjectTrackedFiles { project, .. }
             | Self::ProjectOverview { project, .. }
             | Self::SearchProjectText { project, .. }
+            | Self::SearchProjectTexts { project, .. }
             | Self::GitDiffSummary { project, .. }
             | Self::ShowChanges { project, .. }
             | Self::ReplaceInFile { project, .. }
