@@ -513,6 +513,7 @@ impl ToolCall {
             Self::ReadFile {
                 project,
                 path,
+                items,
                 start_line,
                 limit,
                 with_line_numbers,
@@ -520,6 +521,7 @@ impl ToolCall {
             } => serde_json::json!({
                 "project": project,
                 "path": path,
+                "item_count": items.as_ref().map(Vec::len).unwrap_or(0),
                 "start_line": start_line,
                 "limit": limit,
                 "with_line_numbers": with_line_numbers,

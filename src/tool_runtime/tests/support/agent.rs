@@ -157,7 +157,14 @@ fn run_agent_file_read_request_locally(req: &ShellAgentShellRequest) -> (i32, St
             });
             (0, output.to_string(), String::new())
         }
-        Err(error) => (-1, String::new(), error.to_string()),
+        Err(error) => (
+            -1,
+            String::new(),
+            // Production runners emit `read_file failed: <reason_code>` (space);
+            // `map_agent_read_error` relies on that exact prefix. The shared
+            // `ReadFileError` Display uses an underscore, so normalize here.
+            format!("read_file failed: {}", error.reason.as_str()),
+        ),
     }
 }
 

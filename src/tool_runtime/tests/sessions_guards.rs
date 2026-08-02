@@ -41,7 +41,8 @@ async fn unknown_session_id_fails_before_execution_or_mutation() {
     let read = runtime
         .dispatch(ToolCall::ReadFile {
             project: "demo".to_string(),
-            path: "README.md".to_string(),
+            path: Some("README.md".to_string()),
+            items: None,
             session_id: Some("wc_sess_missing".to_string()),
             start_line: None,
             limit: None,
@@ -98,7 +99,8 @@ async fn same_project_session_records_without_project_mismatch_warning() {
                 .dispatch_with_auth(
                     ToolCall::ReadFile {
                         project: alpha,
-                        path: "README.md".to_string(),
+                        path: Some("README.md".to_string()),
+                        items: None,
                         session_id: Some(session_id),
                         start_line: None,
                         limit: None,
@@ -155,7 +157,8 @@ async fn read_only_cross_project_session_succeeds_with_structured_warning() {
                 .dispatch_with_auth(
                     ToolCall::ReadFile {
                         project: bravo,
-                        path: "README.md".to_string(),
+                        path: Some("README.md".to_string()),
+                        items: None,
                         session_id: Some(session_id),
                         start_line: None,
                         limit: None,
@@ -409,7 +412,8 @@ async fn current_session_binding_cannot_cross_project_boundary() {
                 .dispatch_with_auth(
                     ToolCall::ReadFile {
                         project: bravo,
-                        path: "README.md".to_string(),
+                        path: Some("README.md".to_string()),
+                        items: None,
                         session_id: None,
                         start_line: None,
                         limit: None,
@@ -773,7 +777,8 @@ async fn read_only_session_allows_read_file_and_records_success() {
                 .dispatch_with_auth(
                     ToolCall::ReadFile {
                         project,
-                        path: "README.md".to_string(),
+                        path: Some("README.md".to_string()),
+                        items: None,
                         session_id: Some(session_id),
                         start_line: None,
                         limit: None,
@@ -1123,7 +1128,8 @@ async fn deny_write_only_allows_read_and_shell_tools() {
                 .dispatch_with_auth(
                     ToolCall::ReadFile {
                         project,
-                        path: "README.md".to_string(),
+                        path: Some("README.md".to_string()),
+                        items: None,
                         session_id: Some(session_id),
                         start_line: None,
                         limit: None,

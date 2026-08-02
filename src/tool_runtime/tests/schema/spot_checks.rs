@@ -121,8 +121,8 @@ fn tool_specs_schema_spot_checks() {
         ),
         (
             "read_file",
-            vec!["project", "path"],
-            vec!["with_line_numbers"],
+            vec!["project"],
+            vec!["path", "items", "with_line_numbers"],
         ),
         ("list_jobs", vec![], vec![]),
         (

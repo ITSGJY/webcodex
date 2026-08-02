@@ -534,10 +534,15 @@ pub enum ToolCall {
         timeout_secs: Option<u64>,
     },
 
-    /// Read a file from a project.
+    /// Read a file range from a project, or a bounded batch of up to 16 file
+    /// ranges in one call. `path` (single range) and `items` (batch) are
+    /// mutually exclusive; the runtime enforces the choice and the item count.
     ReadFile {
         project: String,
-        path: String,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        items: Option<Vec<super::file_read_batch::ReadFileItem>>,
         #[serde(default)]
         session_id: Option<String>,
         #[serde(default)]
@@ -1118,6 +1123,38 @@ pub enum ToolCall {
     },
 }
 
+/// Runtime argument validation for `read_file`. The single-file form (`path`)
+/// and the batch form (`items`) are mutually exclusive; the batch form forbids
+/// top-level `start_line`/`limit` and bounds its item count to 1..=16. Both the
+/// JSON Schema and this runtime check enforce the same rules so no transport can
+/// send a shape the executor does not expect.
+fn validate_read_file_arguments(arguments: &Value) -> Result<(), String> {
+    let Some(object) = arguments.as_object() else {
+        return Ok(());
+    };
+    let has_path = object
+        .get("path")
+        .and_then(Value::as_str)
+        .is_some_and(|p| !p.is_empty());
+    // `null` items deserialize to `None` (single-file form), so treat it as
+    // absent here to keep runtime validation and serde in agreement.
+    let has_items = object.get("items").is_some_and(|value| !value.is_null());
+    match (has_path, has_items) {
+        (true, true) => Err("path and items are mutually exclusive".to_string()),
+        (false, false) => Err("exactly one of path or items is required".to_string()),
+        // Single-file form: default behavior unchanged.
+        (true, false) => Ok(()),
+        (false, true) => {
+            if object.contains_key("start_line") || object.contains_key("limit") {
+                return Err("top-level start_line/limit are not allowed with items".to_string());
+            }
+            super::file_read_batch::validate_batch_items_value(
+                object.get("items").expect("items present"),
+            )
+        }
+    }
+}
+
 /// Strict argument validation for `start_coding_task`: the removed legacy
 /// startup flags must fail loudly instead of being silently ignored by serde.
 fn reject_unknown_start_coding_task_fields(arguments: &Value) -> Result<(), String> {
@@ -1185,6 +1222,11 @@ impl ToolCall {
         if name == "start_coding_task" {
             if let Err(message) = reject_unknown_start_coding_task_fields(&arguments) {
                 return Err(message);
+            }
+        }
+        if name == "read_file" {
+            if let Err(message) = validate_read_file_arguments(&arguments) {
+                return Err(format!("invalid arguments for tool 'read_file': {message}"));
             }
         }
         let mut wrapped = serde_json::Map::new();

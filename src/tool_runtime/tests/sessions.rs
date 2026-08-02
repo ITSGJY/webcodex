@@ -42,7 +42,8 @@ async fn read_agent_file_for_session(
                 .dispatch_with_auth(
                     ToolCall::ReadFile {
                         project,
-                        path: "README.md".to_string(),
+                        path: Some("README.md".to_string()),
+                        items: None,
                         session_id,
                         start_line: None,
                         limit: None,
@@ -95,7 +96,8 @@ async fn read_file_with_session_id_records_event_without_content() {
                 .dispatch_with_auth(
                     ToolCall::ReadFile {
                         project,
-                        path: "README.md".to_string(),
+                        path: Some("README.md".to_string()),
+                        items: None,
                         session_id: Some(session_id),
                         start_line: None,
                         limit: None,
@@ -166,7 +168,8 @@ async fn read_file_without_session_id_omits_session_telemetry() {
                 .dispatch_with_auth(
                     ToolCall::ReadFile {
                         project,
-                        path: "README.md".to_string(),
+                        path: Some("README.md".to_string()),
+                        items: None,
                         session_id: None,
                         start_line: None,
                         limit: None,

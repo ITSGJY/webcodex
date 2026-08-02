@@ -619,7 +619,8 @@ async fn restart_restored_coding_task_session_reloads_rules_without_persisting_b
         "rules-restart",
         ToolCall::ReadFile {
             project: project.clone(),
-            path: "src/restart.rs".to_string(),
+            path: Some("src/restart.rs".to_string()),
+            items: None,
             session_id: Some(session_id.clone()),
             start_line: None,
             limit: None,

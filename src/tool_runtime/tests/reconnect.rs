@@ -1275,7 +1275,8 @@ async fn start_coding_task_mode_upgrade_is_atomic_and_permission_checked() {
         "oauth-client",
         ToolCall::ReadFile {
             project: project.clone(),
-            path: "src/inspect.rs".to_string(),
+            path: Some("src/inspect.rs".to_string()),
+            items: None,
             session_id: Some(session_id.clone()),
             start_line: None,
             limit: None,

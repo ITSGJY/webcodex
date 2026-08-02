@@ -141,7 +141,8 @@ pub async fn projects_read_file(req: &mut Request, depot: &mut Depot, res: &mut 
         .dispatch_with_auth(
             ToolCall::ReadFile {
                 project: body.project,
-                path: body.path,
+                path: Some(body.path),
+                items: None,
                 session_id: body.session_id,
                 start_line: body.start_line,
                 limit: body.limit,

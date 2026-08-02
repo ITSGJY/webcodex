@@ -166,9 +166,14 @@ pub(crate) fn search_project_text_input_schema() -> Value {
 }
 
 pub(crate) fn read_file_input_schema() -> Value {
-    object_schema(with_optional_session_id(vec![
+    let mut schema = object_schema(with_optional_session_id(vec![
         ("project", "string", "Configured project id.", true),
-        ("path", "string", "Project-relative file path.", true),
+        (
+            "path",
+            "string",
+            "Project-relative file path. Exactly one of path or items is required.",
+            false,
+        ),
         ("start_line", "integer", "1-based line offset.", false),
         ("limit", "integer", "Maximum line count.", false),
         (
@@ -177,5 +182,41 @@ pub(crate) fn read_file_input_schema() -> Value {
             "When true, return the single text field in numbered format instead of plain format.",
             false,
         ),
-    ]))
+    ]));
+    schema["properties"]["items"] = json!({
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 16,
+        "description": "Batch of file ranges to read in one call. Exactly one of path or items is required; top-level start_line/limit must not be combined with items. Results always return in request order.",
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "path": {"type": "string", "description": "Project-relative file path."},
+                "start_line": {"type": "integer", "description": "1-based line offset."},
+                "limit": {"type": "integer", "description": "Maximum line count."}
+            },
+            "required": ["path"]
+        }
+    });
+    // Exactly one of `path` (single range) or `items` (batch) is required.
+    // Top-level `start_line`/`limit` only apply to the single-file form and are
+    // rejected when combined with `items`, matching the runtime validator.
+    schema["oneOf"] = json!([
+        {
+            "required": ["path"],
+            "not": {"required": ["items"]}
+        },
+        {
+            "required": ["items"],
+            "not": {
+                "anyOf": [
+                    {"required": ["path"]},
+                    {"required": ["start_line"]},
+                    {"required": ["limit"]}
+                ]
+            }
+        }
+    ]);
+    schema
 }

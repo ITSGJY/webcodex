@@ -763,7 +763,8 @@ async fn explicit_resume_mode_upgrade_rechecks_write_scope_atomically() {
         "oauth-client",
         ToolCall::ReadFile {
             project: project.clone(),
-            path: "src/read_only.rs".to_string(),
+            path: Some("src/read_only.rs".to_string()),
+            items: None,
             session_id: Some(session_b.clone()),
             start_line: None,
             limit: None,

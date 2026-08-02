@@ -282,7 +282,8 @@ async fn bound_current_session_records_project_tool_without_session_id() {
                 &runtime,
                 ToolCall::ReadFile {
                     project,
-                    path: "README.md".to_string(),
+                    path: Some("README.md".to_string()),
+                    items: None,
                     session_id: None,
                     start_line: None,
                     limit: None,
@@ -399,7 +400,8 @@ async fn open_anonymous_can_bind_current_session_and_record_project_read() {
                 &runtime,
                 ToolCall::ReadFile {
                     project,
-                    path: "README.md".to_string(),
+                    path: Some("README.md".to_string()),
+                    items: None,
                     session_id: None,
                     start_line: None,
                     limit: None,
@@ -570,7 +572,8 @@ async fn explicit_session_id_wins_over_current_session() {
                 .dispatch_with_auth(
                     ToolCall::ReadFile {
                         project,
-                        path: "README.md".to_string(),
+                        path: Some("README.md".to_string()),
+                        items: None,
                         session_id: Some(explicit_id),
                         start_line: None,
                         limit: None,
@@ -660,7 +663,8 @@ async fn unknown_explicit_session_id_does_not_fallback_to_current_session() {
         .dispatch_with_auth(
             ToolCall::ReadFile {
                 project: project.clone(),
-                path: "README.md".to_string(),
+                path: Some("README.md".to_string()),
+                items: None,
                 session_id: Some("wc_sess_missing".to_string()),
                 start_line: None,
                 limit: None,
@@ -745,7 +749,8 @@ async fn stale_current_session_is_cleared_and_project_tool_runs_without_session(
                 &runtime,
                 ToolCall::ReadFile {
                     project,
-                    path: "README.md".to_string(),
+                    path: Some("README.md".to_string()),
+                    items: None,
                     session_id: None,
                     start_line: None,
                     limit: None,

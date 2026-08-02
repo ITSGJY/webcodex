@@ -209,7 +209,8 @@ async fn session_handoff_summary_includes_recent_failed_tools() {
                 .dispatch_with_auth(
                     ToolCall::ReadFile {
                         project,
-                        path: "definitely_does_not_exist.md".to_string(),
+                        path: Some("definitely_does_not_exist.md".to_string()),
+                        items: None,
                         session_id: Some(sid),
                         start_line: None,
                         limit: None,

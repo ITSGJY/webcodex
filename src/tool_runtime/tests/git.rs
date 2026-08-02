@@ -1423,7 +1423,8 @@ async fn show_changes_with_session_id_returns_session_block_and_records_call() {
                 .dispatch_with_auth(
                     ToolCall::ReadFile {
                         project,
-                        path: "README.md".to_string(),
+                        path: Some("README.md".to_string()),
+                        items: None,
                         session_id: Some(session_id),
                         start_line: None,
                         limit: Some(1),

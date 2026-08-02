@@ -30,6 +30,14 @@ fn flattened_tool_arg_schema_from_input(input_schema: &Value) -> Option<Value> {
             true
         }
         Some("string" | "boolean" | "integer" | "number") => true,
+        // Arrays of objects (e.g. `read_file` batch `items`) are passed through
+        // as their declared schema so a top-level GPT Action argument stays
+        // valid; the runtime validates the item shape.
+        Some("array")
+            if input_schema.pointer("/items/type").and_then(Value::as_str) == Some("object") =>
+        {
+            true
+        }
         _ => false,
     };
     if !supported {

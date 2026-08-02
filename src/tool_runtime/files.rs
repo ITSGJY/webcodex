@@ -1,10 +1,14 @@
 use base64::{engine::general_purpose, Engine as _};
+use futures_util::stream::StreamExt;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+use webcodex_workspace::file_read_normalize::MAX_SERIALIZED_OUTPUT_PAYLOAD_BYTES;
 use webcodex_workspace::file_read_range::{self, EffectiveRange, FileReadRange, ReadFileReason};
 
 #[cfg(test)]
@@ -116,6 +120,24 @@ fn build_read_file_success(
     ToolResult::ok(output)
 }
 
+/// One batch item's execution state after the request has been enqueued (or has
+/// already failed before enqueue). The executor enqueues every request up front
+/// so the whole batch is queued before any single-range timeout can expire, then
+/// awaits the oneshot receivers with bounded concurrency.
+enum PendingBatchRead {
+    /// Failed before/without enqueue (invalid path, secret path, enqueue error).
+    /// The `ToolResult` is already complete.
+    Failed(ToolResult),
+    /// An agent `file_read` request awaiting its runner response.
+    Agent {
+        request_id: String,
+        rx: tokio::sync::oneshot::Receiver<crate::shell_protocol::ShellRunResponse>,
+        path: String,
+        start_line: Option<usize>,
+        limit: Option<usize>,
+    },
+}
+
 /// Stable, schema-backed failure output for `read_file`. Carries only the
 /// project-relative input path and a stable reason code — never absolute paths,
 /// raw OS error text, or runner stdout/stderr.
@@ -127,6 +149,88 @@ fn read_file_failure(reason: ReadFileReason, path: Option<&str>) -> ToolResult {
         "state_changed": false,
     });
     ToolResult::err_with_output(format!("read_file failed: {}", reason.as_str()), output)
+}
+
+/// Serialize the full batch output object and report whether it fits the final
+/// model-output payload budget. The budget is over the actual JSON serialization
+/// — escapes, line numbers, paths, SHA-256, per-item metadata, the envelope, and
+/// `next_items` — never the sum of raw `text.len()`. `requested_count` and the
+/// succeeded/failed counts are derived from `items` so the probe is exact.
+fn serialized_batch_fits(project: &str, items: &[Value], next_items: &[Value]) -> bool {
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+    for item in items {
+        if item.get("success").and_then(Value::as_bool) == Some(true) {
+            succeeded += 1;
+        } else {
+            failed += 1;
+        }
+    }
+    let output = json!({
+        "mode": "batch",
+        "project": project,
+        "requested_count": items.len() + next_items.len(),
+        "returned_count": items.len(),
+        "succeeded_count": succeeded,
+        "failed_count": failed,
+        "items": items,
+        "output_truncated": !next_items.is_empty(),
+        "next_items": next_items,
+    });
+    serde_json::to_vec(&output)
+        .map(|bytes| bytes.len() <= MAX_SERIALIZED_OUTPUT_PAYLOAD_BYTES)
+        .unwrap_or(false)
+}
+
+/// Original batch request preserved for `next_items` — path/start_line/limit.
+fn next_item_json(item: &super::file_read_batch::ReadFileItem) -> Value {
+    json!({
+        "path": item.path,
+        "start_line": item.start_line,
+        "limit": item.limit
+    })
+}
+
+/// Greedily fit complete batch items into the final serialized budget in
+/// request order, using the real project path. The first item that does not fit,
+/// and every item after it, is moved to `next_items`; nothing is partially
+/// serialized.
+fn fit_batch_items_to_budget(
+    project: &str,
+    batch_items: &[Value],
+    items: &[super::file_read_batch::ReadFileItem],
+) -> (Vec<Value>, Vec<Value>, bool) {
+    let mut returned = Vec::new();
+    let mut next = Vec::new();
+    let mut truncated = false;
+    for (index, item) in batch_items.iter().enumerate() {
+        if truncated {
+            next.push(next_item_json(&items[index]));
+            continue;
+        }
+        let mut candidate = returned.clone();
+        candidate.push(item.clone());
+        if serialized_batch_fits(project, &candidate, &next) {
+            returned = candidate;
+        } else {
+            truncated = true;
+            next.push(next_item_json(&items[index]));
+        }
+    }
+    (returned, next, truncated)
+}
+
+/// Per-item path validation shared by the single-file and batch forms. Returns
+/// a per-item failure result for an invalid or secret path; the caller decides
+/// whether that failure is top-level (single-file) or one item in a batch.
+fn validate_read_path(path: &str) -> Result<(), ToolResult> {
+    if validate_project_relative_path(path).is_err() {
+        return Err(read_file_failure(ReadFileReason::InvalidPath, Some(path)));
+    }
+    if crate::sensitive_paths::is_secret_path(path) {
+        return Err(read_file_failure(ReadFileReason::SensitivePath, Some(path)));
+    }
+    Ok(())
 }
 
 fn io_error_reason(error: &std::io::Error) -> ReadFileReason {
@@ -3974,6 +4078,278 @@ impl ToolRuntime {
         match file_read_range::read_range(&canonical, range) {
             Ok(result) => build_read_file_success(&result, with_line_numbers, Some(&path)),
             Err(error) => read_file_failure(error.reason, Some(&path)),
+        }
+    }
+
+    /// Read up to [`super::file_read_batch::MAX_BATCH_ITEMS`] bounded file
+    /// ranges in one call, returning a single batch `ToolResult`. Every range is
+    /// routed through the same single-range helper as the single-file form; the
+    /// project is resolved once for the whole batch.
+    ///
+    /// Partial success semantics: any valid batch request succeeds at the top
+    /// level even when individual items fail. A range that cannot be read
+    /// yields a structured failure item in its request position. The overall
+    /// serialized batch output is capped by the same final model-output budget
+    /// as single-file reads (not N× the single-file cap); items that do not fit
+    /// whole are moved to `next_items` in request order with `output_truncated`
+    /// set, never partially serialized.
+    pub(crate) async fn read_file_batch(
+        &self,
+        project: String,
+        items: Vec<super::file_read_batch::ReadFileItem>,
+        with_line_numbers: Option<bool>,
+    ) -> ToolResult {
+        use super::file_read_batch::{BATCH_MAX_CONCURRENCY, MAX_BATCH_ITEMS};
+        if items.is_empty() {
+            return ToolResult::err("read_file items must contain at least one range");
+        }
+        if items.len() > MAX_BATCH_ITEMS {
+            return ToolResult::err(format!(
+                "read_file items must contain at most {MAX_BATCH_ITEMS} ranges"
+            ));
+        }
+        let with_line_numbers = with_line_numbers.unwrap_or(false);
+        // Resolve the project once for the whole batch. A project that cannot be
+        // resolved or routed fails the entire batch at the top level.
+        let proj = match self.resolve_project(&project).await {
+            Ok(p) => p,
+            Err(e) => return ToolResult::err(e),
+        };
+
+        // A single shared deadline bounds the worst-case wait to one read
+        // timeout regardless of how many items are in flight. When it fires, the
+        // cancel flag is set and every still-pending receiver that observes the
+        // flag cancels its own request and fails as a per-item `timeout`, so
+        // nothing is left parked and the whole batch resolves within the bound.
+        let overall_deadline = Duration::from_secs(30 + 2);
+        let deadline = tokio::time::Instant::now() + overall_deadline;
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        // Phase 1: enqueue every request up front. The whole batch is queued
+        // before any single-range timeout can expire, and path validation /
+        // project routing errors become immediate per-item failures in their
+        // request positions.
+        let mut pending: Vec<PendingBatchRead> = Vec::with_capacity(items.len());
+        for item in &items {
+            if let Err(failure) = validate_read_path(&item.path) {
+                pending.push(PendingBatchRead::Failed(failure));
+                continue;
+            }
+            let client_id = match proj.agent_client_id() {
+                Ok(id) => id.to_string(),
+                Err(_) => {
+                    pending.push(PendingBatchRead::Failed(read_file_failure(
+                        ReadFileReason::AgentUnavailable,
+                        Some(&item.path),
+                    )));
+                    continue;
+                }
+            };
+            let (eff_start, _eff_limit, eff_end) =
+                effective_read_file_range(item.start_line, item.limit);
+            let (request_id, rx) = match self
+                .shell_clients
+                .enqueue_file_op(
+                    ShellFileOpRequest {
+                        op: "read".to_string(),
+                        client_id,
+                        path: item.path.clone(),
+                        cwd: Some(proj.path.clone()),
+                        content: None,
+                        max_bytes: Some(512 * 1024),
+                        old_text: None,
+                        pattern: None,
+                        expected_sha256: None,
+                        expected_prefix: None,
+                        start_line: Some(eff_start),
+                        end_line: Some(eff_end),
+                        line: None,
+                        create_dirs: false,
+                        wait_timeout_secs: 30,
+                    },
+                    "tool_runtime".to_string(),
+                )
+                .await
+            {
+                Ok(pair) => pair,
+                Err(_) => {
+                    pending.push(PendingBatchRead::Failed(read_file_failure(
+                        ReadFileReason::AgentUnavailable,
+                        Some(&item.path),
+                    )));
+                    continue;
+                }
+            };
+            pending.push(PendingBatchRead::Agent {
+                request_id,
+                rx,
+                path: item.path.clone(),
+                start_line: item.start_line,
+                limit: item.limit,
+            });
+        }
+
+        // Phase 2: await the oneshot receivers with bounded concurrency. Each
+        // future carries its original index; results are reassembled in request
+        // order regardless of completion order. A timeout on any one read sets
+        // the shared cancel flag, which makes every later read cancel its own
+        // request and fail immediately.
+        let mut futures = Vec::with_capacity(pending.len());
+        for (index, request) in pending.into_iter().enumerate() {
+            let cancelled = cancelled.clone();
+            let deadline = deadline;
+            futures.push(async move {
+                let outcome = match request {
+                    PendingBatchRead::Failed(result) => result,
+                    PendingBatchRead::Agent {
+                        request_id,
+                        rx,
+                        path,
+                        start_line,
+                        limit,
+                    } => {
+                        self.await_batch_read(
+                            request_id,
+                            rx,
+                            &path,
+                            start_line,
+                            limit,
+                            with_line_numbers,
+                            deadline,
+                            &cancelled,
+                        )
+                        .await
+                    }
+                };
+                (index, outcome)
+            });
+        }
+        let mut stream = futures_util::stream::iter(futures).buffered(BATCH_MAX_CONCURRENCY);
+        let mut results: Vec<(usize, ToolResult)> = Vec::with_capacity(items.len());
+        while let Some((index, result)) = stream.next().await {
+            results.push((index, result));
+        }
+        results.sort_by_key(|(index, _)| *index);
+        let results: Vec<ToolResult> = results.into_iter().map(|(_, result)| result).collect();
+
+        // Attach per-item index/path/success envelope. Session/permission
+        // metadata is not duplicated per item — the dispatch layer records one
+        // outer tool event for the whole batch.
+        let requested_count = items.len();
+        let mut succeeded_count = 0usize;
+        let mut failed_count = 0usize;
+        let mut batch_items = Vec::with_capacity(results.len());
+        for (index, result) in results.iter().enumerate() {
+            let path = items
+                .get(index)
+                .map(|item| item.path.clone())
+                .unwrap_or_default();
+            let item = if result.success {
+                succeeded_count += 1;
+                json!({
+                    "index": index,
+                    "path": path,
+                    "success": true,
+                    "output": result.output,
+                    "error": null
+                })
+            } else {
+                failed_count += 1;
+                json!({
+                    "index": index,
+                    "path": path,
+                    "success": false,
+                    "output": result.output,
+                    "error": result.error.as_deref().unwrap_or("")
+                })
+            };
+            batch_items.push(item);
+        }
+
+        // Serialized-output budget over the final batch output (not the sum of
+        // raw text lengths). Items that do not fit whole go to `next_items` in
+        // request order; nothing is partially serialized.
+        let (returned_items, next_items, output_truncated) =
+            fit_batch_items_to_budget(&proj.path, &batch_items, &items);
+        let returned_count = returned_items.len();
+        let output = json!({
+            "mode": "batch",
+            "project": proj.path,
+            "requested_count": requested_count,
+            "returned_count": returned_count,
+            "succeeded_count": succeeded_count,
+            "failed_count": failed_count,
+            "items": returned_items,
+            "output_truncated": output_truncated,
+            "next_items": next_items
+        });
+        // Final belt-and-suspenders check on the exact assembled output. If a
+        // single normalized-to-cap item still does not fit alongside the real
+        // envelope/counts (e.g. a long project path), degrade to returning no
+        // items and keep every request whole in `next_items` rather than emit an
+        // over-budget result.
+        if !serialized_batch_fits(&proj.path, &returned_items, &next_items) {
+            return ToolResult::ok(json!({
+                "mode": "batch",
+                "project": proj.path,
+                "requested_count": requested_count,
+                "returned_count": 0,
+                "succeeded_count": 0,
+                "failed_count": 0,
+                "items": json!([]),
+                "output_truncated": true,
+                "next_items": items.iter().map(next_item_json).collect::<Vec<_>>()
+            }));
+        }
+        ToolResult::ok(output)
+    }
+
+    /// Await one already-enqueued agent `file_read` response under the shared
+    /// batch deadline. A deadline fire sets the cancel flag and cancels the
+    /// request; a later read that observes the flag cancels its own request and
+    /// fails as `timeout` without waiting again.
+    async fn await_batch_read(
+        &self,
+        request_id: String,
+        rx: tokio::sync::oneshot::Receiver<crate::shell_protocol::ShellRunResponse>,
+        path: &str,
+        start_line: Option<usize>,
+        limit: Option<usize>,
+        with_line_numbers: bool,
+        deadline: tokio::time::Instant,
+        cancelled: &AtomicBool,
+    ) -> ToolResult {
+        if cancelled.load(Ordering::SeqCst) {
+            self.shell_clients.cancel_request(&request_id).await;
+            return read_file_failure(ReadFileReason::Timeout, Some(path));
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, rx).await {
+            Ok(Ok(resp)) if resp.exit_code == Some(0) && resp.error.is_none() => {
+                let mut result = read_file_agent_stdout_result_with_options(
+                    resp.stdout.unwrap_or_default(),
+                    start_line,
+                    limit,
+                    with_line_numbers,
+                );
+                result.output["path"] = json!(path);
+                result
+            }
+            Ok(Ok(resp)) => {
+                // The raw `resp.error`/`resp.stderr` (which may carry the
+                // runner's absolute path) is never forwarded to the model.
+                let reason = map_agent_read_error(&resp);
+                read_file_failure(reason, Some(path))
+            }
+            Ok(Err(_)) => {
+                self.shell_clients.cancel_request(&request_id).await;
+                read_file_failure(ReadFileReason::AgentUnavailable, Some(path))
+            }
+            Err(_) => {
+                cancelled.store(true, Ordering::SeqCst);
+                self.shell_clients.cancel_request(&request_id).await;
+                read_file_failure(ReadFileReason::Timeout, Some(path))
+            }
         }
     }
 

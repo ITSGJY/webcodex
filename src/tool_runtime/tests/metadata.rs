@@ -264,7 +264,8 @@ async fn list_projects_and_dispatch_are_filtered_by_lightweight_auth_group() {
                 .dispatch_with_auth(
                     ToolCall::ReadFile {
                         project: "agent:client-a:proj-a".to_string(),
-                        path: "README.md".to_string(),
+                        path: Some("README.md".to_string()),
+                        items: None,
                         session_id: None,
                         start_line: None,
                         limit: None,
@@ -295,7 +296,8 @@ async fn list_projects_and_dispatch_are_filtered_by_lightweight_auth_group() {
         .dispatch_with_auth(
             ToolCall::ReadFile {
                 project: "agent:client-b:proj-b".to_string(),
-                path: "README.md".to_string(),
+                path: Some("README.md".to_string()),
+                items: None,
                 session_id: None,
                 start_line: None,
                 limit: None,
@@ -325,7 +327,8 @@ async fn list_projects_and_dispatch_are_filtered_by_lightweight_auth_group() {
         .dispatch_with_auth(
             ToolCall::ReadFile {
                 project: "agent:client-a:proj-a".to_string(),
-                path: "README.md".to_string(),
+                path: Some("README.md".to_string()),
+                items: None,
                 session_id: None,
                 start_line: None,
                 limit: None,
@@ -358,7 +361,8 @@ async fn list_projects_and_dispatch_are_filtered_by_lightweight_auth_group() {
                 .dispatch_with_auth(
                     ToolCall::ReadFile {
                         project: "agent:client-open:proj-open".to_string(),
-                        path: "README.md".to_string(),
+                        path: Some("README.md".to_string()),
+                        items: None,
                         session_id: None,
                         start_line: None,
                         limit: None,
@@ -422,7 +426,8 @@ async fn list_projects_and_dispatch_are_filtered_by_lightweight_auth_group() {
         .dispatch_with_auth(
             ToolCall::ReadFile {
                 project: "agent:client-a:proj-a".to_string(),
-                path: "README.md".to_string(),
+                path: Some("README.md".to_string()),
+                items: None,
                 session_id: None,
                 start_line: None,
                 limit: None,
@@ -458,7 +463,8 @@ async fn list_projects_and_dispatch_are_filtered_by_lightweight_auth_group() {
         .dispatch_with_auth(
             ToolCall::ReadFile {
                 project: "agent:client-b:proj-b".to_string(),
-                path: "README.md".to_string(),
+                path: Some("README.md".to_string()),
+                items: None,
                 session_id: None,
                 start_line: None,
                 limit: None,
@@ -474,7 +480,8 @@ async fn list_projects_and_dispatch_are_filtered_by_lightweight_auth_group() {
         .dispatch_with_auth(
             ToolCall::ReadFile {
                 project: "agent:client-open:proj-open".to_string(),
-                path: "README.md".to_string(),
+                path: Some("README.md".to_string()),
+                items: None,
                 session_id: None,
                 start_line: None,
                 limit: None,
@@ -735,7 +742,8 @@ async fn agent_read_file_without_file_read_capability_is_rejected() {
         .dispatch_with_auth(
             ToolCall::ReadFile {
                 project: agent_test_project_id("oe"),
-                path: "README.md".to_string(),
+                path: Some("README.md".to_string()),
+                items: None,
                 session_id: None,
                 start_line: None,
                 limit: None,

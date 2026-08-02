@@ -321,6 +321,12 @@ fn tool_specs_required_fields_match_deserialization() {
             let placeholder = placeholder_from_prop(prop);
             minimal.insert(field.clone(), placeholder);
         }
+        // `read_file` requires exactly one of `path`/`items` (a conditional the
+        // flat `required` array cannot express), so a minimal args object must
+        // add a path to deserialize.
+        if spec.name == "read_file" {
+            minimal.insert("path".to_string(), json!("src/lib.rs"));
+        }
         let args = Value::Object(minimal);
         ToolCall::from_tool_name(&spec.name, args)
             .unwrap_or_else(|e| panic!("tool '{}' minimal args failed: {}", spec.name, e));
@@ -334,6 +340,9 @@ fn tool_specs_required_fields_match_deserialization() {
                     let placeholder = placeholder_from_prop(prop);
                     partial.insert(f.clone(), placeholder);
                 }
+            }
+            if spec.name == "read_file" {
+                partial.insert("path".to_string(), json!("src/lib.rs"));
             }
             let err = ToolCall::from_tool_name(&spec.name, Value::Object(partial))
                 .err()
@@ -385,8 +394,17 @@ fn tool_specs_optional_fields_are_not_required() {
     let read_file = specs.iter().find(|s| s.name == "read_file").unwrap();
     let required = required_fields(read_file);
     assert!(required.contains(&"project".to_string()));
-    assert!(required.contains(&"path".to_string()));
+    // `path` and `items` are mutually exclusive and conditionally required via
+    // `oneOf` (exactly one of them must be present), so neither is in the flat
+    // `required` array.
+    assert!(!required.contains(&"path".to_string()));
+    assert!(!required.contains(&"items".to_string()));
     assert!(!required.contains(&"with_line_numbers".to_string()));
+    assert_eq!(
+        read_file.input_schema["oneOf"].as_array().map(Vec::len),
+        Some(2),
+        "read_file should enforce exactly one of path/items"
+    );
 
     let search_project_text = specs
         .iter()

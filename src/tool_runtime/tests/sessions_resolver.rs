@@ -80,7 +80,8 @@ async fn read_file_accepts_unique_short_id() {
                 .dispatch_with_auth(
                     ToolCall::ReadFile {
                         project: "other-repo".to_string(),
-                        path: "README.md".to_string(),
+                        path: Some("README.md".to_string()),
+                        items: None,
                         session_id: None,
                         start_line: None,
                         limit: None,
@@ -161,7 +162,8 @@ async fn ambiguous_short_id_returns_candidates_for_project_tools() {
         .dispatch_with_auth(
             ToolCall::ReadFile {
                 project: "my-repo".to_string(),
-                path: "README.md".to_string(),
+                path: Some("README.md".to_string()),
+                items: None,
                 session_id: None,
                 start_line: None,
                 limit: None,
@@ -187,7 +189,8 @@ async fn full_id_remains_compatible_for_project_tools() {
                 .dispatch_with_auth(
                     ToolCall::ReadFile {
                         project: "agent:workstation:other-repo".to_string(),
-                        path: "README.md".to_string(),
+                        path: Some("README.md".to_string()),
+                        items: None,
                         session_id: None,
                         start_line: None,
                         limit: None,

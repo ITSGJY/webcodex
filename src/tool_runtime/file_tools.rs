@@ -17,13 +17,21 @@ impl ToolRuntime {
             ToolCall::ReadFile {
                 project,
                 path,
+                items,
                 session_id: _,
                 start_line,
                 limit,
                 with_line_numbers,
             } => {
-                self.read_file(project, path, start_line, limit, with_line_numbers)
-                    .await
+                if let Some(items) = items {
+                    self.read_file_batch(project, items, with_line_numbers)
+                        .await
+                } else if let Some(path) = path {
+                    self.read_file(project, path, start_line, limit, with_line_numbers)
+                        .await
+                } else {
+                    ToolResult::err("read_file requires either path or items")
+                }
             }
             ToolCall::ListProjectFiles {
                 project,

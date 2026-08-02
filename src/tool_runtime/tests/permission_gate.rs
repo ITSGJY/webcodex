@@ -293,7 +293,8 @@ async fn read_only_tool_skips_permission_decision() {
                 .dispatch_with_auth(
                     ToolCall::ReadFile {
                         project,
-                        path: "README.md".to_string(),
+                        path: Some("README.md".to_string()),
+                        items: None,
                         session_id: None,
                         start_line: None,
                         limit: None,

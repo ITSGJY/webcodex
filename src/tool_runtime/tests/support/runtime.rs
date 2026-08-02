@@ -41,7 +41,7 @@ pub(in crate::tool_runtime::tests) fn sample_tool_args_for_spec(spec: &ToolSpec)
         return Value::Null;
     }
 
-    let args = required
+    let mut args = required
         .iter()
         .map(|field| {
             let field = field
@@ -49,7 +49,13 @@ pub(in crate::tool_runtime::tests) fn sample_tool_args_for_spec(spec: &ToolSpec)
                 .unwrap_or_else(|| panic!("{} required field should be a string", spec.name));
             (field.to_string(), sample_field_value(field))
         })
-        .collect();
+        .collect::<serde_json::Map<String, Value>>();
+    // `read_file` takes `path` OR `items` (mutually exclusive); neither is
+    // schema-required, but the single-file form still needs a path to
+    // deserialize into a valid `ToolCall::ReadFile`.
+    if spec.name == "read_file" && !args.contains_key("path") {
+        args.insert("path".to_string(), sample_field_value("path"));
+    }
     Value::Object(args)
 }
 

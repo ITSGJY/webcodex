@@ -298,7 +298,7 @@ fn from_tool_name_parses_read_file_and_git_tools() {
             ..
         } => {
             assert_eq!(project, "demo");
-            assert_eq!(path, "src/main.rs");
+            assert_eq!(path.as_deref(), Some("src/main.rs"));
             assert_eq!(start_line, Some(10));
             assert_eq!(limit, Some(3));
             assert_eq!(with_line_numbers, Some(true));

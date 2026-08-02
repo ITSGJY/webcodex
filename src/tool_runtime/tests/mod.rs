@@ -14,6 +14,7 @@ mod explicit_resume;
 mod files;
 mod files_helpers;
 mod files_line_edit;
+mod files_read_batch;
 mod git;
 mod handoff;
 mod handoff_brief;

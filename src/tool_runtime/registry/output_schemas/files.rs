@@ -243,6 +243,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
 }
 
 fn read_file_output_schema() -> Value {
+    // The single-file and batch forms share the same success/failure property
+    // shapes. The batch form adds a per-item envelope (index/path/success) on
+    // top; Session/permission metadata is attached only to the outer output, so
+    // item schemas intentionally omit it.
     let success_properties = json!({
         "text": schema_type("string", "The single primary text representation: plain content or numbered text according to format."),
         "format": {
@@ -335,6 +339,99 @@ fn read_file_output_schema() -> Value {
             }
         ]
     });
+    let batch_item_success = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "index": {"type": "integer", "minimum": 0},
+            "path": schema_type("string", "Project-relative path."),
+            "success": {"type": "boolean", "const": true},
+            "output": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "text": schema_type("string", "The single primary text representation: plain content or numbered text according to format."),
+                    "format": {"type": "string", "enum": ["plain", "numbered"]},
+                    "path": schema_type("string", "Project-relative path."),
+                    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                    "start_line": {"type": "integer", "minimum": 1},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 2000},
+                    "total_lines": {"type": "integer", "minimum": 0},
+                    "returned_lines": {"type": "integer", "minimum": 0, "maximum": 2000},
+                    "end_line": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+                    "has_more": {"type": "boolean"},
+                    "next_start_line": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]}
+                },
+                "required": ["text", "format", "path", "sha256", "start_line", "limit", "total_lines", "returned_lines", "end_line", "has_more", "next_start_line"]
+            },
+            "error": {"type": "null"}
+        },
+        "required": ["index", "path", "success", "output", "error"]
+    });
+    let batch_item_failure = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "index": {"type": "integer", "minimum": 0},
+            "path": schema_type("string", "Project-relative path."),
+            "success": {"type": "boolean", "const": false},
+            "output": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "error_kind": {"type": "string", "const": "read_file_failed"},
+                    "reason_code": {"type": "string", "enum": [
+                        "invalid_path", "sensitive_path", "not_found", "not_file",
+                        "permission_denied", "invalid_utf8", "range_too_large",
+                        "agent_unavailable", "timeout", "malformed_agent_response", "io_error"
+                    ]},
+                    "path": schema_type("string", "Project-relative path."),
+                    "state_changed": {"type": "boolean", "const": false}
+                },
+                "required": ["error_kind", "reason_code", "path", "state_changed"]
+            },
+            "error": schema_type("string", "Stable failure message.")
+        },
+        "required": ["index", "path", "success", "output", "error"]
+    });
+    let batch_output = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "mode": {"type": "string", "const": "batch"},
+            "project": schema_type("string", "Resolved project id."),
+            "requested_count": {"type": "integer", "minimum": 1},
+            "returned_count": {"type": "integer", "minimum": 0},
+            "succeeded_count": {"type": "integer", "minimum": 0},
+            "failed_count": {"type": "integer", "minimum": 0},
+            "items": {"type": "array", "items": {"anyOf": [batch_item_success, batch_item_failure]}},
+            "output_truncated": {"type": "boolean"},
+            "next_items": {
+                "type": "array",
+                "description": "Original requests that were not returned because the overall serialized batch budget was exhausted. Never partially serialized.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "path": schema_type("string", "Project-relative path."),
+                        "start_line": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+                        "limit": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]}
+                    },
+                    "required": ["path"]
+                }
+            },
+            "session_recorded": schema_type("boolean", "True when this call was recorded in a provided session_id."),
+            "session_id": schema_type("string", "Session id used for telemetry recording."),
+            "session_event_id": schema_type("string", "Session event id for the recorded call."),
+            "session_hint": session_hint_schema(),
+            "permission": permission_decision_schema()
+        },
+        "required": ["mode", "project", "requested_count", "returned_count", "succeeded_count", "failed_count", "items", "output_truncated", "next_items"]
+    });
+    // Superset property map for tooling that inspects `output` at the top
+    // level (schema presence tests). The authoritative shape validation is the
+    // `allOf` conditional below; this map only documents the union of possible
+    // single-file success, batch, and failure fields.
     let mut discovery_properties = success_properties
         .as_object()
         .expect("read_file success properties")
@@ -345,13 +442,25 @@ fn read_file_output_schema() -> Value {
             .expect("read_file failure properties")
             .clone(),
     );
+    for batch_field in [
+        "mode",
+        "requested_count",
+        "returned_count",
+        "succeeded_count",
+        "failed_count",
+        "items",
+        "output_truncated",
+        "next_items",
+    ] {
+        discovery_properties.insert(batch_field.to_string(), json!({}));
+    }
     json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
             "success": {"type": "boolean"},
             "output": {
-                "properties": discovery_properties,
+                "properties": serde_json::Value::Object(discovery_properties),
                 "anyOf": [
                     {"type": "object"},
                     {"type": "null"}
@@ -373,7 +482,7 @@ fn read_file_output_schema() -> Value {
                 },
                 "then": {
                     "properties": {
-                        "output": success_output,
+                        "output": {"anyOf": [success_output, batch_output]},
                         "error": {"type": "null"}
                     }
                 },
