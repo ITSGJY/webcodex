@@ -1,4 +1,7 @@
+use super::projections::{paginate_search_output, parse_search_cursor, search_cursor_signature};
+use super::wire_models::FilesSearchInput;
 use super::*;
+use crate::auth::{AuthKind, SCOPE_JOB_RUN, SCOPE_PROJECT_READ, SCOPE_RUNTIME_READ};
 use crate::shell_client::ShellClientRegistry;
 use crate::shell_protocol::{
     ShellAgentProjectSummary, ShellClientCapabilities, ShellClientRegisterRequest,

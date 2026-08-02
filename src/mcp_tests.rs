@@ -102,7 +102,7 @@ async fn mcp_initialize_returns_protocol_and_server_info() {
             assert!(value["result"]["serverInfo"]["version"].is_string());
             assert_eq!(
                 value["result"]["serverInfo"]["modelSurface"],
-                crate::connector_runtime::MODEL_SURFACE_FULL_OPERATOR_RUNTIME
+                crate::model_surface::MODEL_SURFACE_FULL_OPERATOR_RUNTIME
             );
             assert_eq!(
                 value["result"]["capabilities"]["tools"]["listChanged"],
@@ -1327,7 +1327,7 @@ async fn http_mcp_initialize_success() {
     assert_eq!(body["result"]["serverInfo"]["name"], "webcodex");
     assert_eq!(
         body["result"]["serverInfo"]["modelSurface"],
-        crate::connector_runtime::MODEL_SURFACE_FULL_OPERATOR_RUNTIME
+        crate::model_surface::MODEL_SURFACE_FULL_OPERATOR_RUNTIME
     );
     assert!(body["result"]["protocolVersion"].is_string());
     assert_eq!(
@@ -1396,7 +1396,7 @@ async fn http_project_connector_lists_and_dispatches_only_canonical_capabilities
     let discovery_body: Value = discovery.take_json().await.unwrap();
     assert_eq!(
         discovery_body["modelSurface"],
-        crate::connector_runtime::MODEL_SURFACE_CANONICAL_CONNECTOR
+        crate::model_surface::MODEL_SURFACE_CANONICAL_CONNECTOR
     );
 
     let mut schema = TestClient::get("http://localhost/openapi.json")
@@ -1482,7 +1482,7 @@ async fn http_project_connector_lists_and_dispatches_only_canonical_capabilities
     let initialized_body: Value = initialized.take_json().await.unwrap();
     assert_eq!(
         initialized_body["result"]["serverInfo"]["modelSurface"],
-        crate::connector_runtime::MODEL_SURFACE_CANONICAL_CONNECTOR
+        crate::model_surface::MODEL_SURFACE_CANONICAL_CONNECTOR
     );
 
     let mut action_started = TestClient::post("http://localhost/api/connector/task/start")
@@ -2069,7 +2069,7 @@ async fn http_mcp_get_discovery_returns_metadata() {
     assert_eq!(body["protocol"], "mcp");
     assert_eq!(
         body["modelSurface"],
-        crate::connector_runtime::MODEL_SURFACE_FULL_OPERATOR_RUNTIME
+        crate::model_surface::MODEL_SURFACE_FULL_OPERATOR_RUNTIME
     );
     assert!(body["protocolVersion"].is_string());
     assert_eq!(body["endpoint"], "/mcp");
