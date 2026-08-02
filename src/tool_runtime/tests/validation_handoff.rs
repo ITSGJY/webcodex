@@ -847,6 +847,103 @@ async fn explicit_short_timeout_never_creates_a_job() {
 /// A queued hidden validation can be cancelled atomically before the Runner
 /// receives its start request. The command never starts and no hidden/public
 /// record survives.
+/// Invalid structured Cargo arguments (option-like `--features`/`-p` values,
+/// control characters, over-long values) must be rejected before any command
+/// or Agent request is started — on both the sync path and the long-Job
+/// handoff path.
+#[tokio::test]
+async fn invalid_cargo_args_fail_before_command_or_agent_request() {
+    let client_id = "vhandoff-invalid-args";
+    let runtime = runtime_with_agent_project(client_id)
+        .with_validation_sync_wait(std::time::Duration::from_millis(50));
+    let mut caps = ShellClientCapabilities::default();
+    caps.async_shell_jobs = true;
+    caps.structured_validation_argv = true;
+    register_agent(&runtime, client_id, None, caps).await;
+    let project = agent_test_project_id(client_id);
+    let auth = auth_context(None, true);
+
+    for (label, call) in [
+        (
+            "features=--no-run",
+            ToolCall::CargoCheck {
+                project: project.clone(),
+                session_id: None,
+                cwd: None,
+                all_targets: Some(true),
+                all_features: None,
+                no_default_features: None,
+                features: Some("--no-run".to_string()),
+                package: None,
+                timeout_secs: Some(1800),
+            },
+        ),
+        (
+            "package=--all-features",
+            ToolCall::CargoCheck {
+                project: project.clone(),
+                session_id: None,
+                cwd: None,
+                all_targets: Some(true),
+                all_features: None,
+                no_default_features: None,
+                features: None,
+                package: Some("--all-features".to_string()),
+                timeout_secs: Some(1800),
+            },
+        ),
+        (
+            "features contains control char",
+            ToolCall::CargoTest {
+                project: project.clone(),
+                session_id: None,
+                cwd: None,
+                filter: None,
+                all_targets: None,
+                all_features: None,
+                no_default_features: None,
+                features: Some("line\nbreak".to_string()),
+                package: None,
+                no_run: None,
+                timeout_secs: Some(1800),
+            },
+        ),
+        (
+            "over-long feature value",
+            ToolCall::CargoCheck {
+                project: project.clone(),
+                session_id: None,
+                cwd: None,
+                all_targets: Some(true),
+                all_features: None,
+                no_default_features: None,
+                features: Some("a".repeat(crate::shell_protocol::CARGO_VALUE_MAX_BYTES + 1)),
+                package: None,
+                timeout_secs: Some(1800),
+            },
+        ),
+    ] {
+        let result = runtime.dispatch_with_auth(call, Some(&auth)).await;
+        assert!(!result.success, "{label} must fail");
+        assert_eq!(
+            result.output["command_started"],
+            serde_json::json!(false),
+            "{label}: command must not start"
+        );
+        // No agent request may have been enqueued for the rejected call.
+        assert!(
+            next_patch_agent_request(&runtime, client_id)
+                .await
+                .is_none(),
+            "{label}: no agent request may be enqueued"
+        );
+        assert!(
+            runtime.shell_clients.list_jobs(Some(10)).await.is_empty(),
+            "{label}: no job may be created"
+        );
+    }
+}
+
 #[tokio::test]
 async fn cancel_queued_before_handoff_removes_start_request_and_hidden_record() {
     let client_id = "vhandoff-cancel-queued";

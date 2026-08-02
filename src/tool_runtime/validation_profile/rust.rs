@@ -170,7 +170,7 @@ fn cargo_check_command(options: ValidationCommandOptions) -> Result<String, Stri
 }
 
 fn cargo_test_command(options: ValidationCommandOptions) -> Result<String, String> {
-    let filter = validate_arg("filter", options.filter)?;
+    let filter = validate_filter(options.filter)?;
     let features = validate_arg("features", options.features)?;
     let package = validate_arg("package", options.package)?;
     let mut args = vec!["cargo".to_string(), "test".to_string()];
@@ -200,19 +200,29 @@ fn cargo_test_command(options: ValidationCommandOptions) -> Result<String, Strin
     Ok(args.join(" "))
 }
 
+/// Normalize one value-taking Cargo option using the same shared contract the
+/// structured Job argv builder uses, so a request produces identical
+/// arguments whether it runs synchronously or as a long Job. The error label
+/// is mapped to the tool-facing message.
 fn validate_arg(label: &str, value: Option<String>) -> Result<Option<String>, String> {
     match value {
-        Some(raw) => {
-            if raw.contains('\0') {
-                return Err(format!("{} cannot contain NUL bytes", label));
-            }
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(trimmed.to_string()))
-            }
-        }
+        Some(raw) => match crate::shell_protocol::normalize_cargo_value(&raw) {
+            Ok(normalized) => Ok(normalized),
+            Err(reason) => Err(format!("{} {reason}", label)),
+        },
+        None => Ok(None),
+    }
+}
+
+/// Normalize the libtest filter using the shared filter contract (which also
+/// rejects option-like values) so the synchronous command matches the Job
+/// argv builder.
+fn validate_filter(value: Option<String>) -> Result<Option<String>, String> {
+    match value {
+        Some(raw) => match crate::shell_protocol::normalize_rust_test_filter(&raw) {
+            Ok(normalized) => Ok(normalized),
+            Err(reason) => Err(format!("filter {reason}")),
+        },
         None => Ok(None),
     }
 }

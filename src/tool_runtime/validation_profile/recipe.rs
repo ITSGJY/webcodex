@@ -474,13 +474,12 @@ fn safe_rust_filter(filter: Option<&str>) -> Result<Option<String>, RecipeError>
     let Some(raw) = filter else {
         return Ok(None);
     };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        Ok(None)
-    } else if crate::shell_protocol::valid_rust_test_filter(trimmed) {
-        Ok(Some(trimmed.to_string()))
-    } else {
-        Err(filter_unsupported())
+    // The shared filter contract performs the single trim, rejects option-like
+    // values and control bytes, and bounds the length.
+    match crate::shell_protocol::normalize_rust_test_filter(raw) {
+        Ok(Some(normalized)) => Ok(Some(normalized)),
+        Ok(None) => Ok(None),
+        Err(_) => Err(filter_unsupported()),
     }
 }
 

@@ -1713,14 +1713,20 @@ fn validation_step(
             if options.no_default_features.unwrap_or(false) {
                 args.push("--no-default-features".to_string());
             }
-            push_paired_arg(&mut args, "--features", options.features.as_deref());
-            push_paired_arg(&mut args, "-p", options.package.as_deref());
+            push_paired_arg(&mut args, "--features", options.features.as_deref())?;
+            push_paired_arg(&mut args, "-p", options.package.as_deref())?;
             ("check", args)
         }
         "cargo_test" => {
             let mut args = vec!["test".to_string()];
             if let Some(filter) = options.filter.as_deref() {
-                args.push(filter.to_string());
+                // Whitespace-only filter means "no filter", matching the
+                // synchronous path. Option-like filters are rejected by the
+                // shared filter contract before any argv is built.
+                if let Some(normalized) = crate::shell_protocol::normalize_rust_test_filter(filter)?
+                {
+                    args.push(normalized);
+                }
             }
             if options.all_targets.unwrap_or(false) {
                 args.push("--all-targets".to_string());
@@ -1731,8 +1737,8 @@ fn validation_step(
             if options.no_default_features.unwrap_or(false) {
                 args.push("--no-default-features".to_string());
             }
-            push_paired_arg(&mut args, "--features", options.features.as_deref());
-            push_paired_arg(&mut args, "-p", options.package.as_deref());
+            push_paired_arg(&mut args, "--features", options.features.as_deref())?;
+            push_paired_arg(&mut args, "-p", options.package.as_deref())?;
             if options.no_run.unwrap_or(false) {
                 args.push("--no-run".to_string());
             }
@@ -1752,11 +1758,22 @@ fn validation_step(
     Ok(step)
 }
 
-fn push_paired_arg(args: &mut Vec<String>, flag: &str, value: Option<&str>) {
-    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
-        args.push(flag.to_string());
-        args.push(value.to_string());
-    }
+/// Append a value-taking Cargo flag with its already-normalized value.
+/// Normalization is the shared `normalize_cargo_value` contract (a single
+/// trim, non-empty, not `-`-prefixed, NUL/control-free, bounded), so the
+/// structured argv matches what the synchronous path would have built. Values
+/// are normalized here and written normalized into argv, never passed through
+/// raw.
+fn push_paired_arg(args: &mut Vec<String>, flag: &str, value: Option<&str>) -> Result<(), String> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let Some(normalized) = crate::shell_protocol::normalize_cargo_value(value)? else {
+        return Ok(());
+    };
+    args.push(flag.to_string());
+    args.push(normalized);
+    Ok(())
 }
 
 fn apply_validation_projection_fields(payload: &mut Value, projection: &Value) {
@@ -1904,6 +1921,189 @@ impl Drop for ValidationCleanupGuard {
             handle.spawn(async move {
                 clients.process_hidden_cleanup_intents().await;
             });
+        }
+    }
+}
+
+#[cfg(test)]
+mod structured_cargo_arg_parity_tests {
+    use super::*;
+
+    /// The structured Job argv builder must normalize a value-taking Cargo
+    /// argument identically to the synchronous command builder, so the same
+    /// request produces the same effective arguments no matter how long it
+    /// runs. Whitespace-padded inputs are normalized in both paths; invalid
+    /// values fail closed before any argv is produced.
+    #[test]
+    fn job_and_sync_paths_produce_the_same_normalized_values() {
+        for (tool_name, options) in [
+            (
+                "cargo_check",
+                ValidationCommandOptions {
+                    all_targets: Some(true),
+                    all_features: Some(true),
+                    no_default_features: Some(true),
+                    features: Some("  serde  ".to_string()),
+                    package: Some("  my-crate  ".to_string()),
+                    ..ValidationCommandOptions::default()
+                },
+            ),
+            (
+                "cargo_test",
+                ValidationCommandOptions {
+                    filter: Some("  module::nested::test  ".to_string()),
+                    all_targets: Some(true),
+                    all_features: Some(true),
+                    no_default_features: Some(true),
+                    features: Some("  a  b  ".to_string()),
+                    package: Some("  my-crate  ".to_string()),
+                    no_run: Some(true),
+                    ..ValidationCommandOptions::default()
+                },
+            ),
+        ] {
+            // Sync path: build_command normalizes via the shared contract and
+            // shell-escapes. The parsed argv words after `cargo <sub>` must
+            // contain the normalized values.
+            let adapter = validation_adapter_for_tool(tool_name).unwrap();
+            let sync = adapter
+                .build_command(options.clone())
+                .unwrap_or_else(|error| panic!("{tool_name} sync build: {error}"));
+            assert!(
+                sync.contains("serde") || sync.contains("a  b"),
+                "{tool_name} sync command missing normalized feature: {sync}"
+            );
+            assert!(sync.contains("my-crate"), "{tool_name} sync: {sync}");
+            if tool_name == "cargo_test" {
+                assert!(
+                    sync.contains("module::nested::test"),
+                    "cargo_test sync missing normalized filter: {sync}"
+                );
+            }
+
+            // Job path: validation_step writes normalized values into the
+            // structured argv, never the raw padded strings.
+            let step = validation_step(tool_name, &options).unwrap();
+            let joined = step.args.join(" ");
+            assert!(
+                !joined.contains("  serde") && !joined.contains("serde  "),
+                "{tool_name} job argv must contain normalized feature: {joined:?}"
+            );
+            assert!(
+                joined.contains("serde") || joined.contains("a  b"),
+                "{tool_name} job argv missing feature: {joined:?}"
+            );
+            assert!(
+                !joined.contains("  my-crate") && !joined.contains("my-crate  "),
+                "{tool_name} job argv must contain normalized package: {joined:?}"
+            );
+            assert!(joined.contains("my-crate"), "{tool_name} job: {joined:?}");
+            if tool_name == "cargo_test" {
+                assert!(
+                    step.args.iter().any(|arg| arg == "module::nested::test"),
+                    "cargo_test job argv must contain the normalized filter: {joined:?}"
+                );
+            }
+            assert!(step.is_canonical(), "{tool_name} step must be canonical");
+        }
+    }
+
+    #[test]
+    fn invalid_cargo_values_fail_closed_on_both_paths() {
+        for (tool_name, invalid) in [
+            (
+                "cargo_check",
+                ValidationCommandOptions {
+                    features: Some("--no-run".to_string()),
+                    ..ValidationCommandOptions::default()
+                },
+            ),
+            (
+                "cargo_check",
+                ValidationCommandOptions {
+                    package: Some("--all-features".to_string()),
+                    ..ValidationCommandOptions::default()
+                },
+            ),
+            (
+                "cargo_check",
+                ValidationCommandOptions {
+                    features: Some("line\nbreak".to_string()),
+                    ..ValidationCommandOptions::default()
+                },
+            ),
+            (
+                "cargo_check",
+                ValidationCommandOptions {
+                    features: Some("a".repeat(crate::shell_protocol::CARGO_VALUE_MAX_BYTES + 1)),
+                    ..ValidationCommandOptions::default()
+                },
+            ),
+            (
+                "cargo_test",
+                ValidationCommandOptions {
+                    filter: Some("--all-features".to_string()),
+                    ..ValidationCommandOptions::default()
+                },
+            ),
+            (
+                "cargo_test",
+                ValidationCommandOptions {
+                    filter: Some("line\nbreak".to_string()),
+                    ..ValidationCommandOptions::default()
+                },
+            ),
+        ] {
+            // Sync path: build_command must reject before any command string.
+            let adapter = validation_adapter_for_tool(tool_name).unwrap();
+            assert!(
+                adapter.build_command(invalid.clone()).is_err(),
+                "{tool_name} sync must reject {invalid:?}"
+            );
+            // Job path: validation_step must reject before any argv is built.
+            assert!(
+                validation_step(tool_name, &invalid).is_err(),
+                "{tool_name} job must reject {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn whitespace_only_values_mean_option_omitted_on_both_paths() {
+        for (tool_name, options) in [
+            (
+                "cargo_check",
+                ValidationCommandOptions {
+                    features: Some("   ".to_string()),
+                    package: Some("   ".to_string()),
+                    ..ValidationCommandOptions::default()
+                },
+            ),
+            (
+                "cargo_test",
+                ValidationCommandOptions {
+                    filter: Some("   ".to_string()),
+                    features: Some("   ".to_string()),
+                    ..ValidationCommandOptions::default()
+                },
+            ),
+        ] {
+            let adapter = validation_adapter_for_tool(tool_name).unwrap();
+            let sync = adapter.build_command(options.clone()).unwrap();
+            assert!(
+                !sync.contains("--features") && !sync.contains(" -p "),
+                "{tool_name} whitespace-only values must be omitted: {sync}"
+            );
+            let step = validation_step(tool_name, &options).unwrap();
+            assert!(
+                !step
+                    .args
+                    .iter()
+                    .any(|arg| arg == "--features" || arg == "-p"),
+                "{tool_name} whitespace-only values must be omitted: {:?}",
+                step.args
+            );
+            assert!(step.is_canonical(), "{tool_name} step must be canonical");
         }
     }
 }

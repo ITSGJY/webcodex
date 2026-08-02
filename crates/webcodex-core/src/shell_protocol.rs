@@ -74,6 +74,10 @@ pub fn validation_infrastructure_failure_code(error: &str) -> Option<&'static st
 /// Maximum byte length of the single argv value that may follow `cargo test`.
 pub const RUST_TEST_FILTER_MAX_BYTES: usize = 200;
 
+/// Maximum byte length of a value-taking Cargo argument (`--features`,
+/// `-p`). Matches the `is_canonical` per-argument bound.
+pub const CARGO_VALUE_MAX_BYTES: usize = 500;
+
 /// Protocol version announced by `webcodex-runner` builds that connect over
 /// WebSocket. Kept in the shared protocol module so both the server and the
 /// agent binary reference the same literal.
@@ -983,7 +987,7 @@ impl ShellJobValidationStep {
         if self
             .args
             .iter()
-            .any(|arg| arg.contains('\0') || arg.len() > 500)
+            .any(|arg| arg.contains('\0') || arg.len() > CARGO_VALUE_MAX_BYTES)
         {
             return false;
         }
@@ -1031,6 +1035,12 @@ fn is_canonical_cargo_check_args(args: &[&str]) -> bool {
 /// Canonical `cargo test` argv: the `test` subcommand, an optional libtest
 /// filter (never a Cargo option), then zero or more distinct read-only flags
 /// and `--features <value>` / `-p <value>` pairs, optionally `--no-run`.
+///
+/// The flat argv boundary has inherent information loss: `["test",
+/// "--all-features"]` is a legal `cargo test --all-features` whether the
+/// caller meant the flag or mis-placed it in the filter field, so it is parsed
+/// here as the flag. Rejecting option-like filters is the planner and
+/// request-validation contract (`valid_rust_test_filter`), not this function.
 fn is_canonical_cargo_test_args(args: &[&str]) -> bool {
     if args.first() != Some(&"test") {
         return false;
@@ -1042,10 +1052,45 @@ fn is_canonical_cargo_test_args(args: &[&str]) -> bool {
     is_canonical_cargo_flags(&args[flags_start..], true)
 }
 
+/// Normalize and validate one value-taking Cargo argument (`--features`,
+/// `-p`). This is the single shared contract used by the synchronous command
+/// builders and the structured long-Job argv builder, so a given request runs
+/// identical arguments no matter how long it takes.
+///
+/// Applies exactly one leading/trailing whitespace trim, then rejects values
+/// that are NUL/control-containing, longer than [`CARGO_VALUE_MAX_BYTES`],
+/// start with `-` (which would consume the next Cargo option as this option's
+/// value), or are empty after trimming. The length bound applies to the
+/// normalized value that is written into argv, so a padded input whose
+/// trimmed form is within bounds stays accepted. `Ok(None)` means the option
+/// is simply omitted. Valid multi-word values such as `"a b"` are preserved.
+pub fn normalize_cargo_value(raw: &str) -> Result<Option<String>, &'static str> {
+    if raw.contains('\0') {
+        return Err("cannot contain NUL bytes");
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err("contains control characters");
+    }
+    if trimmed.starts_with('-') {
+        return Err("must not start with '-'");
+    }
+    if trimmed.len() > CARGO_VALUE_MAX_BYTES {
+        return Err("exceeds 500 bytes");
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
 /// Validate the read-only Cargo flag tail shared by `cargo check` and
 /// `cargo test` validation steps. Each single flag and each value-taking flag
-/// appears at most once; the value must be non-empty, bounded, and NUL-free.
-/// `--no-run` is accepted only for `cargo test`.
+/// appears at most once. A value-taking flag's value must already satisfy the
+/// shared [`normalize_cargo_value`] contract: non-empty after trimming, not a
+/// `-`-prefixed option, NUL/control-free, bounded to `CARGO_VALUE_MAX_BYTES`,
+/// and already normalized (no leading/trailing whitespace). `--no-run` is
+/// accepted only for `cargo test`.
 fn is_canonical_cargo_flags(args: &[&str], allow_no_run: bool) -> bool {
     let mut seen = HashSet::new();
     let mut iter = args.iter();
@@ -1060,10 +1105,13 @@ fn is_canonical_cargo_flags(args: &[&str], allow_no_run: bool) -> bool {
                 let Some(value) = iter.next() else {
                     return false;
                 };
-                if value.is_empty() || value.contains('\0') || value.len() > 500 {
-                    return false;
+                // The value must already be exactly its normalized form; a
+                // whitespace-padded, option-like, control-containing, or
+                // over-long value is not a canonical cargo value.
+                match normalize_cargo_value(value) {
+                    Ok(Some(normalized)) if normalized == *value => continue,
+                    _ => return false,
                 }
-                continue;
             }
             _ => return false,
         };
@@ -1083,21 +1131,44 @@ fn node_script_allowed(kind: &str, script: &str) -> bool {
     )
 }
 
-/// Shared contract for the single argv value that may follow `cargo test`: a
-/// libtest name substring, never a Cargo option. Enforced identically by the
-/// planner (`safe_rust_filter`) and the Agent-facing `is_canonical`, so a
+/// Normalize and validate the single argv value that may follow `cargo test`:
+/// a libtest name substring, never a Cargo option. This is the shared contract
+/// used by the planner (`safe_rust_filter`), the synchronous command builder,
+/// and the structured long-Job argv builder, so a given filter runs identically
+/// regardless of runtime path.
+///
+/// Applies exactly one leading/trailing trim and rejects control bytes,
+/// over-long values, and anything that begins with `-` after trimming, so a
 /// forged, replayed, or drifted request cannot smuggle an option such as
-/// `--manifest-path`. Rejects control bytes, over-long values, and anything
-/// that is empty or begins with `-` after trimming.
+/// `--manifest-path` through the filter field. `Ok(None)` means no filter.
+pub fn normalize_rust_test_filter(raw: &str) -> Result<Option<String>, &'static str> {
+    if raw.len() > RUST_TEST_FILTER_MAX_BYTES {
+        return Err("exceeds 200 bytes");
+    }
+    if raw.contains('\0') {
+        return Err("cannot contain NUL bytes");
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err("contains control characters");
+    }
+    if trimmed.starts_with('-') {
+        return Err("must not start with '-'");
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+/// True when `value` is a valid non-empty libtest filter (never a Cargo
+/// option). `is_canonical` uses this to decide whether a flat argv's second
+/// element is the filter, but enforcement of "no option-like filter" lives
+/// with the planner and request-validation builders, not the flat-argv
+/// boundary: `["test", "--all-features"]` is a legal `cargo test
+/// --all-features` regardless of how it was constructed.
 pub fn valid_rust_test_filter(value: &str) -> bool {
-    if value.len() > RUST_TEST_FILTER_MAX_BYTES {
-        return false;
-    }
-    if value.chars().any(char::is_control) {
-        return false;
-    }
-    let trimmed = value.trim();
-    !trimmed.is_empty() && !trimmed.starts_with('-')
+    normalize_rust_test_filter(value).is_ok_and(|normalized| normalized.is_some())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2379,10 +2450,29 @@ mod filter_canonical_tests {
             vec!["check", "--no-run"],
             vec!["check", "--features"],
             vec!["check", "--features", ""],
+            vec!["check", "--features", "--no-run"],
+            vec!["check", "-p", "--all-features"],
+            vec!["check", "--features", " "],
+            vec!["check", "--features", "  serde"],
+            vec!["check", "--features", "serde  "],
+            vec!["check", "--features", "line\nbreak"],
+            vec!["check", "-p", "tab\tvalue"],
             vec!["check", "--manifest-path", "/tmp/Cargo.toml"],
             vec!["check", "--locked"],
             vec!["check", "--", "--all-targets"],
         ];
+        let over_long_value = "a".repeat(CARGO_VALUE_MAX_BYTES + 1);
+        let rejected_over_long = vec!["check", "--features", over_long_value.as_str()];
+        assert!(
+            !step(rejected_over_long.clone()).is_canonical(),
+            "expected non-canonical for {rejected_over_long:?}"
+        );
+        // A feature list at exactly the max length remains canonical.
+        let max_len_feature = "a".repeat(CARGO_VALUE_MAX_BYTES);
+        assert!(
+            step(vec!["check", "--features", max_len_feature.as_str()]).is_canonical(),
+            "max-length feature value must stay canonical"
+        );
         for args in rejected {
             assert!(
                 !step(args.clone()).is_canonical(),
@@ -2420,6 +2510,12 @@ mod filter_canonical_tests {
             vec!["test", "--no-default-features", "--no-default-features"],
             vec!["test", "--all-features", "--all-features"],
             vec!["test", "--features", "--no-run"],
+            vec!["test", "-p", "--all-features"],
+            vec!["test", "--features", ""],
+            vec!["test", "--features", "  serde"],
+            vec!["test", "-p", "crate  "],
+            vec!["test", "--features", "nul\0byte"],
+            vec!["test", "--features", "col\tumn"],
             vec!["test", "--manifest-path", "/tmp/Cargo.toml"],
             vec!["test", "--", "--all-targets"],
         ];
@@ -2438,6 +2534,12 @@ mod filter_canonical_tests {
         // must reject them independently of the planner so an old server,
         // forged request, or protocol drift cannot redirect the manifest.
         let too_long = "a".repeat(RUST_TEST_FILTER_MAX_BYTES + 1);
+        // `--all-features` and `--no-default-features` are in the Cargo flag
+        // allowlist, so a flat `["test", "--all-features"]` argv is a legal
+        // `cargo test --all-features` and parses as the flag (flat-argv
+        // information loss). The rejection of option-like filters belongs to
+        // `valid_rust_test_filter` / the planner, not this flat-argv boundary.
+        // Every other option is still rejected at the canonical boundary.
         let rejected = [
             "--manifest-path=/tmp/outside/Cargo.toml",
             "--manifest-path",
@@ -2449,8 +2551,6 @@ mod filter_canonical_tests {
             "--test=another-target",
             "--bench=another-target",
             "--features=unexpected",
-            "--all-features",
-            "--no-default-features",
             "-Zunstable-options",
             "-h",
             "--help",
@@ -2469,6 +2569,19 @@ mod filter_canonical_tests {
             assert!(
                 !cargo_test(filter).is_canonical(),
                 "expected non-canonical for {filter:?}"
+            );
+        }
+        // The option-like values that are allowlisted Cargo flags are rejected
+        // as *filters* by the shared contract even though the flat argv parses
+        // as the flag.
+        for filter in ["--all-features", "--no-default-features"] {
+            assert!(
+                !valid_rust_test_filter(filter),
+                "expected non-canonical filter for {filter:?}"
+            );
+            assert!(
+                cargo_test(filter).is_canonical(),
+                "flat argv {filter:?} must parse as the legal Cargo flag"
             );
         }
 
@@ -2492,6 +2605,126 @@ mod filter_canonical_tests {
                 cargo_test(filter).is_canonical(),
                 "expected canonical for {filter:?}"
             );
+        }
+    }
+
+    #[test]
+    fn cargo_value_contract_normalizes_exactly_once_and_fails_closed() {
+        // The shared normalization contract used by both the synchronous
+        // command builders and the structured Job argv builder.
+        assert_eq!(
+            normalize_cargo_value("serde").unwrap(),
+            Some("serde".to_string())
+        );
+        // Multi-word feature lists remain legal.
+        assert_eq!(
+            normalize_cargo_value("a b").unwrap(),
+            Some("a b".to_string())
+        );
+        assert_eq!(
+            normalize_cargo_value("  a  b  ").unwrap(),
+            Some("a  b".to_string())
+        );
+        // Exactly one leading/trailing trim, applied consistently.
+        assert_eq!(
+            normalize_cargo_value("  serde  ").unwrap(),
+            Some("serde".to_string())
+        );
+        // Blank input means "option omitted".
+        assert_eq!(normalize_cargo_value("").unwrap(), None);
+        assert_eq!(normalize_cargo_value("   ").unwrap(), None);
+
+        // Option-like values must never be consumed as an option's value.
+        assert!(normalize_cargo_value("--no-run").is_err());
+        assert!(normalize_cargo_value("--all-features").is_err());
+        assert!(normalize_cargo_value("-p").is_err());
+        // Control bytes and NUL are rejected.
+        assert!(normalize_cargo_value("line\nbreak").is_err());
+        assert!(normalize_cargo_value("tab\tvalue").is_err());
+        assert!(normalize_cargo_value("nul\0byte").is_err());
+        // Over-long values are rejected; the max length is accepted.
+        let over_long = "a".repeat(CARGO_VALUE_MAX_BYTES + 1);
+        assert!(normalize_cargo_value(&over_long).is_err());
+        let max_len_value = "a".repeat(CARGO_VALUE_MAX_BYTES);
+        assert_eq!(
+            normalize_cargo_value(&max_len_value).unwrap(),
+            Some(max_len_value.clone())
+        );
+    }
+
+    #[test]
+    fn flat_argv_with_option_like_value_is_rejected_by_normalization() {
+        // The reported failure and its variants. A value-taking flag must never
+        // consume the next Cargo option as its value, whether on `check` or
+        // `test`, and regardless of runtime path.
+        let check = |args: Vec<&str>| ShellJobValidationStep {
+            name: "check".to_string(),
+            program: "cargo".to_string(),
+            args: args.into_iter().map(str::to_string).collect(),
+            env: Vec::new(),
+        };
+        for args in [
+            vec!["check", "--features", "--no-run"],
+            vec!["check", "-p", "--all-features"],
+            vec!["check", "--features", "-p"],
+        ] {
+            assert!(
+                !check(args.clone()).is_canonical(),
+                "expected non-canonical for {args:?}"
+            );
+        }
+        let test = |args: Vec<&str>| ShellJobValidationStep {
+            name: "test".to_string(),
+            program: "cargo".to_string(),
+            args: args.into_iter().map(str::to_string).collect(),
+            env: Vec::new(),
+        };
+        for args in [
+            vec!["test", "--features", "--no-run"],
+            vec!["test", "-p", "--all-features"],
+        ] {
+            assert!(
+                !test(args.clone()).is_canonical(),
+                "expected non-canonical for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn filter_boundary_is_flat_argv_information_loss_not_acceptance() {
+        // `["test", "--all-features"]` is a legal `cargo test --all-features`
+        // and must parse as the flag. It is NOT a legal filter: the planner
+        // rejects option-like filters before argv is built. `is_canonical`
+        // cannot classify the same flat argv as both legal and illegal.
+        let step = cargo_test("--all-features");
+        assert!(step.is_canonical(), "flat argv parses as the Cargo flag");
+        assert!(
+            !valid_rust_test_filter("--all-features"),
+            "option-like values must be rejected as filters"
+        );
+        // --all-features as a filter value must equally never survive as a
+        // value-taking argument's value.
+        assert!(normalize_cargo_value("--all-features").is_err());
+        // The still-forbidden options remain rejected at the canonical
+        // boundary when they appear as value-taking values or extra flags.
+        for args in [
+            vec!["test", "--manifest-path", "/tmp/Cargo.toml"],
+            vec!["test", "--target-dir", "/tmp/outside-target"],
+            vec!["test", "-Z", "unstable-options"],
+        ] {
+            assert!(
+                !cargo_test_argv(args.clone()).is_canonical(),
+                "expected non-canonical for {args:?}"
+            );
+        }
+    }
+
+    fn cargo_test_argv(args: Vec<&str>) -> ShellJobValidationStep {
+        ShellJobValidationStep {
+            name: "test".to_string(),
+            program: "cargo".to_string(),
+            args: args.into_iter().map(str::to_string).collect(),
+            env: Vec::new(),
         }
     }
 }
