@@ -16,7 +16,8 @@ use crate::shell_protocol::{
     read_quic_frame, write_quic_frame, AgentEnvelope, QuicFrameError, ShellAgentJobUpdateRequest,
     ShellAgentJobUpdateResponse, ShellAgentPersistentShellResultRequest,
     ShellAgentPersistentShellResultResponse, ShellAgentProjectSummary, ShellAgentResultRequest,
-    ShellAgentResultResponse, AGENT_PROTOCOL_VERSION_QUIC_V1, AGENT_PROTOCOL_VERSION_WEBSOCKET_V1,
+    ShellAgentResultResponse, ShellJobInventory, AGENT_PROTOCOL_VERSION_QUIC_V1,
+    AGENT_PROTOCOL_VERSION_WEBSOCKET_V1,
 };
 use crate::{
     build_register_request_with_provider_status, dispatch_request, handle_one_poll, register,
@@ -1158,18 +1159,14 @@ pub(crate) fn auto_transport_plan(cfg: &AgentConfig) -> Vec<&'static str> {
 }
 
 #[derive(Debug, Clone)]
-struct ReconnectBackoff {
+struct RetryBackoff {
     attempts: usize,
+    steps: &'static [Duration],
 }
 
-#[derive(Debug, Clone)]
-struct PollingRecoveryBackoff {
-    attempts: usize,
-}
-
-impl PollingRecoveryBackoff {
-    fn new() -> Self {
-        Self { attempts: 0 }
+impl RetryBackoff {
+    fn new(steps: &'static [Duration]) -> Self {
+        Self { attempts: 0, steps }
     }
 
     fn reset(&mut self) {
@@ -1177,23 +1174,17 @@ impl PollingRecoveryBackoff {
     }
 
     fn next_delay(&mut self) -> Duration {
-        let delay = POLLING_RECOVERY_BACKOFF_STEPS
+        let delay = self
+            .steps
             .get(self.attempts)
             .copied()
-            .unwrap_or_else(|| {
-                *POLLING_RECOVERY_BACKOFF_STEPS
-                    .last()
-                    .expect("polling recovery backoff is non-empty")
-            });
+            .unwrap_or_else(|| *self.steps.last().expect("retry backoff is non-empty"));
         self.attempts = self.attempts.saturating_add(1);
         delay
     }
 }
 
-fn next_lease_conflict_delay(
-    backoff: &mut PollingRecoveryBackoff,
-    elapsed: Duration,
-) -> Option<Duration> {
+fn next_lease_conflict_delay(backoff: &mut RetryBackoff, elapsed: Duration) -> Option<Duration> {
     if elapsed >= POLLING_LEASE_CONFLICT_MAX_WAIT {
         return None;
     }
@@ -1204,29 +1195,6 @@ fn next_lease_conflict_delay(
     )
 }
 
-impl ReconnectBackoff {
-    fn new() -> Self {
-        Self { attempts: 0 }
-    }
-
-    fn reset(&mut self) {
-        self.attempts = 0;
-    }
-
-    fn next_delay(&mut self) -> Duration {
-        let delay = RECONNECT_BACKOFF_STEPS
-            .get(self.attempts)
-            .copied()
-            .unwrap_or_else(|| {
-                *RECONNECT_BACKOFF_STEPS
-                    .last()
-                    .expect("reconnect backoff is non-empty")
-            });
-        self.attempts = self.attempts.saturating_add(1);
-        delay
-    }
-}
-
 fn format_delay(delay: Duration) -> String {
     if delay.as_millis() % 1000 == 0 {
         format!("{}s", delay.as_secs())
@@ -1235,7 +1203,7 @@ fn format_delay(delay: Duration) -> String {
     }
 }
 
-fn schedule_reconnect(transport: &str, backoff: &mut ReconnectBackoff) -> Duration {
+fn schedule_reconnect(transport: &str, backoff: &mut RetryBackoff) -> Duration {
     let delay = backoff.next_delay();
     eprintln!(
         "webcodex-runner reconnect attempt scheduled transport={} delay={}",
@@ -1250,10 +1218,228 @@ fn schedule_reconnect(transport: &str, backoff: &mut ReconnectBackoff) -> Durati
     delay
 }
 
-fn reset_backoff_after_stable_session(backoff: &mut ReconnectBackoff, started_at: Instant) {
+fn reset_backoff_after_stable_session(backoff: &mut RetryBackoff, started_at: Instant) {
     if started_at.elapsed() >= RECONNECT_STABLE_RESET_AFTER {
         backoff.reset();
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamTransport {
+    WebSocket,
+    Quic,
+}
+
+impl StreamTransport {
+    fn name(self) -> &'static str {
+        match self {
+            Self::WebSocket => TRANSPORT_WEBSOCKET,
+            Self::Quic => TRANSPORT_QUIC,
+        }
+    }
+
+    fn ping_interval(self) -> Duration {
+        match self {
+            Self::WebSocket => WS_PING_INTERVAL,
+            Self::Quic => QUIC_PING_INTERVAL,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamSupervisorMode {
+    Strict(StreamTransport),
+    Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamSupervisorExit {
+    Completed,
+    PollingFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentSessionExit {
+    Completed,
+    TransportDisconnected,
+    Shutdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StreamSessionDecision {
+    Complete { shutdown: bool },
+    Reconnect(Option<AgentTransportError>),
+    TryNext(AgentTransportError),
+    Fatal(String),
+}
+
+fn decide_stream_session(
+    mode: StreamSupervisorMode,
+    transport: StreamTransport,
+    once: bool,
+    result: Result<AgentSessionExit, String>,
+) -> StreamSessionDecision {
+    match result {
+        Ok(AgentSessionExit::Shutdown) => StreamSessionDecision::Complete { shutdown: true },
+        Ok(AgentSessionExit::Completed) => StreamSessionDecision::Complete { shutdown: false },
+        Ok(AgentSessionExit::TransportDisconnected) if once => {
+            StreamSessionDecision::Complete { shutdown: false }
+        }
+        Ok(AgentSessionExit::TransportDisconnected) => StreamSessionDecision::Reconnect(None),
+        Err(error) => {
+            let error = classify_session_error(error);
+            if error.is_fatal()
+                || matches!(mode, StreamSupervisorMode::Strict(_)) && once
+                || mode == StreamSupervisorMode::Auto
+                    && transport == StreamTransport::WebSocket
+                    && once
+            {
+                StreamSessionDecision::Fatal(error.into_message())
+            } else if matches!(mode, StreamSupervisorMode::Strict(_)) {
+                StreamSessionDecision::Reconnect(Some(error))
+            } else {
+                StreamSessionDecision::TryNext(error)
+            }
+        }
+    }
+}
+
+fn stream_transport_plan(cfg: &AgentConfig, mode: StreamSupervisorMode) -> Vec<StreamTransport> {
+    match mode {
+        StreamSupervisorMode::Strict(transport) => vec![transport],
+        StreamSupervisorMode::Auto => auto_transport_plan(cfg)
+            .into_iter()
+            .filter_map(|transport| match transport {
+                TRANSPORT_QUIC => Some(StreamTransport::Quic),
+                TRANSPORT_WEBSOCKET => Some(StreamTransport::WebSocket),
+                _ => None,
+            })
+            .collect(),
+    }
+}
+
+async fn run_stream_session(
+    transport: StreamTransport,
+    cfg: &AgentConfig,
+    projects: Vec<ShellAgentProjectSummary>,
+    agent_instance_id: &str,
+    once: bool,
+    runtime: &AgentRuntimeState,
+) -> Result<AgentSessionExit, String> {
+    match transport {
+        StreamTransport::WebSocket => {
+            websocket_session(cfg, projects, agent_instance_id, runtime).await
+        }
+        StreamTransport::Quic => {
+            quic_session(cfg, projects, agent_instance_id, once, runtime).await
+        }
+    }
+}
+
+async fn supervise_stream_transports(
+    cfg: &AgentConfig,
+    once: bool,
+    agent_instance_id: &str,
+    runtime: &AgentRuntimeState,
+    mode: StreamSupervisorMode,
+) -> Result<StreamSupervisorExit, String> {
+    let mut project_cache = AgentProjectCache::default();
+    let mut backoff = RetryBackoff::new(&RECONNECT_BACKOFF_STEPS);
+    'supervisor: loop {
+        if mode == StreamSupervisorMode::Auto && cfg.quic.is_none() {
+            eprintln!("{}", auto_quic_not_configured_log_line());
+        }
+        for transport in stream_transport_plan(cfg, mode) {
+            if mode == StreamSupervisorMode::Auto {
+                eprintln!("{}", auto_trying_log_line(transport.name()));
+            }
+            let projects = runtime.project_summaries(&mut project_cache, cfg);
+            let session_started = Instant::now();
+            let result =
+                run_stream_session(transport, cfg, projects, agent_instance_id, once, runtime)
+                    .await;
+            project_cache.invalidate();
+            match decide_stream_session(mode, transport, once, result) {
+                StreamSessionDecision::Complete { shutdown } => {
+                    if shutdown {
+                        runtime.shutdown();
+                    }
+                    return Ok(StreamSupervisorExit::Completed);
+                }
+                StreamSessionDecision::Reconnect(error) => {
+                    if let Some(error) = error {
+                        eprintln!(
+                            "webcodex-runner {} error: {}; reconnecting",
+                            transport.name(),
+                            error
+                        );
+                        tracing::debug!(
+                            transport = transport.name(),
+                            error = %error,
+                            "webcodex-runner stream transport transient error"
+                        );
+                    } else {
+                        reset_backoff_after_stable_session(&mut backoff, session_started);
+                        eprintln!(
+                            "webcodex-runner {} connection closed; reconnecting",
+                            transport.name()
+                        );
+                    }
+                    let delay = schedule_reconnect(transport.name(), &mut backoff);
+                    if async_sleep_or_shutdown(delay, runtime).await {
+                        runtime.shutdown();
+                        return Ok(StreamSupervisorExit::Completed);
+                    }
+                    continue 'supervisor;
+                }
+                StreamSessionDecision::TryNext(error) => {
+                    let log_error = concise_log_error(&error.to_string(), &cfg.token);
+                    match transport {
+                        StreamTransport::Quic => eprintln!(
+                            "webcodex-runner transport auto: quic unavailable: {}; trying websocket",
+                            log_error
+                        ),
+                        StreamTransport::WebSocket => eprintln!(
+                            "webcodex-runner transport auto: websocket failed: {}; falling back to polling",
+                            log_error
+                        ),
+                    }
+                    tracing::debug!(
+                        transport = transport.name(),
+                        error = %log_error,
+                        "webcodex-runner auto transport attempt failed"
+                    );
+                }
+                StreamSessionDecision::Fatal(error) => return Err(error),
+            }
+        }
+        debug_assert_eq!(mode, StreamSupervisorMode::Auto);
+        eprintln!("{}", auto_trying_log_line(TRANSPORT_POLLING));
+        return Ok(StreamSupervisorExit::PollingFallback);
+    }
+}
+
+fn run_stream_transport_agent(
+    cfg: &AgentConfig,
+    once: bool,
+    agent_instance_id: &str,
+    runtime: &AgentRuntimeState,
+    mode: StreamSupervisorMode,
+) -> Result<StreamSupervisorExit, String> {
+    let runtime_for_shutdown = runtime.clone();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("failed to create tokio runtime: {}", e))?;
+    let result = rt.block_on(supervise_stream_transports(
+        cfg,
+        once,
+        agent_instance_id,
+        runtime,
+        mode,
+    ));
+    rt.shutdown_timeout(runtime_for_shutdown.transport_runtime_shutdown_timeout());
+    result
 }
 
 fn run_auto_agent(
@@ -1262,96 +1448,16 @@ fn run_auto_agent(
     agent_instance_id: &str,
     runtime: &AgentRuntimeState,
 ) -> Result<(), String> {
-    let mut backoff = ReconnectBackoff::new();
-    'supervisor: loop {
-        if cfg.quic.is_none() {
-            eprintln!("{}", auto_quic_not_configured_log_line());
-        }
-        for transport in auto_transport_plan(&cfg) {
-            match transport {
-                TRANSPORT_QUIC => {
-                    eprintln!("{}", auto_trying_log_line(TRANSPORT_QUIC));
-                    let session_started = Instant::now();
-                    match run_quic_agent_single_session(&cfg, once, agent_instance_id, runtime) {
-                        Ok(AgentSessionExit::Shutdown) => return Ok(()),
-                        Ok(AgentSessionExit::Completed) if once => return Ok(()),
-                        Ok(AgentSessionExit::Completed) => return Ok(()),
-                        Ok(AgentSessionExit::TransportDisconnected) if once => return Ok(()),
-                        Ok(AgentSessionExit::TransportDisconnected) => {
-                            reset_backoff_after_stable_session(&mut backoff, session_started);
-                            eprintln!("webcodex-runner quic connection closed; reconnecting");
-                            let delay = schedule_reconnect(TRANSPORT_QUIC, &mut backoff);
-                            let shutdown = runtime.shutdown_flag();
-                            if sleep_or_shutdown(delay, shutdown.as_ref()) {
-                                runtime.shutdown();
-                                return Ok(());
-                            }
-                            continue 'supervisor;
-                        }
-                        Err(e) => {
-                            let e = classify_session_error(e);
-                            if e.is_fatal() {
-                                return Err(e.into_message());
-                            }
-                            let log_error = concise_log_error(&e.to_string(), &cfg.token);
-                            eprintln!(
-                                "webcodex-runner transport auto: quic unavailable: {}; trying websocket",
-                                log_error
-                            );
-                            tracing::debug!(
-                                transport = "quic",
-                                error = %log_error,
-                                "webcodex-runner auto transport attempt failed"
-                            );
-                        }
-                    }
-                }
-                TRANSPORT_WEBSOCKET => {
-                    eprintln!("{}", auto_trying_log_line(TRANSPORT_WEBSOCKET));
-                    let session_started = Instant::now();
-                    match run_websocket_agent_single_session(&cfg, agent_instance_id, runtime) {
-                        Ok(AgentSessionExit::Shutdown) => return Ok(()),
-                        Ok(AgentSessionExit::Completed) if once => return Ok(()),
-                        Ok(AgentSessionExit::Completed) => return Ok(()),
-                        Ok(AgentSessionExit::TransportDisconnected) if once => return Ok(()),
-                        Ok(AgentSessionExit::TransportDisconnected) => {
-                            reset_backoff_after_stable_session(&mut backoff, session_started);
-                            eprintln!("webcodex-runner websocket connection closed; reconnecting");
-                            let delay = schedule_reconnect(TRANSPORT_WEBSOCKET, &mut backoff);
-                            let shutdown = runtime.shutdown_flag();
-                            if sleep_or_shutdown(delay, shutdown.as_ref()) {
-                                runtime.shutdown();
-                                return Ok(());
-                            }
-                            continue 'supervisor;
-                        }
-                        Err(e) => {
-                            let e = classify_session_error(e);
-                            if once {
-                                return Err(e.into_message());
-                            }
-                            if e.is_fatal() {
-                                return Err(e.into_message());
-                            }
-                            let log_error = concise_log_error(&e.to_string(), &cfg.token);
-                            eprintln!(
-                                "webcodex-runner transport auto: websocket failed: {}; falling back to polling",
-                                log_error
-                            );
-                            tracing::debug!(
-                                transport = "websocket",
-                                error = %log_error,
-                                "webcodex-runner auto transport attempt failed"
-                            );
-                        }
-                    }
-                }
-                TRANSPORT_POLLING => {
-                    eprintln!("{}", auto_trying_log_line(TRANSPORT_POLLING));
-                    return run_polling_agent(cfg, once, agent_instance_id, runtime);
-                }
-                _ => {}
-            }
+    match run_stream_transport_agent(
+        &cfg,
+        once,
+        agent_instance_id,
+        runtime,
+        StreamSupervisorMode::Auto,
+    )? {
+        StreamSupervisorExit::Completed => Ok(()),
+        StreamSupervisorExit::PollingFallback => {
+            run_polling_agent(cfg, once, agent_instance_id, runtime)
         }
     }
 }
@@ -1382,7 +1488,7 @@ fn run_polling_agent_with_shutdown(
     let mut registered = false;
     let mut recovering = false;
     let mut session_refreshed_during_recovery = false;
-    let mut recovery_backoff = PollingRecoveryBackoff::new();
+    let mut recovery_backoff = RetryBackoff::new(&POLLING_RECOVERY_BACKOFF_STEPS);
     let mut lease_conflict_started: Option<Instant> = None;
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -1561,117 +1667,364 @@ fn run_polling_agent_with_shutdown(
 }
 
 // ============================================================================
-// Experimental custom QUIC agent transport
+// Shared streaming transport lifecycle
 // ============================================================================
 //
-// A custom QUIC *stream* transport (NOT HTTP/3). The agent opens a single QUIC
-// bidirectional stream to the server, sends a `Register` envelope carrying the
-// agent token in `auth_token` (there is no HTTP middleware to set an
-// `Authorization` header), reads a `Registered` ack, then handles `Request`,
-// `Result`, `JobUpdate`, `Ping`, and `Pong` envelopes on that same serialized
-// stream. WebSocket/polling behavior is unchanged.
+// WebSocket and QUIC keep their own frame codecs and close mechanics. Register
+// acknowledgement, dispatch, keepalive, disconnect, and shutdown policy live
+// here once for both long-lived transports.
 
 /// Interval between agent-initiated keepalive Pings.
 const QUIC_PING_INTERVAL: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AgentSessionExit {
-    Completed,
-    TransportDisconnected,
-    Shutdown,
+type RunnerWebSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+enum StreamRead {
+    Envelope(AgentEnvelope),
+    Closed,
 }
 
-/// Entry point for the QUIC transport. Runs a tokio current-thread runtime and
-/// reconnects on session failure, mirroring `run_websocket_agent`.
+enum RegisteredStream {
+    WebSocket {
+        reader: futures_util::stream::SplitStream<RunnerWebSocket>,
+        writer: tokio::task::JoinHandle<()>,
+    },
+    Quic {
+        reader: quinn::RecvStream,
+        writer: tokio::task::JoinHandle<()>,
+        connection: quinn::Connection,
+        endpoint: quinn::Endpoint,
+    },
+}
+
+impl RegisteredStream {
+    async fn receive(&mut self) -> Result<StreamRead, String> {
+        use futures_util::StreamExt;
+
+        match self {
+            Self::WebSocket { reader, .. } => loop {
+                let message = match reader.next().await {
+                    Some(Ok(message)) => message,
+                    Some(Err(error)) => {
+                        tracing::debug!(
+                            transport = "websocket",
+                            error = ?error,
+                            "webcodex-runner websocket read error"
+                        );
+                        return Ok(StreamRead::Closed);
+                    }
+                    None => {
+                        tracing::debug!(
+                            transport = "websocket",
+                            "webcodex-runner websocket stream ended"
+                        );
+                        return Ok(StreamRead::Closed);
+                    }
+                };
+                if let tokio_tungstenite::tungstenite::Message::Close(frame) = message {
+                    if let Some(frame) = frame {
+                        tracing::debug!(
+                            transport = "websocket",
+                            close_code = ?frame.code,
+                            close_reason = %frame.reason,
+                            "webcodex-runner websocket close frame received"
+                        );
+                    } else {
+                        tracing::debug!(
+                            transport = "websocket",
+                            "webcodex-runner websocket close frame received"
+                        );
+                    }
+                    return Ok(StreamRead::Closed);
+                }
+                let text = match message.into_text() {
+                    Ok(text) => text,
+                    Err(_) => continue,
+                };
+                match AgentEnvelope::from_slice(text.as_bytes()) {
+                    Ok(envelope) => return Ok(StreamRead::Envelope(envelope)),
+                    Err(error) => {
+                        eprintln!("webcodex-runner websocket malformed envelope: {}", error);
+                    }
+                }
+            },
+            Self::Quic { reader, .. } => match read_quic_frame(reader).await {
+                Ok(envelope) => Ok(StreamRead::Envelope(envelope)),
+                Err(QuicFrameError::EmptyStream) => {
+                    tracing::debug!(
+                        transport = "quic",
+                        "webcodex-runner quic stream closed by peer"
+                    );
+                    Ok(StreamRead::Closed)
+                }
+                Err(error) => Err(format!("quic stream read error: {}", error)),
+            },
+        }
+    }
+
+    async fn finish(self, graceful: bool) {
+        use futures_util::StreamExt;
+
+        match self {
+            Self::WebSocket {
+                mut reader,
+                mut writer,
+            } => {
+                if !graceful {
+                    writer.abort();
+                    return;
+                }
+                // Continue polling the read half while the writer flushes
+                // Goodbye and the close frame. One absolute deadline bounds
+                // both the writer and peer-close observation.
+                let close_deadline = tokio::time::Instant::now() + WS_WRITER_CLOSE_TIMEOUT;
+                let mut reader_open = true;
+                let mut writer_finished = false;
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(close_deadline) => {
+                            writer.abort();
+                            break;
+                        }
+                        _ = &mut writer => {
+                            writer_finished = true;
+                            break;
+                        }
+                        message = reader.next(), if reader_open => {
+                            if !matches!(message, Some(Ok(_))) {
+                                reader_open = false;
+                            }
+                        }
+                    }
+                }
+                while writer_finished && reader_open {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(close_deadline) => break,
+                        message = reader.next() => {
+                            if !matches!(message, Some(Ok(message)) if !message.is_close()) {
+                                reader_open = false;
+                            }
+                        }
+                    }
+                }
+            }
+            Self::Quic {
+                mut writer,
+                connection,
+                endpoint,
+                ..
+            } => {
+                if graceful {
+                    connection.close(quinn::VarInt::from_u32(0), b"process shutdown");
+                    endpoint.close(quinn::VarInt::from_u32(0), b"process shutdown");
+                    if tokio::time::timeout(WS_WRITER_CLOSE_TIMEOUT, &mut writer)
+                        .await
+                        .is_err()
+                    {
+                        writer.abort();
+                    }
+                } else {
+                    writer.abort();
+                }
+            }
+        }
+    }
+}
+
+fn registered_ack(ack: AgentEnvelope) -> Result<(), String> {
+    match ack {
+        AgentEnvelope::Registered { success: true, .. } => Ok(()),
+        AgentEnvelope::Registered { error, .. } => Err(format!(
+            "register rejected by server: {}",
+            error.unwrap_or_else(|| "no server error message".to_string())
+        )),
+        AgentEnvelope::Error { code, message } => Err(format!(
+            "server error during register {}: {}",
+            code, message
+        )),
+        other => Err(format!("expected registered ack, got {}", other.kind())),
+    }
+}
+
+fn handle_stream_envelope(
+    transport: StreamTransport,
+    envelope: AgentEnvelope,
+    cfg: &AgentConfig,
+    sink: &AgentSink,
+    out_tx: &tokio::sync::mpsc::Sender<AgentEnvelope>,
+    runtime: &AgentRuntimeState,
+) -> Option<String> {
+    match envelope {
+        AgentEnvelope::Request { request } => {
+            let sink = sink.clone();
+            let config = Arc::clone(&runtime.config);
+            let hot = config.snapshot();
+            let jobs = runtime.jobs.clone();
+            let persistent_shells = runtime.persistent_shells.clone();
+            let projects_dir = projects_dir(cfg);
+            let lsp = runtime.lsp.clone();
+            let dispatch_guard = runtime.dispatches.enter();
+            tokio::task::spawn_blocking(move || {
+                let _dispatch_guard = dispatch_guard;
+                let _ = dispatch_request(
+                    &sink,
+                    &hot,
+                    &config,
+                    &jobs,
+                    &persistent_shells,
+                    &projects_dir,
+                    &lsp,
+                    request,
+                );
+            });
+            None
+        }
+        AgentEnvelope::Ping { ts } => {
+            let _ = out_tx.try_send(AgentEnvelope::Pong { ts });
+            None
+        }
+        AgentEnvelope::Pong { .. } => None,
+        AgentEnvelope::Registered { .. } if transport == StreamTransport::Quic => None,
+        AgentEnvelope::Error { code, message } => {
+            Some(format!("server error {}: {}", code, message))
+        }
+        other => {
+            eprintln!(
+                "webcodex-runner {} ignoring unexpected envelope: {}",
+                transport.name(),
+                other.kind()
+            );
+            None
+        }
+    }
+}
+
+async fn serve_registered_stream<F>(
+    transport: StreamTransport,
+    cfg: &AgentConfig,
+    agent_instance_id: &str,
+    registered_jobs: &ShellJobInventory,
+    out_tx: tokio::sync::mpsc::Sender<AgentEnvelope>,
+    mut stream: RegisteredStream,
+    runtime: &AgentRuntimeState,
+    shutdown: F,
+) -> Result<AgentSessionExit, String>
+where
+    F: std::future::Future<Output = ()>,
+{
+    let sink = match transport {
+        StreamTransport::WebSocket => AgentSink::WebSocket {
+            tx: out_tx.clone(),
+            client_id: cfg.client_id.clone(),
+            agent_instance_id: agent_instance_id.to_string(),
+        },
+        StreamTransport::Quic => AgentSink::Quic {
+            tx: out_tx.clone(),
+            client_id: cfg.client_id.clone(),
+            agent_instance_id: agent_instance_id.to_string(),
+        },
+    };
+    let jobs = runtime.jobs.clone();
+    jobs.install_sink(sink.clone());
+    jobs.replay_snapshots_since(registered_jobs);
+    let mut ping_interval = tokio::time::interval(transport.ping_interval());
+    ping_interval.tick().await;
+    let mut shutdown = Box::pin(shutdown);
+    let mut shutdown_requested = false;
+    let mut session_error = None;
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => {
+                runtime.request_shutdown_signal();
+                shutdown_requested = true;
+                break;
+            }
+            read = stream.receive() => {
+                match read {
+                    Ok(StreamRead::Envelope(envelope)) => {
+                        if let Some(error) =
+                            handle_stream_envelope(transport, envelope, cfg, &sink, &out_tx, runtime)
+                        {
+                            session_error = Some(error);
+                            break;
+                        }
+                    }
+                    Ok(StreamRead::Closed) => break,
+                    Err(error) => {
+                        session_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            _ = ping_interval.tick() => {
+                tracing::debug!(
+                    transport = transport.name(),
+                    "webcodex-runner stream keepalive ping"
+                );
+                send_provider_metadata(&out_tx, &runtime.config, None);
+                let _ = out_tx.try_send(AgentEnvelope::Ping {
+                    ts: chrono::Utc::now().timestamp(),
+                });
+            }
+        }
+    }
+
+    if shutdown_requested {
+        let _ = tokio::time::timeout(
+            TRANSPORT_CONTROL_SEND_TIMEOUT,
+            out_tx.send(AgentEnvelope::Goodbye {
+                reason: Some("process shutdown".to_string()),
+            }),
+        )
+        .await;
+    } else if jobs.has_work() {
+        tracing::warn!(
+            transport = transport.name(),
+            "webcodex-runner stream disconnected with active jobs; reconnecting without waiting"
+        );
+    }
+    if !shutdown_requested && transport == StreamTransport::Quic {
+        runtime
+            .persistent_shells
+            .close_all("runner_transport_disconnected");
+    }
+    drop(sink);
+    drop(out_tx);
+    stream.finish(shutdown_requested).await;
+    if !shutdown_requested && transport == StreamTransport::WebSocket {
+        runtime
+            .persistent_shells
+            .close_all("runner_transport_disconnected");
+    }
+    if let Some(error) = session_error {
+        return Err(error);
+    }
+    Ok(if shutdown_requested {
+        AgentSessionExit::Shutdown
+    } else {
+        AgentSessionExit::TransportDisconnected
+    })
+}
+
+// The custom QUIC transport is a QUIC stream, not HTTP/3. It intentionally
+// keeps one serialized bidirectional stream today so a future multistream
+// implementation can change this adapter without changing the supervisor.
 fn run_quic_agent(
     cfg: AgentConfig,
     once: bool,
     agent_instance_id: &str,
     runtime: &AgentRuntimeState,
 ) -> Result<(), String> {
-    let agent_instance_id = agent_instance_id.to_string();
-    let runtime_for_shutdown = runtime.clone();
-    let runtime = runtime.clone();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("failed to create tokio runtime: {}", e))?;
-    let result = rt.block_on(async move {
-        let mut project_cache = AgentProjectCache::default();
-        let mut backoff = ReconnectBackoff::new();
-        loop {
-            let projects = runtime.project_summaries(&mut project_cache, &cfg);
-            let session_started = Instant::now();
-            match quic_session(&cfg, projects, &agent_instance_id, once, &runtime).await {
-                Ok(AgentSessionExit::Shutdown) => {
-                    project_cache.invalidate();
-                    runtime.shutdown();
-                    return Ok(());
-                }
-                Ok(AgentSessionExit::Completed) => {
-                    project_cache.invalidate();
-                    return Ok(());
-                }
-                Ok(AgentSessionExit::TransportDisconnected) => {
-                    project_cache.invalidate();
-                    if once {
-                        return Ok(());
-                    }
-                    reset_backoff_after_stable_session(&mut backoff, session_started);
-                    eprintln!("webcodex-runner quic connection closed; reconnecting");
-                    let delay = schedule_reconnect(TRANSPORT_QUIC, &mut backoff);
-                    if async_sleep_or_shutdown(delay, &runtime).await {
-                        runtime.shutdown();
-                        return Ok(());
-                    }
-                }
-                Err(e) => {
-                    let e = classify_session_error(e);
-                    project_cache.invalidate();
-                    if once {
-                        return Err(e.into_message());
-                    }
-                    if e.is_fatal() {
-                        return Err(e.into_message());
-                    }
-                    eprintln!("webcodex-runner quic error: {}; reconnecting", e);
-                    tracing::debug!(
-                        transport = "quic",
-                        error = %e,
-                        "webcodex-runner quic transient error"
-                    );
-                    let delay = schedule_reconnect(TRANSPORT_QUIC, &mut backoff);
-                    if async_sleep_or_shutdown(delay, &runtime).await {
-                        runtime.shutdown();
-                        return Ok(());
-                    }
-                }
-            }
-        }
-    });
-    rt.shutdown_timeout(runtime_for_shutdown.transport_runtime_shutdown_timeout());
-    result
-}
-
-fn run_quic_agent_single_session(
-    cfg: &AgentConfig,
-    once: bool,
-    agent_instance_id: &str,
-    runtime: &AgentRuntimeState,
-) -> Result<AgentSessionExit, String> {
-    let runtime_for_shutdown = runtime.clone();
-    let runtime = runtime.clone();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("failed to create tokio runtime: {}", e))?;
-    let result = rt.block_on(async move {
-        let mut project_cache = AgentProjectCache::default();
-        let projects = runtime.project_summaries(&mut project_cache, cfg);
-        quic_session(cfg, projects, agent_instance_id, once, &runtime).await
-    });
-    rt.shutdown_timeout(runtime_for_shutdown.transport_runtime_shutdown_timeout());
-    result
+    run_stream_transport_agent(
+        &cfg,
+        once,
+        agent_instance_id,
+        runtime,
+        StreamSupervisorMode::Strict(StreamTransport::Quic),
+    )
+    .map(|_| ())
 }
 
 /// Validate the `[quic]` config section. Returns a cloned, resolved config so
@@ -1902,24 +2255,8 @@ async fn quic_session(
     let ack = ack_result
         .map_err(|_| "quic register ack timed out".to_string())?
         .map_err(|e| format!("failed to read quic register ack: {}", e))?;
-    match ack {
-        AgentEnvelope::Registered { success: true, .. } => {
-            provider.mark_status_reported(provider_revision);
-        }
-        AgentEnvelope::Registered { error, .. } => {
-            return Err(format!(
-                "register rejected by server: {}",
-                error.unwrap_or_else(|| "no server error message".to_string())
-            ));
-        }
-        AgentEnvelope::Error { code, message } => {
-            return Err(format!(
-                "server error during register {}: {}",
-                code, message
-            ));
-        }
-        other => return Err(format!("expected registered ack, got {}", other.kind())),
-    }
+    registered_ack(ack)?;
+    provider.mark_status_reported(provider_revision);
     eprintln!(
         "{}",
         registered_log_line(cfg, TRANSPORT_QUIC, projects_count)
@@ -1967,9 +2304,8 @@ async fn quic_session(
         return Ok(AgentSessionExit::Completed);
     }
 
-    // Split into a single writer task and a reader/dispatch loop. Outgoing
-    // Result/JobUpdate/Pong/Ping envelopes all pass through the channel so no
-    // two tasks write the QUIC SendStream at the same time.
+    // Outgoing envelopes share one writer so future QUIC multistream work can
+    // change the transport adapter without duplicating the session lifecycle.
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<AgentEnvelope>(WS_OUTGOING_CAPACITY);
     let writer_task = tokio::spawn(async move {
         while let Some(env) = out_rx.recv().await {
@@ -1979,145 +2315,22 @@ async fn quic_session(
         }
         let _ = send.finish();
     });
-
-    let sink_handle = AgentSink::Quic {
-        tx: out_tx.clone(),
-        client_id: cfg.client_id.clone(),
-        agent_instance_id: agent_instance_id.to_string(),
-    };
-    let jobs = runtime.jobs.clone();
-    jobs.install_sink(sink_handle.clone());
-    jobs.replay_snapshots_since(&registered_jobs);
-    let mut ping_interval = tokio::time::interval(QUIC_PING_INTERVAL);
-    ping_interval.tick().await; // skip immediate first tick
-    let mut shutdown = Box::pin(runtime.wait_for_shutdown());
-    let mut shutdown_requested = false;
-    let mut session_error: Option<String> = None;
-
-    loop {
-        tokio::select! {
-            _ = &mut shutdown => {
-                shutdown_requested = true;
-                break;
-            }
-            frame = read_quic_frame(&mut recv) => {
-                let env = match frame {
-                    Ok(env) => env,
-                    Err(QuicFrameError::EmptyStream) => {
-                        tracing::debug!(
-                            transport = "quic",
-                            "webcodex-runner quic stream closed by peer"
-                        );
-                        break;
-                    }
-                    Err(e) => {
-                        session_error = Some(format!("quic stream read error: {}", e));
-                        break;
-                    }
-                };
-                match env {
-                    AgentEnvelope::Request { request } => {
-                        let sink_handle = sink_handle.clone();
-                        let config = Arc::clone(&runtime.config);
-                        let hot = config.snapshot();
-                        let jobs = jobs.clone();
-                        let persistent_shells = runtime.persistent_shells.clone();
-                        let projects_dir = projects_dir(cfg);
-                        let lsp = runtime.lsp.clone();
-                        let dispatch_guard = runtime.dispatches.enter();
-                        tokio::task::spawn_blocking(move || {
-                            let _dispatch_guard = dispatch_guard;
-                            let _ = dispatch_request(
-                                &sink_handle,
-                                &hot,
-                                &config,
-                                &jobs,
-                                &persistent_shells,
-                                &projects_dir,
-                                &lsp,
-                                request,
-                            );
-                        });
-                    }
-                    AgentEnvelope::Ping { ts } => {
-                        let _ = out_tx.try_send(AgentEnvelope::Pong { ts });
-                    }
-                    AgentEnvelope::Pong { .. } => {
-                        // Normal keepalive response.
-                    }
-                    AgentEnvelope::Registered { .. } => {
-                        // Ignore a redundant ack.
-                    }
-                    AgentEnvelope::Error { code, message } => {
-                        session_error = Some(format!("server error {}: {}", code, message));
-                        break;
-                    }
-                    other => {
-                        eprintln!(
-                            "webcodex-runner quic ignoring unexpected envelope: {}",
-                            other.kind()
-                        );
-                    }
-                }
-            }
-            _ = ping_interval.tick() => {
-                tracing::debug!(
-                    transport = "quic",
-                    "webcodex-runner quic keepalive ping"
-                );
-                send_provider_metadata(&out_tx, &runtime.config, None);
-                let _ = out_tx.try_send(AgentEnvelope::Ping {
-                    ts: chrono::Utc::now().timestamp(),
-                });
-            }
-        }
-    }
-
-    let graceful_writer_shutdown = shutdown_requested;
-    if shutdown_requested {
-        let _ = tokio::time::timeout(
-            TRANSPORT_CONTROL_SEND_TIMEOUT,
-            out_tx.send(AgentEnvelope::Goodbye {
-                reason: Some("process shutdown".to_string()),
-            }),
-        )
-        .await;
-    } else if jobs.has_work() {
-        tracing::warn!(
-            transport = "quic",
-            "webcodex-runner quic disconnected with active jobs; reconnecting without waiting"
-        );
-    }
-    if !shutdown_requested {
-        runtime
-            .persistent_shells
-            .close_all("runner_transport_disconnected");
-    }
-    if shutdown_requested {
-        conn.close(quinn::VarInt::from_u32(0), b"process shutdown");
-        client_endpoint.close(quinn::VarInt::from_u32(0), b"process shutdown");
-    }
-    drop(sink_handle);
-    drop(out_tx);
-    let mut writer_task = writer_task;
-    if graceful_writer_shutdown {
-        if tokio::time::timeout(WS_WRITER_CLOSE_TIMEOUT, &mut writer_task)
-            .await
-            .is_err()
-        {
-            writer_task.abort();
-        }
-    } else {
-        writer_task.abort();
-    }
-    if let Some(error) = session_error {
-        return Err(error);
-    }
-    Ok(if shutdown_requested {
-        AgentSessionExit::Shutdown
-    } else {
-        AgentSessionExit::TransportDisconnected
-    })
+    serve_registered_stream(
+        StreamTransport::Quic,
+        cfg,
+        agent_instance_id,
+        &registered_jobs,
+        out_tx,
+        RegisteredStream::Quic {
+            reader: recv,
+            writer: writer_task,
+            connection: conn,
+            endpoint: client_endpoint,
+        },
+        runtime,
+        runtime.wait_for_shutdown(),
+    )
+    .await
 }
 
 // ============================================================================
@@ -2174,96 +2387,20 @@ pub(crate) fn build_ws_request(
     Ok(request)
 }
 
-/// Entry point for the WebSocket transport. Runs a tokio current-thread
-/// runtime and reconnects on session failure.
 fn run_websocket_agent(
     cfg: AgentConfig,
     once: bool,
     agent_instance_id: &str,
     runtime: &AgentRuntimeState,
 ) -> Result<(), String> {
-    let agent_instance_id = agent_instance_id.to_string();
-    let runtime_for_shutdown = runtime.clone();
-    let runtime = runtime.clone();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("failed to create tokio runtime: {}", e))?;
-    let result = rt.block_on(async move {
-        let mut project_cache = AgentProjectCache::default();
-        let mut backoff = ReconnectBackoff::new();
-        loop {
-            let projects = runtime.project_summaries(&mut project_cache, &cfg);
-            let session_started = Instant::now();
-            match websocket_session(&cfg, projects, &agent_instance_id, &runtime).await {
-                Ok(AgentSessionExit::Shutdown) => {
-                    project_cache.invalidate();
-                    runtime.shutdown();
-                    return Ok(());
-                }
-                Ok(AgentSessionExit::Completed) => {
-                    project_cache.invalidate();
-                    return Ok(());
-                }
-                Ok(AgentSessionExit::TransportDisconnected) => {
-                    project_cache.invalidate();
-                    if once {
-                        return Ok(());
-                    }
-                    reset_backoff_after_stable_session(&mut backoff, session_started);
-                    eprintln!("webcodex-runner websocket connection closed; reconnecting");
-                    let delay = schedule_reconnect(TRANSPORT_WEBSOCKET, &mut backoff);
-                    if async_sleep_or_shutdown(delay, &runtime).await {
-                        runtime.shutdown();
-                        return Ok(());
-                    }
-                }
-                Err(e) => {
-                    let e = classify_session_error(e);
-                    project_cache.invalidate();
-                    if once {
-                        return Err(e.into_message());
-                    }
-                    if e.is_fatal() {
-                        return Err(e.into_message());
-                    }
-                    eprintln!("webcodex-runner websocket error: {}; reconnecting", e);
-                    tracing::debug!(
-                        transport = "websocket",
-                        error = %e,
-                        "webcodex-runner websocket transient error"
-                    );
-                    let delay = schedule_reconnect(TRANSPORT_WEBSOCKET, &mut backoff);
-                    if async_sleep_or_shutdown(delay, &runtime).await {
-                        runtime.shutdown();
-                        return Ok(());
-                    }
-                }
-            }
-        }
-    });
-    rt.shutdown_timeout(runtime_for_shutdown.transport_runtime_shutdown_timeout());
-    result
-}
-
-fn run_websocket_agent_single_session(
-    cfg: &AgentConfig,
-    agent_instance_id: &str,
-    runtime: &AgentRuntimeState,
-) -> Result<AgentSessionExit, String> {
-    let runtime_for_shutdown = runtime.clone();
-    let runtime = runtime.clone();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("failed to create tokio runtime: {}", e))?;
-    let result = rt.block_on(async move {
-        let mut project_cache = AgentProjectCache::default();
-        let projects = runtime.project_summaries(&mut project_cache, cfg);
-        websocket_session(cfg, projects, agent_instance_id, &runtime).await
-    });
-    rt.shutdown_timeout(runtime_for_shutdown.transport_runtime_shutdown_timeout());
-    result
+    run_stream_transport_agent(
+        &cfg,
+        once,
+        agent_instance_id,
+        runtime,
+        StreamSupervisorMode::Strict(StreamTransport::WebSocket),
+    )
+    .map(|_| ())
 }
 
 /// One WebSocket connection lifecycle: connect, register, then serve requests
@@ -2366,31 +2503,15 @@ where
         .map_err(|_| "register ack was not text".to_string())?;
     let ack = AgentEnvelope::from_slice(ack_text.as_bytes())
         .map_err(|e| format!("register ack is not a valid envelope: {}", e))?;
-    match ack {
-        AgentEnvelope::Registered { success: true, .. } => {
-            provider.mark_status_reported(provider_revision);
-        }
-        AgentEnvelope::Registered { error, .. } => {
-            return Err(format!(
-                "register rejected by server: {}",
-                error.unwrap_or_else(|| "no server error message".to_string())
-            ));
-        }
-        AgentEnvelope::Error { code, message } => {
-            return Err(format!(
-                "server error during register {}: {}",
-                code, message
-            ));
-        }
-        other => return Err(format!("expected registered ack, got {}", other.kind())),
-    }
+    registered_ack(ack)?;
+    provider.mark_status_reported(provider_revision);
     eprintln!(
         "{}",
         registered_log_line(cfg, TRANSPORT_WEBSOCKET, projects_count)
     );
 
     // Split socket into writer (drains outgoing envelopes) and reader.
-    let (mut sink, mut stream) = ws_stream.split();
+    let (mut sink, stream) = ws_stream.split();
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<AgentEnvelope>(WS_OUTGOING_CAPACITY);
     let writer_task = tokio::spawn(async move {
         let mut graceful_close = false;
@@ -2416,213 +2537,20 @@ where
             let _ = sink.close().await;
         }
     });
-
-    let sink_handle = AgentSink::WebSocket {
-        tx: out_tx.clone(),
-        client_id: cfg.client_id.clone(),
-        agent_instance_id: agent_instance_id.to_string(),
-    };
-    let jobs = runtime.jobs.clone();
-    jobs.install_sink(sink_handle.clone());
-    jobs.replay_snapshots_since(&registered_jobs);
-    let mut ping_interval = tokio::time::interval(WS_PING_INTERVAL);
-    ping_interval.tick().await; // skip immediate first tick
-    let mut quit_after_session = false;
-    let mut session_error: Option<String> = None;
-
-    loop {
-        tokio::select! {
-            _ = &mut shutdown => {
-                runtime.request_shutdown_signal();
-                quit_after_session = true;
-                break;
-            }
-            msg = stream.next() => {
-                let msg = match msg {
-                    Some(Ok(m)) => m,
-                    Some(Err(e)) => {
-                        tracing::debug!(
-                            transport = "websocket",
-                            error = ?e,
-                            "webcodex-runner websocket read error"
-                        );
-                        break;
-                    }
-                    None => {
-                        tracing::debug!(
-                            transport = "websocket",
-                            "webcodex-runner websocket stream ended"
-                        );
-                        break;
-                    }
-                };
-                if let WsMessage::Close(frame) = msg {
-                    if let Some(frame) = frame {
-                        tracing::debug!(
-                            transport = "websocket",
-                            close_code = ?frame.code,
-                            close_reason = %frame.reason,
-                            "webcodex-runner websocket close frame received"
-                        );
-                    } else {
-                        tracing::debug!(
-                            transport = "websocket",
-                            "webcodex-runner websocket close frame received"
-                        );
-                    }
-                    break;
-                }
-                let text = match msg.into_text() {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-                let env = match AgentEnvelope::from_slice(text.as_bytes()) {
-                    Ok(env) => env,
-                    Err(e) => {
-                        eprintln!("webcodex-runner websocket malformed envelope: {}", e);
-                        continue;
-                    }
-                };
-                match env {
-                    AgentEnvelope::Request { request } => {
-                        let sink_handle = sink_handle.clone();
-                        let config = Arc::clone(&runtime.config);
-                        let hot = config.snapshot();
-                        let jobs = jobs.clone();
-                        let persistent_shells = runtime.persistent_shells.clone();
-                        let projects_dir = projects_dir(&cfg);
-                        let lsp = runtime.lsp.clone();
-                        let dispatch_guard = runtime.dispatches.enter();
-                        // Execution is blocking (shell/file/jobs/lsp); run it off
-                        // the async runtime thread. dispatch_request sends
-                        // results/updates via the shared AgentSink.
-                        tokio::task::spawn_blocking(move || {
-                            let _dispatch_guard = dispatch_guard;
-                            let _ = dispatch_request(
-                                &sink_handle,
-                                &hot,
-                                &config,
-                                &jobs,
-                                &persistent_shells,
-                                &projects_dir,
-                                &lsp,
-                                request,
-                            );
-                        });
-                    }
-                    AgentEnvelope::Ping { ts } => {
-                        let _ = out_tx.try_send(AgentEnvelope::Pong { ts });
-                    }
-                    AgentEnvelope::Pong { .. } => {
-                        // Normal keepalive response from the server to our
-                        // Ping. This is expected liveness traffic: do not
-                        // log at info level, do not disconnect, do not treat
-                        // it as an unexpected envelope. Staying silent here
-                        // keeps the agent log quiet during idle periods.
-                    }
-                    AgentEnvelope::Error { code, message } => {
-                        session_error = Some(format!("server error {}: {}", code, message));
-                        break;
-                    }
-                    other => {
-                        eprintln!(
-                            "webcodex-runner websocket ignoring unexpected envelope: {}",
-                            other.kind()
-                        );
-                    }
-                }
-            }
-            _ = ping_interval.tick() => {
-                tracing::debug!(
-                    transport = "websocket",
-                    "webcodex-runner websocket keepalive ping"
-                );
-                send_provider_metadata(&out_tx, &runtime.config, None);
-                let _ = out_tx.try_send(AgentEnvelope::Ping {
-                    ts: chrono::Utc::now().timestamp(),
-                });
-            }
-        }
-    }
-
-    let graceful_writer_shutdown = quit_after_session;
-    if quit_after_session {
-        let _ = tokio::time::timeout(
-            TRANSPORT_CONTROL_SEND_TIMEOUT,
-            out_tx.send(AgentEnvelope::Goodbye {
-                reason: Some("process shutdown".to_string()),
-            }),
-        )
-        .await;
-    } else if jobs.has_work() {
-        tracing::warn!(
-            transport = "websocket",
-            "webcodex-runner websocket disconnected with active jobs; reconnecting without waiting"
-        );
-    }
-
-    // Shutdown: drop the senders and read half so the underlying socket can be
-    // torn down. Only process shutdown gets a brief grace window to flush the
-    // Goodbye frame; ordinary transport disconnects abort the writer so active
-    // job sender clones cannot delay reconnect.
-    drop(sink_handle);
-    drop(out_tx);
-    let mut writer_task = writer_task;
-    if graceful_writer_shutdown {
-        // Keep polling the read half while the writer flushes Goodbye and a
-        // WebSocket close frame. The single absolute timeout keeps a peer
-        // that never acknowledges close from extending process shutdown.
-        let close_deadline = tokio::time::Instant::now() + WS_WRITER_CLOSE_TIMEOUT;
-        let mut stream_open = true;
-        let mut writer_finished = false;
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep_until(close_deadline) => {
-                    writer_task.abort();
-                    break;
-                }
-                _ = &mut writer_task => {
-                    writer_finished = true;
-                    break;
-                }
-                message = stream.next(), if stream_open => {
-                    if !matches!(message, Some(Ok(_))) {
-                        stream_open = false;
-                    }
-                }
-            }
-        }
-        // `SinkExt::send` has flushed Goodbye, but immediately dropping the
-        // read half can still reset a split TCP socket before the peer
-        // consumes those bytes. Observe peer close/EOF using the remainder of
-        // the same deadline; no second per-component grace period is added.
-        while writer_finished && stream_open {
-            tokio::select! {
-                _ = tokio::time::sleep_until(close_deadline) => break,
-                message = stream.next() => {
-                    if !matches!(message, Some(Ok(message)) if !message.is_close()) {
-                        stream_open = false;
-                    }
-                }
-            }
-        }
-    } else {
-        writer_task.abort();
-    }
-    drop(stream);
-    if !quit_after_session {
-        runtime
-            .persistent_shells
-            .close_all("runner_transport_disconnected");
-    }
-    if let Some(error) = session_error {
-        return Err(error);
-    }
-    Ok(if quit_after_session {
-        AgentSessionExit::Shutdown
-    } else {
-        AgentSessionExit::TransportDisconnected
-    })
+    serve_registered_stream(
+        StreamTransport::WebSocket,
+        cfg,
+        agent_instance_id,
+        &registered_jobs,
+        out_tx,
+        RegisteredStream::WebSocket {
+            reader: stream,
+            writer: writer_task,
+        },
+        runtime,
+        shutdown,
+    )
+    .await
 }
 
 #[cfg(test)]
