@@ -279,6 +279,9 @@ impl ToolRuntime {
                         ToolCall::RunShell { .. }
                             | ToolCall::RunJob { .. }
                             | ToolCall::OpenSessionShell { .. }
+                            | ToolCall::CargoFmt { .. }
+                            | ToolCall::CargoCheck { .. }
+                            | ToolCall::CargoTest { .. }
                     ) {
                         ssh_resource = execution_context.resource.clone();
                     }
@@ -602,7 +605,8 @@ impl ToolRuntime {
             call @ (ToolCall::CargoFmt { .. }
             | ToolCall::CargoCheck { .. }
             | ToolCall::CargoTest { .. }) => {
-                self.dispatch_cargo_tool(call, execution_sandbox).await
+                self.dispatch_cargo_tool(call, execution_sandbox, ssh_resource, auth)
+                    .await
             }
 
             call @ (ToolCall::RunJob { .. }

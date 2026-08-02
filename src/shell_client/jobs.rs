@@ -210,6 +210,7 @@ pub(super) fn job_view(job: &ShellJobRecord) -> ShellJobInfo {
         codex: job.codex.clone(),
         result,
         validation_progress: job.validation_progress.clone(),
+        validation: job.validation.clone(),
         recovery_state: job.recovery_state.clone(),
         recovered_after_server_restart: job.recovered_after_server_restart,
         reconciled_at: job.reconciled_at,

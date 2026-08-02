@@ -1702,7 +1702,9 @@ async fn structured_progress_rejects_invalid_order_and_preserves_fail_fast_plan(
                 env: Vec::new(),
             })
             .collect(),
+        validation: None,
         sandbox: None,
+        visibility: crate::shell_client::ShellJobVisibility::Public,
     };
     let duplicate = fixture
         .registry

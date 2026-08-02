@@ -1,12 +1,17 @@
 //! Synchronous timeout contract for cargo_* and run_shell.
+//!
+//! Read-only structured validation tools (`cargo_check`, `cargo_test`,
+//! `cargo_fmt(check=true)`) now define `timeout_secs` as the total runtime
+//! budget of the command (1..=3600). Short validations return immediately; a
+//! long validation continues as a Job and returns `job_id`. `run_shell`
+//! keeps the synchronous 1..=120 contract.
 
 use super::support::*;
 use crate::shell_protocol::{
     ShellAgentPollRequest, ShellAgentResultRequest, ShellClientCapabilities,
 };
 use crate::tool_runtime::helpers::{
-    resolve_sync_timeout_secs, DEFAULT_CARGO_TIMEOUT_SECS, MAX_SYNC_TIMEOUT_SECS,
-    MIN_SYNC_TIMEOUT_SECS,
+    resolve_sync_timeout_secs, DEFAULT_RUN_SHELL_TIMEOUT_SECS, MIN_SYNC_TIMEOUT_SECS,
 };
 use crate::tool_runtime::validation_events::validation_summary_for_session;
 use crate::tool_runtime::{SessionMode, ToolCall, ToolResult};
@@ -26,10 +31,8 @@ fn assert_timeout_rejected(result: &ToolResult, tool_name: &str) {
         "error should name calling tool {tool_name}: {error}"
     );
     assert!(
-        error.contains("timeout_secs")
-            && error.contains(&MIN_SYNC_TIMEOUT_SECS.to_string())
-            && error.contains(&MAX_SYNC_TIMEOUT_SECS.to_string()),
-        "error should describe the 1..=120 range: {error}"
+        error.contains("timeout_secs") && error.contains(&MIN_SYNC_TIMEOUT_SECS.to_string()),
+        "error should describe the timeout range: {error}"
     );
     assert!(
         !error.to_ascii_lowercase().contains("runshell"),
@@ -66,8 +69,8 @@ async fn assert_no_pending_shell_request(
 #[test]
 fn resolve_sync_timeout_secs_rejects_out_of_range() {
     assert_eq!(
-        resolve_sync_timeout_secs(None, DEFAULT_CARGO_TIMEOUT_SECS).unwrap(),
-        DEFAULT_CARGO_TIMEOUT_SECS
+        resolve_sync_timeout_secs(None, DEFAULT_RUN_SHELL_TIMEOUT_SECS).unwrap(),
+        DEFAULT_RUN_SHELL_TIMEOUT_SECS
     );
     assert_eq!(resolve_sync_timeout_secs(Some(1), 120).unwrap(), 1);
     assert_eq!(resolve_sync_timeout_secs(Some(120), 120).unwrap(), 120);
@@ -78,19 +81,19 @@ fn resolve_sync_timeout_secs_rejects_out_of_range() {
 }
 
 #[tokio::test]
-async fn cargo_validation_tools_reject_timeout_above_120_before_enqueue() {
-    let runtime = runtime_with_agent_project("sync-timeout-cargo");
+async fn cargo_validation_tools_accept_long_total_runtime_budget() {
+    // Read-only validation tools accept a long total runtime budget (1..=3600);
+    // they are no longer limited to the 120s synchronous cap.
+    let runtime = runtime_with_agent_project("sync-timeout-cargo-long")
+        .with_validation_sync_wait(std::time::Duration::from_millis(10));
     let mut caps = ShellClientCapabilities::default();
-    caps.shell = true;
-    register_agent(&runtime, "sync-timeout-cargo", None, caps).await;
-    let project = agent_test_project_id("sync-timeout-cargo");
-
+    caps.async_shell_jobs = true;
+    caps.structured_validation_argv = true;
+    register_agent(&runtime, "sync-timeout-cargo-long", None, caps).await;
+    let project = agent_test_project_id("sync-timeout-cargo-long");
     for (tool_name, timeout) in [
-        ("cargo_check", 121u64),
-        ("cargo_check", 300),
-        ("cargo_test", 121),
-        ("cargo_test", 300),
-        ("cargo_fmt", 121),
+        ("cargo_check", 300u64),
+        ("cargo_test", 1800),
         ("cargo_fmt", 300),
     ] {
         let result = match tool_name {
@@ -131,8 +134,120 @@ async fn cargo_validation_tools_reject_timeout_above_120_before_enqueue() {
             }
             _ => unreachable!(),
         };
-        assert_timeout_rejected(&result, tool_name);
-        assert_no_pending_shell_request(&runtime, "sync-timeout-cargo").await;
+        // These values are within 1..=3600, so the request is accepted and the
+        // validation is promoted to a Job (the wait window is tiny in tests).
+        assert!(
+            result.success,
+            "{tool_name} long budget should be accepted: {:?}",
+            result.error
+        );
+        assert!(result.output["promoted_to_job"].as_bool().unwrap_or(false));
+        assert_eq!(result.output["effective_timeout_secs"], timeout);
+        // The promoted Job is immediately queryable.
+        let job_id = result.output["job_id"].as_str().unwrap().to_string();
+        let status = runtime.job_status_for_auth(job_id, false, None).await;
+        assert!(status.success, "{:?}", status.error);
+    }
+}
+
+#[tokio::test]
+async fn cargo_validation_tools_reject_timeout_outside_1_3600() {
+    let runtime = runtime_with_agent_project("sync-timeout-cargo-range");
+    let mut caps = ShellClientCapabilities::default();
+    caps.shell = true;
+    register_agent(&runtime, "sync-timeout-cargo-range", None, caps).await;
+    let project = agent_test_project_id("sync-timeout-cargo-range");
+
+    for (tool_name, timeout) in [
+        ("cargo_check", 0u64),
+        ("cargo_test", 0),
+        ("cargo_fmt", 0),
+        ("cargo_check", 3601),
+        ("cargo_test", 3601),
+        ("cargo_fmt", 3601),
+    ] {
+        let result = match tool_name {
+            "cargo_check" => {
+                runtime
+                    .cargo_check(
+                        project.clone(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(timeout),
+                    )
+                    .await
+            }
+            "cargo_test" => {
+                runtime
+                    .cargo_test(
+                        project.clone(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(timeout),
+                    )
+                    .await
+            }
+            "cargo_fmt" => {
+                runtime
+                    .cargo_fmt(project.clone(), None, Some(true), Some(timeout))
+                    .await
+            }
+            _ => unreachable!(),
+        };
+        assert!(!result.success, "{tool_name} {timeout} should be rejected");
+        assert_eq!(result.output["failure_kind"], "invalid_arguments");
+        assert_no_pending_shell_request(&runtime, "sync-timeout-cargo-range").await;
+    }
+}
+
+#[tokio::test]
+async fn cargo_fmt_mutating_timeout_stays_within_120_seconds() {
+    let client_id = "sync-timeout-fmt-mutating";
+    let runtime = runtime_with_agent_project(client_id);
+    register_agent(
+        &runtime,
+        client_id,
+        None,
+        ShellClientCapabilities::default(),
+    )
+    .await;
+    let project = agent_test_project_id(client_id);
+
+    let accepted = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        async move {
+            runtime
+                .cargo_fmt(project, None, Some(false), Some(120))
+                .await
+        }
+    });
+    let request = next_patch_agent_request(&runtime, client_id)
+        .await
+        .expect("cargo_fmt(check=false, timeout=120) should start");
+    assert_ne!(request.kind, "start_validation_job");
+    complete_patch_agent_request(&runtime, client_id, &request.request_id, 0, "", "").await;
+    let accepted = accepted.await.unwrap();
+    assert!(accepted.success, "{:?}", accepted.error);
+    assert_eq!(accepted.output["promoted_to_job"], false);
+
+    for check in [Some(false), None] {
+        let rejected = runtime
+            .cargo_fmt(project.clone(), None, check, Some(121))
+            .await;
+        assert!(!rejected.success);
+        assert_eq!(rejected.output["failure_kind"], "invalid_arguments");
+        assert_no_pending_shell_request(&runtime, client_id).await;
     }
 }
 
@@ -154,8 +269,11 @@ async fn run_shell_rejects_timeout_above_120_before_enqueue() {
 }
 
 #[tokio::test]
-async fn full_cargo_test_timeout_reports_dispatched_state_and_cleans_request() {
-    let client_id = "sync-slow-full-test";
+async fn explicit_short_cargo_test_timeout_reports_real_terminal_timeout_without_job() {
+    // When `timeout_secs <= SYNC_VALIDATION_WAIT_SECS`, there is no handoff
+    // headroom: the command runs synchronously and a real terminal timeout is
+    // reported at the budget boundary. No Job is created.
+    let client_id = "sync-short-full-test";
     let runtime = runtime_with_agent_project(client_id);
     let mut caps = ShellClientCapabilities::default();
     caps.shell = true;
@@ -206,7 +324,7 @@ async fn full_cargo_test_timeout_reports_dispatched_state_and_cleans_request() {
     assert!(!result.success);
     assert_eq!(result.output["failure_kind"], "timeout");
     assert_eq!(result.output["command_started"], true);
-    assert_eq!(result.output["command_completed"], false);
+    assert_eq!(result.output["command_completed"], true);
     assert_eq!(result.output["passed"], false);
     assert!(result
         .error
@@ -287,12 +405,13 @@ async fn timeout_rejection_does_not_pollute_validation_summary() {
                 no_default_features: None,
                 features: None,
                 package: None,
-                timeout_secs: Some(300),
+                timeout_secs: Some(0),
             },
             Some(&auth),
         )
         .await;
-    assert_timeout_rejected(&rejected, "cargo_check");
+    assert!(!rejected.success);
+    assert_eq!(rejected.output["failure_kind"], "invalid_arguments");
 
     let summary_after_reject = runtime
         .sessions

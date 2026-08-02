@@ -374,6 +374,126 @@ async fn session_ssh_resource_uses_remote_cwd_and_safe_agent_context_for_shell_a
 }
 
 #[tokio::test]
+async fn session_ssh_resource_rejects_structured_cargo_before_legacy_sync_start() {
+    let runtime = test_runtime();
+    let auth = open_auth_context();
+    let mut capabilities = ShellClientCapabilities::default();
+    capabilities.ssh_shell = true;
+    register_agent_projects_for_auth(
+        &runtime,
+        "context-ssh-cargo",
+        &auth,
+        capabilities,
+        vec![registered_project("demo", "/runner-local-project")],
+    )
+    .await;
+    let project = "agent:context-ssh-cargo:demo".to_string();
+    let session = runtime
+        .sessions
+        .start_session_with_options(
+            sessions::SessionCreateOptions::new(
+                Some(project.clone()),
+                Some("SSH cargo rejection".to_string()),
+                SessionMode::Normal,
+                sessions::SessionGuards::default(),
+            )
+            .with_execution_context(ssh_context("tmp", None)),
+        )
+        .unwrap();
+
+    let result = runtime
+        .dispatch_with_auth(
+            ToolCall::CargoCheck {
+                project,
+                session_id: Some(session.session_id),
+                cwd: None,
+                all_targets: None,
+                all_features: None,
+                no_default_features: None,
+                features: None,
+                package: None,
+                timeout_secs: Some(30),
+            },
+            Some(&auth),
+        )
+        .await;
+
+    assert!(!result.success);
+    assert!(result
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("ssh_resource_unsupported_for_request")));
+    assert!(
+        next_agent_request_for_client(&runtime, "context-ssh-cargo")
+            .await
+            .is_none(),
+        "structured Cargo rejection must happen before the legacy sync command starts"
+    );
+}
+
+#[tokio::test]
+async fn session_ssh_resource_rejects_mutating_cargo_fmt_before_start() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    let source = root.join("src/lib.rs");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    let original = "pub fn value()->i32{1}\n";
+    std::fs::write(&source, original).unwrap();
+
+    let runtime = test_runtime();
+    let auth = open_auth_context();
+    let mut capabilities = ShellClientCapabilities::default();
+    capabilities.ssh_shell = true;
+    register_agent_projects_for_auth(
+        &runtime,
+        "context-ssh-cargo-fmt",
+        &auth,
+        capabilities,
+        vec![registered_project("demo", root.to_string_lossy().as_ref())],
+    )
+    .await;
+    let project = "agent:context-ssh-cargo-fmt:demo".to_string();
+    let session = runtime
+        .sessions
+        .start_session_with_options(
+            sessions::SessionCreateOptions::new(
+                Some(project.clone()),
+                Some("SSH mutating cargo fmt rejection".to_string()),
+                SessionMode::Normal,
+                sessions::SessionGuards::default(),
+            )
+            .with_execution_context(ssh_context("tmp", None)),
+        )
+        .unwrap();
+
+    let result = runtime
+        .dispatch_with_auth(
+            ToolCall::CargoFmt {
+                project,
+                session_id: Some(session.session_id),
+                cwd: None,
+                check: None,
+                timeout_secs: Some(30),
+            },
+            Some(&auth),
+        )
+        .await;
+
+    assert!(!result.success);
+    assert!(result
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("ssh_resource_unsupported_for_request")));
+    assert!(
+        next_agent_request_for_client(&runtime, "context-ssh-cargo-fmt")
+            .await
+            .is_none(),
+        "mutating cargo fmt rejection must happen before an Agent shell request starts"
+    );
+    assert_eq!(std::fs::read_to_string(source).unwrap(), original);
+}
+
+#[tokio::test]
 async fn session_ssh_resource_requires_runner_ssh_shell_capability() {
     let runtime = test_runtime();
     let auth = open_auth_context();

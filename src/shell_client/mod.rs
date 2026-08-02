@@ -57,6 +57,7 @@ pub(crate) use projects::ShellClientLookupError;
 pub(crate) use reconciliation::recovery_timeout_sweep;
 pub(crate) use requests::EnqueueLspError;
 use state::ShellClientRegistryInner;
+pub(crate) use state::ShellJobVisibility;
 use validation::sha256_hex;
 #[cfg(test)]
 use validation::{
@@ -137,6 +138,11 @@ pub const TRANSPORT_QUIC: &str = "quic";
 pub struct ShellClientRegistry {
     inner: Arc<Mutex<ShellClientRegistryInner>>,
     observation_epoch: Arc<str>,
+    /// Cancellation intents recorded synchronously by Drop guards before any
+    /// asynchronous stop delivery. The periodic registry lifecycle drains this
+    /// map, so cleanup does not depend on one detached task getting polled.
+    cleanup_intents:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, Option<crate::auth::AuthContext>>>>,
 }
 
 impl Default for ShellClientRegistry {
@@ -144,6 +150,7 @@ impl Default for ShellClientRegistry {
         Self {
             inner: Arc::new(Mutex::new(ShellClientRegistryInner::default())),
             observation_epoch: Arc::from(crate::job_observation::new_epoch()),
+            cleanup_intents: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 }

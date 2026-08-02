@@ -445,8 +445,26 @@ pub(crate) const COMMAND_STDIO_TAIL_CHARS: usize = 12_000;
 /// `shell_client` validation (`wait_timeout_secs` must be <= 120).
 pub(crate) const MIN_SYNC_TIMEOUT_SECS: u64 = 1;
 pub(crate) const MAX_SYNC_TIMEOUT_SECS: u64 = 120;
-pub(crate) const DEFAULT_CARGO_TIMEOUT_SECS: u64 = 120;
 pub(crate) const DEFAULT_RUN_SHELL_TIMEOUT_SECS: u64 = 60;
+
+/// Read-only structured validation tools (`cargo_check`, `cargo_test`,
+/// `cargo_fmt(check=true)`) define `timeout_secs` as the total runtime budget
+/// of the command, independent of how long the tool call itself blocks. The
+/// command runs once; a long validation continues as a Job and returns a
+/// `job_id` instead of being killed at the sync wait boundary.
+pub(crate) const MIN_VALIDATION_TIMEOUT_SECS: u64 = 1;
+pub(crate) const MAX_VALIDATION_TIMEOUT_SECS: u64 = 3600;
+/// Default total runtime budget per structured validation tool when the caller
+/// omits `timeout_secs`.
+pub(crate) const DEFAULT_CARGO_CHECK_TIMEOUT_SECS: u64 = 600;
+pub(crate) const DEFAULT_CARGO_TEST_TIMEOUT_SECS: u64 = 1800;
+pub(crate) const DEFAULT_CARGO_FMT_TIMEOUT_SECS: u64 = 120;
+
+/// Internal synchronous wait window for a structured validation. The tool call
+/// blocks up to this long for the command to finish in-process; after that the
+/// same execution is promoted to a queryable Job. Kept below the 120s MCP
+/// hard ceiling so transport/result serialization keeps ~30s of headroom.
+pub(crate) const SYNC_VALIDATION_WAIT_SECS: u64 = 90;
 
 /// Resolve a synchronous command timeout. Out-of-range values are rejected
 /// (not clamped) so callers cannot request longer waits than the sync path

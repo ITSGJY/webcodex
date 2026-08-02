@@ -2,7 +2,9 @@ use super::jobs::{
     command_preview, is_final_job_status, is_runner_active_job_status, mark_job_lost,
     notify_job_update, replace_log_from_snapshot, COMMAND_PREVIEW_MAX_CHARS,
 };
-use super::state::{ShellClientRegistryInner, ShellJobLogState, ShellJobRecord};
+use super::state::{
+    ShellClientRegistryInner, ShellJobLogState, ShellJobRecord, ShellJobVisibility,
+};
 use super::validation::validate_id;
 use super::{job_recovery_grace_secs, ShellClientRegistry};
 use crate::shell_protocol::{
@@ -105,6 +107,17 @@ fn validate_context(
             .any(|step| !matches!(step.as_str(), "format" | "check" | "test"))
     {
         return Err("job inventory validation_steps are invalid".to_string());
+    }
+    if context.validation.as_ref().is_some_and(|validation| {
+        !validation.is_valid()
+            || validation
+                .steps
+                .iter()
+                .map(|step| step.name.clone())
+                .collect::<Vec<_>>()
+                != context.validation_steps
+    }) {
+        return Err("job inventory validation metadata is invalid".to_string());
     }
     if context
         .workflow_session_id
@@ -333,6 +346,7 @@ fn same_context(job: &ShellJobRecord, snapshot: &ShellJobSnapshot) -> bool {
         && job.shell == context.shell
         && job.command_preview == context.command_preview
         && job.validation_steps == context.validation_steps
+        && job.validation == context.validation
 }
 
 pub(super) fn preflight_inventory_locked(
@@ -475,7 +489,9 @@ fn record_from_snapshot(
         error: snapshot.error.clone(),
         codex: None,
         validation_steps: context.validation_steps.clone(),
+        validation: context.validation.clone(),
         validation_progress: snapshot.validation_progress.clone(),
+        visibility: super::state::ShellJobVisibility::Public,
         last_update_seq: snapshot.update_seq,
         recovery_state: Some("reconciled".to_string()),
         recovered_after_server_restart: true,
@@ -497,6 +513,7 @@ fn apply_snapshot(job: &mut ShellJobRecord, snapshot: &ShellJobSnapshot, now: i6
     job.duration_ms = snapshot.duration_ms;
     job.error = snapshot.error.clone();
     job.validation_progress = snapshot.validation_progress.clone();
+    job.validation = snapshot.context.validation.clone();
     replace_log_from_snapshot(&mut job.stdout, &snapshot.stdout);
     replace_log_from_snapshot(&mut job.stderr, &snapshot.stderr);
     job.last_update_seq = snapshot.update_seq;
@@ -506,6 +523,21 @@ fn apply_snapshot(job: &mut ShellJobRecord, snapshot: &ShellJobSnapshot, now: i6
     job.recovering_since = None;
     job.recovery_original_status = None;
     notify_job_update(job);
+}
+
+fn remove_cleanup_terminal_jobs_locked(inner: &mut ShellClientRegistryInner) {
+    let removable = inner
+        .jobs_by_id
+        .iter()
+        .filter_map(|(job_id, job)| {
+            (job.visibility == ShellJobVisibility::CleanupPending
+                && is_final_job_status(&job.status))
+            .then(|| job_id.clone())
+        })
+        .collect::<Vec<_>>();
+    for job_id in removable {
+        inner.jobs_by_id.remove(&job_id);
+    }
 }
 
 /// Maximum number of recovering jobs transitioned to lost in a single
@@ -592,6 +624,7 @@ pub(super) fn expire_recovering_jobs_locked(
     for client_id in distinct_clients {
         remove_job_control_requests(inner, &client_id, &expired_job_ids);
     }
+    remove_cleanup_terminal_jobs_locked(inner);
     expired.len()
 }
 
@@ -603,6 +636,7 @@ pub(super) fn expire_recovering_jobs_locked(
 /// registry mutex only for bounded HashMap work (capped by
 /// [`RECOVERY_SWEEP_PASS_CAP`]) and never awaits under it.
 pub(crate) async fn recovery_timeout_sweep(registry: &ShellClientRegistry) {
+    registry.process_hidden_cleanup_intents().await;
     let now = crate::shell_client::now_ts();
     let mut inner = registry.inner.lock().await;
     expire_recovering_jobs_locked(&mut inner, None, now, RECOVERY_SWEEP_PASS_CAP);
@@ -683,6 +717,7 @@ pub(super) fn reconcile_inventory_locked(
             remove_job_request_mapping(inner, client_id, Some(&snapshot.request_id));
         }
     }
+    remove_cleanup_terminal_jobs_locked(inner);
 }
 
 pub(super) fn terminate_instance_jobs_locked(
@@ -717,4 +752,5 @@ pub(super) fn terminate_instance_jobs_locked(
         remove_job_request_mapping(inner, client_id, request_id.as_deref());
     }
     remove_job_control_requests(inner, client_id, &terminated_job_ids);
+    remove_cleanup_terminal_jobs_locked(inner);
 }

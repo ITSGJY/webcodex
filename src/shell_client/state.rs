@@ -61,6 +61,19 @@ pub(super) struct PendingShellRequest {
     pub(super) dispatched: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShellJobVisibility {
+    Public,
+    HiddenUntilHandoff,
+    CleanupPending,
+}
+
+impl Default for ShellJobVisibility {
+    fn default() -> Self {
+        Self::Public
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct ShellJobRecord {
     pub(super) job_id: String,
@@ -88,7 +101,9 @@ pub(super) struct ShellJobRecord {
     pub(super) error: Option<String>,
     pub(super) codex: Option<ShellJobCodexMetadata>,
     pub(super) validation_steps: Vec<String>,
+    pub(super) validation: Option<crate::shell_protocol::ShellJobValidationMetadata>,
     pub(super) validation_progress: Option<ShellJobValidationProgress>,
+    pub(super) visibility: ShellJobVisibility,
     pub(super) last_update_seq: u64,
     pub(super) recovery_state: Option<String>,
     pub(super) recovered_after_server_restart: bool,

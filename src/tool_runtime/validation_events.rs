@@ -198,8 +198,10 @@ impl ToolRuntime {
             .iter()
             .filter(|event| {
                 event.kind == "tool_call_finished"
-                    && event.tool_name == "run_job"
                     && event.job_id.is_some()
+                    && (event.tool_name == "run_job"
+                        || validation_adapter_for_tool(&event.tool_name).is_some())
+                    && job_acceptance_only(event)
             })
             .filter_map(|event| event.job_id.clone())
             .collect::<Vec<_>>();
@@ -219,8 +221,9 @@ impl ToolRuntime {
                 .await;
             let Some(accepted) = summary.events.iter().find(|event| {
                 event.kind == "tool_call_finished"
-                    && event.tool_name == "run_job"
                     && event.job_id.as_deref() == Some(job_id.as_str())
+                    && (event.tool_name == "run_job"
+                        || validation_adapter_for_tool(&event.tool_name).is_some())
             }) else {
                 continue;
             };
@@ -256,6 +259,23 @@ impl ToolRuntime {
                     "stderr_truncated": false,
                 })
             };
+            if let Some(validation) = status.output.get("validation").and_then(Value::as_object) {
+                for field in [
+                    "passed",
+                    "warnings_count",
+                    "errors_count",
+                    "tests_detected",
+                    "tests_run_count",
+                    "tests_passed",
+                    "tests_failed",
+                    "zero_tests_run",
+                    "diagnostics",
+                ] {
+                    if let Some(value) = validation.get(field) {
+                        output[field] = value.clone();
+                    }
+                }
+            }
             for field in ["purpose", "command_summary", "cwd", "shell", "executor"] {
                 if output.get(field).is_none_or(Value::is_null) {
                     output[field] = accepted
@@ -280,7 +300,10 @@ impl ToolRuntime {
                 .cloned()
                 .unwrap_or(Value::Null);
             observed.validation_output_summary =
-                super::sessions::execution_output_summary_for_tool_result("run_job", &output);
+                super::sessions::execution_output_summary_for_tool_result(
+                    &accepted.tool_name,
+                    &output,
+                );
             events.push(observed);
         }
         events.sort_by_key(|event| {
@@ -498,7 +521,11 @@ pub(crate) fn extract_validation_events(events: &[SessionEvent]) -> Vec<Validati
                 started.push(event.clone());
             }
             "tool_call_finished" => {
-                if run_job_acceptance_only(event) {
+                // A `run_job` acceptance or a promoted structured validation
+                // handoff (still queued/running) is not a terminal validation
+                // outcome. The Job's terminal status feeds the summary
+                // separately through `validation_summary_for_session_with_jobs`.
+                if job_acceptance_only(event) {
                     continue;
                 }
                 let start = matching_start(&mut started, event);
@@ -515,16 +542,26 @@ pub(crate) fn extract_validation_events(events: &[SessionEvent]) -> Vec<Validati
     validation_events
 }
 
-fn run_job_acceptance_only(event: &SessionEvent) -> bool {
-    event.tool_name == "run_job"
-        && event.exit_code.is_none()
-        && (event.validation_output_summary.is_none()
-            || event
-                .validation_output_summary
-                .as_ref()
-                .and_then(|summary| summary.get("execution_state"))
-                .and_then(Value::as_str)
-                == Some("started"))
+/// True for a finished tool event that merely accepted a Job (or promoted a
+/// validation to a Job) without a terminal result. Such events carry a
+/// `job_id` and a non-terminal `execution_state`, and never contribute a
+/// pass/fail verdict by themselves.
+fn job_acceptance_only(event: &SessionEvent) -> bool {
+    if event.exit_code.is_some() {
+        return false;
+    }
+    if event.job_id.as_deref().is_none_or(str::is_empty) {
+        return false;
+    }
+    let execution_state = event
+        .validation_output_summary
+        .as_ref()
+        .and_then(|summary| summary.get("execution_state"))
+        .and_then(Value::as_str);
+    matches!(
+        execution_state,
+        Some("started") | Some("queued") | Some("running")
+    )
 }
 
 pub(crate) fn validation_kind_for_tool(tool_name: &str) -> Option<&'static str> {
@@ -952,12 +989,24 @@ fn validation_test_run_metadata(
     }
     let summary = finished.validation_output_summary.as_ref();
     let parsed_test_summary = diagnostics.and_then(|value| value.test_summary.as_ref());
-    let parsed_tests_run = parsed_test_summary.map(|value| {
-        value
-            .passed
-            .unwrap_or(0)
-            .saturating_add(value.failed.unwrap_or(0))
-    });
+    let truncated = summary
+        .and_then(|value| value.get("stdout_truncated"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || summary
+            .and_then(|value| value.get("stderr_truncated"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    let parsed_tests_run = (!truncated)
+        .then(|| {
+            parsed_test_summary.map(|value| {
+                value
+                    .passed
+                    .unwrap_or(0)
+                    .saturating_add(value.failed.unwrap_or(0))
+            })
+        })
+        .flatten();
     let tests_detected = summary
         .and_then(|value| value.get("tests_detected"))
         .and_then(Value::as_bool)

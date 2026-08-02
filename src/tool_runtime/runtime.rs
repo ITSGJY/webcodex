@@ -28,6 +28,10 @@ pub struct ToolRuntime {
     pub(crate) job_killer: Arc<dyn LocalJobKiller>,
     pub(crate) semantic_navigation_probe_timeout: Duration,
     pub(crate) repository_overview_probe_timeout: Duration,
+    /// Internal synchronous wait window for a read-only structured validation
+    /// before it promotes to a Job. Defaults to `SYNC_VALIDATION_WAIT_SECS`;
+    /// tests shrink it so the handoff path can be exercised without sleeping.
+    pub(crate) validation_sync_wait: Duration,
     /// Authoritative permission evaluator for this runtime instance.
     /// Resolved once at construction (`WEBCODEX_AUTHORITY_MODE`); dispatch
     /// evaluates once per tool request before mutation.
@@ -61,6 +65,7 @@ impl ToolRuntime {
                 super::semantic_navigation::DEFAULT_SEMANTIC_NAVIGATION_PROBE_TIMEOUT,
             repository_overview_probe_timeout:
                 super::coding_task::DEFAULT_REPOSITORY_OVERVIEW_PROBE_TIMEOUT,
+            validation_sync_wait: Duration::from_secs(super::helpers::SYNC_VALIDATION_WAIT_SECS),
             permission_evaluator: PermissionEvaluator::from_env(),
             activity: Arc::new(NoopActivityRecorder),
             observations: Arc::new(RuntimeObservations::default()),
@@ -119,6 +124,12 @@ impl ToolRuntime {
     #[cfg(test)]
     pub(crate) fn with_repository_overview_probe_timeout(mut self, timeout: Duration) -> Self {
         self.repository_overview_probe_timeout = timeout;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_validation_sync_wait(mut self, wait: Duration) -> Self {
+        self.validation_sync_wait = wait;
         self
     }
 

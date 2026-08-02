@@ -160,24 +160,44 @@ fn search_project_text_schema_declares_bounded_advanced_inputs() {
 #[test]
 fn sync_validation_and_run_shell_timeout_schema_bounds() {
     let specs = registered_tool_specs();
-    for (name, default) in [
-        ("cargo_fmt", 120),
-        ("cargo_check", 120),
-        ("cargo_test", 120),
-        ("run_shell", 60),
-    ] {
+    // Read-only structured validation tools accept a long total runtime budget
+    // (1..=3600). `cargo_fmt` uses a conditional schema: check=true accepts
+    // 1..=3600 while the default/check=false mutating path remains 1..=120.
+    // `run_shell` keeps its own synchronous bounds.
+    for (name, default) in [("cargo_check", 600), ("cargo_test", 1800)] {
         let spec = specs.iter().find(|s| s.name == name).expect(name);
         let timeout = &spec.input_schema["properties"]["timeout_secs"];
         assert_eq!(timeout["type"], "integer", "{name}");
         assert_eq!(timeout["minimum"], 1, "{name}");
-        assert_eq!(timeout["maximum"], 120, "{name}");
+        assert_eq!(timeout["maximum"], 3600, "{name}");
         assert_eq!(timeout["default"], default, "{name}");
         let desc = timeout["description"].as_str().unwrap_or("");
         assert!(
-            desc.contains("120") && desc.to_ascii_lowercase().contains("reject"),
-            "{name} timeout description should document reject contract: {desc}"
+            desc.contains("3600") && desc.to_ascii_lowercase().contains("job"),
+            "{name} timeout description should document the total budget + Job handoff: {desc}"
         );
     }
+    let cargo_fmt = specs.iter().find(|s| s.name == "cargo_fmt").unwrap();
+    let timeout = &cargo_fmt.input_schema["properties"]["timeout_secs"];
+    assert_eq!(timeout["type"], "integer");
+    assert_eq!(timeout["minimum"], 1);
+    assert_eq!(timeout["maximum"], 3600);
+    assert_eq!(timeout["default"], 120);
+    assert_eq!(
+        cargo_fmt.input_schema["allOf"][0]["then"]["properties"]["timeout_secs"]["maximum"],
+        3600
+    );
+    assert_eq!(
+        cargo_fmt.input_schema["allOf"][0]["else"]["properties"]["timeout_secs"]["maximum"],
+        120
+    );
+
+    let run_shell = specs.iter().find(|s| s.name == "run_shell").unwrap();
+    let timeout = &run_shell.input_schema["properties"]["timeout_secs"];
+    assert_eq!(timeout["type"], "integer");
+    assert_eq!(timeout["minimum"], 1);
+    assert_eq!(timeout["maximum"], 120);
+    assert_eq!(timeout["default"], 60);
 
     // search_project_text keeps its own 1..120 clamp semantics without schema max.
     let search = specs
@@ -187,6 +207,61 @@ fn sync_validation_and_run_shell_timeout_schema_bounds() {
     assert!(search.input_schema["properties"]["timeout_secs"]
         .get("maximum")
         .is_none());
+}
+
+#[test]
+fn cargo_fmt_conditional_timeout_schema_matches_tool_call_contract() {
+    let specs = registered_tool_specs();
+    let schema = &specs
+        .iter()
+        .find(|spec| spec.name == "cargo_fmt")
+        .expect("cargo_fmt")
+        .input_schema;
+    let validates = |value: &Value| {
+        crate::tool_runtime::startup_brief::validate_schema_instance_for_test(value, schema).is_ok()
+    };
+
+    assert!(validates(&json!({
+        "project": "demo",
+        "check": true,
+        "timeout_secs": 3600
+    })));
+    assert!(!validates(&json!({
+        "project": "demo",
+        "check": true,
+        "timeout_secs": 3601
+    })));
+    assert!(validates(&json!({
+        "project": "demo",
+        "check": false,
+        "timeout_secs": 120
+    })));
+    assert!(!validates(&json!({
+        "project": "demo",
+        "check": false,
+        "timeout_secs": 121
+    })));
+    assert!(!validates(&json!({
+        "project": "demo",
+        "timeout_secs": 121
+    })));
+
+    let parsed = ToolCall::from_tool_name(
+        "cargo_fmt",
+        json!({"project": "demo", "check": true, "timeout_secs": 3600}),
+    )
+    .unwrap();
+    match parsed {
+        ToolCall::CargoFmt {
+            check,
+            timeout_secs,
+            ..
+        } => {
+            assert_eq!(check, Some(true));
+            assert_eq!(timeout_secs, Some(3600));
+        }
+        other => panic!("expected cargo_fmt, got {other:?}"),
+    }
 }
 
 #[test]
