@@ -519,6 +519,27 @@ fi
 # 6. MCP surface smoke
 # ----------------------------------------------------------------------------
 
+# The model surface is startup-selected and immutable. The default local_coding
+# surface is the intentional 33-tool canonical coding loop; the explicit
+# full-operator-v1 surface exposes the complete operator tool set. Neither
+# surface re-exposes the ModelHidden compatibility tools (replace_in_file,
+# job_tail) to the model via MCP tools/list; write_project_file is ModelVisible
+# and appears only on the full-operator surface.
+MODEL_SURFACE_ENV="${WEBCODEX_MCP_MODEL_SURFACE:-}"
+case "$MODEL_SURFACE_ENV" in
+    "" | "local-coding-v1")
+        EXPECTED_SURFACE="local_coding"
+        ;;
+    "full-operator-v1")
+        EXPECTED_SURFACE="full_operator_runtime"
+        ;;
+    *)
+        fail "unsupported WEBCODEX_MCP_MODEL_SURFACE=$MODEL_SURFACE_ENV"
+        EXPECTED_SURFACE="local_coding"
+        ;;
+esac
+log "expected model surface: $EXPECTED_SURFACE"
+
 log "---- MCP surface (/mcp) ----"
 
 # initialize
@@ -529,42 +550,85 @@ if [ -n "$proto" ] && [ "$proto" != "" ]; then
 else
     fail "MCP initialize did not return a protocolVersion (body: ${body:0:300})"
 fi
+mcp_surface="$(json_get "$body" result.serverInfo.modelSurface)"
+if [ "$mcp_surface" = "$EXPECTED_SURFACE" ]; then
+    pass "MCP initialize modelSurface=$mcp_surface"
+else
+    fail "MCP initialize modelSurface mismatch (expected $EXPECTED_SURFACE got '$mcp_surface' body: ${body:0:300})"
+fi
 
 # tools/list
 body="$(api_post /mcp '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}')"
 TOOLS_LIST_BODY="$body"
 tools_count="$(echo "$body" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d.get("result",{}).get("tools",[])))' 2>/dev/null || echo 0)"
-if [ "${tools_count:-0}" -gt 0 ]; then
+if [ "${tools_count:-0}" -ge 30 ]; then
     pass "MCP tools/list returned $tools_count tools"
 else
-    fail "MCP tools/list returned no tools (body: ${body:0:300})"
+    fail "MCP tools/list returned too few tools (got $tools_count; body: ${body:0:300})"
 fi
-# MCP tools/list is the runtime tool discovery surface, not the OpenAPI
-# operation surface. Keep this as a non-empty + key-tool smoke check.
-mcp_core_present=1
-for tname in list_tools list_projects validate_patch replace_in_file write_project_file; do
-    if echo "$TOOLS_LIST_BODY" | grep -q "\"$tname\""; then
-        :
-    else
-        mcp_core_present=0
-        fail "MCP tools/list missing $tname"
-    fi
-done
-if [ "$mcp_core_present" = "1" ]; then
-    pass "MCP tools/list exposes key runtime tools"
-fi
+mcp_tool_present() {
+    echo "$TOOLS_LIST_BODY" | grep -q "\"$1\""
+}
 
-workflow_tools_present=1
-for tname in start_coding_task finish_coding_task; do
-    if echo "$TOOLS_LIST_BODY" | grep -q "\"$tname\""; then
-        :
-    else
-        workflow_tools_present=0
-        fail "MCP tools/list missing $tname"
+if [ "$EXPECTED_SURFACE" = "local_coding" ]; then
+    # The local_coding canonical coding loop must expose its key tools.
+    mcp_canonical_present=1
+    for tname in work_on_project list_projects project_overview read_file \
+        search_project_text apply_text_edits apply_patch_checked run_shell \
+        run_job job_status job_log list_jobs stop_job cargo_fmt cargo_check \
+        cargo_test validation_summary git_status git_diff show_changes \
+        finish_coding_task; do
+        if mcp_tool_present "$tname"; then
+            :
+        else
+            mcp_canonical_present=0
+            fail "MCP tools/list missing local_coding tool $tname"
+        fi
+    done
+    if [ "$mcp_canonical_present" = "1" ]; then
+        pass "MCP tools/list exposes the local_coding canonical coding loop"
     fi
-done
-if [ "$workflow_tools_present" = "1" ]; then
-    pass "MCP tools/list exposes deterministic workflow tools"
+    # Compatibility / old-granularity tools must NOT re-enter the model surface.
+    mcp_compat_absent=1
+    for tname in replace_in_file write_project_file job_tail list_tools \
+        git_diff_summary start_coding_task; do
+        if mcp_tool_present "$tname"; then
+            mcp_compat_absent=0
+            fail "MCP tools/list must not expose $tname on local_coding"
+        fi
+    done
+    if [ "$mcp_compat_absent" = "1" ]; then
+        pass "MCP tools/list excludes compatibility tools on local_coding"
+    fi
+else
+    # full_operator_runtime: the complete operator tool surface.
+    mcp_operator_present=1
+    for tname in list_tools start_coding_task work_on_project finish_coding_task \
+        git_diff_summary validate_patch apply_patch apply_patch_checked read_file \
+        run_shell run_job job_status job_log list_jobs show_changes; do
+        if mcp_tool_present "$tname"; then
+            :
+        else
+            mcp_operator_present=0
+            fail "MCP tools/list missing full-operator tool $tname"
+        fi
+    done
+    if [ "$mcp_operator_present" = "1" ]; then
+        pass "MCP tools/list exposes the full-operator tool surface"
+    fi
+    # ModelHidden compatibility tools must still never appear in MCP tools/list.
+    # write_project_file is ModelVisible and is part of the full-operator
+    # surface, so it is not asserted absent here.
+    mcp_hidden_absent=1
+    for tname in replace_in_file job_tail; do
+        if mcp_tool_present "$tname"; then
+            mcp_hidden_absent=0
+            fail "MCP tools/list must not expose ModelHidden tool $tname"
+        fi
+    done
+    if [ "$mcp_hidden_absent" = "1" ]; then
+        pass "MCP tools/list excludes ModelHidden compatibility tools"
+    fi
 fi
 
 # tools/call list_projects — must return structuredContent with the agent project.
@@ -659,18 +723,25 @@ else
     fail "job_tail skipped: no JOB_ID available"
 fi
 
-# MCP tools/list must now expose the Phase A tool names.
+# MCP tools/list must now expose the Phase A tool names that are on the model
+# surface. job_tail is ModelHidden (never on the model surface); git_diff is
+# the canonical replacement on local_coding, while git_diff_summary is a
+# full-operator-only tool.
 phase_a_present=1
-for tname in list_project_files search_project_text git_diff_summary list_jobs job_tail; do
-    if echo "$TOOLS_LIST_BODY" | grep -q "\"$tname\""; then
+for tname in list_project_files search_project_text list_jobs job_log git_diff; do
+    if mcp_tool_present "$tname"; then
         :
     else
         phase_a_present=0
         fail "MCP tools/list missing $tname"
     fi
 done
+if [ "$EXPECTED_SURFACE" = "local_coding" ] && mcp_tool_present "git_diff_summary"; then
+    phase_a_present=0
+    fail "MCP tools/list must not expose git_diff_summary on local_coding"
+fi
 if [ "$phase_a_present" = "1" ]; then
-    pass "MCP tools/list exposes all Phase A console tools"
+    pass "MCP tools/list exposes the Phase A console tools on the model surface"
 fi
 
 # ----------------------------------------------------------------------------
@@ -778,11 +849,21 @@ else
     fail "validate_patch modified the worktree (pre=${pre_porcelain:0:120} post=${post_porcelain:0:120})"
 fi
 
-# MCP tools/list must expose validate_patch.
-if echo "$TOOLS_LIST_BODY" | grep -q '"validate_patch"'; then
-    pass "MCP tools/list exposes validate_patch"
+# MCP tools/list must expose validate_patch on the surfaces that include it
+# (full-operator). On the local_coding surface validate_patch is intentionally
+# not exposed; apply_patch_checked is the canonical guarded-apply entry.
+if [ "$EXPECTED_SURFACE" = "local_coding" ]; then
+    if mcp_tool_present "validate_patch"; then
+        fail "MCP tools/list must not expose validate_patch on local_coding"
+    else
+        pass "MCP tools/list excludes validate_patch on local_coding"
+    fi
 else
-    fail "MCP tools/list missing validate_patch"
+    if mcp_tool_present "validate_patch"; then
+        pass "MCP tools/list exposes validate_patch"
+    else
+        fail "MCP tools/list missing validate_patch"
+    fi
 fi
 
 # ----------------------------------------------------------------------------
@@ -995,13 +1076,33 @@ else
     fail "GET /console did not return expected HTML shell (got: ${console_html:0:200})"
 fi
 
-# The bundled JS is public and must use only the protected console API base.
-console_js="$(curl -sS --max-time 10 "http://127.0.0.1:${PORT}/console/app.js" 2>/dev/null)"
-if echo "$console_js" | grep -q 'CONSOLE_BASE = "/api/console/"' && \
-   ! echo "$console_js" | grep -q "WEBCODEX_TOKEN"; then
-    pass "GET /console/app.js uses protected console API without embedding token material"
-else
-    fail "GET /console/app.js missing protected console API contract or contains token material (got: ${console_js:0:200})"
+# The bundled JS is public. Assert on stable properties (non-empty resource,
+# correct content type, no token/credential material) rather than any specific
+# JavaScript implementation text, which may be refactored. The console page is
+# already verified above to reference the bundle and embed no token literal.
+console_js="$(curl -sS -D /tmp/console_js_headers.$$ --max-time 10 "http://127.0.0.1:${PORT}/console/app.js" 2>/dev/null)"
+js_bytes="${#console_js}"
+js_type="$(awk 'BEGIN{IGNORECASE=1} /^Content-Type:/{gsub("\r",""); print substr($0, index($0,":")+2)}' /tmp/console_js_headers.$$ 2>/dev/null)"
+rm -f /tmp/console_js_headers.$$
+console_js_ok=1
+if [ "$js_bytes" -le 0 ]; then
+    console_js_ok=0
+    fail "GET /console/app.js returned an empty resource"
+fi
+case "$js_type" in
+    application/javascript*|text/javascript*|application/x-javascript*)
+        ;;
+    *)
+        console_js_ok=0
+        fail "GET /console/app.js content-type '$js_type' is not a JS type"
+        ;;
+esac
+if echo "$console_js" | grep -qi "WEBCODEX_TOKEN\|wc_agent_secret"; then
+    console_js_ok=0
+    fail "GET /console/app.js contains token or credential material"
+fi
+if [ "$console_js_ok" = "1" ]; then
+    pass "GET /console/app.js returns a non-empty JS resource (${js_bytes} bytes) without token material"
 fi
 
 # The bundle must never embed the token key in the DOM.
@@ -1064,6 +1165,9 @@ if not isinstance(count, int):
 elif isinstance(tools, list) and count != len(tools):
     errors.append(f"count {count} does not match tools length {len(tools)}")
 if isinstance(names, list):
+    # /api/tools/list reflects the full registered operator surface, so the
+    # deterministic workflow tools are always present regardless of the MCP
+    # model surface. git_diff_summary is the canonical summary tool.
     missing = sorted({
         "finish_coding_task",
         "git_diff_summary",
