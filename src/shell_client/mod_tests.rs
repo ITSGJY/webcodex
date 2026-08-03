@@ -115,6 +115,27 @@ fn project_summary(id: &str, path: &str) -> ShellAgentProjectSummary {
     }
 }
 
+fn runner_registration(
+    client_id: &str,
+    agent_instance_id: &str,
+    projects: Vec<ShellAgentProjectSummary>,
+) -> ShellClientRegisterRequest {
+    ShellClientRegisterRequest {
+        process_started_at: None,
+        build: None,
+        job_inventory: None,
+        client_id: client_id.to_string(),
+        agent_instance_id: agent_instance_id.to_string(),
+        display_name: None,
+        owner: None,
+        hostname: None,
+        capabilities: Some(async_job_capabilities()),
+        projects: Some(projects),
+        agent_protocol_version: None,
+        policy: None,
+    }
+}
+
 fn async_job_capabilities() -> ShellClientCapabilities {
     let mut capabilities = ShellClientCapabilities::default();
     capabilities.async_jobs = true;
@@ -527,6 +548,460 @@ async fn shared_key_client_id_collision_cannot_cross_group_or_revive_old_connect
         .touch_client_for_connection("shared-client", "shared-instance", "connection-new")
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn shared_key_runner_limit_is_per_group_and_reconnects_do_not_consume_capacity() {
+    let registry = ShellClientRegistry::default();
+    let shared_a = crate::auth::shared_key::shared_key_context("shared-limit-a");
+    let shared_b = crate::auth::shared_key::shared_key_context("shared-limit-b");
+
+    for index in 0..MAX_SHARED_KEY_RUNNERS_PER_GROUP {
+        registry
+            .register_with_auth(
+                runner_registration(
+                    &format!("shared-a-{index}"),
+                    &format!("shared-a-instance-{index}"),
+                    vec![project_summary(&format!("project-{index}"), "/tmp/project")],
+                ),
+                Some(&shared_a),
+            )
+            .await
+            .unwrap();
+    }
+
+    let mut reconnect = runner_registration(
+        "shared-a-0",
+        "shared-a-instance-0",
+        vec![project_summary("replacement-project", "/tmp/replacement")],
+    );
+    reconnect.hostname = Some("reconnected-host".to_string());
+    registry
+        .register_with_auth(reconnect, Some(&shared_a))
+        .await
+        .expect("an existing shared-key client reconnect must not consume capacity");
+
+    let rejected = registry
+        .register_with_auth(
+            runner_registration(
+                "shared-a-over-limit",
+                "shared-a-over-limit-instance",
+                vec![project_summary("over-limit", "/tmp/over-limit")],
+            ),
+            Some(&shared_a),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        rejected,
+        format!(
+            "shared-key runner group limit reached (maximum {} runners)",
+            MAX_SHARED_KEY_RUNNERS_PER_GROUP
+        )
+    );
+    assert!(registry
+        .get_client_view("shared-a-over-limit")
+        .await
+        .is_none());
+    assert_eq!(
+        registry
+            .get_client_view_for_auth("shared-a-0", Some(&shared_a))
+            .await
+            .unwrap()
+            .hostname
+            .as_deref(),
+        Some("reconnected-host"),
+        "a rejected new client must not modify an existing registration"
+    );
+
+    registry
+        .register_with_auth(
+            runner_registration(
+                "shared-b-0",
+                "shared-b-instance-0",
+                vec![project_summary("project-b", "/tmp/project-b")],
+            ),
+            Some(&shared_b),
+        )
+        .await
+        .expect("a different shared-key group has its own capacity");
+
+    let managed = agent_auth_context(
+        "managed",
+        "managed-beyond-shared-group-limit",
+        vec!["agent:register"],
+    );
+    let mut managed_registration = runner_registration(
+        "managed-beyond-shared-group-limit",
+        "managed-instance",
+        vec![project_summary("managed-project", "/tmp/managed")],
+    );
+    managed_registration.owner = Some("managed".to_string());
+    registry
+        .register_with_auth(managed_registration, Some(&managed))
+        .await
+        .expect("managed Agent Tokens are not subject to shared-key group capacity");
+}
+
+#[tokio::test]
+async fn shared_key_global_runner_limit_excludes_reconnects_and_managed_runners() {
+    let registry = ShellClientRegistry::with_shared_key_limits_for_test(
+        MAX_SHARED_KEY_RUNNERS_PER_GROUP,
+        3,
+        SHARED_KEY_OFFLINE_TTL_SECS,
+    );
+    let shared_a = crate::auth::shared_key::shared_key_context("shared-global-a");
+    let shared_b = crate::auth::shared_key::shared_key_context("shared-global-b");
+    let shared_c = crate::auth::shared_key::shared_key_context("shared-global-c");
+
+    for (client_id, instance_id, auth) in [
+        ("global-a-0", "global-a-instance-0", &shared_a),
+        ("global-a-1", "global-a-instance-1", &shared_a),
+        ("global-b-0", "global-b-instance-0", &shared_b),
+    ] {
+        registry
+            .register_with_auth(
+                runner_registration(client_id, instance_id, Vec::new()),
+                Some(auth),
+            )
+            .await
+            .unwrap();
+    }
+
+    let rejected = registry
+        .register_with_auth(
+            runner_registration("global-c-0", "global-c-instance-0", Vec::new()),
+            Some(&shared_c),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        rejected,
+        "shared-key runner global limit reached (maximum 3 runners)"
+    );
+
+    registry
+        .register_with_auth(
+            runner_registration("global-a-0", "global-a-instance-0", Vec::new()),
+            Some(&shared_a),
+        )
+        .await
+        .expect("an existing client reconnect remains available at global capacity");
+
+    let managed = agent_auth_context(
+        "managed",
+        "managed-at-shared-global-limit",
+        vec!["agent:register"],
+    );
+    let mut managed_registration = runner_registration(
+        "managed-at-shared-global-limit",
+        "managed-global-instance",
+        Vec::new(),
+    );
+    managed_registration.owner = Some("managed".to_string());
+    registry
+        .register_with_auth(managed_registration, Some(&managed))
+        .await
+        .expect("managed Agent Tokens are excluded from shared-key global capacity");
+}
+
+#[tokio::test]
+async fn shared_key_offline_ttl_prunes_only_expired_clients_and_all_associated_state() {
+    let ttl_secs = 10;
+    let registry = ShellClientRegistry::with_shared_key_limits_for_test(1, 4, ttl_secs);
+    let connected_auth = crate::auth::shared_key::shared_key_context("ttl-connected");
+    let fresh_auth = crate::auth::shared_key::shared_key_context("ttl-fresh");
+    let expired_auth = crate::auth::shared_key::shared_key_context("ttl-expired");
+
+    registry
+        .register_with_auth_connection(
+            runner_registration("ttl-connected", "ttl-connected-instance", Vec::new()),
+            Some(&connected_auth),
+            Some("ttl-connected-connection"),
+        )
+        .await
+        .unwrap();
+    registry
+        .register_notifier_for_connection(
+            "ttl-connected",
+            "ttl-connected-instance",
+            "ttl-connected-connection",
+            Arc::new(Notify::new()),
+        )
+        .await
+        .unwrap();
+    registry
+        .set_last_seen_for_test("ttl-connected", now_ts() - ttl_secs - 100)
+        .await;
+
+    registry
+        .register_with_auth_connection(
+            runner_registration("ttl-fresh", "ttl-fresh-instance", Vec::new()),
+            Some(&fresh_auth),
+            Some("ttl-fresh-connection"),
+        )
+        .await
+        .unwrap();
+    registry
+        .register_notifier_for_connection(
+            "ttl-fresh",
+            "ttl-fresh-instance",
+            "ttl-fresh-connection",
+            Arc::new(Notify::new()),
+        )
+        .await
+        .unwrap();
+    registry
+        .reconcile_disconnect_for_connection(
+            "ttl-fresh",
+            "ttl-fresh-instance",
+            "ttl-fresh-connection",
+        )
+        .await;
+
+    registry
+        .register_with_auth(
+            runner_registration(
+                "ttl-expired",
+                "ttl-expired-instance",
+                vec![project_summary("expired-project", "/tmp/expired")],
+            ),
+            Some(&expired_auth),
+        )
+        .await
+        .unwrap();
+    let job = registry
+        .start_job(
+            ShellJobOpRequest {
+                op: "start".to_string(),
+                client_id: Some("ttl-expired".to_string()),
+                cwd: None,
+                command: Some("sleep 10".to_string()),
+                timeout_secs: Some(10),
+                job_id: None,
+                since_stdout_line: None,
+                since_stderr_line: None,
+                tail_lines: None,
+                limit: None,
+                codex: None,
+            },
+            "test".to_string(),
+        )
+        .await
+        .unwrap();
+    let (sync_request_id, sync_rx) = registry
+        .enqueue_run(
+            ShellRunRequest {
+                client_id: "ttl-expired".to_string(),
+                cwd: None,
+                command: "echo pending".to_string(),
+                stdin: None,
+                timeout_secs: 30,
+                wait_timeout_secs: 30,
+            },
+            "test".to_string(),
+        )
+        .await
+        .unwrap();
+    registry.record_hidden_cleanup_intent(job.job_id.clone(), None);
+    let job_revision = {
+        let mut inner = registry.inner.lock().await;
+        let expired_at = now_ts() - CLIENT_ONLINE_WINDOW_SECS - ttl_secs - 1;
+        let client = inner.clients.get_mut("ttl-expired").unwrap();
+        client.last_seen = expired_at;
+        client.disconnected_at = Some(expired_at);
+        inner.retired_instances.insert(
+            "ttl-expired".to_string(),
+            std::collections::VecDeque::from(["old-expired-instance".to_string()]),
+        );
+        inner
+            .unregistering_projects
+            .insert("agent:ttl-expired:expired-project".to_string(), 1);
+        inner
+            .jobs_by_id
+            .get(&job.job_id)
+            .unwrap()
+            .public_revision
+            .clone()
+    };
+    let revision_before = job_revision.load(std::sync::atomic::Ordering::Relaxed);
+
+    let visible_expired = registry.list_clients_for_auth(Some(&expired_auth)).await;
+    assert!(visible_expired.is_empty());
+    assert!(
+        job_revision.load(std::sync::atomic::Ordering::Relaxed) > revision_before,
+        "a non-terminal job must transition through the existing lost notifier before removal"
+    );
+    let sync_response = tokio::time::timeout(std::time::Duration::from_secs(1), sync_rx)
+        .await
+        .expect("expired request waiter should be resolved")
+        .expect("expired request waiter should receive a response");
+    assert_eq!(sync_response.request_id, sync_request_id);
+    assert!(sync_response
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("registration expired")));
+    assert!(registry.get_job(&job.job_id).await.is_err());
+    assert!(!registry.has_hidden_cleanup_intent_for_test(&job.job_id));
+    assert!(registry.list_client_projects("ttl-expired").await.is_err());
+    {
+        let inner = registry.inner.lock().await;
+        assert!(!inner.clients.contains_key("ttl-expired"));
+        assert!(!inner.queues_by_client.contains_key("ttl-expired"));
+        assert!(!inner.notifiers.contains_key("ttl-expired"));
+        assert!(!inner.retired_instances.contains_key("ttl-expired"));
+        assert!(inner
+            .pending_by_id
+            .values()
+            .all(|pending| pending.request.client_id != "ttl-expired"));
+        assert!(inner
+            .jobs_by_id
+            .values()
+            .all(|job| job.client_id != "ttl-expired"));
+        assert!(inner
+            .unregistering_projects
+            .keys()
+            .all(|project_id| !project_id.starts_with("agent:ttl-expired:")));
+    }
+
+    assert!(registry
+        .get_client_view_for_auth("ttl-connected", Some(&connected_auth))
+        .await
+        .is_some());
+    assert!(registry
+        .get_client_view_for_auth("ttl-fresh", Some(&fresh_auth))
+        .await
+        .is_some());
+
+    let managed = agent_auth_context("managed", "ttl-managed", vec!["agent:register"]);
+    let mut managed_registration =
+        runner_registration("ttl-managed", "ttl-managed-instance", Vec::new());
+    managed_registration.owner = Some("managed".to_string());
+    registry
+        .register_with_auth(managed_registration, Some(&managed))
+        .await
+        .unwrap();
+    {
+        let mut inner = registry.inner.lock().await;
+        let managed_record = inner.clients.get_mut("ttl-managed").unwrap();
+        managed_record.last_seen = now_ts() - ttl_secs - 100;
+        managed_record.disconnected_at = Some(now_ts() - ttl_secs - 100);
+    }
+    assert!(registry
+        .get_client_view_for_auth("ttl-managed", Some(&managed))
+        .await
+        .is_some());
+
+    registry
+        .register_with_auth(
+            runner_registration(
+                "ttl-expired-replacement",
+                "ttl-expired-replacement-instance",
+                Vec::new(),
+            ),
+            Some(&expired_auth),
+        )
+        .await
+        .expect("pruning an expired runner must release its group capacity");
+}
+
+#[tokio::test]
+async fn shared_key_project_summary_limit_uses_raw_input_and_preserves_existing_projects() {
+    let registry = ShellClientRegistry::default();
+    let shared = crate::auth::shared_key::shared_key_context("project-limit-shared");
+    let projects = (0..MAX_RUNNER_PROJECT_SUMMARIES)
+        .map(|index| project_summary(&format!("project-{index}"), "/tmp/project"))
+        .collect::<Vec<_>>();
+    registry
+        .register_with_auth(
+            runner_registration("project-limit", "project-limit-instance", projects.clone()),
+            Some(&shared),
+        )
+        .await
+        .expect("the documented project limit is accepted");
+
+    let too_many = (0..=MAX_RUNNER_PROJECT_SUMMARIES)
+        .map(|index| project_summary(&format!("project-{index}"), "/tmp/project"))
+        .collect::<Vec<_>>();
+    let error = registry
+        .register_with_auth(
+            runner_registration("project-limit", "project-limit-instance", too_many),
+            Some(&shared),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        format!(
+            "runner project summary limit exceeded (maximum {} projects)",
+            MAX_RUNNER_PROJECT_SUMMARIES
+        )
+    );
+    assert_eq!(
+        registry
+            .list_client_projects("project-limit")
+            .await
+            .unwrap()
+            .len(),
+        MAX_RUNNER_PROJECT_SUMMARIES
+    );
+
+    let duplicate_projects =
+        vec![project_summary("duplicate", "/tmp/duplicate"); MAX_RUNNER_PROJECT_SUMMARIES + 1];
+    let poll_error = registry
+        .poll(ShellAgentPollRequest {
+            client_id: "project-limit".to_string(),
+            agent_instance_id: "project-limit-instance".to_string(),
+            projects: Some(duplicate_projects),
+        })
+        .await
+        .unwrap_err();
+    assert!(poll_error.contains("project summary limit exceeded"));
+    assert_eq!(
+        registry
+            .list_client_projects("project-limit")
+            .await
+            .unwrap()
+            .len(),
+        MAX_RUNNER_PROJECT_SUMMARIES,
+        "an oversized polling refresh must not overwrite the existing project list"
+    );
+    let upsert_error = registry
+        .upsert_client_project(
+            "project-limit",
+            project_summary("project-over-limit", "/tmp/project-over-limit"),
+        )
+        .await
+        .unwrap_err();
+    assert!(upsert_error.contains("project summary limit reached"));
+    registry
+        .upsert_client_project(
+            "project-limit",
+            project_summary("project-0", "/tmp/project-replaced"),
+        )
+        .await
+        .expect("replacing an existing project remains allowed at the limit");
+    assert_eq!(
+        registry
+            .list_client_projects("project-limit")
+            .await
+            .unwrap()
+            .len(),
+        MAX_RUNNER_PROJECT_SUMMARIES
+    );
+
+    let managed = agent_auth_context("managed", "managed-project-limit", vec!["agent:register"]);
+    let mut managed_registration = runner_registration(
+        "managed-project-limit",
+        "managed-project-limit-instance",
+        vec![project_summary("duplicate", "/tmp/duplicate"); MAX_RUNNER_PROJECT_SUMMARIES + 1],
+    );
+    managed_registration.owner = Some("managed".to_string());
+    let managed_error = registry
+        .register_with_auth(managed_registration, Some(&managed))
+        .await
+        .unwrap_err();
+    assert!(managed_error.contains("project summary limit exceeded"));
 }
 
 #[test]

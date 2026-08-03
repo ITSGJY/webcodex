@@ -639,6 +639,7 @@ pub(crate) async fn recovery_timeout_sweep(registry: &ShellClientRegistry) {
     registry.process_hidden_cleanup_intents().await;
     let now = crate::shell_client::now_ts();
     let mut inner = registry.inner.lock().await;
+    registry.prune_expired_shared_key_clients_locked(&mut inner, now);
     expire_recovering_jobs_locked(&mut inner, None, now, RECOVERY_SWEEP_PASS_CAP);
 }
 

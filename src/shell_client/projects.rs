@@ -71,6 +71,7 @@ impl ShellClientRegistry {
         &self,
         client_id: &str,
     ) -> Result<ShellClientCapabilities, ShellClientLookupError> {
+        self.prune_expired_shared_key_clients().await;
         let inner = self.inner.lock().await;
         let client =
             inner
@@ -104,6 +105,7 @@ impl ShellClientRegistry {
         capability: &str,
         auth: Option<&crate::auth::AuthContext>,
     ) -> Result<bool, String> {
+        self.prune_expired_shared_key_clients().await;
         let inner = self.inner.lock().await;
         let client = inner
             .clients
@@ -121,6 +123,7 @@ impl ShellClientRegistry {
         client_id: &str,
     ) -> Result<Vec<ShellAgentProjectSummary>, String> {
         validate_id(client_id, "client_id")?;
+        self.prune_expired_shared_key_clients().await;
         let inner = self.inner.lock().await;
         let Some(client) = inner.clients.get(client_id) else {
             return Err(format!("unknown shell client: {}", client_id));
@@ -144,6 +147,17 @@ impl ShellClientRegistry {
         let Some(client) = inner.clients.get_mut(client_id) else {
             return Err(format!("unknown shell client: {}", client_id));
         };
+        if client.projects.len() >= super::MAX_RUNNER_PROJECT_SUMMARIES
+            && !client
+                .projects
+                .iter()
+                .any(|existing| existing.id == project.id)
+        {
+            return Err(format!(
+                "runner project summary limit reached (maximum {} projects)",
+                super::MAX_RUNNER_PROJECT_SUMMARIES
+            ));
+        }
         upsert_project_summary(&mut client.projects, project);
         Ok(())
     }

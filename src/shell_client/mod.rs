@@ -66,6 +66,10 @@ use validation::{
 
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 pub(crate) const CLIENT_ONLINE_WINDOW_SECS: i64 = 60;
+pub(crate) const MAX_SHARED_KEY_RUNNERS_PER_GROUP: usize = 16;
+pub(crate) const MAX_SHARED_KEY_RUNNERS_GLOBAL: usize = 1024;
+pub(crate) const MAX_RUNNER_PROJECT_SUMMARIES: usize = 64;
+pub(crate) const SHARED_KEY_OFFLINE_TTL_SECS: i64 = 24 * 60 * 60;
 /// Same-process runners have this long to re-register and submit their
 /// complete active inventory before a recovering job becomes terminal lost.
 /// This is the documented production default; tests and operators may lower it
@@ -134,10 +138,28 @@ pub const TRANSPORT_WEBSOCKET: &str = "websocket";
 /// with `[quic]` configured so QUIC is attempted before fallback transports.
 pub const TRANSPORT_QUIC: &str = "quic";
 
+#[derive(Debug, Clone, Copy)]
+struct SharedKeyRegistrationLimits {
+    per_group: usize,
+    global: usize,
+    offline_ttl_secs: i64,
+}
+
+impl Default for SharedKeyRegistrationLimits {
+    fn default() -> Self {
+        Self {
+            per_group: MAX_SHARED_KEY_RUNNERS_PER_GROUP,
+            global: MAX_SHARED_KEY_RUNNERS_GLOBAL,
+            offline_ttl_secs: SHARED_KEY_OFFLINE_TTL_SECS,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ShellClientRegistry {
     inner: Arc<Mutex<ShellClientRegistryInner>>,
     observation_epoch: Arc<str>,
+    shared_key_limits: SharedKeyRegistrationLimits,
     /// Cancellation intents recorded synchronously by Drop guards before any
     /// asynchronous stop delivery. The periodic registry lifecycle drains this
     /// map, so cleanup does not depend on one detached task getting polled.
@@ -150,7 +172,26 @@ impl Default for ShellClientRegistry {
         Self {
             inner: Arc::new(Mutex::new(ShellClientRegistryInner::default())),
             observation_epoch: Arc::from(crate::job_observation::new_epoch()),
+            shared_key_limits: SharedKeyRegistrationLimits::default(),
             cleanup_intents: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+}
+
+#[cfg(test)]
+impl ShellClientRegistry {
+    fn with_shared_key_limits_for_test(
+        per_group: usize,
+        global: usize,
+        offline_ttl_secs: i64,
+    ) -> Self {
+        Self {
+            shared_key_limits: SharedKeyRegistrationLimits {
+                per_group,
+                global,
+                offline_ttl_secs,
+            },
+            ..Self::default()
         }
     }
 }

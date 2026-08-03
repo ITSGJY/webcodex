@@ -3,7 +3,10 @@ use super::jobs::{
     truncate_output_to,
 };
 use super::requests::{remove_pending_request_locked, take_pending_request_locked};
-use super::validation::{normalize_project_summaries, validate_agent_instance_id, validate_id};
+use super::validation::{
+    normalize_project_summaries, validate_agent_instance_id, validate_id,
+    validate_project_summary_count,
+};
 use super::{now_ts, ShellClientRegistry};
 use crate::shell_protocol::{
     ShellAgentPersistentShellResultRequest, ShellAgentPollRequest, ShellAgentResultRequest,
@@ -51,6 +54,7 @@ impl ShellClientRegistry {
     ) -> Result<Option<ShellAgentShellRequest>, String> {
         validate_id(&body.client_id, "client_id")?;
         validate_agent_instance_id(&body.agent_instance_id)?;
+        validate_project_summary_count(body.projects.as_deref())?;
         let mut inner = self.inner.lock().await;
         {
             let Some(client) = inner.clients.get_mut(&body.client_id) else {

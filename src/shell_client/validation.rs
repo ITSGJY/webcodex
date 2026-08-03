@@ -621,6 +621,19 @@ pub(super) fn normalize_project_summaries(
     projects
 }
 
+pub(super) fn validate_project_summary_count(
+    projects: Option<&[ShellAgentProjectSummary]>,
+) -> Result<(), String> {
+    let count = projects.map_or(0, <[ShellAgentProjectSummary]>::len);
+    if count > super::MAX_RUNNER_PROJECT_SUMMARIES {
+        return Err(format!(
+            "runner project summary limit exceeded (maximum {} projects)",
+            super::MAX_RUNNER_PROJECT_SUMMARIES
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn sha256_hex(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());

@@ -8,14 +8,14 @@ use super::requests::resolve_disconnected_sync_requests_locked;
 use super::state::{NotifierEntry, ShellClientRecord, ShellClientRegistryInner};
 use super::validation::{
     normalize_project_summaries, normalize_tool_providers, trim_string, validate_agent_instance_id,
-    validate_id, validate_optional_field,
+    validate_id, validate_optional_field, validate_project_summary_count,
 };
 use super::{
     now_ts, ShellClientRegistry, CLIENT_ONLINE_WINDOW_SECS, MAX_RETIRED_INSTANCES_PER_CLIENT,
     TRANSPORT_POLLING,
 };
 use crate::shell_protocol::{ShellClientRegisterRequest, ShellClientView};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Notify;
 
@@ -47,6 +47,7 @@ impl ShellClientRegistry {
         validate_optional_field(&body.display_name, "display_name")?;
         validate_optional_field(&body.owner, "owner")?;
         validate_optional_field(&body.hostname, "hostname")?;
+        validate_project_summary_count(body.projects.as_deref())?;
 
         let client_id = body.client_id.trim().to_string();
         let agent_instance_id = body.agent_instance_id.trim().to_string();
@@ -101,6 +102,7 @@ impl ShellClientRegistry {
             (false, None) => {}
         }
         let mut inner = self.inner.lock().await;
+        self.prune_expired_shared_key_clients_locked(&mut inner, now);
 
         if inner
             .clients
@@ -108,6 +110,41 @@ impl ShellClientRegistry {
             .is_some_and(|existing| existing.auth_group != record.auth_group)
         {
             return Err("agent client identity is unavailable".to_string());
+        }
+        if let Some(ShellClientAuthGroup::SharedKey(group)) = record.auth_group.as_ref() {
+            let is_new_client = !inner.clients.contains_key(&client_id);
+            if is_new_client {
+                let group_count = inner
+                    .clients
+                    .values()
+                    .filter(|client| {
+                        matches!(
+                            client.auth_group.as_ref(),
+                            Some(ShellClientAuthGroup::SharedKey(existing_group))
+                                if existing_group == group
+                        )
+                    })
+                    .count();
+                if group_count >= self.shared_key_limits.per_group {
+                    return Err(format!(
+                        "shared-key runner group limit reached (maximum {} runners)",
+                        self.shared_key_limits.per_group
+                    ));
+                }
+                let global_count = inner
+                    .clients
+                    .values()
+                    .filter(|client| {
+                        matches!(client.auth_group, Some(ShellClientAuthGroup::SharedKey(_)))
+                    })
+                    .count();
+                if global_count >= self.shared_key_limits.global {
+                    return Err(format!(
+                        "shared-key runner global limit reached (maximum {} runners)",
+                        self.shared_key_limits.global
+                    ));
+                }
+            }
         }
         if inner
             .retired_instances
@@ -396,6 +433,100 @@ impl ShellClientRegistry {
         }
     }
 
+    pub(super) fn prune_expired_shared_key_clients_locked(
+        &self,
+        inner: &mut ShellClientRegistryInner,
+        now: i64,
+    ) {
+        let expired = inner
+            .clients
+            .iter()
+            .filter_map(|(client_id, client)| {
+                if !matches!(client.auth_group, Some(ShellClientAuthGroup::SharedKey(_))) {
+                    return None;
+                }
+                let transport_connected = inner.notifiers.contains_key(client_id);
+                let recently_seen =
+                    now.saturating_sub(client.last_seen) <= CLIENT_ONLINE_WINDOW_SECS;
+                if transport_connected || recently_seen {
+                    return None;
+                }
+                let offline_since = client.disconnected_at.unwrap_or(client.last_seen);
+                (now.saturating_sub(offline_since) > self.shared_key_limits.offline_ttl_secs)
+                    .then(|| client_id.clone())
+            })
+            .collect::<Vec<_>>();
+        if expired.is_empty() {
+            return;
+        }
+
+        let expired_set = expired.iter().cloned().collect::<HashSet<_>>();
+        let request_ids = inner
+            .pending_by_id
+            .iter()
+            .filter_map(|(request_id, pending)| {
+                expired_set
+                    .contains(&pending.request.client_id)
+                    .then(|| request_id.clone())
+            })
+            .collect::<HashSet<_>>();
+        let job_ids = inner
+            .jobs_by_id
+            .iter()
+            .filter_map(|(job_id, job)| {
+                expired_set.contains(&job.client_id).then(|| job_id.clone())
+            })
+            .collect::<HashSet<_>>();
+
+        for client_id in &expired {
+            resolve_disconnected_sync_requests_locked(
+                inner,
+                client_id,
+                "agent went offline: shared-key runner registration expired",
+            );
+        }
+        for job_id in &job_ids {
+            if let Some(job) = inner.jobs_by_id.get_mut(job_id) {
+                mark_job_lost(
+                    job,
+                    now,
+                    "shared_key_runner_expired",
+                    "shared-key runner registration expired after being offline",
+                );
+            }
+        }
+        for request_id in &request_ids {
+            inner.pending_by_id.remove(request_id);
+            inner.persistent_waiters.remove(request_id);
+        }
+        inner.request_to_job.retain(|request_id, job_id| {
+            !request_ids.contains(request_id) && !job_ids.contains(job_id)
+        });
+        inner
+            .jobs_by_id
+            .retain(|job_id, _| !job_ids.contains(job_id));
+        for client_id in &expired {
+            inner.clients.remove(client_id);
+            inner.queues_by_client.remove(client_id);
+            inner.notifiers.remove(client_id);
+            inner.retired_instances.remove(client_id);
+            let project_prefix = format!("agent:{client_id}:");
+            inner
+                .unregistering_projects
+                .retain(|project_id, _| !project_id.starts_with(&project_prefix));
+        }
+        self.cleanup_intents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|job_id, _| !job_ids.contains(job_id));
+    }
+
+    pub(super) async fn prune_expired_shared_key_clients(&self) {
+        let now = now_ts();
+        let mut inner = self.inner.lock().await;
+        self.prune_expired_shared_key_clients_locked(&mut inner, now);
+    }
+
     /// Register a push notifier for a client. The WebSocket handler calls
     /// this after register; the server's request pump waits on the notifier
     /// between polls. Calling this replaces any previously registered
@@ -595,7 +726,8 @@ impl ShellClientRegistry {
 
     #[cfg(test)]
     pub async fn list_clients(&self) -> Vec<ShellClientView> {
-        let inner = self.inner.lock().await;
+        let mut inner = self.inner.lock().await;
+        self.prune_expired_shared_key_clients_locked(&mut inner, now_ts());
         let mut ids = inner.clients.keys().cloned().collect::<Vec<_>>();
         ids.sort();
         ids.into_iter()
@@ -607,7 +739,8 @@ impl ShellClientRegistry {
         &self,
         auth: Option<&crate::auth::AuthContext>,
     ) -> Vec<ShellClientView> {
-        let inner = self.inner.lock().await;
+        let mut inner = self.inner.lock().await;
+        self.prune_expired_shared_key_clients_locked(&mut inner, now_ts());
         let mut ids = inner.clients.keys().cloned().collect::<Vec<_>>();
         ids.sort();
         ids.into_iter()
@@ -623,7 +756,8 @@ impl ShellClientRegistry {
     }
 
     pub async fn get_client_view(&self, client_id: &str) -> Option<ShellClientView> {
-        let inner = self.inner.lock().await;
+        let mut inner = self.inner.lock().await;
+        self.prune_expired_shared_key_clients_locked(&mut inner, now_ts());
         Self::client_view_locked(&inner, client_id)
     }
 
@@ -633,7 +767,8 @@ impl ShellClientRegistry {
         agent_instance_id: &str,
         connection_id: &str,
     ) -> Option<ShellClientView> {
-        let inner = self.inner.lock().await;
+        let mut inner = self.inner.lock().await;
+        self.prune_expired_shared_key_clients_locked(&mut inner, now_ts());
         let client = inner.clients.get(client_id)?;
         if client.agent_instance_id != agent_instance_id
             || client.connection_id.as_deref() != Some(connection_id)
@@ -648,7 +783,8 @@ impl ShellClientRegistry {
         client_id: &str,
         auth: Option<&crate::auth::AuthContext>,
     ) -> Option<ShellClientView> {
-        let inner = self.inner.lock().await;
+        let mut inner = self.inner.lock().await;
+        self.prune_expired_shared_key_clients_locked(&mut inner, now_ts());
         let client = inner.clients.get(client_id)?;
         if !shell_client_visible_to_auth(auth, client) {
             return None;
@@ -661,7 +797,8 @@ impl ShellClientRegistry {
         auth: Option<&crate::auth::AuthContext>,
         client_id: &str,
     ) -> Result<(), String> {
-        let inner = self.inner.lock().await;
+        let mut inner = self.inner.lock().await;
+        self.prune_expired_shared_key_clients_locked(&mut inner, now_ts());
         let client = inner
             .clients
             .get(client_id)
