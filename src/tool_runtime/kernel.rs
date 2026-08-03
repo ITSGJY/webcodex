@@ -564,12 +564,11 @@ mod tests {
         let outcome = runtime
             .call_tool_with_context(
                 ToolCallRequest {
-                    tool_name: "replace_in_file".to_string(),
+                    tool_name: "write_project_file".to_string(),
                     arguments: json!({
                         "project": "demo",
                         "path": "README.md",
-                        "old": "secret-old",
-                        "new": "secret-new"
+                        "content": "secret-content"
                     }),
                 },
                 ToolCallContext {
@@ -588,10 +587,8 @@ mod tests {
             .summary(&session.session_id, Some(10))
             .unwrap();
         let serialized = serde_json::to_string(&summary.events).unwrap();
-        assert!(serialized.contains("\"old_present\":true"));
-        assert!(serialized.contains("\"new_present\":true"));
-        assert!(!serialized.contains("secret-old"));
-        assert!(!serialized.contains("secret-new"));
+        assert!(serialized.contains("\"content_present\":true"));
+        assert!(!serialized.contains("secret-content"));
     }
 
     #[tokio::test]

@@ -123,56 +123,6 @@ impl ToolRuntime {
                 Some(Err(error)) => error.into_tool_result(),
                 None => self.search_project_texts(project, queries).await,
             },
-            ToolCall::ReplaceInFile {
-                project,
-                path,
-                old,
-                new,
-                session_id: _,
-                expected_replacements,
-                allow_multiple,
-            } => {
-                self.replace_in_file(
-                    project,
-                    path,
-                    old,
-                    new,
-                    expected_replacements,
-                    allow_multiple,
-                )
-                .await
-            }
-            ToolCall::ReplaceExactBlock {
-                project,
-                path,
-                old_text,
-                new_text,
-                session_id: _,
-                expected_old_sha256,
-            } => {
-                self.replace_exact_block(project, path, old_text, new_text, expected_old_sha256)
-                    .await
-            }
-            ToolCall::InsertBeforePattern {
-                project,
-                path,
-                pattern,
-                text,
-                session_id: _,
-            } => {
-                self.insert_around_pattern(project, path, pattern, text, "insert_before_pattern")
-                    .await
-            }
-            ToolCall::InsertAfterPattern {
-                project,
-                path,
-                pattern,
-                text,
-                session_id: _,
-            } => {
-                self.insert_around_pattern(project, path, pattern, text, "insert_after_pattern")
-                    .await
-            }
             ToolCall::WriteProjectFile {
                 project,
                 path,
@@ -275,65 +225,6 @@ impl ToolRuntime {
                 upload_id,
                 session_id: _,
             } => self.artifact_upload_abort(project, path, upload_id).await,
-            ToolCall::ReplaceLineRange {
-                project,
-                path,
-                start_line,
-                end_line,
-                new_text,
-                session_id: _,
-                expected_old_sha256,
-                expected_old_prefix,
-            } => {
-                self.replace_line_range(
-                    project,
-                    path,
-                    start_line,
-                    end_line,
-                    new_text,
-                    expected_old_sha256,
-                    expected_old_prefix,
-                )
-                .await
-            }
-            ToolCall::InsertAtLine {
-                project,
-                path,
-                line,
-                text,
-                session_id: _,
-                expected_anchor_sha256,
-                expected_anchor_prefix,
-            } => {
-                self.insert_at_line(
-                    project,
-                    path,
-                    line,
-                    text,
-                    expected_anchor_sha256,
-                    expected_anchor_prefix,
-                )
-                .await
-            }
-            ToolCall::DeleteLineRange {
-                project,
-                path,
-                start_line,
-                end_line,
-                session_id: _,
-                expected_old_sha256,
-                expected_old_prefix,
-            } => {
-                self.delete_line_range(
-                    project,
-                    path,
-                    start_line,
-                    end_line,
-                    expected_old_sha256,
-                    expected_old_prefix,
-                )
-                .await
-            }
             ToolCall::ApplyTextEdits {
                 project,
                 changes,

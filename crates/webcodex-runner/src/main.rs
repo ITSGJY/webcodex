@@ -65,14 +65,13 @@ use webcodex_runner::{
     configured_shell_job_command, configured_validation_job_command, cwd_allowed,
     default_config_path, dispatch_request, err_cmd, handle_apply_text_edits_file_request,
     handle_artifact_file_request, handle_basic_file_request, handle_checkpoint_file_request,
-    handle_line_edit_file_request, handle_replace_in_file_request,
     handle_write_project_file_request, hostname, is_artifact_request_kind,
-    is_basic_file_request_kind, is_checkpoint_request_kind, is_line_edit_request_kind,
-    is_project_op, load_config, ok_cmd, projects_dir, resolve_prepared_shell_profile,
-    resolve_requested_path, run_agent, validate_client_profile, validate_line_edit_agent_path,
-    AgentConfig, AgentPolicy, AgentProjectCache, AgentSink, CommandResult, HotAgentConfig,
-    HttpSendConfig, PreparedShellProfile, PreparedShellProfileCache, ReloadableAgentConfig,
-    ShellConfig, SubmitResultError,
+    is_basic_file_request_kind, is_checkpoint_request_kind, is_project_op,
+    is_structured_edit_request_kind, load_config, ok_cmd, projects_dir,
+    resolve_prepared_shell_profile, resolve_requested_path, run_agent, validate_client_profile,
+    validate_structured_edit_agent_path, AgentConfig, AgentPolicy, AgentProjectCache, AgentSink,
+    CommandResult, HotAgentConfig, HttpSendConfig, PreparedShellProfile, PreparedShellProfileCache,
+    ReloadableAgentConfig, ShellConfig, SubmitResultError,
 };
 use webcodex_runner::{is_transport_failure, SshConfig, SshConnectionPool};
 
@@ -1458,7 +1457,7 @@ fn register(
 
 fn is_file_request_kind(kind: &str) -> bool {
     is_basic_file_request_kind(kind)
-        || is_line_edit_request_kind(kind)
+        || is_structured_edit_request_kind(kind)
         || is_artifact_request_kind(kind)
         || is_checkpoint_request_kind(kind)
 }
@@ -1474,8 +1473,8 @@ fn handle_file_request(policy: &AgentPolicy, request: &ShellAgentShellRequest) -
         };
     };
     let start = Instant::now();
-    if is_line_edit_request_kind(&request.kind) {
-        if let Err(e) = validate_line_edit_agent_path(path) {
+    if is_structured_edit_request_kind(&request.kind) {
+        if let Err(e) = validate_structured_edit_agent_path(path) {
             return CommandResult {
                 exit_code: None,
                 stdout: None,
@@ -1498,13 +1497,6 @@ fn handle_file_request(policy: &AgentPolicy, request: &ShellAgentShellRequest) -
         }
     };
     match request.kind.as_str() {
-        "file_replace_line_range"
-        | "file_insert_at_line"
-        | "file_delete_line_range"
-        | "file_replace_exact_block"
-        | "file_insert_before_pattern"
-        | "file_insert_after_pattern" => handle_line_edit_file_request(request, &resolved, start),
-        "file_replace_in_file" => handle_replace_in_file_request(request, &resolved, start),
         "file_write_project_file" => handle_write_project_file_request(request, &resolved, start),
         "file_apply_text_edits" => handle_apply_text_edits_file_request(policy, request, start),
         "file_save_project_artifact"

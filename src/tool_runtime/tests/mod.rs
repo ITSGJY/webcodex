@@ -13,7 +13,6 @@ mod execution_context;
 mod explicit_resume;
 mod files;
 mod files_helpers;
-mod files_line_edit;
 mod git;
 mod handoff;
 mod handoff_brief;

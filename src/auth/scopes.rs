@@ -689,10 +689,6 @@ mod tests {
                 "artifact_upload_abort",
                 OAuthToolScopePolicy::Require(SCOPE_PROJECT_WRITE),
             ),
-            (
-                "replace_line_range",
-                OAuthToolScopePolicy::Require(SCOPE_PROJECT_WRITE),
-            ),
             ("run_shell", OAuthToolScopePolicy::Require(SCOPE_JOB_RUN)),
             ("stop_job", OAuthToolScopePolicy::Require(SCOPE_JOB_RUN)),
             ("cargo_test", OAuthToolScopePolicy::Require(SCOPE_JOB_RUN)),

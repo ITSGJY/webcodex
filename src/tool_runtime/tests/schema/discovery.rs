@@ -994,7 +994,6 @@ fn tool_categories_and_recommended_flows_are_well_formed() {
         "edit: prefer apply_text_edits for transactional guarded file changes",
         "apply_patch_checked for complex unified diffs",
         "write_project_file only for intentional full rewrites",
-        "line/pattern tools are compatibility paths",
         "validate: use cargo_check / cargo_test / validate_patch",
         "raw run_shell is a bounded escape hatch",
         "not the primary editing or validation path",
@@ -1016,10 +1015,9 @@ fn tool_categories_include_edit_group() {
     let edit = cats[TOOL_DISCOVERY_GROUP_EDIT]
         .as_array()
         .expect("edit category present");
-    // The edit category lists only model-visible canonical tools. The
-    // compatibility line/pattern/anchor tools are ModelHidden (dispatched
-    // for back-compat but withheld from the surface), so they must NOT
-    // appear here.
+    // The edit category lists only model-visible canonical tools. The removed
+    // legacy line/pattern/anchor tools are not known tools at all, so they must
+    // NOT appear here.
     assert!(edit.iter().any(|v| v == "apply_text_edits"));
     assert!(edit.iter().any(|v| v == "write_project_file"));
     assert!(edit.iter().any(|v| v == "apply_patch_checked"));

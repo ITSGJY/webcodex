@@ -400,9 +400,8 @@ const TOOL_DEFINITION_GROUPS: &[&[ToolDefinition]] = &[
     patches::APPLY_DEFINITIONS,
     hygiene::CLEANUP_DEFINITIONS,
     patches::VALIDATION_DEFINITIONS,
-    edits::COMPATIBILITY_DEFINITIONS,
     artifacts::DEFINITIONS,
-    edits::LINE_DEFINITIONS,
+    edits::DEFINITIONS,
 ];
 
 const TOOL_DEFINITION_HEAD: &[ToolDefinition] = &[def(

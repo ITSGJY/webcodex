@@ -827,46 +827,21 @@ fn extract_tool_call_collects_flattened_session_handoff_flags() {
 }
 
 #[test]
-fn extract_tool_call_collects_flattened_line_edit_fields() {
+fn extract_tool_call_collects_flattened_write_project_file_fields() {
     let (tool, params) = extract_tool_call(&json!({
-        "tool": "replace_line_range",
+        "tool": "write_project_file",
         "project": "agent:oe:webcodex",
         "path": "x.tmp",
-        "start_line": 2,
-        "end_line": 3,
-        "new_text": "BETA\nGAMMA\n",
-        "expected_old_prefix": "beta\n",
+        "content": "BETA\n",
+        "overwrite": true,
     }))
     .unwrap();
 
-    assert_eq!(tool, "replace_line_range");
+    assert_eq!(tool, "write_project_file");
     assert_eq!(params["project"], "agent:oe:webcodex");
     assert_eq!(params["path"], "x.tmp");
-    assert_eq!(params["start_line"], 2);
-    assert_eq!(params["end_line"], 3);
-    assert_eq!(params["new_text"], "BETA\nGAMMA\n");
-    assert_eq!(params["expected_old_prefix"], "beta\n");
-}
-
-#[test]
-fn extract_tool_call_collects_flattened_anchor_edit_fields() {
-    let old_key = concat!("old_", "text");
-    let guard_key = concat!("expected_old_", "sha256");
-    let mut body = serde_json::Map::new();
-    body.insert("tool".to_string(), json!("replace_exact_block"));
-    body.insert("project".to_string(), json!("demo"));
-    body.insert("path".to_string(), json!("x.tmp"));
-    body.insert(old_key.to_string(), json!("old\n"));
-    body.insert("new_text".to_string(), json!("new\n"));
-    body.insert(guard_key.to_string(), json!("whole-file-sha"));
-    let (tool, params) = extract_tool_call(&Value::Object(body)).unwrap();
-
-    assert_eq!(tool, "replace_exact_block");
-    assert_eq!(params["project"], "demo");
-    assert_eq!(params["path"], "x.tmp");
-    assert_eq!(params[old_key], "old\n");
-    assert_eq!(params["new_text"], "new\n");
-    assert_eq!(params[guard_key], "whole-file-sha");
+    assert_eq!(params["content"], "BETA\n");
+    assert_eq!(params["overwrite"], true);
 }
 
 #[test]
@@ -1861,13 +1836,13 @@ async fn oauth2_tools_call_show_changes_tool_scope_is_project_read() {
 }
 
 #[tokio::test]
-async fn oauth2_tools_call_requires_project_write_for_anchor_edit_tools() {
+async fn oauth2_tools_call_requires_project_write_for_edit_tools() {
     let (_tmp, service, token) = phase2_oauth_service("project:write");
     let (status, body, _) = oauth_tools_call(
         &service,
         &token,
-        "replace_exact_block",
-        json!({"project": "demo", "path": "README.md", "old_text": "old", "new_text": "new"}),
+        "write_project_file",
+        json!({"project": "demo", "path": "README.md", "content": "new"}),
     )
     .await;
     assert_ne!(status, StatusCode::FORBIDDEN, "body: {:?}", body);
@@ -1876,13 +1851,8 @@ async fn oauth2_tools_call_requires_project_write_for_anchor_edit_tools() {
     let (status, body, challenge) = oauth_tools_call(
         &service,
         &token,
-        "insert_before_pattern",
-        json!({
-            "project": "demo",
-            "path": "README.md",
-            "pattern": "anchor",
-            "text": "inserted\n"
-        }),
+        "write_project_file",
+        json!({"project": "demo", "path": "README.md", "content": "new"}),
     )
     .await;
     assert_oauth_scope_rejected(
@@ -1991,10 +1961,9 @@ async fn http_tools_list_includes_phase4_edit_tools() {
     assert_eq!(effective_status(&resp), StatusCode::OK);
     let body: Value = resp.take_json().await.unwrap();
     let names = body["names"].as_array().unwrap();
-    // `replace_in_file` and `start_session` are ModelHidden: still
-    // dispatched for back-compat via callRuntimeTool, but withheld from the
-    // model-facing tools/list surface. Only the visible canonical tools
-    // appear here.
+    // `replace_in_file` was removed and `start_session` is ModelHidden: both
+    // are withheld from the model-facing tools/list surface. Only the visible
+    // canonical tools appear here.
     assert!(!names.iter().any(|n| n == "replace_in_file"));
     assert!(!names.iter().any(|n| n == "start_session"));
     assert!(!names.iter().any(|n| n == "bind_current_session"));
@@ -2025,18 +1994,26 @@ async fn http_tools_list_includes_phase4_edit_tools() {
 
 #[tokio::test]
 async fn http_tools_call_dispatches_phase4_edit_tools() {
-    // callRuntimeTool routes replace_in_file / write_project_file to the
+    // callRuntimeTool routes write_project_file / apply_text_edits to the
     // runtime. With a non-agent project the runtime returns a structured
     // error (not a 401/404), proving the generic path dispatches them.
     let (_tmp, service) = phase2_service();
     for (tool, params) in [
         (
-            "replace_in_file",
-            json!({"project": "agent:nope:nope", "path": "x.txt", "old": "a", "new": "b"}),
-        ),
-        (
             "write_project_file",
             json!({"project": "agent:nope:nope", "path": "x.txt", "content": "a"}),
+        ),
+        (
+            "apply_text_edits",
+            json!({
+                "project": "agent:nope:nope",
+                "changes": [{
+                    "kind": "edit",
+                    "path": "x.txt",
+                    "expected_sha256": "a".repeat(64),
+                    "edits": [{"kind": "replace_exact", "old_text": "a", "new_text": "b"}]
+                }]
+            }),
         ),
     ] {
         let mut resp = TestClient::post("http://localhost/api/tools/call")

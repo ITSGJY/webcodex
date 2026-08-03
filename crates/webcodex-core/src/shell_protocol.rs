@@ -663,10 +663,6 @@ pub struct ShellAgentShellRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub old_text: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pattern: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_prefix: Option<String>,
@@ -674,8 +670,6 @@ pub struct ShellAgentShellRequest {
     pub start_line: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_line: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub line: Option<usize>,
     #[serde(default)]
     pub create_dirs: bool,
     pub command: String,
@@ -889,6 +883,9 @@ pub struct ShellFileOpRequest {
     pub content: Option<String>,
     #[serde(default)]
     pub max_bytes: Option<usize>,
+    // Retired edit fields remain on the operator-facing request only so the
+    // Server can reject old payloads explicitly instead of silently ignoring
+    // unknown JSON fields. They are never forwarded to the Runner.
     #[serde(default)]
     pub old_text: Option<String>,
     #[serde(default)]
@@ -1947,13 +1944,10 @@ mod envelope_tests {
             path: None,
             content: None,
             max_bytes: None,
-            old_text: None,
-            pattern: None,
             expected_sha256: None,
             expected_prefix: None,
             start_line: None,
             end_line: None,
-            line: None,
             create_dirs: false,
             command: "echo hi".to_string(),
             stdin: Some("input".to_string()),

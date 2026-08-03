@@ -13,24 +13,6 @@ async fn dispatch_records_edit_tool_usage_without_sensitive_args() {
     clear_test_edit_tool_usage();
     let runtime = test_runtime();
 
-    // Compatibility path: fails without a registered agent/project, but selection
-    // still must be counted.
-    let compatibility = runtime
-        .dispatch_with_auth(
-            ToolCall::ReplaceInFile {
-                project: "agent:oe:missing".to_string(),
-                path: "src/secret.rs".to_string(),
-                old: "token=super-secret-value".to_string(),
-                new: "token=other".to_string(),
-                expected_replacements: None,
-                allow_multiple: None,
-                session_id: None,
-            },
-            None,
-        )
-        .await;
-    assert!(!compatibility.success);
-
     // Canonical path selection.
     let canonical = runtime
         .dispatch_with_auth(
@@ -90,22 +72,18 @@ async fn dispatch_records_edit_tool_usage_without_sensitive_args() {
     let events = take_test_edit_tool_usage();
     assert_eq!(
         events.len(),
-        3,
+        2,
         "only edit tools should emit usage events: {events:?}"
     );
 
-    assert_eq!(events[0].tool_name, "replace_in_file");
-    assert_eq!(events[0].edit_surface, EditToolSurface::Compatibility);
+    assert_eq!(events[0].tool_name, "apply_text_edits");
+    assert_eq!(events[0].edit_surface, EditToolSurface::Canonical);
     assert_eq!(events[0].category, TELEMETRY_CATEGORY_EDIT);
     assert!(!events[0].success);
 
-    assert_eq!(events[1].tool_name, "apply_text_edits");
-    assert_eq!(events[1].edit_surface, EditToolSurface::Canonical);
+    assert_eq!(events[1].tool_name, "write_project_file");
+    assert_eq!(events[1].edit_surface, EditToolSurface::Advanced);
     assert!(!events[1].success);
-
-    assert_eq!(events[2].tool_name, "write_project_file");
-    assert_eq!(events[2].edit_surface, EditToolSurface::Advanced);
-    assert!(!events[2].success);
 
     for event in &events {
         assert!(!record_contains_sensitive_keys(event));
@@ -141,13 +119,13 @@ async fn edit_tool_usage_does_not_change_session_ledger_shape() {
 
     let _ = runtime
         .dispatch_with_auth(
-            ToolCall::ReplaceInFile {
+            ToolCall::WriteProjectFile {
                 project: "agent:oe:missing".to_string(),
                 path: "src/x.rs".to_string(),
-                old: "a".to_string(),
-                new: "b".to_string(),
-                expected_replacements: None,
-                allow_multiple: None,
+                content: "a".to_string(),
+                overwrite: None,
+                expected_sha256: None,
+                expected_content_prefix: None,
                 session_id: Some(session.session_id.clone()),
             },
             None,
@@ -162,14 +140,14 @@ async fn edit_tool_usage_does_not_change_session_ledger_shape() {
         summary
             .events
             .iter()
-            .any(|e| e.kind == "tool_call_started" && e.tool_name == "replace_in_file"),
+            .any(|e| e.kind == "tool_call_started" && e.tool_name == "write_project_file"),
         "session ledger must still record tool_call_started"
     );
     assert!(
         summary
             .events
             .iter()
-            .any(|e| e.kind == "tool_call_finished" && e.tool_name == "replace_in_file"),
+            .any(|e| e.kind == "tool_call_finished" && e.tool_name == "write_project_file"),
         "session ledger must still record tool_call_finished"
     );
     // Telemetry must remain a parallel structured-log stream — no new ledger kinds.
@@ -185,14 +163,14 @@ async fn edit_tool_usage_does_not_change_session_ledger_shape() {
 
     let usage = take_test_edit_tool_usage();
     assert_eq!(usage.len(), 1);
-    assert_eq!(usage[0].tool_name, "replace_in_file");
-    assert_eq!(usage[0].edit_surface, EditToolSurface::Compatibility);
+    assert_eq!(usage[0].tool_name, "write_project_file");
+    assert_eq!(usage[0].edit_surface, EditToolSurface::Advanced);
 }
 
 #[test]
 fn edit_surface_table_matches_canonicalization_contract() {
     // Keep the classification table aligned with the product contract used by
-    // tool descriptions / discovery (canonical vs advanced vs compatibility).
+    // tool descriptions / discovery (canonical vs advanced).
     assert_eq!(
         edit_tool_surface("apply_text_edits"),
         Some(EditToolSurface::Canonical)
@@ -209,6 +187,7 @@ fn edit_surface_table_matches_canonicalization_contract() {
         edit_tool_surface("apply_patch"),
         Some(EditToolSurface::Advanced)
     );
+    // Removed legacy compatibility tools are no longer classified.
     for name in [
         "replace_in_file",
         "replace_exact_block",
@@ -218,11 +197,7 @@ fn edit_surface_table_matches_canonicalization_contract() {
         "insert_at_line",
         "delete_line_range",
     ] {
-        assert_eq!(
-            edit_tool_surface(name),
-            Some(EditToolSurface::Compatibility),
-            "{name}"
-        );
+        assert_eq!(edit_tool_surface(name), None, "{name}");
     }
     assert_eq!(edit_tool_surface("validate_patch"), None);
     assert_eq!(edit_tool_surface("read_file"), None);
@@ -235,10 +210,9 @@ fn sample_edit_tool_args_are_not_required_by_telemetry_module() {
     // Sanity: telemetry classification is name-only; sample args (paths/content)
     // used elsewhere for schema fixtures must not be needed to classify tools.
     // `apply_text_edits` is the canonical model-visible edit tool and can
-    // synthesize args from its spec; the ModelHidden compatibility edit tools
-    // (replace_in_file, etc.) carry no public ToolSpec, but their telemetry
-    // classification is still name-only and is asserted via `edit_tool_surface`
-    // above, so they need no sample-args construction here.
+    // synthesize args from its spec; telemetry classification is name-only and
+    // is asserted via `edit_tool_surface` above, so no sample-args construction
+    // is required beyond the canonical tools.
     let _ = sample_tool_args("apply_text_edits");
     let _ = json!({"path": "ignored-by-telemetry"});
     assert!(edit_tool_surface("apply_text_edits").is_some());

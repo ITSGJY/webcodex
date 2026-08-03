@@ -224,7 +224,7 @@ pub(crate) const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
     ToolRecommendedFlow {
         name: "edit",
         summary:
-            "Edit: prefer apply_text_edits for transactional guarded file changes; apply_patch_checked for complex unified diffs; write_project_file only for intentional full rewrites. Line/pattern tools are compatibility paths.",
+            "Edit: prefer apply_text_edits for transactional guarded file changes; apply_patch_checked for complex unified diffs; write_project_file only for intentional full rewrites.",
         manifest_purpose:
             "Prefer guarded transactional changes and checked complex diffs for source changes; whole-file write only for an intentional full rewrite.",
         tools: &[

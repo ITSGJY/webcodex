@@ -68,8 +68,8 @@ the static WebCodex tool definitions only. Claude `tools/list` output is never
 inserted into those registries. A Claude upgrade may therefore add `Read`,
 `Bash`, `Write`, or other names to provider discovery without making any of
 them visible to an external WebCodex client. Public names and input schemas,
-including `replace_in_file`, are identical with the provider disabled or
-enabled.
+including `write_project_file` and `apply_text_edits`, are identical with the
+provider disabled or enabled.
 
 The agent also carries three internal diagnostic request kinds
 (`claude_list_tools`, `claude_describe_tool`, `claude_tool_call`). They remain

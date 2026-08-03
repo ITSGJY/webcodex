@@ -257,14 +257,7 @@ mod tests {
     fn tool_metadata_write_tools_are_project_write() {
         for name in [
             "write_project_file",
-            "replace_line_range",
-            "insert_at_line",
-            "delete_line_range",
             "apply_text_edits",
-            "replace_in_file",
-            "replace_exact_block",
-            "insert_before_pattern",
-            "insert_after_pattern",
             "apply_patch",
             "apply_patch_checked",
             "delete_project_files",

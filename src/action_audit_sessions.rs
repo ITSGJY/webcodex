@@ -448,7 +448,6 @@ pub fn compute_stats(events: &[ActionEventView]) -> ActionSessionStats {
         match event.endpoint.as_str() {
             "/api/projects/apply_patch"
             | "/api/projects/apply_patch_checked"
-            | "/api/projects/replace_in_file"
             | "/api/projects/write_file" => edit_count += 1,
             "/api/projects/list"
             | "/api/projects/read_file"

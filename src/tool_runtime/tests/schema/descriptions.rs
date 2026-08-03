@@ -57,7 +57,6 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "edit/create/delete/rename",
         "whole batch",
         "prefer over whole-file",
-        "compatibility edit",
         "dry_run",
         "per-file hashes",
     ] {
@@ -105,14 +104,13 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         );
     }
 
-    // The compatibility line/pattern tools (replace_line_range,
-    // insert_at_line, delete_line_range, replace_in_file,
-    // replace_exact_block, insert_before_pattern, insert_after_pattern)
-    // are ModelHidden: still parser-known and dispatched for back-compat,
-    // but no longer carry a model-facing ToolSpec/description. Their hidden
-    // status and continued parseability are asserted by
-    // `anchor_edit_tools_are_hidden_from_model_surface` and the parser-name
-    // gate in `tool_call_parser_name_gate_matches_tool_definitions`.
+    // The legacy single-purpose edit tools (replace_line_range, insert_at_line,
+    // delete_line_range, replace_in_file, replace_exact_block,
+    // insert_before_pattern, insert_after_pattern) were removed; they no longer
+    // carry a model-facing ToolSpec/description. Their absence from the known
+    // tool set is asserted by
+    // `removed_legacy_edit_tools_are_not_known_tools` and the parser-name gate
+    // in `tool_call_parser_name_gate_matches_tool_definitions`.
 
     for name in ["cargo_check", "cargo_test"] {
         let validation_desc = desc(name);
@@ -157,13 +155,13 @@ fn tool_specs_describe_default_coding_loop_preferences() {
 }
 
 #[test]
-fn anchor_edit_tools_are_hidden_from_model_surface() {
-    use crate::tool_runtime::tool_definition::is_model_hidden_tool_name;
+fn removed_legacy_edit_tools_are_not_known_tools() {
+    use crate::tool_runtime::tool_definition::{is_known_tool_name, is_model_hidden_tool_name};
 
     let specs = registered_tool_specs();
     let spec_names: std::collections::BTreeSet<&str> =
         specs.iter().map(|s| s.name.as_str()).collect();
-    for hidden in [
+    for removed in [
         "replace_exact_block",
         "insert_before_pattern",
         "insert_after_pattern",
@@ -173,12 +171,16 @@ fn anchor_edit_tools_are_hidden_from_model_surface() {
         "delete_line_range",
     ] {
         assert!(
-            is_model_hidden_tool_name(hidden),
-            "{hidden} must be ModelHidden (canonical apply_text_edits covers it)"
+            !is_known_tool_name(removed),
+            "{removed} must no longer be a known tool definition"
         );
         assert!(
-            !spec_names.contains(hidden),
-            "{hidden} must not keep a model-facing ToolSpec"
+            !is_model_hidden_tool_name(removed),
+            "{removed} must not be a hidden ToolDefinition"
+        );
+        assert!(
+            !spec_names.contains(removed),
+            "{removed} must not keep a model-facing ToolSpec"
         );
     }
 }

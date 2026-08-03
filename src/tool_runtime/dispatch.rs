@@ -603,10 +603,6 @@ impl ToolRuntime {
             | ToolCall::ProjectOverview { .. }
             | ToolCall::SearchProjectText { .. }
             | ToolCall::SearchProjectTexts { .. }
-            | ToolCall::ReplaceInFile { .. }
-            | ToolCall::ReplaceExactBlock { .. }
-            | ToolCall::InsertBeforePattern { .. }
-            | ToolCall::InsertAfterPattern { .. }
             | ToolCall::WriteProjectFile { .. }
             | ToolCall::SaveProjectArtifact { .. }
             | ToolCall::ReadProjectArtifactMetadata { .. }
@@ -615,9 +611,6 @@ impl ToolRuntime {
             | ToolCall::ArtifactUploadChunk { .. }
             | ToolCall::ArtifactUploadFinish { .. }
             | ToolCall::ArtifactUploadAbort { .. }
-            | ToolCall::ReplaceLineRange { .. }
-            | ToolCall::InsertAtLine { .. }
-            | ToolCall::DeleteLineRange { .. }
             | ToolCall::ApplyTextEdits { .. }) => {
                 self.dispatch_file_tool(call, transport, project_resolution)
                     .await

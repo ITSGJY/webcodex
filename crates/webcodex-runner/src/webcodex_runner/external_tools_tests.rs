@@ -88,10 +88,10 @@ impl Fixture {
             enabled: true,
             command: fake.path.to_string_lossy().to_string(),
             args: vec![scenario.to_string(), marker.to_string_lossy().to_string()],
-            mapping: HashMap::from([
-                ("search_project_text".to_string(), "fake_search".to_string()),
-                ("edit_file".to_string(), "fake_edit".to_string()),
-            ]),
+            mapping: HashMap::from([(
+                "search_project_text".to_string(),
+                "fake_search".to_string(),
+            )]),
             timeout_secs,
         };
         let provider = ClaudeCodeMcpProvider::new(config.clone());
@@ -134,15 +134,6 @@ fn search_request() -> Value {
         "include_globs": [],
         "exclude_globs": [],
         "result_mode": "matches",
-    })
-}
-
-fn edit_request() -> Value {
-    json!({
-        "old": "before",
-        "new": "after",
-        "expected_replacements": 1,
-        "allow_multiple": false,
     })
 }
 
@@ -189,13 +180,10 @@ fn agent_request(
         path: Some(path.to_string()),
         content: content.map(|value| value.to_string()),
         max_bytes: Some(MAX_MCP_OUTPUT_BYTES),
-        old_text: None,
-        pattern: None,
         expected_sha256: None,
         expected_prefix: None,
         start_line: Some(1),
         end_line: Some(20),
-        line: None,
         create_dirs: false,
         command: String::new(),
         stdin: None,
@@ -274,10 +262,7 @@ fn real_tool_name(
             ))
         };
     }
-    let needle = match capability {
-        ProviderCapability::SearchProjectText => "grep",
-        ProviderCapability::EditFile => "edit",
-    };
+    let needle = "grep";
     let candidates = client
         .tools
         .iter()
@@ -310,12 +295,14 @@ strategy = "claude_code_then_native"
 enabled = true
 [claude_code.mapping]
 search_project_text = "project_search"
-edit_file = "project_edit"
 "#,
     )
     .unwrap();
     assert_eq!(parsed.strategy, ToolProviderStrategy::ClaudeCodeThenNative);
-    assert_eq!(parsed.claude_code.mapping["edit_file"], "project_edit");
+    assert_eq!(
+        parsed.claude_code.mapping["search_project_text"],
+        "project_search"
+    );
 
     let disabled = ClaudeCodeMcpProvider::new(ClaudeCodeMcpConfig::default());
     assert!(!disabled.status().available);
@@ -362,7 +349,6 @@ fn status_reports_discovery_mapping_process_and_bounded_error() {
         ]
     );
     assert_eq!(status.capabilities["search_project_text"], "available");
-    assert_eq!(status.capabilities["edit_file"], "available");
     assert_eq!(status.last_error_code, None);
     assert!(status
         .discovered_tool_names
@@ -383,7 +369,6 @@ fn status_reports_discovery_mapping_process_and_bounded_error() {
         assert!(!serialized.contains(forbidden), "status leaked {forbidden}");
     }
     let mut mismatched = fixture.config.clone();
-    mismatched.mapping.remove("edit_file");
     mismatched
         .mapping
         .insert("search_project_text".to_string(), "fake_edit".to_string());
@@ -392,7 +377,6 @@ fn status_reports_discovery_mapping_process_and_bounded_error() {
         .project_client(&fixture.root, Instant::now() + Duration::from_secs(1))
         .unwrap();
     let status = mismatched.status();
-    assert_eq!(status.capabilities["edit_file"], "unmapped");
     assert_eq!(
         status.capabilities["search_project_text"],
         "schema_mismatch"
@@ -402,7 +386,7 @@ fn status_reports_discovery_mapping_process_and_bounded_error() {
 }
 
 #[test]
-fn search_and_edit_mappings_normalize_results() {
+fn search_mapping_normalizes_results() {
     let fixture = Fixture::new("normal");
     let router = ExternalToolRouter::new(&ToolProvidersConfig {
         strategy: ToolProviderStrategy::ClaudeCode,
@@ -419,29 +403,13 @@ fn search_and_edit_mappings_normalize_results() {
         .unwrap()
         .contains(r#""output_mode":"content""#));
 
-    let edit = agent_request(
-        "file_replace_in_file",
-        &fixture.root,
-        "edit.txt",
-        Some(edit_request()),
-    );
-    let ExternalRoute::Handled(edit) = router.route(&permissive_test_policy(), &edit) else {
-        panic!("edit routed to native");
-    };
-    let edit: Value = serde_json::from_str(edit.stdout.as_deref().unwrap()).unwrap();
-    assert_eq!(edit["changed"], true);
-    assert_eq!(
-        fs::read_to_string(fixture.root.join("edit.txt")).unwrap(),
-        "after\n"
-    );
-
     let status = router.status();
     let call = status.claude_code.last_call.unwrap();
-    assert_eq!(call.capability, "edit_file");
+    assert_eq!(call.capability, "search_project_text");
     assert_eq!(call.selected_provider, "claude_code");
     assert!(!call.fallback_used);
     assert_eq!(call.result, "success");
-    assert_eq!(call.write_state.as_deref(), Some("confirmed"));
+    assert_eq!(call.write_state, None);
     assert_eq!(call.error_code, None);
 }
 
@@ -482,54 +450,29 @@ fn fallback_and_failure_routes_record_bounded_last_call_evidence() {
         status.claude_code.last_error_code.as_deref(),
         Some("provider_capability_unavailable")
     );
-
-    let timeout = Fixture::new("timeout");
-    let router = ExternalToolRouter::new(&ToolProvidersConfig {
-        strategy: ToolProviderStrategy::ClaudeCodeThenNative,
-        claude_code: timeout.config.clone(),
-    });
-    let edit = agent_request(
-        "file_replace_in_file",
-        &timeout.root,
-        "edit.txt",
-        Some(edit_request()),
-    );
-    let ExternalRoute::Handled(_) = router.route(&permissive_test_policy(), &edit) else {
-        panic!("uncertain edit was allowed to fall back");
-    };
-    let status = router.status();
-    let call = status.claude_code.last_call.unwrap();
-    assert_eq!(call.selected_provider, "claude_code");
-    assert!(!call.fallback_used);
-    assert_eq!(call.result, "failure");
-    assert_eq!(call.write_state.as_deref(), Some("uncertain"));
-    assert_eq!(call.error_code.as_deref(), Some("mcp_request_timeout"));
 }
 
 #[test]
-fn edit_falls_back_only_before_submission_and_confirms_native_write() {
+fn search_falls_back_before_submission() {
     let fixture = Fixture::new("normal");
-    let mut unmapped_edit = fixture.config.clone();
-    unmapped_edit.mapping.remove("edit_file");
+    let mut unmapped_search = fixture.config.clone();
+    unmapped_search.mapping.remove("search_project_text");
     let router = ExternalToolRouter::new(&ToolProvidersConfig {
         strategy: ToolProviderStrategy::ClaudeCodeThenNative,
-        claude_code: unmapped_edit,
+        claude_code: unmapped_search,
     });
-    let edit = agent_request(
-        "file_replace_in_file",
-        &fixture.root,
-        "edit.txt",
-        Some(edit_request()),
-    );
-    let ExternalRoute::NativeFallback(fallback) = router.route(&permissive_test_policy(), &edit)
+    let mut search = agent_request("run_shell", &fixture.root, ".", None);
+    search.command = EXTERNAL_SEARCH_REQUEST_PREFIX.to_string();
+    search.stdin = Some(search_request().to_string());
+    let ExternalRoute::NativeFallback(fallback) = router.route(&permissive_test_policy(), &search)
     else {
-        panic!("unsubmitted edit did not request Native fallback");
+        panic!("unsubmitted search did not request Native fallback");
     };
     router.complete_native_fallback(
         fallback,
         &CommandResult {
             exit_code: Some(0),
-            stdout: Some(json!({"changed": true}).to_string()),
+            stdout: Some("native search".to_string()),
             stderr: Some(String::new()),
             duration_ms: Some(1),
             error: None,
@@ -538,7 +481,7 @@ fn edit_falls_back_only_before_submission_and_confirms_native_write() {
     let call = router.status().claude_code.last_call.unwrap();
     assert_eq!(call.selected_provider, "native");
     assert!(call.fallback_used);
-    assert_eq!(call.write_state.as_deref(), Some("confirmed"));
+    assert_eq!(call.write_state, None);
 }
 
 #[test]
@@ -607,13 +550,10 @@ fn router_rejects_absolute_parent_and_symlink_escape_paths() {
             .to_string(),
     ];
     for path in cases {
-        let request = agent_request(
-            "file_replace_in_file",
-            &fixture.root,
-            &path,
-            Some(edit_request()),
-        );
-        let ExternalRoute::Handled(result) = router.route(&AgentPolicy::default(), &request) else {
+        let mut search = agent_request("run_shell", &fixture.root, ".", None);
+        search.command = EXTERNAL_SEARCH_REQUEST_PREFIX.to_string();
+        search.stdin = Some(search_request_with_path(&path).to_string());
+        let ExternalRoute::Handled(result) = router.route(&AgentPolicy::default(), &search) else {
             panic!("unsafe path routed to native");
         };
         let output: Value = serde_json::from_str(result.stdout.as_deref().unwrap()).unwrap();
@@ -623,17 +563,20 @@ fn router_rejects_absolute_parent_and_symlink_escape_paths() {
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(outside.path(), fixture.root.join("escape")).unwrap();
-        let request = agent_request(
-            "file_replace_in_file",
-            &fixture.root,
-            "escape/outside.txt",
-            Some(edit_request()),
-        );
-        let ExternalRoute::Handled(result) = router.route(&AgentPolicy::default(), &request) else {
+        let mut search = agent_request("run_shell", &fixture.root, ".", None);
+        search.command = EXTERNAL_SEARCH_REQUEST_PREFIX.to_string();
+        search.stdin = Some(search_request_with_path("escape/outside.txt").to_string());
+        let ExternalRoute::Handled(result) = router.route(&AgentPolicy::default(), &search) else {
             panic!("symlink escape routed to native");
         };
         assert!(result.stdout.unwrap().contains("provider_path_rejected"));
     }
+}
+
+fn search_request_with_path(path: &str) -> Value {
+    let mut request = search_request();
+    request["path"] = json!(path);
+    request
 }
 
 #[test]
@@ -680,7 +623,7 @@ fn process_exit_clears_pending_and_next_call_restarts_lazily() {
 }
 
 #[test]
-fn timeout_removes_pending_and_uncertain_edit_never_falls_back() {
+fn timeout_removes_pending_request() {
     let fixture = Fixture::new("timeout");
     let error = call_search(&fixture).unwrap_err();
     assert_eq!(error.code, "mcp_request_timeout");
@@ -692,33 +635,17 @@ fn timeout_removes_pending_and_uncertain_edit_never_falls_back() {
         Some("mcp_request_timeout")
     );
 
-    let router = ExternalToolRouter::new(&ToolProvidersConfig {
-        strategy: ToolProviderStrategy::ClaudeCodeThenNative,
-        claude_code: fixture.config.clone(),
-    });
-    let request = agent_request(
-        "file_replace_in_file",
-        &fixture.root,
-        "edit.txt",
-        Some(edit_request()),
-    );
-    let ExternalRoute::Handled(result) = router.route(&permissive_test_policy(), &request) else {
-        panic!("uncertain edit fell back to native");
-    };
-    let output: Value = serde_json::from_str(result.stdout.as_deref().unwrap()).unwrap();
-    assert_eq!(output["write_state"], "uncertain");
-    assert_eq!(output["changed"], Value::Null);
-    assert_eq!(
-        fs::read_to_string(fixture.root.join("edit.txt")).unwrap(),
-        "before\n"
-    );
-
+    // An unmapped capability with claude_code_then_native requests a Native
+    // fallback instead of a hard provider error.
     let mut unmapped = fixture.config.clone();
-    unmapped.mapping.remove("edit_file");
+    unmapped.mapping.remove("search_project_text");
     let router = ExternalToolRouter::new(&ToolProvidersConfig {
         strategy: ToolProviderStrategy::ClaudeCodeThenNative,
         claude_code: unmapped,
     });
+    let mut request = agent_request("run_shell", &fixture.root, ".", None);
+    request.command = EXTERNAL_SEARCH_REQUEST_PREFIX.to_string();
+    request.stdin = Some(search_request().to_string());
     assert!(matches!(
         router.route(&permissive_test_policy(), &request),
         ExternalRoute::NativeFallback(_)
@@ -868,19 +795,16 @@ fn native_strategy_does_not_start_claude() {
 
 #[cfg(unix)]
 #[test]
-fn retiring_router_keeps_inflight_edit_alive_then_reaps_its_process() {
+fn retiring_router_keeps_inflight_search_alive_then_reaps_its_process() {
     let fixture = Fixture::with_timeout("delayed", 2);
     let old = Arc::new(ExternalToolRouter::new(&ToolProvidersConfig {
         strategy: ToolProviderStrategy::ClaudeCode,
         claude_code: fixture.config.clone(),
     }));
     let weak = Arc::downgrade(&old);
-    let request = agent_request(
-        "file_replace_in_file",
-        &fixture.root,
-        "edit.txt",
-        Some(edit_request()),
-    );
+    let mut request = agent_request("run_shell", &fixture.root, ".", None);
+    request.command = EXTERNAL_SEARCH_REQUEST_PREFIX.to_string();
+    request.stdin = Some(search_request().to_string());
     let worker_router = Arc::clone(&old);
     let worker = std::thread::spawn(move || {
         assert!(matches!(
@@ -906,15 +830,11 @@ fn retiring_router_keeps_inflight_edit_alive_then_reaps_its_process() {
     drop(old);
     assert!(
         weak.upgrade().is_some(),
-        "in-flight edit lost its old router"
+        "in-flight search lost its old router"
     );
     assert_eq!(unsafe { libc::kill(pid as i32, 0) }, 0);
 
     worker.join().unwrap();
-    assert_eq!(
-        fs::read_to_string(fixture.root.join("edit.txt")).unwrap(),
-        "after\n"
-    );
     assert!(wait_until(Duration::from_secs(1), || weak
         .upgrade()
         .is_none()));
@@ -932,9 +852,6 @@ fn opt_in_real_claude_mcp_probe() {
     let root = tempfile::tempdir().unwrap();
     let mut config = ClaudeCodeMcpConfig::default();
     config.enabled = true;
-    config
-        .mapping
-        .insert("edit_file".to_string(), "Edit".to_string());
     let provider = ClaudeCodeMcpProvider::new(config);
     provider
         .project_client(root.path(), Instant::now() + Duration::from_secs(30))
@@ -980,15 +897,6 @@ fn opt_in_real_claude_mcp_smoke() {
         ProviderCapability::SearchProjectText,
         "WEBCODEX_TEST_CLAUDE_GREP_TOOL",
     );
-    config.mapping.insert(
-        "edit_file".to_string(),
-        real_tool_name(
-            &client,
-            ProviderCapability::EditFile,
-            "WEBCODEX_TEST_CLAUDE_EDIT_TOOL",
-        )
-        .unwrap_or_else(|error| panic!("{error}")),
-    );
 
     if let Ok(name) = &grep_tool {
         config
@@ -1019,29 +927,6 @@ fn opt_in_real_claude_mcp_smoke() {
         );
         eprintln!("claude_mcp_grep_result matched={matched}");
     }
-
-    let edit_context = ToolExecutionContext {
-        project_root: &root,
-        target: root.join("edit.txt"),
-        relative_path: "edit.txt",
-        max_output_bytes: MAX_MCP_OUTPUT_BYTES,
-        timeout_secs: 30,
-    };
-    let edit = client
-        .call(
-            ProviderCapability::EditFile,
-            edit_request(),
-            &edit_context,
-            &config,
-            Instant::now() + Duration::from_secs(30),
-        )
-        .unwrap_or_else(|error| panic!("real Edit call failed with {}", error.code));
-    let final_content = fs::read_to_string(root.join("edit.txt")).unwrap();
-    assert_eq!(final_content, "after\n");
-    eprintln!(
-        "claude_mcp_edit_result changed={} final_content_verified=true",
-        edit["changed"]
-    );
 
     let process_groups = process_ids(&provider);
     assert!(

@@ -124,16 +124,18 @@ const LEGACY_FORBIDDEN_PATHS: &[&str] = &[
     "/api/shell/jobs/stop",
     "/api/jobs/stop",
     "/api/shell/jobs/list",
-    // Compatibility edit tools remain runtime-only. They are reachable through
-    // callRuntimeTool / MCP tools/call, but must not be promoted to dedicated
-    // GPT Actions.
-    "/api/projects/replace_in_file",
-    "/api/projects/write_file",
     "/api/shell/agent/register",
     "/api/shell/agent/poll",
     "/api/shell/agent/result",
     "/api/shell/agent/persistent_shell_result",
     "/api/shell/agent/job_update",
+    // Retained whole-file write tool stays runtime-only through
+    // callRuntimeTool / MCP tools/call; it must not be promoted to a
+    // dedicated GPT Action. The legacy single-purpose edit tools
+    // (replace_in_file, replace_exact_block, insert_before_pattern,
+    // insert_after_pattern, replace_line_range, insert_at_line,
+    // delete_line_range) were removed entirely, so they have no paths.
+    "/api/projects/write_file",
     "/api/audit/sessions",
     "/api/audit/session",
     "/api/audit/stats",
@@ -1524,42 +1526,6 @@ fn schemas() -> Value {
                 "session_id": {
                     "type": "string",
                     "description": SESSION_ID_FIELD_DESCRIPTION
-                }
-            }
-        },
-        "ReplaceInFileRequest": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["project", "path", "old", "new"],
-            "description": "Replace a unique substring in a project file. Mutation with side effects; routes to the owning agent. Fails without writing when `old` is missing or ambiguous.",
-            "properties": {
-                "project": {
-                    "type": "string",
-                    "description": "Agent-registered runtime project id from listProjects, such as `agent:<client_id>:<project_id>`."
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Project-relative file path. Absolute paths and traversal (..) are rejected."
-                },
-                "old": {
-                    "type": "string",
-                    "description": "Non-empty substring to replace. The call fails without writing when it is missing or ambiguous (unless allow_multiple/expected_replacements permit more)."
-                },
-                "new": {
-                    "type": "string",
-                    "description": "Replacement string. May be empty to delete the match."
-                },
-                "session_id": {
-                    "type": "string",
-                    "description": SESSION_ID_FIELD_DESCRIPTION
-                },
-                "expected_replacements": {
-                    "type": "integer",
-                    "description": "Optional expected number of replacements. Defaults to 1. The call fails if the actual count differs."
-                },
-                "allow_multiple": {
-                    "type": "boolean",
-                    "description": "Optional. When true, allows more than one replacement. Defaults to false."
                 }
             }
         },
