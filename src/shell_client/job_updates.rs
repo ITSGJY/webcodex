@@ -1,7 +1,8 @@
 use super::auth::{assert_shell_client_access, shell_job_visible_to_auth};
 use super::jobs::{
     append_log_limited, assert_active_instance_locked, command_preview, is_final_job_status,
-    job_view, notify_job_update, refresh_job_status_locked, replace_log_limited, select_log_lines,
+    job_view, notify_job_update, observe_job_terminal, refresh_job_status_locked,
+    replace_log_limited, select_log_lines,
 };
 use super::reconciliation::validate_stream_snapshot;
 use super::requests::{
@@ -401,6 +402,7 @@ impl ShellClientRegistry {
             return Err("project_unregister_in_progress".to_string());
         }
         let agent_instance_id = client.agent_instance_id.clone();
+        let auth_group = client.auth_group.clone();
         enqueue_pending_request_locked(
             &mut inner,
             &client_id,
@@ -413,6 +415,7 @@ impl ShellClientRegistry {
             job_id: job_id.clone(),
             request_id: Some(request_id.clone()),
             client_id: client_id.clone(),
+            auth_group,
             agent_instance_id,
             kind: "shell".to_string(),
             project_id: metadata.project_id,
@@ -427,6 +430,7 @@ impl ShellClientRegistry {
             created_at,
             started_at: None,
             ended_at: None,
+            terminal_observed_at: None,
             exit_code: None,
             duration_ms: None,
             stdout: Default::default(),
@@ -501,7 +505,7 @@ impl ShellClientRegistry {
             .jobs_by_id
             .get(job_id)
             .ok_or_else(|| format!("unknown shell job: {job_id}"))?;
-        if !shell_job_visible_to_auth(auth, &inner, &job.client_id) {
+        if !shell_job_visible_to_auth(auth, &inner, job) {
             return Err(format!("unknown shell job: {job_id}"));
         }
         Ok(job_view(job))
@@ -520,7 +524,7 @@ impl ShellClientRegistry {
             .jobs_by_id
             .get(job_id)
             .ok_or_else(|| format!("unknown shell job: {job_id}"))?;
-        if !shell_job_visible_to_auth(auth, &inner, &job.client_id) {
+        if !shell_job_visible_to_auth(auth, &inner, job) {
             return Err(format!("unknown shell job: {job_id}"));
         }
         let (stdout, next_stdout_line, _, _) = select_log_lines(&job.stdout, None, tail_lines);
@@ -599,7 +603,7 @@ impl ShellClientRegistry {
             .cloned()
             .ok_or_else(|| format!("unknown shell job: {job_id}"))?;
         if job.visibility == ShellJobVisibility::Public
-            || !shell_job_visible_to_auth(auth, &inner, &job.client_id)
+            || !shell_job_visible_to_auth(auth, &inner, &job)
         {
             return Err(format!("unknown shell job: {job_id}"));
         }
@@ -710,7 +714,7 @@ impl ShellClientRegistry {
             return Err(format!("unknown shell job: {}", job_id));
         };
         if job.visibility != ShellJobVisibility::Public
-            || !shell_job_visible_to_auth(auth, &inner, &job.client_id)
+            || !shell_job_visible_to_auth(auth, &inner, job)
         {
             return Err(format!("unknown shell job: {}", job_id));
         }
@@ -735,7 +739,7 @@ impl ShellClientRegistry {
             .jobs_by_id
             .values()
             .filter(|job| job.visibility == ShellJobVisibility::Public)
-            .filter(|job| shell_job_visible_to_auth(auth, &inner, &job.client_id))
+            .filter(|job| shell_job_visible_to_auth(auth, &inner, job))
             .cloned()
             .collect::<Vec<_>>();
         jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -762,7 +766,7 @@ impl ShellClientRegistry {
             .jobs_by_id
             .values()
             .filter(|job| job.visibility == ShellJobVisibility::Public)
-            .filter(|job| shell_job_visible_to_auth(auth, &inner, &job.client_id))
+            .filter(|job| shell_job_visible_to_auth(auth, &inner, job))
             .filter(|job| job.project_id.as_deref() == Some(runtime_project_id))
             .filter(|job| crate::tool_runtime::ACTIVE_JOB_STATUSES.contains(&job.status.as_str()))
             .count()
@@ -783,7 +787,7 @@ impl ShellClientRegistry {
         let active = inner
             .jobs_by_id
             .values()
-            .filter(|job| shell_job_visible_to_auth(auth, &inner, &job.client_id))
+            .filter(|job| shell_job_visible_to_auth(auth, &inner, job))
             .filter(|job| job.project_id.as_deref() == Some(runtime_project_id))
             .filter(|job| crate::tool_runtime::ACTIVE_JOB_STATUSES.contains(&job.status.as_str()))
             .count();
@@ -904,7 +908,7 @@ impl ShellClientRegistry {
                 return Err(format!("unknown shell job: {}", job_id));
             };
             if job.visibility != ShellJobVisibility::Public
-                || !shell_job_visible_to_auth(auth, &inner, &job.client_id)
+                || !shell_job_visible_to_auth(auth, &inner, job)
             {
                 return Err(format!("unknown shell job: {}", job_id));
             }
@@ -955,7 +959,7 @@ impl ShellClientRegistry {
                 return Err(format!("unknown shell job: {}", job_id));
             };
             if job.visibility != ShellJobVisibility::Public
-                || !shell_job_visible_to_auth(auth, &inner, &job.client_id)
+                || !shell_job_visible_to_auth(auth, &inner, job)
             {
                 return Err(format!("unknown shell job: {}", job_id));
             }
@@ -1005,7 +1009,7 @@ impl ShellClientRegistry {
                     return Err(format!("unknown shell job: {}", job_id));
                 };
                 if job.visibility != ShellJobVisibility::Public
-                    || !shell_job_visible_to_auth(auth, &inner, &job.client_id)
+                    || !shell_job_visible_to_auth(auth, &inner, job)
                 {
                     return Err(format!("unknown shell job: {}", job_id));
                 }
@@ -1063,7 +1067,7 @@ impl ShellClientRegistry {
             return Err(format!("unknown shell job: {}", job_id));
         };
         if job.visibility != ShellJobVisibility::Public
-            || !shell_job_visible_to_auth(auth, &inner, &job.client_id)
+            || !shell_job_visible_to_auth(auth, &inner, &job)
         {
             return Err(format!("unknown shell job: {}", job_id));
         }
@@ -1074,8 +1078,10 @@ impl ShellClientRegistry {
                     inner.request_to_job.remove(request_id);
                 }
                 let job = inner.jobs_by_id.get_mut(job_id).expect("job exists");
+                let terminal_now = now_ts();
                 job.status = "stopped".to_string();
-                job.ended_at = Some(now_ts());
+                observe_job_terminal(job, terminal_now);
+                job.ended_at = Some(terminal_now);
                 job.error = Some("job stopped before agent picked it up".to_string());
                 notify_job_update(job);
                 Ok(job_view(job))
@@ -1309,8 +1315,10 @@ impl ShellClientRegistry {
                 );
             }
             if let Err(error) = validate_validation_progress(job, &body) {
+                let terminal_now = now_ts();
                 job.status = "failed".to_string();
-                job.ended_at = Some(now_ts());
+                observe_job_terminal(job, terminal_now);
+                job.ended_at = Some(terminal_now);
                 job.exit_code = body.exit_code;
                 job.duration_ms = body.duration_ms;
                 job.error = Some(format!("executor protocol violation: {}", error.0));
@@ -1331,23 +1339,24 @@ impl ShellClientRegistry {
                 }
                 if job.started_at.is_none()
                     && matches!(
-                        body.status.as_str(),
+                        incoming_status,
                         "running" | "completed" | "failed" | "stopped" | "timeout"
                     )
                 {
                     job.started_at = Some(now_ts());
                 }
-                if !body.status.trim().is_empty() && !is_final_job_status(&job.status) {
-                    let incoming_status = body.status.trim();
+                if !incoming_status.is_empty() && !is_final_job_status(&job.status) {
                     job.status = if incoming_status == "queued" && job.started_at.is_some() {
                         "agent_queued".to_string()
                     } else {
                         incoming_status.to_string()
                     };
                 }
-                if is_final_job_status(&body.status) {
-                    job.status = body.status;
-                    job.ended_at = Some(now_ts());
+                if is_final_job_status(incoming_status) {
+                    let terminal_now = now_ts();
+                    job.status = incoming_status.to_string();
+                    observe_job_terminal(job, terminal_now);
+                    job.ended_at = Some(terminal_now);
                     job.exit_code = body.exit_code;
                     job.duration_ms = body.duration_ms;
                     job.error = body.error;
@@ -1359,12 +1368,14 @@ impl ShellClientRegistry {
                     job.error = body.error;
                 }
                 if body.finished && !is_final_job_status(&job.status) {
+                    let terminal_now = now_ts();
                     job.status = if job.error.is_none() && job.exit_code == Some(0) {
                         "completed".to_string()
                     } else {
                         "failed".to_string()
                     };
-                    job.ended_at = Some(now_ts());
+                    observe_job_terminal(job, terminal_now);
+                    job.ended_at = Some(terminal_now);
                     request_id_to_remove = job.request_id.clone();
                 }
                 if was_recovering {

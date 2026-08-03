@@ -825,13 +825,48 @@ async fn shared_key_offline_ttl_prunes_only_expired_clients_and_all_associated_s
             .clone()
     };
     let revision_before = job_revision.load(std::sync::atomic::Ordering::Relaxed);
+    let observation_token = job.observation_token.clone().expect("observation token");
+    let waiter_registry = registry.clone();
+    let waiter_auth = expired_auth.clone();
+    let waiter_job_id = job.job_id.clone();
+    let waiter = tokio::spawn(async move {
+        waiter_registry
+            .job_log_for_auth(
+                Some(&waiter_auth),
+                &waiter_job_id,
+                None,
+                None,
+                None,
+                Some(&observation_token),
+                Some(5),
+            )
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let visible_expired = registry.list_clients_for_auth(Some(&expired_auth)).await;
     assert!(visible_expired.is_empty());
     assert!(
         job_revision.load(std::sync::atomic::Ordering::Relaxed) > revision_before,
-        "a non-terminal job must transition through the existing lost notifier before removal"
+        "a non-terminal job must transition through the existing lost notifier"
     );
+    let (waited_job, _, _, _, _, wait) =
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("lost transition should wake the observation waiter")
+            .expect("waiter task should complete")
+            .expect("same shared key should still observe the retained Job");
+    assert!(wait.changed);
+    assert!(wait.terminal);
+    assert_eq!(waited_job.status, "lost");
+    assert_eq!(
+        waited_job.recovery_reason_code.as_deref(),
+        Some("shared_key_runner_expired")
+    );
+    assert!(waited_job
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("registration expired")));
     let sync_response = tokio::time::timeout(std::time::Duration::from_secs(1), sync_rx)
         .await
         .expect("expired request waiter should be resolved")
@@ -841,7 +876,59 @@ async fn shared_key_offline_ttl_prunes_only_expired_clients_and_all_associated_s
         .error
         .as_deref()
         .is_some_and(|error| error.contains("registration expired")));
-    assert!(registry.get_job(&job.job_id).await.is_err());
+    let retained = registry
+        .get_job_for_auth(Some(&expired_auth), &job.job_id)
+        .await
+        .expect("same shared key should query the retained lost Job");
+    assert_eq!(retained.status, "lost");
+    let (first_terminal_observed_at, first_ended_at, first_error, first_reason, first_revision) = {
+        let inner = registry.inner.lock().await;
+        let record = inner.jobs_by_id.get(&job.job_id).unwrap();
+        (
+            record
+                .terminal_observed_at
+                .expect("TTL prune records Server terminal observation time"),
+            record.ended_at,
+            record.error.clone(),
+            record.recovery_reason_code.clone(),
+            record
+                .public_revision
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    };
+    registry.prune_expired_shared_key_clients().await;
+    {
+        let inner = registry.inner.lock().await;
+        let record = inner.jobs_by_id.get(&job.job_id).unwrap();
+        assert_eq!(record.status, "lost");
+        assert_eq!(record.ended_at, first_ended_at);
+        assert_eq!(record.error, first_error);
+        assert_eq!(record.recovery_reason_code, first_reason);
+        assert_eq!(
+            record.terminal_observed_at,
+            Some(first_terminal_observed_at),
+            "repeated TTL prune must not extend retention"
+        );
+        assert_eq!(
+            record
+                .public_revision
+                .load(std::sync::atomic::Ordering::Relaxed),
+            first_revision,
+            "repeated TTL prune must not publish a duplicate terminal update"
+        );
+    }
+    let other_key = crate::auth::shared_key::shared_key_context("ttl-other-key");
+    assert!(registry
+        .get_job_for_auth(Some(&other_key), &job.job_id)
+        .await
+        .unwrap_err()
+        .contains("unknown shell job"));
+    let managed_reader = auth_context(Some("managed-reader"), false);
+    assert!(registry
+        .get_job_for_auth(Some(&managed_reader), &job.job_id)
+        .await
+        .unwrap_err()
+        .contains("unknown shell job"));
     assert!(!registry.has_hidden_cleanup_intent_for_test(&job.job_id));
     assert!(registry.list_client_projects("ttl-expired").await.is_err());
     {
@@ -854,10 +941,12 @@ async fn shared_key_offline_ttl_prunes_only_expired_clients_and_all_associated_s
             .pending_by_id
             .values()
             .all(|pending| pending.request.client_id != "ttl-expired"));
-        assert!(inner
+        let retained = inner
             .jobs_by_id
-            .values()
-            .all(|job| job.client_id != "ttl-expired"));
+            .get(&job.job_id)
+            .expect("lost Job retained");
+        assert_eq!(retained.status, "lost");
+        assert_eq!(retained.client_id, "ttl-expired");
         assert!(inner
             .unregistering_projects
             .keys()
@@ -891,6 +980,39 @@ async fn shared_key_offline_ttl_prunes_only_expired_clients_and_all_associated_s
         .get_client_view_for_auth("ttl-managed", Some(&managed))
         .await
         .is_some());
+
+    {
+        let mut inner = registry.inner.lock().await;
+        inner
+            .jobs_by_id
+            .get_mut(&job.job_id)
+            .unwrap()
+            .terminal_observed_at =
+            Some(now_ts() - crate::shell_protocol::JOB_TERMINAL_RETENTION_SECS);
+    }
+    super::reconciliation::recovery_timeout_sweep(&registry).await;
+    assert!(registry
+        .get_job_for_auth(Some(&expired_auth), &job.job_id)
+        .await
+        .is_err());
+    {
+        let inner = registry.inner.lock().await;
+        assert!(!inner.request_to_job.values().any(|id| id == &job.job_id));
+        assert!(inner
+            .pending_by_id
+            .values()
+            .all(|pending| { pending.job_id.as_deref() != Some(job.job_id.as_str()) }));
+        assert!(inner.persistent_waiters.is_empty());
+        assert!(inner
+            .queues_by_client
+            .values()
+            .all(|queue| queue.iter().all(|request_id| {
+                inner
+                    .pending_by_id
+                    .get(request_id)
+                    .is_none_or(|pending| pending.job_id.as_deref() != Some(job.job_id.as_str()))
+            })));
+    }
 
     registry
         .register_with_auth(
@@ -1950,7 +2072,7 @@ fn validate_run_request_rejects_oversized_stdin() {
 }
 
 #[tokio::test]
-async fn registry_shell_job_start_poll_complete_and_log() {
+async fn terminal_observed_legacy_poll_complete_and_log() {
     let registry = ShellClientRegistry::default();
     registry
         .register(ShellClientRegisterRequest {
@@ -2033,6 +2155,12 @@ async fn registry_shell_job_start_poll_complete_and_log() {
     let done = registry.get_job(&job.job_id).await.unwrap();
     assert_eq!(done.status, "completed");
     assert_eq!(done.exit_code, Some(0));
+    {
+        let inner = registry.inner.lock().await;
+        let record = inner.jobs_by_id.get(&job.job_id).unwrap();
+        assert!(record.terminal_observed_at.is_some());
+        assert_eq!(record.terminal_observed_at, record.ended_at);
+    }
     assert_eq!(
         done.codex
             .as_ref()
@@ -2059,7 +2187,7 @@ async fn registry_shell_job_start_poll_complete_and_log() {
 }
 
 #[tokio::test]
-async fn registry_shell_job_stop_cancels_queued_job() {
+async fn terminal_observed_queued_stop_records_server_time() {
     let registry = ShellClientRegistry::default();
     registry
         .register(ShellClientRegisterRequest {
@@ -2102,6 +2230,12 @@ async fn registry_shell_job_stop_cancels_queued_job() {
         .await
         .unwrap();
     assert_eq!(stopped.status, "stopped");
+    {
+        let inner = registry.inner.lock().await;
+        let record = inner.jobs_by_id.get(&job.job_id).unwrap();
+        assert!(record.terminal_observed_at.is_some());
+        assert_eq!(record.terminal_observed_at, record.ended_at);
+    }
     let polled = registry
         .poll(ShellAgentPollRequest {
             client_id: "oe".to_string(),

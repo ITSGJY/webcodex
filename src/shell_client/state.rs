@@ -79,6 +79,11 @@ pub(super) struct ShellJobRecord {
     pub(super) job_id: String,
     pub(super) request_id: Option<String>,
     pub(super) client_id: String,
+    /// Non-secret authorization partition captured when the Job is created.
+    /// Shared-key runners store only the existing key hash group, never the
+    /// plaintext key. Keeping this on the Job preserves authorization after
+    /// the originating client registration is removed.
+    pub(super) auth_group: Option<ShellClientAuthGroup>,
     /// Internal lease owner. Never exposed through public job tools.
     pub(super) agent_instance_id: String,
     pub(super) kind: String,
@@ -94,6 +99,11 @@ pub(super) struct ShellJobRecord {
     pub(super) created_at: i64,
     pub(super) started_at: Option<i64>,
     pub(super) ended_at: Option<i64>,
+    /// Server-process-local lifecycle clock: the first time this Server
+    /// observed the Job in a terminal state. Runner-reported execution
+    /// timestamps remain in `ended_at` for public results and diagnostics,
+    /// but never control Server registry retention.
+    pub(super) terminal_observed_at: Option<i64>,
     pub(super) exit_code: Option<i32>,
     pub(super) duration_ms: Option<u64>,
     pub(super) stdout: ShellJobLogState,

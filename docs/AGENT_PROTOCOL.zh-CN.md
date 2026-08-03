@@ -83,6 +83,16 @@ register/ack 窗口内的状态变化。
 - 每个 stdout/stderr tail 最多 64 KiB；
 - 序列化 inventory 总计最多 1 MiB。
 
+Runner inventory retention 与 Server Job history retention 使用两套独立时钟。
+Runner 将有界的近期 terminal snapshot 保留 15 分钟，以便在 registration
+inventory 中提交。与此独立，Server 对所有 public agent-backed terminal Job
+（`completed`、`failed`、`stopped`、`timeout`/`timed_out`、`cancelled`、
+`lost`），从当前 Server 第一次观察到 terminal 状态起在内存 registry 中保留
+15 分钟。Server observation timestamp 是内部生命周期元数据，不属于公开协议。
+Snapshot 的 `ended_at` 继续表示执行结束时间，可来自 Runner，并用于结果展示与诊断，
+但不控制 Server 回收。因此，即使 Runner 上报未来的 `ended_at`，也不能阻止回收；
+重复 replay terminal inventory 也不能延长 Server retention window。
+
 可恢复断线后，已由 Runner 接管的 Job 在有界 grace window 内处于 `recovering`
 （默认 120 秒，可通过 `WEBCODEX_JOB_RECOVERY_GRACE_SECS` 覆盖，clamp ��� 5–3600 秒）。
 `recovering` 是有界而非永久状态：同一实例的完整 inventory 会恢复实际状态、日志、

@@ -764,11 +764,23 @@ explicit session id when available, and `confirm=true`.
 #### Recovering agent jobs
 
 Runners with the `job_state_reconciliation` capability retain active jobs and
-recent terminal snapshots in process memory. If the WebCodex server restarts
+recent terminal snapshots in process memory. Runner terminal inventory is
+bounded to 64 records retained for 15 minutes. If the WebCodex server restarts
 or the agent transport drops briefly while that same runner process remains
 alive, the job may temporarily report `status="recovering"`. It is still
 active, has no `ended_at`, and does not imply a live connection. Do not submit
 a replacement command.
+
+The Server has a separate 15-minute in-memory history window for every public
+agent-backed terminal Job, measured from the first time the current Server
+process observes the terminal state. This includes successful completion,
+failures, stops, timeouts, cancellations, and all `lost` reasons. Runner
+`ended_at` is still displayed as the execution end timestamp, but it is not the
+Server retention clock; clock skew or a future Runner timestamp cannot keep a
+Job indefinitely. Re-registering and replaying the same terminal snapshot also
+does not restart the Server window. After expiration, a bounded periodic sweep
+removes the Job and its in-memory request/mapping/waiter/queue/control cleanup
+state. This does not affect local-executor Jobs and is not a durable ledger.
 
 The same `agent_instance_id` has a bounded recovery window (default 120 seconds;
 overridable with `WEBCODEX_JOB_RECOVERY_GRACE_SECS`, clamped to 5–3600 seconds).

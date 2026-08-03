@@ -89,9 +89,22 @@ Accepted terminal states never revert to active or change terminal class.
 The bounds are part of the internal protocol:
 
 - at most 64 active records, always ordered before terminal history;
-- at most 64 terminal records, retained for 15 minutes by the runner;
+- at most 64 terminal records, retained for 15 minutes by the Runner;
 - at most 64 KiB per stdout/stderr tail;
 - at most 1 MiB for the serialized inventory.
+
+Runner inventory retention and Server Job-history retention use separate clocks.
+The Runner keeps its bounded recent-terminal snapshots for 15 minutes so they
+can be included in registration inventory. Independently, the Server keeps
+every public agent-backed terminal Job in its in-memory registry for 15 minutes
+from the first time that Server observes the terminal state. The Server-owned
+observation timestamp is internal and is not part of this protocol. Snapshot
+`ended_at` continues to describe execution completion for results and
+diagnostics; it may come from the Runner and does not control Server cleanup.
+A future-skewed `ended_at` therefore cannot prevent cleanup, and repeated
+terminal inventory replay cannot extend the Server retention window. The
+bounded Server sweep applies uniformly to `completed`, `failed`, `stopped`,
+`timeout`/`timed_out`, `cancelled`, and `lost` Jobs.
 
 On a recoverable disconnect, an already accepted job becomes `recovering` for
 a bounded grace window (default 120 seconds, overridable with

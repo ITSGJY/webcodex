@@ -1,6 +1,7 @@
+use super::auth::ShellClientAuthGroup;
 use super::jobs::{
     command_preview, is_final_job_status, is_runner_active_job_status, mark_job_lost,
-    notify_job_update, replace_log_from_snapshot, COMMAND_PREVIEW_MAX_CHARS,
+    notify_job_update, observe_job_terminal, replace_log_from_snapshot, COMMAND_PREVIEW_MAX_CHARS,
 };
 use super::state::{
     ShellClientRegistryInner, ShellJobLogState, ShellJobRecord, ShellJobVisibility,
@@ -10,7 +11,7 @@ use super::{job_recovery_grace_secs, ShellClientRegistry};
 use crate::shell_protocol::{
     ShellAgentProjectSummary, ShellJobInventory, ShellJobSnapshot, ShellJobStreamSnapshot,
     JOB_INVENTORY_MAX_ACTIVE_JOBS, JOB_INVENTORY_MAX_JOBS, JOB_INVENTORY_MAX_SERIALIZED_BYTES,
-    JOB_INVENTORY_MAX_TERMINAL_JOBS, JOB_SNAPSHOT_STREAM_MAX_BYTES,
+    JOB_INVENTORY_MAX_TERMINAL_JOBS, JOB_SNAPSHOT_STREAM_MAX_BYTES, JOB_TERMINAL_RETENTION_SECS,
 };
 use std::collections::HashSet;
 
@@ -428,6 +429,7 @@ fn remove_job_request_mapping(
         return;
     };
     inner.pending_by_id.remove(request_id);
+    inner.persistent_waiters.remove(request_id);
     inner.request_to_job.remove(request_id);
     if let Some(queue) = inner.queues_by_client.get_mut(client_id) {
         queue.retain(|queued| queued != request_id);
@@ -459,15 +461,17 @@ fn remove_job_control_requests(
 fn record_from_snapshot(
     client_id: &str,
     agent_instance_id: &str,
+    auth_group: Option<ShellClientAuthGroup>,
     observation_epoch: std::sync::Arc<str>,
     snapshot: &ShellJobSnapshot,
     now: i64,
 ) -> ShellJobRecord {
     let context = &snapshot.context;
-    ShellJobRecord {
+    let mut record = ShellJobRecord {
         job_id: snapshot.job_id.clone(),
         request_id: Some(snapshot.request_id.clone()),
         client_id: client_id.to_string(),
+        auth_group,
         agent_instance_id: agent_instance_id.to_string(),
         kind: "shell".to_string(),
         project_id: context.runtime_project_id.clone(),
@@ -482,6 +486,7 @@ fn record_from_snapshot(
         created_at: snapshot.created_at,
         started_at: snapshot.started_at,
         ended_at: snapshot.ended_at,
+        terminal_observed_at: None,
         exit_code: snapshot.exit_code,
         duration_ms: snapshot.duration_ms,
         stdout: ShellJobLogState::default(),
@@ -502,11 +507,14 @@ fn record_from_snapshot(
         observation_epoch,
         public_revision: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         update_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
-    }
+    };
+    observe_job_terminal(&mut record, now);
+    record
 }
 
 fn apply_snapshot(job: &mut ShellJobRecord, snapshot: &ShellJobSnapshot, now: i64) {
     job.status = snapshot.status.clone();
+    observe_job_terminal(job, now);
     job.started_at = snapshot.started_at;
     job.ended_at = snapshot.ended_at;
     job.exit_code = snapshot.exit_code;
@@ -537,6 +545,88 @@ fn remove_cleanup_terminal_jobs_locked(inner: &mut ShellClientRegistryInner) {
         .collect::<Vec<_>>();
     for job_id in removable {
         inner.jobs_by_id.remove(&job_id);
+    }
+}
+
+impl ShellClientRegistry {
+    fn prune_expired_terminal_jobs_locked(
+        &self,
+        inner: &mut ShellClientRegistryInner,
+        now: i64,
+    ) -> usize {
+        enum TerminalSweepAction {
+            Observe(String),
+            Remove(String, String, Option<String>),
+        }
+
+        let actions = inner
+            .jobs_by_id
+            .iter()
+            .filter_map(|(job_id, job)| {
+                if job.visibility != ShellJobVisibility::Public || !is_final_job_status(&job.status)
+                {
+                    return None;
+                }
+                match job.terminal_observed_at {
+                    None => Some(TerminalSweepAction::Observe(job_id.clone())),
+                    Some(observed_at)
+                        if now.saturating_sub(observed_at) >= JOB_TERMINAL_RETENTION_SECS =>
+                    {
+                        Some(TerminalSweepAction::Remove(
+                            job_id.clone(),
+                            job.client_id.clone(),
+                            job.request_id.clone(),
+                        ))
+                    }
+                    Some(_) => None,
+                }
+            })
+            .take(RECOVERY_SWEEP_PASS_CAP)
+            .collect::<Vec<_>>();
+        if actions.is_empty() {
+            return 0;
+        }
+        let mut expired = Vec::new();
+        for action in actions {
+            match action {
+                TerminalSweepAction::Observe(job_id) => {
+                    if let Some(job) = inner.jobs_by_id.get_mut(&job_id) {
+                        observe_job_terminal(job, now);
+                    }
+                }
+                TerminalSweepAction::Remove(job_id, client_id, request_id) => {
+                    expired.push((job_id, client_id, request_id));
+                }
+            }
+        }
+        if expired.is_empty() {
+            return 0;
+        }
+        let expired_job_ids = expired
+            .iter()
+            .map(|(job_id, _, _)| job_id.clone())
+            .collect::<HashSet<_>>();
+        let distinct_clients = expired
+            .iter()
+            .map(|(_, client_id, _)| client_id.clone())
+            .collect::<HashSet<_>>();
+        for (_, client_id, request_id) in &expired {
+            remove_job_request_mapping(inner, client_id, request_id.as_deref());
+        }
+        for client_id in distinct_clients {
+            remove_job_control_requests(inner, &client_id, &expired_job_ids);
+        }
+        inner
+            .request_to_job
+            .retain(|_, job_id| !expired_job_ids.contains(job_id));
+        for job_id in &expired_job_ids {
+            inner.jobs_by_id.remove(job_id);
+        }
+        self.cleanup_intents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|job_id, _| !expired_job_ids.contains(job_id));
+        expired.len()
     }
 }
 
@@ -641,12 +731,14 @@ pub(crate) async fn recovery_timeout_sweep(registry: &ShellClientRegistry) {
     let mut inner = registry.inner.lock().await;
     registry.prune_expired_shared_key_clients_locked(&mut inner, now);
     expire_recovering_jobs_locked(&mut inner, None, now, RECOVERY_SWEEP_PASS_CAP);
+    registry.prune_expired_terminal_jobs_locked(&mut inner, now);
 }
 
 pub(super) fn reconcile_inventory_locked(
     inner: &mut ShellClientRegistryInner,
     client_id: &str,
     agent_instance_id: &str,
+    auth_group: Option<ShellClientAuthGroup>,
     observation_epoch: std::sync::Arc<str>,
     inventory: &ShellJobInventory,
     now: i64,
@@ -705,6 +797,7 @@ pub(super) fn reconcile_inventory_locked(
             let mut record = record_from_snapshot(
                 client_id,
                 agent_instance_id,
+                auth_group.clone(),
                 observation_epoch.clone(),
                 snapshot,
                 now,

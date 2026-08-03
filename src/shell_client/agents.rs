@@ -230,10 +230,15 @@ impl ShellClientRegistry {
         inner.notifiers.remove(&client_id);
         inner.clients.insert(client_id.clone(), record);
         if let Some(inventory) = job_inventory.as_ref() {
+            let auth_group = inner
+                .clients
+                .get(&client_id)
+                .and_then(|client| client.auth_group.clone());
             reconcile_inventory_locked(
                 &mut inner,
                 &client_id,
                 &agent_instance_id,
+                auth_group,
                 self.observation_epoch.clone(),
                 inventory,
                 now,
@@ -502,9 +507,6 @@ impl ShellClientRegistry {
         inner.request_to_job.retain(|request_id, job_id| {
             !request_ids.contains(request_id) && !job_ids.contains(job_id)
         });
-        inner
-            .jobs_by_id
-            .retain(|job_id, _| !job_ids.contains(job_id));
         for client_id in &expired {
             inner.clients.remove(client_id);
             inner.queues_by_client.remove(client_id);

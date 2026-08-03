@@ -268,11 +268,23 @@ progress, and live child/process-group control handles.
 
 Every executor transition updates that runner record under the JobManager lock
 before best-effort network delivery. Active records are never evicted. Terminal
-records release process-control resources but remain in memory for 15 minutes,
-up to 64 records. Each stream is capped at 64 KiB; the complete registration
-inventory is capped at 1 MiB and always prioritizes at most 64 active records.
-Raw command, stdin, environment, credentials, and complete Agent configuration
-are absent from the inventory.
+records release process-control resources but remain in Runner memory for 15
+minutes, up to 64 records. Each stream is capped at 64 KiB; the complete
+registration inventory is capped at 1 MiB and always prioritizes at most 64
+active records. Raw command, stdin, environment, credentials, and complete
+Agent configuration are absent from the inventory.
+
+Separately, every public agent-backed terminal Job (`completed`, `failed`,
+`stopped`, `timeout`/`timed_out`, `cancelled`, or `lost`) remains in the
+Server's process-local `ShellClientRegistry` for 15 minutes from the first time
+that Server observes the terminal state. The Server records this internal
+observation time itself; Runner-provided `ended_at` remains the public execution
+end timestamp and never controls registry retention. Terminal inventory replay
+does not reset the observation time. A bounded periodic sweep removes expired
+Jobs and their request, queue, waiter, control-request, and cleanup-intent
+state without disk or network work under the registry mutex. This policy is
+limited to agent-backed Jobs; local executor history is unchanged, and no
+durable Server Job ledger is introduced.
 
 On a capable-runner disconnect, the server changes accepted active jobs to
 nonterminal `recovering` instead of immediately claiming the result was lost.

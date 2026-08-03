@@ -378,6 +378,16 @@ pub(super) fn is_final_job_status(status: &str) -> bool {
     )
 }
 
+/// Record the first time this Server process observes a Job in a terminal
+/// state. This internal lifecycle timestamp is deliberately independent of
+/// the Runner-reported `ended_at` execution timestamp. Replays and duplicate
+/// terminal transitions are idempotent.
+pub(super) fn observe_job_terminal(job: &mut ShellJobRecord, now: i64) {
+    if is_final_job_status(&job.status) && job.terminal_observed_at.is_none() {
+        job.terminal_observed_at = Some(now);
+    }
+}
+
 /// Broadcast an observable update for a job. Any mutation to a job's public
 /// snapshot or `last_update_seq` must call this while holding the registry
 /// mutex, so bounded `job_log`/`job_tail` waiters are woken to re-read the
@@ -417,6 +427,7 @@ pub(super) fn mark_job_lost(job: &mut ShellJobRecord, now: i64, reason_code: &st
         return;
     }
     job.status = "lost".to_string();
+    observe_job_terminal(job, now);
     if job.ended_at.is_none() {
         job.ended_at = Some(now);
     }

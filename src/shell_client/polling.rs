@@ -1,6 +1,6 @@
 use super::jobs::{
-    assert_active_instance_locked, command_preview, replace_log_limited, truncate_output,
-    truncate_output_to,
+    assert_active_instance_locked, command_preview, observe_job_terminal, replace_log_limited,
+    truncate_output, truncate_output_to,
 };
 use super::requests::{remove_pending_request_locked, take_pending_request_locked};
 use super::validation::{
@@ -185,12 +185,14 @@ impl ShellClientRegistry {
         if let Some(job_id) = pending.job_id.clone() {
             inner.request_to_job.remove(&request_id);
             if let Some(job) = inner.jobs_by_id.get_mut(&job_id) {
+                let terminal_now = now_ts();
                 job.status = if error.is_none() && body.exit_code == Some(0) {
                     "completed".to_string()
                 } else {
                     "failed".to_string()
                 };
-                job.ended_at = Some(now_ts());
+                observe_job_terminal(job, terminal_now);
+                job.ended_at = Some(terminal_now);
                 job.exit_code = body.exit_code;
                 job.duration_ms = body.duration_ms;
                 replace_log_limited(&mut job.stdout, stdout.clone());

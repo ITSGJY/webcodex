@@ -1,17 +1,18 @@
-use super::job_updates::ShellJobStartMetadata;
+use super::job_updates::{JobLogWaitOutcome, ShellJobStartMetadata};
 use super::reconciliation::{
     recovery_timeout_sweep, validate_job_inventory, RECOVERY_SWEEP_PASS_CAP,
 };
-use super::state::ShellJobVisibility;
+use super::state::{PendingShellRequest, ShellJobVisibility};
 use super::{
     clamp_grace, job_recovery_grace_secs, now_ts, ShellClientRegistry, JOB_RECOVERY_GRACE_SECS,
     MAX_OUTPUT_BYTES,
 };
 use crate::shell_protocol::{
-    ShellAgentJobUpdateRequest, ShellAgentPollRequest, ShellAgentProjectSummary,
-    ShellClientCapabilities, ShellClientRegisterRequest, ShellJobContext, ShellJobInventory,
-    ShellJobLogSnapshot, ShellJobOpRequest, ShellJobSnapshot, ShellJobStreamSnapshot,
-    ShellJobValidationProgress, JOB_INVENTORY_MAX_TERMINAL_JOBS, JOB_SNAPSHOT_STREAM_MAX_BYTES,
+    PersistentShellResult, ShellAgentJobUpdateRequest, ShellAgentPollRequest,
+    ShellAgentProjectSummary, ShellAgentShellRequest, ShellClientCapabilities,
+    ShellClientRegisterRequest, ShellJobContext, ShellJobInventory, ShellJobLogSnapshot,
+    ShellJobOpRequest, ShellJobSnapshot, ShellJobStreamSnapshot, ShellJobValidationProgress,
+    JOB_INVENTORY_MAX_TERMINAL_JOBS, JOB_SNAPSHOT_STREAM_MAX_BYTES, JOB_TERMINAL_RETENTION_SECS,
 };
 
 const CLIENT_ID: &str = "oe";
@@ -263,7 +264,7 @@ async fn job_reconciliation_server_restart_restores_running_job_and_completion()
 }
 
 #[tokio::test]
-async fn job_reconciliation_restores_terminal_snapshot_and_replay_is_idempotent() {
+async fn terminal_observed_inventory_replay_is_idempotent() {
     let registry_a = ShellClientRegistry::default();
     register(&registry_a, INSTANCE_A, empty_inventory()).await;
     let (job, request) = start_and_take_over(&registry_a, INSTANCE_A).await;
@@ -303,18 +304,496 @@ async fn job_reconciliation_restores_terminal_snapshot_and_replay_is_idempotent(
     assert_eq!(first.stdout_retained_from_line, Some(4));
     let first_reconciled_at = first.reconciled_at;
     let first_ended_at = first.ended_at;
+    let (first_terminal_observed_at, first_revision) = {
+        let inner = registry_b.inner.lock().await;
+        let record = inner.jobs_by_id.get(&job.job_id).unwrap();
+        (
+            record
+                .terminal_observed_at
+                .expect("terminal inventory is observed by the Server"),
+            record
+                .public_revision
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    };
 
-    register(&registry_b, INSTANCE_A, inventory).await;
+    register(&registry_b, INSTANCE_A, inventory.clone()).await;
     let replayed = registry_b.get_job(&job.job_id).await.unwrap();
     assert_eq!(replayed.status, "completed");
     assert_eq!(replayed.ended_at, first_ended_at);
     assert_eq!(replayed.reconciled_at, first_reconciled_at);
+    {
+        let inner = registry_b.inner.lock().await;
+        let record = inner.jobs_by_id.get(&job.job_id).unwrap();
+        assert_eq!(
+            record.terminal_observed_at,
+            Some(first_terminal_observed_at),
+            "terminal inventory replay must not extend Server retention"
+        );
+        assert_eq!(
+            record
+                .public_revision
+                .load(std::sync::atomic::Ordering::Relaxed),
+            first_revision,
+            "idempotent terminal replay must not publish a new revision"
+        );
+    }
+    {
+        let mut inner = registry_b.inner.lock().await;
+        inner
+            .jobs_by_id
+            .get_mut(&job.job_id)
+            .unwrap()
+            .terminal_observed_at = Some(now_ts() - JOB_TERMINAL_RETENTION_SECS);
+    }
+    let aged_observation = {
+        let inner = registry_b.inner.lock().await;
+        inner.jobs_by_id[&job.job_id].terminal_observed_at
+    };
+    register(&registry_b, INSTANCE_A, inventory).await;
+    {
+        let inner = registry_b.inner.lock().await;
+        assert_eq!(
+            inner.jobs_by_id[&job.job_id].terminal_observed_at, aged_observation,
+            "replay at the retention boundary must not re-anchor the deadline"
+        );
+    }
     let (_, stdout, _, next, _) = registry_b
         .job_log(&job.job_id, Some(1), None, None)
         .await
         .unwrap();
     assert_eq!(stdout.as_deref(), Some("offline output\n"));
     assert_eq!(next, 5);
+
+    recovery_timeout_sweep(&registry_b).await;
+    assert!(registry_b.get_job(&job.job_id).await.is_err());
+}
+
+#[tokio::test]
+async fn terminal_observed_future_inventory_ended_at_cannot_bypass_prune() {
+    let registry_a = ShellClientRegistry::default();
+    register(&registry_a, INSTANCE_A, empty_inventory()).await;
+    let (job, request) = start_and_take_over(&registry_a, INSTANCE_A).await;
+    let mut snapshot = snapshot_from_request(
+        &job,
+        &request,
+        "completed",
+        7,
+        stream("future clock output\n", 1, false),
+    );
+    let future_ended_at = now_ts() + JOB_TERMINAL_RETENTION_SECS * 100;
+    snapshot.ended_at = Some(future_ended_at);
+    let inventory = ShellJobInventory {
+        active_complete: true,
+        jobs: vec![snapshot],
+    };
+
+    let registry_b = ShellClientRegistry::default();
+    let before_register = now_ts();
+    register(&registry_b, INSTANCE_A, inventory).await;
+    let after_register = now_ts();
+    let restored = registry_b.get_job(&job.job_id).await.unwrap();
+    assert_eq!(restored.status, "completed");
+    assert_eq!(restored.ended_at, Some(future_ended_at));
+    let observed_at = {
+        let inner = registry_b.inner.lock().await;
+        inner.jobs_by_id[&job.job_id]
+            .terminal_observed_at
+            .expect("terminal inventory observation time")
+    };
+    assert!((before_register..=after_register).contains(&observed_at));
+    assert_ne!(observed_at, future_ended_at);
+
+    let original_request_id = request.request_id.clone();
+    let control_request_id = format!("control-{}", job.job_id);
+    let mut control_request: ShellAgentShellRequest = request.clone();
+    control_request.request_id = control_request_id.clone();
+    control_request.kind = "stop_job".to_string();
+    control_request.job_id = Some(job.job_id.clone());
+    let (persistent_tx, _persistent_rx) = tokio::sync::oneshot::channel::<PersistentShellResult>();
+    {
+        let mut inner = registry_b.inner.lock().await;
+        inner
+            .request_to_job
+            .insert(original_request_id.clone(), job.job_id.clone());
+        inner.pending_by_id.insert(
+            original_request_id.clone(),
+            PendingShellRequest {
+                request: request.clone(),
+                waiter: None,
+                job_id: Some(job.job_id.clone()),
+                dispatched: true,
+            },
+        );
+        inner
+            .persistent_waiters
+            .insert(original_request_id.clone(), persistent_tx);
+        inner.pending_by_id.insert(
+            control_request_id.clone(),
+            PendingShellRequest {
+                request: control_request,
+                waiter: None,
+                job_id: Some(job.job_id.clone()),
+                dispatched: false,
+            },
+        );
+        let queue = inner
+            .queues_by_client
+            .entry(CLIENT_ID.to_string())
+            .or_default();
+        queue.push_back(original_request_id.clone());
+        queue.push_back(control_request_id.clone());
+        inner
+            .jobs_by_id
+            .get_mut(&job.job_id)
+            .unwrap()
+            .terminal_observed_at = Some(now_ts() - JOB_TERMINAL_RETENTION_SECS);
+    }
+    registry_b.record_hidden_cleanup_intent(job.job_id.clone(), None);
+
+    recovery_timeout_sweep(&registry_b).await;
+
+    assert!(registry_b.list_jobs(Some(10)).await.is_empty());
+    assert!(registry_b.get_job(&job.job_id).await.is_err());
+    assert!(registry_b
+        .job_log(&job.job_id, None, None, None)
+        .await
+        .is_err());
+    assert!(!registry_b.has_hidden_cleanup_intent_for_test(&job.job_id));
+    let inner = registry_b.inner.lock().await;
+    assert!(!inner.jobs_by_id.contains_key(&job.job_id));
+    assert!(!inner.request_to_job.contains_key(&original_request_id));
+    assert!(!inner.request_to_job.values().any(|id| id == &job.job_id));
+    assert!(!inner.pending_by_id.contains_key(&original_request_id));
+    assert!(!inner.pending_by_id.contains_key(&control_request_id));
+    assert!(!inner.persistent_waiters.contains_key(&original_request_id));
+    assert!(inner.queues_by_client.get(CLIENT_ID).is_none_or(|queue| {
+        !queue.contains(&original_request_id) && !queue.contains(&control_request_id)
+    }));
+}
+
+#[tokio::test]
+async fn terminal_observed_completed_job_is_retained_then_pruned() {
+    let registry = ShellClientRegistry::default();
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let (job, _) = start_and_take_over(&registry, INSTANCE_A).await;
+    registry
+        .update_job(update(
+            INSTANCE_A,
+            &job.job_id,
+            1,
+            "completed",
+            Some("done\n"),
+            true,
+        ))
+        .await
+        .unwrap();
+
+    let observed_at = {
+        let inner = registry.inner.lock().await;
+        inner.jobs_by_id[&job.job_id]
+            .terminal_observed_at
+            .expect("normal completed job has Server observation time")
+    };
+    assert!(observed_at <= now_ts());
+    recovery_timeout_sweep(&registry).await;
+    assert_eq!(
+        registry.get_job(&job.job_id).await.unwrap().status,
+        "completed"
+    );
+    assert!(registry
+        .list_jobs(Some(10))
+        .await
+        .iter()
+        .any(|listed| listed.job_id == job.job_id));
+    let (_, stdout, _, _, _) = registry
+        .job_log(&job.job_id, Some(1), None, None)
+        .await
+        .unwrap();
+    assert_eq!(stdout.as_deref(), Some("done\n"));
+
+    {
+        let mut inner = registry.inner.lock().await;
+        inner
+            .jobs_by_id
+            .get_mut(&job.job_id)
+            .unwrap()
+            .terminal_observed_at = Some(now_ts() - JOB_TERMINAL_RETENTION_SECS);
+    }
+    recovery_timeout_sweep(&registry).await;
+    assert!(!registry
+        .list_jobs(Some(10))
+        .await
+        .iter()
+        .any(|listed| listed.job_id == job.job_id));
+    assert!(registry.get_job(&job.job_id).await.is_err());
+    assert!(registry
+        .job_log(&job.job_id, None, None, None)
+        .await
+        .is_err());
+    let inner = registry.inner.lock().await;
+    assert!(!inner.request_to_job.values().any(|id| id == &job.job_id));
+    assert!(inner
+        .pending_by_id
+        .values()
+        .all(|pending| pending.job_id.as_deref() != Some(job.job_id.as_str())));
+}
+
+#[tokio::test]
+async fn terminal_observed_hidden_until_handoff_is_not_pruned_by_public_retention_sweep() {
+    let registry = ShellClientRegistry::default();
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let (job, _) = start_and_take_over(&registry, INSTANCE_A).await;
+    {
+        let mut inner = registry.inner.lock().await;
+        inner.jobs_by_id.get_mut(&job.job_id).unwrap().visibility =
+            ShellJobVisibility::HiddenUntilHandoff;
+    }
+    registry
+        .update_job(update(INSTANCE_A, &job.job_id, 1, "completed", None, true))
+        .await
+        .unwrap();
+    {
+        let mut inner = registry.inner.lock().await;
+        let record = inner.jobs_by_id.get_mut(&job.job_id).unwrap();
+        assert_eq!(record.visibility, ShellJobVisibility::HiddenUntilHandoff);
+        record.terminal_observed_at = Some(now_ts() - JOB_TERMINAL_RETENTION_SECS);
+    }
+
+    recovery_timeout_sweep(&registry).await;
+
+    let inner = registry.inner.lock().await;
+    let record = inner
+        .jobs_by_id
+        .get(&job.job_id)
+        .expect("hidden terminal jobs use the hidden cleanup lifecycle");
+    assert_eq!(record.visibility, ShellJobVisibility::HiddenUntilHandoff);
+    assert_eq!(record.status, "completed");
+}
+
+#[tokio::test]
+async fn terminal_observed_legacy_trimmed_terminal_status_cleans_request_state() {
+    let registry = ShellClientRegistry::default();
+    let mut request = register_request(INSTANCE_A, empty_inventory());
+    request.capabilities = Some(ShellClientCapabilities {
+        jobs: true,
+        async_jobs: true,
+        async_shell_jobs: true,
+        ..Default::default()
+    });
+    request.job_inventory = None;
+    registry.register(request).await.unwrap();
+    let job = registry
+        .start_job(start_request("printf legacy"), "tester".to_string())
+        .await
+        .unwrap();
+    let dispatched = registry
+        .poll(ShellAgentPollRequest {
+            client_id: CLIENT_ID.to_string(),
+            agent_instance_id: INSTANCE_A.to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap()
+        .expect("legacy start request");
+    let before_update = registry.get_job(&job.job_id).await.unwrap();
+    let observation_token = before_update.observation_token.unwrap();
+    let request_id = dispatched.request_id.clone();
+    let revision_before = {
+        let inner = registry.inner.lock().await;
+        assert!(inner.pending_by_id.contains_key(&request_id));
+        assert_eq!(inner.request_to_job.get(&request_id), Some(&job.job_id));
+        inner.jobs_by_id[&job.job_id]
+            .public_revision
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let before_terminal = now_ts();
+
+    let completed = registry
+        .update_job(ShellAgentJobUpdateRequest {
+            client_id: CLIENT_ID.to_string(),
+            agent_instance_id: INSTANCE_A.to_string(),
+            job_id: job.job_id.clone(),
+            request_id: Some(request_id.clone()),
+            update_seq: None,
+            status: " completed ".to_string(),
+            stdout_chunk: None,
+            stderr_chunk: None,
+            stdout_tail: Some("done\n".to_string()),
+            stderr_tail: Some(String::new()),
+            log_snapshot: None,
+            exit_code: Some(0),
+            duration_ms: Some(20),
+            error: None,
+            validation_progress: None,
+            finished: true,
+        })
+        .await
+        .unwrap();
+    let after_terminal = now_ts();
+
+    assert_eq!(completed.status, "completed");
+    assert_eq!(completed.exit_code, Some(0));
+    assert_eq!(completed.duration_ms, Some(20));
+    assert!(completed.started_at.is_some());
+    let ended_at = completed.ended_at.expect("legacy terminal update ended_at");
+    assert!((before_terminal..=after_terminal).contains(&ended_at));
+    {
+        let inner = registry.inner.lock().await;
+        let record = inner.jobs_by_id.get(&job.job_id).unwrap();
+        assert_eq!(record.status, "completed");
+        assert_eq!(record.terminal_observed_at, Some(ended_at));
+        assert_eq!(record.ended_at, Some(ended_at));
+        assert_eq!(record.exit_code, Some(0));
+        assert_eq!(record.duration_ms, Some(20));
+        assert!(!inner.pending_by_id.contains_key(&request_id));
+        assert!(!inner.request_to_job.contains_key(&request_id));
+        assert_eq!(
+            record
+                .public_revision
+                .load(std::sync::atomic::Ordering::Relaxed),
+            revision_before + 1
+        );
+    }
+    let (info, stdout, stderr, _, _, wait) = registry
+        .job_log_for_auth(
+            None,
+            &job.job_id,
+            None,
+            None,
+            None,
+            Some(&observation_token),
+            Some(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(info.status, "completed");
+    assert_eq!(stdout.as_deref(), Some("done\n"));
+    assert_eq!(stderr.as_deref(), Some(""));
+    assert_eq!(wait.wait_outcome, JobLogWaitOutcome::Immediate);
+    assert!(wait.changed);
+    assert!(wait.terminal);
+}
+
+#[tokio::test]
+async fn terminal_observed_missing_internal_time_is_backfilled_before_prune() {
+    let registry = ShellClientRegistry::default();
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let (job, _) = start_and_take_over(&registry, INSTANCE_A).await;
+    registry
+        .update_job(update(INSTANCE_A, &job.job_id, 1, "completed", None, true))
+        .await
+        .unwrap();
+    let ancient_ended_at = now_ts() - JOB_TERMINAL_RETENTION_SECS * 100;
+    let revision_before = {
+        let mut inner = registry.inner.lock().await;
+        let record = inner.jobs_by_id.get_mut(&job.job_id).unwrap();
+        record.ended_at = Some(ancient_ended_at);
+        record.terminal_observed_at = None;
+        record
+            .public_revision
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let before_sweep = now_ts();
+
+    recovery_timeout_sweep(&registry).await;
+
+    let after_sweep = now_ts();
+    {
+        let inner = registry.inner.lock().await;
+        let record = inner
+            .jobs_by_id
+            .get(&job.job_id)
+            .expect("missing observation is initialized, not immediately pruned");
+        let observed_at = record.terminal_observed_at.unwrap();
+        assert!((before_sweep..=after_sweep).contains(&observed_at));
+        assert_eq!(record.ended_at, Some(ancient_ended_at));
+        assert_eq!(
+            record
+                .public_revision
+                .load(std::sync::atomic::Ordering::Relaxed),
+            revision_before,
+            "internal lifecycle backfill is not a public Job mutation"
+        );
+    }
+    recovery_timeout_sweep(&registry).await;
+    assert!(registry.get_job(&job.job_id).await.is_ok());
+    {
+        let mut inner = registry.inner.lock().await;
+        inner
+            .jobs_by_id
+            .get_mut(&job.job_id)
+            .unwrap()
+            .terminal_observed_at = Some(now_ts() - JOB_TERMINAL_RETENTION_SECS);
+    }
+    recovery_timeout_sweep(&registry).await;
+    assert!(registry.get_job(&job.job_id).await.is_err());
+}
+
+#[tokio::test]
+async fn terminal_observed_sequenced_terminal_classes_are_recorded_once() {
+    let registry = ShellClientRegistry::default();
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+
+    for status in [
+        "completed",
+        "failed",
+        "stopped",
+        "timeout",
+        "timed_out",
+        "cancelled",
+        "lost",
+    ] {
+        let (job, _) = start_and_take_over(&registry, INSTANCE_A).await;
+        registry
+            .update_job(update(INSTANCE_A, &job.job_id, 1, status, None, true))
+            .await
+            .unwrap();
+        let first = registry.get_job(&job.job_id).await.unwrap();
+        let (observed_at, revision) = {
+            let inner = registry.inner.lock().await;
+            let record = inner.jobs_by_id.get(&job.job_id).unwrap();
+            (
+                record
+                    .terminal_observed_at
+                    .expect("terminal update has Server observation time"),
+                record
+                    .public_revision
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+        };
+        let late_status = if status == "completed" {
+            "failed"
+        } else {
+            "completed"
+        };
+        registry
+            .update_job(update(
+                INSTANCE_A,
+                &job.job_id,
+                2,
+                late_status,
+                Some("late\n"),
+                true,
+            ))
+            .await
+            .unwrap();
+        let replayed = registry.get_job(&job.job_id).await.unwrap();
+        assert_eq!(replayed.status, first.status);
+        assert_eq!(replayed.ended_at, first.ended_at);
+        assert_eq!(replayed.error, first.error);
+        assert_eq!(replayed.recovery_reason_code, first.recovery_reason_code);
+        assert_eq!(replayed.last_update_seq, first.last_update_seq);
+        let inner = registry.inner.lock().await;
+        let record = inner.jobs_by_id.get(&job.job_id).unwrap();
+        assert_eq!(record.terminal_observed_at, Some(observed_at));
+        assert_eq!(
+            record
+                .public_revision
+                .load(std::sync::atomic::Ordering::Relaxed),
+            revision
+        );
+    }
 }
 
 #[tokio::test]
@@ -1102,7 +1581,7 @@ async fn recovery_sweep_noop_before_deadline() {
 }
 
 #[tokio::test]
-async fn recovery_sweep_is_idempotent_and_sets_ended_at_once() {
+async fn terminal_observed_recovery_sweep_is_idempotent() {
     let registry = ShellClientRegistry::default();
     register(&registry, INSTANCE_A, empty_inventory()).await;
     let (job, _) = start_and_take_over(&registry, INSTANCE_A).await;
@@ -1113,6 +1592,18 @@ async fn recovery_sweep_is_idempotent_and_sets_ended_at_once() {
     let first = registry.get_job(&job.job_id).await.unwrap();
     assert_eq!(first.status, "lost");
     let first_ended_at = first.ended_at.expect("ended_at set");
+    let (first_terminal_observed_at, first_revision) = {
+        let inner = registry.inner.lock().await;
+        let record = inner.jobs_by_id.get(&job.job_id).unwrap();
+        (
+            record
+                .terminal_observed_at
+                .expect("lost transition has Server observation time"),
+            record
+                .public_revision
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    };
 
     recovery_timeout_sweep(&registry).await;
     let second = registry.get_job(&job.job_id).await.unwrap();
@@ -1126,6 +1617,20 @@ async fn recovery_sweep_is_idempotent_and_sets_ended_at_once() {
         second.recovery_reason_code.as_deref(),
         Some("runner_recovery_deadline_exceeded"),
         "reason not overwritten"
+    );
+    let inner = registry.inner.lock().await;
+    let record = inner.jobs_by_id.get(&job.job_id).unwrap();
+    assert_eq!(
+        record.terminal_observed_at,
+        Some(first_terminal_observed_at),
+        "repeated recovery sweep must not extend retention"
+    );
+    assert_eq!(
+        record
+            .public_revision
+            .load(std::sync::atomic::Ordering::Relaxed),
+        first_revision,
+        "no public revision without a public state change"
     );
 }
 
@@ -1318,14 +1823,24 @@ async fn runner_reconnect_before_deadline_cancels_timeout() {
 }
 
 #[tokio::test]
-async fn late_update_after_timeout_does_not_revive_job() {
+async fn terminal_observed_late_update_after_timeout_is_idempotent() {
     let registry = ShellClientRegistry::default();
     register(&registry, INSTANCE_A, empty_inventory()).await;
     let (job, _) = start_and_take_over(&registry, INSTANCE_A).await;
     drive_into_recovering(&registry, &job.job_id, INSTANCE_A).await;
     age_recovering_since(&registry, &job.job_id, job_recovery_grace_secs() + 1).await;
     recovery_timeout_sweep(&registry).await;
-    let first_ended_at = registry.get_job(&job.job_id).await.unwrap().ended_at;
+    let first = registry.get_job(&job.job_id).await.unwrap();
+    let (first_terminal_observed_at, first_revision) = {
+        let inner = registry.inner.lock().await;
+        let record = inner.jobs_by_id.get(&job.job_id).unwrap();
+        (
+            record.terminal_observed_at.unwrap(),
+            record
+                .public_revision
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    };
 
     // An older-sequence update is dropped by the seq guard.
     let _ = registry
@@ -1347,8 +1862,26 @@ async fn late_update_after_timeout_does_not_revive_job() {
         ))
         .await;
     let lost = registry.get_job(&job.job_id).await.unwrap();
-    assert_eq!(lost.status, "lost", "terminal job must not revive");
-    assert_eq!(lost.ended_at, first_ended_at, "ended_at unchanged");
+    assert_eq!(lost.status, first.status, "terminal job must not revive");
+    assert_eq!(lost.ended_at, first.ended_at, "ended_at unchanged");
+    assert_eq!(lost.error, first.error, "terminal error unchanged");
+    assert_eq!(
+        lost.recovery_reason_code, first.recovery_reason_code,
+        "terminal recovery reason unchanged"
+    );
+    let inner = registry.inner.lock().await;
+    let record = inner.jobs_by_id.get(&job.job_id).unwrap();
+    assert_eq!(
+        record.terminal_observed_at,
+        Some(first_terminal_observed_at),
+        "late updates must not extend retention"
+    );
+    assert_eq!(
+        record
+            .public_revision
+            .load(std::sync::atomic::Ordering::Relaxed),
+        first_revision
+    );
 }
 
 #[tokio::test]

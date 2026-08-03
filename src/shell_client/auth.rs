@@ -1,4 +1,4 @@
-use super::state::{ShellClientRecord, ShellClientRegistryInner};
+use super::state::{ShellClientRecord, ShellClientRegistryInner, ShellJobRecord};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ShellClientAuthGroup {
@@ -94,14 +94,20 @@ pub(super) fn assert_shell_client_access(
 pub(super) fn shell_job_visible_to_auth(
     auth: Option<&crate::auth::AuthContext>,
     inner: &ShellClientRegistryInner,
-    client_id: &str,
+    job: &ShellJobRecord,
 ) -> bool {
     let Some(auth) = auth else {
         return true;
     };
+    if auth.is_admin() {
+        return true;
+    }
+    if let Some(group) = job.auth_group.as_ref() {
+        return lightweight_group_matches(Some(auth), Some(group));
+    }
     inner
         .clients
-        .get(client_id)
+        .get(&job.client_id)
         .map(|client| assert_shell_client_access(Some(auth), client).is_ok())
         .unwrap_or(false)
 }
