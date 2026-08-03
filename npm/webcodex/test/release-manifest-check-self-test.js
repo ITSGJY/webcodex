@@ -32,7 +32,7 @@ function assertInvalid(manifest, pattern) {
 
 function main() {
   const current = loadManifest(path.join(__dirname, "..", "manifest.json"));
-  assertInvalid(current, /placeholder|lowercase hexadecimal/);
+  assert.strictEqual(validateReleaseManifest(current), true);
 
   const linuxOnly = validFixture(["linux-x64"]);
   assert.strictEqual(validateReleaseManifest(linuxOnly), true);

@@ -61,7 +61,7 @@ on the machine that owns the repository.
 
 ## Install
 
-On supported Linux x64 and macOS arm64 systems:
+On supported Linux x64, Linux arm64, and macOS arm64 systems:
 
 ```bash
 npm install -g @yyjeqhc/webcodex
@@ -125,8 +125,8 @@ decision tree.
 | Need full infrastructure and identity-system control | Follow the self-hosting path in [DEPLOYMENT.md](docs/DEPLOYMENT.md). |
 | Keep everything loopback-only | Use the three local project commands below. |
 
-The packaged 0.3.1 path supports Linux x64 and macOS arm64. Full self-hosting
-on Linux still assumes systemd, `sudo`, and an HTTPS domain or trusted tunnel;
+The packaged 0.3.1 path supports Linux x64, Linux arm64, and macOS arm64.
+Full self-hosting on Linux still assumes systemd, `sudo`, and an HTTPS domain or trusted tunnel;
 the hosted `connect` path does not.
 
 ## One Project, One Entry

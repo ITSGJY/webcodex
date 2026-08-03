@@ -16,7 +16,7 @@ WebCodex 0.3.1 重点改善官方托管路径的新用户接入体验，同时�
 
 ## Hosted 最快接入
 
-计划发布 Linux x64 与 macOS arm64 artifacts：
+已提供 Linux x64、Linux arm64 与 macOS arm64 artifacts：
 
 ```bash
 npm install -g @yyjeqhc/webcodex
@@ -40,15 +40,16 @@ webcodex connect https://sg4.yyjeqhc.cn
 npm package 是 thin installer/wrapper。v0.3.1 manifest 声明：
 
 - `webcodex-v0.3.1-linux-x64.tar.gz`
+- `webcodex-v0.3.1-linux-arm64.tar.gz`
 - `webcodex-v0.3.1-darwin-arm64.tar.gz`
 
-每个 artifact 都包含由同一个干净 tag revision 构建的 `webcodex`、`webcodex-server` 与 `webcodex-runner`。Release-preparation tag 会暂时保留 checksum placeholder。只有两个不可变 artifact 都上传完成，并在不移动 `v0.3.1` tag 的前提下，通过明确报告的 post-tag manifest commit 写入实际 SHA-256 后，才能发布 npm。
+每个 artifact 都包含由同一个干净 tag revision 构建的 `webcodex`、`webcodex-server` 与 `webcodex-runner`。Release-preparation tag 会暂时保留 checksum placeholder。只有三个不可变 artifact 都上传完成，并在不移动 `v0.3.1` tag 的前提下，通过明确报告的 post-tag manifest commit 写入实际 SHA-256 后，才能发布 npm。
 
 ## 已知限制
 
 - Hosted shared key 是 capability credential；持有者可以使用关联项目边界 Runner profile 的权限。
 - Detached Runner 不是 OS startup service，机器重启后需要重新启动。
-- Linux arm64、macOS x64 与 Windows 不在计划的 v0.3.1 npm 覆盖范围内。
+- macOS x64 与 Windows 不在 v0.3.1 npm 覆盖范围内。
 - Browser console 是 review/operations 界面，不是完整 IDE。
 - Production 安全仍依赖 HTTPS、收窄 credential、OS user 隔离、备份和 operator review。
 

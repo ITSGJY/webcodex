@@ -111,7 +111,7 @@ The documented distribution path uses the npm thin installer/wrapper:
 ```bash
 npm install -g @yyjeqhc/webcodex
 ```
-The v0.3.1 npm wrapper is prepared for `linux-x64` and `darwin-arm64`. `linux-arm64`, `darwin-x64`, Windows, and other targets remain unavailable unless matching artifacts are added before release. Do not publish the npm package until both v0.3.1 GitHub Release artifacts exist and `npm/webcodex/manifest.json` contains the SHA-256 checksum of each exact uploaded tarball. Validate the local package path first with `bash scripts/npm_package_smoke.sh`.
+The v0.3.1 npm wrapper supports `linux-x64`, `linux-arm64`, and `darwin-arm64`. `darwin-x64`, Windows, and other targets are unavailable in this release. Do not publish the npm package until all three v0.3.1 GitHub Release artifacts exist and `npm/webcodex/manifest.json` contains the SHA-256 checksum of each exact uploaded tarball. Validate the local package path first with `bash scripts/npm_package_smoke.sh`.
 
 Initialize the env file:
 

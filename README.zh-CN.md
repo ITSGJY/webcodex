@@ -53,7 +53,7 @@ Git、修改和验证仍留在拥有仓库的机器上。
 
 ## 安装
 
-支持的 Linux x64 和 macOS arm64 环境可以直接安装：
+支持的 Linux x64、Linux arm64 和 macOS arm64 环境可以直接安装：
 
 ```bash
 npm install -g @yyjeqhc/webcodex
@@ -111,8 +111,8 @@ Token: 命令生成的 MCP key
 | 需要完全控制基础设施与身份系统 | 阅读 [DEPLOYMENT.zh-CN.md](docs/DEPLOYMENT.zh-CN.md) 走完整自托管。 |
 | 只在本机 loopback 使用 | 使用下面三条本地项目命令。 |
 
-0.3.1 的 package 路径支持 Linux x64 和 macOS arm64。Linux 上的完整自托管仍要求
-systemd、`sudo` 以及 HTTPS 域名或可信隧道；hosted `connect` 路径不需要这些运维
+0.3.1 的 package 路径支持 Linux x64、Linux arm64 和 macOS arm64。Linux 上的完整
+自托管仍要求 systemd、`sudo` 以及 HTTPS 域名或可信隧道；hosted `connect` 路径不需要这些运维
 步骤。
 
 ## 一个项目，一个入口

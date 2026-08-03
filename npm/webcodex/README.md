@@ -8,7 +8,7 @@ WebCodex lets ChatGPT, Claude, and other MCP clients work on private repositorie
 
 ### Install and connect
 
-Supported in v0.3.1: Linux x64 and macOS arm64. Node.js 18 or newer is required for the installer wrapper.
+Supported in v0.3.1: Linux x64, Linux arm64, and macOS arm64. Node.js 18 or newer is required for the installer wrapper.
 
 ```bash
 npm install -g @yyjeqhc/webcodex
@@ -51,7 +51,7 @@ WebCodex 让 ChatGPT、Claude 和其他 MCP client 通过本地 Runner 操作私
 
 ### 安装与接入
 
-v0.3.1 支持 Linux x64 和 macOS arm64。npm installer wrapper 需要 Node.js 18 或更新版本。
+v0.3.1 支持 Linux x64、Linux arm64 和 macOS arm64。npm installer wrapper 需要 Node.js 18 或更新版本。
 
 ```bash
 npm install -g @yyjeqhc/webcodex

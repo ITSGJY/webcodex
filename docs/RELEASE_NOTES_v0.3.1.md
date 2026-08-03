@@ -16,7 +16,7 @@ WebCodex 0.3.1 focuses on making the official hosted path practical for a new us
 
 ## Hosted Quick Start
 
-Supported release artifacts are planned for Linux x64 and macOS arm64:
+Release artifacts are available for Linux x64, Linux arm64, and macOS arm64:
 
 ```bash
 npm install -g @yyjeqhc/webcodex
@@ -40,15 +40,16 @@ No intentional public CLI command or canonical MCP operation is removed in this 
 The npm package is a thin installer/wrapper. The v0.3.1 manifest declares:
 
 - `webcodex-v0.3.1-linux-x64.tar.gz`
+- `webcodex-v0.3.1-linux-arm64.tar.gz`
 - `webcodex-v0.3.1-darwin-arm64.tar.gz`
 
-Each artifact contains `webcodex`, `webcodex-server`, and `webcodex-runner` from one clean tagged revision. The release-preparation tag intentionally keeps checksum placeholders. npm must not be published until both immutable artifacts are uploaded and the exact SHA-256 values are committed in a reported post-tag manifest commit without moving `v0.3.1`.
+Each artifact contains `webcodex`, `webcodex-server`, and `webcodex-runner` from one clean tagged revision. The release-preparation tag intentionally keeps checksum placeholders. npm must not be published until all three immutable artifacts are uploaded and the exact SHA-256 values are committed in a reported post-tag manifest commit without moving `v0.3.1`.
 
 ## Known Limitations
 
 - A hosted shared key is a capability credential. Anyone who possesses it can use the permissions of the associated project-bounded Runner profile.
 - The detached Runner is not an OS startup service and must be restarted after a machine reboot.
-- Linux arm64, macOS x64, and Windows artifacts are not part of the planned v0.3.1 npm coverage.
+- macOS x64 and Windows artifacts are not part of the v0.3.1 npm coverage.
 - The browser console is a review and operations surface, not a full IDE.
 - Production safety still depends on HTTPS, scoped credentials, OS-user isolation, backups, and operator review.
 

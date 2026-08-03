@@ -35,12 +35,15 @@ cargo "${CARGO_ARGS[@]}"
 echo "[npm-smoke] running npm installer/wrapper tests"
 npm --prefix "$PACKAGE_DIR" test
 
-echo "[npm-smoke] confirming placeholder manifest blocks publishing"
-if npm --prefix "$PACKAGE_DIR" run prepublishOnly >"$TMP/publish-guard.log" 2>&1; then
+echo "[npm-smoke] confirming release manifest permits publishing"
+npm --prefix "$PACKAGE_DIR" run prepublishOnly
+
+echo "[npm-smoke] confirming placeholder example blocks publishing"
+if node "$PACKAGE_DIR/test/release-manifest-check.js" "$PACKAGE_DIR/manifest.example.json" >"$TMP/publish-guard.log" 2>&1; then
     echo "[npm-smoke] placeholder release manifest unexpectedly passed publish guard" >&2
     exit 1
 fi
-if ! grep -Eq 'release manifest.*(missing planned platform|checksum)|must not be a placeholder|64 lowercase hexadecimal' "$TMP/publish-guard.log"; then
+if ! grep -Eq 'must not be a placeholder|64 lowercase hexadecimal' "$TMP/publish-guard.log"; then
     echo "[npm-smoke] publish guard failed without a recognized bounded manifest diagnostic" >&2
     cat "$TMP/publish-guard.log" >&2
     exit 1
