@@ -21,7 +21,9 @@ use std::time::Duration;
 use super::tool_result::ToolResult;
 use super::{agent_project_runtime_id, ToolRuntime};
 use crate::auth::AuthContext;
-use crate::shell_protocol::ShellAgentProjectSummary;
+use crate::shell_protocol::{
+    ShellAgentProjectSummary, SHELL_CLIENT_CAPABILITY_PROJECT_PATH_REGISTRATION,
+};
 
 /// Maximum time the runtime waits for an agent project-op response. Project
 /// operations are fast (write a small TOML, maybe create a directory + git
@@ -214,6 +216,31 @@ impl ToolRuntime {
                     "state_changed": false,
                 }),
             );
+        }
+        if let Some(client) = self
+            .shell_clients
+            .get_client_view_for_auth(&client_id, auth)
+            .await
+        {
+            if let Err(error) = self
+                .shell_clients
+                .assert_client_access(auth, &client_id)
+                .await
+            {
+                return ToolResult::err(error);
+            }
+            if !client.capabilities.project_path_registration {
+                return ToolResult::err_with_output(
+                    "agent_capability_unavailable: the selected Runner does not support project path registration; upgrade the Runner or use an existing registered project id",
+                    json!({
+                        "error_kind": "agent_capability_unavailable",
+                        "failure_kind": "capability_unavailable",
+                        "reason_code": "project_path_registration_requires_newer_runner",
+                        "capability": SHELL_CLIENT_CAPABILITY_PROJECT_PATH_REGISTRATION,
+                        "state_changed": false,
+                    }),
+                );
+            }
         }
         self.submit_project_op(
             "resolve_or_register_project",

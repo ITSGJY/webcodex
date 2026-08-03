@@ -9,7 +9,9 @@
 use super::reconnect::dispatch_start_coding_task_in_window;
 use super::support::*;
 use crate::lsp_bridge::{AgentLspRequest, AgentLspResultEnvelope, AGENT_LSP_REQUEST_KIND};
-use crate::shell_protocol::ShellClientCapabilities;
+use crate::shell_protocol::{
+    AgentBuildInfo, ShellAgentProjectSummary, ShellClientCapabilities, ShellClientRegisterRequest,
+};
 use crate::tool_runtime::permissions::{AuthorityMode, PermissionEvaluator};
 use crate::tool_runtime::sessions::{SessionEvent, SessionGuards};
 use crate::tool_runtime::{
@@ -40,6 +42,35 @@ fn path_work_on_project_call(
         instruction: instruction.to_string(),
         session_id: session_id.map(str::to_string),
     }
+}
+
+async fn register_legacy_031_runner(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    capabilities: ShellClientCapabilities,
+    projects: Vec<ShellAgentProjectSummary>,
+) {
+    runtime
+        .shell_clients
+        .register(ShellClientRegisterRequest {
+            process_started_at: None,
+            build: Some(AgentBuildInfo {
+                version: Some("0.3.1".to_string()),
+                git_commit: None,
+            }),
+            job_inventory: None,
+            client_id: client_id.to_string(),
+            agent_instance_id: "inst".to_string(),
+            display_name: Some("legacy v0.3.1 runner".to_string()),
+            owner: None,
+            hostname: None,
+            capabilities: Some(capabilities),
+            projects: Some(projects),
+            agent_protocol_version: Some("polling-v1".to_string()),
+            policy: None,
+        })
+        .await
+        .unwrap();
 }
 
 fn start_coding_task_call(project: &str, instruction: &str, detail: StartupDetail) -> ToolCall {
@@ -611,6 +642,130 @@ async fn work_on_project_creates_a_new_normal_session_without_binding() {
 }
 
 #[tokio::test]
+async fn legacy_031_runner_existing_project_remains_functional() {
+    let root = tempfile::tempdir().unwrap();
+    init_git_repo(root.path());
+    std::fs::write(root.path().join("hello.txt"), "hello\n").unwrap();
+    let project_path = root.path().canonicalize().unwrap();
+    let project_path = project_path.to_string_lossy().to_string();
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "wop-legacy-031-existing";
+    register_legacy_031_runner(
+        &runtime,
+        client_id,
+        ShellClientCapabilities {
+            shell: true,
+            git: true,
+            file_read: true,
+            file_write: true,
+            project_path_registration: false,
+            ..Default::default()
+        },
+        vec![registered_project("existing", &project_path)],
+    )
+    .await;
+    let project = crate::tool_runtime::agent_project_runtime_id(client_id, "existing");
+    let auth = auth_context(None, true);
+
+    let (result, request_kinds) = dispatch_recording_startup_requests(
+        &runtime,
+        client_id,
+        work_on_project_call(&project, "use the existing project", None),
+        Some(&auth),
+        "legacy-031-existing-window",
+    )
+    .await;
+
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["resolved_project"], project);
+    assert!(
+        request_kinds.iter().any(|kind| kind == "file_read"),
+        "existing-project rules read did not reach the legacy Runner: {request_kinds:?}"
+    );
+    assert!(
+        request_kinds.iter().any(|kind| kind == "run_shell"),
+        "existing-project Git inspection did not reach the legacy Runner: {request_kinds:?}"
+    );
+    assert!(
+        request_kinds
+            .iter()
+            .all(|kind| kind != "resolve_or_register_project"),
+        "existing project unexpectedly used path registration: {request_kinds:?}"
+    );
+    assert_eq!(
+        runtime
+            .sessions
+            .active_session_count_for_test(Some(&project)),
+        1
+    );
+}
+
+#[tokio::test]
+async fn legacy_031_runner_path_source_fails_before_queue_or_session_state() {
+    let root = tempfile::tempdir().unwrap();
+    let project_path = root.path().canonicalize().unwrap();
+    let project_path = project_path.to_string_lossy().to_string();
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "wop-legacy-031-path";
+    register_legacy_031_runner(
+        &runtime,
+        client_id,
+        ShellClientCapabilities {
+            shell: true,
+            git: true,
+            file_read: true,
+            file_write: true,
+            project_path_registration: false,
+            ..Default::default()
+        },
+        Vec::new(),
+    )
+    .await;
+    let auth = auth_context(None, true);
+    let sessions_before = runtime.sessions.active_session_count_for_test(None);
+    let projects_before = runtime.list_projects(Some(&auth)).await.output["count"].clone();
+
+    let result = runtime
+        .dispatch_with_auth(
+            path_work_on_project_call(client_id, &project_path, "must fail closed", None),
+            Some(&auth),
+        )
+        .await;
+
+    assert!(!result.success);
+    assert_eq!(
+        result.error.as_deref(),
+        Some(
+            "agent_capability_unavailable: the selected Runner does not support project path registration; upgrade the Runner or use an existing registered project id"
+        )
+    );
+    assert_eq!(result.output["error_kind"], "agent_capability_unavailable");
+    assert_eq!(result.output["failure_kind"], "capability_unavailable");
+    assert_eq!(
+        result.output["reason_code"],
+        "project_path_registration_requires_newer_runner"
+    );
+    assert_eq!(result.output["capability"], "project_path_registration");
+    assert_eq!(result.output["state_changed"], false);
+    assert_eq!(result.output["permission"]["status"], "auto_approved");
+    assert_eq!(result.output["permission"]["tool_name"], "register_project");
+    assert!(
+        next_patch_agent_request(&runtime, client_id)
+            .await
+            .is_none(),
+        "legacy Runner received a path-registration request"
+    );
+    assert_eq!(
+        runtime.sessions.active_session_count_for_test(None),
+        sessions_before
+    );
+    assert_eq!(
+        runtime.list_projects(Some(&auth)).await.output["count"],
+        projects_before
+    );
+}
+
+#[tokio::test]
 async fn path_source_auto_registers_reuses_and_supports_both_coding_entries() {
     let root = tempfile::tempdir().unwrap();
     init_git_repo(root.path());
@@ -628,6 +783,7 @@ async fn path_source_auto_registers_reuses_and_supports_both_coding_entries() {
             git: true,
             file_read: true,
             file_write: true,
+            project_path_registration: true,
             ..Default::default()
         },
         Vec::new(),
@@ -778,6 +934,7 @@ async fn path_source_registers_before_exact_session_mismatch_and_never_falls_bac
             git: true,
             file_read: true,
             file_write: true,
+            project_path_registration: true,
             ..Default::default()
         },
         Vec::new(),
@@ -879,6 +1036,7 @@ async fn path_source_registers_before_unknown_session_rejection() {
             git: true,
             file_read: true,
             file_write: true,
+            project_path_registration: true,
             ..Default::default()
         },
         Vec::new(),

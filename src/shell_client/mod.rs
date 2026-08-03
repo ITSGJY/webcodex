@@ -6,7 +6,7 @@ use crate::shell_protocol::{
     ShellClientCapabilities, ShellClientRegisterRequest, ShellClientView, ShellJobCodexMetadata,
     ToolProvidersStatus, SHELL_CLIENT_CAPABILITY_ASYNC_SHELL_JOBS,
     SHELL_CLIENT_CAPABILITY_FILE_READ, SHELL_CLIENT_CAPABILITY_GIT, SHELL_CLIENT_CAPABILITY_NAMES,
-    SHELL_CLIENT_CAPABILITY_SHELL,
+    SHELL_CLIENT_CAPABILITY_PROJECT_PATH_REGISTRATION, SHELL_CLIENT_CAPABILITY_SHELL,
 };
 use crate::shell_protocol::{
     ShellClientJobLogRequest, ShellClientJobLogResponse, ShellClientJobStatusRequest,

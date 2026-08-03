@@ -3127,6 +3127,7 @@ async fn read_only_commands_run_is_denied_even_when_agent_advertises_sandbox() {
                     shell: true,
                     sandbox_inspect_commands: true,
                     project_lifecycle: false,
+                    project_path_registration: false,
                     ..Default::default()
                 }),
                 projects: Some(vec![project_summary(
@@ -3188,6 +3189,7 @@ async fn enable_inspect_sandbox(fixture: &Fixture) {
                     structured_validation_argv: true,
                     sandbox_inspect_commands: true,
                     project_lifecycle: false,
+                    project_path_registration: false,
                     ..Default::default()
                 }),
                 projects: Some(vec![project_summary(

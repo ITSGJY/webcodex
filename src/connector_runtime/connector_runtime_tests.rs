@@ -43,6 +43,7 @@ async fn register_agent(registry: &ShellClientRegistry, project_id: &str, path: 
                     lsp_read_only_navigation: false,
                     sandbox_inspect_commands: false,
                     project_lifecycle: false,
+                    project_path_registration: false,
                     job_state_reconciliation: false,
                 }),
                 projects: Some(vec![ShellAgentProjectSummary {

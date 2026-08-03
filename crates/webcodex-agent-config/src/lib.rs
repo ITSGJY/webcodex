@@ -210,6 +210,7 @@ pub fn generated_agent_config_toml(opts: &AgentInitOptions) -> Result<String, St
             lsp_read_only_navigation: true,
             sandbox_inspect_commands: false,
             project_lifecycle: false,
+            project_path_registration: false,
             job_state_reconciliation: false,
         },
         policy: GeneratedAgentPolicy {

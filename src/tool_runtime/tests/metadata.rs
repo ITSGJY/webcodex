@@ -119,6 +119,7 @@ async fn register_agent_projects_for_auth(
                     lsp_read_only_navigation: false,
                     sandbox_inspect_commands: false,
                     project_lifecycle: false,
+                    project_path_registration: false,
                     job_state_reconciliation: false,
                 }),
                 projects: Some(vec![registered_project(
@@ -565,6 +566,41 @@ async fn list_projects_shell_profile_status_unknown_without_summary() {
     let projects = result.output["projects"].as_array().unwrap();
     assert_eq!(projects[0]["resolved_shell_profile"], "rust");
     assert_eq!(projects[0]["shell_profile_status"], "unknown");
+}
+
+#[tokio::test]
+async fn project_path_registration_capability_is_projected_safely() {
+    let runtime = test_runtime();
+    let private_path = "/srv/private/project-path-registration";
+    register_agent_with_projects(
+        &runtime,
+        "path-capable-agent",
+        None,
+        ShellClientCapabilities {
+            project_path_registration: true,
+            ..Default::default()
+        },
+        vec![registered_project("private-project", private_path)],
+    )
+    .await;
+
+    let listed = runtime.dispatch(ToolCall::ListAgents).await;
+    assert!(listed.success, "{:?}", listed.error);
+    assert_eq!(
+        listed.output["agents"][0]["capabilities"]["project_path_registration"],
+        true
+    );
+
+    let status = runtime.dispatch(runtime_status_call()).await;
+    assert!(status.success, "{:?}", status.error);
+    assert_eq!(
+        status.output["agents"]["clients"][0]["capabilities"]["project_path_registration"],
+        true
+    );
+    assert!(
+        !status.output.to_string().contains(private_path),
+        "runtime_status leaked a registered project path"
+    );
 }
 
 #[tokio::test]

@@ -5215,6 +5215,7 @@ fn register_request_announces_correct_protocol_version() {
     cfg.capabilities = Some(ShellClientCapabilities {
         sandbox_inspect_commands: true,
         project_lifecycle: false,
+        project_path_registration: false,
         ..Default::default()
     });
     for (version, expected_str) in [
@@ -5247,6 +5248,8 @@ fn register_request_announces_correct_protocol_version() {
     assert!(caps.async_shell_jobs);
     assert!(caps.structured_validation_argv);
     assert!(caps.lsp_read_only_navigation);
+    assert!(caps.project_lifecycle);
+    assert!(caps.project_path_registration);
     assert_eq!(
         caps.sandbox_inspect_commands,
         crate::command_sandbox::inspect_sandbox_available().is_ok()

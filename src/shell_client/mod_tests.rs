@@ -1441,6 +1441,7 @@ async fn client_supports_reflects_registered_capabilities() {
     caps.shell = true;
     caps.file_read = true;
     caps.async_shell_jobs = true;
+    caps.project_path_registration = true;
     registry
         .register(ShellClientRegisterRequest {
             process_started_at: None,
@@ -1468,6 +1469,10 @@ async fn client_supports_reflects_registered_capabilities() {
         .unwrap());
     assert!(registry
         .client_supports("oe", SHELL_CLIENT_CAPABILITY_ASYNC_SHELL_JOBS)
+        .await
+        .unwrap());
+    assert!(registry
+        .client_supports("oe", SHELL_CLIENT_CAPABILITY_PROJECT_PATH_REGISTRATION)
         .await
         .unwrap());
     assert!(!registry
@@ -1527,6 +1532,7 @@ async fn client_supports_recognizes_all_protocol_capability_names() {
                 lsp_read_only_navigation: true,
                 sandbox_inspect_commands: true,
                 project_lifecycle: true,
+                project_path_registration: true,
                 job_state_reconciliation: true,
             }),
             projects: None,

@@ -192,6 +192,21 @@ agent:<client_id>:<project_id>
 
 The server routes project tool calls to the owning connected agent.
 
+### Path registration capability
+
+Current Runners advertise the serde-defaulted `project_path_registration`
+capability because their binary implements the internal
+`resolve_or_register_project` operation. A Runner configuration cannot enable
+or suppress this implementation capability. Runners from v0.3.1 and earlier
+omit the field, so a new Server treats it as `false`.
+
+An older Runner remains fully usable through its existing registered project
+ids. Only coding startup that supplies `client_id + path` requires this
+capability. The Server validates the path and preserves authorization error
+ordering, then returns `agent_capability_unavailable` before enqueueing a
+Runner request or creating a Workflow Session. It never falls back to using an
+unregistered path or guessing a project id.
+
 ## Session SSH resources
 
 Runners that can invoke local OpenSSH advertise the `ssh_shell` capability.

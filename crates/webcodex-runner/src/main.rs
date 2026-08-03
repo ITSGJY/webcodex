@@ -1211,6 +1211,9 @@ fn agent_register_capabilities(cfg: &AgentConfig) -> ShellClientCapabilities {
     capabilities.ssh_persistent_shell = SshConnectionPool::is_available() && cfg!(unix);
     capabilities.structured_validation_argv = true;
     capabilities.project_lifecycle = true;
+    // This binary implements resolve_or_register_project; do not trust config to
+    // advertise a capability that the binary does not implement.
+    capabilities.project_path_registration = true;
     // `job_state_reconciliation` is on by default. A hidden, test/ops-only env
     // knob lets an E2E simulate a legacy runner that predates the capability
     // (it then has no job inventory and a disconnect falls straight to `lost`).

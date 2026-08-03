@@ -380,6 +380,7 @@ mod tests {
                     lsp_read_only_navigation: false,
                     sandbox_inspect_commands: false,
                     project_lifecycle: false,
+                    project_path_registration: false,
                     job_state_reconciliation: false,
                 }),
                 projects: None,

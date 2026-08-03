@@ -122,6 +122,10 @@ pub const SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION: &str = "lsp_read_onl
 /// Linux Landlock ABI v3 inspect-command write sandbox.
 pub const SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS: &str = "sandbox_inspect_commands";
 pub const SHELL_CLIENT_CAPABILITY_PROJECT_LIFECYCLE: &str = "project_lifecycle";
+/// Resolve an absolute canonical project path to an existing registration or
+/// atomically persist a new projects.d entry. Missing on older runners and
+/// therefore fails closed.
+pub const SHELL_CLIENT_CAPABILITY_PROJECT_PATH_REGISTRATION: &str = "project_path_registration";
 /// Same-process async job recovery across server restarts and transport
 /// reconnects. Missing on older runners and therefore defaults to `false`.
 pub const SHELL_CLIENT_CAPABILITY_JOB_STATE_RECONCILIATION: &str = "job_state_reconciliation";
@@ -140,6 +144,7 @@ pub const SHELL_CLIENT_CAPABILITY_NAMES: &[&str] = &[
     SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
     SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS,
     SHELL_CLIENT_CAPABILITY_PROJECT_LIFECYCLE,
+    SHELL_CLIENT_CAPABILITY_PROJECT_PATH_REGISTRATION,
     SHELL_CLIENT_CAPABILITY_JOB_STATE_RECONCILIATION,
 ];
 
@@ -206,6 +211,11 @@ pub struct ShellClientCapabilities {
     /// runners and therefore fail-closed.
     #[serde(default)]
     pub project_lifecycle: bool,
+    /// The Runner can resolve an absolute canonical project path or
+    /// atomically register it. Missing on older runners and therefore
+    /// fail-closed.
+    #[serde(default)]
+    pub project_path_registration: bool,
     /// The runner retains bounded active and recent terminal job snapshots and
     /// submits a complete active inventory at register/re-register time.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -253,6 +263,7 @@ impl Default for ShellClientCapabilities {
             lsp_read_only_navigation: false,
             sandbox_inspect_commands: false,
             project_lifecycle: false,
+            project_path_registration: false,
             job_state_reconciliation: false,
         }
     }
@@ -1757,6 +1768,7 @@ mod envelope_tests {
                 lsp_read_only_navigation: false,
                 sandbox_inspect_commands: false,
                 project_lifecycle: false,
+                project_path_registration: false,
                 job_state_reconciliation: false,
             }),
             projects: None,
@@ -1826,7 +1838,16 @@ mod envelope_tests {
         // a legacy/older runner that omits the field fails closed.
         assert!(!capabilities.ssh_shell);
         assert!(!capabilities.ssh_persistent_shell);
+        assert!(!capabilities.project_path_registration);
         assert!(!ShellClientCapabilities::default().ssh_persistent_shell);
+        assert!(!ShellClientCapabilities::default().project_path_registration);
+    }
+
+    #[test]
+    fn project_path_registration_capability_deserializes_when_present() {
+        let capabilities: ShellClientCapabilities =
+            serde_json::from_str(r#"{"project_path_registration":true}"#).unwrap();
+        assert!(capabilities.project_path_registration);
     }
 
     fn reconciliation_inventory() -> ShellJobInventory {
