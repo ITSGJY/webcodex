@@ -11,16 +11,16 @@
 
 ```bash
 npm install -g @yyjeqhc/webcodex
-
-webcodex connect https://sg4.yyjeqhc.cn \
-  --key '<不以 wc_ 开头的随机 key>' \
-  --project .
+cd /path/to/your/repository
+webcodex connect https://sg4.yyjeqhc.cn
 ```
 
-MCP URL 使用 `https://sg4.yyjeqhc.cn/mcp`，Bearer token 使用完全相同的 key。
-省略 `--key` 时，`connect` 会生成强随机 key，并且只完整显示一次。这条路径不需要
-本地 Server、数据库、反向代理、systemd unit 或 sudo。Runner 配置沿用现有
-WebCodex client profile 配置目录；后台 PID state 与日志存放在用户 state 目录。
+当前目录就是默认项目。`connect` 会自动生成强随机 key，并且只完整显示一次；随后
+写入 owner-only profile、启动 detached Runner，并等待 Server 确实能看到 Runner
+与项目。MCP client 使用命令输出的 `https://sg4.yyjeqhc.cn/mcp` URL 和 key。这条
+路径不需要本地 Server、数据库、反向代理、systemd unit 或 sudo。输出会给出
+profile、配置路径和日志路径。机器重启后，重新执行同一条 `connect`，或运行
+`webcodex agent start --profile <profile>`。
 
 ## 构建 binaries
 
@@ -69,7 +69,7 @@ binary、npm 命令、systemd unit 与 QUIC ALPN（`webcodex-runner/1`）统一�
 npm install -g @yyjeqhc/webcodex
 ```
 
-v0.3.0 npm wrapper 只按 `linux-x64` 准备。除非在发布前补齐匹配 artifacts，否则 v0.3.0 不包含 `linux-arm64`、`darwin-arm64`、`darwin-x64`、Windows 和其他 targets。不要在 v0.3.0 GitHub Release artifact 已存在、且 `npm/webcodex/manifest.json` 写入该次实际上传 tarball 的 SHA-256 checksum 之前发布 npm package。
+v0.3.1 npm wrapper 按 `linux-x64` 和 `darwin-arm64` 准备。除非在发布前补齐匹配 artifacts，否则不包含 `linux-arm64`、`darwin-x64`、Windows 和其他 targets。两个 v0.3.1 GitHub Release artifacts 都存在，并且 `npm/webcodex/manifest.json` 写入每个实际上传 tarball 的 SHA-256 checksum 后，才能发布 npm package。
 
 npm package 是 native release artifacts 的 thin wrapper。安装时会下载匹配的 GitHub Release artifact，并使用 manifest 中的 SHA-256 checksum 验证。发布前先运行本地 package smoke；它不会发布：
 

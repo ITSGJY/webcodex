@@ -1741,12 +1741,36 @@ fn command_wrapper(command: &str, token: &str, printf: &str, pwd: &str) -> Strin
     format!("\\eval {}\n", shell_quote(&framed))
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn set_close_on_exec(fd: RawFd) -> std::io::Result<()> {
+    // `pipe2(O_CLOEXEC)` is unavailable on Darwin. Preserve any existing
+    // descriptor flags and add FD_CLOEXEC immediately after creating the pipe.
+    // SAFETY: `fd` is owned by a live `File` for the duration of both calls.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn create_control_pipe() -> Result<(File, File), ShellError> {
-    let mut fds = [0_i32; 2];
+    let mut fds = [-1_i32; 2];
+    // Linux and Android can set close-on-exec atomically. Darwin and other Unix
+    // targets use `pipe` followed immediately by `fcntl(FD_CLOEXEC)` because
+    // their libc does not expose `pipe2`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     // SAFETY: `fds` points to two valid integers and `pipe2` initializes both
-    // on success. `O_CLOEXEC` keeps the parent reader out of unrelated execs;
-    // pre_exec duplicates only the writer to the fixed control fd.
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == -1 {
+    // on success.
+    let pipe_result = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    // SAFETY: `fds` points to two valid integers and `pipe` initializes both on
+    // success.
+    let pipe_result = unsafe { libc::pipe(fds.as_mut_ptr()) };
+
+    if pipe_result == -1 {
         return Err(ShellError::new(
             "persistent_shell_spawn_failed",
             format!(
@@ -1755,9 +1779,23 @@ fn create_control_pipe() -> Result<(File, File), ShellError> {
             ),
         ));
     }
-    // SAFETY: both descriptors were created by the successful `pipe2` above
+    // SAFETY: both descriptors were created by the successful pipe call above
     // and ownership is transferred exactly once to these `File` values.
-    Ok(unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) })
+    let reader = unsafe { File::from_raw_fd(fds[0]) };
+    // SAFETY: same ownership argument as for `reader`.
+    let writer = unsafe { File::from_raw_fd(fds[1]) };
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    for fd in [reader.as_raw_fd(), writer.as_raw_fd()] {
+        set_close_on_exec(fd).map_err(|error| {
+            ShellError::new(
+                "persistent_shell_spawn_failed",
+                format!("failed to secure persistent shell control pipe: {error}"),
+            )
+        })?;
+    }
+
+    Ok((reader, writer))
 }
 
 fn spawn_shell_process(launch: &ShellLaunch) -> Result<ShellProcess, ShellError> {
@@ -2248,6 +2286,17 @@ mod tests {
                 Duration::from_secs(3),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn control_pipe_descriptors_are_close_on_exec() {
+        let (reader, writer) = create_control_pipe().unwrap();
+        for fd in [reader.as_raw_fd(), writer.as_raw_fd()] {
+            // SAFETY: each fd remains owned by its `File` during this query.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert_ne!(flags, -1, "failed to inspect descriptor flags");
+            assert_ne!(flags & libc::FD_CLOEXEC, 0, "FD_CLOEXEC was not set");
+        }
     }
 
     #[test]

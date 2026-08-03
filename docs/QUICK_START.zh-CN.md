@@ -13,7 +13,7 @@ reference 或内部 config path。
 - `PATH` 中有 Git；
 - 一个可以安全查看和修改的 Git 项目。
 
-安装 Linux x64 package：
+安装 Linux x64 或 macOS arm64 package：
 
 ```bash
 npm install -g @yyjeqhc/webcodex

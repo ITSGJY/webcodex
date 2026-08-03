@@ -13,7 +13,7 @@ workflow session, executor reference, or internal config path.
 - Git available on `PATH`.
 - A Git project you can safely inspect and edit.
 
-Install the packaged Linux x64 build:
+Install the packaged Linux x64 or macOS arm64 build:
 
 ```bash
 npm install -g @yyjeqhc/webcodex

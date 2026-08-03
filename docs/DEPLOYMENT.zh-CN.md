@@ -105,7 +105,7 @@ token、`userinfo_endpoint`、`client_credentials` grant、device code 流程，
 npm install -g @yyjeqhc/webcodex
 ```
 
-v0.3.0 npm wrapper 只按 `linux-x64` 准备。除非在发布前补齐匹配 artifacts，否则 v0.3.0 不包含 `linux-arm64`、`darwin-arm64`、`darwin-x64`、Windows 和其他目标平台。不要在 v0.3.0 GitHub Release artifact 已存在、且 `npm/webcodex/manifest.json` 写入该次实际上传 tarball 的 SHA-256 checksum 之前发布 npm package。先用 `bash scripts/npm_package_smoke.sh` 校验本地 package 路径。
+v0.3.1 npm wrapper 按 `linux-x64` 和 `darwin-arm64` 准备。除非在发布前补齐匹配 artifacts，否则不包含 `linux-arm64`、`darwin-x64`、Windows 和其他目标平台。两个 v0.3.1 GitHub Release artifacts 都存在，并且 `npm/webcodex/manifest.json` 写入每个实际上传 tarball 的 SHA-256 checksum 后，才能发布 npm package。先用 `bash scripts/npm_package_smoke.sh` 校验本地 package 路径。
 
 初始化 env 文件：
 

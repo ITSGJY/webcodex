@@ -23,22 +23,21 @@ Hosted 路径不要部署 WebCodex Server。
 
 ```bash
 npm install -g @yyjeqhc/webcodex
-
-webcodex connect https://sg4.yyjeqhc.cn \
-  --key '<user-chosen-key>' \
-  --project .
+cd /path/to/your/repository
+webcodex connect https://sg4.yyjeqhc.cn
 ```
 
-然后配置 MCP client：
+当前目录就是默认项目。除非用户显式提供 `--key-file` 或 `--key`，命令会自动生成
+shared key。完整链路检查通过后，按输出配置 MCP client：
 
 ```text
 MCP URL: https://sg4.yyjeqhc.cn/mcp
 Authentication: Bearer token
-Bearer token: 完全相同的 key
+Bearer token: 命令生成的 MCP key
 ```
 
-去掉两端 key 首尾空白后，MCP 和 Runner 必须完全相同。请使用不以 `wc_` 开头的
-随机值，不要提交进 Git。
+去掉两端 key 首尾空白后，MCP 和 Runner 必须完全相同。不要把 key 或生成的
+`agent.toml` 提交进 Git。
 
 `connect` 会完成整条本地链路：
 
@@ -64,17 +63,20 @@ managed `wc_agent_*` Agent Token；所有 Runner 注册都有 64 个项目的输
 
 ## 自动 key
 
-用户可以省略 key：
+默认命令不需要 key 或 project 参数：
 
 ```bash
-webcodex connect https://sg4.yyjeqhc.cn --project .
+webcodex connect https://sg4.yyjeqhc.cn
 ```
 
 命令会生成 URL-safe 的 `wck_...` key，随机性超过 256 bits。完整 key 只在首次创建
-时显示，并安全写入本地 profile。提醒用户立即复制到 MCP client。重复连接会找到
-匹配的本地 profile，不再完整打印 key。
+时显示，并安全写入本地 profile；应立即复制到 MCP client。重复连接会找到匹配的
+本地 profile，不再完整打印 key。输出会给出 owner-only `agent.toml` 路径，便于用户
+显式进行本地恢复；status 与日志命令不会泄露 key。
 
-`wck_` 刻意不同于 managed credential 保留前缀 `wc_`。
+Detached Runner 在关闭终端后继续运行，但机器重启会终止它。重启后重新运行同一条
+`connect`，或执行 `webcodex agent start --profile <profile>`。`wck_` 刻意不同于
+managed credential 保留前缀 `wc_`。
 
 ## 正式 Managed flow
 
@@ -136,6 +138,8 @@ Hosted Runner 在该 profile state 目录写入 `runner.log`，运行期间约�
 
 ```bash
 webcodex agent status --profile <profile>
+webcodex agent start --profile <profile>
+webcodex agent restart --profile <profile>
 webcodex agent logs --profile <profile> --lines 100
 webcodex agent stop --profile <profile>
 ```

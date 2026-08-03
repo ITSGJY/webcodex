@@ -52,7 +52,7 @@ node - "$TMP/pack-dry-run.json" <<'NODE'
 const fs = require('fs');
 const report = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'))[0];
 const files = report.files.map((entry) => entry.path);
-for (const required of ['bin/webcodex.js', 'bin/wrapper.js', 'install.js', 'manifest.json', 'package.json']) {
+for (const required of ['README.md', 'bin/webcodex.js', 'bin/wrapper.js', 'install.js', 'manifest.json', 'package.json']) {
   if (!files.includes(required)) throw new Error(`npm pack missing ${required}`);
 }
 for (const forbidden of ['bin/webcodex-cli.js', 'bin/webcodex-runner.js', 'vendor/bin/webcodex-cli']) {

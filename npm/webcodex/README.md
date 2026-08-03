@@ -1,49 +1,98 @@
 # @yyjeqhc/webcodex
 
-Thin npm installer and public command wrapper for WebCodex.
+[English](#english) | [简体中文](#简体中文)
+
+## English
+
+WebCodex lets ChatGPT, Claude, and other MCP clients work on private repositories through a local Runner while source files and command execution stay on the machine that owns the code.
+
+### Install and connect
+
+Supported in v0.3.1: Linux x64 and macOS arm64. Node.js 18 or newer is required for the installer wrapper.
 
 ```bash
 npm install -g @yyjeqhc/webcodex
-webcodex --help
+cd /path/to/your/repository
+webcodex connect https://sg4.yyjeqhc.cn
 ```
 
-The npm package exposes one command only: `webcodex`. The wrapper launches the package-local native `webcodex` executable with inherited standard streams, unchanged arguments, exit status, and terminal signals.
+`connect` uses the current directory by default, generates a strong shared key, writes an owner-only profile, starts a detached background Runner, and waits until the hosted Server can see the Runner and project. Copy the generated key immediately into the MCP client; it is printed in full only when first created. The output also gives the profile, config path, and log path.
 
-During installation, `install.js` installs one atomic runtime set into `vendor/bin`:
+The Runner survives terminal closure but not a machine reboot. After reboot, rerun the same `connect` command or use:
 
-- `webcodex`
-- `webcodex-server`
-- `webcodex-runner`
+```bash
+webcodex agent start --profile <profile>
+```
 
-`webcodex-server` and `webcodex-runner` are intentionally not npm `bin` entries. The public `webcodex` command finds those internal executables beside itself when `webcodex server run` or `webcodex agent run` is used. No `webcodex-cli` executable, wrapper, or symlink is installed.
+Advanced users can provide `--key-file`, `--key`, or `--project`. Keep shared keys and generated `agent.toml` files out of Git.
 
-## Artifact and integrity model
+### Package layout and integrity
 
-The installer recognizes `linux-x64`, `linux-arm64`, `darwin-x64`, `darwin-arm64`, and `win32-x64`. The artifacts actually declared in a manifest are that release's platform coverage; recognized platforms are not implicitly required to be published. Each declared artifact contains all three executables from one build. The installer downloads to a temporary file, verifies SHA-256, extracts to a staging directory, checks all three regular files, sets Unix execute permissions, runs bounded `--version` checks, verifies one shared build identity, and atomically replaces the prior `vendor/bin` directory. A failed download, checksum, extraction, or validation leaves the previous complete installation intact.
+The npm package exposes one public command: `webcodex`. During installation it downloads one platform artifact containing `webcodex`, `webcodex-server`, and `webcodex-runner`, verifies the manifest SHA-256, validates that all three binaries share one version/build identity, and atomically replaces the prior `vendor/bin` set. A failed download, checksum, extraction, or validation leaves the previous complete installation intact.
 
-Current v0.3.0 release coverage is `linux-x64`. Other recognized platform keys fail clearly as unavailable unless the manifest declares a matching artifact. Release operators build all three binaries together and create an artifact with:
+`webcodex-server` and `webcodex-runner` are intentionally not npm `bin` entries. The public command discovers those package-local executables for `webcodex server run` and `webcodex agent run`.
+
+Release operators build and package one platform at a time:
 
 ```bash
 cargo build --release -p webcodex-cli --bin webcodex -p webcodex --bin webcodex-server -p webcodex-runner --bin webcodex-runner
 bash scripts/package_release_artifact.sh
 ```
 
-Do not publish npm until the checksum in `manifest.json` matches the immutable uploaded artifact.
+Do not publish npm until every artifact declared in `manifest.json` has been uploaded immutably and its exact SHA-256 has replaced the placeholder.
 
-## Development switches
+### Disclaimer
 
-- `WEBCODEX_SKIP_DOWNLOAD=1` skips installation.
-- `WEBCODEX_BINARY_DIR=/path/to/bin` atomically copies a local three-binary build.
-- `WEBCODEX_MANIFEST=/path/to/manifest.json` or a file/HTTP URL selects another manifest.
+WebCodex is provided only for research and learning. It can read and modify files and execute commands inside configured project boundaries. Use version control and backups. The author is not responsible for filesystem damage, data loss, or other consequences arising from use of the software.
 
-## Local verification
+## 简体中文
+
+WebCodex 让 ChatGPT、Claude 和其他 MCP client 通过本地 Runner 操作私有仓库；源码、文件修改和命令执行仍留在持有代码的机器上。
+
+### 安装与接入
+
+v0.3.1 支持 Linux x64 和 macOS arm64。npm installer wrapper 需要 Node.js 18 或更新版本。
+
+```bash
+npm install -g @yyjeqhc/webcodex
+cd /path/to/your/repository
+webcodex connect https://sg4.yyjeqhc.cn
+```
+
+`connect` 默认使用当前目录，自动生成强随机 shared key，写入 owner-only profile，启动 detached 后台 Runner，并等待托管 Server 确实能看到 Runner 与项目。生成的 key 只在首次创建时完整显示，请立即复制到 MCP client；输出也会给出 profile、配置路径和日志路径。
+
+关闭终端不会停止 Runner，但机器重启会终止它。重启后重新执行同一条 `connect`，或运行：
+
+```bash
+webcodex agent start --profile <profile>
+```
+
+高级用户可以使用 `--key-file`、`--key` 或 `--project`。不要把 shared key 或生成的 `agent.toml` 提交进 Git。
+
+### Package 与完整性
+
+npm package 只暴露一个公共命令：`webcodex`。安装时会下载包含 `webcodex`、`webcodex-server` 和 `webcodex-runner` 的平台 artifact，校验 manifest SHA-256，确认三个二进制具有相同版本和 build identity，再原子替换旧的 `vendor/bin`。下载、checksum、解压或校验失败时，旧的完整安装保持不变。
+
+`webcodex-server` 与 `webcodex-runner` 不作为 npm `bin` 暴露；公共 `webcodex` 命令会在执行 `webcodex server run` 或 `webcodex agent run` 时发现 package 内部的二进制。
+
+只有 `manifest.json` 中声明的每个平台 artifact 都已经不可变上传，并写入实际 SHA-256 后，才能发布 npm。
+
+### 免责声明
+
+WebCodex 仅用于研究与学习。它能够在配置的项目边界内读取、修改文件并执行命令；请使用版本控制和备份。若因使用本软件造成文件系统损坏、数据丢失或其他后果，作者概不负责。
+
+## Acknowledgements / 鸣谢
+
+Thanks to the [LINUX DO](https://linux.do/) community for its welcoming space for technical discussion and support for open-source sharing.
+
+感谢 [LINUX DO](https://linux.do/) 社区提供的交流氛围与开源推广支持。
+
+## Development verification / 开发验证
 
 ```bash
 npm --prefix npm/webcodex test
 bash scripts/npm_package_smoke.sh
 ```
-
-The smoke builds all three binaries, inspects `npm pack --dry-run`, creates and unpacks a local tarball, installs it into a temporary npm prefix, and verifies the public wrapper plus same-directory Server and Runner discovery. It does not publish.
 
 ## License
 

@@ -11,18 +11,17 @@ machine that owns the project and run one command:
 
 ```bash
 npm install -g @yyjeqhc/webcodex
-
-webcodex connect https://sg4.yyjeqhc.cn \
-  --key '<a-random-key-that-does-not-start-with-wc_>' \
-  --project .
+cd /path/to/your/repository
+webcodex connect https://sg4.yyjeqhc.cn
 ```
 
-Use `https://sg4.yyjeqhc.cn/mcp` as the MCP URL and the exact same key as its
-Bearer token. If `--key` is omitted, `connect` generates a strong key and
-prints it once. This path needs no local Server, database, reverse proxy,
-systemd unit, or sudo. The Runner configuration is stored under the existing
-WebCodex client-profile config directory; background PID state and logs use
-the user state directory.
+The current directory is the default project. `connect` generates a strong key,
+prints it once, writes an owner-only profile, starts a detached Runner, and
+waits until the Server can see both the Runner and project. Use the printed
+`https://sg4.yyjeqhc.cn/mcp` URL and key in the MCP client. This path needs no
+local Server, database, reverse proxy, systemd unit, or sudo. The output names
+the profile, configuration path, and log path. After a machine reboot, rerun
+the same `connect` command or use `webcodex agent start --profile <profile>`.
 
 ## Build binaries
 
@@ -70,7 +69,7 @@ The documented distribution path uses the npm thin installer/wrapper:
 ```bash
 npm install -g @yyjeqhc/webcodex
 ```
-The v0.3.0 npm wrapper is prepared for `linux-x64` only. `linux-arm64`, `darwin-arm64`, `darwin-x64`, Windows, and other targets are not included in v0.3.0 unless matching artifacts are added before release. Do not publish the npm package until the v0.3.0 GitHub Release artifact exists and `npm/webcodex/manifest.json` contains the SHA-256 checksum of that exact uploaded tarball.
+The v0.3.1 npm wrapper is prepared for `linux-x64` and `darwin-arm64`. `linux-arm64`, `darwin-x64`, Windows, and other targets are unavailable unless matching artifacts are added before release. Do not publish the npm package until both v0.3.1 GitHub Release artifacts exist and `npm/webcodex/manifest.json` contains the SHA-256 checksum of each exact uploaded tarball.
 
 The npm package is a thin wrapper around native release artifacts. During install it downloads the matching GitHub Release artifact and verifies the SHA-256 checksum from the manifest. Before publishing, run the local package smoke without publishing:
 

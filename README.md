@@ -6,6 +6,10 @@
 [![npm](https://img.shields.io/npm/v/%40yyjeqhc%2Fwebcodex)](https://www.npmjs.com/package/@yyjeqhc/webcodex)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
+[Latest release](https://github.com/yyjeqhc/webcodex/releases/latest) ·
+[0.3.1 release notes](docs/RELEASE_NOTES_v0.3.1.md) ·
+[Documentation](docs/INDEX.md)
+
 **Let ChatGPT or Claude work on your private code — and nothing lands until
 you review and accept it.** The AI edits and tests in an isolated workspace on
 your machine; you see the diff and click Accept. That review gate is the whole
@@ -57,7 +61,7 @@ on the machine that owns the repository.
 
 ## Install
 
-On supported Linux x64 systems:
+On supported Linux x64 and macOS arm64 systems:
 
 ```bash
 npm install -g @yyjeqhc/webcodex
@@ -79,29 +83,36 @@ on the machine that owns your code. You do not deploy a Server, database,
 HTTPS, reverse proxy, OAuth, or systemd service:
 
 ```bash
-webcodex connect https://sg4.yyjeqhc.cn \
-  --key '<a-random-key-that-does-not-start-with-wc_>' \
-  --project .
+cd /path/to/your/repository
+webcodex connect https://sg4.yyjeqhc.cn
 ```
 
-Then configure the MCP client with:
+The current directory is the default project. `connect` generates a strong
+`wck_...` shared key, creates or reuses a local profile and client ID,
+registers the project outside the checkout, starts one detached Runner, and
+waits until the same key can see both the Runner and project. It then prints
+the MCP URL, profile, safe config/log paths, and the generated key.
+
+Configure the MCP client with the values printed by the command:
 
 ```text
 MCP URL: https://sg4.yyjeqhc.cn/mcp
 Authentication: Bearer token
-Token: exactly the same key passed to webcodex connect
+Token: the generated MCP key
 ```
 
-Omit `--key` to have `connect` generate a strong key and print it once:
+Copy an automatically generated key immediately: it is printed in full only
+when first created. The owner-only `agent.toml` path is shown in the output,
+but status and log commands deliberately never reveal the key. Keep that file
+and key out of Git. Advanced users may supply `--key-file <path>` or `--key`,
+and `--project` is needed only when connecting a directory other than the
+current one.
 
-```bash
-webcodex connect https://sg4.yyjeqhc.cn --project .
-```
-
-`connect` creates or reuses a local profile and client ID, registers the
-project outside the checkout, starts one detached Runner, and waits until the
-same key can see both the Runner and project. Re-running the command reuses the
-profile and running process. Keep the key out of Git. See
+Closing the terminal does not stop the detached Runner, but a machine reboot
+does. After a reboot, either rerun the same `webcodex connect` command or run
+`webcodex agent start --profile <profile>` using the profile printed during
+setup. Re-running `connect` reuses the existing profile, identity, project
+record, and live Runner instead of creating duplicates. See
 [AI Onboarding](docs/AI_ONBOARDING.md) for the hosted/managed/self-hosted
 decision tree.
 
@@ -114,9 +125,9 @@ decision tree.
 | Need full infrastructure and identity-system control | Follow the self-hosting path in [DEPLOYMENT.md](docs/DEPLOYMENT.md). |
 | Keep everything loopback-only | Use the three local project commands below. |
 
-The packaged 0.3.0 path currently assumes Linux x64. Full self-hosting also
-assumes systemd, `sudo`, and an HTTPS domain or trusted tunnel; the hosted
-`connect` path does not.
+The packaged 0.3.1 path supports Linux x64 and macOS arm64. Full self-hosting
+on Linux still assumes systemd, `sudo`, and an HTTPS domain or trusted tunnel;
+the hosted `connect` path does not.
 
 ## One Project, One Entry
 
@@ -349,6 +360,19 @@ project entry above.
 - GPT Actions: [docs/GPT_ACTIONS.md](docs/GPT_ACTIONS.md)
 - Deployment: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
 - Roadmap: [docs/ROADMAP.zh-CN.md](docs/ROADMAP.zh-CN.md)
+
+## Disclaimer
+
+WebCodex is provided only for research and learning. It can read and modify
+files and execute commands within configured project boundaries. Use it only
+on repositories you are prepared to restore from version control or backups.
+The author is not responsible for filesystem damage, data loss, or other
+consequences arising from use of the software.
+
+## Acknowledgements
+
+Thanks to the [LINUX DO](https://linux.do/) community for its welcoming space
+for technical discussion and support for open-source sharing.
 
 ## License
 

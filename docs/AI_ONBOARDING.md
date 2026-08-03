@@ -25,23 +25,22 @@ Run on the machine that owns the repository:
 
 ```bash
 npm install -g @yyjeqhc/webcodex
-
-webcodex connect https://sg4.yyjeqhc.cn \
-  --key '<user-chosen-key>' \
-  --project .
+cd /path/to/your/repository
+webcodex connect https://sg4.yyjeqhc.cn
 ```
 
-Then configure the MCP client:
+The current directory is the default project. The command generates the shared
+key unless the user explicitly supplies `--key-file` or `--key`. Configure the
+MCP client from the values printed after the connection check succeeds:
 
 ```text
 MCP URL: https://sg4.yyjeqhc.cn/mcp
 Authentication: Bearer token
-Bearer token: exactly the same key
+Bearer token: the generated MCP key
 ```
 
 The key must be identical on the MCP and Runner sides after surrounding
-whitespace is trimmed. Use a random value that does not begin with `wc_`. Do
-not commit it to Git.
+whitespace is trimmed. Do not commit it or the generated `agent.toml` to Git.
 
 `connect` performs the complete local setup:
 
@@ -69,19 +68,23 @@ Do not pass `--key` and `--key-file` together.
 
 ## Automatic key
 
-The user may omit the key:
+The default command omits the key and project flags:
 
 ```bash
-webcodex connect https://sg4.yyjeqhc.cn --project .
+webcodex connect https://sg4.yyjeqhc.cn
 ```
 
-The command generates a `wck_...` URL-safe key with more than 256 bits of
-randomness. It stores the key in the protected profile and prints the complete
-value only when first created. Tell the user to copy it immediately into the
-MCP client. A repeat connection recovers the matching local profile and does
-not print the key again.
+It generates a `wck_...` URL-safe key with more than 256 bits of randomness,
+stores it in the protected profile, and prints the complete value only when
+first created. Tell the user to copy it immediately into the MCP client. A
+repeat connection recovers the matching local profile and does not print the
+key again. The output names the owner-only `agent.toml` path for explicit local
+recovery, while status and log commands never disclose the key.
 
-`wck_` is deliberately different from the reserved managed prefix `wc_`.
+The detached Runner survives terminal closure but not a machine reboot. After
+reboot, rerun the same `connect` command or use
+`webcodex agent start --profile <profile>`. `wck_` is deliberately different
+from the reserved managed prefix `wc_`.
 
 ## Managed flow
 
@@ -147,6 +150,8 @@ Useful commands:
 
 ```bash
 webcodex agent status --profile <profile>
+webcodex agent start --profile <profile>
+webcodex agent restart --profile <profile>
 webcodex agent logs --profile <profile> --lines 100
 webcodex agent stop --profile <profile>
 ```

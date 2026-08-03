@@ -6,6 +6,10 @@
 [![npm](https://img.shields.io/npm/v/%40yyjeqhc%2Fwebcodex)](https://www.npmjs.com/package/@yyjeqhc/webcodex)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
+[下载最新版本](https://github.com/yyjeqhc/webcodex/releases/latest) ·
+[0.3.1 发布说明](docs/RELEASE_NOTES_v0.3.1.zh-CN.md) ·
+[完整文档](docs/INDEX.zh-CN.md)
+
 **让网页版 ChatGPT / Claude 直接改你的私有代码——但没有你的审核，一行都落不了地。**
 AI 在你机器上的隔离工作区里编辑、跑测试、提交结果；你看 diff、点 Accept 才真正生效。
 这道人工审核闸门是整个产品的核心：那些让模型直接写盘的工具，架构上补不回这一层。
@@ -49,7 +53,7 @@ Git、修改和验证仍留在拥有仓库的机器上。
 
 ## 安装
 
-支持的 Linux x64 环境可以直接安装：
+支持的 Linux x64 和 macOS arm64 环境可以直接安装：
 
 ```bash
 npm install -g @yyjeqhc/webcodex
@@ -70,28 +74,32 @@ export PATH="$PWD/target/release:$PATH"
 无需部署 Server、数据库、HTTPS、反向代理、OAuth 或 systemd service：
 
 ```bash
-webcodex connect https://sg4.yyjeqhc.cn \
-  --key '<不以 wc_ 开头的随机 key>' \
-  --project .
+cd /path/to/your/repository
+webcodex connect https://sg4.yyjeqhc.cn
 ```
 
-然后在 MCP client 中配置：
+当前目录就是默认项目。`connect` 会自动生成强随机 `wck_...` shared key，创建或
+复用本地 profile 与 client ID，在 checkout 外注册项目，启动唯一的 detached
+Runner，并等待同一个 key 确实能看到 Runner 与项目。成功后会直接输出 MCP URL、
+profile、安全的配置/日志路径和生成的 key。
+
+按命令输出配置 MCP client：
 
 ```text
 MCP URL: https://sg4.yyjeqhc.cn/mcp
 Authentication: Bearer token
-Token: 与 webcodex connect 完全相同的 key
+Token: 命令生成的 MCP key
 ```
 
-省略 `--key` 时，`connect` 会生成强随机 key，并且只在首次创建时完整显示：
+自动生成的 key 只在首次创建时完整显示，请立即复制。输出会给出 owner-only
+`agent.toml` 路径，但 status 与日志命令刻意不会再次显示 key。不要把该文件或 key
+提交进 Git。高级用户可以使用 `--key-file <path>` 或 `--key`；只有接入非当前目录
+时才需要 `--project`。
 
-```bash
-webcodex connect https://sg4.yyjeqhc.cn --project .
-```
-
-`connect` 会创建或复用本地 profile 与 client ID，在 checkout 外注册项目，启动
-唯一的后台 Runner，并等待同一个 key 确实能看到 Runner 和项目。重复执行会复用
-profile 与现有进程。不要把 key 提交进 Git。Hosted、managed、自托管的选择见
+关闭终端不会停止 detached Runner，但机器重启会终止它。重启后可以重新执行同一条
+`webcodex connect`，也可以使用首次输出的 profile 运行
+`webcodex agent start --profile <profile>`。重复执行 `connect` 会复用已有 profile、
+身份、项目记录和运行中的 Runner，不会重复创建。Hosted、managed、自托管的选择见
 [AI 接入指南](docs/AI_ONBOARDING.zh-CN.md)。
 
 ## 先选部署方式
@@ -103,8 +111,9 @@ profile 与现有进程。不要把 key 提交进 Git。Hosted、managed、自�
 | 需要完全控制基础设施与身份系统 | 阅读 [DEPLOYMENT.zh-CN.md](docs/DEPLOYMENT.zh-CN.md) 走完整自托管。 |
 | 只在本机 loopback 使用 | 使用下面三条本地项目命令。 |
 
-0.3.0 的 package 路径目前只支持 Linux x64。完整自托管仍要求 systemd、`sudo`
-以及 HTTPS 域名或可信隧道；hosted `connect` 路径不需要这些运维步骤。
+0.3.1 的 package 路径支持 Linux x64 和 macOS arm64。Linux 上的完整自托管仍要求
+systemd、`sudo` 以及 HTTPS 域名或可信隧道；hosted `connect` 路径不需要这些运维
+步骤。
 
 ## 一个项目，一个入口
 
@@ -289,6 +298,16 @@ multi-client enrollment、production OAuth、remote deployment、QUIC、shell pr
 - GPT Actions：[docs/GPT_ACTIONS.zh-CN.md](docs/GPT_ACTIONS.zh-CN.md)
 - 部署：[docs/DEPLOYMENT.zh-CN.md](docs/DEPLOYMENT.zh-CN.md)
 - Roadmap：[docs/ROADMAP.zh-CN.md](docs/ROADMAP.zh-CN.md)
+
+## 免责声明
+
+WebCodex 仅用于研究与学习。它能够在配置的项目边界内读取、修改文件并执行命令；
+请只在可通过版本控制或备份恢复的仓库中使用。若因使用本软件造成文件系统损坏、
+数据丢失或其他后果，作者概不负责。
+
+## 鸣谢
+
+感谢 [LINUX DO](https://linux.do/) 社区提供的交流氛围与开源推广支持。
 
 ## License
 

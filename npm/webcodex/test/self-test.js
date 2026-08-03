@@ -112,7 +112,7 @@ async function expectInstallFailure(action, destination, tempRoot, pattern) {
 }
 
 async function main() {
-  assert.strictEqual(packageJson.version, "0.3.0");
+  assert.strictEqual(packageJson.version, "0.3.1");
   assert.deepStrictEqual(packageJson.bin, { webcodex: "bin/webcodex.js" });
   assert.deepStrictEqual(install.RUNTIME_BINARIES, ["webcodex", "webcodex-server", "webcodex-runner"]);
   assert.deepStrictEqual(install.SUPPORTED_PLATFORM_KEYS, ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64", "win32-x64"]);
@@ -142,7 +142,7 @@ async function main() {
     const destination = path.join(tmp, "destination");
     makeBinarySet(source);
     const identity = install.copyLocalBinaryDir(source, { destinationDir: destination, platform: "linux" });
-    assert.match(identity, /^0\.3\.0 test-revision/);
+    assert.strictEqual(identity, `${packageJson.version} test-revision dirty=false`);
     for (const name of install.RUNTIME_BINARIES) {
       const file = path.join(destination, name);
       assert.ok(fs.statSync(file).isFile());
