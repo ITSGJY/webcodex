@@ -54,6 +54,11 @@ Bearer token: 完全相同的 key
 重复执行相同命令会复用 profile、client ID、项目记录和运行中的 Runner。向同一个
 profile 增加第二个项目时，会保留已有项目并扩展 allowed roots。
 
+公开 shared-key 注册路径有简单的内存安全边界：每个 shared-key group 最多 16 个
+Runner，单个 Server 进程全局最多 1,024 个 shared-key Runner。离线 shared-key
+Runner 记录会在 24 小时后清理。这些 shared-key 数量和保留期限限制不适用于
+managed `wc_agent_*` Agent Token；所有 Runner 注册都有 64 个项目的输入安全上限。
+
 自动化场景优先使用 `--key-file <path>`，避免 key 进入 shell history。不能同时传
 `--key` 和 `--key-file`。
 
@@ -121,6 +126,11 @@ Hosted `webcodex connect` 不需要这些前置条件。
 `$XDG_CONFIG_HOME/webcodex/clients/<profile>/`）。Runner state 与日志默认位于
 `~/.local/state/webcodex/clients/<profile>/`（或
 `$XDG_STATE_HOME/webcodex/clients/<profile>/`）。
+
+Hosted Runner 在该 profile state 目录写入 `runner.log`，运行期间约每 10 MiB
+轮转，只保留 `runner.log`、`runner.log.1` 和 `runner.log.2`；Unix 上均为 `0600`。
+`agent logs --lines` 只从这些文件尾部做有界读取，不会完整加载归档；`--follow`
+会在轮转后重新打开新的 `runner.log`。
 
 常用命令：
 

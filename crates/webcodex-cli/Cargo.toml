@@ -15,6 +15,7 @@ webcodex-agent-config = { path = "../webcodex-agent-config" }
 webcodex-core = { path = "../webcodex-core" }
 chrono = "0.4"
 fs2 = "0.4"
+os_pipe = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rustls = "0.23"
 serde = { version = "1", features = ["derive"] }

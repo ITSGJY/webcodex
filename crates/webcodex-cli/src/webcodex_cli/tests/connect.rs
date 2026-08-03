@@ -76,6 +76,7 @@ fn connect_help_is_a_top_level_quick_start() {
     let top = cli_exit(["--help"]).unwrap();
     assert!(top.contains("connect"));
     assert!(top.contains("hosted Server"));
+    assert!(!top.contains("__hosted-log-writer"));
 }
 
 #[tokio::test]

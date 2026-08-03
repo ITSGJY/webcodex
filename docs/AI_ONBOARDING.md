@@ -58,6 +58,12 @@ Running the same command again reuses the profile, client ID, project record,
 and live Runner. Adding another project to the same profile preserves existing
 projects and expands the allowed roots.
 
+The public shared-key registration path has simple in-memory safety bounds:
+16 Runners per shared-key group and 1,024 shared-key Runners across one Server
+process. Offline shared-key Runner records expire after 24 hours. Those
+shared-key count and retention limits do not apply to managed `wc_agent_*`
+Agent Tokens. Every Runner registration has a 64-project input safety limit.
+
 For automation, prefer `--key-file <path>` over putting a key in shell history.
 Do not pass `--key` and `--key-file` together.
 
@@ -130,6 +136,12 @@ For a normal non-root user, profile configuration defaults below
 `$XDG_CONFIG_HOME/webcodex/clients/<profile>/`). Runner state and logs default
 below `~/.local/state/webcodex/clients/<profile>/` (or
 `$XDG_STATE_HOME/webcodex/clients/<profile>/`).
+
+The hosted Runner writes `runner.log` in that profile state directory and
+rotates it while running at approximately 10 MiB. It keeps only
+`runner.log`, `runner.log.1`, and `runner.log.2`, all mode `0600` on Unix.
+`agent logs --lines` reads bounded tails from those files instead of loading
+complete archives; `--follow` reopens `runner.log` after rotation.
 
 Useful commands:
 

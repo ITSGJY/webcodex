@@ -4,8 +4,8 @@ mod process;
 mod profile;
 
 pub(crate) use process::{
-    local_runner_profile_marker, local_runner_state_summary, run_local_runner_logs,
-    run_local_runner_service, LocalRunnerServiceAction,
+    local_runner_profile_marker, local_runner_state_summary, run_hosted_log_writer,
+    run_local_runner_logs, run_local_runner_service, LocalRunnerServiceAction,
 };
 pub(crate) use profile::ConnectOptions;
 
@@ -16,6 +16,8 @@ use super::profiles::{
     default_client_state_base_dir, validate_client_profile,
 };
 use super::system::discover_internal_binary;
+use std::io::Write;
+use std::path::PathBuf;
 
 use self::output::render_connect_output;
 use self::probe::{preflight_shared_key, wait_for_connection};
@@ -31,7 +33,36 @@ use self::profile::{
 
 const DEFAULT_CONNECT_WAIT_MS: u64 = 15_000;
 
-pub(crate) async fn run_connect(opts: ConnectOptions) -> Result<String, String> {
+#[derive(Debug)]
+pub(crate) struct ConnectResult {
+    output: String,
+    disclosure_marker: Option<PathBuf>,
+}
+
+pub(crate) fn write_connect_result(
+    result: ConnectResult,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> Result<(), String> {
+    stdout
+        .write_all(result.output.as_bytes())
+        .map_err(|error| format!("failed to write connect output: {error}"))?;
+    stdout
+        .flush()
+        .map_err(|error| format!("failed to flush connect output: {error}"))?;
+    if let Some(marker) = result.disclosure_marker {
+        if let Err(error) = atomic_write(&marker, b"disclosed = true\n", false) {
+            let _ = writeln!(
+                stderr,
+                "Warning: the connection is healthy, but WebCodex could not record that the generated key was displayed ({error}). The key may be displayed again on the next connect."
+            );
+            let _ = stderr.flush();
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn run_connect(opts: ConnectOptions) -> Result<ConnectResult, String> {
     let canonical_server = canonical_server_url(&opts.server_url)?;
     let canonical_project = opts.project.canonicalize().map_err(|error| {
         format!(
@@ -171,21 +202,156 @@ pub(crate) async fn run_connect(opts: ConnectOptions) -> Result<String, String> 
         }
         return Err(format!("{error}. Runner logs: {}", log_path.display()));
     }
-    if resolved_key.generated {
-        atomic_write(
-            &profile_dir.join(profile::KEY_DISCLOSED_FILE),
-            b"disclosed = true\n",
-            false,
-        )?;
+    Ok(ConnectResult {
+        output: render_connect_output(
+            &canonical_server.url,
+            &profile,
+            &client_id,
+            &runtime_project_id,
+            &config_path,
+            &log_path,
+            &resolved_key,
+        ),
+        disclosure_marker: resolved_key
+            .generated
+            .then(|| profile_dir.join(profile::KEY_DISCLOSED_FILE)),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    struct ControlledWriter {
+        bytes: Vec<u8>,
+        fail_after: Option<usize>,
+        fail_flush: bool,
     }
 
-    Ok(render_connect_output(
-        &canonical_server.url,
-        &profile,
-        &client_id,
-        &runtime_project_id,
-        &config_path,
-        &log_path,
-        &resolved_key,
-    ))
+    impl ControlledWriter {
+        fn successful() -> Self {
+            Self {
+                bytes: Vec::new(),
+                fail_after: None,
+                fail_flush: false,
+            }
+        }
+
+        fn failing_after(limit: usize) -> Self {
+            Self {
+                bytes: Vec::new(),
+                fail_after: Some(limit),
+                fail_flush: false,
+            }
+        }
+    }
+
+    impl Write for ControlledWriter {
+        fn write(&mut self, content: &[u8]) -> io::Result<usize> {
+            if self
+                .fail_after
+                .is_some_and(|limit| self.bytes.len() >= limit)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected write failure",
+                ));
+            }
+            let available = self
+                .fail_after
+                .map(|limit| limit.saturating_sub(self.bytes.len()))
+                .unwrap_or(content.len());
+            let written = available.min(content.len());
+            self.bytes.extend_from_slice(&content[..written]);
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected flush failure",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn generated_result(marker: PathBuf) -> ConnectResult {
+        ConnectResult {
+            output: "Connected\nMCP key: wck_test_generated_secret\n".to_string(),
+            disclosure_marker: Some(marker),
+        }
+    }
+
+    #[test]
+    fn generated_key_marker_is_committed_only_after_write_and_flush() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join(profile::KEY_DISCLOSED_FILE);
+        let mut stdout = ControlledWriter::successful();
+        let mut stderr = Vec::new();
+        write_connect_result(generated_result(marker.clone()), &mut stdout, &mut stderr).unwrap();
+        assert!(marker.is_file());
+        assert!(stderr.is_empty());
+
+        for fail_after in [0, 5] {
+            let marker = tmp.path().join(format!(
+                "failed-{fail_after}-{}",
+                profile::KEY_DISCLOSED_FILE
+            ));
+            let mut stdout = ControlledWriter::failing_after(fail_after);
+            let error = write_connect_result(
+                generated_result(marker.clone()),
+                &mut stdout,
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+            assert!(error.contains("write connect output"));
+            assert!(!marker.exists());
+        }
+
+        let marker = tmp
+            .path()
+            .join(format!("flush-{}", profile::KEY_DISCLOSED_FILE));
+        let mut stdout = ControlledWriter::successful();
+        stdout.fail_flush = true;
+        let error = write_connect_result(
+            generated_result(marker.clone()),
+            &mut stdout,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(error.contains("flush connect output"));
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn marker_failure_warns_without_secret_and_keeps_connect_successful() {
+        let tmp = tempfile::tempdir().unwrap();
+        let not_directory = tmp.path().join("not-a-directory");
+        std::fs::write(&not_directory, b"file").unwrap();
+        let marker = not_directory.join(profile::KEY_DISCLOSED_FILE);
+        let mut stdout = ControlledWriter::successful();
+        let mut stderr = Vec::new();
+        write_connect_result(generated_result(marker.clone()), &mut stdout, &mut stderr).unwrap();
+        assert!(!marker.exists());
+        let warning = String::from_utf8(stderr).unwrap();
+        assert!(warning.contains("connection is healthy"));
+        assert!(warning.contains("may be displayed again"));
+        assert!(!warning.contains("wck_test_generated_secret"));
+    }
+
+    #[test]
+    fn explicit_key_result_never_creates_a_disclosure_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join(profile::KEY_DISCLOSED_FILE);
+        let result = ConnectResult {
+            output: "Connected with an explicitly supplied key\n".to_string(),
+            disclosure_marker: None,
+        };
+        write_connect_result(result, &mut Vec::new(), &mut Vec::new()).unwrap();
+        assert!(!marker.exists());
+    }
 }

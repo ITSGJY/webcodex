@@ -16,6 +16,7 @@
 //! execution remains in the separate `webcodex-server` and `webcodex-runner`
 //! binaries.
 
+use std::io::Write;
 use std::path::PathBuf;
 
 mod webcodex_cli;
@@ -39,11 +40,12 @@ use webcodex_cli::{
     discover_internal_binary, login_usage, logout_usage, ops_agents_usage, ops_projects_usage,
     ops_smoke_preflight_usage, ops_status_usage, ops_usage, pairing_create_usage, pairing_usage,
     render_token_generate, run_agent_install_service, run_agent_service, run_agent_status,
-    run_agent_token_create_local, run_client_enroll, run_connect, run_internal_binary, run_login,
-    run_logout, run_ops_command, run_pairing_create, run_server_init, run_server_install_service,
-    run_server_service, run_server_status, run_setup_single_user, run_status,
-    run_token_create_local, server_init_usage, server_install_service_usage, server_status_usage,
-    server_usage, status_usage, usage, validate_client_profile, write_secret_file, write_text_file,
+    run_agent_token_create_local, run_client_enroll, run_connect, run_hosted_log_writer,
+    run_internal_binary, run_login, run_logout, run_ops_command, run_pairing_create,
+    run_server_init, run_server_install_service, run_server_service, run_server_status,
+    run_setup_single_user, run_status, run_token_create_local, server_init_usage,
+    server_install_service_usage, server_status_usage, server_usage, status_usage, usage,
+    validate_client_profile, write_connect_result, write_secret_file, write_text_file,
     ConnectOptions, LoginOptions, LogoutOptions, OpsCommand, OpsCommonOptions,
     OpsSmokePreflightOptions, ServerStatusOptions, ServiceControl, StatusOptions,
     AGENT_SERVICE_FILE, AGENT_SERVICE_UNIT, DEFAULT_LOG_LINES, SERVER_SERVICE_FILE,
@@ -61,6 +63,7 @@ const SETUP_AGENT_SCOPES: &[&str] = &[
 enum CliAction {
     Project(Vec<String>),
     Connect(ConnectOptions),
+    HostedLogWriter(PathBuf),
     Admin(AdminCliCommand),
     TokenGenerate(TokenGenerateOptions),
     TokenCreateLocal(TokenCreateLocalOptions),
@@ -274,6 +277,13 @@ where
             CliAction::Project(args)
         }
         "connect" => parse_connect(&args[1..]),
+        "__hosted-log-writer" => {
+            if args.len() == 2 {
+                CliAction::HostedLogWriter(PathBuf::from(&args[1]))
+            } else {
+                cli_parse_error("invalid hosted log writer arguments".to_string())
+            }
+        }
         "server" => parse_server_subcommand(&args[1..]),
         "pairing" => parse_pairing_subcommand(&args[1..]),
         "client" => parse_client_subcommand(&args[1..]),
@@ -1921,15 +1931,35 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(output.code);
         }
         CliAction::Connect(opts) => match run_connect(opts).await {
-            Ok(stdout) => {
-                print!("{}", stdout);
-                std::process::exit(0);
+            Ok(result) => {
+                let stdout = std::io::stdout();
+                let stderr = std::io::stderr();
+                let mut stdout = stdout.lock();
+                let mut stderr = stderr.lock();
+                match write_connect_result(result, &mut stdout, &mut stderr) {
+                    Ok(()) => std::process::exit(0),
+                    Err(error) => {
+                        let _ = writeln!(stderr, "{error}");
+                        let _ = stderr.flush();
+                        std::process::exit(1);
+                    }
+                }
             }
             Err(stderr) => {
                 eprintln!("{}", stderr);
                 std::process::exit(1);
             }
         },
+        CliAction::HostedLogWriter(state_dir) => {
+            let stdin = std::io::stdin();
+            match run_hosted_log_writer(&state_dir, &mut stdin.lock()) {
+                Ok(()) => std::process::exit(0),
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+            }
+        }
         CliAction::Admin(cmd) => match run_admin_command(cmd).await {
             Ok(stdout) => {
                 println!("{}", stdout);

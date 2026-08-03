@@ -273,10 +273,11 @@ legacy ToolRuntime discovery/operations tools 继续供管理和诊断使用，�
 
 ## 范围
 
-WebCodex 是 self-hosted infrastructure，不是 hosted SaaS 或完整 Browser IDE。
-高级 multi-client enrollment、production OAuth、remote deployment、QUIC、shell
-profile 和 operator observability 继续通过管理文档和 `webcodex` 提供，但不会
-改变上面的普通项目入口。
+WebCodex 同时支持官方托管协调 Server 和完整自托管部署。用户代码与实际执行默认
+仍留在用户控制的 Runner 机器上，除非用户明确将它们部署到其他位置。高级
+multi-client enrollment、production OAuth、remote deployment、QUIC、shell profile
+和 operator observability 继续通过管理文档和 `webcodex` 提供，但不会改变上面的
+普通项目入口。
 
 ## 文档
 

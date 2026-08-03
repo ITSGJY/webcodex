@@ -44,6 +44,20 @@ different key intentionally sees no Runner or project. If this invocation
 started a Runner that could not register, `connect` stops it; the local config
 is retained so the command can be retried.
 
+The hosted log is
+`$XDG_STATE_HOME/webcodex/clients/<profile>/runner.log` (or the equivalent
+default under `~/.local/state`). It rotates while the Runner is alive and keeps
+only the current file plus `.1` and `.2`, at approximately 10 MiB each.
+`agent logs --lines` reads only bounded file tails and can span those archives;
+`--follow` follows the new current filename after rotation. Do not search or
+edit internal Runner state to repair registration.
+
+By default one shared-key group can register 16 Runners and the Server process
+can hold 1,024 shared-key Runners in total. An offline shared-key Runner record
+is pruned after 24 hours. Managed Agent Tokens are not charged against those
+shared-key count or retention limits. All Runner registrations have a
+64-project input safety limit.
+
 ### `connect` rejects a `wc_*` value
 
 This is deliberate. `wc_pat_*`, `wc_agent_*`, `wc_acct_*`, and other `wc_*`

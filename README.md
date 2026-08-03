@@ -331,9 +331,11 @@ Read [SECURITY.md](SECURITY.md) and
 
 ## Scope
 
-WebCodex is self-hosted infrastructure, not a hosted SaaS or a full browser
-IDE. Advanced multi-client enrollment, production OAuth, remote deployment,
-QUIC, shell profiles, and operator observability remain available through the
+WebCodex supports both the official hosted coordination Server and fully
+self-hosted deployments. Source code and execution remain on the
+user-controlled Runner unless the user explicitly deploys them elsewhere.
+Advanced multi-client enrollment, production OAuth, remote deployment, QUIC,
+shell profiles, and operator observability remain available through the
 management documentation and `webcodex`; they do not change the ordinary
 project entry above.
 

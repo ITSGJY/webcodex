@@ -53,6 +53,17 @@ deadline_ok() {
     [ "$(( $(date +%s) - STARTED_AT ))" -lt "$TIMEOUT_SECS" ]
 }
 
+process_active() {
+    local pid="$1"
+    local state
+    kill -0 "$pid" 2>/dev/null || return 1
+    state="$(ps -p "$pid" -o stat= 2>/dev/null | tr -d '[:space:]')"
+    case "$state" in
+        ""|Z*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
 random_secret() {
     python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
 }
@@ -91,8 +102,9 @@ post() {
         -d "$body"
 }
 
-if ! command -v curl >/dev/null || ! command -v python3 >/dev/null || ! command -v git >/dev/null; then
-    die "curl, python3, and git are required"
+if ! command -v curl >/dev/null || ! command -v python3 >/dev/null \
+    || ! command -v git >/dev/null || ! command -v timeout >/dev/null; then
+    die "curl, python3, git, and timeout are required"
 fi
 
 log "building Server, Runner, and CLI binaries"
@@ -117,6 +129,42 @@ mkdir -p "$TMP_ROOT/data" "$TMP_ROOT/project" "$TMP_ROOT/second-project" "$TMP_R
     git commit -q -m init
 )
 printf '# second hosted project\n' >"$TMP_ROOT/second-project/README.md"
+
+log "exercising the real bounded hosted log writer"
+ROTATION_PROFILE="rotation-e2e"
+ROTATION_STATE="$TMP_ROOT/state/webcodex/clients/$ROTATION_PROFILE"
+mkdir -p "$ROTATION_STATE"
+printf 'profile = "%s"\n' "$ROTATION_PROFILE" >"$ROTATION_STATE/hosted-connect"
+python3 -c '
+import sys
+out = sys.stdout.buffer
+for start in range(0, 350000, 1000):
+    out.write(b"".join(
+        f"{line:06d} ".encode() + b"x" * 96 + b"\n"
+        for line in range(start, min(start + 1000, 350000))
+    ))
+' | timeout 45 "$REPO_DIR/target/debug/webcodex" \
+    __hosted-log-writer "$ROTATION_STATE"
+for log_file in runner.log runner.log.1 runner.log.2; do
+    [ -f "$ROTATION_STATE/$log_file" ] \
+        || die "runtime rotation did not create $log_file"
+    [ "$(stat -c '%a' "$ROTATION_STATE/$log_file")" = "600" ] \
+        || die "$log_file is not mode 0600"
+    [ "$(stat -c '%s' "$ROTATION_STATE/$log_file")" -le 10485760 ] \
+        || die "$log_file exceeded the 10 MiB bound"
+done
+ROTATION_TOTAL="$(du -cb "$ROTATION_STATE"/runner.log* | tail -1 | awk '{print $1}')"
+[ "$ROTATION_TOTAL" -le 31457280 ] \
+    || die "runtime log rotation exceeded the three-file bound"
+HOME="$TMP_ROOT/home" \
+XDG_CONFIG_HOME="$TMP_ROOT/config" \
+XDG_STATE_HOME="$TMP_ROOT/state" \
+"$REPO_DIR/target/debug/webcodex" agent logs --profile "$ROTATION_PROFILE" --lines 100 \
+    >"$TMP_ROOT/rotation-tail.out"
+[ "$(head -1 "$TMP_ROOT/rotation-tail.out" | cut -d' ' -f1)" = "349900" ] \
+    || die "bounded agent logs did not return the expected first tail line"
+[ "$(tail -1 "$TMP_ROOT/rotation-tail.out" | cut -d' ' -f1)" = "349999" ] \
+    || die "bounded agent logs did not return the expected final tail line"
 
 log "starting temporary shared-key-enabled Server"
 WEBCODEX_ADDR="127.0.0.1:${PORT}" \
@@ -167,7 +215,12 @@ STATE_DIR="$TMP_ROOT/state/webcodex/clients/$PROFILE"
 [ -f "$STATE_DIR/runner.toml" ] && [ -f "$STATE_DIR/runner.log" ] \
     || die "connect did not persist Runner state and logs"
 FIRST_PID="$(python3 -c 'import sys,tomllib; print(tomllib.load(open(sys.argv[1],"rb"))["pid"])' "$STATE_DIR/runner.toml")"
+LOG_WRITER_PID="$(python3 -c 'import sys,tomllib; print(tomllib.load(open(sys.argv[1],"rb"))["log_writer"]["pid"])' "$STATE_DIR/runner.toml")"
 kill -0 "$FIRST_PID" 2>/dev/null || die "Runner did not survive connect command exit"
+process_active "$LOG_WRITER_PID" \
+    || die "hosted log writer did not survive connect command exit"
+[ ! -e "$PROFILE_DIR/.hosted-key-disclosed" ] \
+    || die "an explicitly supplied key created a disclosure marker"
 
 PROJECTS_A="$(post "$SHARED_KEY_A" /api/projects/list '{}')"
 [ "$(printf '%s' "$PROJECTS_A" | json_field output.projects.0.id)" = "$RUNTIME_PROJECT" ] \
@@ -254,8 +307,8 @@ grep -q 'client online:.*yes' "$TMP_ROOT/status.out" \
     || die "agent status did not confirm Server visibility"
 
 for safe_output in "$TMP_ROOT/connect-first.out" "$TMP_ROOT/connect-second.out" \
-    "$TMP_ROOT/connect-third.out" "$TMP_ROOT/status.out" "$STATE_DIR/runner.log" \
-    "$STATE_DIR/runner.toml"; do
+    "$TMP_ROOT/connect-third.out" "$TMP_ROOT/status.out" \
+    "$STATE_DIR"/runner.log* "$STATE_DIR/runner.toml"; do
     if grep -F "$SHARED_KEY_A" "$safe_output" >/dev/null 2>&1; then
         die "shared key leaked into $(basename "$safe_output")"
     fi
@@ -269,6 +322,15 @@ XDG_STATE_HOME="$TMP_ROOT/state" \
 "$REPO_DIR/target/debug/webcodex" agent stop --profile "$PROFILE" \
     >"$TMP_ROOT/stop.out"
 [ ! -f "$STATE_DIR/runner.toml" ] || die "agent stop left active Runner state"
+for _ in $(seq 1 40); do
+    if ! process_active "$LOG_WRITER_PID"; then
+        break
+    fi
+    sleep 0.05
+done
+if process_active "$LOG_WRITER_PID"; then
+    die "agent stop left the hosted log writer running"
+fi
 HOME="$TMP_ROOT/home" \
 XDG_CONFIG_HOME="$TMP_ROOT/config" \
 XDG_STATE_HOME="$TMP_ROOT/state" \

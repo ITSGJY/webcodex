@@ -41,6 +41,18 @@ webcodex agent logs --profile <connect 输出的 profile> --lines 100
 使用 trim 后完全相同的 key。不同 key 按设计看不到该 Runner 和项目。如果本次
 命令启动的 Runner 无法注册，`connect` 会停止它；本地配置会保留，修复后可重试。
 
+Hosted 日志位于
+`$XDG_STATE_HOME/webcodex/clients/<profile>/runner.log`（或
+`~/.local/state` 下的对应默认路径）。Runner 运行期间会轮转日志，只保留当前文件和
+`.1`、`.2`，每个约 10 MiB。`agent logs --lines` 只做有界尾部读取，并可按需跨这些
+归档补齐；`--follow` 会在轮转后跟随新的当前文件。不要通过编辑内部 Runner state
+来修复注册问题。
+
+默认每个 shared-key group 最多注册 16 个 Runner，单个 Server 进程全局最多保留
+1,024 个 shared-key Runner。离线 shared-key Runner 记录会在 24 小时后清理。
+Managed Agent Token 不受这些 shared-key 数量和保留期限限制；所有 Runner 注册都有
+64 个项目的输入安全上限。
+
 ### `connect` 拒绝 `wc_*`
 
 这是预期边界。`wc_pat_*`、`wc_agent_*`、`wc_acct_*` 和其他 `wc_*` 都是 managed
