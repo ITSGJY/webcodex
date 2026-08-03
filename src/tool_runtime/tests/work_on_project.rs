@@ -8,10 +8,13 @@
 
 use super::reconnect::dispatch_start_coding_task_in_window;
 use super::support::*;
+use crate::lsp_bridge::{AgentLspRequest, AgentLspResultEnvelope, AGENT_LSP_REQUEST_KIND};
 use crate::shell_protocol::ShellClientCapabilities;
 use crate::tool_runtime::permissions::{AuthorityMode, PermissionEvaluator};
 use crate::tool_runtime::sessions::{SessionEvent, SessionGuards};
-use crate::tool_runtime::{registered_tool_specs, SessionMode, ToolCall, ToolResult, ToolRuntime};
+use crate::tool_runtime::{
+    registered_tool_specs, SessionMode, StartupDetail, ToolCall, ToolResult, ToolRuntime,
+};
 use serde_json::{json, Value};
 
 fn work_on_project_call(project: &str, instruction: &str, session_id: Option<&str>) -> ToolCall {
@@ -37,6 +40,93 @@ fn path_work_on_project_call(
         instruction: instruction.to_string(),
         session_id: session_id.map(str::to_string),
     }
+}
+
+fn start_coding_task_call(project: &str, instruction: &str, detail: StartupDetail) -> ToolCall {
+    ToolCall::StartCodingTask {
+        project: project.to_string(),
+        client_id: None,
+        path: None,
+        temporary_project_name: None,
+        title: Some(instruction.to_string()),
+        mode: SessionMode::Normal,
+        detail,
+        deny_write_tools: false,
+        deny_shell_tools: false,
+        resume_session_id: None,
+        bind_current: false,
+        new_session: true,
+        execution_context: None,
+    }
+}
+
+/// Drive any coding startup to completion while recording every Runner request.
+/// The typed LSP status probe gets a valid bounded error envelope; file/Git and
+/// overview requests use the existing local fixture implementation.
+async fn dispatch_recording_startup_requests(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    call: ToolCall,
+    auth: Option<&crate::auth::AuthContext>,
+    window_id: &str,
+) -> (ToolResult, Vec<String>) {
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.cloned();
+        let window_id = window_id.to_string();
+        async move {
+            let window = crate::client_window::ClientWindow::for_test(&window_id);
+            runtime
+                .dispatch_with_auth_transport_options_and_metadata_with_sandbox(
+                    call,
+                    auth.as_ref(),
+                    crate::tool_runtime::sessions::SessionTransport::Mcp,
+                    true,
+                    false,
+                    Default::default(),
+                    None,
+                    Some(&window),
+                )
+                .await
+        }
+    });
+    let mut request_kinds = Vec::new();
+    for _ in 0..800 {
+        if task.is_finished() {
+            break;
+        }
+        let Some(request) = next_patch_agent_request(runtime, client_id).await else {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            continue;
+        };
+        request_kinds.push(request.kind.clone());
+        if request.kind == AGENT_LSP_REQUEST_KIND {
+            assert_eq!(
+                request.lsp.as_ref().map(|payload| &payload.request),
+                Some(&AgentLspRequest::Status)
+            );
+            complete_patch_agent_request(
+                runtime,
+                client_id,
+                &request.request_id,
+                0,
+                &AgentLspResultEnvelope::err(
+                    "lsp_status_unavailable",
+                    "fixture intentionally has no language server",
+                )
+                .to_stdout_json(),
+                "",
+            )
+            .await;
+        } else {
+            complete_agent_request_by_running_locally(runtime, client_id, request).await;
+        }
+    }
+    assert!(
+        task.is_finished(),
+        "coding startup did not finish after servicing Runner requests: {request_kinds:?}"
+    );
+    (task.await.unwrap(), request_kinds)
 }
 
 async fn dispatch_with_path_runner(
@@ -155,7 +245,7 @@ fn valid_work_on_project_projection_input() -> serde_json::Value {
         },
         "repository": {
             "status": "unavailable",
-            "reason_code": "unsupported_or_unavailable",
+            "reason_code": "not_requested_by_work_on_project",
         },
         "continuation": {
             "suggested_next_actions": {
@@ -1179,14 +1269,29 @@ fn overwrite_agents_rule(root: &std::path::Path, body: &str) {
 }
 
 #[tokio::test]
-async fn work_on_project_new_task_returns_repository_overview_and_startup_context() {
+async fn work_on_project_new_task_is_lightweight_and_preserves_startup_context() {
     let root = tempfile::tempdir().unwrap();
     seed_coding_repository(root.path(), "Preserve unrelated changes.");
     let runtime = ToolRuntime::new_for_tests();
-    let project = register_agent_project_at_path(&runtime, "wop-repo", "demo", root.path()).await;
+    register_agent_with_projects(
+        &runtime,
+        "wop-repo",
+        None,
+        ShellClientCapabilities {
+            shell: true,
+            git: true,
+            file_read: true,
+            file_write: true,
+            lsp_read_only_navigation: true,
+            ..Default::default()
+        },
+        vec![registered_project("demo", &root.path().to_string_lossy())],
+    )
+    .await;
+    let project = crate::tool_runtime::agent_project_runtime_id("wop-repo", "demo");
     let auth = auth_context(None, true);
 
-    let result = dispatch_start_coding_task_in_window(
+    let (result, request_kinds) = dispatch_recording_startup_requests(
         &runtime,
         "wop-repo",
         work_on_project_call(&project, "start on the repository", None),
@@ -1202,44 +1307,44 @@ async fn work_on_project_new_task_returns_repository_overview_and_startup_contex
     assert_eq!(result.output["readiness"]["status"].as_str(), Some("warn"));
     assert_eq!(result.output["readiness"]["blocking"], false);
 
-    // Repository overview: Rust detected via Cargo.toml, project-relative.
+    // work_on_project deliberately omits the optional repository overview. The
+    // compact compatibility field reports intentional omission without any
+    // overview lists or a failure warning.
     let repository = &result.output["repository"];
-    assert_eq!(repository["status"], "available");
-    let types = repository["project_types"]["items"].as_array().unwrap();
-    assert!(types.iter().any(|kind| kind["kind"] == "rust"), "{types:?}");
-    let manifests = repository["manifests"]["items"].as_array().unwrap();
-    assert!(
-        manifests
-            .iter()
-            .any(|manifest| manifest["path"] == "Cargo.toml"),
-        "{manifests:?}"
+    assert_eq!(repository["status"], "unavailable");
+    assert_eq!(
+        repository["reason_code"],
+        "not_requested_by_work_on_project"
     );
-    let key_files = repository["key_files"]["items"].as_array().unwrap();
-    assert!(key_files
-        .iter()
-        .any(|key| key["path"] == "AGENTS.md" || key["path"] == "README.md"));
-    let roots = &repository["roots"];
-    assert!(roots["source"]["items"]
+    assert_eq!(repository.as_object().unwrap().len(), 2);
+    assert!(!result.output["warnings"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|path| path == "src"));
-    let top_level = repository["top_level"]["items"].as_array().unwrap();
-    assert!(top_level.iter().any(|entry| entry["path"] == "Cargo.toml"));
-    let serialized = repository.to_string();
-    // No absolute path leak.
-    assert!(!serialized.contains(&root.path().to_string_lossy().to_string()));
-    // Overview warnings are present (symlinks are not part of the fixture but
-    // the scan metadata is deterministic).
-    assert!(repository["scan"].is_object());
+        .any(|warning| warning == "repository_overview_unavailable"));
 
-    // suggested reads use project-relative paths with reasons.
-    let suggested = repository["suggested_next_reads"]["items"]
-        .as_array()
-        .unwrap();
-    assert!(suggested
-        .iter()
-        .all(|item| { item["path"].as_str().is_some() && item["reason"].as_str().is_some() }));
+    // Runner request evidence: rules, Git, and LSP probes remain; repository
+    // overview is not merely hidden from JSON, it is never enqueued.
+    assert!(
+        request_kinds.iter().any(|kind| kind == "file_read"),
+        "repository rules were not observed: {request_kinds:?}"
+    );
+    assert!(
+        request_kinds.iter().any(|kind| kind == "run_shell"),
+        "Git/workspace inspection was not executed: {request_kinds:?}"
+    );
+    assert!(
+        request_kinds
+            .iter()
+            .any(|kind| kind == AGENT_LSP_REQUEST_KIND),
+        "semantic navigation was not probed: {request_kinds:?}"
+    );
+    assert!(
+        request_kinds
+            .iter()
+            .all(|kind| kind != "file_project_overview"),
+        "work_on_project unexpectedly enqueued an overview: {request_kinds:?}"
+    );
 
     // Instructions loaded with bounded body and headings.
     let instructions = &result.output["instructions"];
@@ -1300,6 +1405,13 @@ async fn work_on_project_new_task_returns_repository_overview_and_startup_contex
         .unwrap_or_else(|error| panic!("compact output must match its schema: {error}"));
     let bytes = serde_json::to_vec(&result.output).unwrap().len();
     assert!(bytes <= crate::tool_runtime::startup_brief::STANDARD_STARTUP_HARD_MAX_BYTES);
+    assert!(
+        !result
+            .output
+            .to_string()
+            .contains(&root.path().to_string_lossy().to_string()),
+        "compact output leaked the absolute repository path"
+    );
 }
 
 #[tokio::test]
@@ -1379,7 +1491,133 @@ async fn work_on_project_exact_resume_reuses_rules_and_detects_changes() {
 }
 
 #[tokio::test]
-async fn work_on_project_repository_unavailable_keeps_session_and_warns() {
+async fn work_on_project_sizes_and_runner_request_reduction_are_stable() {
+    let root = tempfile::tempdir().unwrap();
+    seed_coding_repository(root.path(), "Keep the focused startup safe.");
+    let runtime = ToolRuntime::new_for_tests();
+    register_agent_with_projects(
+        &runtime,
+        "wop-size",
+        None,
+        ShellClientCapabilities {
+            shell: true,
+            git: true,
+            file_read: true,
+            file_write: true,
+            lsp_read_only_navigation: true,
+            ..Default::default()
+        },
+        vec![registered_project("demo", &root.path().to_string_lossy())],
+    )
+    .await;
+    let project = crate::tool_runtime::agent_project_runtime_id("wop-size", "demo");
+    let auth = auth_context(None, true);
+
+    let (fresh, fresh_requests) = dispatch_recording_startup_requests(
+        &runtime,
+        "wop-size",
+        work_on_project_call(&project, "fresh lightweight startup", None),
+        Some(&auth),
+        "wop-size-fresh",
+    )
+    .await;
+    assert!(fresh.success, "{:?}", fresh.error);
+    let session_id = fresh.output["session_id"].as_str().unwrap().to_string();
+
+    let (reused, reused_requests) = dispatch_recording_startup_requests(
+        &runtime,
+        "wop-size",
+        work_on_project_call(&project, "unchanged continuation", Some(&session_id)),
+        Some(&auth),
+        "wop-size-reused",
+    )
+    .await;
+    assert!(reused.success, "{:?}", reused.error);
+    assert_eq!(reused.output["instructions"]["status"], "reused");
+    assert_eq!(reused.output["instructions"]["content_included"], false);
+
+    let (standard, standard_requests) = dispatch_recording_startup_requests(
+        &runtime,
+        "wop-size",
+        start_coding_task_call(
+            &project,
+            "same fixture standard startup",
+            StartupDetail::Standard,
+        ),
+        Some(&auth),
+        "wop-size-standard",
+    )
+    .await;
+    assert!(standard.success, "{:?}", standard.error);
+    assert_eq!(standard.output["repository"]["status"], "available");
+
+    for output in [&fresh.output, &reused.output] {
+        assert_eq!(
+            output["repository"]["reason_code"],
+            "not_requested_by_work_on_project"
+        );
+        for omitted in [
+            "project_types",
+            "manifests",
+            "key_files",
+            "roots",
+            "top_level",
+            "suggested_next_reads",
+            "scan",
+            "warnings",
+        ] {
+            assert!(
+                output["repository"].get(omitted).is_none(),
+                "work_on_project repository unexpectedly contains {omitted}"
+            );
+        }
+    }
+
+    let fresh_overviews = fresh_requests
+        .iter()
+        .filter(|kind| kind.as_str() == "file_project_overview")
+        .count();
+    let reused_overviews = reused_requests
+        .iter()
+        .filter(|kind| kind.as_str() == "file_project_overview")
+        .count();
+    let standard_overviews = standard_requests
+        .iter()
+        .filter(|kind| kind.as_str() == "file_project_overview")
+        .count();
+    assert_eq!(fresh_overviews, 0);
+    assert_eq!(reused_overviews, 0);
+    assert_eq!(standard_overviews, 1);
+    assert_eq!(
+        standard_requests.len(),
+        fresh_requests.len() + 1,
+        "the identical advanced fixture should add only the overview request"
+    );
+    assert_eq!(
+        reused_requests.len(),
+        fresh_requests.len(),
+        "unchanged continuation should retain the same lightweight probes"
+    );
+
+    let fresh_bytes = serde_json::to_vec(&fresh.output).unwrap().len();
+    let reused_bytes = serde_json::to_vec(&reused.output).unwrap().len();
+    let standard_bytes = serde_json::to_vec(&standard.output).unwrap().len();
+    let hard_max = crate::tool_runtime::startup_brief::STANDARD_STARTUP_HARD_MAX_BYTES;
+    assert!(fresh_bytes < hard_max);
+    assert!(reused_bytes < hard_max);
+    assert!(standard_bytes <= hard_max);
+    assert!(fresh_bytes < standard_bytes);
+    assert!(reused_bytes < standard_bytes);
+    eprintln!(
+        "work_on_project_fixture_bytes fresh={fresh_bytes} unchanged_continuation={reused_bytes} standard={standard_bytes}; runner_requests fresh={} unchanged_continuation={} standard={}",
+        fresh_requests.len(),
+        reused_requests.len(),
+        standard_requests.len()
+    );
+}
+
+#[tokio::test]
+async fn start_coding_task_standard_repository_unavailable_keeps_session_and_warns() {
     // Agent without the file capability: the overview probe fails closed to
     // unavailable, but the session still creates/continues successfully.
     let root = tempfile::tempdir().unwrap();
@@ -1405,7 +1643,11 @@ async fn work_on_project_repository_unavailable_keeps_session_and_warns() {
     let result = dispatch_start_coding_task_in_window(
         &runtime,
         "wop-nocap",
-        work_on_project_call(&project, "start without file capability", None),
+        start_coding_task_call(
+            &project,
+            "start without file capability",
+            StartupDetail::Standard,
+        ),
         Some(&auth),
         "wop-nocap-window",
     )
@@ -1413,7 +1655,10 @@ async fn work_on_project_repository_unavailable_keeps_session_and_warns() {
     assert!(result.success, "{:?}", result.error);
 
     // Session created; repository overview unavailable; warning present.
-    let session_id = result.output["session_id"].as_str().unwrap().to_string();
+    let session_id = result.output["session"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert!(session_id.starts_with("wc_sess_"));
     assert_eq!(result.output["repository"]["status"], "unavailable");
     assert_eq!(
@@ -1442,7 +1687,7 @@ async fn work_on_project_repository_unavailable_keeps_session_and_warns() {
 }
 
 #[tokio::test]
-async fn work_on_project_repository_overview_timeout_is_nonblocking() {
+async fn start_coding_task_standard_repository_overview_timeout_is_nonblocking() {
     let root = tempfile::tempdir().unwrap();
     seed_coding_repository(root.path(), "rules load despite overview timeout");
     // Tight overview timeout so the probe expires quickly.
@@ -1460,7 +1705,11 @@ async fn work_on_project_repository_overview_timeout_is_nonblocking() {
             let window = crate::client_window::ClientWindow::for_test("wop-timeout-window");
             runtime
                 .dispatch_with_auth_transport_options_and_metadata_with_sandbox(
-                    work_on_project_call(&project, "start despite overview timeout", None),
+                    start_coding_task_call(
+                        &project,
+                        "start despite overview timeout",
+                        StartupDetail::Standard,
+                    ),
                     Some(&auth),
                     crate::tool_runtime::sessions::SessionTransport::Mcp,
                     true,
@@ -1510,7 +1759,7 @@ async fn work_on_project_repository_overview_timeout_is_nonblocking() {
         .unwrap()
         .iter()
         .any(|warning| warning == "repository_overview_unavailable"));
-    let session_id = result.output["session_id"].as_str().unwrap();
+    let session_id = result.output["session"]["session_id"].as_str().unwrap();
     assert!(session_id.starts_with("wc_sess_"));
     let summary = runtime.sessions.summary(session_id, Some(20)).unwrap();
     assert_eq!(summary.project.as_deref(), Some(project.as_str()));
@@ -1538,26 +1787,26 @@ async fn work_on_project_repository_overview_timeout_is_nonblocking() {
     }
 }
 
-/// Drive a `work_on_project` dispatch to completion, completing the
+/// Drive an advanced `start_coding_task` dispatch to completion, completing the
 /// `file_project_overview` probe with `overview_stdout` (exit code 0, no error)
-/// while servicing every other agent request locally. Returns the compact
-/// task result and the overview request id that was answered.
-async fn dispatch_work_on_project_with_overview_stdout(
+/// while servicing every other agent request locally. Returns the startup
+/// result and the overview request id that was answered.
+async fn dispatch_start_coding_task_with_overview_stdout(
     runtime: &ToolRuntime,
     client_id: &str,
     project: &str,
     instruction: &str,
+    detail: StartupDetail,
     overview_stdout: String,
     auth: Option<&crate::auth::AuthContext>,
 ) -> (crate::tool_runtime::ToolResult, Option<String>) {
     use crate::client_window::ClientWindow;
     use crate::tool_runtime::sessions::SessionTransport;
-    use crate::tool_runtime::StartupDetail;
 
     let task = tokio::spawn({
         let runtime = runtime.clone();
         let auth = auth.cloned();
-        let call = work_on_project_call(project, instruction, None);
+        let call = start_coding_task_call(project, instruction, detail);
         async move {
             let window = ClientWindow::for_test("overview-window");
             runtime
@@ -1606,7 +1855,6 @@ async fn dispatch_work_on_project_with_overview_stdout(
         .await;
     }
     let result = task.await.unwrap();
-    let _ = StartupDetail::Standard;
     (result, overview_request_id)
 }
 
@@ -1625,7 +1873,7 @@ fn valid_agent_overview_stdout(
 }
 
 #[tokio::test]
-async fn work_on_project_repository_overview_rejects_malformed_runner_responses() {
+async fn start_coding_task_standard_repository_overview_rejects_malformed_runner_responses() {
     let root = tempfile::tempdir().unwrap();
     seed_coding_repository(root.path(), "rules load despite malformed overview");
     let runtime = ToolRuntime::new_for_tests();
@@ -1704,11 +1952,12 @@ async fn work_on_project_repository_overview_rejects_malformed_runner_responses(
 
     for (label, payload) in cases {
         let stdout = payload.to_string();
-        let (result, overview_id) = dispatch_work_on_project_with_overview_stdout(
+        let (result, overview_id) = dispatch_start_coding_task_with_overview_stdout(
             &runtime,
             "wop-malformed",
             &project,
             label,
+            StartupDetail::Standard,
             stdout,
             Some(&auth),
         )
@@ -1764,7 +2013,7 @@ async fn work_on_project_repository_overview_rejects_malformed_runner_responses(
             "{label}: repository_overview_unavailable warning missing"
         );
         // A session is still created despite the malformed overview.
-        let session_id = result.output["session_id"].as_str().unwrap();
+        let session_id = result.output["session"]["session_id"].as_str().unwrap();
         assert!(
             session_id.starts_with("wc_sess_"),
             "{label}: session not created"
@@ -1773,7 +2022,7 @@ async fn work_on_project_repository_overview_rejects_malformed_runner_responses(
 }
 
 #[tokio::test]
-async fn work_on_project_repository_overview_strips_unknown_runner_fields_and_stays_bounded() {
+async fn start_coding_task_standard_overview_strips_unknown_runner_fields_and_stays_bounded() {
     let root = tempfile::tempdir().unwrap();
     seed_coding_repository(root.path(), "rules load despite extra runner fields");
     let runtime = ToolRuntime::new_for_tests();
@@ -1790,11 +2039,12 @@ async fn work_on_project_repository_overview_strips_unknown_runner_fields_and_st
     payload["scan"]["nested"] = json!({"deep": json!(["Y".repeat(10_000), 1, 2])});
     payload["runner_secret"] = json!("/absolute/leak");
 
-    let (result, overview_id) = dispatch_work_on_project_with_overview_stdout(
+    let (result, overview_id) = dispatch_start_coding_task_with_overview_stdout(
         &runtime,
         "wop-strip",
         &project,
         "strip extras",
+        StartupDetail::Standard,
         payload.to_string(),
         Some(&auth),
     )
@@ -1848,43 +2098,64 @@ async fn work_on_project_repository_overview_strips_unknown_runner_fields_and_st
 }
 
 #[tokio::test]
-async fn work_on_project_repository_overview_accepts_valid_runner_response() {
+async fn start_coding_task_standard_and_full_accept_valid_repository_overview() {
     let root = tempfile::tempdir().unwrap();
     seed_coding_repository(root.path(), "rules load with valid overview");
     let runtime = ToolRuntime::new_for_tests();
     let project =
         register_agent_project_at_path(&runtime, "wop-valid-overview", "demo", root.path()).await;
 
-    let stdout = valid_agent_overview_stdout(&runtime, "wop-valid-overview", root.path());
     let auth = auth_context(None, true);
-    let (result, overview_id) = dispatch_work_on_project_with_overview_stdout(
-        &runtime,
-        "wop-valid-overview",
-        &project,
-        "valid overview",
-        stdout,
-        Some(&auth),
-    )
-    .await;
-    assert!(result.success, "{:?}", result.error);
-    assert!(overview_id.is_some(), "overview probe must be issued");
-    let repository = &result.output["repository"];
-    assert_eq!(
-        repository["status"], "available",
-        "valid response must be accepted"
-    );
-    // scan projection keeps only the fixed fields, no extras.
-    let scan = &repository["scan"];
-    assert!(scan.is_object());
-    assert!(
-        scan.as_object().unwrap().len() == 5,
-        "scan must keep 5 fields"
-    );
-    assert_eq!(scan["max_depth"], 2);
-    assert_eq!(scan["limit"], 120);
-    // Rust is detected via the committed Cargo.toml fixture.
-    let types = repository["project_types"]["items"].as_array().unwrap();
-    assert!(types.iter().any(|kind| kind["kind"] == "rust"));
-    let serialized = repository.to_string();
-    assert!(!serialized.contains(&root.path().to_string_lossy().to_string()));
+    for detail in [StartupDetail::Standard, StartupDetail::Full] {
+        let stdout = valid_agent_overview_stdout(&runtime, "wop-valid-overview", root.path());
+        let (result, overview_id) = dispatch_start_coding_task_with_overview_stdout(
+            &runtime,
+            "wop-valid-overview",
+            &project,
+            "valid overview",
+            detail,
+            stdout,
+            Some(&auth),
+        )
+        .await;
+        assert!(result.success, "{detail:?}: {:?}", result.error);
+        assert!(
+            overview_id.is_some(),
+            "{detail:?}: overview probe must be issued"
+        );
+        let brief = crate::tool_runtime::startup_brief::startup_brief_from_output(&result.output)
+            .expect("advanced startup brief");
+        let repository = &brief["repository"];
+        assert_eq!(
+            repository["status"], "available",
+            "{detail:?}: valid response must be accepted"
+        );
+        // scan projection keeps only the fixed fields, no extras.
+        let scan = &repository["scan"];
+        assert!(scan.is_object());
+        assert_eq!(scan.as_object().unwrap().len(), 5);
+        assert_eq!(scan["max_depth"], 2);
+        assert_eq!(scan["limit"], 120);
+        // Rust is detected via the committed Cargo.toml fixture.
+        let types = repository["project_types"]["items"].as_array().unwrap();
+        assert!(types.iter().any(|kind| kind["kind"] == "rust"));
+        assert!(repository["manifests"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|manifest| manifest["path"] == "Cargo.toml"));
+        assert!(!repository["key_files"]["items"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let serialized = repository.to_string();
+        assert!(!serialized.contains(&root.path().to_string_lossy().to_string()));
+
+        let schema = crate::tool_runtime::registry::output_schema_for_tool("start_coding_task");
+        let instance = json!({"success": true, "output": result.output});
+        crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&instance, &schema)
+            .unwrap_or_else(|error| {
+                panic!("{detail:?} advanced startup must match strict schema: {error}")
+            });
+    }
 }

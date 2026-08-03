@@ -59,6 +59,9 @@ absolute roots, marks an evicted attempt boundary `complete=false`, and is
 reused across continuation, explicit resume, mode upgrade, and restart without
 automatically executing tools. The standard/full core returns at most 12 paths
 (`minimal`: 3), and the complete Action response remains below 32 KiB.
+The advanced `start_coding_task(detail=standard|full)` contract continues to
+include the bounded repository overview; `project_overview` remains available
+as an explicit generic runtime call.
 
 The flattened generic request accepts exactly one ordinary project source:
 `project`, or `client_id` plus an existing absolute `path`. The latter invokes

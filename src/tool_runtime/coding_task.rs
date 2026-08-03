@@ -30,7 +30,10 @@ use super::session_context::{
 };
 use super::sessions::tool_failure_summary_from_events;
 use super::sessions::{self, SessionTransport, TOOL_CALL_RECORDING_SESSION_ID_FIELD};
-use super::startup_brief::{build_startup_brief, startup_brief_from_output, StartupBriefInput};
+use super::startup_brief::{
+    build_startup_brief, startup_brief_from_output, StartupBriefInput,
+    REPOSITORY_OVERVIEW_NOT_REQUESTED_REASON,
+};
 use super::tool_catalog::TOOL_RECOMMENDED_FLOWS;
 use super::tool_inputs::{SessionMode, StartupDetail};
 use super::tool_result::ToolResult;
@@ -77,6 +80,28 @@ enum CodingProjectSource {
         client_id: String,
         name: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CodingStartupOptions {
+    detail: StartupDetail,
+    include_repository_overview: bool,
+}
+
+impl CodingStartupOptions {
+    fn start_coding_task(detail: StartupDetail) -> Self {
+        Self {
+            detail,
+            include_repository_overview: true,
+        }
+    }
+
+    fn work_on_project() -> Self {
+        Self {
+            detail: StartupDetail::Standard,
+            include_repository_overview: false,
+        }
+    }
 }
 
 fn invalid_project_source(message: impl Into<String>, fields: Value) -> ToolResult {
@@ -293,6 +318,48 @@ impl ToolRuntime {
         transport: SessionTransport,
         window: Option<&crate::client_window::ClientWindow>,
     ) -> ToolResult {
+        self.start_coding_task_with_options(
+            project,
+            client_id,
+            path,
+            temporary_project_name,
+            title,
+            mode,
+            deny_write_tools,
+            deny_shell_tools,
+            CodingStartupOptions::start_coding_task(detail),
+            resume_session_id,
+            bind_current,
+            new_session,
+            execution_context,
+            auth,
+            transport,
+            window,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_coding_task_with_options(
+        &self,
+        project: String,
+        client_id: Option<String>,
+        path: Option<String>,
+        temporary_project_name: Option<String>,
+        title: Option<String>,
+        mode: SessionMode,
+        deny_write_tools: bool,
+        deny_shell_tools: bool,
+        startup: CodingStartupOptions,
+        resume_session_id: Option<String>,
+        bind_current: bool,
+        new_session: bool,
+        execution_context: Option<sessions::SessionExecutionContext>,
+        auth: Option<&AuthContext>,
+        transport: SessionTransport,
+        window: Option<&crate::client_window::ClientWindow>,
+    ) -> ToolResult {
+        let detail = startup.detail;
         let project_source =
             match resolve_project_source(project, client_id, path, temporary_project_name, true) {
                 Ok(source) => source,
@@ -562,18 +629,30 @@ impl ToolRuntime {
             }
         };
         project_resolution.resolved_project = resolved.resolved_id.clone();
-        // The semantic-navigation probe, the fixed project-instruction load,
-        // and the repository overview are independent read-only startup
-        // probes. They run concurrently so the overview never adds serial
-        // startup latency; each fails independently to a deterministic state
-        // without blocking the coding task.
+        // Semantic-navigation and fixed project-instruction observation remain
+        // mandatory startup probes. The advanced start_coding_task entry also
+        // runs the independent repository overview concurrently. The ordinary
+        // work_on_project entry deliberately omits that optional scan/request.
         let (semantic_navigation, project_instructions, repository_overview) =
-            futures_util::future::join3(
-                self.probe_semantic_navigation_for_startup(&resolved),
-                self.load_coding_project_instructions(&resolved.config),
-                self.repository_overview_for_startup(&resolved, auth),
-            )
-            .await;
+            if startup.include_repository_overview {
+                futures_util::future::join3(
+                    self.probe_semantic_navigation_for_startup(&resolved),
+                    self.load_coding_project_instructions(&resolved.config),
+                    self.repository_overview_for_startup(&resolved, auth),
+                )
+                .await
+            } else {
+                let (semantic_navigation, project_instructions) = futures_util::future::join(
+                    self.probe_semantic_navigation_for_startup(&resolved),
+                    self.load_coding_project_instructions(&resolved.config),
+                )
+                .await;
+                (
+                    semantic_navigation,
+                    project_instructions,
+                    repository_overview_not_requested(),
+                )
+            };
         let semantic_navigation = serde_json::to_value(semantic_navigation).unwrap_or_else(|_| {
             json!({
                 "supported": false,
@@ -586,7 +665,12 @@ impl ToolRuntime {
         // candidate. The complete bounded body remains only in the in-memory
         // Workflow Session; the ledger persistence path omits it.
         let mut warnings = Vec::new();
-        if repository_overview.get("status").and_then(Value::as_str) == Some("unavailable") {
+        if repository_overview.get("status").and_then(Value::as_str) == Some("unavailable")
+            && repository_overview
+                .get("reason_code")
+                .and_then(Value::as_str)
+                != Some(REPOSITORY_OVERVIEW_NOT_REQUESTED_REASON)
+        {
             warnings.push(json!({
                 "kind": "repository_overview_unavailable",
                 "message": "repository structure overview was unavailable during startup",
@@ -1113,16 +1197,15 @@ impl ToolRuntime {
             Some(session_id) => Some(session_id),
             None => None,
         };
-        // Map onto the existing coding-task business implementation. Detail is
-        // standard: the shared compact brief includes rule bodies, headings,
-        // repository structure, semantic navigation, and job metadata, while
-        // the wrapper still projects only its own compact result and never the
-        // full diagnostics, tool manifest, or binding internals.
+        // Map onto the existing coding-task business implementation. The
+        // internal work-on-project profile keeps the standard shared brief,
+        // including rules, semantic navigation, workspace, and job metadata,
+        // while deliberately skipping the optional repository overview.
         // bind_current=false keeps the wrapper window-agnostic; it never
         // establishes a current-window binding or guesses an old Session.
         let new_session = session_id.is_none();
         let result = self
-            .start_coding_task(
+            .start_coding_task_with_options(
                 project.clone(),
                 client_id,
                 path,
@@ -1131,7 +1214,7 @@ impl ToolRuntime {
                 SessionMode::Normal,
                 false,
                 false,
-                StartupDetail::Standard,
+                CodingStartupOptions::work_on_project(),
                 session_id.clone(),
                 false,
                 new_session,
@@ -1732,6 +1815,16 @@ fn repository_overview_unavailable() -> Value {
     json!({
         "status": "unavailable",
         "reason_code": "unsupported_or_unavailable",
+    })
+}
+
+/// Compact marker for the ordinary work_on_project profile. This is an
+/// intentional omission, not a failed repository probe, so it must not produce
+/// an unavailable warning or lower readiness.
+fn repository_overview_not_requested() -> Value {
+    json!({
+        "status": "unavailable",
+        "reason_code": REPOSITORY_OVERVIEW_NOT_REQUESTED_REASON,
     })
 }
 

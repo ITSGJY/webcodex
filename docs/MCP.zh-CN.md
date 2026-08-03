@@ -133,23 +133,26 @@ finish_coding_task
 `tools/list` 也绝不公布它们。
 
 在 `local_coding` 上，`work_on_project(project, instruction, session_id?)` 是
-普通入口：一次调用即可返回规则、仓库结构、Git 状态、LSP 就绪度、jobs 与
-blockers，让模型可以立即开始或继续聚焦工作。没有 `session_id` 时创建新的
-Workflow Session；有 `session_id` 时只精确继续该 Session（绝不猜测最近 Session，
-也绝不 credential-wide fallback），且从不建立 current-window binding。成功调用
-返回 `session_id`、解析后的项目 id、`readiness` verdict、`workspace` Git 投影、
-`repository` 概览、有界的 `rules`（`status` 为 loaded/reused/changed/not_found/
-unavailable，含每个 source 的 fingerprint、headings、有界正文与 `read_more`
-提示）、`semantic_navigation` 就绪度、紧凑 `jobs` 计数，以及 `blockers`/
-`warnings`/`suggested_next_actions`。返回的 `repository` block 是确定性的
-元数据扫描：只读取目录项、文件类型和 Git tracked index（project types、
-manifests、key files、roots、top-level 项以及带原因的项目相对 suggested
-reads）；绝不读取普通文件正文、执行项目代码、跟随符号链接或扫描
-protected/sensitive/build/cache 路径。每个列表都有界，并各自记录
-total/returned/truncated 元数据。概览不可用时，Session 仍正常启动，
-`repository.status=unavailable` 并带有 `repository_overview_unavailable` warning；
-原始错误、绝对路径或 Runner 输出永不返回。这些新增信息仅用于参考：不会自动
-修改或自动执行任何内容，模型仍需按需使用 `read_file`、搜索、编辑与验证工具。
+轻量普通入口：一次调用即可返回规则、Git 状态、LSP 就绪度、jobs 与 blockers，
+让模型可以立即开始或继续聚焦工作。没有 `session_id` 时创建新的 Workflow
+Session；有 `session_id` 时只精确继续该 Session（绝不猜测最近 Session，也绝不
+credential-wide fallback），且从不建立 current-window binding。成功调用返回
+`session_id`、解析后的项目 id、`readiness` verdict、`workspace` Git 投影、有界的
+`instructions`（`status` 为 loaded/reused/changed/not_found/unavailable，含每个
+source 的 fingerprint、headings、有界正文与 `read_more` 提示）、
+`semantic_navigation` 就绪度、紧凑 `jobs` 计数，以及 `blockers`/`warnings`/
+`suggested_next_actions`。新 Session 首次调用仍会包含 `AGENTS.md` 等适用规则的
+有界正文；同一 Session 精确继续且 fingerprint 未变化时返回 `status=reused`，
+不会重复正文；规则变化时返回 `status=changed` 并包含更新后的正文。
+
+`work_on_project` 不会请求 Runner repository overview，也不会在本地扫描概览。
+为保持输出形状，`repository` 返回紧凑标记
+`{"status":"unavailable","reason_code":"not_requested_by_work_on_project"}`，
+不包含 project types、manifests、key files、roots、top-level、suggested reads
+或 scan metadata，也不会生成 overview failure warning。确实需要完整概览时，
+可在 `full_operator_runtime` 使用 `start_coding_task(detail=standard|full)`，
+或显式调用 `project_overview`。这些启动信息仅用于参考：不会自动修改或执行任何
+内容，模型仍需按需使用聚焦读取、搜索、编辑与验证工具。
 
 在 `full_operator_runtime` 上，普通 coding 使用 `start_coding_task` 开始或继续。
 稳定窗口默认继续同一仓库；切换仓库会切换上下文，切回会恢复此前 Workflow

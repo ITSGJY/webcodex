@@ -264,6 +264,17 @@ id generation, and atomic `projects.d` persistence under the registry write
 lock. The Server continues ordinary project resolution and Workflow Session
 matching only after the Runner returns the complete runtime project id.
 
+`work_on_project` uses an internal lightweight startup profile. It preserves
+project resolution, Workflow Session handling, repository-rule observation and
+fingerprint comparison, Git/workspace inspection, semantic-navigation probing,
+Job summaries, permission evidence, and readiness, but it neither enqueues the
+Runner's `file_project_overview` request nor performs a local overview scan.
+Its compatibility `repository` field reports the intentional omission without
+an unavailable warning. The public
+`start_coding_task(detail=minimal|standard|full)` semantics are unchanged:
+`standard` and `full` still obtain the repository overview, which is also
+available through explicit `project_overview`.
+
 ### Same-Runner Job Continuity
 
 Agent-backed async jobs have a bounded, process-local continuity layer

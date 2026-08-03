@@ -164,31 +164,33 @@ directory and never runs `git init`. This conditional registration requires
 `project:write` and the same authority decision as `register_project`, even
 though the existing-project form retains its prior read-only startup behavior.
 
-After project resolution, one call returns the rules, repository structure,
-Git state, LSP readiness, jobs, and blockers a coding model needs to start or
-continue focused work. It creates a new Workflow Session when `session_id` is
-absent, and exactly resumes the given Session when present (never a guess or a
+After project resolution, one lightweight call returns the rules, Git state,
+LSP readiness, jobs, and blockers a coding model needs to start or continue
+focused work. It creates a new Workflow Session when `session_id` is absent,
+and exactly resumes the given Session when present (never a guess or a
 credential-wide fallback); it never binds a current window. Path resolution
 always happens before explicit Session validation, so mismatch or unknown
 Session failures never fall back. A successful call returns `session_id`, the
 resolved project id, bounded path-free `project_resolution` metadata, a
-`readiness` verdict, the
-`workspace` Git projection, the `repository` overview, the bounded `rules`
+`readiness` verdict, the `workspace` Git projection, bounded `instructions`
 (`status` loaded/reused/changed/not_found/unavailable, per-source fingerprint,
 headings, bounded content, and `read_more` hints), `semantic_navigation`
-readiness, the compact `jobs` counts, and `blockers`/`warnings`/
-`suggested_next_actions`. The returned `repository` block is a deterministic
-metadata scan of directory entries, file types, and the Git tracked index
-(project types, manifests, key files, roots, top level entries, and
-project-relative suggested reads with reasons); it never reads ordinary file
-bodies, executes project code, follows symlinks, or scans
-protected/sensitive/build/cache paths. Every list is bounded and records its
-own total/returned/truncated metadata. If the overview is unavailable, the
-session still starts and `repository.status=unavailable` with a
-`repository_overview_unavailable` warning; raw errors, absolute paths, or
-Runner output are never returned. The extra context is informational only: it
-does not modify or execute project contents, and the model still uses
-`read_file`, search, edits, and validation tools as needed.
+readiness, compact `jobs` counts, and `blockers`/`warnings`/
+`suggested_next_actions`. A fresh Session includes bounded applicable rule
+bodies such as `AGENTS.md`. An exact continuation with unchanged rule
+fingerprints reports `status=reused` and does not repeat those bodies; changed
+rules report `status=changed` and include the new content.
+
+`work_on_project` deliberately does not request or locally scan a repository
+overview. Its compatibility `repository` field is the compact marker
+`{"status":"unavailable","reason_code":"not_requested_by_work_on_project"}`;
+it contains no project types, manifests, key files, roots, top-level entries,
+suggested reads, scan metadata, or overview-failure warning. Use
+`start_coding_task(detail=standard|full)` on `full_operator_runtime`, or call
+`project_overview` explicitly, when that metadata is useful. The returned
+startup context is informational only: it does not modify or execute project
+contents, and the model still uses focused reads, search, edits, and validation
+tools as needed.
 
 ```json
 {

@@ -21,6 +21,8 @@ use super::tool_inputs::StartupDetail;
 // Reserve transport-envelope headroom so a ToolResult and the GPT Actions
 // wrapper also remain below the externally documented 32 KiB ceiling.
 pub(crate) const STANDARD_STARTUP_HARD_MAX_BYTES: usize = 30 * 1024;
+pub(crate) const REPOSITORY_OVERVIEW_NOT_REQUESTED_REASON: &str =
+    "not_requested_by_work_on_project";
 const INSTRUCTION_CONTENT_JSON_BUDGET: usize = 10 * 1024;
 const MIN_INSTRUCTION_CONTENT_JSON_BYTES: usize = 512;
 const MAX_RULE_HEADINGS: usize = 6;
@@ -295,9 +297,16 @@ fn semantic_navigation_projection(value: &Value) -> Value {
 /// total and flips truncated instead of silently presenting as complete.
 pub(crate) fn repository_projection(source: &Value) -> Value {
     if source.get("status").and_then(Value::as_str) != Some("available") {
+        let reason_code = if source.get("reason_code").and_then(Value::as_str)
+            == Some(REPOSITORY_OVERVIEW_NOT_REQUESTED_REASON)
+        {
+            REPOSITORY_OVERVIEW_NOT_REQUESTED_REASON
+        } else {
+            "unsupported_or_unavailable"
+        };
         return json!({
             "status": "unavailable",
-            "reason_code": "unsupported_or_unavailable",
+            "reason_code": reason_code,
         });
     }
     json!({
@@ -1001,7 +1010,10 @@ fn startup_issues(
     if instructions.get("status").and_then(Value::as_str) == Some("unavailable") {
         push_unique(&mut warnings, "rules_unavailable");
     }
-    if input.repository.get("status").and_then(Value::as_str) == Some("unavailable") {
+    if input.repository.get("status").and_then(Value::as_str) == Some("unavailable")
+        && input.repository.get("reason_code").and_then(Value::as_str)
+            != Some(REPOSITORY_OVERVIEW_NOT_REQUESTED_REASON)
+    {
         push_unique(&mut warnings, "repository_overview_unavailable");
     }
     let semantic_status = semantic_navigation.get("status").and_then(Value::as_str);

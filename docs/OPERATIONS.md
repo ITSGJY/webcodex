@@ -496,7 +496,12 @@ snapshot; it does not close the Session or change its lifecycle.
 For ordinary daily coding, `work_on_project` is the default entry point: pass an
 existing project and an instruction, plus `session_id` only when continuing one
 exact Workflow Session. It returns a compact startup projection and never
-depends on or creates a chat-window binding.
+depends on or creates a chat-window binding. Fresh Sessions still include
+bounded applicable repository-rule bodies; unchanged exact continuations reuse
+their fingerprints without repeating content. The compact response deliberately
+does not request a repository overview. Use
+`start_coding_task(detail=standard|full)` or explicit `project_overview` when
+project types, manifests, key files, roots, or suggested reads are needed.
 
 ### 1. Start ordinary coding work
 

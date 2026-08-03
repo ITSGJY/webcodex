@@ -235,15 +235,21 @@ configuration serves the focused `local_coding` surface on `/mcp` by default;
 the explicit `WEBCODEX_MCP_MODEL_SURFACE=full-operator-v1` selects the full
 operator runtime. `GET /mcp`, MCP initialize, and `runtime_status.model_surface`
 all identify the active surface. On `local_coding`, `work_on_project` is the
-ordinary entry point: one call returns the repository rules, a deterministic
-repository structure overview (project types, manifests, key files, roots, and
-project-relative suggested reads — metadata only, never file bodies), Git
-state, LSP readiness, jobs, and blockers so the model can start targeted
-inspection immediately. It creates a new Workflow Session or exactly resumes the
-given one, never binds a current window, and never falls back to a guessed
-Session. The added context is informational: it modifies or executes nothing,
-and the model still uses `read_file`, search, edits, and validation tools as
-needed. The project source is either the existing `project` runtime id or
+lightweight ordinary entry point: one call returns the applicable repository
+rules, Git state, LSP readiness, jobs, and blockers so the model can start
+targeted inspection immediately. It deliberately does not run a repository
+overview scan; the compatibility `repository` field reports
+`reason_code=not_requested_by_work_on_project` without overview lists or a
+failure warning. A fresh Workflow Session includes bounded rule bodies such as
+`AGENTS.md`; an exact continuation with unchanged fingerprints returns rule
+metadata without repeating those bodies, while changed rules are returned
+again. Use `start_coding_task(detail=standard|full)` on the full runtime, or
+call `project_overview` explicitly, when a complete repository overview is
+actually needed. `work_on_project` creates a new Workflow Session or exactly
+resumes the given one, never binds a current window, and never falls back to a
+guessed Session. The returned context is informational: it modifies or executes
+nothing, and the model still uses `read_file`, search, edits, and validation
+tools as needed. The project source is either the existing `project` runtime id or
 `client_id` plus an existing absolute `path`; the two forms are mutually
 exclusive. For the path form, the owning Runner canonicalizes and policy-checks
 the directory, reuses one unique enabled canonical-path registration, or
