@@ -41,7 +41,7 @@ pub(in crate::tool_runtime::tests) fn sample_tool_args_for_spec(spec: &ToolSpec)
         return Value::Null;
     }
 
-    let args = required
+    let mut args: serde_json::Map<String, Value> = required
         .iter()
         .map(|field| {
             let field = field
@@ -50,6 +50,19 @@ pub(in crate::tool_runtime::tests) fn sample_tool_args_for_spec(spec: &ToolSpec)
             (field.to_string(), sample_field_value(field))
         })
         .collect();
+    // Conditional project-source schemas cannot express one representative
+    // source through the top-level `required` array. Keep fixtures aligned with
+    // each tool's metadata contract: start_coding_task may create/resolve its
+    // project, while work_on_project is always project-scoped.
+    match spec.name.as_str() {
+        "start_coding_task" => {
+            args.insert("client_id".to_string(), json!("oe"));
+        }
+        "work_on_project" => {
+            args.insert("project".to_string(), json!(SAMPLE_PROJECT));
+        }
+        _ => {}
+    }
     Value::Object(args)
 }
 
@@ -106,48 +119,6 @@ pub(in crate::tool_runtime::tests) fn sample_tool_args_with_session(name: &str) 
         Value::String("wc_sess_accessor".to_string()),
     );
     args
-}
-
-/// Build a placeholder value for a required field from its JSON Schema
-/// property definition. When the property carries an `enum` constraint the
-/// first allowed value is used so that serde deserialization succeeds.
-pub(in crate::tool_runtime::tests) fn placeholder_from_prop(prop: &Value) -> Value {
-    if let Some(vals) = prop["enum"].as_array() {
-        if let Some(first) = vals.first() {
-            return first.clone();
-        }
-    }
-    let kind = prop["type"].as_str().unwrap_or("string");
-    match kind {
-        "integer" => json!(1),
-        "array" => {
-            let minimum = prop["minItems"].as_u64().unwrap_or(0) as usize;
-            let item = prop.get("items").unwrap_or(&Value::Null);
-            Value::Array(
-                std::iter::repeat_with(|| placeholder_from_prop(item))
-                    .take(minimum)
-                    .collect(),
-            )
-        }
-        "object" => {
-            let properties = prop["properties"].as_object();
-            let fields = prop["required"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .map(|field| {
-                    let child = properties
-                        .and_then(|properties| properties.get(field))
-                        .unwrap_or(&Value::Null);
-                    (field.to_string(), placeholder_from_prop(child))
-                })
-                .collect();
-            Value::Object(fields)
-        }
-        "boolean" => json!(true),
-        _ => json!("value"),
-    }
 }
 
 /// Helper: fetch a ToolSpec by name from the runtime.

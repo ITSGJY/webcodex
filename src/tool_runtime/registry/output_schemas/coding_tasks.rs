@@ -197,6 +197,7 @@ fn startup_brief_schema(detail: &str) -> Value {
             "detail": {"type": "string", "const": detail},
             "session": startup_session_schema(),
             "project": startup_project_schema(),
+            "project_resolution": project_resolution_schema(),
             "workspace": startup_workspace_schema(),
             "instructions": startup_instructions_schema(),
             "continuation": startup_continuation_schema(detail),
@@ -212,6 +213,7 @@ fn startup_brief_schema(detail: &str) -> Value {
             "detail",
             "session",
             "project",
+            "project_resolution",
             "workspace",
             "instructions",
             "continuation",
@@ -234,6 +236,7 @@ fn full_startup_output_schema() -> Value {
         "properties": {
             "detail": {"type": "string", "const": "full"},
             "project": schema_type("string", "Original project input."),
+            "project_resolution": project_resolution_schema(),
             "resolved_project": open_object_schema("Resolved project id, absolute execution path, executor, and diagnostic project metadata."),
             "session": open_object_schema("Full Workflow Session, guard, capability, context-refresh, exact-binding, and explicitly resumed session diagnostics."),
             "runtime_status": open_object_schema("Full runtime status diagnostics."),
@@ -254,6 +257,7 @@ fn full_startup_output_schema() -> Value {
         "required": [
             "detail",
             "project",
+            "project_resolution",
             "resolved_project",
             "session",
             "runtime_status",
@@ -275,6 +279,38 @@ fn full_startup_output_schema() -> Value {
     });
     add_startup_recorder_metadata(&mut schema);
     schema
+}
+
+fn project_resolution_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Bounded, path-free project source resolution metadata.",
+        "properties": {
+            "source": {
+                "type": "string",
+                "enum": ["project", "path", "managed_temporary"]
+            },
+            "outcome": {
+                "type": "string",
+                "enum": [
+                    "resolved_existing_project",
+                    "reused_existing_registration",
+                    "auto_registered",
+                    "managed_temporary_created"
+                ]
+            },
+            "resolved_project": {
+                "type": "string",
+                "description": "Full runtime project id; never an absolute path."
+            },
+            "registered": {
+                "type": "boolean",
+                "description": "True only when this call permanently created a registration."
+            }
+        },
+        "required": ["source", "outcome", "resolved_project", "registered"],
+        "additionalProperties": false
+    })
 }
 
 fn startup_session_schema() -> Value {
@@ -1039,6 +1075,10 @@ fn work_on_project_output_schema() -> Value {
         (
             "resolved_project",
             schema_type("string", "Resolved full runtime project id from the permission check and exact project resolution."),
+        ),
+        (
+            "project_resolution",
+            project_resolution_schema(),
         ),
         (
             "continuation",

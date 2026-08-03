@@ -1,24 +1,106 @@
 //! Focused tests for the `work_on_project` thin coding-task entry point.
 //!
 //! `work_on_project` is a model-facing wrapper over `start_coding_task`: it
-//! validates three simple inputs, maps them onto normal coding-task defaults,
-//! delegates the business implementation, and projects a compact startup
-//! result. It never binds a current window, never guesses a recent Session,
-//! and never falls back to a credential-wide Session.
+//! validates one of two project sources plus the task inputs, maps them onto
+//! normal coding-task defaults, delegates the business implementation, and
+//! projects a compact startup result. It never binds a current window, never
+//! guesses a recent Session, and never falls back to a credential-wide Session.
 
 use super::reconnect::dispatch_start_coding_task_in_window;
 use super::support::*;
 use crate::shell_protocol::ShellClientCapabilities;
+use crate::tool_runtime::permissions::{AuthorityMode, PermissionEvaluator};
 use crate::tool_runtime::sessions::{SessionEvent, SessionGuards};
-use crate::tool_runtime::{registered_tool_specs, SessionMode, ToolCall, ToolRuntime};
-use serde_json::json;
+use crate::tool_runtime::{registered_tool_specs, SessionMode, ToolCall, ToolResult, ToolRuntime};
+use serde_json::{json, Value};
 
 fn work_on_project_call(project: &str, instruction: &str, session_id: Option<&str>) -> ToolCall {
     ToolCall::WorkOnProject {
         project: project.to_string(),
+        client_id: None,
+        path: None,
         instruction: instruction.to_string(),
         session_id: session_id.map(str::to_string),
     }
+}
+
+fn path_work_on_project_call(
+    client_id: &str,
+    path: &str,
+    instruction: &str,
+    session_id: Option<&str>,
+) -> ToolCall {
+    ToolCall::WorkOnProject {
+        project: String::new(),
+        client_id: Some(client_id.to_string()),
+        path: Some(path.to_string()),
+        instruction: instruction.to_string(),
+        session_id: session_id.map(str::to_string),
+    }
+}
+
+async fn dispatch_with_path_runner(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    call: ToolCall,
+    agent_project_id: &str,
+    project_path: &str,
+    outcome: &str,
+    registered: bool,
+) -> ToolResult {
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth_context(None, true);
+        async move { runtime.dispatch_with_auth(call, Some(&auth)).await }
+    });
+    for _ in 0..400 {
+        if task.is_finished() {
+            break;
+        }
+        if let Some(request) = next_patch_agent_request(runtime, client_id).await {
+            if request.kind == "resolve_or_register_project" {
+                let payload: Value =
+                    serde_json::from_str(request.stdin.as_deref().unwrap()).unwrap();
+                assert_eq!(payload["path"], project_path);
+                let response = json!({
+                    "id": format!("agent:{client_id}:{agent_project_id}"),
+                    "agent_project_id": agent_project_id,
+                    "client_id": client_id,
+                    "name": agent_project_id,
+                    "path": project_path,
+                    "kind": "auto_registered",
+                    "description": null,
+                    "allow_patch": true,
+                    "disabled": false,
+                    "revision": "sha256:test",
+                    "source": "path",
+                    "outcome": outcome,
+                    "registered": registered,
+                    "created_config": registered,
+                    "changed": registered,
+                    "recovered": !registered,
+                });
+                complete_patch_agent_request(
+                    runtime,
+                    client_id,
+                    &request.request_id,
+                    0,
+                    &response.to_string(),
+                    "",
+                )
+                .await;
+            } else {
+                complete_agent_request_by_running_locally(runtime, client_id, request).await;
+            }
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+    assert!(
+        task.is_finished(),
+        "path-based coding call did not finish after servicing Runner requests"
+    );
+    task.await.unwrap()
 }
 
 fn instruction_events(runtime: &ToolRuntime, session_id: &str) -> Vec<SessionEvent> {
@@ -42,6 +124,12 @@ fn valid_work_on_project_projection_input() -> serde_json::Value {
         },
         "project": {
             "resolved_id": "agent:wop:demo",
+        },
+        "project_resolution": {
+            "source": "project",
+            "outcome": "resolved_existing_project",
+            "resolved_project": "agent:wop:demo",
+            "registered": false,
         },
         "workspace": {
             "status": "clean",
@@ -118,12 +206,14 @@ fn work_on_project_schema_and_registration() {
     assert!(definition.creates_or_binds_session());
     assert!(!definition.requires_explicit_business_session());
 
-    // Schema requires project and instruction; session_id is optional with the
-    // existing wc_sess_* format constraint.
+    // Schema requires instruction plus exactly one project source; session_id
+    // is optional with the existing wc_sess_* format constraint.
     let spec = spec_named(&specs, "work_on_project");
-    assert_eq!(required_fields(spec), vec!["project", "instruction"]);
+    assert_eq!(required_fields(spec), vec!["instruction"]);
     let props = spec.input_schema["properties"].as_object().unwrap();
     assert_eq!(props["project"]["minLength"], 1);
+    assert_eq!(props["path"]["pattern"], "^/");
+    assert_eq!(spec.input_schema["oneOf"].as_array().unwrap().len(), 2);
     assert_eq!(props["instruction"]["minLength"], 1);
     assert_eq!(
         props["instruction"]["maxLength"],
@@ -131,6 +221,31 @@ fn work_on_project_schema_and_registration() {
     );
     assert_eq!(props["session_id"]["type"], "string");
     assert_eq!(props["session_id"]["pattern"], "^wc_sess_[A-Za-z0-9_]+$");
+    let schema_accepts = |value: Value| {
+        crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
+            &value,
+            &spec.input_schema,
+        )
+        .is_ok()
+    };
+    assert!(schema_accepts(
+        json!({"project": SAMPLE_PROJECT, "instruction": "do it"})
+    ));
+    assert!(schema_accepts(json!({
+        "client_id": "special",
+        "path": "/root/git/example",
+        "instruction": "do it"
+    })));
+    for invalid in [
+        json!({"path": "/root/git/example", "instruction": "do it"}),
+        json!({"client_id": "special", "instruction": "do it"}),
+        json!({"project": SAMPLE_PROJECT, "client_id": "special", "path": "/root/git/example", "instruction": "do it"}),
+    ] {
+        assert!(
+            !schema_accepts(invalid.clone()),
+            "work_on_project schema accepted conflicting path source: {invalid}"
+        );
+    }
 
     // The wrapper must not expose advanced start_coding_task controls.
     for hidden in [
@@ -142,7 +257,6 @@ fn work_on_project_schema_and_registration() {
         "deny_shell_tools",
         "execution_context",
         "detail",
-        "client_id",
         "temporary_project_name",
     ] {
         assert!(
@@ -160,6 +274,7 @@ fn work_on_project_schema_and_registration() {
         "session_id",
         "project",
         "resolved_project",
+        "project_resolution",
         "continuation",
         "execution_context",
         "readiness",
@@ -226,8 +341,18 @@ fn work_on_project_tool_call_requires_project_and_instruction() {
         ToolCall::from_tool_name("work_on_project", json!({"project": SAMPLE_PROJECT})).is_err(),
         "instruction is required"
     );
-    // The schema declares additionalProperties: false so advanced start_coding_task
-    // controls are not part of the wrapper's model-visible surface.
+    let path_call = ToolCall::from_tool_name(
+        "work_on_project",
+        json!({
+            "client_id": "special",
+            "path": "/root/git/example",
+            "instruction": "do it"
+        }),
+    )
+    .unwrap();
+    assert!(path_call.project().is_none());
+    // The schema declares additionalProperties: false so advanced
+    // start_coding_task controls are not part of the wrapper surface.
     let spec = registered_tool_specs()
         .into_iter()
         .find(|spec| spec.name == "work_on_project")
@@ -243,7 +368,6 @@ fn work_on_project_tool_call_requires_project_and_instruction() {
         "deny_shell_tools",
         "execution_context",
         "detail",
-        "client_id",
         "temporary_project_name",
     ] {
         assert!(
@@ -327,7 +451,7 @@ async fn work_on_project_creates_a_new_normal_session_without_binding() {
     let result = dispatch_start_coding_task_in_window(
         &runtime,
         "wop-create",
-        work_on_project_call(&project, "first root instruction", None),
+        work_on_project_call("demo", "first root instruction", None),
         Some(&auth),
         "wop-create-window",
     )
@@ -339,7 +463,12 @@ async fn work_on_project_creates_a_new_normal_session_without_binding() {
     assert_eq!(result.output["llm_summary"], false);
     let session_id = result.output["session_id"].as_str().unwrap().to_string();
     assert!(session_id.starts_with("wc_sess_"));
-    assert_eq!(result.output["project"], project);
+    assert_eq!(result.output["project"], "demo");
+    assert_eq!(result.output["resolved_project"], project);
+    assert_eq!(
+        result.output["project_resolution"]["resolved_project"],
+        project
+    );
     assert_eq!(result.output["continuation"], "created");
     for hidden in [
         "runtime_status",
@@ -389,6 +518,380 @@ async fn work_on_project_creates_a_new_normal_session_without_binding() {
     let instance = json!({ "success": true, "output": result.output });
     crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&instance, &schema)
         .unwrap_or_else(|error| panic!("compact output must match its schema: {error}"));
+}
+
+#[tokio::test]
+async fn path_source_auto_registers_reuses_and_supports_both_coding_entries() {
+    let root = tempfile::tempdir().unwrap();
+    init_git_repo(root.path());
+    std::fs::write(root.path().join("hello.txt"), "hello\n").unwrap();
+    let project_path = root.path().canonicalize().unwrap();
+    let project_path = project_path.to_string_lossy().to_string();
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "wop-path";
+    register_agent_with_projects(
+        &runtime,
+        client_id,
+        None,
+        ShellClientCapabilities {
+            shell: true,
+            git: true,
+            file_read: true,
+            file_write: true,
+            ..Default::default()
+        },
+        Vec::new(),
+    )
+    .await;
+
+    let first = dispatch_with_path_runner(
+        &runtime,
+        client_id,
+        path_work_on_project_call(client_id, &project_path, "first path instruction", None),
+        "repo-a1b2c3d4",
+        &project_path,
+        "auto_registered",
+        true,
+    )
+    .await;
+    assert!(first.success, "{:?}", first.error);
+    assert_eq!(first.output["project_resolution"]["source"], "path");
+    assert_eq!(
+        first.output["project_resolution"]["outcome"],
+        "auto_registered"
+    );
+    assert_eq!(first.output["project_resolution"]["registered"], true);
+    assert_eq!(first.output["permission"]["status"], "auto_approved");
+    assert_eq!(first.output["permission"]["tool_name"], "register_project");
+    assert_eq!(
+        first.output["resolved_project"],
+        "agent:wop-path:repo-a1b2c3d4"
+    );
+    assert!(
+        !first.output.to_string().contains(&project_path),
+        "compact work_on_project output leaked the absolute input path"
+    );
+    let session_id = first.output["session_id"].as_str().unwrap().to_string();
+
+    let second = dispatch_with_path_runner(
+        &runtime,
+        client_id,
+        path_work_on_project_call(
+            client_id,
+            &project_path,
+            "second path instruction",
+            Some(&session_id),
+        ),
+        "repo-a1b2c3d4",
+        &project_path,
+        "reused_existing_registration",
+        false,
+    )
+    .await;
+    assert!(second.success, "{:?}", second.error);
+    assert_eq!(second.output["session_id"], session_id);
+    assert_eq!(second.output["continuation"], "resumed_explicitly");
+    assert_eq!(second.output["permission"]["status"], "auto_approved");
+    assert_eq!(second.output["permission"]["tool_name"], "register_project");
+    assert_eq!(
+        second.output["project_resolution"]["outcome"],
+        "reused_existing_registration"
+    );
+    assert_eq!(instruction_events(&runtime, &session_id).len(), 2);
+
+    let advanced = ToolCall::from_tool_name(
+        "start_coding_task",
+        json!({
+            "client_id": client_id,
+            "path": project_path,
+            "title": "advanced path entry",
+            "detail": "standard",
+            "bind_current": false,
+            "new_session": true
+        }),
+    )
+    .unwrap();
+    let advanced = dispatch_with_path_runner(
+        &runtime,
+        client_id,
+        advanced,
+        "repo-a1b2c3d4",
+        &project_path,
+        "reused_existing_registration",
+        false,
+    )
+    .await;
+    assert!(advanced.success, "{:?}", advanced.error);
+    assert_eq!(advanced.output["permission"]["status"], "auto_approved");
+    assert_eq!(
+        advanced.output["permission"]["tool_name"],
+        "register_project"
+    );
+    assert_eq!(advanced.output["project_resolution"]["source"], "path");
+    assert_eq!(
+        advanced.output["project_resolution"]["resolved_project"],
+        "agent:wop-path:repo-a1b2c3d4"
+    );
+
+    let listed = runtime.list_projects(Some(&auth_context(None, true))).await;
+    assert!(listed.success);
+    assert!(listed.output["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|project| project["id"] == "agent:wop-path:repo-a1b2c3d4"
+            && project["source"] == "auto_registered"));
+
+    let read = ToolCall::from_tool_name(
+        "read_file",
+        json!({
+            "project": "agent:wop-path:repo-a1b2c3d4",
+            "session_id": session_id,
+            "path": "hello.txt"
+        }),
+    )
+    .unwrap();
+    let read = dispatch_with_path_runner(
+        &runtime,
+        client_id,
+        read,
+        "repo-a1b2c3d4",
+        &project_path,
+        "reused_existing_registration",
+        false,
+    )
+    .await;
+    assert!(read.success, "{:?}", read.error);
+    assert!(read.output["text"]
+        .as_str()
+        .is_some_and(|content| content.contains("hello")));
+}
+
+#[tokio::test]
+async fn path_source_registers_before_exact_session_mismatch_and_never_falls_back() {
+    let first_root = tempfile::tempdir().unwrap();
+    let second_root = tempfile::tempdir().unwrap();
+    init_git_repo(first_root.path());
+    init_git_repo(second_root.path());
+    let first_path = first_root.path().canonicalize().unwrap();
+    let second_path = second_root.path().canonicalize().unwrap();
+    let first_path = first_path.to_string_lossy().to_string();
+    let second_path = second_path.to_string_lossy().to_string();
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "wop-path-mismatch";
+    register_agent_with_projects(
+        &runtime,
+        client_id,
+        None,
+        ShellClientCapabilities {
+            shell: true,
+            git: true,
+            file_read: true,
+            file_write: true,
+            ..Default::default()
+        },
+        Vec::new(),
+    )
+    .await;
+
+    let first = dispatch_with_path_runner(
+        &runtime,
+        client_id,
+        path_work_on_project_call(client_id, &first_path, "first project", None),
+        "first-a1b2c3d4",
+        &first_path,
+        "auto_registered",
+        true,
+    )
+    .await;
+    assert!(first.success);
+    let session_id = first.output["session_id"].as_str().unwrap();
+    let mismatch = dispatch_with_path_runner(
+        &runtime,
+        client_id,
+        path_work_on_project_call(
+            client_id,
+            &second_path,
+            "must not fall back",
+            Some(session_id),
+        ),
+        "second-a1b2c3d4",
+        &second_path,
+        "auto_registered",
+        true,
+    )
+    .await;
+    assert!(!mismatch.success);
+    assert_eq!(mismatch.output["error_kind"], "session_project_mismatch");
+    assert_eq!(mismatch.output["state_changed"], true);
+    assert_eq!(mismatch.output["permission"]["status"], "auto_approved");
+    assert_eq!(
+        mismatch.output["permission"]["tool_name"],
+        "register_project"
+    );
+    assert_eq!(
+        mismatch.output["project_resolution"]["resolved_project"],
+        "agent:wop-path-mismatch:second-a1b2c3d4"
+    );
+    assert_eq!(instruction_events(&runtime, session_id).len(), 1);
+
+    let advanced_mismatch = ToolCall::from_tool_name(
+        "start_coding_task",
+        json!({
+            "client_id": client_id,
+            "path": second_path,
+            "resume_session_id": session_id,
+            "detail": "standard",
+            "bind_current": false
+        }),
+    )
+    .unwrap();
+    let advanced_mismatch = dispatch_with_path_runner(
+        &runtime,
+        client_id,
+        advanced_mismatch,
+        "second-a1b2c3d4",
+        &second_path,
+        "reused_existing_registration",
+        false,
+    )
+    .await;
+    assert!(!advanced_mismatch.success);
+    assert_eq!(
+        advanced_mismatch.output["error_kind"],
+        "session_project_mismatch"
+    );
+    assert_eq!(advanced_mismatch.output["state_changed"], false);
+    assert_eq!(
+        advanced_mismatch.output["project_resolution"]["outcome"],
+        "reused_existing_registration"
+    );
+    assert_eq!(instruction_events(&runtime, session_id).len(), 1);
+
+    let listed = runtime.list_projects(Some(&auth_context(None, true))).await;
+    assert_eq!(listed.output["count"], 2);
+}
+
+#[tokio::test]
+async fn path_source_registers_before_unknown_session_rejection() {
+    let root = tempfile::tempdir().unwrap();
+    init_git_repo(root.path());
+    let project_path = root.path().canonicalize().unwrap();
+    let project_path = project_path.to_string_lossy().to_string();
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "wop-path-unknown";
+    register_agent_with_projects(
+        &runtime,
+        client_id,
+        None,
+        ShellClientCapabilities {
+            shell: true,
+            git: true,
+            file_read: true,
+            file_write: true,
+            ..Default::default()
+        },
+        Vec::new(),
+    )
+    .await;
+
+    let result = dispatch_with_path_runner(
+        &runtime,
+        client_id,
+        path_work_on_project_call(
+            client_id,
+            &project_path,
+            "unknown must not fall back",
+            Some("wc_sess_unknown"),
+        ),
+        "unknown-a1b2c3d4",
+        &project_path,
+        "auto_registered",
+        true,
+    )
+    .await;
+    assert!(!result.success);
+    assert_eq!(result.output["error_kind"], "unknown_session_id");
+    assert_eq!(result.output["state_changed"], true);
+    assert_eq!(result.output["permission"]["status"], "auto_approved");
+    assert_eq!(result.output["permission"]["tool_name"], "register_project");
+    assert_eq!(
+        result.output["project_resolution"]["resolved_project"],
+        "agent:wop-path-unknown:unknown-a1b2c3d4"
+    );
+    let listed = runtime.list_projects(Some(&auth_context(None, true))).await;
+    assert_eq!(listed.output["count"], 1);
+}
+
+#[tokio::test]
+async fn path_source_requires_project_write_scope_before_runner_enqueue() {
+    let root = tempfile::tempdir().unwrap();
+    let project_path = root.path().canonicalize().unwrap();
+    let project_path = project_path.to_string_lossy().to_string();
+    let runtime = ToolRuntime::new_for_tests();
+    let auth = managed_oauth_auth_context("path-read-only", Some("path-read-only-hash"));
+    register_agent_projects_for_auth(
+        &runtime,
+        "oauth-client",
+        &auth,
+        ShellClientCapabilities {
+            shell: true,
+            git: true,
+            ..Default::default()
+        },
+        Vec::new(),
+    )
+    .await;
+
+    let result = runtime
+        .dispatch_with_auth(
+            path_work_on_project_call("oauth-client", &project_path, "must not register", None),
+            Some(&auth),
+        )
+        .await;
+    assert!(!result.success);
+    assert_eq!(result.output["error_kind"], "insufficient_scope");
+    assert_eq!(
+        result.output["required_scope"],
+        crate::auth::SCOPE_PROJECT_WRITE
+    );
+    assert_eq!(result.output["state_changed"], false);
+}
+
+#[tokio::test]
+async fn path_source_respects_restricted_authority_before_runner_enqueue() {
+    let root = tempfile::tempdir().unwrap();
+    let project_path = root.path().canonicalize().unwrap();
+    let project_path = project_path.to_string_lossy().to_string();
+    let runtime = ToolRuntime::new_for_tests()
+        .with_permission_evaluator(PermissionEvaluator::with_mode(AuthorityMode::Restricted));
+    let client_id = "wop-path-restricted";
+    register_agent_with_projects(
+        &runtime,
+        client_id,
+        None,
+        ShellClientCapabilities {
+            shell: true,
+            git: true,
+            ..Default::default()
+        },
+        Vec::new(),
+    )
+    .await;
+
+    let result = runtime
+        .dispatch_with_auth(
+            path_work_on_project_call(client_id, &project_path, "must not register", None),
+            Some(&auth_context(None, true)),
+        )
+        .await;
+    assert!(!result.success);
+    assert_eq!(result.output["error_kind"], "permission_denied");
+    assert_eq!(result.output["permission"]["status"], "denied");
+    assert_eq!(result.output["permission"]["tool_name"], "register_project");
+    assert!(next_patch_agent_request(&runtime, client_id)
+        .await
+        .is_none());
 }
 
 #[tokio::test]

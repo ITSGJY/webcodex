@@ -243,7 +243,16 @@ inspection immediately. It creates a new Workflow Session or exactly resumes the
 given one, never binds a current window, and never falls back to a guessed
 Session. The added context is informational: it modifies or executes nothing,
 and the model still uses `read_file`, search, edits, and validation tools as
-needed. The full runtime's `start_coding_task` has the same
+needed. The project source is either the existing `project` runtime id or
+`client_id` plus an existing absolute `path`; the two forms are mutually
+exclusive. For the path form, the owning Runner canonicalizes and policy-checks
+the directory, reuses one unique enabled canonical-path registration, or
+atomically persists a stable hashed id under `projects.d` before Session
+handling. The result adds bounded, path-free `project_resolution` metadata
+(`reused_existing_registration` or `auto_registered`). Registration is the
+path resolver's only filesystem mutation; it requires project-write authority
+and does not create or modify the target directory or initialize Git. The full
+runtime's `start_coding_task` has the same
 window/repository start-or-continue semantics, but its current binding is
 process-local and its broader tool set is intended for operator and debugging
 workflows.

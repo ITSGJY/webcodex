@@ -60,6 +60,15 @@ reused across continuation, explicit resume, mode upgrade, and restart without
 automatically executing tools. The standard/full core returns at most 12 paths
 (`minimal`: 3), and the complete Action response remains below 32 KiB.
 
+The flattened generic request accepts exactly one ordinary project source:
+`project`, or `client_id` plus an existing absolute `path`. The latter invokes
+the owning Runner's internal canonical-path resolve-or-register operation
+before Workflow Session matching; it does not add an Action operation or MCP
+tool. Conditional registration requires `project:write`, respects Runner path
+policy, persists atomically under `projects.d`, and returns only bounded
+path-free `project_resolution` metadata. The existing `client_id` managed
+temporary-project form for `start_coding_task` remains available and distinct.
+
 The same generic path exposes a strict flattened `execution_context` object
 with only `default_cwd` (project-relative) and `default_shell` (`sh` or
 `bash`). `start_coding_task` can set or replace it and

@@ -202,7 +202,24 @@ impl ToolRuntime {
                 }
             }
         }
-        let session_id = call.session_id().map(str::to_string);
+        // A path-backed work_on_project call must let the Runner resolve or
+        // register the canonical project before exact Workflow Session
+        // validation. The wrapper delegates all Session checks to
+        // start_coding_task, so suppress only the generic pre-dispatch Session
+        // path here; the business session_id remains on the ToolCall.
+        let defer_path_work_session = matches!(
+            &call,
+            ToolCall::WorkOnProject {
+                project,
+                path: Some(path),
+                ..
+            } if project.trim().is_empty() && !path.trim().is_empty()
+        );
+        let session_id = if defer_path_work_session {
+            None
+        } else {
+            call.session_id().map(str::to_string)
+        };
         if let Some(session_id) = session_id.as_deref() {
             // `work_on_project` owns validation of its public `session_id`
             // argument so malformed ids retain the stable invalid_session_id

@@ -19,7 +19,9 @@ use super::handoff::{
     unresolved_unexpected_failure_count, validation_has_cargo_test_zero_tests,
 };
 use super::handoff_brief::{build_handoff_brief, HandoffBriefInput};
-use super::permissions::{authority_profile_payload, permission_summary_from_events};
+use super::permissions::{
+    authority_profile_payload, permission_summary_from_events, PermissionDecision,
+};
 use super::project_instructions::{ProjectInstructionFile, ProjectInstructionsSnapshot};
 use super::project_resolution::ResolvedProject;
 use super::runtime_info::compact_runtime_status;
@@ -53,12 +55,230 @@ const FINISH_SESSION_EVENT_LIMIT: usize = 200;
 /// failure must not block the coding task, so it fails over quickly.
 pub(crate) const DEFAULT_REPOSITORY_OVERVIEW_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct ProjectResolutionMetadata {
+    pub(crate) source: String,
+    pub(crate) outcome: String,
+    pub(crate) resolved_project: String,
+    pub(crate) registered: bool,
+    #[serde(skip)]
+    pub(crate) permission: Option<PermissionDecision>,
+}
+
+enum CodingProjectSource {
+    Existing {
+        project: String,
+    },
+    RunnerPath {
+        client_id: String,
+        path: String,
+    },
+    ManagedTemporary {
+        client_id: String,
+        name: Option<String>,
+    },
+}
+
+fn invalid_project_source(message: impl Into<String>, fields: Value) -> ToolResult {
+    let mut output = json!({
+        "error_kind": "invalid_arguments",
+        "failure_kind": "invalid_arguments",
+        "constraint": "exactly_one_project_source",
+        "state_changed": false,
+    });
+    if let (Some(output), Some(fields)) = (output.as_object_mut(), fields.as_object()) {
+        output.extend(fields.clone());
+    }
+    ToolResult::err_with_output(message, output)
+}
+
+fn non_empty_optional_field(
+    field: &'static str,
+    value: Option<String>,
+) -> Result<Option<String>, ToolResult> {
+    match value {
+        Some(value) => {
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() {
+                Err(invalid_project_source(
+                    format!("{field} must not be empty"),
+                    json!({"field": field}),
+                ))
+            } else {
+                Ok(Some(trimmed))
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+fn resolve_project_source(
+    project: String,
+    client_id: Option<String>,
+    path: Option<String>,
+    temporary_project_name: Option<String>,
+    managed_temporary_allowed: bool,
+) -> Result<CodingProjectSource, ToolResult> {
+    let project = project.trim().to_string();
+    let client_id = non_empty_optional_field("client_id", client_id)?;
+    let path = non_empty_optional_field("path", path)?;
+    let temporary_project_name =
+        non_empty_optional_field("temporary_project_name", temporary_project_name)?;
+
+    if !project.is_empty() {
+        let mut conflicts = Vec::new();
+        if client_id.is_some() {
+            conflicts.push("client_id");
+        }
+        if path.is_some() {
+            conflicts.push("path");
+        }
+        if temporary_project_name.is_some() {
+            conflicts.push("temporary_project_name");
+        }
+        if !conflicts.is_empty() {
+            let mut fields = vec!["project"];
+            fields.extend(conflicts);
+            return Err(invalid_project_source(
+                "project cannot be combined with client_id, path, or temporary_project_name",
+                json!({"conflicting_fields": fields}),
+            ));
+        }
+        return Ok(CodingProjectSource::Existing { project });
+    }
+
+    if let Some(path) = path {
+        if temporary_project_name.is_some() {
+            return Err(invalid_project_source(
+                "path cannot be combined with temporary_project_name",
+                json!({"conflicting_fields": ["path", "temporary_project_name"]}),
+            ));
+        }
+        if !Path::new(&path).is_absolute() {
+            return Err(invalid_project_source(
+                "path must be an absolute path",
+                json!({"field": "path", "expected": "absolute_path"}),
+            ));
+        }
+        let Some(client_id) = client_id else {
+            return Err(invalid_project_source(
+                "path requires client_id",
+                json!({"field": "client_id", "required_with": "path"}),
+            ));
+        };
+        return Ok(CodingProjectSource::RunnerPath { client_id, path });
+    }
+
+    if !managed_temporary_allowed {
+        return Err(if client_id.is_some() {
+            invalid_project_source(
+                "client_id requires path",
+                json!({"field": "path", "required_with": "client_id"}),
+            )
+        } else {
+            invalid_project_source(
+                "project or client_id + path is required",
+                json!({"required_any_of": ["project", "client_id + path"]}),
+            )
+        });
+    }
+    let Some(client_id) = client_id else {
+        return Err(if temporary_project_name.is_some() {
+            invalid_project_source(
+                "temporary_project_name requires client_id",
+                json!({"field": "client_id", "required_with": "temporary_project_name"}),
+            )
+        } else {
+            invalid_project_source(
+                "start_coding_task requires project, client_id + path, or client_id for a managed temporary project",
+                json!({"required_any_of": ["project", "client_id + path", "client_id"]}),
+            )
+        });
+    };
+    Ok(CodingProjectSource::ManagedTemporary {
+        client_id,
+        name: temporary_project_name,
+    })
+}
+
+fn registration_scope_denied(auth: Option<&AuthContext>, operation: &str) -> Option<ToolResult> {
+    auth.is_some_and(|auth| {
+        auth.is_oauth_token() && !auth.has_scope(crate::auth::SCOPE_PROJECT_WRITE)
+    })
+    .then(|| {
+        ToolResult::err_with_output(
+            format!("{operation} requires project:write"),
+            json!({
+                "error_kind": "insufficient_scope",
+                "failure_kind": "insufficient_scope",
+                "required_scope": crate::auth::SCOPE_PROJECT_WRITE,
+                "state_changed": false,
+            }),
+        )
+    })
+}
+
+fn attach_permission(
+    mut result: ToolResult,
+    permission: Option<&PermissionDecision>,
+) -> ToolResult {
+    if let Some(permission) = permission {
+        super::permissions::add_permission_to_result(&mut result, permission);
+    }
+    result
+}
+
+fn attach_project_resolution(
+    mut result: ToolResult,
+    resolution: &ProjectResolutionMetadata,
+) -> ToolResult {
+    // Existing-project aliases are not authoritative until runtime resolution
+    // succeeds. Path and managed-temporary sources already carry a Runner-issued
+    // full id, so their metadata remains useful on later Session failures.
+    if !resolution.resolved_project.is_empty() {
+        result.output["project_resolution"] =
+            serde_json::to_value(resolution).unwrap_or_else(|_| json!({}));
+    }
+    if resolution.registered && !result.success {
+        result.output["state_changed"] = json!(true);
+    }
+    attach_permission(result, resolution.permission.as_ref())
+}
+
 impl ToolRuntime {
+    async fn require_runner_coding_capability(
+        &self,
+        client_id: &str,
+        auth: Option<&AuthContext>,
+    ) -> Result<(), ToolResult> {
+        let supports_shell = self
+            .shell_clients
+            .client_supports_for_auth(client_id, SHELL_CLIENT_CAPABILITY_SHELL, auth)
+            .await
+            .map_err(ToolResult::err)?;
+        let supports_git = if supports_shell {
+            false
+        } else {
+            self.shell_clients
+                .client_supports_for_auth(client_id, SHELL_CLIENT_CAPABILITY_GIT, auth)
+                .await
+                .map_err(ToolResult::err)?
+        };
+        if supports_shell || supports_git {
+            Ok(())
+        } else {
+            Err(ToolResult::err(format!(
+                "agent client {client_id} does not support shell or git"
+            )))
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn start_coding_task(
         &self,
         project: String,
         client_id: Option<String>,
+        path: Option<String>,
         temporary_project_name: Option<String>,
         title: Option<String>,
         mode: SessionMode,
@@ -73,20 +293,11 @@ impl ToolRuntime {
         transport: SessionTransport,
         window: Option<&crate::client_window::ClientWindow>,
     ) -> ToolResult {
-        let create_managed_temporary_project = project.trim().is_empty();
-        if !create_managed_temporary_project
-            && (client_id.is_some() || temporary_project_name.is_some())
-        {
-            return ToolResult::err_with_output(
-                "project cannot be combined with client_id or temporary_project_name",
-                json!({
-                    "error_kind": "invalid_arguments",
-                    "failure_kind": "invalid_arguments",
-                    "constraint": "existing_project_or_managed_temporary_project",
-                    "state_changed": false,
-                }),
-            );
-        }
+        let project_source =
+            match resolve_project_source(project, client_id, path, temporary_project_name, true) {
+                Ok(source) => source,
+                Err(result) => return result,
+            };
         let resume_requested = resume_session_id.is_some();
         if resume_requested && new_session {
             return ToolResult::err_with_output(
@@ -158,106 +369,176 @@ impl ToolRuntime {
             }
             None => None,
         };
-        let project = if create_managed_temporary_project {
-            if resume_session_id.is_some() {
-                return ToolResult::err_with_output(
-                    "resume_session_id requires an existing project",
-                    json!({
-                        "error_kind": "invalid_arguments",
-                        "failure_kind": "invalid_arguments",
-                        "field": "resume_session_id",
-                        "constraint": "managed_temporary_project_cannot_resume",
-                        "state_changed": false,
-                    }),
-                );
+        let (project, mut project_resolution) = match project_source {
+            CodingProjectSource::Existing { project } => {
+                let resolution = ProjectResolutionMetadata {
+                    source: "project".to_string(),
+                    outcome: "resolved_existing_project".to_string(),
+                    resolved_project: String::new(),
+                    registered: false,
+                    permission: None,
+                };
+                (project, resolution)
             }
-            let client_id = match client_id.map(|id| id.trim().to_string()) {
-                Some(client_id) if !client_id.is_empty() => client_id,
-                _ => {
+            CodingProjectSource::ManagedTemporary { client_id, name } => {
+                if resume_session_id.is_some() {
                     return ToolResult::err_with_output(
-                        "start_coding_task requires project or client_id",
+                        "resume_session_id requires an existing project",
                         json!({
                             "error_kind": "invalid_arguments",
                             "failure_kind": "invalid_arguments",
-                            "required_any_of": ["project", "client_id"],
+                            "field": "resume_session_id",
+                            "constraint": "managed_temporary_project_cannot_resume",
                             "state_changed": false,
                         }),
-                    )
+                    );
                 }
-            };
-            if auth.is_some_and(|auth| {
-                auth.is_oauth_token() && !auth.has_scope(crate::auth::SCOPE_PROJECT_WRITE)
-            }) {
-                return ToolResult::err_with_output(
-                    "managed temporary project creation requires project:write",
-                    json!({
-                        "error_kind": "insufficient_scope",
-                        "failure_kind": "insufficient_scope",
-                        "required_scope": crate::auth::SCOPE_PROJECT_WRITE,
-                        "state_changed": false,
-                    }),
-                );
-            }
-            if let Some(decision) = self.permission_evaluator.evaluate("create_project", None) {
-                if !decision.allows_execution() {
-                    let mut result =
-                        super::permissions::permission_execution_denied_result(&decision);
-                    super::permissions::add_permission_to_result(&mut result, &decision);
+                if let Some(result) =
+                    registration_scope_denied(auth, "managed temporary project creation")
+                {
                     return result;
                 }
-            }
-            let supports_shell = match self
-                .shell_clients
-                .client_supports_for_auth(&client_id, SHELL_CLIENT_CAPABILITY_SHELL, auth)
-                .await
-            {
-                Ok(supported) => supported,
-                Err(error) => return ToolResult::err(error),
-            };
-            let supports_git = if supports_shell {
-                false
-            } else {
-                match self
-                    .shell_clients
-                    .client_supports_for_auth(&client_id, SHELL_CLIENT_CAPABILITY_GIT, auth)
+                let permission = self.permission_evaluator.evaluate("create_project", None);
+                if let Some(decision) = permission.as_ref() {
+                    if !decision.allows_execution() {
+                        let mut result =
+                            super::permissions::permission_execution_denied_result(decision);
+                        super::permissions::add_permission_to_result(&mut result, decision);
+                        return result;
+                    }
+                }
+                if let Err(result) = self
+                    .require_runner_coding_capability(&client_id, auth)
                     .await
                 {
-                    Ok(supported) => supported,
-                    Err(error) => return ToolResult::err(error),
+                    return attach_permission(result, permission.as_ref());
                 }
-            };
-            if !supports_shell && !supports_git {
-                return ToolResult::err(format!(
-                    "agent client {} does not support shell or git",
-                    client_id
-                ));
-            }
-            let created = self
-                .create_managed_temporary_project(client_id, temporary_project_name, auth)
-                .await;
-            if !created.success {
-                return created;
-            }
-            match created
-                .output
-                .get("id")
-                .and_then(Value::as_str)
-                .filter(|id| !id.trim().is_empty())
-            {
-                Some(id) => id.to_string(),
-                None => {
-                    return ToolResult::err_with_output(
-                        "agent returned a managed temporary project without a runtime id",
-                        json!({
-                            "error_kind": "operation_failed",
-                            "failure_kind": "operation_failed",
-                            "state_changed": true,
-                        }),
-                    )
+                let created = self
+                    .create_managed_temporary_project(client_id, name, auth)
+                    .await;
+                if !created.success {
+                    return attach_permission(created, permission.as_ref());
                 }
+                let Some(project) = created
+                    .output
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                    .map(str::to_string)
+                else {
+                    return attach_permission(
+                        ToolResult::err_with_output(
+                            "agent returned a managed temporary project without a runtime id",
+                            json!({
+                                "error_kind": "operation_failed",
+                                "failure_kind": "operation_failed",
+                                "state_changed": true,
+                            }),
+                        ),
+                        permission.as_ref(),
+                    );
+                };
+                let resolution = ProjectResolutionMetadata {
+                    source: "managed_temporary".to_string(),
+                    outcome: "managed_temporary_created".to_string(),
+                    resolved_project: project.clone(),
+                    registered: true,
+                    permission,
+                };
+                (project, resolution)
             }
-        } else {
-            project
+            CodingProjectSource::RunnerPath { client_id, path } => {
+                if let Some(result) = registration_scope_denied(auth, "project path registration") {
+                    return result;
+                }
+                let permission = self.permission_evaluator.evaluate("register_project", None);
+                if let Some(decision) = permission.as_ref() {
+                    if !decision.allows_execution() {
+                        let mut result =
+                            super::permissions::permission_execution_denied_result(decision);
+                        super::permissions::add_permission_to_result(&mut result, decision);
+                        return result;
+                    }
+                }
+                if let Err(result) = self
+                    .require_runner_coding_capability(&client_id, auth)
+                    .await
+                {
+                    return attach_permission(result, permission.as_ref());
+                }
+                let resolved = self
+                    .resolve_or_register_project(client_id, path, auth)
+                    .await;
+                if !resolved.success {
+                    return attach_permission(resolved, permission.as_ref());
+                }
+                let Some(project) = resolved
+                    .output
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                    .map(str::to_string)
+                else {
+                    return attach_permission(
+                        ToolResult::err_with_output(
+                            "Runner returned a path resolution without a runtime project id",
+                            json!({
+                                "error_kind": "operation_failed",
+                                "failure_kind": "operation_failed",
+                                "state_changed": resolved.output["registered"]
+                                    .as_bool()
+                                    .unwrap_or(false),
+                            }),
+                        ),
+                        permission.as_ref(),
+                    );
+                };
+                let outcome = resolved
+                    .output
+                    .get("outcome")
+                    .and_then(Value::as_str)
+                    .filter(|outcome| {
+                        matches!(*outcome, "reused_existing_registration" | "auto_registered")
+                    })
+                    .map(str::to_string);
+                let registered = resolved.output.get("registered").and_then(Value::as_bool);
+                let (Some(outcome), Some(registered)) = (outcome, registered) else {
+                    return attach_permission(
+                        ToolResult::err_with_output(
+                            "Runner returned malformed path resolution metadata",
+                            json!({
+                                "error_kind": "operation_failed",
+                                "failure_kind": "operation_failed",
+                                "state_changed": resolved.output["registered"]
+                                    .as_bool()
+                                    .unwrap_or(false),
+                            }),
+                        ),
+                        permission.as_ref(),
+                    );
+                };
+                if registered != (outcome == "auto_registered") {
+                    return attach_permission(
+                        ToolResult::err_with_output(
+                            "Runner returned inconsistent path resolution metadata",
+                            json!({
+                                "error_kind": "operation_failed",
+                                "failure_kind": "operation_failed",
+                                "state_changed": registered,
+                            }),
+                        ),
+                        permission.as_ref(),
+                    );
+                }
+                let resolution = ProjectResolutionMetadata {
+                    source: "path".to_string(),
+                    outcome,
+                    resolved_project: project.clone(),
+                    registered,
+                    permission,
+                };
+                (project, resolution)
+            }
         };
         // `detail` is the single startup projection control: full keeps the
         // complete runtime status, recent commits, rules, and tool manifest;
@@ -268,7 +549,7 @@ impl ToolRuntime {
         let tool_manifest = if include_tool_manifest {
             match self.compact_tool_manifest_payload_bounded(None, None, None) {
                 Ok(payload) => Some(payload),
-                Err(result) => return result,
+                Err(result) => return attach_project_resolution(result, &project_resolution),
             }
         } else {
             None
@@ -276,8 +557,11 @@ impl ToolRuntime {
 
         let resolved = match self.resolve_project_input_for_auth(&project, auth).await {
             Ok(resolved) => resolved,
-            Err(err) => return err.into_tool_result(),
+            Err(err) => {
+                return attach_project_resolution(err.into_tool_result(), &project_resolution)
+            }
         };
+        project_resolution.resolved_project = resolved.resolved_id.clone();
         // The semantic-navigation probe, the fixed project-instruction load,
         // and the repository overview are independent read-only startup
         // probes. They run concurrently so the overview never adds serial
@@ -400,19 +684,25 @@ impl ToolRuntime {
         ) {
             Ok(outcome) => outcome,
             Err(sessions::CodingSessionError::InvalidResumeSessionId) => {
-                return ToolResult::err_with_output(
-                    "resume_session_id must be a valid wc_sess_* Workflow Session id",
-                    json!({
-                        "error_kind": "invalid_resume_session_id",
-                        "failure_kind": "invalid_arguments",
-                        "field": "resume_session_id",
-                        "expected_format": "wc_sess_*",
-                        "state_changed": false,
-                    }),
+                return attach_project_resolution(
+                    ToolResult::err_with_output(
+                        "resume_session_id must be a valid wc_sess_* Workflow Session id",
+                        json!({
+                            "error_kind": "invalid_resume_session_id",
+                            "failure_kind": "invalid_arguments",
+                            "field": "resume_session_id",
+                            "expected_format": "wc_sess_*",
+                            "state_changed": false,
+                        }),
+                    ),
+                    &project_resolution,
                 );
             }
             Err(sessions::CodingSessionError::UnknownResumeSession { session_id }) => {
-                return unknown_session_result(&session_id);
+                return attach_project_resolution(
+                    unknown_session_result(&session_id),
+                    &project_resolution,
+                );
             }
             Err(sessions::CodingSessionError::ResumeSessionNotActive {
                 session_id,
@@ -423,19 +713,22 @@ impl ToolRuntime {
                     sessions::SessionLifecycle::Archived => "session_archived",
                     sessions::SessionLifecycle::Active => "session_lifecycle_denied",
                 };
-                return ToolResult::err_with_output(
-                    format!(
-                        "{error_kind}: start_coding_task cannot resume a {} session",
-                        lifecycle.as_str()
+                return attach_project_resolution(
+                    ToolResult::err_with_output(
+                        format!(
+                            "{error_kind}: start_coding_task cannot resume a {} session",
+                            lifecycle.as_str()
+                        ),
+                        json!({
+                            "error_kind": error_kind,
+                            "failure_kind": error_kind,
+                            "session_id": session_id,
+                            "lifecycle": lifecycle,
+                            "resume_requested": true,
+                            "state_changed": false,
+                        }),
                     ),
-                    json!({
-                        "error_kind": error_kind,
-                        "failure_kind": error_kind,
-                        "session_id": session_id,
-                        "lifecycle": lifecycle,
-                        "resume_requested": true,
-                        "state_changed": false,
-                    }),
+                    &project_resolution,
                 );
             }
             Err(sessions::CodingSessionError::ResumeProjectMismatch {
@@ -443,60 +736,75 @@ impl ToolRuntime {
                 session_project,
                 request_project,
             }) => {
-                return ToolResult::err_with_output(
-                    "session_project_mismatch: explicit Workflow Session resume requires an exact project match",
-                    json!({
-                        "error_kind": "session_project_mismatch",
-                        "failure_kind": "session_project_mismatch",
-                        "session_id": session_id,
-                        "session_project": session_project,
-                        "request_project": request_project,
-                        "resume_requested": true,
-                        "state_changed": false,
-                    }),
+                return attach_project_resolution(
+                    ToolResult::err_with_output(
+                        "session_project_mismatch: explicit Workflow Session resume requires an exact project match",
+                        json!({
+                            "error_kind": "session_project_mismatch",
+                            "failure_kind": "session_project_mismatch",
+                            "session_id": session_id,
+                            "session_project": session_project,
+                            "request_project": request_project,
+                            "resume_requested": true,
+                            "state_changed": false,
+                        }),
+                    ),
+                    &project_resolution,
                 );
             }
             Err(sessions::CodingSessionError::ResumeNewSessionConflict) => {
-                return ToolResult::err_with_output(
-                    "resume_session_id and new_session=true are mutually exclusive",
-                    json!({
-                        "error_kind": "invalid_arguments",
-                        "failure_kind": "invalid_arguments",
-                        "conflicting_fields": ["resume_session_id", "new_session"],
-                        "constraint": "resume_session_id_mutually_exclusive_with_new_session",
-                        "state_changed": false,
-                    }),
+                return attach_project_resolution(
+                    ToolResult::err_with_output(
+                        "resume_session_id and new_session=true are mutually exclusive",
+                        json!({
+                            "error_kind": "invalid_arguments",
+                            "failure_kind": "invalid_arguments",
+                            "conflicting_fields": ["resume_session_id", "new_session"],
+                            "constraint": "resume_session_id_mutually_exclusive_with_new_session",
+                            "state_changed": false,
+                        }),
+                    ),
+                    &project_resolution,
                 );
             }
             Err(sessions::CodingSessionError::WriteScopeRequired) => {
-                return ToolResult::err_with_output(
-                    "session capability upgrade requires project:write",
-                    json!({
-                        "error_kind": "session_capability_upgrade_denied",
-                        "required_scope": crate::auth::SCOPE_PROJECT_WRITE,
-                        "mode": mode.as_str(),
-                        "state_changed": false,
-                    }),
+                return attach_project_resolution(
+                    ToolResult::err_with_output(
+                        "session capability upgrade requires project:write",
+                        json!({
+                            "error_kind": "session_capability_upgrade_denied",
+                            "required_scope": crate::auth::SCOPE_PROJECT_WRITE,
+                            "mode": mode.as_str(),
+                            "state_changed": false,
+                        }),
+                    ),
+                    &project_resolution,
                 );
             }
             Err(sessions::CodingSessionError::InvalidExecutionContext(error)) => {
-                return ToolResult::err_with_output(
-                    error,
-                    json!({
-                        "error_kind": "invalid_execution_context",
-                        "failure_kind": "invalid_arguments",
-                        "field": "execution_context",
-                        "state_changed": false,
-                    }),
+                return attach_project_resolution(
+                    ToolResult::err_with_output(
+                        error,
+                        json!({
+                            "error_kind": "invalid_execution_context",
+                            "failure_kind": "invalid_arguments",
+                            "field": "execution_context",
+                            "state_changed": false,
+                        }),
+                    ),
+                    &project_resolution,
                 );
             }
             Err(sessions::CodingSessionError::CommitFailed) => {
-                return ToolResult::err_with_output(
-                    "coding continuity state could not be committed",
-                    json!({
-                        "error_kind": "coding_continuity_commit_failed",
-                        "state_changed": false,
-                    }),
+                return attach_project_resolution(
+                    ToolResult::err_with_output(
+                        "coding continuity state could not be committed",
+                        json!({
+                            "error_kind": "coding_continuity_commit_failed",
+                            "state_changed": false,
+                        }),
+                    ),
+                    &project_resolution,
                 );
             }
         };
@@ -606,6 +914,7 @@ impl ToolRuntime {
         let mut output = json!({
             "detail": detail.as_str(),
             "project": project.clone(),
+            "project_resolution": project_resolution.clone(),
             "resolved_project": resolved_project_payload(&resolved),
             "session": {
                 "session_id": session_summary.session_id,
@@ -700,9 +1009,12 @@ impl ToolRuntime {
             // the canonical repository-root key.
             Some(true)
         };
+        let project_resolution_value =
+            serde_json::to_value(&project_resolution).unwrap_or_else(|_| json!({}));
         let startup_brief = build_startup_brief(StartupBriefInput {
             detail,
             requested_project: &project,
+            project_resolution: &project_resolution_value,
             resolved: &resolved,
             session: session_summary,
             continuation_kind,
@@ -722,12 +1034,13 @@ impl ToolRuntime {
             canonical_repository_root_matches,
             runtime_status_call_failed,
         });
-        if detail == StartupDetail::Full {
+        let result = if detail == StartupDetail::Full {
             output["startup_brief"] = startup_brief;
             ToolResult::ok(output)
         } else {
             ToolResult::ok(startup_brief)
-        }
+        };
+        attach_permission(result, project_resolution.permission.as_ref())
     }
 
     /// Thin `start_coding_task` wrapper for the daily model coding loop.
@@ -743,24 +1056,27 @@ impl ToolRuntime {
     pub(crate) async fn work_on_project(
         &self,
         project: String,
+        client_id: Option<String>,
+        path: Option<String>,
         instruction: String,
         session_id: Option<String>,
         auth: Option<&AuthContext>,
         transport: SessionTransport,
         window: Option<&crate::client_window::ClientWindow>,
     ) -> ToolResult {
-        let project = project.trim().to_string();
-        if project.is_empty() {
-            return ToolResult::err_with_output(
-                "project must be a non-empty existing runtime project id",
-                json!({
-                    "error_kind": "invalid_arguments",
-                    "failure_kind": "invalid_arguments",
-                    "field": "project",
-                    "state_changed": false,
-                }),
-            );
-        }
+        let project_source = match resolve_project_source(project, client_id, path, None, false) {
+            Ok(source) => source,
+            Err(result) => return result,
+        };
+        let (project, client_id, path) = match project_source {
+            CodingProjectSource::Existing { project } => (project, None, None),
+            CodingProjectSource::RunnerPath { client_id, path } => {
+                (String::new(), Some(client_id), Some(path))
+            }
+            CodingProjectSource::ManagedTemporary { .. } => {
+                unreachable!("managed temporary project is disabled for work_on_project")
+            }
+        };
         let instruction = instruction.trim().to_string();
         if instruction.is_empty()
             || instruction.chars().count() > sessions::MAX_CODING_INSTRUCTION_CHARS
@@ -808,7 +1124,8 @@ impl ToolRuntime {
         let result = self
             .start_coding_task(
                 project.clone(),
-                None,
+                client_id,
+                path,
                 None,
                 Some(instruction.clone()),
                 SessionMode::Normal,
@@ -827,7 +1144,19 @@ impl ToolRuntime {
         if !result.success {
             return result;
         }
-        project_work_on_project_output(project, result.output)
+        let projected_project = if project.is_empty() {
+            startup_brief_from_output(&result.output)
+                .and_then(|brief| {
+                    brief
+                        .pointer("/project_resolution/resolved_project")
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            project
+        };
+        project_work_on_project_output(projected_project, result.output)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1455,6 +1784,7 @@ fn repository_overview_local(project_root: &str) -> Value {
 struct WorkOnProjectBriefProjection {
     session: WorkOnProjectSessionProjection,
     project: WorkOnProjectProjectProjection,
+    project_resolution: ProjectResolutionMetadata,
     workspace: WorkOnProjectWorkspaceProjection,
     instructions: WorkOnProjectInstructionsProjection,
     semantic_navigation: WorkOnProjectSemanticNavigationProjection,
@@ -1564,6 +1894,7 @@ struct WorkOnProjectStartupVerdictProjection {
 /// `work_on_project` contract. The delegated call may already have changed
 /// Session state, so protocol drift fails closed with `state_changed=true`.
 pub(crate) fn project_work_on_project_output(project: String, output: Value) -> ToolResult {
+    let permission = output.get("permission").cloned();
     let Some(brief) = startup_brief_from_output(&output) else {
         return work_on_project_projection_failed(
             "output",
@@ -1655,10 +1986,11 @@ pub(crate) fn project_work_on_project_output(project: String, output: Value) -> 
         "capability": projection.semantic_navigation.capability,
         "reason_code": projection.semantic_navigation.reason_code,
     });
-    ToolResult::ok(json!({
+    let mut result = ToolResult::ok(json!({
         "session_id": projection.session.session_id,
         "project": project,
         "resolved_project": projection.project.resolved_id,
+        "project_resolution": projection.project_resolution,
         "continuation": projection.session.continuation,
         "execution_context": projection.session.execution_context,
         "readiness": {
@@ -1689,7 +2021,11 @@ pub(crate) fn project_work_on_project_output(project: String, output: Value) -> 
         "suggested_next_actions": suggested_next_actions,
         "deterministic": true,
         "llm_summary": false,
-    }))
+    }));
+    if let Some(permission) = permission {
+        result.output["permission"] = permission;
+    }
+    result
 }
 
 fn work_on_project_projection_failed(

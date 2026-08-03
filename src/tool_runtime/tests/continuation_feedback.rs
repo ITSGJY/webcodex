@@ -1689,6 +1689,7 @@ fn coding_call(
     ToolCall::StartCodingTask {
         project: project.to_string(),
         client_id: None,
+        path: None,
         temporary_project_name: None,
         title: Some(instruction.to_string()),
         mode: SessionMode::Normal,

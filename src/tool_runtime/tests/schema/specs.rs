@@ -376,9 +376,9 @@ fn tool_specs_output_schemas_are_objects() {
 
 #[test]
 fn tool_specs_required_fields_match_deserialization() {
-    // For every tool spec, building arguments with only the required
-    // fields must deserialize successfully, and omitting any required
-    // field must fail.
+    // Build one representative valid argument set per schema. For conditional
+    // oneOf sources, the shared fixture adds a valid source that cannot be
+    // expressed through the top-level `required` array alone.
     for spec in registered_tool_specs() {
         let required: Vec<String> = spec.input_schema["required"]
             .as_array()
@@ -386,30 +386,18 @@ fn tool_specs_required_fields_match_deserialization() {
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
-
-        // Build a minimal valid args object using a placeholder for each
-        // required field based on its declared type.
-        let mut minimal = serde_json::Map::new();
-        let properties = spec.input_schema["properties"].as_object().unwrap();
-        for field in &required {
-            let prop = &properties[field.as_str()];
-            let placeholder = placeholder_from_prop(prop);
-            minimal.insert(field.clone(), placeholder);
-        }
-        let args = Value::Object(minimal);
-        ToolCall::from_tool_name(&spec.name, args)
+        let args = sample_tool_args_for_spec(&spec);
+        ToolCall::from_tool_name(&spec.name, args.clone())
             .unwrap_or_else(|e| panic!("tool '{}' minimal args failed: {}", spec.name, e));
 
-        // Omitting each required field should fail.
+        // Removing any top-level required field from that otherwise-valid
+        // representative must fail and identify the omitted field.
         for field in &required {
-            let mut partial = serde_json::Map::new();
-            for f in &required {
-                if f != field {
-                    let prop = &properties[f.as_str()];
-                    let placeholder = placeholder_from_prop(prop);
-                    partial.insert(f.clone(), placeholder);
-                }
-            }
+            let mut partial = args
+                .as_object()
+                .cloned()
+                .unwrap_or_else(serde_json::Map::new);
+            partial.remove(field);
             let err = ToolCall::from_tool_name(&spec.name, Value::Object(partial))
                 .err()
                 .unwrap_or_else(|| {

@@ -487,8 +487,9 @@ impl ShellClientRegistry {
         Ok((request_id, rx))
     }
 
-    /// Enqueue a project-management agent request (`register_project` or
-    /// `create_project`). The JSON payload is carried in `stdin` so the
+    /// Enqueue a project-management agent request (`register_project`,
+    /// `create_project`, or the internal path resolver). The JSON payload is
+    /// carried in `stdin` so the
     /// agent can parse it without shell interpolation. The `command` field is
     /// empty (unused for these kinds); the agent dispatches on `kind` and
     /// reads the payload from `stdin`. Returns a oneshot receiver for the
@@ -505,6 +506,7 @@ impl ShellClientRegistry {
             kind,
             "register_project"
                 | "create_project"
+                | "resolve_or_register_project"
                 | "project_lifecycle_enable"
                 | "project_lifecycle_disable"
                 | "project_lifecycle_unregister"

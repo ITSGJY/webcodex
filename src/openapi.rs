@@ -693,6 +693,15 @@ pub(crate) fn build_openapi_spec() -> Value {
                                 "mode": "read_only"
                             }
                         },
+                        "workOnAbsolutePath": {
+                            "summary": "Resolve or register a Runner path, then start coding",
+                            "value": {
+                                "tool": "work_on_project",
+                                "client_id": "special",
+                                "path": "/root/git/example-worktree",
+                                "instruction": "Complete the development task"
+                            }
+                        },
                         "recordedGitStatus": {
                             "summary": "Record this wrapper call while passing flattened tool args",
                             "value": {

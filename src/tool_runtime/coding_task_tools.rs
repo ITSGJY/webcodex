@@ -15,6 +15,7 @@ impl ToolRuntime {
             ToolCall::StartCodingTask {
                 project,
                 client_id,
+                path,
                 temporary_project_name,
                 title,
                 mode,
@@ -29,6 +30,7 @@ impl ToolRuntime {
                 self.start_coding_task(
                     project,
                     client_id,
+                    path,
                     temporary_project_name,
                     title,
                     mode,
@@ -47,11 +49,22 @@ impl ToolRuntime {
             }
             ToolCall::WorkOnProject {
                 project,
+                client_id,
+                path,
                 instruction,
                 session_id,
             } => {
-                self.work_on_project(project, instruction, session_id, auth, transport, window)
-                    .await
+                self.work_on_project(
+                    project,
+                    client_id,
+                    path,
+                    instruction,
+                    session_id,
+                    auth,
+                    transport,
+                    window,
+                )
+                .await
             }
             ToolCall::FinishCodingTask {
                 project,

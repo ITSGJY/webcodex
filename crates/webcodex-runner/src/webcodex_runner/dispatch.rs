@@ -4,8 +4,9 @@ use super::transport::ResultSubmission;
 use super::validation::{handle_validation_request, is_validation_request_kind};
 use super::{
     handle_project_lifecycle_op, handle_project_op_with_temporary_projects_root,
-    run_shell_with_profiles_in_sandbox, run_ssh_shell, AgentSink, CommandResult, HotAgentConfig,
-    PersistentShellManager, ReloadableAgentConfig, SubmitResultError,
+    handle_resolve_or_register_project, run_shell_with_profiles_in_sandbox, run_ssh_shell,
+    AgentSink, CommandResult, HotAgentConfig, PersistentShellManager, ReloadableAgentConfig,
+    SubmitResultError,
 };
 use crate::shell_protocol::ShellAgentShellRequest;
 use crate::{handle_file_request, is_file_request_kind, JobManager};
@@ -162,6 +163,12 @@ pub(crate) fn dispatch_request(
             sink.submit_result_with_metadata(request_id, result, config, runtime)
                 .map(|_| true)
         }
+        "resolve_or_register_project" => {
+            let request_id = request.request_id.clone();
+            let result = handle_resolve_or_register_project(policy, projects_dir, &request);
+            sink.submit_result_with_metadata(request_id, result, config, runtime)
+                .map(|_| true)
+        }
         "project_lifecycle_enable"
         | "project_lifecycle_disable"
         | "project_lifecycle_unregister" => {
@@ -268,6 +275,7 @@ pub(crate) fn is_project_op(kind: &str) -> bool {
         kind,
         "register_project"
             | "create_project"
+            | "resolve_or_register_project"
             | "project_lifecycle_enable"
             | "project_lifecycle_disable"
             | "project_lifecycle_unregister"

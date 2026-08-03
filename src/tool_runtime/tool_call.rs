@@ -147,14 +147,19 @@ pub enum ToolCall {
     /// flags (`compact_startup`, `include_*`, `tool_manifest_*`) are rejected
     /// as unknown fields by strict argument validation.
     StartCodingTask {
-        /// Existing runtime project id. Omit this only with `client_id` to ask
-        /// the selected Runner to create a managed temporary project first.
+        /// Existing runtime project id. Omit this with `client_id` plus
+        /// `path` for Runner-side path resolution/registration, or with only
+        /// `client_id` for the legacy managed temporary-project flow.
         #[serde(default)]
         project: String,
-        /// Runner client that should create the managed temporary project when
-        /// no existing `project` is supplied.
+        /// Runner client that owns `path`, or that should create the managed
+        /// temporary project when neither `project` nor `path` is supplied.
         #[serde(default)]
         client_id: Option<String>,
+        /// Existing absolute directory on the selected Runner. The Runner
+        /// canonicalizes, policy-checks, reuses, or permanently registers it.
+        #[serde(default)]
+        path: Option<String>,
         /// Optional safe display name for a Runner-managed temporary project.
         #[serde(default)]
         temporary_project_name: Option<String>,
@@ -192,7 +197,12 @@ pub enum ToolCall {
     /// the exact Workflow Session to continue; it is distinct from wrapper
     /// `recording_session_id` metadata and never a current-session fallback.
     WorkOnProject {
+        #[serde(default)]
         project: String,
+        #[serde(default)]
+        client_id: Option<String>,
+        #[serde(default)]
+        path: Option<String>,
         instruction: String,
         #[serde(default)]
         session_id: Option<String>,
@@ -1233,6 +1243,7 @@ fn reject_unknown_start_coding_task_fields(arguments: &Value) -> Result<(), Stri
     const ALLOWED: &[&str] = &[
         "project",
         "client_id",
+        "path",
         "temporary_project_name",
         "title",
         "mode",
@@ -1264,6 +1275,96 @@ fn reject_unknown_start_coding_task_fields(arguments: &Value) -> Result<(), Stri
          Startup projection is controlled solely by detail=minimal|standard|full; \
          the legacy startup flags were removed.",
         unknown.join(", ")
+    ))
+}
+
+fn validate_coding_project_source_shape(
+    tool_name: &str,
+    arguments: &Value,
+    managed_temporary_allowed: bool,
+) -> Result<(), String> {
+    let Some(arguments) = arguments.as_object() else {
+        return Ok(());
+    };
+    let project = arguments.contains_key("project");
+    let client_id = arguments.contains_key("client_id");
+    let path = arguments.contains_key("path");
+    let temporary_project_name = arguments.contains_key("temporary_project_name");
+    for field in ["project", "client_id", "path", "temporary_project_name"] {
+        if arguments
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(format!(
+                "invalid arguments for tool '{tool_name}': {field} must not be empty"
+            ));
+        }
+    }
+    if path
+        && arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| !std::path::Path::new(path).is_absolute())
+    {
+        return Err(format!(
+            "invalid arguments for tool '{tool_name}': path must be absolute"
+        ));
+    }
+    if project {
+        let mut conflicts = Vec::new();
+        if client_id {
+            conflicts.push("client_id");
+        }
+        if path {
+            conflicts.push("path");
+        }
+        if temporary_project_name {
+            conflicts.push("temporary_project_name");
+        }
+        return if conflicts.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "invalid arguments for tool '{tool_name}': conflicting fields project and {}",
+                conflicts.join(", ")
+            ))
+        };
+    }
+    if path {
+        if temporary_project_name {
+            return Err(format!(
+                "invalid arguments for tool '{tool_name}': conflicting fields path and temporary_project_name"
+            ));
+        }
+        return if client_id {
+            Ok(())
+        } else {
+            Err(format!(
+                "invalid arguments for tool '{tool_name}': missing client_id required with path"
+            ))
+        };
+    }
+    if temporary_project_name && !client_id {
+        return Err(format!(
+            "invalid arguments for tool '{tool_name}': missing client_id required with temporary_project_name"
+        ));
+    }
+    if managed_temporary_allowed && client_id {
+        return Ok(());
+    }
+    if client_id {
+        return Err(format!(
+            "invalid arguments for tool '{tool_name}': missing path required with client_id"
+        ));
+    }
+    let expected = if managed_temporary_allowed {
+        "project, client_id + path, or the existing client_id managed temporary-project source"
+    } else {
+        "project or client_id + path"
+    };
+    Err(format!(
+        "invalid arguments for tool '{tool_name}': missing project source; expected {expected}"
     ))
 }
 
@@ -1350,6 +1451,10 @@ impl ToolCall {
             if let Err(message) = reject_unknown_start_coding_task_fields(&arguments) {
                 return Err(message);
             }
+            validate_coding_project_source_shape(name, &arguments, true)?;
+        }
+        if name == "work_on_project" {
+            validate_coding_project_source_shape(name, &arguments, false)?;
         }
         if name == "read_files" {
             reject_unknown_read_files_fields(&arguments)?;
@@ -1716,7 +1821,9 @@ impl ToolCall {
             Self::StartCodingTask { project, .. } if !project.trim().is_empty() => {
                 Some(project.as_str())
             }
-            Self::WorkOnProject { project, .. } => Some(project.as_str()),
+            Self::WorkOnProject { project, .. } if !project.trim().is_empty() => {
+                Some(project.as_str())
+            }
             Self::FinishCodingTask { project, .. } => Some(project.as_str()),
             Self::UpdateSessionContext { project, .. }
             | Self::ValidationSummary { project, .. } => Some(project.as_str()),

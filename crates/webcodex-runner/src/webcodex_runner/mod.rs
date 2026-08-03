@@ -54,7 +54,8 @@ pub(crate) use projects::{
     agent_project_summary, parse_agent_project_toml, validate_project_path_policy,
 };
 pub(crate) use projects::{
-    handle_project_lifecycle_op, handle_project_op_with_temporary_projects_root, AgentProjectCache,
+    handle_project_lifecycle_op, handle_project_op_with_temporary_projects_root,
+    handle_resolve_or_register_project, AgentProjectCache,
 };
 #[cfg(test)]
 pub(crate) use shell::run_shell;

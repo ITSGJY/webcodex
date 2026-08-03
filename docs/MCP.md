@@ -140,13 +140,39 @@ tools, and runtime/operator management (`runtime_status`, `tool_manifest`)
 are not part of this surface: `tools/call` rejects them at the MCP boundary
 before ToolRuntime dispatch, and `tools/list` never advertises them.
 
-On `local_coding`, `work_on_project(project, instruction, session_id?)` is the
-ordinary entry point: one call returns the rules, repository structure, Git
-state, LSP readiness, jobs, and blockers a coding model needs to start or
+On `local_coding`, `work_on_project` is the ordinary entry point. It accepts
+exactly one project source:
+
+```json
+{"project":"agent:special:webcodex","instruction":"implement it"}
+```
+
+or:
+
+```json
+{"client_id":"special","path":"/root/git/webcodex","instruction":"implement it"}
+```
+
+The path must be an existing absolute directory on that Runner. Under the
+Runner's project-registry write lock it canonicalizes the requested path and
+configured project paths, enforces `allowed_roots` and dangerous-root policy,
+then reuses one unique enabled registration or atomically persists a stable
+`<sanitized-basename>-<path-hash-prefix>` id in `projects.d`. Disabled matches
+return `project_disabled`; multiple ids for the canonical path return sorted
+`ambiguous_project_path` metadata. It never creates or changes the target
+directory and never runs `git init`. This conditional registration requires
+`project:write` and the same authority decision as `register_project`, even
+though the existing-project form retains its prior read-only startup behavior.
+
+After project resolution, one call returns the rules, repository structure,
+Git state, LSP readiness, jobs, and blockers a coding model needs to start or
 continue focused work. It creates a new Workflow Session when `session_id` is
 absent, and exactly resumes the given Session when present (never a guess or a
-credential-wide fallback); it never binds a current window. A successful call
-returns `session_id`, the resolved project id, a `readiness` verdict, the
+credential-wide fallback); it never binds a current window. Path resolution
+always happens before explicit Session validation, so mismatch or unknown
+Session failures never fall back. A successful call returns `session_id`, the
+resolved project id, bounded path-free `project_resolution` metadata, a
+`readiness` verdict, the
 `workspace` Git projection, the `repository` overview, the bounded `rules`
 (`status` loaded/reused/changed/not_found/unavailable, per-source fingerprint,
 headings, bounded content, and `read_more` hints), `semantic_navigation`
@@ -161,11 +187,25 @@ own total/returned/truncated metadata. If the overview is unavailable, the
 session still starts and `repository.status=unavailable` with a
 `repository_overview_unavailable` warning; raw errors, absolute paths, or
 Runner output are never returned. The extra context is informational only: it
-does not modify anything or execute anything, and the model still uses
+does not modify or execute project contents, and the model still uses
 `read_file`, search, edits, and validation tools as needed.
 
+```json
+{
+  "project_resolution": {
+    "source": "path",
+    "outcome": "auto_registered",
+    "resolved_project": "agent:special:webcodex-4f2a91c8",
+    "registered": true
+  }
+}
+```
+
 On `full_operator_runtime`, ordinary coding starts or continues with
-`start_coding_task`. A stable window continues the same repository by default;
+`start_coding_task`. It accepts the same `project` or `client_id + path`
+sources, in addition to its existing `client_id` managed temporary-project
+source (optionally named with `temporary_project_name`). A stable window
+continues the same repository by default;
 switching repositories changes context and switching back restores the prior
 Workflow Session. `new_session=true` is the explicit advanced isolation
 request. The exact binding is cached in-process and persisted as a bounded,

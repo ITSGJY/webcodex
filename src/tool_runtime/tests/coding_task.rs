@@ -16,6 +16,11 @@ use std::path::PathBuf;
 fn coding_task_tools_are_registered_in_metadata_and_openapi() {
     let specs = registered_tool_specs();
     let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
+    assert!(
+        !names.contains(&"resolve_or_register_project"),
+        "internal Runner path resolution must not become model-visible"
+    );
+    assert!(!is_known_tool_name("resolve_or_register_project"));
 
     for name in ["start_coding_task", "finish_coding_task"] {
         assert!(is_known_tool_name(name), "{name} missing from known names");
@@ -39,10 +44,16 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
     let start = spec_named(&specs, "start_coding_task");
     assert_eq!(required_fields(start), Vec::<String>::new());
     let start_props = start.input_schema["properties"].as_object().unwrap();
-    for field in ["project", "client_id", "temporary_project_name", "detail"] {
+    for field in [
+        "project",
+        "client_id",
+        "path",
+        "temporary_project_name",
+        "detail",
+    ] {
         assert!(start_props.contains_key(field), "missing {field}");
     }
-    assert_eq!(start.input_schema["oneOf"].as_array().unwrap().len(), 2);
+    assert_eq!(start.input_schema["oneOf"].as_array().unwrap().len(), 3);
     assert_eq!(start_props["bind_current"]["default"], true);
     assert_eq!(start_props["new_session"]["default"], false);
     for removed in [
@@ -83,6 +94,13 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
             .unwrap()
             .contains_key("startup_verdict"),
         "start_coding_task output schema should include startup_verdict"
+    );
+    assert!(
+        standard["properties"]
+            .as_object()
+            .unwrap()
+            .contains_key("project_resolution"),
+        "start_coding_task output schema should include project_resolution"
     );
     assert!(
         !standard["properties"]
@@ -133,6 +151,10 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
     assert!(tool_desc.contains("finish_coding_task"));
     let properties = tool_call["properties"].as_object().unwrap();
     for field in [
+        "project",
+        "client_id",
+        "path",
+        "temporary_project_name",
         "detail",
         "bind_current",
         "new_session",
@@ -207,6 +229,7 @@ async fn start_coding_task_creates_managed_temporary_project_then_restores_it_as
                     ToolCall::StartCodingTask {
                         project: String::new(),
                         client_id: Some(client_id.to_string()),
+                        path: None,
                         temporary_project_name: Some("Scratch task".to_string()),
                         title: Some("implement a temporary task".to_string()),
                         mode: SessionMode::Normal,
@@ -373,6 +396,7 @@ async fn start_coding_task_can_explicitly_disable_current_binding() {
                     ToolCall::StartCodingTask {
                         project,
                         client_id: None,
+                        path: None,
                         temporary_project_name: None,
                         title: Some("implement deterministic aggregate".to_string()),
                         mode: SessionMode::Normal,
@@ -501,6 +525,16 @@ async fn start_coding_task_can_explicitly_disable_current_binding() {
         .unwrap()
         .iter()
         .any(|field| field == "detail"));
+    for field in ["project", "client_id", "path", "temporary_project_name"] {
+        assert!(
+            start_tool["accepted_flattened_args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|accepted| accepted == field),
+            "start_coding_task manifest entry missing {field}"
+        );
+    }
     for removed in [
         "include_tool_manifest",
         "tool_manifest_intent",
@@ -540,6 +574,7 @@ async fn start_coding_task_can_omit_compact_tool_manifest() {
             ToolCall::StartCodingTask {
                 project,
                 client_id: None,
+                path: None,
                 temporary_project_name: None,
                 title: Some("small startup payload".to_string()),
                 mode: SessionMode::Normal,
@@ -1104,6 +1139,14 @@ async fn start_coding_task_unknown_project_still_fails() {
         result.output
     );
     assert!(
+        !result
+            .output
+            .as_object()
+            .unwrap()
+            .contains_key("project_resolution"),
+        "unresolved aliases must not be presented as authoritative project resolution metadata"
+    );
+    assert!(
         result
             .error
             .as_deref()
@@ -1222,6 +1265,7 @@ async fn finish_coding_task_requires_explicit_session_and_returns_structured_fie
             ToolCall::StartCodingTask {
                 project: project.clone(),
                 client_id: None,
+                path: None,
                 temporary_project_name: None,
                 title: Some("finish contract".to_string()),
                 mode: SessionMode::Normal,
@@ -2277,6 +2321,7 @@ async fn finish_coding_task_includes_active_jobs_warning_without_logs() {
             ToolCall::StartCodingTask {
                 project: project.clone(),
                 client_id: None,
+                path: None,
                 temporary_project_name: None,
                 title: Some("finish active jobs".to_string()),
                 mode: SessionMode::Normal,
@@ -2406,6 +2451,7 @@ async fn finish_coding_task_treats_stop_requested_jobs_as_nonblocking() {
             ToolCall::StartCodingTask {
                 project: project.clone(),
                 client_id: None,
+                path: None,
                 temporary_project_name: None,
                 title: Some("finish stop pending".to_string()),
                 mode: SessionMode::Normal,

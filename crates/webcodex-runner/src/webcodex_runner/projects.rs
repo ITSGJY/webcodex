@@ -22,9 +22,11 @@ const PROJECT_GIT_TIMEOUT: Duration = Duration::from_secs(2);
 const PROJECT_GIT_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
 const PROJECT_GIT_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 const MANAGED_TEMPORARY_PROJECT_KIND: &str = "managed_temporary";
+const AUTO_REGISTERED_PROJECT_KIND: &str = "auto_registered";
 const DEFAULT_MANAGED_TEMPORARY_PROJECT_NAME: &str = "Temporary Project";
 const MANAGED_TEMPORARY_PROJECT_ID_PREFIX: &str = "temporary";
 const MANAGED_TEMPORARY_PROJECT_CREATE_ATTEMPTS: usize = 16;
+const AUTO_PROJECT_HASH_PREFIX_LENGTHS: &[usize] = &[8, 12, 16, 24, 32, 48, 64];
 static PROJECT_REGISTRY_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn project_registry_write_lock() -> &'static Mutex<()> {
@@ -36,6 +38,33 @@ fn project_error_cmd(start: Instant, error_code: &'static str) -> CommandResult 
         exit_code: Some(1),
         stdout: Some(
             serde_json::to_string(&serde_json::json!({"error_code": error_code}))
+                .unwrap_or_else(|_| r#"{"error_code":"operation_failed"}"#.to_string()),
+        ),
+        stderr: Some(String::new()),
+        duration_ms: Some(start.elapsed().as_millis() as u64),
+        error: None,
+    }
+}
+
+fn structured_project_error_cmd(
+    start: Instant,
+    error_kind: &'static str,
+    state_changed: bool,
+    fields: serde_json::Value,
+) -> CommandResult {
+    let mut output = serde_json::json!({
+        "error_code": error_kind,
+        "error_kind": error_kind,
+        "failure_kind": error_kind,
+        "state_changed": state_changed,
+    });
+    if let (Some(output), Some(fields)) = (output.as_object_mut(), fields.as_object()) {
+        output.extend(fields.clone());
+    }
+    CommandResult {
+        exit_code: Some(1),
+        stdout: Some(
+            serde_json::to_string(&output)
                 .unwrap_or_else(|_| r#"{"error_code":"operation_failed"}"#.to_string()),
         ),
         stderr: Some(String::new()),
@@ -775,11 +804,17 @@ enum ProjectTomlWriteError {
 #[cfg(test)]
 thread_local! {
     static FAIL_PARENT_SYNC_AFTER_PROJECT_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_PROJECT_PUBLISH_BEFORE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
 pub(crate) fn fail_next_project_parent_sync_after_rename() {
     FAIL_PARENT_SYNC_AFTER_PROJECT_RENAME.set(true);
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_project_publish_before_rename() {
+    FAIL_PROJECT_PUBLISH_BEFORE_RENAME.set(true);
 }
 
 fn sync_project_parent_after_rename(path: &Path) -> Result<(), String> {
@@ -792,7 +827,8 @@ fn sync_project_parent_after_rename(path: &Path) -> Result<(), String> {
 
 /// Write a project TOML file atomically into `projects_dir`. Creates
 /// `projects_dir` if missing. Returns write metadata on success.
-/// The temp file is written and fsynced, then renamed to `<id>.toml`.
+/// The temp file is written and fsynced, then atomically published as
+/// `<id>.toml`.
 fn sync_parent_dir(path: &Path) -> Result<(), String> {
     let dir = path
         .parent()
@@ -824,17 +860,36 @@ fn write_project_toml_atomic(
         return Err(ProjectTomlWriteError::BeforeRename);
     }
     let temp_path = unique_registry_temp(&canonical_dir, id, "toml.tmp");
+    let mut published = false;
     let before = (|| -> Result<(), String> {
         let mut file = std::fs::File::create(&temp_path).map_err(|e| e.to_string())?;
         file.write_all(toml_content.as_bytes())
             .map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
-        std::fs::rename(&temp_path, &config_path).map_err(|e| e.to_string())?;
+        #[cfg(test)]
+        if FAIL_PROJECT_PUBLISH_BEFORE_RENAME.replace(false) {
+            return Err("injected project publish failure".to_string());
+        }
+        if overwrite {
+            std::fs::rename(&temp_path, &config_path).map_err(|e| e.to_string())?;
+            published = true;
+        } else {
+            // Publish a complete, synced same-directory temp file without the
+            // overwrite-on-rename race. A concurrent creator wins cleanly and
+            // the caller can rescan the registry to converge.
+            std::fs::hard_link(&temp_path, &config_path).map_err(|e| e.to_string())?;
+            published = true;
+            std::fs::remove_file(&temp_path).map_err(|e| e.to_string())?;
+        }
         Ok(())
     })();
     if before.is_err() {
         let _ = std::fs::remove_file(&temp_path);
-        return Err(ProjectTomlWriteError::BeforeRename);
+        return Err(if published {
+            ProjectTomlWriteError::AfterRename
+        } else {
+            ProjectTomlWriteError::BeforeRename
+        });
     }
     sync_project_parent_after_rename(&config_path)
         .map_err(|_| ProjectTomlWriteError::AfterRename)?;
@@ -843,6 +898,403 @@ fn write_project_toml_atomic(
         created_config: !existed_before,
         overwritten: existed_before && overwrite,
     })
+}
+
+fn load_project_files_for_path_resolution(
+    projects_dir: &Path,
+) -> Result<Vec<AgentProjectFile>, &'static str> {
+    let entries = match std::fs::read_dir(projects_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err("project_registry_unavailable"),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|_| "project_registry_unavailable")?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) == Some("toml") {
+            files.push(path);
+        }
+    }
+    files.sort();
+
+    let mut projects = Vec::with_capacity(files.len());
+    for file in files {
+        let content = std::fs::read_to_string(&file).map_err(|_| "project_registry_unavailable")?;
+        let project =
+            parse_agent_project_toml(&content).map_err(|_| "project_registry_unavailable")?;
+        projects.push(project);
+    }
+    Ok(projects)
+}
+
+fn projects_matching_canonical_path(
+    projects: &[AgentProjectFile],
+    canonical_path: &Path,
+) -> Vec<AgentProjectFile> {
+    projects
+        .iter()
+        .filter_map(|project| {
+            let registered_path = canonicalize_existing(Path::new(&project.path)).ok()?;
+            (registered_path.is_dir() && registered_path == canonical_path).then(|| project.clone())
+        })
+        .collect()
+}
+
+fn bounded_project_name(canonical_path: &Path) -> String {
+    let raw = canonical_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("Project")
+        .trim();
+    let mut name = String::new();
+    for character in raw.chars() {
+        if name.len() + character.len_utf8() > 120 {
+            break;
+        }
+        name.push(character);
+    }
+    if name.is_empty() {
+        "Project".to_string()
+    } else {
+        name
+    }
+}
+
+fn sanitized_project_basename(canonical_path: &Path) -> String {
+    let raw = canonical_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("project");
+    let mut sanitized = String::new();
+    let mut separator_pending = false;
+    for character in raw.chars() {
+        if character.is_ascii_alphanumeric() {
+            if separator_pending && !sanitized.is_empty() {
+                sanitized.push('-');
+            }
+            sanitized.push(character.to_ascii_lowercase());
+            separator_pending = false;
+        } else {
+            separator_pending = true;
+        }
+    }
+    if sanitized.is_empty() {
+        "project".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn canonical_project_path_hash(canonical_path: &Path) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        return format!(
+            "{:x}",
+            Sha256::digest(canonical_path.as_os_str().as_bytes())
+        );
+    }
+    #[cfg(not(unix))]
+    format!(
+        "{:x}",
+        Sha256::digest(canonical_path.to_string_lossy().as_bytes())
+    )
+}
+
+fn auto_project_id_candidate(
+    canonical_path: &Path,
+    hash_prefix_length: usize,
+) -> Result<String, &'static str> {
+    let digest = canonical_project_path_hash(canonical_path);
+    let hash_prefix = digest
+        .get(..hash_prefix_length.min(digest.len()))
+        .ok_or("project_id_collision")?;
+    let max_basename_length = 64usize.saturating_sub(hash_prefix.len() + 1);
+    if max_basename_length == 0 {
+        return Err("project_id_collision");
+    }
+    let basename = sanitized_project_basename(canonical_path);
+    let basename = basename
+        .chars()
+        .take(max_basename_length)
+        .collect::<String>();
+    let candidate = format!("{basename}-{hash_prefix}");
+    validate_project_op_id(&candidate).map_err(|_| "project_id_collision")?;
+    Ok(candidate)
+}
+
+fn choose_auto_project_id(
+    projects_dir: &Path,
+    projects: &[AgentProjectFile],
+    canonical_path: &Path,
+) -> Result<String, &'static str> {
+    let configured_ids = projects
+        .iter()
+        .map(|project| project.id.as_str())
+        .collect::<HashSet<_>>();
+    for &prefix_length in AUTO_PROJECT_HASH_PREFIX_LENGTHS {
+        let candidate = auto_project_id_candidate(canonical_path, prefix_length)?;
+        if configured_ids.contains(candidate.as_str())
+            || projects_dir.join(format!("{candidate}.toml")).exists()
+        {
+            continue;
+        }
+        return Ok(candidate);
+    }
+    Err("project_id_collision")
+}
+
+fn path_resolution_success(
+    request: &ShellAgentShellRequest,
+    project: &AgentProjectFile,
+    canonical_path: &Path,
+    outcome: &'static str,
+    registered: bool,
+    projects_config_path: Option<&Path>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("agent:{}:{}", request.client_id, project.id),
+        "agent_project_id": project.id,
+        "client_id": request.client_id,
+        "name": project.name,
+        "path": canonical_path.to_string_lossy(),
+        "kind": project.kind,
+        "description": project.description,
+        "allow_patch": project.allow_patch,
+        "disabled": project.disabled,
+        "revision": project_revision(project),
+        "source": "path",
+        "outcome": outcome,
+        "registered": registered,
+        "created_config": registered,
+        "changed": registered,
+        "recovered": !registered,
+        "projects_config_path": projects_config_path.map(|path| path.to_string_lossy().to_string()),
+    })
+}
+
+fn existing_path_resolution_result(
+    start: Instant,
+    request: &ShellAgentShellRequest,
+    canonical_path: &Path,
+    matches: Vec<AgentProjectFile>,
+) -> Option<CommandResult> {
+    if matches.len() > 1 {
+        let mut matching_project_ids = matches
+            .iter()
+            .map(|project| project.id.clone())
+            .collect::<Vec<_>>();
+        matching_project_ids.sort();
+        matching_project_ids.dedup();
+        return Some(structured_project_error_cmd(
+            start,
+            "ambiguous_project_path",
+            false,
+            serde_json::json!({"matching_project_ids": matching_project_ids}),
+        ));
+    }
+    let project = matches.into_iter().next()?;
+    if project.disabled {
+        return Some(structured_project_error_cmd(
+            start,
+            "project_disabled",
+            false,
+            serde_json::json!({"matching_project_id": project.id}),
+        ));
+    }
+    Some(ok_cmd(
+        start,
+        path_resolution_success(
+            request,
+            &project,
+            canonical_path,
+            "reused_existing_registration",
+            false,
+            None,
+        ),
+    ))
+}
+
+/// Resolve an existing Runner registration by canonical path or atomically
+/// persist a new one. This is an internal Server↔Runner operation, not a
+/// model-visible runtime tool.
+pub(crate) fn handle_resolve_or_register_project(
+    policy: &AgentPolicy,
+    projects_dir: &Path,
+    request: &ShellAgentShellRequest,
+) -> CommandResult {
+    let start = Instant::now();
+    let _registry_guard = match project_registry_write_lock().lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return structured_project_error_cmd(
+                start,
+                "operation_failed",
+                false,
+                serde_json::json!({}),
+            )
+        }
+    };
+    let payload = match request
+        .stdin
+        .as_deref()
+        .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .and_then(|payload| payload.as_object().cloned())
+    {
+        Some(payload) => payload,
+        None => {
+            return structured_project_error_cmd(
+                start,
+                "invalid_request",
+                false,
+                serde_json::json!({}),
+            )
+        }
+    };
+    if payload.len() != 1 {
+        return structured_project_error_cmd(
+            start,
+            "invalid_request",
+            false,
+            serde_json::json!({}),
+        );
+    }
+    let path = match payload.get("path").and_then(serde_json::Value::as_str) {
+        Some(path) if !path.is_empty() && !path.contains('\0') && Path::new(path).is_absolute() => {
+            path
+        }
+        _ => {
+            return structured_project_error_cmd(
+                start,
+                "invalid_project_path",
+                false,
+                serde_json::json!({"field": "path"}),
+            )
+        }
+    };
+    let canonical_path = match canonicalize_existing(Path::new(path)) {
+        Ok(path) => path,
+        Err(_) => {
+            return structured_project_error_cmd(
+                start,
+                "project_path_not_found",
+                false,
+                serde_json::json!({"field": "path"}),
+            )
+        }
+    };
+    if !canonical_path.is_dir() {
+        return structured_project_error_cmd(
+            start,
+            "project_path_not_directory",
+            false,
+            serde_json::json!({"field": "path"}),
+        );
+    }
+    if canonical_path.to_str().is_none() {
+        return structured_project_error_cmd(
+            start,
+            "invalid_project_path",
+            false,
+            serde_json::json!({"field": "path"}),
+        );
+    }
+    if validate_project_path_policy(policy, &canonical_path).is_err() {
+        return structured_project_error_cmd(
+            start,
+            "path_outside_allowed_roots",
+            false,
+            serde_json::json!({"field": "path"}),
+        );
+    }
+
+    let projects = match load_project_files_for_path_resolution(projects_dir) {
+        Ok(projects) => projects,
+        Err(error_kind) => {
+            return structured_project_error_cmd(start, error_kind, false, serde_json::json!({}))
+        }
+    };
+    let matches = projects_matching_canonical_path(&projects, &canonical_path);
+    if let Some(result) = existing_path_resolution_result(start, request, &canonical_path, matches)
+    {
+        return result;
+    }
+
+    let project_id = match choose_auto_project_id(projects_dir, &projects, &canonical_path) {
+        Ok(project_id) => project_id,
+        Err(error_kind) => {
+            return structured_project_error_cmd(start, error_kind, false, serde_json::json!({}))
+        }
+    };
+    let canonical_path_string = canonical_path
+        .to_str()
+        .expect("validated UTF-8 canonical project path")
+        .to_string();
+    let name = bounded_project_name(&canonical_path);
+    let description = None;
+    let toml_content = build_project_toml_with_kind(
+        &project_id,
+        &name,
+        &canonical_path_string,
+        Some(AUTO_REGISTERED_PROJECT_KIND),
+        &description,
+        true,
+    );
+    let write_result =
+        match write_project_toml_atomic(projects_dir, &project_id, &toml_content, false) {
+            Ok(result) => result,
+            Err(ProjectTomlWriteError::BeforeRename) => {
+                // A different process may have won publication. Rescan under
+                // our process-local lock and converge if it registered the
+                // same canonical directory.
+                if let Ok(projects) = load_project_files_for_path_resolution(projects_dir) {
+                    let matches = projects_matching_canonical_path(&projects, &canonical_path);
+                    if let Some(result) =
+                        existing_path_resolution_result(start, request, &canonical_path, matches)
+                    {
+                        return result;
+                    }
+                }
+                return structured_project_error_cmd(
+                    start,
+                    "operation_failed",
+                    false,
+                    serde_json::json!({}),
+                );
+            }
+            Err(ProjectTomlWriteError::AfterRename) => {
+                return structured_project_error_cmd(
+                    start,
+                    "operation_indeterminate",
+                    true,
+                    serde_json::json!({}),
+                )
+            }
+        };
+    let project = match parse_agent_project_toml(&toml_content) {
+        Ok(project) => project,
+        Err(_) => {
+            return structured_project_error_cmd(
+                start,
+                "operation_indeterminate",
+                true,
+                serde_json::json!({}),
+            )
+        }
+    };
+    ok_cmd(
+        start,
+        path_resolution_success(
+            request,
+            &project,
+            &canonical_path,
+            "auto_registered",
+            true,
+            Some(&write_result.config_path),
+        ),
+    )
 }
 
 fn lifecycle_config_path(projects_dir: &Path, id: &str) -> Result<PathBuf, String> {

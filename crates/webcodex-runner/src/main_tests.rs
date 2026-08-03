@@ -2,6 +2,7 @@ use super::*;
 use crate::webcodex_runner::config::validate_shell_config;
 use crate::webcodex_runner::{
     handle_project_lifecycle_op, handle_project_op_with_temporary_projects_root,
+    handle_resolve_or_register_project,
 };
 static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -5831,6 +5832,17 @@ fn project_err(result: CommandResult) -> String {
         .to_string()
 }
 
+fn project_error_value(result: CommandResult) -> serde_json::Value {
+    assert_ne!(
+        result.exit_code,
+        Some(0),
+        "unexpected success: {:?}",
+        result
+    );
+    assert!(result.error.is_none(), "unexpected raw error: {:?}", result);
+    serde_json::from_str(result.stdout.as_deref().expect("error json")).unwrap()
+}
+
 #[test]
 fn register_project_writes_valid_toml_into_projects_dir() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5859,6 +5871,401 @@ fn register_project_writes_valid_toml_into_projects_dir() {
     assert_eq!(parsed.name.as_deref(), Some("Demo"));
     assert_eq!(parsed.path, project_dir.to_string_lossy());
     assert!(!parsed.allow_patch);
+}
+
+#[test]
+fn resolve_or_register_project_persists_and_reuses_canonical_directory_without_touching_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("Example Repo");
+    let projects_dir = tmp.path().join("projects.d");
+    std::fs::create_dir(&project_dir).unwrap();
+    std::fs::write(project_dir.join("keep.txt"), "unchanged").unwrap();
+    let target_entries_before = std::fs::read_dir(&project_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    let policy = project_policy(tmp.path());
+
+    let first = project_ok(handle_resolve_or_register_project(
+        &policy,
+        &projects_dir,
+        &project_request(
+            "resolve_or_register_project",
+            serde_json::json!({"path": project_dir.join(".").to_string_lossy()}),
+        ),
+    ));
+    assert_eq!(first["outcome"], "auto_registered");
+    assert_eq!(first["registered"], true);
+    assert_eq!(first["changed"], true);
+    let project_id = first["agent_project_id"].as_str().unwrap();
+    assert!(project_id.starts_with("example-repo-"), "{project_id}");
+    assert!(project_id.len() <= 64);
+
+    let config_path = projects_dir.join(format!("{project_id}.toml"));
+    let persisted =
+        parse_agent_project_toml(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert_eq!(persisted.id, project_id);
+    assert_eq!(
+        Path::new(&persisted.path),
+        project_dir.canonicalize().unwrap()
+    );
+    assert_eq!(persisted.kind.as_deref(), Some("auto_registered"));
+    assert!(persisted.allow_patch);
+    assert_eq!(
+        std::fs::read_to_string(project_dir.join("keep.txt")).unwrap(),
+        "unchanged"
+    );
+    let target_entries_after = std::fs::read_dir(&project_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(target_entries_after, target_entries_before);
+    assert!(!project_dir.join(".git").exists());
+
+    let reloaded = load_agent_project_summaries_from_dir(&projects_dir);
+    assert_eq!(reloaded.len(), 1);
+    assert_eq!(reloaded[0].id, project_id);
+    let second = project_ok(handle_resolve_or_register_project(
+        &policy,
+        &projects_dir,
+        &project_request(
+            "resolve_or_register_project",
+            serde_json::json!({"path": project_dir.to_string_lossy()}),
+        ),
+    ));
+    assert_eq!(second["outcome"], "reused_existing_registration");
+    assert_eq!(second["registered"], false);
+    assert_eq!(second["agent_project_id"], project_id);
+    assert_eq!(
+        std::fs::read_dir(&projects_dir).unwrap().count(),
+        1,
+        "retry created a duplicate registration"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn resolve_or_register_project_reuses_symlink_target() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("repo");
+    let link = tmp.path().join("repo-link");
+    let projects_dir = tmp.path().join("projects.d");
+    std::fs::create_dir(&project_dir).unwrap();
+    symlink(&project_dir, &link).unwrap();
+    let policy = project_policy(tmp.path());
+
+    let first = project_ok(handle_resolve_or_register_project(
+        &policy,
+        &projects_dir,
+        &project_request(
+            "resolve_or_register_project",
+            serde_json::json!({"path": project_dir.to_string_lossy()}),
+        ),
+    ));
+    let second = project_ok(handle_resolve_or_register_project(
+        &policy,
+        &projects_dir,
+        &project_request(
+            "resolve_or_register_project",
+            serde_json::json!({"path": link.to_string_lossy()}),
+        ),
+    ));
+    assert_eq!(second["outcome"], "reused_existing_registration");
+    assert_eq!(second["agent_project_id"], first["agent_project_id"]);
+    assert_eq!(
+        Path::new(second["path"].as_str().unwrap()),
+        project_dir.canonicalize().unwrap()
+    );
+}
+
+#[test]
+fn resolve_or_register_project_prefers_manual_id_and_distinguishes_same_basenames() {
+    let tmp = tempfile::tempdir().unwrap();
+    let first_parent = tmp.path().join("first");
+    let second_parent = tmp.path().join("second");
+    let manual_dir = tmp.path().join("manual");
+    let projects_dir = tmp.path().join("projects.d");
+    for directory in [
+        first_parent.join("repo"),
+        second_parent.join("repo"),
+        manual_dir.clone(),
+    ] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    std::fs::create_dir(&projects_dir).unwrap();
+    std::fs::write(
+        projects_dir.join("friendly.toml"),
+        format!(
+            "id = \"friendly\"\nname = \"Friendly\"\npath = {:?}\nallow_patch = true\n",
+            manual_dir.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let policy = project_policy(tmp.path());
+
+    let manual = project_ok(handle_resolve_or_register_project(
+        &policy,
+        &projects_dir,
+        &project_request(
+            "resolve_or_register_project",
+            serde_json::json!({"path": manual_dir.join(".").to_string_lossy()}),
+        ),
+    ));
+    assert_eq!(manual["outcome"], "reused_existing_registration");
+    assert_eq!(manual["agent_project_id"], "friendly");
+
+    let first = project_ok(handle_resolve_or_register_project(
+        &policy,
+        &projects_dir,
+        &project_request(
+            "resolve_or_register_project",
+            serde_json::json!({"path": first_parent.join("repo").to_string_lossy()}),
+        ),
+    ));
+    let second = project_ok(handle_resolve_or_register_project(
+        &policy,
+        &projects_dir,
+        &project_request(
+            "resolve_or_register_project",
+            serde_json::json!({"path": second_parent.join("repo").to_string_lossy()}),
+        ),
+    ));
+    assert_ne!(first["agent_project_id"], second["agent_project_id"]);
+    assert!(first["agent_project_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("repo-"));
+    assert!(second["agent_project_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("repo-"));
+}
+
+#[test]
+fn resolve_or_register_project_fails_closed_for_disabled_and_ambiguous_matches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("repo");
+    let projects_dir = tmp.path().join("projects.d");
+    std::fs::create_dir(&project_dir).unwrap();
+    std::fs::create_dir(&projects_dir).unwrap();
+    std::fs::write(
+        projects_dir.join("disabled.toml"),
+        format!(
+            "id = \"disabled\"\npath = {:?}\ndisabled = true\n",
+            project_dir.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let policy = project_policy(tmp.path());
+
+    let disabled = project_error_value(handle_resolve_or_register_project(
+        &policy,
+        &projects_dir,
+        &project_request(
+            "resolve_or_register_project",
+            serde_json::json!({"path": project_dir.to_string_lossy()}),
+        ),
+    ));
+    assert_eq!(disabled["error_kind"], "project_disabled");
+    assert_eq!(disabled["matching_project_id"], "disabled");
+    assert_eq!(disabled["state_changed"], false);
+    assert!(
+        !disabled.to_string().contains(project_dir.to_str().unwrap()),
+        "disabled error leaked the absolute path"
+    );
+
+    std::fs::write(
+        projects_dir.join("alpha.toml"),
+        format!(
+            "id = \"alpha\"\npath = {:?}\n",
+            project_dir.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        projects_dir.join("zeta.toml"),
+        format!(
+            "id = \"zeta\"\npath = {:?}\n",
+            project_dir.join(".").to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let ambiguous = project_error_value(handle_resolve_or_register_project(
+        &policy,
+        &projects_dir,
+        &project_request(
+            "resolve_or_register_project",
+            serde_json::json!({"path": project_dir.to_string_lossy()}),
+        ),
+    ));
+    assert_eq!(ambiguous["error_kind"], "ambiguous_project_path");
+    assert_eq!(
+        ambiguous["matching_project_ids"],
+        serde_json::json!(["alpha", "disabled", "zeta"])
+    );
+    assert_eq!(ambiguous["state_changed"], false);
+}
+
+#[test]
+fn resolve_or_register_project_rejects_invalid_non_directory_and_disallowed_paths() {
+    let allowed = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let projects_dir = allowed.path().join("projects.d");
+    let file = allowed.path().join("file.txt");
+    std::fs::write(&file, "not a directory").unwrap();
+    let policy = project_policy(allowed.path());
+
+    for (path, expected) in [
+        ("relative/path".to_string(), "invalid_project_path"),
+        (
+            allowed.path().join("missing").to_string_lossy().to_string(),
+            "project_path_not_found",
+        ),
+        (
+            file.to_string_lossy().to_string(),
+            "project_path_not_directory",
+        ),
+        (
+            outside.path().to_string_lossy().to_string(),
+            "path_outside_allowed_roots",
+        ),
+    ] {
+        let error = project_error_value(handle_resolve_or_register_project(
+            &policy,
+            &projects_dir,
+            &project_request(
+                "resolve_or_register_project",
+                serde_json::json!({"path": path}),
+            ),
+        ));
+        assert_eq!(error["error_kind"], expected);
+        assert_eq!(error["state_changed"], false);
+    }
+    assert!(!projects_dir.exists());
+
+    let unrestricted = AgentPolicy {
+        allow_cwd_anywhere: true,
+        allowed_roots: Vec::new(),
+        ..AgentPolicy::default()
+    };
+    let dangerous = project_error_value(handle_resolve_or_register_project(
+        &unrestricted,
+        &projects_dir,
+        &project_request(
+            "resolve_or_register_project",
+            serde_json::json!({"path": "/etc"}),
+        ),
+    ));
+    assert_eq!(dangerous["error_kind"], "path_outside_allowed_roots");
+}
+
+#[test]
+fn concurrent_path_resolution_converges_on_one_registration() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("repo");
+    let projects_dir = tmp.path().join("projects.d");
+    std::fs::create_dir(&project_dir).unwrap();
+    let policy = project_policy(tmp.path());
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let project_dir = project_dir.clone();
+        let projects_dir = projects_dir.clone();
+        let policy = policy.clone();
+        workers.push(std::thread::spawn(move || {
+            project_ok(handle_resolve_or_register_project(
+                &policy,
+                &projects_dir,
+                &project_request(
+                    "resolve_or_register_project",
+                    serde_json::json!({"path": project_dir.to_string_lossy()}),
+                ),
+            ))
+        }));
+    }
+    let results = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results[0]["agent_project_id"],
+        results[1]["agent_project_id"]
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| result["registered"] == true)
+            .count(),
+        1
+    );
+    assert_eq!(std::fs::read_dir(&projects_dir).unwrap().count(), 1);
+}
+
+#[test]
+fn auto_project_id_collision_extends_hash_without_overwriting() {
+    use sha2::{Digest, Sha256};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("repo");
+    let other_dir = tmp.path().join("other");
+    let projects_dir = tmp.path().join("projects.d");
+    std::fs::create_dir(&project_dir).unwrap();
+    std::fs::create_dir(&other_dir).unwrap();
+    std::fs::create_dir(&projects_dir).unwrap();
+    let canonical = project_dir.canonicalize().unwrap();
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(canonical.to_string_lossy().as_bytes())
+    );
+    let colliding_id = format!("repo-{}", &digest[..8]);
+    let colliding_config = format!(
+        "id = {:?}\npath = {:?}\n",
+        colliding_id,
+        other_dir.to_string_lossy()
+    );
+    std::fs::write(
+        projects_dir.join(format!("{colliding_id}.toml")),
+        &colliding_config,
+    )
+    .unwrap();
+
+    let result = project_ok(handle_resolve_or_register_project(
+        &project_policy(tmp.path()),
+        &projects_dir,
+        &project_request(
+            "resolve_or_register_project",
+            serde_json::json!({"path": project_dir.to_string_lossy()}),
+        ),
+    ));
+    let generated = result["agent_project_id"].as_str().unwrap();
+    assert_ne!(generated, colliding_id);
+    assert_eq!(generated, format!("repo-{}", &digest[..12]));
+    assert_eq!(
+        std::fs::read_to_string(projects_dir.join(format!("{colliding_id}.toml"))).unwrap(),
+        colliding_config
+    );
+}
+
+#[test]
+fn path_registration_publish_failure_leaves_no_config_or_temp_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("repo");
+    let projects_dir = tmp.path().join("projects.d");
+    std::fs::create_dir(&project_dir).unwrap();
+    webcodex_runner::projects::fail_next_project_publish_before_rename();
+
+    let error = project_error_value(handle_resolve_or_register_project(
+        &project_policy(tmp.path()),
+        &projects_dir,
+        &project_request(
+            "resolve_or_register_project",
+            serde_json::json!({"path": project_dir.to_string_lossy()}),
+        ),
+    ));
+    assert_eq!(error["error_kind"], "operation_failed");
+    assert_eq!(error["state_changed"], false);
+    assert_eq!(std::fs::read_dir(&projects_dir).unwrap().count(), 0);
 }
 
 #[test]

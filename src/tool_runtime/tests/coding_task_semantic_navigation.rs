@@ -47,6 +47,7 @@ fn start_call(project: String, mode: SessionMode) -> ToolCall {
     ToolCall::StartCodingTask {
         project,
         client_id: None,
+        path: None,
         temporary_project_name: None,
         title: Some("semantic navigation startup".to_string()),
         mode,

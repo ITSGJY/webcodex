@@ -361,25 +361,21 @@ fn from_tool_name_error_includes_tool_name() {
 #[test]
 fn tool_call_project_accessor_covers_project_tool_specs() {
     for spec in registered_tool_specs() {
-        let call = ToolCall::from_tool_name(&spec.name, sample_tool_args(&spec.name))
-            .unwrap_or_else(|e| panic!("{} should deserialize: {}", spec.name, e));
-        let schema_has_project = spec.input_schema["properties"].get("project").is_some();
-        // `start_session` has an optional project for task association that is
-        // intentionally not exposed by `project()`. `session_handoff_summary`
-        // has an optional project for workspace/checkpoint enrichment; sample
-        // args omit it (it is not required), so `project()` returns `None`.
-        let expected_project = if schema_has_project
-            && spec.name != "start_session"
-            && spec.name != "start_coding_task"
-            && spec.name != "session_handoff_summary"
-        {
-            Some("agent:oe:private-drop")
-        } else {
+        let args = sample_tool_args(&spec.name);
+        let expected_project = if spec.name == "start_session" {
+            // start_session project is task association metadata, not an
+            // execution target exposed by the project accessor.
             None
+        } else {
+            args.get("project")
+                .and_then(Value::as_str)
+                .map(str::to_string)
         };
+        let call = ToolCall::from_tool_name(&spec.name, args)
+            .unwrap_or_else(|e| panic!("{} should deserialize: {}", spec.name, e));
         assert_eq!(
             call.project(),
-            expected_project,
+            expected_project.as_deref(),
             "{} ToolCall::project() mismatch",
             spec.name
         );
@@ -603,6 +599,92 @@ fn start_coding_task_parses_managed_temporary_project_request_without_project() 
         _ => panic!("expected start_coding_task"),
     }
     assert!(call.project().is_none());
+}
+
+#[test]
+fn coding_task_entries_parse_path_source_and_reject_ambiguous_sources() {
+    let start = ToolCall::from_tool_name(
+        "start_coding_task",
+        json!({
+            "client_id": "runner-1",
+            "path": "/root/git/example"
+        }),
+    )
+    .unwrap();
+    match &start {
+        ToolCall::StartCodingTask {
+            project,
+            client_id,
+            path,
+            ..
+        } => {
+            assert!(project.is_empty());
+            assert_eq!(client_id.as_deref(), Some("runner-1"));
+            assert_eq!(path.as_deref(), Some("/root/git/example"));
+        }
+        _ => panic!("expected start_coding_task"),
+    }
+    let start_audit = start.session_log_arguments();
+    assert_eq!(start_audit["path_source_requested"], true);
+    assert!(start_audit.get("path").is_none());
+    assert!(!start_audit.to_string().contains("/root/git/example"));
+
+    let work = ToolCall::from_tool_name(
+        "work_on_project",
+        json!({
+            "client_id": "runner-1",
+            "path": "/root/git/example",
+            "instruction": "implement it"
+        }),
+    )
+    .unwrap();
+    assert!(work.project().is_none());
+    let work_audit = work.session_log_arguments();
+    assert_eq!(work_audit["path_source_requested"], true);
+    assert!(work_audit.get("path").is_none());
+    assert!(!work_audit.to_string().contains("/root/git/example"));
+
+    for (tool, arguments) in [
+        (
+            "start_coding_task",
+            json!({"project": "agent:x:y", "client_id": "x", "path": "/tmp/y"}),
+        ),
+        ("start_coding_task", json!({"path": "/tmp/y"})),
+        (
+            "start_coding_task",
+            json!({"client_id": "x", "path": "/tmp/y", "temporary_project_name": "tmp"}),
+        ),
+        (
+            "start_coding_task",
+            json!({"client_id": "x", "path": "relative/repo"}),
+        ),
+        ("start_coding_task", json!({"client_id": "x", "path": ""})),
+        (
+            "work_on_project",
+            json!({"project": "agent:x:y", "path": "/tmp/y", "instruction": "x"}),
+        ),
+        (
+            "work_on_project",
+            json!({"client_id": "x", "instruction": "x"}),
+        ),
+        (
+            "work_on_project",
+            json!({"client_id": "x", "path": "relative/repo", "instruction": "x"}),
+        ),
+        (
+            "work_on_project",
+            json!({"client_id": "", "path": "/tmp/y", "instruction": "x"}),
+        ),
+    ] {
+        let error = ToolCall::from_tool_name(tool, arguments).unwrap_err();
+        assert!(
+            error.contains("conflicting fields")
+                || error.contains("missing ")
+                || error.contains("must be absolute")
+                || error.contains("must not be empty"),
+            "{error}"
+        );
+    }
 }
 
 #[test]

@@ -256,6 +256,14 @@ Audit Sessions are never sources for this Workflow Session lookup.
 
 The agent is where private repository paths are interpreted. The server routes by runtime project id, such as `agent:<client_id>:<project_id>`.
 
+The full-runtime `start_coding_task` and local-coding `work_on_project` may
+also receive `client_id` plus an existing absolute path. This does not create a
+new model-visible operation: the Server calls an internal Runner request, and
+the Runner performs canonical matching, path-policy enforcement, collision-safe
+id generation, and atomic `projects.d` persistence under the registry write
+lock. The Server continues ordinary project resolution and Workflow Session
+matching only after the Runner returns the complete runtime project id.
+
 ### Same-Runner Job Continuity
 
 Agent-backed async jobs have a bounded, process-local continuity layer

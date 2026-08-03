@@ -28,6 +28,7 @@ use crate::shell_protocol::ShellAgentProjectSummary;
 /// init), so 30s is generous while still bounding the caller.
 const PROJECT_OP_WAIT_SECS: u64 = 32;
 const MANAGED_TEMPORARY_PROJECT_SOURCE: &str = "managed_temporary";
+const AUTO_REGISTERED_PROJECT_SOURCE: &str = "auto_registered";
 
 impl ToolRuntime {
     pub(crate) async fn list_projects(&self, auth: Option<&AuthContext>) -> ToolResult {
@@ -188,6 +189,36 @@ impl ToolRuntime {
                 "managed_temporary_project": true,
                 "name": name,
             }),
+            auth,
+        )
+        .await
+    }
+
+    /// Ask the selected Runner to resolve an existing registration by
+    /// canonical path or persist a new projects.d entry under its registry
+    /// write lock. This internal operation is intentionally absent from the
+    /// model-visible tool registry.
+    pub(crate) async fn resolve_or_register_project(
+        &self,
+        client_id: String,
+        path: String,
+        auth: Option<&AuthContext>,
+    ) -> ToolResult {
+        if let Err(error) = validate_project_op_path(&path) {
+            return ToolResult::err_with_output(
+                error,
+                json!({
+                    "error_kind": "invalid_project_path",
+                    "failure_kind": "invalid_arguments",
+                    "field": "path",
+                    "state_changed": false,
+                }),
+            );
+        }
+        self.submit_project_op(
+            "resolve_or_register_project",
+            client_id,
+            json!({"path": path}),
             auth,
         )
         .await
@@ -370,10 +401,10 @@ fn agent_protocol_reports_project_git(protocol: &str) -> bool {
 }
 
 fn project_source(project: &ShellAgentProjectSummary) -> &'static str {
-    if project.kind.as_deref() == Some(MANAGED_TEMPORARY_PROJECT_SOURCE) {
-        MANAGED_TEMPORARY_PROJECT_SOURCE
-    } else {
-        "agent_registered"
+    match project.kind.as_deref() {
+        Some(MANAGED_TEMPORARY_PROJECT_SOURCE) => MANAGED_TEMPORARY_PROJECT_SOURCE,
+        Some(AUTO_REGISTERED_PROJECT_SOURCE) => AUTO_REGISTERED_PROJECT_SOURCE,
+        _ => "agent_registered",
     }
 }
 

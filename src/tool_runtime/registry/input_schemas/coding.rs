@@ -9,12 +9,18 @@ pub(crate) fn start_coding_task_input_schema() -> Value {
             "project": {
                 "type": "string",
                 "minLength": 1,
-                "description": "Existing runtime project id. Use a full id from list_projects, such as agent:<client_id>:<project_id>. Omit only with client_id to create a Runner-managed temporary project."
+                "description": "Existing runtime project id. Use a full id from list_projects, such as agent:<client_id>:<project_id>. Mutually exclusive with the Runner path source and managed temporary-project source."
             },
             "client_id": {
                 "type": "string",
                 "minLength": 1,
-                "description": "Runner client_id used only when project is omitted. The Runner creates a new managed temporary project under its configured temporary_projects_root, registers it normally, and binds the new Session to it."
+                "description": "Runner client_id that owns path. For backward compatibility, client_id without path retains the existing Runner-managed temporary-project flow."
+            },
+            "path": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^/",
+                "description": "Existing absolute directory path on the selected Runner. The Runner authoritatively canonicalizes and policy-checks it, reuses a unique enabled canonical-path registration, or permanently writes a new projects.d entry. Mutually exclusive with project and temporary_project_name."
             },
             "temporary_project_name": {
                 "type": "string",
@@ -67,13 +73,28 @@ pub(crate) fn start_coding_task_input_schema() -> Value {
                 "not": {
                     "anyOf": [
                         {"required": ["client_id"]},
+                        {"required": ["path"]},
+                        {"required": ["temporary_project_name"]}
+                    ]
+                }
+            },
+            {
+                "required": ["client_id", "path"],
+                "not": {
+                    "anyOf": [
+                        {"required": ["project"]},
                         {"required": ["temporary_project_name"]}
                     ]
                 }
             },
             {
                 "required": ["client_id"],
-                "not": {"required": ["project"]}
+                "not": {
+                    "anyOf": [
+                        {"required": ["project"]},
+                        {"required": ["path"]}
+                    ]
+                }
             }
         ],
         "additionalProperties": false,
@@ -93,7 +114,18 @@ pub(crate) fn work_on_project_input_schema() -> Value {
             "project": {
                 "type": "string",
                 "minLength": 1,
-                "description": "Required existing runtime project id, such as agent:<client_id>:<project_id>."
+                "description": "Existing runtime project id, such as agent:<client_id>:<project_id>. Mutually exclusive with client_id + path."
+            },
+            "client_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Runner client_id that owns path. Required exactly with path."
+            },
+            "path": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^/",
+                "description": "Existing absolute directory path on the selected Runner. The Runner authoritatively resolves or permanently registers it before exact Workflow Session handling."
             },
             "instruction": {
                 "type": "string",
@@ -107,7 +139,22 @@ pub(crate) fn work_on_project_input_schema() -> Value {
                 "description": "Optional explicit Workflow Session to continue exactly. It must match the project and be active and accessible; failure never falls back, guesses, or creates a new Session. This is explicit business input, distinct from wrapper recording_session_id and never a current-session fallback."
             }
         },
-        "required": ["project", "instruction"],
+        "required": ["instruction"],
+        "oneOf": [
+            {
+                "required": ["project"],
+                "not": {
+                    "anyOf": [
+                        {"required": ["client_id"]},
+                        {"required": ["path"]}
+                    ]
+                }
+            },
+            {
+                "required": ["client_id", "path"],
+                "not": {"required": ["project"]}
+            }
+        ],
         "additionalProperties": false,
     })
 }

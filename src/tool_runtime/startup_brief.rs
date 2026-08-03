@@ -51,6 +51,7 @@ pub(crate) const REPOSITORY_MAX_PROJECT_TYPE_EVIDENCE: usize = 4;
 pub(crate) struct StartupBriefInput<'a> {
     pub(crate) detail: StartupDetail,
     pub(crate) requested_project: &'a str,
+    pub(crate) project_resolution: &'a Value,
     pub(crate) resolved: &'a ResolvedProject,
     pub(crate) session: &'a SessionSummary,
     pub(crate) continuation_kind: &'a str,
@@ -128,6 +129,7 @@ pub(crate) fn build_startup_brief(input: StartupBriefInput<'_>) -> Value {
             "repository_identity": repository_identity,
             "canonical_repository_root_matches": input.canonical_repository_root_matches,
         },
+        "project_resolution": input.project_resolution,
         "workspace": workspace,
         "instructions": instruction_projection,
         "continuation": continuation,
@@ -2012,10 +2014,17 @@ mod tests {
             "terminal_pending_count": 1,
             "recent": [{"status": "recovering"}],
         });
+        let project_resolution = json!({
+            "source": "project",
+            "outcome": "resolved_existing_project",
+            "resolved_project": "agent:size:demo",
+            "registered": false,
+        });
         let build = || {
             build_startup_brief(StartupBriefInput {
                 detail: StartupDetail::Standard,
                 requested_project: "agent:size:demo",
+                project_resolution: &project_resolution,
                 resolved: &resolved,
                 session: &session,
                 continuation_kind: "continued",

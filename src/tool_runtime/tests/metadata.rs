@@ -1116,6 +1116,9 @@ async fn tool_manifest_reports_accepted_flattened_args_without_schemas() {
     }
     for field in [
         "project",
+        "client_id",
+        "path",
+        "temporary_project_name",
         "title",
         "mode",
         "deny_write_tools",
@@ -1127,6 +1130,16 @@ async fn tool_manifest_reports_accepted_flattened_args_without_schemas() {
         TOOL_CALL_RECORDING_SESSION_ID_FIELD,
     ] {
         assert!(accepted("start_coding_task").contains(&field.to_string()));
+    }
+    for field in [
+        "project",
+        "client_id",
+        "path",
+        "instruction",
+        "session_id",
+        TOOL_CALL_RECORDING_SESSION_ID_FIELD,
+    ] {
+        assert!(accepted("work_on_project").contains(&field.to_string()));
     }
     for field in [
         "session_id",

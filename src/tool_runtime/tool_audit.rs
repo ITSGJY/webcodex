@@ -41,6 +41,7 @@ pub(crate) fn session_log_arguments_for_tool_request(tool_name: &str, arguments:
                 &mut out,
                 &[
                     "project",
+                    "client_id",
                     "title",
                     "mode",
                     "deny_write_tools",
@@ -52,6 +53,12 @@ pub(crate) fn session_log_arguments_for_tool_request(tool_name: &str, arguments:
                     "session_id",
                 ],
             );
+            if tool_name == "start_coding_task" {
+                out.insert(
+                    "path_source_requested".to_string(),
+                    Value::Bool(obj.contains_key("path")),
+                );
+            }
             let context = obj
                 .get("execution_context")
                 .cloned()
@@ -63,7 +70,11 @@ pub(crate) fn session_log_arguments_for_tool_request(tool_name: &str, arguments:
             out.insert("execution_context".to_string(), context);
         }
         "work_on_project" => {
-            copy_keys(obj, &mut out, &["project", "session_id"]);
+            copy_keys(obj, &mut out, &["project", "client_id", "session_id"]);
+            out.insert(
+                "path_source_requested".to_string(),
+                Value::Bool(obj.contains_key("path")),
+            );
             if let Some(instruction) = obj.get("instruction").and_then(Value::as_str) {
                 out.insert(
                     "instruction_summary".to_string(),
@@ -1039,6 +1050,7 @@ impl ToolCall {
             Self::StartCodingTask {
                 project,
                 client_id,
+                path,
                 temporary_project_name,
                 title,
                 mode,
@@ -1052,6 +1064,7 @@ impl ToolCall {
             } => serde_json::json!({
                 "project": project,
                 "client_id": client_id,
+                "path_source_requested": path.is_some(),
                 "temporary_project_name": temporary_project_name,
                 "title": title,
                 "mode": mode,
@@ -1067,10 +1080,14 @@ impl ToolCall {
             }),
             Self::WorkOnProject {
                 project,
+                client_id,
+                path,
                 instruction,
                 session_id,
             } => serde_json::json!({
                 "project": project,
+                "client_id": client_id,
+                "path_source_requested": path.is_some(),
                 "instruction_present": true,
                 "instruction_summary": crate::shell_client::command_preview(instruction),
                 "session_id": session_id,
