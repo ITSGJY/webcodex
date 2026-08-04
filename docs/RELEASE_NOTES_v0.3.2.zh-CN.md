@@ -80,6 +80,14 @@ GHCR 或 Docker Hub 是独立的 release operation，不是 source 或 binary re
 - `webcodex-v0.3.2-linux-arm64.tar.gz`
 - `webcodex-v0.3.2-darwin-arm64.tar.gz`
 
+实际上传 release assets 的 SHA-256：
+
+```text
+ee6fd40d26524dd3d4ad76b2fdb31a626d0321703b55414ff66b7962b4ec3aaa  webcodex-v0.3.2-linux-x64.tar.gz
+bb582960d6ab0b6001514997e4fa23adcbabf355c878abd6c790ac83e4c13aab  webcodex-v0.3.2-linux-arm64.tar.gz
+56bfc43cb1dce0ede9810f81a4eb0a25d5e991fb729db6154b16cca35cfb8533  webcodex-v0.3.2-darwin-arm64.tar.gz
+```
+
 每个 artifact 都必须包含从不可变 `v0.3.2` tag 构建的 `webcodex`、
 `webcodex-server` 和 `webcodex-runner`。只有实际上传 bytes 的真实 SHA-256 已写入
 release manifest 后，才能发布 npm package。

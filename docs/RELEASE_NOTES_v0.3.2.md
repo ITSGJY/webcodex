@@ -90,6 +90,14 @@ The planned binary artifacts are:
 - `webcodex-v0.3.2-linux-arm64.tar.gz`
 - `webcodex-v0.3.2-darwin-arm64.tar.gz`
 
+SHA-256 checksums of the exact uploaded release assets:
+
+```text
+ee6fd40d26524dd3d4ad76b2fdb31a626d0321703b55414ff66b7962b4ec3aaa  webcodex-v0.3.2-linux-x64.tar.gz
+bb582960d6ab0b6001514997e4fa23adcbabf355c878abd6c790ac83e4c13aab  webcodex-v0.3.2-linux-arm64.tar.gz
+56bfc43cb1dce0ede9810f81a4eb0a25d5e991fb729db6154b16cca35cfb8533  webcodex-v0.3.2-darwin-arm64.tar.gz
+```
+
 Each artifact must contain `webcodex`, `webcodex-server`, and
 `webcodex-runner` built from the exact immutable `v0.3.2` tag. The npm package
 must not be published until the exact uploaded bytes have been recorded in the
