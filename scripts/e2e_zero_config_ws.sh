@@ -522,9 +522,9 @@ fi
 # The model surface is startup-selected and immutable. The default local_coding
 # surface is the intentional 35-tool canonical coding loop; the explicit
 # full-operator-v1 surface exposes the complete operator tool set. Neither
-# surface re-exposes the ModelHidden compatibility tools (replace_in_file,
-# job_tail) to the model via MCP tools/list; write_project_file is ModelVisible
-# and appears only on the full-operator surface.
+# surface re-exposes the removed legacy edit tools or the ModelHidden tools
+# (job_tail) to the model via MCP tools/list; write_project_file is
+# ModelVisible and appears only on the full-operator surface.
 MODEL_SURFACE_ENV="${WEBCODEX_MCP_MODEL_SURFACE:-}"
 case "$MODEL_SURFACE_ENV" in
     "" | "local-coding-v1")
@@ -601,9 +601,12 @@ if [ "$EXPECTED_SURFACE" = "local_coding" ]; then
     if [ "$mcp_canonical_present" = "1" ]; then
         pass "MCP tools/list exposes the local_coding canonical coding loop"
     fi
-    # Compatibility / old-granularity tools must NOT re-enter the model surface.
+    # Non-local_coding / old-granularity tools must NOT re-enter the model
+    # surface. replace_in_file was removed entirely; write_project_file is a
+    # retained whole-file write tool that stays ModelVisible only on the
+    # full-operator surface, never on local_coding.
     mcp_compat_absent=1
-    for tname in replace_in_file write_project_file job_tail list_tools \
+    for tname in write_project_file job_tail list_tools \
         git_diff_summary start_coding_task; do
         if mcp_tool_present "$tname"; then
             mcp_compat_absent=0
@@ -611,7 +614,7 @@ if [ "$EXPECTED_SURFACE" = "local_coding" ]; then
         fi
     done
     if [ "$mcp_compat_absent" = "1" ]; then
-        pass "MCP tools/list excludes compatibility tools on local_coding"
+        pass "MCP tools/list excludes non-local_coding tools on local_coding"
     fi
 else
     # full_operator_runtime: the complete operator tool surface.
@@ -629,18 +632,19 @@ else
     if [ "$mcp_operator_present" = "1" ]; then
         pass "MCP tools/list exposes the full-operator tool surface"
     fi
-    # ModelHidden compatibility tools must still never appear in MCP tools/list.
+    # ModelHidden tools must still never appear in MCP tools/list.
     # write_project_file is ModelVisible and is part of the full-operator
-    # surface, so it is not asserted absent here.
+    # surface, so it is not asserted absent here. replace_in_file was removed
+    # entirely and is not a known tool on any surface.
     mcp_hidden_absent=1
-    for tname in replace_in_file job_tail; do
+    for tname in job_tail; do
         if mcp_tool_present "$tname"; then
             mcp_hidden_absent=0
             fail "MCP tools/list must not expose ModelHidden tool $tname"
         fi
     done
     if [ "$mcp_hidden_absent" = "1" ]; then
-        pass "MCP tools/list excludes ModelHidden compatibility tools"
+        pass "MCP tools/list excludes ModelHidden tools"
     fi
 fi
 
@@ -1567,8 +1571,8 @@ fi
 body="$(api_post /api/projects/run_shell "{\"project\":\"$RUNTIME_PROJECT_ID\",\"command\":\"git rm -f RESTORE_PROBE.txt >/dev/null 2>&1 && git commit -m cleanup-probe >/dev/null 2>&1\"}")" || true
 
 # ----------------------------------------------------------------------------
-# 7e. Phase 4: structured edit tools (replace_in_file / write_project_file)
-#     via callRuntimeTool and MCP, against probe files only
+# 7e. Phase 4: structured edit tools (apply_text_edits / write_project_file)
+#     via callRuntimeTool, against probe files only
 # ----------------------------------------------------------------------------
 
 log "---- Phase 4: structured edit tools (probe files only) ----"
@@ -1608,60 +1612,68 @@ else
     fail "readProjectFile did not confirm probe content (got: ${body:0:200})"
 fi
 
-# replace_in_file via callRuntimeTool — change "world" -> "rust".
-rif_body="$(python3 -c '
+# apply_text_edits via callRuntimeTool — replace_exact "world" -> "rust" on
+# EDIT_PROBE.txt, guarded by the create-time sha256.
+ate_body="$(python3 -c '
 import json, sys
 print(json.dumps({
-    "tool": "replace_in_file",
+    "tool": "apply_text_edits",
     "params": {
         "project": sys.argv[1],
-        "path": "EDIT_PROBE.txt",
-        "old": "world",
-        "new": "rust"
+        "changes": [{
+            "kind": "edit",
+            "path": "EDIT_PROBE.txt",
+            "expected_sha256": sys.argv[2],
+            "edits": [{"kind": "replace_exact", "old_text": "world", "new_text": "rust"}]
+        }]
     }
 }))
-' "$RUNTIME_PROJECT_ID")"
-body="$(api_post /api/tools/call "$rif_body")"
-rif_success="$(json_get "$body" success)"
-rif_changed="$(json_get "$body" output.changed)"
-if [ "$rif_success" = "True" ] && [ "$rif_changed" = "True" ]; then
-    pass "callRuntimeTool(replace_in_file) edits EDIT_PROBE.txt"
+' "$RUNTIME_PROJECT_ID" "$wpf_sha")"
+body="$(api_post /api/tools/call "$ate_body")"
+ate_success="$(json_get "$body" success)"
+ate_changed="$(json_get "$body" output.changed)"
+if [ "$ate_success" = "True" ] && [ "$ate_changed" = "True" ]; then
+    pass "callRuntimeTool(apply_text_edits) edits EDIT_PROBE.txt"
 else
-    fail "callRuntimeTool(replace_in_file) did not edit probe (success=$rif_success changed=$rif_changed body=${body:0:300})"
+    fail "callRuntimeTool(apply_text_edits) did not edit probe (success=$ate_success changed=$ate_changed body=${body:0:300})"
 fi
 
 # readProjectFile confirms the edited content.
 body="$(api_post /api/projects/read_file "{\"project\":\"$RUNTIME_PROJECT_ID\",\"path\":\"EDIT_PROBE.txt\"}")"
 if echo "$(json_get "$body" output.text)" | grep -q "hello rust"; then
-    pass "readProjectFile confirms replace_in_file edit"
+    pass "readProjectFile confirms apply_text_edits edit"
 else
     fail "readProjectFile did not confirm edit (got: ${body:0:200})"
 fi
 
-# replace_in_file with a missing old must fail WITHOUT modifying the file.
-rif_miss="$(python3 -c '
+# apply_text_edits with a stale expected_sha256 (the create-time hash no longer
+# matches the edited file) must reject the whole batch WITHOUT modifying it.
+ate_miss="$(python3 -c '
 import json, sys
 print(json.dumps({
-    "tool": "replace_in_file",
+    "tool": "apply_text_edits",
     "params": {
         "project": sys.argv[1],
-        "path": "EDIT_PROBE.txt",
-        "old": "does-not-exist",
-        "new": "x"
+        "changes": [{
+            "kind": "edit",
+            "path": "EDIT_PROBE.txt",
+            "expected_sha256": sys.argv[2],
+            "edits": [{"kind": "replace_exact", "old_text": "rust", "new_text": "x"}]
+        }]
     }
 }))
-' "$RUNTIME_PROJECT_ID")"
-body="$(api_post /api/tools/call "$rif_miss")"
+' "$RUNTIME_PROJECT_ID" "$wpf_sha")"
+body="$(api_post /api/tools/call "$ate_miss")"
 if [ "$(json_get "$body" success)" = "False" ]; then
-    pass "replace_in_file(missing old) fails"
+    pass "apply_text_edits(stale sha guard) fails"
 else
-    fail "replace_in_file(missing old) unexpectedly succeeded (body: ${body:0:200})"
+    fail "apply_text_edits(stale sha guard) unexpectedly succeeded (body: ${body:0:200})"
 fi
 body="$(api_post /api/projects/read_file "{\"project\":\"$RUNTIME_PROJECT_ID\",\"path\":\"EDIT_PROBE.txt\"}")"
 if echo "$(json_get "$body" output.text)" | grep -q "hello rust"; then
-    pass "replace_in_file(missing old) left file unchanged"
+    pass "apply_text_edits(stale sha guard) left file unchanged"
 else
-    fail "replace_in_file(missing old) modified the file (got: ${body:0:200})"
+    fail "apply_text_edits(stale sha guard) modified the file (got: ${body:0:200})"
 fi
 
 # deleteProjectFiles removes the probe so the worktree returns to clean.
@@ -1674,92 +1686,68 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# 7f. Runtime-only compatibility edit through callRuntimeTool (probe files only)
+# 7f. Removed-tool negative contract (probe file only)
+#
+# replace_in_file was removed entirely, so a call to it must fail
+# deterministically as an unknown tool, must not be routed to any compatibility
+# path, and must never mutate the worktree.
 # ----------------------------------------------------------------------------
 
-log "---- Phase 5: replace_in_file through callRuntimeTool (probe files only) ----"
+log "---- removed legacy edit tool negative contract ----"
 
-# Create a temporary probe file via the safe write_project_file runtime tool.
-wpf2_body="$(python3 -c '
+# Create a probe file so we can prove a removed-tool call leaves content intact.
+neg_body="$(python3 -c '
 import json, sys
 print(json.dumps({
     "tool": "write_project_file",
     "params": {
         "project": sys.argv[1],
-        "path": "REPLACE_PROBE.txt",
-        "content": "alpha beta\n"
+        "path": "NEG_PROBE.txt",
+        "content": "unchanged\n"
     }
 }))
 ' "$RUNTIME_PROJECT_ID")"
-body="$(api_post /api/tools/call "$wpf2_body")"
+body="$(api_post /api/tools/call "$neg_body")"
 if [ "$(json_get "$body" success)" = "True" ]; then
-    pass "write_project_file creates REPLACE_PROBE.txt for runtime-tool smoke"
+    pass "write_project_file creates NEG_PROBE.txt for removed-tool probe"
 else
-    fail "write_project_file did not create REPLACE_PROBE.txt (body: ${body:0:300})"
+    fail "write_project_file did not create NEG_PROBE.txt (body: ${body:0:300})"
 fi
 
-# replace_in_file remains runtime-only and is reached through callRuntimeTool.
-rif_ded_body="$(python3 -c '
+# replace_in_file must fail as an unknown tool and never mutate. The unknown
+# tool path is a 400 json_error envelope (status + error, no success field).
+neg_rif="$(python3 -c '
 import json, sys
 print(json.dumps({
     "tool": "replace_in_file",
     "params": {
         "project": sys.argv[1],
-        "path": "REPLACE_PROBE.txt",
-        "old": "beta",
-        "new": "gamma"
+        "path": "NEG_PROBE.txt",
+        "old": "unchanged",
+        "new": "mutated"
     }
 }))
 ' "$RUNTIME_PROJECT_ID")"
-body="$(api_post /api/tools/call "$rif_ded_body")"
-if [ "$(json_get "$body" success)" = "True" ] && [ "$(json_get "$body" output.changed)" = "True" ]; then
-    pass "replace_in_file edits REPLACE_PROBE.txt through callRuntimeTool"
+body="$(api_post /api/tools/call "$neg_rif")"
+neg_status="$(json_get "$body" status)"
+neg_err="$(json_get "$body" error)"
+if [ "$neg_status" = "400" ] && \
+   echo "$neg_err" | grep -q "unknown tool" && \
+   echo "$neg_err" | grep -q "replace_in_file"; then
+    pass "replace_in_file fails deterministically as an unknown tool"
 else
-    fail "replace_in_file did not edit probe (body: ${body:0:300})"
+    fail "replace_in_file did not fail as an unknown tool (status=$neg_status error: ${neg_err:0:200})"
 fi
-
-# readProjectFile confirms the runtime-tool edit.
-body="$(api_post /api/projects/read_file "{\"project\":\"$RUNTIME_PROJECT_ID\",\"path\":\"REPLACE_PROBE.txt\"}")"
-if echo "$(json_get "$body" output.text)" | grep -q "alpha gamma"; then
-    pass "readProjectFile confirms replace_in_file edit"
+body="$(api_post /api/projects/read_file "{\"project\":\"$RUNTIME_PROJECT_ID\",\"path\":\"NEG_PROBE.txt\"}")"
+if echo "$(json_get "$body" output.text)" | grep -q "unchanged"; then
+    pass "replace_in_file unknown-tool failure left file unchanged"
 else
-    fail "readProjectFile did not confirm runtime-tool edit (got: ${body:0:200})"
-fi
-
-# replace_in_file with a missing old must fail WITHOUT modifying the file.
-rif_ded_miss="$(python3 -c '
-import json, sys
-print(json.dumps({
-    "tool": "replace_in_file",
-    "params": {
-        "project": sys.argv[1],
-        "path": "REPLACE_PROBE.txt",
-        "old": "does-not-exist",
-        "new": "x"
-    }
-}))
-' "$RUNTIME_PROJECT_ID")"
-body="$(api_post /api/tools/call "$rif_ded_miss")"
-if [ "$(json_get "$body" success)" = "False" ]; then
-    pass "replace_in_file(missing old) fails"
-else
-    fail "replace_in_file(missing old) unexpectedly succeeded (body: ${body:0:200})"
-fi
-body="$(api_post /api/projects/read_file "{\"project\":\"$RUNTIME_PROJECT_ID\",\"path\":\"REPLACE_PROBE.txt\"}")"
-if echo "$(json_get "$body" output.text)" | grep -q "alpha gamma"; then
-    pass "replace_in_file(missing old) left file unchanged"
-else
-    fail "replace_in_file(missing old) modified the file (got: ${body:0:200})"
+    fail "replace_in_file probe was modified (got: ${body:0:200})"
 fi
 
 # Clean up the probe file so the worktree returns to a clean state.
-del_body="$(build_body "{\"project\":\"$RUNTIME_PROJECT_ID\",\"paths\":[\"REPLACE_PROBE.txt\"]}")"
-body="$(api_post /api/projects/delete_files "$del_body")"
-if [ "$(json_get "$body" success)" = "True" ]; then
-    pass "deleteProjectFiles removes REPLACE_PROBE.txt"
-else
-    fail "deleteProjectFiles did not remove REPLACE_PROBE.txt (body: ${body:0:300})"
-fi
+del_body="$(build_body "{\"project\":\"$RUNTIME_PROJECT_ID\",\"paths\":[\"NEG_PROBE.txt\"]}")"
+body="$(api_post /api/projects/delete_files "$del_body")" || true
 
 # ----------------------------------------------------------------------------
 # 7g. Patch chain hardening: large patch via applyProjectPatchChecked, and a
@@ -1846,14 +1834,15 @@ fi
 # ----------------------------------------------------------------------------
 #
 # Simulates a GPT Actions auto coding loop using the dedicated read/diff/check
-# actions plus callRuntimeTool for runtime-only compatibility edits. Proves a custom GPT can complete a small
-# edit → verify → cleanup cycle through the recommended flow:
+# actions plus callRuntimeTool for the canonical apply_text_edits edit. Proves
+# a custom GPT can complete a small edit → verify → cleanup cycle through the
+# recommended flow:
 #
 #   1. listProjects              — find the agent project
 #   2. readProjectFile           — read a tracked file (README.md)
 #   3. searchProjectText         — locate the target substring
 #   4. getProjectGitDiffSummary  — confirm initial clean state
-#   5. callRuntimeTool           — run replace_in_file for a reversible text edit
+#   5. callRuntimeTool           — run apply_text_edits for a reversible text edit
 #   6. getProjectGitDiffSummary  — confirm the diff is visible
 #   7. runProjectShellCommand    — lightweight check (grep)
 #   8. gitRestorePaths           — restore the modified tracked file
@@ -1907,24 +1896,32 @@ else
     fail "loop: worktree not clean before loop (changed_files_count=$loop_pre_count got: ${body:0:200})"
 fi
 
-# Step 5: callRuntimeTool(replace_in_file) — small reversible edit on README.md.
+# Step 5: callRuntimeTool(apply_text_edits) — small reversible edit on
+# README.md, guarded by the committed README.md sha256.
 loop_replace_body="$(python3 -c '
 import json, sys
 print(json.dumps({
-    "tool": "replace_in_file",
+    "tool": "apply_text_edits",
     "params": {
         "project": sys.argv[1],
-        "path": "README.md",
-        "old": sys.argv[2],
-        "new": sys.argv[3]
+        "changes": [{
+            "kind": "edit",
+            "path": "README.md",
+            "expected_sha256": "b67afe311aa47539e65e06d0fed1427a83ef8ccd99473709def128081f7c6d6e",
+            "edits": [{
+                "kind": "replace_exact",
+                "old_text": sys.argv[2],
+                "new_text": sys.argv[3]
+            }]
+        }]
     }
 }))
 ' "$RUNTIME_PROJECT_ID" "$LOOP_MARKER_OLD" "$LOOP_MARKER_NEW")"
 body="$(api_post /api/tools/call "$loop_replace_body")"
 if [ "$(json_get "$body" success)" = "True" ] && [ "$(json_get "$body" output.changed)" = "True" ]; then
-    pass "loop: callRuntimeTool(replace_in_file) edited README.md"
+    pass "loop: callRuntimeTool(apply_text_edits) edited README.md"
 else
-    fail "loop: callRuntimeTool(replace_in_file) did not edit README.md (body: ${body:0:300})"
+    fail "loop: callRuntimeTool(apply_text_edits) did not edit README.md (body: ${body:0:300})"
 fi
 
 # Step 6: getProjectGitDiffSummary — confirm the diff is now visible.

@@ -1303,11 +1303,12 @@ fn openapi_runtime_only_tools_do_not_get_dedicated_paths() {
 }
 
 #[test]
-fn openapi_operation_count_is_twenty_five_after_demoting_compatibility_edits() {
+fn openapi_operation_count_is_twenty_five_after_retiring_legacy_edits() {
     // Phase 3 promoted 10 core runtime tools to dedicated GPT Actions,
     // then later phases promoted run_job plus project onboarding actions.
-    // Compatibility edit tools are now runtime-only again, so the current
-    // GPT Action count is 25 after removing legacy `/api/codex/*` routes.
+    // The single-purpose legacy edit tools are retired, while retained editing
+    // tools stay on the generic runtime surface. The current GPT Action count
+    // is 25 after removing legacy `/api/codex/*` routes.
     // The surface must stay <= 30.
     let spec = build_openapi_spec();
     let count: usize = spec["paths"]
@@ -1318,7 +1319,7 @@ fn openapi_operation_count_is_twenty_five_after_demoting_compatibility_edits() {
         .sum();
     assert_eq!(
         count, 25,
-        "GPT Actions schema must be 25 operations after demoting compatibility edits"
+        "GPT Actions schema must be 25 operations after retiring legacy edits"
     );
     assert!(count <= 30, "GPT Actions schema must stay <= 30 operations");
 }
@@ -1411,7 +1412,7 @@ fn openapi_artifact_upload_tools_remain_generic_and_under_action_limit() {
 }
 
 #[test]
-fn openapi_compatibility_edit_tools_remain_runtime_only() {
+fn openapi_retained_edit_tools_remain_runtime_only() {
     // Retained edit tools (write_project_file) remain reachable via
     // callRuntimeTool / MCP tools/call, but should not be promoted to
     // dedicated GPT Actions. The removed legacy edit tools are absent.

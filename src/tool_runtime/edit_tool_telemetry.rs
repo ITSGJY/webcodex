@@ -1,7 +1,9 @@
 //! Edit tool usage telemetry (phase 1).
 //!
 //! Emits always-on structured logs for edit-surface tool calls so operators can
-//! measure whether models prefer canonical edit tools over compatibility paths.
+//! measure how often the canonical edit tools (`apply_text_edits`,
+//! `apply_patch_checked`) are used relative to the advanced whole-file/raw-patch
+//! paths (`write_project_file`, `apply_patch`).
 //!
 //! Design constraints:
 //! - No new database tables, Action Audit columns, session ledger fields, or

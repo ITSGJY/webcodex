@@ -60,11 +60,11 @@ pub(crate) fn public_url() -> String {
 /// 5. job inspection (`listRuntimeJobs`, `getRuntimeJobTail`)
 /// 6. advanced/generic entry point (`callRuntimeTool`)
 ///
-/// Compatibility edit tools (line/pattern helpers, raw `apply_patch`, and
-/// whole-file write) remain runtime tools reachable through `callRuntimeTool`.
-/// Prefer `apply_text_edits` for guarded transactional file changes and
-/// `apply_patch_checked` for complex unified diffs; use `write_project_file`
-/// only for an intentional full rewrite.
+/// Edit tools reachable through `callRuntimeTool` are `apply_text_edits`
+/// (guarded transactional file changes), `apply_patch_checked` (complex checked
+/// unified diff), `write_project_file` (intentional full rewrite), and the
+/// lower-level raw `apply_patch`. The legacy line/pattern edit tools were
+/// removed entirely.
 #[cfg(test)]
 const GPT_ACTION_OPS: &[&str] = &[
     "listRuntimeTools",
@@ -496,7 +496,7 @@ pub(crate) fn build_openapi_spec() -> Value {
                 "post": operation_with_examples(
                     "applyProjectPatch",
                     "Apply a patch to a project",
-                    "Applies a unified diff patch to an agent-registered project through the owning agent. Mutation with side effects; requires Bearer auth and the agent shell capability. Use after inspecting files and validating the patch; for targeted edits prefer structured line edit tools via callRuntimeTool.",
+                    "Applies a unified diff patch to an agent-registered project through the owning agent. Mutation with side effects; requires Bearer auth and the agent shell capability. Use after inspecting files and validating the patch; for targeted edits prefer apply_text_edits via callRuntimeTool.",
                     "ApplyPatchRequest",
                     "ToolResult",
                     json!({

@@ -66,8 +66,13 @@ Common tool groups:
 - Discovery: `runtime_status`, `list_projects`, `list_agents`, `tool_manifest`.
 - Inspect: `read_file`, then `run_shell` with `rg` or `git grep` for code
   search, plus `git_status` / `git_diff_hunks` for worktree review.
-  `search_project_text` remains available as a compatibility path.
-- Edit: `apply_text_edits` (guarded transactional file changes), `apply_patch_checked` (complex checked unified diff), `write_project_file` (intentional full rewrite). Line/pattern tools remain compatibility paths.
+  `search_project_text` / `search_project_texts` provide bounded structured
+  search.
+- Edit: `apply_text_edits` (guarded transactional file changes) for ordinary
+  local edits, `apply_patch_checked` (complex checked unified diff),
+  `write_project_file` (intentional full rewrite), and the lower-level
+  `apply_patch` raw path. The legacy line/pattern edit tools were removed
+  entirely.
 - Validate: `validate_patch`, `cargo_fmt`, `cargo_check`, `cargo_test`.
 - Review: `show_changes`, `workspace_hygiene_check`.
 - Finish: `finish_coding_task`, `session_handoff_summary`.

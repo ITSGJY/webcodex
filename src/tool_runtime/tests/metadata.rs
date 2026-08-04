@@ -1430,7 +1430,7 @@ async fn tool_manifest_recommends_default_remote_coding_loop() {
     for tool in ["replace_line_range", "insert_at_line", "delete_line_range"] {
         assert!(
             !serialized.contains(tool),
-            "recommended_flows should not rank compatibility edit tool {tool}: {serialized}"
+            "recommended_flows should not rank retired edit tool {tool}: {serialized}"
         );
     }
     // Avoid substring false positives against apply_patch_checked.

@@ -141,8 +141,6 @@ enabled = ${enabled}
 command = "claude-does-not-need-to-exist-for-lazy-status"
 args = ["mcp", "serve"]
 timeout_secs = ${provider_timeout}
-[tool_providers.claude_code.mapping]
-edit_file = "Edit"
 EOF
     mv "$AGENT_CONFIG.next" "$AGENT_CONFIG"
 }
