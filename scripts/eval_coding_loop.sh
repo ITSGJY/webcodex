@@ -491,6 +491,36 @@ assert_failure() {
     fi
 }
 
+assert_failure_error_kind() {
+    local label="$1"
+    local body="$2"
+    local expected="$3"
+    if python3 - "$body" "$expected" <<'PY'
+import json
+import sys
+
+try:
+    data = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(1)
+
+output = data.get("output") or {}
+error = data.get("error")
+ok = (
+    data.get("success") is False
+    and output.get("error_kind") == sys.argv[2]
+    and isinstance(error, str)
+    and bool(error)
+)
+sys.exit(0 if ok else 1)
+PY
+    then
+        case_ok "$label"
+    else
+        case_fail "$label (expected error_kind=$expected; body: ${body:0:240})"
+    fi
+}
+
 workspace_clean_local() {
     local status
     status="$(git -C "$TEST_REPO" status --porcelain --untracked-files=normal 2>/dev/null || true)"
@@ -1376,7 +1406,8 @@ print(json.dumps({
 PY
 )"
     call_tool "apply_text_edits" "$params"
-    assert_failure "apply_text_edits wrong sha guard fails in a controlled way" "$LAST_BODY"
+    assert_failure_error_kind \
+        "apply_text_edits wrong sha guard reports sha256_conflict" "$LAST_BODY" "sha256_conflict"
 
     params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" <<'PY'
 import json

@@ -1664,10 +1664,11 @@ print(json.dumps({
 }))
 ' "$RUNTIME_PROJECT_ID" "$wpf_sha")"
 body="$(api_post /api/tools/call "$ate_miss")"
-if [ "$(json_get "$body" success)" = "False" ]; then
-    pass "apply_text_edits(stale sha guard) fails"
+ate_error_kind="$(json_get "$body" output.error_kind)"
+if [ "$(json_get "$body" success)" = "False" ] && [ "$ate_error_kind" = "sha256_conflict" ]; then
+    pass "apply_text_edits(stale sha guard) fails with sha256_conflict"
 else
-    fail "apply_text_edits(stale sha guard) unexpectedly succeeded (body: ${body:0:200})"
+    fail "apply_text_edits(stale sha guard) did not report sha256_conflict (error_kind=$ate_error_kind body: ${body:0:200})"
 fi
 body="$(api_post /api/projects/read_file "{\"project\":\"$RUNTIME_PROJECT_ID\",\"path\":\"EDIT_PROBE.txt\"}")"
 if echo "$(json_get "$body" output.text)" | grep -q "hello rust"; then
@@ -1872,10 +1873,16 @@ fi
 # Step 2: readProjectFile — read README.md.
 body="$(api_post /api/projects/read_file "{\"project\":\"$RUNTIME_PROJECT_ID\",\"path\":\"README.md\"}")"
 loop_readme="$(json_get "$body" output.text)"
+loop_readme_sha="$(json_get "$body" output.sha256)"
 if echo "$loop_readme" | grep -q "$LOOP_MARKER_OLD"; then
     pass "loop: readProjectFile sees README.md with target marker"
 else
     fail "loop: readProjectFile did not find marker in README.md (got: ${loop_readme:0:120})"
+fi
+if [ -n "$loop_readme_sha" ] && [ "$loop_readme_sha" != "None" ] && [ ${#loop_readme_sha} -eq 64 ]; then
+    pass "loop: readProjectFile returns README.md sha256 guard"
+else
+    fail "loop: readProjectFile did not return a valid README.md sha256 (got: $loop_readme_sha)"
 fi
 
 # Step 3: searchProjectText — locate the target substring.
@@ -1897,7 +1904,7 @@ else
 fi
 
 # Step 5: callRuntimeTool(apply_text_edits) — small reversible edit on
-# README.md, guarded by the committed README.md sha256.
+# README.md, guarded by the sha256 returned by Step 2 for this fixture.
 loop_replace_body="$(python3 -c '
 import json, sys
 print(json.dumps({
@@ -1907,16 +1914,16 @@ print(json.dumps({
         "changes": [{
             "kind": "edit",
             "path": "README.md",
-            "expected_sha256": "b67afe311aa47539e65e06d0fed1427a83ef8ccd99473709def128081f7c6d6e",
+            "expected_sha256": sys.argv[2],
             "edits": [{
                 "kind": "replace_exact",
-                "old_text": sys.argv[2],
-                "new_text": sys.argv[3]
+                "old_text": sys.argv[3],
+                "new_text": sys.argv[4]
             }]
         }]
     }
 }))
-' "$RUNTIME_PROJECT_ID" "$LOOP_MARKER_OLD" "$LOOP_MARKER_NEW")"
+' "$RUNTIME_PROJECT_ID" "$loop_readme_sha" "$LOOP_MARKER_OLD" "$LOOP_MARKER_NEW")"
 body="$(api_post /api/tools/call "$loop_replace_body")"
 if [ "$(json_get "$body" success)" = "True" ] && [ "$(json_get "$body" output.changed)" = "True" ]; then
     pass "loop: callRuntimeTool(apply_text_edits) edited README.md"

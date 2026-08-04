@@ -140,6 +140,15 @@ impl ExternalToolRouter {
         self.status_with_revision().0
     }
 
+    #[cfg(test)]
+    pub(crate) fn configured_search_tool_name(&self) -> Option<&str> {
+        self.claude
+            .config
+            .mapping
+            .get(ProviderCapability::SearchProjectText.name())
+            .map(String::as_str)
+    }
+
     fn status_with_revision(&self) -> (ToolProvidersStatus, u64) {
         let (claude_code, provider_revision) = self.claude.status_with_revision();
         if self

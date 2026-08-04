@@ -318,6 +318,7 @@ fn reload_toml(
     strategy: &str,
     claude_enabled: bool,
     claude_command: &str,
+    search_mapping: &str,
 ) -> String {
     let max_jobs = max_jobs
         .map(|value| format!("max_concurrent_jobs = {value}\n"))
@@ -341,6 +342,8 @@ tool_providers.claude_code.enabled = {claude_enabled}
 tool_providers.claude_code.command = "{claude_command}"
 tool_providers.claude_code.args = ["mcp", "serve"]
 tool_providers.claude_code.timeout_secs = 30
+[tool_providers.claude_code.mapping]
+search_project_text = "{search_mapping}"
 "#
     )
 }
@@ -350,7 +353,17 @@ fn reload_fixture() -> (tempfile::TempDir, PathBuf, ReloadableAgentConfig) {
     let path = tmp.path().join("agent.toml");
     std::fs::write(
         &path,
-        reload_toml("oe", None, 60, 1024, "sh", "native", false, "claude"),
+        reload_toml(
+            "oe",
+            None,
+            60,
+            1024,
+            "sh",
+            "native",
+            false,
+            "claude",
+            "project_search_generation_1",
+        ),
     )
     .unwrap();
     let runtime = ReloadableAgentConfig::new(load_config(&path).unwrap(), path.clone());
@@ -393,6 +406,15 @@ fn valid_reload_switches_one_complete_generation_and_preserves_old_snapshot() {
     let (_tmp, path, runtime) = reload_fixture();
     let old = runtime.snapshot();
 
+    assert_eq!(
+        old.external_tools.configured_search_tool_name(),
+        Some("project_search_generation_1")
+    );
+    assert_eq!(
+        old.external_tools.status().claude_code.process_state,
+        "not_started"
+    );
+
     std::fs::write(
         &path,
         reload_toml(
@@ -404,6 +426,7 @@ fn valid_reload_switches_one_complete_generation_and_preserves_old_snapshot() {
             "claude_code_then_native",
             false,
             "claude",
+            "project_search_generation_2",
         ),
     )
     .unwrap();
@@ -423,6 +446,10 @@ fn valid_reload_switches_one_complete_generation_and_preserves_old_snapshot() {
     );
     assert_eq!(old.external_tools.status().strategy, "native");
     assert_eq!(
+        old.external_tools.configured_search_tool_name(),
+        Some("project_search_generation_1")
+    );
+    assert_eq!(
         (
             new.policy.max_timeout_secs,
             new.policy.max_output_bytes,
@@ -433,6 +460,14 @@ fn valid_reload_switches_one_complete_generation_and_preserves_old_snapshot() {
     assert_eq!(
         new.external_tools.status().strategy,
         "claude_code_then_native"
+    );
+    assert_eq!(
+        new.external_tools.configured_search_tool_name(),
+        Some("project_search_generation_2")
+    );
+    assert_eq!(
+        new.external_tools.status().claude_code.process_state,
+        "not_started"
     );
 }
 
@@ -452,11 +487,31 @@ fn failed_reload_keeps_generation_and_can_recover() {
     for (candidate, code) in [
         ("{ invalid toml".to_string(), "config_parse_failed"),
         (
-            reload_toml("oe", None, 60, 1024, "", "native", false, "claude"),
+            reload_toml(
+                "oe",
+                None,
+                60,
+                1024,
+                "",
+                "native",
+                false,
+                "claude",
+                "project_search_generation_1",
+            ),
             "config_validation_failed",
         ),
         (
-            reload_toml("oe", None, 60, 1024, "sh", "native", true, ""),
+            reload_toml(
+                "oe",
+                None,
+                60,
+                1024,
+                "sh",
+                "native",
+                true,
+                "",
+                "project_search_generation_1",
+            ),
             "provider_config_invalid",
         ),
     ] {
@@ -473,7 +528,17 @@ fn failed_reload_keeps_generation_and_can_recover() {
 
     std::fs::write(
         &path,
-        reload_toml("oe", None, 90, 1024, "sh", "native", false, "claude"),
+        reload_toml(
+            "oe",
+            None,
+            90,
+            1024,
+            "sh",
+            "native",
+            false,
+            "claude",
+            "project_search_generation_2",
+        ),
     )
     .unwrap();
     assert_eq!(runtime.reload().generation, 2);
@@ -494,6 +559,7 @@ fn mixed_reload_applies_hot_fields_and_reports_static_restart_fields() {
             "native",
             false,
             "claude",
+            "project_search_generation_2",
         ),
     )
     .unwrap();

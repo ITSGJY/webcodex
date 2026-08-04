@@ -113,6 +113,7 @@ api_post() {
 write_agent_config() {
     local marker="$1" max_timeout="$2" max_output="$3" strategy="$4"
     local enabled="$5" provider_timeout="$6" display="$7" max_jobs="$8"
+    local search_mapping="$9"
     cat >"$AGENT_CONFIG.next" <<EOF
 server_url = "http://127.0.0.1:${PORT}"
 token = "${TOKEN}"
@@ -141,6 +142,8 @@ enabled = ${enabled}
 command = "claude-does-not-need-to-exist-for-lazy-status"
 args = ["mcp", "serve"]
 timeout_secs = ${provider_timeout}
+[tool_providers.claude_code.mapping]
+search_project_text = "${search_mapping}"
 EOF
     mv "$AGENT_CONFIG.next" "$AGENT_CONFIG"
 }
@@ -244,7 +247,8 @@ kind = "text"
 shell_profile = "reload-test"
 EOF
 PORT="$(find_port)"
-write_agent_config generation-1 5 65536 native false 30 "$STARTUP_DISPLAY" 1
+write_agent_config generation-1 5 65536 native false 30 "$STARTUP_DISPLAY" 1 \
+    project_search_generation_1
 setsid env -i PATH="$PATH" LANG=C HOME="$ISOLATED_HOME" \
     XDG_CONFIG_HOME="$ISOLATED_HOME/.config" XDG_DATA_HOME="$ISOLATED_HOME/.local/share" \
     XDG_STATE_HOME="$ISOLATED_HOME/.local/state" XDG_CACHE_HOME="$ISOLATED_HOME/.cache" \
@@ -266,7 +270,8 @@ assert_marker generation-1
 assert_agent_pid
 ok "generation 1 registered and dispatched marker generation-1"
 STAGE="generation 2 valid hot-only reload"
-write_agent_config generation-2 2 32768 claude_code_then_native true 17 "$STARTUP_DISPLAY" 1
+write_agent_config generation-2 2 32768 claude_code_then_native true 17 "$STARTUP_DISPLAY" 1 \
+    project_search_generation_2
 cp "$AGENT_CONFIG" "$GENERATION_TWO_CONFIG"
 kill -HUP "$AGENT_PID"
 wait_for_status 2 success null false - claude_code_then_native true \
@@ -292,7 +297,8 @@ mv "$AGENT_CONFIG.next" "$AGENT_CONFIG"
 ok "invalid TOML kept generation 2 and its active request snapshot"
 
 STAGE="generation 3 mixed reload"
-write_agent_config generation-3 5 24576 native false 11 'Restart-Only Display' 2
+write_agent_config generation-3 5 24576 native false 11 'Restart-Only Display' 2 \
+    project_search_generation_3
 kill -HUP "$AGENT_PID"
 wait_for_status 3 partial null true display_name,max_concurrent_jobs native false \
     || fail "mixed reload status did not arrive"
@@ -323,7 +329,8 @@ done
 ok "generation 3 applied hot fields and retained startup identity/concurrency"
 
 STAGE="generation 4 recovery"
-write_agent_config generation-4 3 16384 claude_code_then_native true 13 "$STARTUP_DISPLAY" 1
+write_agent_config generation-4 3 16384 claude_code_then_native true 13 "$STARTUP_DISPLAY" 1 \
+    project_search_generation_4
 kill -HUP "$AGENT_PID"
 wait_for_status 4 success null false - claude_code_then_native true \
     || fail "recovery reload status did not arrive"
