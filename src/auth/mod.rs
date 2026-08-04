@@ -275,5 +275,4 @@ fn bootstrap_context() -> AuthContext {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[path = "../auth_tests.rs"]
 mod tests;

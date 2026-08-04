@@ -58,6 +58,19 @@ WEBCODEX_MCP_MODEL_SURFACE=local-coding-v1
 EOF_ENV
 chmod 600 .env
 
+WEBCODEX_GIT_COMMIT=
+WEBCODEX_GIT_DIRTY=
+if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    WEBCODEX_GIT_COMMIT=$(git rev-parse --short=12 HEAD)
+    if [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
+        WEBCODEX_GIT_DIRTY=true
+    else
+        WEBCODEX_GIT_DIRTY=false
+    fi
+fi
+WEBCODEX_BUILT_AT=$(date +%s)
+export WEBCODEX_GIT_COMMIT WEBCODEX_GIT_DIRTY WEBCODEX_BUILT_AT
+
 docker compose up -d --build
 
 cat <<EOF_DONE

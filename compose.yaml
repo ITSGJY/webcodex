@@ -5,6 +5,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        WEBCODEX_GIT_COMMIT: ${WEBCODEX_GIT_COMMIT:-}
+        WEBCODEX_GIT_DIRTY: ${WEBCODEX_GIT_DIRTY:-}
+        WEBCODEX_BUILT_AT: ${WEBCODEX_BUILT_AT:-}
     image: webcodex-server-local:${WEBCODEX_IMAGE_TAG:-latest}
     restart: unless-stopped
     environment:

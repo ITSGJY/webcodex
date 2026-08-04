@@ -1,6 +1,10 @@
 # Build artifacts
 /target
 
+# Python test caches
+__pycache__/
+*.pyc
+
 # Local runtime data (SQLite DB, uploads, job metadata)
 data*
 
