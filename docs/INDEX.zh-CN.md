@@ -15,6 +15,7 @@
 ## Operations
 
 - [部署](DEPLOYMENT.zh-CN.md) / [Deployment](DEPLOYMENT.md)
+- [Docker 部署](DOCKER_DEPLOYMENT.zh-CN.md) / [Docker Deployment](DOCKER_DEPLOYMENT.md)
 - [Operations](OPERATIONS.md)
 - [故障排查](TROUBLESHOOTING.zh-CN.md) / [Troubleshooting](TROUBLESHOOTING.md)
 - [认证模型](AUTH_MODEL.zh-CN.md) / [Authentication Model](AUTH_MODEL.md)
@@ -51,6 +52,7 @@
 
 - [Release Checklist](RELEASE_CHECKLIST.md)
 - [Release Process](agent/release-process.md)
+- [v0.3.2 发布说明](RELEASE_NOTES_v0.3.2.zh-CN.md) / [English](RELEASE_NOTES_v0.3.2.md)
 - [v0.3.1 发布说明](RELEASE_NOTES_v0.3.1.zh-CN.md) / [English](RELEASE_NOTES_v0.3.1.md)
 - [v0.3.0 Release Notes](RELEASE_NOTES_v0.3.0.zh-CN.md) / [English](RELEASE_NOTES_v0.3.0.md)
 - [v0.2.0 Release Notes](RELEASE_NOTES_v0.2.0.md)

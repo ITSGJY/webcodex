@@ -4,11 +4,15 @@
 
 ## English
 
-WebCodex lets ChatGPT, Claude, and other MCP clients work on private repositories through a local Runner while source files and command execution stay on the machine that owns the code.
+WebCodex turns ChatGPT, Claude, and other MCP clients into assistants connected
+to your own repositories and machines. The npm package installs the native
+`webcodex`, `webcodex-server`, and `webcodex-runner` binaries for supported
+platforms.
 
 ### Install and connect
 
-Supported in v0.3.1: Linux x64, Linux arm64, and macOS arm64. Node.js 18 or newer is required for the installer wrapper.
+Supported platforms are Linux x64, Linux arm64, and macOS arm64. Node.js 18 or
+newer is required by the installer wrapper.
 
 ```bash
 npm install -g @yyjeqhc/webcodex
@@ -16,42 +20,47 @@ cd /path/to/your/repository
 webcodex connect https://sg4.yyjeqhc.cn
 ```
 
-`connect` uses the current directory by default, generates a strong shared key, writes an owner-only profile, starts a detached background Runner, and waits until the hosted Server can see the Runner and project. Copy the generated key immediately into the MCP client; it is printed in full only when first created. The output also gives the profile, config path, and log path.
+`connect` uses the current directory, creates a local profile, starts a detached
+Runner, and prints the MCP URL and generated key. Add those values to ChatGPT or
+Claude, then ask it to inspect code, edit files, run tests, or work with Git.
 
-The Runner survives terminal closure but not a machine reboot. After reboot, rerun the same `connect` command or use:
+The generated key is printed in full only when first created. Keep it and the
+generated `agent.toml` out of Git. After a machine reboot, rerun `connect` or
+start the profile reported by the first run:
 
 ```bash
 webcodex agent start --profile <profile>
 ```
 
-Advanced users can provide `--key-file`, `--key`, or `--project`. Keep shared keys and generated `agent.toml` files out of Git.
+Advanced users can provide `--key-file`, `--key`, or `--project`.
 
-### Package layout and integrity
+### Package integrity
 
-The npm package exposes one public command: `webcodex`. During installation it downloads one platform artifact containing `webcodex`, `webcodex-server`, and `webcodex-runner`, verifies the manifest SHA-256, validates that all three binaries share one version/build identity, and atomically replaces the prior `vendor/bin` set. A failed download, checksum, extraction, or validation leaves the previous complete installation intact.
+The npm package exposes one public command: `webcodex`. During installation it
+downloads the matching release artifact, verifies its SHA-256 checksum, checks
+that all three binaries share one version and build identity, and atomically
+replaces the previous complete binary set. A failed download, extraction,
+checksum, or identity check leaves the previous installation intact.
 
-`webcodex-server` and `webcodex-runner` are intentionally not npm `bin` entries. The public command discovers those package-local executables for `webcodex server run` and `webcodex agent run`.
-
-Release operators build and package one platform at a time:
-
-```bash
-cargo build --release -p webcodex-cli --bin webcodex -p webcodex --bin webcodex-server -p webcodex-runner --bin webcodex-runner
-bash scripts/package_release_artifact.sh
-```
-
-Do not publish npm until every artifact declared in `manifest.json` has been uploaded immutably and its exact SHA-256 has replaced the placeholder.
+`webcodex-server` and `webcodex-runner` are package-local binaries rather than
+separate npm `bin` entries. The public CLI discovers them for `webcodex server`
+and `webcodex agent` commands.
 
 ### Disclaimer
 
-WebCodex is provided only for research and learning. It can read and modify files and execute commands inside configured project boundaries. Use version control and backups. The author is not responsible for filesystem damage, data loss, or other consequences arising from use of the software.
+WebCodex can read and modify files and execute commands inside configured
+project boundaries. Use version control and recoverable backups.
 
 ## 简体中文
 
-WebCodex 让 ChatGPT、Claude 和其他 MCP client 通过本地 Runner 操作私有仓库；源码、文件修改和命令执行仍留在持有代码的机器上。
+WebCodex 让 ChatGPT、Claude 和其他 MCP client 成为连接到你自己仓库和机器的
+专属助手。npm package 会为支持的平台安装原生 `webcodex`、
+`webcodex-server` 和 `webcodex-runner` binaries。
 
 ### 安装与接入
 
-v0.3.1 支持 Linux x64、Linux arm64 和 macOS arm64。npm installer wrapper 需要 Node.js 18 或更新版本。
+支持 Linux x64、Linux arm64 和 macOS arm64；installer wrapper 需要 Node.js 18
+或更新版本。
 
 ```bash
 npm install -g @yyjeqhc/webcodex
@@ -59,33 +68,32 @@ cd /path/to/your/repository
 webcodex connect https://sg4.yyjeqhc.cn
 ```
 
-`connect` 默认使用当前目录，自动生成强随机 shared key，写入 owner-only profile，启动 detached 后台 Runner，并等待托管 Server 确实能看到 Runner 与项目。生成的 key 只在首次创建时完整显示，请立即复制到 MCP client；输出也会给出 profile、配置路径和日志路径。
+`connect` 默认使用当前目录，创建本地 profile，启动 detached Runner，并输出 MCP
+URL 与生成的 key。把这些信息添加到 ChatGPT 或 Claude 后，就可以让它查看和修改
+代码、运行测试、执行命令或操作 Git。
 
-关闭终端不会停止 Runner，但机器重启会终止它。重启后重新执行同一条 `connect`，或运行：
+生成的 key 只在首次创建时完整显示。不要把它或生成的 `agent.toml` 提交进 Git。
+机器重启后重新执行 `connect`，或者启动首次输出的 profile：
 
 ```bash
 webcodex agent start --profile <profile>
 ```
 
-高级用户可以使用 `--key-file`、`--key` 或 `--project`。不要把 shared key 或生成的 `agent.toml` 提交进 Git。
+高级用户可以使用 `--key-file`、`--key` 或 `--project`。
 
-### Package 与完整性
+### Package 完整性
 
-npm package 只暴露一个公共命令：`webcodex`。安装时会下载包含 `webcodex`、`webcodex-server` 和 `webcodex-runner` 的平台 artifact，校验 manifest SHA-256，确认三个二进制具有相同版本和 build identity，再原子替换旧的 `vendor/bin`。下载、checksum、解压或校验失败时，旧的完整安装保持不变。
+npm package 只暴露一个公共命令：`webcodex`。安装时会下载匹配的 release
+artifact，校验 SHA-256，确认三个 binary 的版本和 build identity 一致，再原子替换
+旧的完整 binary set。下载、解压、checksum 或 identity 校验失败时，旧安装保持不变。
 
-`webcodex-server` 与 `webcodex-runner` 不作为 npm `bin` 暴露；公共 `webcodex` 命令会在执行 `webcodex server run` 或 `webcodex agent run` 时发现 package 内部的二进制。
-
-只有 `manifest.json` 中声明的每个平台 artifact 都已经不可变上传，并写入实际 SHA-256 后，才能发布 npm。
+`webcodex-server` 和 `webcodex-runner` 是 package-local binaries，不单独作为 npm
+`bin` 暴露；公共 CLI 会在 `webcodex server` 和 `webcodex agent` 命令中发现它们。
 
 ### 免责声明
 
-WebCodex 仅用于研究与学习。它能够在配置的项目边界内读取、修改文件并执行命令；请使用版本控制和备份。若因使用本软件造成文件系统损坏、数据丢失或其他后果，作者概不负责。
-
-## Acknowledgements / 鸣谢
-
-Thanks to the [LINUX DO](https://linux.do/) community for its welcoming space for technical discussion and support for open-source sharing.
-
-感谢 [LINUX DO](https://linux.do/) 社区提供的交流氛围与开源推广支持。
+WebCodex 能够在配置的项目边界内读取、修改文件并执行命令，请使用版本控制和可恢复
+备份。
 
 ## Development verification / 开发验证
 
