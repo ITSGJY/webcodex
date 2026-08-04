@@ -48,7 +48,8 @@ The included image is intentionally server-only: it contains
 `webcodex-runner`, repositories, or language toolchains.
 
 ```bash
-git clone https://github.com/yyjeqhc/webcodex.git
+git clone --branch v0.3.2 --depth 1 \
+  https://github.com/yyjeqhc/webcodex.git
 cd webcodex
 ./deploy/docker/bootstrap.sh https://webcodex.example.com
 ```
@@ -56,6 +57,17 @@ cd webcodex
 The current Compose path builds from the tagged source checkout. Publishing the
 same server-only image to GHCR or Docker Hub is a separate release operation and
 is not required for a valid source or binary release.
+
+## Breaking changes
+
+- The seven retired single-purpose edit tools are no longer exposed. Use
+  transactional text edits, checked patches, or whole-file writes instead.
+- MCP and GPT Actions clients that cache schemas must refresh them before using
+  the 0.3.2 tool surface.
+- Old Servers that send retired or unknown `file_*` request kinds to a 0.3.2
+  Runner receive a deterministic unsupported-request failure instead of shell
+  or provider fallback.
+- Mixed Server and Runner versions are not recommended for this upgrade.
 
 ## Upgrade notes
 
@@ -100,6 +112,11 @@ The final tagged candidate should pass formatting, workspace compilation and
 tests, hosted-connect and Runner lifecycle E2E coverage, npm package smoke,
 release-binary identity checks, Docker build/health smoke, Markdown local-link
 validation, and clean-worktree review.
+
+## Next steps
+
+After upgrading, refresh the client schema, verify Server and Runner build
+identities, and run one read-only project task before resuming write access.
 
 ## Acknowledgements
 

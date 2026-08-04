@@ -16,9 +16,15 @@ COPY . .
 
 # The server image also contains the webcodex CLI so server-side pairing and
 # administration can be run with `docker compose exec webcodex webcodex ...`.
-# webcodex-runner is intentionally not built into this image.
-RUN cargo build --locked --release -p webcodex --bin webcodex-server \
-    && cargo build --locked --release -p webcodex-cli --bin webcodex
+# webcodex-runner is intentionally not built into this image. Git metadata is
+# supplied as build args because .git is intentionally outside the build context.
+ARG WEBCODEX_GIT_COMMIT
+ARG WEBCODEX_GIT_DIRTY
+ARG WEBCODEX_BUILT_AT
+RUN WEBCODEX_GIT_COMMIT="$WEBCODEX_GIT_COMMIT" \
+    WEBCODEX_GIT_DIRTY="$WEBCODEX_GIT_DIRTY" \
+    WEBCODEX_BUILT_AT="$WEBCODEX_BUILT_AT" \
+    cargo build --locked --release --bins -p webcodex -p webcodex-cli
 
 FROM debian:bookworm-slim AS runtime
 

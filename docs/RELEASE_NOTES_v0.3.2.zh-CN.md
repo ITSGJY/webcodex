@@ -41,7 +41,8 @@ webcodex connect https://sg4.yyjeqhc.cn
 不包含 `webcodex-runner`、项目仓库或语言工具链。
 
 ```bash
-git clone https://github.com/yyjeqhc/webcodex.git
+git clone --branch v0.3.2 --depth 1 \
+  https://github.com/yyjeqhc/webcodex.git
 cd webcodex
 ./deploy/docker/bootstrap.sh https://webcodex.example.com
 ```
@@ -49,6 +50,15 @@ cd webcodex
 当前 Compose 从 tag 对应的源码 checkout 构建。把同一个 server-only image 发布到
 GHCR 或 Docker Hub 是独立的 release operation，不是 source 或 binary release
 成立的必要条件。
+
+## 破坏性变更
+
+- 七个已退役的单用途 edit tools 不再暴露；请改用事务 text edits、checked patch
+  或 whole-file write。
+- 缓存 MCP 或 GPT Actions schema 的 client 必须刷新后再使用 0.3.2 tool surface。
+- 旧 Server 向 0.3.2 Runner 发送已退役或未知的 `file_*` request kind 时，会收到
+  确定性的 unsupported-request 失败，不再进入 provider 或 shell fallback。
+- 本次升级不建议混用不同版本的 Server 与 Runner。
 
 ## 升级说明
 
@@ -88,6 +98,11 @@ release manifest 后，才能发布 npm package。
 最终 tag candidate 应通过格式化、workspace 编译与测试、hosted-connect 和 Runner
 service 生命周期 E2E、npm package smoke、release binary identity、Docker
 build/health smoke、Markdown 本地链接检查与 clean-worktree review。
+
+## 后续检查
+
+升级后刷新 client schema，核对 Server 与 Runner 的 build identity，并先运行一次
+只读项目任务，再恢复写入操作。
 
 ## 鸣谢
 

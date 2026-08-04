@@ -44,6 +44,7 @@ FORBIDDEN_DIRECT_DEPENDENCIES = {
 EXCLUDED_DIRECTORIES = frozenset(
     {
         ".git",
+        ".claude",
         "docs",
         "target",
         "generated",

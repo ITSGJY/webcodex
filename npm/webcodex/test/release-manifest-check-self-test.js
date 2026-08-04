@@ -5,6 +5,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const packageJson = require("../package.json");
+const install = require("../install");
 const {
   EXPECTED_BINARIES,
   SUPPORTED_PLATFORMS,
@@ -32,7 +33,7 @@ function assertInvalid(manifest, pattern) {
 
 function main() {
   const current = loadManifest(path.join(__dirname, "..", "manifest.json"));
-  assert.strictEqual(validateReleaseManifest(current), true);
+  install.validateManifest(current);
 
   const linuxOnly = validFixture(["linux-x64"]);
   assert.strictEqual(validateReleaseManifest(linuxOnly), true);

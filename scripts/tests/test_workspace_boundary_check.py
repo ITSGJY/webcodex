@@ -73,7 +73,13 @@ class ParentSourcePathTests(unittest.TestCase):
     def test_generated_and_non_rust_files_are_excluded(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            for excluded in ("target", "generated", "dist", "node_modules"):
+            for excluded in (
+                ".claude",
+                "target",
+                "generated",
+                "dist",
+                "node_modules",
+            ):
                 directory = root / excluded
                 directory.mkdir()
                 (directory / "fixture.rs").write_text(
