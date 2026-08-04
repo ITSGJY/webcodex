@@ -4969,6 +4969,92 @@ fn dispatch_request_edit_routes_to_file_handler() {
 }
 
 #[test]
+fn dispatch_request_rejects_unsupported_file_kinds_without_starting_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let jobs = JobManager::new(max_concurrent_jobs(&cfg));
+    let pdir = projects_dir(&cfg);
+    let hot = runtime_config(&cfg);
+    let persistent_shells = webcodex_runner::PersistentShellManager::new(
+        &cfg.shell,
+        webcodex_runner::SshConnectionPool::default(),
+    );
+    let kinds = [
+        "file_replace_line_range",
+        "file_insert_at_line",
+        "file_delete_line_range",
+        "file_replace_exact_block",
+        "file_insert_before_pattern",
+        "file_insert_after_pattern",
+        "file_replace_in_file",
+        "file_future_unknown_operation",
+    ];
+
+    for (index, kind) in kinds.into_iter().enumerate() {
+        let marker_name = format!("unsupported-file-marker-{index}");
+        let target_name = format!("unsupported-file-target-{index}.txt");
+        let marker = tmp.path().join(&marker_name);
+        let target = tmp.path().join(&target_name);
+        std::fs::write(&target, "original\n").unwrap();
+        let command = format!(
+            "printf shell-ran > {marker_name}; printf modified > {target_name}; printf shell-stdout"
+        );
+        let request: ShellAgentShellRequest = serde_json::from_value(serde_json::json!({
+            "request_id": format!("req-unsupported-file-{index}"),
+            "client_id": "ws-client",
+            "kind": kind,
+            "cwd": tmp.path().to_string_lossy(),
+            "path": target_name,
+            "content": "replacement",
+            "command": command,
+            "old_text": "old",
+            "pattern": "needle",
+            "line": 10,
+            "timeout_secs": 10,
+            "requested_by": "tester",
+            "created_at": 0,
+        }))
+        .unwrap();
+        let (sink, mut rx) = ws_sink("ws-client");
+
+        let ran = dispatch_request(
+            &sink,
+            &hot.snapshot(),
+            &hot,
+            &jobs,
+            &persistent_shells,
+            &pdir,
+            &webcodex_runner::LspSupervisor::default(),
+            request,
+        )
+        .unwrap();
+
+        assert!(ran, "{kind}");
+        let env = rx.try_recv().expect("result envelope was sent");
+        match env {
+            AgentEnvelope::Result { payload } => {
+                assert_eq!(payload.exit_code, None, "{kind}");
+                assert_eq!(payload.stdout, None, "{kind}");
+                assert_eq!(
+                    payload.error.as_deref(),
+                    Some(
+                        "unsupported_file_request_kind: unsupported file request kind; command was not started"
+                    ),
+                    "{kind}"
+                );
+            }
+            other => panic!("{kind}: expected result, got {:?}", other.kind()),
+        }
+        assert!(!marker.exists(), "{kind}: shell marker was created");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "original\n",
+            "{kind}: target file was modified"
+        );
+    }
+}
+
+#[test]
 fn dispatch_request_run_shell_sends_result_over_sink() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = test_config(tmp.path().join("config/projects.d"));
