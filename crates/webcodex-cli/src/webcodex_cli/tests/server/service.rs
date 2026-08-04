@@ -542,6 +542,77 @@ fn agent_status_rejects_agent_token_in_user_runtime_token_file_without_leaking_i
     assert!(!error.contains(secret));
 }
 
+#[cfg(unix)]
+#[test]
+fn hosted_profile_status_uses_xdg_config_and_never_invokes_systemctl() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = admin_cli::TEST_ENV_LOCK.lock().unwrap();
+    let old_home = std::env::var_os("HOME");
+    let old_xdg_config = std::env::var_os("XDG_CONFIG_HOME");
+    let old_xdg_state = std::env::var_os("XDG_STATE_HOME");
+    let old_path = std::env::var_os("PATH");
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let config_home = tmp.path().join("config");
+    let state_home = tmp.path().join("state");
+    let profile_config = config_home.join("webcodex/clients/hosted/agent.toml");
+    let profile_state = state_home.join("webcodex/clients/hosted");
+    let fake_bin = tmp.path().join("bin");
+    let systemctl_called = tmp.path().join("systemctl-called");
+    std::fs::create_dir_all(profile_config.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&profile_state).unwrap();
+    std::fs::create_dir_all(&fake_bin).unwrap();
+    std::fs::write(
+        &profile_config,
+        format!(
+            "server_url = \"\"\ntoken = \"hosted-shared-key\"\nclient_id = \"hosted\"\nprojects_dir = {:?}\n",
+            profile_config.parent().unwrap().join("projects.d")
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        crate::webcodex_cli::local_runner_profile_marker(&profile_state),
+        "profile = \"hosted\"\n",
+    )
+    .unwrap();
+    let fake_systemctl = fake_bin.join("systemctl");
+    std::fs::write(
+        &fake_systemctl,
+        format!("#!/bin/sh\n: > {:?}\n", systemctl_called),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    std::env::set_var("HOME", &home);
+    std::env::set_var("XDG_CONFIG_HOME", &config_home);
+    std::env::set_var("XDG_STATE_HOME", &state_home);
+    std::env::set_var("PATH", &fake_bin);
+    let opts = parse_agent_status_with_identity(&args(&["--profile", "hosted"]), true).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let output = runtime.block_on(run_agent_status(opts));
+
+    for (name, value) in [
+        ("HOME", old_home),
+        ("XDG_CONFIG_HOME", old_xdg_config),
+        ("XDG_STATE_HOME", old_xdg_state),
+        ("PATH", old_path),
+    ] {
+        if let Some(value) = value {
+            std::env::set_var(name, value);
+        } else {
+            std::env::remove_var(name);
+        }
+    }
+
+    let output = output.unwrap();
+    assert!(output.contains("runner mode:          hosted local process"));
+    assert!(!systemctl_called.exists());
+}
+
 #[tokio::test]
 async fn agent_status_detects_current_client_online_and_agent_boundary() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

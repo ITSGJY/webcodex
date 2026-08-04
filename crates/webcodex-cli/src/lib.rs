@@ -34,8 +34,9 @@ use webcodex_cli::ops::ops_exit_code;
 use webcodex_cli::{
     agent_config_for_scope, agent_init_usage, agent_install_service_usage,
     agent_service_file_for_scope, agent_status_usage, agent_usage, base_dir_or_default,
-    client_enroll_usage, client_profile_agent_config, client_profile_agent_token_file_for_scope,
-    client_profile_projects_dir, client_profile_state_dir,
+    client_enroll_usage, client_profile_agent_config, client_profile_agent_token_file,
+    client_profile_agent_token_file_for_scope, client_profile_projects_dir,
+    client_profile_state_dir, client_profile_user_token_file,
     client_profile_user_token_file_for_scope, client_usage, connect_usage, current_user_home,
     default_client_output_dir_for_profile, default_device_name, default_server_paths,
     discover_internal_binary, is_effective_root, login_usage, logout_usage, ops_agents_usage,
@@ -1575,6 +1576,13 @@ fn parse_agent_install_service_with_identity(
 }
 
 fn parse_agent_status(args: &[String]) -> Result<AgentStatusOptions, String> {
+    parse_agent_status_with_identity(args, is_effective_root())
+}
+
+fn parse_agent_status_with_identity(
+    args: &[String],
+    effective_root: bool,
+) -> Result<AgentStatusOptions, String> {
     let mut profile: Option<String> = None;
     let mut scope: Option<ServiceScope> = None;
     let mut config: Option<PathBuf> = None;
@@ -1613,15 +1621,17 @@ fn parse_agent_status(args: &[String]) -> Result<AgentStatusOptions, String> {
         }
     }
     let scope_explicit = scope.is_some();
-    let scope = scope.unwrap_or_else(|| default_agent_service_scope(is_effective_root()));
+    let scope = scope.unwrap_or_else(|| default_agent_service_scope(effective_root));
     opts.scope = scope;
     let profile = profile
         .as_deref()
         .map(validate_client_profile)
         .transpose()?;
-    opts.config = config
-        .map(Ok)
-        .unwrap_or_else(|| agent_config_for_scope(scope, profile.as_deref()))?;
+    opts.config = match (config, profile.as_deref(), scope_explicit) {
+        (Some(config), _, _) => config,
+        (None, Some(profile), false) => client_profile_agent_config(profile),
+        (None, profile, _) => agent_config_for_scope(scope, profile)?,
+    };
     opts.service_file = service_file
         .map(Ok)
         .unwrap_or_else(|| agent_service_file_for_scope(scope, profile.as_deref()))?;
@@ -1631,11 +1641,18 @@ fn parse_agent_status(args: &[String]) -> Result<AgentStatusOptions, String> {
             opts.local_state_dir = Some(client_profile_state_dir(&profile));
         }
         if opts.user_token_file.is_none() {
-            opts.user_token_file = Some(client_profile_user_token_file_for_scope(scope, &profile)?);
+            opts.user_token_file = Some(if scope_explicit {
+                client_profile_user_token_file_for_scope(scope, &profile)?
+            } else {
+                client_profile_user_token_file(&profile)
+            });
         }
         if opts.agent_token_file.is_none() {
-            opts.agent_token_file =
-                Some(client_profile_agent_token_file_for_scope(scope, &profile)?);
+            opts.agent_token_file = Some(if scope_explicit {
+                client_profile_agent_token_file_for_scope(scope, &profile)?
+            } else {
+                client_profile_agent_token_file(&profile)
+            });
         }
     }
     if opts.config.as_os_str().is_empty() {

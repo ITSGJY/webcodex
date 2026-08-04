@@ -302,14 +302,16 @@ fn runtime_client_online(output: &Value, client_id: &str) -> Option<bool> {
 
 pub(crate) async fn run_agent_status(opts: AgentStatusOptions) -> Result<String, String> {
     let service_unit = service_unit_name(&opts.service_file, AGENT_SERVICE_UNIT);
-    let systemd = query_systemd_service_status_for_scope(opts.scope, &service_unit);
-    let metadata = read_agent_config_metadata(&opts.config)?;
     let local = opts
         .local_state_dir
         .as_ref()
         .filter(|dir| local_runner_profile_marker(dir).is_file())
         .map(|dir| local_runner_state_summary(dir))
         .transpose()?;
+    let systemd = local
+        .is_none()
+        .then(|| query_systemd_service_status_for_scope(opts.scope, &service_unit));
+    let metadata = read_agent_config_metadata(&opts.config)?;
     let effective_server_url = opts.server_url.clone().or_else(|| {
         let url = metadata.server_url.trim().to_string();
         if url.is_empty() {
@@ -380,8 +382,8 @@ pub(crate) async fn run_agent_status(opts: AgentStatusOptions) -> Result<String,
                 "mode": if local.is_some() { "hosted_local" } else { "systemd" },
                 "scope": if local.is_some() { Value::Null } else { json!(opts.scope.as_str()) },
                 "unit": service_unit,
-                "active": local.as_ref().map(|state| json!(state.running)).unwrap_or_else(|| json!(systemd.active)),
-                "enabled": local.as_ref().map(|state| json!(state.managed)).unwrap_or_else(|| json!(systemd.enabled)),
+                "active": local.as_ref().map(|state| json!(state.running)).unwrap_or_else(|| json!(systemd.as_ref().expect("systemd status exists outside hosted mode").active)),
+                "enabled": local.as_ref().map(|state| json!(state.managed)).unwrap_or_else(|| json!(systemd.as_ref().expect("systemd status exists outside hosted mode").enabled)),
                 "pid": local.as_ref().and_then(|state| state.pid),
                 "logs": local.as_ref().map(|state| state.log_path.to_string_lossy().to_string()),
             },
@@ -439,6 +441,9 @@ pub(crate) async fn run_agent_status(opts: AgentStatusOptions) -> Result<String,
             local.log_path.display()
         ));
     } else {
+        let systemd = systemd
+            .as_ref()
+            .expect("systemd status exists outside hosted mode");
         out.push_str(&format!(
             "  service scope:        {}\n",
             opts.scope.as_str()

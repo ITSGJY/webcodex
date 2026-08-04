@@ -196,3 +196,11 @@ pub(crate) fn client_profile_agent_config(profile: &str) -> PathBuf {
 pub(crate) fn client_profile_projects_dir(profile: &str) -> PathBuf {
     client_profile_dir(profile).join("projects.d")
 }
+
+pub(crate) fn client_profile_user_token_file(profile: &str) -> PathBuf {
+    client_profile_dir(profile).join("webcodex-user-token")
+}
+
+pub(crate) fn client_profile_agent_token_file(profile: &str) -> PathBuf {
+    client_profile_dir(profile).join("webcodex-runner-token")
+}

@@ -641,6 +641,46 @@ fn explicit_scope_selects_systemd_while_omitted_scope_preserves_hosted_profile()
 }
 
 #[test]
+fn omitted_scope_hosted_status_keeps_xdg_profile_paths_for_root() {
+    let _guard = admin_cli::TEST_ENV_LOCK.lock().unwrap();
+    let old_home = std::env::var_os("HOME");
+    let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+    std::env::set_var("HOME", "/root");
+    std::env::set_var("XDG_CONFIG_HOME", "/tmp/hosted-xdg");
+
+    let opts = parse_agent_status_with_identity(&args(&["--profile", "hosted"]), true).unwrap();
+    assert_eq!(opts.scope, ServiceScope::System);
+    assert_eq!(
+        opts.config,
+        PathBuf::from("/tmp/hosted-xdg/webcodex/clients/hosted/agent.toml")
+    );
+    assert_eq!(
+        opts.user_token_file,
+        Some(PathBuf::from(
+            "/tmp/hosted-xdg/webcodex/clients/hosted/webcodex-user-token"
+        ))
+    );
+    assert_eq!(
+        opts.agent_token_file,
+        Some(PathBuf::from(
+            "/tmp/hosted-xdg/webcodex/clients/hosted/webcodex-runner-token"
+        ))
+    );
+    assert!(opts.local_state_dir.is_some());
+
+    if let Some(value) = old_home {
+        std::env::set_var("HOME", value);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    if let Some(value) = old_xdg {
+        std::env::set_var("XDG_CONFIG_HOME", value);
+    } else {
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+}
+
+#[test]
 fn every_agent_service_action_accepts_scope_and_service_file() {
     let service_file = "/home/alice/.config/systemd/user/webcodex-runner-work.service";
     for command in ["start", "stop", "restart"] {

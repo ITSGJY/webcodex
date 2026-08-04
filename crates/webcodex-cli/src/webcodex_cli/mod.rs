@@ -99,8 +99,9 @@ pub(crate) use pairing::{ensure_enroll_outputs_available, resolve_pairing_create
 pub(crate) use pairing::{run_client_enroll, run_pairing_create};
 pub(crate) use profiles::{
     agent_config_for_scope, agent_service_file_for_scope, client_profile_agent_config,
-    client_profile_agent_token_file_for_scope, client_profile_projects_dir,
-    client_profile_state_dir, client_profile_user_token_file_for_scope, current_user_home,
+    client_profile_agent_token_file, client_profile_agent_token_file_for_scope,
+    client_profile_projects_dir, client_profile_state_dir, client_profile_user_token_file,
+    client_profile_user_token_file_for_scope, current_user_home,
     default_client_output_dir_for_profile, validate_client_profile, validate_service_file_scope,
 };
 #[cfg(test)]
