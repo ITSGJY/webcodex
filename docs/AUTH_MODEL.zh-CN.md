@@ -12,8 +12,8 @@ WebCodex 把 bootstrap administration、account onboarding、runtime API access 
 | Project Credential | setup 生成的 Connector + Agent | 精确访问一个 private project grant | 其他项目/admin/普通 quick start |
 | shared key | agent + GPT/MCP quick start | shared-key group onboarding | production IAM/admin |
 | `wc_acct_xxx` | user CLI | 创建本地 PAT/agent token | GPT/MCP/agent |
-| `wc_pat_xxx` | GPT Action/MCP/API | runtime tools | agent connection |
-| `wc_agent_xxx` | `webcodex-runner` | 连接 agent 到 server | GPT/MCP/runtime API |
+| `wc_pat_xxx`（`webcodex-user-token`） | GPT Action/MCP/API | runtime 和 project API | agent connection |
+| `wc_agent_xxx`（`webcodex-runner-token`） | `webcodex-runner` | 仅 Agent transport | GPT/MCP/runtime/project API |
 
 ## `WEBCODEX_TOKEN`
 
@@ -113,6 +113,11 @@ key。Hosted quick-start 应通过 `webcodex connect` 使用非 `wc_` key；mana
 `wc_agent_xxx` 是用户本地生成的 agent token。server 只保存它的 hash，并把 token 绑定到 `allowed_client_id`。
 
 `wc_agent_xxx` 只能用于 `webcodex-runner` connectivity。它不能调用 runtime、project、tool、MCP 或 account endpoints。
+
+managed login 会把 user credential 写入 `webcodex-user-token`，把 Runner
+credential 写入 `agent.toml`（并带 companion `webcodex-runner-token`）。在
+user/runtime CLI token 位置选择 `wc_agent_*` 时，CLI 会尽可能先给出本地诊断，
+server 端仍保持 403。该诊断不会扩大权限，也不会打印完整 token。
 
 ## `client_id`
 

@@ -172,14 +172,19 @@ Server/admin:
 Client:
 
 8. Install the public `webcodex` CLI and the `webcodex-runner` binary.
-9. Run `webcodex login <server-url> --code <code>` (advanced: `webcodex client enroll`).
-10. Run `webcodex agent install --config <login-reported-agent-config>`.
-11. Run `sudo systemctl daemon-reload`.
-12. Run `sudo systemctl enable --now webcodex-runner`.
-13. Run `webcodex agent status`.
-14. Run `webcodex ops status --strict`.
+9. As the ordinary account that will run project commands, run
+   `webcodex login <server-url> --code <code>` (advanced:
+   `webcodex client enroll`). Do not use `sudo`.
+10. Run `webcodex agent install --scope user --config <login-reported-agent-config>`.
+11. Run `webcodex agent status --scope user --config <login-reported-agent-config>`.
+12. Run `webcodex ops status --strict`.
 
-`/etc/webcodex/webcodex.env` is server-side only. Client-side files live under a profile directory such as `/etc/webcodex/clients/workstation/agent.toml`, `/etc/webcodex/clients/workstation/webcodex-user-token`, `/etc/webcodex/clients/workstation/webcodex-runner-token`, and `/etc/webcodex/clients/workstation/projects.d` when multiple users or clients share one machine.
+`agent install` reloads, enables, and starts the selected service manager. The
+ordinary path therefore needs neither `sudo` nor separate `systemctl`
+commands. `/etc/webcodex/webcodex.env` is server-side only. An ordinary user's
+client files default to `$XDG_CONFIG_HOME/webcodex` (or
+`$HOME/.config/webcodex`); system-scope profiles can instead live under
+`/etc/webcodex` when an administrator deliberately provisions them.
 
 ## Account credential onboarding flow
 
@@ -214,27 +219,26 @@ Client/friend side:
 
 ```bash
 webcodex login https://your-domain.example --code <wc_pair_...> \
-  --allowed-root /home/friend/git
+  --allowed-root "$HOME/git"
 
-webcodex agent install --config /etc/webcodex/https_your-domain.example/friendname/agent.toml \
-  --overwrite
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now webcodex-runner
+webcodex agent install --scope user \
+  --config "$HOME/.config/webcodex/https_your-domain.example/friendname/agent.toml"
+webcodex agent status --scope user \
+  --config "$HOME/.config/webcodex/https_your-domain.example/friendname/agent.toml"
 
 webcodex ops status \
   --server-url https://your-domain.example \
-  --token-file /etc/webcodex/https_your-domain.example/friendname/webcodex-user-token \
+  --token-file "$HOME/.config/webcodex/https_your-domain.example/friendname/webcodex-user-token" \
   --strict
 ```
 
 `webcodex login` is the client/friend-side entry: it derives a unique device
 name, redeems the pairing code, and writes the client-side `webcodex-user-token`
-and an `agent.toml` under `<dir>/<server>/<user>/` (root: `/etc/webcodex/...`,
-user: `~/.config/webcodex/...`). Login prints the exact agent config path and
-the `webcodex agent install --config <path>` command to use. GPT Actions should
-use the client-side `webcodex-user-token`; the generated agent config uses the
-client-side agent token for `webcodex-runner`. Do not copy `WEBCODEX_TOKEN`,
+and an `agent.toml` below the user's WebCodex config directory. Login prints
+the exact agent config path and a `webcodex agent install --scope user
+--config <path>` command. GPT Actions, MCP, and ordinary REST/project APIs use
+the client-side `webcodex-user-token`; the generated agent config uses the
+client-side `webcodex-runner-token` only for Agent transport. Do not copy `WEBCODEX_TOKEN`,
 `wc_pat_*`, `wc_agent_*`, complete env files, or complete `agent.toml` files
 between machines. Each friend should use a unique `username`; the device name is
 made unique automatically. The advanced `webcodex client enroll` flow is still
@@ -315,18 +319,56 @@ Keep WebCodex listening on `127.0.0.1:8080` behind the proxy. The QUIC agent tra
 
 ## Agent configuration
 
-Client enroll generates the agent config. Install a systemd unit with:
+Client enroll generates the agent config. For the normal non-root installation,
+install a user unit with:
 
 ```bash
-sudo webcodex agent install \
+webcodex agent install \
+  --scope user \
   --profile workstation \
   --bin /opt/webcodex/bin/webcodex-runner
-sudo systemctl daemon-reload
-sudo systemctl enable --now webcodex-runner-workstation
 webcodex agent status \
+  --scope user \
   --profile workstation \
   --server-url https://your-domain.example
 ```
+
+The npm install location and systemd scope are independent. User scope uses
+`systemctl --user`, stores units under `$XDG_CONFIG_HOME/systemd/user` (or
+`$HOME/.config/systemd/user`), uses `default.target`, omits `User=`/`Group=`,
+and needs no administrator privileges. Non-root callers default to user scope.
+Use the same scope for install, status, start, stop, restart, logs, and
+uninstall.
+
+An enabled user unit follows the lifetime of that account's user manager. It
+does not by itself guarantee startup before the first login or continued
+operation after the last logout. For unattended boot persistence, an
+administrator may explicitly enable lingering with
+`sudo loginctl enable-linger <runner-user>` after reviewing the resulting
+long-lived service authority. WebCodex never changes lingering automatically.
+
+For an administrator-managed service, system scope uses
+`/etc/systemd/system`, `systemctl`, and `multi-user.target`. It normally
+requires a named non-root user and a working directory that account can use:
+
+```bash
+sudo webcodex agent install \
+  --scope system \
+  --profile workstation \
+  --user <runner-user> \
+  --working-directory /home/<runner-user> \
+  --config /etc/webcodex/clients/workstation/agent.toml
+sudo webcodex agent status --scope system --profile workstation
+```
+
+`--group` is optional. WebCodex does not create a system user, change sudoers,
+or migrate permissions. A root Runner is refused unless the administrator
+also supplies `--allow-root-runner`; this discouraged exception prints and
+embeds a prominent warning. Explicit config and working-directory overrides
+remain available, but the selected service account must be able to read or use
+them. An explicit service-file must match the selected manager scope: user
+scope rejects system unit paths and system scope rejects user-unit paths.
+Existing units are never silently overwritten.
 
 For a foreground test, start the agent with:
 
@@ -410,8 +452,10 @@ when its long-lived process opens; later commands use that process state.
 Neither path sources `.bashrc`/`.profile` by default. See
 [SHELL_PROFILES.md](SHELL_PROFILES.md) for Rust/Cargo, Python venv, Conda
 examples, resolution rules, and safety boundaries. After editing `agent.toml`,
-`sudo systemctl reload webcodex-runner` atomically applies policy, shell,
-SSH-resource, and tool-provider settings to new requests. An already-open
+reload the matching manager (`systemctl --user reload webcodex-runner` for
+user scope, or `sudo systemctl reload webcodex-runner` for system scope). This
+atomically applies policy, shell, SSH-resource, and tool-provider settings to
+new requests. An already-open
 persistent shell is not silently restarted or moved; current policy is still
 rechecked before later exec/status operations, while close remains available
 for cleanup; close/reopen applies new defaults. Identity, server/auth,
@@ -425,13 +469,18 @@ documented in
 
 ## Authentication and transport
 
-Ordinary REST, polling, MCP, and GPT Actions calls must use:
+Ordinary REST, polling, MCP, and GPT Actions calls must use the generated
+`webcodex-user-token` (`wc_pat_*`):
 
 ```text
 Authorization: Bearer <token>
 ```
 
 `?token=` is allowed only for `/api/agents/ws` WebSocket handshake compatibility. Do not use query-string tokens for polling, REST, MCP, or GPT Actions.
+
+The `webcodex-runner-token` (`wc_agent_*`) is accepted only by Agent transport
+endpoints. Using it on a project/runtime endpoint remains a 403; do not work
+around that boundary.
 
 For agents, prefer `transport = "auto"` with QUIC configured. WebSocket and polling remain supported fallbacks for constrained networks.
 
@@ -444,6 +493,10 @@ https://your-domain.example/openapi.json
 ```
 
 Configure GPT Actions authentication as HTTP Bearer/API key in the `Authorization` header.
+
+This is an OpenAPI Custom GPT Action integration, not a claim that WebCodex is
+published in the ChatGPT plugin directory. Plugins, apps, Custom GPTs, and GPT
+Actions are distinct layers; see [GPT_ACTIONS.md](GPT_ACTIONS.md).
 
 The OpenAPI GPT Actions management surface intentionally excludes users, API tokens, agent tokens, pairing/enrollment, setup, doctor, npm, server management, and audit endpoints. Use `webcodex` for those tasks.
 

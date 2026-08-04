@@ -213,7 +213,8 @@ clients on one machine.
 
 ### Profile-based config (advanced)
 
-Each client or user profile gets its own directory under `/etc/webcodex/clients/`:
+This example is an administrator-managed system-scope profile under
+`/etc/webcodex/clients/`:
 
 ```text
 /etc/webcodex/clients/<profile>/agent.toml
@@ -231,20 +232,25 @@ Enroll a client with a profile:
   --client-id workstation \
   --display-name "Workstation" \
   --profile workstation \
-  --allowed-root /root/git
+  --allowed-root /home/<runner-user>/git
 ```
 
 Install a profile-specific agent service:
 
 ```bash
 "$CLI" agent install \
+  --scope system \
   --profile workstation \
+  --user <runner-user> \
+  --working-directory /home/<runner-user> \
   --bin /opt/webcodex/bin/webcodex-runner \
   --overwrite
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now webcodex-runner-workstation
 ```
+
+Run that install command with administrator privileges. It reloads, enables,
+and starts the system manager itself. A normal ordinary-user installation
+instead uses the user's WebCodex config directory plus `--scope user` and does
+not need `sudo`.
 
 ### Legacy flat paths (not recommended)
 

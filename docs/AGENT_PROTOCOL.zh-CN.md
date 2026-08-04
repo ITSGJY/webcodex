@@ -12,7 +12,7 @@ Managed Agent 应使用 client enrollment 期间创建的 agent tokens（`webcod
 webcodex login URL --code CODE
 ```
 
-Server/admin 侧用 `webcodex pairing create` 创建临时代码。Agent token 在 login 期间返回给 client，并写入生成的 `agent.toml`；不要从 server 复制 agent token files。二进制部署时，使用 `webcodex agent install --config <path>` 安装 client-side service，并用 `webcodex agent status` 检查。
+Server/admin 侧用 `webcodex pairing create` 创建临时代码。Agent token 在 login 期间返回给 client，并写入生成的 `agent.toml`；不要从 server 复制 agent token files。普通二进制部署应由 Runner 的普通账户使用 `webcodex agent install --scope user --config <path>` 安装 client-side service，并用 `webcodex agent status --scope user` 检查。
 
 当 Server 开启 `WEBCODEX_SHARED_KEY_ENABLED=true` 时，hosted quick-start 是另一种受支持
 模式：Runner 可以提交与 MCP 完全相同的 direct、非 `wc_` shared key。Server 与

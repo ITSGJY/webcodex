@@ -125,9 +125,16 @@ sudo ln -s /opt/webcodex/bin/webcodex /usr/local/bin/webcodex
 Hosted `connect` profile 使用上面的 profile-specific status 和日志路径。
 systemd-managed deployment 则检查 agent service 和连接详情：
 
+使用安装 service 时选择的同一 scope：
+
 ```bash
-systemctl status webcodex-runner
-journalctl -u webcodex-runner
+# 普通 user service
+webcodex agent status --scope user
+webcodex agent logs --scope user --lines 100
+
+# 管理员管理的 system service
+sudo webcodex agent status --scope system
+sudo webcodex agent logs --scope system --lines 100
 ```
 
 同时确认 server URL、本地 token files 和 agent `allowed_roots`。缺失或为空的 `allowed_roots` 默认使用 `$HOME`；显式 `allowed_roots` 会覆盖该默认值。
@@ -158,8 +165,9 @@ schema；artifact upload tools 应继续作为 runtime-only tools 通过
 先运行 `runtime_status` 或 `listAgents`，再在 agent host 上检查：
 
 ```bash
-systemctl status webcodex-runner
-journalctl -u webcodex-runner
+webcodex agent status --scope user
+webcodex agent logs --scope user --lines 100
+# 管理员管理的 system service 使用 `sudo ... --scope system`。
 ```
 
 确认 agent server URL、token file、service user 和 `allowed_roots`。
@@ -167,9 +175,26 @@ journalctl -u webcodex-runner
 ### Token type 错误
 
 Hosted quick-start 中，MCP 与 Runner 使用同一个非 `wc_` shared key。Managed
-mode 中，GPT Actions 和 MCP 使用 `wc_pat_*`，`wc_agent_*` 只给
-`webcodex-runner` 使用。`WEBCODEX_TOKEN` 面向 bootstrap/admin，
+mode 中，GPT Actions、MCP 和普通 REST/project API 使用
+`webcodex-user-token`（`wc_pat_*`）；`webcodex-runner-token`
+（`wc_agent_*`）只给 Runner/Agent transport 使用。把 `wc_agent_*` 放入
+`--token` 或 `--token-file` 后得到 403，正是预期安全边界；应改用生成的
+`webcodex-user-token`。新版 CLI 也会在不打印完整 token 的前提下诊断这个错误。
+`WEBCODEX_TOKEN` 面向 bootstrap/admin，
 不应复制到 GPT Actions、MCP 或 agent config。
+
+### 一条命令能看到 Runner service，另一条却看不到
+
+install、status、start、stop、restart、logs 和 uninstall 必须传入相同的
+`--scope`。user scope 调用 `systemctl --user` / `journalctl --user`，并使用
+`$XDG_CONFIG_HOME/systemd/user`（未设置时为 `$HOME/.config/systemd/user`）；
+system scope 调用 system manager，并使用 `/etc/systemd/system`。
+
+非 root 调用者默认使用 user scope。root 调用者默认使用 system scope，但安装时
+仍需提供非 root `--user`；有意使用 root Runner 还必须传
+`--allow-root-runner`，且不推荐这样做。install 时若使用了自定义
+`--service-file`，后续命令也要传同一 absolute path 与 scope。WebCodex 不会静默
+迁移或覆盖另一 scope 的 unit。
 
 ### 非 git smoke workspace 不能运行 `git_status`
 

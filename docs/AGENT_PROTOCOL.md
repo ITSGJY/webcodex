@@ -12,7 +12,7 @@ Managed agents use agent tokens created during client enrollment (`webcodex logi
 webcodex login URL --code CODE
 ```
 
-The server/admin side creates the temporary code with `webcodex pairing create`. The agent token is returned to the client during login and written into the generated `agent.toml`; do not copy agent token files from the server. For binary deployments, install the client-side service with `webcodex agent install --config <path>` and inspect it with `webcodex agent status`.
+The server/admin side creates the temporary code with `webcodex pairing create`. The agent token is returned to the client during login and written into the generated `agent.toml`; do not copy agent token files from the server. For normal binary deployments, install the client-side service as the ordinary Runner account with `webcodex agent install --scope user --config <path>` and inspect it with `webcodex agent status --scope user`.
 
 On a Server with `WEBCODEX_SHARED_KEY_ENABLED=true`, the hosted quick-start is
 the other supported mode: a Runner may present the exact same direct,

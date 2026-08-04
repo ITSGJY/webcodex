@@ -76,6 +76,25 @@ export PATH="$PWD/target/release:$PATH"
 
 See [docs/BUILD_INSTALL.md](docs/BUILD_INSTALL.md) for installation details.
 
+The npm install location and the systemd service scope are separate choices.
+An ordinary user can install the package in a user-owned npm prefix, log in
+without `sudo`, and run a persistent Runner as a user service:
+
+```bash
+webcodex login https://your-domain.example --code <wc_pair_...> \
+  --allowed-root "$HOME/git"
+webcodex agent install --scope user \
+  --config <login-reported-agent-config>
+webcodex agent status --scope user \
+  --config <login-reported-agent-config>
+```
+
+User services use `systemctl --user`, require no root privileges, and store
+their unit under `$XDG_CONFIG_HOME/systemd/user` (or
+`$HOME/.config/systemd/user`). Non-root users default to this scope. See the
+[build/install guide](docs/BUILD_INSTALL.md#runner-service-scopes) for the
+administrator-managed system scope and its non-root Runner requirement.
+
 ## Hosted Quick Start
 
 The lowest-cost path uses the official hosted Server and one background Runner
@@ -180,6 +199,15 @@ Actions → Import from URL), with copy buttons. Authentication stays the
 Project Credential from setup — the console never displays it. Set
 `WEBCODEX_PUBLIC_URL` when the advertised schema should pin a fixed public
 address.
+
+WebCodex currently integrates with ChatGPT as an OpenAPI-based **Custom GPT
+Action** (also called GPT Actions); it is not claiming to be a published
+ChatGPT plugin. The current ChatGPT/Codex plugin directory contains installable
+bundles that may combine apps, skills, connectors, and MCP servers, while an
+app, a Custom GPT, and an Action are different layers. See OpenAI's
+[GPT Actions introduction](https://developers.openai.com/api/docs/actions/introduction),
+[plugin documentation](https://learn.chatgpt.com/docs/plugins), and the
+[WebCodex GPT Actions guide](docs/GPT_ACTIONS.md).
 
 ## Long-Running Self-Hosting
 

@@ -5,6 +5,15 @@
 Custom GPT 需要调用 project-bound WebCodex Connector 时使用 GPT Actions；
 client 直接支持 MCP 时优先 MCP。
 
+## 产品术语
+
+WebCodex 当前提供的是基于 OpenAPI 的 **Custom GPT Action** 接入。本文不把它
+描述为已经发布到 ChatGPT 插件目录的正式插件。按 OpenAI 当前术语，plugin 是
+ChatGPT/Codex 插件目录中的可安装 bundle，可以包含 app、skill、connector 或 MCP
+server；app、Custom GPT 和 Action 则是不同层次。参见 OpenAI 的
+[GPT Actions 介绍](https://developers.openai.com/api/docs/actions/introduction)和
+[插件文档](https://learn.chatgpt.com/docs/plugins)。
+
 ## Schema
 
 导入：
@@ -17,8 +26,12 @@ ChatGPT 要求公网 HTTPS。`webcodex setup` 有意只创建 loopback project r
 ingress 和 production authentication 由 operator 负责，见
 [DEPLOYMENT.zh-CN.md](DEPLOYMENT.zh-CN.md)。
 
-Bearer/API-key authentication 使用 scoped runtime credential。不要把
-bootstrap/admin、account 或 Agent credential 粘贴进 GPT。
+API-key 认证配置为 HTTP Bearer credential。Managed login 应选择生成的
+`webcodex-user-token`（`wc_pat_*`）；它用于 GPT Actions、MCP 和普通
+REST/project API。`webcodex-runner-token`（`wc_agent_*`）是 Agent transport
+credential，只能访问 Agent transport endpoints。不要把它、bootstrap/admin
+token 或 account credential 粘贴进 GPT。Agent token 调用 project/runtime
+endpoint 时，server 仍会返回 403。
 
 ## Canonical hosted operations
 
@@ -128,6 +141,9 @@ webcodex task accept <task-id>
 即使模型托管在远端，accept authority 仍留在本机。
 
 ## 常见错误
+
+- 复制 `wc_agent_*` 后出现认证错误，说明选错了 credential type。请改用生成的
+  `webcodex-user-token`；日志和 issue 中都不要粘贴完整 token。
 
 - `project_not_configured`：运行 `webcodex setup`。
 - `project_registration_invalid` / `project_credential_invalid`：解决报告的
