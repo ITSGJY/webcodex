@@ -68,6 +68,23 @@ export PATH="$PWD/target/release:$PATH"
 
 安装细节见 [docs/BUILD_INSTALL.zh-CN.md](docs/BUILD_INSTALL.zh-CN.md)。
 
+npm 安装位置与 systemd service scope 是两件事。普通用户可以把 package 安装到
+自己拥有的 npm prefix，不使用 `sudo` 登录，并把常驻 Runner 安装为用户 service：
+
+```bash
+webcodex login https://your-domain.example --code <wc_pair_...> \
+  --allowed-root "$HOME/git"
+webcodex agent install --scope user \
+  --config <login 输出的 agent config 路径>
+webcodex agent status --scope user \
+  --config <login 输出的 agent config 路径>
+```
+
+user service 使用 `systemctl --user`，不需要 root 权限，unit 位于
+`$XDG_CONFIG_HOME/systemd/user`（未设置时为 `$HOME/.config/systemd/user`）。
+非 root 用户省略 scope 时默认使用 user scope。管理员管理的 system scope 及其
+非 root Runner 要求见[构建与安装指南](docs/BUILD_INSTALL.zh-CN.md#runner-service-scope)。
+
 ## Hosted 最快接入
 
 最低成本路径使用官方托管 Server，只在持有代码的机器上运行一个后台 Runner。
@@ -162,6 +179,14 @@ cloudflared tunnel --url http://127.0.0.1:8080
 要导入的 schema URL，均带复制按钮。认证始终使用 setup 生成的 Project
 Credential——console 永远不会显示它。需要在 schema 里固定公网地址时设置
 `WEBCODEX_PUBLIC_URL`。
+
+WebCodex 当前通过 OpenAPI **Custom GPT Action**（也称 GPT Actions）接入
+ChatGPT；本文不声称 WebCodex 已发布为 ChatGPT 官方插件。当前 ChatGPT/Codex 的
+插件目录提供可安装的 bundle，可组合 app、skill、connector 和 MCP server；app、
+Custom GPT、Action 又是不同层次。参见 OpenAI 的
+[GPT Actions 介绍](https://developers.openai.com/api/docs/actions/introduction)、
+[插件文档](https://learn.chatgpt.com/docs/plugins)以及
+[WebCodex GPT Actions 指南](docs/GPT_ACTIONS.zh-CN.md)。
 
 ## 长期自托管
 

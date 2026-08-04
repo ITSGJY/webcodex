@@ -23,7 +23,7 @@ use super::connections::{
     list_connections, resolve_connection_parent, user_slug, Connection, ConnectionPaths,
     INTERNAL_DIR_PREFIX,
 };
-use super::shell_command;
+use super::{is_effective_root, shell_command, validate_user_api_token};
 
 /// Device name reported to the server. The hostname is what a person would call
 /// this machine; `--device` overrides it.
@@ -545,33 +545,52 @@ pub(crate) fn stage_connection(
     write_descriptor(&paths, server_url, &identity.username, device, now)
 }
 
+const ROOT_AGENT_INSTALL_REASON: &str = "login ran as root; no safe systemd installation argv can be generated without explicitly selecting a non-root Runner user and validating access to the agent config, working directory, projects directory, and allowed roots";
+const ROOT_FOREGROUND_REASON: &str = "login ran as root; no foreground Runner argv is emitted because it would execute project commands as root";
+
 pub(crate) fn render_login_result(
     paths: &ConnectionPaths,
     server_url: &str,
     username: &str,
     device: &str,
+    effective_root: bool,
     json: bool,
     print_mcp_config: bool,
 ) -> Result<String, String> {
-    let foreground_argv = vec![
-        "webcodex-runner".to_string(),
-        "--config".to_string(),
-        paths.agent_config.to_string_lossy().into_owned(),
-    ];
-    let agent_install_argv = vec![
-        "webcodex".to_string(),
-        "agent".to_string(),
-        "install".to_string(),
-        "--config".to_string(),
-        paths.agent_config.to_string_lossy().into_owned(),
-    ];
-    let foreground_command = shell_command(&foreground_argv);
-    let agent_install_command = shell_command(&agent_install_argv);
+    let foreground_argv = (!effective_root).then(|| {
+        vec![
+            "webcodex-runner".to_string(),
+            "--config".to_string(),
+            paths.agent_config.to_string_lossy().into_owned(),
+        ]
+    });
+    let agent_install_argv = if effective_root {
+        None
+    } else {
+        Some(vec![
+            "webcodex".to_string(),
+            "agent".to_string(),
+            "install".to_string(),
+            "--scope".to_string(),
+            "user".to_string(),
+            "--config".to_string(),
+            paths.agent_config.to_string_lossy().into_owned(),
+        ])
+    };
+    let foreground_command = foreground_argv.as_ref().map(|argv| shell_command(argv));
+    let agent_install_command = agent_install_argv.as_ref().map(|argv| shell_command(argv));
 
     // JSON output carries only safe metadata; never a full token. The
     // `--print-mcp-config` path is text-only and mutually exclusive with `--json`
     // (enforced at parse time), so the two cannot both apply here.
     if json {
+        let mut next_steps = Vec::new();
+        if let Some(command) = &foreground_command {
+            next_steps.push(command.clone());
+        }
+        if let Some(command) = &agent_install_command {
+            next_steps.push(command.clone());
+        }
         let summary = serde_json::json!({
             "server_url": server_url,
             "username": username,
@@ -580,9 +599,17 @@ pub(crate) fn render_login_result(
             "dir": paths.dir.to_string_lossy(),
             "user_token_file": paths.user_token.to_string_lossy(),
             "agent_config": paths.agent_config.to_string_lossy(),
+            "credential_usage": {
+                "webcodex-user-token": "GPT Actions, MCP, and REST/project APIs",
+                "agent_config_token": "Runner/Agent transport only",
+            },
+            "foreground_available": foreground_argv.is_some(),
             "foreground_argv": &foreground_argv,
+            "foreground_reason": effective_root.then_some(ROOT_FOREGROUND_REASON),
+            "agent_install_available": agent_install_argv.is_some(),
             "agent_install_argv": &agent_install_argv,
-            "next_steps": [&foreground_command, &agent_install_command],
+            "agent_install_reason": effective_root.then_some(ROOT_AGENT_INSTALL_REASON),
+            "next_steps": next_steps,
         });
         return serde_json::to_string_pretty(&summary).map_err(|error| error.to_string());
     }
@@ -597,6 +624,7 @@ pub(crate) fn render_login_result(
             })?
             .trim()
             .to_string();
+        validate_user_api_token(&token)?;
         return Ok(format!(
             "Sensitive HTTP MCP connection details\n\
              ======================================\n\
@@ -606,17 +634,27 @@ pub(crate) fn render_login_result(
         ));
     }
 
+    let next_step_guidance = match (foreground_command, agent_install_command) {
+        (Some(foreground_command), Some(command)) => format!(
+            "Start the agent in the foreground:\n  {foreground_command}\n\n\
+             Or install it as a non-root user service (run as the same ordinary user):\n  {command}\n"
+        ),
+        (None, None) => "Login ran as root, so no command to start a root Runner is recommended.\n\
+                        Recommended: have the ordinary local user who will run the Runner use a fresh pairing code to execute `webcodex login`, then install the user service as that same user.\n\
+                        Advanced system service deployment requires an administrator to explicitly select a non-root account with `--scope system --user`, verify that account can read the agent config and access the working directory, and ensure the config, projects directory, and allowed roots have suitable permissions.\n"
+            .to_string(),
+        _ => return Err("inconsistent login Runner guidance state".to_string()),
+    };
+
     Ok(format!(
         "Logged in to {server_url} as {username} ({device}).\n\n  \
          MCP endpoint: {server_url}/mcp\n  \
-         user token file: {}\n  \
-         agent config:   {}\n\n\
-         Start the agent in the foreground:\n  {}\n\n\
-         Or install it as a service:\n  {}\n",
+         user token file: {} (GPT Actions, MCP, and REST/project APIs)\n  \
+         agent config:   {} (contains Runner/Agent transport credentials only)\n\n\
+         {}",
         paths.user_token.display(),
         paths.agent_config.display(),
-        foreground_command,
-        agent_install_command,
+        next_step_guidance,
     ))
 }
 
@@ -801,6 +839,7 @@ pub(crate) async fn redeem_pairing_code(
 
 /// Log this device into a server.
 pub(crate) async fn run_login(opts: LoginOptions) -> Result<String, String> {
+    let effective_root = is_effective_root();
     // Reject a URL we could not turn into an identity *before* spending the
     // one-time code on it, and settle the directory it would be stored under
     // for the same reason: a symlinked base is better found now than after the
@@ -836,6 +875,7 @@ pub(crate) async fn run_login(opts: LoginOptions) -> Result<String, String> {
             &server_url,
             &identity.username,
             &device,
+            effective_root,
             opts.json,
             opts.print_mcp_config,
         ),
@@ -1980,6 +2020,7 @@ mod tests {
             "laptop",
             false,
             false,
+            false,
         )
         .unwrap();
         assert!(text.contains("https://api.example.com/mcp"), "{text}");
@@ -1993,11 +2034,23 @@ mod tests {
         );
         assert!(text.contains("webcodex-runner --config"), "{text}");
         assert!(
+            text.contains("GPT Actions, MCP, and REST/project APIs"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Runner/Agent transport credentials only"),
+            "{text}"
+        );
+        assert!(
             text.contains(&format!(
-                "webcodex agent install --config {}",
+                "webcodex agent install --scope user --config {}",
                 paths.agent_config.display()
             )),
             "{text}"
+        );
+        assert!(
+            text.contains("same ordinary user"),
+            "non-root guidance was not explicit: {text}"
         );
         assert!(!text.contains(USER_TOKEN), "default text leaked a token");
         assert!(!text.contains(AGENT_TOKEN), "default text leaked a token");
@@ -2007,11 +2060,13 @@ mod tests {
             "https://api.example.com",
             "alice",
             "laptop",
+            false,
             true,
             false,
         )
         .unwrap();
         assert!(json.contains("mcp_url"), "{json}");
+        assert!(json.contains("credential_usage"), "{json}");
         assert!(
             json.contains(&paths.user_token.display().to_string()),
             "{json}"
@@ -2032,6 +2087,8 @@ mod tests {
             "webcodex".to_string(),
             "agent".to_string(),
             "install".to_string(),
+            "--scope".to_string(),
+            "user".to_string(),
             "--config".to_string(),
             paths.agent_config.to_string_lossy().into_owned(),
         ];
@@ -2041,6 +2098,7 @@ mod tests {
             "https://api.example.com",
             "alice",
             "laptop",
+            false,
             false,
             false,
         )
@@ -2053,13 +2111,18 @@ mod tests {
             "https://api.example.com",
             "alice",
             "laptop",
+            false,
             true,
             false,
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&json_text).unwrap();
+        assert_eq!(value["foreground_available"], serde_json::json!(true));
         assert_eq!(value["foreground_argv"], serde_json::json!(foreground_argv));
+        assert!(value["foreground_reason"].is_null());
         assert_eq!(value["agent_install_argv"], serde_json::json!(install_argv));
+        assert_eq!(value["agent_install_available"], serde_json::json!(true));
+        assert!(value["agent_install_reason"].is_null());
         assert_eq!(
             value["next_steps"][0].as_str().unwrap(),
             shell_command(&foreground_argv)
@@ -2070,6 +2133,121 @@ mod tests {
         );
         assert!(!json_text.contains(USER_TOKEN));
         assert!(!json_text.contains(AGENT_TOKEN));
+
+        let recommended_argv: Vec<String> =
+            serde_json::from_value(value["agent_install_argv"].clone()).unwrap();
+        let parser_env = tempfile::TempDir::new().unwrap();
+        std::fs::write(parser_env.path().join("webcodex-runner"), "").unwrap();
+        #[cfg(windows)]
+        std::fs::write(parser_env.path().join("webcodex-runner.exe"), "").unwrap();
+        let _guard = crate::admin_cli::TEST_ENV_LOCK.lock().unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let old_path = std::env::var_os("PATH");
+        std::env::set_var("HOME", parser_env.path());
+        std::env::set_var("XDG_CONFIG_HOME", parser_env.path());
+        std::env::set_var("PATH", parser_env.path());
+        let parsed =
+            crate::parse_agent_install_service_with_identity(&recommended_argv[3..], false);
+        if let Some(value) = old_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(value) = old_xdg {
+            std::env::set_var("XDG_CONFIG_HOME", value);
+        } else {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        if let Some(value) = old_path {
+            std::env::set_var("PATH", value);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        assert!(
+            parsed.is_ok(),
+            "non-root recommendation was rejected by the install parser: {parsed:?}"
+        );
+    }
+
+    #[test]
+    fn render_login_result_omits_invalid_root_service_guidance() {
+        let paths = ConnectionPaths::new(PathBuf::from("/tmp/root-login"));
+        let foreground_argv = vec![
+            "webcodex-runner".to_string(),
+            "--config".to_string(),
+            paths.agent_config.to_string_lossy().into_owned(),
+        ];
+
+        let text = render_login_result(
+            &paths,
+            "https://api.example.com",
+            "alice",
+            "laptop",
+            true,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(
+            !text.contains("webcodex agent install --scope user"),
+            "{text}"
+        );
+        assert!(!text.contains("--allow-root-runner"), "{text}");
+        assert!(
+            !text.contains("Start the agent in the foreground"),
+            "{text}"
+        );
+        assert!(!text.contains(&shell_command(&foreground_argv)), "{text}");
+        assert!(text.contains("Login ran as root"), "{text}");
+        assert!(
+            text.contains("ordinary local user who will run the Runner"),
+            "{text}"
+        );
+        assert!(text.contains("fresh pairing code"), "{text}");
+        assert!(
+            text.contains("install the user service as that same user"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Advanced system service deployment"),
+            "{text}"
+        );
+        assert!(text.contains("--scope system --user"), "{text}");
+        assert!(text.contains("read the agent config"), "{text}");
+        assert!(text.contains("working directory"), "{text}");
+        assert!(text.contains("projects directory"), "{text}");
+        assert!(text.contains("allowed roots"), "{text}");
+        assert!(!text.contains(USER_TOKEN), "root text leaked a token");
+        assert!(!text.contains(AGENT_TOKEN), "root text leaked a token");
+
+        let json_text = render_login_result(
+            &paths,
+            "https://api.example.com",
+            "alice",
+            "laptop",
+            true,
+            true,
+            false,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json_text).unwrap();
+        assert_eq!(value["agent_install_available"], serde_json::json!(false));
+        assert!(value["agent_install_argv"].is_null());
+        let reason = value["agent_install_reason"].as_str().unwrap();
+        assert!(reason.contains("login ran as root"), "{reason}");
+        assert!(reason.contains("non-root Runner user"), "{reason}");
+        assert!(!reason.contains("--allow-root-runner"), "{reason}");
+        assert_eq!(value["foreground_available"], serde_json::json!(false));
+        assert!(value["foreground_argv"].is_null());
+        let foreground_reason = value["foreground_reason"].as_str().unwrap();
+        assert!(foreground_reason.contains("login ran as root"));
+        assert!(foreground_reason.contains("project commands as root"));
+        assert_eq!(value["next_steps"], serde_json::json!([]));
+        assert!(!json_text.contains("--allow-root-runner"));
+        assert!(!json_text.contains("webcodex agent install --scope user"));
+        assert!(!json_text.contains(USER_TOKEN), "root json leaked a token");
+        assert!(!json_text.contains(AGENT_TOKEN), "root json leaked a token");
     }
 
     #[test]
@@ -2084,6 +2262,7 @@ mod tests {
             "alice",
             "laptop",
             false,
+            false,
             true,
         )
         .unwrap();
@@ -2096,6 +2275,28 @@ mod tests {
             text.contains(&format!("Authorization: Bearer {USER_TOKEN}")),
             "{text}"
         );
+    }
+
+    #[test]
+    fn print_mcp_config_rejects_an_agent_token_in_the_user_token_file() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let paths = ConnectionPaths::new(temp.path().join("connection"));
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        let secret = "wc_agent_do_not_echo_login_0123456789";
+        std::fs::write(&paths.user_token, format!("{secret}\n")).unwrap();
+        let error = render_login_result(
+            &paths,
+            "https://api.example.com",
+            "alice",
+            "laptop",
+            false,
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("Agent transport token"), "{error}");
+        assert!(error.contains("webcodex-user-token"), "{error}");
+        assert!(!error.contains(secret));
     }
 
     #[test]

@@ -135,9 +135,16 @@ For a hosted `connect` profile, use the profile-specific status and log path
 shown above. For a systemd-managed deployment, check the agent service and its
 connection details:
 
+Use the same scope that installed the service:
+
 ```bash
-systemctl status webcodex-runner
-journalctl -u webcodex-runner
+# Ordinary user service
+webcodex agent status --scope user
+webcodex agent logs --scope user --lines 100
+
+# Administrator-managed system service
+sudo webcodex agent status --scope system
+sudo webcodex agent logs --scope system --lines 100
 ```
 
 Also verify the server URL, local token files, and agent `allowed_roots`. Missing or empty `allowed_roots` defaults to `$HOME`; explicit `allowed_roots` replaces that default.
@@ -168,8 +175,9 @@ new service and check `journalctl -u webcodex` for startup or auth errors.
 Run `runtime_status` or `listAgents`, then check the agent host:
 
 ```bash
-systemctl status webcodex-runner
-journalctl -u webcodex-runner
+webcodex agent status --scope user
+webcodex agent logs --scope user --lines 100
+# Use `sudo ... --scope system` for an administrator-managed system service.
 ```
 
 Confirm the agent server URL, token file, service user, and `allowed_roots`.
@@ -177,10 +185,28 @@ Confirm the agent server URL, token file, service user, and `allowed_roots`.
 ### Wrong token type
 
 In the hosted quick-start, MCP and Runner use the same non-`wc_` shared key.
-In managed mode, GPT Actions and MCP use a `wc_pat_*`, while `wc_agent_*` is
-only for `webcodex-runner`.
+In managed mode, GPT Actions, MCP, and ordinary REST/project APIs use
+`webcodex-user-token` (`wc_pat_*`), while `webcodex-runner-token`
+(`wc_agent_*`) is only for Runner/Agent transport. A 403 after putting a
+`wc_agent_*` value in `--token` or `--token-file` is the expected security
+boundary: select the generated `webcodex-user-token` instead. Recent CLI
+commands also diagnose this mismatch without printing the complete token.
 `WEBCODEX_TOKEN` is bootstrap/admin-oriented and should not be copied into GPT
 Actions, MCP, or agent config.
+
+### Runner service is visible in one command but missing in another
+
+Pass the same `--scope` to install, status, start, stop, restart, logs, and
+uninstall. User scope invokes `systemctl --user` and `journalctl --user` and
+uses `$XDG_CONFIG_HOME/systemd/user` (or `$HOME/.config/systemd/user`). System
+scope invokes the system manager and uses `/etc/systemd/system`.
+
+Non-root callers default to user scope. Root callers default to system scope,
+but installation still requires a non-root `--user`; an intentional root
+Runner additionally requires `--allow-root-runner` and is discouraged. If a
+custom `--service-file` was used during install, pass that same absolute path
+and scope to later commands. WebCodex does not silently migrate or overwrite a
+unit in the other scope.
 
 ### Non-git smoke workspace cannot run `git_status`
 

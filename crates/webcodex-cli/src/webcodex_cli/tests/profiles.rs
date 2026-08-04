@@ -258,17 +258,25 @@ fn agent_init_rejects_unsafe_profile() {
 
 #[test]
 fn agent_status_profile_derives_config_and_token_paths() {
-    let opts = parse_agent_status(&args(&["--profile", "special"])).unwrap();
-    assert_eq!(opts.config, client_profile_agent_config("special"));
-    assert_eq!(opts.service_file, client_profile_service_file("special"));
+    let opts = parse_agent_status(&args(&["--profile", "special", "--scope", "system"])).unwrap();
+    assert_eq!(opts.scope, ServiceScope::System);
+    assert_eq!(
+        opts.config,
+        agent_config_for_scope(ServiceScope::System, Some("special")).unwrap()
+    );
+    assert_eq!(
+        opts.service_file,
+        agent_service_file_for_scope(ServiceScope::System, Some("special")).unwrap()
+    );
     assert_eq!(
         opts.user_token_file,
-        Some(client_profile_user_token_file("special"))
+        Some(client_profile_user_token_file_for_scope(ServiceScope::System, "special").unwrap())
     );
     assert_eq!(
         opts.agent_token_file,
-        Some(client_profile_agent_token_file("special"))
+        Some(client_profile_agent_token_file_for_scope(ServiceScope::System, "special").unwrap())
     );
+    assert!(opts.local_state_dir.is_none());
 }
 
 #[test]
@@ -276,6 +284,8 @@ fn agent_status_explicit_paths_win_and_no_profile_keeps_legacy_default() {
     let opts = parse_agent_status(&args(&[
         "--profile",
         "special",
+        "--scope",
+        "system",
         "--config",
         "/tmp/agent.toml",
         "--user-token-file",
@@ -291,7 +301,7 @@ fn agent_status_explicit_paths_win_and_no_profile_keeps_legacy_default() {
         Some(PathBuf::from("/tmp/agent-token"))
     );
 
-    let legacy = parse_agent_status(&args(&[])).unwrap();
+    let legacy = parse_agent_status(&args(&["--scope", "system"])).unwrap();
     assert_eq!(legacy.config, PathBuf::from("/etc/webcodex/agent.toml"));
     assert_eq!(
         legacy.service_file,
@@ -306,13 +316,25 @@ fn agent_install_service_profile_derives_config_and_service_file() {
     let opts = parse_agent_install_service(&args(&[
         "--profile",
         "special",
+        "--scope",
+        "system",
+        "--user",
+        "webcodex",
+        "--working-directory",
+        "/srv/webcodex",
         "--bin",
         "/opt/webcodex/bin/webcodex-runner",
         "--dry-run",
     ]))
     .unwrap();
-    assert_eq!(opts.config, client_profile_agent_config("special"));
-    assert_eq!(opts.service_file, client_profile_service_file("special"));
+    assert_eq!(
+        opts.config,
+        agent_config_for_scope(ServiceScope::System, Some("special")).unwrap()
+    );
+    assert_eq!(
+        opts.service_file,
+        agent_service_file_for_scope(ServiceScope::System, Some("special")).unwrap()
+    );
     let unit = render_agent_systemd_unit(&opts).unwrap();
     assert!(unit.contains(
         "ExecStart=\"/opt/webcodex/bin/webcodex-runner\" \"--config\" \"/etc/webcodex/clients/special/agent.toml\""
@@ -324,6 +346,12 @@ fn agent_install_service_explicit_paths_win_and_rejects_unsafe_profile() {
     let opts = parse_agent_install_service(&args(&[
         "--profile",
         "special",
+        "--scope",
+        "system",
+        "--user",
+        "webcodex",
+        "--working-directory",
+        "/srv/webcodex",
         "--config",
         "/tmp/agent.toml",
         "--service-file",
@@ -341,9 +369,361 @@ fn agent_install_service_explicit_paths_win_and_rejects_unsafe_profile() {
     let err = parse_agent_install_service(&args(&[
         "--profile",
         "../x",
+        "--scope",
+        "system",
+        "--user",
+        "webcodex",
+        "--working-directory",
+        "/srv/webcodex",
         "--bin",
         "/opt/webcodex/bin/webcodex-runner",
     ]))
     .unwrap_err();
     assert_eq!(err, CLIENT_PROFILE_ERROR);
+}
+
+#[test]
+fn agent_service_scope_parsing_defaults_and_paths_are_deterministic() {
+    let _guard = admin_cli::TEST_ENV_LOCK.lock().unwrap();
+    let old_home = std::env::var_os("HOME");
+    let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+    std::env::set_var("HOME", "/home/alice");
+    std::env::set_var("XDG_CONFIG_HOME", "/tmp/alice-config");
+
+    let user = parse_agent_install_service_with_identity(
+        &args(&["--bin", "/opt/webcodex/bin/webcodex-runner", "--dry-run"]),
+        false,
+    )
+    .unwrap();
+    assert_eq!(user.scope, ServiceScope::User);
+    assert_eq!(
+        user.config,
+        PathBuf::from("/tmp/alice-config/webcodex/agent.toml")
+    );
+    assert_eq!(
+        user.service_file,
+        PathBuf::from("/tmp/alice-config/systemd/user/webcodex-runner.service")
+    );
+    assert_eq!(user.working_directory, PathBuf::from("/home/alice"));
+    assert!(!user.root_runner);
+
+    let root_error = parse_agent_install_service_with_identity(
+        &args(&["--bin", "/opt/webcodex/bin/webcodex-runner", "--dry-run"]),
+        true,
+    )
+    .unwrap_err();
+    assert!(root_error.contains("would run as root"), "{root_error}");
+
+    let root = parse_agent_install_service_with_identity(
+        &args(&[
+            "--bin",
+            "/opt/webcodex/bin/webcodex-runner",
+            "--allow-root-runner",
+            "--dry-run",
+        ]),
+        true,
+    )
+    .unwrap();
+    assert_eq!(root.scope, ServiceScope::System);
+    assert_eq!(root.config, PathBuf::from("/etc/webcodex/agent.toml"));
+    assert_eq!(
+        root.service_file,
+        PathBuf::from("/etc/systemd/system/webcodex-runner.service")
+    );
+    assert!(root.root_runner);
+
+    let root_user_error = parse_agent_install_service_with_identity(
+        &args(&[
+            "--scope",
+            "user",
+            "--bin",
+            "/opt/webcodex/bin/webcodex-runner",
+        ]),
+        true,
+    )
+    .unwrap_err();
+    assert!(
+        root_user_error.contains("would run as root"),
+        "{root_user_error}"
+    );
+
+    if let Some(value) = old_home {
+        std::env::set_var("HOME", value);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    if let Some(value) = old_xdg {
+        std::env::set_var("XDG_CONFIG_HOME", value);
+    } else {
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+}
+
+#[test]
+fn user_scope_falls_back_to_home_and_profile_paths() {
+    let _guard = admin_cli::TEST_ENV_LOCK.lock().unwrap();
+    let old_home = std::env::var_os("HOME");
+    let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+    std::env::set_var("HOME", "/home/bob");
+    std::env::remove_var("XDG_CONFIG_HOME");
+
+    let opts = parse_agent_install_service_with_identity(
+        &args(&[
+            "--scope",
+            "user",
+            "--profile",
+            "work",
+            "--bin",
+            "/opt/webcodex/bin/webcodex-runner",
+            "--dry-run",
+        ]),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        opts.config,
+        PathBuf::from("/home/bob/.config/webcodex/clients/work/agent.toml")
+    );
+    assert_eq!(
+        opts.service_file,
+        PathBuf::from("/home/bob/.config/systemd/user/webcodex-runner-work.service")
+    );
+
+    if let Some(value) = old_home {
+        std::env::set_var("HOME", value);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    if let Some(value) = old_xdg {
+        std::env::set_var("XDG_CONFIG_HOME", value);
+    } else {
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+}
+
+#[test]
+fn agent_service_scope_rejects_invalid_and_conflicting_flags() {
+    let bin = "/opt/webcodex/bin/webcodex-runner";
+    let invalid = parse_agent_install_service_with_identity(
+        &args(&["--scope", "session", "--bin", bin]),
+        false,
+    )
+    .unwrap_err();
+    assert_eq!(invalid, "--scope must be 'user' or 'system'");
+
+    for flags in [
+        vec!["--scope", "user", "--user", "alice"],
+        vec!["--scope", "user", "--group", "alice"],
+    ] {
+        let mut values = flags;
+        values.extend(["--bin", bin]);
+        let error = parse_agent_install_service_with_identity(&args(&values), false).unwrap_err();
+        assert!(error.contains("valid only with --scope system"), "{error}");
+    }
+
+    let system_root = parse_agent_install_service_with_identity(
+        &args(&["--scope", "system", "--bin", bin]),
+        false,
+    )
+    .unwrap_err();
+    assert!(system_root.contains("would run as root"), "{system_root}");
+
+    let unnecessary_opt_in = parse_agent_install_service_with_identity(
+        &args(&[
+            "--scope",
+            "system",
+            "--user",
+            "alice",
+            "--working-directory",
+            "/home/alice",
+            "--allow-root-runner",
+            "--bin",
+            bin,
+        ]),
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        unnecessary_opt_in.contains("only valid"),
+        "{unnecessary_opt_in}"
+    );
+}
+
+#[test]
+fn explicit_service_paths_override_defaults_but_wrong_scope_paths_are_rejected() {
+    let user = parse_agent_install_service_with_identity(
+        &args(&[
+            "--scope",
+            "user",
+            "--config",
+            "/tmp/custom-agent.toml",
+            "--service-file",
+            "/tmp/webcodex-runner-custom.service",
+            "--working-directory",
+            "/tmp",
+            "--bin",
+            "/opt/webcodex/bin/webcodex-runner",
+        ]),
+        false,
+    )
+    .unwrap();
+    assert_eq!(user.config, PathBuf::from("/tmp/custom-agent.toml"));
+    assert_eq!(
+        user.service_file,
+        PathBuf::from("/tmp/webcodex-runner-custom.service")
+    );
+
+    let error = parse_agent_install_service_with_identity(
+        &args(&[
+            "--scope",
+            "user",
+            "--service-file",
+            "/etc/systemd/system/webcodex-runner.service",
+            "--bin",
+            "/opt/webcodex/bin/webcodex-runner",
+        ]),
+        false,
+    )
+    .unwrap_err();
+    assert!(error.contains("user scope cannot write"), "{error}");
+
+    let error = parse_agent_install_service_with_identity(
+        &args(&[
+            "--scope",
+            "user",
+            "--service-file",
+            "/etc/webcodex-runner.service",
+            "--bin",
+            "/opt/webcodex/bin/webcodex-runner",
+        ]),
+        false,
+    )
+    .unwrap_err();
+    assert!(error.contains("user scope cannot write"), "{error}");
+
+    let error = parse_agent_service_action(
+        "start",
+        &args(&[
+            "--scope",
+            "system",
+            "--service-file",
+            "/home/alice/.config/systemd/user/webcodex-runner.service",
+        ]),
+    )
+    .unwrap_err();
+    assert!(error.contains("system scope cannot write"), "{error}");
+
+    let error = parse_agent_service_action(
+        "start",
+        &args(&[
+            "--scope",
+            "user",
+            "--service-file",
+            "/home/alice/.config/systemd/user/../../../../etc/systemd/system/webcodex-runner.service",
+        ]),
+    )
+    .unwrap_err();
+    assert!(error.contains("cannot contain '..'"), "{error}");
+}
+
+#[test]
+fn explicit_scope_selects_systemd_while_omitted_scope_preserves_hosted_profile() {
+    let implicit = parse_agent_service_action("start", &args(&["--profile", "hosted"])).unwrap();
+    assert!(implicit.local_profile.is_some());
+
+    let explicit = parse_agent_service_action(
+        "start",
+        &args(&["--profile", "hosted", "--scope", "system"]),
+    )
+    .unwrap();
+    assert_eq!(explicit.scope, ServiceScope::System);
+    assert!(explicit.local_profile.is_none());
+}
+
+#[test]
+fn omitted_scope_hosted_status_keeps_xdg_profile_paths_for_root() {
+    let _guard = admin_cli::TEST_ENV_LOCK.lock().unwrap();
+    let old_home = std::env::var_os("HOME");
+    let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+    std::env::set_var("HOME", "/root");
+    std::env::set_var("XDG_CONFIG_HOME", "/tmp/hosted-xdg");
+
+    let opts = parse_agent_status_with_identity(&args(&["--profile", "hosted"]), true).unwrap();
+    assert_eq!(opts.scope, ServiceScope::System);
+    assert_eq!(
+        opts.config,
+        PathBuf::from("/tmp/hosted-xdg/webcodex/clients/hosted/agent.toml")
+    );
+    assert_eq!(
+        opts.user_token_file,
+        Some(PathBuf::from(
+            "/tmp/hosted-xdg/webcodex/clients/hosted/webcodex-user-token"
+        ))
+    );
+    assert_eq!(
+        opts.agent_token_file,
+        Some(PathBuf::from(
+            "/tmp/hosted-xdg/webcodex/clients/hosted/webcodex-runner-token"
+        ))
+    );
+    assert!(opts.local_state_dir.is_some());
+
+    if let Some(value) = old_home {
+        std::env::set_var("HOME", value);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    if let Some(value) = old_xdg {
+        std::env::set_var("XDG_CONFIG_HOME", value);
+    } else {
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+}
+
+#[test]
+fn every_agent_service_action_accepts_scope_and_service_file() {
+    let service_file = "/home/alice/.config/systemd/user/webcodex-runner-work.service";
+    for command in ["start", "stop", "restart"] {
+        let parsed = parse_agent_service_action(
+            command,
+            &args(&["--scope", "user", "--service-file", service_file]),
+        )
+        .unwrap();
+        assert_eq!(parsed.scope, ServiceScope::User);
+        assert_eq!(parsed.service_file, PathBuf::from(service_file));
+        assert_eq!(parsed.unit, "webcodex-runner-work.service");
+    }
+
+    let logs = parse_agent_service_action(
+        "logs",
+        &args(&[
+            "--scope",
+            "user",
+            "--service-file",
+            service_file,
+            "--lines",
+            "25",
+        ]),
+    )
+    .unwrap();
+    assert!(matches!(
+        logs.kind,
+        ServiceActionKind::Logs { lines: 25, .. }
+    ));
+
+    let uninstall = parse_agent_service_action(
+        "uninstall",
+        &args(&[
+            "--scope",
+            "user",
+            "--service-file",
+            service_file,
+            "--confirm",
+        ]),
+    )
+    .unwrap();
+    assert!(matches!(
+        uninstall.kind,
+        ServiceActionKind::Uninstall { confirm: true }
+    ));
 }

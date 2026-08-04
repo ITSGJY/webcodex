@@ -32,24 +32,26 @@ use agent_init::{
 };
 use webcodex_cli::ops::ops_exit_code;
 use webcodex_cli::{
-    agent_init_usage, agent_install_service_usage, agent_status_usage, agent_usage,
-    base_dir_or_default, client_enroll_usage, client_profile_agent_config,
-    client_profile_agent_token_file, client_profile_projects_dir, client_profile_service_file,
-    client_profile_state_dir, client_profile_user_token_file, client_usage, connect_usage,
+    agent_config_for_scope, agent_init_usage, agent_install_service_usage,
+    agent_service_file_for_scope, agent_status_usage, agent_usage, base_dir_or_default,
+    client_enroll_usage, client_profile_agent_config, client_profile_agent_token_file,
+    client_profile_agent_token_file_for_scope, client_profile_projects_dir,
+    client_profile_state_dir, client_profile_user_token_file,
+    client_profile_user_token_file_for_scope, client_usage, connect_usage, current_user_home,
     default_client_output_dir_for_profile, default_device_name, default_server_paths,
-    discover_internal_binary, login_usage, logout_usage, ops_agents_usage, ops_projects_usage,
-    ops_smoke_preflight_usage, ops_status_usage, ops_usage, pairing_create_usage, pairing_usage,
-    render_token_generate, run_agent_install_service, run_agent_service, run_agent_status,
-    run_agent_token_create_local, run_client_enroll, run_connect, run_hosted_log_writer,
-    run_internal_binary, run_login, run_logout, run_ops_command, run_pairing_create,
-    run_server_init, run_server_install_service, run_server_service, run_server_status,
-    run_setup_single_user, run_status, run_token_create_local, server_init_usage,
-    server_install_service_usage, server_status_usage, server_usage, status_usage, usage,
-    validate_client_profile, write_connect_result, write_secret_file, write_text_file,
-    ConnectOptions, LoginOptions, LogoutOptions, OpsCommand, OpsCommonOptions,
+    discover_internal_binary, is_effective_root, login_usage, logout_usage, ops_agents_usage,
+    ops_projects_usage, ops_smoke_preflight_usage, ops_status_usage, ops_usage,
+    pairing_create_usage, pairing_usage, render_token_generate, run_agent_install_service,
+    run_agent_service, run_agent_status, run_agent_token_create_local, run_client_enroll,
+    run_connect, run_hosted_log_writer, run_internal_binary, run_login, run_logout,
+    run_ops_command, run_pairing_create, run_server_init, run_server_install_service,
+    run_server_service, run_server_status, run_setup_single_user, run_status,
+    run_token_create_local, server_init_usage, server_install_service_usage, server_status_usage,
+    server_usage, status_usage, system_user_home, system_user_is_root, usage,
+    validate_client_profile, validate_service_file_scope, write_connect_result, write_secret_file,
+    write_text_file, ConnectOptions, LoginOptions, LogoutOptions, OpsCommand, OpsCommonOptions,
     OpsSmokePreflightOptions, ServerStatusOptions, ServiceControl, StatusOptions,
-    AGENT_SERVICE_FILE, AGENT_SERVICE_UNIT, DEFAULT_LOG_LINES, SERVER_SERVICE_FILE,
-    SERVER_SERVICE_UNIT,
+    AGENT_SERVICE_UNIT, DEFAULT_LOG_LINES, SERVER_SERVICE_FILE, SERVER_SERVICE_UNIT,
 };
 const SETUP_GPT_SCOPES: &[&str] = &["runtime:read", "project:read", "project:write", "job:run"];
 const SETUP_AGENT_SCOPES: &[&str] = &[
@@ -58,6 +60,37 @@ const SETUP_AGENT_SCOPES: &[&str] = &[
     "agent:result",
     "agent:job_update",
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceScope {
+    User,
+    System,
+}
+
+impl ServiceScope {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "user" => Ok(Self::User),
+            "system" => Ok(Self::System),
+            _ => Err("--scope must be 'user' or 'system'".to_string()),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::System => "system",
+        }
+    }
+}
+
+fn default_agent_service_scope(effective_root: bool) -> ServiceScope {
+    if effective_root {
+        ServiceScope::System
+    } else {
+        ServiceScope::User
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliAction {
@@ -191,12 +224,15 @@ struct ServerInstallServiceOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AgentInstallServiceOptions {
+    scope: ServiceScope,
     config: PathBuf,
     bin: PathBuf,
     service_file: PathBuf,
     user: Option<String>,
     group: Option<String>,
     working_directory: PathBuf,
+    root_runner: bool,
+    allow_root_runner: bool,
     overwrite: bool,
     dry_run: bool,
     output_stdout: bool,
@@ -225,6 +261,7 @@ enum ServiceActionKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ServiceActionOptions {
+    scope: ServiceScope,
     service_file: PathBuf,
     unit: String,
     kind: ServiceActionKind,
@@ -239,6 +276,7 @@ struct LocalProfileOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AgentStatusOptions {
+    scope: ServiceScope,
     config: PathBuf,
     service_file: PathBuf,
     local_state_dir: Option<PathBuf>,
@@ -850,10 +888,10 @@ fn parse_agent_subcommand(args: &[String]) -> CliAction {
             "init" => agent_init_usage(),
             "install" => agent_install_service_usage(),
             "run" => "Usage: webcodex agent run [--profile NAME|--config PATH]\n\nRun webcodex-runner directly in the foreground.\n",
-            "start" | "stop" | "restart" => "Usage: webcodex agent <start|stop|restart> [--profile NAME]\n\nWith a profile created by `webcodex connect`, manage its user-level background Runner. Other profiles use the installed systemd service.\n",
+            "start" | "stop" | "restart" => "Usage: webcodex agent <start|stop|restart> [--profile NAME] [--scope user|system] [--service-file PATH]\n\nWith a profile created by `webcodex connect`, omitting --scope manages its user-level background Runner. An explicit scope manages the matching systemd service.\n",
             "status" => agent_status_usage(),
-            "logs" => "Usage: webcodex agent logs [--profile NAME] [--lines N] [--since VALUE] [--follow]\n",
-            "uninstall" => "Usage: webcodex agent uninstall [--profile NAME] --confirm\n",
+            "logs" => "Usage: webcodex agent logs [--profile NAME] [--scope user|system] [--service-file PATH] [--lines N] [--since VALUE] [--follow]\n",
+            "uninstall" => "Usage: webcodex agent uninstall [--profile NAME] [--scope user|system] [--service-file PATH] --confirm\n",
             "install-service" => "`webcodex agent install-service` was removed; use `webcodex agent install`.\n",
             _ => agent_usage(),
         };
@@ -1279,6 +1317,7 @@ fn parse_server_service_action(
     args: &[String],
 ) -> Result<ServiceActionOptions, String> {
     Ok(ServiceActionOptions {
+        scope: ServiceScope::System,
         service_file: PathBuf::from(SERVER_SERVICE_FILE),
         unit: SERVER_SERVICE_UNIT.to_string(),
         kind: parse_service_kind(command, args)?,
@@ -1291,36 +1330,51 @@ fn parse_agent_service_action(
     args: &[String],
 ) -> Result<ServiceActionOptions, String> {
     let mut profile: Option<String> = None;
+    let mut scope: Option<ServiceScope> = None;
+    let mut service_file: Option<PathBuf> = None;
     let mut remaining = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
-        if arg == "--profile" {
-            profile = Some(next_value(&mut iter, arg)?);
-        } else {
-            remaining.push(arg.clone());
+        match arg.as_str() {
+            "--profile" => profile = Some(next_value(&mut iter, arg)?),
+            "--scope" => {
+                if scope.is_some() {
+                    return Err("--scope may be specified only once".to_string());
+                }
+                scope = Some(ServiceScope::parse(&next_value(&mut iter, arg)?)?);
+            }
+            "--service-file" => service_file = Some(PathBuf::from(next_value(&mut iter, arg)?)),
+            _ => remaining.push(arg.clone()),
         }
     }
+    let scope_explicit = scope.is_some();
+    let scope = scope.unwrap_or_else(|| default_agent_service_scope(is_effective_root()));
     let profile = profile
         .as_deref()
         .map(validate_client_profile)
         .transpose()?;
-    let service_file = profile
-        .as_deref()
-        .map(client_profile_service_file)
-        .unwrap_or_else(|| PathBuf::from(AGENT_SERVICE_FILE));
+    let service_file = service_file
+        .map(Ok)
+        .unwrap_or_else(|| agent_service_file_for_scope(scope, profile.as_deref()))?;
+    validate_service_file_scope(scope, &service_file)?;
     let unit = service_file
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(AGENT_SERVICE_UNIT)
         .to_string();
     Ok(ServiceActionOptions {
+        scope,
         service_file,
         unit,
         kind: parse_service_kind(command, &remaining)?,
-        local_profile: profile.as_deref().map(|profile| LocalProfileOptions {
-            config: client_profile_agent_config(profile),
-            state_dir: client_profile_state_dir(profile),
-        }),
+        local_profile: if scope_explicit {
+            None
+        } else {
+            profile.as_deref().map(|profile| LocalProfileOptions {
+                config: client_profile_agent_config(profile),
+                state_dir: client_profile_state_dir(profile),
+            })
+        },
     })
 }
 
@@ -1366,13 +1420,22 @@ fn parse_server_init(args: &[String]) -> Result<ServerInitOptions, String> {
 }
 
 fn parse_agent_install_service(args: &[String]) -> Result<AgentInstallServiceOptions, String> {
+    parse_agent_install_service_with_identity(args, is_effective_root())
+}
+
+fn parse_agent_install_service_with_identity(
+    args: &[String],
+    effective_root: bool,
+) -> Result<AgentInstallServiceOptions, String> {
     let mut profile: Option<String> = None;
+    let mut scope: Option<ServiceScope> = None;
     let mut config: Option<PathBuf> = None;
     let mut bin: Option<PathBuf> = None;
     let mut service_file: Option<PathBuf> = None;
-    let mut working_directory = PathBuf::from("/root");
+    let mut working_directory: Option<PathBuf> = None;
     let mut user = None;
     let mut group = None;
+    let mut allow_root_runner = false;
     let mut overwrite = false;
     let mut dry_run = false;
     let mut output_stdout = false;
@@ -1382,12 +1445,21 @@ fn parse_agent_install_service(args: &[String]) -> Result<AgentInstallServiceOpt
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--profile" => profile = Some(next_value(&mut iter, arg)?),
+            "--scope" => {
+                if scope.is_some() {
+                    return Err("--scope may be specified only once".to_string());
+                }
+                scope = Some(ServiceScope::parse(&next_value(&mut iter, arg)?)?);
+            }
             "--config" => config = Some(PathBuf::from(next_value(&mut iter, arg)?)),
             "--bin" => bin = Some(PathBuf::from(next_value(&mut iter, arg)?)),
             "--service-file" => service_file = Some(PathBuf::from(next_value(&mut iter, arg)?)),
-            "--working-directory" => working_directory = PathBuf::from(next_value(&mut iter, arg)?),
+            "--working-directory" => {
+                working_directory = Some(PathBuf::from(next_value(&mut iter, arg)?))
+            }
             "--user" => user = Some(next_value(&mut iter, arg)?),
             "--group" => group = Some(next_value(&mut iter, arg)?),
+            "--allow-root-runner" => allow_root_runner = true,
             "--overwrite" => overwrite = true,
             "--dry-run" => dry_run = true,
             "--no-start" => no_start = true,
@@ -1406,18 +1478,14 @@ fn parse_agent_install_service(args: &[String]) -> Result<AgentInstallServiceOpt
         .as_deref()
         .map(validate_client_profile)
         .transpose()?;
-    let config = config.unwrap_or_else(|| {
-        profile
-            .as_deref()
-            .map(client_profile_agent_config)
-            .unwrap_or_else(|| PathBuf::from("/etc/webcodex/agent.toml"))
-    });
-    let service_file = service_file.unwrap_or_else(|| {
-        profile
-            .as_deref()
-            .map(client_profile_service_file)
-            .unwrap_or_else(|| PathBuf::from("/etc/systemd/system/webcodex-runner.service"))
-    });
+    let scope = scope.unwrap_or_else(|| default_agent_service_scope(effective_root));
+    let config = config
+        .map(Ok)
+        .unwrap_or_else(|| agent_config_for_scope(scope, profile.as_deref()))?;
+    let service_file = service_file
+        .map(Ok)
+        .unwrap_or_else(|| agent_service_file_for_scope(scope, profile.as_deref()))?;
+    validate_service_file_scope(scope, &service_file)?;
     let bin = match bin.or_else(|| discover_internal_binary("webcodex-runner")) {
         Some(path) => path,
         None => {
@@ -1435,16 +1503,70 @@ fn parse_agent_install_service(args: &[String]) -> Result<AgentInstallServiceOpt
     if service_file.as_os_str().is_empty() {
         return Err("--service-file cannot be empty".to_string());
     }
+    let root_runner = match scope {
+        ServiceScope::User => effective_root,
+        ServiceScope::System => user.as_deref().is_none_or(system_user_is_root),
+    };
+    match scope {
+        ServiceScope::User => {
+            if user.is_some() || group.is_some() {
+                return Err(
+                    "--user and --group are valid only with --scope system; user services run as the current user"
+                        .to_string(),
+                );
+            }
+        }
+        ServiceScope::System if !root_runner && user.is_none() => {
+            return Err("--scope system requires an explicit non-root --user".to_string());
+        }
+        ServiceScope::System => {}
+    }
+    if root_runner && !allow_root_runner {
+        return Err(
+            "refusing to install a Runner that would run as root; pass a non-root --user with --scope system, or explicitly opt in with --allow-root-runner"
+                .to_string(),
+        );
+    }
+    if !root_runner && allow_root_runner {
+        return Err(
+            "--allow-root-runner is only valid when the selected Runner would run as root"
+                .to_string(),
+        );
+    }
+    let working_directory = match working_directory {
+        Some(path) => path,
+        None if scope == ServiceScope::User => current_user_home()?,
+        None => {
+            let selected_user = user.as_deref().unwrap_or("root");
+            system_user_home(selected_user).ok_or_else(|| {
+                format!(
+                    "could not determine the home directory for system Runner user '{selected_user}'; pass --working-directory explicitly"
+                )
+            })?
+        }
+    };
     if working_directory.as_os_str().is_empty() {
         return Err("--working-directory cannot be empty".to_string());
     }
+    if !working_directory.is_absolute() {
+        return Err("--working-directory must be an absolute path".to_string());
+    }
+    if !root_runner && working_directory.starts_with("/root") {
+        return Err(
+            "a non-root Runner cannot use /root as its WorkingDirectory; use that user's home or another accessible directory"
+                .to_string(),
+        );
+    }
     Ok(AgentInstallServiceOptions {
+        scope,
         config,
         bin,
         service_file,
         user,
         group,
         working_directory,
+        root_runner,
+        allow_root_runner,
         overwrite,
         dry_run,
         output_stdout,
@@ -1454,11 +1576,21 @@ fn parse_agent_install_service(args: &[String]) -> Result<AgentInstallServiceOpt
 }
 
 fn parse_agent_status(args: &[String]) -> Result<AgentStatusOptions, String> {
+    parse_agent_status_with_identity(args, is_effective_root())
+}
+
+fn parse_agent_status_with_identity(
+    args: &[String],
+    effective_root: bool,
+) -> Result<AgentStatusOptions, String> {
     let mut profile: Option<String> = None;
+    let mut scope: Option<ServiceScope> = None;
     let mut config: Option<PathBuf> = None;
+    let mut service_file: Option<PathBuf> = None;
     let mut opts = AgentStatusOptions {
+        scope: ServiceScope::System,
         config: PathBuf::new(),
-        service_file: PathBuf::from("/etc/systemd/system/webcodex-runner.service"),
+        service_file: PathBuf::new(),
         local_state_dir: None,
         server_url: None,
         user_token_file: None,
@@ -1469,7 +1601,14 @@ fn parse_agent_status(args: &[String]) -> Result<AgentStatusOptions, String> {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--profile" => profile = Some(next_value(&mut iter, arg)?),
+            "--scope" => {
+                if scope.is_some() {
+                    return Err("--scope may be specified only once".to_string());
+                }
+                scope = Some(ServiceScope::parse(&next_value(&mut iter, arg)?)?);
+            }
             "--config" => config = Some(PathBuf::from(next_value(&mut iter, arg)?)),
+            "--service-file" => service_file = Some(PathBuf::from(next_value(&mut iter, arg)?)),
             "--server-url" => opts.server_url = Some(next_value(&mut iter, arg)?),
             "--user-token-file" => {
                 opts.user_token_file = Some(PathBuf::from(next_value(&mut iter, arg)?))
@@ -1481,22 +1620,40 @@ fn parse_agent_status(args: &[String]) -> Result<AgentStatusOptions, String> {
             _ => return Err(format!("unknown agent status flag: {}", arg)),
         }
     }
-    if let Some(profile) = profile
+    let scope_explicit = scope.is_some();
+    let scope = scope.unwrap_or_else(|| default_agent_service_scope(effective_root));
+    opts.scope = scope;
+    let profile = profile
         .as_deref()
         .map(validate_client_profile)
-        .transpose()?
-    {
-        opts.config = config.unwrap_or_else(|| client_profile_agent_config(&profile));
-        opts.service_file = client_profile_service_file(&profile);
-        opts.local_state_dir = Some(client_profile_state_dir(&profile));
-        opts.user_token_file = opts
-            .user_token_file
-            .or_else(|| Some(client_profile_user_token_file(&profile)));
-        opts.agent_token_file = opts
-            .agent_token_file
-            .or_else(|| Some(client_profile_agent_token_file(&profile)));
-    } else {
-        opts.config = config.unwrap_or_else(|| PathBuf::from("/etc/webcodex/agent.toml"));
+        .transpose()?;
+    opts.config = match (config, profile.as_deref(), scope_explicit) {
+        (Some(config), _, _) => config,
+        (None, Some(profile), false) => client_profile_agent_config(profile),
+        (None, profile, _) => agent_config_for_scope(scope, profile)?,
+    };
+    opts.service_file = service_file
+        .map(Ok)
+        .unwrap_or_else(|| agent_service_file_for_scope(scope, profile.as_deref()))?;
+    validate_service_file_scope(scope, &opts.service_file)?;
+    if let Some(profile) = profile {
+        if !scope_explicit {
+            opts.local_state_dir = Some(client_profile_state_dir(&profile));
+        }
+        if opts.user_token_file.is_none() {
+            opts.user_token_file = Some(if scope_explicit {
+                client_profile_user_token_file_for_scope(scope, &profile)?
+            } else {
+                client_profile_user_token_file(&profile)
+            });
+        }
+        if opts.agent_token_file.is_none() {
+            opts.agent_token_file = Some(if scope_explicit {
+                client_profile_agent_token_file_for_scope(scope, &profile)?
+            } else {
+                client_profile_agent_token_file(&profile)
+            });
+        }
     }
     if opts.config.as_os_str().is_empty() {
         return Err("--config cannot be empty".to_string());

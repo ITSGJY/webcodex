@@ -170,6 +170,9 @@ fn webcodex_cli_agent_help_mentions_new_subcommands() {
             assert_eq!(code, 0);
             assert!(stdout.contains("--config PATH"));
             assert!(stdout.contains("--bin PATH"));
+            assert!(stdout.contains("--scope user|system"));
+            assert!(stdout.contains("--allow-root-runner"));
+            assert!(stdout.contains("default: user for non-root"));
             assert!(stdout.contains("Tokens are never inlined"));
         }
         other => panic!("expected help exit, got {other:?}"),
@@ -179,6 +182,8 @@ fn webcodex_cli_agent_help_mentions_new_subcommands() {
             assert_eq!(code, 0);
             assert!(stdout.contains("--user-token-file PATH"));
             assert!(stdout.contains("--agent-token-file PATH"));
+            assert!(stdout.contains("--scope user|system"));
+            assert!(stdout.contains("--service-file PATH"));
             assert!(stdout.contains("no tokens"));
         }
         other => panic!("expected help exit, got {other:?}"),

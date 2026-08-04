@@ -166,6 +166,40 @@ fn ops_parser_errors_do_not_leak_token_value() {
 }
 
 #[tokio::test]
+async fn ops_rejects_agent_token_from_env_file_without_leaking_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env_file = tmp.path().join("webcodex.env");
+    let secret = "wc_agent_do_not_echo_ops_env_file_0123456789";
+    std::fs::write(&env_file, format!("WEBCODEX_TOKEN={secret}\n")).unwrap();
+    let mut opts = ops_common_opts("http://127.0.0.1:1".to_string());
+    opts.env_file = Some(env_file);
+
+    let error = run_ops_command(OpsCommand::Status(opts)).await.unwrap_err();
+    assert!(error.contains("Agent transport token"), "{error}");
+    assert!(error.contains("webcodex-user-token"), "{error}");
+    assert!(!error.contains(secret));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ops_rejects_agent_token_from_process_env_without_leaking_it() {
+    let _guard = admin_cli::TEST_ENV_LOCK.lock().unwrap();
+    let previous = std::env::var_os("WEBCODEX_TOKEN");
+    let secret = "wc_agent_do_not_echo_ops_process_env_0123456789";
+    std::env::set_var("WEBCODEX_TOKEN", secret);
+    let opts = ops_common_opts("http://127.0.0.1:1".to_string());
+    let error = run_ops_command(OpsCommand::Status(opts)).await.unwrap_err();
+    if let Some(value) = previous {
+        std::env::set_var("WEBCODEX_TOKEN", value);
+    } else {
+        std::env::remove_var("WEBCODEX_TOKEN");
+    }
+
+    assert!(error.contains("Agent transport token"), "{error}");
+    assert!(error.contains("webcodex-user-token"), "{error}");
+    assert!(!error.contains(secret));
+}
+
+#[tokio::test]
 async fn ops_status_http_401_reports_auth_required_not_runtime_unreachable() {
     let output = run_ops_with_routes(
         OpsCommand::Status(ops_common_opts(String::new())),

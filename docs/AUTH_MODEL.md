@@ -12,8 +12,8 @@ WebCodex separates bootstrap administration, account onboarding, runtime API acc
 | Project Credential | setup-generated Connector + Agent | exact access to one private project grant | other projects/admin/general quick start |
 | shared key | agent + GPT/MCP quick start | shared-key group onboarding | production IAM/admin |
 | `wc_acct_xxx` | user CLI | create local PAT/agent token | GPT/MCP/agent |
-| `wc_pat_xxx` | GPT Action/MCP/API | runtime tools | agent connection |
-| `wc_agent_xxx` | `webcodex-runner` | connect agent to server | GPT/MCP/runtime API |
+| `wc_pat_xxx` (`webcodex-user-token`) | GPT Action/MCP/API | runtime and project APIs | agent connection |
+| `wc_agent_xxx` (`webcodex-runner-token`) | `webcodex-runner` | Agent transport only | GPT/MCP/runtime/project API |
 
 ## `WEBCODEX_TOKEN`
 
@@ -132,6 +132,12 @@ Scope the PAT to the workflow. For example, a GPT Action that inspects and edits
 `wc_agent_xxx` is an agent token generated locally by the user. The server stores only its hash and binds the token to `allowed_client_id`.
 
 Use `wc_agent_xxx` only for `webcodex-runner` connectivity. It cannot call runtime, project, tool, MCP, or account endpoints.
+
+The managed login writes the user credential to `webcodex-user-token` and the
+Runner credential into `agent.toml` (with a companion
+`webcodex-runner-token`). Selecting a `wc_agent_*` value for a user/runtime CLI
+token is diagnosed locally where possible and remains a server-side 403. The
+diagnostic never grants broader authority or prints the complete token.
 
 ## `client_id`
 

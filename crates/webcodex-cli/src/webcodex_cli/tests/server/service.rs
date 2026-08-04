@@ -23,8 +23,58 @@ fn install_service_generates_expected_unit_without_tokens() {
     assert!(unit.contains("WorkingDirectory=/var/lib/webcodex\n"));
     assert!(unit.contains("User=webcodex\n"));
     assert!(unit.contains("Group=webcodex\n"));
+    assert!(unit.contains("WantedBy=multi-user.target\n"));
     assert!(!unit.contains("WEBCODEX_TOKEN"));
     assert!(!unit.contains("wc_boot_"));
+}
+
+#[test]
+fn user_agent_unit_uses_user_target_without_identity_directives_or_root_workdir() {
+    let opts = parse_agent_install_service_with_identity(
+        &args(&[
+            "--scope",
+            "user",
+            "--config",
+            "/home/alice/.config/webcodex/agent.toml",
+            "--service-file",
+            "/home/alice/.config/systemd/user/webcodex-runner.service",
+            "--bin",
+            "/home/alice/.local/bin/webcodex-runner",
+            "--working-directory",
+            "/home/alice",
+            "--dry-run",
+        ]),
+        false,
+    )
+    .unwrap();
+    let unit = run_agent_install_service(opts).unwrap();
+    assert!(unit.contains("WantedBy=default.target\n"));
+    assert!(!unit.contains("network-online.target"));
+    assert!(unit.contains("WorkingDirectory=/home/alice\n"));
+    assert!(!unit.contains("WorkingDirectory=/root\n"));
+    assert!(!unit.contains("\nUser="));
+    assert!(!unit.contains("\nGroup="));
+}
+
+#[test]
+fn explicitly_allowed_root_runner_is_visibly_marked() {
+    let opts = parse_agent_install_service_with_identity(
+        &args(&[
+            "--scope",
+            "system",
+            "--bin",
+            "/opt/webcodex/bin/webcodex-runner",
+            "--working-directory",
+            "/root",
+            "--allow-root-runner",
+            "--dry-run",
+        ]),
+        true,
+    )
+    .unwrap();
+    let unit = run_agent_install_service(opts).unwrap();
+    assert!(unit.contains("WARNING: --allow-root-runner was explicitly accepted"));
+    assert!(unit.contains("WorkingDirectory=/root\n"));
 }
 
 #[test]
@@ -74,12 +124,14 @@ fn agent_install_service_generates_expected_unit_without_tokens() {
     let config = tmp.path().join("agent.toml");
     std::fs::write(&config, "token = \"agent_secret_should_not_print\"\n").unwrap();
     let opts = parse_agent_install_service(&args(&[
+        "--scope",
+        "system",
         "--config",
         config.to_str().unwrap(),
         "--bin",
         "/opt/webcodex/bin/webcodex-runner",
         "--working-directory",
-        "/root",
+        "/srv/webcodex",
         "--user",
         "webcodex",
         "--group",
@@ -89,6 +141,8 @@ fn agent_install_service_generates_expected_unit_without_tokens() {
     .unwrap();
     let unit = run_agent_install_service(opts).unwrap();
     assert!(unit.contains("[Unit]\nDescription=WebCodex Runner\n"));
+    assert!(unit.contains("After=network-online.target\n"));
+    assert!(unit.contains("Wants=network-online.target\n"));
     assert!(unit.contains(&format!(
         "ExecStart=\"/opt/webcodex/bin/webcodex-runner\" \"--config\" \"{}\"\n",
         config.display()
@@ -99,7 +153,7 @@ fn agent_install_service_generates_expected_unit_without_tokens() {
     assert!(unit.contains("StandardOutput=journal\n"));
     assert!(unit.contains("StandardError=journal\n"));
     assert!(unit.contains("Environment=RUST_LOG=info\n"));
-    assert!(unit.contains("WorkingDirectory=/root\n"));
+    assert!(unit.contains("WorkingDirectory=/srv/webcodex\n"));
     assert!(unit.contains("User=webcodex\n"));
     assert!(unit.contains("Group=webcodex\n"));
     assert!(!unit.contains("agent_secret_should_not_print"));
@@ -113,6 +167,12 @@ fn agent_install_service_refuses_overwrite_unless_requested() {
     let service_file = tmp.path().join("webcodex-runner.service");
     std::fs::write(&service_file, "old").unwrap();
     let opts = parse_agent_install_service(&args(&[
+        "--scope",
+        "system",
+        "--user",
+        "webcodex",
+        "--working-directory",
+        "/srv/webcodex",
         "--config",
         "/etc/webcodex/agent.toml",
         "--bin",
@@ -128,6 +188,12 @@ fn agent_install_service_refuses_overwrite_unless_requested() {
 #[test]
 fn agent_install_service_dry_run_and_output_work_without_systemd() {
     let dry = parse_agent_install_service(&args(&[
+        "--scope",
+        "system",
+        "--user",
+        "webcodex",
+        "--working-directory",
+        "/srv/webcodex",
         "--config",
         "/etc/webcodex/agent.toml",
         "--bin",
@@ -140,6 +206,12 @@ fn agent_install_service_dry_run_and_output_work_without_systemd() {
     ));
 
     let out = parse_agent_install_service(&args(&[
+        "--scope",
+        "system",
+        "--user",
+        "webcodex",
+        "--working-directory",
+        "/srv/webcodex",
         "--config",
         "/etc/webcodex/agent.toml",
         "--bin",
@@ -269,6 +341,10 @@ fn generated_server_and_agent_units_pass_systemd_analyze_verify() {
     let config = tmp.path().join("agent.toml");
     std::fs::write(&config, "server_url = \"http://127.0.0.1\"\n").unwrap();
     let agent = parse_agent_install_service(&args(&[
+        "--scope",
+        "system",
+        "--user",
+        "webcodex",
         "--bin",
         runner_bin.to_str().unwrap(),
         "--config",
@@ -318,6 +394,10 @@ fn special_supported_paths_pass_systemd_analyze_verify() {
     verify_systemd_unit(&server_unit, "webcodex-special.service");
 
     let agent = parse_agent_install_service(&args(&[
+        "--scope",
+        "system",
+        "--user",
+        "webcodex",
         "--bin",
         runner_bin.to_str().unwrap(),
         "--config",
@@ -347,6 +427,12 @@ fn executable_program_rejects_quote_and_backslash_in_dry_run() {
 #[test]
 fn agent_output_mode_rejects_invalid_unit_fields() {
     let opts = parse_agent_install_service(&args(&[
+        "--scope",
+        "system",
+        "--user",
+        "webcodex",
+        "--working-directory",
+        "/srv/webcodex",
         "--config",
         "/etc/webcodex/agent.toml\nEnvironment=BAD=1",
         "--bin",
@@ -386,8 +472,14 @@ allowed_roots = ["/srv/projects"]
         ),
     )
     .unwrap();
-    let opts =
-        parse_agent_status(&args(&["--config", config.to_str().unwrap(), "--json"])).unwrap();
+    let opts = parse_agent_status(&args(&[
+        "--scope",
+        "system",
+        "--config",
+        config.to_str().unwrap(),
+        "--json",
+    ]))
+    .unwrap();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -409,6 +501,116 @@ allowed_roots = ["/srv/projects"]
     assert_eq!(json["config"]["allowed_roots"]["count"], 1);
     assert!(json.get("token").is_none());
     assert!(json["config"].get("token").is_none());
+}
+
+#[test]
+fn agent_status_rejects_agent_token_in_user_runtime_token_file_without_leaking_it() {
+    let _guard = admin_cli::TEST_ENV_LOCK.lock().unwrap();
+    let old_path = std::env::var_os("PATH");
+    std::env::set_var("PATH", "");
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("agent.toml");
+    std::fs::write(
+        &config,
+        "server_url = \"https://example.test\"\nclient_id = \"alice\"\n",
+    )
+    .unwrap();
+    let token_file = tmp.path().join("webcodex-user-token");
+    let secret = "wc_agent_do_not_echo_status_0123456789";
+    std::fs::write(&token_file, format!("{secret}\n")).unwrap();
+    let opts = parse_agent_status(&args(&[
+        "--scope",
+        "system",
+        "--config",
+        config.to_str().unwrap(),
+        "--user-token-file",
+        token_file.to_str().unwrap(),
+    ]))
+    .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let error = runtime.block_on(run_agent_status(opts)).unwrap_err();
+    if let Some(path) = old_path {
+        std::env::set_var("PATH", path);
+    } else {
+        std::env::remove_var("PATH");
+    }
+    assert!(error.contains("Agent transport token"), "{error}");
+    assert!(error.contains("webcodex-user-token"), "{error}");
+    assert!(!error.contains(secret));
+}
+
+#[cfg(unix)]
+#[test]
+fn hosted_profile_status_uses_xdg_config_and_never_invokes_systemctl() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = admin_cli::TEST_ENV_LOCK.lock().unwrap();
+    let old_home = std::env::var_os("HOME");
+    let old_xdg_config = std::env::var_os("XDG_CONFIG_HOME");
+    let old_xdg_state = std::env::var_os("XDG_STATE_HOME");
+    let old_path = std::env::var_os("PATH");
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let config_home = tmp.path().join("config");
+    let state_home = tmp.path().join("state");
+    let profile_config = config_home.join("webcodex/clients/hosted/agent.toml");
+    let profile_state = state_home.join("webcodex/clients/hosted");
+    let fake_bin = tmp.path().join("bin");
+    let systemctl_called = tmp.path().join("systemctl-called");
+    std::fs::create_dir_all(profile_config.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&profile_state).unwrap();
+    std::fs::create_dir_all(&fake_bin).unwrap();
+    std::fs::write(
+        &profile_config,
+        format!(
+            "server_url = \"\"\ntoken = \"hosted-shared-key\"\nclient_id = \"hosted\"\nprojects_dir = {:?}\n",
+            profile_config.parent().unwrap().join("projects.d")
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        crate::webcodex_cli::local_runner_profile_marker(&profile_state),
+        "profile = \"hosted\"\n",
+    )
+    .unwrap();
+    let fake_systemctl = fake_bin.join("systemctl");
+    std::fs::write(
+        &fake_systemctl,
+        format!("#!/bin/sh\n: > {:?}\n", systemctl_called),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    std::env::set_var("HOME", &home);
+    std::env::set_var("XDG_CONFIG_HOME", &config_home);
+    std::env::set_var("XDG_STATE_HOME", &state_home);
+    std::env::set_var("PATH", &fake_bin);
+    let opts = parse_agent_status_with_identity(&args(&["--profile", "hosted"]), true).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let output = runtime.block_on(run_agent_status(opts));
+
+    for (name, value) in [
+        ("HOME", old_home),
+        ("XDG_CONFIG_HOME", old_xdg_config),
+        ("XDG_STATE_HOME", old_xdg_state),
+        ("PATH", old_path),
+    ] {
+        if let Some(value) = value {
+            std::env::set_var(name, value);
+        } else {
+            std::env::remove_var(name);
+        }
+    }
+
+    let output = output.unwrap();
+    assert!(output.contains("runner mode:          hosted local process"));
+    assert!(!systemctl_called.exists());
 }
 
 #[tokio::test]
@@ -462,6 +664,8 @@ transport = "websocket"
     std::fs::write(&user_token_file, "pat_online_secret_1234567890\n").unwrap();
     std::fs::write(&agent_token_file, "agent_boundary_secret_1234567890\n").unwrap();
     let opts = parse_agent_status(&args(&[
+        "--scope",
+        "system",
         "--config",
         config.to_str().unwrap(),
         "--server-url",

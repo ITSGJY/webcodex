@@ -151,21 +151,23 @@ npm install -g @yyjeqhc/webcodex
 使用配对码登录，并限制允许访问的代码根目录：
 
 ```bash
-sudo webcodex login https://webcodex.example.com \
+webcodex login https://webcodex.example.com \
   --code '<wc_pair_...>' \
-  --allowed-root /home/your-user/git
+  --allowed-root "$HOME/git"
 ```
 
 按照 `login` 输出的实际配置路径安装 Runner 服务：
 
 ```bash
-sudo webcodex agent install \
-  --config /path/reported/by/login/agent.toml \
-  --overwrite
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now webcodex-runner
+webcodex agent install --scope user \
+  --config /path/reported/by/login/agent.toml
+webcodex agent status --scope user \
+  --config /path/reported/by/login/agent.toml
 ```
+
+普通用户的 npm 安装和 user systemd service 都不需要 `sudo`。若管理员有意使用
+system scope，请改用 `--scope system --user <runner-user>
+--working-directory /home/<runner-user>`；不要让 Runner 静默以 root 运行。
 
 因此，公网服务器只负责协调；源代码、Git 凭据和项目工具链都留在代码机器。
 

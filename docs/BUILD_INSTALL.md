@@ -58,7 +58,8 @@ The examples in this guide were checked against the current help output from `we
 | Client enrollment (primary) | `webcodex login <server-url> --code <pairing-code>` |
 | Client enrollment (advanced) | `webcodex client enroll --server-url ... --pairing-code ... --client-id ...` |
 | Agent foreground run | `webcodex-runner --profile ...` |
-| Agent service | `webcodex agent install --profile ... --bin ...` |
+| Runner user service | `webcodex agent install --scope user --profile ... --bin ...` |
+| Runner system service | `sudo webcodex agent install --scope system --user ... --working-directory ...` |
 
 The account-management command uses `users create` and `--server-url`; local token creation commands use `--server`. That difference comes from the current CLI surface and is intentionally reflected in the examples.
 
@@ -145,29 +146,84 @@ Client:
 7. Exchange the pairing code over HTTPS and write client-side credentials/config:
 
 ```bash
-sudo webcodex login https://your-domain.example --code <wc_pair_...> \
-  --allowed-root /home/friend/git
+webcodex login https://your-domain.example --code <wc_pair_...> \
+  --allowed-root "$HOME/git"
 ```
 
 Login derives a unique device name automatically (hostname + local suffix), redeems the pairing code, writes the `wc_pat_*` user token to `webcodex-user-token`, and stores the `wc_agent_*` agent token inside the generated `agent.toml`; both files use `0600` permissions on Unix. `/etc/webcodex/webcodex.env` is server-side only. For an explicit client id or a custom output directory, the advanced `webcodex client enroll` flow still works with its existing flags.
 
-8. Install and start the agent service, then validate. Login prints the exact
-   `webcodex agent install --config <agent-config-path>` command for the config
-   it wrote; it is the equivalent of the profile-based form below. The agent
-   config path is the one login reported (for example under
-   `/etc/webcodex/<server>/<user>/agent.toml` as root):
+8. As that same ordinary user, install and start the Runner user service, then
+   validate. Login prints the exact config path and a `--scope user` install
+   command. `agent install` performs the user-manager daemon reload and
+   enable/start operation itself:
 
 ```bash
-sudo webcodex agent install --config /path/to/login/wrote/agent.toml --overwrite
-sudo systemctl daemon-reload
-sudo systemctl enable --now webcodex-runner
-webcodex agent status --server-url https://your-domain.example
+webcodex agent install --scope user \
+  --config /path/to/login/wrote/agent.toml
+webcodex agent status --scope user \
+  --config /path/to/login/wrote/agent.toml \
+  --server-url https://your-domain.example
 webcodex ops status \
   --server-url https://your-domain.example \
   --token-file /path/to/login/wrote/webcodex-user-token
 ```
 
-GPT Actions should use the generated client-side user-token file. GPT Actions require a public HTTPS URL; WebCodex CLI does not automate reverse proxies or tunnels.
+GPT Actions, MCP, and ordinary REST/project APIs use the generated client-side
+`webcodex-user-token`. The Agent token stored in `agent.toml` is Runner
+transport-only. GPT Actions require a public HTTPS URL; WebCodex CLI does not
+automate reverse proxies or tunnels.
+
+## Runner service scopes
+
+The npm package can be installed in an ordinary user's npm environment. Its
+install location does not select the systemd service scope.
+
+`--scope user` uses `systemctl --user`, writes the unit to
+`$XDG_CONFIG_HOME/systemd/user` (or `$HOME/.config/systemd/user`), stores
+default WebCodex config under `$XDG_CONFIG_HOME/webcodex` (or
+`$HOME/.config/webcodex`), uses `default.target`, and runs without `User=` or
+`Group=`. It requires no `sudo`. Use the same scope for every lifecycle
+command:
+
+```bash
+webcodex agent install --scope user --profile workstation
+webcodex agent status --scope user --profile workstation
+webcodex agent restart --scope user --profile workstation
+webcodex agent logs --scope user --profile workstation --lines 100
+webcodex agent uninstall --scope user --profile workstation --confirm
+```
+
+An enabled user unit starts when that account's user manager starts. It does not
+by itself guarantee that the Runner starts at boot before the first login or
+remains after the last logout. If unattended boot persistence is required, an
+administrator may explicitly run `sudo loginctl enable-linger <runner-user>`
+after reviewing the long-lived service authority granted to that account.
+WebCodex does not change lingering automatically.
+
+Non-root callers default to user scope. Root callers default to system scope,
+but a system Runner may not run as root without explicit opt-in. The normal
+administrator-managed installation names a non-root account and a matching
+working directory; `--group` is optional:
+
+```bash
+sudo webcodex agent install \
+  --scope system \
+  --profile workstation \
+  --user <runner-user> \
+  --working-directory /home/<runner-user> \
+  --config /etc/webcodex/clients/workstation/agent.toml
+sudo webcodex agent status --scope system --profile workstation
+```
+
+System scope uses `/etc/systemd/system`, `systemctl`, and
+`multi-user.target`. It does not create users, change sudoers, migrate files,
+or overwrite an existing unit unless `--overwrite` is explicit. Running
+project commands as root is strongly discouraged and is accepted only with
+`--allow-root-runner`, which prints and embeds a prominent warning. Explicit
+`--config` and `--working-directory` values override the defaults and must be
+readable or usable by the selected service account. An explicit
+`--service-file` must belong to the selected manager scope; reuse the same
+`--scope` and `--service-file` for status, control, logs, and uninstall.
 
 Compatibility commands still work, but should not be the first choice in new docs:
 
@@ -180,7 +236,8 @@ webcodex setup single-user
 
 ## Agent config
 
-Client enroll writes `agent.toml`. For a systemd service, use `webcodex agent install`; for a foreground test, run:
+Client enroll writes `agent.toml`. For the normal user service, use
+`webcodex agent install --scope user`; for a foreground test, run:
 
 ```bash
 webcodex-runner --profile workstation
@@ -235,13 +292,16 @@ The example above is a narrowing example, not the default.
 
 ## Auth reminders
 
-Use:
+Use a user token such as the generated `webcodex-user-token` (`wc_pat_*`):
 
 ```text
 Authorization: Bearer <token>
 ```
 
 for REST, polling, MCP, and GPT Actions.
+
+Use `webcodex-runner-token` (`wc_agent_*`) only through the Runner config for
+Agent transport. It is intentionally rejected by project/runtime APIs.
 
 `?token=` is allowed only for `/api/agents/ws` WebSocket handshake compatibility.
 

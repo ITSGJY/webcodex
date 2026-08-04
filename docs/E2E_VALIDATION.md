@@ -66,8 +66,8 @@ webcodex server install
 webcodex server status
 webcodex pairing create --server-url URL --username alice
 webcodex login URL --code CODE --allowed-root /home/alice/git
-webcodex agent install --config PATH_FROM_LOGIN
-webcodex agent status --server-url URL
+webcodex agent install --scope user --config PATH_FROM_LOGIN
+webcodex agent status --scope user --config PATH_FROM_LOGIN --server-url URL
 webcodex ops status --strict --server-url URL --token-file PATH
 ```
 

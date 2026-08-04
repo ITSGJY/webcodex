@@ -57,7 +57,8 @@ binary、npm 命令、systemd unit 与 QUIC ALPN（`webcodex-runner/1`）统一�
 | 客户端 enrollment（主入口） | `webcodex login <server-url> --code <pairing-code>` |
 | 客户端 enrollment（高级） | `webcodex client enroll --server-url ... --pairing-code ... --client-id ...` |
 | 前台运行 agent | `webcodex-runner --profile ...` |
-| 安装 agent service | `webcodex agent install --profile ... --bin ...` |
+| 安装 Runner user service | `webcodex agent install --scope user --profile ... --bin ...` |
+| 安装 Runner system service | `sudo webcodex agent install --scope system --user ... --working-directory ...` |
 
 账户管理命令使用 `users create` 和 `--server-url`；本地 token 创建命令使用 `--server`。这是当前 CLI surface 的实际差异，示例中会按这个差异书写。
 
@@ -144,29 +145,82 @@ Client：
 7. 通过 HTTPS 交换 pairing code，并写入 client-side credentials/config：
 
 ```bash
-sudo webcodex login https://your-domain.example --code <wc_pair_...> \
-  --allowed-root /home/friend/git
+webcodex login https://your-domain.example --code <wc_pair_...> \
+  --allowed-root "$HOME/git"
 ```
 
 `login` 会自动生成唯一设备名（hostname + 本地后缀），兑换 pairing code，把 `wc_pat_*` user token 写入 `webcodex-user-token`，并把 `wc_agent_*` agent token 存入生成的 `agent.toml`；两个文件在 Unix 上均使用 `0600` 权限。`/etc/webcodex/webcodex.env` 只属于 server 侧。如需显式 client id 或自定义输出目录，高级的 `webcodex client enroll` 流程仍支持原有参数。
 
-8. 安装并启动 agent service，然后验证：
+8. 仍由同一个普通用户安装并启动 Runner user service，然后验证。`login` 会打印
+   确切 config 路径和带 `--scope user` 的安装命令。`agent install` 会自行完成 user
+   manager 的 daemon reload 和 enable/start：
 
 ```bash
-sudo webcodex agent install --config /path/to/login/wrote/agent.toml --overwrite
-sudo systemctl daemon-reload
-sudo systemctl enable --now webcodex-runner
-webcodex agent status --server-url https://your-domain.example
+webcodex agent install --scope user \
+  --config /path/to/login/wrote/agent.toml
+webcodex agent status --scope user \
+  --config /path/to/login/wrote/agent.toml \
+  --server-url https://your-domain.example
 webcodex ops status \
   --server-url https://your-domain.example \
   --token-file /path/to/login/wrote/webcodex-user-token
 ```
 
-GPT Actions 应使用生成的 client-side user-token file。GPT Actions 需要 public HTTPS URL；WebCodex CLI 不会自动配置 reverse proxies 或 tunnels。
+GPT Actions、MCP 和普通 REST/project API 使用生成的 client-side
+`webcodex-user-token`。`agent.toml` 中的 Agent token 只用于 Runner transport。
+GPT Actions 需要 public HTTPS URL；WebCodex CLI 不会自动配置 reverse proxy 或
+tunnel。
+
+## Runner service scope
+
+npm package 可以安装在普通用户自己的 npm 环境中；npm 安装位置不会选择 systemd
+service scope。
+
+`--scope user` 使用 `systemctl --user`，unit 写入
+`$XDG_CONFIG_HOME/systemd/user`（未设置时为 `$HOME/.config/systemd/user`），默认
+WebCodex config 位于 `$XDG_CONFIG_HOME/webcodex`（未设置时为
+`$HOME/.config/webcodex`），使用 `default.target`，且不生成 `User=` 或 `Group=`。
+全程不需要 `sudo`。所有 lifecycle 命令必须使用同一 scope：
+
+```bash
+webcodex agent install --scope user --profile workstation
+webcodex agent status --scope user --profile workstation
+webcodex agent restart --scope user --profile workstation
+webcodex agent logs --scope user --profile workstation --lines 100
+webcodex agent uninstall --scope user --profile workstation --confirm
+```
+
+启用后的 user unit 会在该账户的 user manager 启动时启动，但这并不自动保证 Runner
+能在首次登录前随系统启动，或在最后一次注销后继续运行。若确实需要无人值守的开机
+常驻，管理员应先评估该账户长期运行 service 的权限，再显式执行
+`sudo loginctl enable-linger <runner-user>`。WebCodex 不会自动修改 linger 设置。
+
+非 root 调用者默认使用 user scope。root 调用者默认使用 system scope，但 system
+Runner 不得在没有显式确认时以 root 运行。正常的管理员安装应指定非 root 账户和
+匹配的 working directory；`--group` 可选：
+
+```bash
+sudo webcodex agent install \
+  --scope system \
+  --profile workstation \
+  --user <runner-user> \
+  --working-directory /home/<runner-user> \
+  --config /etc/webcodex/clients/workstation/agent.toml
+sudo webcodex agent status --scope system --profile workstation
+```
+
+system scope 使用 `/etc/systemd/system`、`systemctl` 和 `multi-user.target`。它
+不会创建用户、修改 sudoers、迁移文件，也不会在没有 `--overwrite` 时覆盖已有
+unit。强烈不建议以 root 执行项目命令；只有显式传入 `--allow-root-runner` 才会
+接受，并输出且写入醒目警告。显式 `--config` 和 `--working-directory` 会覆盖
+默认值，并且所选 service account 必须能够读取或使用它们；显式
+`--service-file` 必须属于所选 manager scope。status、control、logs 和 uninstall
+也要复用同一 `--scope` 与 `--service-file`。
 
 ## Agent config
 
-`login` / `client enroll` 会写入 `agent.toml`。systemd service 使用 `webcodex agent install --config <path>`；前台测试可运行：
+`login` / `client enroll` 会写入 `agent.toml`。普通 user service 使用
+`webcodex agent install --scope user --config <path>`；前台测试可运行：
 
 ```bash
 webcodex-runner --config /path/to/login/wrote/agent.toml
@@ -207,13 +261,17 @@ webcodex ops status \
 
 ## Auth reminders
 
-REST、polling、MCP 和 GPT Actions 使用：
+REST、polling、MCP 和 GPT Actions 使用 user token，例如生成的
+`webcodex-user-token`（`wc_pat_*`）：
 
 ```text
 Authorization: Bearer <token>
 ```
 
 `?token=` 只允许用于 `/api/agents/ws` WebSocket handshake 兼容场景。
+
+`webcodex-runner-token`（`wc_agent_*`）只应通过 Runner config 用于 Agent
+transport；project/runtime API 会按设计拒绝它。
 
 ## systemd PATH reminder
 

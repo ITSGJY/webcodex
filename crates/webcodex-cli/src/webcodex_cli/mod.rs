@@ -71,7 +71,6 @@ pub(crate) use connect::{
     run_local_runner_logs, run_local_runner_service, write_connect_result, ConnectOptions,
     LocalRunnerServiceAction,
 };
-#[cfg(test)]
 pub(crate) use env::is_effective_root;
 #[cfg(test)]
 pub(crate) use env::parse_env_content_value;
@@ -98,27 +97,31 @@ pub(crate) use output::{
 #[cfg(test)]
 pub(crate) use pairing::{ensure_enroll_outputs_available, resolve_pairing_create_token};
 pub(crate) use pairing::{run_client_enroll, run_pairing_create};
+pub(crate) use profiles::{
+    agent_config_for_scope, agent_service_file_for_scope, client_profile_agent_config,
+    client_profile_agent_token_file, client_profile_agent_token_file_for_scope,
+    client_profile_projects_dir, client_profile_state_dir, client_profile_user_token_file,
+    client_profile_user_token_file_for_scope, current_user_home,
+    default_client_output_dir_for_profile, validate_client_profile, validate_service_file_scope,
+};
 #[cfg(test)]
 pub(crate) use profiles::{client_output_dir_for_profile, CLIENT_PROFILE_ERROR};
-pub(crate) use profiles::{
-    client_profile_agent_config, client_profile_agent_token_file, client_profile_projects_dir,
-    client_profile_service_file, client_profile_state_dir, client_profile_user_token_file,
-    default_client_output_dir_for_profile, validate_client_profile,
-};
 pub(crate) use server::{
     run_server_init, run_server_install_service, run_server_service, run_server_status,
     ServerStatusOptions,
 };
 pub(crate) use service::{
-    control_service, encode_exec_argument, encode_exec_path_argument, encode_exec_program,
-    encode_unit_path_value, install_unit, query_systemd_service_status, query_systemd_status,
-    run_internal_binary, run_logs, service_unit_name, uninstall_unit, validate_systemd_identity,
-    ServiceControl, AGENT_SERVICE_FILE, AGENT_SERVICE_UNIT, DEFAULT_LOG_LINES, SERVER_SERVICE_FILE,
-    SERVER_SERVICE_UNIT,
+    control_service, control_service_for_scope, encode_exec_argument, encode_exec_path_argument,
+    encode_exec_program, encode_unit_path_value, ensure_service_file_parent, install_unit,
+    install_unit_for_scope, query_systemd_service_status_for_scope, query_systemd_status,
+    run_internal_binary, run_logs, run_logs_for_scope, service_unit_name, uninstall_unit,
+    uninstall_unit_for_scope, validate_systemd_identity, ServiceControl, AGENT_SERVICE_UNIT,
+    DEFAULT_LOG_LINES, SERVER_SERVICE_FILE, SERVER_SERVICE_UNIT,
 };
 pub(crate) use setup::run_setup_single_user;
 pub(crate) use system::{
-    discover_internal_binary, read_optional_token, write_secret_file, write_text_file,
+    discover_internal_binary, read_optional_token, read_optional_user_api_token, system_user_home,
+    system_user_is_root, validate_user_api_token, write_secret_file, write_text_file,
 };
 #[cfg(test)]
 pub(crate) use token_commands::resolve_account_credential;

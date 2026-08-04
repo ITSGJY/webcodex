@@ -166,14 +166,18 @@ Server/admin：
 Client：
 
 8. 安装公开 `webcodex` CLI 和 `webcodex-runner` binary。
-9. 运行 `webcodex login <server-url> --code <code>`（高级替代：`webcodex client enroll`）。
-10. 运行 `webcodex agent install --config <login 报告的 agent config 路径>`。
-11. 运行 `sudo systemctl daemon-reload`。
-12. 运行 `sudo systemctl enable --now webcodex-runner`。
-13. 运行 `webcodex agent status`。
-14. 运行 `webcodex ops status --strict`。
+9. 由实际运行项目命令的普通账户执行
+   `webcodex login <server-url> --code <code>`（高级替代：
+   `webcodex client enroll`），不要使用 `sudo`。
+10. 运行 `webcodex agent install --scope user --config <login 报告的 agent config 路径>`。
+11. 运行 `webcodex agent status --scope user --config <login 报告的 agent config 路径>`。
+12. 运行 `webcodex ops status --strict`。
 
-`/etc/webcodex/webcodex.env` 只属于 server 侧。多用户或多个 client 共享一台机器时，client 侧文件应放在 profile 目录下，例如 `/etc/webcodex/clients/workstation/agent.toml`、`/etc/webcodex/clients/workstation/webcodex-user-token`、`/etc/webcodex/clients/workstation/webcodex-runner-token` 和 `/etc/webcodex/clients/workstation/projects.d`。
+`agent install` 会自行对所选 service manager 执行 reload、enable 和 start；普通
+流程不需要 `sudo`，也不需要另行调用 `systemctl`。
+`/etc/webcodex/webcodex.env` 只属于 server 侧。普通用户的 client files 默认位于
+`$XDG_CONFIG_HOME/webcodex`（未设置时为 `$HOME/.config/webcodex`）；管理员有意
+配置 system scope 时，profile 可以放在 `/etc/webcodex` 下。
 
 ## 账户凭据开通流程
 
@@ -208,21 +212,28 @@ Client/friend 侧：
 
 ```bash
 webcodex login https://your-domain.example --code <wc_pair_...> \
-  --allowed-root /home/friend/git
+  --allowed-root "$HOME/git"
 
-webcodex agent install --config /etc/webcodex/https_your-domain.example/friendname/agent.toml \
-  --overwrite
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now webcodex-runner
+webcodex agent install --scope user \
+  --config "$HOME/.config/webcodex/https_your-domain.example/friendname/agent.toml"
+webcodex agent status --scope user \
+  --config "$HOME/.config/webcodex/https_your-domain.example/friendname/agent.toml"
 
 webcodex ops status \
   --server-url https://your-domain.example \
-  --token-file /etc/webcodex/https_your-domain.example/friendname/webcodex-user-token \
+  --token-file "$HOME/.config/webcodex/https_your-domain.example/friendname/webcodex-user-token" \
   --strict
 ```
 
-`webcodex login` 是 client/friend 侧入口：自动生成唯一设备名、兑换 pairing code，并在 `<dir>/<server>/<user>/`（root：`/etc/webcodex/...`，普通用户：`~/.config/webcodex/...`）下写入 client 侧 `webcodex-user-token` 和 `agent.toml`。login 会打印确切的 agent config 路径和要使用的 `webcodex agent install --config <path>` 命令。GPT Actions 应使用 client 侧的 `webcodex-user-token`；生成的 agent config 使用 client 侧 agent token 连接 `webcodex-runner`。不要在机器之间复制 `WEBCODEX_TOKEN`、`wc_pat_*`、`wc_agent_*`、完整 env files 或完整 `agent.toml` files。每个 friend 都应使用唯一的 `username`；设备名会自动唯一。如需显式 client id 或自定义输出目录，高级的 `webcodex client enroll` 流程仍可用。
+`webcodex login` 是 client/friend 侧入口：自动生成唯一设备名、兑换 pairing code，
+并在用户 WebCodex config 目录下写入 client 侧 `webcodex-user-token` 和
+`agent.toml`。login 会打印确切 config 路径和
+`webcodex agent install --scope user --config <path>` 命令。GPT Actions、MCP 和普通
+REST/project API 使用 client 侧 `webcodex-user-token`；生成的 agent config 只把
+`webcodex-runner-token` 用于 Agent transport。不要在机器之间复制
+`WEBCODEX_TOKEN`、`wc_pat_*`、`wc_agent_*`、完整 env files 或完整
+`agent.toml` files。每个 friend 都应使用唯一的 `username`；设备名会自动唯一。
+如需显式 client id 或自定义输出目录，高级的 `webcodex client enroll` 流程仍可用。
 
 ## Runtime console
 
@@ -297,14 +308,45 @@ server {
 
 ## Agent 配置
 
-`login` / `client enroll` 会生成 agent config。使用下面命令安装 systemd unit（`login` 会打印确切的 config 路径）：
+`login` / `client enroll` 会生成 agent config。普通非 root 安装使用 user unit
+（`login` 会打印确切的 config 路径）：
 
 ```bash
-sudo webcodex agent install --config /etc/webcodex/https_your-domain.example/friendname/agent.toml
-sudo systemctl daemon-reload
-sudo systemctl enable --now webcodex-runner
-webcodex agent status --server-url https://your-domain.example
+webcodex agent install --scope user --profile workstation
+webcodex agent status --scope user --profile workstation \
+  --server-url https://your-domain.example
 ```
+
+npm 安装位置与 systemd scope 相互独立。user scope 使用 `systemctl --user`，unit
+位于 `$XDG_CONFIG_HOME/systemd/user`（未设置时为
+`$HOME/.config/systemd/user`），使用 `default.target`，不生成 `User=` 或
+`Group=`，也不需要管理员权限。非 root 调用者默认使用 user scope。install、
+status、start、stop、restart、logs 和 uninstall 必须使用同一 scope。
+
+启用后的 user unit 跟随该账户的 user manager 生命周期；这并不自动保证它能在首次
+登录前启动，或在最后一次注销后继续运行。若需要无人值守的开机常驻，管理员应先
+评估该账户长期运行 service 的权限，再显式执行
+`sudo loginctl enable-linger <runner-user>`。WebCodex 不会自动修改 linger 设置。
+
+管理员管理的 service 使用 system scope：`/etc/systemd/system`、`systemctl` 和
+`multi-user.target`。正常安装应指定非 root 用户及其可用的 working directory：
+
+```bash
+sudo webcodex agent install \
+  --scope system \
+  --profile workstation \
+  --user <runner-user> \
+  --working-directory /home/<runner-user> \
+  --config /etc/webcodex/clients/workstation/agent.toml
+sudo webcodex agent status --scope system --profile workstation
+```
+
+`--group` 可选。WebCodex 不创建系统用户、不修改 sudoers，也不迁移权限。只有
+管理员同时传入 `--allow-root-runner` 时才允许 root Runner；这个不推荐的例外会
+输出并写入醒目警告。显式 config 和 working-directory override 仍然可用，但
+所选 service account 必须能够读取或使用它们。显式 service-file 必须匹配所选
+manager scope：user scope 拒绝 system unit path，system scope 拒绝 user-unit
+path；已有 unit 不会被静默覆盖。
 
 前台测试可直接启动 agent：
 
@@ -369,8 +411,10 @@ Python venv、Conda 示例、解析规则和安全边界见
 [SHELL_PROFILES.md](SHELL_PROFILES.md)。修改配置不会静默移动、重启或改变已打开
 Shell；需要显式 close/reopen 才应用新默认值。当前 policy 会在后续 exec/status
 操作前重检，而 close 仍可用于清理。
-修改 `agent.toml` 后，`sudo systemctl reload webcodex-runner` 会把新的 policy、
-shell、SSH resource 和 tool-provider generation 应用于后续请求；已打开的
+修改 `agent.toml` 后，应 reload 匹配的 manager（user scope 使用
+`systemctl --user reload webcodex-runner`，system scope 使用
+`sudo systemctl reload webcodex-runner`）。这会把新的 policy、shell、SSH
+resource 和 tool-provider generation 应用于后续请求；已打开的
 persistent shell 仍保持原进程状态。无效 reload 保留当前 generation，
 `projects.d` 继续独立刷新。
 
@@ -378,13 +422,17 @@ persistent shell 仍保持原进程状态。无效 reload 保留当前 generatio
 
 ## Authentication and transport
 
-普通 REST、polling、MCP 和 GPT Actions 调用必须使用：
+普通 REST、polling、MCP 和 GPT Actions 必须使用生成的
+`webcodex-user-token`（`wc_pat_*`）：
 
 ```text
 Authorization: Bearer <token>
 ```
 
 `?token=` 只允许用于 `/api/agents/ws` WebSocket handshake 兼容场景。不要把 query-string token 用在 polling、REST、MCP 或 GPT Actions。
+
+`webcodex-runner-token`（`wc_agent_*`）只允许访问 Agent transport endpoints；
+project/runtime endpoint 仍会返回 403，不要绕过这条边界。
 
 Agent 推荐配置 QUIC 并使用 `transport = "auto"`。WebSocket 和 polling 继续作为受限网络下的 fallback。
 
@@ -397,6 +445,10 @@ https://your-domain.example/openapi.json
 ```
 
 在 GPT Actions 中把认证配置为 HTTP Bearer/API key，并放在 `Authorization` header。
+
+这里指基于 OpenAPI 的 Custom GPT Action 接入，并不声称 WebCodex 已发布到 ChatGPT
+插件目录。plugin、app、Custom GPT 和 GPT Action 属于不同层次，详见
+[GPT_ACTIONS.zh-CN.md](GPT_ACTIONS.zh-CN.md)。
 
 OpenAPI GPT Actions 管理面有意排除 users、API tokens、agent tokens、pairing/enrollment、setup、doctor、npm、server management 和 audit endpoints。这些任务请使用 `webcodex`。
 

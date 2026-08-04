@@ -256,6 +256,10 @@ pub(crate) async fn run_client_enroll(opts: ClientEnrollOptions) -> Result<Strin
                 "start webcodex-runner with the generated agent.toml",
                 "configure GPT Actions with the user-token file"
             ],
+            "credential_usage": {
+                "webcodex-user-token": "GPT Actions, MCP, and REST/project APIs",
+                "webcodex-runner-token": "Runner/Agent transport only"
+            }
         });
         serde_json::to_string_pretty(&summary).map_err(|e| e.to_string())
     } else {
@@ -277,6 +281,9 @@ pub(crate) async fn run_client_enroll(opts: ClientEnrollOptions) -> Result<Strin
             "  agent config:      {}\n",
             opts.agent_config.display()
         ));
+        out.push_str("\nCredential usage:\n");
+        out.push_str("  - webcodex-user-token: GPT Actions, MCP, and REST/project APIs\n");
+        out.push_str("  - webcodex-runner-token: Runner/Agent transport only\n");
         out.push_str("\nNext steps:\n");
         let foreground_command = shell_command(&[
             "webcodex-runner".to_string(),

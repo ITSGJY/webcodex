@@ -5,6 +5,16 @@
 Use GPT Actions when a Custom GPT should call the project-bound WebCodex
 Connector. Use MCP when the client supports MCP directly.
 
+## Product terminology
+
+WebCodex currently provides an OpenAPI-based **Custom GPT Action** integration.
+It is not described here as a published ChatGPT plugin. In current OpenAI
+terminology, a plugin is an installable bundle in the ChatGPT/Codex plugin
+directory and can contain apps, skills, connectors, or MCP servers; an app, a
+Custom GPT, and an Action are distinct layers. See OpenAI's
+[GPT Actions introduction](https://developers.openai.com/api/docs/actions/introduction)
+and [plugin documentation](https://learn.chatgpt.com/docs/plugins).
+
 ## Schema
 
 Import:
@@ -17,8 +27,13 @@ ChatGPT requires public HTTPS. `webcodex setup` intentionally creates only a
 loopback project runtime; ingress and production authentication are operator
 responsibilities described in [DEPLOYMENT.md](DEPLOYMENT.md).
 
-Configure Bearer/API-key authentication with a scoped runtime credential. Do
-not paste bootstrap/admin, account, or Agent credentials into a GPT.
+Configure API-key authentication as an HTTP Bearer credential. In a managed
+login, select the generated `webcodex-user-token` (`wc_pat_*`); it is for GPT
+Actions, MCP, and ordinary REST/project APIs. `webcodex-runner-token`
+(`wc_agent_*`) is an Agent transport credential and is accepted only by Agent
+transport endpoints. Do not paste it, a bootstrap/admin token, or an account
+credential into a GPT. The server continues to return 403 when an Agent token
+is used on a project/runtime endpoint.
 
 ## Canonical Hosted Operations
 
@@ -156,6 +171,10 @@ webcodex task accept <task-id>
 This keeps the acceptance authority local even when the model is hosted.
 
 ## Common Errors
+
+- An authentication error after copying a `wc_agent_*` value means the wrong
+  credential type was selected. Use the generated `webcodex-user-token`
+  instead; never paste complete token values into logs or bug reports.
 
 - `project_not_configured`: run `webcodex setup`.
 - `project_registration_invalid` / `project_credential_invalid`: resolve the

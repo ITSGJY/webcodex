@@ -3,10 +3,10 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::system::discover_named_binary_absolute;
+use crate::ServiceScope;
 
 pub(crate) const SERVER_SERVICE_FILE: &str = "/etc/systemd/system/webcodex.service";
 pub(crate) const SERVER_SERVICE_UNIT: &str = "webcodex.service";
-pub(crate) const AGENT_SERVICE_FILE: &str = "/etc/systemd/system/webcodex-runner.service";
 pub(crate) const AGENT_SERVICE_UNIT: &str = "webcodex-runner.service";
 pub(crate) const DEFAULT_LOG_LINES: u32 = 200;
 
@@ -240,6 +240,32 @@ fn systemctl_invocation(
     }
 }
 
+fn invocation_for_scope(scope: ServiceScope, invocation: &ProcessInvocation) -> ProcessInvocation {
+    let mut invocation = invocation.clone();
+    if scope == ServiceScope::User {
+        invocation.args.insert(0, "--user".to_string());
+        invocation.operation = invocation
+            .operation
+            .replacen("systemctl", "systemctl --user", 1);
+        invocation.operation = invocation
+            .operation
+            .replacen("journalctl", "journalctl --user", 1);
+    }
+    invocation
+}
+
+struct ScopedProcessExecutor<'a, E> {
+    inner: &'a mut E,
+    scope: ServiceScope,
+}
+
+impl<E: ProcessExecutor> ProcessExecutor for ScopedProcessExecutor<'_, E> {
+    fn execute(&mut self, invocation: &ProcessInvocation) -> Result<ProcessOutput, String> {
+        self.inner
+            .execute(&invocation_for_scope(self.scope, invocation))
+    }
+}
+
 pub(crate) fn plan_install(systemctl: &Path, unit: &str, no_start: bool) -> Vec<ProcessInvocation> {
     let mut enable_args = vec!["enable".to_string()];
     if !no_start {
@@ -266,6 +292,19 @@ pub(crate) fn plan_install(systemctl: &Path, unit: &str, no_start: bool) -> Vec<
             Some(unit),
         ),
     ]
+}
+
+#[cfg(test)]
+pub(crate) fn plan_install_for_scope(
+    scope: ServiceScope,
+    systemctl: &Path,
+    unit: &str,
+    no_start: bool,
+) -> Vec<ProcessInvocation> {
+    plan_install(systemctl, unit, no_start)
+        .iter()
+        .map(|invocation| invocation_for_scope(scope, invocation))
+        .collect()
 }
 
 pub(crate) fn plan_control(
@@ -295,6 +334,19 @@ pub(crate) fn plan_control(
     plan
 }
 
+#[cfg(test)]
+pub(crate) fn plan_control_for_scope(
+    scope: ServiceScope,
+    systemctl: &Path,
+    unit: &str,
+    control: ServiceControl,
+) -> Vec<ProcessInvocation> {
+    plan_control(systemctl, unit, control)
+        .iter()
+        .map(|invocation| invocation_for_scope(scope, invocation))
+        .collect()
+}
+
 pub(crate) fn plan_uninstall_before_remove(systemctl: &Path, unit: &str) -> Vec<ProcessInvocation> {
     vec![
         systemctl_invocation(
@@ -312,6 +364,18 @@ pub(crate) fn plan_uninstall_before_remove(systemctl: &Path, unit: &str) -> Vec<
     ]
 }
 
+#[cfg(test)]
+pub(crate) fn plan_uninstall_before_remove_for_scope(
+    scope: ServiceScope,
+    systemctl: &Path,
+    unit: &str,
+) -> Vec<ProcessInvocation> {
+    plan_uninstall_before_remove(systemctl, unit)
+        .iter()
+        .map(|invocation| invocation_for_scope(scope, invocation))
+        .collect()
+}
+
 pub(crate) fn plan_uninstall_after_remove(systemctl: &Path, unit: &str) -> Vec<ProcessInvocation> {
     vec![
         systemctl_invocation(
@@ -327,6 +391,18 @@ pub(crate) fn plan_uninstall_after_remove(systemctl: &Path, unit: &str) -> Vec<P
             Some(unit),
         ),
     ]
+}
+
+#[cfg(test)]
+pub(crate) fn plan_uninstall_after_remove_for_scope(
+    scope: ServiceScope,
+    systemctl: &Path,
+    unit: &str,
+) -> Vec<ProcessInvocation> {
+    plan_uninstall_after_remove(systemctl, unit)
+        .iter()
+        .map(|invocation| invocation_for_scope(scope, invocation))
+        .collect()
 }
 
 pub(crate) fn journalctl_invocation(
@@ -357,6 +433,39 @@ pub(crate) fn journalctl_invocation(
         unit: Some(unit.to_string()),
         inherit_stdio: follow,
     }
+}
+
+#[cfg(test)]
+pub(crate) fn journalctl_invocation_for_scope(
+    scope: ServiceScope,
+    journalctl: &Path,
+    unit: &str,
+    lines: u32,
+    since: Option<&str>,
+    follow: bool,
+) -> ProcessInvocation {
+    invocation_for_scope(
+        scope,
+        &journalctl_invocation(journalctl, unit, lines, since, follow),
+    )
+}
+
+pub(crate) fn ensure_service_file_parent(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| format!("{} must have a parent directory", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    let metadata = std::fs::symlink_metadata(parent)
+        .map_err(|error| format!("failed to inspect {}: {error}", parent.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "refusing to use non-directory or symlinked service unit directory: {}",
+            parent.display()
+        ));
+    }
+    Ok(())
 }
 
 fn failure_detail(output: &ProcessOutput) -> String {
@@ -861,6 +970,31 @@ pub(crate) fn install_unit_with_executor<E: ProcessExecutor>(
     })
 }
 
+pub(crate) fn install_unit_with_executor_for_scope<E: ProcessExecutor>(
+    scope: ServiceScope,
+    executor: &mut E,
+    systemctl: &Path,
+    service_file: &Path,
+    unit: &str,
+    content: &str,
+    overwrite: bool,
+    no_start: bool,
+) -> Result<InstallUnitResult, String> {
+    let mut executor = ScopedProcessExecutor {
+        inner: executor,
+        scope,
+    };
+    install_unit_with_executor(
+        &mut executor,
+        systemctl,
+        service_file,
+        unit,
+        content,
+        overwrite,
+        no_start,
+    )
+}
+
 pub(crate) fn control_service_with_executor<E: ProcessExecutor>(
     executor: &mut E,
     systemctl: &Path,
@@ -868,6 +1002,20 @@ pub(crate) fn control_service_with_executor<E: ProcessExecutor>(
     control: ServiceControl,
 ) -> Result<(), String> {
     execute_plan(executor, &plan_control(systemctl, unit, control))
+}
+
+pub(crate) fn control_service_with_executor_for_scope<E: ProcessExecutor>(
+    scope: ServiceScope,
+    executor: &mut E,
+    systemctl: &Path,
+    unit: &str,
+    control: ServiceControl,
+) -> Result<(), String> {
+    let mut executor = ScopedProcessExecutor {
+        inner: executor,
+        scope,
+    };
+    control_service_with_executor(&mut executor, systemctl, unit, control)
 }
 
 fn missing_unit_failure(output: &ProcessOutput) -> bool {
@@ -930,6 +1078,20 @@ pub(crate) fn uninstall_unit_with_executor<E: ProcessExecutor>(
     })
 }
 
+pub(crate) fn uninstall_unit_with_executor_for_scope<E: ProcessExecutor>(
+    scope: ServiceScope,
+    executor: &mut E,
+    systemctl: &Path,
+    service_file: &Path,
+    unit: &str,
+) -> Result<UninstallUnitResult, String> {
+    let mut executor = ScopedProcessExecutor {
+        inner: executor,
+        scope,
+    };
+    uninstall_unit_with_executor(&mut executor, systemctl, service_file, unit)
+}
+
 pub(crate) fn run_logs_with_executor<E: ProcessExecutor>(
     executor: &mut E,
     journalctl: &Path,
@@ -941,6 +1103,22 @@ pub(crate) fn run_logs_with_executor<E: ProcessExecutor>(
     let invocation = journalctl_invocation(journalctl, unit, lines, since, follow);
     let output = execute_required(executor, &invocation)?;
     Ok(output.stdout)
+}
+
+pub(crate) fn run_logs_with_executor_for_scope<E: ProcessExecutor>(
+    scope: ServiceScope,
+    executor: &mut E,
+    journalctl: &Path,
+    unit: &str,
+    lines: u32,
+    since: Option<&str>,
+    follow: bool,
+) -> Result<String, String> {
+    let mut executor = ScopedProcessExecutor {
+        inner: executor,
+        scope,
+    };
+    run_logs_with_executor(&mut executor, journalctl, unit, lines, since, follow)
 }
 
 pub(crate) fn install_unit(
@@ -964,10 +1142,43 @@ pub(crate) fn install_unit(
     )
 }
 
+pub(crate) fn install_unit_for_scope(
+    scope: ServiceScope,
+    service_file: &Path,
+    unit: &str,
+    content: &str,
+    overwrite: bool,
+    no_start: bool,
+) -> Result<InstallUnitResult, String> {
+    preflight_unit_path(service_file, overwrite)?;
+    let systemctl = systemctl_path()?;
+    let mut executor = RealProcessExecutor;
+    install_unit_with_executor_for_scope(
+        scope,
+        &mut executor,
+        &systemctl,
+        service_file,
+        unit,
+        content,
+        overwrite,
+        no_start,
+    )
+}
+
 pub(crate) fn control_service(unit: &str, control: ServiceControl) -> Result<(), String> {
     let systemctl = systemctl_path()?;
     let mut executor = RealProcessExecutor;
     control_service_with_executor(&mut executor, &systemctl, unit, control)
+}
+
+pub(crate) fn control_service_for_scope(
+    scope: ServiceScope,
+    unit: &str,
+    control: ServiceControl,
+) -> Result<(), String> {
+    let systemctl = systemctl_path()?;
+    let mut executor = RealProcessExecutor;
+    control_service_with_executor_for_scope(scope, &mut executor, &systemctl, unit, control)
 }
 
 pub(crate) fn uninstall_unit(
@@ -979,6 +1190,16 @@ pub(crate) fn uninstall_unit(
     uninstall_unit_with_executor(&mut executor, &systemctl, service_file, unit)
 }
 
+pub(crate) fn uninstall_unit_for_scope(
+    scope: ServiceScope,
+    service_file: &Path,
+    unit: &str,
+) -> Result<UninstallUnitResult, String> {
+    let systemctl = systemctl_path()?;
+    let mut executor = RealProcessExecutor;
+    uninstall_unit_with_executor_for_scope(scope, &mut executor, &systemctl, service_file, unit)
+}
+
 pub(crate) fn run_logs(
     unit: &str,
     lines: u32,
@@ -988,6 +1209,26 @@ pub(crate) fn run_logs(
     let journalctl = journalctl_path()?;
     let mut executor = RealProcessExecutor;
     run_logs_with_executor(&mut executor, &journalctl, unit, lines, since, follow)
+}
+
+pub(crate) fn run_logs_for_scope(
+    scope: ServiceScope,
+    unit: &str,
+    lines: u32,
+    since: Option<&str>,
+    follow: bool,
+) -> Result<String, String> {
+    let journalctl = journalctl_path()?;
+    let mut executor = RealProcessExecutor;
+    run_logs_with_executor_for_scope(
+        scope,
+        &mut executor,
+        &journalctl,
+        unit,
+        lines,
+        since,
+        follow,
+    )
 }
 
 pub(crate) fn run_internal_binary(path: &Path, args: &[String]) -> Result<i32, String> {
@@ -1025,6 +1266,27 @@ pub(crate) fn query_systemd_service_status(service_name: &str) -> SystemdStatus 
     }
 }
 
+pub(crate) fn query_systemd_service_status_for_scope(
+    scope: ServiceScope,
+    service_name: &str,
+) -> SystemdStatus {
+    let Ok(systemctl) = systemctl_path() else {
+        return SystemdStatus {
+            active: "unknown".to_string(),
+            enabled: "unknown".to_string(),
+        };
+    };
+    let mut executor = RealProcessExecutor;
+    let mut executor = ScopedProcessExecutor {
+        inner: &mut executor,
+        scope,
+    };
+    SystemdStatus {
+        active: query_status_output(&mut executor, &systemctl, service_name, "is-active"),
+        enabled: query_status_output(&mut executor, &systemctl, service_name, "is-enabled"),
+    }
+}
+
 pub(crate) fn query_systemd_status() -> SystemdStatus {
     query_systemd_service_status(SERVER_SERVICE_UNIT)
 }
@@ -1048,6 +1310,87 @@ mod tests {
             no_start[2].args,
             ["is-enabled", "--quiet", AGENT_SERVICE_UNIT]
         );
+    }
+
+    #[test]
+    fn user_scope_covers_install_status_control_logs_and_uninstall_manager_args() {
+        let systemctl = Path::new("/usr/bin/systemctl");
+        let journalctl = Path::new("/usr/bin/journalctl");
+        let unit = "webcodex-runner-work.service";
+
+        for invocation in plan_install_for_scope(ServiceScope::User, systemctl, unit, false) {
+            assert_eq!(invocation.args.first().map(String::as_str), Some("--user"));
+        }
+        for control in [
+            ServiceControl::Start,
+            ServiceControl::Stop,
+            ServiceControl::Restart,
+        ] {
+            for invocation in plan_control_for_scope(ServiceScope::User, systemctl, unit, control) {
+                assert_eq!(invocation.args.first().map(String::as_str), Some("--user"));
+            }
+        }
+        for invocation in
+            plan_uninstall_before_remove_for_scope(ServiceScope::User, systemctl, unit)
+                .into_iter()
+                .chain(plan_uninstall_after_remove_for_scope(
+                    ServiceScope::User,
+                    systemctl,
+                    unit,
+                ))
+        {
+            assert_eq!(invocation.args.first().map(String::as_str), Some("--user"));
+        }
+        let logs =
+            journalctl_invocation_for_scope(ServiceScope::User, journalctl, unit, 50, None, false);
+        assert_eq!(logs.args.first().map(String::as_str), Some("--user"));
+
+        let mut executor = FakeExecutor::with_outputs(vec![status("active")]);
+        let mut scoped = ScopedProcessExecutor {
+            inner: &mut executor,
+            scope: ServiceScope::User,
+        };
+        assert_eq!(
+            query_status_output(&mut scoped, systemctl, unit, "is-active"),
+            "active"
+        );
+        assert_eq!(executor.calls, [["--user", "is-active", unit]]);
+    }
+
+    #[test]
+    fn system_scope_never_adds_user_manager_flags() {
+        let systemctl = Path::new("/usr/bin/systemctl");
+        let unit = "webcodex-runner.service";
+        for invocation in plan_install_for_scope(ServiceScope::System, systemctl, unit, false)
+            .into_iter()
+            .chain(plan_control_for_scope(
+                ServiceScope::System,
+                systemctl,
+                unit,
+                ServiceControl::Restart,
+            ))
+            .chain(plan_uninstall_before_remove_for_scope(
+                ServiceScope::System,
+                systemctl,
+                unit,
+            ))
+            .chain(plan_uninstall_after_remove_for_scope(
+                ServiceScope::System,
+                systemctl,
+                unit,
+            ))
+        {
+            assert_ne!(invocation.args.first().map(String::as_str), Some("--user"));
+        }
+        let logs = journalctl_invocation_for_scope(
+            ServiceScope::System,
+            Path::new("/usr/bin/journalctl"),
+            unit,
+            50,
+            None,
+            false,
+        );
+        assert_ne!(logs.args.first().map(String::as_str), Some("--user"));
     }
 
     #[test]
@@ -1350,6 +1693,33 @@ mod tests {
         ] {
             assert!(validate_systemd_identity("User", value).is_err());
         }
+    }
+
+    #[test]
+    fn user_unit_parent_is_created_without_touching_systemd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service_file = tmp.path().join("xdg/systemd/user/webcodex-runner.service");
+        ensure_service_file_parent(&service_file).unwrap();
+        assert!(service_file.parent().unwrap().is_dir());
+        assert!(!service_file.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_unit_parent_rejects_a_symlinked_final_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let linked = tmp.path().join("user");
+        symlink(&target, &linked).unwrap();
+        let error =
+            ensure_service_file_parent(&linked.join("webcodex-runner.service")).unwrap_err();
+        assert!(
+            error.contains("symlinked service unit directory"),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]
