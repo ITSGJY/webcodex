@@ -703,10 +703,6 @@ require `capabilities.git_available=true`; a project such as
    `apply_patch`.
 4. **New files or intentional whole-file rewrite:** `write_project_file`. Not the
    default for ordinary local edits.
-5. **Compatibility tools** (`replace_line_range`, `insert_at_line`,
-   `delete_line_range`, `replace_in_file`, `replace_exact_block`,
-   `insert_before_pattern`, `insert_after_pattern`) remain supported for special
-   cases; prefer `apply_text_edits` for new workflows.
 
 ```json
 {"tool": "apply_text_edits", "params": {"project": "agent:workstation:my-repo", "changes": [{"kind": "edit", "path": "src/auth.rs", "expected_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "edits": [{"kind": "replace_exact", "old_text": "old", "new_text": "new"}]}]}}

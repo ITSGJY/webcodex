@@ -203,14 +203,24 @@ fn validate_file_request_rejects_invalid_read_requests() {
             "invalid line range",
         ),
         (
+            "old_text field on read",
+            |req| req.old_text = Some("old".to_string()),
+            "old_text is not supported for any file op",
+        ),
+        (
+            "pattern field on read",
+            |req| req.pattern = Some("needle".to_string()),
+            "pattern is not supported for any file op",
+        ),
+        (
             "line field on read",
             |req| req.line = Some(10),
-            "line is only allowed for op=insert_at_line",
+            "line is not supported for any file op",
         ),
         (
             "expected_prefix on read",
             |req| req.expected_prefix = Some("pub fn".to_string()),
-            "expected_prefix is only allowed for line edit ops",
+            "expected_prefix is only allowed for op=write",
         ),
     ];
 
@@ -224,7 +234,7 @@ fn validate_file_request_rejects_invalid_read_requests() {
 
 #[test]
 fn validate_file_request_allows_structured_edit_payload_ops() {
-    for op in ["replace_in_file", "write_project_file"] {
+    for op in ["write_project_file", "apply_text_edits"] {
         let mut req = file_request(op);
         req.content = Some(r#"{"path":"src/lib.rs"}"#.to_string());
 
@@ -1911,7 +1921,6 @@ async fn enqueue_file_op_allows_read_with_line_range() {
     assert_eq!(polled.path.as_deref(), Some("src/auth/scopes.rs"));
     assert_eq!(polled.start_line, Some(7));
     assert_eq!(polled.end_line, Some(12));
-    assert_eq!(polled.line, None);
 }
 
 #[tokio::test]

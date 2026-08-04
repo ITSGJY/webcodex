@@ -228,13 +228,6 @@ pub(super) fn validate_file_request(body: &ShellFileOpRequest) -> Result<(), Str
         | "write"
         | "list"
         | "project_overview"
-        | "replace_line_range"
-        | "insert_at_line"
-        | "delete_line_range"
-        | "replace_exact_block"
-        | "insert_before_pattern"
-        | "insert_after_pattern"
-        | "replace_in_file"
         | "write_project_file"
         | "apply_text_edits"
         | "save_project_artifact"
@@ -248,23 +241,12 @@ pub(super) fn validate_file_request(body: &ShellFileOpRequest) -> Result<(), Str
         | "checkpoint_restore" => {}
         _ => {
             return Err(
-                "op must be one of read, write, list, project_overview, replace_line_range, insert_at_line, delete_line_range, replace_exact_block, insert_before_pattern, insert_after_pattern, replace_in_file, write_project_file, apply_text_edits, save_project_artifact, read_project_artifact_metadata, read_project_artifact, artifact_upload_begin, artifact_upload_chunk, artifact_upload_finish, artifact_upload_abort, checkpoint_create, checkpoint_restore"
+                "op must be one of read, write, list, project_overview, write_project_file, apply_text_edits, save_project_artifact, read_project_artifact_metadata, read_project_artifact, artifact_upload_begin, artifact_upload_chunk, artifact_upload_finish, artifact_upload_abort, checkpoint_create, checkpoint_restore"
                     .to_string(),
             )
         }
     }
-    let line_edit = matches!(
-        body.op.as_str(),
-        "replace_line_range" | "insert_at_line" | "delete_line_range"
-    );
-    let replace_exact_block = body.op == "replace_exact_block";
-    let insert_pattern = matches!(
-        body.op.as_str(),
-        "insert_before_pattern" | "insert_after_pattern"
-    );
-    let anchor_edit = replace_exact_block || insert_pattern;
-    let structured_edit_payload =
-        matches!(body.op.as_str(), "replace_in_file" | "write_project_file");
+    let structured_edit_payload = body.op == "write_project_file";
     let artifact_payload = matches!(
         body.op.as_str(),
         "save_project_artifact"
@@ -300,15 +282,12 @@ pub(super) fn validate_file_request(body: &ShellFileOpRequest) -> Result<(), Str
     }
 
     validate_sha256(&body.expected_sha256)?;
-    if body.expected_sha256.is_some() && body.op != "write" && !line_edit && !replace_exact_block {
-        return Err(
-            "expected_sha256 is only allowed for op=write, replace_exact_block, or line edit ops"
-                .to_string(),
-        );
+    if body.expected_sha256.is_some() && body.op != "write" {
+        return Err("expected_sha256 is only allowed for op=write".to_string());
     }
     if let Some(prefix) = &body.expected_prefix {
-        if !line_edit {
-            return Err("expected_prefix is only allowed for line edit ops".to_string());
+        if body.op != "write" {
+            return Err("expected_prefix is only allowed for op=write".to_string());
         }
         if prefix.contains('\0') {
             return Err("expected_prefix cannot contain NUL bytes".to_string());
@@ -336,35 +315,22 @@ pub(super) fn validate_file_request(body: &ShellFileOpRequest) -> Result<(), Str
         }
         if body.op != "write"
             && body.op != "project_overview"
-            && body.op != "replace_line_range"
-            && body.op != "insert_at_line"
             && body.op != "apply_text_edits"
             && !structured_edit_payload
             && !artifact_payload
             && !checkpoint_payload
-            && !anchor_edit
         {
             return Err(
-                "content is only allowed for op=write, project_overview options, line edit insert/replace, apply_text_edits, structured edit tools, artifact tools, checkpoint tools, or anchor edit tools"
+                "content is only allowed for op=write, project_overview options, apply_text_edits, structured edit tools, artifact tools, or checkpoint tools"
                     .to_string(),
             );
         }
     }
-    if let Some(old_text) = &body.old_text {
-        if !replace_exact_block {
-            return Err("old_text is only allowed for op=replace_exact_block".to_string());
-        }
-        if old_text.contains('\0') {
-            return Err("old_text cannot contain NUL bytes".to_string());
-        }
+    if body.old_text.is_some() {
+        return Err("old_text is not supported for any file op".to_string());
     }
-    if let Some(pattern) = &body.pattern {
-        if !insert_pattern {
-            return Err("pattern is only allowed for insert pattern ops".to_string());
-        }
-        if pattern.contains('\0') {
-            return Err("pattern cannot contain NUL bytes".to_string());
-        }
+    if body.pattern.is_some() {
+        return Err("pattern is not supported for any file op".to_string());
     }
 
     if body.op == "write" && body.content.is_none() {
@@ -392,93 +358,10 @@ pub(super) fn validate_file_request(body: &ShellFileOpRequest) -> Result<(), Str
                 (None, None) => {}
             }
             if body.line.is_some() {
-                return Err("line is only allowed for op=insert_at_line".to_string());
+                return Err("line is not supported for any file op".to_string());
             }
         }
-        "replace_line_range" => {
-            let start = body
-                .start_line
-                .ok_or_else(|| "start_line is required for op=replace_line_range".to_string())?;
-            let end = body
-                .end_line
-                .ok_or_else(|| "end_line is required for op=replace_line_range".to_string())?;
-            if start == 0 || end < start {
-                return Err("invalid line range".to_string());
-            }
-            if body.line.is_some() {
-                return Err("line is only allowed for op=insert_at_line".to_string());
-            }
-            if body.content.is_none() {
-                return Err("content is required for op=replace_line_range".to_string());
-            }
-        }
-        "delete_line_range" => {
-            let start = body
-                .start_line
-                .ok_or_else(|| "start_line is required for op=delete_line_range".to_string())?;
-            let end = body
-                .end_line
-                .ok_or_else(|| "end_line is required for op=delete_line_range".to_string())?;
-            if start == 0 || end < start {
-                return Err("invalid line range".to_string());
-            }
-            if body.line.is_some() || body.content.is_some() {
-                return Err("delete_line_range only accepts start_line/end_line guards".to_string());
-            }
-        }
-        "insert_at_line" => {
-            let line = body
-                .line
-                .ok_or_else(|| "line is required for op=insert_at_line".to_string())?;
-            if line == 0 {
-                return Err("line out of range".to_string());
-            }
-            if body.start_line.is_some() || body.end_line.is_some() {
-                return Err(
-                    "start_line/end_line are only allowed for range line edit ops".to_string(),
-                );
-            }
-            if body.content.is_none() {
-                return Err("content is required for op=insert_at_line".to_string());
-            }
-        }
-        "replace_exact_block" => {
-            if body.old_text.as_deref().unwrap_or_default().is_empty() {
-                return Err("old_text is required for op=replace_exact_block".to_string());
-            }
-            if body.content.is_none() {
-                return Err("content is required for op=replace_exact_block".to_string());
-            }
-            if body.pattern.is_some()
-                || body.expected_prefix.is_some()
-                || body.start_line.is_some()
-                || body.end_line.is_some()
-                || body.line.is_some()
-            {
-                return Err(
-                    "replace_exact_block only accepts old_text/content/expected_sha256 guards"
-                        .to_string(),
-                );
-            }
-        }
-        "insert_before_pattern" | "insert_after_pattern" => {
-            if body.pattern.as_deref().unwrap_or_default().is_empty() {
-                return Err("pattern is required for insert pattern ops".to_string());
-            }
-            if body.content.as_deref().unwrap_or_default().is_empty() {
-                return Err("content is required for insert pattern ops".to_string());
-            }
-            if body.old_text.is_some()
-                || body.expected_sha256.is_some()
-                || body.expected_prefix.is_some()
-                || body.start_line.is_some()
-                || body.end_line.is_some()
-                || body.line.is_some()
-            {
-                return Err("insert pattern ops only accept pattern/content".to_string());
-            }
-        }
-        "replace_in_file" | "write_project_file" => {
+        "write_project_file" => {
             if body.content.is_none() {
                 return Err(format!("content is required for op={}", body.op));
             }
@@ -540,11 +423,12 @@ pub(super) fn validate_file_request(body: &ShellFileOpRequest) -> Result<(), Str
                 || body.start_line.is_some()
                 || body.end_line.is_some()
                 || body.line.is_some()
+                || body.old_text.is_some()
+                || body.pattern.is_some()
             {
-                return Err("line edit fields are only allowed for line edit ops".to_string());
-            }
-            if body.old_text.is_some() || body.pattern.is_some() {
-                return Err("anchor edit fields are only allowed for anchor edit ops".to_string());
+                return Err(
+                    "line/range/anchor edit fields are not supported for this file op".to_string(),
+                );
             }
         }
     }

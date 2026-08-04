@@ -768,13 +768,13 @@ fn cleanup_output_schemas_describe_result_metadata_only() {
 }
 
 #[test]
-fn compatibility_edit_output_schemas_include_metadata_fields() {
+fn write_project_file_output_schema_include_metadata_fields() {
     let specs = registered_tool_specs();
 
-    // `replace_in_file` is ModelHidden (canonical apply_text_edits covers it):
-    // no public ToolSpec/output schema. Its back-compat metadata safety is
-    // covered by implementation-level tests. Only the visible whole-file
-    // write tool's metadata schema is asserted here.
+    // The removed legacy edit tools (`replace_in_file` and friends) are no
+    // longer known tools, so they have no public ToolSpec/output schema.
+    // Only the visible whole-file write tool's metadata schema is asserted
+    // here.
 
     for field in [
         "path",

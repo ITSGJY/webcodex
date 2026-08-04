@@ -879,7 +879,6 @@ fn openapi_dedicated_project_action_schemas_include_optional_session_id() {
         "DeleteProjectFilesRequest",
         "GitRestorePathsRequest",
         "DiscardUntrackedRequest",
-        "ReplaceInFileRequest",
         "StartProjectShellJobRequest",
         "ListProjectFilesRequest",
     ] {
@@ -1293,7 +1292,6 @@ fn openapi_runtime_only_tools_do_not_get_dedicated_paths() {
         "/api/projects/workspace_checkpoint_restore",
         "/api/projects/workspace_checkpoint_delete",
         "/api/projects/project_overview",
-        "/api/projects/replace_in_file",
         "/api/projects/write_file",
     ] {
         assert!(
@@ -1305,11 +1303,12 @@ fn openapi_runtime_only_tools_do_not_get_dedicated_paths() {
 }
 
 #[test]
-fn openapi_operation_count_is_twenty_five_after_demoting_compatibility_edits() {
+fn openapi_operation_count_is_twenty_five_after_retiring_legacy_edits() {
     // Phase 3 promoted 10 core runtime tools to dedicated GPT Actions,
     // then later phases promoted run_job plus project onboarding actions.
-    // Compatibility edit tools are now runtime-only again, so the current
-    // GPT Action count is 25 after removing legacy `/api/codex/*` routes.
+    // The single-purpose legacy edit tools are retired, while retained editing
+    // tools stay on the generic runtime surface. The current GPT Action count
+    // is 25 after removing legacy `/api/codex/*` routes.
     // The surface must stay <= 30.
     let spec = build_openapi_spec();
     let count: usize = spec["paths"]
@@ -1320,7 +1319,7 @@ fn openapi_operation_count_is_twenty_five_after_demoting_compatibility_edits() {
         .sum();
     assert_eq!(
         count, 25,
-        "GPT Actions schema must be 25 operations after demoting compatibility edits"
+        "GPT Actions schema must be 25 operations after retiring legacy edits"
     );
     assert!(count <= 30, "GPT Actions schema must stay <= 30 operations");
 }
@@ -1413,9 +1412,10 @@ fn openapi_artifact_upload_tools_remain_generic_and_under_action_limit() {
 }
 
 #[test]
-fn openapi_compatibility_edit_tools_remain_runtime_only() {
-    // Compatibility edit tools remain reachable via callRuntimeTool / MCP
-    // tools/call, but should not be promoted to dedicated GPT Actions.
+fn openapi_retained_edit_tools_remain_runtime_only() {
+    // Retained edit tools (write_project_file) remain reachable via
+    // callRuntimeTool / MCP tools/call, but should not be promoted to
+    // dedicated GPT Actions. The removed legacy edit tools are absent.
     let spec = build_openapi_spec();
     let paths = spec["paths"].as_object().unwrap();
     assert!(
@@ -1424,7 +1424,7 @@ fn openapi_compatibility_edit_tools_remain_runtime_only() {
     );
     assert!(
         !paths.contains_key("/api/projects/replace_in_file"),
-        "replace_in_file must remain runtime-only through callRuntimeTool"
+        "replace_in_file must not have a dedicated path"
     );
     assert!(
         paths.contains_key("/api/projects/run_job"),
@@ -1439,10 +1439,6 @@ fn openapi_compatibility_edit_tools_remain_runtime_only() {
         "write_file must stay in the forbidden guard"
     );
     assert!(
-        LEGACY_FORBIDDEN_PATHS.contains(&"/api/projects/replace_in_file"),
-        "replace_in_file must stay in the forbidden guard"
-    );
-    assert!(
         !LEGACY_FORBIDDEN_PATHS.contains(&"/api/projects/run_job"),
         "run_job must not be in the forbidden guard now that it is a dedicated action"
     );
@@ -1450,19 +1446,17 @@ fn openapi_compatibility_edit_tools_remain_runtime_only() {
         [TOOL_CALL_TOOL_FIELD]["description"]
         .as_str()
         .unwrap();
-    for tool in ["write_project_file"] {
+    for tool in ["write_project_file", "apply_text_edits"] {
         assert!(
             tool_desc.contains(tool),
             "callRuntimeTool must document runtime tool {tool}"
         );
     }
-    // `replace_in_file` is ModelHidden (canonical apply_text_edits covers
-    // it): still dispatched for back-compat via callRuntimeTool and still
-    // gated by LEGACY_FORBIDDEN_PATHS, but no longer documented in the
-    // model-facing ToolCallRequest description.
+    // `replace_in_file` was removed entirely, so it is neither documented in
+    // the model-facing ToolCallRequest description nor a known tool.
     assert!(
         !tool_desc.contains("replace_in_file"),
-        "callRuntimeTool must not document the ModelHidden replace_in_file tool"
+        "callRuntimeTool must not document the removed replace_in_file tool"
     );
 }
 

@@ -60,11 +60,11 @@ pub(crate) fn public_url() -> String {
 /// 5. job inspection (`listRuntimeJobs`, `getRuntimeJobTail`)
 /// 6. advanced/generic entry point (`callRuntimeTool`)
 ///
-/// Compatibility edit tools (line/pattern helpers, raw `apply_patch`, and
-/// whole-file write) remain runtime tools reachable through `callRuntimeTool`.
-/// Prefer `apply_text_edits` for guarded transactional file changes and
-/// `apply_patch_checked` for complex unified diffs; use `write_project_file`
-/// only for an intentional full rewrite.
+/// Edit tools reachable through `callRuntimeTool` are `apply_text_edits`
+/// (guarded transactional file changes), `apply_patch_checked` (complex checked
+/// unified diff), `write_project_file` (intentional full rewrite), and the
+/// lower-level raw `apply_patch`. The legacy line/pattern edit tools were
+/// removed entirely.
 #[cfg(test)]
 const GPT_ACTION_OPS: &[&str] = &[
     "listRuntimeTools",
@@ -124,16 +124,18 @@ const LEGACY_FORBIDDEN_PATHS: &[&str] = &[
     "/api/shell/jobs/stop",
     "/api/jobs/stop",
     "/api/shell/jobs/list",
-    // Compatibility edit tools remain runtime-only. They are reachable through
-    // callRuntimeTool / MCP tools/call, but must not be promoted to dedicated
-    // GPT Actions.
-    "/api/projects/replace_in_file",
-    "/api/projects/write_file",
     "/api/shell/agent/register",
     "/api/shell/agent/poll",
     "/api/shell/agent/result",
     "/api/shell/agent/persistent_shell_result",
     "/api/shell/agent/job_update",
+    // Retained whole-file write tool stays runtime-only through
+    // callRuntimeTool / MCP tools/call; it must not be promoted to a
+    // dedicated GPT Action. The legacy single-purpose edit tools
+    // (replace_in_file, replace_exact_block, insert_before_pattern,
+    // insert_after_pattern, replace_line_range, insert_at_line,
+    // delete_line_range) were removed entirely, so they have no paths.
+    "/api/projects/write_file",
     "/api/audit/sessions",
     "/api/audit/session",
     "/api/audit/stats",
@@ -494,7 +496,7 @@ pub(crate) fn build_openapi_spec() -> Value {
                 "post": operation_with_examples(
                     "applyProjectPatch",
                     "Apply a patch to a project",
-                    "Applies a unified diff patch to an agent-registered project through the owning agent. Mutation with side effects; requires Bearer auth and the agent shell capability. Use after inspecting files and validating the patch; for targeted edits prefer structured line edit tools via callRuntimeTool.",
+                    "Applies a unified diff patch to an agent-registered project through the owning agent. Mutation with side effects; requires Bearer auth and the agent shell capability. Use after inspecting files and validating the patch; for targeted edits prefer apply_text_edits via callRuntimeTool.",
                     "ApplyPatchRequest",
                     "ToolResult",
                     json!({
@@ -1524,42 +1526,6 @@ fn schemas() -> Value {
                 "session_id": {
                     "type": "string",
                     "description": SESSION_ID_FIELD_DESCRIPTION
-                }
-            }
-        },
-        "ReplaceInFileRequest": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["project", "path", "old", "new"],
-            "description": "Replace a unique substring in a project file. Mutation with side effects; routes to the owning agent. Fails without writing when `old` is missing or ambiguous.",
-            "properties": {
-                "project": {
-                    "type": "string",
-                    "description": "Agent-registered runtime project id from listProjects, such as `agent:<client_id>:<project_id>`."
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Project-relative file path. Absolute paths and traversal (..) are rejected."
-                },
-                "old": {
-                    "type": "string",
-                    "description": "Non-empty substring to replace. The call fails without writing when it is missing or ambiguous (unless allow_multiple/expected_replacements permit more)."
-                },
-                "new": {
-                    "type": "string",
-                    "description": "Replacement string. May be empty to delete the match."
-                },
-                "session_id": {
-                    "type": "string",
-                    "description": SESSION_ID_FIELD_DESCRIPTION
-                },
-                "expected_replacements": {
-                    "type": "integer",
-                    "description": "Optional expected number of replacements. Defaults to 1. The call fails if the actual count differs."
-                },
-                "allow_multiple": {
-                    "type": "boolean",
-                    "description": "Optional. When true, allows more than one replacement. Defaults to false."
                 }
             }
         },

@@ -3182,118 +3182,24 @@ async fn write_project_file_rejects_invalid_input_before_agent_dispatch() {
     assert!(result.error.unwrap().contains("expected_sha256"));
 }
 
-#[tokio::test]
-async fn replace_in_file_rejects_server_configured_project() {
-    // A server-configured (local) project is not an agent-registered
-    // runtime surface; replace_in_file must refuse it.
-    let tmp = tempfile::tempdir().unwrap();
-    let runtime = runtime_with_local_project(tmp.path(), "demo");
-    std::fs::write(tmp.path().join("EDIT_PROBE.txt"), "hello").unwrap();
-    let result = runtime
-        .dispatch_with_auth(
-            ToolCall::ReplaceInFile {
-                project: "demo".to_string(),
-                path: "EDIT_PROBE.txt".to_string(),
-                old: "hello".to_string(),
-                new: "world".to_string(),
-                session_id: None,
-                expected_replacements: None,
-                allow_multiple: None,
-            },
-            None,
-        )
-        .await;
-    assert!(!result.success);
-    let err = result.error.unwrap();
-    assert!(
-        err.contains("agent-registered") || err.contains("unknown_project"),
-        "should reject server-configured project: {}",
-        err
-    );
-    // File must be unchanged — the server never wrote it.
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join("EDIT_PROBE.txt")).unwrap(),
-        "hello"
-    );
-}
-
-#[tokio::test]
-async fn replace_in_file_routes_to_owning_agent_file_op() {
-    let runtime = runtime_with_agent_project("editor");
-    let mut caps = ShellClientCapabilities::default();
-    caps.file_write = true;
-    register_agent(&runtime, "editor", None, caps).await;
-    let project = agent_test_project_id("editor");
-
-    let runtime_for_task = runtime.clone();
-    let project_for_task = project.clone();
-    let task = tokio::spawn(async move {
-        runtime_for_task
-            .replace_in_file(
-                project_for_task,
-                "EDIT_PROBE.txt".to_string(),
-                "foo".to_string(),
-                "bar".to_string(),
-                None,
-                None,
-            )
-            .await
-    });
-
-    // Drain requests until the helper run arrives.
-    let mut req = None;
-    for _ in 0..20 {
-        req = runtime
-            .shell_clients
-            .poll(ShellAgentPollRequest {
-                client_id: "editor".to_string(),
-                agent_instance_id: "inst".to_string(),
-                projects: None,
-            })
-            .await
-            .unwrap();
-        if req.is_some() {
-            break;
-        }
-        tokio::task::yield_now().await;
+#[test]
+fn removed_legacy_edit_tools_are_rejected_as_unknown() {
+    // The 7 legacy edit tools are no longer known ToolDefinitions, so any
+    // dispatch attempt resolves to the standard unknown-tool rejection before
+    // any project or file-op work. This replaces the old back-compat dispatch
+    // tests for these tools.
+    for name in [
+        "replace_in_file",
+        "replace_exact_block",
+        "insert_before_pattern",
+        "insert_after_pattern",
+        "replace_line_range",
+        "insert_at_line",
+        "delete_line_range",
+    ] {
+        let err = ToolCall::from_tool_name(name, json!({})).unwrap_err();
+        assert!(err.contains("unknown tool"), "{name}: {err}");
     }
-    let req = req.expect("replace_in_file should enqueue a file-op request for the agent");
-    assert_eq!(req.kind, "file_replace_in_file");
-    assert!(req.command.is_empty());
-    assert!(req.stdin.is_none());
-    // old/new/path travel in the native file-op content payload.
-    let payload = req.content.as_deref().expect("file-op payload");
-    assert!(payload.contains("EDIT_PROBE.txt"));
-    assert!(payload.contains("foo"));
-    assert!(payload.contains("bar"));
-    assert!(payload.contains("\"expected_replacements\":1"));
-    assert!(payload.contains("\"allow_multiple\":false"));
-    // The agent (server side) never reads the agent fs: respond with a
-    // canned JSON result that the runtime forwards verbatim.
-    runtime
-        .shell_clients
-        .complete(ShellAgentResultRequest {
-            client_id: "editor".to_string(),
-            agent_instance_id: "inst".to_string(),
-            request_id: req.request_id,
-            exit_code: Some(0),
-            stdout: Some(
-                "{\"changed\":true,\"path\":\"EDIT_PROBE.txt\",\"replacements\":1,\
-                     \"before_sha256\":\"b\",\"after_sha256\":\"a\",\"bytes_written\":3}"
-                    .to_string(),
-            ),
-            stderr: Some(String::new()),
-            duration_ms: Some(1),
-            error: None,
-        })
-        .await
-        .unwrap();
-
-    let result = task.await.unwrap();
-    assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["changed"], true);
-    assert_eq!(result.output["replacements"], 1);
-    assert_eq!(result.output["path"], "EDIT_PROBE.txt");
 }
 
 #[test]

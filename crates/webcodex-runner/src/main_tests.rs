@@ -318,6 +318,7 @@ fn reload_toml(
     strategy: &str,
     claude_enabled: bool,
     claude_command: &str,
+    search_mapping: &str,
 ) -> String {
     let max_jobs = max_jobs
         .map(|value| format!("max_concurrent_jobs = {value}\n"))
@@ -341,6 +342,8 @@ tool_providers.claude_code.enabled = {claude_enabled}
 tool_providers.claude_code.command = "{claude_command}"
 tool_providers.claude_code.args = ["mcp", "serve"]
 tool_providers.claude_code.timeout_secs = 30
+[tool_providers.claude_code.mapping]
+search_project_text = "{search_mapping}"
 "#
     )
 }
@@ -350,7 +353,17 @@ fn reload_fixture() -> (tempfile::TempDir, PathBuf, ReloadableAgentConfig) {
     let path = tmp.path().join("agent.toml");
     std::fs::write(
         &path,
-        reload_toml("oe", None, 60, 1024, "sh", "native", false, "claude"),
+        reload_toml(
+            "oe",
+            None,
+            60,
+            1024,
+            "sh",
+            "native",
+            false,
+            "claude",
+            "project_search_generation_1",
+        ),
     )
     .unwrap();
     let runtime = ReloadableAgentConfig::new(load_config(&path).unwrap(), path.clone());
@@ -393,6 +406,15 @@ fn valid_reload_switches_one_complete_generation_and_preserves_old_snapshot() {
     let (_tmp, path, runtime) = reload_fixture();
     let old = runtime.snapshot();
 
+    assert_eq!(
+        old.external_tools.configured_search_tool_name(),
+        Some("project_search_generation_1")
+    );
+    assert_eq!(
+        old.external_tools.status().claude_code.process_state,
+        "not_started"
+    );
+
     std::fs::write(
         &path,
         reload_toml(
@@ -404,6 +426,7 @@ fn valid_reload_switches_one_complete_generation_and_preserves_old_snapshot() {
             "claude_code_then_native",
             false,
             "claude",
+            "project_search_generation_2",
         ),
     )
     .unwrap();
@@ -423,6 +446,10 @@ fn valid_reload_switches_one_complete_generation_and_preserves_old_snapshot() {
     );
     assert_eq!(old.external_tools.status().strategy, "native");
     assert_eq!(
+        old.external_tools.configured_search_tool_name(),
+        Some("project_search_generation_1")
+    );
+    assert_eq!(
         (
             new.policy.max_timeout_secs,
             new.policy.max_output_bytes,
@@ -433,6 +460,14 @@ fn valid_reload_switches_one_complete_generation_and_preserves_old_snapshot() {
     assert_eq!(
         new.external_tools.status().strategy,
         "claude_code_then_native"
+    );
+    assert_eq!(
+        new.external_tools.configured_search_tool_name(),
+        Some("project_search_generation_2")
+    );
+    assert_eq!(
+        new.external_tools.status().claude_code.process_state,
+        "not_started"
     );
 }
 
@@ -452,11 +487,31 @@ fn failed_reload_keeps_generation_and_can_recover() {
     for (candidate, code) in [
         ("{ invalid toml".to_string(), "config_parse_failed"),
         (
-            reload_toml("oe", None, 60, 1024, "", "native", false, "claude"),
+            reload_toml(
+                "oe",
+                None,
+                60,
+                1024,
+                "",
+                "native",
+                false,
+                "claude",
+                "project_search_generation_1",
+            ),
             "config_validation_failed",
         ),
         (
-            reload_toml("oe", None, 60, 1024, "sh", "native", true, ""),
+            reload_toml(
+                "oe",
+                None,
+                60,
+                1024,
+                "sh",
+                "native",
+                true,
+                "",
+                "project_search_generation_1",
+            ),
             "provider_config_invalid",
         ),
     ] {
@@ -473,7 +528,17 @@ fn failed_reload_keeps_generation_and_can_recover() {
 
     std::fs::write(
         &path,
-        reload_toml("oe", None, 90, 1024, "sh", "native", false, "claude"),
+        reload_toml(
+            "oe",
+            None,
+            90,
+            1024,
+            "sh",
+            "native",
+            false,
+            "claude",
+            "project_search_generation_2",
+        ),
     )
     .unwrap();
     assert_eq!(runtime.reload().generation, 2);
@@ -494,6 +559,7 @@ fn mixed_reload_applies_hot_fields_and_reports_static_restart_fields() {
             "native",
             false,
             "claude",
+            "project_search_generation_2",
         ),
     )
     .unwrap();
@@ -1626,13 +1692,10 @@ fn shell_job_request(cwd: &Path, command: &str) -> ShellAgentShellRequest {
         path: None,
         content: None,
         max_bytes: None,
-        old_text: None,
-        pattern: None,
         expected_sha256: None,
         expected_prefix: None,
         start_line: None,
         end_line: None,
-        line: None,
         create_dirs: false,
         command: command.to_string(),
         stdin: None,
@@ -1672,86 +1735,6 @@ fn wait_for_job_stdout(rx: &mut tokio::sync::mpsc::Receiver<AgentEnvelope>) -> S
     panic!("timed out waiting for job completion; stdout so far: {stdout:?}");
 }
 
-fn line_edit_request(
-    cwd: &Path,
-    kind: &str,
-    path: &str,
-    content: Option<&str>,
-    start_line: Option<usize>,
-    end_line: Option<usize>,
-    line: Option<usize>,
-    expected_sha256: Option<String>,
-    expected_prefix: Option<&str>,
-) -> ShellAgentShellRequest {
-    ShellAgentShellRequest {
-        request_id: format!("req-{kind}"),
-        client_id: "agent-1".to_string(),
-        kind: kind.to_string(),
-        job_id: None,
-        cwd: Some(cwd.to_string_lossy().to_string()),
-        path: Some(path.to_string()),
-        content: content.map(str::to_string),
-        max_bytes: None,
-        old_text: None,
-        pattern: None,
-        expected_sha256,
-        expected_prefix: expected_prefix.map(str::to_string),
-        start_line,
-        end_line,
-        line,
-        create_dirs: false,
-        command: String::new(),
-        stdin: None,
-        timeout_secs: 30,
-        requested_by: "tester".to_string(),
-        created_at: 0,
-        validation: None,
-        lsp: None,
-        sandbox: None,
-        job_context: None,
-        persistent_shell: None,
-    }
-}
-
-fn anchor_edit_request(
-    cwd: &Path,
-    kind: &str,
-    path: &str,
-    old_text: Option<&str>,
-    pattern: Option<&str>,
-    content: Option<&str>,
-    expected_sha256: Option<String>,
-) -> ShellAgentShellRequest {
-    ShellAgentShellRequest {
-        request_id: format!("req-{kind}"),
-        client_id: "agent-1".to_string(),
-        kind: kind.to_string(),
-        job_id: None,
-        cwd: Some(cwd.to_string_lossy().to_string()),
-        path: Some(path.to_string()),
-        content: content.map(str::to_string),
-        max_bytes: None,
-        old_text: old_text.map(str::to_string),
-        pattern: pattern.map(str::to_string),
-        expected_sha256,
-        expected_prefix: None,
-        start_line: None,
-        end_line: None,
-        line: None,
-        create_dirs: false,
-        command: String::new(),
-        stdin: None,
-        timeout_secs: 30,
-        requested_by: "tester".to_string(),
-        created_at: 0,
-        validation: None,
-        lsp: None,
-        sandbox: None,
-        job_context: None,
-        persistent_shell: None,
-    }
-}
-
 fn file_read_request(
     cwd: &Path,
     path: &str,
@@ -1768,13 +1751,10 @@ fn file_read_request(
         path: Some(path.to_string()),
         content: None,
         max_bytes,
-        old_text: None,
-        pattern: None,
         expected_sha256: None,
         expected_prefix: None,
         start_line,
         end_line,
-        line: None,
         create_dirs: false,
         command: String::new(),
         stdin: None,
@@ -2034,339 +2014,6 @@ fn agent_file_read_range_errors_never_include_absolute_path() {
     );
 }
 
-#[test]
-fn replace_exact_block_replaces_single_block() {
-    let tmp = tempfile::tempdir().unwrap();
-    let policy = project_policy(tmp.path());
-    let file = tmp.path().join("anchor.txt");
-    std::fs::write(&file, "alpha\nold block\nomega\n").unwrap();
-
-    let out = line_edit_json(handle_file_request(
-        &policy,
-        &anchor_edit_request(
-            tmp.path(),
-            "file_replace_exact_block",
-            "anchor.txt",
-            Some("old block\n"),
-            None,
-            Some("new block\n"),
-            None,
-        ),
-    ));
-    assert_eq!(out["changed"], true);
-    assert_eq!(out["matches_replaced"], 1);
-    assert_eq!(out["bytes_before"], "alpha\nold block\nomega\n".len());
-    assert_eq!(out["bytes_after"], "alpha\nnew block\nomega\n".len());
-    assert_eq!(
-        std::fs::read_to_string(&file).unwrap(),
-        "alpha\nnew block\nomega\n"
-    );
-}
-
-#[test]
-fn replace_exact_block_accepts_matching_whole_file_sha256_guard() {
-    let tmp = tempfile::tempdir().unwrap();
-    let policy = project_policy(tmp.path());
-    let file = tmp.path().join("anchor.txt");
-    let original = "alpha\nold block\nomega\n";
-    std::fs::write(&file, original).unwrap();
-    let whole_file_sha256 = sha256_hex_bytes(original.as_bytes());
-
-    let out = line_edit_json(handle_file_request(
-        &policy,
-        &anchor_edit_request(
-            tmp.path(),
-            "file_replace_exact_block",
-            "anchor.txt",
-            Some("old block\n"),
-            None,
-            Some("new block\n"),
-            Some(whole_file_sha256),
-        ),
-    ));
-    assert_eq!(out["changed"], true);
-    assert_eq!(out["matches_replaced"], 1);
-    assert_ne!(
-        out.get("error").and_then(|v| v.as_str()),
-        Some("expected_old_sha256 mismatch")
-    );
-    assert_eq!(
-        std::fs::read_to_string(&file).unwrap(),
-        "alpha\nnew block\nomega\n"
-    );
-}
-
-#[test]
-fn replace_exact_block_rejects_mismatched_whole_file_sha256_guard() {
-    let tmp = tempfile::tempdir().unwrap();
-    let policy = project_policy(tmp.path());
-    let file = tmp.path().join("anchor.txt");
-    let original = "alpha\nold block\nomega\n";
-    std::fs::write(&file, original).unwrap();
-
-    let out = line_edit_json(handle_file_request(
-        &policy,
-        &anchor_edit_request(
-            tmp.path(),
-            "file_replace_exact_block",
-            "anchor.txt",
-            Some("old block\n"),
-            None,
-            Some("new block\n"),
-            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string()),
-        ),
-    ));
-    assert_eq!(out["changed"], false);
-    let err = out["error"].as_str().unwrap();
-    assert!(err.contains("expected_old_sha256 mismatch"));
-    assert!(err.contains("No files were modified"));
-    assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
-}
-
-#[test]
-fn replace_exact_block_rejects_missing_old_text_without_write() {
-    let tmp = tempfile::tempdir().unwrap();
-    let policy = project_policy(tmp.path());
-    let file = tmp.path().join("anchor.txt");
-    std::fs::write(&file, "alpha\nomega\n").unwrap();
-
-    let out = line_edit_json(handle_file_request(
-        &policy,
-        &anchor_edit_request(
-            tmp.path(),
-            "file_replace_exact_block",
-            "anchor.txt",
-            Some("missing"),
-            None,
-            Some("new"),
-            None,
-        ),
-    ));
-    let err = out["error"].as_str().unwrap();
-    assert!(err.contains("Rejected before write"));
-    assert!(err.contains("No files were modified"));
-    assert!(err.contains("Retry guidance"));
-    assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\nomega\n");
-}
-
-#[test]
-fn replace_exact_block_rejects_multiple_matches_without_write() {
-    let tmp = tempfile::tempdir().unwrap();
-    let policy = project_policy(tmp.path());
-    let file = tmp.path().join("anchor.txt");
-    std::fs::write(&file, "dup\ndup\n").unwrap();
-
-    let out = line_edit_json(handle_file_request(
-        &policy,
-        &anchor_edit_request(
-            tmp.path(),
-            "file_replace_exact_block",
-            "anchor.txt",
-            Some("dup"),
-            None,
-            Some("x"),
-            None,
-        ),
-    ));
-    let err = out["error"].as_str().unwrap();
-    assert!(err.contains("Rejected before write"));
-    assert!(err.contains("expected exactly one match"));
-    assert_eq!(std::fs::read_to_string(&file).unwrap(), "dup\ndup\n");
-}
-
-#[test]
-fn replace_exact_block_rejects_empty_old_text() {
-    let tmp = tempfile::tempdir().unwrap();
-    let policy = project_policy(tmp.path());
-    std::fs::write(tmp.path().join("anchor.txt"), "alpha\n").unwrap();
-
-    let out = line_edit_json(handle_file_request(
-        &policy,
-        &anchor_edit_request(
-            tmp.path(),
-            "file_replace_exact_block",
-            "anchor.txt",
-            Some(""),
-            None,
-            Some("x"),
-            None,
-        ),
-    ));
-    assert!(out["error"]
-        .as_str()
-        .unwrap()
-        .contains("old_text must be non-empty"));
-}
-
-#[test]
-fn replace_exact_block_rejects_non_utf8_file() {
-    let tmp = tempfile::tempdir().unwrap();
-    let policy = project_policy(tmp.path());
-    let file = tmp.path().join("binary.bin");
-    std::fs::write(&file, [0xff, 0xfe, 0xfd]).unwrap();
-
-    let out = line_edit_json(handle_file_request(
-        &policy,
-        &anchor_edit_request(
-            tmp.path(),
-            "file_replace_exact_block",
-            "binary.bin",
-            Some("old"),
-            None,
-            Some("new"),
-            None,
-        ),
-    ));
-    assert!(out["error"].as_str().unwrap().contains("not valid UTF-8"));
-    assert_eq!(std::fs::read(&file).unwrap(), vec![0xff, 0xfe, 0xfd]);
-}
-
-#[test]
-fn insert_before_pattern_inserts_before_single_literal_match() {
-    let tmp = tempfile::tempdir().unwrap();
-    let policy = project_policy(tmp.path());
-    let file = tmp.path().join("anchor.txt");
-    std::fs::write(&file, "alpha\nomega\n").unwrap();
-
-    let out = line_edit_json(handle_file_request(
-        &policy,
-        &anchor_edit_request(
-            tmp.path(),
-            "file_insert_before_pattern",
-            "anchor.txt",
-            None,
-            Some("omega"),
-            Some("before\n"),
-            None,
-        ),
-    ));
-    assert_eq!(out["pattern_matches"], 1);
-    assert_eq!(
-        std::fs::read_to_string(&file).unwrap(),
-        "alpha\nbefore\nomega\n"
-    );
-}
-
-#[test]
-fn insert_after_pattern_inserts_after_single_literal_match() {
-    let tmp = tempfile::tempdir().unwrap();
-    let policy = project_policy(tmp.path());
-    let file = tmp.path().join("anchor.txt");
-    std::fs::write(&file, "alpha\nomega\n").unwrap();
-
-    let out = line_edit_json(handle_file_request(
-        &policy,
-        &anchor_edit_request(
-            tmp.path(),
-            "file_insert_after_pattern",
-            "anchor.txt",
-            None,
-            Some("alpha"),
-            Some("-after"),
-            None,
-        ),
-    ));
-    assert_eq!(out["pattern_matches"], 1);
-    assert_eq!(
-        std::fs::read_to_string(&file).unwrap(),
-        "alpha-after\nomega\n"
-    );
-}
-
-#[test]
-fn insert_pattern_rejects_missing_pattern_without_write() {
-    let tmp = tempfile::tempdir().unwrap();
-    let policy = project_policy(tmp.path());
-    let file = tmp.path().join("anchor.txt");
-    std::fs::write(&file, "alpha\n").unwrap();
-
-    let out = line_edit_json(handle_file_request(
-        &policy,
-        &anchor_edit_request(
-            tmp.path(),
-            "file_insert_before_pattern",
-            "anchor.txt",
-            None,
-            Some("missing"),
-            Some("x"),
-            None,
-        ),
-    ));
-    let err = out["error"].as_str().unwrap();
-    assert!(err.contains("Rejected before write"));
-    assert!(err.contains("No files were modified"));
-    assert!(err.contains("Retry guidance"));
-    assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\n");
-}
-
-#[test]
-fn insert_pattern_rejects_multiple_matches_without_write() {
-    let tmp = tempfile::tempdir().unwrap();
-    let policy = project_policy(tmp.path());
-    let file = tmp.path().join("anchor.txt");
-    std::fs::write(&file, "x-x-x").unwrap();
-
-    let out = line_edit_json(handle_file_request(
-        &policy,
-        &anchor_edit_request(
-            tmp.path(),
-            "file_insert_after_pattern",
-            "anchor.txt",
-            None,
-            Some("x"),
-            Some("!"),
-            None,
-        ),
-    ));
-    let err = out["error"].as_str().unwrap();
-    assert!(err.contains("expected exactly one match"));
-    assert_eq!(std::fs::read_to_string(&file).unwrap(), "x-x-x");
-}
-
-#[test]
-fn insert_pattern_rejects_empty_pattern() {
-    let tmp = tempfile::tempdir().unwrap();
-    let policy = project_policy(tmp.path());
-    std::fs::write(tmp.path().join("anchor.txt"), "alpha\n").unwrap();
-
-    let out = line_edit_json(handle_file_request(
-        &policy,
-        &anchor_edit_request(
-            tmp.path(),
-            "file_insert_before_pattern",
-            "anchor.txt",
-            None,
-            Some(""),
-            Some("x"),
-            None,
-        ),
-    ));
-    assert!(out["error"].as_str().unwrap().contains("literal pattern"));
-}
-
-#[test]
-fn insert_pattern_rejects_empty_text() {
-    let tmp = tempfile::tempdir().unwrap();
-    let policy = project_policy(tmp.path());
-    std::fs::write(tmp.path().join("anchor.txt"), "alpha\n").unwrap();
-
-    let out = line_edit_json(handle_file_request(
-        &policy,
-        &anchor_edit_request(
-            tmp.path(),
-            "file_insert_after_pattern",
-            "anchor.txt",
-            None,
-            Some("alpha"),
-            Some(""),
-            None,
-        ),
-    ));
-    let err = out["error"].as_str().unwrap();
-    assert!(err.contains("inserted text must not be empty"));
-    assert!(err.contains("Retry guidance"));
-}
-
 fn apply_text_edits_request(
     cwd: &Path,
     path: &str,
@@ -2399,13 +2046,10 @@ fn apply_text_edits_request(
         path: Some(path.to_string()),
         content: Some(payload.to_string()),
         max_bytes: None,
-        old_text: None,
-        pattern: None,
         expected_sha256: None,
         expected_prefix: None,
         start_line: None,
         end_line: None,
-        line: None,
         create_dirs: false,
         command: String::new(),
         stdin: None,
@@ -2435,13 +2079,10 @@ fn json_file_op_request(
         path: Some(path.to_string()),
         content: Some(payload.to_string()),
         max_bytes: None,
-        old_text: None,
-        pattern: None,
         expected_sha256: None,
         expected_prefix: None,
         start_line: None,
         end_line: None,
-        line: None,
         create_dirs: false,
         command: String::new(),
         stdin: None,
@@ -3508,159 +3149,6 @@ fn file_project_artifact_ops_reject_symlink_escape() {
 }
 
 #[test]
-fn file_replace_in_file_replaces_multiple_when_expected_count_matches() {
-    let tmp = tempfile::tempdir().unwrap();
-    let policy = project_policy(tmp.path());
-    let file = tmp.path().join("target.txt");
-    std::fs::write(&file, "a a a").unwrap();
-
-    let out = line_edit_json(handle_file_request(
-        &policy,
-        &json_file_op_request(
-            tmp.path(),
-            "file_replace_in_file",
-            "target.txt",
-            serde_json::json!({
-                "path": "target.txt",
-                "old": "a",
-                "new": "b",
-                "expected_replacements": 3,
-                "allow_multiple": true,
-            }),
-        ),
-    ));
-
-    assert_eq!(out["changed"], true);
-    assert_eq!(out["replacements"], 3);
-    assert_eq!(out["before_sha256"].as_str().unwrap().len(), 64);
-    assert_eq!(out["after_sha256"].as_str().unwrap().len(), 64);
-    assert_eq!(out["bytes_written"], "b b b".len());
-    assert_eq!(std::fs::read_to_string(&file).unwrap(), "b b b");
-}
-
-#[test]
-fn file_replace_in_file_rejects_missing_and_ambiguous_without_write() {
-    let tmp = tempfile::tempdir().unwrap();
-    let policy = project_policy(tmp.path());
-    let missing_file = tmp.path().join("missing.txt");
-    let dup_file = tmp.path().join("dup.txt");
-    std::fs::write(&missing_file, "hello world").unwrap();
-    std::fs::write(&dup_file, "a a a").unwrap();
-
-    let missing = line_edit_json(handle_file_request(
-        &policy,
-        &json_file_op_request(
-            tmp.path(),
-            "file_replace_in_file",
-            "missing.txt",
-            serde_json::json!({
-                "old": "absent",
-                "new": "x",
-                "expected_replacements": 1,
-                "allow_multiple": false,
-            }),
-        ),
-    ));
-    assert_eq!(missing["changed"], false);
-    assert!(missing["error"].as_str().unwrap().contains("not found"));
-    assert_eq!(
-        std::fs::read_to_string(&missing_file).unwrap(),
-        "hello world"
-    );
-
-    let ambiguous = line_edit_json(handle_file_request(
-        &policy,
-        &json_file_op_request(
-            tmp.path(),
-            "file_replace_in_file",
-            "dup.txt",
-            serde_json::json!({
-                "old": "a",
-                "new": "b",
-                "expected_replacements": 1,
-                "allow_multiple": false,
-            }),
-        ),
-    ));
-    assert_eq!(ambiguous["changed"], false);
-    assert!(ambiguous["error"].as_str().unwrap().contains("multiple"));
-    assert_eq!(std::fs::read_to_string(&dup_file).unwrap(), "a a a");
-}
-
-#[test]
-fn file_replace_in_file_rejects_count_mismatch_and_non_utf8_without_write() {
-    let tmp = tempfile::tempdir().unwrap();
-    let policy = project_policy(tmp.path());
-    let count_file = tmp.path().join("count.txt");
-    let bin_file = tmp.path().join("bin.dat");
-    std::fs::write(&count_file, "a a a").unwrap();
-    std::fs::write(&bin_file, [0xFF, 0xFE, 0xFD]).unwrap();
-
-    let count = line_edit_json(handle_file_request(
-        &policy,
-        &json_file_op_request(
-            tmp.path(),
-            "file_replace_in_file",
-            "count.txt",
-            serde_json::json!({
-                "old": "a",
-                "new": "b",
-                "expected_replacements": 2,
-                "allow_multiple": true,
-            }),
-        ),
-    ));
-    assert_eq!(count["changed"], false);
-    assert_eq!(count["occurrences"], 3);
-    assert!(count["error"].as_str().unwrap().contains("mismatch"));
-    assert_eq!(std::fs::read_to_string(&count_file).unwrap(), "a a a");
-
-    let non_utf8 = line_edit_json(handle_file_request(
-        &policy,
-        &json_file_op_request(
-            tmp.path(),
-            "file_replace_in_file",
-            "bin.dat",
-            serde_json::json!({
-                "old": "x",
-                "new": "y",
-                "expected_replacements": 1,
-                "allow_multiple": false,
-            }),
-        ),
-    ));
-    assert_eq!(non_utf8["changed"], false);
-    assert!(non_utf8["error"].as_str().unwrap().contains("UTF-8"));
-}
-
-#[test]
-fn file_replace_in_file_rejects_string_allow_multiple() {
-    let tmp = tempfile::tempdir().unwrap();
-    let policy = project_policy(tmp.path());
-    let file = tmp.path().join("target.txt");
-    std::fs::write(&file, "a a a").unwrap();
-
-    let out = line_edit_json(handle_file_request(
-        &policy,
-        &json_file_op_request(
-            tmp.path(),
-            "file_replace_in_file",
-            "target.txt",
-            serde_json::json!({
-                "old": "a",
-                "new": "b",
-                "expected_replacements": 3,
-                "allow_multiple": "false",
-            }),
-        ),
-    ));
-
-    assert_eq!(out["changed"], false);
-    assert_eq!(out["error"], "allow_multiple must be a boolean");
-    assert_eq!(std::fs::read_to_string(&file).unwrap(), "a a a");
-}
-
-#[test]
 fn file_write_project_file_creates_parent_dirs_and_reports_hash() {
     let tmp = tempfile::tempdir().unwrap();
     let policy = project_policy(tmp.path());
@@ -4190,228 +3678,6 @@ fn file_apply_text_edits_rejects_overlapping_edits() {
     assert!(err.contains("No files were modified"));
     assert_eq!(out["changed"], false);
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "abcdef\n");
-}
-
-#[test]
-fn agent_native_line_edit_replace_insert_delete_happy_paths() {
-    let tmp = tempfile::tempdir().unwrap();
-    let policy = project_policy(tmp.path());
-    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-    let file = tmp.path().join("src/example.rs");
-    std::fs::write(&file, "one\ntwo\nthree\nfour\n").unwrap();
-
-    let out = line_edit_json(handle_file_request(
-        &policy,
-        &line_edit_request(
-            tmp.path(),
-            "file_replace_line_range",
-            "src/example.rs",
-            Some("TWO\nTHREE"),
-            Some(2),
-            Some(3),
-            None,
-            None,
-            None,
-        ),
-    ));
-    assert_eq!(out["changed"], true);
-    assert_eq!(out["start_line"], 2);
-    assert_eq!(out["end_line"], 3);
-    assert_eq!(
-        std::fs::read_to_string(&file).unwrap(),
-        "one\nTWO\nTHREE\nfour\n"
-    );
-
-    let out = line_edit_json(handle_file_request(
-        &policy,
-        &line_edit_request(
-            tmp.path(),
-            "file_insert_at_line",
-            "src/example.rs",
-            Some("middle"),
-            None,
-            None,
-            Some(2),
-            None,
-            None,
-        ),
-    ));
-    assert_eq!(out["changed"], true);
-    assert_eq!(out["line"], 2);
-    assert_eq!(
-        std::fs::read_to_string(&file).unwrap(),
-        "one\nmiddle\nTWO\nTHREE\nfour\n"
-    );
-
-    let out = line_edit_json(handle_file_request(
-        &policy,
-        &line_edit_request(
-            tmp.path(),
-            "file_delete_line_range",
-            "src/example.rs",
-            None,
-            Some(2),
-            Some(3),
-            None,
-            None,
-            None,
-        ),
-    ));
-    assert_eq!(out["changed"], true);
-    assert_eq!(out["old_line_count"], 2);
-    assert_eq!(out["new_line_count"], 0);
-    assert_eq!(
-        std::fs::read_to_string(&file).unwrap(),
-        "one\nTHREE\nfour\n"
-    );
-}
-
-#[test]
-fn agent_native_line_edit_guards_reject_without_writing() {
-    let tmp = tempfile::tempdir().unwrap();
-    let policy = project_policy(tmp.path());
-    let file = tmp.path().join("example.rs");
-    std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
-
-    let out = line_edit_json(handle_file_request(
-        &policy,
-        &line_edit_request(
-            tmp.path(),
-            "file_replace_line_range",
-            "example.rs",
-            Some("TWO"),
-            Some(2),
-            Some(2),
-            None,
-            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string()),
-            None,
-        ),
-    ));
-    assert_eq!(out["changed"], false);
-    assert_eq!(out["error"], "expected_old_sha256 mismatch");
-    assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\ntwo\nthree\n");
-
-    let anchor = sha256_hex_bytes("two\n".as_bytes());
-    let out = line_edit_json(handle_file_request(
-        &policy,
-        &line_edit_request(
-            tmp.path(),
-            "file_insert_at_line",
-            "example.rs",
-            Some("middle"),
-            None,
-            None,
-            Some(2),
-            Some(anchor),
-            Some("three"),
-        ),
-    ));
-    assert_eq!(out["changed"], false);
-    assert_eq!(out["error"], "expected_anchor_prefix mismatch");
-    assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\ntwo\nthree\n");
-}
-
-#[test]
-fn agent_native_line_edit_rejects_ranges_utf8_sensitive_and_escape() {
-    let tmp = tempfile::tempdir().unwrap();
-    let policy = project_policy(tmp.path());
-    std::fs::write(tmp.path().join("example.rs"), "one\ntwo\n").unwrap();
-
-    let out = line_edit_json(handle_file_request(
-        &policy,
-        &line_edit_request(
-            tmp.path(),
-            "file_delete_line_range",
-            "example.rs",
-            None,
-            Some(2),
-            Some(3),
-            None,
-            None,
-            None,
-        ),
-    ));
-    assert_eq!(out["changed"], false);
-    assert_eq!(out["error"], "invalid line range");
-
-    let out = line_edit_json(handle_file_request(
-        &policy,
-        &line_edit_request(
-            tmp.path(),
-            "file_insert_at_line",
-            "example.rs",
-            Some("three"),
-            None,
-            None,
-            Some(3),
-            None,
-            None,
-        ),
-    ));
-    assert_eq!(out["changed"], true);
-    assert_eq!(out["old_line_count"], 0);
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join("example.rs")).unwrap(),
-        "one\ntwo\nthree\n"
-    );
-
-    std::fs::write(tmp.path().join("bad.bin"), [0xff, 0xfe]).unwrap();
-    let out = line_edit_json(handle_file_request(
-        &policy,
-        &line_edit_request(
-            tmp.path(),
-            "file_replace_line_range",
-            "bad.bin",
-            Some("ok"),
-            Some(1),
-            Some(1),
-            None,
-            None,
-            None,
-        ),
-    ));
-    assert_eq!(out["changed"], false);
-    assert_eq!(out["error"], "file is not valid UTF-8");
-
-    let sensitive = handle_file_request(
-        &policy,
-        &line_edit_request(
-            tmp.path(),
-            "file_replace_line_range",
-            ".env",
-            Some("SECRET=2"),
-            Some(1),
-            Some(1),
-            None,
-            None,
-            None,
-        ),
-    );
-    assert!(sensitive
-        .error
-        .as_deref()
-        .unwrap_or_default()
-        .contains("sensitive"));
-
-    let escaped = handle_file_request(
-        &policy,
-        &line_edit_request(
-            tmp.path(),
-            "file_replace_line_range",
-            "../outside.txt",
-            Some("x"),
-            Some(1),
-            Some(1),
-            None,
-            None,
-            None,
-        ),
-    );
-    assert!(escaped
-        .error
-        .as_deref()
-        .unwrap_or_default()
-        .contains("escape"));
 }
 
 #[test]
@@ -5494,13 +4760,10 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
         path: None,
         content: None,
         max_bytes: None,
-        old_text: None,
-        pattern: None,
         expected_sha256: None,
         expected_prefix: None,
         start_line: None,
         end_line: None,
-        line: None,
         create_dirs: false,
         command: ": > queued-started".to_string(),
         stdin: None,
@@ -5573,22 +4836,33 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
 }
 
 #[test]
-fn file_request_kind_includes_anchor_edit_ops() {
+fn file_request_kind_includes_edit_and_basic_ops() {
     for kind in [
         "file_read",
         "file_write",
         "file_list",
         "file_project_overview",
+        "file_write_project_file",
+        "file_apply_text_edits",
+    ] {
+        assert!(
+            is_file_request_kind(kind),
+            "{kind} should route to file handler"
+        );
+    }
+    // Removed legacy edit request kinds no longer route to the file handler.
+    for kind in [
         "file_replace_line_range",
         "file_insert_at_line",
         "file_delete_line_range",
         "file_replace_exact_block",
         "file_insert_before_pattern",
         "file_insert_after_pattern",
+        "file_replace_in_file",
     ] {
         assert!(
-            is_file_request_kind(kind),
-            "{kind} should route to file handler"
+            !is_file_request_kind(kind),
+            "{kind} must no longer be a file request kind"
         );
     }
     assert!(!is_file_request_kind("run_shell"));
@@ -5621,29 +4895,32 @@ fn project_overview_agent_request_returns_metadata_without_contents() {
 }
 
 #[test]
-fn dispatch_request_anchor_edit_routes_to_file_handler() {
+fn dispatch_request_edit_routes_to_file_handler() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = test_config(tmp.path().join("config/projects.d"));
     let cwd = tmp.path().to_string_lossy().to_string();
-    std::fs::write(tmp.path().join("anchor.txt"), "old block\n").unwrap();
     let (sink, mut rx) = ws_sink("ws-client");
     let jobs = JobManager::new(max_concurrent_jobs(&cfg));
     let request = ShellAgentShellRequest {
-        request_id: "req-anchor".to_string(),
+        request_id: "req-edit".to_string(),
         client_id: "ws-client".to_string(),
-        kind: "file_replace_exact_block".to_string(),
+        kind: "file_write_project_file".to_string(),
         job_id: None,
         cwd: Some(cwd),
-        path: Some("anchor.txt".to_string()),
-        content: Some("new block\n".to_string()),
+        path: Some("new.txt".to_string()),
+        content: Some(
+            serde_json::json!({
+                "path": "new.txt",
+                "content": "new content\n",
+                "overwrite": false,
+            })
+            .to_string(),
+        ),
         max_bytes: None,
-        old_text: Some("old block\n".to_string()),
-        pattern: None,
         expected_sha256: None,
         expected_prefix: None,
         start_line: None,
         end_line: None,
-        line: None,
         create_dirs: false,
         command: String::new(),
         stdin: None,
@@ -5678,16 +4955,102 @@ fn dispatch_request_anchor_edit_routes_to_file_handler() {
     let env = rx.try_recv().expect("result envelope was sent");
     match env {
         AgentEnvelope::Result { payload } => {
-            assert_eq!(payload.request_id, "req-anchor");
+            assert_eq!(payload.request_id, "req-edit");
             assert_eq!(payload.exit_code, Some(0));
             let stdout = payload.stdout.expect("file handler returns JSON stdout");
-            assert!(stdout.contains("\"changed\":true"), "stdout was {stdout}");
+            assert!(stdout.contains("\"created\":true"), "stdout was {stdout}");
             assert_eq!(
-                std::fs::read_to_string(tmp.path().join("anchor.txt")).unwrap(),
-                "new block\n"
+                std::fs::read_to_string(tmp.path().join("new.txt")).unwrap(),
+                "new content\n"
             );
         }
         other => panic!("expected result, got {:?}", other.kind()),
+    }
+}
+
+#[test]
+fn dispatch_request_rejects_unsupported_file_kinds_without_starting_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let jobs = JobManager::new(max_concurrent_jobs(&cfg));
+    let pdir = projects_dir(&cfg);
+    let hot = runtime_config(&cfg);
+    let persistent_shells = webcodex_runner::PersistentShellManager::new(
+        &cfg.shell,
+        webcodex_runner::SshConnectionPool::default(),
+    );
+    let kinds = [
+        "file_replace_line_range",
+        "file_insert_at_line",
+        "file_delete_line_range",
+        "file_replace_exact_block",
+        "file_insert_before_pattern",
+        "file_insert_after_pattern",
+        "file_replace_in_file",
+        "file_future_unknown_operation",
+    ];
+
+    for (index, kind) in kinds.into_iter().enumerate() {
+        let marker_name = format!("unsupported-file-marker-{index}");
+        let target_name = format!("unsupported-file-target-{index}.txt");
+        let marker = tmp.path().join(&marker_name);
+        let target = tmp.path().join(&target_name);
+        std::fs::write(&target, "original\n").unwrap();
+        let command = format!(
+            "printf shell-ran > {marker_name}; printf modified > {target_name}; printf shell-stdout"
+        );
+        let request: ShellAgentShellRequest = serde_json::from_value(serde_json::json!({
+            "request_id": format!("req-unsupported-file-{index}"),
+            "client_id": "ws-client",
+            "kind": kind,
+            "cwd": tmp.path().to_string_lossy(),
+            "path": target_name,
+            "content": "replacement",
+            "command": command,
+            "old_text": "old",
+            "pattern": "needle",
+            "line": 10,
+            "timeout_secs": 10,
+            "requested_by": "tester",
+            "created_at": 0,
+        }))
+        .unwrap();
+        let (sink, mut rx) = ws_sink("ws-client");
+
+        let ran = dispatch_request(
+            &sink,
+            &hot.snapshot(),
+            &hot,
+            &jobs,
+            &persistent_shells,
+            &pdir,
+            &webcodex_runner::LspSupervisor::default(),
+            request,
+        )
+        .unwrap();
+
+        assert!(ran, "{kind}");
+        let env = rx.try_recv().expect("result envelope was sent");
+        match env {
+            AgentEnvelope::Result { payload } => {
+                assert_eq!(payload.exit_code, None, "{kind}");
+                assert_eq!(payload.stdout, None, "{kind}");
+                assert_eq!(
+                    payload.error.as_deref(),
+                    Some(
+                        "unsupported_file_request_kind: unsupported file request kind; command was not started"
+                    ),
+                    "{kind}"
+                );
+            }
+            other => panic!("{kind}: expected result, got {:?}", other.kind()),
+        }
+        assert!(!marker.exists(), "{kind}: shell marker was created");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "original\n",
+            "{kind}: target file was modified"
+        );
     }
 }
 
@@ -5723,13 +5086,10 @@ fn dispatch_request_run_shell_sends_result_over_sink() {
             path: None,
             content: None,
             max_bytes: None,
-            old_text: None,
-            pattern: None,
             expected_sha256: None,
             expected_prefix: None,
             start_line: None,
             end_line: None,
-            line: None,
             create_dirs: false,
             command: cmd.to_string(),
             stdin: None,
@@ -5787,13 +5147,10 @@ fn project_request(kind: &str, payload: serde_json::Value) -> ShellAgentShellReq
         path: None,
         content: None,
         max_bytes: None,
-        old_text: None,
-        pattern: None,
         expected_sha256: None,
         expected_prefix: None,
         start_line: None,
         end_line: None,
-        line: None,
         create_dirs: false,
         command: String::new(),
         stdin: Some(payload.to_string()),

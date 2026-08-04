@@ -393,26 +393,6 @@ fn required_agent_capability_matches_metadata_risk_table() {
         // Read-only dry run, but implemented through the agent shell path.
         ("validate_patch", ToolRisk::ReadOnly, AgentCapability::Shell),
         (
-            "replace_in_file",
-            ToolRisk::ProjectWrite,
-            AgentCapability::FileWrite,
-        ),
-        (
-            "replace_exact_block",
-            ToolRisk::ProjectWrite,
-            AgentCapability::FileWrite,
-        ),
-        (
-            "insert_before_pattern",
-            ToolRisk::ProjectWrite,
-            AgentCapability::FileWrite,
-        ),
-        (
-            "insert_after_pattern",
-            ToolRisk::ProjectWrite,
-            AgentCapability::FileWrite,
-        ),
-        (
             "write_project_file",
             ToolRisk::ProjectWrite,
             AgentCapability::FileWrite,
@@ -449,21 +429,6 @@ fn required_agent_capability_matches_metadata_risk_table() {
         ),
         (
             "artifact_upload_abort",
-            ToolRisk::ProjectWrite,
-            AgentCapability::FileWrite,
-        ),
-        (
-            "replace_line_range",
-            ToolRisk::ProjectWrite,
-            AgentCapability::FileWrite,
-        ),
-        (
-            "insert_at_line",
-            ToolRisk::ProjectWrite,
-            AgentCapability::FileWrite,
-        ),
-        (
-            "delete_line_range",
             ToolRisk::ProjectWrite,
             AgentCapability::FileWrite,
         ),

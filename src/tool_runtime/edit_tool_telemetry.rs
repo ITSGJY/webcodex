@@ -1,7 +1,9 @@
 //! Edit tool usage telemetry (phase 1).
 //!
 //! Emits always-on structured logs for edit-surface tool calls so operators can
-//! measure whether models prefer canonical edit tools over compatibility paths.
+//! measure how often the canonical edit tools (`apply_text_edits`,
+//! `apply_patch_checked`) are used relative to the advanced whole-file/raw-patch
+//! paths (`write_project_file`, `apply_patch`).
 //!
 //! Design constraints:
 //! - No new database tables, Action Audit columns, session ledger fields, or
@@ -26,8 +28,6 @@ pub(crate) enum EditToolSurface {
     Canonical,
     /// Valid but non-preferred specialized paths (whole-file write, raw patch).
     Advanced,
-    /// Retained for existing workflows; prefer canonical for new work.
-    Compatibility,
 }
 
 impl EditToolSurface {
@@ -35,7 +35,6 @@ impl EditToolSurface {
         match self {
             Self::Canonical => "canonical",
             Self::Advanced => "advanced",
-            Self::Compatibility => "compatibility",
         }
     }
 }
@@ -46,13 +45,6 @@ pub(crate) fn edit_tool_surface(tool_name: &str) -> Option<EditToolSurface> {
     match tool_name {
         "apply_text_edits" | "apply_patch_checked" => Some(EditToolSurface::Canonical),
         "write_project_file" | "apply_patch" => Some(EditToolSurface::Advanced),
-        "replace_in_file"
-        | "replace_exact_block"
-        | "insert_before_pattern"
-        | "insert_after_pattern"
-        | "replace_line_range"
-        | "insert_at_line"
-        | "delete_line_range" => Some(EditToolSurface::Compatibility),
         _ => None,
     }
 }
@@ -251,7 +243,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn classifies_canonical_advanced_and_compatibility_edit_tools() {
+    fn classifies_canonical_and_advanced_edit_tools() {
         assert_eq!(
             edit_tool_surface("apply_text_edits"),
             Some(EditToolSurface::Canonical)
@@ -268,6 +260,7 @@ mod tests {
             edit_tool_surface("apply_patch"),
             Some(EditToolSurface::Advanced)
         );
+        // Removed legacy compatibility tools are no longer classified.
         for name in [
             "replace_in_file",
             "replace_exact_block",
@@ -277,11 +270,7 @@ mod tests {
             "insert_at_line",
             "delete_line_range",
         ] {
-            assert_eq!(
-                edit_tool_surface(name),
-                Some(EditToolSurface::Compatibility),
-                "{name}"
-            );
+            assert_eq!(edit_tool_surface(name), None, "{name}");
         }
     }
 
@@ -303,17 +292,17 @@ mod tests {
     #[test]
     fn telemetry_record_has_no_sensitive_fields() {
         let record = EditToolUsageRecord {
-            tool_name: "replace_in_file",
+            tool_name: "write_project_file",
             category: TELEMETRY_CATEGORY_EDIT,
-            edit_surface: EditToolSurface::Compatibility,
+            edit_surface: EditToolSurface::Advanced,
             success: false,
             duration_ms: 12,
             error_kind: Some("runtime_error"),
         };
         assert!(!record_contains_sensitive_keys(&record));
         assert_eq!(record.category, "edit");
-        assert_eq!(record.edit_surface.as_str(), "compatibility");
-        assert_eq!(record.tool_name, "replace_in_file");
+        assert_eq!(record.edit_surface.as_str(), "advanced");
+        assert_eq!(record.tool_name, "write_project_file");
     }
 
     #[test]
@@ -362,13 +351,13 @@ mod tests {
     fn incomplete_drop_emits_failure_once() {
         clear_test_edit_tool_usage();
         {
-            let _guard = start_edit_tool_usage("replace_in_file").expect("edit tool");
+            let _guard = start_edit_tool_usage("write_project_file").expect("edit tool");
             // drop without finish
         }
         let events = take_test_edit_tool_usage();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].tool_name, "replace_in_file");
-        assert_eq!(events[0].edit_surface, EditToolSurface::Compatibility);
+        assert_eq!(events[0].tool_name, "write_project_file");
+        assert_eq!(events[0].edit_surface, EditToolSurface::Advanced);
         assert!(!events[0].success);
         assert_eq!(events[0].error_kind, Some("incomplete"));
     }

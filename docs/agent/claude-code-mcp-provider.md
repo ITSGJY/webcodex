@@ -1,8 +1,8 @@
 # Claude Code MCP provider (experimental)
 
-`webcodex-runner` can use `claude mcp serve` for two allowlisted, single-call
-capabilities while WebCodex remains the online MCP/API, authorization, session,
-project, permission, timeout, and audit boundary.
+`webcodex-runner` can use `claude mcp serve` for one allowlisted, single-call
+search capability while WebCodex remains the online MCP/API, authorization,
+session, project, permission, timeout, and audit boundary.
 
 This provider is experimental, disabled by default, and not recommended for
 ordinary deployments. Native execution is the default strategy. Enable the
@@ -20,36 +20,41 @@ args = ["mcp", "serve"]
 timeout_secs = 30
 
 [tool_providers.claude_code.mapping]
-edit_file = "Edit"
+search_project_text = "project_search"
 ```
 
-The mapping values are explicit examples, not built-in assumptions. Configure
-`search_project_text` only after a probe confirms that the installed Claude Code
-version exposes a schema-compatible search tool; otherwise leave it unmapped so
-`claude_code_then_native` uses bounded Native `rg`/`grep`. On every project
-process start the provider performs MCP `initialize`, sends
-`notifications/initialized`, and calls `tools/list`. A capability is available
-only when its configured tool name is present and the discovered input schema
-contains all fields required by the adapter. Use the names exposed by the
-installed Claude Code version.
+The only allowlisted capability in ordinary configured provider routing is
+`search_project_text`. The mapping value is an explicit example, not a built-in
+assumption. Configure it only after a probe confirms that the installed Claude
+Code version exposes a schema-compatible search tool; otherwise leave it
+unmapped so `claude_code_then_native` uses bounded Native `rg`/`grep`. On every
+project process start the provider performs MCP `initialize`, sends
+`notifications/initialized`, and calls `tools/list`. The search capability is
+available only when its configured tool name is present and the discovered
+input schema contains all fields required by the adapter. Use the names exposed
+by the installed Claude Code version. This ordinary routing path never executes
+WebCodex file writes or edits.
 
 Strategies:
 
 - `native` — existing WebCodex execution only; this is the default.
 - `claude_code` — return a structured provider error when Claude is disabled,
   missing, incompatible, or fails.
-- `claude_code_then_native` — use Claude first. Searches may fall back after
-  failure. An edit falls back only when the adapter can prove the
-  Claude write was not submitted; a timeout, EOF, JSON-RPC error, or
-  unverifiable edit result is treated as an uncertain write and is never
-  executed again through Native.
+- `claude_code_then_native` — use Claude first. Searches may fall back to the
+  existing bounded Native `rg`/`grep` command after failure. Because ordinary
+  provider routing exposes only read-only search, it never routes a WebCodex
+  write to Claude and therefore has no uncertain-write state. The independent
+  agent-internal raw diagnostic harness described below has its own mutating
+  call boundary and write-state handling.
 
-Claude Code builds do not necessarily expose a Grep tool. The real smoke with
-Claude Code 2.1.220 exposed `Edit` but no schema-compatible Grep. This does not
-disable WebCodex search when using `native` or `claude_code_then_native`: the
-latter falls back to the existing bounded Native `rg`/`grep` command. Strict
-`claude_code` strategy instead returns a capability error when no mapped Grep
-is available. The provider does not route search through Claude's `Bash` tool.
+Claude Code builds do not necessarily expose a search tool. The real smoke with
+Claude Code 2.1.220 exposed `Edit` but no schema-compatible search tool. This
+does not disable WebCodex search when using `native` or `claude_code_then_native`:
+the latter falls back to the existing bounded Native `rg`/`grep` command. Strict
+`claude_code` strategy instead returns a capability error when no mapped search
+tool is available. Ordinary search routing does not use Claude's `Bash` tool and
+never invokes Claude's `Edit`; this restriction is specific to the configured
+`search_project_text` capability, not the internal raw diagnostic harness.
 
 The agent runs one lazy child per canonical registered project root, fixes the
 child `cwd` to that root, bounds requests/responses/pending calls, discards
@@ -59,25 +64,29 @@ call starts a fresh child lazily. It passes only a small environment allowlist
 needed for executable lookup, locale, temporary files, and Claude's local
 configuration. It does not inherit API-key or WebCodex credential variables.
 
-WebCodex `read_file` always keeps its existing Native implementation. The
-experimental provider does not discover, map, or call Claude's `Read` tool.
+WebCodex `read_file` always keeps its existing Native implementation in ordinary
+provider routing. That routing path does not discover, map, or call Claude's
+`Read` tool.
 
 Claude tools remain an agent-internal implementation detail. WebCodex builds
 its public MCP `tools/list`, runtime registry, OAuth policy, and OpenAPI from
 the static WebCodex tool definitions only. Claude `tools/list` output is never
 inserted into those registries. A Claude upgrade may therefore add `Read`,
-`Bash`, `Write`, or other names to provider discovery without making any of
-them visible to an external WebCodex client. Public names and input schemas,
-including `replace_in_file`, are identical with the provider disabled or
-enabled.
+`Bash`, `Write`, `Edit`, or other names to provider discovery without making
+any of them visible to an external WebCodex client. Public names and input
+schemas, including `write_project_file` and `apply_text_edits`, are identical
+with the provider disabled or enabled.
 
-The agent also carries three internal diagnostic request kinds
-(`claude_list_tools`, `claude_describe_tool`, `claude_tool_call`). They remain
-absent from public MCP/OpenAPI. Raw calls are fixed to the `Read`, `Edit`,
-`Write`, and `Bash` allowlist; orchestration, workflow, network, and other
-discovered tools are never callable. Mutating calls are never automatically
-retried after an uncertain result because the provider may already have
-applied the write.
+Separately, the agent carries an experimental raw diagnostic harness with three
+agent-internal request kinds (`claude_list_tools`, `claude_describe_tool`,
+`claude_tool_call`). They remain absent from public MCP/OpenAPI and do not extend
+the ordinary provider capability mapping. Raw calls are fixed to the `Read`,
+`Edit`, `Write`, and `Bash` allowlist; orchestration, workflow, network, and
+other discovered tools are never callable. An explicit raw diagnostic call may
+therefore read or mutate the fixture through those Claude tools. Mutating raw
+calls retain the existing uncertain-write semantics and are never automatically
+retried after an uncertain result because the provider may already have applied
+the write.
 
 The bounded version reported by MCP `initialize.serverInfo` is exposed in
 provider status after a successful start. A version is retained only when it
@@ -116,9 +125,10 @@ one request-time generation for `policy` (`allow_raw_shell`,
 `env`, `init_script`), and `tool_providers` (strategy plus the Claude Code
 enabled flag, command, args, mapping, and timeout). Requests and jobs that
 already captured the old generation keep its
-policy, timeout, shell environment, and Provider route. In-flight Claude edits
-are allowed to finish; their old Provider process is shut down when the last
-old-generation caller releases it. New calls cannot enter a disabled Provider.
+policy, timeout, shell environment, and Provider route. In-flight Claude search
+calls are allowed to finish; their old Provider process is shut down when the
+last old-generation caller releases it. New calls cannot enter a disabled
+Provider.
 
 Identity, server/auth, registration, project source, concurrency, and transport
 fields still require restart: `server_url`, `token`, `client_id`,
@@ -161,36 +171,36 @@ restart succeeds.
 
 ```json
 {
-  "capability": "edit_file",
+  "capability": "search_project_text",
   "selected_provider": "claude_code",
   "fallback_used": false,
   "result": "success",
-  "write_state": "confirmed",
   "duration_ms": 14,
   "error_code": null
 }
 ```
 
-`write_state` is absent for search and is one of `not_submitted`, `confirmed`,
-or `uncertain` for edit. A successful Native search fallback records
-`selected_provider=native`, `fallback_used=true`, and no final error code;
-`last_error_code` still identifies the Claude-side reason that caused the
-fallback. An Edit may fall back only from `not_submitted`. RPC error, EOF,
-timeout, Claude tool error, or failed post-write verification is `uncertain`
-and cannot execute a second Native write.
+`write_state` is absent for ordinary search-routing calls, so their
+`last_call.write_state` is never present. A successful Native search fallback
+records `selected_provider=native`, `fallback_used=true`, and no final error
+code; `last_error_code` still identifies the Claude-side reason that caused the
+fallback. Strict `claude_code` mode records `selected_provider=claude_code`,
+`fallback_used=false`, `result=failure`, and a capability error code when no
+compatible search tool is mapped.
 
 All provider strings are allowlisted or bounded, discovered names are sorted,
-deduplicated, and capped at 64, and only the two configured WebCodex capability
-keys are accepted by the server. Provider status never contains environment
-variables, authentication data, Claude configuration, executable/project
-paths, request arguments, file contents, user code, stderr, raw RPC responses,
-tokens, or cookies.
+deduplicated, and capped at 64, and only the configured WebCodex capability
+key (`search_project_text`, with `edit_file` accepted from older Runners for
+mixed-version compatibility) is accepted by the server. Provider status never
+contains environment variables, authentication data, Claude configuration,
+executable/project paths, request arguments, file contents, user code, stderr,
+raw RPC responses, tokens, or cookies.
 
 For a non-mutating active probe, use the opt-in diagnostic test. It creates an
 empty temporary directory, starts `claude mcp serve`, performs only initialize
 and tools/list, prints the safe status object, and shuts the process group down.
-It does not call Edit, read a project file, run Bash, install Claude, log in, or
-start a model conversation:
+It does not call a tool, read a project file, run Bash, install Claude, log in,
+or start a model conversation:
 
 ```bash
 WEBCODEX_PROBE_CLAUDE_PROVIDER=1 \
@@ -204,11 +214,12 @@ smoke check is opt-in:
 WEBCODEX_TEST_CLAUDE_MCP=1 cargo test -p webcodex-runner --bin webcodex-runner opt_in_real_claude_mcp_smoke -- --nocapture
 ```
 
-This smoke test prints a bounded tool/schema inventory, resolves configured or
-schema-compatible Grep/Edit mappings, calls available tools only inside a
-temporary fixture, verifies Edit, reports Grep as unavailable when the installed
+This search-only smoke test prints a bounded tool/schema inventory, resolves a
+configured or schema-compatible search mapping, calls the search tool only
+inside a temporary fixture, reports search as unavailable when the installed
 version has none, and confirms provider shutdown reaps its Claude process. It
-does not install Claude Code or perform login.
+does not install Claude Code or perform login, and this smoke never invokes
+Claude `Edit`.
 
 The full server/agent path is also opt-in:
 
@@ -219,9 +230,10 @@ WEBCODEX_E2E_CLAUDE_PROVIDER=1 \
 
 It builds a temporary Git fixture, uses independent server/agent configuration,
 an automatically selected loopback port, and a temporary HOME/XDG/Claude config
-directory. It checks the public MCP tool set before and after Claude discovery,
-Native read, Native `rg`/`grep` search fallback, strict Claude Edit evidence,
-file restoration, a clean worktree, provider process-group cleanup, and port
-release. The default suite never requires Claude Code, login, network, a fixed
-fixture path, or user-global configuration. Default `native` strategy behavior
-is unchanged.
+directory. It checks the public MCP tool set before and after Claude discovery
+(including that the removed `replace_in_file` never re-enters the surface),
+Native read, Native `rg`/`grep` search fallback, strict Claude search
+capability-error behavior, a clean worktree, provider process-group cleanup,
+and port release. The default suite never requires Claude Code, login, network,
+a fixed fixture path, or user-global configuration. Default `native` strategy
+behavior is unchanged.

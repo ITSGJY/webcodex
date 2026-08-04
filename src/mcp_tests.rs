@@ -1917,10 +1917,10 @@ async fn oauth2_mcp_tool_call_requires_project_read_for_read_file() {
 }
 
 #[tokio::test]
-async fn oauth2_mcp_tool_call_requires_project_write_for_anchor_edit_tools() {
-    // The anchor/line compatibility tools are ModelHidden and only reachable
-    // on the explicit full operator surface; select it so the scope gate
-    // (not the local_coding boundary) decides this call.
+async fn oauth2_mcp_tool_call_requires_project_write_for_edit_tools() {
+    // Edit tools require the project:write scope. Select the explicit full
+    // operator surface so the scope gate (not the local_coding boundary)
+    // decides this call.
     let _full = full_operator_mcp_env();
     let (_tmp, service, token) = oauth_mcp_service("project:write");
     let (status, body, _) = oauth_mcp_request(
@@ -1928,12 +1928,11 @@ async fn oauth2_mcp_tool_call_requires_project_write_for_anchor_edit_tools() {
         &token,
         "tools/call",
         json!({
-            "name": "replace_exact_block",
+            "name": "write_project_file",
             "arguments": {
                 "project": "demo",
                 "path": "README.md",
-                "old_text": "old",
-                "new_text": "new"
+                "content": "new"
             }
         }),
     )
@@ -1946,12 +1945,11 @@ async fn oauth2_mcp_tool_call_requires_project_write_for_anchor_edit_tools() {
         &token,
         "tools/call",
         json!({
-            "name": "insert_after_pattern",
+            "name": "write_project_file",
             "arguments": {
                 "project": "demo",
                 "path": "README.md",
-                "pattern": "anchor",
-                "text": "inserted\n"
+                "content": "new"
             }
         }),
     )

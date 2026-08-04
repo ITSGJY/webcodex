@@ -131,7 +131,8 @@ wait_for_agent() {
 provider_status_matches() {
     local provider="$1"
     local fallback="$2"
-    local write_state="$3"
+    local result="$3"
+    local error_code="$4"
     local body
     body="$(api_post /api/runtime/status '{}' 2>/dev/null || true)"
     printf '%s' "$body" | python3 -c '
@@ -140,22 +141,24 @@ d = json.load(sys.stdin)
 client = next(c for c in d["output"]["agents"]["clients"] if c["client_id"] == sys.argv[1])
 claude = client["tool_providers"]["claude_code"]
 call = claude["last_call"]
+assert call["capability"] == "search_project_text"
 assert call["selected_provider"] == sys.argv[2]
 assert call["fallback_used"] is (sys.argv[3] == "true")
-expected_write = None if sys.argv[4] == "null" else sys.argv[4]
-assert call.get("write_state") == expected_write
-assert call["result"] == "success"
-assert call.get("error_code") is None
+assert call["result"] == sys.argv[4]
+expected_code = None if sys.argv[5] == "null" else sys.argv[5]
+assert call.get("error_code") == expected_code
+assert call.get("write_state") is None
 assert claude["process_state"] == "running"
-' "$CLIENT_ID" "$provider" "$fallback" "$write_state" >/dev/null 2>&1
+' "$CLIENT_ID" "$provider" "$fallback" "$result" "$error_code" >/dev/null 2>&1
 }
 
 wait_for_provider_call() {
     local provider="$1"
     local fallback="$2"
-    local write_state="$3"
+    local result="$3"
+    local error_code="$4"
     for _ in $(seq 1 150); do
-        if provider_status_matches "$provider" "$fallback" "$write_state"; then
+        if provider_status_matches "$provider" "$fallback" "$result" "$error_code"; then
             return 0
         fi
         sleep 0.1
@@ -189,9 +192,6 @@ enabled = true
 command = "${CLAUDE_BIN}"
 args = ["mcp", "serve"]
 timeout_secs = 30
-
-[tool_providers.claude_code.mapping]
-edit_file = "Edit"
 EOF
 }
 
@@ -282,14 +282,16 @@ ok "fallback-strategy agent registered"
 
 TOOLS_BEFORE="$TMP_ROOT/tools-before.json"
 api_post /mcp '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' >"$TOOLS_BEFORE"
-python3 - "$TOOLS_BEFORE" <<'PY' || fail "public MCP tools exposed Claude internals"
+python3 - "$TOOLS_BEFORE" <<'PY' || fail "public MCP tools exposed Claude internals or stale edit tools"
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as stream:
     names = {t["name"] for t in json.load(stream)["result"]["tools"]}
-assert {"read_file", "replace_in_file", "search_project_text"} <= names
+assert {"read_file", "search_project_text"} <= names
+# replace_in_file was removed entirely and must never re-enter the surface.
+assert "replace_in_file" not in names
 assert not ({"Edit", "Read", "Bash", "Write", "NotebookEdit", "Agent"} & names)
 PY
-ok "public MCP tools exclude Claude internals"
+ok "public MCP tools exclude Claude internals and removed edit tools"
 
 api_get /openapi.json | python3 -c '
 import json, sys
@@ -329,7 +331,7 @@ d = json.load(sys.stdin)
 assert d["success"]
 assert d["output"]["backend"] in ("rg", "grep")
 ' || fail "Native search fallback failed"
-wait_for_provider_call native true null || fail "search fallback evidence did not propagate"
+wait_for_provider_call native true success null || fail "search fallback evidence did not propagate"
 ok "search fallback recorded selected_provider=native"
 
 TOOLS_AFTER="$TMP_ROOT/tools-after.json"
@@ -354,28 +356,34 @@ write_agent_config claude_code
 start_agent
 ok "strict Claude agent registered"
 
-EDIT_ARGS="$(python3 - "$RUNTIME_PROJECT" <<'PY'
+# Strict `claude_code` cannot map a compatible search tool (Claude Code builds
+# do not necessarily expose a Grep), so search must surface a deterministic
+# provider capability error instead of routing through Claude Edit or Bash.
+# No file writes are ever routed to the provider. A failed tool result renders
+# as HTTP 400 with a ToolResult body, so curl must not `-f` fail on that status.
+SEARCH_STRICT_BODY="$(python3 - "$RUNTIME_PROJECT" <<'PY'
 import json, sys
-print(json.dumps({
-    "project": sys.argv[1],
-    "path": "fixture.txt",
-    "old": "before",
-    "new": "after"
-}))
+print(json.dumps({"tool": "search_project_text", "project": sys.argv[1], "pattern": "needle", "path": "."}))
 PY
 )"
-tool_call replace_in_file "$EDIT_ARGS" | python3 -c '
+STRICT_RESPONSE="$(curl -sS --max-time 15 \
+    -H "Authorization: Bearer ${TOKEN}" \
+    -H 'Content-Type: application/json' \
+    -X POST "http://127.0.0.1:${PORT}/api/tools/call" \
+    -d "$SEARCH_STRICT_BODY" || true)"
+printf '%s' "$STRICT_RESPONSE" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
-assert d["success"] and d["output"]["changed"]
-' || fail "strict Claude Edit failed"
-wait_for_provider_call claude_code false confirmed || fail "Claude Edit evidence did not propagate"
-grep -q '^after$' "$FIXTURE/fixture.txt" || fail "edited file content was not verified"
-ok "strict Edit recorded Claude, no fallback, confirmed write"
-
-git -C "$FIXTURE" restore -- fixture.txt
-[ -z "$(git -C "$FIXTURE" status --porcelain)" ] || fail "fixture worktree is not clean"
-ok "fixture restored and worktree clean"
+assert not d["success"]
+out = d.get("output") or {}
+assert out.get("format") == "webcodex.external_provider_error.v1"
+assert out.get("code") == "provider_capability_unavailable"
+' || fail "strict Claude search did not surface a deterministic capability error"
+wait_for_provider_call claude_code false failure provider_capability_unavailable \
+    || fail "strict capability-error evidence did not propagate"
+grep -q '^before$' "$FIXTURE/fixture.txt" || fail "strict provider call modified the fixture"
+[ -z "$(git -C "$FIXTURE" status --porcelain)" ] || fail "strict fixture worktree is dirty"
+ok "strict search recorded Claude, no fallback, no write, capability error"
 
 SECOND_GROUPS="$(claude_process_groups)"
 [ -n "$SECOND_GROUPS" ] || fail "strict Claude process group was not observable"

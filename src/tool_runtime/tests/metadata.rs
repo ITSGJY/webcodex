@@ -1430,7 +1430,7 @@ async fn tool_manifest_recommends_default_remote_coding_loop() {
     for tool in ["replace_line_range", "insert_at_line", "delete_line_range"] {
         assert!(
             !serialized.contains(tool),
-            "recommended_flows should not rank compatibility edit tool {tool}: {serialized}"
+            "recommended_flows should not rank retired edit tool {tool}: {serialized}"
         );
     }
     // Avoid substring false positives against apply_patch_checked.
@@ -2038,8 +2038,7 @@ async fn external_provider_discovery_cannot_change_public_tool_or_openapi_surfac
         .map(|spec| spec.name.clone())
         .collect::<BTreeSet<_>>();
     // Snapshot a model-visible tool's schema as the baseline that external
-    // provider discovery must not perturb. `replace_in_file` is ModelHidden
-    // (no public ToolSpec), so it cannot serve as the baseline here.
+    // provider discovery must not perturb.
     let write_schema_before = before
         .iter()
         .find(|spec| spec.name == "write_project_file")

@@ -6,7 +6,6 @@
 use super::config::{ClaudeCodeMcpConfig, ToolProviderStrategy, ToolProvidersConfig};
 use super::files::sha256_hex_bytes;
 use super::output::CommandResult;
-use super::patches::validate_line_edit_agent_path;
 use super::shell::cwd_allowed;
 use super::shutdown::{lock_unpoison, SHUTDOWN_POLL_INTERVAL};
 use super::AgentPolicy;
@@ -50,15 +49,11 @@ pub(crate) struct ExternalShutdownOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ProviderCapability {
     SearchProjectText,
-    EditFile,
 }
 
 impl ProviderCapability {
     fn name(self) -> &'static str {
-        match self {
-            Self::SearchProjectText => "search_project_text",
-            Self::EditFile => "edit_file",
-        }
+        "search_project_text"
     }
 }
 
@@ -91,6 +86,9 @@ impl ProviderError {
 struct ToolExecutionContext<'a> {
     project_root: &'a Path,
     target: PathBuf,
+    /// Retained because tests construct this struct with the field and the
+    /// router still fills it; not read by the production search path.
+    #[allow(dead_code)]
     relative_path: &'a str,
     max_output_bytes: usize,
     timeout_secs: u64,
@@ -140,6 +138,15 @@ impl ExternalToolRouter {
     #[cfg(test)]
     pub(crate) fn status(&self) -> ToolProvidersStatus {
         self.status_with_revision().0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn configured_search_tool_name(&self) -> Option<&str> {
+        self.claude
+            .config
+            .mapping
+            .get(ProviderCapability::SearchProjectText.name())
+            .map(String::as_str)
     }
 
     fn status_with_revision(&self) -> (ToolProvidersStatus, u64) {
@@ -241,15 +248,10 @@ impl ExternalToolRouter {
             {
                 ProviderCapability::SearchProjectText
             }
-            "file_replace_in_file" => ProviderCapability::EditFile,
             _ => return ExternalRoute::Native,
         };
         let started = Instant::now();
-        let raw = if capability == ProviderCapability::SearchProjectText {
-            request.stdin.as_deref()
-        } else {
-            request.content.as_deref()
-        };
+        let raw = request.stdin.as_deref();
         let payload = match raw
             .ok_or_else(request_error)
             .and_then(|raw| serde_json::from_str(raw).map_err(|_| request_error()))
@@ -268,7 +270,7 @@ impl ExternalToolRouter {
                         "claude_code",
                         false,
                         false,
-                        error_write_state(capability, error.write_state),
+                        None,
                         started,
                         Some(error.code),
                     ),
@@ -294,15 +296,7 @@ impl ExternalToolRouter {
         {
             Ok(output) => {
                 self.claude.record_call(
-                    call_summary(
-                        capability,
-                        "claude_code",
-                        false,
-                        true,
-                        (capability == ProviderCapability::EditFile).then_some("confirmed"),
-                        started,
-                        None,
-                    ),
+                    call_summary(capability, "claude_code", false, true, None, started, None),
                     true,
                 );
                 ExternalRoute::Handled(command_result(
@@ -325,8 +319,6 @@ impl ExternalToolRouter {
     ) -> ExternalRoute {
         self.claude.record_error(&error);
         if self.strategy == ToolProviderStrategy::ClaudeCodeThenNative
-            && (capability != ProviderCapability::EditFile
-                || error.write_state == WriteState::NotSubmitted)
             && !matches!(
                 error.code,
                 "mcp_connection_closed" | "claude_code_unavailable"
@@ -343,7 +335,7 @@ impl ExternalToolRouter {
                     "claude_code",
                     false,
                     false,
-                    error_write_state(capability, error.write_state),
+                    None,
                     started,
                     Some(error.code),
                 ),
@@ -359,19 +351,13 @@ impl ExternalToolRouter {
         result: &CommandResult,
     ) {
         let succeeded = native_result_succeeded(fallback.capability, result);
-        let write_state =
-            (fallback.capability == ProviderCapability::EditFile).then_some(if succeeded {
-                "confirmed"
-            } else {
-                "not_submitted"
-            });
         self.claude.record_call(
             call_summary(
                 fallback.capability,
                 "native",
                 true,
                 succeeded,
-                write_state,
+                None,
                 fallback.started,
                 (!succeeded).then_some("native_tool_failed"),
             ),
@@ -406,31 +392,11 @@ fn call_summary(
     }
 }
 
-fn error_write_state(
-    capability: ProviderCapability,
-    write_state: WriteState,
-) -> Option<&'static str> {
-    (capability == ProviderCapability::EditFile).then_some(match write_state {
-        WriteState::NotSubmitted => "not_submitted",
-        WriteState::Uncertain => "uncertain",
-    })
-}
-
-fn native_result_succeeded(capability: ProviderCapability, result: &CommandResult) -> bool {
+fn native_result_succeeded(_capability: ProviderCapability, result: &CommandResult) -> bool {
     if result.error.is_some() {
         return false;
     }
-    match capability {
-        ProviderCapability::SearchProjectText => matches!(result.exit_code, Some(0 | 1)),
-        ProviderCapability::EditFile => {
-            result.exit_code == Some(0)
-                && result
-                    .stdout
-                    .as_deref()
-                    .and_then(|stdout| serde_json::from_str::<Value>(stdout).ok())
-                    .is_some_and(|output| output.get("error").map_or(true, Value::is_null))
-        }
-    }
+    matches!(result.exit_code, Some(0 | 1))
 }
 
 fn provider_error_result(
@@ -438,18 +404,14 @@ fn provider_error_result(
     error: ProviderError,
     started: Instant,
 ) -> CommandResult {
-    let (write_state, changed) = match error.write_state {
-        WriteState::NotSubmitted => ("not_submitted", Value::Bool(false)),
-        WriteState::Uncertain => ("uncertain", Value::Null),
-    };
     let output = json!({
         "format": "webcodex.external_provider_error.v1",
         "provider": "claude_code",
         "capability": capability.name(),
         "code": error.code,
         "message": error.code,
-        "write_state": write_state,
-        "changed": changed,
+        "write_state": "not_submitted",
+        "changed": false,
         "error": error.code,
     });
     command_result(output.to_string(), started)
@@ -468,20 +430,13 @@ fn command_result(stdout: String, started: Instant) -> CommandResult {
 fn validate_context(
     policy: &AgentPolicy,
     request: &ShellAgentShellRequest,
-    capability: ProviderCapability,
+    _capability: ProviderCapability,
     payload: &Value,
 ) -> Result<(PathBuf, PathBuf, String), ProviderError> {
     let root = request.cwd.as_deref().ok_or_else(path_error)?;
     let root = Path::new(root).canonicalize().map_err(|_| path_error())?;
     cwd_allowed(policy, &root).map_err(|_| path_error())?;
-    let relative = if capability == ProviderCapability::SearchProjectText {
-        payload.get("path").and_then(Value::as_str).unwrap_or(".")
-    } else {
-        request.path.as_deref().unwrap_or(".")
-    };
-    if capability == ProviderCapability::EditFile {
-        validate_line_edit_agent_path(relative).map_err(|_| path_error())?;
-    }
+    let relative = payload.get("path").and_then(Value::as_str).unwrap_or(".");
     let raw = Path::new(relative);
     if raw.is_absolute()
         || raw
@@ -502,10 +457,7 @@ fn path_error() -> ProviderError {
 }
 
 fn unmapped_capabilities() -> BTreeMap<String, String> {
-    BTreeMap::from([
-        ("edit_file".to_string(), "unmapped".to_string()),
-        ("search_project_text".to_string(), "unmapped".to_string()),
-    ])
+    BTreeMap::from([("search_project_text".to_string(), "unmapped".to_string())])
 }
 
 struct ProviderState {
@@ -866,20 +818,12 @@ impl ProjectMcpClient {
             status.discovered_tool_names = discovered_tool_names;
             status.process_state = "mapping".to_string();
         });
-        let capabilities = BTreeMap::from([
-            (
-                "edit_file".to_string(),
-                client
-                    .mapping_status(ProviderCapability::EditFile, config)
-                    .to_string(),
-            ),
-            (
-                "search_project_text".to_string(),
-                client
-                    .mapping_status(ProviderCapability::SearchProjectText, config)
-                    .to_string(),
-            ),
-        ]);
+        let capabilities = BTreeMap::from([(
+            "search_project_text".to_string(),
+            client
+                .mapping_status(ProviderCapability::SearchProjectText, config)
+                .to_string(),
+        )]);
         state.update(|status| {
             status.capabilities = capabilities;
             status.available = true;
@@ -952,12 +896,8 @@ impl ProjectMcpClient {
         shutdown: Option<&AtomicBool>,
     ) -> Result<Value, ProviderError> {
         let tool = self.tool_for(capability, config)?;
-        let (arguments, expected_after) = build_arguments(capability, &request, context)?;
-        let failure_state = if capability == ProviderCapability::EditFile {
-            WriteState::Uncertain
-        } else {
-            WriteState::NotSubmitted
-        };
+        let arguments = build_arguments(capability, &request, context)?;
+        let failure_state = WriteState::NotSubmitted;
         let timeout = deadline.saturating_duration_since(Instant::now());
         if timeout.is_zero() {
             return Err(ProviderError::new("mcp_request_timeout"));
@@ -976,14 +916,11 @@ impl ProjectMcpClient {
         {
             return Err(ProviderError::new("claude_tool_failed").with_state(failure_state));
         }
-        match capability {
-            ProviderCapability::SearchProjectText => normalize_search_result(&result, context),
-            ProviderCapability::EditFile => normalize_edit_result(expected_after.unwrap(), context),
-        }
+        normalize_search_result(&result, context)
     }
 }
 
-fn required_fields(capability: ProviderCapability) -> &'static [&'static str] {
+fn required_fields(_capability: ProviderCapability) -> &'static [&'static str] {
     const GREP: &[&str] = &[
         "pattern",
         "path",
@@ -993,82 +930,40 @@ fn required_fields(capability: ProviderCapability) -> &'static [&'static str] {
         "-B",
         "-A",
     ];
-    const EDIT: &[&str] = &["file_path", "old_string", "new_string"];
-    match capability {
-        ProviderCapability::SearchProjectText => GREP,
-        ProviderCapability::EditFile => EDIT,
-    }
+    GREP
 }
 
 fn build_arguments(
-    capability: ProviderCapability,
+    _capability: ProviderCapability,
     request: &Value,
     context: &ToolExecutionContext<'_>,
-) -> Result<(Value, Option<(String, String)>), ProviderError> {
+) -> Result<Value, ProviderError> {
     let target = context.target.to_string_lossy();
-    match capability {
-        ProviderCapability::SearchProjectText => {
-            if ["include_globs", "exclude_globs"].iter().any(|field| {
-                request
-                    .get(field)
-                    .and_then(Value::as_array)
-                    .is_some_and(|values| !values.is_empty())
-            }) {
-                return Err(capability_error());
-            }
-            let output_mode = if request["result_mode"] == "matches" {
-                "content"
-            } else {
-                request["result_mode"].as_str().ok_or_else(request_error)?
-            };
-            let mut args = json!({
-                "pattern": request["pattern"],
-                "path": target,
-                "output_mode": output_mode,
-                "head_limit": request["limit"],
-            });
-            if request["result_mode"] == "matches" {
-                args["-n"] = json!(true);
-                args["-B"] = request["context_before"].clone();
-                args["-A"] = request["context_after"].clone();
-            }
-            Ok((args, None))
-        }
-        ProviderCapability::EditFile => {
-            let old = request
-                .get("old")
-                .and_then(Value::as_str)
-                .ok_or_else(request_error)?;
-            let new = request
-                .get("new")
-                .and_then(Value::as_str)
-                .ok_or_else(request_error)?;
-            let expected = request
-                .get("expected_replacements")
-                .and_then(Value::as_i64)
-                .unwrap_or(1);
-            let allow_multiple = request
-                .get("allow_multiple")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if expected != 1 || allow_multiple {
-                return Err(capability_error());
-            }
-            let before = std::fs::read_to_string(&context.target).map_err(|_| request_error())?;
-            if before.matches(old).count() != 1 {
-                return Err(request_error());
-            }
-            let after = before.replacen(old, new, 1);
-            Ok((
-                json!({
-                    "file_path": target,
-                    "old_string": old,
-                    "new_string": new,
-                }),
-                Some((before, after)),
-            ))
-        }
+    if ["include_globs", "exclude_globs"].iter().any(|field| {
+        request
+            .get(field)
+            .and_then(Value::as_array)
+            .is_some_and(|values| !values.is_empty())
+    }) {
+        return Err(capability_error());
     }
+    let output_mode = if request["result_mode"] == "matches" {
+        "content"
+    } else {
+        request["result_mode"].as_str().ok_or_else(request_error)?
+    };
+    let mut args = json!({
+        "pattern": request["pattern"],
+        "path": target,
+        "output_mode": output_mode,
+        "head_limit": request["limit"],
+    });
+    if request["result_mode"] == "matches" {
+        args["-n"] = json!(true);
+        args["-B"] = request["context_before"].clone();
+        args["-A"] = request["context_after"].clone();
+    }
+    Ok(args)
 }
 
 fn normalize_search_result(
@@ -1097,26 +992,6 @@ fn normalize_search_result(
         lines.push(normalized.to_string());
     }
     Ok(Value::String(lines.join("\n")))
-}
-
-fn normalize_edit_result(
-    (before, expected_after): (String, String),
-    context: &ToolExecutionContext<'_>,
-) -> Result<Value, ProviderError> {
-    let after = std::fs::read_to_string(&context.target).map_err(|_| {
-        ProviderError::new("edit_result_uncertain").with_state(WriteState::Uncertain)
-    })?;
-    if after != expected_after {
-        return Err(ProviderError::new("edit_result_uncertain").with_state(WriteState::Uncertain));
-    }
-    Ok(json!({
-        "changed": before != after,
-        "path": context.relative_path,
-        "replacements": 1,
-        "before_sha256": sha256_hex_bytes(before.as_bytes()),
-        "after_sha256": sha256_hex_bytes(after.as_bytes()),
-        "bytes_written": after.len(),
-    }))
 }
 
 fn tool_text(result: &Value, maximum: usize) -> Result<String, ProviderError> {

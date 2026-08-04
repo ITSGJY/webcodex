@@ -831,56 +831,6 @@ pub enum ToolCall {
         wait_secs: Option<u64>,
     },
 
-    /// Replace a (unique) substring in a project file via the owning agent.
-    /// Safer than `run_shell` sed/awk/python one-liners for text edits: the
-    /// edit travels through a native file-op request, sensitive paths are
-    /// rejected, and the file is left untouched whenever `old` is missing or
-    /// ambiguous.
-    ReplaceInFile {
-        project: String,
-        path: String,
-        old: String,
-        new: String,
-        #[serde(default)]
-        session_id: Option<String>,
-        #[serde(default)]
-        expected_replacements: Option<i64>,
-        #[serde(default)]
-        allow_multiple: Option<bool>,
-    },
-
-    /// Replace a literal block that must occur exactly once in a UTF-8 file.
-    ReplaceExactBlock {
-        project: String,
-        path: String,
-        old_text: String,
-        new_text: String,
-        #[serde(default)]
-        session_id: Option<String>,
-        #[serde(default)]
-        expected_old_sha256: Option<String>,
-    },
-
-    /// Insert literal text before a literal pattern that must occur exactly once.
-    InsertBeforePattern {
-        project: String,
-        path: String,
-        pattern: String,
-        text: String,
-        #[serde(default)]
-        session_id: Option<String>,
-    },
-
-    /// Insert literal text after a literal pattern that must occur exactly once.
-    InsertAfterPattern {
-        project: String,
-        path: String,
-        pattern: String,
-        text: String,
-        #[serde(default)]
-        session_id: Option<String>,
-    },
-
     /// Write a UTF-8 file in a project via the owning agent. Creates new files
     /// and (with `overwrite`) replaces existing ones, gating overwrites on an
     /// optional `expected_sha256` / `expected_content_prefix` so a stale caller
@@ -991,54 +941,6 @@ pub enum ToolCall {
         upload_id: String,
         #[serde(default)]
         session_id: Option<String>,
-    },
-
-    /// Replace a 1-based inclusive line range in a UTF-8 file via the owning
-    /// agent. The original range may be guarded by sha256 and/or prefix checks.
-    ReplaceLineRange {
-        project: String,
-        path: String,
-        start_line: usize,
-        end_line: usize,
-        new_text: String,
-        #[serde(default)]
-        session_id: Option<String>,
-        #[serde(default)]
-        expected_old_sha256: Option<String>,
-        #[serde(default)]
-        expected_old_prefix: Option<String>,
-    },
-
-    /// Insert text before a 1-based line in a UTF-8 file via the owning agent.
-    /// `line == total_lines + 1` appends at EOF; optional guards apply to the
-    /// anchor line (or the empty EOF anchor).
-    InsertAtLine {
-        project: String,
-        path: String,
-        line: usize,
-        text: String,
-        #[serde(default)]
-        session_id: Option<String>,
-        #[serde(default)]
-        expected_anchor_sha256: Option<String>,
-        #[serde(default)]
-        expected_anchor_prefix: Option<String>,
-    },
-
-    /// Delete a 1-based inclusive line range in a UTF-8 file via the owning
-    /// agent. Equivalent to `replace_line_range` with an empty replacement but
-    /// exposed separately for easier tool selection.
-    DeleteLineRange {
-        project: String,
-        path: String,
-        start_line: usize,
-        end_line: usize,
-        #[serde(default)]
-        session_id: Option<String>,
-        #[serde(default)]
-        expected_old_sha256: Option<String>,
-        #[serde(default)]
-        expected_old_prefix: Option<String>,
     },
 
     /// Apply a bounded transactional batch of edit/create/delete/rename file
@@ -1570,10 +1472,6 @@ impl ToolCall {
             Self::WorkspaceHygieneCheck { .. } => "workspace_hygiene_check",
             Self::ListJobs { .. } => "list_jobs",
             Self::JobTail { .. } => "job_tail",
-            Self::ReplaceInFile { .. } => "replace_in_file",
-            Self::ReplaceExactBlock { .. } => "replace_exact_block",
-            Self::InsertBeforePattern { .. } => "insert_before_pattern",
-            Self::InsertAfterPattern { .. } => "insert_after_pattern",
             Self::WriteProjectFile { .. } => "write_project_file",
             Self::SaveProjectArtifact { .. } => "save_project_artifact",
             Self::ReadProjectArtifactMetadata { .. } => "read_project_artifact_metadata",
@@ -1582,9 +1480,6 @@ impl ToolCall {
             Self::ArtifactUploadChunk { .. } => "artifact_upload_chunk",
             Self::ArtifactUploadFinish { .. } => "artifact_upload_finish",
             Self::ArtifactUploadAbort { .. } => "artifact_upload_abort",
-            Self::ReplaceLineRange { .. } => "replace_line_range",
-            Self::InsertAtLine { .. } => "insert_at_line",
-            Self::DeleteLineRange { .. } => "delete_line_range",
             Self::ApplyTextEdits { .. } => "apply_text_edits",
             Self::LspStatus { .. } => "lsp_status",
             Self::DocumentSymbols { .. } => "document_symbols",
@@ -1629,10 +1524,6 @@ impl ToolCall {
             | Self::SearchProjectTexts { session_id, .. }
             | Self::GitDiffSummary { session_id, .. }
             | Self::ShowChanges { session_id, .. }
-            | Self::ReplaceInFile { session_id, .. }
-            | Self::ReplaceExactBlock { session_id, .. }
-            | Self::InsertBeforePattern { session_id, .. }
-            | Self::InsertAfterPattern { session_id, .. }
             | Self::WriteProjectFile { session_id, .. }
             | Self::SaveProjectArtifact { session_id, .. }
             | Self::ReadProjectArtifactMetadata { session_id, .. }
@@ -1641,9 +1532,6 @@ impl ToolCall {
             | Self::ArtifactUploadChunk { session_id, .. }
             | Self::ArtifactUploadFinish { session_id, .. }
             | Self::ArtifactUploadAbort { session_id, .. }
-            | Self::ReplaceLineRange { session_id, .. }
-            | Self::InsertAtLine { session_id, .. }
-            | Self::DeleteLineRange { session_id, .. }
             | Self::ApplyTextEdits { session_id, .. }
             | Self::WorkspaceCheckpointCreate { session_id, .. }
             | Self::WorkspaceCheckpointList { session_id, .. }
@@ -1695,10 +1583,6 @@ impl ToolCall {
             | Self::SearchProjectTexts { session_id, .. }
             | Self::GitDiffSummary { session_id, .. }
             | Self::ShowChanges { session_id, .. }
-            | Self::ReplaceInFile { session_id, .. }
-            | Self::ReplaceExactBlock { session_id, .. }
-            | Self::InsertBeforePattern { session_id, .. }
-            | Self::InsertAfterPattern { session_id, .. }
             | Self::WriteProjectFile { session_id, .. }
             | Self::SaveProjectArtifact { session_id, .. }
             | Self::ReadProjectArtifactMetadata { session_id, .. }
@@ -1707,9 +1591,6 @@ impl ToolCall {
             | Self::ArtifactUploadChunk { session_id, .. }
             | Self::ArtifactUploadFinish { session_id, .. }
             | Self::ArtifactUploadAbort { session_id, .. }
-            | Self::ReplaceLineRange { session_id, .. }
-            | Self::InsertAtLine { session_id, .. }
-            | Self::DeleteLineRange { session_id, .. }
             | Self::ApplyTextEdits { session_id, .. }
             | Self::WorkspaceCheckpointCreate { session_id, .. }
             | Self::WorkspaceCheckpointList { session_id, .. }
@@ -1786,10 +1667,6 @@ impl ToolCall {
             | Self::SearchProjectTexts { project, .. }
             | Self::GitDiffSummary { project, .. }
             | Self::ShowChanges { project, .. }
-            | Self::ReplaceInFile { project, .. }
-            | Self::ReplaceExactBlock { project, .. }
-            | Self::InsertBeforePattern { project, .. }
-            | Self::InsertAfterPattern { project, .. }
             | Self::WriteProjectFile { project, .. }
             | Self::SaveProjectArtifact { project, .. }
             | Self::ReadProjectArtifactMetadata { project, .. }
@@ -1798,9 +1675,6 @@ impl ToolCall {
             | Self::ArtifactUploadChunk { project, .. }
             | Self::ArtifactUploadFinish { project, .. }
             | Self::ArtifactUploadAbort { project, .. }
-            | Self::ReplaceLineRange { project, .. }
-            | Self::InsertAtLine { project, .. }
-            | Self::DeleteLineRange { project, .. }
             | Self::ApplyTextEdits { project, .. }
             | Self::BindCurrentSession { project, .. }
             | Self::CurrentSession { project }

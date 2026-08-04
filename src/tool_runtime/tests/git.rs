@@ -977,7 +977,7 @@ fn show_changes_with_session_id_includes_session_summary() {
     let write = runtime.sessions.record_tool_call_started(
         Some(&session.session_id),
         crate::tool_runtime::sessions::SessionTransport::Api,
-        "replace_line_range",
+        "write_project_file",
         &write_args,
     );
     runtime

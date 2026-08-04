@@ -943,16 +943,17 @@ async fn start_coding_task_tracked_modified_is_nonblocking_and_allows_continued_
     assert!(worktree.contains("user-wip"));
     assert!(!worktree.contains("head"));
 
-    let (updated, out) = crate::tool_runtime::files::apply_line_edit_content(
+    let (updated, out) = crate::tool_runtime::files::apply_text_edits_to_string(
         &worktree,
         "src/example.rs",
-        crate::tool_runtime::files::LineEditOperation::Replace,
-        Some(2),
-        Some(2),
+        &[crate::tool_runtime::tool_inputs::ApplyTextEditInput {
+            kind: crate::tool_runtime::tool_inputs::ApplyTextEditKind::ReplaceExact,
+            old_text: Some("    println!(\"user-wip\");".to_string()),
+            new_text: Some("    println!(\"user-wip-plus-agent\");".to_string()),
+            anchor_text: None,
+        }],
         None,
-        "    println!(\"user-wip-plus-agent\");",
-        None,
-        Some("    println!(\"user-wip\");"),
+        false,
     )
     .expect("continued edit on already-modified worktree content must succeed");
     assert_eq!(out["changed"], true);
@@ -966,25 +967,25 @@ async fn start_coding_task_tracked_modified_is_nonblocking_and_allows_continued_
         "must not revert to HEAD content: {updated}"
     );
 
-    // Applying against HEAD-only content with the same worktree expected_prefix fails,
+    // Applying against HEAD-only content with the same worktree old_text fails,
     // proving the tool is not using HEAD as the silent baseline.
     let head_content = "fn main() {\n    println!(\"head\");\n}\n";
-    let head_err = crate::tool_runtime::files::apply_line_edit_content(
-        head_content,
+    let head_err = crate::tool_runtime::files::apply_text_edits_to_string(
+        &head_content,
         "src/example.rs",
-        crate::tool_runtime::files::LineEditOperation::Replace,
-        Some(2),
-        Some(2),
+        &[crate::tool_runtime::tool_inputs::ApplyTextEditInput {
+            kind: crate::tool_runtime::tool_inputs::ApplyTextEditKind::ReplaceExact,
+            old_text: Some("    println!(\"user-wip\");".to_string()),
+            new_text: Some("    println!(\"user-wip-plus-agent\");".to_string()),
+            anchor_text: None,
+        }],
         None,
-        "    println!(\"user-wip-plus-agent\");",
-        None,
-        Some("    println!(\"user-wip\");"),
+        false,
     )
     .unwrap_err();
     assert!(
-        head_err.contains("expected_old_prefix mismatch")
-            || head_err.contains("Rejected before write"),
-        "HEAD baseline should not satisfy worktree prefix: {head_err}"
+        head_err.contains("match text was not found") || head_err.contains("Rejected before write"),
+        "HEAD baseline should not satisfy worktree old_text: {head_err}"
     );
 
     // Persist continued edit and confirm disk still differs from a clean checkout.
@@ -1548,13 +1549,11 @@ async fn finish_coding_task_summary_only_includes_review_evidence_for_docs_only_
     record_coding_task_tool_event(
         &runtime,
         &session_id,
-        "replace_line_range",
+        "write_project_file",
         json!({
             "project": project,
             "path": "docs.md",
-            "start_line": 1,
-            "end_line": 1,
-            "replacement": "updated docs"
+            "content": "updated docs"
         }),
         true,
         json!({}),

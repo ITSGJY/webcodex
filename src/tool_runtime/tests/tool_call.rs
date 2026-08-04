@@ -1050,30 +1050,7 @@ fn from_tool_name_parses_validate_patch() {
 }
 
 #[test]
-fn from_tool_name_parses_phase4_edit_tools() {
-    let replace = ToolCall::from_tool_name(
-        "replace_in_file",
-        json!({
-            "project": "agent:c:p",
-            "path": "src/main.rs",
-            "old": "foo",
-            "new": "bar",
-            "expected_replacements": 3,
-            "allow_multiple": true
-        }),
-    )
-    .unwrap();
-    assert!(matches!(
-        replace,
-        ToolCall::ReplaceInFile { project, path, old, new, expected_replacements, allow_multiple, .. }
-            if project == "agent:c:p"
-            && path == "src/main.rs"
-            && old == "foo"
-            && new == "bar"
-            && expected_replacements == Some(3)
-            && allow_multiple == Some(true)
-    ));
-
+fn from_tool_name_parses_write_project_file() {
     let write = ToolCall::from_tool_name(
         "write_project_file",
         json!({
@@ -1093,102 +1070,25 @@ fn from_tool_name_parses_phase4_edit_tools() {
             && expected_sha256.is_none()
             && expected_content_prefix.is_none()
     ));
+}
 
-    let replace_lines = ToolCall::from_tool_name(
+#[test]
+fn from_tool_name_rejects_removed_legacy_edit_tools() {
+    // The 7 legacy edit tools replaced by `apply_text_edits` are no longer
+    // known ToolDefinitions, so `from_tool_name` must reject them with the
+    // same unknown-tool error as any other unknown name.
+    for name in [
+        "replace_in_file",
+        "replace_exact_block",
+        "insert_before_pattern",
+        "insert_after_pattern",
         "replace_line_range",
-        json!({
-            "project": "agent:c:p",
-            "path": "src/main.rs",
-            "start_line": 2,
-            "end_line": 4,
-            "new_text": "replacement",
-            "expected_old_prefix": "old"
-        }),
-    )
-    .unwrap();
-    assert!(matches!(
-        replace_lines,
-        ToolCall::ReplaceLineRange { project, path, start_line, end_line, new_text, expected_old_prefix, .. }
-            if project == "agent:c:p"
-            && path == "src/main.rs"
-            && start_line == 2
-            && end_line == 4
-            && new_text == "replacement"
-            && expected_old_prefix.as_deref() == Some("old")
-    ));
-
-    let insert = ToolCall::from_tool_name(
         "insert_at_line",
-        json!({"project": "agent:c:p", "path": "src/main.rs", "line": 1, "text": "use x;"}),
-    )
-    .unwrap();
-    assert!(matches!(insert, ToolCall::InsertAtLine { line: 1, .. }));
-
-    let delete = ToolCall::from_tool_name(
         "delete_line_range",
-        json!({"project": "agent:c:p", "path": "src/main.rs", "start_line": 8, "end_line": 9}),
-    )
-    .unwrap();
-    assert!(matches!(
-        delete,
-        ToolCall::DeleteLineRange {
-            start_line: 8,
-            end_line: 9,
-            ..
-        }
-    ));
-}
-
-#[test]
-fn from_tool_name_parses_replace_exact_block() {
-    let call = ToolCall::from_tool_name(
-            "replace_exact_block",
-            json!({
-                "project": "agent:c:p",
-                "path": "src/main.rs",
-                "old_text": "old",
-                "new_text": "new",
-                "expected_old_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-            }),
-        )
-        .unwrap();
-    assert!(matches!(
-        call,
-        ToolCall::ReplaceExactBlock { project, path, old_text, new_text, expected_old_sha256, .. }
-            if project == "agent:c:p"
-            && path == "src/main.rs"
-            && old_text == "old"
-            && new_text == "new"
-            && expected_old_sha256.is_some()
-    ));
-}
-
-#[test]
-fn from_tool_name_parses_insert_before_pattern() {
-    let call = ToolCall::from_tool_name(
-            "insert_before_pattern",
-            json!({"project": "agent:c:p", "path": "src/main.rs", "pattern": "fn main", "text": "// before\n"}),
-        )
-        .unwrap();
-    assert!(matches!(
-        call,
-        ToolCall::InsertBeforePattern { project, path, pattern, text, .. }
-            if project == "agent:c:p" && path == "src/main.rs" && pattern == "fn main" && text == "// before\n"
-    ));
-}
-
-#[test]
-fn from_tool_name_parses_insert_after_pattern() {
-    let call = ToolCall::from_tool_name(
-            "insert_after_pattern",
-            json!({"project": "agent:c:p", "path": "src/main.rs", "pattern": "fn main", "text": " // after"}),
-        )
-        .unwrap();
-    assert!(matches!(
-        call,
-        ToolCall::InsertAfterPattern { project, path, pattern, text, .. }
-            if project == "agent:c:p" && path == "src/main.rs" && pattern == "fn main" && text == " // after"
-    ));
+    ] {
+        let err = ToolCall::from_tool_name(name, Value::Null).unwrap_err();
+        assert!(err.contains("unknown tool"), "{name}: {err}");
+    }
 }
 
 #[test]

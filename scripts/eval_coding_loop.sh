@@ -432,7 +432,7 @@ call_tool() {
             ;;
     esac
     case "$tool" in
-        replace_line_range|insert_at_line|delete_line_range|apply_text_edits)
+        apply_text_edits)
             CASE_STRUCTURED_EDIT_CALLS=$((CASE_STRUCTURED_EDIT_CALLS + 1))
             ;;
     esac
@@ -488,6 +488,36 @@ assert_failure() {
         case_ok "$label"
     else
         case_fail "$label (expected controlled failure; body: ${body:0:240})"
+    fi
+}
+
+assert_failure_error_kind() {
+    local label="$1"
+    local body="$2"
+    local expected="$3"
+    if python3 - "$body" "$expected" <<'PY'
+import json
+import sys
+
+try:
+    data = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(1)
+
+output = data.get("output") or {}
+error = data.get("error")
+ok = (
+    data.get("success") is False
+    and output.get("error_kind") == sys.argv[2]
+    and isinstance(error, str)
+    and bool(error)
+)
+sys.exit(0 if ok else 1)
+PY
+    then
+        case_ok "$label"
+    else
+        case_fail "$label (expected error_kind=$expected; body: ${body:0:240})"
     fi
 }
 
@@ -716,7 +746,7 @@ recent = handoff.get("recent_failed_tools") or []
 ok = (
     data.get("success") is True
     and counts.get("failed_tool_calls", 0) >= 1
-    and any(item.get("tool_name") == "replace_line_range" for item in recent if isinstance(item, dict))
+    and any(item.get("tool_name") == "apply_text_edits" for item in recent if isinstance(item, dict))
 )
 sys.exit(0 if ok else 1)
 PY
@@ -1249,23 +1279,32 @@ PY
         case_fail "read_file line-number metadata missing"
     fi
 
-    params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" <<'PY'
+    params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" "$TEST_REPO/src/lib.rs" <<'PY'
+import hashlib
 import json
 import sys
+
+with open(sys.argv[3], "rb") as handle:
+    current_sha = hashlib.sha256(handle.read()).hexdigest()
 
 print(json.dumps({
     "project": sys.argv[1],
     "session_id": sys.argv[2],
-    "path": "src/lib.rs",
-    "start_line": 2,
-    "end_line": 2,
-    "new_text": "    \"hello eval\"\n",
-    "expected_old_prefix": "    \"hello\"",
+    "changes": [{
+        "kind": "edit",
+        "path": "src/lib.rs",
+        "expected_sha256": current_sha,
+        "edits": [{
+            "kind": "replace_exact",
+            "old_text": "    \"hello\"",
+            "new_text": "    \"hello eval\""
+        }]
+    }]
 }, separators=(",", ":")))
 PY
 )"
-    call_tool "replace_line_range" "$params"
-    assert_success "replace_line_range structured edit succeeds" "$LAST_BODY"
+    call_tool "apply_text_edits" "$params"
+    assert_success "apply_text_edits structured edit succeeds" "$LAST_BODY"
 
     params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" <<'PY'
 import json
@@ -1353,16 +1392,22 @@ import sys
 print(json.dumps({
     "project": sys.argv[1],
     "session_id": sys.argv[2],
-    "path": "src/lib.rs",
-    "start_line": 2,
-    "end_line": 2,
-    "new_text": "    \"should not apply\"\n",
-    "expected_old_prefix": "    \"definitely not the current line\"",
+    "changes": [{
+        "kind": "edit",
+        "path": "src/lib.rs",
+        "expected_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "edits": [{
+            "kind": "replace_exact",
+            "old_text": "    \"hello\"",
+            "new_text": "    \"should not apply\""
+        }]
+    }]
 }, separators=(",", ":")))
 PY
 )"
-    call_tool "replace_line_range" "$params"
-    assert_failure "replace_line_range wrong guard fails in a controlled way" "$LAST_BODY"
+    call_tool "apply_text_edits" "$params"
+    assert_failure_error_kind \
+        "apply_text_edits wrong sha guard reports sha256_conflict" "$LAST_BODY" "sha256_conflict"
 
     params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" <<'PY'
 import json
@@ -1395,23 +1440,32 @@ PY
         case_fail "failed edit changed src/lib.rs unexpectedly"
     fi
 
-    params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" <<'PY'
+    params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" "$TEST_REPO/src/lib.rs" <<'PY'
+import hashlib
 import json
 import sys
+
+with open(sys.argv[3], "rb") as handle:
+    current_sha = hashlib.sha256(handle.read()).hexdigest()
 
 print(json.dumps({
     "project": sys.argv[1],
     "session_id": sys.argv[2],
-    "path": "src/lib.rs",
-    "start_line": 2,
-    "end_line": 2,
-    "new_text": "    \"recovered\"\n",
-    "expected_old_prefix": "    \"hello\"",
+    "changes": [{
+        "kind": "edit",
+        "path": "src/lib.rs",
+        "expected_sha256": current_sha,
+        "edits": [{
+            "kind": "replace_exact",
+            "old_text": "    \"hello\"",
+            "new_text": "    \"recovered\""
+        }]
+    }]
 }, separators=(",", ":")))
 PY
 )"
-    call_tool "replace_line_range" "$params"
-    assert_success "replace_line_range recovery edit succeeds" "$LAST_BODY"
+    call_tool "apply_text_edits" "$params"
+    assert_success "apply_text_edits recovery edit succeeds" "$LAST_BODY"
 
     if [ "$CASE_FAILED_TOOL_CALLS" -ge 1 ]; then
         CASE_RECOVERED_FAILED_TOOL_CALLS=1

@@ -183,89 +183,6 @@ pub(crate) fn session_log_arguments_for_tool_request(tool_name: &str, arguments:
             );
             copy_keys(obj, &mut out, &["deny_sensitive_paths"]);
         }
-        "replace_in_file" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &["path", "expected_replacements", "allow_multiple"],
-            );
-            out.insert(
-                "old_present".to_string(),
-                Value::Bool(obj.contains_key("old")),
-            );
-            out.insert(
-                "new_present".to_string(),
-                Value::Bool(obj.contains_key("new")),
-            );
-        }
-        "replace_exact_block" => {
-            copy_keys(obj, &mut out, &["path", "expected_old_sha256"]);
-            out.insert(
-                "old_text_present".to_string(),
-                Value::Bool(obj.contains_key("old_text")),
-            );
-            out.insert(
-                "new_text_present".to_string(),
-                Value::Bool(obj.contains_key("new_text")),
-            );
-        }
-        "insert_before_pattern" | "insert_after_pattern" => {
-            copy_keys(obj, &mut out, &["path"]);
-            out.insert(
-                "pattern_present".to_string(),
-                Value::Bool(obj.contains_key("pattern")),
-            );
-            out.insert(
-                "text_present".to_string(),
-                Value::Bool(obj.contains_key("text")),
-            );
-        }
-        "replace_line_range" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &[
-                    "path",
-                    "start_line",
-                    "end_line",
-                    "expected_old_sha256",
-                    "expected_old_prefix",
-                ],
-            );
-            out.insert(
-                "new_text_present".to_string(),
-                Value::Bool(obj.contains_key("new_text")),
-            );
-        }
-        "insert_at_line" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &[
-                    "path",
-                    "line",
-                    "expected_anchor_sha256",
-                    "expected_anchor_prefix",
-                ],
-            );
-            out.insert(
-                "text_present".to_string(),
-                Value::Bool(obj.contains_key("text")),
-            );
-        }
-        "delete_line_range" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &[
-                    "path",
-                    "start_line",
-                    "end_line",
-                    "expected_old_sha256",
-                    "expected_old_prefix",
-                ],
-            );
-        }
         "delete_project_files" | "git_restore_paths" | "discard_untracked" => {
             copy_keys(obj, &mut out, &["paths"]);
         }
@@ -697,39 +614,6 @@ impl ToolCall {
                 "max_hunk_lines": max_hunk_lines,
                 "session_event_limit": session_event_limit,
             }),
-            Self::ReplaceInFile {
-                project,
-                path,
-                expected_replacements,
-                allow_multiple,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "path": path,
-                "old_present": true,
-                "new_present": true,
-                "expected_replacements": expected_replacements,
-                "allow_multiple": allow_multiple,
-            }),
-            Self::ReplaceExactBlock {
-                project,
-                path,
-                expected_old_sha256,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "path": path,
-                "old_text_present": true,
-                "new_text_present": true,
-                "expected_old_sha256_present": expected_old_sha256.as_ref().is_some_and(|v| !v.is_empty()),
-            }),
-            Self::InsertBeforePattern { project, path, .. }
-            | Self::InsertAfterPattern { project, path, .. } => serde_json::json!({
-                "project": project,
-                "path": path,
-                "pattern_present": true,
-                "text_present": true,
-            }),
             Self::WriteProjectFile {
                 project,
                 path,
@@ -830,54 +714,6 @@ impl ToolCall {
                 "project": project,
                 "path": path,
                 "upload_id": upload_id,
-            }),
-            Self::ReplaceLineRange {
-                project,
-                path,
-                start_line,
-                end_line,
-                expected_old_sha256,
-                expected_old_prefix,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "path": path,
-                "start_line": start_line,
-                "end_line": end_line,
-                "new_text_present": true,
-                "expected_old_sha256_present": expected_old_sha256.as_ref().is_some_and(|v| !v.is_empty()),
-                "expected_old_prefix_present": expected_old_prefix.as_ref().is_some_and(|v| !v.is_empty()),
-            }),
-            Self::InsertAtLine {
-                project,
-                path,
-                line,
-                expected_anchor_sha256,
-                expected_anchor_prefix,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "path": path,
-                "line": line,
-                "text_present": true,
-                "expected_anchor_sha256_present": expected_anchor_sha256.as_ref().is_some_and(|v| !v.is_empty()),
-                "expected_anchor_prefix_present": expected_anchor_prefix.as_ref().is_some_and(|v| !v.is_empty()),
-            }),
-            Self::DeleteLineRange {
-                project,
-                path,
-                start_line,
-                end_line,
-                expected_old_sha256,
-                expected_old_prefix,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "path": path,
-                "start_line": start_line,
-                "end_line": end_line,
-                "expected_old_sha256_present": expected_old_sha256.as_ref().is_some_and(|v| !v.is_empty()),
-                "expected_old_prefix_present": expected_old_prefix.as_ref().is_some_and(|v| !v.is_empty()),
             }),
             Self::ApplyTextEdits {
                 project,

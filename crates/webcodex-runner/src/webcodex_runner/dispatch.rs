@@ -30,6 +30,23 @@ pub(crate) fn dispatch_request(
     if runtime.shutdown_flag().load(Ordering::SeqCst) {
         return Ok(false);
     }
+    // File operations are an explicit protocol surface. Unknown `file_*`
+    // requests must fail before provider routing or any shell fallback.
+    if request.kind.starts_with("file_") && !is_file_request_kind(&request.kind) {
+        let result = CommandResult {
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            duration_ms: Some(0),
+            error: Some(
+                "unsupported_file_request_kind: unsupported file request kind; command was not started"
+                    .to_string(),
+            ),
+        };
+        return sink
+            .submit_result_with_metadata(request.request_id, result, config, runtime)
+            .map(|_| true);
+    }
     let policy = &config.policy;
     let shell = &config.shell;
     let external_tools = &config.external_tools;

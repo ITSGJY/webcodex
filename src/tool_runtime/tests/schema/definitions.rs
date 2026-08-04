@@ -223,25 +223,15 @@ fn tool_call_parser_name_gate_matches_tool_definitions() {
         .is_err(),
         "delete_files must remain legacy route metadata only, not ToolCall parseable"
     );
-    // A ToolDefinition may be `ModelHidden`: dispatched for back-compat but
-    // withheld from the model-facing surface. These are compatibility,
-    // duplicate-granularity, and low-level plumbing tools the canonical
-    // coding surface already covers. The set is intentionally fixed and
-    // documented here so an accidental hide is caught.
-    let expected_hidden: BTreeSet<&str> = [
-        "start_session",
-        "bind_current_session",
-        "job_tail",
-        "replace_in_file",
-        "replace_exact_block",
-        "insert_before_pattern",
-        "insert_after_pattern",
-        "replace_line_range",
-        "insert_at_line",
-        "delete_line_range",
-    ]
-    .into_iter()
-    .collect();
+    // A ToolDefinition may be `ModelHidden`: dispatched but withheld from the
+    // model-facing surface. These are duplicate-granularity and low-level
+    // plumbing tools the canonical coding surface already covers. The set is
+    // intentionally fixed and documented here so an accidental hide is caught.
+    // The legacy single-purpose edit tools are no longer ToolDefinitions at
+    // all, so they are absent here.
+    let expected_hidden: BTreeSet<&str> = ["start_session", "bind_current_session", "job_tail"]
+        .into_iter()
+        .collect();
     assert_eq!(
         model_hidden_tool_names().collect::<BTreeSet<_>>(),
         expected_hidden,
