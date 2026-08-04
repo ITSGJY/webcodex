@@ -546,6 +546,7 @@ pub(crate) fn stage_connection(
 }
 
 const ROOT_AGENT_INSTALL_REASON: &str = "login ran as root; no safe systemd installation argv can be generated without explicitly selecting a non-root Runner user and validating access to the agent config, working directory, projects directory, and allowed roots";
+const ROOT_FOREGROUND_REASON: &str = "login ran as root; no foreground Runner argv is emitted because it would execute project commands as root";
 
 pub(crate) fn render_login_result(
     paths: &ConnectionPaths,
@@ -556,11 +557,13 @@ pub(crate) fn render_login_result(
     json: bool,
     print_mcp_config: bool,
 ) -> Result<String, String> {
-    let foreground_argv = vec![
-        "webcodex-runner".to_string(),
-        "--config".to_string(),
-        paths.agent_config.to_string_lossy().into_owned(),
-    ];
+    let foreground_argv = (!effective_root).then(|| {
+        vec![
+            "webcodex-runner".to_string(),
+            "--config".to_string(),
+            paths.agent_config.to_string_lossy().into_owned(),
+        ]
+    });
     let agent_install_argv = if effective_root {
         None
     } else {
@@ -574,14 +577,17 @@ pub(crate) fn render_login_result(
             paths.agent_config.to_string_lossy().into_owned(),
         ])
     };
-    let foreground_command = shell_command(&foreground_argv);
+    let foreground_command = foreground_argv.as_ref().map(|argv| shell_command(argv));
     let agent_install_command = agent_install_argv.as_ref().map(|argv| shell_command(argv));
 
     // JSON output carries only safe metadata; never a full token. The
     // `--print-mcp-config` path is text-only and mutually exclusive with `--json`
     // (enforced at parse time), so the two cannot both apply here.
     if json {
-        let mut next_steps = vec![foreground_command.clone()];
+        let mut next_steps = Vec::new();
+        if let Some(command) = &foreground_command {
+            next_steps.push(command.clone());
+        }
         if let Some(command) = &agent_install_command {
             next_steps.push(command.clone());
         }
@@ -597,7 +603,9 @@ pub(crate) fn render_login_result(
                 "webcodex-user-token": "GPT Actions, MCP, and REST/project APIs",
                 "agent_config_token": "Runner/Agent transport only",
             },
+            "foreground_available": foreground_argv.is_some(),
             "foreground_argv": &foreground_argv,
+            "foreground_reason": effective_root.then_some(ROOT_FOREGROUND_REASON),
             "agent_install_available": agent_install_argv.is_some(),
             "agent_install_argv": &agent_install_argv,
             "agent_install_reason": effective_root.then_some(ROOT_AGENT_INSTALL_REASON),
@@ -626,14 +634,16 @@ pub(crate) fn render_login_result(
         ));
     }
 
-    let service_guidance = match agent_install_command {
-        Some(command) => format!(
-            "Or install it as a non-root user service (run as the same ordinary user):\n  {command}\n"
+    let next_step_guidance = match (foreground_command, agent_install_command) {
+        (Some(foreground_command), Some(command)) => format!(
+            "Start the agent in the foreground:\n  {foreground_command}\n\n\
+             Or install it as a non-root user service (run as the same ordinary user):\n  {command}\n"
         ),
-        None => "No safe systemd installation command was generated because login ran as root.\n\
-                 Recommended: have the ordinary local user who will run the Runner execute `webcodex login`, then install the user service as that same user.\n\
-                 Advanced system service deployment requires an administrator to explicitly select a non-root account with `--scope system --user`, verify that account can read the agent config and access the working directory, and ensure the config, projects directory, and allowed roots have suitable permissions.\n"
+        (None, None) => "Login ran as root, so no command to start a root Runner is recommended.\n\
+                        Recommended: have the ordinary local user who will run the Runner use a fresh pairing code to execute `webcodex login`, then install the user service as that same user.\n\
+                        Advanced system service deployment requires an administrator to explicitly select a non-root account with `--scope system --user`, verify that account can read the agent config and access the working directory, and ensure the config, projects directory, and allowed roots have suitable permissions.\n"
             .to_string(),
+        _ => return Err("inconsistent login Runner guidance state".to_string()),
     };
 
     Ok(format!(
@@ -641,12 +651,10 @@ pub(crate) fn render_login_result(
          MCP endpoint: {server_url}/mcp\n  \
          user token file: {} (GPT Actions, MCP, and REST/project APIs)\n  \
          agent config:   {} (contains Runner/Agent transport credentials only)\n\n\
-         Start the agent in the foreground:\n  {}\n\n\
          {}",
         paths.user_token.display(),
         paths.agent_config.display(),
-        foreground_command,
-        service_guidance,
+        next_step_guidance,
     ))
 }
 
@@ -2109,7 +2117,9 @@ mod tests {
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&json_text).unwrap();
+        assert_eq!(value["foreground_available"], serde_json::json!(true));
         assert_eq!(value["foreground_argv"], serde_json::json!(foreground_argv));
+        assert!(value["foreground_reason"].is_null());
         assert_eq!(value["agent_install_argv"], serde_json::json!(install_argv));
         assert_eq!(value["agent_install_available"], serde_json::json!(true));
         assert!(value["agent_install_reason"].is_null());
@@ -2184,11 +2194,17 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("--allow-root-runner"), "{text}");
-        assert!(text.contains("login ran as root"), "{text}");
+        assert!(
+            !text.contains("Start the agent in the foreground"),
+            "{text}"
+        );
+        assert!(!text.contains(&shell_command(&foreground_argv)), "{text}");
+        assert!(text.contains("Login ran as root"), "{text}");
         assert!(
             text.contains("ordinary local user who will run the Runner"),
             "{text}"
         );
+        assert!(text.contains("fresh pairing code"), "{text}");
         assert!(
             text.contains("install the user service as that same user"),
             "{text}"
@@ -2222,11 +2238,13 @@ mod tests {
         assert!(reason.contains("login ran as root"), "{reason}");
         assert!(reason.contains("non-root Runner user"), "{reason}");
         assert!(!reason.contains("--allow-root-runner"), "{reason}");
-        assert_eq!(value["foreground_argv"], serde_json::json!(foreground_argv));
-        assert_eq!(
-            value["next_steps"],
-            serde_json::json!([shell_command(&foreground_argv)])
-        );
+        assert_eq!(value["foreground_available"], serde_json::json!(false));
+        assert!(value["foreground_argv"].is_null());
+        let foreground_reason = value["foreground_reason"].as_str().unwrap();
+        assert!(foreground_reason.contains("login ran as root"));
+        assert!(foreground_reason.contains("project commands as root"));
+        assert_eq!(value["next_steps"], serde_json::json!([]));
+        assert!(!json_text.contains("--allow-root-runner"));
         assert!(!json_text.contains("webcodex agent install --scope user"));
         assert!(!json_text.contains(USER_TOKEN), "root json leaked a token");
         assert!(!json_text.contains(AGENT_TOKEN), "root json leaked a token");
