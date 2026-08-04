@@ -1,7 +1,9 @@
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-use super::{http_post_json_status, read_env_file_value, read_optional_token};
+use super::{
+    http_post_json_status, read_env_file_value, read_optional_token, validate_user_api_token,
+};
 
 const DEFAULT_EXPECTED_TOOL_COUNT: u64 = 66;
 
@@ -283,15 +285,18 @@ fn resolve_ops_token(opts: &OpsCommonOptions) -> Result<Option<String>, String> 
         if token.is_empty() {
             return Err("--token cannot be empty".to_string());
         }
+        validate_user_api_token(&token)?;
         return Ok(Some(token));
     }
     if let Some(token) = read_optional_token(&opts.token_file, "--token-file")? {
+        validate_user_api_token(&token)?;
         return Ok(Some(token));
     }
     if let Some(path) = &opts.env_file {
         if let Some(token) = read_env_file_value(path, "WEBCODEX_TOKEN")? {
             let token = token.trim().to_string();
             if !token.is_empty() {
+                validate_user_api_token(&token)?;
                 return Ok(Some(token));
             }
         }
@@ -299,6 +304,7 @@ fn resolve_ops_token(opts: &OpsCommonOptions) -> Result<Option<String>, String> 
     if let Ok(token) = std::env::var("WEBCODEX_TOKEN") {
         let token = token.trim().to_string();
         if !token.is_empty() {
+            validate_user_api_token(&token)?;
             return Ok(Some(token));
         }
     }

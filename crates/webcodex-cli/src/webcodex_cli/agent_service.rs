@@ -4,19 +4,37 @@ use std::path::{Path, PathBuf};
 
 use super::http::{fetch_runtime_status, http_post_json_status, HttpStatusSummary};
 use super::{
-    control_service, encode_exec_argument, encode_exec_path_argument, encode_exec_program,
-    encode_unit_path_value, install_unit, local_runner_profile_marker, local_runner_state_summary,
-    query_systemd_service_status, read_optional_token, run_local_runner_logs,
-    run_local_runner_service, run_logs, service_unit_name, uninstall_unit,
-    validate_systemd_identity, LocalRunnerServiceAction, AGENT_SERVICE_UNIT,
+    control_service_for_scope, encode_exec_argument, encode_exec_path_argument,
+    encode_exec_program, encode_unit_path_value, ensure_service_file_parent,
+    install_unit_for_scope, local_runner_profile_marker, local_runner_state_summary,
+    query_systemd_service_status_for_scope, read_optional_token, read_optional_user_api_token,
+    run_local_runner_logs, run_local_runner_service, run_logs_for_scope, service_unit_name,
+    uninstall_unit_for_scope, validate_systemd_identity, LocalRunnerServiceAction,
+    AGENT_SERVICE_UNIT,
 };
 use crate::{
     AgentInstallServiceOptions, AgentStatusOptions, ServiceActionKind, ServiceActionOptions,
+    ServiceScope,
 };
 
 pub(crate) fn render_agent_systemd_unit(
     opts: &AgentInstallServiceOptions,
 ) -> Result<String, String> {
+    match opts.scope {
+        ServiceScope::User if opts.user.is_some() || opts.group.is_some() => {
+            return Err(
+                "user service units cannot contain User= or Group=; they run as the current user"
+                    .to_string(),
+            );
+        }
+        _ if opts.root_runner && !opts.allow_root_runner => {
+            return Err(
+                "refusing to render a Runner that would run as root without --allow-root-runner"
+                    .to_string(),
+            );
+        }
+        _ => {}
+    }
     let binary = encode_exec_program("ExecStart", &opts.bin)?;
     let config_flag = encode_exec_argument("ExecStart option", "--config")?;
     let config = encode_exec_path_argument("ExecStart --config", &opts.config)?;
@@ -30,11 +48,18 @@ pub(crate) fn render_agent_systemd_unit(
     }
 
     let mut unit = String::new();
+    if opts.root_runner {
+        unit.push_str(
+            "# WARNING: --allow-root-runner was explicitly accepted; project commands run as root.\n",
+        );
+    }
     unit.push_str("[Unit]\n");
     unit.push_str("Description=WebCodex Runner\n");
-    unit.push_str("After=network-online.target\n");
-    unit.push_str("Wants=network-online.target\n\n");
-    unit.push_str("[Service]\n");
+    if opts.scope == ServiceScope::System {
+        unit.push_str("After=network-online.target\n");
+        unit.push_str("Wants=network-online.target\n");
+    }
+    unit.push_str("\n[Service]\n");
     unit.push_str("Type=simple\n");
     unit.push_str(&format!("ExecStart={exec_start}\n"));
     unit.push_str("ExecReload=/bin/kill -HUP $MAINPID\n");
@@ -44,14 +69,19 @@ pub(crate) fn render_agent_systemd_unit(
     unit.push_str("StandardError=journal\n");
     unit.push_str("Environment=RUST_LOG=info\n");
     unit.push_str(&format!("WorkingDirectory={working_directory}\n"));
-    if let Some(user) = &opts.user {
-        unit.push_str(&format!("User={user}\n"));
-    }
-    if let Some(group) = &opts.group {
-        unit.push_str(&format!("Group={group}\n"));
+    if opts.scope == ServiceScope::System {
+        if let Some(user) = &opts.user {
+            unit.push_str(&format!("User={user}\n"));
+        }
+        if let Some(group) = &opts.group {
+            unit.push_str(&format!("Group={group}\n"));
+        }
     }
     unit.push_str("\n[Install]\n");
-    unit.push_str("WantedBy=multi-user.target\n");
+    unit.push_str(match opts.scope {
+        ServiceScope::User => "WantedBy=default.target\n",
+        ServiceScope::System => "WantedBy=multi-user.target\n",
+    });
     Ok(unit)
 }
 
@@ -67,6 +97,8 @@ pub(crate) fn run_agent_install_service(
                 "config": opts.config.to_string_lossy(),
                 "bin": opts.bin.to_string_lossy(),
                 "unit_name": unit,
+                "scope": opts.scope.as_str(),
+                "root_runner": opts.root_runner,
                 "dry_run": true,
                 "systemd_called": false,
                 "unit": rendered,
@@ -75,7 +107,11 @@ pub(crate) fn run_agent_install_service(
         }
         return Ok(rendered);
     }
-    let result = install_unit(
+    if opts.scope == ServiceScope::User {
+        ensure_service_file_parent(&opts.service_file)?;
+    }
+    let result = install_unit_for_scope(
+        opts.scope,
         &opts.service_file,
         &unit,
         &rendered,
@@ -88,18 +124,27 @@ pub(crate) fn run_agent_install_service(
             "config": opts.config.to_string_lossy(),
             "bin": opts.bin.to_string_lossy(),
             "unit": result.unit,
+            "scope": opts.scope.as_str(),
+            "root_runner": opts.root_runner,
             "enabled": true,
             "started": result.started,
         }))
         .map_err(|e| e.to_string());
     }
+    let warning = if opts.root_runner {
+        "\nWARNING: explicit --allow-root-runner accepted; this Runner executes project commands as root.\n"
+    } else {
+        ""
+    };
     Ok(format!(
-        "Agent service installed.\n\n  service file: {}\n  unit:         {}\n  config:       {}\n  binary:       {}\n  enabled:      yes\n  started:      {}\n",
+        "Agent service installed.\n\n  scope:        {}\n  service file: {}\n  unit:         {}\n  config:       {}\n  binary:       {}\n  enabled:      yes\n  started:      {}\n{}",
+        opts.scope.as_str(),
         opts.service_file.display(),
         result.unit,
         opts.config.display(),
         opts.bin.display(),
-        if result.started { "yes" } else { "no (--no-start)" }
+        if result.started { "yes" } else { "no (--no-start)" },
+        warning,
     ))
 }
 
@@ -136,7 +181,7 @@ pub(crate) fn run_agent_service(opts: ServiceActionOptions) -> Result<String, St
     }
     match opts.kind {
         ServiceActionKind::Control(control) => {
-            control_service(&opts.unit, control)?;
+            control_service_for_scope(opts.scope, &opts.unit, control)?;
             Ok(format!(
                 "Agent service {} completed for {}.\n",
                 control.as_str(),
@@ -147,12 +192,12 @@ pub(crate) fn run_agent_service(opts: ServiceActionOptions) -> Result<String, St
             lines,
             since,
             follow,
-        } => run_logs(&opts.unit, lines, since.as_deref(), follow),
+        } => run_logs_for_scope(opts.scope, &opts.unit, lines, since.as_deref(), follow),
         ServiceActionKind::Uninstall { confirm } => {
             if !confirm {
                 return Err("agent uninstall requires --confirm; no changes were made".to_string());
             }
-            let result = uninstall_unit(&opts.service_file, &opts.unit)?;
+            let result = uninstall_unit_for_scope(opts.scope, &opts.service_file, &opts.unit)?;
             Ok(format!(
                 "Agent service {}. Agent config, tokens, profile data and binaries were not deleted.\n",
                 if result.removed { "uninstalled" } else { "was already absent" }
@@ -257,7 +302,7 @@ fn runtime_client_online(output: &Value, client_id: &str) -> Option<bool> {
 
 pub(crate) async fn run_agent_status(opts: AgentStatusOptions) -> Result<String, String> {
     let service_unit = service_unit_name(&opts.service_file, AGENT_SERVICE_UNIT);
-    let systemd = query_systemd_service_status(&service_unit);
+    let systemd = query_systemd_service_status_for_scope(opts.scope, &service_unit);
     let metadata = read_agent_config_metadata(&opts.config)?;
     let local = opts
         .local_state_dir
@@ -280,7 +325,7 @@ pub(crate) async fn run_agent_status(opts: AgentStatusOptions) -> Result<String,
         }
         Some(key.to_string())
     } else {
-        read_optional_token(&opts.user_token_file, "--user-token-file")?
+        read_optional_user_api_token(&opts.user_token_file, "--user-token-file")?
     };
     let agent_token = if local.is_some() {
         None
@@ -333,6 +378,7 @@ pub(crate) async fn run_agent_status(opts: AgentStatusOptions) -> Result<String,
         let summary = json!({
             "service": {
                 "mode": if local.is_some() { "hosted_local" } else { "systemd" },
+                "scope": if local.is_some() { Value::Null } else { json!(opts.scope.as_str()) },
                 "unit": service_unit,
                 "active": local.as_ref().map(|state| json!(state.running)).unwrap_or_else(|| json!(systemd.active)),
                 "enabled": local.as_ref().map(|state| json!(state.managed)).unwrap_or_else(|| json!(systemd.enabled)),
@@ -393,6 +439,10 @@ pub(crate) async fn run_agent_status(opts: AgentStatusOptions) -> Result<String,
             local.log_path.display()
         ));
     } else {
+        out.push_str(&format!(
+            "  service scope:        {}\n",
+            opts.scope.as_str()
+        ));
         out.push_str(&format!("  service unit:         {service_unit}\n"));
         out.push_str(&format!("  service active:       {}\n", systemd.active));
         out.push_str(&format!("  service enabled:      {}\n", systemd.enabled));

@@ -23,7 +23,7 @@ use super::connections::{
     list_connections, resolve_connection_parent, user_slug, Connection, ConnectionPaths,
     INTERNAL_DIR_PREFIX,
 };
-use super::shell_command;
+use super::{shell_command, validate_user_api_token};
 
 /// Device name reported to the server. The hostname is what a person would call
 /// this machine; `--device` overrides it.
@@ -562,6 +562,8 @@ pub(crate) fn render_login_result(
         "webcodex".to_string(),
         "agent".to_string(),
         "install".to_string(),
+        "--scope".to_string(),
+        "user".to_string(),
         "--config".to_string(),
         paths.agent_config.to_string_lossy().into_owned(),
     ];
@@ -580,6 +582,10 @@ pub(crate) fn render_login_result(
             "dir": paths.dir.to_string_lossy(),
             "user_token_file": paths.user_token.to_string_lossy(),
             "agent_config": paths.agent_config.to_string_lossy(),
+            "credential_usage": {
+                "webcodex-user-token": "GPT Actions, MCP, and REST/project APIs",
+                "agent_config_token": "Runner/Agent transport only",
+            },
             "foreground_argv": &foreground_argv,
             "agent_install_argv": &agent_install_argv,
             "next_steps": [&foreground_command, &agent_install_command],
@@ -597,6 +603,7 @@ pub(crate) fn render_login_result(
             })?
             .trim()
             .to_string();
+        validate_user_api_token(&token)?;
         return Ok(format!(
             "Sensitive HTTP MCP connection details\n\
              ======================================\n\
@@ -609,10 +616,10 @@ pub(crate) fn render_login_result(
     Ok(format!(
         "Logged in to {server_url} as {username} ({device}).\n\n  \
          MCP endpoint: {server_url}/mcp\n  \
-         user token file: {}\n  \
-         agent config:   {}\n\n\
+         user token file: {} (GPT Actions, MCP, and REST/project APIs)\n  \
+         agent config:   {} (contains Runner/Agent transport credentials only)\n\n\
          Start the agent in the foreground:\n  {}\n\n\
-         Or install it as a service:\n  {}\n",
+         Or install it as a non-root user service (run as the same ordinary user):\n  {}\n",
         paths.user_token.display(),
         paths.agent_config.display(),
         foreground_command,
@@ -1993,8 +2000,16 @@ mod tests {
         );
         assert!(text.contains("webcodex-runner --config"), "{text}");
         assert!(
+            text.contains("GPT Actions, MCP, and REST/project APIs"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Runner/Agent transport credentials only"),
+            "{text}"
+        );
+        assert!(
             text.contains(&format!(
-                "webcodex agent install --config {}",
+                "webcodex agent install --scope user --config {}",
                 paths.agent_config.display()
             )),
             "{text}"
@@ -2012,6 +2027,7 @@ mod tests {
         )
         .unwrap();
         assert!(json.contains("mcp_url"), "{json}");
+        assert!(json.contains("credential_usage"), "{json}");
         assert!(
             json.contains(&paths.user_token.display().to_string()),
             "{json}"
@@ -2032,6 +2048,8 @@ mod tests {
             "webcodex".to_string(),
             "agent".to_string(),
             "install".to_string(),
+            "--scope".to_string(),
+            "user".to_string(),
             "--config".to_string(),
             paths.agent_config.to_string_lossy().into_owned(),
         ];
@@ -2096,6 +2114,27 @@ mod tests {
             text.contains(&format!("Authorization: Bearer {USER_TOKEN}")),
             "{text}"
         );
+    }
+
+    #[test]
+    fn print_mcp_config_rejects_an_agent_token_in_the_user_token_file() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let paths = ConnectionPaths::new(temp.path().join("connection"));
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        let secret = "wc_agent_do_not_echo_login_0123456789";
+        std::fs::write(&paths.user_token, format!("{secret}\n")).unwrap();
+        let error = render_login_result(
+            &paths,
+            "https://api.example.com",
+            "alice",
+            "laptop",
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("Agent transport token"), "{error}");
+        assert!(error.contains("webcodex-user-token"), "{error}");
+        assert!(!error.contains(secret));
     }
 
     #[test]

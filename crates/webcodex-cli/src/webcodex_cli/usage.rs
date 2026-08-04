@@ -267,6 +267,8 @@ Commands:\n\
   status      Check Runner lifecycle, safe config metadata, and connectivity\n\
   logs        Read hosted Runner logs or the installed service journal\n\
   uninstall   Remove only the systemd unit; requires --confirm\n\n\
+Service commands accept --scope user|system. Non-root users default to user; root defaults to system.\n\
+Profiles created by `connect` keep their detached-process behavior when --scope is omitted.\n\n\
 `webcodex run` is the current-project runtime coordinator. `webcodex agent run` directly executes the standalone Runner.\n"
 }
 pub(crate) fn agent_init_usage() -> &'static str {
@@ -297,36 +299,43 @@ pub(crate) fn agent_install_service_usage() -> &'static str {
     "Usage: webcodex agent install [--profile NAME] [--config PATH] [OPTIONS]\n\n\
 Options:\n\
   --profile NAME             Profile for config and unit defaults\n\
+  --scope user|system        Service manager scope [default: user for non-root; system for root]\n\
   --config PATH              Agent config path\n\
   --bin PATH                 webcodex-runner path; sibling then absolute PATH by default\n\
   --service-file PATH        Unit path [default: webcodex-runner[-<profile>].service]\n\
-  --working-directory PATH   WorkingDirectory=\n\
-  --user USER                Optional systemd User=\n\
-  --group GROUP              Optional systemd Group=\n\
+  --working-directory PATH   WorkingDirectory= [default: selected user's home]\n\
+  --user USER                Required non-root system service user\n\
+  --group GROUP              Optional system service Group=\n\
+  --allow-root-runner        Explicitly allow project commands to run as root\n\
   --overwrite                Replace an existing unit\n\
   --no-start                 Enable without starting immediately\n\
   --dry-run                  Render only; never call systemctl\n\
   --output -                 Render only; never call systemctl\n\
   --json                     Print machine-readable output\n\
   -h, --help                 Print help and exit\n\n\
+User scope uses systemctl --user, the XDG user unit directory, default.target,\n\
+and never writes User= or Group=. System scope uses /etc/systemd/system,\n\
+multi-user.target, and requires --user unless --allow-root-runner is explicit.\n\
 The unit runs webcodex-runner --config <config>. Tokens are never inlined.\n"
 }
 pub(crate) fn agent_status_usage() -> &'static str {
     "Usage: webcodex agent status [OPTIONS]\n\n\
      Options:\n\
        --profile NAME             Client config profile for config/token defaults\n\
-       --config PATH              Agent config path [default: /etc/webcodex/agent.toml, or profile agent.toml]\n\
+       --scope user|system        Service manager scope [default: user for non-root; system for root]\n\
+       --config PATH              Agent config path [default: scope-specific agent.toml]\n\
+       --service-file PATH        Override the scope-specific systemd unit path\n\
        --server-url URL           Override server URL for runtime checks\n\
        --user-token-file PATH     Read user API token for /api/runtime/status\n\
        --agent-token-file PATH    Read agent token for boundary check\n\
        --json                     Print a machine-readable summary\n\
        -h, --help                 Print help and exit\n\n\
-     With --profile, missing config and token paths are derived under\n\
-     /etc/webcodex/clients/<profile> for root or\n\
-     ~/.config/webcodex/clients/<profile> for non-root users. Explicit path\n\
-     flags override profile-derived defaults. Profiles created by `connect`\n\
-     report their user-level background process, PID, and log path instead of\n\
-     systemd state. Status prints safe metadata only:\n\
+     User scope derives config under $XDG_CONFIG_HOME/webcodex (or\n\
+     $HOME/.config/webcodex) and units under $XDG_CONFIG_HOME/systemd/user\n\
+     (or $HOME/.config/systemd/user). System scope uses /etc/webcodex and\n\
+     /etc/systemd/system. Explicit path flags override profile-derived defaults.\n\
+     Profiles created by `connect` report their detached process when --scope\n\
+     is omitted; an explicit scope checks systemd instead. Status prints safe metadata only:\n\
      no tokens, Authorization headers, full agent.toml, env files, or secrets.\n"
 }
 
