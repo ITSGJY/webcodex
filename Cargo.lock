@@ -3638,6 +3638,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "webcodex-process"
+version = "0.3.2"
+dependencies = [
+ "libc",
+ "tempfile",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "webcodex-runner"
 version = "0.3.2"
 dependencies = [
