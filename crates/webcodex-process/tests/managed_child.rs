@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use webcodex_process::{ManagedChild, SpawnOptions};
+use webcodex_process::{GracefulTermination, ManagedChild, SpawnOptions};
 
 /// Path to the compiled helper binary, provided by Cargo for integration tests.
 fn helper() -> &'static str {
@@ -473,6 +473,133 @@ fn reusable_command_is_not_left_suspended() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 9. Graceful termination request
+// ---------------------------------------------------------------------------
+
+/// Unix: a graceful request terminates an ordinary process tree and can be
+/// followed by a bounded tree wait.
+#[cfg(unix)]
+#[test]
+fn graceful_request_terminates_tree_and_tree_wait_completes() {
+    let marker = unique_temp_path("graceful-request");
+    let (mut managed, gc_pid, reader) = spawn_tree_with_grandchild(&marker);
+
+    let _ = managed.wait().expect("wait direct child");
+    assert!(
+        process_alive(gc_pid),
+        "grandchild should still be alive before the graceful request"
+    );
+
+    match managed
+        .request_terminate_tree()
+        .expect("graceful request must succeed on unix")
+    {
+        GracefulTermination::Requested => {}
+        GracefulTermination::AlreadyExited => {
+            panic!("tree unexpectedly already exited before the graceful request")
+        }
+        GracefulTermination::Unsupported => {
+            panic!("graceful termination reported unsupported on unix")
+        }
+    }
+
+    assert!(
+        wait_for_liveness(gc_pid, false, Duration::from_secs(10), "gc-after-graceful"),
+        "grandchild survived SIGTERM to its process group"
+    );
+    assert!(
+        managed
+            .wait_tree_exit(Duration::from_secs(10))
+            .expect("bounded tree wait"),
+        "tree should be empty after the graceful request"
+    );
+    reader
+        .wait_for_eof(Duration::from_secs(10))
+        .expect("stdout should close after the graceful request");
+    assert!(
+        !marker.exists(),
+        "delayed marker must never appear after the graceful request"
+    );
+}
+
+/// Windows: a graceful request returns `Unsupported` without killing anything,
+/// and the child remains owned so it can subsequently be terminated with
+/// `terminate_tree()`.
+#[cfg(windows)]
+#[test]
+fn graceful_request_is_unsupported_and_child_stays_owned() {
+    let marker = unique_temp_path("graceful-unsupported");
+    let (mut managed, gc_pid, reader) = spawn_tree_with_grandchild(&marker);
+
+    let _ = managed.wait().expect("wait direct child");
+    assert!(
+        process_alive(gc_pid),
+        "grandchild should still be alive before the graceful request"
+    );
+
+    assert_eq!(
+        managed
+            .request_terminate_tree()
+            .expect("graceful request must not error on windows"),
+        GracefulTermination::Unsupported
+    );
+    assert!(
+        process_alive(gc_pid),
+        "graceful Unsupported must not kill anything in the tree"
+    );
+
+    // The child remains owned: force termination still works afterwards.
+    managed.terminate_tree().expect("terminate tree");
+    assert!(
+        wait_for_liveness(gc_pid, false, Duration::from_secs(10), "gc-after-terminate"),
+        "grandchild survived terminate_tree after graceful Unsupported"
+    );
+    assert!(
+        managed
+            .wait_tree_exit(Duration::from_secs(10))
+            .expect("bounded tree wait"),
+        "tree should be empty after terminate_tree"
+    );
+    reader
+        .wait_for_eof(Duration::from_secs(10))
+        .expect("stdout should close after terminate_tree");
+    assert!(
+        !marker.exists(),
+        "delayed marker must never appear after terminate_tree"
+    );
+}
+
+/// Repeated calls and an already-exited tree must not panic.
+#[test]
+fn graceful_request_repeated_and_already_exited_do_not_panic() {
+    // Repeated calls on a live tree: results are defined by the platform but a
+    // panic (from an unexpected Err) is the failure being tested.
+    let (mut managed, _) = spawn_helper("sleep", &["1", "0"], false);
+    let first = managed.request_terminate_tree();
+    let second = managed.request_terminate_tree();
+    // Both calls must at least succeed as an I/O result.
+    let _ = first.expect("first graceful request returned an error");
+    let _ = second.expect("second graceful request returned an error");
+
+    // An already-exited tree: wait for natural exit, then request again.
+    let (mut exited, _) = spawn_helper("sleep", &["0", "0"], false);
+    let _ = exited.wait().expect("wait direct child");
+    assert!(
+        exited
+            .wait_tree_exit(Duration::from_secs(10))
+            .expect("bounded tree wait"),
+        "tree should be empty after the only child exits"
+    );
+    let result = exited
+        .request_terminate_tree()
+        .expect("graceful request on an exited tree returned an error");
+    // The group may be gone (AlreadyExited) or still fleetingly present
+    // (Requested to an empty group); both are defined outcomes. The test only
+    // forbids a panic or an unexpected Err.
+    let _ = result;
 }
 
 // ---------------------------------------------------------------------------

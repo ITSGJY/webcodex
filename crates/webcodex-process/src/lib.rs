@@ -41,6 +41,23 @@ pub use unix::ManagedChild;
 #[cfg(windows)]
 pub use windows::ManagedChild;
 
+/// Outcome of a graceful tree-termination request
+/// ([`ManagedChild::request_terminate_tree`]).
+///
+/// The three states are deliberately explicit rather than a boolean: callers
+/// must be able to distinguish "the graceful signal was delivered" from "the
+/// tree had already exited" from "this platform cannot do graceful tree
+/// termination at all", because each requires a different follow-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GracefulTermination {
+    /// The graceful termination signal was delivered to the owned process tree.
+    Requested,
+    /// The owned tree had already fully exited before the request.
+    AlreadyExited,
+    /// Graceful tree termination is not supported on this platform.
+    Unsupported,
+}
+
 /// Options that influence how a [`ManagedChild`] is spawned.
 ///
 /// All fields have platform-neutral defaults; set only what you need.

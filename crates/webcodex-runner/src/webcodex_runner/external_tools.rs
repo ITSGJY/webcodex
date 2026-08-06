@@ -17,11 +17,13 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+use webcodex_process::{GracefulTermination, ManagedChild};
 
 mod experimental;
 
@@ -1025,8 +1027,7 @@ fn protocol_error() -> ProviderError {
 type PendingSender = mpsc::Sender<Result<Value, ProviderError>>;
 
 struct McpConnection {
-    child: Mutex<Child>,
-    process_group_id: u32,
+    child: Mutex<ManagedChild>,
     stdin: Arc<Mutex<ChildStdin>>,
     pending: Arc<Mutex<HashMap<u64, PendingSender>>>,
     next_id: AtomicU64,
@@ -1068,33 +1069,24 @@ impl McpConnection {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
         apply_safe_environment(&mut command);
-        let mut child = command
-            .spawn()
+        let mut managed = ManagedChild::spawn(&mut command)
             .map_err(|_| ProviderError::new("claude_code_spawn_failed"))?;
-        let process_group_id = child.id();
-        let stdin = match child.stdin.take() {
+        let stdin = match managed.child_mut().stdin.take() {
             Some(stdin) => Arc::new(Mutex::new(stdin)),
             None => {
-                terminate_unowned_mcp_child(
-                    &mut child,
-                    process_group_id,
+                cleanup_failed_mcp_child(
+                    &mut managed,
                     Instant::now() + MCP_FALLBACK_SHUTDOWN_BUDGET,
                 );
                 return Err(protocol_error());
             }
         };
-        let stdout = match child.stdout.take() {
+        let stdout = match managed.child_mut().stdout.take() {
             Some(stdout) => stdout,
             None => {
-                terminate_unowned_mcp_child(
-                    &mut child,
-                    process_group_id,
+                cleanup_failed_mcp_child(
+                    &mut managed,
                     Instant::now() + MCP_FALLBACK_SHUTDOWN_BUDGET,
                 );
                 return Err(protocol_error());
@@ -1107,8 +1099,7 @@ impl McpConnection {
             status.process_state = "initializing".to_string();
         });
         let connection = Arc::new(Self {
-            child: Mutex::new(child),
-            process_group_id,
+            child: Mutex::new(managed),
             stdin: Arc::clone(&stdin),
             pending: Arc::clone(&pending),
             next_id: AtomicU64::new(1),
@@ -1231,17 +1222,20 @@ impl McpConnection {
         self.state.stopped(None);
         *lock_unpoison(&self.shutdown_started_at) = Some(Instant::now());
         fail_pending(&self.pending, ProviderError::new("mcp_connection_closed"));
-        #[cfg(unix)]
-        {
-            if self.process_group_id == 0
-                || signal_mcp_process_group(self.process_group_id, libc::SIGTERM).is_err()
-            {
+        // Graceful tree termination. On Unix this preserves the old SIGTERM
+        // grace phase; on Windows it reports Unsupported and this first
+        // shutdown transition immediately escalates with terminate_tree().
+        let request = lock_unpoison(&self.child).request_terminate_tree();
+        match request {
+            Ok(GracefulTermination::Requested) | Ok(GracefulTermination::AlreadyExited) => {}
+            Ok(GracefulTermination::Unsupported) => {
+                if lock_unpoison(&self.child).terminate_tree().is_err() {
+                    self.shutdown_failures.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            Err(_) => {
                 self.shutdown_failures.fetch_add(1, Ordering::SeqCst);
             }
-        }
-        #[cfg(not(unix))]
-        if lock_unpoison(&self.child).kill().is_err() {
-            self.shutdown_failures.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -1271,12 +1265,7 @@ impl McpConnection {
                 )
                 .is_ok()
         {
-            #[cfg(unix)]
-            if signal_mcp_process_group(self.process_group_id, libc::SIGKILL).is_err() {
-                self.shutdown_failures.fetch_add(1, Ordering::SeqCst);
-            }
-            #[cfg(not(unix))]
-            if lock_unpoison(&self.child).kill().is_err() {
+            if lock_unpoison(&self.child).terminate_tree().is_err() {
                 self.shutdown_failures.fetch_add(1, Ordering::SeqCst);
             }
         }
@@ -1298,39 +1287,33 @@ impl McpConnection {
     }
 
     fn process_reaped_and_group_gone(&self) -> bool {
-        let child_reaped = match self.child.try_lock() {
-            Ok(mut child) => matches!(child.try_wait(), Ok(Some(_)) | Err(_)),
+        // The direct child must be reaped AND the complete managed process
+        // tree must be empty. A direct-child exit alone is never "reaped".
+        match self.child.try_lock() {
+            Ok(mut child) => {
+                let child_reaped = matches!(child.try_wait(), Ok(Some(_)) | Err(_));
+                child_reaped && child.wait_tree_exit(Duration::ZERO).unwrap_or(false)
+            }
             Err(std::sync::TryLockError::WouldBlock) => false,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => {
                 let mut child = poisoned.into_inner();
-                matches!(child.try_wait(), Ok(Some(_)) | Err(_))
+                let child_reaped = matches!(child.try_wait(), Ok(Some(_)) | Err(_));
+                child_reaped && child.wait_tree_exit(Duration::ZERO).unwrap_or(false)
             }
-        };
-        #[cfg(unix)]
-        let group_gone = !mcp_process_group_exists(self.process_group_id);
-        #[cfg(not(unix))]
-        let group_gone = true;
-        child_reaped && group_gone
+        }
     }
 }
 
-fn terminate_unowned_mcp_child(child: &mut Child, process_group_id: u32, deadline: Instant) {
-    #[cfg(unix)]
-    {
-        let _ = signal_mcp_process_group(process_group_id, libc::SIGTERM);
-        let grace = deadline.min(Instant::now() + MCP_TERMINATION_GRACE);
-        while Instant::now() < grace && mcp_process_group_exists(process_group_id) {
-            let remaining = grace.saturating_duration_since(Instant::now());
-            std::thread::sleep(SHUTDOWN_POLL_INTERVAL.min(remaining));
-        }
-        if mcp_process_group_exists(process_group_id) {
-            let _ = signal_mcp_process_group(process_group_id, libc::SIGKILL);
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = child.kill();
+/// Clean up an MCP child that failed early (missing pipe or thread spawn).
+///
+/// The server can never be used, so the whole managed tree is forcefully
+/// terminated, then the direct child and the whole tree are reaped within the
+/// shared deadline. Never re-arms a fresh wait, never leaks the Job Object /
+/// process group, and never leaves a descendant holding stdout open.
+fn cleanup_failed_mcp_child(managed: &mut ManagedChild, deadline: Instant) {
+    let _ = managed.terminate_tree();
     while Instant::now() < deadline {
-        match child.try_wait() {
+        match managed.try_wait() {
             Ok(Some(_)) | Err(_) => break,
             Ok(None) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1338,27 +1321,8 @@ fn terminate_unowned_mcp_child(child: &mut Child, process_group_id: u32, deadlin
             }
         }
     }
-}
-
-#[cfg(unix)]
-fn signal_mcp_process_group(process_group_id: u32, signal: i32) -> Result<bool, ()> {
-    if process_group_id == 0 {
-        return Err(());
-    }
-    let process_group_id = i32::try_from(process_group_id).map_err(|_| ())?;
-    // SAFETY: the child is placed in a private process group at spawn.
-    if unsafe { libc::kill(-process_group_id, signal) } == 0 {
-        Ok(true)
-    } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-        Ok(false)
-    } else {
-        Err(())
-    }
-}
-
-#[cfg(unix)]
-fn mcp_process_group_exists(process_group_id: u32) -> bool {
-    signal_mcp_process_group(process_group_id, 0).unwrap_or(true)
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let _ = managed.wait_tree_exit(remaining);
 }
 
 fn join_mcp_reader_until(reader: &Mutex<Option<JoinHandle<()>>>, deadline: Instant) -> bool {

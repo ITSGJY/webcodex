@@ -1,7 +1,9 @@
 use super::*;
 use serde_json::{json, Value};
 use std::fs;
-use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Barrier, OnceLock, Weak};
@@ -142,6 +144,15 @@ impl Fixture {
             .filter_map(|pid| pid.parse().ok())
             .collect()
     }
+
+    fn descendant_pids(&self) -> Vec<u32> {
+        fs::read_to_string(&self.marker)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.strip_prefix("descendant:"))
+            .filter_map(|pid| pid.parse().ok())
+            .collect()
+    }
 }
 
 fn wait_until(timeout: Duration, condition: impl Fn() -> bool) -> bool {
@@ -157,6 +168,7 @@ fn wait_until(timeout: Duration, condition: impl Fn() -> bool) -> bool {
 
 #[test]
 fn lsp_supervisor_is_lazy_and_reuses_one_process_for_concurrent_project_calls() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::new("normal");
     assert!(!fixture.marker.exists());
     let barrier = Arc::new(Barrier::new(7));
@@ -197,6 +209,7 @@ fn lsp_supervisor_is_lazy_and_reuses_one_process_for_concurrent_project_calls() 
 
 #[test]
 fn concurrent_document_refresh_uses_one_monotonic_version() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::new("normal");
     let document_path = fixture.root.join("main.rs");
     fs::write(&document_path, "fn initial() {}\n").unwrap();
@@ -255,6 +268,7 @@ fn concurrent_document_refresh_uses_one_monotonic_version() {
 
 #[test]
 fn failed_did_change_does_not_advance_document_state() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let documents = Mutex::new(HashMap::new());
     let initial = DocumentOpen {
         uri: "file:///workspace/main.rs",
@@ -295,6 +309,7 @@ fn failed_did_change_does_not_advance_document_state() {
 
 #[test]
 fn document_version_overflow_is_safe_and_state_is_fingerprint_only() {
+    let _serial = super::super::serialize_fake_lsp_test();
     assert!(std::mem::size_of::<OpenDocumentState>() <= 40);
     let uri = "file:///workspace/main.rs";
     let initial_text = "fn initial() {}\n";
@@ -321,6 +336,7 @@ fn document_version_overflow_is_safe_and_state_is_fingerprint_only() {
 
 #[test]
 fn diagnostics_cache_is_latest_value_bounded_and_counts_malformed_notifications() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let cache = DiagnosticsCache::default();
     cache.record_publish_diagnostics(Some(&json!({"uri": 7, "diagnostics": []})));
     cache.record_publish_diagnostics(Some(&json!({"uri": "file:///bad.rs"})));
@@ -370,6 +386,7 @@ fn diagnostics_cache_is_latest_value_bounded_and_counts_malformed_notifications(
 
 #[test]
 fn diagnostics_cache_wait_has_version_generation_and_timeout_semantics() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let cache = DiagnosticsCache::default();
     let uri = "file:///workspace/main.rs";
     let no_cache = cache
@@ -408,6 +425,7 @@ fn diagnostics_cache_wait_has_version_generation_and_timeout_semantics() {
 
 #[test]
 fn diagnostics_cache_is_cleared_with_server_instance_restart() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::with_manual_cleanup("diagnostics_one", 4, Duration::ZERO);
     let document_path = fixture.root.join("main.rs");
     let text = "fn main() {}\n";
@@ -445,6 +463,7 @@ fn diagnostics_cache_is_cleared_with_server_instance_restart() {
 
 #[test]
 fn lsp_supervisor_uses_distinct_processes_for_distinct_projects() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::new("normal");
     let second_root = fixture._temp.path().join("second-project");
     fs::create_dir(&second_root).unwrap();
@@ -462,6 +481,7 @@ fn lsp_supervisor_uses_distinct_processes_for_distinct_projects() {
 
 #[test]
 fn lsp_supervisor_enforces_agent_capacity() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::with_limits("normal", 1, Duration::from_secs(60));
     let second_root = fixture._temp.path().join("second-project");
     fs::create_dir(&second_root).unwrap();
@@ -479,6 +499,7 @@ fn lsp_supervisor_enforces_agent_capacity() {
 
 #[test]
 fn lsp_jsonrpc_handles_interleaved_notifications_and_multiple_request_ids() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::new("interleaved");
     for method in ["fake/one", "fake/two", "fake/three"] {
         let result = fixture
@@ -497,6 +518,7 @@ fn lsp_jsonrpc_handles_interleaved_notifications_and_multiple_request_ids() {
 
 #[test]
 fn lsp_jsonrpc_surfaces_errors_and_ignores_unknown_response_ids() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let errors = Fixture::new("json_error");
     let error = errors
         .supervisor
@@ -531,6 +553,7 @@ fn lsp_jsonrpc_surfaces_errors_and_ignores_unknown_response_ids() {
 
 #[test]
 fn lsp_jsonrpc_replies_method_not_found_to_server_requests() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::new("server_request");
     let result = fixture
         .supervisor
@@ -551,6 +574,7 @@ fn lsp_jsonrpc_replies_method_not_found_to_server_requests() {
 
 #[test]
 fn lsp_request_timeout_removes_pending_request() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::new("timeout");
     let server = fixture
         .supervisor
@@ -572,6 +596,7 @@ fn lsp_request_timeout_removes_pending_request() {
 
 #[test]
 fn lsp_request_timeout_sends_cancel_request() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::new("timeout_cancel");
     let server = fixture
         .supervisor
@@ -617,6 +642,7 @@ fn lsp_request_timeout_sends_cancel_request() {
 
 #[test]
 fn lsp_pending_request_receives_server_exit_error() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::new("crash_request");
     let server = fixture
         .supervisor
@@ -632,6 +658,7 @@ fn lsp_pending_request_receives_server_exit_error() {
 
 #[test]
 fn lsp_supervisor_restarts_once_then_succeeds() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::new("restart_then_success");
     let result = fixture
         .supervisor
@@ -648,6 +675,7 @@ fn lsp_supervisor_restarts_once_then_succeeds() {
 
 #[test]
 fn lsp_supervisor_never_restarts_more_than_once_per_call() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::new("restart_exhausted");
     let error = fixture
         .supervisor
@@ -667,6 +695,7 @@ fn lsp_supervisor_never_restarts_more_than_once_per_call() {
 
 #[test]
 fn lsp_supervisor_restarts_malformed_alive_process_once_then_succeeds() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::new("malformed_alive_then_success");
     let result = fixture
         .supervisor
@@ -691,6 +720,7 @@ fn lsp_supervisor_restarts_malformed_alive_process_once_then_succeeds() {
 
 #[test]
 fn lsp_supervisor_malformed_alive_exhausts_restart_without_timeout() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::new("malformed_alive_always");
     let started = Instant::now();
     let error = fixture
@@ -720,6 +750,7 @@ fn lsp_supervisor_malformed_alive_exhausts_restart_without_timeout() {
 
 #[test]
 fn lsp_initialize_failure_consumes_the_single_restart_budget() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::new("initialize_exit");
     let error = fixture
         .supervisor
@@ -739,6 +770,7 @@ fn lsp_initialize_failure_consumes_the_single_restart_budget() {
 
 #[test]
 fn lsp_initialize_pre_exit_with_stderr_surfaces_component_missing_diagnostic() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::new("missing_component_stderr");
     let error = fixture
         .supervisor
@@ -768,6 +800,7 @@ fn lsp_initialize_pre_exit_with_stderr_surfaces_component_missing_diagnostic() {
 
 #[test]
 fn lsp_rustup_proxy_without_component_is_not_available() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let temp = tempfile::tempdir().unwrap();
     let bin = temp.path().join("bin");
     let rustup_home = temp.path().join("rustup");
@@ -843,6 +876,7 @@ fn lsp_rustup_proxy_without_component_is_not_available() {
 
 #[test]
 fn generic_startup_stderr_summary_compacts_bounds_or_none() {
+    let _serial = super::super::serialize_fake_lsp_test();
     // Language-specific classification (e.g. rustup component missing) is
     // owned by the profile's `startup_stderr_classifier`; the generic
     // fallback compacts control characters to spaces, trims, and bounds.
@@ -858,6 +892,7 @@ fn generic_startup_stderr_summary_compacts_bounds_or_none() {
 
 #[test]
 fn lsp_exit_immediately_after_initialize_is_detected_and_bounded() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::new("exit_after_initialize");
     let error = fixture
         .supervisor
@@ -877,6 +912,7 @@ fn lsp_exit_immediately_after_initialize_is_detected_and_bounded() {
 
 #[test]
 fn lsp_malformed_json_and_invalid_content_length_are_distinct() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let malformed = Fixture::new("malformed_json");
     let server = malformed
         .supervisor
@@ -900,6 +936,7 @@ fn lsp_malformed_json_and_invalid_content_length_are_distinct() {
 
 #[test]
 fn lsp_position_encoding_uses_server_capability_or_utf16_default() {
+    let _serial = super::super::serialize_fake_lsp_test();
     for (scenario, expected) in [
         ("utf8", PositionEncoding::Utf8),
         ("utf16", PositionEncoding::Utf16),
@@ -917,6 +954,7 @@ fn lsp_position_encoding_uses_server_capability_or_utf16_default() {
 
 #[test]
 fn lsp_initialize_uses_constrained_rust_analyzer_profile() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::new("normal");
     let _server = fixture
         .supervisor
@@ -1029,6 +1067,7 @@ fn captured_initialize_options(kind: LspServerKind) -> Value {
 
 #[test]
 fn lsp_initialize_uses_constrained_pyright_profile() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let options = captured_initialize_options(LspServerKind::Pyright);
     // openFilesOnly bounds analysis; pyright never executes project code, so
     // the code-execution boundary needs no build-script/proc-macro toggles.
@@ -1056,6 +1095,7 @@ fn lsp_initialize_uses_constrained_pyright_profile() {
 
 #[test]
 fn lsp_initialize_uses_constrained_typescript_profile() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let options = captured_initialize_options(LspServerKind::TypeScriptLanguageServer);
     // disableAutomaticTypingAcquisition is the network boundary (no @types
     // downloads from npm) — the analog to rust-analyzer's cargo.noDeps.
@@ -1078,6 +1118,7 @@ fn lsp_initialize_uses_constrained_typescript_profile() {
 
 #[test]
 fn lsp_default_args_apply_to_env_and_path_but_not_configured() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let supervisor = LspSupervisor::default();
     // Pyright resolves from the env override with `--stdio` appended.
     let (from_env, source) = supervisor
@@ -1114,6 +1155,7 @@ fn lsp_default_args_apply_to_env_and_path_but_not_configured() {
 
 #[test]
 fn lsp_crashed_connection_reaps_immediately_without_full_shutdown_deadline() {
+    let _serial = super::super::serialize_fake_lsp_test();
     // Crashed-but-alive child must not wait the full shutdown timeout before
     // kill/wait. Use a deliberately large budget so the difference is obvious.
     let shutdown_timeout = Duration::from_secs(1);
@@ -1160,6 +1202,7 @@ fn lsp_crashed_connection_reaps_immediately_without_full_shutdown_deadline() {
 
 #[test]
 fn lsp_stderr_capture_is_bounded() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::new("stderr_flood");
     let server = fixture
         .supervisor
@@ -1170,7 +1213,47 @@ fn lsp_stderr_capture_is_bounded() {
 }
 
 #[test]
+fn lsp_graceful_leader_exit_still_reaps_surviving_descendant() {
+    let _serial = super::super::serialize_fake_lsp_test();
+    let fixture = Fixture::with_config(
+        "shutdown_descendant",
+        4,
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        false,
+    );
+    let server = fixture
+        .supervisor
+        .server_for_test(&fixture.root, LspServerKind::RustAnalyzer)
+        .unwrap();
+    let direct_pid = server.process_id();
+    assert!(wait_until(Duration::from_secs(1), || !fixture
+        .descendant_pids()
+        .is_empty()));
+    let descendant_pid = fixture.descendant_pids()[0];
+    assert!(process_exists(direct_pid));
+    assert!(process_exists(descendant_pid));
+
+    let outcome = fixture
+        .supervisor
+        .shutdown_until(Instant::now() + Duration::from_secs(1));
+    assert_eq!(outcome.servers, 1);
+    assert_eq!(outcome.timed_out, 0, "whole-tree shutdown timed out");
+    assert_eq!(
+        outcome.failures, 0,
+        "whole-tree shutdown reported a failure"
+    );
+    assert!(wait_until(Duration::from_secs(1), || !process_exists(
+        direct_pid
+    )));
+    assert!(wait_until(Duration::from_secs(1), || !process_exists(
+        descendant_pid
+    )));
+}
+
+#[test]
 fn lsp_shutdown_and_drop_reap_the_child_process() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::new("normal");
     let server = fixture
         .supervisor
@@ -1207,6 +1290,7 @@ fn lsp_shutdown_and_drop_reap_the_child_process() {
 
 #[test]
 fn lsp_shutdown_uses_single_deadline_against_hanging_server() {
+    let _serial = super::super::serialize_fake_lsp_test();
     // Shutdown timeout 200ms. Multiplied waits would approach 600–800ms+.
     let shutdown_timeout = Duration::from_millis(200);
     let fixture = Fixture::with_config(
@@ -1256,6 +1340,7 @@ fn lsp_shutdown_uses_single_deadline_against_hanging_server() {
 
 #[test]
 fn lsp_multiple_hanging_servers_share_one_supervisor_deadline() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let shutdown_timeout = Duration::from_millis(200);
     let fixture = Fixture::with_config(
         "shutdown_hang",
@@ -1331,6 +1416,7 @@ fn lsp_multiple_hanging_servers_share_one_supervisor_deadline() {
 
 #[test]
 fn lsp_reaper_timeout_does_not_rearm_supervisor_drop_budget() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::with_config(
         "normal",
         4,
@@ -1384,6 +1470,7 @@ fn lsp_reaper_timeout_does_not_rearm_supervisor_drop_budget() {
 
 #[test]
 fn lsp_initialize_timeout_cleanup_uses_configured_shutdown_budget() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let shutdown_timeout = Duration::from_millis(150);
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("project");
@@ -1448,6 +1535,7 @@ fn lsp_initialize_timeout_cleanup_uses_configured_shutdown_budget() {
 
 #[test]
 fn lsp_idle_cleanup_is_explicit_and_bounded() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::with_manual_cleanup("normal", 4, Duration::ZERO);
     let server = fixture
         .supervisor
@@ -1461,6 +1549,7 @@ fn lsp_idle_cleanup_is_explicit_and_bounded() {
 
 #[test]
 fn lsp_idle_cleanup_skips_active_pending_requests() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::with_manual_cleanup("timeout", 4, Duration::ZERO);
     let server = fixture
         .supervisor
@@ -1487,6 +1576,7 @@ fn lsp_idle_cleanup_skips_active_pending_requests() {
 
 #[test]
 fn lsp_idle_cleanup_reaps_crashed_alive_server_immediately() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture =
         Fixture::with_manual_cleanup("malformed_alive_always", 4, Duration::from_secs(3600));
     let server = fixture
@@ -1509,6 +1599,7 @@ fn lsp_idle_cleanup_reaps_crashed_alive_server_immediately() {
 
 #[test]
 fn lsp_background_reaper_reclaims_idle_capacity_without_explicit_cleanup() {
+    let _serial = super::super::serialize_fake_lsp_test();
     // Production agents never call cleanup_idle directly; idle_ttl must be
     // honored by the built-in background reaper or capacity leaks forever.
     let fixture = Fixture::with_limits("normal", 1, Duration::from_millis(100));
@@ -1539,6 +1630,7 @@ fn lsp_background_reaper_reclaims_idle_capacity_without_explicit_cleanup() {
 
 #[test]
 fn lsp_project_root_is_canonical_and_external_uris_are_not_trusted() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::new("normal");
     let canonical = fs::canonicalize(&fixture.root).unwrap();
     let result = fixture
@@ -1577,6 +1669,7 @@ fn lsp_project_root_is_canonical_and_external_uris_are_not_trusted() {
 
 #[test]
 fn lsp_rejects_missing_or_non_directory_project_roots_before_spawn() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::new("normal");
     let missing = fixture._temp.path().join("missing");
     assert!(matches!(
@@ -1601,6 +1694,7 @@ fn lsp_rejects_missing_or_non_directory_project_roots_before_spawn() {
 
 #[test]
 fn lsp_command_resolution_uses_explicit_env_then_path_without_shell() {
+    let _serial = super::super::serialize_fake_lsp_test();
     let fake = fake_server_binary();
     let explicit = LspSupervisor::new(LspSupervisorConfig {
         commands: HashMap::from([(
@@ -1677,7 +1771,23 @@ fn process_exists(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+fn process_exists(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let mut exit_code = 0u32;
+    let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+    unsafe { CloseHandle(handle) };
+    ok == 1 && exit_code == 259
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn process_exists(_pid: u32) -> bool {
     false
 }

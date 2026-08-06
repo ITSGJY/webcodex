@@ -29,6 +29,7 @@ fn call_payload(tool_name: &str, arguments: Value) -> Option<Value> {
 
 #[test]
 fn experimental_invalid_payload_is_rejected_before_claude_start() {
+    let _serial = serialize_fake_mcp_test();
     let fixture = Fixture::new("normal");
     let router = experimental_router(&fixture);
 
@@ -62,6 +63,7 @@ fn experimental_invalid_payload_is_rejected_before_claude_start() {
 
 #[test]
 fn experimental_list_describe_and_fixed_allowlist() {
+    let _serial = serialize_fake_mcp_test();
     let fixture = Fixture::new("normal");
     let router = experimental_router(&fixture);
     assert_eq!(
@@ -180,6 +182,7 @@ fn experimental_list_describe_and_fixed_allowlist() {
 
 #[test]
 fn experimental_arguments_validation_and_schema_hash_are_stable() {
+    let _serial = serialize_fake_mcp_test();
     let fixture = Fixture::new("normal");
     let router = experimental_router(&fixture);
     let invalid = experimental_stdout(
@@ -217,6 +220,7 @@ fn experimental_arguments_validation_and_schema_hash_are_stable() {
 
 #[test]
 fn experimental_read_edit_write_bash_reuse_and_tool_level_is_error() {
+    let _serial = serialize_fake_mcp_test();
     let fixture = Fixture::new("normal");
     let router = experimental_router(&fixture);
 
@@ -328,6 +332,7 @@ fn experimental_read_edit_write_bash_reuse_and_tool_level_is_error() {
 
 #[test]
 fn experimental_mutating_tool_exit_returns_uncertain_write_state() {
+    let _serial = serialize_fake_mcp_test();
     let fixture = Fixture::new("exp_mutate_exit");
     let router = experimental_router(&fixture);
     let target = fixture.root.join("tmp-mutate-exit.txt");
@@ -363,6 +368,7 @@ fn experimental_mutating_tool_exit_returns_uncertain_write_state() {
 
 #[test]
 fn experimental_recovers_lazily_after_process_exit() {
+    let _serial = serialize_fake_mcp_test();
     let exit = Fixture::new("exit");
     let router = experimental_router(&exit);
     let first = experimental_stdout(
@@ -396,6 +402,7 @@ fn experimental_recovers_lazily_after_process_exit() {
 
 #[test]
 fn experimental_discovery_bounds_over_64_tools_and_oversized_schema() {
+    let _serial = serialize_fake_mcp_test();
     let many = Fixture::new("exp_many_tools");
     let router = experimental_router(&many);
     let listed = experimental_stdout(
@@ -461,6 +468,7 @@ fn experimental_discovery_bounds_over_64_tools_and_oversized_schema() {
 
 #[test]
 fn experimental_result_bounds_soft_truncate_and_hard_fail() {
+    let _serial = serialize_fake_mcp_test();
     let soft = Fixture::new("exp_soft_oversized");
     let router = experimental_router(&soft);
     let result = experimental_stdout(
@@ -532,6 +540,7 @@ fn experimental_result_bounds_soft_truncate_and_hard_fail() {
 
 #[test]
 fn experimental_oversized_mcp_request_is_pre_send_not_submitted() {
+    let _serial = serialize_fake_mcp_test();
     let fixture = Fixture::new("normal");
     let router = experimental_router(&fixture);
     // Warm process so marker has only non-tools/call traffic before the huge call.
@@ -573,6 +582,7 @@ fn experimental_oversized_mcp_request_is_pre_send_not_submitted() {
 #[cfg(unix)]
 #[test]
 fn experimental_raw_edit_survives_generation_router_retirement() {
+    let _serial = serialize_fake_mcp_test();
     let fixture = Fixture::with_timeout("delayed", 2);
     let old = Arc::new(experimental_router(&fixture));
     let weak = Arc::downgrade(&old);
@@ -653,6 +663,7 @@ fn experimental_raw_edit_survives_generation_router_retirement() {
 
 #[test]
 fn opt_in_experimental_real_claude_tools_smoke() {
+    let _serial = serialize_fake_mcp_test();
     if env::var_os("WEBCODEX_EXPERIMENTAL_CLAUDE_TOOLS").is_none() {
         return;
     }
@@ -788,15 +799,14 @@ fn opt_in_experimental_real_claude_tools_smoke() {
     // Claude may surface non-zero exits as isError or as structured text.
     eprintln!("experimental_real_claude_bash_nonzero={bash_fail}");
 
+    #[cfg(unix)]
     let process_groups = process_ids(&router.claude);
     router.shutdown();
     #[cfg(unix)]
-    for process_group in process_groups {
+    for pid in process_groups {
         assert!(
-            wait_until(Duration::from_secs(2), || !process_group_exists(
-                process_group
-            )),
-            "Claude process group {process_group} remained after experimental shutdown"
+            wait_until(Duration::from_secs(2), || !process_exists(pid)),
+            "Claude process {pid} remained after experimental shutdown"
         );
     }
 }

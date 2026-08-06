@@ -10,7 +10,7 @@ use std::fmt;
 use std::fs;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -187,7 +187,7 @@ impl LspCommand {
         self
     }
 
-    fn spawn(&self, project_root: &Path) -> Result<Child, LspError> {
+    fn spawn(&self, project_root: &Path) -> Result<webcodex_process::ManagedChild, LspError> {
         let mut command = Command::new(&self.program);
         command
             .args(&self.args)
@@ -196,13 +196,7 @@ impl LspCommand {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
-        command
-            .spawn()
+        webcodex_process::ManagedChild::spawn(&mut command)
             .map_err(|error| LspError::SpawnFailed(error.to_string()))
     }
 
@@ -1595,8 +1589,7 @@ fn synchronize_document_state(
 
 struct ServerInstance {
     key: ProcessKey,
-    child: Mutex<Child>,
-    process_group_id: u32,
+    child: Mutex<webcodex_process::ManagedChild>,
     writer: Arc<Mutex<ChildStdin>>,
     connection: Arc<ConnectionState>,
     next_id: AtomicU64,
@@ -1632,22 +1625,21 @@ impl ServerInstance {
             lock_unpoison(&global_shutdown_deadline)
                 .unwrap_or_else(|| Instant::now() + shutdown_timeout)
         };
-        let mut child = command.spawn(&key.project_root)?;
-        let process_group_id = child.id();
-        let Some(stdin) = child.stdin.take() else {
-            terminate_child_until(&mut child, process_group_id, cleanup_deadline());
+        let mut managed = command.spawn(&key.project_root)?;
+        let Some(stdin) = managed.child_mut().stdin.take() else {
+            cleanup_failed_lsp_child(&mut managed, cleanup_deadline());
             return Err(LspError::SpawnFailed(
                 "stdin pipe was unavailable".to_string(),
             ));
         };
-        let Some(stdout) = child.stdout.take() else {
-            terminate_child_until(&mut child, process_group_id, cleanup_deadline());
+        let Some(stdout) = managed.child_mut().stdout.take() else {
+            cleanup_failed_lsp_child(&mut managed, cleanup_deadline());
             return Err(LspError::SpawnFailed(
                 "stdout pipe was unavailable".to_string(),
             ));
         };
-        let Some(stderr) = child.stderr.take() else {
-            terminate_child_until(&mut child, process_group_id, cleanup_deadline());
+        let Some(stderr) = managed.child_mut().stderr.take() else {
+            cleanup_failed_lsp_child(&mut managed, cleanup_deadline());
             return Err(LspError::SpawnFailed(
                 "stderr pipe was unavailable".to_string(),
             ));
@@ -1672,7 +1664,7 @@ impl ServerInstance {
             }) {
             Ok(thread) => thread,
             Err(error) => {
-                terminate_child_until(&mut child, process_group_id, cleanup_deadline());
+                cleanup_failed_lsp_child(&mut managed, cleanup_deadline());
                 return Err(LspError::SpawnFailed(error.to_string()));
             }
         };
@@ -1692,7 +1684,7 @@ impl ServerInstance {
             }) {
             Ok(thread) => thread,
             Err(error) => {
-                terminate_child_until(&mut child, process_group_id, cleanup_deadline());
+                cleanup_failed_lsp_child(&mut managed, cleanup_deadline());
                 if reader_thread.is_finished() {
                     let _ = reader_thread.join();
                 }
@@ -1702,8 +1694,7 @@ impl ServerInstance {
 
         let server = Arc::new(Self {
             key,
-            child: Mutex::new(child),
-            process_group_id,
+            child: Mutex::new(managed),
             writer,
             connection,
             next_id: AtomicU64::new(1),
@@ -1999,7 +1990,7 @@ impl ServerInstance {
                     let _ = self.notify("exit", Value::Null);
                 }
             }
-            if !self.reap_child(graceful_deadline) {
+            if !self.wait_child_and_tree(graceful_deadline) {
                 if let Err(error) = self.kill_and_reap_child(deadline) {
                     graceful_error = Some(error);
                 }
@@ -2029,19 +2020,13 @@ impl ServerInstance {
 
     fn kill_and_reap_child(&self, deadline: Instant) -> Result<(), String> {
         let mut errors = Vec::new();
-        #[cfg(unix)]
-        if signal_lsp_process_group(self.process_group_id, libc::SIGKILL).is_err() {
-            errors.push("process_group_kill_failed".to_string());
+        // Forcefully terminate the whole managed tree. Idempotent when the
+        // tree is already gone, so it is safe to call unconditionally.
+        if lock_unpoison(&self.child).terminate_tree().is_err() {
+            errors.push("tree_terminate_failed".to_string());
         }
-        #[cfg(not(unix))]
-        {
-            let mut child = lock_unpoison(&self.child);
-            if child.try_wait().is_ok_and(|status| status.is_none()) && child.kill().is_err() {
-                errors.push("child_kill_failed".to_string());
-            }
-        }
-        if !self.reap_child(deadline) {
-            errors.push("child_reap_timed_out".to_string());
+        if !self.wait_child_and_tree(deadline) {
+            errors.push("tree_reap_timed_out".to_string());
         }
         if errors.is_empty() {
             Ok(())
@@ -2050,36 +2035,28 @@ impl ServerInstance {
         }
     }
 
-    /// Wait for the child to exit using the shared deadline. Returns true when
-    /// the process has been reaped (exited before the deadline).
-    fn reap_child(&self, deadline: Instant) -> bool {
+    /// Wait for both the direct child and the complete managed tree to exit,
+    /// using only the caller's shared deadline.
+    fn wait_child_and_tree(&self, deadline: Instant) -> bool {
         while Instant::now() < deadline {
-            let wait_result = {
-                let mut child = lock_unpoison(&self.child);
-                child.try_wait()
-            };
-            match wait_result {
-                Ok(Some(_)) => return true,
-                Ok(None) => {
-                    let remaining = remaining_until(deadline);
-                    if remaining.is_zero() {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(10).min(remaining));
-                }
-                Err(_) => return true,
+            if self.process_reaped_and_group_gone() {
+                return true;
             }
+            let remaining = remaining_until(deadline);
+            if remaining.is_zero() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10).min(remaining));
         }
-        matches!(lock_unpoison(&self.child).try_wait(), Ok(Some(_)) | Err(_))
+        self.process_reaped_and_group_gone()
     }
 
     fn process_reaped_and_group_gone(&self) -> bool {
-        let child_reaped = matches!(lock_unpoison(&self.child).try_wait(), Ok(Some(_)) | Err(_));
-        #[cfg(unix)]
-        let group_gone = !lsp_process_group_exists(self.process_group_id);
-        #[cfg(not(unix))]
-        let group_gone = true;
-        child_reaped && group_gone
+        // The direct child must be reaped AND the complete managed process
+        // tree must be empty. A direct-child exit alone is never "gone".
+        let mut child = lock_unpoison(&self.child);
+        let child_reaped = matches!(child.try_wait(), Ok(Some(_)) | Err(_));
+        child_reaped && child.wait_tree_exit(Duration::ZERO).unwrap_or(false)
     }
 
     #[cfg(test)]
@@ -2240,42 +2217,27 @@ fn join_owned_thread_until(handle: JoinHandle<()>, deadline: Instant) {
     let _ = handle.join();
 }
 
-#[cfg(unix)]
-fn signal_lsp_process_group(process_group_id: u32, signal: i32) -> Result<bool, ()> {
-    if process_group_id == 0 {
-        return Err(());
-    }
-    let process_group_id = i32::try_from(process_group_id).map_err(|_| ())?;
-    // SAFETY: every LSP child is placed in its own private process group.
-    if unsafe { libc::kill(-process_group_id, signal) } == 0 {
-        Ok(true)
-    } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-        Ok(false)
-    } else {
-        Err(())
-    }
-}
-
-#[cfg(unix)]
-fn lsp_process_group_exists(process_group_id: u32) -> bool {
-    signal_lsp_process_group(process_group_id, 0).unwrap_or(true)
-}
-
-fn terminate_child_until(child: &mut Child, process_group_id: u32, deadline: Instant) {
-    #[cfg(unix)]
-    let _ = signal_lsp_process_group(process_group_id, libc::SIGKILL);
-    #[cfg(not(unix))]
-    let _ = child.kill();
-    loop {
-        if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
-            return;
+/// Clean up an LSP child that failed early (missing pipe or thread spawn).
+///
+/// The server can never be used, so the whole managed tree is forcefully
+/// terminated, then the direct child and the whole tree are reaped within the
+/// shared deadline. Never re-arms a fresh wait.
+fn cleanup_failed_lsp_child(managed: &mut webcodex_process::ManagedChild, deadline: Instant) {
+    let _ = managed.terminate_tree();
+    while Instant::now() < deadline {
+        match managed.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) => {
+                let remaining = remaining_until(deadline);
+                if remaining.is_zero() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10).min(remaining));
+            }
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(10).min(remaining));
     }
+    let remaining = remaining_until(deadline);
+    let _ = managed.wait_tree_exit(remaining);
 }
 
 fn lock_unpoison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

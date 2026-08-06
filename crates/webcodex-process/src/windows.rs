@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Threading::{
     GetProcessId, OpenThread, ResumeThread, CREATE_SUSPENDED, THREAD_SUSPEND_RESUME,
 };
 
-use crate::SpawnOptions;
+use crate::{GracefulTermination, SpawnOptions};
 
 /// `Thread32Next` reports this when enumeration reaches the end of the table.
 const ERROR_NO_MORE_FILES: u32 = 18;
@@ -233,6 +233,14 @@ impl ManagedChild {
         }
     }
 
+    /// Graceful tree termination is not available through Job Objects.
+    ///
+    /// Returns `Unsupported` without killing anything; callers may escalate
+    /// explicitly with `terminate_tree`.
+    pub fn request_terminate_tree(&mut self) -> io::Result<GracefulTermination> {
+        Ok(GracefulTermination::Unsupported)
+    }
+
     /// Wait until the job contains no live processes.
     ///
     /// Returns `Ok(true)` once `ActiveProcesses` reaches zero, `Ok(false)` if
@@ -328,7 +336,6 @@ fn resume_process_threads(process_handle: HANDLE) -> io::Result<()> {
         return Err(with_context("Thread32First", error));
     }
 
-    let mut resumed_any = false;
     loop {
         if entry.th32OwnerProcessID == pid {
             // SAFETY: OpenThread returns a valid thread handle or NULL; the
@@ -336,8 +343,7 @@ fn resume_process_threads(process_handle: HANDLE) -> io::Result<()> {
             // right to resume the thread.
             let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
             if thread.is_null() {
-                let error = io::Error::last_os_error();
-                return Err(with_context("OpenThread", error));
+                return Err(with_context("OpenThread", io::Error::last_os_error()));
             }
             // SAFETY: the non-null thread handle is transferred exactly once
             // to the standard library RAII wrapper.
@@ -346,33 +352,30 @@ fn resume_process_threads(process_handle: HANDLE) -> io::Result<()> {
             // returns the previous suspend count, or u32::MAX on failure.
             let previous = unsafe { ResumeThread(thread.as_raw_handle() as HANDLE) };
             if previous == u32::MAX {
-                let error = io::Error::last_os_error();
-                return Err(with_context("ResumeThread", error));
+                return Err(with_context("ResumeThread", io::Error::last_os_error()));
             }
             if previous != 1 {
                 return Err(io::Error::other(format!(
                     "ResumeThread: expected suspend count 1, got {previous}",
                 )));
             }
-            resumed_any = true;
+            // CREATE_SUSPENDED creates exactly one initial thread. User code
+            // has not run yet, so after resuming that matching thread there is
+            // no reason to enumerate the rest of the system-wide snapshot.
+            return Ok(());
         }
         // SAFETY: continues the enumeration, updating `entry` in place.
         if unsafe { Thread32Next(snapshot.as_raw_handle() as HANDLE, &mut entry) } == 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
-                break;
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("resume_process_threads: no thread found for pid {pid}"),
+                ));
             }
             return Err(with_context("Thread32Next", error));
         }
     }
-
-    if !resumed_any {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("resume_process_threads: no threads found for pid {pid}"),
-        ));
-    }
-    Ok(())
 }
 
 /// Wrap the current OS error with call-site context while preserving its

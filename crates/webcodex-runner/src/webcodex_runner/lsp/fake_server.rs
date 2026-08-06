@@ -6,6 +6,7 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -19,6 +20,11 @@ fn main() {
 fn run() -> io::Result<()> {
     let mut args = env::args().skip(1);
     let scenario = args.next().unwrap_or_else(|| "normal".to_string());
+    if scenario == "sleep_descendant" {
+        let seconds = args.next().and_then(|value| value.parse().ok()).unwrap_or(60);
+        thread::sleep(Duration::from_secs(seconds));
+        return Ok(());
+    }
     let marker = args.next().map(PathBuf::from);
     let exit_marker = args.next().map(PathBuf::from);
     if let Some(marker) = &marker {
@@ -30,6 +36,13 @@ fn run() -> io::Result<()> {
                 env::current_dir()?.display()
             ),
         )?;
+    }
+    if scenario == "shutdown_descendant" {
+        let descendant = spawn_sleep_descendant()?;
+        if let Some(marker) = &marker {
+            append_marker(marker, &format!("descendant:{}\n", descendant.id()))?;
+        }
+        drop(descendant);
     }
     if scenario == "stderr_flood" {
         let mut stderr = io::stderr().lock();
@@ -222,6 +235,16 @@ fn run() -> io::Result<()> {
             }
         }
     }
+}
+
+fn spawn_sleep_descendant() -> io::Result<std::process::Child> {
+    let self_exe = env::current_exe()?;
+    Command::new(self_exe)
+        .args(["sleep_descendant", "60"])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
 }
 
 fn maybe_publish_diagnostics(
