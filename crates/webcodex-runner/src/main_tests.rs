@@ -1391,6 +1391,7 @@ fn inspect_shell_real_smoke_reads_checks_and_blocks_project_writes() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn shell_config_path_prepend_discovers_fake_executable() {
     use std::os::unix::fs::PermissionsExt;

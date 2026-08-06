@@ -67,7 +67,9 @@ pub(crate) struct PreparedSshCommand {
 }
 
 /// A ready-to-spawn long-lived SSH shell command paired with the pool entry it
-/// reuses and the resource's default remote cwd.
+/// reuses and the resource's default remote cwd. Used only by the Unix remote
+/// persistent-shell transport.
+#[cfg(unix)]
 pub(crate) struct PreparedPersistentShellCommand {
     pub(crate) command: Command,
     pub(crate) key: SshConnectionKey,
@@ -169,6 +171,7 @@ impl SshConnectionPool {
     /// binary (no `-c` script); the Runner drives it over stdin. The long-lived
     /// channel reuses the same authenticated control socket (`ControlMaster=no
     /// -S <path>`) and never creates a second master.
+    #[cfg(unix)]
     pub(crate) fn prepare_persistent_shell_command(
         &self,
         generation: u64,

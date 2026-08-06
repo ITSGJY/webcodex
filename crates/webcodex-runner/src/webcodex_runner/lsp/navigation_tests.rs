@@ -1353,6 +1353,7 @@ fn real_pyright_document_symbols_end_to_end() {
 /// `typescript-language-server`. Ignored by default (needs the server and
 /// Node). Run with:
 /// `cargo test -p webcodex-runner --bin webcodex-runner real_typescript -- --ignored --nocapture`
+#[cfg(unix)]
 #[test]
 // Needs typescript@5 (classic tsserver.js); typescript@7 native preview lacks it.
 #[ignore = "requires typescript-language-server + typescript@5 (npm i -g typescript-language-server typescript@5)"]

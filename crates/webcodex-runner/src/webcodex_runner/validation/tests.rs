@@ -6,7 +6,6 @@ use crate::validation_bridge::{
     VALIDATION_BRIDGE_PROTOCOL_VERSION,
 };
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -48,9 +47,13 @@ fn write_fake_pyright(bin_dir: &std::path::Path, script_body: &str) -> PathBuf {
     fs::create_dir_all(bin_dir).unwrap();
     let path = bin_dir.join("pyright");
     fs::write(&path, script_body).unwrap();
-    let mut perms = fs::metadata(&path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&path, perms).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+    }
     path
 }
 

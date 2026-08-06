@@ -2,8 +2,10 @@ use super::config::{
     validate_shell_config, AgentPolicy, ShellConfig, ShellProfileConfig, SshConfig,
 };
 use super::projects::{find_project_shell_context_by_id, AgentProjectShellContext};
+#[cfg(unix)]
 use super::remote_shell::{remote_shell_bootstrap, RemoteShellTransport};
 use super::shell::{base_shell_env, cwd_allowed, shell_quote};
+#[cfg(unix)]
 use super::ssh::SshConnectionPool;
 use crate::shell_protocol::{
     PersistentShellRequest, PersistentShellResult, ShellAgentShellRequest,
@@ -16,6 +18,8 @@ use webcodex_persistent_shell::{
 };
 
 const EXECUTOR_AGENT: &str = "agent";
+/// Only the Unix remote (SSH) transport opens shells under this executor id.
+#[cfg(unix)]
 const EXECUTOR_SSH: &str = "ssh";
 const TERMINAL_RECORDS: usize = 128;
 const MAX_COMMAND_BYTES: usize = 8_000;
@@ -23,13 +27,24 @@ const MAX_COMMAND_BYTES: usize = 8_000;
 #[derive(Debug, Clone)]
 pub(crate) struct PersistentShellManager {
     processes: ProcessManager,
+    /// Pool reused only by the Unix remote (SSH) persistent shell transport.
+    #[cfg(unix)]
     ssh_pool: SshConnectionPool,
 }
 
 impl PersistentShellManager {
-    pub(crate) fn new(shell: &ShellConfig, ssh_pool: SshConnectionPool) -> Self {
+    /// `ssh_pool` is consumed only by the Unix remote (SSH) transport. The
+    /// parameter stays on every platform so the constructor signature is
+    /// identical across targets; Windows names it with a leading underscore
+    /// because it is intentionally unused there.
+    pub(crate) fn new(
+        shell: &ShellConfig,
+        #[cfg(unix)] ssh_pool: super::ssh::SshConnectionPool,
+        #[cfg(not(unix))] _ssh_pool: super::ssh::SshConnectionPool,
+    ) -> Self {
         Self {
             processes: ProcessManager::new(limits(shell)),
+            #[cfg(unix)]
             ssh_pool,
         }
     }
@@ -123,6 +138,7 @@ impl PersistentShellManager {
         }
     }
 
+    #[cfg(unix)]
     fn open_ssh(
         &self,
         policy: &AgentPolicy,
@@ -220,6 +236,29 @@ impl PersistentShellManager {
             Ok(summary) => summary_result(summary, "opened", false),
             Err(error) => shell_error_result(operation, error),
         }
+    }
+
+    /// Windows has no SSH persistent shell (and no persistent shell at all
+    /// yet). Fail closed with a stable error; the Runner never advertises
+    /// `ssh_persistent_shell` on Windows.
+    #[cfg(not(unix))]
+    fn open_ssh(
+        &self,
+        _policy: &AgentPolicy,
+        _ssh: &SshConfig,
+        _ssh_generation: u64,
+        _request: &ShellAgentShellRequest,
+        operation: &PersistentShellRequest,
+        _resource_name: &str,
+        _project: &AgentProjectShellContext,
+    ) -> PersistentShellResult {
+        error_result(
+            &operation.shell_id,
+            &operation.workflow_session_id,
+            &operation.runtime_project_id,
+            "persistent_shell_unsupported",
+            "persistent shell is not supported on Windows yet",
+        )
     }
 
     fn exec_ssh(
@@ -1022,7 +1061,7 @@ fn error_result(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::shell_protocol::ShellAgentShellRequest;
