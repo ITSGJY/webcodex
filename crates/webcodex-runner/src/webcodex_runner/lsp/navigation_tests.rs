@@ -946,12 +946,53 @@ fn rejects_absolute_traversal_symlink_and_non_rs() {
     assert_eq!(non_rs["success"], false);
     assert_eq!(non_rs["error"]["code"], "unsupported_language");
 
-    // Symlink outside project.
+    #[cfg(windows)]
+    {
+        // Windows absolute, root-relative, drive-relative, and UNC forms are
+        // not project-relative either (`Path::is_absolute` alone misses the
+        // root-relative and drive-relative shapes); each must be rejected up
+        // front with the absolute-input error.
+        for absolute in [
+            r"\etc\passwd.rs",
+            r"C:\etc\passwd.rs",
+            r"C:passwd.rs",
+            r"\\?\C:\etc\passwd.rs",
+            r"\\server\share\passwd.rs",
+        ] {
+            let rejected = fixture.request(AgentLspPayload {
+                project_id: "demo".into(),
+                request: AgentLspRequest::DocumentSymbols {
+                    path: absolute.into(),
+                    limit: 10,
+                },
+            });
+            assert_eq!(rejected["success"], false, "path {absolute:?}: {rejected}");
+            assert_eq!(
+                rejected["error"]["code"], "invalid_project_path",
+                "path {absolute:?}: {rejected}"
+            );
+        }
+        // Backslash-separated `..` traversal is rejected by component
+        // semantics, which are separator-agnostic.
+        let traversal_win = fixture.request(AgentLspPayload {
+            project_id: "demo".into(),
+            request: AgentLspRequest::DocumentSymbols {
+                path: r"..\..\secret.rs".into(),
+                limit: 10,
+            },
+        });
+        assert_eq!(traversal_win["success"], false);
+        assert_eq!(traversal_win["error"]["code"], "invalid_project_path");
+    }
+
+    // Symlink/junction escape outside the project root. The canonicalization
+    // check must resolve reparse points before deciding trust, so the target
+    // file outside the root is rejected.
     let outside = fixture._temp.path().join("outside.rs");
     fs::write(&outside, "fn x() {}\n").unwrap();
-    let link = fixture.root.join("src/linked.rs");
     #[cfg(unix)]
     {
+        let link = fixture.root.join("src/linked.rs");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
         let sym = fixture.request(AgentLspPayload {
             project_id: "demo".into(),
@@ -963,6 +1004,98 @@ fn rejects_absolute_traversal_symlink_and_non_rs() {
         assert_eq!(sym["success"], false);
         assert_eq!(sym["error"]["code"], "invalid_project_path");
     }
+    #[cfg(windows)]
+    {
+        // Directory junction escaping the project root (`mklink /J` needs no
+        // administrator rights). A file reached through the junction resolves
+        // outside the canonical root and must be rejected like a symlink.
+        let outside_dir = fixture._temp.path().join("outside_dir");
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(outside_dir.join("escaped.rs"), "fn x() {}\n").unwrap();
+        let junction = fixture.root.join("src/escaped");
+        let created = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "New-Item -ItemType Junction -Path $env:WC_JUNCTION_PATH -Target $env:WC_JUNCTION_TARGET | Out-Null",
+            ])
+            .env("WC_JUNCTION_PATH", &junction)
+            .env("WC_JUNCTION_TARGET", &outside_dir)
+            .output()
+            .expect("create junction for escape regression");
+        assert!(
+            created.status.success(),
+            "junction creation failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&created.stdout),
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let escaped = fixture.request(AgentLspPayload {
+            project_id: "demo".into(),
+            request: AgentLspRequest::DocumentSymbols {
+                path: "src/escaped/escaped.rs".into(),
+                limit: 10,
+            },
+        });
+        assert_eq!(escaped["success"], false, "{escaped}");
+        assert_eq!(
+            escaped["error"]["code"], "invalid_project_path",
+            "{escaped}"
+        );
+    }
+}
+
+#[test]
+fn navigation_round_trips_space_and_unicode_paths() {
+    let _serial = super::serialize_fake_lsp_test();
+    // A project-relative path containing a space and non-ASCII characters
+    // must survive the full round trip: canonical resolution, percent-encoded
+    // document URI, server response URI, classification, and `/`-separated
+    // project-relative output.
+    // Four lines so the fake server's default documentSymbol ranges (which
+    // span lines 0..3) convert cleanly against this document.
+    let fixture = NavFixture::with_language(
+        "space_unicode",
+        LspServerKind::RustAnalyzer,
+        &[(
+            "src/ünïcode file.rs",
+            "fn unicode_fn() {}\nlet x = 1;\n// pad line\n// pad line\n",
+        )],
+    );
+    let goto = fixture.request(AgentLspPayload {
+        project_id: "demo".into(),
+        request: AgentLspRequest::GotoDefinition {
+            path: "src/ünïcode file.rs".into(),
+            line: 1,
+            column: 1,
+            limit: 20,
+        },
+    });
+    assert_eq!(goto["success"], true, "{goto}");
+    assert_eq!(goto["result"]["returned_count"], 1, "{goto}");
+    assert_eq!(
+        goto["result"]["locations"][0]["path"], "src/ünïcode file.rs",
+        "{goto}"
+    );
+
+    let symbols = fixture.request(AgentLspPayload {
+        project_id: "demo".into(),
+        request: AgentLspRequest::DocumentSymbols {
+            path: "src/ünïcode file.rs".into(),
+            limit: 10,
+        },
+    });
+    assert_eq!(symbols["success"], true, "{symbols}");
+    assert_eq!(
+        symbols["result"]["symbols"][0]["name"], "outer",
+        "{symbols}"
+    );
+
+    // No absolute host path, extended-length prefix, or file URI may leak
+    // into the public result.
+    let serialized = format!("{goto}{symbols}");
+    assert!(!serialized.contains("file://"), "{serialized}");
+    assert!(!serialized.contains(r"\\?\"), "{serialized}");
 }
 
 #[test]

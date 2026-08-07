@@ -341,7 +341,15 @@ fn start_count(marker: Option<&Path>) -> usize {
 
 fn write_result(writer: &mut impl Write, id: Option<u64>, method: &str) -> io::Result<()> {
     let cwd = env::current_dir()?.display().to_string();
-    let main_uri = path_to_file_uri(&Path::new(&cwd).join("src/main.rs"));
+    // The `space_unicode` scenario points responses at a file whose name
+    // needs URI percent-encoding (space + non-ASCII), exercising the full
+    // didOpen → response → classification round-trip on every platform.
+    let main_relative = if scenario_is_space_unicode() {
+        "src/ünïcode file.rs"
+    } else {
+        "src/main.rs"
+    };
+    let main_uri = path_to_file_uri(&Path::new(&cwd).join(main_relative));
     let other_uri = path_to_file_uri(&Path::new(&cwd).join("src/other.rs"));
     let external_uri = "file:///usr/lib/rustlib/src/rust/library/core/src/lib.rs";
     // Scenario is argv[1]; navigation scenarios encode response shape without
@@ -461,6 +469,10 @@ fn write_result(writer: &mut impl Write, id: Option<u64>, method: &str) -> io::R
     )
 }
 
+fn scenario_is_space_unicode() -> bool {
+    env::args().nth(1).as_deref() == Some("space_unicode")
+}
+
 fn path_to_file_uri(path: &Path) -> String {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -468,10 +480,24 @@ fn path_to_file_uri(path: &Path) -> String {
         env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(path)
     };
     let text = absolute.display().to_string();
-    if text.starts_with('/') {
-        format!("file://{}", text)
+    // Percent-encode every byte outside the URL-unreserved set, the path
+    // separators, and the Windows drive colon — the same encoding real
+    // language servers use when emitting file URIs. Raw spaces or non-ASCII
+    // bytes would produce an unparseable URI.
+    let mut encoded = String::new();
+    for &byte in text.as_bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'/' | b'\\' | b':' | b'-' | b'.' | b'_' | b'~')
+        {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    if encoded.starts_with('/') {
+        format!("file://{encoded}")
     } else {
-        format!("file:///{}", text.replace('\\', "/"))
+        format!("file:///{}", encoded.replace('\\', "/"))
     }
 }
 

@@ -49,7 +49,37 @@ pub(crate) fn is_executable_file(path: &Path) -> bool {
 /// `which_in_path`. Callers that need the ambient `PATH` should read
 /// `std::env::var_os("PATH")` and pass it here.
 pub(crate) fn find_executable_in_path(name: &str, path: &OsStr) -> Option<PathBuf> {
-    std::env::split_paths(path)
-        .map(|directory| directory.join(name))
-        .find(|candidate| is_executable_file(candidate))
+    for directory in std::env::split_paths(path) {
+        let candidate = directory.join(name);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        if Path::new(name).extension().is_none() {
+            let candidate = directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+            if is_executable_file(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn executable_lookup_matches_windows_exe_suffix_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("webcodex-path-probe.exe");
+        std::fs::write(&executable, b"fixture").unwrap();
+        let path = std::env::join_paths([temp.path()]).unwrap();
+
+        assert_eq!(
+            find_executable_in_path("webcodex-path-probe", &path),
+            Some(executable)
+        );
+    }
 }

@@ -1148,7 +1148,7 @@ pub(super) fn is_unusable_rustup_proxy(path: &Path) -> bool {
         .join("toolchains")
         .join(toolchain)
         .join("bin")
-        .join("rust-analyzer");
+        .join(format!("rust-analyzer{}", env::consts::EXE_SUFFIX));
     !is_executable_file(&component)
 }
 
@@ -1176,7 +1176,7 @@ fn looks_like_rustup_proxy(path: &Path) -> bool {
     let Some(parent) = path.parent() else {
         return false;
     };
-    let sibling = parent.join("rustup");
+    let sibling = parent.join(format!("rustup{}", env::consts::EXE_SUFFIX));
     if !sibling.exists() {
         return false;
     }
@@ -1203,8 +1203,14 @@ fn rustup_home_dir() -> Option<PathBuf> {
             return Some(PathBuf::from(value));
         }
     }
-    let home = env::var_os("HOME").filter(|value| !value.is_empty())?;
-    Some(PathBuf::from(home).join(".rustup"))
+    if let Some(home) = env::var_os("HOME").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(home).join(".rustup"));
+    }
+    #[cfg(windows)]
+    if let Some(profile) = env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(profile).join(".rustup"));
+    }
+    None
 }
 
 fn active_rustup_toolchain() -> Option<String> {
@@ -2271,8 +2277,14 @@ pub(crate) fn classify_uri_against_project_root(
     if uri.scheme() != "file" {
         return ProjectUriClassification::Unsupported;
     }
+    // A `file:` URI that cannot be mapped to a local filesystem path can
+    // never refer to a file inside the project, so it is external rather
+    // than unsupported. On Windows this includes POSIX-style absolute URIs
+    // (`file:///usr/lib/...`): the url crate's `to_file_path` requires a
+    // drive-letter or UNC prefix there, so such URIs fail conversion and
+    // must still count as outside the project boundary.
     let Ok(path) = uri.to_file_path() else {
-        return ProjectUriClassification::Unsupported;
+        return ProjectUriClassification::OutsideProject;
     };
     let Ok(path) = fs::canonicalize(path) else {
         return ProjectUriClassification::OutsideProject;

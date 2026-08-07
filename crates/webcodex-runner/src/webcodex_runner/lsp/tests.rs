@@ -874,6 +874,36 @@ fn lsp_rustup_proxy_without_component_is_not_available() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn rustup_home_falls_back_to_userprofile_on_windows() {
+    let _serial = super::super::serialize_fake_lsp_test();
+    let temp = tempfile::tempdir().unwrap();
+    let previous_rustup_home = env::var_os("RUSTUP_HOME");
+    let previous_home = env::var_os("HOME");
+    let previous_userprofile = env::var_os("USERPROFILE");
+
+    env::remove_var("RUSTUP_HOME");
+    env::remove_var("HOME");
+    env::set_var("USERPROFILE", temp.path());
+    let detected = rustup_home_dir();
+
+    match previous_rustup_home {
+        Some(value) => env::set_var("RUSTUP_HOME", value),
+        None => env::remove_var("RUSTUP_HOME"),
+    }
+    match previous_home {
+        Some(value) => env::set_var("HOME", value),
+        None => env::remove_var("HOME"),
+    }
+    match previous_userprofile {
+        Some(value) => env::set_var("USERPROFILE", value),
+        None => env::remove_var("USERPROFILE"),
+    }
+
+    assert_eq!(detected, Some(temp.path().join(".rustup")));
+}
+
 #[test]
 fn generic_startup_stderr_summary_compacts_bounds_or_none() {
     let _serial = super::super::serialize_fake_lsp_test();
@@ -1642,7 +1672,21 @@ fn lsp_project_root_is_canonical_and_external_uris_are_not_trusted() {
             json!({}),
         )
         .unwrap();
-    assert_eq!(result["cwd"], canonical.display().to_string());
+    // The server process must run with the canonical project root as its
+    // working directory. Windows reports the current directory to child
+    // processes in ordinary DOS form (`C:\...`) even when the process was
+    // spawned with the extended-length form (`\\?\C:\...`) that
+    // `fs::canonicalize` returns, so compare resolved identity rather than
+    // string form.
+    let reported_cwd = result["cwd"].as_str().expect("fake server cwd");
+    assert_eq!(
+        fs::canonicalize(reported_cwd)
+            .expect("server cwd must be accessible")
+            .display()
+            .to_string(),
+        canonical.display().to_string(),
+        "server cwd must resolve to the canonical project root"
+    );
     let marker = fs::read_to_string(&fixture.marker).unwrap();
     let root_uri = Url::from_directory_path(&canonical).unwrap().to_string();
     assert!(marker.contains(&root_uri));
@@ -1654,11 +1698,31 @@ fn lsp_project_root_is_canonical_and_external_uris_are_not_trusted() {
         classify_uri_against_project_root(&canonical, inside_uri.as_str()),
         ProjectUriClassification::InsideProject(_)
     ));
+    // The same file identified through its canonicalized (extended-length on
+    // Windows) path must round-trip to a normal file URI that classifies as
+    // inside the project again.
+    let canonical_inside = fs::canonicalize(&inside).unwrap();
+    let canonical_inside_uri = Url::from_file_path(&canonical_inside).unwrap();
+    assert!(matches!(
+        classify_uri_against_project_root(&canonical, canonical_inside_uri.as_str()),
+        ProjectUriClassification::InsideProject(_)
+    ));
     let outside = fixture._temp.path().join("outside.rs");
     fs::write(&outside, "outside\n").unwrap();
     let outside_uri = Url::from_file_path(outside).unwrap();
     assert_eq!(
         classify_uri_against_project_root(&canonical, outside_uri.as_str()),
+        ProjectUriClassification::OutsideProject
+    );
+    // POSIX-style absolute file URIs (e.g. stdlib locations returned by
+    // language servers) must stay external. On Windows the url crate cannot
+    // map them to a local path at all; either way they are outside the
+    // project boundary and must never be trusted as project-relative.
+    assert_eq!(
+        classify_uri_against_project_root(
+            &canonical,
+            "file:///usr/lib/rustlib/src/rust/library/core/src/lib.rs"
+        ),
         ProjectUriClassification::OutsideProject
     );
     assert_eq!(
