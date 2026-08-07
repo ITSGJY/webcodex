@@ -162,6 +162,39 @@ fn ensure_component(path: &Path) -> Result<(), String> {
     }
 }
 
+/// Compare the canonical path returned by the OS with the exact directory
+/// chain that was verified component-by-component above.
+///
+/// Windows `std::fs::canonicalize` returns an extended-length path (`\\?\C:\...`
+/// or `\\?\UNC\server\share\...`) even when no component was redirected. That
+/// spelling-only prefix must not make every ordinary Windows login fail. Ignore
+/// exactly that prefix transformation and nothing else: case changes, junction
+/// redirects, symlinks, or a different path still fail the comparison.
+#[cfg(windows)]
+fn canonical_matches_verified_path(canonical: &Path, verified: &Path) -> bool {
+    if canonical == verified {
+        return true;
+    }
+
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    let verified_wide: Vec<u16> = verified.as_os_str().encode_wide().collect();
+    let mut extended = Vec::with_capacity(verified_wide.len() + 8);
+    if verified_wide.starts_with(&[b'\\' as u16, b'\\' as u16]) {
+        extended.extend("\\\\?\\UNC\\".encode_utf16());
+        extended.extend_from_slice(&verified_wide[2..]);
+    } else {
+        extended.extend("\\\\?\\".encode_utf16());
+        extended.extend_from_slice(&verified_wide);
+    }
+    canonical.as_os_str() == std::ffi::OsString::from_wide(&extended).as_os_str()
+}
+
+#[cfg(not(windows))]
+fn canonical_matches_verified_path(canonical: &Path, verified: &Path) -> bool {
+    canonical == verified
+}
+
 /// Walk `path` component by component, requiring every existing part to be a
 /// real directory and creating the missing tail one level at a time.
 ///
@@ -216,7 +249,7 @@ pub(crate) fn ensure_real_directory_tree(path: &Path) -> Result<PathBuf, String>
     let canonical = resolved
         .canonicalize()
         .map_err(|error| format!("failed to resolve {}: {error}", resolved.display()))?;
-    if canonical != resolved {
+    if !canonical_matches_verified_path(&canonical, &resolved) {
         return Err(format!(
             "{} resolves to {}; refusing to store credentials there",
             resolved.display(),
@@ -485,6 +518,32 @@ mod tests {
 
     fn canon(raw: &str) -> String {
         canonical_server_url(raw).unwrap().url
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_verbatim_prefix_is_the_only_ignored_canonical_difference() {
+        assert!(canonical_matches_verified_path(
+            Path::new(r"\\?\C:\safe\config"),
+            Path::new(r"C:\safe\config")
+        ));
+        assert!(canonical_matches_verified_path(
+            Path::new(r"\\?\UNC\server\share\safe"),
+            Path::new(r"\\server\share\safe")
+        ));
+        assert!(!canonical_matches_verified_path(
+            Path::new(r"\\?\C:\outside\config"),
+            Path::new(r"C:\safe\config")
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn real_windows_directory_tree_accepts_std_canonical_verbatim_form() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let canonical = ensure_real_directory_tree(temp.path()).unwrap();
+        assert!(canonical.is_absolute());
+        assert!(canonical.to_string_lossy().starts_with(r"\\?\"));
     }
 
     #[test]

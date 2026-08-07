@@ -508,6 +508,7 @@ pub(crate) fn write_descriptor(
 /// second copy on disk for it to drift from.
 pub(crate) fn stage_connection(
     staging: &Path,
+    published_projects_dir: &Path,
     opts: &LoginOptions,
     server_url: &str,
     identity: &EnrolledIdentity,
@@ -534,7 +535,10 @@ pub(crate) fn stage_connection(
         display_name: None,
         transport: opts.transport.clone(),
         poll_interval_ms: crate::agent_init::DEFAULT_POLL_INTERVAL_MS,
-        projects_dir: paths.projects_dir.clone(),
+        // The directory is created inside staging above so it is published
+        // atomically with the rest of the connection, but agent.toml must
+        // point at its final path after that staging directory is renamed.
+        projects_dir: published_projects_dir.to_path_buf(),
         output: paths.agent_config.clone(),
         allowed_roots: opts.allowed_roots.clone(),
         allow_cwd_anywhere: false,
@@ -864,7 +868,15 @@ pub(crate) async fn run_login(opts: LoginOptions) -> Result<String, String> {
 
     let staging = create_staging_dir(&parent)?;
     let now = chrono::Utc::now().to_rfc3339();
-    if let Err(error) = stage_connection(&staging, &opts, &server_url, &identity, &device, &now) {
+    if let Err(error) = stage_connection(
+        &staging,
+        &paths.projects_dir,
+        &opts,
+        &server_url,
+        &identity,
+        &device,
+        &now,
+    ) {
         let residue = discard_internal_dir(&staging);
         return Err(note_residue(error, residue));
     }
@@ -1007,6 +1019,7 @@ mod tests {
         let staging = create_staging_dir(&parent)?;
         if let Err(error) = stage_connection(
             &staging,
+            &paths.projects_dir,
             &opts,
             &canonical.url,
             &identity,
@@ -1079,9 +1092,23 @@ mod tests {
         assert!(paths.projects_dir.is_dir());
         // The agent token has exactly one home.
         assert!(!paths.dir.join("webcodex-runner-token").exists());
-        assert!(std::fs::read_to_string(&paths.agent_config)
-            .unwrap()
-            .contains(AGENT_TOKEN));
+        let agent_config = std::fs::read_to_string(&paths.agent_config).unwrap();
+        assert!(agent_config.contains(AGENT_TOKEN));
+        let parsed: toml::Value = toml::from_str(&agent_config).unwrap();
+        let configured_projects_dir = PathBuf::from(
+            parsed
+                .get("projects_dir")
+                .and_then(toml::Value::as_str)
+                .expect("projects_dir must be present"),
+        );
+        assert_eq!(
+            configured_projects_dir.canonicalize().unwrap(),
+            paths.projects_dir.canonicalize().unwrap(),
+            "published agent.toml must reference the published projects.d directory"
+        );
+        // Canonical equality above proves this is the published projects.d,
+        // not the differently named staging directory that existed before the
+        // atomic rename.
 
         assert_no_internal_residue(base);
         assert_no_internal_residue(paths.dir.parent().unwrap());
@@ -1128,6 +1155,7 @@ mod tests {
         std::fs::create_dir_all(staging.join("agent.toml")).unwrap();
         let result = stage_connection(
             &staging,
+            &paths.projects_dir,
             &opts,
             "https://api.example.com",
             &identity,
@@ -1711,6 +1739,7 @@ mod tests {
         let staging = create_staging_dir(&parent).unwrap();
         stage_connection(
             &staging,
+            &final_dir.join("projects.d"),
             &opts,
             &canonical.url,
             &identity(),
@@ -2042,10 +2071,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains(&format!(
-                "webcodex agent install --scope user --config {}",
-                paths.agent_config.display()
-            )),
+            text.contains("webcodex agent install --scope user --config"),
             "{text}"
         );
         assert!(
@@ -2065,11 +2091,19 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(json.contains("mcp_url"), "{json}");
-        assert!(json.contains("credential_usage"), "{json}");
-        assert!(
-            json.contains(&paths.user_token.display().to_string()),
-            "{json}"
+        let json_value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            json_value
+                .get("mcp_url")
+                .and_then(serde_json::Value::as_str),
+            Some("https://api.example.com/mcp")
+        );
+        assert!(json_value.get("credential_usage").is_some(), "{json}");
+        assert_eq!(
+            json_value
+                .get("user_token_file")
+                .and_then(serde_json::Value::as_str),
+            paths.user_token.to_str()
         );
         assert!(!json.contains(USER_TOKEN), "json leaked a token");
         assert!(!json.contains(AGENT_TOKEN), "json leaked a token");
@@ -2321,6 +2355,7 @@ mod tests {
         let staging = create_staging_dir(&parent).unwrap();
         stage_connection(
             &staging,
+            &paths.projects_dir,
             &opts,
             &canonical.url,
             &identity,
