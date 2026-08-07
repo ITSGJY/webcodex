@@ -602,34 +602,26 @@ fn graceful_request_repeated_and_already_exited_do_not_panic() {
     let _ = result;
 }
 
-/// A caller-installed `setsid` pre-exec hook must remain compatible with
-/// ManagedChild's Unix process-tree ownership.
+/// ManagedChild must preserve the normal Command spawn failure for an
+/// executable text file without a shebang. A generic pre_exec hook changes
+/// this on Unix by allowing libc execvp to fall back to /bin/sh on ENOEXEC.
 #[cfg(unix)]
 #[test]
-fn caller_setsid_pre_exec_remains_compatible() {
-    use std::os::unix::process::CommandExt;
+fn spawn_preserves_enoexec_failure() {
+    use std::os::unix::fs::PermissionsExt;
 
-    let mut command = Command::new(helper());
-    command.arg("sleep").arg("60");
-    // SAFETY: the hook performs only the async-signal-safe setsid syscall.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut managed = ManagedChild::spawn(&mut command)
-        .expect("ManagedChild must accept a caller-created session");
-    assert!(!managed.try_tree_exit().expect("probe live tree"));
-    managed.terminate_tree().expect("terminate setsid tree");
-    assert!(managed
-        .wait_tree_exit(Duration::from_secs(10))
-        .expect("wait setsid tree"));
-    let _ = managed.try_wait();
+    let temp = tempfile::tempdir().unwrap();
+    let executable = temp.path().join("not-an-executable-format");
+    std::fs::write(&executable, "echo should-not-run\n").unwrap();
+    let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&executable, permissions).unwrap();
+
+    let mut command = Command::new(&executable);
+    let error = ManagedChild::spawn(&mut command)
+        .expect_err("ENOEXEC must remain a spawn failure, not a /bin/sh fallback");
+    assert_eq!(error.raw_os_error(), Some(libc::ENOEXEC));
 }
-
 /// `try_tree_exit` is the non-blocking tree probe used by Runner shutdown.
 #[test]
 fn try_tree_exit_tracks_tree_liveness() {

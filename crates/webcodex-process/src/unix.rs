@@ -43,36 +43,11 @@ impl ManagedChild {
     pub fn spawn_with_options(command: &mut Command, _options: SpawnOptions) -> io::Result<Self> {
         // The child becomes the leader of a new process group whose id equals
         // the child's pid; every descendant it spawns inherits the group.
-        //
-        // This is installed as a pre_exec closure rather than via
-        // `CommandExt::process_group`, because std applies `process_group`
-        // *before* running caller-installed `pre_exec` closures. A caller that
-        // already established a private group through a `setsid` pre_exec (the
-        // shell job commands do) would then have its `setsid` fail with EPERM
-        // on a process std just made a group leader. Running after the caller's
-        // pre_execs, the check below is a no-op when the child is already a
-        // group leader and otherwise creates the private group.
-        //
-        // SAFETY: `pre_exec` may run arbitrary code in the post-fork child;
-        // the closure it installs only calls async-signal-safe syscalls and
-        // touches no Rust-managed memory.
-        unsafe {
-            command.pre_exec(|| {
-                // SAFETY: getpid/getpgid are async-signal-safe syscalls that
-                // touch no Rust-managed memory in the post-fork child.
-                let pid = libc::getpid();
-                if libc::getpgid(0) != pid {
-                    // SAFETY: setting our own pgid to our own pid in the
-                    // freshly forked child cannot move us into another session,
-                    // and the pgid is unused, so this only fails in exotic
-                    // environments.
-                    if libc::setpgid(0, 0) == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                }
-                Ok(())
-            });
-        }
+        // Keep this on CommandExt rather than a pre_exec closure: adding any
+        // pre_exec hook changes normal Command spawn semantics for ENOEXEC.
+        // Callers that need a conflicting setsid pre_exec require a dedicated
+        // future spawn mode rather than changing the default contract.
+        command.process_group(0);
         let child = command.spawn()?;
         let pgid = child.id();
         Ok(Self { child, pgid })

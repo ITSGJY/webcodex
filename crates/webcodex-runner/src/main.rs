@@ -3400,7 +3400,7 @@ impl JobManager {
             );
             return;
         }
-        let prepared = match self.ssh_pool.prepare_command(
+        let prepared = match self.ssh_pool.prepare_job_command(
             generation,
             &ssh,
             resource_name,

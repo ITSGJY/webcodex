@@ -127,10 +127,8 @@ pub(crate) fn configured_shell_job_command(
         cmd.arg(arg);
     }
     cmd.arg(shell_command_text(shell, command));
-    // Establish the private group before `Command::spawn` returns. Executing
-    // an external `setsid` wrapper left a race where shutdown could signal a
-    // group that the wrapper had not created yet, then lose the group id.
-    configure_direct_process_group(&mut cmd);
+    // JobManager owns this process tree through ManagedChild; do not add
+    // the legacy setsid pre_exec here. ManagedChild creates the private group.
     apply_shell_environment(&mut cmd, shell)?;
     Ok(cmd)
 }
@@ -144,7 +142,8 @@ pub(crate) fn configured_prepared_shell_job_command(
         cmd.arg(arg);
     }
     cmd.arg(command);
-    configure_direct_process_group(&mut cmd);
+    // JobManager owns this process tree through ManagedChild; do not add
+    // the legacy setsid pre_exec here. ManagedChild creates the private group.
     apply_env_snapshot(&mut cmd, &profile.env_snapshot);
     Ok(cmd)
 }
@@ -157,7 +156,8 @@ pub(crate) fn configured_validation_job_command(
 ) -> Result<Command, String> {
     let mut cmd = Command::new(program);
     cmd.args(args);
-    configure_direct_process_group(&mut cmd);
+    // JobManager owns this process tree through ManagedChild; do not add
+    // the legacy setsid pre_exec here. ManagedChild creates the private group.
     match profile {
         Some(profile) => apply_env_snapshot(&mut cmd, &profile.env_snapshot),
         None => {
