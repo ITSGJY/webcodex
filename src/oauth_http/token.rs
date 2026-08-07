@@ -6,7 +6,10 @@ use sha2::{Digest, Sha256};
 use crate::auth::{generate_oauth_access_token, generate_oauth_refresh_token, hash_token};
 use crate::models::{OAuthAccessTokenRecord, OAuthRefreshTokenRecord};
 
-use super::{apply_oauth_no_store_headers, oauth_error, MAX_OAUTH_TOKEN_FORM_BYTES};
+use super::{
+    apply_oauth_no_store_headers, oauth_error, validate_authorize_resource,
+    MAX_OAUTH_TOKEN_FORM_BYTES,
+};
 
 /// Verify a PKCE S256 code verifier against the stored code challenge.
 ///
@@ -28,6 +31,27 @@ struct TokenRequest {
     code_verifier: Option<String>,
     refresh_token: Option<String>,
     scope: Option<String>,
+    resource: Option<String>,
+}
+
+/// Resolve the RFC 8707 resource indicator for a token grant while retaining
+/// compatibility with pre-resource clients. When the authorization grant is
+/// already resource-bound, a token request may only repeat the same target.
+fn resolve_token_resource(
+    config: &crate::Config,
+    requested: Option<&str>,
+    authorized: Option<&str>,
+) -> Result<Option<String>, ()> {
+    let Some(requested) = requested else {
+        return Ok(authorized.map(str::to_string));
+    };
+    let normalized = validate_authorize_resource(Some(requested), config).map_err(|_| ())?;
+    if let Some(authorized) = authorized {
+        if normalized.as_deref() != Some(authorized) {
+            return Err(());
+        }
+    }
+    Ok(normalized)
 }
 
 #[handler]
@@ -403,6 +427,24 @@ async fn handle_authorization_code_grant(
         return;
     }
 
+    let token_resource = match resolve_token_resource(
+        config,
+        form.resource.as_deref(),
+        code_record.resource.as_deref(),
+    ) {
+        Ok(resource) => resource,
+        Err(()) => {
+            let _ = db.consume_oauth_authorization_code_by_hash(&code_hash, now);
+            oauth_error(
+                res,
+                StatusCode::BAD_REQUEST,
+                "invalid_target",
+                "resource does not match authorization grant",
+            );
+            return;
+        }
+    };
+
     // --- All validations passed — transactional exchange ---
     let access_token = generate_oauth_access_token();
     let refresh_token = generate_oauth_refresh_token();
@@ -419,7 +461,7 @@ async fn handle_authorization_code_grant(
         subject_id: code_record.subject_id.clone(),
         user_id: code_record.user_id.clone(),
         scopes: code_record.scopes.clone(),
-        resource: code_record.resource.clone(),
+        resource: token_resource.clone(),
         shared_key_hash: code_record.shared_key_hash.clone(),
         created_at: now,
         expires_at: at_expires_at,
@@ -435,7 +477,7 @@ async fn handle_authorization_code_grant(
         subject_id: code_record.subject_id.clone(),
         user_id: code_record.user_id.clone(),
         scopes: code_record.scopes.clone(),
-        resource: code_record.resource.clone(),
+        resource: token_resource,
         shared_key_hash: code_record.shared_key_hash.clone(),
         created_at: now,
         expires_at: rt_expires_at,
@@ -575,6 +617,23 @@ async fn handle_refresh_token_grant(
         }
     };
 
+    let token_resource = match resolve_token_resource(
+        config,
+        form.resource.as_deref(),
+        old_rt_metadata.resource.as_deref(),
+    ) {
+        Ok(resource) => resource,
+        Err(()) => {
+            oauth_error(
+                res,
+                StatusCode::BAD_REQUEST,
+                "invalid_target",
+                "resource does not match refresh token",
+            );
+            return;
+        }
+    };
+
     let at_record = OAuthAccessTokenRecord {
         id: uuid::Uuid::new_v4().to_string(),
         token_hash: new_at_hash,
@@ -583,7 +642,7 @@ async fn handle_refresh_token_grant(
         subject_id: old_rt_metadata.subject_id.clone(),
         user_id: old_rt_metadata.user_id.clone(),
         scopes: old_rt_metadata.scopes.clone(),
-        resource: old_rt_metadata.resource.clone(),
+        resource: token_resource.clone(),
         shared_key_hash: old_rt_metadata.shared_key_hash.clone(),
         created_at: now,
         expires_at: at_expires_at,
@@ -599,7 +658,7 @@ async fn handle_refresh_token_grant(
         subject_id: old_rt_metadata.subject_id.clone(),
         user_id: old_rt_metadata.user_id.clone(),
         scopes: old_rt_metadata.scopes.clone(),
-        resource: old_rt_metadata.resource.clone(),
+        resource: token_resource,
         shared_key_hash: old_rt_metadata.shared_key_hash.clone(),
         created_at: now,
         expires_at: new_rt_expires_at,

@@ -45,7 +45,7 @@ async fn oauth_protected_resource_metadata_fields() {
         "resource should be absolute URL, got {}",
         resource
     );
-    assert_eq!(resource, "https://codex.example.com");
+    assert_eq!(resource, "https://codex.example.com/mcp");
 
     // authorization_servers is an array whose first element matches issuer
     let auth_servers = body["authorization_servers"].as_array().unwrap();
@@ -64,6 +64,10 @@ async fn oauth_protected_resource_metadata_fields() {
     assert!(
         scopes.iter().any(|s| s == "runtime:read"),
         "scopes_supported should contain runtime:read"
+    );
+    assert!(
+        scopes.iter().any(|s| s == "offline_access"),
+        "discovery should advertise offline_access when refresh tokens are supported"
     );
 
     // resource_name
@@ -92,7 +96,7 @@ async fn oauth_protected_resource_metadata_no_issuer_fallback() {
         .await;
     assert_eq!(resp.status_code, Some(StatusCode::OK));
     let body: serde_json::Value = resp.take_json().await.unwrap();
-    assert_eq!(body["resource"], "http://localhost");
+    assert_eq!(body["resource"], "http://localhost/mcp");
     let auth_servers = body["authorization_servers"].as_array().unwrap();
     assert_eq!(auth_servers[0], "http://localhost");
 }
@@ -121,6 +125,11 @@ async fn oauth_authorization_server_metadata_is_public() {
     assert_eq!(
         body["authorization_endpoint"],
         "http://localhost/oauth/authorize"
+    );
+    assert_eq!(
+        body["authorization_response_iss_parameter_supported"],
+        serde_json::json!(false),
+        "local HTTP fallback must not claim RFC 9207 issuer-bound responses"
     );
 }
 
@@ -181,7 +190,11 @@ async fn oauth_authorization_server_metadata_fields() {
     );
     assert_eq!(
         body["scopes_supported"],
-        serde_json::json!(oauth_scopes_supported())
+        serde_json::json!(oauth_discovery_scopes_supported())
+    );
+    assert_eq!(
+        body["authorization_response_iss_parameter_supported"],
+        serde_json::json!(true)
     );
 
     assert!(

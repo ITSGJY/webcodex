@@ -23,13 +23,37 @@ pub(super) fn oauth_authorize_direct_error(
     })));
 }
 
+/// Return the RFC 9207 authorization-response issuer when the configured
+/// public issuer is suitable for Internet OAuth interoperability. Local HTTP
+/// development keeps legacy redirects and does not advertise issuer binding.
+pub(super) fn authorization_response_issuer(config: &crate::Config) -> Option<&str> {
+    let issuer = config.oauth2.issuer.as_deref()?;
+    let parsed = url::Url::parse(issuer).ok()?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    Some(issuer)
+}
+
 pub(super) fn redirect_with_oauth_error(
     res: &mut Response,
+    config: &crate::Config,
     redirect_uri: &str,
     error: &str,
     state: Option<&str>,
 ) {
-    let location = match append_authorize_error_params(redirect_uri, error, state) {
+    let location = match append_authorize_error_params(
+        redirect_uri,
+        error,
+        state,
+        authorization_response_issuer(config),
+    ) {
         Ok(location) => location,
         Err(_) => {
             oauth_authorize_direct_error(
@@ -63,6 +87,7 @@ fn append_authorize_error_params(
     redirect_uri: &str,
     error: &str,
     state: Option<&str>,
+    issuer: Option<&str>,
 ) -> Result<String, url::ParseError> {
     let mut url = url::Url::parse(redirect_uri)?;
     {
@@ -71,17 +96,26 @@ fn append_authorize_error_params(
         if let Some(state) = state {
             query.append_pair("state", state);
         }
+        if let Some(issuer) = issuer {
+            query.append_pair("iss", issuer);
+        }
     }
     Ok(url.into())
 }
 
 pub(super) fn redirect_with_authorization_code(
     res: &mut Response,
+    config: &crate::Config,
     redirect_uri: &str,
     code: &str,
     state: Option<&str>,
 ) {
-    let location = match append_authorize_success_params(redirect_uri, code, state) {
+    let location = match append_authorize_success_params(
+        redirect_uri,
+        code,
+        state,
+        authorization_response_issuer(config),
+    ) {
         Ok(location) => location,
         Err(_) => {
             oauth_authorize_direct_error(
@@ -115,6 +149,7 @@ fn append_authorize_success_params(
     redirect_uri: &str,
     code: &str,
     state: Option<&str>,
+    issuer: Option<&str>,
 ) -> Result<String, url::ParseError> {
     let mut url = url::Url::parse(redirect_uri)?;
     {
@@ -122,6 +157,9 @@ fn append_authorize_success_params(
         query.append_pair("code", code);
         if let Some(state) = state {
             query.append_pair("state", state);
+        }
+        if let Some(issuer) = issuer {
+            query.append_pair("iss", issuer);
         }
     }
     Ok(url.into())
@@ -732,6 +770,7 @@ pub(crate) async fn oauth_authorize_consent(
         // Deny: redirect with error=access_denied.
         redirect_with_oauth_error(
             res,
+            &config,
             &parsed.redirect_uri,
             "access_denied",
             parsed.state.as_deref(),
@@ -743,6 +782,7 @@ pub(crate) async fn oauth_authorize_consent(
     if parsed.response_type != "code" {
         redirect_with_oauth_error(
             res,
+            &config,
             &parsed.redirect_uri,
             "unsupported_response_type",
             parsed.state.as_deref(),
@@ -752,6 +792,7 @@ pub(crate) async fn oauth_authorize_consent(
     if parsed.code_challenge.is_empty() || parsed.code_challenge_method != "S256" {
         redirect_with_oauth_error(
             res,
+            &config,
             &parsed.redirect_uri,
             "invalid_request",
             parsed.state.as_deref(),
@@ -763,6 +804,7 @@ pub(crate) async fn oauth_authorize_consent(
         Err(_) => {
             redirect_with_oauth_error(
                 res,
+                &config,
                 &parsed.redirect_uri,
                 "invalid_scope",
                 parsed.state.as_deref(),
@@ -775,6 +817,7 @@ pub(crate) async fn oauth_authorize_consent(
         Err(_) => {
             redirect_with_oauth_error(
                 res,
+                &config,
                 &parsed.redirect_uri,
                 "invalid_target",
                 parsed.state.as_deref(),
@@ -820,6 +863,7 @@ pub(crate) async fn oauth_authorize_consent(
 
     redirect_with_authorization_code(
         res,
+        &config,
         &parsed.redirect_uri,
         &plaintext_code,
         parsed.state.as_deref(),
@@ -1117,6 +1161,7 @@ async fn authorize_issue_with_context(
         Err(error) if is_redirectable_missing_authorize_param(&error) => {
             redirect_with_oauth_error(
                 res,
+                config,
                 &redirect_uri,
                 redirect_error_for_missing_authorize_param(&error),
                 state.as_deref(),
@@ -1137,6 +1182,7 @@ async fn authorize_issue_with_context(
     if parsed.response_type.is_empty() || parsed.response_type != "code" {
         redirect_with_oauth_error(
             res,
+            config,
             &redirect_uri,
             "unsupported_response_type",
             parsed.state.as_deref(),
@@ -1147,6 +1193,7 @@ async fn authorize_issue_with_context(
     if parsed.code_challenge.is_empty() {
         redirect_with_oauth_error(
             res,
+            config,
             &redirect_uri,
             "invalid_request",
             parsed.state.as_deref(),
@@ -1157,6 +1204,7 @@ async fn authorize_issue_with_context(
     if parsed.code_challenge_method.is_empty() || parsed.code_challenge_method != "S256" {
         redirect_with_oauth_error(
             res,
+            config,
             &redirect_uri,
             "invalid_request",
             parsed.state.as_deref(),
@@ -1167,7 +1215,13 @@ async fn authorize_issue_with_context(
     let scopes = match normalize_oauth_scopes(parsed.scope.as_deref(), &client.allowed_scopes) {
         Ok(scopes) => scopes,
         Err(_) => {
-            redirect_with_oauth_error(res, &redirect_uri, "invalid_scope", parsed.state.as_deref());
+            redirect_with_oauth_error(
+                res,
+                config,
+                &redirect_uri,
+                "invalid_scope",
+                parsed.state.as_deref(),
+            );
             return;
         }
     };
@@ -1177,6 +1231,7 @@ async fn authorize_issue_with_context(
         Err(_) => {
             redirect_with_oauth_error(
                 res,
+                config,
                 &redirect_uri,
                 "invalid_target",
                 parsed.state.as_deref(),
@@ -1220,7 +1275,13 @@ async fn authorize_issue_with_context(
         return;
     }
 
-    redirect_with_authorization_code(res, &redirect_uri, &plaintext_code, parsed.state.as_deref());
+    redirect_with_authorization_code(
+        res,
+        config,
+        &redirect_uri,
+        &plaintext_code,
+        parsed.state.as_deref(),
+    );
 }
 
 /// Browser session path: validate the client + redirect_uri + scope against
@@ -1289,6 +1350,7 @@ fn authorize_render_consent(
         Err(_) => {
             redirect_with_oauth_error(
                 res,
+                config,
                 &parsed.redirect_uri,
                 "invalid_target",
                 parsed.state.as_deref(),

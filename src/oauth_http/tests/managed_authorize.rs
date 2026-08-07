@@ -408,6 +408,10 @@ async fn oauth_authorize_consent_allow_stores_resource_on_code() {
     assert_eq!(record.resource.as_deref(), Some("https://example.test/mcp"));
     assert_eq!(record.shared_key_hash, None);
     assert_eq!(params.get("state").map(String::as_str), Some("state-1"));
+    assert_eq!(
+        params.get("iss").map(String::as_str),
+        Some("https://example.test")
+    );
 }
 
 #[tokio::test]

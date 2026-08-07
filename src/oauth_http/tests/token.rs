@@ -114,6 +114,84 @@ async fn oauth_token_exchange_inherits_resource_from_code() {
 }
 
 #[tokio::test]
+async fn oauth_token_exchange_accepts_matching_rfc8707_resource_parameter() {
+    let config = test_config(oauth2_enabled_no_pkce_with_issuer("https://example.test"));
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let (client, secret) = seed_client(&db, &user, "Test App");
+    let (_, code) = seed_auth_code_with_resource(
+        &db,
+        &client,
+        &user,
+        "https://example.com/callback",
+        "runtime:read",
+        None,
+        None,
+        Some("https://example.test/mcp"),
+    );
+
+    let service = Service::new(build_router(config, db.clone()));
+    let body = form_body(&[
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("redirect_uri", "https://example.com/callback"),
+        ("client_id", &client.client_id),
+        ("client_secret", &secret),
+        ("resource", "https://example.test/mcp"),
+    ]);
+    let mut resp = post_form("http://localhost/oauth/token", body)
+        .send(&service)
+        .await;
+
+    assert_eq!(resp.status_code, Some(StatusCode::OK));
+    let json: serde_json::Value = resp.take_json().await.unwrap();
+    let access_token = json["access_token"].as_str().unwrap();
+    assert_eq!(
+        access_token_resource_by_plaintext(&db, access_token).as_deref(),
+        Some("https://example.test/mcp")
+    );
+}
+
+#[tokio::test]
+async fn oauth_token_exchange_rejects_mismatched_rfc8707_resource_parameter() {
+    let config = test_config(oauth2_enabled_no_pkce_with_issuer("https://example.test"));
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let (client, secret) = seed_client(&db, &user, "Test App");
+    let (_, code) = seed_auth_code_with_resource(
+        &db,
+        &client,
+        &user,
+        "https://example.com/callback",
+        "runtime:read",
+        None,
+        None,
+        Some("https://example.test/mcp"),
+    );
+    let (at_before, rt_before) = oauth_token_counts(&db);
+
+    let service = Service::new(build_router(config, db.clone()));
+    let body = form_body(&[
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("redirect_uri", "https://example.com/callback"),
+        ("client_id", &client.client_id),
+        ("client_secret", &secret),
+        ("resource", "https://example.test"),
+    ]);
+    let mut resp = post_form("http://localhost/oauth/token", body)
+        .send(&service)
+        .await;
+
+    assert_eq!(resp.status_code, Some(StatusCode::BAD_REQUEST));
+    let json: serde_json::Value = resp.take_json().await.unwrap();
+    assert_eq!(json["error"], "invalid_target");
+    let (at_after, rt_after) = oauth_token_counts(&db);
+    assert_eq!(at_before, at_after);
+    assert_eq!(rt_before, rt_after);
+}
+
+#[tokio::test]
 async fn oauth_token_exchange_inherits_bridge_shared_key_hash_from_code() {
     let config = test_config(oauth2_enabled_no_pkce());
     let (_tmp, db) = test_db();

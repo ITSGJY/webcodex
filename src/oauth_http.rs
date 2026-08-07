@@ -39,10 +39,10 @@ use html::authorize_bridge_html;
 #[cfg(test)]
 use managed_authorize::AUTHORIZE_SESSION_COOKIE;
 use managed_authorize::{
-    decoded_authorize_param, form_field, is_authorize_identity_allowed,
-    oauth_authorize_direct_error, parse_authorize_query, parse_form_body,
-    redirect_with_authorization_code, redirect_with_oauth_error, validate_authorize_resource,
-    OAuthAuthorizeError, OAuthAuthorizeRequest,
+    authorization_response_issuer, decoded_authorize_param, form_field,
+    is_authorize_identity_allowed, oauth_authorize_direct_error, parse_authorize_query,
+    parse_form_body, redirect_with_authorization_code, redirect_with_oauth_error,
+    validate_authorize_resource, OAuthAuthorizeError, OAuthAuthorizeRequest,
 };
 pub(crate) use managed_authorize::{
     oauth_authorize, oauth_authorize_consent, oauth_authorize_login, AuthorizeSessionStore,
@@ -50,7 +50,10 @@ pub(crate) use managed_authorize::{
 pub(crate) use metadata::{oauth_authorization_server_metadata, oauth_metadata};
 use responses::{apply_oauth_no_store_headers, oauth_error};
 pub(crate) use revoke::oauth_revoke;
-pub(crate) use scope_registry::{normalize_oauth_scopes, oauth_scopes_supported};
+pub(crate) use scope_registry::{
+    normalize_oauth_scopes, oauth_discovery_scopes_supported, oauth_scopes_supported,
+    OAUTH_OFFLINE_ACCESS_SCOPE,
+};
 pub(crate) use shared_key_bridge::oauth_authorize_bridge;
 #[cfg(test)]
 pub(crate) use shared_key_bridge::{
