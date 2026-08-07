@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use webcodex_process::{GracefulTermination, ManagedChild};
+
 const SHELL_PROFILE_PREPARE_TIMEOUT_SECS: u64 = 30;
 const PROCESS_GROUP_TERMINATION_GRACE: Duration = Duration::from_millis(50);
 const PROFILE_PREPARE_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -98,7 +100,9 @@ fn configured_shell_command(shell: &ShellConfig, command: &str) -> Result<Comman
         cmd.arg(arg);
     }
     cmd.arg(shell_command_text(shell, command));
-    configure_direct_process_group(&mut cmd);
+    // The shell execution path owns its process tree through ManagedChild; do
+    // not add a process-group pre_exec here. ManagedChild creates the private
+    // process group (Unix) / Job Object (Windows) at spawn time.
     apply_shell_environment(&mut cmd, shell)?;
     Ok(cmd)
 }
@@ -112,7 +116,9 @@ fn configured_prepared_shell_command(
         cmd.arg(arg);
     }
     cmd.arg(command);
-    configure_direct_process_group(&mut cmd);
+    // The shell execution path owns its process tree through ManagedChild; do
+    // not add a process-group pre_exec here. ManagedChild creates the private
+    // process group (Unix) / Job Object (Windows) at spawn time.
     apply_env_snapshot(&mut cmd, &profile.env_snapshot);
     Ok(cmd)
 }
@@ -166,24 +172,6 @@ pub(crate) fn configured_validation_job_command(
         }
     }
     Ok(cmd)
-}
-
-fn configure_direct_process_group(command: &mut Command) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: `setsid` is async-signal-safe and touches no Rust-managed
-        // memory in the post-fork child.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(())
-                }
-            });
-        }
-    }
 }
 
 pub(crate) fn base_shell_env(
@@ -318,12 +306,11 @@ fn run_prepare_command(
     if stop_requested.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
         return Err("profile prepare stopped during runner shutdown".to_string());
     }
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    // ManagedChild owns the whole profile-prepare process tree: a private
+    // process group on Unix, a kill-on-close Job Object on Windows.
+    let mut child = ManagedChild::spawn(&mut cmd.stdout(Stdio::piped()).stderr(Stdio::piped()))
         .map_err(|e| format!("failed to spawn profile prepare command: {}", e))?;
-    let stdout = match child.stdout.take() {
+    let stdout = match child.child_mut().stdout.take() {
         Some(stdout) => stdout,
         None => {
             let cleanup = terminate_child_without_output(child).err();
@@ -333,7 +320,7 @@ fn run_prepare_command(
             ));
         }
     };
-    let stderr = match child.stderr.take() {
+    let stderr = match child.child_mut().stderr.take() {
         Some(stderr) => stderr,
         None => {
             drop(stdout);
@@ -403,9 +390,10 @@ fn run_prepare_command(
             }
         }
     };
-    // The direct child has already exited, but its private process group can
+    // The direct child has already exited, but its managed process tree can
     // still contain background descendants that inherited these pipe handles.
-    // Reap that group before waiting on the readers so they see EOF promptly.
+    // Terminate the whole tree before waiting on the readers so they see EOF
+    // promptly.
     let cleanup = terminate_child_process_tree(&mut child).err();
     let output = collect_profile_prepare_output(stdout_reader, stderr_reader);
     match (cleanup, output) {
@@ -491,7 +479,9 @@ fn capture_profile_env_snapshot(
         cmd.arg(arg);
     }
     cmd.arg(prepare_script).current_dir(prepare_cwd).env_clear();
-    configure_direct_process_group(&mut cmd);
+    // `run_prepare_command` owns this process tree through ManagedChild; do
+    // not add a process-group pre_exec here. ManagedChild creates the private
+    // process group (Unix) / Job Object (Windows) at spawn time.
     for (key, value) in initial_env {
         cmd.env(key, value);
     }
@@ -716,103 +706,85 @@ fn with_cleanup_error(base: impl Into<String>, cleanup: Option<String>) -> Strin
     }
 }
 
-#[cfg(unix)]
-fn signal_process_group(pgid: u32, signal: i32) -> Result<bool, String> {
-    let target = i32::try_from(pgid)
-        .map_err(|_| format!("process-group id {pgid} exceeds the supported range"))?;
-    // SAFETY: callers use only the private session/process group created for
-    // this command by `configure_direct_process_group`. A negative target is
-    // required by POSIX to signal the whole group, not just its leader.
-    if unsafe { libc::kill(-target, signal) } == 0 {
-        Ok(true)
-    } else {
-        match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::ESRCH) => Ok(false),
-            Some(libc::EPERM) => Err(format!(
-                "permission denied signaling command process group {pgid} with signal {signal}"
-            )),
-            _ => Err(format!(
-                "failed to signal command process group {pgid} with signal {signal}: {}",
-                std::io::Error::last_os_error()
-            )),
-        }
-    }
-}
-
-/// Terminate a command and all members of its private process group, then
-/// reap the direct child. Callers do this before waiting for output pipes, so
-/// descendants cannot keep them open after a timeout, stop, executor failure,
-/// or direct-child exit.
-fn terminate_child_process_tree(child: &mut std::process::Child) -> Result<(), String> {
+/// Terminate a command and its entire managed process tree, then confirm the
+/// whole tree exited and reap the direct child. Callers do this before waiting
+/// for output pipes, so descendants cannot keep them open after a timeout,
+/// stop, executor failure, or direct-child exit.
+///
+/// The whole tree is owned by the [`ManagedChild`]: a private process group on
+/// Unix, a kill-on-close Job Object on Windows. No pid/pgid is handled here
+/// directly.
+fn terminate_child_process_tree(child: &mut ManagedChild) -> Result<(), String> {
     terminate_child_process_tree_until(child, Instant::now() + Duration::from_secs(1))
 }
 
+/// Terminate the managed command tree within one overall cleanup deadline.
+///
+/// Every phase recomputes its remaining budget from the single deadline, so an
+/// expired graceful phase can never silently reuse a stale deadline for the
+/// force-confirmation wait.
+///
+/// 1. Graceful request ([`GracefulTermination`]): on Unix this delivers SIGTERM
+///    to the whole managed process group, which gets a bounded grace
+///    ([`PROCESS_GROUP_TERMINATION_GRACE`]) to exit on its own; on Windows the
+///    request reports `Unsupported` and the next phase escalates immediately.
+/// 2. Force phase: `terminate_tree` for anything still alive.
+/// 3. Whole-tree exit confirmation: `wait_tree_exit`, not just the direct
+///    child (a direct-child exit never proves the tree is gone).
+/// 4. Direct-child reap within the remaining budget.
 fn terminate_child_process_tree_until(
-    child: &mut std::process::Child,
+    child: &mut ManagedChild,
     deadline: Instant,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
-    #[cfg(unix)]
-    {
-        // `configure_direct_process_group` calls `setsid` before exec, making
-        // this pid the private session and process-group leader. Guard zero so
-        // a malformed Child can never turn into a signal for the runner's own
-        // process group.
-        let pgid = child.id();
-        if pgid == 0 {
-            errors.push("command child has invalid process-group id 0".to_string());
-        } else {
-            let sent_sigterm = match signal_process_group(pgid, libc::SIGTERM) {
-                Ok(true) => {
-                    let grace_deadline =
-                        deadline.min(Instant::now() + PROCESS_GROUP_TERMINATION_GRACE);
-                    while Instant::now() < grace_deadline {
-                        match signal_process_group(pgid, 0) {
-                            Ok(false) => break,
-                            Ok(true) => {}
-                            Err(error) => {
-                                errors.push(error);
-                                break;
-                            }
-                        }
-                        std::thread::sleep(
-                            Duration::from_millis(10)
-                                .min(grace_deadline.saturating_duration_since(Instant::now())),
-                        );
-                    }
-                    true
-                }
-                // If the group is already gone, do not probe this numeric ID
-                // again: a later probe could observe an unrelated, reused
-                // process-group ID.
-                Ok(false) => false,
+    let mut tree_exited = false;
+    let mut force_tree = false;
+    match child.request_terminate_tree() {
+        Ok(GracefulTermination::Requested) => {
+            let grace_deadline = deadline.min(Instant::now() + PROCESS_GROUP_TERMINATION_GRACE);
+            let grace = grace_deadline.saturating_duration_since(Instant::now());
+            match child.wait_tree_exit(grace) {
+                Ok(true) => tree_exited = true,
+                Ok(false) => force_tree = true,
                 Err(error) => {
-                    errors.push(error);
-                    false
-                }
-            };
-            if sent_sigterm {
-                match signal_process_group(pgid, 0) {
-                    Ok(true) => {
-                        if let Err(error) = signal_process_group(pgid, libc::SIGKILL) {
-                            errors.push(error);
-                        }
-                    }
-                    Ok(false) => {}
-                    Err(error) => errors.push(error),
+                    errors.push(format!(
+                        "failed to wait for command process tree graceful exit: {error}"
+                    ));
+                    force_tree = true;
                 }
             }
         }
+        // Once the backend reports that the tree is already gone, do not
+        // probe the numeric Unix process-group id again. The direct child may
+        // already have been reaped, allowing that id to be reused by an
+        // unrelated process group between calls.
+        Ok(GracefulTermination::AlreadyExited) => tree_exited = true,
+        Ok(GracefulTermination::Unsupported) => force_tree = true,
+        Err(error) => {
+            errors.push(format!(
+                "failed to request graceful command process tree termination: {error}"
+            ));
+            force_tree = true;
+        }
     }
-    #[cfg(not(unix))]
-    {
-        // Non-Unix platforms retain the existing direct-child behavior; they
-        // do not have the POSIX process-group signalling used above.
-        if let Err(error) = child.kill() {
-            match child.try_wait() {
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => errors.push(format!("failed to kill command: {error}")),
+    if force_tree {
+        if let Err(error) = child.terminate_tree() {
+            errors.push(format!("failed to terminate command process tree: {error}"));
+        }
+    }
+    if !tree_exited {
+        // Confirm the complete tree exited, not just the direct child.
+        // Forceful termination can complete asynchronously (notably Job Object
+        // teardown on Windows), so use the remaining cleanup budget.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match child.wait_tree_exit(remaining) {
+            Ok(true) => {}
+            Ok(false) => {
+                errors.push("command process tree did not exit before deadline".to_string())
             }
+            Err(error) => errors.push(format!(
+                "failed to wait for command process tree exit: {error}"
+            )),
         }
     }
     loop {
@@ -839,18 +811,18 @@ fn terminate_child_process_tree_until(
     }
 }
 
-fn terminate_child_without_output(mut child: std::process::Child) -> Result<(), String> {
+fn terminate_child_without_output(mut child: ManagedChild) -> Result<(), String> {
     let result = terminate_child_process_tree(&mut child);
     // The direct child has been reaped above. Closing the local pipe handles
     // is sufficient on error paths where the response intentionally has no
     // command output.
-    drop(child.stdout.take());
-    drop(child.stderr.take());
+    drop(child.child_mut().stdout.take());
+    drop(child.child_mut().stderr.take());
     result
 }
 
 fn terminate_and_read_pipes(
-    mut child: std::process::Child,
+    mut child: ManagedChild,
     max_output_bytes: usize,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), String> {
     let deadline = Instant::now() + Duration::from_secs(1);
@@ -869,15 +841,17 @@ fn terminate_and_read_pipes(
 }
 
 fn read_pipes_until(
-    mut child: std::process::Child,
+    mut child: ManagedChild,
     max_output_bytes: usize,
     deadline: Instant,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), String> {
     let stdout = child
+        .child_mut()
         .stdout
         .take()
         .ok_or_else(|| "stdout pipe missing".to_string())?;
     let stderr = child
+        .child_mut()
         .stderr
         .take()
         .ok_or_else(|| "stderr pipe missing".to_string())?;
@@ -1168,7 +1142,11 @@ fn run_shell_impl(
             };
         }
     }
-    let spawn = cmd.spawn();
+    // ManagedChild owns the whole shell process tree: a private process group
+    // on Unix, a kill-on-close Job Object on Windows. `child_mut()` below only
+    // accesses pipe handles; every termination still goes through the managed
+    // tree API.
+    let spawn = ManagedChild::spawn(&mut cmd);
     let mut child = match spawn {
         Ok(child) => child,
         Err(e) => {
@@ -1188,7 +1166,7 @@ fn run_shell_impl(
         }
     };
     if let Some(input) = stdin {
-        match child.stdin.take() {
+        match child.child_mut().stdin.take() {
             Some(mut child_stdin) => {
                 if let Err(e) = child_stdin.write_all(input.as_bytes()) {
                     // A command may reject a request or report a missing

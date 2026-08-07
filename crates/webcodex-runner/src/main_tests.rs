@@ -4473,6 +4473,677 @@ fn shell_job_stdout_stderr_are_bounded() {
     assert!(stderr.ends_with("cdefghij"));
 }
 
+// ---------------------------------------------------------------------------
+// Stage 2F: shell.rs ManagedChild lifecycle coverage.
+//
+// The shell execution path owns its process tree through ManagedChild (a
+// private process group on Unix, a kill-on-close Job Object on Windows). These
+// tests drive the cross-platform `validation_tree_helper` fixture through the
+// real configured shell (`sh -c` on Unix, PowerShell on Windows) and probe
+// descendant pids with a platform-native liveness probe — never with
+// taskkill / Stop-Process / wmic / `ps` and never through shell quoting of
+// process listings.
+// ---------------------------------------------------------------------------
+
+/// Compiled copy of the `validation_tree_helper` fixture, kept alive for the
+/// whole test process so its binary path never disappears under a running
+/// descendant (same pattern as the validation lifecycle tests).
+struct ShellTreeHelper {
+    _temp: tempfile::TempDir,
+    path: PathBuf,
+}
+
+static SHELL_TREE_HELPER: std::sync::OnceLock<std::sync::Arc<ShellTreeHelper>> =
+    std::sync::OnceLock::new();
+
+fn shell_tree_helper() -> PathBuf {
+    SHELL_TREE_HELPER
+        .get_or_init(|| {
+            let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("src/webcodex_runner/validation/validation_tree_helper.rs");
+            let temp = tempfile::tempdir().unwrap();
+            let output = temp
+                .path()
+                .join(format!("shell-tree-helper{}", std::env::consts::EXE_SUFFIX));
+            let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+            let result = std::process::Command::new(rustc)
+                .arg("--edition=2021")
+                .arg("--crate-name=webcodex_shell_tree_helper")
+                .arg(&source)
+                .arg("-o")
+                .arg(&output)
+                .output()
+                .expect("run rustc for shell tree helper");
+            assert!(
+                result.status.success(),
+                "shell tree helper compilation failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            std::sync::Arc::new(ShellTreeHelper {
+                _temp: temp,
+                path: output,
+            })
+        })
+        .path
+        .clone()
+}
+
+/// Single-quote `value` for the platform test shell. Windows uses PowerShell
+/// ('' escapes an embedded quote); Unix uses POSIX sh ('\'' escapes one).
+#[cfg(windows)]
+fn shell_tree_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(not(windows))]
+fn shell_tree_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Build the shell command line that runs the fixture helper with `args`.
+///
+/// Windows drives the helper through PowerShell with single-quoted paths (no
+/// cmd.exe quote-parsing pitfalls) and appends `exit $LASTEXITCODE` so the
+/// helper's exit status becomes the shell's exit status. Unix uses the POSIX
+/// shell directly.
+fn shell_tree_command(helper: &Path, args: &[String]) -> String {
+    let mut parts: Vec<String> = vec![shell_tree_quote(&helper.to_string_lossy())];
+    parts.extend(args.iter().map(|arg| shell_tree_quote(arg)));
+    let joined = parts.join(" ");
+    #[cfg(windows)]
+    {
+        format!("& {joined}; exit $LASTEXITCODE")
+    }
+    #[cfg(not(windows))]
+    {
+        joined
+    }
+}
+
+/// Test shell that can actually run on this platform: PowerShell on Windows
+/// (cmd.exe quote parsing and missing `sleep` make POSIX-style commands
+/// unusable), the default `sh -c` on Unix.
+#[cfg(windows)]
+fn shell_tree_test_shell() -> ShellConfig {
+    ShellConfig {
+        program: "powershell.exe".to_string(),
+        args: vec!["-NoProfile".to_string(), "-Command".to_string()],
+        ..ShellConfig::default()
+    }
+}
+
+#[cfg(not(windows))]
+fn shell_tree_test_shell() -> ShellConfig {
+    ShellConfig::default()
+}
+
+/// Shell timeout used by the tree tests: Windows needs headroom for
+/// PowerShell startup, Unix shells start instantly.
+fn shell_tree_test_timeout_secs() -> u64 {
+    if cfg!(windows) {
+        5
+    } else {
+        1
+    }
+}
+
+/// Platform-native liveness probe, so the tree tests never shell out to
+/// `tasklist` / `ps` / PowerShell / wmic and never depend on shell quoting.
+#[cfg(windows)]
+fn shell_tree_process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: OpenProcess returns a handle or NULL; NULL means the pid no
+    // longer exists (or is inaccessible, which also means not ours).
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let mut exit_code = 0u32;
+    // SAFETY: `handle` is valid; `exit_code` is a valid out-param.
+    let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+    // SAFETY: close the handle we opened.
+    unsafe { CloseHandle(handle) };
+    ok == 1 && exit_code == 259 // 259 == STILL_ACTIVE
+}
+
+#[cfg(target_os = "linux")]
+fn shell_tree_process_alive(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    stat.rsplit_once(") ")
+        .and_then(|(_, rest)| rest.chars().next())
+        .is_some_and(|state| state != 'Z')
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn shell_tree_process_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 is an existence probe; the pid comes from our own
+    // helper subprocess.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+fn wait_until_file(path: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if path.exists() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_until_process_dead(pid: u32, timeout: Duration, tag: &str) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !shell_tree_process_alive(pid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            eprintln!("wait_until_process_dead({tag}): pid {pid} still alive");
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Parse `KEY=<pid>` from a marker file written by the fixture helper.
+fn read_marker_pid(marker: &Path, key: &str) -> u32 {
+    let text = std::fs::read_to_string(marker).expect("read pid marker");
+    text.lines()
+        .find_map(|line| {
+            line.strip_prefix(key)
+                .and_then(|rest| rest.strip_prefix('='))
+                .and_then(|value| value.trim().parse().ok())
+        })
+        .unwrap_or_else(|| panic!("marker {marker:?} missing {key}: {text}"))
+}
+
+/// Marker paths and the keepalive command for the two-argument
+/// `spawn-descendant-keepalive` / `spawn-descendant` fixtures.
+struct ShellTreeMarkers {
+    parent: PathBuf,
+    alive: PathBuf,
+}
+
+impl ShellTreeMarkers {
+    fn in_dir(tmp: &std::path::Path, tag: &str) -> Self {
+        Self {
+            parent: tmp.join(format!("{tag}-parent.txt")),
+            alive: tmp.join(format!("{tag}-alive.txt")),
+        }
+    }
+
+    fn keepalive_command(&self, helper: &Path) -> String {
+        shell_tree_command(
+            helper,
+            &[
+                "spawn-descendant-keepalive".to_string(),
+                self.parent.to_string_lossy().into_owned(),
+                self.alive.to_string_lossy().into_owned(),
+                "120".to_string(),
+            ],
+        )
+    }
+
+    /// Both pids must be dead after cancellation; `PARENT_PID` and
+    /// `DESCENDANT_PID` are both written to the parent marker.
+    fn assert_tree_dead(&self, tag: &str) {
+        let parent = read_marker_pid(&self.parent, "PARENT_PID");
+        let descendant = read_marker_pid(&self.parent, "DESCENDANT_PID");
+        assert!(
+            wait_until_process_dead(parent, Duration::from_secs(10), &format!("{tag}-parent")),
+            "tree parent {parent} survived {tag}"
+        );
+        assert!(
+            wait_until_process_dead(
+                descendant,
+                Duration::from_secs(10),
+                &format!("{tag}-descendant")
+            ),
+            "tree descendant {descendant} survived {tag}"
+        );
+    }
+}
+
+#[test]
+fn shell_job_normal_success_preserves_output_and_exit_code() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let helper = shell_tree_helper();
+    let result = run_shell(
+        &unrestricted_test_policy(),
+        &shell_tree_test_shell(),
+        Some(&cwd),
+        &shell_tree_command(
+            &helper,
+            &["sleep".to_string(), "0".to_string(), "7".to_string()],
+        ),
+        None,
+        10,
+        None,
+    );
+    assert_eq!(result.exit_code, Some(7), "{result:?}");
+    assert!(result.error.is_none(), "{result:?}");
+    assert!(
+        result
+            .stdout
+            .as_deref()
+            .unwrap_or_default()
+            .contains("VALIDATION_HELPER_STDOUT"),
+        "{result:?}"
+    );
+    assert!(
+        result
+            .stderr
+            .as_deref()
+            .unwrap_or_default()
+            .contains("VALIDATION_HELPER_STDERR"),
+        "{result:?}"
+    );
+    assert!(
+        result.duration_ms.unwrap_or(u64::MAX) < 30_000,
+        "unbounded shell run: {result:?}"
+    );
+}
+
+#[test]
+fn shell_job_timeout_kills_whole_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let helper = shell_tree_helper();
+    let markers = ShellTreeMarkers::in_dir(tmp.path(), "timeout");
+    let timeout_secs = shell_tree_test_timeout_secs();
+
+    let result = run_shell(
+        &unrestricted_test_policy(),
+        &shell_tree_test_shell(),
+        Some(&cwd),
+        &markers.keepalive_command(&helper),
+        None,
+        timeout_secs,
+        None,
+    );
+    assert!(
+        wait_until_file(&markers.parent, Duration::from_secs(15)),
+        "tree markers were never written: {result:?}"
+    );
+    assert_eq!(result.exit_code, Some(-1), "{result:?}");
+    assert_eq!(
+        result.error.as_deref(),
+        Some("command timed out"),
+        "{result:?}"
+    );
+    assert!(
+        result
+            .stderr
+            .as_deref()
+            .unwrap_or_default()
+            .contains(&format!("command timed out after {timeout_secs} seconds")),
+        "{result:?}"
+    );
+    markers.assert_tree_dead("timeout");
+}
+
+#[test]
+fn shell_job_stop_kills_whole_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let helper = shell_tree_helper();
+    let markers = ShellTreeMarkers::in_dir(tmp.path(), "stop");
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::clone(&stop_requested);
+    let stop_marker = markers.parent.clone();
+    let stopper = std::thread::spawn(move || {
+        let written = wait_until_file(&stop_marker, Duration::from_secs(15));
+        stop_flag.store(true, Ordering::SeqCst);
+        written
+    });
+
+    let result = run_shell(
+        &unrestricted_test_policy(),
+        &shell_tree_test_shell(),
+        Some(&cwd),
+        &markers.keepalive_command(&helper),
+        None,
+        60,
+        Some(stop_requested.as_ref()),
+    );
+
+    assert!(stopper.join().expect("stopper thread panicked"));
+    assert_eq!(result.exit_code, Some(-1), "{result:?}");
+    assert_eq!(result.error.as_deref(), Some("job stopped"), "{result:?}");
+    assert!(
+        result
+            .stderr
+            .as_deref()
+            .unwrap_or_default()
+            .contains("job stopped by request"),
+        "{result:?}"
+    );
+    markers.assert_tree_dead("stop");
+}
+
+#[test]
+fn shell_job_parent_exit_first_descendant_holds_pipe() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let helper = shell_tree_helper();
+    let markers = ShellTreeMarkers::in_dir(tmp.path(), "orphan");
+
+    // `spawn-descendant`: the helper spawns a sleeping descendant that
+    // inherits the capture pipes, waits until it is provably alive, then
+    // exits 0. The direct shell child therefore exits while the descendant
+    // is still running and still holding the stdout/stderr write ends.
+    let result = run_shell(
+        &unrestricted_test_policy(),
+        &shell_tree_test_shell(),
+        Some(&cwd),
+        &shell_tree_command(
+            &helper,
+            &[
+                "spawn-descendant".to_string(),
+                markers.parent.to_string_lossy().into_owned(),
+                markers.alive.to_string_lossy().into_owned(),
+                "120".to_string(),
+            ],
+        ),
+        None,
+        30,
+        None,
+    );
+
+    // Direct-child exit code is preserved even though the descendant was
+    // still alive at that point.
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert!(result.error.is_none(), "{result:?}");
+    assert!(
+        result
+            .stdout
+            .as_deref()
+            .unwrap_or_default()
+            .contains("DESCENDANT_PID="),
+        "stdout did not reach EOF with the helper output: {result:?}"
+    );
+    // The descendant was sleeping (total 120s) when the direct child exited;
+    // the whole-tree cleanup must terminate it instead of waiting for the
+    // sleep to finish.
+    let descendant = read_marker_pid(&markers.parent, "DESCENDANT_PID");
+    assert!(
+        wait_until_process_dead(descendant, Duration::from_secs(10), "orphan-descendant"),
+        "descendant {descendant} survived whole-tree cleanup after direct child exit"
+    );
+    assert!(
+        result.duration_ms.unwrap_or(u64::MAX) < 30_000,
+        "runner waited for the descendant's natural sleep: {result:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_job_unix_graceful_sigterm_responsive_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let helper = shell_tree_helper();
+
+    // `sigterm-marker`: the helper installs a SIGTERM handler that writes
+    // SIGTERM_HANDLED to the captured stdout. SIGKILL cannot be caught, so
+    // the marker only appears when the graceful phase delivered SIGTERM and
+    // the tree exited on its own — no force escalation required.
+    let result = run_shell(
+        &unrestricted_test_policy(),
+        &ShellConfig::default(),
+        Some(&cwd),
+        &shell_tree_command(&helper, &["sigterm-marker".to_string(), "60".to_string()]),
+        None,
+        1,
+        None,
+    );
+    assert_eq!(result.exit_code, Some(-1), "{result:?}");
+    assert_eq!(
+        result.error.as_deref(),
+        Some("command timed out"),
+        "{result:?}"
+    );
+    assert!(
+        result
+            .stdout
+            .as_deref()
+            .unwrap_or_default()
+            .contains("SIGTERM_HANDLED"),
+        "graceful SIGTERM handler did not run: {result:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_job_unix_sigterm_resistant_tree_escalates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let helper = shell_tree_helper();
+    let markers = ShellTreeMarkers::in_dir(tmp.path(), "resist");
+
+    // `ignore-term-keepalive`: the helper (and its descendant) ignore
+    // SIGTERM, so the 50ms graceful phase cannot end the tree; only the
+    // force escalation (SIGKILL) finishes it, within the cleanup deadline.
+    let result = run_shell(
+        &unrestricted_test_policy(),
+        &ShellConfig::default(),
+        Some(&cwd),
+        &shell_tree_command(
+            &helper,
+            &[
+                "ignore-term-keepalive".to_string(),
+                markers.parent.to_string_lossy().into_owned(),
+                markers.alive.to_string_lossy().into_owned(),
+                "120".to_string(),
+            ],
+        ),
+        None,
+        1,
+        None,
+    );
+    assert!(
+        wait_until_file(&markers.parent, Duration::from_secs(15)),
+        "tree markers were never written: {result:?}"
+    );
+    assert_eq!(result.exit_code, Some(-1), "{result:?}");
+    assert_eq!(
+        result.error.as_deref(),
+        Some("command timed out"),
+        "{result:?}"
+    );
+    markers.assert_tree_dead("resist");
+}
+
+#[test]
+fn shell_job_repeated_stop_is_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let helper = shell_tree_helper();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+
+    let first = ShellTreeMarkers::in_dir(tmp.path(), "repeat-1");
+    let stop_flag = Arc::clone(&stop_requested);
+    let stop_marker = first.parent.clone();
+    let stopper = std::thread::spawn(move || {
+        let written = wait_until_file(&stop_marker, Duration::from_secs(15));
+        stop_flag.store(true, Ordering::SeqCst);
+        written
+    });
+    let result = run_shell(
+        &unrestricted_test_policy(),
+        &shell_tree_test_shell(),
+        Some(&cwd),
+        &first.keepalive_command(&helper),
+        None,
+        60,
+        Some(stop_requested.as_ref()),
+    );
+    assert!(stopper.join().expect("stopper thread panicked"));
+    assert_eq!(result.exit_code, Some(-1), "{result:?}");
+    assert_eq!(result.error.as_deref(), Some("job stopped"), "{result:?}");
+    first.assert_tree_dead("repeat-1");
+
+    // A second run against the same already-set flag must stop promptly and
+    // clean up its own freshly spawned tree without a panic or deadlock.
+    let second = ShellTreeMarkers::in_dir(tmp.path(), "repeat-2");
+    let result = run_shell(
+        &unrestricted_test_policy(),
+        &shell_tree_test_shell(),
+        Some(&cwd),
+        &second.keepalive_command(&helper),
+        None,
+        60,
+        Some(stop_requested.as_ref()),
+    );
+    assert_eq!(result.exit_code, Some(-1), "{result:?}");
+    assert_eq!(result.error.as_deref(), Some("job stopped"), "{result:?}");
+    if wait_until_file(&second.parent, Duration::from_secs(5)) {
+        // If the tree got far enough to write markers, it must be dead.
+        second.assert_tree_dead("repeat-2");
+    }
+}
+
+#[test]
+fn shell_job_timeout_racing_stop_is_bounded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let helper = shell_tree_helper();
+    let markers = ShellTreeMarkers::in_dir(tmp.path(), "race");
+    let timeout_secs = shell_tree_test_timeout_secs();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::clone(&stop_requested);
+    let stop_marker = markers.parent.clone();
+    let stopper = std::thread::spawn(move || {
+        let written = wait_until_file(&stop_marker, Duration::from_secs(15));
+        // Set the stop flag shortly before the timeout would fire; either
+        // outcome (stop or timeout) is legitimate for the shell API.
+        let delay = if cfg!(windows) { 3600 } else { 600 };
+        std::thread::sleep(Duration::from_millis(delay));
+        stop_flag.store(true, Ordering::SeqCst);
+        written
+    });
+
+    let result = run_shell(
+        &unrestricted_test_policy(),
+        &shell_tree_test_shell(),
+        Some(&cwd),
+        &markers.keepalive_command(&helper),
+        None,
+        timeout_secs,
+        Some(stop_requested.as_ref()),
+    );
+
+    assert!(stopper.join().expect("stopper thread panicked"));
+    assert_eq!(result.exit_code, Some(-1), "{result:?}");
+    assert!(
+        matches!(
+            result.error.as_deref(),
+            Some("command timed out" | "job stopped")
+        ),
+        "unexpected race outcome: {result:?}"
+    );
+    markers.assert_tree_dead("race");
+}
+
+#[test]
+fn shell_job_spawn_failure_preserves_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("no-such-shell-program");
+    let shell = ShellConfig {
+        program: missing.to_string_lossy().into_owned(),
+        ..ShellConfig::default()
+    };
+    let result = run_shell(
+        &unrestricted_test_policy(),
+        &shell,
+        None,
+        "true",
+        None,
+        10,
+        None,
+    );
+    assert_eq!(result.exit_code, None, "{result:?}");
+    let error = result.error.as_deref().unwrap_or_default();
+    assert!(
+        error.starts_with("failed to spawn command: "),
+        "spawn error semantics changed: {result:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_job_profile_prepare_stop_reaps_whole_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pid_file = tmp.path().join("prepare.pid");
+    let started_marker = tmp.path().join("prepare-started.txt");
+    let init_script = format!(
+        "echo $$ > {}; : > {}; sleep 60",
+        shell_tree_quote(&pid_file.to_string_lossy()),
+        shell_tree_quote(&started_marker.to_string_lossy())
+    );
+    let shell = shell_with_profiles(
+        Some("test"),
+        vec![(
+            "test",
+            ShellProfileConfig {
+                init_script: Some(init_script),
+                ..ShellProfileConfig::default()
+            },
+        )],
+    );
+    let policy = unrestricted_test_policy();
+    let cache = PreparedShellProfileCache::default();
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::clone(&stop_requested);
+    let stop_marker = started_marker.clone();
+    let stopper = std::thread::spawn(move || {
+        let written = wait_until_file(&stop_marker, Duration::from_secs(15));
+        stop_flag.store(true, Ordering::SeqCst);
+        written
+    });
+
+    let result = run_shell_with_profiles(
+        1,
+        &policy,
+        &shell,
+        tmp.path(),
+        &cache,
+        Some(&cwd),
+        "true",
+        None,
+        10,
+        Some(stop_requested.as_ref()),
+    );
+
+    assert!(stopper.join().expect("stopper thread panicked"));
+    assert!(
+        result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("profile prepare stopped during runner shutdown"),
+        "{result:?}"
+    );
+    let prepare_pid = std::fs::read_to_string(&pid_file)
+        .expect("read prepare pid")
+        .trim()
+        .parse::<u32>()
+        .expect("parse prepare pid");
+    assert!(
+        wait_until_process_dead(prepare_pid, Duration::from_secs(10), "prepare"),
+        "profile prepare tree survived stop"
+    );
+}
+
 #[test]
 fn register_request_announces_correct_protocol_version() {
     let tmp = tempfile::tempdir().unwrap();

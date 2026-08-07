@@ -596,9 +596,13 @@ fn graceful_request_repeated_and_already_exited_do_not_panic() {
     let result = exited
         .request_terminate_tree()
         .expect("graceful request on an exited tree returned an error");
-    // The group may be gone (AlreadyExited) or still fleetingly present
-    // (Requested to an empty group); both are defined outcomes. The test only
-    // forbids a panic or an unexpected Err.
+    #[cfg(unix)]
+    assert_eq!(
+        result,
+        GracefulTermination::AlreadyExited,
+        "once whole-tree exit is confirmed, Unix must not probe or signal that numeric pgid again"
+    );
+    #[cfg(windows)]
     let _ = result;
 }
 

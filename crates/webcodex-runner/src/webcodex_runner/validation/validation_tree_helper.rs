@@ -13,8 +13,26 @@ const SIGTERM: i32 = 15;
 #[cfg(unix)]
 const SIG_IGN: usize = 1;
 #[cfg(unix)]
+static SIGTERM_HANDLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(unix)]
 unsafe extern "C" {
     fn signal(signum: i32, handler: usize) -> usize;
+    fn write(fd: i32, buf: *const core::ffi::c_void, count: usize) -> isize;
+}
+
+/// SIGTERM handler for the `sigterm-marker` mode. Writes the marker to the
+/// captured stdout with raw `write(2)` (async-signal-safe) and records that
+/// the graceful request was received. SIGKILL cannot be caught, so the marker
+/// only appears when a graceful SIGTERM reached the helper.
+#[cfg(unix)]
+extern "C" fn handle_sigterm(_signum: i32) {
+    let msg = b"SIGTERM_HANDLED\n";
+    // SAFETY: fd 1 is the capture pipe inherited from the parent; write(2)
+    // is async-signal-safe.
+    unsafe {
+        write(1, msg.as_ptr() as *const core::ffi::c_void, msg.len());
+    }
+    SIGTERM_HANDLED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 fn main() {
@@ -54,6 +72,34 @@ fn main() {
                 std::process::exit(2);
             }
             spawn_descendant(&args, true);
+        }
+        "sigterm-marker" => {
+            #[cfg(unix)]
+            {
+                let total: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(60);
+                // SAFETY: installing the handler is async-signal-safe and the
+                // helper is single-threaded at this point.
+                unsafe {
+                    signal(SIGTERM, handle_sigterm as usize);
+                }
+                // Keep running until the graceful SIGTERM arrives. Exiting 0
+                // after `total` is only a defensive backstop for a fixture
+                // misconfiguration; the graceful exit path is the exit 0
+                // reached right after the handler runs.
+                let deadline = std::time::Instant::now() + Duration::from_secs(total);
+                while !SIGTERM_HANDLED.load(std::sync::atomic::Ordering::SeqCst) {
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                std::process::exit(0);
+            }
+            #[cfg(not(unix))]
+            {
+                eprintln!("validation_tree_helper: sigterm-marker is unix-only");
+                std::process::exit(2);
+            }
         }
         "descendant" => {
             let alive_marker = args.get(2).expect("alive marker path");

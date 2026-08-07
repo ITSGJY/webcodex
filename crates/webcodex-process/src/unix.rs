@@ -8,6 +8,7 @@
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::{GracefulTermination, SpawnOptions};
@@ -21,6 +22,11 @@ const DROP_REAP_TIMEOUT: Duration = Duration::from_millis(200);
 pub struct ManagedChild {
     child: Child,
     pgid: u32,
+    // Sticky once whole-tree exit is confirmed. After the group disappears
+    // and its leader is reaped, this numeric pgid can be reused by an
+    // unrelated process group, so later operations must never probe or signal
+    // it again.
+    tree_exited: AtomicBool,
 }
 
 impl std::fmt::Debug for ManagedChild {
@@ -50,7 +56,11 @@ impl ManagedChild {
         command.process_group(0);
         let child = command.spawn()?;
         let pgid = child.id();
-        Ok(Self { child, pgid })
+        Ok(Self {
+            child,
+            pgid,
+            tree_exited: AtomicBool::new(false),
+        })
     }
 
     /// PID of the direct child (which is also the process group id).
@@ -87,7 +97,16 @@ impl ManagedChild {
     ///
     /// `ESRCH` (group already gone) is treated as idempotent success.
     pub fn terminate_tree(&mut self) -> io::Result<()> {
-        kill_group(self.pgid, libc::SIGKILL)
+        if self.tree_exited.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        match signal_group(self.pgid, libc::SIGKILL)? {
+            true => Ok(()),
+            false => {
+                self.tree_exited.store(true, Ordering::Release);
+                Ok(())
+            }
+        }
     }
 
     /// Non-blocking check whether the owned process tree has fully exited.
@@ -98,7 +117,14 @@ impl ManagedChild {
     /// live (see [`group_has_live_members`]); callers that hold the only handle
     /// to the direct child should still call `try_wait` to reap it.
     pub fn try_tree_exit(&self) -> io::Result<bool> {
-        Ok(!group_has_live_members(self.pgid))
+        if self.tree_exited.load(Ordering::Acquire) {
+            return Ok(true);
+        }
+        let exited = !group_has_live_members(self.pgid);
+        if exited {
+            self.tree_exited.store(true, Ordering::Release);
+        }
+        Ok(exited)
     }
 
     /// Request graceful termination of the entire owned process tree.
@@ -109,9 +135,15 @@ impl ManagedChild {
     /// (`ESRCH`), and an [`io::Error`] for any other failure. The process
     /// group id is deliberately never exposed to callers.
     pub fn request_terminate_tree(&mut self) -> io::Result<GracefulTermination> {
+        if self.tree_exited.load(Ordering::Acquire) {
+            return Ok(GracefulTermination::AlreadyExited);
+        }
         match signal_group(self.pgid, libc::SIGTERM)? {
             true => Ok(GracefulTermination::Requested),
-            false => Ok(GracefulTermination::AlreadyExited),
+            false => {
+                self.tree_exited.store(true, Ordering::Release);
+                Ok(GracefulTermination::AlreadyExited)
+            }
         }
     }
 
@@ -121,6 +153,9 @@ impl ManagedChild {
     /// elapses. Zombie members are not considered live (see
     /// [`group_has_live_members`]).
     pub fn wait_tree_exit(&self, timeout: Duration) -> io::Result<bool> {
+        if self.tree_exited.load(Ordering::Acquire) {
+            return Ok(true);
+        }
         let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -129,6 +164,7 @@ impl ManagedChild {
         })?;
         loop {
             if !group_has_live_members(self.pgid) {
+                self.tree_exited.store(true, Ordering::Release);
                 return Ok(true);
             }
             if Instant::now() >= deadline {
@@ -141,10 +177,16 @@ impl ManagedChild {
 
 impl Drop for ManagedChild {
     fn drop(&mut self) {
-        // Best-effort group kill as a fail-safe backstop. `Child` does not
-        // reap on drop, so make a short bounded effort to reap our direct child
-        // and avoid accumulating zombies in a long-lived Runner process.
-        let _ = kill_group(self.pgid, libc::SIGKILL);
+        // Best-effort group kill as a fail-safe backstop only while this tree
+        // has not already been confirmed gone. Never retarget a known-dead
+        // numeric pgid, which may already belong to an unrelated group. `Child`
+        // does not reap on drop, so make a short bounded effort to reap our
+        // direct child and avoid accumulating zombies in a long-lived Runner.
+        if !self.tree_exited.load(Ordering::Acquire) {
+            if matches!(signal_group(self.pgid, libc::SIGKILL), Ok(false)) {
+                self.tree_exited.store(true, Ordering::Release);
+            }
+        }
         let Some(deadline) = Instant::now().checked_add(DROP_REAP_TIMEOUT) else {
             return;
         };
@@ -176,11 +218,6 @@ fn signal_group(pgid: u32, signal: i32) -> io::Result<bool> {
         return Ok(false);
     }
     Err(error)
-}
-
-/// Forcefully signal a whole process group. `ESRCH` is treated as success.
-fn kill_group(pgid: u32, signal: i32) -> io::Result<()> {
-    signal_group(pgid, signal).map(|_| ())
 }
 
 /// Whether the group still exists as a POSIX entity (any member, including a
