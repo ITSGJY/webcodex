@@ -1,4 +1,7 @@
-use super::config::{validate_shell_config, AgentPolicy, ShellConfig, ShellProfileConfig};
+use super::config::{
+    dialect_for_program, platform_default_dialect, validate_shell_config, AgentPolicy, ShellConfig,
+    ShellDialect, ShellProfileConfig,
+};
 use super::output::CommandResult;
 use super::projects::find_project_shell_context;
 use std::collections::HashMap;
@@ -27,6 +30,7 @@ pub(crate) struct PreparedShellProfile {
     pub(crate) profile_name: String,
     program: String,
     args: Vec<String>,
+    dialect: ShellDialect,
     env_snapshot: HashMap<String, String>,
 }
 
@@ -40,35 +44,167 @@ pub(crate) struct PreparedShellProfileCache {
     profiles: Arc<Mutex<HashMap<PreparedShellProfileKey, Arc<PreparedShellProfile>>>>,
 }
 
+/// POSIX sh single-quote escaping.
 pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// PowerShell single-quote escaping (an embedded single quote is doubled).
+/// PowerShell's single-quoted strings are literal, so spaces, backslashes,
+/// double quotes, `$`, Unicode, and `C:\...` Windows paths need no further
+/// escaping; only `'` does.
+fn shell_quote_powershell(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Resolve the effective shell dialect: an explicit config value wins, then a
+/// known shell program basename, then the platform default. Profiles pass
+/// `profile.dialect.or(shell.dialect)` as the explicit value so they inherit
+/// the parent shell dialect unless designed otherwise.
+fn resolve_dialect(program: &str, explicit: Option<ShellDialect>) -> ShellDialect {
+    explicit
+        .or_else(|| dialect_for_program(program))
+        .unwrap_or_else(platform_default_dialect)
+}
+
+const SENSITIVE_ENV_KEYS: [&str; 4] = [
+    "WEBCODEX_TOKEN",
+    "WEBCODEX_AGENT_TOKEN",
+    "WEBCODEX_USER_TOKEN",
+    "AUTHORIZATION",
+];
+
+/// Sensitive environment keys must never reach child processes. Windows
+/// environment names are case-insensitive, so a mixed-case spelling such as
+/// `WebCodex_Token` must be filtered too; Unix stays case-sensitive.
+fn is_sensitive_env_key(key: &str) -> bool {
+    if cfg!(windows) {
+        let upper = key.to_ascii_uppercase();
+        SENSITIVE_ENV_KEYS
+            .iter()
+            .any(|sensitive| *sensitive == upper)
+    } else {
+        SENSITIVE_ENV_KEYS.contains(&key)
+    }
+}
+
 fn should_inherit_env_key(key: &str) -> bool {
-    !matches!(
-        key,
-        "WEBCODEX_TOKEN" | "WEBCODEX_AGENT_TOKEN" | "WEBCODEX_USER_TOKEN" | "AUTHORIZATION"
+    !is_sensitive_env_key(key)
+}
+
+/// Case-insensitive lookup on Windows (where environment names are
+/// case-insensitive), exact match on Unix.
+fn env_lookup<'a>(env: &'a HashMap<String, String>, key: &str) -> Option<&'a String> {
+    if cfg!(windows) {
+        env.iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value)
+    } else {
+        env.get(key)
+    }
+}
+
+/// Insert `key=value`, replacing any existing entry that names the same
+/// environment variable. On Windows the replacement is case-insensitive so a
+/// snapshot never carries both `Path` and `PATH` (which would make the final
+/// child environment depend on HashMap iteration order); on Unix it is exact.
+fn env_insert(env: &mut HashMap<String, String>, key: &str, value: String) {
+    if cfg!(windows) {
+        env.retain(|candidate, _| !candidate.eq_ignore_ascii_case(key));
+    }
+    env.insert(key.to_string(), value);
+}
+
+/// Remove every sensitive environment key from `env`, case-insensitively on
+/// Windows (a profile could configure `webcodetoken = ...`).
+fn remove_sensitive_env(env: &mut HashMap<String, String>) {
+    let sensitive: Vec<String> = env
+        .keys()
+        .filter(|key| is_sensitive_env_key(key))
+        .cloned()
+        .collect();
+    for key in sensitive {
+        env.remove(&key);
+    }
+}
+
+/// Deterministic UTF-8 setup for redirected PowerShell output. Bounded to the
+/// child process: when stdout is redirected, .NET only caches these encodings
+/// instead of calling SetConsoleOutputCP, so the parent Runner console state
+/// is never mutated. PowerShell 5.1 otherwise writes through the console code
+/// page (OEM), which would corrupt Unicode output and the env snapshot.
+const POWERSHELL_UTF8_PREAMBLE: &str = concat!(
+    "try { $OutputEncoding = [Console]::InputEncoding = ",
+    "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { }",
+);
+
+/// Wrap `command` so the PowerShell process exits with a meaningful status:
+/// the shell's own `exit N` statements pass through, a failing trailing native
+/// command is reported through `$LASTEXITCODE`, a failing PowerShell statement
+/// returns 1, and a successful trailing PowerShell statement returns 0 even if
+/// an earlier native command left a stale non-zero `$LASTEXITCODE` behind.
+/// PowerShell 5.1 does not propagate these statuses consistently on its own,
+/// so inspect `$?` immediately after the requested command and exit explicitly.
+fn powershell_command_text(command: &str) -> String {
+    format!(
+        "{POWERSHELL_UTF8_PREAMBLE}\n\
+         $LASTEXITCODE = 0\n\
+         {command}\n\
+         if (-not $?) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; exit 1 }}\n\
+         exit 0"
     )
 }
 
-fn shell_command_text(shell: &ShellConfig, command: &str) -> String {
-    match shell.init_script.as_ref() {
-        Some(path) => format!(
+/// Dot-source a shell init script, then run the command only after the init
+/// script reported success. Native-command failure inside the init script
+/// blocks the command (like POSIX `. <path> && (...)`); a terminating
+/// PowerShell error aborts the whole script, which also blocks the command.
+///
+/// `$?` is inspected immediately after dot-sourcing so a failed dot-source
+/// operation (for example, an unavailable script) blocks the command. Native
+/// failure status is preserved through `$LASTEXITCODE`; ordinary PowerShell
+/// non-terminating errors retain PowerShell's own dot-source semantics.
+fn powershell_init_command_text(init_script: &Path, command: &str) -> String {
+    format!(
+        "{POWERSHELL_UTF8_PREAMBLE}\n\
+         . {}\n\
+         if (-not $?) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; exit 1 }}\n\
+         $LASTEXITCODE = 0\n\
+         {command}\n\
+         if (-not $?) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; exit 1 }}\n\
+         exit 0",
+        shell_quote_powershell(&init_script.to_string_lossy()),
+    )
+}
+
+fn shell_command_text(shell: &ShellConfig, dialect: ShellDialect, command: &str) -> String {
+    match (dialect, shell.init_script.as_ref()) {
+        (ShellDialect::Posix, Some(path)) => format!(
             ". {} && (\n{}\n)",
             shell_quote(&path.to_string_lossy()),
             command
         ),
-        None => command.to_string(),
+        (ShellDialect::Posix, None) => command.to_string(),
+        (ShellDialect::PowerShell, Some(path)) => powershell_init_command_text(path, command),
+        (ShellDialect::PowerShell, None) => powershell_command_text(command),
+    }
+}
+
+/// Command text for an already-prepared profile execution. POSIX shells get
+/// the raw command (the last statement's status is the shell status); the
+/// PowerShell wrapper adds the explicit exit-status propagation.
+fn prepared_shell_command_text(dialect: ShellDialect, command: &str) -> String {
+    match dialect {
+        ShellDialect::Posix => command.to_string(),
+        ShellDialect::PowerShell => powershell_command_text(command),
     }
 }
 
 fn apply_shell_environment(cmd: &mut Command, shell: &ShellConfig) -> Result<(), String> {
-    for key in [
-        "WEBCODEX_TOKEN",
-        "WEBCODEX_AGENT_TOKEN",
-        "WEBCODEX_USER_TOKEN",
-        "AUTHORIZATION",
-    ] {
+    // Rust's Windows env handling is case-insensitive (like the OS itself), so
+    // removing the canonical spellings also removes mixed-case variants such
+    // as `WebCodex_Token`.
+    for key in SENSITIVE_ENV_KEYS {
         cmd.env_remove(key);
     }
     if !shell.path_prepend.is_empty() {
@@ -81,7 +217,9 @@ fn apply_shell_environment(cmd: &mut Command, shell: &ShellConfig) -> Result<(),
         cmd.env("PATH", joined);
     }
     for (key, value) in &shell.env {
-        cmd.env(key, value);
+        if !is_sensitive_env_key(key) {
+            cmd.env(key, value);
+        }
     }
     Ok(())
 }
@@ -95,11 +233,12 @@ fn apply_env_snapshot(cmd: &mut Command, env_snapshot: &HashMap<String, String>)
 
 fn configured_shell_command(shell: &ShellConfig, command: &str) -> Result<Command, String> {
     validate_shell_config(shell)?;
+    let dialect = resolve_dialect(&shell.program, shell.dialect);
     let mut cmd = Command::new(&shell.program);
     for arg in &shell.args {
         cmd.arg(arg);
     }
-    cmd.arg(shell_command_text(shell, command));
+    cmd.arg(shell_command_text(shell, dialect, command));
     // The shell execution path owns its process tree through ManagedChild; do
     // not add a process-group pre_exec here. ManagedChild creates the private
     // process group (Unix) / Job Object (Windows) at spawn time.
@@ -115,7 +254,7 @@ fn configured_prepared_shell_command(
     for arg in &profile.args {
         cmd.arg(arg);
     }
-    cmd.arg(command);
+    cmd.arg(prepared_shell_command_text(profile.dialect, command));
     // The shell execution path owns its process tree through ManagedChild; do
     // not add a process-group pre_exec here. ManagedChild creates the private
     // process group (Unix) / Job Object (Windows) at spawn time.
@@ -128,11 +267,12 @@ pub(crate) fn configured_shell_job_command(
     command: &str,
 ) -> Result<Command, String> {
     validate_shell_config(shell)?;
+    let dialect = resolve_dialect(&shell.program, shell.dialect);
     let mut cmd = Command::new(&shell.program);
     for arg in &shell.args {
         cmd.arg(arg);
     }
-    cmd.arg(shell_command_text(shell, command));
+    cmd.arg(shell_command_text(shell, dialect, command));
     // JobManager owns this process tree through ManagedChild; do not add
     // the legacy setsid pre_exec here. ManagedChild creates the private group.
     apply_shell_environment(&mut cmd, shell)?;
@@ -147,7 +287,7 @@ pub(crate) fn configured_prepared_shell_job_command(
     for arg in &profile.args {
         cmd.arg(arg);
     }
-    cmd.arg(command);
+    cmd.arg(prepared_shell_command_text(profile.dialect, command));
     // JobManager owns this process tree through ManagedChild; do not add
     // the legacy setsid pre_exec here. ManagedChild creates the private group.
     apply_env_snapshot(&mut cmd, &profile.env_snapshot);
@@ -183,27 +323,25 @@ pub(crate) fn base_shell_env(
         .collect();
     if !shell.path_prepend.is_empty() {
         let mut paths = shell.path_prepend.clone();
-        if let Some(current) = env.get("PATH") {
+        // The inherited Windows PATH may be spelled `Path`; lookup must be
+        // case-insensitive or the prepended entries would replace it instead
+        // of extending it.
+        if let Some(current) = env_lookup(&env, "PATH") {
             paths.extend(std::env::split_paths(current));
         }
         let joined = std::env::join_paths(paths)
             .map_err(|e| format!("failed to build shell PATH from shell.path_prepend: {}", e))?;
-        env.insert("PATH".to_string(), joined.to_string_lossy().to_string());
+        env_insert(&mut env, "PATH", joined.to_string_lossy().to_string());
     }
     for (key, value) in &shell.env {
-        env.insert(key.clone(), value.clone());
+        env_insert(&mut env, key, value.clone());
     }
     for (key, value) in &profile.env {
-        env.insert(key.clone(), value.clone());
+        env_insert(&mut env, key, value.clone());
     }
-    for key in [
-        "WEBCODEX_TOKEN",
-        "WEBCODEX_AGENT_TOKEN",
-        "WEBCODEX_USER_TOKEN",
-        "AUTHORIZATION",
-    ] {
-        env.remove(key);
-    }
+    // A profile could configure a sensitive name in any case; Windows filters
+    // case-insensitively.
+    remove_sensitive_env(&mut env);
     Ok(env)
 }
 
@@ -457,11 +595,52 @@ fn parse_env_payload(
     Ok(env)
 }
 
+/// POSIX profile-prepare script: `set -e`, the configured init snippet, a
+/// marker line, then a NUL-delimited `env -0` dump. Unchanged from the legacy
+/// Unix behavior.
+fn posix_profile_prepare_script(init_script: &str, marker: &str) -> String {
+    format!(
+        "set -e\n{}\nprintf '\\n{}\\n'\nenv -0\n",
+        init_script, marker
+    )
+}
+
+/// PowerShell profile-prepare script. The UTF-8 preamble makes the env dump
+/// deterministic Unicode; `$ErrorActionPreference = 'Stop'` mirrors `set -e`
+/// for cmdlet errors (a terminating error in the snippet aborts preparation
+/// and reports a non-zero exit instead of producing a truncated snapshot); the
+/// trailing `$LASTEXITCODE` truthiness check mirrors it for the last native
+/// command (`$LASTEXITCODE` is `$null` after a pure-PowerShell snippet, which
+/// is falsy). The marker is a host-formatted line, then each environment
+/// entry is written as `NAME=VALUE\0` straight through `[Console]::Out` — no
+/// human-formatted table, no line wrapping, values may contain `=`, spaces,
+/// quotes, newlines, or any shell metacharacter, and entries are unambiguous
+/// because the value can never contain NUL. `Get-ChildItem Env:` reflects the
+/// process block after the init snippet ran.
+fn powershell_profile_prepare_script(init_script: &str, marker: &str) -> String {
+    format!(
+        "{POWERSHELL_UTF8_PREAMBLE}\n\
+         $ErrorActionPreference = 'Stop'\n\
+         try {{\n\
+         {init_script}\n\
+         if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}\n\
+         }} catch {{\n\
+         [Console]::Error.WriteLine($_)\n\
+         exit 1\n\
+         }}\n\
+         Write-Output '{marker}'\n\
+         Get-ChildItem Env: | ForEach-Object {{ \
+         [Console]::Out.Write($_.Name + '=' + $_.Value + [string][char]0) }}\n\
+         [Console]::Out.Flush()"
+    )
+}
+
 fn capture_profile_env_snapshot(
     profile_name: &str,
     profile: &ShellProfileConfig,
     program: &str,
     args: &[String],
+    dialect: ShellDialect,
     prepare_cwd: &Path,
     initial_env: HashMap<String, String>,
     stop_requested: Option<&AtomicBool>,
@@ -470,10 +649,10 @@ fn capture_profile_env_snapshot(
         return Ok(initial_env);
     };
     let marker = format!("__WEBCODEX_ENV_START_{}__", uuid::Uuid::new_v4().simple());
-    let prepare_script = format!(
-        "set -e\n{}\nprintf '\\n{}\\n'\nenv -0\n",
-        init_script, marker
-    );
+    let prepare_script = match dialect {
+        ShellDialect::Posix => posix_profile_prepare_script(init_script, &marker),
+        ShellDialect::PowerShell => powershell_profile_prepare_script(init_script, &marker),
+    };
     let mut cmd = Command::new(program);
     for arg in args {
         cmd.arg(arg);
@@ -522,14 +701,9 @@ fn capture_profile_env_snapshot(
         payload_start += 1;
     }
     let mut snapshot = parse_env_payload(&stdout[payload_start..], profile_name)?;
-    for key in [
-        "WEBCODEX_TOKEN",
-        "WEBCODEX_AGENT_TOKEN",
-        "WEBCODEX_USER_TOKEN",
-        "AUTHORIZATION",
-    ] {
-        snapshot.remove(key);
-    }
+    // The init snippet may have exported a sensitive variable in any case;
+    // Windows filters case-insensitively.
+    remove_sensitive_env(&mut snapshot);
     Ok(snapshot)
 }
 
@@ -571,12 +745,17 @@ impl PreparedShellProfileCache {
             .clone()
             .unwrap_or_else(|| shell.program.clone());
         let args = profile.args.clone().unwrap_or_else(|| shell.args.clone());
+        // The profile inherits the parent shell dialect unless it (or the
+        // parent) explicitly configures one; the prepare script and every
+        // later command in this profile use the same resolved dialect.
+        let dialect = resolve_dialect(&program, profile.dialect.or(shell.dialect));
         let initial_env = base_shell_env(shell, profile)?;
         let env_snapshot = capture_profile_env_snapshot(
             profile_name,
             profile,
             &program,
             &args,
+            dialect,
             prepare_cwd,
             initial_env,
             stop_requested,
@@ -585,6 +764,7 @@ impl PreparedShellProfileCache {
             profile_name: profile_name.to_string(),
             program,
             args,
+            dialect,
             env_snapshot,
         });
         let mut profiles = self.profiles.lock().unwrap();

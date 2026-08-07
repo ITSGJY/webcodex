@@ -171,6 +171,46 @@ impl Default for AgentPolicy {
     }
 }
 
+/// Shell grammar dialect used for quoting, init-script sourcing, profile
+/// preparation, and environment snapshot serialization. The Runner never
+/// guesses the grammar of an arbitrary custom executable: an explicit
+/// `shell.dialect` / `shell.profiles.<name>.dialect` value wins, otherwise a
+/// known shell basename is mapped, otherwise the platform default applies.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub(crate) enum ShellDialect {
+    /// `sh`-compatible syntax: `. <path> && (...)`, single-quote escaping,
+    /// `set -e`, `printf`, `env -0`.
+    #[serde(rename = "posix")]
+    Posix,
+    /// Windows PowerShell syntax: dot-sourcing, `''` single-quote escaping,
+    /// `[Console]::Out` env serialization.
+    #[serde(rename = "powershell")]
+    PowerShell,
+}
+
+/// Known-shell basename mapping used when no explicit dialect is configured.
+/// Never guesses for arbitrary custom executables; unknown names return `None`
+/// and callers fall back to the platform default shell dialect.
+pub(crate) fn dialect_for_program(program: &str) -> Option<ShellDialect> {
+    match Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program)
+    {
+        "sh" | "bash" => Some(ShellDialect::Posix),
+        "powershell" | "powershell.exe" | "pwsh" => Some(ShellDialect::PowerShell),
+        _ => None,
+    }
+}
+
+pub(crate) fn platform_default_dialect() -> ShellDialect {
+    if cfg!(windows) {
+        ShellDialect::PowerShell
+    } else {
+        ShellDialect::Posix
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub(crate) struct ShellConfig {
     #[serde(default)]
@@ -181,6 +221,12 @@ pub(crate) struct ShellConfig {
     pub(crate) program: String,
     #[serde(default = "default_shell_args")]
     pub(crate) args: Vec<String>,
+    /// Explicit shell dialect (`"posix"` or `"powershell"`). When omitted the
+    /// dialect is resolved from the program basename for known shells
+    /// (sh/bash -> posix, powershell/pwsh -> powershell) and otherwise defaults
+    /// to the platform shell (posix on Unix, powershell on Windows).
+    #[serde(default)]
+    pub(crate) dialect: Option<ShellDialect>,
     #[serde(default)]
     pub(crate) path_prepend: Vec<PathBuf>,
     #[serde(default)]
@@ -204,6 +250,7 @@ impl Default for ShellConfig {
             profiles: BTreeMap::new(),
             program: default_shell_program(),
             args: default_shell_args(),
+            dialect: None,
             path_prepend: Vec::new(),
             env: HashMap::new(),
             init_script: None,
@@ -241,6 +288,11 @@ pub(crate) struct ShellProfileConfig {
     pub(crate) program: Option<String>,
     #[serde(default)]
     pub(crate) args: Option<Vec<String>>,
+    /// Explicit dialect override for this profile. When omitted the profile
+    /// inherits `shell.dialect`, then the known-basename mapping, then the
+    /// platform default.
+    #[serde(default)]
+    pub(crate) dialect: Option<ShellDialect>,
     #[serde(default)]
     pub(crate) env: BTreeMap<String, String>,
     #[serde(default)]
@@ -432,10 +484,35 @@ pub(crate) fn restart_required_fields(
     )
 }
 
+/// Windows default shell: native PowerShell (no sh/Git Bash/WSL required).
+/// `-NoProfile` skips the user's interactive profile, `-NonInteractive` never
+/// prompts, `-ExecutionPolicy Bypass` is process-scoped and lets configured
+/// init/profile scripts dot-source `.ps1` files even under the stock
+/// Restricted machine policy, and `-Command` accepts the full script text as a
+/// single argument. stdout/stderr are captured through the Runner pipes and the
+/// script text appends an explicit `exit $LASTEXITCODE`.
+#[cfg(windows)]
+fn default_shell_program() -> String {
+    "powershell.exe".to_string()
+}
+
+#[cfg(windows)]
+fn default_shell_args() -> Vec<String> {
+    vec![
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-ExecutionPolicy".to_string(),
+        "Bypass".to_string(),
+        "-Command".to_string(),
+    ]
+}
+
+#[cfg(not(windows))]
 fn default_shell_program() -> String {
     "sh".to_string()
 }
 
+#[cfg(not(windows))]
 fn default_shell_args() -> Vec<String> {
     vec!["-c".to_string()]
 }
@@ -766,6 +843,7 @@ fn validate_shell_profile_toml_shape(content: &str) -> Result<(), String> {
         return Err("shell must be a table".to_string());
     };
     validate_optional_toml_string(shell, "default_profile", "shell.default_profile")?;
+    validate_optional_toml_string(shell, "dialect", "shell.dialect")?;
     let Some(profiles) = shell.get("profiles") else {
         return Ok(());
     };
@@ -785,6 +863,11 @@ fn validate_shell_profile_toml_shape(content: &str) -> Result<(), String> {
             profile,
             "program",
             &format!("shell.profiles.{}.program", name),
+        )?;
+        validate_optional_toml_string(
+            profile,
+            "dialect",
+            &format!("shell.profiles.{}.dialect", name),
         )?;
         validate_optional_toml_string(
             profile,

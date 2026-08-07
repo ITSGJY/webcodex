@@ -358,17 +358,17 @@ fn job_manager_stop_terminates_the_process_group() {
     let child = Arc::new(Mutex::new(ManagedChild::spawn(&mut command).unwrap()));
     let leader_pid = child.lock().unwrap().id();
     let pid_file = temp.path().join("descendant.pid");
-    for _ in 0..200 {
-        if pid_file.exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let descendant_pid = std::fs::read_to_string(&pid_file)
-        .unwrap()
-        .trim()
-        .parse::<u32>()
-        .unwrap();
+    let descendant_pid = (0..200)
+        .find_map(|_| {
+            let pid = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok());
+            if pid.is_none() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            pid
+        })
+        .expect("descendant pid marker was not ready");
     assert!(process_running(leader_pid));
     assert!(process_running(descendant_pid));
 

@@ -1375,8 +1375,10 @@ fn runner_build_info() -> shell_protocol::AgentBuildInfo {
 }
 
 /// Shell dialect derived from a program path basename. Only `sh` and `bash`
-/// map to portable dialects; anything else is `custom` and callers that need
-/// deterministic syntax must select an explicit `shell=sh|bash`.
+/// map to portable POSIX dialects; `powershell`/`powershell.exe`/`pwsh` map to
+/// the Windows PowerShell dialect; anything else is `custom` and callers that
+/// need deterministic syntax must select an explicit `shell=sh|bash` (or a
+/// configured dialect on the Runner side).
 fn shell_dialect_for_program(program: &str) -> &'static str {
     match std::path::Path::new(program)
         .file_name()
@@ -1385,6 +1387,7 @@ fn shell_dialect_for_program(program: &str) -> &'static str {
     {
         "sh" => "sh",
         "bash" => "bash",
+        "powershell" | "powershell.exe" | "pwsh" => "powershell",
         _ => "custom",
     }
 }
