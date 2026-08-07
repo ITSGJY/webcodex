@@ -7,6 +7,9 @@
 //! * `spawn-grandchild <marker> <delay> <total>` — spawn ourself again as a
 //!   grandchild, print `GRANDCHILD_PID=<pid>`, then exit immediately while the
 //!   grandchild keeps running.
+//! * `spawn-grandchild-keepalive <marker> <delay> <total> <keepalive>` — spawn
+//!   ourself again as a grandchild, print `GRANDCHILD_PID=<pid>`, then sleep
+//!   `keepalive` so the direct child stays alive while the grandchild runs.
 //! * `grandchild <marker> <delay> <total>` — sleep `delay`, write our own PID
 //!   to `marker`, sleep until `total`, then exit 0.
 //! * `hold-stdout` — write `PING` and keep the stdout write end open forever.
@@ -26,20 +29,13 @@ fn main() {
             std::process::exit(code);
         }
         "spawn-grandchild" => {
-            let marker = args.get(2).expect("marker path");
-            let delay: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
-            let total: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(60);
-            let self_exe = std::env::current_exe().expect("current_exe");
-            // The grandchild inherits stdin/stdout/stderr so it keeps the piped
-            // stdout write end open and the test can observe the tree.
-            let mut cmd = Command::new(self_exe);
-            cmd.args(["grandchild", marker, &delay.to_string(), &total.to_string()]);
-            cmd.stdin(Stdio::inherit())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit());
-            let child = cmd.spawn().expect("spawn grandchild");
-            println!("GRANDCHILD_PID={}", child.id());
-            std::io::stdout().flush().expect("flush stdout");
+            spawn_grandchild(&args);
+            std::process::exit(0);
+        }
+        "spawn-grandchild-keepalive" => {
+            spawn_grandchild(&args);
+            let keepalive: u64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(60);
+            std::thread::sleep(std::time::Duration::from_secs(keepalive));
             std::process::exit(0);
         }
         "grandchild" => {
@@ -63,4 +59,22 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+/// Spawn ourself again as a `grandchild` that inherits stdin/stdout/stderr so
+/// it keeps the piped stdout write end open, and print its pid on the parent's
+/// stdout. Args are indexed as in the `spawn-grandchild` family of modes.
+fn spawn_grandchild(args: &[String]) {
+    let marker = args.get(2).expect("marker path");
+    let delay: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
+    let total: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(60);
+    let self_exe = std::env::current_exe().expect("current_exe");
+    let mut cmd = Command::new(self_exe);
+    cmd.args(["grandchild", marker, &delay.to_string(), &total.to_string()]);
+    cmd.stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let child = cmd.spawn().expect("spawn grandchild");
+    println!("GRANDCHILD_PID={}", child.id());
+    std::io::stdout().flush().expect("flush stdout");
 }

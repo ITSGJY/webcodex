@@ -1,5 +1,11 @@
 use super::*;
 use serde_json::json;
+use std::ffi::OsString;
+use std::io::BufReader;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::OnceLock;
+use tempfile::TempDir;
 
 fn retained_terminal_job(job_id: &str, ended_at: i64) -> RunningJob {
     let mut snapshot = test_job_snapshot(job_id);
@@ -12,7 +18,6 @@ fn retained_terminal_job(job_id: &str, ended_at: i64) -> RunningJob {
         agent_instance_id: "test-instance".to_string(),
         snapshot,
         child: None,
-        process_group_id: None,
         stop_requested: Arc::new(AtomicBool::new(false)),
         slot_reserved: false,
     }
@@ -32,7 +37,6 @@ fn job_reconciliation_inventory_prioritizes_active_and_bounds_terminal_history()
             agent_instance_id: "test-instance".to_string(),
             snapshot: active,
             child: None,
-            process_group_id: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             slot_reserved: true,
         },
@@ -93,7 +97,6 @@ fn job_reconciliation_inventory_drops_terminal_payload_before_active_jobs() {
             agent_instance_id: "test-instance".to_string(),
             snapshot: active,
             child: None,
-            process_group_id: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             slot_reserved: true,
         },
@@ -137,7 +140,6 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
             agent_instance_id: "test-instance".to_string(),
             snapshot,
             child: None,
-            process_group_id: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             slot_reserved: true,
         },
@@ -216,7 +218,6 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
         .cloned()
         .unwrap();
     assert!(record.child.is_none());
-    assert!(record.process_group_id.is_none());
     assert!(!record.slot_reserved);
 
     manager.update_and_send(
@@ -350,14 +351,11 @@ fn job_manager_stop_terminates_the_process_group() {
         "sleep 60 & echo $! > descendant.pid; wait",
     )
     .unwrap();
-    let child = Arc::new(Mutex::new(
-        command
-            .current_dir(temp.path())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    ));
+    command
+        .current_dir(temp.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let child = Arc::new(Mutex::new(ManagedChild::spawn(&mut command).unwrap()));
     let leader_pid = child.lock().unwrap().id();
     let pid_file = temp.path().join("descendant.pid");
     for _ in 0..200 {
@@ -383,7 +381,6 @@ fn job_manager_stop_terminates_the_process_group() {
             agent_instance_id: "test-instance".into(),
             snapshot: test_job_snapshot("process-group-job"),
             child: Some(child.clone()),
-            process_group_id: Some(leader_pid),
             stop_requested: stop_requested.clone(),
             slot_reserved: true,
         },
@@ -415,14 +412,11 @@ fn job_shutdown_reaps_a_sigterm_responsive_child() {
         "trap 'exit 0' TERM; : > ready; while :; do sleep 1; done",
     )
     .unwrap();
-    let child = Arc::new(Mutex::new(
-        command
-            .current_dir(temp.path())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    ));
+    command
+        .current_dir(temp.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let child = Arc::new(Mutex::new(ManagedChild::spawn(&mut command).unwrap()));
     let leader_pid = child.lock().unwrap().id();
     assert!(wait_until(Duration::from_secs(1), || ready.exists()));
     let manager = JobManager::new(1);
@@ -434,7 +428,6 @@ fn job_shutdown_reaps_a_sigterm_responsive_child() {
             agent_instance_id: "test-instance".into(),
             snapshot: test_job_snapshot("term-responsive"),
             child: Some(Arc::clone(&child)),
-            process_group_id: Some(leader_pid),
             stop_requested: Arc::clone(&stop_requested),
             slot_reserved: true,
         },
@@ -459,14 +452,11 @@ fn job_shutdown_escalates_ignored_sigterm_for_parent_and_descendant() {
         "trap '' TERM; sleep 60 & echo $! > descendant.pid; wait",
     )
     .unwrap();
-    let child = Arc::new(Mutex::new(
-        command
-            .current_dir(temp.path())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    ));
+    command
+        .current_dir(temp.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let child = Arc::new(Mutex::new(ManagedChild::spawn(&mut command).unwrap()));
     let leader_pid = child.lock().unwrap().id();
     let pid_file = temp.path().join("descendant.pid");
     assert!(wait_until(Duration::from_secs(2), || pid_file.exists()));
@@ -487,7 +477,6 @@ fn job_shutdown_escalates_ignored_sigterm_for_parent_and_descendant() {
             agent_instance_id: "test-instance".into(),
             snapshot: test_job_snapshot("term-ignoring"),
             child: Some(Arc::clone(&child)),
-            process_group_id: Some(leader_pid),
             stop_requested: Arc::clone(&stop_requested),
             slot_reserved: true,
         },
@@ -529,33 +518,6 @@ fn poisoned_job_mutex_does_not_panic_shutdown() {
     let outcome = manager.drain_shutdown(batch, Instant::now() + Duration::from_millis(50));
     assert_eq!(outcome.resources, 0);
     assert_eq!(outcome.timed_out, 0);
-}
-
-#[cfg(unix)]
-#[test]
-fn process_group_signal_errors_distinguish_gone_permission_and_other_failures() {
-    assert_eq!(
-        classify_process_group_signal_error(
-            42,
-            libc::SIGTERM,
-            std::io::Error::from_raw_os_error(libc::ESRCH),
-        ),
-        Ok(false)
-    );
-    let permission = classify_process_group_signal_error(
-        42,
-        libc::SIGTERM,
-        std::io::Error::from_raw_os_error(libc::EPERM),
-    )
-    .unwrap_err();
-    assert!(permission.contains("permission"));
-    let other = classify_process_group_signal_error(
-        42,
-        libc::SIGTERM,
-        std::io::Error::from_raw_os_error(libc::EINVAL),
-    )
-    .unwrap_err();
-    assert!(other.contains("Invalid argument"));
 }
 
 /// One run of the fail-fast plan, plus the side effect the plan must not have.
@@ -967,6 +929,35 @@ fn python_module_probe_reports_tool_unavailable_without_running_recipe() {
     );
 }
 
+/// Platform-native liveness probe for job descendants, so the tree tests never
+/// shell out to `tasklist`/`ps`/PowerShell.
+#[cfg(windows)]
+pub(super) fn process_running(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: OpenProcess returns a handle or NULL; NULL means the pid no
+    // longer exists (or is inaccessible, which also means not ours).
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let mut exit_code = 0u32;
+    // SAFETY: `handle` is valid; `exit_code` is a valid out-param.
+    let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+    // SAFETY: close the handle we opened.
+    unsafe { CloseHandle(handle) };
+    ok == 1 && exit_code == 259 // 259 == STILL_ACTIVE
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(super) fn process_running(pid: u32) -> bool {
+    // SAFETY: signal 0 is an existence probe; the pid comes from our own
+    // helper subprocess.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
 #[cfg(target_os = "linux")]
 pub(super) fn process_running(pid: u32) -> bool {
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
@@ -986,4 +977,618 @@ fn wait_until(timeout: Duration, condition: impl Fn() -> bool) -> bool {
         std::thread::sleep(Duration::from_millis(10));
     }
     condition()
+}
+
+/// Poll `process_running(pid)` until the process is gone or `timeout` elapses.
+fn wait_for_process_exit(pid: u32, timeout: Duration, tag: &str) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !process_running(pid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            eprintln!("wait_for_process_exit({tag}): pid {pid} still running");
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JobManager process-tree fixtures and tests
+//
+// The job tree tests run the real `process_tree_helper` binary from
+// `webcodex-process` (compiled at test time with rustc, exactly like the LSP
+// and MCP fake servers), so the same scenarios run on Windows and Unix without
+// cmd, PowerShell, or bash. Liveness is probed with the platform-native
+// `process_running` above. Every test reaps the tree it starts before
+// returning, so no helper process is left behind.
+// ---------------------------------------------------------------------------
+
+/// Compiled copy of the `process_tree_helper` fixture, kept alive for the whole
+/// test process so its binary path never disappears under a running grandchild.
+struct JobTreeHelper {
+    _temp: TempDir,
+    path: PathBuf,
+}
+
+static JOB_TREE_HELPER: OnceLock<Arc<JobTreeHelper>> = OnceLock::new();
+
+fn job_tree_helper() -> Arc<JobTreeHelper> {
+    JOB_TREE_HELPER
+        .get_or_init(|| {
+            let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../webcodex-process/src/bin/process_tree_helper.rs");
+            let temp = tempfile::tempdir().unwrap();
+            let output = temp.path().join(format!(
+                "process-tree-helper{}",
+                std::env::consts::EXE_SUFFIX
+            ));
+            let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
+            let result = Command::new(rustc)
+                .arg("--edition=2021")
+                .arg("--crate-name=webcodex_job_tree_helper")
+                .arg(&source)
+                .arg("-o")
+                .arg(&output)
+                .output()
+                .expect("run rustc for job tree helper");
+            assert!(
+                result.status.success(),
+                "job tree helper compilation failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            Arc::new(JobTreeHelper {
+                _temp: temp,
+                path: output,
+            })
+        })
+        .clone()
+}
+
+/// A background line reader over a job's captured stdout. Each complete line is
+/// delivered as `Line`, and a final `Eof` marks the pipe closing (which a
+/// descendant holding the write end would otherwise delay indefinitely).
+enum JobTreeOut {
+    Line(Vec<u8>),
+    Eof,
+}
+
+/// Spawn the helper in `mode`, capturing its stdout and piping it through a
+/// background line reader. The helper's descendants inherit the stdout write
+/// end, so `Eof` only arrives once the whole tree is gone.
+fn spawn_helper_raw(mode: &str, args: &[&str]) -> (ManagedChild, mpsc::Receiver<JobTreeOut>) {
+    let helper = job_tree_helper();
+    let mut cmd = Command::new(&helper.path);
+    cmd.arg(mode).args(args);
+    cmd.stdout(Stdio::piped());
+    let mut managed = ManagedChild::spawn(&mut cmd).expect("spawn job tree helper");
+    let (tx, rx) = mpsc::sync_channel(64);
+    let stdout = managed
+        .child_mut()
+        .stdout
+        .take()
+        .expect("job tree helper piped stdout");
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            match reader.read(&mut byte) {
+                Ok(0) => {
+                    if !line.is_empty() {
+                        let _ = tx.send(JobTreeOut::Line(std::mem::take(&mut line)));
+                    }
+                    let _ = tx.send(JobTreeOut::Eof);
+                    return;
+                }
+                Ok(1) => {
+                    line.push(byte[0]);
+                    if line.ends_with(b"\n") {
+                        let _ = tx.send(JobTreeOut::Line(std::mem::take(&mut line)));
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    let _ = tx.send(JobTreeOut::Eof);
+                    return;
+                }
+            }
+        }
+    });
+    (managed, rx)
+}
+
+fn read_grandchild_pid(rx: &mpsc::Receiver<JobTreeOut>) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("timed out reading GRANDCHILD_PID from job stdout");
+        }
+        match rx.recv_timeout(remaining.min(Duration::from_secs(1))) {
+            Ok(JobTreeOut::Line(line)) => {
+                let text = String::from_utf8_lossy(&line);
+                if let Some(value) = text.trim().strip_prefix("GRANDCHILD_PID=") {
+                    return value.trim().parse().expect("grandchild pid number");
+                }
+            }
+            Ok(JobTreeOut::Eof) => panic!("job stdout reached EOF before GRANDCHILD_PID"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("job stdout reader disconnected before GRANDCHILD_PID")
+            }
+        }
+    }
+}
+
+fn wait_for_stdout_eof(rx: &mpsc::Receiver<JobTreeOut>, timeout: Duration, tag: &str) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            eprintln!("wait_for_stdout_eof({tag}): no EOF within {timeout:?}");
+            return false;
+        }
+        match rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            Ok(JobTreeOut::Eof) => return true,
+            Ok(JobTreeOut::Line(_)) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+    }
+}
+
+fn extract_grandchild_pid(text: &str) -> Option<u32> {
+    text.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("GRANDCHILD_PID=")?
+            .trim()
+            .parse::<u32>()
+            .ok()
+    })
+}
+
+fn insert_running_job(
+    manager: &JobManager,
+    job_id: &str,
+    child: Option<Arc<Mutex<ManagedChild>>>,
+) -> Arc<AtomicBool> {
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    lock_unpoison(&manager.jobs).insert(
+        job_id.to_string(),
+        RunningJob {
+            client_id: "tree-agent".to_string(),
+            agent_instance_id: "tree-instance".to_string(),
+            snapshot: test_job_snapshot(job_id),
+            child,
+            stop_requested: Arc::clone(&stop_requested),
+            slot_reserved: true,
+        },
+    );
+    stop_requested
+}
+
+/// An explicit stop terminates the whole job process tree, including a
+/// descendant that inherited the stdout pipe, and the stdout reader reaches
+/// EOF instead of blocking forever.
+#[test]
+fn job_stop_terminates_whole_tree_including_descendant() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("stop-grandchild.marker");
+    let (managed, rx) = spawn_helper_raw(
+        "spawn-grandchild-keepalive",
+        &[marker.to_str().unwrap(), "3", "60", "60"],
+    );
+    let parent_pid = managed.id();
+    let grandchild_pid = read_grandchild_pid(&rx);
+    assert!(
+        process_running(parent_pid),
+        "job parent should be running before stop"
+    );
+    assert!(
+        process_running(grandchild_pid),
+        "job descendant should be running before stop"
+    );
+    let child = Arc::new(Mutex::new(managed));
+
+    let manager = JobManager::new(1);
+    let stop_requested = insert_running_job(&manager, "stop-tree-job", Some(child.clone()));
+    manager.stop("stop-tree-job").expect("stop job");
+    assert!(stop_requested.load(Ordering::SeqCst));
+
+    assert!(
+        wait_for_process_exit(parent_pid, Duration::from_secs(5), "parent-after-stop"),
+        "job parent survived stop"
+    );
+    assert!(
+        wait_for_process_exit(
+            grandchild_pid,
+            Duration::from_secs(5),
+            "grandchild-after-stop"
+        ),
+        "job descendant survived stop; stop must terminate the whole tree"
+    );
+    assert!(
+        wait_for_stdout_eof(&rx, Duration::from_secs(5), "stop-eof"),
+        "stdout must reach EOF after the whole tree is terminated"
+    );
+    assert!(
+        !marker.exists(),
+        "delayed grandchild marker must never appear after stop"
+    );
+}
+
+/// The job worker's cleanup sequence (bounded tree wait, force terminate, then
+/// reader join) must kill an orphaned descendant that keeps the stdout pipe
+/// open, and the output reader must reach EOF instead of being detached.
+#[test]
+fn job_cleanup_after_parent_exit_terminates_descendant_and_reaches_eof() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("orphan.marker");
+    let helper = job_tree_helper();
+    let mut cmd = Command::new(&helper.path);
+    cmd.arg("spawn-grandchild")
+        .arg(marker.to_str().unwrap())
+        .arg("3")
+        .arg("60");
+    cmd.stdout(Stdio::piped());
+    let mut managed = ManagedChild::spawn(&mut cmd).expect("spawn job tree helper");
+    let (tx, rx) = mpsc::sync_channel::<OutputChunk>(64);
+    let stdout = managed.child_mut().stdout.take().expect("piped stdout");
+    let readers = vec![spawn_reader(stdout, tx.clone(), true)];
+    drop(tx);
+    let child = Arc::new(Mutex::new(managed));
+
+    // The direct child exits on its own right after spawning the grandchild;
+    // collect its pid line from the production reader's chunk stream.
+    let mut accumulated = String::new();
+    let mut grandchild_pid = None;
+    let read_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < read_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            if let OutputChunk::Stdout(text) = chunk {
+                accumulated.push_str(&text);
+            }
+        }
+        if let Some(pid) = extract_grandchild_pid(&accumulated) {
+            grandchild_pid = Some(pid);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let grandchild_pid = grandchild_pid.expect("GRANDCHILD_PID in job stdout");
+    assert!(
+        wait_until(Duration::from_secs(5), || lock_unpoison(&child)
+            .try_wait()
+            .unwrap()
+            .is_some()),
+        "job parent should exit on its own"
+    );
+    assert!(
+        process_running(grandchild_pid),
+        "grandchild must still be alive after the parent exits"
+    );
+
+    // This is exactly what the job worker runs after the direct child's status
+    // is decided.
+    cleanup_managed_tree(&child);
+    let detached = join_reader_threads_until(readers, Instant::now() + Duration::from_secs(1));
+    assert_eq!(
+        detached, 0,
+        "stdout reader must finish on EOF instead of being detached"
+    );
+    assert!(
+        wait_for_process_exit(grandchild_pid, Duration::from_secs(5), "orphan-grandchild"),
+        "orphaned grandchild survived tree cleanup"
+    );
+    assert!(
+        !marker.exists(),
+        "delayed grandchild marker must never appear after cleanup"
+    );
+}
+
+/// A shutdown drain terminates every running job's whole tree, leaves a
+/// completed job untouched, and is bounded.
+#[test]
+fn job_stop_all_terminates_all_trees_and_preserves_completed_jobs() {
+    let manager = JobManager::new(2);
+    let completed_stop = Arc::new(AtomicBool::new(false));
+    {
+        let mut snapshot = test_job_snapshot("completed-job");
+        snapshot.status = "completed".to_string();
+        lock_unpoison(&manager.jobs).insert(
+            "completed-job".to_string(),
+            RunningJob {
+                client_id: "tree-agent".to_string(),
+                agent_instance_id: "tree-instance".to_string(),
+                snapshot,
+                child: None,
+                stop_requested: Arc::clone(&completed_stop),
+                slot_reserved: false,
+            },
+        );
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let marker_a = temp.path().join("stop-all-a.marker");
+    let marker_b = temp.path().join("stop-all-b.marker");
+    let (managed_a, rx_a) = spawn_helper_raw(
+        "spawn-grandchild-keepalive",
+        &[marker_a.to_str().unwrap(), "3", "60", "60"],
+    );
+    let (managed_b, rx_b) = spawn_helper_raw(
+        "spawn-grandchild-keepalive",
+        &[marker_b.to_str().unwrap(), "3", "60", "60"],
+    );
+    let a_parent = managed_a.id();
+    let a_grandchild = read_grandchild_pid(&rx_a);
+    let b_parent = managed_b.id();
+    let b_grandchild = read_grandchild_pid(&rx_b);
+    insert_running_job(&manager, "running-a", Some(Arc::new(Mutex::new(managed_a))));
+    insert_running_job(&manager, "running-b", Some(Arc::new(Mutex::new(managed_b))));
+
+    manager.stop_all();
+
+    let completed = lock_unpoison(&manager.jobs)
+        .get("completed-job")
+        .cloned()
+        .unwrap();
+    assert_eq!(completed.snapshot.status, "completed");
+    assert!(
+        !completed_stop.load(Ordering::SeqCst),
+        "a terminal job must not be signalled during shutdown"
+    );
+    for (pid, tag) in [
+        (a_parent, "a-parent"),
+        (a_grandchild, "a-grandchild"),
+        (b_parent, "b-parent"),
+        (b_grandchild, "b-grandchild"),
+    ] {
+        assert!(
+            wait_for_process_exit(pid, Duration::from_secs(5), tag),
+            "{tag} survived stop_all"
+        );
+    }
+    assert!(wait_for_stdout_eof(&rx_a, Duration::from_secs(5), "a-eof"));
+    assert!(wait_for_stdout_eof(&rx_b, Duration::from_secs(5), "b-eof"));
+}
+
+/// Repeated stops are idempotent: the second stop must not panic and must not
+/// leave the tree running.
+#[test]
+fn job_stop_twice_is_idempotent() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("twice.marker");
+    let (managed, rx) = spawn_helper_raw(
+        "spawn-grandchild-keepalive",
+        &[marker.to_str().unwrap(), "3", "60", "60"],
+    );
+    let parent_pid = managed.id();
+    let grandchild_pid = read_grandchild_pid(&rx);
+    let child = Arc::new(Mutex::new(managed));
+    let manager = JobManager::new(1);
+    insert_running_job(&manager, "twice-job", Some(child));
+
+    manager.stop("twice-job").expect("first stop");
+    manager
+        .stop("twice-job")
+        .expect("second stop must be idempotent");
+
+    assert!(wait_for_process_exit(
+        parent_pid,
+        Duration::from_secs(5),
+        "twice-parent"
+    ));
+    assert!(wait_for_process_exit(
+        grandchild_pid,
+        Duration::from_secs(5),
+        "twice-grandchild"
+    ));
+    assert!(wait_for_stdout_eof(
+        &rx,
+        Duration::from_secs(5),
+        "twice-eof"
+    ));
+}
+
+/// Stopping a job whose tree already exited naturally must not panic and must
+/// report success.
+#[test]
+fn job_stop_after_natural_exit_does_not_panic() {
+    let (managed, _rx) = spawn_helper_raw("sleep", &["0", "0"]);
+    let parent_pid = managed.id();
+    let child = Arc::new(Mutex::new(managed));
+    assert!(
+        wait_until(Duration::from_secs(5), || lock_unpoison(&child)
+            .try_wait()
+            .unwrap()
+            .is_some()),
+        "job should exit on its own"
+    );
+    let manager = JobManager::new(1);
+    insert_running_job(&manager, "exited-job", Some(child));
+    manager.stop("exited-job").expect("stop after natural exit");
+    assert!(wait_for_process_exit(
+        parent_pid,
+        Duration::from_secs(5),
+        "exited-parent"
+    ));
+}
+
+/// Dropping the last real JobManager owner must terminate an active tree even
+/// while a worker clone still holds the jobs map and ManagedChild Arc.
+#[test]
+fn last_job_manager_owner_drop_terminates_running_tree_with_worker_clone_alive() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("drop.marker");
+    let (managed, rx) = spawn_helper_raw(
+        "spawn-grandchild-keepalive",
+        &[marker.to_str().unwrap(), "3", "60", "60"],
+    );
+    let parent_pid = managed.id();
+    let grandchild_pid = read_grandchild_pid(&rx);
+    let manager = JobManager::new(1);
+    let second_owner = manager.clone();
+    let worker_manager = manager.clone_for_worker();
+    let stop_requested =
+        insert_running_job(&manager, "drop-job", Some(Arc::new(Mutex::new(managed))));
+
+    drop(manager);
+    assert!(process_running(parent_pid) && process_running(grandchild_pid));
+    assert!(!stop_requested.load(Ordering::SeqCst));
+
+    drop(second_owner);
+    assert!(worker_manager.shutting_down.load(Ordering::SeqCst));
+    assert!(stop_requested.load(Ordering::SeqCst));
+    assert!(
+        wait_for_process_exit(parent_pid, Duration::from_secs(5), "drop-parent"),
+        "running job parent survived last owner drop"
+    );
+    assert!(
+        wait_for_process_exit(grandchild_pid, Duration::from_secs(5), "drop-grandchild"),
+        "running job descendant survived last owner drop"
+    );
+    assert!(wait_for_stdout_eof(&rx, Duration::from_secs(5), "drop-eof"));
+    drop(worker_manager);
+}
+
+/// Cleanup on an already-exited tree must be a no-op that never panics.
+#[test]
+fn cleanup_managed_tree_on_exited_tree_does_not_panic() {
+    let (managed, _rx) = spawn_helper_raw("sleep", &["0", "0"]);
+    let child = Arc::new(Mutex::new(managed));
+    assert!(wait_until(Duration::from_secs(5), || lock_unpoison(&child)
+        .try_wait()
+        .unwrap()
+        .is_some()));
+    cleanup_managed_tree(&child);
+    assert!(
+        lock_unpoison(&child).try_tree_exit().unwrap(),
+        "cleanup must leave an already-exited tree confirmed empty"
+    );
+}
+
+/// A user stop racing Runner shutdown must not deadlock or panic, and both
+/// paths must converge on a fully-terminated tree.
+#[test]
+fn job_stop_racing_shutdown_does_not_panic() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("race.marker");
+    let (managed, rx) = spawn_helper_raw(
+        "spawn-grandchild-keepalive",
+        &[marker.to_str().unwrap(), "3", "60", "60"],
+    );
+    let parent_pid = managed.id();
+    let grandchild_pid = read_grandchild_pid(&rx);
+    let child = Arc::new(Mutex::new(managed));
+    let manager = JobManager::new(1);
+    insert_running_job(&manager, "race-job", Some(child.clone()));
+
+    let stop_manager = manager.clone();
+    let stopper = std::thread::spawn(move || {
+        let _ = stop_manager.stop("race-job");
+    });
+    manager.stop_accepting_work();
+    let batch = manager.signal_all_for_shutdown();
+    let outcome = manager.drain_shutdown(batch, Instant::now() + Duration::from_secs(2));
+    stopper.join().expect("stop thread must not panic");
+    assert!(outcome.resources >= 1);
+
+    assert!(wait_for_process_exit(
+        parent_pid,
+        Duration::from_secs(5),
+        "race-parent"
+    ));
+    assert!(wait_for_process_exit(
+        grandchild_pid,
+        Duration::from_secs(5),
+        "race-grandchild"
+    ));
+    assert!(wait_for_stdout_eof(&rx, Duration::from_secs(5), "race-eof"));
+}
+
+/// A job timeout must terminate the whole tree (parent shell, helper, and the
+/// helper's descendant) and publish exactly one `timeout` completion. Requires
+/// a real `sh` for the full worker path, so it runs on Linux.
+#[cfg(target_os = "linux")]
+#[test]
+fn job_timeout_terminates_the_whole_tree() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("timeout-grandchild.marker");
+    let helper = job_tree_helper();
+    // `sh -c '<helper> spawn-grandchild-keepalive <marker> 3 60 60'` so the
+    // job's direct child spawns a grandchild and keeps running until timeout.
+    let command = format!(
+        "{} spawn-grandchild-keepalive {} 3 60 60",
+        helper.path.display(),
+        marker.display()
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let sink = AgentSink::WebSocket {
+        tx,
+        client_id: "timeout-agent".into(),
+        agent_instance_id: "timeout-instance".into(),
+    };
+    let manager = JobManager::new(1);
+    manager.enqueue(
+        sink,
+        1,
+        AgentPolicy {
+            allow_cwd_anywhere: true,
+            ..AgentPolicy::default()
+        },
+        ShellConfig::default(),
+        SshConfig::default(),
+        temp.path().join("projects.d"),
+        serde_json::from_value(json!({
+            "request_id": "timeout-request",
+            "client_id": "timeout-agent",
+            "kind": "start_job",
+            "job_id": "timeout-job",
+            "cwd": temp.path(),
+            "command": command,
+            "timeout_secs": 1,
+            "requested_by": "test",
+            "created_at": 1,
+            "job_context": test_job_context(temp.path(), Vec::new())
+        }))
+        .unwrap(),
+    );
+
+    let updates = collect_job_updates(&mut rx, Duration::from_secs(20));
+    let final_update = updates.last().expect("timeout job should finish");
+    assert!(final_update.finished, "{}", describe_update(final_update));
+    assert_eq!(final_update.status, "timeout", "{final_update:?}");
+    assert_eq!(final_update.exit_code, Some(-1), "{final_update:?}");
+    assert!(
+        final_update
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("timed out")),
+        "{final_update:?}"
+    );
+    assert_eq!(
+        updates.iter().filter(|update| update.finished).count(),
+        1,
+        "timeout must produce exactly one finished update"
+    );
+
+    // The helper's captured stdout carries the grandchild pid, which must be
+    // gone after the timeout terminates the whole tree.
+    let stdout_tail = final_update
+        .log_snapshot
+        .as_ref()
+        .map(|log| log.stdout.tail.clone())
+        .unwrap_or_default();
+    let grandchild_pid =
+        extract_grandchild_pid(&stdout_tail).expect("GRANDCHILD_PID in job stdout");
+    assert!(
+        wait_for_process_exit(grandchild_pid, Duration::from_secs(5), "timeout-grandchild"),
+        "grandchild survived job timeout"
+    );
+    assert!(
+        !marker.exists(),
+        "delayed grandchild marker must never appear after timeout"
+    );
 }

@@ -602,6 +602,47 @@ fn graceful_request_repeated_and_already_exited_do_not_panic() {
     let _ = result;
 }
 
+/// A caller-installed `setsid` pre-exec hook must remain compatible with
+/// ManagedChild's Unix process-tree ownership.
+#[cfg(unix)]
+#[test]
+fn caller_setsid_pre_exec_remains_compatible() {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = Command::new(helper());
+    command.arg("sleep").arg("60");
+    // SAFETY: the hook performs only the async-signal-safe setsid syscall.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut managed = ManagedChild::spawn(&mut command)
+        .expect("ManagedChild must accept a caller-created session");
+    assert!(!managed.try_tree_exit().expect("probe live tree"));
+    managed.terminate_tree().expect("terminate setsid tree");
+    assert!(managed
+        .wait_tree_exit(Duration::from_secs(10))
+        .expect("wait setsid tree"));
+    let _ = managed.try_wait();
+}
+
+/// `try_tree_exit` is the non-blocking tree probe used by Runner shutdown.
+#[test]
+fn try_tree_exit_tracks_tree_liveness() {
+    let (mut managed, _) = spawn_helper("sleep", &["60", "0"], false);
+    assert!(!managed.try_tree_exit().expect("live tree probe"));
+    managed.terminate_tree().expect("terminate tree");
+    assert!(managed
+        .wait_tree_exit(Duration::from_secs(10))
+        .expect("wait tree"));
+    assert!(managed.try_tree_exit().expect("empty tree probe"));
+    let _ = managed.try_wait();
+}
+
 // ---------------------------------------------------------------------------
 // Platform-native liveness probing
 // ---------------------------------------------------------------------------

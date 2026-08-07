@@ -4730,13 +4730,12 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
     let stop_requested = Arc::new(AtomicBool::new(false));
     let mut running_command =
         configured_shell_job_command(&ShellConfig::default(), "sleep 60").unwrap();
+    running_command
+        .current_dir(tmp.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let running_child = Arc::new(Mutex::new(
-        running_command
-            .current_dir(tmp.path())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+        ManagedChild::spawn(&mut running_command).unwrap(),
     ));
     let running_pid = lock_unpoison(&running_child).id();
     jobs.jobs.lock().unwrap().insert(
@@ -4746,7 +4745,6 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
             agent_instance_id: "ws-instance".to_string(),
             snapshot: test_job_snapshot("running-job"),
             child: Some(Arc::clone(&running_child)),
-            process_group_id: Some(running_pid),
             stop_requested: stop_requested.clone(),
             slot_reserved: true,
         },

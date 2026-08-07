@@ -3,11 +3,12 @@ use std::collections::{HashMap, VecDeque};
 use std::error::Error as StdError;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing_subscriber::EnvFilter;
+use webcodex_process::{GracefulTermination, ManagedChild};
 use webcodex_runner::shutdown::{lock_unpoison, ActivityTracker};
 
 #[cfg(test)]
@@ -83,6 +84,42 @@ const AGENT_POLL_PATH: &str = "/api/shell/agent/poll";
 /// finite bound.
 const AGENT_HTTP_RESPONSE_BODY_MAX_BYTES: usize = 32 * 1024 * 1024;
 
+#[derive(Debug)]
+struct JobManagerOwnerLifetime {
+    jobs: std::sync::Weak<Mutex<HashMap<String, RunningJob>>>,
+    shutting_down: std::sync::Weak<AtomicBool>,
+}
+
+impl Drop for JobManagerOwnerLifetime {
+    fn drop(&mut self) {
+        if let Some(shutting_down) = self.shutting_down.upgrade() {
+            shutting_down.store(true, Ordering::SeqCst);
+        }
+        let Some(jobs) = self.jobs.upgrade() else {
+            return;
+        };
+        let targets = {
+            let jobs = lock_unpoison(&jobs);
+            jobs.values()
+                .filter(|job| runner_job_is_active(&job.snapshot.status))
+                .map(|job| (job.child.clone(), Arc::clone(&job.stop_requested)))
+                .collect::<Vec<_>>()
+        };
+        for (child, stop_requested) in targets {
+            stop_requested.store(true, Ordering::SeqCst);
+            let Some(child) = child else {
+                continue;
+            };
+            let mut child = match child.try_lock() {
+                Ok(child) => child,
+                Err(std::sync::TryLockError::WouldBlock) => continue,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            };
+            let _ = child.terminate_tree();
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct JobManager {
     max_concurrent: usize,
@@ -106,21 +143,35 @@ struct JobManager {
     shutting_down: Arc<AtomicBool>,
     workers: ActivityTracker,
     current_sink: Arc<Mutex<Option<AgentSink>>>,
+    owner_lifetime: Option<Arc<JobManagerOwnerLifetime>>,
 }
 
 impl JobManager {
     fn new(max_concurrent: usize) -> Self {
+        let jobs = Arc::new(Mutex::new(HashMap::new()));
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let owner_lifetime = Arc::new(JobManagerOwnerLifetime {
+            jobs: Arc::downgrade(&jobs),
+            shutting_down: Arc::downgrade(&shutting_down),
+        });
         Self {
             max_concurrent: max_concurrent.max(1),
-            jobs: Arc::new(Mutex::new(HashMap::new())),
+            jobs,
             queued: Arc::new(Mutex::new(VecDeque::new())),
             prepared_profiles: PreparedShellProfileCache::default(),
             ssh_pool: SshConnectionPool::default(),
             lifecycle: Arc::new(Mutex::new(())),
-            shutting_down: Arc::new(AtomicBool::new(false)),
+            shutting_down,
             workers: ActivityTracker::default(),
             current_sink: Arc::new(Mutex::new(None)),
+            owner_lifetime: Some(owner_lifetime),
         }
+    }
+
+    fn clone_for_worker(&self) -> Self {
+        let mut worker = self.clone();
+        worker.owner_lifetime = None;
+        worker
     }
 }
 
@@ -129,8 +180,10 @@ struct RunningJob {
     client_id: String,
     agent_instance_id: String,
     snapshot: ShellJobSnapshot,
-    child: Option<Arc<Mutex<Child>>>,
-    process_group_id: Option<u32>,
+    /// The single owner of the job's process tree. Clones are shared with the
+    /// job's worker thread so it can poll the direct child and terminate the
+    /// whole tree, but there is never more than one live `ManagedChild`.
+    child: Option<Arc<Mutex<ManagedChild>>>,
     stop_requested: Arc<AtomicBool>,
     slot_reserved: bool,
 }
@@ -1652,7 +1705,13 @@ fn take_utf8_output(pending: &mut Vec<u8>, end_of_stream: bool) -> String {
     output
 }
 
-fn join_reader_threads_until(mut readers: Vec<std::thread::JoinHandle<()>>, deadline: Instant) {
+/// Join the output reader threads until `deadline`. Returns the number of
+/// readers that had not finished by the deadline and were detached (their
+/// `JoinHandle`s dropped without joining).
+fn join_reader_threads_until(
+    mut readers: Vec<std::thread::JoinHandle<()>>,
+    deadline: Instant,
+) -> usize {
     loop {
         let mut index = 0;
         while index < readers.len() {
@@ -1664,14 +1723,14 @@ fn join_reader_threads_until(mut readers: Vec<std::thread::JoinHandle<()>>, dead
             }
         }
         if readers.is_empty() {
-            return;
+            return 0;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             // Dropping a JoinHandle detaches it. The output channel is bounded,
             // so an abnormal pipe holder cannot retain unbounded runner memory
             // or block process shutdown.
-            return;
+            return readers.len();
         }
         std::thread::sleep(Duration::from_millis(10).min(remaining));
     }
@@ -1729,7 +1788,7 @@ fn validation_module_available(
             return false;
         }
     }
-    let Ok(child) = command.spawn() else {
+    let Ok(child) = ManagedChild::spawn(&mut command) else {
         return false;
     };
     let child = Arc::new(Mutex::new(child));
@@ -1742,19 +1801,19 @@ fn validation_module_available(
         match wait_result {
             Ok(Some(status)) => {
                 let success = status.success();
-                let _ = kill_child_group(&child);
+                let _ = terminate_managed_tree(&child);
                 return success;
             }
             Ok(None) => {
                 if shutdown.is_some_and(|flag| flag.load(Ordering::SeqCst))
                     || Instant::now() >= deadline
                 {
-                    let _ = kill_child_group(&child);
+                    let _ = terminate_managed_tree(&child);
                     return false;
                 }
             }
             Err(_) => {
-                let _ = kill_child_group(&child);
+                let _ = terminate_managed_tree(&child);
                 return false;
             }
         }
@@ -1762,83 +1821,104 @@ fn validation_module_available(
     }
 }
 
-#[cfg(unix)]
-fn classify_process_group_signal_error(
-    pgid: u32,
-    signal: i32,
-    error: std::io::Error,
-) -> Result<bool, String> {
-    match error.raw_os_error() {
-        Some(libc::ESRCH) => Ok(false),
-        Some(libc::EPERM) => Err(format!(
-            "permission denied signaling process group {pgid} with signal {signal}"
-        )),
-        _ => Err(format!(
-            "failed to signal process group {pgid} with signal {signal}: {error}"
-        )),
-    }
-}
-
-#[cfg(unix)]
-fn signal_process_group(pgid: u32, signal: i32) -> Result<bool, String> {
-    if pgid == 0 {
-        return Err("process-group id 0 is invalid".to_string());
-    }
-    let target = i32::try_from(pgid).map_err(|_| format!("process-group id {pgid} exceeds i32"))?;
-    // SAFETY: callers only pass the private process-group id of a child that
-    // this JobManager launched through `setsid`.
-    if unsafe { libc::kill(-target, signal) } == 0 {
-        Ok(true)
-    } else {
-        classify_process_group_signal_error(pgid, signal, std::io::Error::last_os_error())
-    }
-}
-
-fn kill_child_group(child: &Arc<Mutex<Child>>) -> Result<(), String> {
-    let pid = lock_unpoison(child).id();
-    #[cfg(unix)]
-    {
-        if pid == 0 {
-            return Err("job child has invalid process-group id 0".to_string());
-        }
-        if !signal_process_group(pid, libc::SIGTERM)? {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-        // Escalate the whole group, not only the leader; a descendant may
-        // ignore SIGTERM or outlive the wrapper shell.
-        if signal_process_group(pid, 0)? {
-            let _ = signal_process_group(pid, libc::SIGKILL)?;
-        }
-    }
-    #[cfg(not(unix))]
+/// Forcefully terminate the entire process tree owned by a job.
+///
+/// The platform detail (SIGKILL to a private process group on Unix,
+/// `TerminateJobObject` on Windows) stays inside `webcodex-process`.
+fn terminate_managed_tree(child: &Arc<Mutex<ManagedChild>>) -> Result<(), String> {
     lock_unpoison(child)
-        .kill()
-        .map_err(|error| error.to_string())?;
-    if reap_job_child_until(child, Instant::now() + Duration::from_secs(1))? {
-        Ok(())
-    } else {
-        Err("job child did not reap within the bounded stop deadline".to_string())
-    }
+        .terminate_tree()
+        .map_err(|error| error.to_string())
 }
 
-fn try_reap_job_child(child: &Arc<Mutex<Child>>) -> Result<bool, String> {
-    let mut child = match child.try_lock() {
-        Ok(child) => child,
-        Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-    };
-    match child.try_wait() {
-        Ok(Some(_)) => Ok(true),
-        Ok(None) => Ok(false),
+/// Request graceful tree termination, escalating to force termination where the
+/// platform cannot deliver a graceful signal to the whole tree (Windows Job
+/// Objects). An already-exited tree is idempotent success.
+fn request_terminate_managed_tree(child: &Arc<Mutex<ManagedChild>>) -> Result<(), String> {
+    // Bind the result first so the temporary `MutexGuard` is released before
+    // the match arms: the Unsupported arm re-locks the same mutex, and a guard
+    // still alive across the match would deadlock that re-lock.
+    let outcome = lock_unpoison(child).request_terminate_tree();
+    match outcome {
+        Ok(GracefulTermination::Requested | GracefulTermination::AlreadyExited) => Ok(()),
+        Ok(GracefulTermination::Unsupported) => terminate_managed_tree(child),
         Err(error) => Err(error.to_string()),
     }
 }
 
-fn reap_job_child_until(child: &Arc<Mutex<Child>>, deadline: Instant) -> Result<bool, String> {
+/// Wait, bounded by `deadline`, until the managed process tree is empty.
+///
+/// Returns `Ok(true)` when the tree exited within the budget, `Ok(false)` when
+/// the deadline elapsed first, and `Err` on a platform failure. The lock is
+/// held while polling, so a concurrent `terminate_tree` blocks only until this
+/// bounded wait returns; nothing here waits on another thread's progress.
+fn wait_managed_tree_exit(
+    child: &Arc<Mutex<ManagedChild>>,
+    deadline: Instant,
+) -> Result<bool, String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Ok(false);
+    }
+    lock_unpoison(child)
+        .wait_tree_exit(remaining)
+        .map_err(|error| error.to_string())
+}
+
+/// Non-blocking probe: is the managed process tree still running?
+///
+/// Opportunistically reaps the direct child so a Unix zombie is not mistaken
+/// for a live tree member. A busy lock or a platform probe failure is treated
+/// conservatively as "still running".
+fn managed_tree_running(child: &Arc<Mutex<ManagedChild>>) -> bool {
+    let mut guard = match child.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => return true,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+    };
+    if guard.try_wait().is_err() {
+        return true;
+    }
+    match guard.try_tree_exit() {
+        Ok(true) => false,
+        Ok(false) => true,
+        Err(_) => true,
+    }
+}
+
+/// Complete a job step's tree lifecycle after the direct child's status has
+/// been decided: give the tree a short bounded window to exit on its own,
+/// force-terminate whatever remains, and confirm the tree emptied, so
+/// pipe-holding descendants cannot stall the output readers forever.
+fn cleanup_managed_tree(child: &Arc<Mutex<ManagedChild>>) {
+    const NATURAL_EXIT_GRACE: Duration = Duration::from_millis(500);
+    const FORCE_EXIT_GRACE: Duration = Duration::from_millis(500);
+    let natural_deadline = Instant::now() + NATURAL_EXIT_GRACE;
+    if !wait_managed_tree_exit(child, natural_deadline).unwrap_or(false) {
+        let _ = terminate_managed_tree(child);
+        let force_deadline = Instant::now() + FORCE_EXIT_GRACE;
+        let _ = wait_managed_tree_exit(child, force_deadline);
+    }
+}
+
+/// Best-effort bounded reap of the direct child. Returns `Ok(true)` once the
+/// direct child has been reaped, `Ok(false)` if the deadline elapsed first
+/// (including when another thread reaped it concurrently), and `Err` on a wait
+/// failure. The lock is only ever taken briefly with `try_lock`.
+fn reap_managed_direct_child(
+    child: &Arc<Mutex<ManagedChild>>,
+    deadline: Instant,
+) -> Result<bool, String> {
     loop {
-        if try_reap_job_child(child)? {
-            return Ok(true);
+        let mut guard = match child.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        match guard.try_wait() {
+            Ok(Some(_)) => return Ok(true),
+            Ok(None) => {}
+            Err(error) => return Err(error.to_string()),
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -1850,8 +1930,7 @@ fn reap_job_child_until(child: &Arc<Mutex<Child>>, deadline: Instant) -> Result<
 
 #[derive(Clone)]
 struct JobShutdownTarget {
-    child: Arc<Mutex<Child>>,
-    process_group_id: Option<u32>,
+    child: Arc<Mutex<ManagedChild>>,
 }
 
 struct JobShutdownBatch {
@@ -1868,26 +1947,7 @@ struct JobShutdownOutcome {
 }
 
 fn shutdown_target_running(target: &mut JobShutdownTarget) -> bool {
-    let child_running = !matches!(try_reap_job_child(&target.child), Ok(true));
-    #[cfg(unix)]
-    let group_running = match target.process_group_id {
-        Some(process_group_id) => match signal_process_group(process_group_id, 0) {
-            Ok(true) => true,
-            Ok(false) => {
-                target.process_group_id = None;
-                false
-            }
-            Err(_) => true,
-        },
-        None => false,
-    };
-    #[cfg(not(unix))]
-    let group_running = false;
-    child_running || group_running
-}
-
-fn shutdown_target_child_running(target: &mut JobShutdownTarget) -> bool {
-    !matches!(try_reap_job_child(&target.child), Ok(true))
+    managed_tree_running(&target.child)
 }
 
 #[derive(Debug, Default)]
@@ -2219,7 +2279,6 @@ impl JobManager {
                 job.snapshot.duration_ms = delta.duration_ms;
                 job.snapshot.error = bounded_runner_error(delta.error.take());
                 job.child = None;
-                job.process_group_id = None;
                 job.slot_reserved = false;
             } else if delta.error.is_some() {
                 job.snapshot.error = bounded_runner_error(delta.error.take());
@@ -2416,37 +2475,24 @@ impl JobManager {
             let jobs = lock_unpoison(&self.jobs);
             jobs.iter()
                 .filter(|(_, job)| runner_job_is_active(&job.snapshot.status))
-                .map(|(_, job)| {
-                    (
-                        job.child.clone(),
-                        job.process_group_id,
-                        Arc::clone(&job.stop_requested),
-                    )
-                })
+                .map(|(_, job)| (job.child.clone(), Arc::clone(&job.stop_requested)))
                 .collect::<Vec<_>>()
         };
         let running_count = running.len();
         let mut targets = Vec::with_capacity(running.len());
         let mut failures = 0;
-        for (child, process_group_id, stop_requested) in running {
+        for (child, stop_requested) in running {
             stop_requested.store(true, Ordering::SeqCst);
             let Some(child) = child else {
                 continue;
             };
-            #[cfg(unix)]
-            if let Some(process_group_id) = process_group_id {
-                if signal_process_group(process_group_id, libc::SIGTERM).is_err() {
-                    failures += 1;
-                }
-            }
-            #[cfg(not(unix))]
-            if lock_unpoison(&child).kill().is_err() {
+            // Graceful tree termination where supported (SIGTERM on Unix);
+            // Windows has no graceful Job Object signal and escalates to a
+            // force terminate immediately.
+            if request_terminate_managed_tree(&child).is_err() {
                 failures += 1;
             }
-            targets.push(JobShutdownTarget {
-                child,
-                process_group_id,
-            });
+            targets.push(JobShutdownTarget { child });
         }
         JobShutdownBatch {
             running: running_count,
@@ -2459,6 +2505,8 @@ impl JobManager {
         const TERM_GRACE: Duration = Duration::from_millis(500);
         let resources = batch.targets.len();
         let grace_deadline = deadline.min(Instant::now() + TERM_GRACE);
+        // Phase 1: after the graceful request, wait up to the grace window for
+        // each managed tree to empty on its own.
         while Instant::now() < grace_deadline {
             if batch
                 .targets
@@ -2471,25 +2519,20 @@ impl JobManager {
             std::thread::sleep(Duration::from_millis(10).min(remaining));
         }
 
+        // Phase 2: force-terminate every tree that is still alive.
         for target in &mut batch.targets {
-            #[cfg(unix)]
-            if let Some(process_group_id) = target.process_group_id {
-                if signal_process_group(process_group_id, libc::SIGKILL).is_err() {
-                    batch.failures += 1;
-                }
-            }
-            #[cfg(not(unix))]
-            if shutdown_target_child_running(target) && lock_unpoison(&target.child).kill().is_err()
+            if managed_tree_running(&target.child) && terminate_managed_tree(&target.child).is_err()
             {
                 batch.failures += 1;
             }
         }
 
+        // Phase 3: wait out the remaining budget for all trees to empty.
         while Instant::now() < deadline {
             if batch
                 .targets
                 .iter_mut()
-                .all(|target| !shutdown_target_child_running(target))
+                .all(|target| !shutdown_target_running(target))
             {
                 break;
             }
@@ -2498,7 +2541,7 @@ impl JobManager {
         }
         let mut timed_out = 0;
         for target in &mut batch.targets {
-            timed_out += usize::from(shutdown_target_child_running(target));
+            timed_out += usize::from(shutdown_target_running(target));
         }
         JobShutdownOutcome {
             resources,
@@ -2651,7 +2694,6 @@ impl JobManager {
                         validation_progress: None,
                     },
                     child: None,
-                    process_group_id: None,
                     stop_requested: Arc::new(AtomicBool::new(false)),
                     slot_reserved,
                 },
@@ -2973,12 +3015,10 @@ impl JobManager {
             return;
         };
         let start = Instant::now();
-        let spawn = commands
-            .pop_front()
-            .expect("validated non-empty plan")
-            .spawn();
+        let mut command = commands.pop_front().expect("validated non-empty plan");
+        let spawn = ManagedChild::spawn(&mut command);
         let mut child = match spawn {
-            Ok(c) => c,
+            Ok(child) => child,
             Err(e) => {
                 if validation {
                     self.fail_job(
@@ -3005,9 +3045,8 @@ impl JobManager {
                 return;
             }
         };
-        let process_group_id = child.id();
-        let mut stdout = child.stdout.take();
-        let mut stderr = child.stderr.take();
+        let mut stdout = child.child_mut().stdout.take();
+        let mut stderr = child.child_mut().stderr.take();
         let mut child = Arc::new(Mutex::new(child));
         let reject_for_shutdown = {
             let _lifecycle = lock_unpoison(&self.lifecycle);
@@ -3015,14 +3054,13 @@ impl JobManager {
                 true
             } else if let Some(job) = lock_unpoison(&self.jobs).get_mut(&job_id) {
                 job.child = Some(child.clone());
-                job.process_group_id = Some(process_group_id);
                 false
             } else {
                 true
             }
         };
         if reject_for_shutdown {
-            let _ = kill_child_group(&child);
+            let _ = terminate_managed_tree(&child);
             self.shutdown_rejection(&request);
             return;
         }
@@ -3041,7 +3079,7 @@ impl JobManager {
         let jobs = self.jobs.clone();
         let lifecycle = Arc::clone(&self.lifecycle);
         let shutting_down = Arc::clone(&self.shutting_down);
-        let manager = self.clone();
+        let manager = self.clone_for_worker();
         let inspect_scratch_guard = inspect_scratch;
         let worker_guard = self.workers.enter();
         std::thread::spawn(move || {
@@ -3115,7 +3153,7 @@ impl JobManager {
                         }
                         Ok(None) => {
                             if stop_requested.load(Ordering::SeqCst) {
-                                let _ = kill_child_group(&child);
+                                let _ = terminate_managed_tree(&child);
                                 break (
                                     "stopped".to_string(),
                                     Some(-1),
@@ -3124,7 +3162,7 @@ impl JobManager {
                             }
                             if start.elapsed() >= Duration::from_secs(timeout_secs) {
                                 stop_requested.store(true, Ordering::SeqCst);
-                                let _ = kill_child_group(&child);
+                                let _ = terminate_managed_tree(&child);
                                 break (
                                     "timeout".to_string(),
                                     Some(-1),
@@ -3150,9 +3188,10 @@ impl JobManager {
                     std::thread::sleep(Duration::from_millis(JOB_UPDATE_INTERVAL_MS));
                 };
                 // A direct child can exit while a background descendant keeps
-                // stdout/stderr open. Terminate the private group before the
-                // bounded reader join so cleanup cannot wait forever on EOF.
-                let _ = kill_child_group(&child);
+                // stdout/stderr open. Give the tree a short window to exit on
+                // its own, then force-terminate whatever remains before the
+                // bounded reader join, so cleanup cannot wait forever on EOF.
+                cleanup_managed_tree(&child);
                 join_reader_threads_until(readers, Instant::now() + Duration::from_secs(1));
                 let mut out = String::new();
                 let mut err = String::new();
@@ -3201,10 +3240,10 @@ impl JobManager {
                             );
                         }
                     }
-                    let spawn = commands
+                    let mut next_command = commands
                         .pop_front()
-                        .expect("one command per validation step")
-                        .spawn();
+                        .expect("one command per validation step");
+                    let spawn = ManagedChild::spawn(&mut next_command);
                     let mut next = match spawn {
                         Ok(child) => child,
                         Err(_error) => {
@@ -3224,9 +3263,8 @@ impl JobManager {
                             )
                         }
                     };
-                    let next_stdout = next.stdout.take();
-                    let next_stderr = next.stderr.take();
-                    let process_group_id = next.id();
+                    let next_stdout = next.child_mut().stdout.take();
+                    let next_stderr = next.child_mut().stderr.take();
                     let next = Arc::new(Mutex::new(next));
                     let reject_for_shutdown = {
                         let _lifecycle_guard = lock_unpoison(&lifecycle);
@@ -3236,14 +3274,13 @@ impl JobManager {
                             true
                         } else if let Some(job) = lock_unpoison(&jobs).get_mut(&job_id) {
                             job.child = Some(Arc::clone(&next));
-                            job.process_group_id = Some(process_group_id);
                             false
                         } else {
                             true
                         }
                     };
                     if reject_for_shutdown {
-                        let _ = kill_child_group(&next);
+                        let _ = terminate_managed_tree(&next);
                         break (
                             (
                                 "stopped".to_string(),
@@ -3402,7 +3439,8 @@ impl JobManager {
             return;
         };
         let start = Instant::now();
-        let mut child = match command.spawn() {
+        let spawn = ManagedChild::spawn(&mut command);
+        let mut child = match spawn {
             Ok(child) => child,
             Err(error) => {
                 self.fail_job(
@@ -3415,9 +3453,8 @@ impl JobManager {
                 return;
             }
         };
-        let process_group_id = child.id();
-        let mut stdout = child.stdout.take();
-        let mut stderr = child.stderr.take();
+        let mut stdout = child.child_mut().stdout.take();
+        let mut stderr = child.child_mut().stderr.take();
         let child = Arc::new(Mutex::new(child));
         let reject_for_shutdown = {
             let _lifecycle = lock_unpoison(&self.lifecycle);
@@ -3425,14 +3462,13 @@ impl JobManager {
                 true
             } else if let Some(job) = lock_unpoison(&self.jobs).get_mut(&job_id) {
                 job.child = Some(Arc::clone(&child));
-                job.process_group_id = Some(process_group_id);
                 false
             } else {
                 true
             }
         };
         if reject_for_shutdown {
-            let _ = kill_child_group(&child);
+            let _ = terminate_managed_tree(&child);
             self.shutdown_rejection(&request);
             return;
         }
@@ -3443,7 +3479,7 @@ impl JobManager {
                 ..Default::default()
             },
         );
-        let manager = self.clone();
+        let manager = self.clone_for_worker();
         let ssh_pool = self.ssh_pool.clone();
         let worker_guard = self.workers.enter();
         std::thread::spawn(move || {
@@ -3503,7 +3539,7 @@ impl JobManager {
                     }
                     Ok(None) => {
                         if stop_requested.load(Ordering::SeqCst) {
-                            let _ = kill_child_group(&child);
+                            let _ = terminate_managed_tree(&child);
                             break (
                                 "stopped".to_string(),
                                 Some(-1),
@@ -3512,7 +3548,7 @@ impl JobManager {
                         }
                         if start.elapsed() >= Duration::from_secs(timeout_secs) {
                             stop_requested.store(true, Ordering::SeqCst);
-                            let _ = kill_child_group(&child);
+                            let _ = terminate_managed_tree(&child);
                             break (
                                 "timeout".to_string(),
                                 Some(-1),
@@ -3532,10 +3568,10 @@ impl JobManager {
                 }
                 std::thread::sleep(Duration::from_millis(JOB_UPDATE_INTERVAL_MS));
             };
-            // The SSH client is a private process-group leader. Ensure a
+            // The SSH client is the root of a private process tree. Ensure a
             // background child holding either pipe cannot delay the terminal
             // update indefinitely.
-            let _ = kill_child_group(&child);
+            cleanup_managed_tree(&child);
             join_reader_threads_until(readers, Instant::now() + Duration::from_secs(1));
             let mut final_out = String::new();
             let mut final_err = String::new();
@@ -3636,7 +3672,27 @@ impl JobManager {
             },
         );
         if let Some(child) = child {
-            kill_child_group(&child).map_err(|e| format!("failed to kill job {}: {}", job_id, e))
+            let deadline = Instant::now() + Duration::from_secs(1);
+            if let Err(e) = terminate_managed_tree(&child) {
+                return Err(format!("failed to kill job {}: {}", job_id, e));
+            }
+            match wait_managed_tree_exit(&child, deadline) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(format!(
+                        "failed to kill job {}: job tree did not exit within the bounded stop deadline",
+                        job_id
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!("failed to wait for job {} tree: {}", job_id, e));
+                }
+            }
+            // Best-effort reap of the direct child so a Unix parent killed by
+            // termination is not left as a zombie for the worker to discover
+            // late.
+            let _ = reap_managed_direct_child(&child, deadline);
+            Ok(())
         } else {
             Ok(())
         }

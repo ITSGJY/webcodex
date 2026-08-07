@@ -131,6 +131,15 @@ pub struct ManagedChild {
     child: Child,
 }
 
+impl std::fmt::Debug for ManagedChild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `std::process::Child` has no `Debug`; print identity only.
+        f.debug_struct("ManagedChild")
+            .field("id", &self.child.id())
+            .finish()
+    }
+}
+
 impl ManagedChild {
     /// Spawn `command` inside a private Job Object tree.
     ///
@@ -264,6 +273,15 @@ impl ManagedChild {
             }
             std::thread::sleep(TREE_POLL);
         }
+    }
+
+    /// Non-blocking check whether the owned process tree has fully exited.
+    ///
+    /// This is the non-blocking counterpart of [`ManagedChild::wait_tree_exit`]:
+    /// `Ok(true)` means the job currently contains zero active processes,
+    /// `Ok(false)` means at least one member is still running.
+    pub fn try_tree_exit(&self) -> io::Result<bool> {
+        self.tree_is_empty()
     }
 
     fn tree_is_empty(&self) -> io::Result<bool> {
