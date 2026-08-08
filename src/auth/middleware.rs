@@ -456,19 +456,7 @@ pub(crate) fn json_error(status: StatusCode, msg: impl Into<String>) -> Json<ser
     }))
 }
 
-pub(crate) fn require_json_same_origin(
-    req: &Request,
-) -> Result<(), (u16, &'static str, &'static str)> {
-    if !req
-        .content_type()
-        .is_some_and(|content_type| content_type.essence_str() == "application/json")
-    {
-        return Err((
-            415,
-            "unsupported_media_type",
-            "Content-Type must be application/json",
-        ));
-    }
+pub(crate) fn require_same_origin(req: &Request) -> Result<(), (u16, &'static str, &'static str)> {
     if let Some(origin) = req
         .headers()
         .get("origin")
@@ -486,6 +474,23 @@ pub(crate) fn require_json_same_origin(
                 "cross-origin requests are not allowed",
             ));
         }
+    }
+    Ok(())
+}
+
+pub(crate) fn require_json_same_origin(
+    req: &Request,
+) -> Result<(), (u16, &'static str, &'static str)> {
+    require_same_origin(req)?;
+    if !req
+        .content_type()
+        .is_some_and(|content_type| content_type.essence_str() == "application/json")
+    {
+        return Err((
+            415,
+            "unsupported_media_type",
+            "Content-Type must be application/json",
+        ));
     }
     Ok(())
 }

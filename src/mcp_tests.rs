@@ -66,6 +66,20 @@ fn rpc(method: &str, id: Option<Value>, params: Value) -> JsonRpcRequest {
     }
 }
 
+fn mcp_2026_params(mut params: Value) -> Value {
+    params
+        .as_object_mut()
+        .expect("MCP params must be an object")
+        .insert(
+            "_meta".to_string(),
+            json!({
+                "io.modelcontextprotocol/protocolVersion": MCP_STATELESS_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }),
+        );
+    params
+}
+
 #[test]
 fn rpc_result_envelope_is_valid() {
     let value = rpc_result(Some(Value::from(1)), json!({"ok": true}));
@@ -125,6 +139,21 @@ async fn mcp_ping_returns_empty_result() {
             assert!(value["result"].as_object().unwrap().is_empty());
         }
         other => panic!("expected Ok, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn mcp_2026_ping_is_removed() {
+    let runtime = test_runtime();
+    let outcome = handle_mcp_request(
+        &runtime,
+        rpc("ping", Some(Value::from(2002)), mcp_2026_params(json!({}))),
+        None,
+    )
+    .await;
+    match outcome {
+        McpOutcome::NotFound(value) => assert_eq!(value["error"]["code"], -32601),
+        other => panic!("modern ping must be method-not-found, got {other:?}"),
     }
 }
 
@@ -1468,6 +1497,368 @@ async fn http_mcp_tools_list_success() {
 }
 
 #[tokio::test]
+async fn http_mcp_2026_validates_headers_and_ignores_legacy_session_id() {
+    let _full = full_operator_mcp_env();
+    let config = test_config(Some("secret"));
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime());
+    let service = Service::new(build_test_router(config, db, runtime));
+    let params = mcp_2026_params(json!({}));
+
+    let mut missing_headers = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 200,
+            "method": "tools/list",
+            "params": params.clone()
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(effective_status(&missing_headers), StatusCode::BAD_REQUEST);
+    let missing_body: Value = missing_headers.take_json().await.unwrap();
+    assert_eq!(missing_body["error"]["code"], MCP_HEADER_MISMATCH);
+
+    let mut ok = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_STATELESS_PROTOCOL_VERSION,
+            true,
+        )
+        .add_header(MCP_METHOD_HEADER, "tools/list", true)
+        .add_header(
+            crate::client_window::MCP_SESSION_HEADER,
+            "legacy-session-must-be-ignored",
+            true,
+        )
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 201,
+            "method": "tools/list",
+            "params": params.clone()
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(effective_status(&ok), StatusCode::OK);
+    assert!(ok
+        .headers
+        .get(crate::client_window::MCP_SESSION_HEADER)
+        .is_none());
+    let ok_body: Value = ok.take_json().await.unwrap();
+    assert_eq!(ok_body["result"]["resultType"], "complete");
+    assert_eq!(ok_body["result"]["cacheScope"], "private");
+
+    let mut method_mismatch = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_STATELESS_PROTOCOL_VERSION,
+            true,
+        )
+        .add_header(MCP_METHOD_HEADER, "ping", true)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 202,
+            "method": "tools/list",
+            "params": params.clone()
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(effective_status(&method_mismatch), StatusCode::BAD_REQUEST);
+    let mismatch_body: Value = method_mismatch.take_json().await.unwrap();
+    assert_eq!(mismatch_body["error"]["code"], MCP_HEADER_MISMATCH);
+
+    let mut missing_capabilities = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_STATELESS_PROTOCOL_VERSION,
+            true,
+        )
+        .add_header(MCP_METHOD_HEADER, "tools/list", true)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2021,
+            "method": "tools/list",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MCP_STATELESS_PROTOCOL_VERSION
+                }
+            }
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(
+        effective_status(&missing_capabilities),
+        StatusCode::BAD_REQUEST
+    );
+    let missing_capabilities_body: Value = missing_capabilities.take_json().await.unwrap();
+    assert_eq!(missing_capabilities_body["error"]["code"], -32602);
+
+    let unsupported_params = json!({
+        "_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2099-01-01",
+            "io.modelcontextprotocol/clientCapabilities": {}
+        }
+    });
+    let mut unsupported = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header(MCP_PROTOCOL_VERSION_HEADER, "2099-01-01", true)
+        .add_header(MCP_METHOD_HEADER, "tools/list", true)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 203,
+            "method": "tools/list",
+            "params": unsupported_params
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(effective_status(&unsupported), StatusCode::BAD_REQUEST);
+    let unsupported_body: Value = unsupported.take_json().await.unwrap();
+    assert_eq!(
+        unsupported_body["error"]["code"],
+        MCP_UNSUPPORTED_PROTOCOL_VERSION
+    );
+    assert_eq!(unsupported_body["error"]["data"]["requested"], "2099-01-01");
+    assert_eq!(
+        unsupported_body["error"]["data"]["supported"],
+        json!(MCP_SUPPORTED_PROTOCOL_VERSIONS)
+    );
+}
+
+#[tokio::test]
+async fn http_mcp_2026_tools_call_requires_matching_name_and_accepts_base64_sentinel() {
+    let _full = full_operator_mcp_env();
+    let config = test_config(Some("secret"));
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime());
+    let service = Service::new(build_test_router(config, db, runtime));
+    let params = mcp_2026_params(json!({"name": "list_projects", "arguments": {}}));
+
+    let mut missing_name = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_STATELESS_PROTOCOL_VERSION,
+            true,
+        )
+        .add_header(MCP_METHOD_HEADER, "tools/call", true)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 204,
+            "method": "tools/call",
+            "params": params.clone()
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(effective_status(&missing_name), StatusCode::BAD_REQUEST);
+    let missing_name_body: Value = missing_name.take_json().await.unwrap();
+    assert_eq!(missing_name_body["error"]["code"], MCP_HEADER_MISMATCH);
+
+    let encoded = general_purpose::STANDARD.encode("list_projects");
+    let encoded = format!("=?base64?{encoded}?=");
+    let mut ok = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_STATELESS_PROTOCOL_VERSION,
+            true,
+        )
+        .add_header(MCP_METHOD_HEADER, "tools/call", true)
+        .add_header(MCP_NAME_HEADER, &encoded, true)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 205,
+            "method": "tools/call",
+            "params": params
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(effective_status(&ok), StatusCode::OK);
+    let ok_body: Value = ok.take_json().await.unwrap();
+    assert_eq!(ok_body["result"]["resultType"], "complete");
+}
+
+#[tokio::test]
+async fn http_mcp_2026_unknown_method_is_404_jsonrpc_method_not_found() {
+    let config = test_config(Some("secret"));
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime());
+    let service = Service::new(build_test_router(config, db, runtime));
+    let mut resp = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_STATELESS_PROTOCOL_VERSION,
+            true,
+        )
+        .add_header(MCP_METHOD_HEADER, "resources/list", true)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 206,
+            "method": "resources/list",
+            "params": mcp_2026_params(json!({}))
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(effective_status(&resp), StatusCode::NOT_FOUND);
+    let body: Value = resp.take_json().await.unwrap();
+    assert_eq!(body["error"]["code"], -32601);
+}
+
+#[tokio::test]
+async fn http_mcp_2026_validates_name_header_before_rejecting_unimplemented_named_method() {
+    let config = test_config(Some("secret"));
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime());
+    let service = Service::new(build_test_router(config, db, runtime));
+    let params = mcp_2026_params(json!({"uri": "file:///demo.txt"}));
+
+    let mut missing_name = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_STATELESS_PROTOCOL_VERSION,
+            true,
+        )
+        .add_header(MCP_METHOD_HEADER, "resources/read", true)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2061,
+            "method": "resources/read",
+            "params": params.clone()
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(effective_status(&missing_name), StatusCode::BAD_REQUEST);
+    let missing_body: Value = missing_name.take_json().await.unwrap();
+    assert_eq!(missing_body["error"]["code"], MCP_HEADER_MISMATCH);
+
+    let mut unsupported = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_STATELESS_PROTOCOL_VERSION,
+            true,
+        )
+        .add_header(MCP_METHOD_HEADER, "resources/read", true)
+        .add_header(MCP_NAME_HEADER, "file:///demo.txt", true)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2062,
+            "method": "resources/read",
+            "params": params
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(effective_status(&unsupported), StatusCode::NOT_FOUND);
+    let unsupported_body: Value = unsupported.take_json().await.unwrap();
+    assert_eq!(unsupported_body["error"]["code"], -32601);
+}
+
+#[tokio::test]
+async fn http_mcp_2026_rejects_legacy_lifecycle_and_cross_origin_transport() {
+    let config = test_config(Some("secret"));
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime());
+    let service = Service::new(build_test_router(config, db, runtime));
+
+    let mut initialize = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_STATELESS_PROTOCOL_VERSION,
+            true,
+        )
+        .add_header(MCP_METHOD_HEADER, "initialize", true)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 207,
+            "method": "initialize",
+            "params": mcp_2026_params(json!({}))
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(effective_status(&initialize), StatusCode::NOT_FOUND);
+    let initialize_body: Value = initialize.take_json().await.unwrap();
+    assert_eq!(initialize_body["error"]["code"], -32601);
+
+    let cross_origin = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_STATELESS_PROTOCOL_VERSION,
+            true,
+        )
+        .add_header(MCP_METHOD_HEADER, "tools/list", true)
+        .add_header("origin", "https://attacker.example", true)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 208,
+            "method": "tools/list",
+            "params": mcp_2026_params(json!({}))
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(effective_status(&cross_origin), StatusCode::FORBIDDEN);
+
+    let legacy_cross_origin = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header("origin", "https://attacker.example", true)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2081,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(
+        effective_status(&legacy_cross_origin),
+        StatusCode::FORBIDDEN
+    );
+
+    let legacy_cross_origin_get = TestClient::get("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header("origin", "https://attacker.example", true)
+        .send(&service)
+        .await;
+    assert_eq!(
+        effective_status(&legacy_cross_origin_get),
+        StatusCode::FORBIDDEN
+    );
+
+    let modern_get = TestClient::get("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_STATELESS_PROTOCOL_VERSION,
+            true,
+        )
+        .send(&service)
+        .await;
+    assert_eq!(
+        effective_status(&modern_get),
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+
+    let modern_delete = TestClient::delete("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_STATELESS_PROTOCOL_VERSION,
+            true,
+        )
+        .send(&service)
+        .await;
+    assert_eq!(
+        effective_status(&modern_delete),
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+}
+
+#[tokio::test]
 async fn http_project_connector_lists_and_dispatches_only_canonical_capabilities() {
     // A Connector test must not observe a concurrent local_coding/full-operator
     // test's WEBCODEX_MCP_MODEL_SURFACE value; hold the env lock and clear it.
@@ -1743,6 +2134,124 @@ async fn http_project_connector_lists_and_dispatches_only_canonical_capabilities
 }
 
 #[tokio::test]
+async fn http_project_connector_2026_uses_explicit_task_ids_without_transport_window_state() {
+    let _guard = crate::admin_cli::TEST_ENV_LOCK.lock().unwrap();
+    std::env::remove_var(crate::model_surface::MCP_MODEL_SURFACE_ENV);
+    let config = test_config(Some("secret"));
+    let (tmp, db) = test_db();
+    let project = tmp.path().join("connector-2026-project");
+    crate::connector_runtime::tests::init_repo(&project);
+    let user_token = "webcodex_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::CanonicalConnector));
+    let service = Service::new(build_connector_test_router(config, db, runtime, &project));
+
+    let start_params = |goal: &str| {
+        mcp_2026_params(json!({
+            "name": "task_start",
+            "arguments": { "goal": goal, "mode": "read_only" }
+        }))
+    };
+
+    let mut first = TestClient::post("http://localhost/mcp")
+        .bearer_auth(user_token)
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_STATELESS_PROTOCOL_VERSION,
+            true,
+        )
+        .add_header(MCP_METHOD_HEADER, "tools/call", true)
+        .add_header(MCP_NAME_HEADER, "task_start", true)
+        .add_header(
+            crate::client_window::MCP_SESSION_HEADER,
+            "legacy-session-must-not-bind-2026",
+            true,
+        )
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 220,
+            "method": "tools/call",
+            "params": start_params("inspect the stateless connector path")
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(effective_status(&first), StatusCode::OK);
+    assert!(first
+        .headers
+        .get(crate::client_window::MCP_SESSION_HEADER)
+        .is_none());
+    let first_body: Value = first.take_json().await.unwrap();
+    let first_task_id = first_body["result"]["structuredContent"]["task_id"]
+        .as_str()
+        .expect("2026 task_start must return task_id")
+        .to_string();
+    assert!(first_task_id.starts_with("wc_task_"));
+    assert_eq!(first_body["result"]["resultType"], "complete");
+
+    let mut second = TestClient::post("http://localhost/mcp")
+        .bearer_auth(user_token)
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_STATELESS_PROTOCOL_VERSION,
+            true,
+        )
+        .add_header(MCP_METHOD_HEADER, "tools/call", true)
+        .add_header(MCP_NAME_HEADER, "task_start", true)
+        .add_header(
+            crate::client_window::MCP_SESSION_HEADER,
+            "legacy-session-must-not-bind-2026",
+            true,
+        )
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 221,
+            "method": "tools/call",
+            "params": start_params("start independent stateless work")
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(effective_status(&second), StatusCode::OK);
+    let second_body: Value = second.take_json().await.unwrap();
+    let second_task_id = second_body["result"]["structuredContent"]["task_id"]
+        .as_str()
+        .expect("second 2026 task_start must return task_id");
+    assert_ne!(
+        second_task_id, first_task_id,
+        "2026 must not derive hidden continuity from Mcp-Session-Id"
+    );
+
+    let mut resumed = TestClient::post("http://localhost/mcp")
+        .bearer_auth(user_token)
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_STATELESS_PROTOCOL_VERSION,
+            true,
+        )
+        .add_header(MCP_METHOD_HEADER, "tools/call", true)
+        .add_header(MCP_NAME_HEADER, "task_resume", true)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 222,
+            "method": "tools/call",
+            "params": mcp_2026_params(json!({
+                "name": "task_resume",
+                "arguments": { "task_id": first_task_id }
+            }))
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(effective_status(&resumed), StatusCode::OK);
+    let resumed_body: Value = resumed.take_json().await.unwrap();
+    assert_eq!(
+        resumed_body["result"]["structuredContent"]["task_id"],
+        first_task_id
+    );
+    assert_eq!(
+        resumed_body["result"]["structuredContent"]["data"]["continuity"]["window_rebound"],
+        false
+    );
+}
+
+#[tokio::test]
 async fn http_mcp_tools_call_list_projects_returns_mcp_content() {
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
@@ -1917,8 +2426,30 @@ async fn oauth_mcp_request(
     method: &str,
     params: Value,
 ) -> (StatusCode, Value, Option<String>) {
-    let mut resp = TestClient::post("http://localhost/mcp")
-        .bearer_auth(token)
+    let stateless_2026 = method == "server/discover"
+        || request_protocol_version(&params) == Some(MCP_STATELESS_PROTOCOL_VERSION);
+    let tool_name = (method == "tools/call")
+        .then(|| {
+            params
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .flatten();
+    let mut request = TestClient::post("http://localhost/mcp").bearer_auth(token);
+    if stateless_2026 {
+        request = request
+            .add_header(
+                MCP_PROTOCOL_VERSION_HEADER,
+                MCP_STATELESS_PROTOCOL_VERSION,
+                true,
+            )
+            .add_header(MCP_METHOD_HEADER, method, true);
+        if let Some(tool_name) = tool_name.as_deref() {
+            request = request.add_header(MCP_NAME_HEADER, tool_name, true);
+        }
+    }
+    let mut resp = request
         .json(&json!({
             "jsonrpc": "2.0",
             "id": 42,
@@ -2004,14 +2535,47 @@ async fn oauth2_mcp_server_discover_requires_runtime_read_and_advertises_both_ve
     assert_eq!(body["result"]["resultType"], "complete");
 
     let (_tmp, service, token) = oauth_mcp_service("project:read");
-    let (status, body, challenge) =
-        oauth_mcp_request(&service, &token, "server/discover", json!({})).await;
+    let (status, body, challenge) = oauth_mcp_request(
+        &service,
+        &token,
+        "server/discover",
+        mcp_2026_params(json!({})),
+    )
+    .await;
     assert_mcp_oauth_scope_rejected(
         status,
         &body,
         challenge.as_deref(),
         Some(crate::auth::SCOPE_RUNTIME_READ),
     );
+}
+
+#[tokio::test]
+async fn oauth2_mcp_unknown_method_keeps_legacy_fail_closed_but_modern_returns_404() {
+    let (_tmp, service, token) = oauth_mcp_service("runtime:read");
+
+    let (legacy_status, legacy_body, legacy_challenge) =
+        oauth_mcp_request(&service, &token, "resources/list", json!({})).await;
+    assert_mcp_oauth_scope_rejected(
+        legacy_status,
+        &legacy_body,
+        legacy_challenge.as_deref(),
+        None,
+    );
+
+    let (modern_status, modern_body, _) = oauth_mcp_request(
+        &service,
+        &token,
+        "resources/list",
+        mcp_2026_params(json!({})),
+    )
+    .await;
+    assert_eq!(
+        modern_status,
+        StatusCode::NOT_FOUND,
+        "body: {modern_body:?}"
+    );
+    assert_eq!(modern_body["error"]["code"], -32601);
 }
 
 #[tokio::test]
