@@ -42,8 +42,9 @@ jobs:
 
   test-windows:
     # Windows release gate: the crates that must run natively on Windows 11
-    # (CLI, Runner, and the cross-platform libraries they depend on). The
-    # Server and its Unix-only runtime stay Linux-only.
+    # (CLI, Runner, persistent-shell's fail-closed gate, and the
+    # cross-platform libraries they depend on). The Server and its Unix-only
+    # runtime stay Linux-only.
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -55,4 +56,4 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run tests
-        run: cargo test --locked -p webcodex-agent-config -p webcodex-process -p webcodex-cli -p webcodex-runner
+        run: cargo test --locked -p webcodex-agent-config -p webcodex-process -p webcodex-persistent-shell -p webcodex-cli -p webcodex-runner
