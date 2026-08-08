@@ -78,8 +78,21 @@ Server and Agent, creates a separate temporary Project Connector credential,
 and exposes `/mcp` through the Quick Tunnel. WebCodex does not silently install
 system packages. The printed HTTPS URL and Bearer credential are valid only for
 that share session; Ctrl-C stops the runtime and tunnel and removes the temporary
-credential. Use `webcodex share --tunnel none` for local-only debugging. Quick
-Tunnels are for development and testing, not stable production deployment.
+credential.
+
+In ChatGPT Developer Mode, create a custom app with the printed `/mcp` URL. If
+your workspace offers **Access token/API key** authentication, choose it, paste
+the temporary Bearer credential, and run **Scan Tools**. ChatGPT UI labels and
+availability can vary by workspace and rollout. Treat this credential as live
+coding access: anyone who has it can modify this project and run commands allowed
+by the share runtime while the session is active. Keep it private and stop
+sharing when finished.
+
+Use `webcodex share --tunnel none` for local-only debugging. Quick Tunnels are
+for development and testing, not stable production deployment. If Quick Tunnel
+startup fails and `~/.cloudflared/config.yaml` already exists, Cloudflare does
+not currently support Quick Tunnels with that default config present; use a
+separate Quick Tunnel environment or temporarily move the file out of the way.
 
 See [AI Onboarding](docs/AI_ONBOARDING.md) for managed accounts, custom servers,
 and other connection paths.
@@ -169,8 +182,10 @@ services and advanced overrides.
 ## Client access
 
 - **ChatGPT over MCP:** create a Developer Mode custom app that points to the
-  Server `/mcp` endpoint. OAuth is supported for managed and self-hosted HTTPS
-  Servers; the setup below shows the current ChatGPT flow.
+  Server `/mcp` endpoint. For `webcodex share`, choose **Access token/API key**
+  when that option is available and paste the temporary Bearer credential.
+  Managed and self-hosted HTTPS Servers can use OAuth; the setup below shows
+  that long-lived ChatGPT flow.
 - **Other MCP clients:** use the Server `/mcp` endpoint with the credential
   produced by the selected setup flow. See [MCP](docs/MCP.md).
 - **GPT Actions:** OpenAPI-based GPT Actions remain available as an alternative

@@ -153,9 +153,17 @@ webcodex share
 `share` reuses the same project-first setup and local runtime, but starts a
 Cloudflare Quick Tunnel and a separate temporary Connector credential. It
 prints a temporary `https://*.trycloudflare.com/mcp` URL and Bearer token; both
-stop being usable when the command exits. `webcodex share --tunnel none` starts
-the same share runtime without a public tunnel for local debugging. Quick
-Tunnels are not a production deployment mechanism.
+stop being usable when the command exits.
+
+For ChatGPT Developer Mode, create a custom app with that `/mcp` URL. If the
+authentication menu offers **Access token/API key**, choose it, paste the
+printed temporary Bearer credential, and run **Scan Tools**. Anyone who has that
+credential can modify this project and run commands allowed by the share runtime
+while the session is active, so keep it private.
+
+`webcodex share --tunnel none` starts the same share runtime without a public
+tunnel for local debugging. Quick Tunnels are not a production deployment
+mechanism.
 
 If Quick Tunnel startup fails and this machine already has a Cloudflare Tunnel
 configuration at `~/.cloudflared/config.yaml`, note that Cloudflare Quick Tunnels

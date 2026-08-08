@@ -145,6 +145,12 @@ webcodex share
 `share` 复用同一套 project-first setup 和 local runtime，但会启动 Cloudflare Quick
 Tunnel，并为本次 session 创建一把独立的临时 Connector credential。命令会输出
 临时 `https://*.trycloudflare.com/mcp` URL 和 Bearer token；命令退出后两者都失效。
+
+在 ChatGPT Developer Mode 中，用这个 `/mcp` URL 创建自定义 app。如果认证菜单提供
+**访问令牌/API 密钥**，选择它并粘贴命令输出的临时 Bearer credential，然后执行
+**Scan Tools / 扫描工具**。在 session 存活期间，任何拿到这把 credential 的人都可以
+修改当前项目并执行 share runtime 允许的命令，因此必须保持私密。
+
 `webcodex share --tunnel none` 可在不创建公网 tunnel 的情况下启动同一 share
 runtime，便于本地 debug。Quick Tunnel 不是 production 部署方式。
 

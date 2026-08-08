@@ -28,14 +28,20 @@ https://your-domain.example/mcp
 
 不要把 bootstrap/admin、account、Agent credential，或 project-first setup 的长期
 Connector credential 当成公网分享 secret。`share` 会创建并只打印本次 session 的
-临时 Connector credential。优先使用 client secret store，不要提交 token。
+临时 Connector credential。该 credential 在 session 存活期间允许对当前项目进行
+修改并执行 share runtime 允许的命令，因此必须保持私密，也不要提交到 Git。
 
-ChatGPT Developer Mode 应指向公网 HTTPS `/mcp` endpoint，并选择用户自定义的
-OAuth client。WebCodex 当前支持 PKCE S256 与 `client_secret_post`；需要把 ChatGPT
-显示的 callback URL 原样注册为 redirect URI。OAuth discovery 会发布
-`offline_access` 以支持 refresh token 连续性；它是协议级 scope，不会增加任何
-WebCodex API 权限，因此不要把它写入 OAuth client 的 `allowed_scopes`。WebCodex
-当前不要求、也未实现 Dynamic Client Registration。
+临时使用 `webcodex share` 接入 ChatGPT Developer Mode 时，用命令输出的公网 HTTPS
+`/mcp` URL 创建自定义 app。如果认证菜单提供 **访问令牌/API 密钥**，选择它并粘贴
+本次临时 Bearer credential，然后执行 **Scan Tools / 扫描工具**。ChatGPT 的 UI
+文案和可用范围可能随 workspace 与 rollout 变化。
+
+对于已经启用 OAuth 的 managed / 自托管 HTTPS Server，则使用用户自定义 OAuth
+client。WebCodex 当前支持 PKCE S256 与 `client_secret_post`；需要把 ChatGPT 显示的
+callback URL 原样注册为 redirect URI。OAuth discovery 会发布 `offline_access` 以
+支持 refresh token 连续性；它是协议级 scope，不会增加任何 WebCodex API 权限，
+因此不要把它写入 OAuth client 的 `allowed_scopes`。WebCodex 当前不要求、也未实现
+Dynamic Client Registration。
 
 Canonical `webcodex setup` 仍然不打印 credential value 或 secret path、不创建
 tunnel，也不开放公网端口。`webcodex share` 是显式的临时例外：它只打印本次

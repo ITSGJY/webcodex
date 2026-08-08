@@ -28,17 +28,24 @@ https://your-domain.example/mcp
 
 Do not use or expose bootstrap/admin, account, Agent, or the persistent
 project-first Connector credential as a public sharing secret. `share` creates
-and prints its own temporary Connector credential. Prefer the client secret
-store; never commit a token.
+and prints its own temporary Connector credential. That credential authorizes
+project modification and allowed command execution for the shared project while
+the session is active, so keep it private and never commit it.
 
-For ChatGPT Developer Mode, point the custom app at the public HTTPS `/mcp`
-endpoint and use a user-defined/custom OAuth client. WebCodex currently supports
-PKCE S256 plus `client_secret_post`; register the exact ChatGPT callback URL as a
-redirect URI. The OAuth discovery metadata advertises `offline_access` for
-refresh-token continuity. `offline_access` is protocol-level and does not add a
-WebCodex API permission, so do not put it in the OAuth client's
-`allowed_scopes` list. Dynamic client registration is not currently required or
-implemented by WebCodex.
+For a temporary `webcodex share` connection in ChatGPT Developer Mode, point the
+custom app at the printed public HTTPS `/mcp` URL. If the authentication menu
+offers **Access token/API key**, choose it, paste the temporary Bearer
+credential, and run **Scan Tools**. ChatGPT UI labels and availability can vary
+by workspace and rollout.
+
+For a managed or self-hosted HTTPS Server with OAuth enabled, use a
+user-defined/custom OAuth client instead. WebCodex currently supports PKCE S256
+plus `client_secret_post`; register the exact ChatGPT callback URL as a redirect
+URI. The OAuth discovery metadata advertises `offline_access` for refresh-token
+continuity. `offline_access` is protocol-level and does not add a WebCodex API
+permission, so do not put it in the OAuth client's `allowed_scopes` list.
+Dynamic client registration is not currently required or implemented by
+WebCodex.
 
 Canonical `webcodex setup` still does not print credential values or secret
 paths, create a tunnel, or expose a public port. `webcodex share` is the

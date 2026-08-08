@@ -75,8 +75,18 @@ webcodex share
 临时 Project Connector credential，并通过 Quick Tunnel 暴露 `/mcp`。WebCodex
 不会静默安装系统软件包。输出的 HTTPS URL 和 Bearer credential 只对本次 share
 session 有效；Ctrl-C 会停止 runtime 与 tunnel，并删除临时 credential。
+
+在 ChatGPT Developer Mode 中，用输出的 `/mcp` URL 创建自定义 app。如果当前
+workspace 提供 **访问令牌/API 密钥** 认证方式，选择它并粘贴本次临时 Bearer
+credential，然后执行 **Scan Tools / 扫描工具**。ChatGPT 的 UI 文案和可用范围可能
+随 workspace 与 rollout 变化。这把 credential 代表实时 coding 权限：在 share
+session 存活期间，持有它的人可以修改当前项目并执行 share runtime 允许的命令。
+请保持私密，并在使用完成后停止分享。
+
 `webcodex share --tunnel none` 可用于纯本地 debug。Quick Tunnel 面向开发/测试，
-不适合作为长期生产部署。
+不适合作为长期生产部署。如果机器上已经存在 `~/.cloudflared/config.yaml` 且 Quick
+Tunnel 启动失败，需要注意 Cloudflare 当前不支持在该默认配置文件存在时使用 Quick
+Tunnel；请使用独立的 Quick Tunnel 环境，或临时移开该文件。
 
 Managed account、自定义 Server 和其他接入方式见
 [AI 接入指南](docs/AI_ONBOARDING.zh-CN.md)。
@@ -161,8 +171,9 @@ System service 与高级覆盖参数见
 ## 接入客户端
 
 - **ChatGPT MCP：** 在 Developer Mode 中创建自定义 app，指向 Server 的 `/mcp`
-  endpoint。Managed 或自托管 HTTPS Server 可以使用 OAuth；下面给出当前 ChatGPT
-  的实际配置流程。
+  endpoint。使用 `webcodex share` 时，如果当前 workspace 提供 **访问令牌/API 密钥**，
+  选择它并粘贴本次临时 Bearer credential。Managed 或自托管 HTTPS Server 可以使用
+  OAuth；下面给出长期接入时的 ChatGPT OAuth 配置流程。
 - **其他 MCP client：** 使用 Server 的 `/mcp` endpoint 和当前接入流程生成的
   credential。详见 [MCP](docs/MCP.zh-CN.md)。
 - **GPT Actions：** 基于 OpenAPI 的 GPT Actions 仍作为另一种接入方式保留。
