@@ -28,6 +28,32 @@ use super::{is_effective_root, shell_command, validate_user_api_token};
 /// Device name reported to the server. The hostname is what a person would call
 /// this machine; `--device` overrides it.
 pub(crate) fn default_device_name() -> String {
+    default_hostname()
+        .map(|value| sanitize_device_name(&value))
+        .unwrap_or_else(|| "device".to_string())
+}
+
+/// The machine-name source for the default device name.
+///
+/// - Windows: `COMPUTERNAME` — the OS-owned machine name set at logon — then
+///   `HOSTNAME` as a fallback for shells that export it. The default never
+///   depends on `HOSTNAME` alone: on a plain Windows machine `HOSTNAME` is
+///   absent and `COMPUTERNAME` is the reliable source.
+/// - Unix: `HOSTNAME`, then `/etc/hostname` (historical behavior preserved).
+#[cfg(windows)]
+fn default_hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("HOSTNAME")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+}
+
+#[cfg(not(windows))]
+fn default_hostname() -> Option<String> {
     std::env::var("HOSTNAME")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -37,8 +63,6 @@ pub(crate) fn default_device_name() -> String {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         })
-        .map(|value| sanitize_device_name(&value))
-        .unwrap_or_else(|| "device".to_string())
 }
 
 fn sanitize_device_name(raw: &str) -> String {
@@ -1059,6 +1083,55 @@ mod tests {
         assert_eq!(sanitize_device_name("---"), "device");
         assert_eq!(sanitize_device_name(""), "device");
         assert!(sanitize_device_name(&"x".repeat(200)).len() <= 80);
+    }
+
+    /// `default_device_name` must be derivable from controlled environment
+    /// variables alone — tests must never depend on the real machine name.
+    #[test]
+    fn default_device_name_uses_the_platform_hostname_source() {
+        let _guard = crate::webcodex_cli::test_support::env_test_guard();
+        #[cfg(windows)]
+        let env = crate::webcodex_cli::test_support::EnvGuard::new()
+            .remove("COMPUTERNAME")
+            .remove("HOSTNAME");
+        #[cfg(not(windows))]
+        let env = crate::webcodex_cli::test_support::EnvGuard::new().remove("HOSTNAME");
+        let _env = env;
+
+        #[cfg(windows)]
+        {
+            // COMPUTERNAME is the OS-owned source and wins over HOSTNAME.
+            let _c = crate::webcodex_cli::test_support::EnvGuard::new()
+                .set("COMPUTERNAME", "DESKTOP-ABC123")
+                .set("HOSTNAME", "msys-host");
+            assert_eq!(default_device_name(), "desktop-abc123");
+            // Without COMPUTERNAME, HOSTNAME is the fallback.
+            let _c2 = crate::webcodex_cli::test_support::EnvGuard::new()
+                .remove("COMPUTERNAME")
+                .set("HOSTNAME", "Msys-Host");
+            assert_eq!(default_device_name(), "msys-host");
+            // Neither: the stable fallback.
+            let _c3 = crate::webcodex_cli::test_support::EnvGuard::new()
+                .remove("COMPUTERNAME")
+                .remove("HOSTNAME");
+            assert_eq!(default_device_name(), "device");
+            // An empty COMPUTERNAME is treated as missing.
+            let _c4 = crate::webcodex_cli::test_support::EnvGuard::new()
+                .set("COMPUTERNAME", "  ")
+                .remove("HOSTNAME");
+            assert_eq!(default_device_name(), "device");
+        }
+        #[cfg(not(windows))]
+        {
+            // Unix keeps the historical HOSTNAME-first behavior.
+            let _h = crate::webcodex_cli::test_support::EnvGuard::new().set("HOSTNAME", "web-1");
+            assert_eq!(default_device_name(), "web-1");
+            // COMPUTERNAME is a foreign variable on Unix and must not win.
+            let _h2 = crate::webcodex_cli::test_support::EnvGuard::new()
+                .set("HOSTNAME", "web-2")
+                .set("COMPUTERNAME", "desktop-x");
+            assert_eq!(default_device_name(), "web-2");
+        }
     }
 
     #[test]

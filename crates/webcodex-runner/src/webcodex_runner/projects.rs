@@ -746,6 +746,30 @@ fn is_windows_drive_root(_canonical_path: &Path) -> bool {
     false
 }
 
+/// Windows-only fail-closed rule: project roots must be on a local disk drive
+/// (`C:\repo`, `D:\repo`, or the canonicalized `\\?\C:\repo` form). UNC
+/// (`\\server\share\repo`), verbatim-UNC (`\\?\UNC\...`), device-namespace
+/// (`\\.\...`) and every other non-disk Windows path prefix is rejected with
+/// the stable `unc_project_path_unsupported` error before any filesystem
+/// access happens.
+///
+/// The classification is grammar-based — the shared
+/// `webcodex_agent_config::paths::is_windows_local_disk_path` parses the
+/// Windows path prefix — never a string `starts_with` check.
+#[cfg(windows)]
+fn validate_windows_project_root(path: &Path) -> Result<(), &'static str> {
+    if webcodex_agent_config::paths::is_windows_local_disk_path(path) {
+        Ok(())
+    } else {
+        Err("unc_project_path_unsupported")
+    }
+}
+
+#[cfg(not(windows))]
+fn validate_windows_project_root(_path: &Path) -> Result<(), &'static str> {
+    Ok(())
+}
+
 /// Escape a string for use as a TOML basic string (double-quoted). NUL is
 /// rejected up front by validation, so we only handle backslash, quote, and
 /// common control characters.
@@ -874,6 +898,17 @@ pub(crate) fn validate_project_path_policy(
     canonical_path: &Path,
 ) -> Result<(), String> {
     let path_str = canonical_path.to_string_lossy().to_string();
+    // Backstop: registration handlers reject non-local-disk paths with the
+    // dedicated `unc_project_path_unsupported` code before this function is
+    // reached, but the policy check itself must never bless one either (for
+    // example through an `allowed_roots` entry that names a UNC share).
+    #[cfg(windows)]
+    if !webcodex_agent_config::paths::is_windows_local_disk_path(canonical_path) {
+        return Err(format!(
+            "path {} is not on a local disk drive; UNC and other Windows network/device paths are not supported for projects",
+            path_str
+        ));
+    }
     // If under an explicit allowed_root, always allow.
     for root in &policy.allowed_roots {
         if let Ok(canonical_root) = canonicalize_existing(root) {
@@ -1320,6 +1355,17 @@ pub(crate) fn handle_resolve_or_register_project(
             )
         }
     };
+    // The raw input path is checked before any filesystem access so a UNC
+    // path is rejected as `unc_project_path_unsupported` even when the share
+    // is unreachable (which would otherwise surface as `project_path_not_found`).
+    if let Err(error_kind) = validate_windows_project_root(Path::new(path)) {
+        return structured_project_error_cmd(
+            start,
+            error_kind,
+            false,
+            serde_json::json!({"field": "path"}),
+        );
+    }
     let canonical_path = match canonicalize_existing(Path::new(path)) {
         Ok(path) => path,
         Err(_) => {
@@ -1331,6 +1377,17 @@ pub(crate) fn handle_resolve_or_register_project(
             )
         }
     };
+    // The canonical form is checked too: Windows canonicalization rewrites
+    // reachable UNC paths into `\\?\UNC\...`, which the raw check may not
+    // have seen verbatim.
+    if let Err(error_kind) = validate_windows_project_root(&canonical_path) {
+        return structured_project_error_cmd(
+            start,
+            error_kind,
+            false,
+            serde_json::json!({"field": "path"}),
+        );
+    }
     if !canonical_path.is_dir() {
         return structured_project_error_cmd(
             start,
@@ -1617,6 +1674,9 @@ pub(crate) fn handle_project_lifecycle_op(
             Ok(v) if v.is_dir() => v,
             _ => return project_error_cmd(start, "project_not_found"),
         };
+        if let Err(error_kind) = validate_windows_project_root(&canonical) {
+            return project_error_cmd(start, error_kind);
+        }
         if let Err(_) = validate_project_path_policy(policy, &canonical) {
             return project_error_cmd(start, "path_outside_allowed_roots");
         }
@@ -1763,6 +1823,9 @@ fn handle_managed_temporary_project(
         Ok(root) if root.is_dir() => root,
         _ => return project_error_cmd(start, "temporary_projects_root_unavailable"),
     };
+    if let Err(error_kind) = validate_windows_project_root(&canonical_root) {
+        return project_error_cmd(start, error_kind);
+    }
     if validate_project_path_policy(policy, &canonical_root).is_err() {
         return project_error_cmd(start, "temporary_projects_root_outside_allowed_roots");
     }
@@ -1960,6 +2023,12 @@ pub(crate) fn handle_project_op_with_temporary_projects_root(
     if path.is_empty() || path.contains('\0') || !Path::new(&path).is_absolute() {
         return err_cmd(start, "path must be a non-empty absolute path".to_string());
     }
+    // Windows supports local-drive project roots only; UNC and other
+    // non-disk prefixes fail closed here, before the directory is touched,
+    // so an unreachable share cannot masquerade as a missing directory.
+    if let Err(error_kind) = validate_windows_project_root(Path::new(&path)) {
+        return project_error_cmd(start, error_kind);
+    }
 
     let client_id = request.client_id.clone();
     let runtime_id = format!("agent:{}:{}", client_id, id);
@@ -1999,6 +2068,9 @@ pub(crate) fn handle_project_op_with_temporary_projects_root(
         };
         if !canonical.is_dir() {
             return err_cmd(start, format!("path {} is not a directory", path));
+        }
+        if let Err(error_kind) = validate_windows_project_root(&canonical) {
+            return project_error_cmd(start, error_kind);
         }
         if validate_project_path_policy(policy, &canonical).is_err() {
             return project_error_cmd(start, "path_outside_allowed_roots");
@@ -2097,6 +2169,9 @@ pub(crate) fn handle_project_op_with_temporary_projects_root(
             }
         }
     };
+    if let Err(error_kind) = validate_windows_project_root(&canonical_for_policy) {
+        return project_error_cmd(start, error_kind);
+    }
     if validate_project_path_policy(policy, &canonical_for_policy).is_err() {
         return project_error_cmd(start, "path_outside_allowed_roots");
     }

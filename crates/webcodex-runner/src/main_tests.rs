@@ -7008,6 +7008,134 @@ fn resolve_or_register_project_rejects_invalid_non_directory_and_disallowed_path
     assert_eq!(dangerous["error_kind"], "path_outside_allowed_roots");
 }
 
+#[cfg(windows)]
+#[test]
+fn resolve_or_register_project_rejects_unc_and_non_local_disk_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let projects_dir = tmp.path().join("projects.d");
+    let policy = project_policy(tmp.path());
+
+    // The raw path check must fire before canonicalization: these shares do
+    // not exist, but the error is the platform rule, not "path not found".
+    for unc_path in [
+        r"\\server\share\repo",
+        r"\\?\UNC\server\share\repo",
+        r"\\.\device\repo",
+        r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\repo",
+    ] {
+        let error = project_error_value(handle_resolve_or_register_project(
+            &policy,
+            &projects_dir,
+            &project_request(
+                "resolve_or_register_project",
+                serde_json::json!({"path": unc_path}),
+            ),
+        ));
+        assert_eq!(
+            error["error_kind"], "unc_project_path_unsupported",
+            "{unc_path} must fail closed as an unsupported non-local-disk path"
+        );
+        assert_eq!(error["state_changed"], false);
+    }
+    assert!(!projects_dir.exists(), "no registration may be attempted");
+
+    // An allowed_roots entry naming a UNC share must not bypass the rule.
+    let unc_allowed = AgentPolicy {
+        allow_cwd_anywhere: false,
+        allowed_roots: vec![PathBuf::from(r"\\server\share\repo")],
+        ..AgentPolicy::default()
+    };
+    let error = project_error_value(handle_resolve_or_register_project(
+        &unc_allowed,
+        &projects_dir,
+        &project_request(
+            "resolve_or_register_project",
+            serde_json::json!({"path": r"\\server\share\repo"}),
+        ),
+    ));
+    assert_eq!(
+        error["error_kind"], "unc_project_path_unsupported",
+        "a UNC allowed_root must not make a UNC project root acceptable"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn resolve_or_register_project_accepts_local_drive_and_verbatim_disk_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("repo");
+    let projects_dir = tmp.path().join("projects.d");
+    std::fs::create_dir(&project_dir).unwrap();
+    let policy = project_policy(tmp.path());
+
+    // Plain local-drive path registers normally.
+    let plain = project_dir.to_string_lossy().to_string();
+    assert!(Path::new(&plain).is_absolute());
+    let first = project_ok(handle_resolve_or_register_project(
+        &policy,
+        &projects_dir,
+        &project_request(
+            "resolve_or_register_project",
+            serde_json::json!({"path": plain}),
+        ),
+    ));
+    assert_eq!(first["outcome"], "auto_registered");
+    let project_id = first["agent_project_id"].as_str().unwrap().to_string();
+
+    // The canonicalized `\\?\C:\...` spelling of the same directory must
+    // reuse the registration instead of minting a duplicate identity. The
+    // verbatim form is built from the plain path: `canonicalize()` already
+    // returns `\\?\`-prefixed paths on modern Rust, so re-prefixing those
+    // would double the prefix.
+    let raw = project_dir.to_string_lossy().to_string();
+    let verbatim = if raw.starts_with(r"\\?\") {
+        raw
+    } else {
+        // `\\?\` + the raw path: the prefix itself ends with a backslash.
+        format!(r"\\?\{raw}")
+    };
+    let second = project_ok(handle_resolve_or_register_project(
+        &policy,
+        &projects_dir,
+        &project_request(
+            "resolve_or_register_project",
+            serde_json::json!({"path": verbatim}),
+        ),
+    ));
+    assert_eq!(second["outcome"], "reused_existing_registration");
+    assert_eq!(second["agent_project_id"], project_id);
+    assert_eq!(
+        std::fs::read_dir(&projects_dir).unwrap().count(),
+        1,
+        "the \\\\?\\ spelling created a duplicate project identity"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn register_project_rejects_unc_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let projects_dir = tmp.path().join("projects.d");
+    let policy = project_policy(tmp.path());
+
+    let error = project_error_value(handle_project_op(
+        &policy,
+        &projects_dir,
+        &project_request(
+            "register_project",
+            serde_json::json!({
+                "id": "demo",
+                "name": "Demo",
+                "path": r"\\server\share\repo",
+                "description": "UNC project",
+                "allow_patch": false
+            }),
+        ),
+    ));
+    assert_eq!(error["error_code"], "unc_project_path_unsupported");
+    assert!(!projects_dir.exists());
+}
+
 #[test]
 fn concurrent_path_resolution_converges_on_one_registration() {
     let tmp = tempfile::tempdir().unwrap();
@@ -7505,18 +7633,27 @@ fn register_project_rejects_dangerous_subpaths_without_explicit_root() {
         ..AgentPolicy::default()
     };
 
-    for path in [
-        "/etc/nginx",
-        "/usr/local",
-        "/var/lib",
-        "/proc/self",
-        "/dev/shm",
-    ] {
+    // Dangerous system roots are platform-specific: the well-known Unix trees,
+    // or the Windows OS trees (which must still be local-disk paths to reach
+    // the dangerous-root check at all).
+    #[cfg(windows)]
+    let dangerous_paths: &[&str] = &[
+        r"C:\Windows\System32\drivers\etc",
+        r"C:\Program Files\WebCodex",
+        r"C:\Program Files (x86)\something",
+    ];
+    #[cfg(not(windows))]
+    let dangerous_paths: &[&str] = &["/etc/nginx", "/usr/local", "/var/lib", "/proc/self", "/dev/shm"];
+    for path in dangerous_paths {
         let err = validate_project_path_policy(&policy, Path::new(path)).unwrap_err();
         assert!(err.contains("dangerous system root"), "{path}: {err}");
     }
 
-    validate_project_path_policy(&policy, Path::new("/usr2/local")).unwrap();
+    #[cfg(windows)]
+    let safe_path = r"C:\Users\alice\projects";
+    #[cfg(not(windows))]
+    let safe_path = "/usr2/local";
+    validate_project_path_policy(&policy, Path::new(safe_path)).unwrap();
 }
 
 #[test]
