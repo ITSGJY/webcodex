@@ -19,14 +19,23 @@ Hosted clients require an operator-managed HTTPS endpoint:
 https://your-domain.example/mcp
 ```
 
-Configure Bearer authentication with a credential issued for runtime/project
+Use either a scoped Bearer credential or OAuth issued for runtime/project
 access. Do not use or expose bootstrap/admin, account, or Agent credentials.
 Prefer the client secret store; never commit a token.
 
+For ChatGPT Developer Mode, point the custom app at the public HTTPS `/mcp`
+endpoint and use a user-defined/custom OAuth client. WebCodex currently supports
+PKCE S256 plus `client_secret_post`; register the exact ChatGPT callback URL as a
+redirect URI. The OAuth discovery metadata advertises `offline_access` for
+refresh-token continuity. `offline_access` is protocol-level and does not add a
+WebCodex API permission, so do not put it in the OAuth client's
+`allowed_scopes` list. Dynamic client registration is not currently required or
+implemented by WebCodex.
+
 Canonical setup does not print credential values or secret paths, create a
 tunnel, or expose a public port. Production enrollment, scoped user tokens, and
-OAuth are described in [AUTH_MODEL.md](AUTH_MODEL.md) and
-[DEPLOYMENT.md](DEPLOYMENT.md).
+OAuth are described in [AUTH_MODEL.md](AUTH_MODEL.md),
+[DEPLOYMENT.md](DEPLOYMENT.md), and [OAUTH2_SMOKE_TEST.md](OAUTH2_SMOKE_TEST.md).
 
 ## Model Surface Selection
 

@@ -99,13 +99,21 @@ For ChatGPT MCP OAuth, configure the connector with:
 - Authentication: OAuth
 - Client registration method: user-defined/custom OAuth client
 - Token endpoint auth method: `client_secret_post`
-- Scopes: the scopes allowed on the WebCodex OAuth client, for example
-  `runtime:read project:read project:write job:run`
+- Scopes: the WebCodex permission scopes allowed on the OAuth client, for
+  example `runtime:read project:read project:write job:run`, plus
+  `offline_access` when ChatGPT offers it. Do **not** add `offline_access` to the
+  WebCodex client's `allowed_scopes`: it is a protocol-level refresh-token scope
+  and grants no WebCodex API permission. Leave `account:manage` disabled unless
+  the app explicitly needs account administration.
+
+Copy the callback URL shown by ChatGPT before creating the WebCodex OAuth client
+and register it exactly; do not reuse the callback ID from another app.
 
 If ChatGPT includes an OAuth `resource` parameter, WebCodex accepts only self
 resource indicators derived from the configured public issuer/base URL:
 `https://your-domain.example` and `https://your-domain.example/mcp`. External
-or malformed resource values are rejected.
+or malformed resource values are rejected, and the token exchange must remain
+bound to the authorization code's resource when one was supplied.
 
 Verify `list` never returns the secret/hash:
 

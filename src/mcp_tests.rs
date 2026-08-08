@@ -965,6 +965,99 @@ async fn mcp_tools_call_unknown_tool_is_bad_request() {
 }
 
 #[tokio::test]
+async fn mcp_server_discover_advertises_modern_and_legacy_protocols() {
+    let runtime = test_runtime();
+    let outcome = handle_mcp_request(
+        &runtime,
+        rpc(
+            "server/discover",
+            Some(Value::from(6)),
+            json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }),
+        ),
+        None,
+    )
+    .await;
+    match outcome {
+        McpOutcome::Ok(value) => {
+            assert_eq!(
+                value["result"]["supportedVersions"],
+                json!([MCP_STATELESS_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION])
+            );
+            assert_eq!(
+                value["result"]["capabilities"]["tools"]["listChanged"],
+                false
+            );
+            assert_eq!(value["result"]["resultType"], "complete");
+            assert_eq!(value["result"]["ttlMs"], 0);
+            assert_eq!(value["result"]["cacheScope"], "private");
+            assert_eq!(
+                value["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+                "webcodex"
+            );
+        }
+        other => panic!("expected Ok for server/discover, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn mcp_stateless_tools_list_uses_2026_result_shape() {
+    let runtime = test_runtime();
+    let outcome = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/list",
+            Some(Value::from(7)),
+            json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MCP_STATELESS_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }),
+        ),
+        None,
+    )
+    .await;
+    match outcome {
+        McpOutcome::Ok(value) => {
+            assert!(value["result"]["tools"].is_array());
+            assert_eq!(value["result"]["resultType"], "complete");
+            assert_eq!(value["result"]["ttlMs"], 0);
+            assert_eq!(value["result"]["cacheScope"], "private");
+            assert_eq!(
+                value["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+                "webcodex"
+            );
+        }
+        other => panic!("expected Ok for stateless tools/list, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn mcp_legacy_tools_list_omits_2026_only_result_fields() {
+    let runtime = test_runtime();
+    let outcome = handle_mcp_request(
+        &runtime,
+        rpc("tools/list", Some(Value::from(8)), json!({})),
+        None,
+    )
+    .await;
+    match outcome {
+        McpOutcome::Ok(value) => {
+            assert!(value["result"]["tools"].is_array());
+            assert!(value["result"].get("resultType").is_none());
+            assert!(value["result"].get("ttlMs").is_none());
+            assert!(value["result"].get("cacheScope").is_none());
+        }
+        other => panic!("expected Ok for legacy tools/list, got {:?}", other),
+    }
+}
+
+#[tokio::test]
 async fn mcp_unknown_method_is_bad_request() {
     let runtime = test_runtime();
     let outcome = handle_mcp_request(
@@ -1880,6 +1973,39 @@ async fn oauth2_mcp_tools_list_requires_runtime_read() {
     let (_tmp, service, token) = oauth_mcp_service("project:read");
     let (status, body, challenge) =
         oauth_mcp_request(&service, &token, "tools/list", json!({})).await;
+    assert_mcp_oauth_scope_rejected(
+        status,
+        &body,
+        challenge.as_deref(),
+        Some(crate::auth::SCOPE_RUNTIME_READ),
+    );
+}
+
+#[tokio::test]
+async fn oauth2_mcp_server_discover_requires_runtime_read_and_advertises_both_versions() {
+    let (_tmp, service, token) = oauth_mcp_service("runtime:read");
+    let (status, body, _) = oauth_mcp_request(
+        &service,
+        &token,
+        "server/discover",
+        json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": MCP_STATELESS_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    assert_eq!(
+        body["result"]["supportedVersions"],
+        json!([MCP_STATELESS_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION])
+    );
+    assert_eq!(body["result"]["resultType"], "complete");
+
+    let (_tmp, service, token) = oauth_mcp_service("project:read");
+    let (status, body, challenge) =
+        oauth_mcp_request(&service, &token, "server/discover", json!({})).await;
     assert_mcp_oauth_scope_rejected(
         status,
         &body,

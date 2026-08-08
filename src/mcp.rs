@@ -17,11 +17,13 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+const MCP_STATELESS_PROTOCOL_VERSION: &str = "2026-07-28";
 
 /// Single source of truth for the JSON-RPC methods advertised by `GET /mcp`.
 /// Must match the dispatch arms in `handle_mcp_request_with_lifecycle`;
 /// pinned by `mcp_info_advertised_methods_match_dispatch`.
 const MCP_INFO_METHODS: &[&str] = &[
+    "server/discover",
     "initialize",
     "ping",
     "tools/list",
@@ -95,6 +97,45 @@ fn tool_name_from_params(params: &Value) -> Option<String> {
 
 fn project_from_tool_call_params(params: &Value) -> Option<String> {
     params["arguments"]["project"].as_str().map(str::to_string)
+}
+
+fn request_uses_stateless_protocol(params: &Value) -> bool {
+    params
+        .get("_meta")
+        .and_then(|meta| meta.get("io.modelcontextprotocol/protocolVersion"))
+        .and_then(Value::as_str)
+        == Some(MCP_STATELESS_PROTOCOL_VERSION)
+}
+
+fn mcp_stateless_result(mut result: Value, cacheable: bool) -> Value {
+    let Some(object) = result.as_object_mut() else {
+        return result;
+    };
+    object
+        .entry("resultType".to_string())
+        .or_insert_with(|| Value::String("complete".to_string()));
+    if cacheable {
+        object
+            .entry("ttlMs".to_string())
+            .or_insert_with(|| Value::from(0));
+        object
+            .entry("cacheScope".to_string())
+            .or_insert_with(|| Value::String("private".to_string()));
+    }
+    let meta = object
+        .entry("_meta".to_string())
+        .or_insert_with(|| json!({}));
+    if let Some(meta_object) = meta.as_object_mut() {
+        meta_object
+            .entry("io.modelcontextprotocol/serverInfo".to_string())
+            .or_insert_with(|| {
+                json!({
+                    "name": "webcodex",
+                    "version": env!("CARGO_PKG_VERSION")
+                })
+            });
+    }
+    result
 }
 
 /// MCP tools/list payload for the immutable startup-selected model surface.
@@ -541,11 +582,13 @@ async fn handle_mcp_request_with_lifecycle(
     mut lifecycle: Option<&mut ToolRequestLifecycle>,
 ) -> McpOutcome {
     let is_oauth2 = auth.is_some_and(|ctx| ctx.is_oauth_token());
+    let stateless_2026 =
+        request.method == "server/discover" || request_uses_stateless_protocol(&request.params);
 
     if is_oauth2
         && matches!(
             request.method.as_str(),
-            "initialize" | "ping" | "tools/list" | "notifications/initialized"
+            "server/discover" | "initialize" | "ping" | "tools/list" | "notifications/initialized"
         )
     {
         if let Some(outcome) = require_mcp_oauth_scope(auth, crate::auth::SCOPE_RUNTIME_READ) {
@@ -556,7 +599,12 @@ async fn handle_mcp_request_with_lifecycle(
     if is_oauth2
         && !matches!(
             request.method.as_str(),
-            "initialize" | "ping" | "tools/list" | "tools/call" | "notifications/initialized"
+            "server/discover"
+                | "initialize"
+                | "ping"
+                | "tools/list"
+                | "tools/call"
+                | "notifications/initialized"
         )
     {
         return oauth_forbidden(None, "OAuth2 access tokens cannot call unknown MCP methods");
@@ -581,6 +629,30 @@ async fn handle_mcp_request_with_lifecycle(
 
     let id = request.id.clone();
     let response = match request.method.as_str() {
+        // MCP 2026-07-28 clients discover capabilities before issuing ordinary
+        // requests. WebCodex supports the stateless tools path required by
+        // modern clients while retaining its existing 2025-06-18
+        // initialize/session lifecycle for legacy clients.
+        "server/discover" => rpc_result(
+            id,
+            json!({
+                "resultType": "complete",
+                "ttlMs": 0,
+                "cacheScope": "private",
+                "supportedVersions": [MCP_STATELESS_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION],
+                "capabilities": {
+                    "tools": {
+                        "listChanged": false
+                    }
+                },
+                "_meta": {
+                    "io.modelcontextprotocol/serverInfo": {
+                        "name": "webcodex",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }
+            }),
+        ),
         "initialize" => rpc_result(
             id,
             json!({
@@ -597,8 +669,25 @@ async fn handle_mcp_request_with_lifecycle(
                 }
             }),
         ),
-        "ping" => rpc_result(id, json!({})),
-        "tools/list" => rpc_result(id, mcp_tools_list_payload(runtime.model_surface())),
+        "ping" => rpc_result(
+            id,
+            if stateless_2026 {
+                mcp_stateless_result(json!({}), false)
+            } else {
+                json!({})
+            },
+        ),
+        "tools/list" => {
+            let result = mcp_tools_list_payload(runtime.model_surface());
+            rpc_result(
+                id,
+                if stateless_2026 {
+                    mcp_stateless_result(result, true)
+                } else {
+                    result
+                },
+            )
+        }
         "tools/call" => {
             let mut params: McpToolCallParams = match serde_json::from_value(request.params) {
                 Ok(params) => params,
@@ -690,13 +779,18 @@ async fn handle_mcp_request_with_lifecycle(
                 }
                 let text =
                     serde_json::to_string(&outcome.body).unwrap_or_else(|_| "{}".to_string());
+                let result = json!({
+                    "content": [{ "type": "text", "text": text }],
+                    "structuredContent": outcome.body,
+                    "isError": !outcome.ok
+                });
                 return McpOutcome::Ok(rpc_result(
                     id,
-                    json!({
-                        "content": [{ "type": "text", "text": text }],
-                        "structuredContent": outcome.body,
-                        "isError": !outcome.ok
-                    }),
+                    if stateless_2026 {
+                        mcp_stateless_result(result, false)
+                    } else {
+                        result
+                    },
                 ));
             }
             let session_id = strip_reserved_session_id(&mut params.arguments);
@@ -754,9 +848,14 @@ async fn handle_mcp_request_with_lifecycle(
                     lc.dispatch_finished(true, Some(false), category);
                 }
             }
+            let result = mcp_runtime_tool_result(&params.name, as_image_requested, result);
             rpc_result(
                 id,
-                mcp_runtime_tool_result(&params.name, as_image_requested, result),
+                if stateless_2026 {
+                    mcp_stateless_result(result, false)
+                } else {
+                    result
+                },
             )
         }
         "notifications/initialized" => rpc_result(id, json!({})),

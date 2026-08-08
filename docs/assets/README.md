@@ -24,8 +24,9 @@ The `mcp-*.png` files document the ChatGPT apps/connectors flow for connecting W
 
 - `mcp-1.png` — open ChatGPT apps/connectors.
 - `mcp-2.png` — choose or create the `webcodex` app.
-- `mcp-3.png` — configure the MCP server URL and authentication.
-- `mcp-4.png` — connect and authorize the `webcodex` app in ChatGPT.
+- `mcp-3.png` — configure the MCP server URL and Bearer authentication.
+- `mcp-4.png` — connect and authorize the `webcodex` app with a Bearer credential.
+- `chatgpt-oauth-create.webp` — configure a ChatGPT custom MCP app with OAuth and copy its generated callback URL before registering the WebCodex OAuth client.
 
 These images are referenced from [../MCP.md](../MCP.md) and [../MCP.zh-CN.md](../MCP.zh-CN.md).
 
