@@ -1,6 +1,6 @@
 use salvo::prelude::*;
 
-use super::oauth_scopes_supported;
+use super::{authorization_response_issuer, oauth_discovery_scopes_supported};
 
 /// Return protected resource metadata (RFC 9728 §3.1).
 ///
@@ -21,17 +21,18 @@ pub(crate) async fn oauth_metadata(depot: &mut Depot, res: &mut Response) {
         return;
     }
 
-    let resource = config
+    let issuer = config
         .oauth2
         .issuer
         .as_deref()
         .unwrap_or("http://localhost");
+    let resource = format!("{}/mcp", issuer.trim_end_matches('/'));
 
     let metadata = serde_json::json!({
         "resource": resource,
-        "authorization_servers": [resource],
+        "authorization_servers": [issuer],
         "bearer_methods_supported": ["header"],
-        "scopes_supported": oauth_scopes_supported(),
+        "scopes_supported": oauth_discovery_scopes_supported(),
         "resource_name": "WebCodex",
     });
 
@@ -72,7 +73,8 @@ pub(crate) async fn oauth_authorization_server_metadata(depot: &mut Depot, res: 
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["client_secret_post"],
-        "scopes_supported": oauth_scopes_supported(),
+        "authorization_response_iss_parameter_supported": authorization_response_issuer(&config).is_some(),
+        "scopes_supported": oauth_discovery_scopes_supported(),
     });
 
     res.render(Json(metadata));

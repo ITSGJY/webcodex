@@ -794,6 +794,73 @@ async fn authorize_issues_code_and_redirects_with_state() {
 }
 
 #[tokio::test]
+async fn authorize_https_issuer_adds_rfc9207_iss_to_success_redirect() {
+    let config = test_config(oauth2_enabled_with_issuer("https://auth.example"));
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let token = seed_user_token(&db, &user);
+    let client = seed_client_with_redirects_and_scopes(
+        &db,
+        &user,
+        "https://example.com/callback",
+        "runtime:read",
+    );
+    let service = Service::new(build_router(config, db.clone()));
+    let url = valid_authorize_url(&client, "https://example.com/callback");
+
+    let (_resp, _location, parsed, _code) = authorize_success(&service, &db, &url, &token).await;
+    let params: std::collections::HashMap<String, String> =
+        parsed.query_pairs().into_owned().collect();
+
+    assert_eq!(
+        params.get("iss").map(String::as_str),
+        Some("https://auth.example")
+    );
+}
+
+#[tokio::test]
+async fn authorize_https_issuer_adds_rfc9207_iss_to_error_redirect() {
+    let config = test_config(oauth2_enabled_with_issuer("https://auth.example"));
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let token = seed_user_token(&db, &user);
+    let client = seed_client_with_redirects_and_scopes(
+        &db,
+        &user,
+        "https://example.com/callback",
+        "runtime:read",
+    );
+    let service = Service::new(build_router(config, db.clone()));
+    let url = authorize_url(&[
+        ("response_type", "token"),
+        ("client_id", &client.client_id),
+        ("redirect_uri", "https://example.com/callback"),
+        ("state", "state-1"),
+        ("code_challenge", "challenge-1"),
+        ("code_challenge_method", "S256"),
+    ]);
+
+    let location = assert_authorize_redirect_error(
+        &service,
+        &db,
+        &url,
+        &token,
+        "https://example.com/callback",
+        "unsupported_response_type",
+        Some("state-1"),
+    )
+    .await;
+    let parsed = url::Url::parse(&location).unwrap();
+    let params: std::collections::HashMap<String, String> =
+        parsed.query_pairs().into_owned().collect();
+
+    assert_eq!(
+        params.get("iss").map(String::as_str),
+        Some("https://auth.example")
+    );
+}
+
+#[tokio::test]
 async fn authorize_stores_only_code_hash() {
     let config = test_config(oauth2_enabled());
     let (_tmp, db) = test_db();

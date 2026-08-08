@@ -135,12 +135,57 @@ services and advanced overrides.
 
 ## Client access
 
-- **MCP:** use the Server `/mcp` endpoint with the credential produced by the
-  selected setup flow. See [MCP](docs/MCP.md).
-- **ChatGPT:** import the Server OpenAPI schema into a Custom GPT Action. See
-  [GPT Actions](docs/GPT_ACTIONS.md).
+- **ChatGPT over MCP:** create a Developer Mode custom app that points to the
+  Server `/mcp` endpoint. OAuth is supported for managed and self-hosted HTTPS
+  Servers; the setup below shows the current ChatGPT flow.
+- **Other MCP clients:** use the Server `/mcp` endpoint with the credential
+  produced by the selected setup flow. See [MCP](docs/MCP.md).
+- **GPT Actions:** OpenAPI-based GPT Actions remain available as an alternative
+  integration path. See [GPT Actions](docs/GPT_ACTIONS.md).
 - **Browser console:** open `/console` for connection details, runtime status,
   and available review or operations controls.
+
+### ChatGPT OAuth (Developer Mode)
+
+For a managed or self-hosted WebCodex Server with public HTTPS and OAuth enabled:
+
+1. In ChatGPT, open **Settings → Apps → Create**, set the Server URL to
+   `https://your-domain.example/mcp`, choose **OAuth**, and select the
+   user-defined/custom OAuth client option. Copy the callback URL shown by
+   ChatGPT; it is specific to that app configuration.
+2. Register that exact callback URL as a WebCodex OAuth client. Keep the returned
+   `client_secret`: it is shown only once.
+
+   ```bash
+   curl -fsS -X POST https://your-domain.example/api/oauth/clients/create \
+     -H "Authorization: Bearer $WEBCODEX_PAT" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "name":"ChatGPT MCP",
+       "redirect_uris":["https://chatgpt.com/connector/oauth/<callback-id>"],
+       "allowed_scopes":["runtime:read","project:read","project:write","job:run"]
+     }'
+   ```
+3. Enter the returned client ID and secret in ChatGPT and choose
+   `client_secret_post` for token-endpoint authentication. Select only the
+   WebCodex permissions the app needs. For the ordinary coding setup that is
+   `runtime:read`, `project:read`, `project:write`, and `job:run`. Keep
+   `account:manage` disabled unless the app really needs account administration.
+   Leave `offline_access` enabled when ChatGPT offers it: WebCodex advertises it
+   as a protocol-level refresh-token scope, and it does **not** grant an extra
+   WebCodex permission or belong in the client's `allowed_scopes` list.
+4. Run **Scan Tools**. On the WebCodex authorization page, sign in with a normal
+   WebCodex PAT, review the requested scopes, choose **Allow**, and wait for the
+   tool scan to finish.
+
+![ChatGPT OAuth client setup](docs/assets/chatgpt-oauth-create.webp)
+
+After **Scan Tools** succeeds, ChatGPT should show the discovered WebCodex operations on the app page.
+
+ChatGPT UI labels can change. If OAuth discovery metadata changes, recreate the
+ChatGPT app so it fetches the new metadata. See [MCP](docs/MCP.md),
+[Deployment](docs/DEPLOYMENT.md), and the
+[OAuth2 smoke test](docs/OAUTH2_SMOKE_TEST.md) for the server-side details.
 
 ## Security boundary
 

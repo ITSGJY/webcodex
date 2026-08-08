@@ -7,7 +7,7 @@ use super::{
     authorize_bridge_html, decoded_authorize_param, form_field, normalize_oauth_scopes,
     oauth_authorize_direct_error, parse_authorize_query, parse_form_body,
     redirect_with_authorization_code, redirect_with_oauth_error, validate_authorize_resource,
-    OAuthAuthorizeError, OAuthAuthorizeRequest,
+    OAuthAuthorizeError, OAuthAuthorizeRequest, OAUTH_OFFLINE_ACCESS_SCOPE,
 };
 
 const OAUTH_BRIDGE_SCOPES_SUPPORTED: &[&str] = &[
@@ -41,10 +41,9 @@ pub(crate) fn normalize_bridge_oauth_scopes(
     client_allowed: &str,
 ) -> Result<String, OAuthAuthorizeError> {
     let normalized = normalize_oauth_scopes(requested, client_allowed)?;
-    if normalized
-        .split_whitespace()
-        .any(|scope| !OAUTH_BRIDGE_SCOPES_SUPPORTED.contains(&scope))
-    {
+    if normalized.split_whitespace().any(|scope| {
+        scope != OAUTH_OFFLINE_ACCESS_SCOPE && !OAUTH_BRIDGE_SCOPES_SUPPORTED.contains(&scope)
+    }) {
         return Err(OAuthAuthorizeError::InvalidScope(
             OAUTH_BRIDGE_INVALID_SCOPE_MESSAGE,
         ));
@@ -146,6 +145,7 @@ pub(super) fn validate_bridge_authorize_request(
     if parsed.response_type.is_empty() || parsed.response_type != "code" {
         redirect_with_oauth_error(
             res,
+            config,
             &parsed.redirect_uri,
             "unsupported_response_type",
             parsed.state.as_deref(),
@@ -159,6 +159,7 @@ pub(super) fn validate_bridge_authorize_request(
     {
         redirect_with_oauth_error(
             res,
+            config,
             &parsed.redirect_uri,
             "invalid_request",
             parsed.state.as_deref(),
@@ -172,6 +173,7 @@ pub(super) fn validate_bridge_authorize_request(
             Err(_) => {
                 redirect_with_oauth_error(
                     res,
+                    config,
                     &parsed.redirect_uri,
                     "invalid_scope",
                     parsed.state.as_deref(),
@@ -185,6 +187,7 @@ pub(super) fn validate_bridge_authorize_request(
         Err(_) => {
             redirect_with_oauth_error(
                 res,
+                config,
                 &parsed.redirect_uri,
                 "invalid_target",
                 parsed.state.as_deref(),
@@ -273,6 +276,7 @@ fn issue_bridge_authorization_code(
 
     redirect_with_authorization_code(
         res,
+        config,
         &validated.parsed.redirect_uri,
         &plaintext_code,
         validated.parsed.state.as_deref(),

@@ -27,6 +27,20 @@ fn normalize_oauth_scopes_requested_subset_success() {
 }
 
 #[test]
+fn normalize_oauth_scopes_accepts_offline_access_without_expanding_client_permissions() {
+    let normalized =
+        normalize_oauth_scopes(Some("offline_access runtime:read"), "runtime:read").unwrap();
+
+    assert_eq!(normalized, "runtime:read offline_access");
+}
+
+#[test]
+fn oauth_discovery_scopes_include_offline_access_but_permission_registry_does_not() {
+    assert!(oauth_discovery_scopes_supported().contains(&OAUTH_OFFLINE_ACCESS_SCOPE));
+    assert!(!oauth_scopes_supported().contains(&OAUTH_OFFLINE_ACCESS_SCOPE));
+}
+
+#[test]
 fn normalize_oauth_scopes_deduplicates_and_orders() {
     let normalized = normalize_oauth_scopes(
         Some("project:write runtime:read runtime:read"),

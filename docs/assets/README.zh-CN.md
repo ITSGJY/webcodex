@@ -24,8 +24,9 @@
 
 - `mcp-1.png` — 打开 ChatGPT apps/connectors。
 - `mcp-2.png` — 选择或创建 `webcodex` app。
-- `mcp-3.png` — 配置 MCP server URL 和 authentication。
-- `mcp-4.png` — 在 ChatGPT 中连接并授权 `webcodex` app。
+- `mcp-3.png` — 配置 MCP server URL 和 Bearer authentication。
+- `mcp-4.png` — 使用 Bearer credential 在 ChatGPT 中连接并授权 `webcodex` app。
+- `chatgpt-oauth-create.webp` — 在 ChatGPT 中配置 OAuth 自定义 MCP app，并在注册 WebCodex OAuth client 前复制 ChatGPT 生成的 callback URL。
 
 这些图片被 [../MCP.md](../MCP.md) 和 [../MCP.zh-CN.md](../MCP.zh-CN.md) 引用。
 

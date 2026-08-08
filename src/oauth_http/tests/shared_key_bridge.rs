@@ -29,6 +29,17 @@ fn normalize_bridge_oauth_scopes_rejects_account_scope_with_bridge_message() {
     );
 }
 
+#[test]
+fn normalize_bridge_oauth_scopes_accepts_offline_access_as_protocol_scope() {
+    let normalized = normalize_bridge_oauth_scopes(
+        Some("runtime:read offline_access"),
+        "runtime:read project:read",
+    )
+    .unwrap();
+
+    assert_eq!(normalized, "runtime:read offline_access");
+}
+
 // -----------------------------------------------------------------------
 // Authorization endpoint
 // -----------------------------------------------------------------------

@@ -19,14 +19,22 @@ Hosted client 需要 operator 管理的 HTTPS endpoint：
 https://your-domain.example/mcp
 ```
 
-Bearer credential 必须用于 runtime/project access。不要使用或暴露
+runtime/project access 可以使用 scoped Bearer credential 或 OAuth。不要使用或暴露
 bootstrap/admin、account 或 Agent credential。优先使用 client secret store，
 不要提交 token。
 
+ChatGPT Developer Mode 应指向公网 HTTPS `/mcp` endpoint，并选择用户自定义的
+OAuth client。WebCodex 当前支持 PKCE S256 与 `client_secret_post`；需要把 ChatGPT
+显示的 callback URL 原样注册为 redirect URI。OAuth discovery 会发布
+`offline_access` 以支持 refresh token 连续性；它是协议级 scope，不会增加任何
+WebCodex API 权限，因此不要把它写入 OAuth client 的 `allowed_scopes`。WebCodex
+当前不要求、也未实现 Dynamic Client Registration。
+
 Canonical setup 不打印 credential value 或 secret path，不创建 tunnel，也不开放
 公网端口。production enrollment、scoped user token 和 OAuth 见
-[AUTH_MODEL.zh-CN.md](AUTH_MODEL.zh-CN.md) 与
-[DEPLOYMENT.zh-CN.md](DEPLOYMENT.zh-CN.md)。
+[AUTH_MODEL.zh-CN.md](AUTH_MODEL.zh-CN.md)、
+[DEPLOYMENT.zh-CN.md](DEPLOYMENT.zh-CN.md) 与
+[OAUTH2_SMOKE_TEST.md](OAUTH2_SMOKE_TEST.md)。
 
 ## Model surface 选择
 

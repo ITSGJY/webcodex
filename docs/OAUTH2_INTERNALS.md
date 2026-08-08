@@ -118,10 +118,11 @@ When a concrete scope is required, the response also includes
 `WWW-Authenticate: Bearer error="insufficient_scope", scope="<scope>"`.
 
 Delegated scope enforcement does not change `/oauth/authorize`, `/oauth/token`, or
-`/oauth/revoke` grant/revocation semantics. Full resource/audience
-enforcement, route-level project-resource authorization, `client_credentials`,
-device code, JWKS, JWT, OIDC, and `/.well-known/openid-configuration` remain
-unimplemented.
+`/oauth/revoke` grant/revocation semantics. OAuth resource binding is limited to
+WebCodex's configured issuer and canonical `/mcp` resource; arbitrary resource
+servers and route-level project-resource authorization are not implemented.
+`client_credentials`, device code, JWKS, JWT, OIDC, and
+`/.well-known/openid-configuration` also remain unimplemented.
 
 ### Authorization server metadata and authorize request handling
 
@@ -141,14 +142,18 @@ Authorization server metadata contains only implemented capabilities:
   "grant_types_supported": ["authorization_code", "refresh_token"],
   "code_challenge_methods_supported": ["S256"],
   "token_endpoint_auth_methods_supported": ["client_secret_post"],
-  "scopes_supported": ["runtime:read", "project:read", "project:write", "job:run", "account:manage"]
+  "authorization_response_iss_parameter_supported": true,
+  "scopes_supported": ["runtime:read", "project:read", "project:write", "job:run", "account:manage", "offline_access"]
 }
 ```
 
 `issuer` is `config.oauth2.issuer` with the existing `http://localhost`
 fallback. Endpoint URLs trim any trailing issuer slash before appending
 `/oauth/authorize`, `/oauth/token`, or `/oauth/revoke`. `scopes_supported`
-reuses `oauth_scopes_supported()`.
+uses `oauth_discovery_scopes_supported()`: it combines delegable WebCodex
+permission scopes with protocol-level `offline_access`. HTTPS issuers also
+advertise RFC 9207 authorization-response issuer support and include `iss` on
+redirect responses; the local HTTP fallback does not claim that capability.
 
 The current token endpoint supports `client_secret_post` only; public clients
 and `token_endpoint_auth_method = "none"` are not supported.

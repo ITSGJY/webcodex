@@ -69,12 +69,18 @@ discovery are reachable by clients and the authorize session cookie is marked
 curl -fsS -X POST https://your-domain.example/api/oauth/clients/create \
   -H "Authorization: Bearer $WEBCODEX_PAT" \
   -H "Content-Type: application/json" \
-  -d '{"name":"ChatGPT Action","redirect_uris":["https://example.com/oauth/callback"],"allowed_scopes":["runtime:read","project:read","project:write","job:run"]}'
+  -d '{"name":"ChatGPT MCP","redirect_uris":["https://chatgpt.com/connector/oauth/<callback-id>"],"allowed_scopes":["runtime:read","project:read","project:write","job:run"]}'
 ```
 
 Save the `client_secret` from the response — it is returned only once and only
 its SHA-256 hash is stored. Omit `allowed_scopes` to grant the full delegable
 OAuth scope set (`runtime:read project:read project:write job:run account:manage`).
+For ChatGPT, copy the callback URL shown in the app's Advanced OAuth Settings
+and register it exactly. Use `client_secret_post` in ChatGPT. Keep
+`offline_access` enabled when offered, but do not add it to `allowed_scopes`:
+it is advertised separately as a protocol-level refresh-token scope and grants
+no WebCodex API permission.
+
 
 List and revoke clients with `POST /api/oauth/clients/list` and
 `POST /api/oauth/clients/revoke` (body `{"client_id":"wc_client_..."}`).
@@ -98,11 +104,12 @@ token exchange, revoke) is in [OAUTH2_SMOKE_TEST.md](OAUTH2_SMOKE_TEST.md).
 ### Not yet supported
 
 Dynamic client registration, OIDC / `/.well-known/openid-configuration`,
-JWKS/JWT ID tokens, `userinfo_endpoint`, `client_credentials` grant, device
-code flow, and MCP resource/audience binding are not implemented. The default
-client scope set can grant full delegable access, which is convenient for
-self-hosted GPT Action / MCP use; use narrowed `allowed_scopes` for
-untrusted clients.
+JWKS/JWT ID tokens, `userinfo_endpoint`, `client_credentials` grant, and device
+code flow are not implemented. OAuth `resource` handling is intentionally
+limited to the configured WebCodex issuer and canonical `/mcp` resource; WebCodex
+does not act as a general multi-resource authorization server. The default
+client scope set can grant full delegable access, so prefer narrowed
+`allowed_scopes` for clients that do not need account administration.
 
 ## Server-first setup
 

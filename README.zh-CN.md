@@ -128,12 +128,56 @@ System service 与高级覆盖参数见
 
 ## 接入客户端
 
-- **MCP：** 使用 Server 的 `/mcp` endpoint 和当前接入流程生成的 credential。
-  详见 [MCP](docs/MCP.zh-CN.md)。
-- **ChatGPT：** 把 Server OpenAPI schema 导入 Custom GPT Action。
+- **ChatGPT MCP：** 在 Developer Mode 中创建自定义 app，指向 Server 的 `/mcp`
+  endpoint。Managed 或自托管 HTTPS Server 可以使用 OAuth；下面给出当前 ChatGPT
+  的实际配置流程。
+- **其他 MCP client：** 使用 Server 的 `/mcp` endpoint 和当前接入流程生成的
+  credential。详见 [MCP](docs/MCP.zh-CN.md)。
+- **GPT Actions：** 基于 OpenAPI 的 GPT Actions 仍作为另一种接入方式保留。
   详见 [GPT Actions](docs/GPT_ACTIONS.zh-CN.md)。
 - **浏览器 console：** 打开 `/console` 查看连接信息、运行状态，以及当前可用的
   review 或运维操作。
+
+### ChatGPT OAuth（Developer Mode）
+
+对于已经配置公网 HTTPS 和 OAuth 的 managed / 自托管 WebCodex Server：
+
+1. 在 ChatGPT 打开 **设置 → Apps → 创建**，Server URL 填
+   `https://your-domain.example/mcp`，认证方式选择 **OAuth**，然后选择
+   “用户自定义 / Custom OAuth client”。复制 ChatGPT 页面显示的 callback URL；
+   每个 app 配置的 callback URL 都可能不同。
+2. 在 WebCodex 注册这个**完全一致**的 callback URL。保存返回的
+   `client_secret`，因为它只会显示一次。
+
+   ```bash
+   curl -fsS -X POST https://your-domain.example/api/oauth/clients/create \
+     -H "Authorization: Bearer $WEBCODEX_PAT" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "name":"ChatGPT MCP",
+       "redirect_uris":["https://chatgpt.com/connector/oauth/<callback-id>"],
+       "allowed_scopes":["runtime:read","project:read","project:write","job:run"]
+     }'
+   ```
+3. 把返回的 Client ID / Client Secret 填回 ChatGPT，并把令牌端点认证方式设为
+   `client_secret_post`。只选择 app 真正需要的 WebCodex 权限；普通 coding 场景
+   使用 `runtime:read`、`project:read`、`project:write`、`job:run` 即可，除非确实
+   需要账号管理，否则不要勾选 `account:manage`。如果 ChatGPT 显示
+   `offline_access`，保持勾选：WebCodex 把它作为 refresh token 的**协议级 scope**
+   发布，它不会额外授予 WebCodex 权限，也不应写进 OAuth client 的
+   `allowed_scopes`。
+4. 执行 **Scan Tools / 扫描工具**。进入 WebCodex Authorization 页面后，使用普通
+   WebCodex PAT 登录，检查请求的 scopes，点击 **Allow**，等待 ChatGPT 完成工具
+   扫描。
+
+![ChatGPT OAuth client 配置](docs/assets/chatgpt-oauth-create.webp)
+
+**Scan Tools / 扫描工具** 成功后，ChatGPT 的 app 页面应显示发现到的 WebCodex operations。
+
+ChatGPT 的 UI 文案可能变化。如果 OAuth discovery metadata 有更新，应重新创建
+ChatGPT app，让它重新获取 metadata。服务端细节见 [MCP](docs/MCP.zh-CN.md)、
+[部署指南](docs/DEPLOYMENT.zh-CN.md) 和
+[OAuth2 smoke test](docs/OAUTH2_SMOKE_TEST.md)。
 
 ## 安全边界
 
