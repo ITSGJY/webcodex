@@ -2088,9 +2088,42 @@ where
         .ok_or_else(|| format!("{} requires a value", flag))
 }
 
+/// Windows release boundary, evaluated before any command dispatch.
+///
+/// The supported Windows surface is the CLI + hosted/local-profile Runner
+/// talking to a remote Linux WebCodex Server. Operations that require a
+/// long-running local Windows Server (`webcodex server ...`, `webcodex
+/// share`) or a systemd-style service install (`webcodex agent install`)
+/// fail here with a clear platform message instead of reaching server or
+/// service logic that cannot work on Windows. `--help` is exempt so help
+/// output still renders normally; only real execution is blocked.
+#[cfg(windows)]
+fn windows_unsupported_platform_action(args: &[String]) -> Option<&'static str> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        return None;
+    }
+    match args.first().map(String::as_str) {
+        Some("server") | Some("share") => Some(
+            "Windows Server runtime is not supported in this release.\n\
+             Use `webcodex connect` with a remote WebCodex Server.",
+        ),
+        Some("agent") if args.get(1).map(String::as_str) == Some("install") => Some(
+            "Automatic Windows Runner startup is not supported yet.\n\
+             Use `webcodex connect` or `webcodex agent start --profile <name>.",
+        ),
+        _ => None,
+    }
+}
+
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    match cli_action(std::env::args().skip(1)) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(windows)]
+    if let Some(message) = windows_unsupported_platform_action(&args) {
+        eprintln!("{message}");
+        std::process::exit(1);
+    }
+    match cli_action(args) {
         CliAction::Project(args) => {
             let output = webcodex::run_project_command(args).await;
             if !output.stdout.is_empty() {
