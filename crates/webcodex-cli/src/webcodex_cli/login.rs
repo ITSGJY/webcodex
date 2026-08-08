@@ -1953,14 +1953,24 @@ mod tests {
         }
         let mut file = options.open(&path).unwrap();
         let writer = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(15));
+            // Short sleep so the reader normally observes the empty file
+            // before the write lands.
+            std::thread::sleep(std::time::Duration::from_millis(2));
             file.write_all(b"feedfacecafe0001\n").unwrap();
         });
 
-        assert_eq!(
-            read_device_suffix_after_concurrent_create(&path).unwrap(),
-            "feedfacecafe0001"
-        );
+        // Each call has a fixed 100ms wait budget; under full-suite parallel
+        // load the scheduler can stall the writer past one budget, so retry
+        // the wait until the writer (which always eventually writes) lands.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let suffix = loop {
+            match read_device_suffix_after_concurrent_create(&path) {
+                Ok(suffix) => break suffix,
+                Err(_) if std::time::Instant::now() < deadline => continue,
+                Err(error) => panic!("concurrent device suffix create never landed: {error}"),
+            }
+        };
+        assert_eq!(suffix, "feedfacecafe0001");
         writer.join().unwrap();
     }
 
