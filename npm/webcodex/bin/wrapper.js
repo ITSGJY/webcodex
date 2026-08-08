@@ -13,8 +13,10 @@ function packageRoot() {
 }
 
 function nativePath(options = {}) {
+  const platform = options.platform || process.platform;
+  const pathApi = platform === "win32" ? path.win32 : path.posix;
   const root = options.packageRoot || packageRoot();
-  return path.join(root, "vendor", "bin", exeName("webcodex", options.platform));
+  return pathApi.join(root, "vendor", "bin", exeName("webcodex", platform));
 }
 
 function runNative(options = {}) {
