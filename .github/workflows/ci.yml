@@ -43,8 +43,9 @@ jobs:
   test-windows:
     # Windows release gate: the crates that must run natively on Windows 11
     # (CLI, Runner, persistent-shell's fail-closed gate, and the
-    # cross-platform libraries they depend on). The Server and its Unix-only
-    # runtime stay Linux-only.
+    # cross-platform libraries they depend on), the npm distribution checks,
+    # and the full Windows artifact -> npm install smoke. The Server and its
+    # Unix-only runtime stay Linux-only.
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -53,7 +54,20 @@ jobs:
         with:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run tests
         run: cargo test --locked -p webcodex-agent-config -p webcodex-process -p webcodex-persistent-shell -p webcodex-cli -p webcodex-runner
+      - name: Test npm installer and release manifest natively
+        run: npm --prefix npm/webcodex test
+      - name: Windows artifact to npm install smoke
+        # Builds the three Windows binaries, packages the win32-x64 artifact
+        # with the native PowerShell script, installs it through the npm
+        # installer into a temporary prefix, and verifies the wrapper plus
+        # --version/--help and the failure-preserves-old-binaries path. Never
+        # touches the npm registry.
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/npm_install_windows_smoke.ps1
