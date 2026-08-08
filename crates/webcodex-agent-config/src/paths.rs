@@ -367,10 +367,17 @@ mod tests {
             default_client_config_base_dir().is_err(),
             "no usable per-user directory must be an error, never CWD"
         );
-        // On Unix without HOME the derivation must also fail closed; the
-        // temporary-state fallback only applies to the state base.
+        // On Unix, effective root intentionally uses the system config scope
+        // even without HOME; non-root must still fail closed rather than use CWD.
         #[cfg(not(windows))]
-        assert!(default_client_config_base_dir().is_err());
+        if is_effective_root() {
+            assert_eq!(
+                default_client_config_base_dir().unwrap(),
+                PathBuf::from("/etc/webcodex")
+            );
+        } else {
+            assert!(default_client_config_base_dir().is_err());
+        }
     }
 
     #[test]
@@ -437,10 +444,17 @@ mod tests {
         );
         let _x2 = EnvVarRestore::remove("XDG_CONFIG_HOME");
         #[cfg(unix)]
-        assert_eq!(
-            default_client_config_base_dir().unwrap(),
-            PathBuf::from("/home/alice/.config/webcodex")
-        );
+        if is_effective_root() {
+            assert_eq!(
+                default_client_config_base_dir().unwrap(),
+                PathBuf::from("/etc/webcodex")
+            );
+        } else {
+            assert_eq!(
+                default_client_config_base_dir().unwrap(),
+                PathBuf::from("/home/alice/.config/webcodex")
+            );
+        }
         #[cfg(windows)]
         assert_eq!(
             default_client_config_base_dir().unwrap(),

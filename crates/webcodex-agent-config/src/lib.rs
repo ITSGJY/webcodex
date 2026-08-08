@@ -358,7 +358,7 @@ mod tests {
 
     #[test]
     fn effective_allowed_roots_defaults_to_home_when_empty() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = home_allowed_root();
         if let Some(home) = home {
             let roots = effective_allowed_roots(&[], false).unwrap();
@@ -368,7 +368,7 @@ mod tests {
 
     #[test]
     fn effective_allowed_roots_errors_when_empty_and_no_home_and_no_cwd_anywhere() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _h = EnvVarRestore::remove("HOME");
         let _u = EnvVarRestore::remove("USERPROFILE");
         let err = effective_allowed_roots(&[], false).unwrap_err();
@@ -377,7 +377,7 @@ mod tests {
 
     #[test]
     fn effective_allowed_roots_empty_with_cwd_anywhere_returns_empty() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _h = EnvVarRestore::remove("HOME");
         let _u = EnvVarRestore::remove("USERPROFILE");
         let roots = effective_allowed_roots(&[], true).unwrap();
