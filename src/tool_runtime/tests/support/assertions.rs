@@ -47,12 +47,7 @@ pub(in crate::tool_runtime::tests) fn finished_event<'a>(
 /// invocations and never carries patch content, a `cd` prefix, a heredoc,
 /// or an `echo`/`cat` splice of the patch body.
 pub(in crate::tool_runtime::tests) fn assert_safe_patch_command(command: &str, marker: &str) {
-    let allowed = [
-        "git apply --check -",
-        "git apply --check - && echo OK",
-        "git apply --stat -",
-        "git apply -",
-    ];
+    let allowed = ["git apply --check -", "git apply --stat -", "git apply -"];
     assert!(
         allowed.contains(&command),
         "unexpected patch command (must be a fixed git apply invocation): {}",
@@ -73,11 +68,11 @@ pub(in crate::tool_runtime::tests) fn assert_safe_patch_command(command: &str, m
         "command must not use a heredoc: {}",
         command
     );
-    // The only permitted `echo` is the fixed `echo OK` success marker; it
-    // never carries patch content. `cat` must never appear (no splicing).
-    if command.contains("echo ") {
-        assert_eq!(command, "git apply --check - && echo OK");
-    }
+    assert!(
+        !command.contains("echo "),
+        "command must not use echo: {}",
+        command
+    );
     assert!(
         !command.contains("cat "),
         "command must not splice the patch via cat: {}",

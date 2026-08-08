@@ -6548,14 +6548,9 @@ fn dispatch_request_run_shell_sends_result_over_sink() {
     );
 
     type SinkFactory = fn(&str) -> (AgentSink, tokio::sync::mpsc::Receiver<AgentEnvelope>);
-    for (label, make_sink, client_id, cmd) in [
-        ("ws", ws_sink as SinkFactory, "ws-client", "printf wsok"),
-        (
-            "quic",
-            quic_sink as SinkFactory,
-            "quic-client",
-            "printf quic-ok",
-        ),
+    for (label, make_sink, client_id, expected_stdout) in [
+        ("ws", ws_sink as SinkFactory, "ws-client", "wsok"),
+        ("quic", quic_sink as SinkFactory, "quic-client", "quic-ok"),
     ] {
         let (sink, mut rx) = make_sink(client_id);
         let request = ShellAgentShellRequest {
@@ -6572,7 +6567,7 @@ fn dispatch_request_run_shell_sends_result_over_sink() {
             start_line: None,
             end_line: None,
             create_dirs: false,
-            command: cmd.to_string(),
+            command: shell_echo(expected_stdout),
             stdin: None,
             timeout_secs: 10,
             requested_by: "tester".to_string(),
@@ -6600,10 +6595,7 @@ fn dispatch_request_run_shell_sends_result_over_sink() {
             AgentEnvelope::Result { payload } => {
                 assert_eq!(payload.request_id, format!("req-{label}"));
                 assert_eq!(payload.exit_code, Some(0));
-                assert_eq!(
-                    payload.stdout.as_deref(),
-                    Some(cmd.split_whitespace().last().unwrap())
-                );
+                assert_eq!(payload.stdout.as_deref(), Some(expected_stdout));
             }
             other => panic!("{label}: expected result, got {:?}", other.kind()),
         }
@@ -7304,7 +7296,7 @@ fn managed_temporary_project_is_registered_persistent_and_ordinary_project_compa
         &policy,
         &ShellConfig::default(),
         Some(path.to_string_lossy().as_ref()),
-        "printf managed-shell",
+        &shell_echo("managed-shell"),
         None,
         10,
         None,
