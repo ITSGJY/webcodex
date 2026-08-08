@@ -2,6 +2,7 @@ use super::config::{
     default_true, projects_dir, validate_shell_profile_name, AgentConfig, AgentPolicy,
 };
 use super::shell::canonicalize_existing;
+use webcodex_agent_config::paths::{path_is_within, paths_equal};
 use crate::shell_protocol::{ShellAgentProjectSummary, ShellAgentShellRequest};
 use crate::{err_cmd, ok_cmd, write_created_file};
 use crate::{CommandResult, CreatedProjectPaths};
@@ -219,7 +220,10 @@ pub(crate) fn find_project_shell_context(
         .into_iter()
         .filter_map(|project| {
             let project_path = PathBuf::from(&project.path).canonicalize().ok()?;
-            if cwd == project_path || cwd.starts_with(&project_path) {
+            // Windows filesystems are case-insensitive and `canonicalize` may
+            // return `\\?\`-prefixed paths, so containment uses the shared
+            // path identity rules instead of raw `==`/`starts_with`.
+            if webcodex_agent_config::paths::path_is_within(&cwd, &project_path) {
                 Some((project_path.components().count(), project))
             } else {
                 None
@@ -702,9 +706,35 @@ impl AgentProjectCache {
 /// explicitly under an `allowed_roots` entry. Even when `allow_cwd_anywhere`
 /// is true, these roots are rejected to prevent accidental registration of
 /// critical system paths.
+///
+/// On Windows the Unix entries can never match (a canonical Windows path has a
+/// drive prefix) and the Windows entries guard the OS/Program Files trees; any
+/// drive root (`C:\`, `D:\`, ...) is rejected by `is_windows_drive_root`.
 const DANGEROUS_PROJECT_ROOTS: &[&str] = &[
     "/", "/etc", "/bin", "/sbin", "/usr", "/var", "/proc", "/sys", "/dev", "/run", "/boot",
+    #[cfg(windows)]
+    "C:\\Windows",
+    #[cfg(windows)]
+    "C:\\Program Files",
+    #[cfg(windows)]
+    "C:\\Program Files (x86)",
 ];
+
+/// True when `canonical_path` is a drive root like `C:\` (any drive letter).
+#[cfg(windows)]
+fn is_windows_drive_root(canonical_path: &Path) -> bool {
+    let mut components = canonical_path.components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Prefix(_)), Some(std::path::Component::RootDir))
+            if components.next().is_none()
+    )
+}
+
+#[cfg(not(windows))]
+fn is_windows_drive_root(_canonical_path: &Path) -> bool {
+    false
+}
 
 /// Escape a string for use as a TOML basic string (double-quoted). NUL is
 /// rejected up front by validation, so we only handle backslash, quote, and
@@ -837,7 +867,9 @@ pub(crate) fn validate_project_path_policy(
     // If under an explicit allowed_root, always allow.
     for root in &policy.allowed_roots {
         if let Ok(canonical_root) = canonicalize_existing(root) {
-            if canonical_path == &canonical_root || canonical_path.starts_with(&canonical_root) {
+            // Case-insensitive component-wise containment on Windows so
+            // `C:\Users\Alice` roots match `c:\users\alice\proj` projects.
+            if webcodex_agent_config::paths::path_is_within(canonical_path, &canonical_root) {
                 return Ok(());
             }
         }
@@ -852,9 +884,9 @@ pub(crate) fn validate_project_path_policy(
     for &dangerous in DANGEROUS_PROJECT_ROOTS {
         let dangerous_root = Path::new(dangerous);
         let is_dangerous = if dangerous_root == Path::new("/") {
-            canonical_path == dangerous_root
+            paths_equal(canonical_path, dangerous_root)
         } else {
-            canonical_path == dangerous_root || canonical_path.starts_with(dangerous_root)
+            webcodex_agent_config::paths::path_is_within(canonical_path, dangerous_root)
         };
         if is_dangerous {
             return Err(format!(
@@ -862,6 +894,12 @@ pub(crate) fn validate_project_path_policy(
                 path_str
             ));
         }
+    }
+    if is_windows_drive_root(canonical_path) {
+        return Err(format!(
+            "path {} is a Windows drive root; register it under an explicit allowed_roots entry if intended",
+            path_str
+        ));
     }
     Ok(())
 }
@@ -911,9 +949,26 @@ fn sync_parent_dir(path: &Path) -> Result<(), String> {
     let dir = path
         .parent()
         .ok_or_else(|| "project config has no parent".to_string())?;
-    std::fs::File::open(dir)
-        .and_then(|file| file.sync_all())
-        .map_err(|e| format!("failed to sync project registry directory: {e}"))
+    sync_dir(dir)
+}
+
+fn sync_dir(dir: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        // Opening a directory with `File::open` fails on Windows (it needs
+        // FILE_FLAG_BACKUP_SEMANTICS, which std does not expose), and NTFS
+        // metadata durability does not rely on directory fsync the way
+        // POSIX filesystems do. The rename is already atomic; skip the
+        // directory sync here.
+        let _ = dir;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::File::open(dir)
+            .and_then(|file| file.sync_all())
+            .map_err(|e| format!("failed to sync project registry directory: {e}"))
+    }
 }
 
 fn unique_registry_temp(dir: &Path, id: &str, suffix: &str) -> PathBuf {
@@ -1014,7 +1069,8 @@ fn projects_matching_canonical_path(
         .iter()
         .filter_map(|project| {
             let registered_path = canonicalize_existing(Path::new(&project.path)).ok()?;
-            (registered_path.is_dir() && registered_path == canonical_path).then(|| project.clone())
+            (registered_path.is_dir() && paths_equal(&registered_path, canonical_path))
+                .then(|| project.clone())
         })
         .collect()
 }
@@ -1077,7 +1133,9 @@ fn canonical_project_path_hash(canonical_path: &Path) -> String {
     #[cfg(not(unix))]
     format!(
         "{:x}",
-        Sha256::digest(canonical_path.to_string_lossy().as_bytes())
+        Sha256::digest(
+            webcodex_agent_config::paths::normalize_path_identity(canonical_path).as_bytes()
+        )
     )
 }
 
@@ -1428,9 +1486,7 @@ fn cleanup_unregister_tombstones(projects_dir: &Path, id: &str) -> Result<(), St
         }
     }
     if changed {
-        std::fs::File::open(projects_dir)
-            .and_then(|file| file.sync_all())
-            .map_err(|e| format!("failed to sync project registry directory: {e}"))?;
+        sync_dir(projects_dir)?;
     }
     Ok(())
 }
@@ -1592,7 +1648,7 @@ fn matching_existing_project(
     let content = std::fs::read_to_string(&config_path).map_err(|_| "operation_failed")?;
     let project = parse_agent_project_toml(&content).map_err(|_| "operation_failed")?;
     let matches = project.id == id
-        && project.path == path
+        && paths_equal(Path::new(&project.path), Path::new(path))
         && project.name.as_deref() == Some(name)
         && project.description.as_deref() == description
         && project.allow_patch == allow_patch
@@ -1888,7 +1944,10 @@ pub(crate) fn handle_project_op_with_temporary_projects_root(
             return err_cmd(start, e);
         }
     }
-    if path.is_empty() || path.contains('\0') || !path.starts_with('/') {
+    // `Path::is_absolute` is platform-correct: drive-letter and UNC paths
+    // (`C:\foo`, `\\server\share`) are absolute on Windows; bare `foo` or
+    // drive-relative `/foo` are not.
+    if path.is_empty() || path.contains('\0') || !Path::new(&path).is_absolute() {
         return err_cmd(start, "path must be a non-empty absolute path".to_string());
     }
 
@@ -2197,6 +2256,11 @@ pub(crate) fn handle_project_op_with_temporary_projects_root(
 mod durability_tests {
     use super::*;
 
+    /// Unix-only: verifies the POSIX directory-fsync contract (opening a
+    /// directory as a file). On Windows directory sync is intentionally
+    /// skipped because std cannot open directories with the required
+    /// FILE_FLAG_BACKUP_SEMANTICS.
+    #[cfg(unix)]
     #[test]
     fn registry_parent_sync_failures_are_not_ignored() {
         let tmp = tempfile::tempdir().unwrap();

@@ -6,6 +6,46 @@ use crate::webcodex_runner::{
 };
 static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// RAII restore for environment variables mutated by tests: restores the
+/// previous value (or absence) on drop, even when the test panics, so a
+/// failure cannot leak env state into later tests.
+struct EnvGuard {
+    restored: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl EnvGuard {
+    fn new() -> Self {
+        EnvGuard { restored: Vec::new() }
+    }
+
+    fn set(mut self, name: &'static str, value: &str) -> Self {
+        self.capture(name);
+        std::env::set_var(name, value);
+        self
+    }
+
+    fn remove(mut self, name: &'static str) -> Self {
+        self.capture(name);
+        std::env::remove_var(name);
+        self
+    }
+
+    fn capture(&mut self, name: &'static str) {
+        self.restored.push((name, std::env::var_os(name)));
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in self.restored.drain(..).rev() {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
 /// Policy for tests that exercise shell/profile behavior inside a temp dir
 /// rather than the filesystem boundary itself. `AgentPolicy::default()` is
 /// now fail-closed (empty `allowed_roots` reaches nothing), so these tests
@@ -330,6 +370,10 @@ client_id = "{client_id}"
 owner = "alice"
 poll_interval_ms = 1000
 {max_jobs}
+# Explicit projects_dir: load_config materializes the default from the
+# per-user config base, which depends on ambient HOME/USERPROFILE that other
+# tests mutate.
+projects_dir = "projects.d"
 policy.allow_raw_shell = true
 policy.allow_cwd_anywhere = true
 policy.allowed_roots = ["/"]
@@ -1684,8 +1728,7 @@ fn shell_config_default_environment_is_inherited() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = test_config(tmp.path().join("config/projects.d"));
     let cwd = tmp.path().to_string_lossy().to_string();
-    let saved = std::env::var_os("WEBCODEX_INHERITED_TEST");
-    std::env::set_var("WEBCODEX_INHERITED_TEST", "inherited-ok");
+    let _env = EnvGuard::new().set("WEBCODEX_INHERITED_TEST", "inherited-ok");
     let result = run_shell(
         &cfg.policy,
         &ShellConfig::default(),
@@ -1695,10 +1738,6 @@ fn shell_config_default_environment_is_inherited() {
         10,
         None,
     );
-    match saved {
-        Some(value) => std::env::set_var("WEBCODEX_INHERITED_TEST", value),
-        None => std::env::remove_var("WEBCODEX_INHERITED_TEST"),
-    }
     assert_eq!(result.exit_code, Some(0), "{result:?}");
     assert_eq!(result.stdout.as_deref(), Some("inherited-ok"));
 }
@@ -4389,8 +4428,7 @@ fn shell_job_filters_sensitive_env_case_insensitive() {
         "Authorization",
         "webcodex_agent_token",
     ] {
-        let saved = std::env::var_os(spelling);
-        std::env::set_var(spelling, "secret-token");
+        let _env = EnvGuard::new().set(spelling, "secret-token");
         let result = run_shell(
             &cfg.policy,
             &ShellConfig::default(),
@@ -4400,10 +4438,6 @@ fn shell_job_filters_sensitive_env_case_insensitive() {
             10,
             None,
         );
-        match saved {
-            Some(value) => std::env::set_var(spelling, value),
-            None => std::env::remove_var(spelling),
-        }
         assert_eq!(result.exit_code, Some(0), "{result:?}");
         assert_eq!(result.stdout.as_deref(), Some("absent"), "{result:?}");
     }
@@ -6955,12 +6989,18 @@ fn resolve_or_register_project_rejects_invalid_non_directory_and_disallowed_path
         allowed_roots: Vec::new(),
         ..AgentPolicy::default()
     };
+    // Dangerous system roots are platform-specific: `/etc` on Unix,
+    // `C:\Windows` on Windows (drive roots are also rejected).
+    #[cfg(windows)]
+    let dangerous_path = "C:\\Windows";
+    #[cfg(not(windows))]
+    let dangerous_path = "/etc";
     let dangerous = project_error_value(handle_resolve_or_register_project(
         &unrestricted,
         &projects_dir,
         &project_request(
             "resolve_or_register_project",
-            serde_json::json!({"path": "/etc"}),
+            serde_json::json!({"path": dangerous_path}),
         ),
     ));
     assert_eq!(dangerous["error_kind"], "path_outside_allowed_roots");
@@ -7019,10 +7059,13 @@ fn auto_project_id_collision_extends_hash_without_overwriting() {
     std::fs::create_dir(&other_dir).unwrap();
     std::fs::create_dir(&projects_dir).unwrap();
     let canonical = project_dir.canonicalize().unwrap();
-    let digest = format!(
-        "{:x}",
-        Sha256::digest(canonical.to_string_lossy().as_bytes())
-    );
+    // Match the Runner's project identity: raw bytes on Unix, normalized
+    // (lowercased, `\\?\` stripped) on Windows.
+    #[cfg(windows)]
+    let identity = webcodex_agent_config::paths::normalize_path_identity(&canonical);
+    #[cfg(not(windows))]
+    let identity = canonical.to_string_lossy().to_string();
+    let digest = format!("{:x}", Sha256::digest(identity.as_bytes()));
     let colliding_id = format!("repo-{}", &digest[..8]);
     let colliding_config = format!(
         "id = {:?}\npath = {:?}\n",
@@ -7568,8 +7611,12 @@ fn load_config_explicit_allowed_roots_override_home_default() {
 #[test]
 fn load_config_empty_roots_without_home_and_no_cwd_anywhere_errors() {
     let _guard = agent_init::TEST_ENV_LOCK.lock().unwrap();
-    let saved = std::env::var_os("HOME");
-    std::env::remove_var("HOME");
+    // Windows derives the allowed-root default from USERPROFILE, so both
+    // home sources must be absent to exercise the fail-closed branch.
+    let _env = EnvGuard::new()
+        .remove("HOME")
+        .remove("USERPROFILE")
+        .remove("APPDATA");
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("agent.toml");
     std::fs::write(
@@ -7580,10 +7627,6 @@ fn load_config_empty_roots_without_home_and_no_cwd_anywhere_errors() {
     .unwrap();
     let err = load_config(&path).unwrap_err();
     assert!(err.contains("allowed_roots is empty"));
-    match saved {
-        Some(v) => std::env::set_var("HOME", v),
-        None => std::env::remove_var("HOME"),
-    }
 }
 
 #[test]

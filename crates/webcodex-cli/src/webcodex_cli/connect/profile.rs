@@ -284,9 +284,12 @@ fn read_project_files(projects_dir: &Path) -> Result<Vec<(PathBuf, ProjectFile)>
 }
 
 fn stored_project_matches(project: &ProjectFile, canonical_project: &Path) -> bool {
-    Path::new(&project.path)
-        .canonicalize()
-        .is_ok_and(|path| path == canonical_project)
+    Path::new(&project.path).canonicalize().is_ok_and(|path| {
+        // Windows `canonicalize` can return `\\?\`-prefixed extended paths and
+        // the filesystem is case-insensitive, so identity uses the shared
+        // normalization instead of raw `Path` equality.
+        webcodex_agent_config::paths::paths_equal(&path, canonical_project)
+    })
 }
 
 fn recover_key_for_project(
