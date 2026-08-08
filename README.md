@@ -23,7 +23,7 @@ toolchains installed on the machine that owns the project.
 
 ## Quick start
 
-Supported package platforms are Linux x64, Linux arm64, and macOS arm64. The
+Supported package platforms are Linux x64, Linux arm64, macOS arm64, and Windows x64. The
 npm installer requires Node.js 18 or newer.
 
 ```bash

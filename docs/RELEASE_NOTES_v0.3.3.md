@@ -66,18 +66,21 @@ clients. Clients that cache tool schemas should refresh them after upgrading.
 
 ## Binary packaging
 
-The planned release artifacts are:
+The v0.3.3 release artifacts are:
 
 - `webcodex-v0.3.3-linux-x64.tar.gz`
 - `webcodex-v0.3.3-linux-arm64.tar.gz`
 - `webcodex-v0.3.3-darwin-arm64.tar.gz`
 - `webcodex-v0.3.3-win32-x64.tar.gz`
 
-Each artifact must contain `webcodex`, `webcodex-server`, and
-`webcodex-runner` built natively from the exact immutable `v0.3.3` tag. Real
-SHA-256 checksums are recorded only after the exact release assets have been
-built and verified; the npm package must not be published before those checksums
-replace the release-manifest placeholders.
+Each artifact was built natively from the exact immutable `v0.3.3` tag and
+contains the three runtime binaries (`.exe` on Windows). The SHA-256 values of
+the exact upload candidates are:
+
+- `linux-x64`: `9b41648a2ca22a2919a47fd52db8a2e9c88b605b8afc9f378929922d3227ffa4`
+- `linux-arm64`: `305eeca72321cca19632cecf9780dcb60a6719291e9ca76bb48a8b00924fb88c`
+- `darwin-arm64`: `bd2ad416d21115248a0473afb186048151de7b407bbfd8eff6f1bb60d09429eb`
+- `win32-x64`: `de44975c7abe5e3947bb486b2fe9172840dcbe3faec07633d8512b72efb790c2`
 
 ## Known limitations
 

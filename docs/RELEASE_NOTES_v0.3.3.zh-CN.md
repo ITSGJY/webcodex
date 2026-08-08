@@ -59,17 +59,20 @@ MCP 2025-06-18 initialize/session 行为继续保留。缓存 tool schema 的 cl
 
 ## Binary 打包
 
-计划发布的 artifacts：
+v0.3.3 release artifacts：
 
 - `webcodex-v0.3.3-linux-x64.tar.gz`
 - `webcodex-v0.3.3-linux-arm64.tar.gz`
 - `webcodex-v0.3.3-darwin-arm64.tar.gz`
 - `webcodex-v0.3.3-win32-x64.tar.gz`
 
-每个 artifact 都必须在对应 native release host 上从同一个不可变 `v0.3.3` tag
-构建，并包含 `webcodex`、`webcodex-server` 和 `webcodex-runner`。真实 SHA-256
-只会在 exact release assets 完成构建和验证后写入；在这些 checksum 替换 release
-manifest placeholder 之前，不得发布 npm package。
+四个 artifact 都已在对应 native release host 上从同一个不可变 `v0.3.3` tag 构建，
+并包含三项 runtime binary（Windows 为 `.exe`）。exact upload candidates 的 SHA-256：
+
+- `linux-x64`: `9b41648a2ca22a2919a47fd52db8a2e9c88b605b8afc9f378929922d3227ffa4`
+- `linux-arm64`: `305eeca72321cca19632cecf9780dcb60a6719291e9ca76bb48a8b00924fb88c`
+- `darwin-arm64`: `bd2ad416d21115248a0473afb186048151de7b407bbfd8eff6f1bb60d09429eb`
+- `win32-x64`: `de44975c7abe5e3947bb486b2fe9172840dcbe3faec07633d8512b72efb790c2`
 
 ## 已知限制
 
