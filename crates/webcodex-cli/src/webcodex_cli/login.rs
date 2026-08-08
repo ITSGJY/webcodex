@@ -575,6 +575,7 @@ pub(crate) fn stage_connection(
 
 const ROOT_AGENT_INSTALL_REASON: &str = "login ran as root; no safe systemd installation argv can be generated without explicitly selecting a non-root Runner user and validating access to the agent config, working directory, projects directory, and allowed roots";
 const ROOT_FOREGROUND_REASON: &str = "login ran as root; no foreground Runner argv is emitted because it would execute project commands as root";
+const WINDOWS_AGENT_INSTALL_REASON: &str = "automatic Windows Runner service installation is not supported in this release; start the foreground Runner shown above instead";
 
 pub(crate) fn render_login_result(
     paths: &ConnectionPaths,
@@ -592,7 +593,7 @@ pub(crate) fn render_login_result(
             paths.agent_config.to_string_lossy().into_owned(),
         ]
     });
-    let agent_install_argv = if effective_root {
+    let agent_install_argv = if effective_root || cfg!(windows) {
         None
     } else {
         Some(vec![
@@ -604,6 +605,13 @@ pub(crate) fn render_login_result(
             "--config".to_string(),
             paths.agent_config.to_string_lossy().into_owned(),
         ])
+    };
+    let agent_install_reason = if effective_root {
+        Some(ROOT_AGENT_INSTALL_REASON)
+    } else if cfg!(windows) {
+        Some(WINDOWS_AGENT_INSTALL_REASON)
+    } else {
+        None
     };
     let foreground_command = foreground_argv.as_ref().map(|argv| shell_command(argv));
     let agent_install_command = agent_install_argv.as_ref().map(|argv| shell_command(argv));
@@ -636,7 +644,7 @@ pub(crate) fn render_login_result(
             "foreground_reason": effective_root.then_some(ROOT_FOREGROUND_REASON),
             "agent_install_available": agent_install_argv.is_some(),
             "agent_install_argv": &agent_install_argv,
-            "agent_install_reason": effective_root.then_some(ROOT_AGENT_INSTALL_REASON),
+            "agent_install_reason": agent_install_reason,
             "next_steps": next_steps,
         });
         return serde_json::to_string_pretty(&summary).map_err(|error| error.to_string());
@@ -666,6 +674,10 @@ pub(crate) fn render_login_result(
         (Some(foreground_command), Some(command)) => format!(
             "Start the agent in the foreground:\n  {foreground_command}\n\n\
              Or install it as a non-root user service (run as the same ordinary user):\n  {command}\n"
+        ),
+        (Some(foreground_command), None) => format!(
+            "Start the agent in the foreground:\n  {foreground_command}\n\n{}\n",
+            agent_install_reason.unwrap_or("automatic Runner service installation is unavailable")
         ),
         (None, None) => "Login ran as root, so no command to start a root Runner is recommended.\n\
                         Recommended: have the ordinary local user who will run the Runner use a fresh pairing code to execute `webcodex login`, then install the user service as that same user.\n\
@@ -2154,12 +2166,17 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("webcodex agent install --scope user --config"),
+            (!cfg!(windows) && text.contains("webcodex agent install --scope user --config"))
+                || (cfg!(windows) && !text.contains("webcodex agent install")),
             "{text}"
         );
         assert!(
-            text.contains("same ordinary user"),
+            cfg!(windows) || text.contains("same ordinary user"),
             "non-root guidance was not explicit: {text}"
+        );
+        assert!(
+            !cfg!(windows) || text.contains(WINDOWS_AGENT_INSTALL_REASON),
+            "Windows login did not explain the service-install boundary: {text}"
         );
         assert!(!text.contains(USER_TOKEN), "default text leaked a token");
         assert!(!text.contains(AGENT_TOKEN), "default text leaked a token");
@@ -2188,6 +2205,18 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             paths.user_token.to_str()
         );
+        if cfg!(windows) {
+            assert_eq!(
+                json_value["agent_install_available"],
+                serde_json::json!(false)
+            );
+            assert!(json_value["agent_install_argv"].is_null());
+            assert_eq!(
+                json_value["agent_install_reason"],
+                serde_json::json!(WINDOWS_AGENT_INSTALL_REASON)
+            );
+            assert_eq!(json_value["next_steps"].as_array().unwrap().len(), 1);
+        }
         assert!(!json.contains(USER_TOKEN), "json leaked a token");
         assert!(!json.contains(AGENT_TOKEN), "json leaked a token");
     }
@@ -2221,7 +2250,15 @@ mod tests {
         )
         .unwrap();
         assert!(text.contains(&shell_command(&foreground_argv)), "{text}");
-        assert!(text.contains(&shell_command(&install_argv)), "{text}");
+        assert_eq!(
+            text.contains(&shell_command(&install_argv)),
+            !cfg!(windows),
+            "{text}"
+        );
+        assert!(
+            !cfg!(windows) || text.contains(WINDOWS_AGENT_INSTALL_REASON),
+            "{text}"
+        );
 
         let json_text = render_login_result(
             &paths,
@@ -2237,22 +2274,49 @@ mod tests {
         assert_eq!(value["foreground_available"], serde_json::json!(true));
         assert_eq!(value["foreground_argv"], serde_json::json!(foreground_argv));
         assert!(value["foreground_reason"].is_null());
-        assert_eq!(value["agent_install_argv"], serde_json::json!(install_argv));
-        assert_eq!(value["agent_install_available"], serde_json::json!(true));
-        assert!(value["agent_install_reason"].is_null());
+        assert_eq!(
+            value["agent_install_argv"],
+            if cfg!(windows) {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(install_argv)
+            }
+        );
+        assert_eq!(
+            value["agent_install_available"],
+            serde_json::json!(!cfg!(windows))
+        );
+        if cfg!(windows) {
+            assert_eq!(
+                value["agent_install_reason"],
+                serde_json::json!(WINDOWS_AGENT_INSTALL_REASON)
+            );
+        } else {
+            assert!(value["agent_install_reason"].is_null());
+        }
         assert_eq!(
             value["next_steps"][0].as_str().unwrap(),
             shell_command(&foreground_argv)
         );
         assert_eq!(
-            value["next_steps"][1].as_str().unwrap(),
-            shell_command(&install_argv)
+            value["next_steps"]
+                .get(1)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+            if cfg!(windows) {
+                String::new()
+            } else {
+                shell_command(&install_argv)
+            }
         );
         assert!(!json_text.contains(USER_TOKEN));
         assert!(!json_text.contains(AGENT_TOKEN));
 
-        let recommended_argv: Vec<String> =
-            serde_json::from_value(value["agent_install_argv"].clone()).unwrap();
+        let recommended_argv: Vec<String> = if cfg!(windows) {
+            install_argv.clone()
+        } else {
+            serde_json::from_value(value["agent_install_argv"].clone()).unwrap()
+        };
         let parser_env = tempfile::TempDir::new().unwrap();
         std::fs::write(parser_env.path().join("webcodex-runner"), "").unwrap();
         #[cfg(windows)]
