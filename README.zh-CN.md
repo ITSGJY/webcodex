@@ -22,7 +22,7 @@ WebCodex 把 ChatGPT、Claude 和其他 MCP 客户端连接到你的本地仓库
 
 ## 三步开始
 
-当前 package 支持 Linux x64、Linux arm64 和 macOS arm64；npm installer 需要
+当前 package 支持 Linux x64、Linux arm64、macOS arm64 和 Windows x64；npm installer 需要
 Node.js 18 或更新版本。
 
 ```bash
