@@ -11,6 +11,7 @@ use crate::tool_runtime::kernel::{
 };
 use crate::tool_runtime::tool_definition::LOCAL_CODING_TOOL_NAMES;
 use crate::tool_runtime::{registered_tool_specs, ToolResult, ToolRuntime, ToolSpec};
+use base64::engine::general_purpose;
 use salvo::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -18,6 +19,13 @@ use std::sync::Arc;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const MCP_STATELESS_PROTOCOL_VERSION: &str = "2026-07-28";
+const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
+const MCP_METHOD_HEADER: &str = "mcp-method";
+const MCP_NAME_HEADER: &str = "mcp-name";
+const MCP_HEADER_MISMATCH: i64 = -32020;
+const MCP_UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+const MCP_SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+    &[MCP_STATELESS_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION];
 
 /// Single source of truth for the JSON-RPC methods advertised by `GET /mcp`.
 /// Must match the dispatch arms in `handle_mcp_request_with_lifecycle`;
@@ -57,6 +65,12 @@ struct McpToolCallParams {
     pub name: String,
     #[serde(default)]
     pub arguments: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpProtocolEra {
+    Legacy,
+    Stateless2026,
 }
 
 fn runtime(depot: &Depot) -> Option<Arc<ToolRuntime>> {
@@ -99,12 +113,190 @@ fn project_from_tool_call_params(params: &Value) -> Option<String> {
     params["arguments"]["project"].as_str().map(str::to_string)
 }
 
-fn request_uses_stateless_protocol(params: &Value) -> bool {
+fn request_protocol_version(params: &Value) -> Option<&str> {
     params
         .get("_meta")
         .and_then(|meta| meta.get("io.modelcontextprotocol/protocolVersion"))
         .and_then(Value::as_str)
-        == Some(MCP_STATELESS_PROTOCOL_VERSION)
+}
+
+fn request_client_capabilities(params: &Value) -> Option<&Value> {
+    params
+        .get("_meta")
+        .and_then(|meta| meta.get("io.modelcontextprotocol/clientCapabilities"))
+}
+
+fn request_client_info_is_valid(params: &Value) -> bool {
+    let Some(meta) = params.get("_meta").and_then(Value::as_object) else {
+        return true;
+    };
+    let Some(client_info) = meta.get("io.modelcontextprotocol/clientInfo") else {
+        return true;
+    };
+    let Some(client_info) = client_info.as_object() else {
+        return false;
+    };
+    client_info.get("name").is_some_and(Value::is_string)
+        && client_info.get("version").is_some_and(Value::is_string)
+}
+
+fn request_header<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
+    req.headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+}
+
+fn decode_mcp_name_header(value: &str) -> Result<String, ()> {
+    let Some(encoded) = value
+        .strip_prefix("=?base64?")
+        .and_then(|value| value.strip_suffix("?="))
+    else {
+        return Ok(value.to_string());
+    };
+    let bytes = base64::Engine::decode(&general_purpose::STANDARD, encoded).map_err(|_| ())?;
+    String::from_utf8(bytes).map_err(|_| ())
+}
+
+fn request_mcp_name(request: &JsonRpcRequest) -> Option<Option<&str>> {
+    match request.method.as_str() {
+        "tools/call" | "prompts/get" => Some(request.params.get("name").and_then(Value::as_str)),
+        "resources/read" => Some(request.params.get("uri").and_then(Value::as_str)),
+        _ => None,
+    }
+}
+
+fn header_mismatch(id: Option<Value>, message: impl Into<String>) -> Value {
+    rpc_error(id, MCP_HEADER_MISMATCH, message)
+}
+
+fn unsupported_protocol_version(id: Option<Value>, requested: &str) -> Value {
+    rpc_error_with_data(
+        id,
+        MCP_UNSUPPORTED_PROTOCOL_VERSION,
+        format!("Unsupported MCP protocol version: {requested}"),
+        json!({
+            "supported": MCP_SUPPORTED_PROTOCOL_VERSIONS,
+            "requested": requested,
+        }),
+    )
+}
+
+fn inferred_protocol_era(request: &JsonRpcRequest) -> McpProtocolEra {
+    if request_protocol_version(&request.params) == Some(MCP_STATELESS_PROTOCOL_VERSION) {
+        McpProtocolEra::Stateless2026
+    } else {
+        McpProtocolEra::Legacy
+    }
+}
+
+/// Validate the HTTP-only request metadata introduced by MCP 2026-07-28.
+/// Requests with no modern markers retain the existing 2025-06-18 behavior.
+fn validate_http_protocol(
+    req: &Request,
+    request: &JsonRpcRequest,
+) -> Result<McpProtocolEra, Value> {
+    let id = request.id.clone();
+    let header_version = request_header(req, MCP_PROTOCOL_VERSION_HEADER);
+    let body_version = request_protocol_version(&request.params);
+
+    if let (Some(header), Some(body)) = (header_version, body_version) {
+        if header != body {
+            return Err(header_mismatch(
+                id.clone(),
+                format!(
+                    "Header mismatch: {MCP_PROTOCOL_VERSION_HEADER} header value '{header}' does not match params._meta protocolVersion '{body}'"
+                ),
+            ));
+        }
+    }
+
+    for requested in [header_version, body_version].into_iter().flatten() {
+        if !MCP_SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) {
+            return Err(unsupported_protocol_version(id.clone(), requested));
+        }
+    }
+
+    let stateless = header_version == Some(MCP_STATELESS_PROTOCOL_VERSION)
+        || body_version == Some(MCP_STATELESS_PROTOCOL_VERSION);
+    if !stateless {
+        return Ok(McpProtocolEra::Legacy);
+    }
+
+    if header_version != Some(MCP_STATELESS_PROTOCOL_VERSION) {
+        return Err(header_mismatch(
+            id,
+            format!(
+                "Header mismatch: {MCP_PROTOCOL_VERSION_HEADER} is required and must equal {MCP_STATELESS_PROTOCOL_VERSION}"
+            ),
+        ));
+    }
+    if body_version != Some(MCP_STATELESS_PROTOCOL_VERSION) {
+        return Err(header_mismatch(
+            id,
+            format!(
+                "Header mismatch: {MCP_PROTOCOL_VERSION_HEADER} does not match params._meta protocolVersion"
+            ),
+        ));
+    }
+    if request.id.is_some() {
+        if !request_client_capabilities(&request.params).is_some_and(Value::is_object) {
+            return Err(rpc_error(
+                id.clone(),
+                -32602,
+                "Invalid params: MCP 2026-07-28 requests require params._meta clientCapabilities",
+            ));
+        }
+        if !request_client_info_is_valid(&request.params) {
+            return Err(rpc_error(
+                id,
+                -32602,
+                "Invalid params: params._meta clientInfo must contain string name and version fields when present",
+            ));
+        }
+    }
+
+    match request_header(req, MCP_METHOD_HEADER) {
+        Some(method) if method == request.method => {}
+        Some(method) => {
+            return Err(header_mismatch(
+                id,
+                format!(
+                    "Header mismatch: Mcp-Method header value '{method}' does not match body value '{}'",
+                    request.method
+                ),
+            ));
+        }
+        None => {
+            return Err(header_mismatch(
+                id,
+                "Header mismatch: required Mcp-Method header is missing or malformed",
+            ));
+        }
+    }
+
+    if let Some(body_name) = request_mcp_name(request) {
+        let header_name = request_header(req, MCP_NAME_HEADER)
+            .and_then(|value| decode_mcp_name_header(value).ok());
+        match (header_name.as_deref(), body_name) {
+            (Some(header), Some(body)) if header == body => {}
+            (Some(header), Some(body)) => {
+                return Err(header_mismatch(
+                    id,
+                    format!(
+                        "Header mismatch: Mcp-Name header value '{header}' does not match body value '{body}'"
+                    ),
+                ));
+            }
+            _ => {
+                return Err(header_mismatch(
+                    id,
+                    "Header mismatch: required Mcp-Name header is missing, malformed, or has no matching body value",
+                ));
+            }
+        }
+    }
+
+    Ok(McpProtocolEra::Stateless2026)
 }
 
 fn mcp_stateless_result(mut result: Value, cacheable: bool) -> Value {
@@ -295,6 +487,8 @@ enum McpOutcome {
     Ok(Value),
     /// A JSON-RPC protocol error. HTTP 400 with the error body.
     BadRequest(Value),
+    /// A modern MCP method is not implemented. HTTP 404 with JSON-RPC -32601.
+    NotFound(Value),
     /// A JSON-RPC notification (request without an `id` member). Per the
     /// JSON-RPC 2.0 and MCP specs the server MUST NOT reply with a
     /// JSON-RPC response body. The HTTP wrapper acknowledges with 202 and
@@ -309,7 +503,17 @@ enum McpOutcome {
 }
 
 #[handler]
-pub async fn mcp_info(depot: &mut Depot, res: &mut Response) {
+pub async fn mcp_info(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    if let Err((status, _, message)) = crate::auth::require_same_origin(req) {
+        let status = StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN);
+        res.status_code(status);
+        res.render(json_error(status, message));
+        return;
+    }
+    if request_header(req, MCP_PROTOCOL_VERSION_HEADER) == Some(MCP_STATELESS_PROTOCOL_VERSION) {
+        res.status_code(StatusCode::METHOD_NOT_ALLOWED);
+        return;
+    }
     let auth_required = crate::auth::get_config(depot)
         .map(|c| c.is_auth_enabled())
         .unwrap_or(false);
@@ -357,6 +561,28 @@ pub async fn mcp_info(depot: &mut Depot, res: &mut Response) {
 pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let mut guard = ToolRequestLifecycle::new("mcp", new_trace_id(), "-", "POST /mcp", None);
     guard.received();
+
+    if let Err((status, _, message)) = crate::auth::require_json_same_origin(req) {
+        let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST);
+        guard.parsed("http_validation_error");
+        guard.response_serialized(
+            status.as_u16(),
+            None,
+            Some(false),
+            None,
+            "http_validation_error",
+        );
+        res.status_code(status);
+        res.render(json_error(status, message));
+        guard.handler_returned(
+            status.as_u16(),
+            None,
+            Some(false),
+            None,
+            "http_validation_error",
+        );
+        return;
+    }
 
     let Some(runtime) = runtime(depot) else {
         // Size unknown without building the json_error body for measurement.
@@ -411,8 +637,28 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
         None
     };
     guard.set_tool_name(tool_name.clone());
+    let protocol_era = match validate_http_protocol(req, &request) {
+        Ok(protocol_era) => protocol_era,
+        Err(body) => {
+            guard.parsed("protocol_error");
+            let estimated = estimate_json_bytes(&body);
+            guard.response_serialized(400, estimated, Some(false), None, "protocol_error");
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(body));
+            guard.handler_returned(400, estimated, Some(false), None, "protocol_error");
+            return;
+        }
+    };
     guard.parsed("ok");
-    let window = crate::client_window::mcp_window(req, request.method == "initialize");
+    let window = match protocol_era {
+        McpProtocolEra::Legacy => {
+            crate::client_window::mcp_window(req, request.method == "initialize")
+        }
+        McpProtocolEra::Stateless2026 => crate::client_window::McpWindow {
+            identity: None,
+            issued_session_id: None,
+        },
+    };
 
     // Chat-window MCP tool calls must land in the action audit exactly like
     // the REST surface (they were previously invisible there). Summary-level
@@ -452,6 +698,7 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
             connector.as_deref(),
             request,
             auth.as_ref(),
+            protocol_era,
             window.identity.as_ref(),
             Some(&mut guard),
         ),
@@ -526,6 +773,18 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
             res.render(Json(body));
             guard.handler_returned(400, estimated, Some(false), None, "bad_request");
         }
+        McpOutcome::NotFound(body) => {
+            record_audit(
+                false,
+                StatusCode::NOT_FOUND,
+                body["error"]["message"].as_str().map(str::to_string),
+            );
+            let estimated = estimate_json_bytes(&body);
+            guard.response_serialized(404, estimated, Some(false), None, "not_found");
+            res.status_code(StatusCode::NOT_FOUND);
+            res.render(Json(body));
+            guard.handler_returned(404, estimated, Some(false), None, "not_found");
+        }
         McpOutcome::Forbidden {
             body,
             required_scope,
@@ -570,7 +829,8 @@ async fn handle_mcp_request(
     request: JsonRpcRequest,
     auth: Option<&AuthContext>,
 ) -> McpOutcome {
-    handle_mcp_request_with_lifecycle(runtime, None, request, auth, None, None).await
+    let protocol_era = inferred_protocol_era(&request);
+    handle_mcp_request_with_lifecycle(runtime, None, request, auth, protocol_era, None, None).await
 }
 
 async fn handle_mcp_request_with_lifecycle(
@@ -578,18 +838,20 @@ async fn handle_mcp_request_with_lifecycle(
     connector: Option<&ConnectorRuntime>,
     request: JsonRpcRequest,
     auth: Option<&AuthContext>,
+    protocol_era: McpProtocolEra,
     window: Option<&crate::client_window::ClientWindow>,
     mut lifecycle: Option<&mut ToolRequestLifecycle>,
 ) -> McpOutcome {
     let is_oauth2 = auth.is_some_and(|ctx| ctx.is_oauth_token());
-    let stateless_2026 =
-        request.method == "server/discover" || request_uses_stateless_protocol(&request.params);
+    let stateless_2026 = protocol_era == McpProtocolEra::Stateless2026;
 
     if is_oauth2
-        && matches!(
-            request.method.as_str(),
-            "server/discover" | "initialize" | "ping" | "tools/list" | "notifications/initialized"
-        )
+        && (matches!(request.method.as_str(), "server/discover" | "tools/list")
+            || (!stateless_2026
+                && matches!(
+                    request.method.as_str(),
+                    "initialize" | "ping" | "notifications/initialized"
+                )))
     {
         if let Some(outcome) = require_mcp_oauth_scope(auth, crate::auth::SCOPE_RUNTIME_READ) {
             return outcome;
@@ -597,6 +859,7 @@ async fn handle_mcp_request_with_lifecycle(
     }
 
     if is_oauth2
+        && !stateless_2026
         && !matches!(
             request.method.as_str(),
             "server/discover"
@@ -619,7 +882,12 @@ async fn handle_mcp_request_with_lifecycle(
         return McpOutcome::Notification;
     }
 
-    if request.jsonrpc.as_deref().unwrap_or("2.0") != "2.0" {
+    let jsonrpc_valid = if stateless_2026 {
+        request.jsonrpc.as_deref() == Some("2.0")
+    } else {
+        request.jsonrpc.as_deref().unwrap_or("2.0") == "2.0"
+    };
+    if !jsonrpc_valid {
         return McpOutcome::BadRequest(rpc_error(request.id, -32600, "jsonrpc must be '2.0'"));
     }
 
@@ -633,7 +901,7 @@ async fn handle_mcp_request_with_lifecycle(
         // requests. WebCodex supports the stateless tools path required by
         // modern clients while retaining its existing 2025-06-18
         // initialize/session lifecycle for legacy clients.
-        "server/discover" => rpc_result(
+        "server/discover" if stateless_2026 => rpc_result(
             id,
             json!({
                 "resultType": "complete",
@@ -653,7 +921,7 @@ async fn handle_mcp_request_with_lifecycle(
                 }
             }),
         ),
-        "initialize" => rpc_result(
+        "initialize" if !stateless_2026 => rpc_result(
             id,
             json!({
                 "protocolVersion": MCP_PROTOCOL_VERSION,
@@ -669,14 +937,7 @@ async fn handle_mcp_request_with_lifecycle(
                 }
             }),
         ),
-        "ping" => rpc_result(
-            id,
-            if stateless_2026 {
-                mcp_stateless_result(json!({}), false)
-            } else {
-                json!({})
-            },
-        ),
+        "ping" if !stateless_2026 => rpc_result(id, json!({})),
         "tools/list" => {
             let result = mcp_tools_list_payload(runtime.model_surface());
             rpc_result(
@@ -727,7 +988,7 @@ async fn handle_mcp_request_with_lifecycle(
             }
             if runtime.model_surface() == ModelSurface::CanonicalConnector {
                 let connector = connector.expect("validated canonical Connector state");
-                if params.name == "task_start" && window.is_none() {
+                if !stateless_2026 && params.name == "task_start" && window.is_none() {
                     if let Some(lc) = lifecycle.as_deref() {
                         lc.dispatch_failed("window_identity_unavailable");
                         lc.dispatch_finished(false, Some(false), "window_identity_unavailable");
@@ -858,13 +1119,14 @@ async fn handle_mcp_request_with_lifecycle(
                 },
             )
         }
-        "notifications/initialized" => rpc_result(id, json!({})),
+        "notifications/initialized" if !stateless_2026 => rpc_result(id, json!({})),
         _ => {
-            return McpOutcome::BadRequest(rpc_error(
-                id,
-                -32601,
-                format!("Method not found: {}", request.method),
-            ));
+            let body = rpc_error(id, -32601, format!("Method not found: {}", request.method));
+            return if stateless_2026 {
+                McpOutcome::NotFound(body)
+            } else {
+                McpOutcome::BadRequest(body)
+            };
         }
     };
     McpOutcome::Ok(response)
@@ -915,6 +1177,23 @@ fn rpc_error(id: Option<Value>, code: i64, message: impl Into<String>) -> Value 
         "error": {
             "code": code,
             "message": message.into(),
+        }
+    })
+}
+
+fn rpc_error_with_data(
+    id: Option<Value>,
+    code: i64,
+    message: impl Into<String>,
+    data: Value,
+) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id.unwrap_or(Value::Null),
+        "error": {
+            "code": code,
+            "message": message.into(),
+            "data": data,
         }
     })
 }

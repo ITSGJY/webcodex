@@ -51,6 +51,28 @@ enrollment、scoped user token 和 OAuth 见
 [DEPLOYMENT.zh-CN.md](DEPLOYMENT.zh-CN.md) 与
 [OAUTH2_SMOKE_TEST.md](OAUTH2_SMOKE_TEST.md)。
 
+## 协议兼容性
+
+WebCodex 通过两代 MCP 协议提供同一套已选择的 tools surface：
+
+- **MCP 2026-07-28 stateless tools core：** client 可以先调用 `server/discover`，
+  随后直接调用 `tools/list` 和 `tools/call`。每个请求都自描述；WebCodex
+  会校验 2026 protocol metadata，以及标准的 `MCP-Protocol-Version`、
+  `Mcp-Method`，并对带名称的请求校验 `Mcp-Name`。这条路径不会创建、消费或
+  回传 `Mcp-Session-Id`。
+- **MCP 2025-06-18 compatibility：** 旧 client 继续使用 `initialize` /
+  `notifications/initialized`，并可以保留 server 签发的 `Mcp-Session-Id`。
+  这条路径为现有 client 保留，不会静默切换成 2026 lifecycle。
+
+两条路径暴露相同的 WebCodex tool surface 与授权规则。MCP transport state 不等于
+WebCodex application state；持久工作应由显式 WebCodex handle 标识，例如
+`task_id`、Workflow Session ID 和 Job ID。
+
+这里刻意定义为 **2026 tools-core support**，不代表已经实现 MCP 2026 的全部
+extension。WebCodex 当前不发布 MCP resources、prompts、Tasks、Apps、MRTR、
+subscriptions 或其它可选 2026 extension。现代 client 调用未实现的方法时，
+WebCodex 会先完成 transport metadata 校验，再返回标准 method-not-found。
+
 ## Model surface 选择
 
 MCP 在 server 启动时选择一个 model surface：
@@ -91,10 +113,13 @@ task_cancel
 task_finish
 ```
 
-同一个聊天窗口会自动继续已配置仓库的工作。`task_start` 会为该窗口和项目解析
-唯一上下文，不创建无意义的重复任务；每条后续指令都会追加到当前持久任务。
-切换仓库连接时各仓库历史保持隔离，切回此前连接时恢复原任务。兼容的 MCP
-client 会自动保留协议 session，用户不需要在 prompt 中传入它。
+Connector context 已经绑定当前配置的仓库。对于 legacy 2025-06-18 client，
+保留的 MCP protocol session 还可以把聊天窗口绑定到当前持久任务，因此同一窗口
+重复调用 `task_start` 时可以复用任务。对于 2026-07-28 client，transport request
+是 stateless 的：WebCodex 会明确忽略 `Mcp-Session-Id`，不会从 credential 推断
+隐藏 window；`task_start` 会返回显式的持久 `task_id`。client/model 应保留这个
+handle；需要重新恢复 task context 时使用 `task_resume(task_id)`。切换仓库连接时
+各仓库的 task history 仍然彼此隔离。
 
 Connector context 已绑定项目。直接从 `task_start` 开始；不要调用
 `list_projects`、`runtime_status`、`tool_manifest`、`start_session` 或
@@ -104,8 +129,8 @@ executor reference 或 workflow session。
 复用前，WebCodex 会比较仓库实际路径、分支与 HEAD、工作区、适用的仓库规则及
 项目 manifest。未变化的上下文直接复用，只把变化部分标为已刷新。如果有界扫描
 无法证明某个 slice 完整，response 会把它标记为 partial/unknown 并返回紧凑
-warning，不会声称已经复用。`task_list` 和 `task_resume` 只用于 client 丢失 MCP
-transport session 后的显式恢复，不是普通工作流的前置步骤。
+warning，不会声称已经复用。`task_list` 和 `task_resume` 用于 client 已经没有
+application-level task context 时的显式恢复，不是每次普通 tool call 的前置步骤。
 
 在 `local_coding` 上，MCP `tools/list` 恰好包含如下聚焦 coding 工具集，且顺序
 严格一致：

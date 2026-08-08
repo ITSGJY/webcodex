@@ -54,6 +54,31 @@ never the persistent project Connector credential. Production enrollment,
 scoped user tokens, and OAuth are described in [AUTH_MODEL.md](AUTH_MODEL.md),
 [DEPLOYMENT.md](DEPLOYMENT.md), and [OAUTH2_SMOKE_TEST.md](OAUTH2_SMOKE_TEST.md).
 
+## Protocol Compatibility
+
+WebCodex serves the existing tools surface over two MCP protocol eras:
+
+- **MCP 2026-07-28 stateless tools core:** clients may start with `server/discover`
+  and then call `tools/list` and `tools/call` directly. Every request is
+  self-describing; WebCodex validates the 2026 protocol metadata and standard
+  `MCP-Protocol-Version`, `Mcp-Method`, and, for named requests, `Mcp-Name`
+  headers. It does not mint, consume, or echo `Mcp-Session-Id` on this path.
+- **MCP 2025-06-18 compatibility:** legacy clients continue to use
+  `initialize` / `notifications/initialized` and may retain the server-issued
+  `Mcp-Session-Id`. This path is kept for existing clients and is not silently
+  converted into the 2026 lifecycle.
+
+Both paths expose the same selected WebCodex tool surface and authorization
+rules. MCP transport state is not WebCodex application state: durable work is
+identified by explicit WebCodex handles such as `task_id`, Workflow Session IDs,
+and Job IDs.
+
+This is deliberately **2026 tools-core support**, not an implementation claim
+for every MCP 2026 extension. WebCodex does not currently advertise MCP
+resources, prompts, Tasks, Apps, MRTR, subscriptions, or other optional 2026
+extensions. Unsupported modern methods return the standard method-not-found
+response after transport metadata has been validated.
+
 ## Model Surface Selection
 
 MCP exposes one model surface selected at server startup:
@@ -96,13 +121,15 @@ task_cancel
 task_finish
 ```
 
-The same chat window continues the configured repository automatically.
-`task_start` resolves one context for that window and project without
-duplicating it; each follow-up instruction is appended to the active durable
-task.
-Switching repository connections keeps their histories isolated, and returning
-to a previous connection restores its prior task. Compatible MCP clients retain
-the protocol session automatically; users do not pass it in prompts.
+The Connector context already binds the configured repository. With legacy
+2025-06-18 clients, a retained MCP protocol session can also bind a chat window
+to its active durable task, so repeated `task_start` calls from that window can
+reuse the same task. With 2026-07-28 clients, transport requests are stateless:
+WebCodex deliberately ignores `Mcp-Session-Id`, does not derive a hidden window
+from the credential, and `task_start` returns an explicit durable `task_id`.
+Keep that handle in client/model context and use `task_resume(task_id)` when the
+application needs to restore task context explicitly. Switching repository
+connections keeps task histories isolated.
 
 The Connector context already binds the project. Start with `task_start`; do
 not call `list_projects`, `runtime_status`, `tool_manifest`, `start_session`,
@@ -114,8 +141,8 @@ applicable repository rules, and project manifests. Unchanged context is
 reused; only changed slices are reported as refreshed. If a bounded scan cannot
 prove a slice complete, the response marks it partial/unknown and includes a
 compact warning instead of claiming reuse. `task_list` and `task_resume` are
-explicit recovery tools for a client that lost its MCP transport session, not
-steps in the ordinary loop.
+explicit recovery tools when a client no longer has the application-level task
+context; they are not prerequisites for every ordinary tool call.
 
 On `local_coding`, MCP `tools/list` contains exactly the focused coding tool
 set, in this order:
