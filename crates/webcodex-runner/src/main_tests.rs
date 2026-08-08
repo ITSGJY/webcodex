@@ -15,7 +15,9 @@ struct EnvGuard {
 
 impl EnvGuard {
     fn new() -> Self {
-        EnvGuard { restored: Vec::new() }
+        EnvGuard {
+            restored: Vec::new(),
+        }
     }
 
     fn set(mut self, name: &'static str, value: &str) -> Self {

@@ -442,7 +442,10 @@ fn oversized_stderr_is_capped_while_stdout_json_remains_parseable() {
 "#,
         0,
     )
-    .with_stderr(format!("{}TAIL_MARKER_MUST_NOT_CROSS_BRIDGE", "e".repeat(over)));
+    .with_stderr(format!(
+        "{}TAIL_MARKER_MUST_NOT_CROSS_BRIDGE",
+        "e".repeat(over)
+    ));
     write_fake_pyright(bin.path(), &spec);
 
     let response = with_path(bin.path(), || {

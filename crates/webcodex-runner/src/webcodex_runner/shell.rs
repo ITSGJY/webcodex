@@ -244,7 +244,9 @@ fn resolved_shell_program(program: &str) -> String {
         if path.components().count() <= 1 && !path.is_absolute() {
             if let Some(resolved) = super::util::resolve_program_in_path(
                 program,
-                std::env::var_os("PATH").as_deref().unwrap_or(OsStr::new("")),
+                std::env::var_os("PATH")
+                    .as_deref()
+                    .unwrap_or(OsStr::new("")),
             ) {
                 return resolved.path().to_string_lossy().into_owned();
             }

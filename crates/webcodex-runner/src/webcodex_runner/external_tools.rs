@@ -7,7 +7,6 @@ use super::config::{ClaudeCodeMcpConfig, ToolProviderStrategy, ToolProvidersConf
 use super::files::sha256_hex_bytes;
 use super::output::CommandResult;
 use super::shell::cwd_allowed;
-use std::ffi::{OsStr, OsString};
 use super::shutdown::{lock_unpoison, SHUTDOWN_POLL_INTERVAL};
 use super::AgentPolicy;
 use crate::shell_protocol::{
@@ -16,6 +15,7 @@ use crate::shell_protocol::{
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
@@ -1066,7 +1066,9 @@ fn mcp_program(command: &str) -> OsString {
     {
         if let Some(program) = super::util::resolve_program_in_path(
             command,
-            std::env::var_os("PATH").as_deref().unwrap_or(OsStr::new("")),
+            std::env::var_os("PATH")
+                .as_deref()
+                .unwrap_or(OsStr::new("")),
         ) {
             return program.path().as_os_str().to_os_string();
         }

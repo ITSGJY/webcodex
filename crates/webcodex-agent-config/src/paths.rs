@@ -123,8 +123,8 @@ pub fn default_client_state_base_dir() -> Result<PathBuf, String> {
 /// The per-user home as an absolute path, for deriving systemd user service
 /// paths. Mirrors the historical `current_user_home` contract.
 pub fn user_home() -> Result<PathBuf, String> {
-    let home = home_dir()
-        .ok_or_else(|| "HOME is required to derive user service paths".to_string())?;
+    let home =
+        home_dir().ok_or_else(|| "HOME is required to derive user service paths".to_string())?;
     if !home.is_absolute() {
         return Err("HOME must be an absolute path to derive user service paths".to_string());
     }
@@ -263,7 +263,11 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(home_dir(), Some(PathBuf::from("/home/alice")));
         #[cfg(windows)]
-        assert_eq!(home_dir(), None, "MSYS-style HOME must not be used on Windows");
+        assert_eq!(
+            home_dir(),
+            None,
+            "MSYS-style HOME must not be used on Windows"
+        );
 
         let _h2 = EnvVarRestore::set("HOME", "/c/Users/alice");
         let _u2 = EnvVarRestore::set("USERPROFILE", "C:\\Users\\alice");

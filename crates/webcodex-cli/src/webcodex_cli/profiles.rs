@@ -140,7 +140,10 @@ pub(crate) fn client_output_dir_for_profile(base_dir: &Path, profile: &str) -> P
 }
 
 pub(crate) fn client_profile_dir(profile: &str) -> Result<PathBuf, String> {
-    Ok(client_output_dir_for_profile(&default_client_base_dir()?, profile))
+    Ok(client_output_dir_for_profile(
+        &default_client_base_dir()?,
+        profile,
+    ))
 }
 
 pub(crate) fn client_state_dir_for_profile(base_dir: &Path, profile: &str) -> PathBuf {
@@ -148,7 +151,10 @@ pub(crate) fn client_state_dir_for_profile(base_dir: &Path, profile: &str) -> Pa
 }
 
 pub(crate) fn client_profile_state_dir(profile: &str) -> Result<PathBuf, String> {
-    Ok(client_state_dir_for_profile(&default_client_state_base_dir()?, profile))
+    Ok(client_state_dir_for_profile(
+        &default_client_state_base_dir()?,
+        profile,
+    ))
 }
 
 pub(crate) fn default_client_output_dir_for_profile(profile: &str) -> Result<PathBuf, String> {

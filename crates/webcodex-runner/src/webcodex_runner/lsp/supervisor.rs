@@ -1011,7 +1011,8 @@ impl LspSupervisor {
                         Some(path) => path,
                         None => ambient_path.as_deref().unwrap_or(OsStr::new("")),
                     };
-                    let resolved = resolve_program_in_path(&program.to_string_lossy(), search_path)?;
+                    let resolved =
+                        resolve_program_in_path(&program.to_string_lossy(), search_path)?;
                     let resolved: OsString = resolved.path().as_os_str().to_os_string();
                     return Some((
                         command_with_default_args(resolved, profile),

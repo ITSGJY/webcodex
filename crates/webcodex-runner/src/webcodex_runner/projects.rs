@@ -2,7 +2,6 @@ use super::config::{
     default_true, projects_dir, validate_shell_profile_name, AgentConfig, AgentPolicy,
 };
 use super::shell::canonicalize_existing;
-use webcodex_agent_config::paths::{path_is_within, paths_equal};
 use crate::shell_protocol::{ShellAgentProjectSummary, ShellAgentShellRequest};
 use crate::{err_cmd, ok_cmd, write_created_file};
 use crate::{CommandResult, CreatedProjectPaths};
@@ -17,6 +16,7 @@ use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+use webcodex_agent_config::paths::paths_equal;
 use webcodex_process::{GracefulTermination, ManagedChild};
 
 const PROJECT_SCAN_CACHE_MS: u64 = 5000;
@@ -711,7 +711,17 @@ impl AgentProjectCache {
 /// drive prefix) and the Windows entries guard the OS/Program Files trees; any
 /// drive root (`C:\`, `D:\`, ...) is rejected by `is_windows_drive_root`.
 const DANGEROUS_PROJECT_ROOTS: &[&str] = &[
-    "/", "/etc", "/bin", "/sbin", "/usr", "/var", "/proc", "/sys", "/dev", "/run", "/boot",
+    "/",
+    "/etc",
+    "/bin",
+    "/sbin",
+    "/usr",
+    "/var",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/run",
+    "/boot",
     #[cfg(windows)]
     "C:\\Windows",
     #[cfg(windows)]

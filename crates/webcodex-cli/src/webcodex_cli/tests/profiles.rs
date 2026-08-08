@@ -433,10 +433,9 @@ fn agent_install_service_explicit_paths_win_and_rejects_unsafe_profile() {
 #[test]
 fn agent_service_scope_parsing_defaults_and_paths_are_deterministic() {
     let _guard = env_test_guard();
-    let _env = EnvGuard::new().set("HOME", "/home/alice").set(
-        "XDG_CONFIG_HOME",
-        "/tmp/alice-config",
-    );
+    let _env = EnvGuard::new()
+        .set("HOME", "/home/alice")
+        .set("XDG_CONFIG_HOME", "/tmp/alice-config");
 
     let user = parse_agent_install_service_with_identity(
         &args(&["--bin", "/opt/webcodex/bin/webcodex-runner", "--dry-run"]),
@@ -502,7 +501,9 @@ fn agent_service_scope_parsing_defaults_and_paths_are_deterministic() {
 #[test]
 fn user_scope_falls_back_to_home_and_profile_paths() {
     let _guard = env_test_guard();
-    let _env = EnvGuard::new().set("HOME", "/home/bob").remove("XDG_CONFIG_HOME");
+    let _env = EnvGuard::new()
+        .set("HOME", "/home/bob")
+        .remove("XDG_CONFIG_HOME");
 
     let opts = parse_agent_install_service_with_identity(
         &args(&[

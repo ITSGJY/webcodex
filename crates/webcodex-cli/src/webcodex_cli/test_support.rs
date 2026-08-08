@@ -30,7 +30,9 @@ pub(crate) struct EnvGuard {
 
 impl EnvGuard {
     pub(crate) fn new() -> Self {
-        EnvGuard { restored: Vec::new() }
+        EnvGuard {
+            restored: Vec::new(),
+        }
     }
 
     pub(crate) fn set(mut self, name: &'static str, value: &str) -> Self {

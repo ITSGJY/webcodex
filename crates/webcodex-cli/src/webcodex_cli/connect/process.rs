@@ -196,18 +196,15 @@ fn process_start(pid: u32) -> Option<String> {
         dwHighDateTime: 0,
     };
     // SAFETY: `handle` is valid and the four out-params are valid FILETIMEs.
-    let ok = unsafe {
-        GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user)
-    };
+    let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
     // SAFETY: close the handle we opened.
     unsafe { CloseHandle(handle) };
     // The creation FILETIME (100ns ticks since 1601) is a stable per-process
     // identity: a reused pid has a different creation time, exactly like the
     // Linux starttime field.
-    (ok != 0).then(|| {
-        u64::from(creation.dwHighDateTime) << 32 | u64::from(creation.dwLowDateTime)
-    })
-    .map(|value| value.to_string())
+    (ok != 0)
+        .then(|| u64::from(creation.dwHighDateTime) << 32 | u64::from(creation.dwLowDateTime))
+        .map(|value| value.to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -783,9 +780,7 @@ fn signal_process(pid: u32, signal: i32) -> Result<(), String> {
 #[cfg(windows)]
 fn terminate_process(pid: u32) -> Result<(), String> {
     use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, TerminateProcess, PROCESS_TERMINATE,
-    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
     if pid <= 1 {
         return Err("refusing to terminate an invalid Runner pid".to_string());
     }
