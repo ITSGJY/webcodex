@@ -182,18 +182,11 @@ async fn ops_rejects_agent_token_from_env_file_without_leaking_it() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn ops_rejects_agent_token_from_process_env_without_leaking_it() {
-    let _guard = admin_cli::TEST_ENV_LOCK.lock().unwrap();
-    let previous = std::env::var_os("WEBCODEX_TOKEN");
+    let _guard = env_test_guard();
     let secret = "wc_agent_do_not_echo_ops_process_env_0123456789";
-    std::env::set_var("WEBCODEX_TOKEN", secret);
+    let _env = EnvGuard::new().set("WEBCODEX_TOKEN", secret);
     let opts = ops_common_opts("http://127.0.0.1:1".to_string());
     let error = run_ops_command(OpsCommand::Status(opts)).await.unwrap_err();
-    if let Some(value) = previous {
-        std::env::set_var("WEBCODEX_TOKEN", value);
-    } else {
-        std::env::remove_var("WEBCODEX_TOKEN");
-    }
-
     assert!(error.contains("Agent transport token"), "{error}");
     assert!(error.contains("webcodex-user-token"), "{error}");
     assert!(!error.contains(secret));
@@ -470,6 +463,11 @@ fn spawn_ops_route_server(
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    // On Windows an accepted socket inherits the listener's
+                    // non-blocking mode; switch back to blocking so the read
+                    // waits for the full request instead of panicking with
+                    // WSAEWOULDBLOCK when the request has not fully arrived.
+                    stream.set_nonblocking(false).unwrap();
                     let mut buf = [0u8; 16384];
                     let n = stream.read(&mut buf).unwrap();
                     let request = String::from_utf8_lossy(&buf[..n]).to_string();
@@ -565,6 +563,9 @@ fn spawn_smoke_preflight_server(
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    // See spawn_ops_route_server: restore blocking mode on
+                    // Windows where accepted sockets inherit non-blocking.
+                    stream.set_nonblocking(false).unwrap();
                     let mut buf = [0u8; 16384];
                     let n = stream.read(&mut buf).unwrap();
                     let request = String::from_utf8_lossy(&buf[..n]).to_string();

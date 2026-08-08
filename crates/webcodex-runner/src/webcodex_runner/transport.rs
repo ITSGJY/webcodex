@@ -1862,7 +1862,10 @@ fn handle_stream_envelope(
             let hot = config.snapshot();
             let jobs = runtime.jobs.clone();
             let persistent_shells = runtime.persistent_shells.clone();
-            let projects_dir = projects_dir(cfg);
+            let projects_dir = match projects_dir(cfg) {
+                Ok(dir) => dir,
+                Err(error) => return Some(error),
+            };
             let lsp = runtime.lsp.clone();
             let dispatch_guard = runtime.dispatches.enter();
             tokio::task::spawn_blocking(move || {

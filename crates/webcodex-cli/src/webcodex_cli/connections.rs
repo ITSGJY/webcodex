@@ -30,7 +30,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use super::env::is_effective_root;
+use webcodex_agent_config::paths;
 
 /// Directory-name prefix reserved for in-progress and salvaged state.
 ///
@@ -40,15 +40,8 @@ use super::env::is_effective_root;
 pub(crate) const INTERNAL_DIR_PREFIX: &str = ".";
 
 /// Where connections live when no explicit directory is given.
-pub(crate) fn default_base_dir() -> PathBuf {
-    if is_effective_root() {
-        PathBuf::from("/etc/webcodex")
-    } else {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        home.join(".config/webcodex")
-    }
+pub(crate) fn default_base_dir() -> Result<PathBuf, String> {
+    paths::default_client_config_base_dir()
 }
 
 /// A server URL reduced to the exact identity WebCodex uses for it.

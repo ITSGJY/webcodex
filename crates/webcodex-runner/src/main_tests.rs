@@ -862,7 +862,7 @@ fn agent_cli_profile_derives_default_config_path() {
     assert_eq!(
         action,
         AgentCliAction::Run {
-            config_path: client_profile_agent_config("special"),
+            config_path: client_profile_agent_config("special").unwrap(),
             once: false,
         }
     );
@@ -6231,7 +6231,7 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
         cfg.policy.clone(),
         cfg.shell.clone(),
         cfg.ssh.clone(),
-        projects_dir(&cfg),
+        projects_dir(&cfg).unwrap(),
         request,
     );
     match rx.try_recv().expect("queued status was sent") {
@@ -6261,7 +6261,7 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
         cfg.policy.clone(),
         cfg.shell.clone(),
         cfg.ssh.clone(),
-        projects_dir(&cfg),
+        projects_dir(&cfg).unwrap(),
         rejected_request,
     );
     assert!(jobs.queued.lock().unwrap().is_empty());
@@ -6378,7 +6378,7 @@ fn dispatch_request_edit_routes_to_file_handler() {
         job_context: None,
         persistent_shell: None,
     };
-    let pdir = projects_dir(&cfg);
+    let pdir = projects_dir(&cfg).unwrap();
     let lsp = webcodex_runner::LspSupervisor::default();
     let hot = runtime_config(&cfg);
     let persistent_shells = webcodex_runner::PersistentShellManager::new(
@@ -6418,7 +6418,7 @@ fn dispatch_request_rejects_unsupported_file_kinds_without_starting_command() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = test_config(tmp.path().join("config/projects.d"));
     let jobs = JobManager::new(max_concurrent_jobs(&cfg));
-    let pdir = projects_dir(&cfg);
+    let pdir = projects_dir(&cfg).unwrap();
     let hot = runtime_config(&cfg);
     let persistent_shells = webcodex_runner::PersistentShellManager::new(
         &cfg.shell,
@@ -6504,7 +6504,7 @@ fn dispatch_request_run_shell_sends_result_over_sink() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = test_config(tmp.path().join("config/projects.d"));
     let jobs = JobManager::new(max_concurrent_jobs(&cfg));
-    let pdir = projects_dir(&cfg);
+    let pdir = projects_dir(&cfg).unwrap();
     let hot = runtime_config(&cfg);
     let persistent_shells = webcodex_runner::PersistentShellManager::new(
         &cfg.shell,

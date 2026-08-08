@@ -1,49 +1,22 @@
 use std::path::{Path, PathBuf};
 
-use super::env::is_effective_root;
+use webcodex_agent_config::paths;
+
 use crate::ServiceScope;
 
 pub(crate) const CLIENT_PROFILE_ERROR: &str =
     "--profile must be a safe path component using only ASCII letters, digits, '.', '_' or '-'";
 
-pub(crate) fn default_client_base_dir() -> PathBuf {
-    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty())
-    {
-        return PathBuf::from(config_home).join("webcodex");
-    }
-    if is_effective_root() {
-        PathBuf::from("/etc/webcodex")
-    } else {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        home.join(".config/webcodex")
-    }
+pub(crate) fn default_client_base_dir() -> Result<PathBuf, String> {
+    paths::default_client_config_base_dir()
 }
 
 pub(crate) fn current_user_home() -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| "HOME is required to derive user service paths".to_string())?;
-    if !home.is_absolute() {
-        return Err("HOME must be an absolute path to derive user service paths".to_string());
-    }
-    Ok(home)
+    paths::user_home()
 }
 
 pub(crate) fn user_config_home() -> Result<PathBuf, String> {
-    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty())
-    {
-        let config_home = PathBuf::from(config_home);
-        if !config_home.is_absolute() {
-            return Err(
-                "XDG_CONFIG_HOME must be an absolute path to derive user service paths".to_string(),
-            );
-        }
-        return Ok(config_home);
-    }
-    Ok(current_user_home()?.join(".config"))
+    paths::user_config_home()
 }
 
 pub(crate) fn client_base_dir_for_scope(scope: ServiceScope) -> Result<PathBuf, String> {
@@ -141,15 +114,8 @@ pub(crate) fn validate_service_file_scope(
     }
 }
 
-pub(crate) fn default_client_state_base_dir() -> PathBuf {
-    if let Some(state_home) = std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
-        return PathBuf::from(state_home).join("webcodex");
-    }
-    std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .map(|home| home.join(".local/state/webcodex"))
-        .unwrap_or_else(|| std::env::temp_dir().join("webcodex"))
+pub(crate) fn default_client_state_base_dir() -> Result<PathBuf, String> {
+    paths::default_client_state_base_dir()
 }
 
 pub(crate) fn validate_client_profile(profile: &str) -> Result<String, String> {
@@ -173,34 +139,34 @@ pub(crate) fn client_output_dir_for_profile(base_dir: &Path, profile: &str) -> P
     base_dir.join("clients").join(profile)
 }
 
-pub(crate) fn client_profile_dir(profile: &str) -> PathBuf {
-    client_output_dir_for_profile(&default_client_base_dir(), profile)
+pub(crate) fn client_profile_dir(profile: &str) -> Result<PathBuf, String> {
+    Ok(client_output_dir_for_profile(&default_client_base_dir()?, profile))
 }
 
 pub(crate) fn client_state_dir_for_profile(base_dir: &Path, profile: &str) -> PathBuf {
     base_dir.join("clients").join(profile)
 }
 
-pub(crate) fn client_profile_state_dir(profile: &str) -> PathBuf {
-    client_state_dir_for_profile(&default_client_state_base_dir(), profile)
+pub(crate) fn client_profile_state_dir(profile: &str) -> Result<PathBuf, String> {
+    Ok(client_state_dir_for_profile(&default_client_state_base_dir()?, profile))
 }
 
-pub(crate) fn default_client_output_dir_for_profile(profile: &str) -> PathBuf {
+pub(crate) fn default_client_output_dir_for_profile(profile: &str) -> Result<PathBuf, String> {
     client_profile_dir(profile)
 }
 
-pub(crate) fn client_profile_agent_config(profile: &str) -> PathBuf {
-    client_profile_dir(profile).join("agent.toml")
+pub(crate) fn client_profile_agent_config(profile: &str) -> Result<PathBuf, String> {
+    Ok(client_profile_dir(profile)?.join("agent.toml"))
 }
 
-pub(crate) fn client_profile_projects_dir(profile: &str) -> PathBuf {
-    client_profile_dir(profile).join("projects.d")
+pub(crate) fn client_profile_projects_dir(profile: &str) -> Result<PathBuf, String> {
+    Ok(client_profile_dir(profile)?.join("projects.d"))
 }
 
-pub(crate) fn client_profile_user_token_file(profile: &str) -> PathBuf {
-    client_profile_dir(profile).join("webcodex-user-token")
+pub(crate) fn client_profile_user_token_file(profile: &str) -> Result<PathBuf, String> {
+    Ok(client_profile_dir(profile)?.join("webcodex-user-token"))
 }
 
-pub(crate) fn client_profile_agent_token_file(profile: &str) -> PathBuf {
-    client_profile_dir(profile).join("webcodex-runner-token")
+pub(crate) fn client_profile_agent_token_file(profile: &str) -> Result<PathBuf, String> {
+    Ok(client_profile_dir(profile)?.join("webcodex-runner-token"))
 }

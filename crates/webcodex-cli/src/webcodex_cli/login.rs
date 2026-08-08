@@ -797,8 +797,8 @@ pub(crate) fn all_connections(base: &Path) -> Vec<Connection> {
     list_connections(base)
 }
 
-pub(crate) fn base_dir_or_default(explicit: Option<PathBuf>) -> PathBuf {
-    explicit.unwrap_or_else(default_base_dir)
+pub(crate) fn base_dir_or_default(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
+    explicit.map(Ok).unwrap_or_else(default_base_dir)
 }
 
 /// Redeem a pairing code. Network only — writes nothing.
@@ -2174,30 +2174,13 @@ mod tests {
         std::fs::write(parser_env.path().join("webcodex-runner"), "").unwrap();
         #[cfg(windows)]
         std::fs::write(parser_env.path().join("webcodex-runner.exe"), "").unwrap();
-        let _guard = crate::admin_cli::TEST_ENV_LOCK.lock().unwrap();
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
-        let old_path = std::env::var_os("PATH");
-        std::env::set_var("HOME", parser_env.path());
-        std::env::set_var("XDG_CONFIG_HOME", parser_env.path());
-        std::env::set_var("PATH", parser_env.path());
+        let _guard = crate::webcodex_cli::test_support::env_test_guard();
+        let _env = crate::webcodex_cli::test_support::EnvGuard::new()
+            .set_os("HOME", parser_env.path().as_os_str().to_owned())
+            .set_os("XDG_CONFIG_HOME", parser_env.path().as_os_str().to_owned())
+            .set_os("PATH", parser_env.path().as_os_str().to_owned());
         let parsed =
             crate::parse_agent_install_service_with_identity(&recommended_argv[3..], false);
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_CONFIG_HOME", value);
-        } else {
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
-        if let Some(value) = old_path {
-            std::env::set_var("PATH", value);
-        } else {
-            std::env::remove_var("PATH");
-        }
         assert!(
             parsed.is_ok(),
             "non-root recommendation was rejected by the install parser: {parsed:?}"

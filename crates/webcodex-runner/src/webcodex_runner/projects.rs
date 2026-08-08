@@ -658,7 +658,17 @@ fn load_agent_project_summaries(
     cfg: &AgentConfig,
     shutdown: Option<&AtomicBool>,
 ) -> Vec<ShellAgentProjectSummary> {
-    load_agent_project_summaries_from_dir_with_shutdown(&projects_dir(cfg), shutdown)
+    // Loaded configs always carry a materialized projects_dir; a bare
+    // test-built config that cannot derive one reports the error instead of
+    // silently scanning a relative path.
+    let dir = match projects_dir(cfg) {
+        Ok(dir) => dir,
+        Err(error) => {
+            eprintln!("webcodex-runner: {error}");
+            return Vec::new();
+        }
+    };
+    load_agent_project_summaries_from_dir_with_shutdown(&dir, shutdown)
 }
 
 impl AgentProjectCache {

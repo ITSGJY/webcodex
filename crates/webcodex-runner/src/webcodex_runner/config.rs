@@ -547,36 +547,8 @@ pub(crate) fn max_concurrent_jobs(cfg: &AgentConfig) -> usize {
         .max(1)
 }
 
-fn default_client_base_dir() -> PathBuf {
-    if is_effective_root() {
-        PathBuf::from("/etc/webcodex")
-    } else {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        home.join(".config/webcodex")
-    }
-}
-
-#[cfg(unix)]
-fn is_effective_root() -> bool {
-    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-        for line in status.lines() {
-            if let Some(rest) = line.strip_prefix("Uid:") {
-                let mut parts = rest.split_whitespace();
-                let _real = parts.next();
-                if let Some(effective) = parts.next() {
-                    return effective == "0";
-                }
-            }
-        }
-    }
-    std::env::var("USER").is_ok_and(|u| u == "root")
-}
-
-#[cfg(not(unix))]
-fn is_effective_root() -> bool {
-    false
+fn default_client_base_dir() -> Result<PathBuf, String> {
+    webcodex_agent_config::paths::default_client_config_base_dir()
 }
 
 pub(crate) fn validate_client_profile(profile: &str) -> Result<String, String> {
@@ -596,29 +568,22 @@ pub(crate) fn validate_client_profile(profile: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-pub(crate) fn client_profile_agent_config(profile: &str) -> PathBuf {
-    default_client_base_dir()
+pub(crate) fn client_profile_agent_config(profile: &str) -> Result<PathBuf, String> {
+    Ok(default_client_base_dir()?
         .join("clients")
         .join(profile)
-        .join("agent.toml")
+        .join("agent.toml"))
 }
 
-pub(crate) fn default_config_path() -> PathBuf {
-    let home_path = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".config/webcodex/agent.toml"));
+pub(crate) fn default_config_path() -> Result<PathBuf, String> {
+    let user_path = default_client_base_dir()?.join("agent.toml");
     let system_path = PathBuf::from(DEFAULT_CONFIG_PATH);
-    for path in [home_path.clone(), Some(system_path.clone())]
-        .into_iter()
-        .flatten()
-    {
+    for path in [user_path.clone(), system_path.clone()] {
         if path.exists() {
-            return path;
+            return Ok(path);
         }
     }
-    home_path
-        .or_else(|| Some(system_path))
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH))
+    Ok(user_path)
 }
 
 fn validate_env_key(key: &str) -> bool {
@@ -948,6 +913,14 @@ pub(crate) fn load_config(path: &Path) -> Result<AgentConfig, String> {
     let effective =
         effective_allowed_roots(&cfg.policy.allowed_roots, cfg.policy.allow_cwd_anywhere)?;
     cfg.policy.allowed_roots = effective;
+    // Materialize the default projects dir at load time so request-time code
+    // never re-derives it and can never fall back to a relative path. A
+    // minimal agent.toml without an explicit projects_dir gets the shared
+    // per-user config base (`$HOME/.config/webcodex/projects.d` on Unix,
+    // `%APPDATA%\webcodex\projects.d` on Windows).
+    if cfg.projects_dir.is_none() {
+        cfg.projects_dir = Some(default_projects_dir()?);
+    }
     validate_shell_config(&cfg.shell)?;
     validate_ssh_config(&mut cfg.ssh)?;
     if let Some(quic) = &cfg.quic {
@@ -978,15 +951,13 @@ pub(crate) fn hostname() -> Option<String> {
         })
 }
 
-fn default_projects_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config/webcodex/projects.d")
+fn default_projects_dir() -> Result<PathBuf, String> {
+    Ok(default_client_base_dir()?.join("projects.d"))
 }
 
-pub(crate) fn projects_dir(cfg: &AgentConfig) -> PathBuf {
-    cfg.projects_dir
-        .clone()
-        .unwrap_or_else(default_projects_dir)
+pub(crate) fn projects_dir(cfg: &AgentConfig) -> Result<PathBuf, String> {
+    match &cfg.projects_dir {
+        Some(projects_dir) => Ok(projects_dir.clone()),
+        None => default_projects_dir(),
+    }
 }

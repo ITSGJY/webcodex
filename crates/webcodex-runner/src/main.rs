@@ -316,9 +316,10 @@ where
             _ => {}
         }
     }
-    let mut config_path = std::env::var("WEBCODEX_AGENT_CONFIG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| default_config_path());
+    let mut config_path = match std::env::var("WEBCODEX_AGENT_CONFIG") {
+        Ok(path) => PathBuf::from(path),
+        Err(_) => default_config_path()?,
+    };
     let mut config_explicit = false;
     let mut profile: Option<String> = None;
     let mut once = false;
@@ -362,7 +363,7 @@ where
         .transpose()?
     {
         if !config_explicit {
-            config_path = client_profile_agent_config(&profile);
+            config_path = client_profile_agent_config(&profile)?;
         }
     }
     Ok(AgentCliAction::Run { config_path, once })
@@ -3775,7 +3776,10 @@ fn handle_one_poll(
     let runtime = Arc::clone(runtime);
     let jobs = jobs.clone();
     let persistent_shells = persistent_shells.clone();
-    let projects_dir = projects_dir(cfg);
+    let projects_dir = match projects_dir(cfg) {
+        Ok(dir) => dir,
+        Err(error) => return Err(PollError::new(PollErrorKind::Config, error)),
+    };
     let lsp = lsp.clone();
     let dispatch_guard = dispatches.enter();
     let persistent_shell_background = request.kind == "persistent_shell" && !once;
