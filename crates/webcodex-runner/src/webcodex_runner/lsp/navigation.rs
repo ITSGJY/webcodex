@@ -738,7 +738,19 @@ fn resolve_source_file(
         ));
     }
     let raw = Path::new(path);
-    if raw.is_absolute() {
+    // Windows-only subtlety: `Path::is_absolute` is false for root-relative
+    // inputs (`/etc/...`, `\etc\...`) and `Path::has_root` is false for
+    // drive-relative inputs (`C:file.rs`); none of these are project-relative
+    // paths. Checking the leading component for a root or drive/UNC prefix
+    // rejects every such form uniformly on both platforms.
+    if raw.is_absolute()
+        || raw.components().next().is_some_and(|component| {
+            matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Prefix(_)
+            )
+        })
+    {
         return Err(AgentLspResultEnvelope::err(
             error_codes::INVALID_PROJECT_PATH,
             "path must be project-relative",

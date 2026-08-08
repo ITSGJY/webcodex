@@ -1,7 +1,9 @@
 #![allow(unused_imports)]
 
 pub(super) use crate::admin_cli::{build_admin_request, AdminCliCommand};
-pub(super) use crate::webcodex_cli::test_support::{args, build_metadata, cli_exit};
+pub(super) use crate::webcodex_cli::test_support::{
+    args, build_metadata, cli_exit, env_test_guard, EnvGuard, TEST_ENV_LOCK,
+};
 pub(super) use crate::webcodex_cli::{
     client_output_dir_for_profile, compare_build_commits, ensure_enroll_outputs_available,
     format_error_body, is_effective_root, parse_env_content_value, read_env_file_value,
@@ -11,6 +13,7 @@ pub(super) use crate::webcodex_cli::{
 };
 pub(super) use crate::*;
 pub(super) use serde_json::{json, Value};
+pub(super) use std::ffi::OsString;
 pub(super) use std::fs;
 pub(super) use std::io::{Read, Write};
 pub(super) use std::net::TcpListener;

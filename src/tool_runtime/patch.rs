@@ -180,7 +180,7 @@ impl ToolRuntime {
                 ShellRunRequest {
                     client_id: client_id.clone(),
                     cwd: Some(proj.path.clone()),
-                    command: "git apply --check - && echo OK".to_string(),
+                    command: "git apply --check -".to_string(),
                     stdin: Some(patch.clone()),
                     timeout_secs: 60,
                     wait_timeout_secs: 62,

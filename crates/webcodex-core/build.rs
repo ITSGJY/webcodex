@@ -7,15 +7,17 @@ fn main() {
     println!("cargo:rerun-if-env-changed=WEBCODEX_GIT_COMMIT");
     println!("cargo:rerun-if-env-changed=WEBCODEX_GIT_DIRTY");
     println!("cargo:rerun-if-env-changed=WEBCODEX_BUILT_AT");
-    println!(
-        "cargo:rerun-if-changed={}",
-        repo_root.join(".git/HEAD").display()
-    );
+
+    let head_path = git_metadata_path(&repo_root, "HEAD")
+        .unwrap_or_else(|| repo_root.join(".git").join("HEAD"));
+    println!("cargo:rerun-if-changed={}", head_path.display());
     if let Some(head_ref) = current_head_ref(&repo_root) {
-        println!(
-            "cargo:rerun-if-changed={}",
-            repo_root.join(".git").join(head_ref).display()
-        );
+        let head_ref_path = git_metadata_path(&repo_root, &head_ref)
+            .unwrap_or_else(|| repo_root.join(".git").join(&head_ref));
+        println!("cargo:rerun-if-changed={}", head_ref_path.display());
+    }
+    if let Some(packed_refs) = git_metadata_path(&repo_root, "packed-refs") {
+        println!("cargo:rerun-if-changed={}", packed_refs.display());
     }
 
     let git_commit =
@@ -49,12 +51,21 @@ fn git_commit_from_git(repo_root: &Path) -> String {
 }
 
 fn current_head_ref(repo_root: &Path) -> Option<String> {
-    let head = std::fs::read_to_string(repo_root.join(".git/HEAD")).ok()?;
-    let head = head.trim();
-    head.strip_prefix("ref: ")
+    command_stdout(repo_root, ["symbolic-ref", "--quiet", "HEAD"])
+        .filter(|value| value.starts_with("refs/"))
         .filter(|value| !value.contains(".."))
-        .filter(|value| !value.starts_with('/'))
-        .map(ToOwned::to_owned)
+}
+
+fn git_metadata_path(repo_root: &Path, name: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(command_stdout(
+        repo_root,
+        ["rev-parse", "--git-path", name],
+    )?);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        repo_root.join(path)
+    })
 }
 
 fn git_dirty_from_git(repo_root: &Path) -> String {

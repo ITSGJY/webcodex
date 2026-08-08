@@ -91,28 +91,30 @@ Confirm:
 
 ## 8. Packaging And Artifact Checks
 
-For the planned v0.3.2 binary and npm release:
+For every new binary and npm release, choose one candidate `<VERSION>` first and treat its tag and uploaded bytes as immutable once published:
 
-- `Cargo.toml` and every local WebCodex workspace entry in `Cargo.lock` must be `0.3.2`.
-- `npm/webcodex/package.json`, `manifest.json`, `manifest.example.json`, and the npm self-test must agree on `0.3.2`.
+- `Cargo.toml` and every local WebCodex workspace entry in `Cargo.lock` must agree on `<VERSION>` before tagging.
+- `npm/webcodex/package.json`, `manifest.json`, `manifest.example.json`, and the npm self-tests must agree on the same `<VERSION>` before tagging.
 - The release-preparation/tag commit may keep `REPLACE_WITH_RELEASE_ARTIFACT_SHA256` for each planned platform in `manifest.json`. Never copy an earlier checksum or invent one to make prepublish checks pass.
-- The planned artifacts are `webcodex-v0.3.2-linux-x64.tar.gz`, `webcodex-v0.3.2-linux-arm64.tar.gz`, and `webcodex-v0.3.2-darwin-arm64.tar.gz`. Each contains `webcodex`, `webcodex-server`, and `webcodex-runner` built from the exact tagged source revision.
-- Build Linux x64 on the release x64 Linux host, Linux arm64 on the release arm64 Linux host, and macOS arm64 on the release Mac. Do not rebuild any artifact on an intermediate packaging machine.
+- Build every platform declared for the release on its native release host from the exact `v<VERSION>` tag. The existing published baseline is Linux x64, Linux arm64, and macOS arm64; do not retrofit new platform artifacts onto an already-published version.
+- Do not rebuild an artifact on an intermediate packaging machine or substitute a cross-compiled artifact for native-platform validation.
+- When Windows x64 is included, build `webcodex-v<VERSION>-win32-x64.tar.gz` on a Windows release host from the exact immutable tag using `scripts/package_release_artifact.ps1` (PowerShell + the built-in System32 `tar.exe`; no Git Bash, no WSL). The script is release-safe by default: it requires a concrete commit, `dirty=false`, a clean packaging worktree at the exact `v<VERSION>` tag, and binary commit identity matching that tag. `-AllowDevelopmentBuild` is for local/CI smoke only and its output must never be uploaded. Pin `WEBCODEX_BUILT_AT` once so all three binaries report one shared `built_at`. The archive contains `webcodex.exe`, `webcodex-server.exe`, and `webcodex-runner.exe`; the Server binary remains packaging-contract-only on Windows.
+- Windows enters the published-supported platform list only in a **new version** that has a real Windows-host-built artifact and checksum; before then, the published `manifest.json` must not contain `win32-x64` and user docs must not claim Windows is published.
 - After producing the exact tarballs, calculate each SHA-256, update the release manifest and platform-scope documentation in a clearly reported post-tag commit, and do not move the tag.
-- Artifact smoke must run `webcodex --version`, `webcodex-server --version`, and `webcodex-runner --version`; all three must report `0.3.2`, the same clean build revision, and `dirty=false`. The npm package exposes only the `webcodex` wrapper.
+- Every final artifact smoke must run `webcodex --version`, `webcodex-server --version`, and `webcodex-runner --version`; all three must report `<VERSION>`, the same concrete commit, and `dirty=false`. For a Windows-enabled release, also run `scripts/npm_install_windows_smoke.ps1` and `npm --prefix npm/webcodex test` on native Windows before approval, then package the upload candidate again **without** `-AllowDevelopmentBuild` from the exact tag.
 - Run `node npm/webcodex/test/release-manifest-check.js` only after all real checksums are present; it must reject placeholders, non-hex values, and all-zero values.
-- Run `bash scripts/npm_package_smoke.sh` before npm publication and verify the packed tarball identifies `@yyjeqhc/webcodex@0.3.2` and includes its README.
+- Run `bash scripts/npm_package_smoke.sh` before npm publication and verify the packed tarball identifies `@yyjeqhc/webcodex@<VERSION>` and includes its README.
 - If publishing a container image, manual local builds and CI builds are both acceptable. Build from the exact immutable tag, verify the image runs as the non-root WebCodex user, confirm the health check, ensure the image contains the Server and administrative CLI but not the Runner, and record the registry, tags, and immutable digest in the GitHub Release.
 
-## 9. v0.3.2 Release Sequence
+## 9. Release Sequence
 
-1. Prepare and review one version/docs commit with placeholder checksums.
-2. Run all source, focused, E2E, documentation, security, and local npm package gates from the candidate commit.
-3. Only after explicit operator authorization, create the immutable annotated `v0.3.2` tag.
-4. Build and smoke the Linux x64, Linux arm64, and macOS arm64 artifacts from that exact tag, then upload the immutable tarballs.
-5. Calculate the checksums of the exact uploaded bytes and create the reported post-tag manifest commit without moving `v0.3.2`.
+1. Select a new `<VERSION>` that does not already exist as a Git tag, GitHub Release, or npm package version. Prepare and review one version/docs commit with placeholder checksums only where real artifact bytes do not yet exist.
+2. Run all source, focused, E2E, documentation, security, platform, and local npm package gates from that candidate commit.
+3. Only after explicit operator authorization, create the immutable annotated `v<VERSION>` tag.
+4. Build and smoke every artifact declared for the release from that exact tag on its native release host. Windows release packaging must use the default provenance-checked mode, never `-AllowDevelopmentBuild`.
+5. Upload the immutable artifacts, calculate checksums from the exact uploaded bytes, and create the reported post-tag manifest commit without moving `v<VERSION>`.
 6. Re-run the manifest check and npm package smoke, then publish npm only after explicit authorization.
-7. Create or finalize the GitHub Release from `docs/RELEASE_NOTES_v0.3.2.md`, record artifact/checksum and optional container-digest results, and perform post-deployment acceptance.
+7. Create or finalize the GitHub Release from the release notes for `<VERSION>`, record artifact/checksum and optional container-digest results, and perform post-deployment acceptance.
 
 ## 10. Post-Deployment Acceptance Smoke
 

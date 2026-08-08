@@ -87,9 +87,10 @@ fn token_generate_agent_prints_token_hash_and_prefix() {
 
 #[test]
 fn credential_resolution_priority_is_explicit_then_env_name_then_default_env() {
-    let _guard = admin_cli::TEST_ENV_LOCK.lock().unwrap();
-    std::env::set_var("WEBCODEX_ACCOUNT_CREDENTIAL", "wc_acct_default");
-    std::env::set_var("CUSTOM_ACCT", "wc_acct_custom");
+    let _guard = env_test_guard();
+    let _env = EnvGuard::new()
+        .set("WEBCODEX_ACCOUNT_CREDENTIAL", "wc_acct_default")
+        .set("CUSTOM_ACCT", "wc_acct_custom");
     assert_eq!(
         resolve_account_credential(&Some("wc_acct_explicit".to_string()), &None).unwrap(),
         "wc_acct_explicit"
@@ -102,8 +103,6 @@ fn credential_resolution_priority_is_explicit_then_env_name_then_default_env() {
         resolve_account_credential(&None, &None).unwrap(),
         "wc_acct_default"
     );
-    std::env::remove_var("WEBCODEX_ACCOUNT_CREDENTIAL");
-    std::env::remove_var("CUSTOM_ACCT");
 }
 
 #[test]
@@ -347,8 +346,8 @@ async fn agent_token_create_local_does_not_send_plaintext_token_to_server() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn agent_token_create_local_prefers_admin_token_over_default_account_credential() {
-    let _guard = admin_cli::TEST_ENV_LOCK.lock().unwrap();
-    std::env::set_var("WEBCODEX_ACCOUNT_CREDENTIAL", "wc_acct_default");
+    let _guard = env_test_guard();
+    let _env = EnvGuard::new().set("WEBCODEX_ACCOUNT_CREDENTIAL", "wc_acct_default");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let handle = thread::spawn(move || {
@@ -383,13 +382,12 @@ async fn agent_token_create_local_prefers_admin_token_over_default_account_crede
     .unwrap();
     assert_eq!(out.matches("wc_agent_").count(), 1);
     handle.join().unwrap();
-    std::env::remove_var("WEBCODEX_ACCOUNT_CREDENTIAL");
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn agent_token_create_local_uses_default_account_credential() {
-    let _guard = admin_cli::TEST_ENV_LOCK.lock().unwrap();
-    std::env::set_var("WEBCODEX_ACCOUNT_CREDENTIAL", "wc_acct_default");
+    let _guard = env_test_guard();
+    let _env = EnvGuard::new().set("WEBCODEX_ACCOUNT_CREDENTIAL", "wc_acct_default");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let handle = thread::spawn(move || {
@@ -423,7 +421,6 @@ async fn agent_token_create_local_uses_default_account_credential() {
     .unwrap();
     assert_eq!(out.matches("wc_agent_").count(), 1);
     handle.join().unwrap();
-    std::env::remove_var("WEBCODEX_ACCOUNT_CREDENTIAL");
 }
 
 #[test]

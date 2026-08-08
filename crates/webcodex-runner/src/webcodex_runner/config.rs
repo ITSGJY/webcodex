@@ -171,6 +171,46 @@ impl Default for AgentPolicy {
     }
 }
 
+/// Shell grammar dialect used for quoting, init-script sourcing, profile
+/// preparation, and environment snapshot serialization. The Runner never
+/// guesses the grammar of an arbitrary custom executable: an explicit
+/// `shell.dialect` / `shell.profiles.<name>.dialect` value wins, otherwise a
+/// known shell basename is mapped, otherwise the platform default applies.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub(crate) enum ShellDialect {
+    /// `sh`-compatible syntax: `. <path> && (...)`, single-quote escaping,
+    /// `set -e`, `printf`, `env -0`.
+    #[serde(rename = "posix")]
+    Posix,
+    /// Windows PowerShell syntax: dot-sourcing, `''` single-quote escaping,
+    /// `[Console]::Out` env serialization.
+    #[serde(rename = "powershell")]
+    PowerShell,
+}
+
+/// Known-shell basename mapping used when no explicit dialect is configured.
+/// Never guesses for arbitrary custom executables; unknown names return `None`
+/// and callers fall back to the platform default shell dialect.
+pub(crate) fn dialect_for_program(program: &str) -> Option<ShellDialect> {
+    match Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program)
+    {
+        "sh" | "bash" => Some(ShellDialect::Posix),
+        "powershell" | "powershell.exe" | "pwsh" => Some(ShellDialect::PowerShell),
+        _ => None,
+    }
+}
+
+pub(crate) fn platform_default_dialect() -> ShellDialect {
+    if cfg!(windows) {
+        ShellDialect::PowerShell
+    } else {
+        ShellDialect::Posix
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub(crate) struct ShellConfig {
     #[serde(default)]
@@ -181,6 +221,12 @@ pub(crate) struct ShellConfig {
     pub(crate) program: String,
     #[serde(default = "default_shell_args")]
     pub(crate) args: Vec<String>,
+    /// Explicit shell dialect (`"posix"` or `"powershell"`). When omitted the
+    /// dialect is resolved from the program basename for known shells
+    /// (sh/bash -> posix, powershell/pwsh -> powershell) and otherwise defaults
+    /// to the platform shell (posix on Unix, powershell on Windows).
+    #[serde(default)]
+    pub(crate) dialect: Option<ShellDialect>,
     #[serde(default)]
     pub(crate) path_prepend: Vec<PathBuf>,
     #[serde(default)]
@@ -204,6 +250,7 @@ impl Default for ShellConfig {
             profiles: BTreeMap::new(),
             program: default_shell_program(),
             args: default_shell_args(),
+            dialect: None,
             path_prepend: Vec::new(),
             env: HashMap::new(),
             init_script: None,
@@ -241,6 +288,11 @@ pub(crate) struct ShellProfileConfig {
     pub(crate) program: Option<String>,
     #[serde(default)]
     pub(crate) args: Option<Vec<String>>,
+    /// Explicit dialect override for this profile. When omitted the profile
+    /// inherits `shell.dialect`, then the known-basename mapping, then the
+    /// platform default.
+    #[serde(default)]
+    pub(crate) dialect: Option<ShellDialect>,
     #[serde(default)]
     pub(crate) env: BTreeMap<String, String>,
     #[serde(default)]
@@ -432,10 +484,35 @@ pub(crate) fn restart_required_fields(
     )
 }
 
+/// Windows default shell: native PowerShell (no sh/Git Bash/WSL required).
+/// `-NoProfile` skips the user's interactive profile, `-NonInteractive` never
+/// prompts, `-ExecutionPolicy Bypass` is process-scoped and lets configured
+/// init/profile scripts dot-source `.ps1` files even under the stock
+/// Restricted machine policy, and `-Command` accepts the full script text as a
+/// single argument. stdout/stderr are captured through the Runner pipes and the
+/// script text appends an explicit `exit $LASTEXITCODE`.
+#[cfg(windows)]
+fn default_shell_program() -> String {
+    "powershell.exe".to_string()
+}
+
+#[cfg(windows)]
+fn default_shell_args() -> Vec<String> {
+    vec![
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-ExecutionPolicy".to_string(),
+        "Bypass".to_string(),
+        "-Command".to_string(),
+    ]
+}
+
+#[cfg(not(windows))]
 fn default_shell_program() -> String {
     "sh".to_string()
 }
 
+#[cfg(not(windows))]
 fn default_shell_args() -> Vec<String> {
     vec!["-c".to_string()]
 }
@@ -470,36 +547,8 @@ pub(crate) fn max_concurrent_jobs(cfg: &AgentConfig) -> usize {
         .max(1)
 }
 
-fn default_client_base_dir() -> PathBuf {
-    if is_effective_root() {
-        PathBuf::from("/etc/webcodex")
-    } else {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        home.join(".config/webcodex")
-    }
-}
-
-#[cfg(unix)]
-fn is_effective_root() -> bool {
-    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-        for line in status.lines() {
-            if let Some(rest) = line.strip_prefix("Uid:") {
-                let mut parts = rest.split_whitespace();
-                let _real = parts.next();
-                if let Some(effective) = parts.next() {
-                    return effective == "0";
-                }
-            }
-        }
-    }
-    std::env::var("USER").is_ok_and(|u| u == "root")
-}
-
-#[cfg(not(unix))]
-fn is_effective_root() -> bool {
-    false
+fn default_client_base_dir() -> Result<PathBuf, String> {
+    webcodex_agent_config::paths::default_client_config_base_dir()
 }
 
 pub(crate) fn validate_client_profile(profile: &str) -> Result<String, String> {
@@ -519,29 +568,22 @@ pub(crate) fn validate_client_profile(profile: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-pub(crate) fn client_profile_agent_config(profile: &str) -> PathBuf {
-    default_client_base_dir()
+pub(crate) fn client_profile_agent_config(profile: &str) -> Result<PathBuf, String> {
+    Ok(default_client_base_dir()?
         .join("clients")
         .join(profile)
-        .join("agent.toml")
+        .join("agent.toml"))
 }
 
-pub(crate) fn default_config_path() -> PathBuf {
-    let home_path = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".config/webcodex/agent.toml"));
+pub(crate) fn default_config_path() -> Result<PathBuf, String> {
+    let user_path = default_client_base_dir()?.join("agent.toml");
     let system_path = PathBuf::from(DEFAULT_CONFIG_PATH);
-    for path in [home_path.clone(), Some(system_path.clone())]
-        .into_iter()
-        .flatten()
-    {
+    for path in [user_path.clone(), system_path.clone()] {
         if path.exists() {
-            return path;
+            return Ok(path);
         }
     }
-    home_path
-        .or_else(|| Some(system_path))
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH))
+    Ok(user_path)
 }
 
 fn validate_env_key(key: &str) -> bool {
@@ -766,6 +808,7 @@ fn validate_shell_profile_toml_shape(content: &str) -> Result<(), String> {
         return Err("shell must be a table".to_string());
     };
     validate_optional_toml_string(shell, "default_profile", "shell.default_profile")?;
+    validate_optional_toml_string(shell, "dialect", "shell.dialect")?;
     let Some(profiles) = shell.get("profiles") else {
         return Ok(());
     };
@@ -785,6 +828,11 @@ fn validate_shell_profile_toml_shape(content: &str) -> Result<(), String> {
             profile,
             "program",
             &format!("shell.profiles.{}.program", name),
+        )?;
+        validate_optional_toml_string(
+            profile,
+            "dialect",
+            &format!("shell.profiles.{}.dialect", name),
         )?;
         validate_optional_toml_string(
             profile,
@@ -865,6 +913,14 @@ pub(crate) fn load_config(path: &Path) -> Result<AgentConfig, String> {
     let effective =
         effective_allowed_roots(&cfg.policy.allowed_roots, cfg.policy.allow_cwd_anywhere)?;
     cfg.policy.allowed_roots = effective;
+    // Materialize the default projects dir at load time so request-time code
+    // never re-derives it and can never fall back to a relative path. A
+    // minimal agent.toml without an explicit projects_dir gets the shared
+    // per-user config base (`$HOME/.config/webcodex/projects.d` on Unix,
+    // `%APPDATA%\webcodex\projects.d` on Windows).
+    if cfg.projects_dir.is_none() {
+        cfg.projects_dir = Some(default_projects_dir()?);
+    }
     validate_shell_config(&cfg.shell)?;
     validate_ssh_config(&mut cfg.ssh)?;
     if let Some(quic) = &cfg.quic {
@@ -895,15 +951,13 @@ pub(crate) fn hostname() -> Option<String> {
         })
 }
 
-fn default_projects_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config/webcodex/projects.d")
+fn default_projects_dir() -> Result<PathBuf, String> {
+    Ok(default_client_base_dir()?.join("projects.d"))
 }
 
-pub(crate) fn projects_dir(cfg: &AgentConfig) -> PathBuf {
-    cfg.projects_dir
-        .clone()
-        .unwrap_or_else(default_projects_dir)
+pub(crate) fn projects_dir(cfg: &AgentConfig) -> Result<PathBuf, String> {
+    match &cfg.projects_dir {
+        Some(projects_dir) => Ok(projects_dir.clone()),
+        None => default_projects_dir(),
+    }
 }

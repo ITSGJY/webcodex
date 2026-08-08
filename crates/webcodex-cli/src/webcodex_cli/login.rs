@@ -28,6 +28,32 @@ use super::{is_effective_root, shell_command, validate_user_api_token};
 /// Device name reported to the server. The hostname is what a person would call
 /// this machine; `--device` overrides it.
 pub(crate) fn default_device_name() -> String {
+    default_hostname()
+        .map(|value| sanitize_device_name(&value))
+        .unwrap_or_else(|| "device".to_string())
+}
+
+/// The machine-name source for the default device name.
+///
+/// - Windows: `COMPUTERNAME` — the OS-owned machine name set at logon — then
+///   `HOSTNAME` as a fallback for shells that export it. The default never
+///   depends on `HOSTNAME` alone: on a plain Windows machine `HOSTNAME` is
+///   absent and `COMPUTERNAME` is the reliable source.
+/// - Unix: `HOSTNAME`, then `/etc/hostname` (historical behavior preserved).
+#[cfg(windows)]
+fn default_hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("HOSTNAME")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+}
+
+#[cfg(not(windows))]
+fn default_hostname() -> Option<String> {
     std::env::var("HOSTNAME")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -37,8 +63,6 @@ pub(crate) fn default_device_name() -> String {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         })
-        .map(|value| sanitize_device_name(&value))
-        .unwrap_or_else(|| "device".to_string())
 }
 
 fn sanitize_device_name(raw: &str) -> String {
@@ -508,6 +532,7 @@ pub(crate) fn write_descriptor(
 /// second copy on disk for it to drift from.
 pub(crate) fn stage_connection(
     staging: &Path,
+    published_projects_dir: &Path,
     opts: &LoginOptions,
     server_url: &str,
     identity: &EnrolledIdentity,
@@ -534,7 +559,10 @@ pub(crate) fn stage_connection(
         display_name: None,
         transport: opts.transport.clone(),
         poll_interval_ms: crate::agent_init::DEFAULT_POLL_INTERVAL_MS,
-        projects_dir: paths.projects_dir.clone(),
+        // The directory is created inside staging above so it is published
+        // atomically with the rest of the connection, but agent.toml must
+        // point at its final path after that staging directory is renamed.
+        projects_dir: published_projects_dir.to_path_buf(),
         output: paths.agent_config.clone(),
         allowed_roots: opts.allowed_roots.clone(),
         allow_cwd_anywhere: false,
@@ -547,6 +575,7 @@ pub(crate) fn stage_connection(
 
 const ROOT_AGENT_INSTALL_REASON: &str = "login ran as root; no safe systemd installation argv can be generated without explicitly selecting a non-root Runner user and validating access to the agent config, working directory, projects directory, and allowed roots";
 const ROOT_FOREGROUND_REASON: &str = "login ran as root; no foreground Runner argv is emitted because it would execute project commands as root";
+const WINDOWS_AGENT_INSTALL_REASON: &str = "automatic Windows Runner service installation is not supported in this release; start the foreground Runner shown above instead";
 
 pub(crate) fn render_login_result(
     paths: &ConnectionPaths,
@@ -564,7 +593,7 @@ pub(crate) fn render_login_result(
             paths.agent_config.to_string_lossy().into_owned(),
         ]
     });
-    let agent_install_argv = if effective_root {
+    let agent_install_argv = if effective_root || cfg!(windows) {
         None
     } else {
         Some(vec![
@@ -576,6 +605,13 @@ pub(crate) fn render_login_result(
             "--config".to_string(),
             paths.agent_config.to_string_lossy().into_owned(),
         ])
+    };
+    let agent_install_reason = if effective_root {
+        Some(ROOT_AGENT_INSTALL_REASON)
+    } else if cfg!(windows) {
+        Some(WINDOWS_AGENT_INSTALL_REASON)
+    } else {
+        None
     };
     let foreground_command = foreground_argv.as_ref().map(|argv| shell_command(argv));
     let agent_install_command = agent_install_argv.as_ref().map(|argv| shell_command(argv));
@@ -608,7 +644,7 @@ pub(crate) fn render_login_result(
             "foreground_reason": effective_root.then_some(ROOT_FOREGROUND_REASON),
             "agent_install_available": agent_install_argv.is_some(),
             "agent_install_argv": &agent_install_argv,
-            "agent_install_reason": effective_root.then_some(ROOT_AGENT_INSTALL_REASON),
+            "agent_install_reason": agent_install_reason,
             "next_steps": next_steps,
         });
         return serde_json::to_string_pretty(&summary).map_err(|error| error.to_string());
@@ -638,6 +674,10 @@ pub(crate) fn render_login_result(
         (Some(foreground_command), Some(command)) => format!(
             "Start the agent in the foreground:\n  {foreground_command}\n\n\
              Or install it as a non-root user service (run as the same ordinary user):\n  {command}\n"
+        ),
+        (Some(foreground_command), None) => format!(
+            "Start the agent in the foreground:\n  {foreground_command}\n\n{}\n",
+            agent_install_reason.unwrap_or("automatic Runner service installation is unavailable")
         ),
         (None, None) => "Login ran as root, so no command to start a root Runner is recommended.\n\
                         Recommended: have the ordinary local user who will run the Runner use a fresh pairing code to execute `webcodex login`, then install the user service as that same user.\n\
@@ -793,8 +833,8 @@ pub(crate) fn all_connections(base: &Path) -> Vec<Connection> {
     list_connections(base)
 }
 
-pub(crate) fn base_dir_or_default(explicit: Option<PathBuf>) -> PathBuf {
-    explicit.unwrap_or_else(default_base_dir)
+pub(crate) fn base_dir_or_default(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
+    explicit.map(Ok).unwrap_or_else(default_base_dir)
 }
 
 /// Redeem a pairing code. Network only — writes nothing.
@@ -864,7 +904,15 @@ pub(crate) async fn run_login(opts: LoginOptions) -> Result<String, String> {
 
     let staging = create_staging_dir(&parent)?;
     let now = chrono::Utc::now().to_rfc3339();
-    if let Err(error) = stage_connection(&staging, &opts, &server_url, &identity, &device, &now) {
+    if let Err(error) = stage_connection(
+        &staging,
+        &paths.projects_dir,
+        &opts,
+        &server_url,
+        &identity,
+        &device,
+        &now,
+    ) {
         let residue = discard_internal_dir(&staging);
         return Err(note_residue(error, residue));
     }
@@ -1007,6 +1055,7 @@ mod tests {
         let staging = create_staging_dir(&parent)?;
         if let Err(error) = stage_connection(
             &staging,
+            &paths.projects_dir,
             &opts,
             &canonical.url,
             &identity,
@@ -1048,6 +1097,55 @@ mod tests {
         assert!(sanitize_device_name(&"x".repeat(200)).len() <= 80);
     }
 
+    /// `default_device_name` must be derivable from controlled environment
+    /// variables alone — tests must never depend on the real machine name.
+    #[test]
+    fn default_device_name_uses_the_platform_hostname_source() {
+        let _guard = crate::webcodex_cli::test_support::env_test_guard();
+        #[cfg(windows)]
+        let env = crate::webcodex_cli::test_support::EnvGuard::new()
+            .remove("COMPUTERNAME")
+            .remove("HOSTNAME");
+        #[cfg(not(windows))]
+        let env = crate::webcodex_cli::test_support::EnvGuard::new().remove("HOSTNAME");
+        let _env = env;
+
+        #[cfg(windows)]
+        {
+            // COMPUTERNAME is the OS-owned source and wins over HOSTNAME.
+            let _c = crate::webcodex_cli::test_support::EnvGuard::new()
+                .set("COMPUTERNAME", "DESKTOP-ABC123")
+                .set("HOSTNAME", "msys-host");
+            assert_eq!(default_device_name(), "desktop-abc123");
+            // Without COMPUTERNAME, HOSTNAME is the fallback.
+            let _c2 = crate::webcodex_cli::test_support::EnvGuard::new()
+                .remove("COMPUTERNAME")
+                .set("HOSTNAME", "Msys-Host");
+            assert_eq!(default_device_name(), "msys-host");
+            // Neither: the stable fallback.
+            let _c3 = crate::webcodex_cli::test_support::EnvGuard::new()
+                .remove("COMPUTERNAME")
+                .remove("HOSTNAME");
+            assert_eq!(default_device_name(), "device");
+            // An empty COMPUTERNAME is treated as missing.
+            let _c4 = crate::webcodex_cli::test_support::EnvGuard::new()
+                .set("COMPUTERNAME", "  ")
+                .remove("HOSTNAME");
+            assert_eq!(default_device_name(), "device");
+        }
+        #[cfg(not(windows))]
+        {
+            // Unix keeps the historical HOSTNAME-first behavior.
+            let _h = crate::webcodex_cli::test_support::EnvGuard::new().set("HOSTNAME", "web-1");
+            assert_eq!(default_device_name(), "web-1");
+            // COMPUTERNAME is a foreign variable on Unix and must not win.
+            let _h2 = crate::webcodex_cli::test_support::EnvGuard::new()
+                .set("HOSTNAME", "web-2")
+                .set("COMPUTERNAME", "desktop-x");
+            assert_eq!(default_device_name(), "web-2");
+        }
+    }
+
     #[test]
     fn destination_is_server_then_user() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -1079,9 +1177,23 @@ mod tests {
         assert!(paths.projects_dir.is_dir());
         // The agent token has exactly one home.
         assert!(!paths.dir.join("webcodex-runner-token").exists());
-        assert!(std::fs::read_to_string(&paths.agent_config)
-            .unwrap()
-            .contains(AGENT_TOKEN));
+        let agent_config = std::fs::read_to_string(&paths.agent_config).unwrap();
+        assert!(agent_config.contains(AGENT_TOKEN));
+        let parsed: toml::Value = toml::from_str(&agent_config).unwrap();
+        let configured_projects_dir = PathBuf::from(
+            parsed
+                .get("projects_dir")
+                .and_then(toml::Value::as_str)
+                .expect("projects_dir must be present"),
+        );
+        assert_eq!(
+            configured_projects_dir.canonicalize().unwrap(),
+            paths.projects_dir.canonicalize().unwrap(),
+            "published agent.toml must reference the published projects.d directory"
+        );
+        // Canonical equality above proves this is the published projects.d,
+        // not the differently named staging directory that existed before the
+        // atomic rename.
 
         assert_no_internal_residue(base);
         assert_no_internal_residue(paths.dir.parent().unwrap());
@@ -1128,6 +1240,7 @@ mod tests {
         std::fs::create_dir_all(staging.join("agent.toml")).unwrap();
         let result = stage_connection(
             &staging,
+            &paths.projects_dir,
             &opts,
             "https://api.example.com",
             &identity,
@@ -1711,6 +1824,7 @@ mod tests {
         let staging = create_staging_dir(&parent).unwrap();
         stage_connection(
             &staging,
+            &final_dir.join("projects.d"),
             &opts,
             &canonical.url,
             &identity(),
@@ -1924,14 +2038,24 @@ mod tests {
         }
         let mut file = options.open(&path).unwrap();
         let writer = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(15));
+            // Short sleep so the reader normally observes the empty file
+            // before the write lands.
+            std::thread::sleep(std::time::Duration::from_millis(2));
             file.write_all(b"feedfacecafe0001\n").unwrap();
         });
 
-        assert_eq!(
-            read_device_suffix_after_concurrent_create(&path).unwrap(),
-            "feedfacecafe0001"
-        );
+        // Each call has a fixed 100ms wait budget; under full-suite parallel
+        // load the scheduler can stall the writer past one budget, so retry
+        // the wait until the writer (which always eventually writes) lands.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let suffix = loop {
+            match read_device_suffix_after_concurrent_create(&path) {
+                Ok(suffix) => break suffix,
+                Err(_) if std::time::Instant::now() < deadline => continue,
+                Err(error) => panic!("concurrent device suffix create never landed: {error}"),
+            }
+        };
+        assert_eq!(suffix, "feedfacecafe0001");
         writer.join().unwrap();
     }
 
@@ -2042,15 +2166,17 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains(&format!(
-                "webcodex agent install --scope user --config {}",
-                paths.agent_config.display()
-            )),
+            (!cfg!(windows) && text.contains("webcodex agent install --scope user --config"))
+                || (cfg!(windows) && !text.contains("webcodex agent install")),
             "{text}"
         );
         assert!(
-            text.contains("same ordinary user"),
+            cfg!(windows) || text.contains("same ordinary user"),
             "non-root guidance was not explicit: {text}"
+        );
+        assert!(
+            !cfg!(windows) || text.contains(WINDOWS_AGENT_INSTALL_REASON),
+            "Windows login did not explain the service-install boundary: {text}"
         );
         assert!(!text.contains(USER_TOKEN), "default text leaked a token");
         assert!(!text.contains(AGENT_TOKEN), "default text leaked a token");
@@ -2065,12 +2191,32 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(json.contains("mcp_url"), "{json}");
-        assert!(json.contains("credential_usage"), "{json}");
-        assert!(
-            json.contains(&paths.user_token.display().to_string()),
-            "{json}"
+        let json_value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            json_value
+                .get("mcp_url")
+                .and_then(serde_json::Value::as_str),
+            Some("https://api.example.com/mcp")
         );
+        assert!(json_value.get("credential_usage").is_some(), "{json}");
+        assert_eq!(
+            json_value
+                .get("user_token_file")
+                .and_then(serde_json::Value::as_str),
+            paths.user_token.to_str()
+        );
+        if cfg!(windows) {
+            assert_eq!(
+                json_value["agent_install_available"],
+                serde_json::json!(false)
+            );
+            assert!(json_value["agent_install_argv"].is_null());
+            assert_eq!(
+                json_value["agent_install_reason"],
+                serde_json::json!(WINDOWS_AGENT_INSTALL_REASON)
+            );
+            assert_eq!(json_value["next_steps"].as_array().unwrap().len(), 1);
+        }
         assert!(!json.contains(USER_TOKEN), "json leaked a token");
         assert!(!json.contains(AGENT_TOKEN), "json leaked a token");
     }
@@ -2104,7 +2250,15 @@ mod tests {
         )
         .unwrap();
         assert!(text.contains(&shell_command(&foreground_argv)), "{text}");
-        assert!(text.contains(&shell_command(&install_argv)), "{text}");
+        assert_eq!(
+            text.contains(&shell_command(&install_argv)),
+            !cfg!(windows),
+            "{text}"
+        );
+        assert!(
+            !cfg!(windows) || text.contains(WINDOWS_AGENT_INSTALL_REASON),
+            "{text}"
+        );
 
         let json_text = render_login_result(
             &paths,
@@ -2120,50 +2274,60 @@ mod tests {
         assert_eq!(value["foreground_available"], serde_json::json!(true));
         assert_eq!(value["foreground_argv"], serde_json::json!(foreground_argv));
         assert!(value["foreground_reason"].is_null());
-        assert_eq!(value["agent_install_argv"], serde_json::json!(install_argv));
-        assert_eq!(value["agent_install_available"], serde_json::json!(true));
-        assert!(value["agent_install_reason"].is_null());
+        assert_eq!(
+            value["agent_install_argv"],
+            if cfg!(windows) {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(install_argv)
+            }
+        );
+        assert_eq!(
+            value["agent_install_available"],
+            serde_json::json!(!cfg!(windows))
+        );
+        if cfg!(windows) {
+            assert_eq!(
+                value["agent_install_reason"],
+                serde_json::json!(WINDOWS_AGENT_INSTALL_REASON)
+            );
+        } else {
+            assert!(value["agent_install_reason"].is_null());
+        }
         assert_eq!(
             value["next_steps"][0].as_str().unwrap(),
             shell_command(&foreground_argv)
         );
         assert_eq!(
-            value["next_steps"][1].as_str().unwrap(),
-            shell_command(&install_argv)
+            value["next_steps"]
+                .get(1)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+            if cfg!(windows) {
+                String::new()
+            } else {
+                shell_command(&install_argv)
+            }
         );
         assert!(!json_text.contains(USER_TOKEN));
         assert!(!json_text.contains(AGENT_TOKEN));
 
-        let recommended_argv: Vec<String> =
-            serde_json::from_value(value["agent_install_argv"].clone()).unwrap();
+        let recommended_argv: Vec<String> = if cfg!(windows) {
+            install_argv.clone()
+        } else {
+            serde_json::from_value(value["agent_install_argv"].clone()).unwrap()
+        };
         let parser_env = tempfile::TempDir::new().unwrap();
         std::fs::write(parser_env.path().join("webcodex-runner"), "").unwrap();
         #[cfg(windows)]
         std::fs::write(parser_env.path().join("webcodex-runner.exe"), "").unwrap();
-        let _guard = crate::admin_cli::TEST_ENV_LOCK.lock().unwrap();
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
-        let old_path = std::env::var_os("PATH");
-        std::env::set_var("HOME", parser_env.path());
-        std::env::set_var("XDG_CONFIG_HOME", parser_env.path());
-        std::env::set_var("PATH", parser_env.path());
+        let _guard = crate::webcodex_cli::test_support::env_test_guard();
+        let _env = crate::webcodex_cli::test_support::EnvGuard::new()
+            .set_os("HOME", parser_env.path().as_os_str().to_owned())
+            .set_os("XDG_CONFIG_HOME", parser_env.path().as_os_str().to_owned())
+            .set_os("PATH", parser_env.path().as_os_str().to_owned());
         let parsed =
             crate::parse_agent_install_service_with_identity(&recommended_argv[3..], false);
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_CONFIG_HOME", value);
-        } else {
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
-        if let Some(value) = old_path {
-            std::env::set_var("PATH", value);
-        } else {
-            std::env::remove_var("PATH");
-        }
         assert!(
             parsed.is_ok(),
             "non-root recommendation was rejected by the install parser: {parsed:?}"
@@ -2321,6 +2485,7 @@ mod tests {
         let staging = create_staging_dir(&parent).unwrap();
         stage_connection(
             &staging,
+            &paths.projects_dir,
             &opts,
             &canonical.url,
             &identity,

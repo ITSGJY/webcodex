@@ -5,6 +5,7 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -18,6 +19,13 @@ fn main() -> io::Result<()> {
         }
     }
     let marker = args.get(1).map(Path::new);
+    if scenario == "sleep_descendant" {
+        // Test-only grandchild mode: keep inherited stdout open and sleep so
+        // the parent can observe that a descendant still owns the tree.
+        let secs: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(60);
+        thread::sleep(Duration::from_secs(secs));
+        return Ok(());
+    }
     append(marker, "start\n")?;
     let mut reader = BufReader::new(io::stdin().lock());
     let mut writer = io::stdout().lock();
@@ -38,6 +46,22 @@ fn main() -> io::Result<()> {
             )?,
             Some("notifications/initialized") => {}
             Some("tools/list") => {
+                if scenario == "spawn_descendant" {
+                    // Spawn a descendant that inherits stdout, then exit right
+                    // after responding. The descendant outlives the direct child
+                    // and keeps the piped stdout write end open, so the
+                    // connection reader must NOT see EOF while it lives.
+                    let child = spawn_sleep_descendant()?;
+                    append(marker, &format!("GRANDCHILD_PID={}\n", child.id()))?;
+                    let tools = tools_list_json(scenario);
+                    send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"tools":[{tools}]}}}}"#
+                        ),
+                    )?;
+                    return Ok(());
+                }
                 let tools = tools_list_json(scenario);
                 send(
                     &mut writer,
@@ -209,6 +233,19 @@ fn send(writer: &mut impl Write, body: &str) -> io::Result<()> {
     writer.write_all(body.as_bytes())?;
     writer.write_all(b"\n")?;
     writer.flush()
+}
+
+/// Re-invoke this fixture as a `sleep_descendant` grandchild that inherits all
+/// std handles, so the piped stdout write end stays open for its lifetime.
+fn spawn_sleep_descendant() -> io::Result<std::process::Child> {
+    let self_exe = std::env::current_exe()?;
+    let mut command = Command::new(self_exe);
+    command
+        .args(["sleep_descendant", "60"])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    command.spawn()
 }
 
 // Production fake_search/fake_edit plus harness tools and one non-callable discovery tool.

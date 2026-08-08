@@ -1848,6 +1848,7 @@ async fn show_changes_preserves_sentinel_text_in_normal_diff_and_tool_result() {
     assert_show_changes_envelope_matches_schema("sentinel normal diff", &result);
 }
 
+#[cfg(unix)]
 #[test]
 fn show_changes_preserves_sentinel_text_from_external_diff() {
     use std::os::unix::fs::PermissionsExt;
@@ -2656,6 +2657,7 @@ fn bounded_show_changes_output_from_frames(
     output
 }
 
+#[cfg(unix)]
 #[test]
 fn show_changes_oversized_no_hunk_preamble_is_bounded_and_drained() {
     use std::os::unix::fs::PermissionsExt;
@@ -2850,6 +2852,7 @@ fn show_changes_long_commit_subject_stays_within_budget() {
     assert_show_changes_envelope_value_matches_schema(&output, "long subject");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn show_changes_runtime_rejects_stat_only_failure_for_both_diff_modes() {
     use std::os::unix::fs::PermissionsExt;

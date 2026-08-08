@@ -15,6 +15,8 @@ use std::path::PathBuf;
 
 use webcodex_core::shell_protocol::ShellClientCapabilities;
 
+pub mod paths;
+
 /// Default projects directory written into generated agent configs.
 pub const DEFAULT_INIT_PROJECTS_DIR: &str = "/etc/webcodex/projects.d";
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
@@ -48,11 +50,10 @@ pub struct AgentInitOptions {
     pub overwrite: bool,
 }
 
-/// Return `$HOME` as an allowed-root candidate, when set and non-empty.
+/// Return the per-user home as an allowed-root candidate, when determinable.
+/// Windows: `USERPROFILE`; Unix: `HOME`. See [`paths::home_dir`].
 pub fn home_allowed_root() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
+    paths::home_dir().filter(|p| !p.as_os_str().is_empty())
 }
 
 /// Resolve the effective `allowed_roots` for an agent policy.
@@ -307,6 +308,30 @@ where
 mod tests {
     use super::*;
 
+    /// RAII restore for environment variables: restores the previous value
+    /// (or removes the variable) on drop, even if the test panics.
+    struct EnvVarRestore {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarRestore {
+        fn remove(name: &'static str) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::remove_var(name);
+            EnvVarRestore { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarRestore {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
     fn init_opts(output: PathBuf) -> AgentInitOptions {
         AgentInitOptions {
             server_url: "https://v4.example.test/".to_string(),
@@ -333,8 +358,8 @@ mod tests {
 
     #[test]
     fn effective_allowed_roots_defaults_to_home_when_empty() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = home_allowed_root();
         if let Some(home) = home {
             let roots = effective_allowed_roots(&[], false).unwrap();
             assert_eq!(roots, vec![home]);
@@ -343,39 +368,41 @@ mod tests {
 
     #[test]
     fn effective_allowed_roots_errors_when_empty_and_no_home_and_no_cwd_anywhere() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
-        let saved = std::env::var_os("HOME");
-        std::env::remove_var("HOME");
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _h = EnvVarRestore::remove("HOME");
+        let _u = EnvVarRestore::remove("USERPROFILE");
         let err = effective_allowed_roots(&[], false).unwrap_err();
         assert!(err.contains("allowed_roots is empty"));
-        match saved {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
     fn effective_allowed_roots_empty_with_cwd_anywhere_returns_empty() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
-        let saved = std::env::var_os("HOME");
-        std::env::remove_var("HOME");
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _h = EnvVarRestore::remove("HOME");
+        let _u = EnvVarRestore::remove("USERPROFILE");
         let roots = effective_allowed_roots(&[], true).unwrap();
         assert!(roots.is_empty());
-        match saved {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
     fn generated_config_uses_home_default_when_roots_empty() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = home_allowed_root();
         if let Some(home) = home {
             let mut opts = init_opts(PathBuf::from("-"));
             opts.allowed_roots.clear();
             let content = generated_agent_config_toml(&opts).unwrap();
-            assert!(content.contains(&format!("allowed_roots = [\"{}\"]", home.to_string_lossy())));
+            // Parse the output back rather than matching the serializer's
+            // quoting: Windows paths contain backslashes and the TOML encoder
+            // may pick basic- or literal-string forms.
+            let parsed: toml::Value = toml::from_str(&content).unwrap();
+            let rendered_roots = parsed["policy"]["allowed_roots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(rendered_roots, vec![home.to_string_lossy().to_string()]);
             assert!(!content.contains("job_state_reconciliation"));
         }
     }

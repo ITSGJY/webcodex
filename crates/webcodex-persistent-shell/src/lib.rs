@@ -7,29 +7,57 @@
 //! terminal byte-stream API.
 
 use std::collections::{HashMap, VecDeque};
-use std::ffi::OsString;
-use std::fs::File;
-use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, MutexGuard, Weak};
+// `mpsc` is used only by the Unix local-shell readers; Windows has no shell yet.
+#[cfg(unix)]
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-pub const STDOUT_SYNC_FD: RawFd = 7;
-pub const STDERR_SYNC_FD: RawFd = 8;
-const CONTROL_FD: RawFd = 9;
+// The local persistent shell spawn/primitives below are Unix-only. Windows has
+// no persistent shell yet; `spawn_shell_process` fails closed there and these
+// imports are compiled out entirely.
+#[cfg(unix)]
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::fs::File;
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
+#[cfg(unix)]
+use std::process::{Child, ChildStdin, Command, Stdio};
+
+/// Reserved descriptor numbers used by the persistent-shell protocol on both
+/// platforms. They are plain integers (not `RawFd`, which does not exist on
+/// Windows) so the shell wrapper templates and any platform code can share them.
+pub const STDOUT_SYNC_FD: i32 = 7;
+pub const STDERR_SYNC_FD: i32 = 8;
+/// Private control-channel descriptor number, used only by the Unix local
+/// shell protocol (and the shell wrapper templates it emits).
+#[cfg(unix)]
+const CONTROL_FD: i32 = 9;
 pub const CONTROL_MAGIC: &[u8] = b"WCPS1";
 pub const STDOUT_SYNC_MAGIC: &[u8] = b"WCPSO1";
 pub const STDERR_SYNC_MAGIC: &[u8] = b"WCPSE1";
+// Constants used only by the Unix local-shell implementation are declared
+// `cfg(unix)` so they do not warn as dead on Windows, where the local shell is
+// fail-closed.
+#[cfg(unix)]
 const CONTROL_FIELD_MAX_BYTES: usize = 8 * 1024;
+#[cfg(unix)]
 const CONTROL_CHANNEL_CAPACITY: usize = 2;
+#[cfg(unix)]
 const OUTPUT_SYNC_CHANNEL_CAPACITY: usize = 2;
+#[cfg(unix)]
 const OUTPUT_READ_SLEEP: Duration = Duration::from_millis(5);
+#[cfg(unix)]
 const PROCESS_SIGNAL_GRACE: Duration = Duration::from_millis(100);
 const TIMEOUT_RECOVERY_WINDOW: Duration = Duration::from_millis(750);
 const OPEN_INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -321,6 +349,7 @@ impl BoundedBuffer {
     }
 }
 
+#[cfg(unix)]
 #[derive(Debug)]
 struct ShellProcess {
     child: Mutex<Child>,
@@ -339,11 +368,13 @@ struct ShellProcess {
     shutdown_started: AtomicBool,
 }
 
+#[cfg(unix)]
 struct SpawnedChildGuard {
     child: Option<Child>,
     process_group_id: u32,
 }
 
+#[cfg(unix)]
 impl SpawnedChildGuard {
     fn new(child: Child) -> Self {
         let process_group_id = child.id();
@@ -366,6 +397,7 @@ impl SpawnedChildGuard {
     }
 }
 
+#[cfg(unix)]
 impl Drop for SpawnedChildGuard {
     fn drop(&mut self) {
         let Some(child) = self.child.as_mut() else {
@@ -524,6 +556,7 @@ impl PersistentShellManager {
     }
 
     pub fn open(&self, launch: ShellLaunch) -> Result<ShellSummary, ShellError> {
+        ensure_local_shell_supported()?;
         validate_launch(&launch)?;
         self.ensure_idle_sweeper();
         self.sweep_idle();
@@ -559,8 +592,12 @@ impl PersistentShellManager {
             }
         }
 
+        #[cfg(unix)]
         let process: Box<dyn ShellTransport> = Box::new(spawn_shell_process(&launch)?);
+        #[cfg(not(unix))]
+        let process: Box<dyn ShellTransport> = spawn_shell_process(&launch)?;
         let timestamp = now_ts();
+
         let entry = Arc::new(ShellEntry {
             identity: launch.identity.clone(),
             dialect: launch.dialect,
@@ -1364,6 +1401,7 @@ impl Drop for BusyGuard {
     }
 }
 
+#[cfg(unix)]
 impl ShellProcess {
     fn set_expected_token(&self, token: &str) {
         *lock_unpoison(&self.expected_token) = Some(token.to_string());
@@ -1546,12 +1584,14 @@ impl ShellProcess {
     }
 }
 
+#[cfg(unix)]
 impl Drop for ShellProcess {
     fn drop(&mut self) {
         self.shutdown();
     }
 }
 
+#[cfg(unix)]
 impl ShellTransport for ShellProcess {
     fn set_expected_token(&self, token: &str) {
         ShellProcess::set_expected_token(self, token);
@@ -1593,6 +1633,24 @@ impl ShellTransport for ShellProcess {
     fn stderr(&self) -> &Arc<Mutex<BoundedBuffer>> {
         ShellProcess::stderr_buffer(self)
     }
+}
+
+#[cfg(unix)]
+fn ensure_local_shell_supported() -> Result<(), ShellError> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_local_shell_supported() -> Result<(), ShellError> {
+    Err(persistent_shell_unsupported_error())
+}
+
+#[cfg(not(unix))]
+fn persistent_shell_unsupported_error() -> ShellError {
+    ShellError::new(
+        "persistent_shell_unsupported",
+        "persistent shell is not supported on Windows yet",
+    )
 }
 
 fn validate_launch(launch: &ShellLaunch) -> Result<(), ShellError> {
@@ -1642,6 +1700,7 @@ fn validate_launch(launch: &ShellLaunch) -> Result<(), ShellError> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn drain_sync_receiver(
     receiver: &Mutex<mpsc::Receiver<String>>,
     token: &str,
@@ -1709,6 +1768,7 @@ pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+#[cfg(unix)]
 fn command_wrapper(command: &str, token: &str, printf: &str, pwd: &str) -> String {
     let status_variable = format!("__wc_ps_status_{token}");
     let framed = format!(
@@ -1741,7 +1801,7 @@ fn command_wrapper(command: &str, token: &str, printf: &str, pwd: &str) -> Strin
     format!("\\eval {}\n", shell_quote(&framed))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
 fn set_close_on_exec(fd: RawFd) -> std::io::Result<()> {
     // `pipe2(O_CLOEXEC)` is unavailable on Darwin. Preserve any existing
     // descriptor flags and add FD_CLOEXEC immediately after creating the pipe.
@@ -1756,6 +1816,7 @@ fn set_close_on_exec(fd: RawFd) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn create_control_pipe() -> Result<(File, File), ShellError> {
     let mut fds = [-1_i32; 2];
     // Linux and Android can set close-on-exec atomically. Darwin and other Unix
@@ -1798,6 +1859,7 @@ fn create_control_pipe() -> Result<(File, File), ShellError> {
     Ok((reader, writer))
 }
 
+#[cfg(unix)]
 fn spawn_shell_process(launch: &ShellLaunch) -> Result<ShellProcess, ShellError> {
     let control_printf = resolve_control_program("printf")?;
     let control_pwd = resolve_control_program("pwd")?;
@@ -1923,6 +1985,17 @@ fn spawn_shell_process(launch: &ShellLaunch) -> Result<ShellProcess, ShellError>
     })
 }
 
+/// Windows has no persistent shell implementation yet. Fail closed with a
+/// stable, explicit error instead of spawning a degraded child that could not
+/// honor the FD-7/8/9 protocol, silently pretending to succeed, or panicking.
+/// The concrete `ShellProcess` type is Unix-only, so the Windows stub reports
+/// through the boxed trait and `open` never constructs a shell on Windows.
+#[cfg(not(unix))]
+fn spawn_shell_process(_launch: &ShellLaunch) -> Result<Box<dyn ShellTransport>, ShellError> {
+    Err(persistent_shell_unsupported_error())
+}
+
+#[cfg(unix)]
 fn resolve_control_program(name: &str) -> Result<String, ShellError> {
     for directory in ["/usr/bin", "/bin"] {
         let path = Path::new(directory).join(name);
@@ -1936,6 +2009,7 @@ fn resolve_control_program(name: &str) -> Result<String, ShellError> {
     ))
 }
 
+#[cfg(unix)]
 fn set_nonblocking(fd: RawFd) -> Result<(), ShellError> {
     // SAFETY: `fd` belongs to a live pipe owned by the caller.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -1951,6 +2025,7 @@ fn set_nonblocking(fd: RawFd) -> Result<(), ShellError> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn spawn_output_reader(
     name: &'static str,
     mut pipe: impl Read + AsRawFd + Send + 'static,
@@ -1998,6 +2073,7 @@ fn spawn_output_reader(
         })
 }
 
+#[cfg(unix)]
 fn process_output_pending(
     pending: &mut Vec<u8>,
     buffer: &Arc<Mutex<BoundedBuffer>>,
@@ -2062,6 +2138,7 @@ pub fn longest_suffix_prefix(value: &[u8], marker: &[u8]) -> usize {
         .unwrap_or(0)
 }
 
+#[cfg(unix)]
 fn spawn_control_reader(
     mut pipe: File,
     expected_token: Arc<Mutex<Option<String>>>,
@@ -2147,6 +2224,7 @@ fn spawn_control_reader(
         })
 }
 
+#[cfg(unix)]
 fn signal_process_group(process_group_id: u32, signal: i32) -> Result<(), ShellError> {
     let process_group_id = i32::try_from(process_group_id).map_err(|_| {
         ShellError::new(
@@ -2206,7 +2284,7 @@ pub fn canonical_dialect(program: &str) -> Option<&'static str> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::sync::Barrier;
@@ -2221,6 +2299,7 @@ mod tests {
     /// process that is still running or sleeping (states such as `R`, `S`, `D`)
     /// is reported as alive, so a shutdown that failed to terminate its
     /// descendants still fails the test.
+    #[cfg(unix)]
     fn process_is_effectively_terminated(pid: i32) -> bool {
         // SAFETY: signal 0 performs an existence check without delivering a
         // signal. The pid came from the test itself.
@@ -2251,6 +2330,7 @@ mod tests {
         state == "Z" || state == "X"
     }
 
+    #[cfg(unix)]
     fn launch(root: &Path, shell_id: &str, session_id: &str) -> ShellLaunch {
         ShellLaunch {
             identity: ShellIdentity {
@@ -2271,6 +2351,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn exec(
         manager: &PersistentShellManager,
         shell_id: &str,
@@ -2940,5 +3021,78 @@ mod tests {
             .state
             .is_active());
         assert!(worker.join().unwrap().command_completed);
+    }
+}
+
+/// Windows-specific fail-closed tests. Persistent shells are not implemented
+/// on Windows yet; every entry point must return a stable, explicit
+/// `persistent_shell_unsupported` error rather than panic, pretend to succeed,
+/// or silently degrade.
+#[cfg(all(test, not(unix)))]
+mod windows_tests {
+    use super::*;
+
+    fn unsupported_launch(root: &Path) -> ShellLaunch {
+        ShellLaunch {
+            identity: ShellIdentity {
+                shell_id: "wc_shell_windows".to_string(),
+                workflow_session_id: "wc_sess_windows".to_string(),
+                runtime_project_id: "agent:oe:test".to_string(),
+                executor: "local".to_string(),
+                client_id: None,
+            },
+            dialect: "bash".to_string(),
+            profile: None,
+            program: "bash".to_string(),
+            args: vec!["--noprofile".to_string(), "--norc".to_string()],
+            initial_cwd: root.to_path_buf(),
+            env: HashMap::new(),
+            initialization: None,
+            max_output_bytes: 4096,
+        }
+    }
+
+    #[test]
+    fn open_fails_closed_with_stable_unsupported_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = PersistentShellManager::new(ShellLimits::default());
+        let error = manager.open(unsupported_launch(temp.path())).unwrap_err();
+        assert_eq!(error.code, "persistent_shell_unsupported");
+        assert_eq!(
+            error.message,
+            "persistent shell is not supported on Windows yet"
+        );
+        // The failed open must not register any shell or start background work.
+        assert_eq!(manager.active_count(), 0);
+        assert!(!manager.inner.sweeper_started.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn unsupported_error_does_not_panic() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = PersistentShellManager::new(ShellLimits::default());
+        let result = manager.open(unsupported_launch(temp.path()));
+        // The error is returned, not panicked; the code and message are stable
+        // so callers can match on them.
+        let error = result.unwrap_err();
+        assert_eq!(error.code, "persistent_shell_unsupported");
+        assert!(format!("{error}").contains("not supported on Windows"));
+    }
+
+    #[test]
+    fn spawn_shell_process_reports_unsupported() {
+        let temp = tempfile::tempdir().unwrap();
+        // The concrete `ShellProcess` type is Unix-only, so the Windows stub
+        // returns the boxed trait and reports through `ShellError`.
+        match spawn_shell_process(&unsupported_launch(temp.path())) {
+            Ok(_) => panic!("Windows persistent shell must fail closed, not spawn"),
+            Err(error) => {
+                assert_eq!(error.code, "persistent_shell_unsupported");
+                assert_eq!(
+                    error.message,
+                    "persistent shell is not supported on Windows yet"
+                );
+            }
+        }
     }
 }

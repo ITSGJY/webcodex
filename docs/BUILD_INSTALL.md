@@ -70,7 +70,15 @@ The documented distribution path uses the npm thin installer/wrapper:
 ```bash
 npm install -g @yyjeqhc/webcodex
 ```
-The npm wrapper currently supports `linux-x64`, `linux-arm64`, and `darwin-arm64`. `darwin-x64`, Windows, and other targets are not currently published. Do not publish an npm package version until all three matching GitHub Release artifacts exist and `npm/webcodex/manifest.json` contains the SHA-256 checksum of each exact uploaded tarball.
+The npm wrapper currently supports `linux-x64`, `linux-arm64`, and `darwin-arm64`. `darwin-x64`, Windows, and other targets are not currently published. Do not publish an npm package version until all matching GitHub Release artifacts exist and `npm/webcodex/manifest.json` contains the SHA-256 checksum of each exact uploaded tarball.
+
+### Windows x64 support scope
+
+Windows x64 is the supported **client + Runner** target: the `webcodex` CLI, `webcodex-runner` as a hosted/local-profile Runner, Windows local repository work, and connecting to a remote Linux WebCodex Server (`webcodex connect <server>`). The Runner is started and stopped with `webcodex agent status|start|stop|restart|logs --profile <name>`, and after a machine restart it resumes with an explicit `webcodex connect ...` or `webcodex agent start --profile <name>` — automatic startup at logon/reboot is not implemented yet.
+
+Not supported on Windows: a long-running local WebCodex Server (`webcodex server ...`, `webcodex share`), `webcodex agent install` (systemd service install), persistent shells, SSH resources, config hot reload, AppContainer sandboxing, ARM64, and UNC project roots. `webcodex-server.exe` is packaged in Windows artifacts only to keep the three-binary npm contract; it does not imply a Windows Server runtime.
+
+A `win32-x64` npm install becomes officially published only in a **new release version** that carries a real Windows-host-built artifact (`webcodex-v<VERSION>-win32-x64.tar.gz`) and its real checksum in `manifest.json`; Windows must not be retrofitted onto an already published tag. `scripts/package_release_artifact.ps1` is release-safe by default: it requires a concrete commit, `dirty=false`, and a binary commit matching the immutable `v<VERSION>` tag. `-AllowDevelopmentBuild` exists only for local/CI distribution smoke and its output must never be published. Until a Windows-enabled release is prepared, the published manifest keeps no `win32-x64` entry. The Windows development/release gate is the `test-windows` CI lane plus `npm --prefix npm/webcodex test` and `scripts/npm_install_windows_smoke.ps1` on native Windows.
 
 The npm package is a thin wrapper around native release artifacts. During install it downloads the matching GitHub Release artifact and verifies the SHA-256 checksum from the manifest. Before publishing, run the local package smoke without publishing:
 

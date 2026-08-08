@@ -12,6 +12,7 @@ use super::profile::{
     atomic_write, ensure_private_directory, protect_secret_file, sha256_hex,
     validate_existing_regular_file, ProfileLock,
 };
+use webcodex_agent_config::paths::paths_equal;
 
 const CONNECT_MARKER_FILE: &str = "hosted-connect";
 const RUNNER_STATE_FILE: &str = "runner.toml";
@@ -166,6 +167,46 @@ fn process_start(pid: u32) -> Option<String> {
     linux_process_start(pid)
 }
 
+#[cfg(windows)]
+fn process_start(pid: u32) -> Option<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: OpenProcess returns a handle or NULL; NULL means the pid no
+    // longer exists (or is inaccessible, which also means it is not ours).
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let mut creation = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exit = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut kernel = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut user = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    // SAFETY: `handle` is valid and the four out-params are valid FILETIMEs.
+    let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+    // SAFETY: close the handle we opened.
+    unsafe { CloseHandle(handle) };
+    // The creation FILETIME (100ns ticks since 1601) is a stable per-process
+    // identity: a reused pid has a different creation time, exactly like the
+    // Linux starttime field.
+    (ok != 0)
+        .then(|| u64::from(creation.dwHighDateTime) << 32 | u64::from(creation.dwLowDateTime))
+        .map(|value| value.to_string())
+}
+
 #[cfg(target_os = "linux")]
 fn process_executable(pid: u32) -> Option<String> {
     std::fs::read_link(format!("/proc/{pid}/exe"))
@@ -173,7 +214,33 @@ fn process_executable(pid: u32) -> Option<String> {
         .map(|path| path.to_string_lossy().to_string())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+fn process_executable(pid: u32) -> Option<String> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: OpenProcess returns a handle or NULL; NULL means the pid no
+    // longer exists (or is inaccessible, which also means it is not ours).
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    // QueryFullProcessImageNameW returns the image path in UTF-16; the size
+    // parameter is both the buffer length and the written length.
+    let mut buffer = [0u16; 32768];
+    let mut size = buffer.len() as u32;
+    // SAFETY: `handle` is valid; `buffer` outlives the call and `size` is a
+    // valid in/out length for it.
+    let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size) };
+    // SAFETY: close the handle we opened.
+    unsafe { CloseHandle(handle) };
+    (ok != 0)
+        .then(|| String::from_utf16(&buffer[..size as usize]).ok())
+        .flatten()
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn process_start(pid: u32) -> Option<String> {
     let output = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "lstart="])
@@ -186,7 +253,7 @@ fn process_start(pid: u32) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn process_executable(_pid: u32) -> Option<String> {
     None
 }
@@ -195,21 +262,41 @@ pub(super) fn process_matches(state: &RunnerState) -> bool {
     if state.pid <= 1 || process_start(state.pid).as_deref() != Some(&state.process_start) {
         return false;
     }
-    #[cfg(target_os = "linux")]
-    {
-        return process_executable(state.pid).as_deref() == Some(&state.executable);
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let output = Command::new("ps")
-            .args(["-p", &state.pid.to_string(), "-o", "command="])
-            .output();
-        output.is_ok_and(|output| {
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains(&state.executable)
-                && String::from_utf8_lossy(&output.stdout).contains(&state.config)
-        })
-    }
+    process_image_matches(state.pid, &state.executable, &[&state.config])
+}
+
+/// Confirm the process with the recorded creation time still runs the
+/// recorded image, without relying on POSIX `ps`.
+///
+/// - Linux: `/proc/<pid>/exe` readlink.
+/// - Windows: `QueryFullProcessImageNameW`, compared under the platform path
+///   identity rules (`\\?\` prefixes, case and separators) because the image
+///   name form can differ from the stored canonical path.
+/// - Other Unix: `ps -p <pid> -o command=` (no `/proc`); the extra needles
+///   (config path / log-writer marker) pin down the command line.
+#[cfg(windows)]
+fn process_image_matches(pid: u32, executable: &str, _needles: &[&str]) -> bool {
+    process_executable(pid)
+        .is_some_and(|actual| paths_equal(Path::new(&actual), Path::new(executable)))
+}
+
+#[cfg(target_os = "linux")]
+fn process_image_matches(pid: u32, executable: &str, _needles: &[&str]) -> bool {
+    process_executable(pid).as_deref() == Some(executable)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn process_image_matches(pid: u32, executable: &str, needles: &[&str]) -> bool {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output();
+    output.is_ok_and(|output| {
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout).contains(executable)
+            && needles
+                .iter()
+                .all(|needle| String::from_utf8_lossy(&output.stdout).contains(needle))
+    })
 }
 
 fn remove_stale_state(state_dir: &Path) -> Result<(), String> {
@@ -683,16 +770,39 @@ fn signal_process(pid: u32, signal: i32) -> Result<(), String> {
     }
 }
 
-#[cfg(not(unix))]
-fn signal_process(pid: u32, _signal: i32) -> Result<(), String> {
-    let status = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T"])
-        .status()
-        .map_err(|error| format!("failed to run taskkill for Runner pid {pid}: {error}"))?;
-    if status.success() {
+/// Native hard stop for the Runner on Windows.
+///
+/// `taskkill` without `/F` only works on GUI apps (it sends `WM_CLOSE`), so
+/// console processes could never be stopped through it. `TerminateProcess`
+/// terminates the Runner directly; its descendants live in Job Objects with
+/// `KILL_ON_JOB_CLOSE` and die with it, so no tree walk is needed. A pid
+/// that no longer exists is not an error (it already stopped).
+#[cfg(windows)]
+fn terminate_process(pid: u32) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    if pid <= 1 {
+        return Err("refusing to terminate an invalid Runner pid".to_string());
+    }
+    // SAFETY: OpenProcess returns a handle or NULL; NULL means the pid no
+    // longer exists (or is inaccessible), which means the stop already
+    // happened.
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if handle.is_null() {
+        return Ok(());
+    }
+    // SAFETY: `handle` is valid; exit code 1 is arbitrary for a killed
+    // process.
+    let ok = unsafe { TerminateProcess(handle, 1) };
+    // SAFETY: close the handle we opened.
+    unsafe { CloseHandle(handle) };
+    if ok != 0 {
         Ok(())
     } else {
-        Err(format!("taskkill failed for Runner pid {pid}"))
+        Err(format!(
+            "failed to terminate Runner pid {pid}: {}",
+            std::io::Error::last_os_error()
+        ))
     }
 }
 
@@ -700,21 +810,7 @@ fn log_writer_matches(state: &LogWriterState) -> bool {
     if state.pid <= 1 || process_start(state.pid).as_deref() != Some(&state.process_start) {
         return false;
     }
-    #[cfg(target_os = "linux")]
-    {
-        return process_executable(state.pid).as_deref() == Some(&state.executable);
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let output = Command::new("ps")
-            .args(["-p", &state.pid.to_string(), "-o", "command="])
-            .output();
-        output.is_ok_and(|output| {
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains(&state.executable)
-                && String::from_utf8_lossy(&output.stdout).contains("__hosted-log-writer")
-        })
-    }
+    process_image_matches(state.pid, &state.executable, &["__hosted-log-writer"])
 }
 
 #[cfg(not(test))]
@@ -736,8 +832,8 @@ fn stop_log_writer(state: &RunnerState) {
         if log_writer_matches(writer) {
             #[cfg(unix)]
             let _ = signal_process(writer.pid, libc::SIGTERM);
-            #[cfg(not(unix))]
-            let _ = signal_process(writer.pid, 0);
+            #[cfg(windows)]
+            let _ = terminate_process(writer.pid);
             let term_deadline = Instant::now() + Duration::from_secs(1);
             while Instant::now() < term_deadline && log_writer_matches(writer) {
                 std::thread::sleep(Duration::from_millis(25));
@@ -762,8 +858,8 @@ pub(super) fn stop_runner_unlocked(state_dir: &Path) -> Result<bool, String> {
     }
     #[cfg(unix)]
     signal_process(state.pid, libc::SIGTERM)?;
-    #[cfg(not(unix))]
-    signal_process(state.pid, 0)?;
+    #[cfg(windows)]
+    terminate_process(state.pid)?;
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if !process_matches(&state) {
@@ -869,22 +965,62 @@ pub(crate) fn run_local_runner_logs(
         ));
     }
     if follow {
-        let mut command = Command::new("tail");
-        command.arg("-n").arg(lines.to_string());
-        #[cfg(unix)]
-        command.arg("-F");
-        #[cfg(not(unix))]
-        command.arg("-f");
-        let status = command
-            .arg(&path)
-            .status()
-            .map_err(|error| format!("failed to follow {}: {error}", path.display()))?;
-        if !status.success() {
-            return Err(format!("tail failed for {}", path.display()));
-        }
-        return Ok(String::new());
+        return follow_log_tail(state_dir, lines);
     }
     read_local_runner_log_tail(state_dir, lines).map(|tail| tail.output)
+}
+
+/// Stream the local Runner log from `lines` back, then keep printing
+/// appended bytes until the CLI is interrupted.
+///
+/// In-process so the CLI never depends on a POSIX `tail` binary (absent on
+/// Windows). The file is re-opened on every poll, so rotation (rename to
+/// `.1` plus recreate, which makes the length shrink) is followed the same
+/// way `tail -F` follows the file across renames.
+fn follow_log_tail(state_dir: &Path, lines: u32) -> Result<String, String> {
+    let path = local_runner_log_path(state_dir);
+    let tail = read_local_runner_log_tail(state_dir, lines)?;
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(tail.output.as_bytes())
+        .and_then(|()| stdout.flush())
+        .map_err(|error| format!("failed to write Runner log tail: {error}"))?;
+    let mut last_len = std::fs::metadata(&path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    loop {
+        std::thread::sleep(Duration::from_millis(250));
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            // Log missing momentarily (rotation gap); keep waiting.
+            continue;
+        };
+        let len = metadata.len();
+        if len < last_len {
+            // Rotated or truncated: a fresh file is being written. The new
+            // file starts empty, so resetting the position prints nothing
+            // until real content arrives (no duplicate lines).
+            last_len = 0;
+        }
+        if len == last_len {
+            continue;
+        }
+        let mut file = match File::open(&path) {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+        if file.seek(SeekFrom::Start(last_len)).is_err() {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        if file.read_to_end(&mut bytes).is_err() {
+            continue;
+        }
+        last_len = last_len.saturating_add(bytes.len() as u64);
+        stdout
+            .write_all(&bytes)
+            .and_then(|()| stdout.flush())
+            .map_err(|error| format!("failed to write Runner log stream: {error}"))?;
+    }
 }
 
 struct LogTail {
@@ -1112,6 +1248,91 @@ mod tests {
             RunnerStart::Reused
         );
         assert_eq!(load_runner_state(&state).unwrap().unwrap().pid, first.pid);
+
+        std::fs::write(
+            &config,
+            "server_url='http://example.test'\ntransport='websocket'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            ensure_runner_unlocked(&runner, &config, &state).unwrap(),
+            RunnerStart::Started
+        );
+        let restarted = load_runner_state(&state).unwrap().unwrap();
+        assert_ne!(restarted.pid, first.pid);
+        assert!(stop_runner_unlocked(&state).unwrap());
+        let mut stale = restarted;
+        stale.pid = std::process::id();
+        stale.process_start = "not-this-process".to_string();
+        atomic_write(
+            &local_runner_state_path(&state),
+            toml::to_string(&stale).unwrap().as_bytes(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            ensure_runner_unlocked(&runner, &config, &state).unwrap(),
+            RunnerStart::Started
+        );
+        assert_ne!(load_runner_state(&state).unwrap().unwrap().pid, stale.pid);
+        assert!(stop_runner_unlocked(&state).unwrap());
+        assert!(!local_runner_state_summary(&state).unwrap().running);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_identity_is_stable_for_current_process() {
+        let pid = std::process::id();
+        let start = process_start(pid).expect("current process creation time");
+        assert_eq!(process_start(pid).as_deref(), Some(start.as_str()));
+        let executable = process_executable(pid).expect("current process image name");
+        let current = std::env::current_exe().unwrap();
+        assert!(
+            paths_equal(Path::new(&executable), &current),
+            "image name {executable} must identity-match current_exe {}",
+            current.display()
+        );
+        // A pid that cannot exist has no identity.
+        assert_eq!(process_start(u32::MAX), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_runner_reuses_process_recovers_stale_pid_and_stops_windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A real, native long-lived "Runner": a cmd batch that loops forever.
+        // ensure_runner_unlocked drives it through the same Win32 identity
+        // capture and taskkill stop path the production binary uses.
+        let runner = tmp.path().join("webcodex-runner.cmd");
+        std::fs::write(
+            &runner,
+            "@echo off\r\n:loop\r\nping -n 2 127.0.0.1 >nul\r\ngoto loop\r\n",
+        )
+        .unwrap();
+        let config = tmp.path().join("agent.toml");
+        std::fs::write(&config, "server_url='http://example.test'\n").unwrap();
+        let state = tmp.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::write(
+            local_runner_profile_marker(&state),
+            "profile = \"lifecycle-test\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            ensure_runner_unlocked(&runner, &config, &state).unwrap(),
+            RunnerStart::Started
+        );
+        let first = load_runner_state(&state).unwrap().unwrap();
+        assert_eq!(
+            ensure_runner_unlocked(&runner, &config, &state).unwrap(),
+            RunnerStart::Reused
+        );
+        assert_eq!(load_runner_state(&state).unwrap().unwrap().pid, first.pid);
+        assert!(
+            process_matches(&first),
+            "the Win32 identity must recognize the running batch process"
+        );
 
         std::fs::write(
             &config,

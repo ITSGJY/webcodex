@@ -222,6 +222,7 @@ impl NavFixture {
 
 #[test]
 fn lsp_kind_never_matches_shell() {
+    let _serial = super::serialize_fake_lsp_test();
     assert!(is_lsp_request_kind("lsp"));
     assert!(!is_lsp_request_kind("run_shell"));
     assert!(!is_lsp_request_kind("file_read"));
@@ -229,6 +230,7 @@ fn lsp_kind_never_matches_shell() {
 
 #[test]
 fn capability_default_is_false_and_new_agent_sets_true() {
+    let _serial = super::serialize_fake_lsp_test();
     let old: ShellClientCapabilities = serde_json::from_str(r#"{"shell":true}"#).unwrap();
     assert!(!old.lsp_read_only_navigation);
     let mut caps = ShellClientCapabilities::default();
@@ -239,6 +241,7 @@ fn capability_default_is_false_and_new_agent_sets_true() {
 
 #[test]
 fn status_does_not_start_server_and_unavailable_succeeds() {
+    let _serial = super::serialize_fake_lsp_test();
     let fixture = NavFixture::new("normal");
     let available = fixture.request(AgentLspPayload {
         project_id: "demo".into(),
@@ -314,6 +317,7 @@ fn status_does_not_start_server_and_unavailable_succeeds() {
 
 #[test]
 fn document_symbols_hierarchical_and_budget() {
+    let _serial = super::serialize_fake_lsp_test();
     let fixture = NavFixture::new("normal");
     let envelope = fixture.request(AgentLspPayload {
         project_id: "demo".into(),
@@ -339,6 +343,7 @@ fn document_symbols_hierarchical_and_budget() {
 
 #[test]
 fn document_symbols_symbol_information_fallback() {
+    let _serial = super::serialize_fake_lsp_test();
     let fixture = NavFixture::new("symbol_information");
     let envelope = fixture.request(AgentLspPayload {
         project_id: "demo".into(),
@@ -354,6 +359,7 @@ fn document_symbols_symbol_information_fallback() {
 
 #[test]
 fn navigation_reuses_one_did_open_for_the_same_document() {
+    let _serial = super::serialize_fake_lsp_test();
     let fixture = NavFixture::new("normal");
     let requests = [
         AgentLspRequest::DocumentSymbols {
@@ -396,6 +402,7 @@ fn navigation_reuses_one_did_open_for_the_same_document() {
 
 #[test]
 fn navigation_sends_full_text_changes_once_per_disk_content_version() {
+    let _serial = super::serialize_fake_lsp_test();
     let fixture = NavFixture::new("normal");
     let request = || {
         fixture.request(AgentLspPayload {
@@ -438,6 +445,7 @@ fn navigation_sends_full_text_changes_once_per_disk_content_version() {
 
 #[test]
 fn document_diagnostics_empty_and_one_error_are_fresh_successes() {
+    let _serial = super::serialize_fake_lsp_test();
     let empty = NavFixture::new("diagnostics_empty").diagnostics(100);
     assert_eq!(empty["success"], true, "{empty}");
     assert_eq!(empty["result"]["diagnostics"], serde_json::json!([]));
@@ -461,6 +469,7 @@ fn document_diagnostics_empty_and_one_error_are_fresh_successes() {
 
 #[test]
 fn document_diagnostics_normalizes_sorts_tags_and_omits_private_payloads() {
+    let _serial = super::serialize_fake_lsp_test();
     let envelope = NavFixture::new("diagnostics_mixed").diagnostics(100);
     assert_eq!(envelope["success"], true, "{envelope}");
     let result = &envelope["result"];
@@ -493,6 +502,7 @@ fn document_diagnostics_normalizes_sorts_tags_and_omits_private_payloads() {
 
 #[test]
 fn document_diagnostics_deduplicates_and_truncates_on_the_agent() {
+    let _serial = super::serialize_fake_lsp_test();
     let duplicate = NavFixture::new("diagnostics_duplicates").diagnostics(100);
     assert_eq!(duplicate["result"]["total_count"], 2);
     assert_eq!(duplicate["result"]["returned_count"], 1);
@@ -511,6 +521,7 @@ fn document_diagnostics_deduplicates_and_truncates_on_the_agent() {
 
 #[test]
 fn document_diagnostics_omits_bad_ranges_and_converts_utf16_emoji() {
+    let _serial = super::serialize_fake_lsp_test();
     let malformed = NavFixture::new("diagnostics_malformed_range").diagnostics(100);
     assert_eq!(malformed["result"]["returned_count"], 1, "{malformed}");
     assert_eq!(malformed["result"]["invalid_results_omitted"], 3);
@@ -524,6 +535,7 @@ fn document_diagnostics_omits_bad_ranges_and_converts_utf16_emoji() {
 
 #[test]
 fn document_diagnostics_bounds_and_sanitizes_text_fields() {
+    let _serial = super::serialize_fake_lsp_test();
     let envelope = NavFixture::new("diagnostics_oversized_message").diagnostics(100);
     let diagnostic = &envelope["result"]["diagnostics"][0];
     assert!(diagnostic["message"].as_str().unwrap().chars().count() <= 4096);
@@ -534,6 +546,7 @@ fn document_diagnostics_bounds_and_sanitizes_text_fields() {
 
 #[test]
 fn document_diagnostics_handles_publication_timing_and_timeouts() {
+    let _serial = super::serialize_fake_lsp_test();
     let delayed = NavFixture::new("diagnostics_delayed").diagnostics(100);
     assert_eq!(delayed["result"]["status"], "complete", "{delayed}");
 
@@ -555,6 +568,7 @@ fn document_diagnostics_handles_publication_timing_and_timeouts() {
 
 #[test]
 fn document_diagnostics_ignores_wrong_external_and_malformed_notifications() {
+    let _serial = super::serialize_fake_lsp_test();
     for scenario in ["diagnostics_wrong_uri", "diagnostics_external_uri"] {
         let result = NavFixture::new(scenario).diagnostics(100);
         assert_eq!(result["success"], true, "scenario={scenario}: {result}");
@@ -571,6 +585,7 @@ fn document_diagnostics_ignores_wrong_external_and_malformed_notifications() {
 
 #[test]
 fn hover_normalizes_markup_content_string_and_marked_string_forms() {
+    let _serial = super::serialize_fake_lsp_test();
     let markdown = NavFixture::new("hover_markup_markdown").hover(1, 1);
     assert_eq!(markdown["success"], true, "{markdown}");
     assert_eq!(markdown["result"]["hover"]["kind"], "markdown");
@@ -596,6 +611,7 @@ fn hover_normalizes_markup_content_string_and_marked_string_forms() {
 
 #[test]
 fn hover_normalizes_arrays_null_bounds_ranges_and_utf16() {
+    let _serial = super::serialize_fake_lsp_test();
     let array = NavFixture::new("hover_array").hover(1, 1);
     assert_eq!(array["success"], true, "{array}");
     let value = array["result"]["hover"]["value"].as_str().unwrap();
@@ -635,6 +651,7 @@ fn hover_normalizes_arrays_null_bounds_ranges_and_utf16() {
 
 #[test]
 fn hover_sanitizes_private_material_and_rejects_malformed_contents() {
+    let _serial = super::serialize_fake_lsp_test();
     let sanitized = NavFixture::new("hover_sanitizer").hover(1, 1);
     assert_eq!(sanitized["success"], true, "{sanitized}");
     let serialized = sanitized.to_string();
@@ -649,6 +666,7 @@ fn hover_sanitizes_private_material_and_rejects_malformed_contents() {
 
 #[test]
 fn workspace_symbols_supports_information_workspace_and_uri_only_shapes() {
+    let _serial = super::serialize_fake_lsp_test();
     let information = NavFixture::new("workspace_symbol_information").workspace_symbols("Tool", 50);
     assert_eq!(information["success"], true, "{information}");
     let symbol = &information["result"]["symbols"][0];
@@ -678,6 +696,7 @@ fn workspace_symbols_supports_information_workspace_and_uri_only_shapes() {
 
 #[test]
 fn workspace_symbols_sorts_deduplicates_filters_and_truncates() {
+    let _serial = super::serialize_fake_lsp_test();
     let duplicates = NavFixture::new("workspace_duplicates").workspace_symbols("Any", 50);
     assert_eq!(duplicates["result"]["total_results"], 3);
     assert_eq!(duplicates["result"]["returned_count"], 2);
@@ -702,6 +721,7 @@ fn workspace_symbols_sorts_deduplicates_filters_and_truncates() {
 
 #[test]
 fn workspace_symbols_validates_query_and_sanitizes_names() {
+    let _serial = super::serialize_fake_lsp_test();
     let trimmed = NavFixture::new("workspace_empty").workspace_symbols("  ToolRuntime  ", 50);
     assert_eq!(trimmed["success"], true, "{trimmed}");
     assert_eq!(trimmed["result"]["query"], "ToolRuntime");
@@ -737,6 +757,7 @@ fn workspace_symbols_validates_query_and_sanitizes_names() {
 
 #[test]
 fn navigation_restart_opens_the_document_on_the_new_server_instance() {
+    let _serial = super::serialize_fake_lsp_test();
     let fixture = NavFixture::new("restart_then_success");
     let envelope = fixture.request(AgentLspPayload {
         project_id: "demo".into(),
@@ -768,6 +789,7 @@ fn navigation_restart_opens_the_document_on_the_new_server_instance() {
 
 #[test]
 fn definition_variants_and_external_invalid() {
+    let _serial = super::serialize_fake_lsp_test();
     let single = NavFixture::new("normal").request(AgentLspPayload {
         project_id: "demo".into(),
         request: AgentLspRequest::GotoDefinition {
@@ -844,6 +866,7 @@ fn definition_variants_and_external_invalid() {
 
 #[test]
 fn references_dedup_truncation_and_external() {
+    let _serial = super::serialize_fake_lsp_test();
     let dedup = NavFixture::new("references_duplicates").request(AgentLspPayload {
         project_id: "demo".into(),
         request: AgentLspRequest::FindReferences {
@@ -891,6 +914,7 @@ fn references_dedup_truncation_and_external() {
 
 #[test]
 fn rejects_absolute_traversal_symlink_and_non_rs() {
+    let _serial = super::serialize_fake_lsp_test();
     let fixture = NavFixture::new("normal");
     let absolute = fixture.request(AgentLspPayload {
         project_id: "demo".into(),
@@ -922,12 +946,53 @@ fn rejects_absolute_traversal_symlink_and_non_rs() {
     assert_eq!(non_rs["success"], false);
     assert_eq!(non_rs["error"]["code"], "unsupported_language");
 
-    // Symlink outside project.
+    #[cfg(windows)]
+    {
+        // Windows absolute, root-relative, drive-relative, and UNC forms are
+        // not project-relative either (`Path::is_absolute` alone misses the
+        // root-relative and drive-relative shapes); each must be rejected up
+        // front with the absolute-input error.
+        for absolute in [
+            r"\etc\passwd.rs",
+            r"C:\etc\passwd.rs",
+            r"C:passwd.rs",
+            r"\\?\C:\etc\passwd.rs",
+            r"\\server\share\passwd.rs",
+        ] {
+            let rejected = fixture.request(AgentLspPayload {
+                project_id: "demo".into(),
+                request: AgentLspRequest::DocumentSymbols {
+                    path: absolute.into(),
+                    limit: 10,
+                },
+            });
+            assert_eq!(rejected["success"], false, "path {absolute:?}: {rejected}");
+            assert_eq!(
+                rejected["error"]["code"], "invalid_project_path",
+                "path {absolute:?}: {rejected}"
+            );
+        }
+        // Backslash-separated `..` traversal is rejected by component
+        // semantics, which are separator-agnostic.
+        let traversal_win = fixture.request(AgentLspPayload {
+            project_id: "demo".into(),
+            request: AgentLspRequest::DocumentSymbols {
+                path: r"..\..\secret.rs".into(),
+                limit: 10,
+            },
+        });
+        assert_eq!(traversal_win["success"], false);
+        assert_eq!(traversal_win["error"]["code"], "invalid_project_path");
+    }
+
+    // Symlink/junction escape outside the project root. The canonicalization
+    // check must resolve reparse points before deciding trust, so the target
+    // file outside the root is rejected.
     let outside = fixture._temp.path().join("outside.rs");
     fs::write(&outside, "fn x() {}\n").unwrap();
-    let link = fixture.root.join("src/linked.rs");
     #[cfg(unix)]
     {
+        let link = fixture.root.join("src/linked.rs");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
         let sym = fixture.request(AgentLspPayload {
             project_id: "demo".into(),
@@ -939,10 +1004,103 @@ fn rejects_absolute_traversal_symlink_and_non_rs() {
         assert_eq!(sym["success"], false);
         assert_eq!(sym["error"]["code"], "invalid_project_path");
     }
+    #[cfg(windows)]
+    {
+        // Directory junction escaping the project root (`mklink /J` needs no
+        // administrator rights). A file reached through the junction resolves
+        // outside the canonical root and must be rejected like a symlink.
+        let outside_dir = fixture._temp.path().join("outside_dir");
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(outside_dir.join("escaped.rs"), "fn x() {}\n").unwrap();
+        let junction = fixture.root.join("src/escaped");
+        let created = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "New-Item -ItemType Junction -Path $env:WC_JUNCTION_PATH -Target $env:WC_JUNCTION_TARGET | Out-Null",
+            ])
+            .env("WC_JUNCTION_PATH", &junction)
+            .env("WC_JUNCTION_TARGET", &outside_dir)
+            .output()
+            .expect("create junction for escape regression");
+        assert!(
+            created.status.success(),
+            "junction creation failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&created.stdout),
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let escaped = fixture.request(AgentLspPayload {
+            project_id: "demo".into(),
+            request: AgentLspRequest::DocumentSymbols {
+                path: "src/escaped/escaped.rs".into(),
+                limit: 10,
+            },
+        });
+        assert_eq!(escaped["success"], false, "{escaped}");
+        assert_eq!(
+            escaped["error"]["code"], "invalid_project_path",
+            "{escaped}"
+        );
+    }
+}
+
+#[test]
+fn navigation_round_trips_space_and_unicode_paths() {
+    let _serial = super::serialize_fake_lsp_test();
+    // A project-relative path containing a space and non-ASCII characters
+    // must survive the full round trip: canonical resolution, percent-encoded
+    // document URI, server response URI, classification, and `/`-separated
+    // project-relative output.
+    // Four lines so the fake server's default documentSymbol ranges (which
+    // span lines 0..3) convert cleanly against this document.
+    let fixture = NavFixture::with_language(
+        "space_unicode",
+        LspServerKind::RustAnalyzer,
+        &[(
+            "src/ünïcode file.rs",
+            "fn unicode_fn() {}\nlet x = 1;\n// pad line\n// pad line\n",
+        )],
+    );
+    let goto = fixture.request(AgentLspPayload {
+        project_id: "demo".into(),
+        request: AgentLspRequest::GotoDefinition {
+            path: "src/ünïcode file.rs".into(),
+            line: 1,
+            column: 1,
+            limit: 20,
+        },
+    });
+    assert_eq!(goto["success"], true, "{goto}");
+    assert_eq!(goto["result"]["returned_count"], 1, "{goto}");
+    assert_eq!(
+        goto["result"]["locations"][0]["path"], "src/ünïcode file.rs",
+        "{goto}"
+    );
+
+    let symbols = fixture.request(AgentLspPayload {
+        project_id: "demo".into(),
+        request: AgentLspRequest::DocumentSymbols {
+            path: "src/ünïcode file.rs".into(),
+            limit: 10,
+        },
+    });
+    assert_eq!(symbols["success"], true, "{symbols}");
+    assert_eq!(
+        symbols["result"]["symbols"][0]["name"], "outer",
+        "{symbols}"
+    );
+
+    // No absolute host path, extended-length prefix, or file URI may leak
+    // into the public result.
+    let serialized = format!("{goto}{symbols}");
+    assert!(!serialized.contains("file://"), "{serialized}");
+    assert!(!serialized.contains(r"\\?\"), "{serialized}");
 }
 
 #[test]
 fn oversized_document_is_rejected_before_read_and_server_start() {
+    let _serial = super::serialize_fake_lsp_test();
     let fixture = NavFixture::new("normal");
     // Sparse file: metadata length is over the cap without writing the bytes.
     let oversized = fixture.root.join("src/generated.rs");
@@ -981,6 +1139,7 @@ fn oversized_document_is_rejected_before_read_and_server_start() {
 
 #[test]
 fn project_relative_normalization_and_no_absolute_in_result() {
+    let _serial = super::serialize_fake_lsp_test();
     let fixture = NavFixture::new("normal");
     let envelope = fixture.request(AgentLspPayload {
         project_id: "demo".into(),
@@ -999,6 +1158,7 @@ fn project_relative_normalization_and_no_absolute_in_result() {
 
 #[test]
 fn utf_encoding_public_conversions() {
+    let _serial = super::serialize_fake_lsp_test();
     let text = "a😀b\n";
     for encoding in [
         PositionEncoding::Utf8,
@@ -1014,6 +1174,7 @@ fn utf_encoding_public_conversions() {
 
 #[test]
 fn missing_lsp_payload_returns_structured_error() {
+    let _serial = super::serialize_fake_lsp_test();
     let fixture = NavFixture::new("normal");
     let req = ShellAgentShellRequest {
         request_id: "x".into(),
@@ -1053,6 +1214,7 @@ fn missing_lsp_payload_returns_structured_error() {
 
 #[test]
 fn lsp_request_ignores_command_field() {
+    let _serial = super::serialize_fake_lsp_test();
     // Typed LSP handling must not consult or execute `command`.
     let fixture = NavFixture::new("normal");
     let marker = fixture._temp.path().join("shell-ran");
@@ -1112,6 +1274,7 @@ fn recorded_did_open_language_id(marker: &Path) -> String {
 
 #[test]
 fn navigation_routes_python_file_to_pyright_with_python_language_id() {
+    let _serial = super::serialize_fake_lsp_test();
     let fixture = NavFixture::with_language(
         "normal",
         LspServerKind::Pyright,
@@ -1134,6 +1297,7 @@ fn navigation_routes_python_file_to_pyright_with_python_language_id() {
 
 #[test]
 fn navigation_routes_tsx_file_with_react_dialect_language_id() {
+    let _serial = super::serialize_fake_lsp_test();
     let fixture = NavFixture::with_language(
         "normal",
         LspServerKind::TypeScriptLanguageServer,
@@ -1161,6 +1325,7 @@ fn navigation_routes_tsx_file_with_react_dialect_language_id() {
 
 #[test]
 fn unsupported_extension_is_rejected_with_supported_list() {
+    let _serial = super::serialize_fake_lsp_test();
     let fixture = NavFixture::with_language(
         "normal",
         LspServerKind::Pyright,
@@ -1185,6 +1350,7 @@ fn unsupported_extension_is_rejected_with_supported_list() {
 
 #[test]
 fn lsp_status_reports_every_registered_language_server() {
+    let _serial = super::serialize_fake_lsp_test();
     let fixture = NavFixture::with_language(
         "normal",
         LspServerKind::Pyright,
@@ -1353,6 +1519,7 @@ fn real_pyright_document_symbols_end_to_end() {
 /// `typescript-language-server`. Ignored by default (needs the server and
 /// Node). Run with:
 /// `cargo test -p webcodex-runner --bin webcodex-runner real_typescript -- --ignored --nocapture`
+#[cfg(unix)]
 #[test]
 // Needs typescript@5 (classic tsserver.js); typescript@7 native preview lacks it.
 #[ignore = "requires typescript-language-server + typescript@5 (npm i -g typescript-language-server typescript@5)"]

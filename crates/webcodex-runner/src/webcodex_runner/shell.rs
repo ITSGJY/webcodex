@@ -1,13 +1,19 @@
-use super::config::{validate_shell_config, AgentPolicy, ShellConfig, ShellProfileConfig};
+use super::config::{
+    dialect_for_program, platform_default_dialect, validate_shell_config, AgentPolicy, ShellConfig,
+    ShellDialect, ShellProfileConfig,
+};
 use super::output::CommandResult;
 use super::projects::find_project_shell_context;
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use webcodex_process::{GracefulTermination, ManagedChild};
 
 const SHELL_PROFILE_PREPARE_TIMEOUT_SECS: u64 = 30;
 const PROCESS_GROUP_TERMINATION_GRACE: Duration = Duration::from_millis(50);
@@ -25,6 +31,7 @@ pub(crate) struct PreparedShellProfile {
     pub(crate) profile_name: String,
     program: String,
     args: Vec<String>,
+    dialect: ShellDialect,
     env_snapshot: HashMap<String, String>,
 }
 
@@ -38,35 +45,167 @@ pub(crate) struct PreparedShellProfileCache {
     profiles: Arc<Mutex<HashMap<PreparedShellProfileKey, Arc<PreparedShellProfile>>>>,
 }
 
+/// POSIX sh single-quote escaping.
 pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// PowerShell single-quote escaping (an embedded single quote is doubled).
+/// PowerShell's single-quoted strings are literal, so spaces, backslashes,
+/// double quotes, `$`, Unicode, and `C:\...` Windows paths need no further
+/// escaping; only `'` does.
+fn shell_quote_powershell(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Resolve the effective shell dialect: an explicit config value wins, then a
+/// known shell program basename, then the platform default. Profiles pass
+/// `profile.dialect.or(shell.dialect)` as the explicit value so they inherit
+/// the parent shell dialect unless designed otherwise.
+fn resolve_dialect(program: &str, explicit: Option<ShellDialect>) -> ShellDialect {
+    explicit
+        .or_else(|| dialect_for_program(program))
+        .unwrap_or_else(platform_default_dialect)
+}
+
+const SENSITIVE_ENV_KEYS: [&str; 4] = [
+    "WEBCODEX_TOKEN",
+    "WEBCODEX_AGENT_TOKEN",
+    "WEBCODEX_USER_TOKEN",
+    "AUTHORIZATION",
+];
+
+/// Sensitive environment keys must never reach child processes. Windows
+/// environment names are case-insensitive, so a mixed-case spelling such as
+/// `WebCodex_Token` must be filtered too; Unix stays case-sensitive.
+fn is_sensitive_env_key(key: &str) -> bool {
+    if cfg!(windows) {
+        let upper = key.to_ascii_uppercase();
+        SENSITIVE_ENV_KEYS
+            .iter()
+            .any(|sensitive| *sensitive == upper)
+    } else {
+        SENSITIVE_ENV_KEYS.contains(&key)
+    }
+}
+
 fn should_inherit_env_key(key: &str) -> bool {
-    !matches!(
-        key,
-        "WEBCODEX_TOKEN" | "WEBCODEX_AGENT_TOKEN" | "WEBCODEX_USER_TOKEN" | "AUTHORIZATION"
+    !is_sensitive_env_key(key)
+}
+
+/// Case-insensitive lookup on Windows (where environment names are
+/// case-insensitive), exact match on Unix.
+fn env_lookup<'a>(env: &'a HashMap<String, String>, key: &str) -> Option<&'a String> {
+    if cfg!(windows) {
+        env.iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value)
+    } else {
+        env.get(key)
+    }
+}
+
+/// Insert `key=value`, replacing any existing entry that names the same
+/// environment variable. On Windows the replacement is case-insensitive so a
+/// snapshot never carries both `Path` and `PATH` (which would make the final
+/// child environment depend on HashMap iteration order); on Unix it is exact.
+fn env_insert(env: &mut HashMap<String, String>, key: &str, value: String) {
+    if cfg!(windows) {
+        env.retain(|candidate, _| !candidate.eq_ignore_ascii_case(key));
+    }
+    env.insert(key.to_string(), value);
+}
+
+/// Remove every sensitive environment key from `env`, case-insensitively on
+/// Windows (a profile could configure `webcodetoken = ...`).
+fn remove_sensitive_env(env: &mut HashMap<String, String>) {
+    let sensitive: Vec<String> = env
+        .keys()
+        .filter(|key| is_sensitive_env_key(key))
+        .cloned()
+        .collect();
+    for key in sensitive {
+        env.remove(&key);
+    }
+}
+
+/// Deterministic UTF-8 setup for redirected PowerShell output. Bounded to the
+/// child process: when stdout is redirected, .NET only caches these encodings
+/// instead of calling SetConsoleOutputCP, so the parent Runner console state
+/// is never mutated. PowerShell 5.1 otherwise writes through the console code
+/// page (OEM), which would corrupt Unicode output and the env snapshot.
+const POWERSHELL_UTF8_PREAMBLE: &str = concat!(
+    "try { $OutputEncoding = [Console]::InputEncoding = ",
+    "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { }",
+);
+
+/// Wrap `command` so the PowerShell process exits with a meaningful status:
+/// the shell's own `exit N` statements pass through, a failing trailing native
+/// command is reported through `$LASTEXITCODE`, a failing PowerShell statement
+/// returns 1, and a successful trailing PowerShell statement returns 0 even if
+/// an earlier native command left a stale non-zero `$LASTEXITCODE` behind.
+/// PowerShell 5.1 does not propagate these statuses consistently on its own,
+/// so inspect `$?` immediately after the requested command and exit explicitly.
+fn powershell_command_text(command: &str) -> String {
+    format!(
+        "{POWERSHELL_UTF8_PREAMBLE}\n\
+         $LASTEXITCODE = 0\n\
+         {command}\n\
+         if (-not $?) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; exit 1 }}\n\
+         exit 0"
     )
 }
 
-fn shell_command_text(shell: &ShellConfig, command: &str) -> String {
-    match shell.init_script.as_ref() {
-        Some(path) => format!(
+/// Dot-source a shell init script, then run the command only after the init
+/// script reported success. Native-command failure inside the init script
+/// blocks the command (like POSIX `. <path> && (...)`); a terminating
+/// PowerShell error aborts the whole script, which also blocks the command.
+///
+/// `$?` is inspected immediately after dot-sourcing so a failed dot-source
+/// operation (for example, an unavailable script) blocks the command. Native
+/// failure status is preserved through `$LASTEXITCODE`; ordinary PowerShell
+/// non-terminating errors retain PowerShell's own dot-source semantics.
+fn powershell_init_command_text(init_script: &Path, command: &str) -> String {
+    format!(
+        "{POWERSHELL_UTF8_PREAMBLE}\n\
+         . {}\n\
+         if (-not $?) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; exit 1 }}\n\
+         $LASTEXITCODE = 0\n\
+         {command}\n\
+         if (-not $?) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; exit 1 }}\n\
+         exit 0",
+        shell_quote_powershell(&init_script.to_string_lossy()),
+    )
+}
+
+fn shell_command_text(shell: &ShellConfig, dialect: ShellDialect, command: &str) -> String {
+    match (dialect, shell.init_script.as_ref()) {
+        (ShellDialect::Posix, Some(path)) => format!(
             ". {} && (\n{}\n)",
             shell_quote(&path.to_string_lossy()),
             command
         ),
-        None => command.to_string(),
+        (ShellDialect::Posix, None) => command.to_string(),
+        (ShellDialect::PowerShell, Some(path)) => powershell_init_command_text(path, command),
+        (ShellDialect::PowerShell, None) => powershell_command_text(command),
+    }
+}
+
+/// Command text for an already-prepared profile execution. POSIX shells get
+/// the raw command (the last statement's status is the shell status); the
+/// PowerShell wrapper adds the explicit exit-status propagation.
+fn prepared_shell_command_text(dialect: ShellDialect, command: &str) -> String {
+    match dialect {
+        ShellDialect::Posix => command.to_string(),
+        ShellDialect::PowerShell => powershell_command_text(command),
     }
 }
 
 fn apply_shell_environment(cmd: &mut Command, shell: &ShellConfig) -> Result<(), String> {
-    for key in [
-        "WEBCODEX_TOKEN",
-        "WEBCODEX_AGENT_TOKEN",
-        "WEBCODEX_USER_TOKEN",
-        "AUTHORIZATION",
-    ] {
+    // Rust's Windows env handling is case-insensitive (like the OS itself), so
+    // removing the canonical spellings also removes mixed-case variants such
+    // as `WebCodex_Token`.
+    for key in SENSITIVE_ENV_KEYS {
         cmd.env_remove(key);
     }
     if !shell.path_prepend.is_empty() {
@@ -79,7 +218,9 @@ fn apply_shell_environment(cmd: &mut Command, shell: &ShellConfig) -> Result<(),
         cmd.env("PATH", joined);
     }
     for (key, value) in &shell.env {
-        cmd.env(key, value);
+        if !is_sensitive_env_key(key) {
+            cmd.env(key, value);
+        }
     }
     Ok(())
 }
@@ -91,14 +232,43 @@ fn apply_env_snapshot(cmd: &mut Command, env_snapshot: &HashMap<String, String>)
     }
 }
 
+/// On Windows, resolve a bare shell program name through the platform rules
+/// so an extensionless POSIX shim shadowing the real executable is never
+/// selected (CreateProcess would fail with error 193). Path-qualified values
+/// are used verbatim; an unresolvable bare name falls back to the configured
+/// value so the spawn surfaces the real error.
+fn resolved_shell_program(program: &str) -> String {
+    #[cfg(windows)]
+    {
+        let path = Path::new(program);
+        if path.components().count() <= 1 && !path.is_absolute() {
+            if let Some(resolved) = super::util::resolve_program_in_path(
+                program,
+                std::env::var_os("PATH")
+                    .as_deref()
+                    .unwrap_or(OsStr::new("")),
+            ) {
+                return resolved.path().to_string_lossy().into_owned();
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = program;
+    program.to_string()
+}
+
 fn configured_shell_command(shell: &ShellConfig, command: &str) -> Result<Command, String> {
     validate_shell_config(shell)?;
-    let mut cmd = Command::new(&shell.program);
+    let dialect = resolve_dialect(&shell.program, shell.dialect);
+    let program = resolved_shell_program(&shell.program);
+    let mut cmd = Command::new(program);
     for arg in &shell.args {
         cmd.arg(arg);
     }
-    cmd.arg(shell_command_text(shell, command));
-    configure_direct_process_group(&mut cmd);
+    cmd.arg(shell_command_text(shell, dialect, command));
+    // The shell execution path owns its process tree through ManagedChild; do
+    // not add a process-group pre_exec here. ManagedChild creates the private
+    // process group (Unix) / Job Object (Windows) at spawn time.
     apply_shell_environment(&mut cmd, shell)?;
     Ok(cmd)
 }
@@ -111,8 +281,10 @@ fn configured_prepared_shell_command(
     for arg in &profile.args {
         cmd.arg(arg);
     }
-    cmd.arg(command);
-    configure_direct_process_group(&mut cmd);
+    cmd.arg(prepared_shell_command_text(profile.dialect, command));
+    // The shell execution path owns its process tree through ManagedChild; do
+    // not add a process-group pre_exec here. ManagedChild creates the private
+    // process group (Unix) / Job Object (Windows) at spawn time.
     apply_env_snapshot(&mut cmd, &profile.env_snapshot);
     Ok(cmd)
 }
@@ -122,15 +294,15 @@ pub(crate) fn configured_shell_job_command(
     command: &str,
 ) -> Result<Command, String> {
     validate_shell_config(shell)?;
-    let mut cmd = Command::new(&shell.program);
+    let dialect = resolve_dialect(&shell.program, shell.dialect);
+    let program = resolved_shell_program(&shell.program);
+    let mut cmd = Command::new(program);
     for arg in &shell.args {
         cmd.arg(arg);
     }
-    cmd.arg(shell_command_text(shell, command));
-    // Establish the private group before `Command::spawn` returns. Executing
-    // an external `setsid` wrapper left a race where shutdown could signal a
-    // group that the wrapper had not created yet, then lose the group id.
-    configure_direct_process_group(&mut cmd);
+    cmd.arg(shell_command_text(shell, dialect, command));
+    // JobManager owns this process tree through ManagedChild; do not add
+    // the legacy setsid pre_exec here. ManagedChild creates the private group.
     apply_shell_environment(&mut cmd, shell)?;
     Ok(cmd)
 }
@@ -143,8 +315,9 @@ pub(crate) fn configured_prepared_shell_job_command(
     for arg in &profile.args {
         cmd.arg(arg);
     }
-    cmd.arg(command);
-    configure_direct_process_group(&mut cmd);
+    cmd.arg(prepared_shell_command_text(profile.dialect, command));
+    // JobManager owns this process tree through ManagedChild; do not add
+    // the legacy setsid pre_exec here. ManagedChild creates the private group.
     apply_env_snapshot(&mut cmd, &profile.env_snapshot);
     Ok(cmd)
 }
@@ -157,7 +330,8 @@ pub(crate) fn configured_validation_job_command(
 ) -> Result<Command, String> {
     let mut cmd = Command::new(program);
     cmd.args(args);
-    configure_direct_process_group(&mut cmd);
+    // JobManager owns this process tree through ManagedChild; do not add
+    // the legacy setsid pre_exec here. ManagedChild creates the private group.
     match profile {
         Some(profile) => apply_env_snapshot(&mut cmd, &profile.env_snapshot),
         None => {
@@ -166,24 +340,6 @@ pub(crate) fn configured_validation_job_command(
         }
     }
     Ok(cmd)
-}
-
-fn configure_direct_process_group(command: &mut Command) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: `setsid` is async-signal-safe and touches no Rust-managed
-        // memory in the post-fork child.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(())
-                }
-            });
-        }
-    }
 }
 
 pub(crate) fn base_shell_env(
@@ -195,27 +351,25 @@ pub(crate) fn base_shell_env(
         .collect();
     if !shell.path_prepend.is_empty() {
         let mut paths = shell.path_prepend.clone();
-        if let Some(current) = env.get("PATH") {
+        // The inherited Windows PATH may be spelled `Path`; lookup must be
+        // case-insensitive or the prepended entries would replace it instead
+        // of extending it.
+        if let Some(current) = env_lookup(&env, "PATH") {
             paths.extend(std::env::split_paths(current));
         }
         let joined = std::env::join_paths(paths)
             .map_err(|e| format!("failed to build shell PATH from shell.path_prepend: {}", e))?;
-        env.insert("PATH".to_string(), joined.to_string_lossy().to_string());
+        env_insert(&mut env, "PATH", joined.to_string_lossy().to_string());
     }
     for (key, value) in &shell.env {
-        env.insert(key.clone(), value.clone());
+        env_insert(&mut env, key, value.clone());
     }
     for (key, value) in &profile.env {
-        env.insert(key.clone(), value.clone());
+        env_insert(&mut env, key, value.clone());
     }
-    for key in [
-        "WEBCODEX_TOKEN",
-        "WEBCODEX_AGENT_TOKEN",
-        "WEBCODEX_USER_TOKEN",
-        "AUTHORIZATION",
-    ] {
-        env.remove(key);
-    }
+    // A profile could configure a sensitive name in any case; Windows filters
+    // case-insensitively.
+    remove_sensitive_env(&mut env);
     Ok(env)
 }
 
@@ -318,12 +472,11 @@ fn run_prepare_command(
     if stop_requested.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
         return Err("profile prepare stopped during runner shutdown".to_string());
     }
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    // ManagedChild owns the whole profile-prepare process tree: a private
+    // process group on Unix, a kill-on-close Job Object on Windows.
+    let mut child = ManagedChild::spawn(&mut cmd.stdout(Stdio::piped()).stderr(Stdio::piped()))
         .map_err(|e| format!("failed to spawn profile prepare command: {}", e))?;
-    let stdout = match child.stdout.take() {
+    let stdout = match child.child_mut().stdout.take() {
         Some(stdout) => stdout,
         None => {
             let cleanup = terminate_child_without_output(child).err();
@@ -333,7 +486,7 @@ fn run_prepare_command(
             ));
         }
     };
-    let stderr = match child.stderr.take() {
+    let stderr = match child.child_mut().stderr.take() {
         Some(stderr) => stderr,
         None => {
             drop(stdout);
@@ -403,9 +556,10 @@ fn run_prepare_command(
             }
         }
     };
-    // The direct child has already exited, but its private process group can
+    // The direct child has already exited, but its managed process tree can
     // still contain background descendants that inherited these pipe handles.
-    // Reap that group before waiting on the readers so they see EOF promptly.
+    // Terminate the whole tree before waiting on the readers so they see EOF
+    // promptly.
     let cleanup = terminate_child_process_tree(&mut child).err();
     let output = collect_profile_prepare_output(stdout_reader, stderr_reader);
     match (cleanup, output) {
@@ -469,11 +623,52 @@ fn parse_env_payload(
     Ok(env)
 }
 
+/// POSIX profile-prepare script: `set -e`, the configured init snippet, a
+/// marker line, then a NUL-delimited `env -0` dump. Unchanged from the legacy
+/// Unix behavior.
+fn posix_profile_prepare_script(init_script: &str, marker: &str) -> String {
+    format!(
+        "set -e\n{}\nprintf '\\n{}\\n'\nenv -0\n",
+        init_script, marker
+    )
+}
+
+/// PowerShell profile-prepare script. The UTF-8 preamble makes the env dump
+/// deterministic Unicode; `$ErrorActionPreference = 'Stop'` mirrors `set -e`
+/// for cmdlet errors (a terminating error in the snippet aborts preparation
+/// and reports a non-zero exit instead of producing a truncated snapshot); the
+/// trailing `$LASTEXITCODE` truthiness check mirrors it for the last native
+/// command (`$LASTEXITCODE` is `$null` after a pure-PowerShell snippet, which
+/// is falsy). The marker is a host-formatted line, then each environment
+/// entry is written as `NAME=VALUE\0` straight through `[Console]::Out` — no
+/// human-formatted table, no line wrapping, values may contain `=`, spaces,
+/// quotes, newlines, or any shell metacharacter, and entries are unambiguous
+/// because the value can never contain NUL. `Get-ChildItem Env:` reflects the
+/// process block after the init snippet ran.
+fn powershell_profile_prepare_script(init_script: &str, marker: &str) -> String {
+    format!(
+        "{POWERSHELL_UTF8_PREAMBLE}\n\
+         $ErrorActionPreference = 'Stop'\n\
+         try {{\n\
+         {init_script}\n\
+         if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}\n\
+         }} catch {{\n\
+         [Console]::Error.WriteLine($_)\n\
+         exit 1\n\
+         }}\n\
+         Write-Output '{marker}'\n\
+         Get-ChildItem Env: | ForEach-Object {{ \
+         [Console]::Out.Write($_.Name + '=' + $_.Value + [string][char]0) }}\n\
+         [Console]::Out.Flush()"
+    )
+}
+
 fn capture_profile_env_snapshot(
     profile_name: &str,
     profile: &ShellProfileConfig,
     program: &str,
     args: &[String],
+    dialect: ShellDialect,
     prepare_cwd: &Path,
     initial_env: HashMap<String, String>,
     stop_requested: Option<&AtomicBool>,
@@ -482,16 +677,18 @@ fn capture_profile_env_snapshot(
         return Ok(initial_env);
     };
     let marker = format!("__WEBCODEX_ENV_START_{}__", uuid::Uuid::new_v4().simple());
-    let prepare_script = format!(
-        "set -e\n{}\nprintf '\\n{}\\n'\nenv -0\n",
-        init_script, marker
-    );
+    let prepare_script = match dialect {
+        ShellDialect::Posix => posix_profile_prepare_script(init_script, &marker),
+        ShellDialect::PowerShell => powershell_profile_prepare_script(init_script, &marker),
+    };
     let mut cmd = Command::new(program);
     for arg in args {
         cmd.arg(arg);
     }
     cmd.arg(prepare_script).current_dir(prepare_cwd).env_clear();
-    configure_direct_process_group(&mut cmd);
+    // `run_prepare_command` owns this process tree through ManagedChild; do
+    // not add a process-group pre_exec here. ManagedChild creates the private
+    // process group (Unix) / Job Object (Windows) at spawn time.
     for (key, value) in initial_env {
         cmd.env(key, value);
     }
@@ -532,14 +729,9 @@ fn capture_profile_env_snapshot(
         payload_start += 1;
     }
     let mut snapshot = parse_env_payload(&stdout[payload_start..], profile_name)?;
-    for key in [
-        "WEBCODEX_TOKEN",
-        "WEBCODEX_AGENT_TOKEN",
-        "WEBCODEX_USER_TOKEN",
-        "AUTHORIZATION",
-    ] {
-        snapshot.remove(key);
-    }
+    // The init snippet may have exported a sensitive variable in any case;
+    // Windows filters case-insensitively.
+    remove_sensitive_env(&mut snapshot);
     Ok(snapshot)
 }
 
@@ -576,17 +768,24 @@ impl PreparedShellProfileCache {
                 prepare_cwd.display()
             )
         })?;
-        let program = profile
-            .program
-            .clone()
-            .unwrap_or_else(|| shell.program.clone());
+        let program = resolved_shell_program(
+            &profile
+                .program
+                .clone()
+                .unwrap_or_else(|| shell.program.clone()),
+        );
         let args = profile.args.clone().unwrap_or_else(|| shell.args.clone());
+        // The profile inherits the parent shell dialect unless it (or the
+        // parent) explicitly configures one; the prepare script and every
+        // later command in this profile use the same resolved dialect.
+        let dialect = resolve_dialect(&program, profile.dialect.or(shell.dialect));
         let initial_env = base_shell_env(shell, profile)?;
         let env_snapshot = capture_profile_env_snapshot(
             profile_name,
             profile,
             &program,
             &args,
+            dialect,
             prepare_cwd,
             initial_env,
             stop_requested,
@@ -595,6 +794,7 @@ impl PreparedShellProfileCache {
             profile_name: profile_name.to_string(),
             program,
             args,
+            dialect,
             env_snapshot,
         });
         let mut profiles = self.profiles.lock().unwrap();
@@ -683,7 +883,8 @@ pub(crate) fn cwd_allowed(policy: &AgentPolicy, cwd: &Path) -> Result<(), String
     let cwd = canonicalize_existing(cwd)?;
     for root in &policy.allowed_roots {
         let root = canonicalize_existing(root)?;
-        if cwd == root || cwd.starts_with(&root) {
+        // Case-insensitive component-wise containment on Windows.
+        if webcodex_agent_config::paths::path_is_within(&cwd, &root) {
             return Ok(());
         }
     }
@@ -716,103 +917,85 @@ fn with_cleanup_error(base: impl Into<String>, cleanup: Option<String>) -> Strin
     }
 }
 
-#[cfg(unix)]
-fn signal_process_group(pgid: u32, signal: i32) -> Result<bool, String> {
-    let target = i32::try_from(pgid)
-        .map_err(|_| format!("process-group id {pgid} exceeds the supported range"))?;
-    // SAFETY: callers use only the private session/process group created for
-    // this command by `configure_direct_process_group`. A negative target is
-    // required by POSIX to signal the whole group, not just its leader.
-    if unsafe { libc::kill(-target, signal) } == 0 {
-        Ok(true)
-    } else {
-        match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::ESRCH) => Ok(false),
-            Some(libc::EPERM) => Err(format!(
-                "permission denied signaling command process group {pgid} with signal {signal}"
-            )),
-            _ => Err(format!(
-                "failed to signal command process group {pgid} with signal {signal}: {}",
-                std::io::Error::last_os_error()
-            )),
-        }
-    }
-}
-
-/// Terminate a command and all members of its private process group, then
-/// reap the direct child. Callers do this before waiting for output pipes, so
-/// descendants cannot keep them open after a timeout, stop, executor failure,
-/// or direct-child exit.
-fn terminate_child_process_tree(child: &mut std::process::Child) -> Result<(), String> {
+/// Terminate a command and its entire managed process tree, then confirm the
+/// whole tree exited and reap the direct child. Callers do this before waiting
+/// for output pipes, so descendants cannot keep them open after a timeout,
+/// stop, executor failure, or direct-child exit.
+///
+/// The whole tree is owned by the [`ManagedChild`]: a private process group on
+/// Unix, a kill-on-close Job Object on Windows. No pid/pgid is handled here
+/// directly.
+fn terminate_child_process_tree(child: &mut ManagedChild) -> Result<(), String> {
     terminate_child_process_tree_until(child, Instant::now() + Duration::from_secs(1))
 }
 
+/// Terminate the managed command tree within one overall cleanup deadline.
+///
+/// Every phase recomputes its remaining budget from the single deadline, so an
+/// expired graceful phase can never silently reuse a stale deadline for the
+/// force-confirmation wait.
+///
+/// 1. Graceful request ([`GracefulTermination`]): on Unix this delivers SIGTERM
+///    to the whole managed process group, which gets a bounded grace
+///    ([`PROCESS_GROUP_TERMINATION_GRACE`]) to exit on its own; on Windows the
+///    request reports `Unsupported` and the next phase escalates immediately.
+/// 2. Force phase: `terminate_tree` for anything still alive.
+/// 3. Whole-tree exit confirmation: `wait_tree_exit`, not just the direct
+///    child (a direct-child exit never proves the tree is gone).
+/// 4. Direct-child reap within the remaining budget.
 fn terminate_child_process_tree_until(
-    child: &mut std::process::Child,
+    child: &mut ManagedChild,
     deadline: Instant,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
-    #[cfg(unix)]
-    {
-        // `configure_direct_process_group` calls `setsid` before exec, making
-        // this pid the private session and process-group leader. Guard zero so
-        // a malformed Child can never turn into a signal for the runner's own
-        // process group.
-        let pgid = child.id();
-        if pgid == 0 {
-            errors.push("command child has invalid process-group id 0".to_string());
-        } else {
-            let sent_sigterm = match signal_process_group(pgid, libc::SIGTERM) {
-                Ok(true) => {
-                    let grace_deadline =
-                        deadline.min(Instant::now() + PROCESS_GROUP_TERMINATION_GRACE);
-                    while Instant::now() < grace_deadline {
-                        match signal_process_group(pgid, 0) {
-                            Ok(false) => break,
-                            Ok(true) => {}
-                            Err(error) => {
-                                errors.push(error);
-                                break;
-                            }
-                        }
-                        std::thread::sleep(
-                            Duration::from_millis(10)
-                                .min(grace_deadline.saturating_duration_since(Instant::now())),
-                        );
-                    }
-                    true
-                }
-                // If the group is already gone, do not probe this numeric ID
-                // again: a later probe could observe an unrelated, reused
-                // process-group ID.
-                Ok(false) => false,
+    let mut tree_exited = false;
+    let mut force_tree = false;
+    match child.request_terminate_tree() {
+        Ok(GracefulTermination::Requested) => {
+            let grace_deadline = deadline.min(Instant::now() + PROCESS_GROUP_TERMINATION_GRACE);
+            let grace = grace_deadline.saturating_duration_since(Instant::now());
+            match child.wait_tree_exit(grace) {
+                Ok(true) => tree_exited = true,
+                Ok(false) => force_tree = true,
                 Err(error) => {
-                    errors.push(error);
-                    false
-                }
-            };
-            if sent_sigterm {
-                match signal_process_group(pgid, 0) {
-                    Ok(true) => {
-                        if let Err(error) = signal_process_group(pgid, libc::SIGKILL) {
-                            errors.push(error);
-                        }
-                    }
-                    Ok(false) => {}
-                    Err(error) => errors.push(error),
+                    errors.push(format!(
+                        "failed to wait for command process tree graceful exit: {error}"
+                    ));
+                    force_tree = true;
                 }
             }
         }
+        // Once the backend reports that the tree is already gone, do not
+        // probe the numeric Unix process-group id again. The direct child may
+        // already have been reaped, allowing that id to be reused by an
+        // unrelated process group between calls.
+        Ok(GracefulTermination::AlreadyExited) => tree_exited = true,
+        Ok(GracefulTermination::Unsupported) => force_tree = true,
+        Err(error) => {
+            errors.push(format!(
+                "failed to request graceful command process tree termination: {error}"
+            ));
+            force_tree = true;
+        }
     }
-    #[cfg(not(unix))]
-    {
-        // Non-Unix platforms retain the existing direct-child behavior; they
-        // do not have the POSIX process-group signalling used above.
-        if let Err(error) = child.kill() {
-            match child.try_wait() {
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => errors.push(format!("failed to kill command: {error}")),
+    if force_tree {
+        if let Err(error) = child.terminate_tree() {
+            errors.push(format!("failed to terminate command process tree: {error}"));
+        }
+    }
+    if !tree_exited {
+        // Confirm the complete tree exited, not just the direct child.
+        // Forceful termination can complete asynchronously (notably Job Object
+        // teardown on Windows), so use the remaining cleanup budget.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match child.wait_tree_exit(remaining) {
+            Ok(true) => {}
+            Ok(false) => {
+                errors.push("command process tree did not exit before deadline".to_string())
             }
+            Err(error) => errors.push(format!(
+                "failed to wait for command process tree exit: {error}"
+            )),
         }
     }
     loop {
@@ -839,18 +1022,18 @@ fn terminate_child_process_tree_until(
     }
 }
 
-fn terminate_child_without_output(mut child: std::process::Child) -> Result<(), String> {
+fn terminate_child_without_output(mut child: ManagedChild) -> Result<(), String> {
     let result = terminate_child_process_tree(&mut child);
     // The direct child has been reaped above. Closing the local pipe handles
     // is sufficient on error paths where the response intentionally has no
     // command output.
-    drop(child.stdout.take());
-    drop(child.stderr.take());
+    drop(child.child_mut().stdout.take());
+    drop(child.child_mut().stderr.take());
     result
 }
 
 fn terminate_and_read_pipes(
-    mut child: std::process::Child,
+    mut child: ManagedChild,
     max_output_bytes: usize,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), String> {
     let deadline = Instant::now() + Duration::from_secs(1);
@@ -869,15 +1052,17 @@ fn terminate_and_read_pipes(
 }
 
 fn read_pipes_until(
-    mut child: std::process::Child,
+    mut child: ManagedChild,
     max_output_bytes: usize,
     deadline: Instant,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), String> {
     let stdout = child
+        .child_mut()
         .stdout
         .take()
         .ok_or_else(|| "stdout pipe missing".to_string())?;
     let stderr = child
+        .child_mut()
         .stderr
         .take()
         .ok_or_else(|| "stderr pipe missing".to_string())?;
@@ -1168,7 +1353,11 @@ fn run_shell_impl(
             };
         }
     }
-    let spawn = cmd.spawn();
+    // ManagedChild owns the whole shell process tree: a private process group
+    // on Unix, a kill-on-close Job Object on Windows. `child_mut()` below only
+    // accesses pipe handles; every termination still goes through the managed
+    // tree API.
+    let spawn = ManagedChild::spawn(&mut cmd);
     let mut child = match spawn {
         Ok(child) => child,
         Err(e) => {
@@ -1188,7 +1377,7 @@ fn run_shell_impl(
         }
     };
     if let Some(input) = stdin {
-        match child.stdin.take() {
+        match child.child_mut().stdin.take() {
             Some(mut child_stdin) => {
                 if let Err(e) = child_stdin.write_all(input.as_bytes()) {
                     // A command may reject a request or report a missing

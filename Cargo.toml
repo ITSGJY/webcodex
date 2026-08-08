@@ -5,6 +5,7 @@ members = [
     "crates/webcodex-cli",
     "crates/webcodex-core",
     "crates/webcodex-persistent-shell",
+    "crates/webcodex-process",
     "crates/webcodex-runner",
     "crates/webcodex-sandbox",
     "crates/webcodex-workspace",
@@ -12,7 +13,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.3.2"
+version = "0.3.3"
 license = "Apache-2.0"
 edition = "2021"
 

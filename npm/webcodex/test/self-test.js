@@ -14,20 +14,104 @@ const packageJson = require("../package.json");
 const releaseManifest = require("../manifest.json");
 const exampleManifest = require("../manifest.example.json");
 
-function makeBinary(dir, name, identity = `${packageJson.version} test-revision dirty=false`) {
+// The whole suite runs against the native platform so `npm test` passes
+// unchanged on windows-latest and on Linux: no sh, no bash, no Git Bash, no
+// Unix tar, no WSL, and no Unix chmod semantics.
+const PLATFORM = process.platform;
+const ARCH = process.arch;
+const KEY = install.platformKey(PLATFORM, ARCH);
+const EXE = (name) => install.exeName(name, PLATFORM);
+
+function defaultIdentity() {
+  return `${packageJson.version} test-revision dirty=false`;
+}
+
+// A test fixture "binary".
+//
+// - Unix: a small shell script that answers `--version` and echoes its
+//   arguments — a real spawned executable, so the installer's actual
+//   spawn-based version check runs.
+// - Windows: CI has no C toolchain to build fake PE fixtures, so the file
+//   carries its identity as content and the narrow test-only seam
+//   (`versionIdentity` override, see install.js) reads it. The real
+//   spawn-based validation against actual build output is covered by the
+//   Windows real-binary smoke (scripts/npm_install_windows_smoke.ps1).
+function makeBinary(dir, name, identity = defaultIdentity()) {
   const file = path.join(dir, name);
-  fs.writeFileSync(file, `#!/bin/sh\nif [ "\${1-}" = "--version" ]; then echo "${name} ${identity}"; exit 0; fi\nprintf '%s\\n' "$@"\nexit "\${WEBCODEX_TEST_EXIT:-0}"\n`, { mode: 0o755 });
+  if (PLATFORM === "win32") {
+    // The identity content uses the runtime binary name (no `.exe`),
+    // matching the `<name> <version> <identity>` parsing in install.js.
+    const runtimeName = name.endsWith(".exe") ? name.slice(0, -4) : name;
+    fs.writeFileSync(file, `${runtimeName} ${identity}\n`);
+    return file;
+  }
+  fs.writeFileSync(
+    file,
+    `#!/bin/sh\nif [ "\${1-}" = "--version" ]; then echo "${name} ${identity}"; exit 0; fi\nprintf '%s\\n' "$@"\nexit "\${WEBCODEX_TEST_EXIT:-0}"\n`,
+    { mode: 0o755 }
+  );
   return file;
 }
 
 function makeBinarySet(dir, identity) {
   fs.mkdirSync(dir, { recursive: true });
-  for (const name of install.RUNTIME_BINARIES) makeBinary(dir, name, identity);
+  for (const name of install.runtimeBinaryFiles(PLATFORM)) makeBinary(dir, name, identity);
+}
+
+// Pure-Node tar.gz writer: no external `tar` binary on any platform.
+function tarEntry(name, content) {
+  const size = content.length;
+  const header = Buffer.alloc(512);
+  header.write(name, 0, 100, "utf8");
+  header.write("0000644\0", 100, 8, "ascii");
+  header.write("0000000\0", 108, 8, "ascii");
+  header.write("0000000\0", 116, 8, "ascii");
+  header.write(`${size.toString(8).padStart(11, "0")}\0`, 124, 12, "ascii");
+  header.write("00000000000\0", 136, 12, "ascii");
+  header.fill(0x20, 148, 156);
+  header[156] = "0".charCodeAt(0);
+  header.write("ustar\0", 257, 6, "ascii");
+  let checksum = 0;
+  for (const byte of header) checksum += byte;
+  header.write(`${checksum.toString(8).padStart(6, "0")}\0 `, 148, 8, "ascii");
+  const padded = Buffer.alloc(Math.ceil(size / 512) * 512);
+  content.copy(padded);
+  return Buffer.concat([header, padded]);
 }
 
 function archiveDirectory(sourceDir, archive) {
-  const result = childProcess.spawnSync("tar", ["-czf", archive, "-C", sourceDir, "."], { encoding: "utf8" });
-  assert.strictEqual(result.status, 0, result.stderr);
+  const entries = [];
+  for (const entry of fs.readdirSync(sourceDir)) {
+    const content = fs.readFileSync(path.join(sourceDir, entry));
+    entries.push(tarEntry(entry, content));
+  }
+  entries.push(Buffer.alloc(1024)); // end-of-archive zero blocks
+  fs.writeFileSync(archive, zlib.gzipSync(Buffer.concat(entries)));
+}
+
+// The narrow test-only seam implementation for Windows: mirrors the
+// production `versionIdentity` parsing exactly (first line must be
+// "<name> <identity>", identity must match the package version), reading the
+// identity from the fixture file content instead of spawning it.
+function fakeVersionIdentity(binary, name, expectedVersion) {
+  const content = fs.readFileSync(binary, "utf8").trim().split(/\r?\n/, 1)[0];
+  const prefix = `${name} `;
+  if (!content.startsWith(prefix)) {
+    throw new Error(`${name} returned an unexpected version string`);
+  }
+  const identity = content.slice(prefix.length);
+  if (identity !== expectedVersion && !identity.startsWith(`${expectedVersion} `)) {
+    throw new Error(`${name} version does not match package ${expectedVersion}`);
+  }
+  return identity;
+}
+
+// Only Windows uses the seam: on Unix the fixture scripts are real spawned
+// executables and the production validation path runs untouched.
+function testOptions(extra = {}) {
+  const options = { platform: PLATFORM, arch: ARCH, ...extra };
+  if (PLATFORM === "win32") options.versionIdentity = fakeVersionIdentity;
+  return options;
 }
 
 function writeTarHeader(name, size) {
@@ -76,11 +160,11 @@ async function waitFor(predicate, timeoutMs = 500) {
   }
 }
 
-function manifestFor(url, sha256) {
+function manifestFor(url, sha256, key = KEY) {
   return {
     version: packageJson.version,
     binaries: install.RUNTIME_BINARIES,
-    artifacts: { "linux-x64": { url, sha256 } }
+    artifacts: { [key]: { url, sha256 } }
   };
 }
 
@@ -89,11 +173,21 @@ function writeManifest(file, manifest) {
 }
 
 function installedIdentity(destination) {
-  return childProcess.execFileSync(path.join(destination, "webcodex"), ["--version"], { encoding: "utf8" });
+  const file = path.join(destination, EXE("webcodex"));
+  if (PLATFORM === "win32") {
+    // Fixture binaries are not real PE images; the identity lives in the
+    // file content (see `makeBinary` / the version-identity seam).
+    const line = fs.readFileSync(file, "utf8").trim().split(/\r?\n/, 1)[0];
+    return `${line}\n`;
+  }
+  return childProcess.execFileSync(file, ["--version"], { encoding: "utf8" });
 }
 
 function assertCompleteInstall(destination) {
-  assert.deepStrictEqual(fs.readdirSync(destination).sort(), install.RUNTIME_BINARIES.slice().sort());
+  assert.deepStrictEqual(
+    fs.readdirSync(destination).sort(),
+    install.runtimeBinaryFiles(PLATFORM).slice().sort()
+  );
 }
 
 function assertNoInstallerTemps(tempRoot) {
@@ -112,7 +206,7 @@ async function expectInstallFailure(action, destination, tempRoot, pattern) {
 }
 
 async function main() {
-  assert.strictEqual(packageJson.version, "0.3.2");
+  assert.strictEqual(packageJson.version, "0.3.3");
   assert.deepStrictEqual(packageJson.bin, { webcodex: "bin/webcodex.js" });
   assert.deepStrictEqual(install.RUNTIME_BINARIES, ["webcodex", "webcodex-server", "webcodex-runner"]);
   assert.deepStrictEqual(install.SUPPORTED_PLATFORM_KEYS, ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64", "win32-x64"]);
@@ -134,19 +228,28 @@ async function main() {
   assert.strictEqual(install.platformKey("linux", "x64"), "linux-x64");
   assert.strictEqual(install.platformKey("darwin", "arm64"), "darwin-arm64");
   assert.throws(() => install.platformKey("sunos", "x64"), /Unsupported/);
-  assert.strictEqual(wrapper.nativePath({ packageRoot: "/tmp/package", platform: "linux" }), "/tmp/package/vendor/bin/webcodex");
+  assert.strictEqual(
+    wrapper.nativePath({ packageRoot: "/tmp/package", platform: "linux" }),
+    path.normalize("/tmp/package/vendor/bin/webcodex")
+  );
+  assert.strictEqual(
+    wrapper.nativePath({ packageRoot: "C:\\package", platform: "win32" }),
+    path.normalize("C:\\package\\vendor\\bin\\webcodex.exe")
+  );
 
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "webcodex-npm-test-"));
   try {
     const source = path.join(tmp, "source");
     const destination = path.join(tmp, "destination");
     makeBinarySet(source);
-    const identity = install.copyLocalBinaryDir(source, { destinationDir: destination, platform: "linux" });
-    assert.strictEqual(identity, `${packageJson.version} test-revision dirty=false`);
-    for (const name of install.RUNTIME_BINARIES) {
+    const identity = install.copyLocalBinaryDir(source, testOptions({ destinationDir: destination }));
+    assert.strictEqual(identity, defaultIdentity());
+    for (const name of install.runtimeBinaryFiles(PLATFORM)) {
       const file = path.join(destination, name);
       assert.ok(fs.statSync(file).isFile());
-      assert.ok((fs.statSync(file).mode & 0o111) !== 0);
+      if (PLATFORM !== "win32") {
+        assert.ok((fs.statSync(file).mode & 0o111) !== 0, `${file} is not executable`);
+      }
     }
     assert.ok(!fs.existsSync(path.join(destination, "webcodex-cli")));
 
@@ -154,10 +257,10 @@ async function main() {
     makeBinarySet(oldDestination, `${packageJson.version} old-revision dirty=false`);
     const incomplete = path.join(tmp, "incomplete");
     fs.mkdirSync(incomplete);
-    makeBinary(incomplete, "webcodex");
-    makeBinary(incomplete, "webcodex-server");
+    makeBinary(incomplete, EXE("webcodex"));
+    makeBinary(incomplete, EXE("webcodex-server"));
     assert.throws(
-      () => install.copyLocalBinaryDir(incomplete, { destinationDir: oldDestination, platform: "linux" }),
+      () => install.copyLocalBinaryDir(incomplete, testOptions({ destinationDir: oldDestination })),
       /missing webcodex-runner/
     );
     assert.match(installedIdentity(oldDestination), /old-revision/);
@@ -165,9 +268,9 @@ async function main() {
 
     const mixed = path.join(tmp, "mixed");
     makeBinarySet(mixed);
-    makeBinary(mixed, "webcodex-runner", `${packageJson.version} other-revision dirty=false`);
+    makeBinary(mixed, EXE("webcodex-runner"), `${packageJson.version} other-revision dirty=false`);
     assert.throws(
-      () => install.copyLocalBinaryDir(mixed, { destinationDir: oldDestination, platform: "linux" }),
+      () => install.copyLocalBinaryDir(mixed, testOptions({ destinationDir: oldDestination })),
       /not from the same build/
     );
     assert.match(installedIdentity(oldDestination), /old-revision/);
@@ -182,12 +285,15 @@ async function main() {
     const manifestPath = path.join(tmp, "manifest.json");
     writeManifest(manifestPath, manifestFor(pathToFileURL(archive).toString(), install.sha256File(archive)));
     const downloaded = path.join(tmp, "downloaded");
-    await install.installFromManifest(manifestPath, { destinationDir: downloaded, platform: "linux", arch: "x64", tempDir: tmp });
-    assert.deepStrictEqual(fs.readdirSync(downloaded).sort(), install.RUNTIME_BINARIES.slice().sort());
+    await install.installFromManifest(manifestPath, testOptions({ destinationDir: downloaded, tempDir: tmp }));
+    assert.deepStrictEqual(
+      fs.readdirSync(downloaded).sort(),
+      install.runtimeBinaryFiles(PLATFORM).slice().sort()
+    );
 
     writeManifest(manifestPath, manifestFor(pathToFileURL(archive).toString(), "0".repeat(64)));
     await expectInstallFailure(
-      () => install.installFromManifest(manifestPath, { destinationDir: downloaded, platform: "linux", arch: "x64", tempDir: tmp }),
+      () => install.installFromManifest(manifestPath, testOptions({ destinationDir: downloaded, tempDir: tmp })),
       downloaded, tmp, /checksum mismatch/
     );
 
@@ -195,27 +301,25 @@ async function main() {
     fs.writeFileSync(corrupt, "not gzip");
     writeManifest(manifestPath, manifestFor(pathToFileURL(corrupt).toString(), install.sha256File(corrupt)));
     await expectInstallFailure(
-      () => install.installFromManifest(manifestPath, { destinationDir: downloaded, platform: "linux", arch: "x64", tempDir: tmp }),
+      () => install.installFromManifest(manifestPath, testOptions({ destinationDir: downloaded, tempDir: tmp })),
       downloaded, tmp, /valid bounded gzip archive/
     );
 
     await withServer((_req, res) => { res.statusCode = 503; res.end("unavailable"); }, async (base) => {
       writeManifest(manifestPath, manifestFor(`${base}/artifact.tar.gz?token=secret`, install.sha256File(archive)));
       await expectInstallFailure(
-        () => install.installFromManifest(manifestPath, { destinationDir: downloaded, platform: "linux", arch: "x64", tempDir: tmp }),
+        () => install.installFromManifest(manifestPath, testOptions({ destinationDir: downloaded, tempDir: tmp })),
         downloaded, tmp, /HTTP 503/
       );
     });
 
     await withServer((_req, _res) => {}, async (base) => {
       await expectInstallFailure(
-        () => install.installFromManifest(`${base}/manifest.json?credential=secret`, {
+        () => install.installFromManifest(`${base}/manifest.json?credential=secret`, testOptions({
           destinationDir: downloaded,
-          platform: "linux",
-          arch: "x64",
           tempDir: tmp,
           manifestDownload: { firstByteTimeoutMs: 40, inactivityTimeoutMs: 40, totalTimeoutMs: 100 }
-        }),
+        })),
         downloaded, tmp, /Manifest download timed out waiting for a response/
       );
     });
@@ -226,13 +330,11 @@ async function main() {
     }, async (base) => {
       writeManifest(manifestPath, manifestFor(`${base}/artifact.tar.gz?credential=secret`, install.sha256File(archive)));
       await expectInstallFailure(
-        () => install.installFromManifest(manifestPath, {
+        () => install.installFromManifest(manifestPath, testOptions({
           destinationDir: downloaded,
-          platform: "linux",
-          arch: "x64",
           tempDir: tmp,
           artifactDownload: { firstByteTimeoutMs: 40, inactivityTimeoutMs: 40, totalTimeoutMs: 150 }
-        }),
+        })),
         downloaded, tmp, /Artifact download stalled before completion/
       );
     });
@@ -243,13 +345,11 @@ async function main() {
     }, async (base) => {
       writeManifest(manifestPath, manifestFor(`${base}/artifact.tar.gz`, install.sha256File(archive)));
       await expectInstallFailure(
-        () => install.installFromManifest(manifestPath, {
+        () => install.installFromManifest(manifestPath, testOptions({
           destinationDir: downloaded,
-          platform: "linux",
-          arch: "x64",
           tempDir: tmp,
           limits: { maxArtifactBytes: 1024 }
-        }),
+        })),
         downloaded, tmp, /1024-byte download limit/
       );
     });
@@ -261,13 +361,11 @@ async function main() {
     }, async (base) => {
       writeManifest(manifestPath, manifestFor(`${base}/artifact.tar.gz`, install.sha256File(archive)));
       await expectInstallFailure(
-        () => install.installFromManifest(manifestPath, {
+        () => install.installFromManifest(manifestPath, testOptions({
           destinationDir: downloaded,
-          platform: "linux",
-          arch: "x64",
           tempDir: tmp,
           limits: { maxArtifactBytes: 1024 }
-        }),
+        })),
         downloaded, tmp, /1024-byte download limit/
       );
     });
@@ -384,45 +482,55 @@ async function main() {
     fs.writeFileSync(expansion, zlib.gzipSync(Buffer.alloc(4096)));
     writeManifest(manifestPath, manifestFor(pathToFileURL(expansion).toString(), install.sha256File(expansion)));
     await expectInstallFailure(
-      () => install.installFromManifest(manifestPath, {
+      () => install.installFromManifest(manifestPath, testOptions({
         destinationDir: downloaded,
-        platform: "linux",
-        arch: "x64",
         tempDir: tmp,
         limits: { maxUncompressedBytes: 1024 }
-      }),
+      })),
       downloaded, tmp, /1024-byte uncompressed size limit/
     );
 
     const oversizedEntry = path.join(tmp, "oversized-entry.tar.gz");
-    makeDeclaredEntryArchive(oversizedEntry, "webcodex", 2048);
+    makeDeclaredEntryArchive(oversizedEntry, EXE("webcodex"), 2048);
     writeManifest(manifestPath, manifestFor(pathToFileURL(oversizedEntry).toString(), install.sha256File(oversizedEntry)));
     await expectInstallFailure(
-      () => install.installFromManifest(manifestPath, {
+      () => install.installFromManifest(manifestPath, testOptions({
         destinationDir: downloaded,
-        platform: "linux",
-        arch: "x64",
         tempDir: tmp,
         limits: { maxTarEntryBytes: 1024 }
-      }),
+      })),
       downloaded, tmp, /1024-byte limit/
     );
 
     const oversizedManifest = path.join(tmp, "oversized-manifest.json");
     fs.writeFileSync(oversizedManifest, " ".repeat(2048));
     await expectInstallFailure(
-      () => install.installFromManifest(oversizedManifest, {
+      () => install.installFromManifest(oversizedManifest, testOptions({
         destinationDir: downloaded,
-        platform: "linux",
-        arch: "x64",
         tempDir: tmp,
         limits: { maxManifestBytes: 1024 }
-      }),
+      })),
       downloaded, tmp, /1024-byte size limit/
     );
 
-    const wrapperTarget = makeBinary(tmp, "wrapper-target");
-    const probe = childProcess.spawnSync(process.execPath, [path.join(__dirname, "wrapper-probe.js"), wrapperTarget, "alpha", "two words"], { encoding: "utf8" });
+    // Wrapper behavior: the wrapper must find the native binary, forward
+    // arguments, and propagate the exit code. On Windows the fixture is
+    // node.exe — a real PE image — with a `-e` script that echoes the
+    // forwarded arguments and exits 23; on Unix it is the sh fixture.
+    let wrapperTarget;
+    let wrapperArgs;
+    if (PLATFORM === "win32") {
+      wrapperTarget = process.execPath;
+      wrapperArgs = ["-e", "console.log(process.argv[1]); console.log(process.argv[2]); process.exitCode = 23;", "alpha", "two words"];
+    } else {
+      wrapperTarget = makeBinary(tmp, "wrapper-target");
+      wrapperArgs = ["alpha", "two words"];
+    }
+    const probe = childProcess.spawnSync(
+      process.execPath,
+      [path.join(__dirname, "wrapper-probe.js"), wrapperTarget, ...wrapperArgs],
+      { encoding: "utf8" }
+    );
     assert.strictEqual(probe.status, 23, probe.stderr);
     assert.deepStrictEqual(probe.stdout.trim().split(/\r?\n/), ["alpha", "two words"]);
 

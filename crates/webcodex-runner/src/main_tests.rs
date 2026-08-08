@@ -6,6 +6,48 @@ use crate::webcodex_runner::{
 };
 static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// RAII restore for environment variables mutated by tests: restores the
+/// previous value (or absence) on drop, even when the test panics, so a
+/// failure cannot leak env state into later tests.
+struct EnvGuard {
+    restored: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl EnvGuard {
+    fn new() -> Self {
+        EnvGuard {
+            restored: Vec::new(),
+        }
+    }
+
+    fn set(mut self, name: &'static str, value: &str) -> Self {
+        self.capture(name);
+        std::env::set_var(name, value);
+        self
+    }
+
+    fn remove(mut self, name: &'static str) -> Self {
+        self.capture(name);
+        std::env::remove_var(name);
+        self
+    }
+
+    fn capture(&mut self, name: &'static str) {
+        self.restored.push((name, std::env::var_os(name)));
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in self.restored.drain(..).rev() {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
 /// Policy for tests that exercise shell/profile behavior inside a temp dir
 /// rather than the filesystem boundary itself. `AgentPolicy::default()` is
 /// now fail-closed (empty `allowed_roots` reaches nothing), so these tests
@@ -330,6 +372,10 @@ client_id = "{client_id}"
 owner = "alice"
 poll_interval_ms = 1000
 {max_jobs}
+# Explicit projects_dir: load_config materializes the default from the
+# per-user config base, which depends on ambient HOME/USERPROFILE that other
+# tests mutate.
+projects_dir = "projects.d"
 policy.allow_raw_shell = true
 policy.allow_cwd_anywhere = true
 policy.allowed_roots = ["/"]
@@ -862,7 +908,7 @@ fn agent_cli_profile_derives_default_config_path() {
     assert_eq!(
         action,
         AgentCliAction::Run {
-            config_path: client_profile_agent_config("special"),
+            config_path: client_profile_agent_config("special").unwrap(),
             once: false,
         }
     );
@@ -1275,6 +1321,122 @@ fn max_concurrent_jobs_defaults_to_two_and_clamps_to_one() {
     assert_eq!(max_concurrent_jobs(&cfg), 4);
 }
 
+// ---------------------------------------------------------------------------
+// Stage 2G: platform-aware shell test helpers.
+//
+// The default shell is `sh -c` on Unix and native PowerShell on Windows, so
+// tests that exercise the default shell use dialect-appropriate command text.
+// PowerShell output goes through `[Console]::Out` / `[Console]::Error` (no
+// host line terminators), and profile init snippets use the platform's
+// variable syntax.
+// ---------------------------------------------------------------------------
+
+/// Command text that writes `text` to stdout with no trailing newline, using
+/// this platform's default shell dialect.
+#[cfg(windows)]
+fn shell_echo(text: &str) -> String {
+    format!("[Console]::Out.Write('{}')", text.replace('\'', "''"))
+}
+
+#[cfg(not(windows))]
+fn shell_echo(text: &str) -> String {
+    format!("printf %s '{}'", text.replace('\'', "'\\''"))
+}
+
+/// Command text that writes `text` to stderr with no trailing newline.
+#[cfg(windows)]
+fn shell_echo_err(text: &str) -> String {
+    format!("[Console]::Error.Write('{}')", text.replace('\'', "''"))
+}
+
+#[cfg(not(windows))]
+fn shell_echo_err(text: &str) -> String {
+    format!("printf %s '{}' >&2", text.replace('\'', "'\\''"))
+}
+
+/// Command text that writes the value of environment variable `name`.
+#[cfg(windows)]
+fn shell_env_var(name: &str) -> String {
+    format!("[Console]::Out.Write($env:{name})")
+}
+
+#[cfg(not(windows))]
+fn shell_env_var(name: &str) -> String {
+    format!("printf %s \"${}\"", name)
+}
+
+/// Command text that echoes stdin back to stdout.
+#[cfg(windows)]
+fn shell_stdin_cat() -> String {
+    "[Console]::Out.Write([Console]::In.ReadToEnd())".to_string()
+}
+
+#[cfg(not(windows))]
+fn shell_stdin_cat() -> String {
+    "cat".to_string()
+}
+
+/// Command text that writes `ran` into `path` (a side-effect marker proving a
+/// command executed).
+#[cfg(windows)]
+fn shell_write_file(path: &Path) -> String {
+    format!(
+        "[IO.File]::WriteAllText({}, 'ran')",
+        shell_tree_quote(&path.to_string_lossy())
+    )
+}
+
+#[cfg(not(windows))]
+fn shell_write_file(path: &Path) -> String {
+    format!("printf ran > {}", shell_tree_quote(&path.to_string_lossy()))
+}
+
+/// Command text that prints `absent` when `name` is not set and `present`
+/// when it is set (even to an empty value).
+#[cfg(windows)]
+fn shell_if_else_env_present(name: &str) -> String {
+    format!(
+        "if ($null -eq $env:{name}) {{ [Console]::Out.Write('absent') }} else {{ [Console]::Out.Write('present') }}"
+    )
+}
+
+#[cfg(not(windows))]
+fn shell_if_else_env_present(name: &str) -> String {
+    format!("if [ -z \"${{{name}+x}}\" ]; then printf absent; else printf present; fi")
+}
+
+/// Write a shell init script for this platform's default shell into `dir`
+/// that exports `name=value`, and return its path.
+#[cfg(windows)]
+fn write_init_script(dir: &Path, name: &str, value: &str) -> PathBuf {
+    let init = dir.join("init.ps1");
+    // PowerShell 5.1 decodes .ps1 files with the system ANSI code page unless
+    // a UTF-8 BOM is present; the BOM keeps non-ASCII script bodies intact.
+    let mut content = "\u{FEFF}".to_string();
+    content.push_str(&format!("$env:{name} = '{}'\n", value.replace('\'', "''")));
+    std::fs::write(&init, content).unwrap();
+    init
+}
+
+#[cfg(not(windows))]
+fn write_init_script(dir: &Path, name: &str, value: &str) -> PathBuf {
+    let init = dir.join("init.sh");
+    std::fs::write(&init, format!("export {name}={value}\n")).unwrap();
+    init
+}
+
+/// Profile init-script snippet that exports `name=value`, matching this
+/// platform's default shell dialect.
+#[cfg(windows)]
+fn profile_init_export(name: &str, value: &str) -> String {
+    format!("$env:{name} = '{}'", value.replace('\'', "''"))
+}
+
+#[cfg(not(windows))]
+fn profile_init_export(name: &str, value: &str) -> String {
+    format!("export {name}={value}")
+}
+
 #[test]
 fn shell_config_default_preserves_sh_c_behavior() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1284,13 +1446,45 @@ fn shell_config_default_preserves_sh_c_behavior() {
         &cfg.policy,
         &ShellConfig::default(),
         Some(&cwd),
-        "printf default-ok",
+        &shell_echo("default-ok"),
         None,
         10,
         None,
     );
     assert_eq!(result.exit_code, Some(0));
     assert_eq!(result.stdout.as_deref(), Some("default-ok"));
+}
+
+#[test]
+fn shell_config_default_shell_is_platform_native() {
+    let shell = ShellConfig::default();
+    #[cfg(windows)]
+    {
+        // The default Windows shell is native PowerShell; the default command
+        // must execute without any sh/Git Bash/WSL on PATH.
+        assert_eq!(shell.program, "powershell.exe");
+        assert!(shell.args.iter().any(|arg| arg == "-Command"));
+        assert!(
+            shell.args.iter().any(|arg| arg == "-NoProfile"),
+            "default must not load the user's interactive profile"
+        );
+        let result = run_shell(
+            &unrestricted_test_policy(),
+            &shell,
+            None,
+            &shell_echo("power-default-ok"),
+            None,
+            10,
+            None,
+        );
+        assert_eq!(result.exit_code, Some(0), "{result:?}");
+        assert_eq!(result.stdout.as_deref(), Some("power-default-ok"));
+    }
+    #[cfg(not(windows))]
+    {
+        assert_eq!(shell.program, "sh");
+        assert_eq!(shell.args, vec!["-c".to_string()]);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1391,6 +1585,7 @@ fn inspect_shell_real_smoke_reads_checks_and_blocks_project_writes() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn shell_config_path_prepend_discovers_fake_executable() {
     use std::os::unix::fs::PermissionsExt;
@@ -1422,6 +1617,133 @@ fn shell_config_path_prepend_discovers_fake_executable() {
     assert_eq!(result.stdout.as_deref(), Some("fake-tool-ok"));
 }
 
+#[cfg(windows)]
+#[test]
+fn shell_config_path_prepend_discovers_fake_executable_and_keeps_windows_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let bin_dir = tmp.path().join("bin dir");
+    std::fs::create_dir(&bin_dir).unwrap();
+    // PowerShell executes .cmd files from PATH through cmd.exe; `<nul
+    // set /p` writes exactly the payload with no trailing newline, and the
+    // explicit `exit /b 0` keeps cmd's errorlevel (set /p with an empty
+    // variable name leaves it 1) from leaking into $LASTEXITCODE.
+    let exe = bin_dir.join("webcodex-fake-tool.cmd");
+    std::fs::write(
+        &exe,
+        "@echo off\r\n<nul set /p \"=fake-tool-ok\"\r\nexit /b 0\r\n",
+    )
+    .unwrap();
+    let shell = ShellConfig {
+        path_prepend: vec![bin_dir],
+        ..ShellConfig::default()
+    };
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let result = run_shell(
+        &cfg.policy,
+        &shell,
+        Some(&cwd),
+        "webcodex-fake-tool.cmd",
+        None,
+        10,
+        None,
+    );
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert_eq!(result.stdout.as_deref(), Some("fake-tool-ok"), "{result:?}");
+
+    // path_prepend must extend the inherited Windows PATH (spelled `Path` in
+    // the process block), not replace it: the prepended directory comes
+    // first and the System32 entries survive.
+    let result = run_shell(
+        &cfg.policy,
+        &shell,
+        Some(&cwd),
+        &shell_env_var("PATH"),
+        None,
+        10,
+        None,
+    );
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    let path = result.stdout.unwrap();
+    let dir_text = tmp.path().join("bin dir").to_string_lossy().to_string();
+    assert!(
+        path.starts_with(&dir_text),
+        "prepended directory is not first in PATH: {path}"
+    );
+    assert!(
+        path.contains("System32"),
+        "inherited Windows PATH lost: {path}"
+    );
+}
+
+#[test]
+fn shell_config_dialect_field_parses_and_validates() {
+    use crate::webcodex_runner::config::ShellDialect;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("agent.toml");
+    std::fs::write(
+        &path,
+        r#"
+server_url = "http://127.0.0.1:8000"
+token = "test-token"
+client_id = "agent-1"
+
+[shell]
+dialect = "powershell"
+
+[shell.profiles.custom]
+dialect = "posix"
+program = "sh"
+args = ["-c"]
+"#,
+    )
+    .unwrap();
+    let cfg = load_config(&path).unwrap();
+    assert_eq!(cfg.shell.dialect, Some(ShellDialect::PowerShell));
+    assert_eq!(
+        cfg.shell.profiles.get("custom").unwrap().dialect,
+        Some(ShellDialect::Posix)
+    );
+
+    // Unknown dialect values are rejected explicitly at parse time.
+    std::fs::write(
+        &path,
+        r#"
+server_url = "http://127.0.0.1:8000"
+token = "test-token"
+client_id = "agent-1"
+
+[shell]
+dialect = "cmd"
+"#,
+    )
+    .unwrap();
+    let err = load_config(&path).unwrap_err();
+    assert!(err.contains("powershell"), "{err}");
+    assert!(err.contains("cmd"), "{err}");
+}
+
+#[test]
+fn shell_config_default_environment_is_inherited() {
+    let _guard = TEST_ENV_LOCK.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let _env = EnvGuard::new().set("WEBCODEX_INHERITED_TEST", "inherited-ok");
+    let result = run_shell(
+        &cfg.policy,
+        &ShellConfig::default(),
+        Some(&cwd),
+        &shell_env_var("WEBCODEX_INHERITED_TEST"),
+        None,
+        10,
+        None,
+    );
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert_eq!(result.stdout.as_deref(), Some("inherited-ok"));
+}
+
 #[test]
 fn shell_config_env_values_are_available() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1435,7 +1757,7 @@ fn shell_config_env_values_are_available() {
         &cfg.policy,
         &shell,
         Some(&cwd),
-        "printf %s \"$WEBCODEX_TEST_VALUE\"",
+        &shell_env_var("WEBCODEX_TEST_VALUE"),
         None,
         10,
         None,
@@ -1448,8 +1770,7 @@ fn shell_config_env_values_are_available() {
 fn shell_config_init_script_is_sourced() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = test_config(tmp.path().join("config/projects.d"));
-    let init = tmp.path().join("init.sh");
-    std::fs::write(&init, "export WEBCODEX_INIT_TEST=init-ok\n").unwrap();
+    let init = write_init_script(tmp.path(), "WEBCODEX_INIT_TEST", "init-ok");
     let shell = ShellConfig {
         init_script: Some(init),
         ..ShellConfig::default()
@@ -1459,13 +1780,79 @@ fn shell_config_init_script_is_sourced() {
         &cfg.policy,
         &shell,
         Some(&cwd),
-        "printf %s \"$WEBCODEX_INIT_TEST\"",
+        &shell_env_var("WEBCODEX_INIT_TEST"),
         None,
         10,
         None,
     );
     assert_eq!(result.exit_code, Some(0));
     assert_eq!(result.stdout.as_deref(), Some("init-ok"));
+}
+
+#[test]
+fn shell_config_init_script_awkward_path_is_sourced() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path().join("config/projects.d"));
+    // Space, single quote, and non-ASCII characters in the init script path.
+    let init_dir = tmp.path().join("init dir '脚本");
+    std::fs::create_dir_all(&init_dir).unwrap();
+    let init = write_init_script(&init_dir, "WEBCODEX_INIT_TEST", "init-ok");
+    let shell = ShellConfig {
+        init_script: Some(init),
+        ..ShellConfig::default()
+    };
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let result = run_shell(
+        &cfg.policy,
+        &shell,
+        Some(&cwd),
+        &shell_env_var("WEBCODEX_INIT_TEST"),
+        None,
+        10,
+        None,
+    );
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert_eq!(result.stdout.as_deref(), Some("init-ok"));
+}
+
+#[test]
+fn shell_job_init_script_failure_blocks_command_and_reports_exit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path().join("config/projects.d"));
+    // Windows: `exit 3` inside the dot-sourced script terminates the process
+    // with 3. Unix: `false` fails the sourced script so `&&` short-circuits
+    // with exit 1. Either way the requested command must never run.
+    #[cfg(windows)]
+    let (init_content, expected_exit) = ("exit 3\n", Some(3));
+    #[cfg(not(windows))]
+    let (init_content, expected_exit) = ("false\n", Some(1));
+    let init = if cfg!(windows) {
+        tmp.path().join("fail.ps1")
+    } else {
+        tmp.path().join("fail.sh")
+    };
+    std::fs::write(&init, init_content).unwrap();
+    let shell = ShellConfig {
+        init_script: Some(init),
+        ..ShellConfig::default()
+    };
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let marker = tmp.path().join("command-ran.txt");
+    let result = run_shell(
+        &cfg.policy,
+        &shell,
+        Some(&cwd),
+        &shell_write_file(&marker),
+        None,
+        10,
+        None,
+    );
+    assert!(
+        !marker.exists(),
+        "command ran despite init script failure: {result:?}"
+    );
+    assert_eq!(result.exit_code, expected_exit, "{result:?}");
+    assert!(result.error.is_none(), "{result:?}");
 }
 
 #[test]
@@ -1575,7 +1962,7 @@ fn prepared_profile_env_is_available_to_run_shell() {
         tmp.path(),
         &PreparedShellProfileCache::default(),
         tmp.path(),
-        "printf %s \"$WEBCODEX_TEST_PROFILE\"",
+        &shell_env_var("WEBCODEX_TEST_PROFILE"),
     );
     assert_eq!(result.exit_code, Some(0), "{result:?}");
     assert_eq!(result.stdout.as_deref(), Some("from_env"));
@@ -1584,14 +1971,18 @@ fn prepared_profile_env_is_available_to_run_shell() {
 #[test]
 fn prepared_profile_init_script_export_is_available_to_run_shell() {
     let tmp = tempfile::tempdir().unwrap();
+    // The profile inherits the platform default shell (`sh -c` on Unix,
+    // PowerShell on Windows) and exports a variable its init snippet; the
+    // captured environment snapshot must reach later commands.
     let shell = shell_with_profiles(
         Some("test"),
         vec![(
             "test",
             ShellProfileConfig {
-                program: Some("/bin/sh".to_string()),
-                args: Some(vec!["-c".to_string()]),
-                init_script: Some("export WEBCODEX_TEST_PROFILE=from_snapshot".to_string()),
+                init_script: Some(profile_init_export(
+                    "WEBCODEX_TEST_PROFILE",
+                    "from_snapshot",
+                )),
                 ..ShellProfileConfig::default()
             },
         )],
@@ -1602,10 +1993,38 @@ fn prepared_profile_init_script_export_is_available_to_run_shell() {
         tmp.path(),
         &PreparedShellProfileCache::default(),
         tmp.path(),
-        "printf %s \"$WEBCODEX_TEST_PROFILE\"",
+        &shell_env_var("WEBCODEX_TEST_PROFILE"),
     );
     assert_eq!(result.exit_code, Some(0), "{result:?}");
     assert_eq!(result.stdout.as_deref(), Some("from_snapshot"));
+}
+
+#[test]
+fn prepared_profile_failure_reports_exit_code() {
+    let tmp = tempfile::tempdir().unwrap();
+    let shell = shell_with_profiles(
+        Some("test"),
+        vec![(
+            "test",
+            ShellProfileConfig {
+                // `exit 4` terminates the prepare shell with 4 on both the
+                // POSIX and PowerShell dialects.
+                init_script: Some("exit 4".to_string()),
+                ..ShellProfileConfig::default()
+            },
+        )],
+    );
+    let result = run_profile_shell(
+        &unrestricted_test_policy(),
+        &shell,
+        tmp.path(),
+        &PreparedShellProfileCache::default(),
+        tmp.path(),
+        "true",
+    );
+    let err = result.error.expect("prepare should fail");
+    assert!(err.contains("failed to prepare shell profile"), "{err}");
+    assert!(err.contains("exit code 4"), "{err}");
 }
 
 #[test]
@@ -1613,10 +2032,20 @@ fn prepared_profile_init_script_is_project_relative() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("project");
     let projects_dir = tmp.path().join("projects.d");
-    std::fs::create_dir_all(project_dir.join(".venv/bin")).unwrap();
+    // Windows virtual environments activate through `.venv/Scripts/
+    // Activate.ps1`; Unix through `.venv/bin/activate`.
+    #[cfg(windows)]
+    let activate_rel = ".venv/Scripts/Activate.ps1";
+    #[cfg(not(windows))]
+    let activate_rel = ".venv/bin/activate";
+    let activate = project_dir.join(activate_rel);
+    std::fs::create_dir_all(activate.parent().unwrap()).unwrap();
     std::fs::write(
-        project_dir.join(".venv/bin/activate"),
-        "export WEBCODEX_PROJECT_VENV=project_local\n",
+        &activate,
+        format!(
+            "{}\n",
+            profile_init_export("WEBCODEX_PROJECT_VENV", "project_local")
+        ),
     )
     .unwrap();
     write_agent_project(&projects_dir, "demo", &project_dir, Some("py-venv"));
@@ -1625,9 +2054,7 @@ fn prepared_profile_init_script_is_project_relative() {
         vec![(
             "py-venv",
             ShellProfileConfig {
-                program: Some("/bin/sh".to_string()),
-                args: Some(vec!["-c".to_string()]),
-                init_script: Some(". .venv/bin/activate".to_string()),
+                init_script: Some(format!(". {activate_rel}")),
                 ..ShellProfileConfig::default()
             },
         )],
@@ -1638,7 +2065,7 @@ fn prepared_profile_init_script_is_project_relative() {
         &projects_dir,
         &PreparedShellProfileCache::default(),
         &project_dir,
-        "printf %s \"$WEBCODEX_PROJECT_VENV\"",
+        &shell_env_var("WEBCODEX_PROJECT_VENV"),
     );
     assert_eq!(result.exit_code, Some(0), "{result:?}");
     assert_eq!(result.stdout.as_deref(), Some("project_local"));
@@ -1676,7 +2103,7 @@ fn project_shell_profile_overrides_default_profile() {
         &projects_dir,
         &PreparedShellProfileCache::default(),
         &project_dir,
-        "printf %s \"$WEBCODEX_TEST_PROFILE\"",
+        &shell_env_var("WEBCODEX_TEST_PROFILE"),
     );
     assert_eq!(result.exit_code, Some(0), "{result:?}");
     assert_eq!(result.stdout.as_deref(), Some("project"));
@@ -3704,7 +4131,7 @@ fn prepared_profile_run_shell_and_run_job_see_same_env() {
         &projects_dir,
         &jobs.prepared_profiles,
         &project_dir,
-        "printf %s \"$WEBCODEX_TEST_PROFILE\"",
+        &shell_env_var("WEBCODEX_TEST_PROFILE"),
     );
     assert_eq!(shell_result.stdout.as_deref(), Some("same"));
 
@@ -3725,7 +4152,7 @@ fn prepared_profile_run_shell_and_run_job_see_same_env() {
         &persistent_shells,
         &projects_dir,
         &lsp,
-        shell_job_request(&project_dir, "printf %s \"$WEBCODEX_TEST_PROFILE\""),
+        shell_job_request(&project_dir, &shell_env_var("WEBCODEX_TEST_PROFILE")),
     )
     .unwrap();
     assert_eq!(wait_for_job_stdout(&mut rx), "same");
@@ -3735,18 +4162,26 @@ fn prepared_profile_run_shell_and_run_job_see_same_env() {
 fn prepared_profile_init_script_runs_once_per_project_profile_generation() {
     let tmp = tempfile::tempdir().unwrap();
     let counter = tmp.path().join("prepare-count");
+    #[cfg(windows)]
     let init_script = format!(
-            "count=$(cat {:?} 2>/dev/null || echo 0)\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > {:?}\nexport WEBCODEX_TEST_PROFILE=counted",
+        "$n = 0\ntry {{ $n = [int](Get-Content -Raw {}) }} catch {{ }}\n\
+         $n = $n + 1\nSet-Content -Path {} -Value $n\n{}",
+        shell_tree_quote(&counter.to_string_lossy()),
+        shell_tree_quote(&counter.to_string_lossy()),
+        profile_init_export("WEBCODEX_TEST_PROFILE", "counted"),
+    );
+    #[cfg(not(windows))]
+    let init_script = format!(
+            "count=$(cat {:?} 2>/dev/null || echo 0)\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > {:?}\n{}",
             counter.to_string_lossy(),
-            counter.to_string_lossy()
+            counter.to_string_lossy(),
+            profile_init_export("WEBCODEX_TEST_PROFILE", "counted"),
         );
     let shell = shell_with_profiles(
         Some("test"),
         vec![(
             "test",
             ShellProfileConfig {
-                program: Some("sh".to_string()),
-                args: Some(vec!["-c".to_string()]),
                 init_script: Some(init_script),
                 ..ShellProfileConfig::default()
             },
@@ -3760,7 +4195,7 @@ fn prepared_profile_init_script_runs_once_per_project_profile_generation() {
             tmp.path(),
             &cache,
             tmp.path(),
-            "printf %s \"$WEBCODEX_TEST_PROFILE\"",
+            &shell_env_var("WEBCODEX_TEST_PROFILE"),
         );
         assert_eq!(result.exit_code, Some(0), "{result:?}");
         assert_eq!(result.stdout.as_deref(), Some("counted"));
@@ -3774,7 +4209,7 @@ fn prepared_profile_init_script_runs_once_per_project_profile_generation() {
         tmp.path(),
         &cache,
         Some(&cwd),
-        "printf %s \"$WEBCODEX_TEST_PROFILE\"",
+        &shell_env_var("WEBCODEX_TEST_PROFILE"),
         None,
         10,
         None,
@@ -3791,7 +4226,7 @@ fn prepared_profile_init_script_runs_once_per_project_profile_generation() {
         tmp.path(),
         &cache,
         Some(&cwd),
-        "printf %s \"$WEBCODEX_TEST_PROFILE\"",
+        &shell_env_var("WEBCODEX_TEST_PROFILE"),
         None,
         10,
         None,
@@ -3806,7 +4241,7 @@ fn prepared_profile_init_script_runs_once_per_project_profile_generation() {
         tmp.path(),
         &cache,
         Some(&cwd),
-        "printf %s \"$WEBCODEX_TEST_PROFILE\"",
+        &shell_env_var("WEBCODEX_TEST_PROFILE"),
         None,
         10,
         None,
@@ -3819,16 +4254,17 @@ fn prepared_profile_init_script_runs_once_per_project_profile_generation() {
 #[test]
 fn prepared_profile_init_script_stdout_noise_does_not_break_env_capture() {
     let tmp = tempfile::tempdir().unwrap();
+    #[cfg(windows)]
+    let init_script =
+        "Write-Output 'noise before env'\n$env:WEBCODEX_TEST_PROFILE = 'ok'".to_string();
+    #[cfg(not(windows))]
+    let init_script = "echo noise before env\nexport WEBCODEX_TEST_PROFILE=ok".to_string();
     let shell = shell_with_profiles(
         Some("test"),
         vec![(
             "test",
             ShellProfileConfig {
-                program: Some("sh".to_string()),
-                args: Some(vec!["-c".to_string()]),
-                init_script: Some(
-                    "echo noise before env\nexport WEBCODEX_TEST_PROFILE=ok".to_string(),
-                ),
+                init_script: Some(init_script),
                 ..ShellProfileConfig::default()
             },
         )],
@@ -3839,7 +4275,7 @@ fn prepared_profile_init_script_stdout_noise_does_not_break_env_capture() {
         tmp.path(),
         &PreparedShellProfileCache::default(),
         tmp.path(),
-        "printf %s \"$WEBCODEX_TEST_PROFILE\"",
+        &shell_env_var("WEBCODEX_TEST_PROFILE"),
     );
     assert_eq!(result.exit_code, Some(0), "{result:?}");
     assert_eq!(result.stdout.as_deref(), Some("ok"));
@@ -3884,7 +4320,7 @@ fn prepared_profile_prepare_reaps_background_pipe_holder() {
             &worker_projects_dir,
             &worker_cache,
             Some(&worker_cwd),
-            "printf %s \"$WEBCODEX_TEST_PROFILE\"",
+            &shell_env_var("WEBCODEX_TEST_PROFILE"),
             None,
             10,
             None,
@@ -3920,14 +4356,16 @@ fn prepared_profile_prepare_reaps_background_pipe_holder() {
 fn prepared_profile_errors_do_not_leak_init_script_body() {
     let tmp = tempfile::tempdir().unwrap();
     let secret = "DO_NOT_LEAK_THIS_INLINE_SCRIPT_BODY";
+    #[cfg(windows)]
+    let failing_init = format!("$env:SECRET = '{secret}'\nexit 1");
+    #[cfg(not(windows))]
+    let failing_init = format!("export SECRET={secret}\nfalse");
     let shell = shell_with_profiles(
         Some("test"),
         vec![(
             "test",
             ShellProfileConfig {
-                program: Some("sh".to_string()),
-                args: Some(vec!["-c".to_string()]),
-                init_script: Some(format!("export SECRET={secret}\nfalse")),
+                init_script: Some(failing_init),
                 ..ShellProfileConfig::default()
             },
         )],
@@ -3948,38 +4386,107 @@ fn prepared_profile_errors_do_not_leak_init_script_body() {
 #[test]
 fn prepared_profile_filters_webcodex_token_env() {
     let _guard = TEST_ENV_LOCK.lock().unwrap();
-    let saved = std::env::var_os("WEBCODEX_TOKEN");
-    std::env::set_var("WEBCODEX_TOKEN", "secret-token");
     let tmp = tempfile::tempdir().unwrap();
     let shell = shell_with_profiles(Some("test"), vec![("test", ShellProfileConfig::default())]);
-    let result = run_profile_shell(
-        &unrestricted_test_policy(),
-        &shell,
-        tmp.path(),
-        &PreparedShellProfileCache::default(),
-        tmp.path(),
-        "if [ -z \"${WEBCODEX_TOKEN+x}\" ]; then printf absent; else printf present; fi",
-    );
-    match saved {
-        Some(value) => std::env::set_var("WEBCODEX_TOKEN", value),
-        None => std::env::remove_var("WEBCODEX_TOKEN"),
+    // Windows environment names are case-insensitive, so mixed-case spellings
+    // must be filtered too; Unix is case-sensitive and only the exact name
+    // can be inherited or configured.
+    #[cfg(windows)]
+    let spellings = ["WEBCODEX_TOKEN", "WebCodex_Token", "authorization"];
+    #[cfg(not(windows))]
+    let spellings = ["WEBCODEX_TOKEN"];
+    for spelling in spellings {
+        let saved = std::env::var_os(spelling);
+        std::env::set_var(spelling, "secret-token");
+        let result = run_profile_shell(
+            &unrestricted_test_policy(),
+            &shell,
+            tmp.path(),
+            &PreparedShellProfileCache::default(),
+            tmp.path(),
+            &shell_if_else_env_present(spelling),
+        );
+        match saved {
+            Some(value) => std::env::set_var(spelling, value),
+            None => std::env::remove_var(spelling),
+        }
+        assert_eq!(result.exit_code, Some(0), "{result:?}");
+        assert_eq!(result.stdout.as_deref(), Some("absent"), "{result:?}");
     }
-    assert_eq!(result.exit_code, Some(0), "{result:?}");
-    assert_eq!(result.stdout.as_deref(), Some("absent"));
+}
+
+#[cfg(windows)]
+#[test]
+fn shell_job_filters_sensitive_env_case_insensitive() {
+    let _guard = TEST_ENV_LOCK.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cwd = tmp.path().to_string_lossy().to_string();
+    // The plain (non-profile) path removes sensitive keys from the child
+    // environment; Windows removal must be case-insensitive like the OS.
+    for spelling in [
+        "WEBCODEX_TOKEN",
+        "WebCodex_User_Token",
+        "Authorization",
+        "webcodex_agent_token",
+    ] {
+        let _env = EnvGuard::new().set(spelling, "secret-token");
+        let result = run_shell(
+            &cfg.policy,
+            &ShellConfig::default(),
+            Some(&cwd),
+            &shell_if_else_env_present(spelling),
+            None,
+            10,
+            None,
+        );
+        assert_eq!(result.exit_code, Some(0), "{result:?}");
+        assert_eq!(result.stdout.as_deref(), Some("absent"), "{result:?}");
+    }
+
+    // A configured shell env must not be able to re-insert a secret after the
+    // inherited environment was scrubbed. Exercise canonical and mixed-case
+    // spellings because Windows environment names are case-insensitive.
+    for spelling in ["WEBCODEX_TOKEN", "WebCodex_User_Token", "authorization"] {
+        let shell = ShellConfig {
+            env: HashMap::from([(spelling.to_string(), "configured-secret".to_string())]),
+            ..ShellConfig::default()
+        };
+        let result = run_shell(
+            &cfg.policy,
+            &shell,
+            Some(&cwd),
+            &shell_if_else_env_present(spelling),
+            None,
+            10,
+            None,
+        );
+        assert_eq!(result.exit_code, Some(0), "{result:?}");
+        assert_eq!(
+            result.stdout.as_deref(),
+            Some("absent"),
+            "configured sensitive env leaked: {result:?}"
+        );
+    }
 }
 
 #[test]
 fn prepared_profile_missing_marker_is_reported_without_script_body() {
     let tmp = tempfile::tempdir().unwrap();
     let secret = "DO_NOT_LEAK_THIS_INLINE_SCRIPT_BODY";
+    // Windows: `exit 0` ends the prepare shell successfully before the marker
+    // can be written. Unix: redirecting stdout away makes the marker
+    // unreachable. Both report "env marker not found" without the body.
+    #[cfg(windows)]
+    let init_script = format!("$env:SECRET = '{secret}'\nexit 0");
+    #[cfg(not(windows))]
+    let init_script = format!("export SECRET={secret}\nexec >/dev/null");
     let shell = shell_with_profiles(
         Some("test"),
         vec![(
             "test",
             ShellProfileConfig {
-                program: Some("sh".to_string()),
-                args: Some(vec!["-c".to_string()]),
-                init_script: Some(format!("export SECRET={secret}\nexec >/dev/null")),
+                init_script: Some(init_script),
                 ..ShellProfileConfig::default()
             },
         )],
@@ -4096,7 +4603,7 @@ fn shell_job_success_and_failure_results_are_structured() {
         &cfg.policy,
         &cfg.shell,
         Some(&cwd),
-        "printf hello; printf warn >&2",
+        &format!("{}; {}", shell_echo("hello"), shell_echo_err("warn")),
         None,
         10,
         None,
@@ -4129,7 +4636,7 @@ fn shell_job_writes_stdin_to_child() {
         &cfg.policy,
         &cfg.shell,
         Some(&cwd),
-        "cat",
+        &shell_stdin_cat(),
         Some("stdin payload\n"),
         10,
         None,
@@ -4382,6 +4889,48 @@ fn shell_job_timeout_profile_reaps_descendant_process_group() {
     assert_descendant_reaped(&pid_file);
 }
 
+#[cfg(windows)]
+#[test]
+fn shell_job_powershell_statement_error_is_nonzero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let result = run_shell(
+        &cfg.policy,
+        &cfg.shell,
+        Some(&cwd),
+        "Write-Error 'expected failure'",
+        None,
+        10,
+        None,
+    );
+    assert_eq!(result.exit_code, Some(1), "{result:?}");
+    assert!(result.error.is_none(), "{result:?}");
+}
+
+#[cfg(windows)]
+#[test]
+fn shell_job_powershell_last_success_overrides_stale_native_exit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let result = run_shell(
+        &cfg.policy,
+        &cfg.shell,
+        Some(&cwd),
+        "cmd.exe /d /c exit 7; Write-Output 'final-ok'",
+        None,
+        10,
+        None,
+    );
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert_eq!(
+        result.stdout.as_deref().map(str::trim_end),
+        Some("final-ok"),
+        "{result:?}"
+    );
+}
+
 #[test]
 fn shell_job_stop_flag_is_best_effort() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4458,7 +5007,11 @@ fn shell_job_stdout_stderr_are_bounded() {
         &cfg.policy,
         &cfg.shell,
         Some(&cwd),
-        "printf 0123456789; printf abcdefghij >&2",
+        &format!(
+            "{}; {}",
+            shell_echo("0123456789"),
+            shell_echo_err("abcdefghij")
+        ),
         None,
         10,
         None,
@@ -4470,6 +5023,936 @@ fn shell_job_stdout_stderr_are_bounded() {
     assert!(stdout.ends_with("23456789"));
     assert!(stderr.contains("[output truncated to last 8 bytes]"));
     assert!(stderr.ends_with("cdefghij"));
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2F: shell.rs ManagedChild lifecycle coverage.
+//
+// The shell execution path owns its process tree through ManagedChild (a
+// private process group on Unix, a kill-on-close Job Object on Windows). These
+// tests drive the cross-platform `validation_tree_helper` fixture through the
+// real configured shell (`sh -c` on Unix, PowerShell on Windows) and probe
+// descendant pids with a platform-native liveness probe — never with
+// taskkill / Stop-Process / wmic / `ps` and never through shell quoting of
+// process listings.
+// ---------------------------------------------------------------------------
+
+/// Compiled copy of the `validation_tree_helper` fixture, kept alive for the
+/// whole test process so its binary path never disappears under a running
+/// descendant (same pattern as the validation lifecycle tests).
+struct ShellTreeHelper {
+    _temp: tempfile::TempDir,
+    path: PathBuf,
+}
+
+static SHELL_TREE_HELPER: std::sync::OnceLock<std::sync::Arc<ShellTreeHelper>> =
+    std::sync::OnceLock::new();
+
+fn shell_tree_helper() -> PathBuf {
+    SHELL_TREE_HELPER
+        .get_or_init(|| {
+            let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("src/webcodex_runner/validation/validation_tree_helper.rs");
+            let temp = tempfile::tempdir().unwrap();
+            let output = temp
+                .path()
+                .join(format!("shell-tree-helper{}", std::env::consts::EXE_SUFFIX));
+            let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+            let result = std::process::Command::new(rustc)
+                .arg("--edition=2021")
+                .arg("--crate-name=webcodex_shell_tree_helper")
+                .arg(&source)
+                .arg("-o")
+                .arg(&output)
+                .output()
+                .expect("run rustc for shell tree helper");
+            assert!(
+                result.status.success(),
+                "shell tree helper compilation failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            std::sync::Arc::new(ShellTreeHelper {
+                _temp: temp,
+                path: output,
+            })
+        })
+        .path
+        .clone()
+}
+
+/// Single-quote `value` for the platform test shell. Windows uses PowerShell
+/// ('' escapes an embedded quote); Unix uses POSIX sh ('\'' escapes one).
+#[cfg(windows)]
+fn shell_tree_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(not(windows))]
+fn shell_tree_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Build the shell command line that runs the fixture helper with `args`.
+///
+/// Windows drives the helper through PowerShell with single-quoted paths (no
+/// cmd.exe quote-parsing pitfalls) and appends `exit $LASTEXITCODE` so the
+/// helper's exit status becomes the shell's exit status. Unix uses the POSIX
+/// shell directly.
+fn shell_tree_command(helper: &Path, args: &[String]) -> String {
+    let mut parts: Vec<String> = vec![shell_tree_quote(&helper.to_string_lossy())];
+    parts.extend(args.iter().map(|arg| shell_tree_quote(arg)));
+    let joined = parts.join(" ");
+    #[cfg(windows)]
+    {
+        format!("& {joined}; exit $LASTEXITCODE")
+    }
+    #[cfg(not(windows))]
+    {
+        joined
+    }
+}
+
+/// Test shell that can actually run on this platform: PowerShell on Windows
+/// (cmd.exe quote parsing and missing `sleep` make POSIX-style commands
+/// unusable), the default `sh -c` on Unix.
+#[cfg(windows)]
+fn shell_tree_test_shell() -> ShellConfig {
+    ShellConfig {
+        program: "powershell.exe".to_string(),
+        args: vec!["-NoProfile".to_string(), "-Command".to_string()],
+        ..ShellConfig::default()
+    }
+}
+
+#[cfg(not(windows))]
+fn shell_tree_test_shell() -> ShellConfig {
+    ShellConfig::default()
+}
+
+/// Shell timeout used by the tree tests: Windows needs headroom for
+/// PowerShell startup, Unix shells start instantly.
+fn shell_tree_test_timeout_secs() -> u64 {
+    if cfg!(windows) {
+        5
+    } else {
+        1
+    }
+}
+
+/// Platform-native liveness probe, so the tree tests never shell out to
+/// `tasklist` / `ps` / PowerShell / wmic and never depend on shell quoting.
+#[cfg(windows)]
+fn shell_tree_process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: OpenProcess returns a handle or NULL; NULL means the pid no
+    // longer exists (or is inaccessible, which also means not ours).
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let mut exit_code = 0u32;
+    // SAFETY: `handle` is valid; `exit_code` is a valid out-param.
+    let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+    // SAFETY: close the handle we opened.
+    unsafe { CloseHandle(handle) };
+    ok == 1 && exit_code == 259 // 259 == STILL_ACTIVE
+}
+
+#[cfg(target_os = "linux")]
+fn shell_tree_process_alive(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    stat.rsplit_once(") ")
+        .and_then(|(_, rest)| rest.chars().next())
+        .is_some_and(|state| state != 'Z')
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn shell_tree_process_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 is an existence probe; the pid comes from our own
+    // helper subprocess.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+fn wait_until_file(path: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if path.exists() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_until_process_dead(pid: u32, timeout: Duration, tag: &str) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !shell_tree_process_alive(pid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            eprintln!("wait_until_process_dead({tag}): pid {pid} still alive");
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Parse `KEY=<pid>` from a marker file written by the fixture helper.
+fn read_marker_pid(marker: &Path, key: &str) -> u32 {
+    let text = std::fs::read_to_string(marker).expect("read pid marker");
+    text.lines()
+        .find_map(|line| {
+            line.strip_prefix(key)
+                .and_then(|rest| rest.strip_prefix('='))
+                .and_then(|value| value.trim().parse().ok())
+        })
+        .unwrap_or_else(|| panic!("marker {marker:?} missing {key}: {text}"))
+}
+
+/// Marker paths and the keepalive command for the two-argument
+/// `spawn-descendant-keepalive` / `spawn-descendant` fixtures.
+struct ShellTreeMarkers {
+    parent: PathBuf,
+    alive: PathBuf,
+}
+
+impl ShellTreeMarkers {
+    fn in_dir(tmp: &std::path::Path, tag: &str) -> Self {
+        Self {
+            parent: tmp.join(format!("{tag}-parent.txt")),
+            alive: tmp.join(format!("{tag}-alive.txt")),
+        }
+    }
+
+    fn keepalive_command(&self, helper: &Path) -> String {
+        shell_tree_command(
+            helper,
+            &[
+                "spawn-descendant-keepalive".to_string(),
+                self.parent.to_string_lossy().into_owned(),
+                self.alive.to_string_lossy().into_owned(),
+                "120".to_string(),
+            ],
+        )
+    }
+
+    /// Both pids must be dead after cancellation; `PARENT_PID` and
+    /// `DESCENDANT_PID` are both written to the parent marker.
+    fn assert_tree_dead(&self, tag: &str) {
+        let parent = read_marker_pid(&self.parent, "PARENT_PID");
+        let descendant = read_marker_pid(&self.parent, "DESCENDANT_PID");
+        assert!(
+            wait_until_process_dead(parent, Duration::from_secs(10), &format!("{tag}-parent")),
+            "tree parent {parent} survived {tag}"
+        );
+        assert!(
+            wait_until_process_dead(
+                descendant,
+                Duration::from_secs(10),
+                &format!("{tag}-descendant")
+            ),
+            "tree descendant {descendant} survived {tag}"
+        );
+    }
+}
+
+#[test]
+fn shell_job_normal_success_preserves_output_and_exit_code() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let helper = shell_tree_helper();
+    let result = run_shell(
+        &unrestricted_test_policy(),
+        &shell_tree_test_shell(),
+        Some(&cwd),
+        &shell_tree_command(
+            &helper,
+            &["sleep".to_string(), "0".to_string(), "7".to_string()],
+        ),
+        None,
+        10,
+        None,
+    );
+    assert_eq!(result.exit_code, Some(7), "{result:?}");
+    assert!(result.error.is_none(), "{result:?}");
+    assert!(
+        result
+            .stdout
+            .as_deref()
+            .unwrap_or_default()
+            .contains("VALIDATION_HELPER_STDOUT"),
+        "{result:?}"
+    );
+    assert!(
+        result
+            .stderr
+            .as_deref()
+            .unwrap_or_default()
+            .contains("VALIDATION_HELPER_STDERR"),
+        "{result:?}"
+    );
+    assert!(
+        result.duration_ms.unwrap_or(u64::MAX) < 30_000,
+        "unbounded shell run: {result:?}"
+    );
+}
+
+#[test]
+fn shell_job_timeout_kills_whole_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let helper = shell_tree_helper();
+    let markers = ShellTreeMarkers::in_dir(tmp.path(), "timeout");
+    let timeout_secs = shell_tree_test_timeout_secs();
+
+    let result = run_shell(
+        &unrestricted_test_policy(),
+        &shell_tree_test_shell(),
+        Some(&cwd),
+        &markers.keepalive_command(&helper),
+        None,
+        timeout_secs,
+        None,
+    );
+    assert!(
+        wait_until_file(&markers.parent, Duration::from_secs(15)),
+        "tree markers were never written: {result:?}"
+    );
+    assert_eq!(result.exit_code, Some(-1), "{result:?}");
+    assert_eq!(
+        result.error.as_deref(),
+        Some("command timed out"),
+        "{result:?}"
+    );
+    assert!(
+        result
+            .stderr
+            .as_deref()
+            .unwrap_or_default()
+            .contains(&format!("command timed out after {timeout_secs} seconds")),
+        "{result:?}"
+    );
+    markers.assert_tree_dead("timeout");
+}
+
+#[test]
+fn shell_job_stop_kills_whole_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let helper = shell_tree_helper();
+    let markers = ShellTreeMarkers::in_dir(tmp.path(), "stop");
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::clone(&stop_requested);
+    let stop_marker = markers.parent.clone();
+    let stopper = std::thread::spawn(move || {
+        let written = wait_until_file(&stop_marker, Duration::from_secs(15));
+        stop_flag.store(true, Ordering::SeqCst);
+        written
+    });
+
+    let result = run_shell(
+        &unrestricted_test_policy(),
+        &shell_tree_test_shell(),
+        Some(&cwd),
+        &markers.keepalive_command(&helper),
+        None,
+        60,
+        Some(stop_requested.as_ref()),
+    );
+
+    assert!(stopper.join().expect("stopper thread panicked"));
+    assert_eq!(result.exit_code, Some(-1), "{result:?}");
+    assert_eq!(result.error.as_deref(), Some("job stopped"), "{result:?}");
+    assert!(
+        result
+            .stderr
+            .as_deref()
+            .unwrap_or_default()
+            .contains("job stopped by request"),
+        "{result:?}"
+    );
+    markers.assert_tree_dead("stop");
+}
+
+#[test]
+fn shell_job_parent_exit_first_descendant_holds_pipe() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let helper = shell_tree_helper();
+    let markers = ShellTreeMarkers::in_dir(tmp.path(), "orphan");
+
+    // `spawn-descendant`: the helper spawns a sleeping descendant that
+    // inherits the capture pipes, waits until it is provably alive, then
+    // exits 0. The direct shell child therefore exits while the descendant
+    // is still running and still holding the stdout/stderr write ends.
+    let result = run_shell(
+        &unrestricted_test_policy(),
+        &shell_tree_test_shell(),
+        Some(&cwd),
+        &shell_tree_command(
+            &helper,
+            &[
+                "spawn-descendant".to_string(),
+                markers.parent.to_string_lossy().into_owned(),
+                markers.alive.to_string_lossy().into_owned(),
+                "120".to_string(),
+            ],
+        ),
+        None,
+        30,
+        None,
+    );
+
+    // Direct-child exit code is preserved even though the descendant was
+    // still alive at that point.
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert!(result.error.is_none(), "{result:?}");
+    assert!(
+        result
+            .stdout
+            .as_deref()
+            .unwrap_or_default()
+            .contains("DESCENDANT_PID="),
+        "stdout did not reach EOF with the helper output: {result:?}"
+    );
+    // The descendant was sleeping (total 120s) when the direct child exited;
+    // the whole-tree cleanup must terminate it instead of waiting for the
+    // sleep to finish.
+    let descendant = read_marker_pid(&markers.parent, "DESCENDANT_PID");
+    assert!(
+        wait_until_process_dead(descendant, Duration::from_secs(10), "orphan-descendant"),
+        "descendant {descendant} survived whole-tree cleanup after direct child exit"
+    );
+    assert!(
+        result.duration_ms.unwrap_or(u64::MAX) < 30_000,
+        "runner waited for the descendant's natural sleep: {result:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_job_unix_graceful_sigterm_responsive_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let helper = shell_tree_helper();
+
+    // `sigterm-marker`: the helper installs a SIGTERM handler that writes
+    // SIGTERM_HANDLED to the captured stdout. SIGKILL cannot be caught, so
+    // the marker only appears when the graceful phase delivered SIGTERM and
+    // the tree exited on its own — no force escalation required.
+    let result = run_shell(
+        &unrestricted_test_policy(),
+        &ShellConfig::default(),
+        Some(&cwd),
+        &shell_tree_command(&helper, &["sigterm-marker".to_string(), "60".to_string()]),
+        None,
+        1,
+        None,
+    );
+    assert_eq!(result.exit_code, Some(-1), "{result:?}");
+    assert_eq!(
+        result.error.as_deref(),
+        Some("command timed out"),
+        "{result:?}"
+    );
+    assert!(
+        result
+            .stdout
+            .as_deref()
+            .unwrap_or_default()
+            .contains("SIGTERM_HANDLED"),
+        "graceful SIGTERM handler did not run: {result:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_job_unix_sigterm_resistant_tree_escalates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let helper = shell_tree_helper();
+    let markers = ShellTreeMarkers::in_dir(tmp.path(), "resist");
+
+    // `ignore-term-keepalive`: the helper (and its descendant) ignore
+    // SIGTERM, so the 50ms graceful phase cannot end the tree; only the
+    // force escalation (SIGKILL) finishes it, within the cleanup deadline.
+    let result = run_shell(
+        &unrestricted_test_policy(),
+        &ShellConfig::default(),
+        Some(&cwd),
+        &shell_tree_command(
+            &helper,
+            &[
+                "ignore-term-keepalive".to_string(),
+                markers.parent.to_string_lossy().into_owned(),
+                markers.alive.to_string_lossy().into_owned(),
+                "120".to_string(),
+            ],
+        ),
+        None,
+        1,
+        None,
+    );
+    assert!(
+        wait_until_file(&markers.parent, Duration::from_secs(15)),
+        "tree markers were never written: {result:?}"
+    );
+    assert_eq!(result.exit_code, Some(-1), "{result:?}");
+    assert_eq!(
+        result.error.as_deref(),
+        Some("command timed out"),
+        "{result:?}"
+    );
+    markers.assert_tree_dead("resist");
+}
+
+#[test]
+fn shell_job_repeated_stop_is_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let helper = shell_tree_helper();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+
+    let first = ShellTreeMarkers::in_dir(tmp.path(), "repeat-1");
+    let stop_flag = Arc::clone(&stop_requested);
+    let stop_marker = first.parent.clone();
+    let stopper = std::thread::spawn(move || {
+        let written = wait_until_file(&stop_marker, Duration::from_secs(15));
+        stop_flag.store(true, Ordering::SeqCst);
+        written
+    });
+    let result = run_shell(
+        &unrestricted_test_policy(),
+        &shell_tree_test_shell(),
+        Some(&cwd),
+        &first.keepalive_command(&helper),
+        None,
+        60,
+        Some(stop_requested.as_ref()),
+    );
+    assert!(stopper.join().expect("stopper thread panicked"));
+    assert_eq!(result.exit_code, Some(-1), "{result:?}");
+    assert_eq!(result.error.as_deref(), Some("job stopped"), "{result:?}");
+    first.assert_tree_dead("repeat-1");
+
+    // A second run against the same already-set flag must stop promptly and
+    // clean up its own freshly spawned tree without a panic or deadlock.
+    let second = ShellTreeMarkers::in_dir(tmp.path(), "repeat-2");
+    let result = run_shell(
+        &unrestricted_test_policy(),
+        &shell_tree_test_shell(),
+        Some(&cwd),
+        &second.keepalive_command(&helper),
+        None,
+        60,
+        Some(stop_requested.as_ref()),
+    );
+    assert_eq!(result.exit_code, Some(-1), "{result:?}");
+    assert_eq!(result.error.as_deref(), Some("job stopped"), "{result:?}");
+    if wait_until_file(&second.parent, Duration::from_secs(5)) {
+        // If the tree got far enough to write markers, it must be dead.
+        second.assert_tree_dead("repeat-2");
+    }
+}
+
+#[test]
+fn shell_job_timeout_racing_stop_is_bounded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let helper = shell_tree_helper();
+    let markers = ShellTreeMarkers::in_dir(tmp.path(), "race");
+    let timeout_secs = shell_tree_test_timeout_secs();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::clone(&stop_requested);
+    let stop_marker = markers.parent.clone();
+    let stopper = std::thread::spawn(move || {
+        let written = wait_until_file(&stop_marker, Duration::from_secs(15));
+        // Set the stop flag shortly before the timeout would fire; either
+        // outcome (stop or timeout) is legitimate for the shell API.
+        let delay = if cfg!(windows) { 3600 } else { 600 };
+        std::thread::sleep(Duration::from_millis(delay));
+        stop_flag.store(true, Ordering::SeqCst);
+        written
+    });
+
+    let result = run_shell(
+        &unrestricted_test_policy(),
+        &shell_tree_test_shell(),
+        Some(&cwd),
+        &markers.keepalive_command(&helper),
+        None,
+        timeout_secs,
+        Some(stop_requested.as_ref()),
+    );
+
+    assert!(stopper.join().expect("stopper thread panicked"));
+    assert_eq!(result.exit_code, Some(-1), "{result:?}");
+    assert!(
+        matches!(
+            result.error.as_deref(),
+            Some("command timed out" | "job stopped")
+        ),
+        "unexpected race outcome: {result:?}"
+    );
+    markers.assert_tree_dead("race");
+}
+
+#[test]
+fn shell_job_spawn_failure_preserves_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("no-such-shell-program");
+    let shell = ShellConfig {
+        program: missing.to_string_lossy().into_owned(),
+        ..ShellConfig::default()
+    };
+    let result = run_shell(
+        &unrestricted_test_policy(),
+        &shell,
+        None,
+        "true",
+        None,
+        10,
+        None,
+    );
+    assert_eq!(result.exit_code, None, "{result:?}");
+    let error = result.error.as_deref().unwrap_or_default();
+    assert!(
+        error.starts_with("failed to spawn command: "),
+        "spawn error semantics changed: {result:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_job_profile_prepare_stop_reaps_whole_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pid_file = tmp.path().join("prepare.pid");
+    let started_marker = tmp.path().join("prepare-started.txt");
+    let init_script = format!(
+        "echo $$ > {}; : > {}; sleep 60",
+        shell_tree_quote(&pid_file.to_string_lossy()),
+        shell_tree_quote(&started_marker.to_string_lossy())
+    );
+    let shell = shell_with_profiles(
+        Some("test"),
+        vec![(
+            "test",
+            ShellProfileConfig {
+                init_script: Some(init_script),
+                ..ShellProfileConfig::default()
+            },
+        )],
+    );
+    let policy = unrestricted_test_policy();
+    let cache = PreparedShellProfileCache::default();
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::clone(&stop_requested);
+    let stop_marker = started_marker.clone();
+    let stopper = std::thread::spawn(move || {
+        let written = wait_until_file(&stop_marker, Duration::from_secs(15));
+        stop_flag.store(true, Ordering::SeqCst);
+        written
+    });
+
+    let result = run_shell_with_profiles(
+        1,
+        &policy,
+        &shell,
+        tmp.path(),
+        &cache,
+        Some(&cwd),
+        "true",
+        None,
+        10,
+        Some(stop_requested.as_ref()),
+    );
+
+    assert!(stopper.join().expect("stopper thread panicked"));
+    assert!(
+        result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("profile prepare stopped during runner shutdown"),
+        "{result:?}"
+    );
+    let prepare_pid = std::fs::read_to_string(&pid_file)
+        .expect("read prepare pid")
+        .trim()
+        .parse::<u32>()
+        .expect("parse prepare pid");
+    assert!(
+        wait_until_process_dead(prepare_pid, Duration::from_secs(10), "prepare"),
+        "profile prepare tree survived stop"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2G: Windows-native PowerShell shell semantics.
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+#[test]
+fn shell_job_native_exe_nonzero_exit_code_is_preserved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let helper = shell_tree_helper();
+    // No fixture-level `exit $LASTEXITCODE`: the PowerShell command wrapper
+    // must propagate the native executable's exit code on its own.
+    let command = format!(
+        "& {} sleep 0 3",
+        shell_tree_quote(&helper.to_string_lossy())
+    );
+    let result = run_shell(
+        &unrestricted_test_policy(),
+        &shell_tree_test_shell(),
+        Some(&cwd),
+        &command,
+        None,
+        10,
+        None,
+    );
+    assert_eq!(result.exit_code, Some(3), "{result:?}");
+    assert!(result.error.is_none(), "{result:?}");
+}
+
+#[cfg(windows)]
+#[test]
+fn shell_job_unicode_stdout_stderr_env_and_cwd() {
+    let _guard = TEST_ENV_LOCK.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let unicode_cwd = tmp.path().join("unicode cwd 测试");
+    std::fs::create_dir_all(&unicode_cwd).unwrap();
+    let cwd = unicode_cwd.to_string_lossy().to_string();
+
+    // Unicode stdout and stderr. The PowerShell wrapper installs the UTF-8
+    // console encodings before the command, so this never depends on the
+    // machine's legacy console code page.
+    let result = run_shell(
+        &cfg.policy,
+        &ShellConfig::default(),
+        Some(&cwd),
+        "[Console]::Out.Write('café ☃ 测试'); [Console]::Error.Write('err 測試')",
+        None,
+        10,
+        None,
+    );
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert_eq!(result.stdout.as_deref(), Some("café ☃ 测试"));
+    assert_eq!(result.stderr.as_deref(), Some("err 測試"));
+
+    // Unicode environment value inherited from the parent process.
+    let saved = std::env::var_os("WEBCODEX_UNICODE_ENV");
+    std::env::set_var("WEBCODEX_UNICODE_ENV", "值 测试");
+    let result = run_shell(
+        &cfg.policy,
+        &ShellConfig::default(),
+        Some(&cwd),
+        &shell_env_var("WEBCODEX_UNICODE_ENV"),
+        None,
+        10,
+        None,
+    );
+    match saved {
+        Some(value) => std::env::set_var("WEBCODEX_UNICODE_ENV", value),
+        None => std::env::remove_var("WEBCODEX_UNICODE_ENV"),
+    }
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert_eq!(result.stdout.as_deref(), Some("值 测试"));
+
+    // Unicode cwd: the shell reports its working directory verbatim.
+    let result = run_shell(
+        &cfg.policy,
+        &ShellConfig::default(),
+        Some(&cwd),
+        "[Console]::Out.Write((Get-Location).Path)",
+        None,
+        10,
+        None,
+    );
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert!(
+        result
+            .stdout
+            .as_deref()
+            .unwrap_or_default()
+            .contains("测试"),
+        "{result:?}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn prepared_profile_unicode_env_round_trip_and_unicode_init_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The init script lives in a directory with spaces and non-ASCII
+    // characters, and exports a Unicode value that must survive the whole
+    // snapshot pipeline: PowerShell `Get-ChildItem Env:` -> UTF-8 NUL
+    // payload -> Runner parse -> environment of later commands.
+    let init_dir = tmp.path().join("init 目录");
+    std::fs::create_dir_all(&init_dir).unwrap();
+    let init = init_dir.join("profile 脚本.ps1");
+    // UTF-8 BOM: PowerShell 5.1 otherwise decodes .ps1 files with the system
+    // ANSI code page and corrupts the non-ASCII value.
+    let mut content = "\u{FEFF}".to_string();
+    content.push_str("$env:WEBCODEX_TEST_PROFILE = 'café 值'\n");
+    std::fs::write(&init, content).unwrap();
+    let shell = shell_with_profiles(
+        Some("test"),
+        vec![(
+            "test",
+            ShellProfileConfig {
+                init_script: Some(format!(". {}", shell_tree_quote(&init.to_string_lossy()))),
+                ..ShellProfileConfig::default()
+            },
+        )],
+    );
+    let result = run_profile_shell(
+        &unrestricted_test_policy(),
+        &shell,
+        tmp.path(),
+        &PreparedShellProfileCache::default(),
+        tmp.path(),
+        &shell_env_var("WEBCODEX_TEST_PROFILE"),
+    );
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert_eq!(result.stdout.as_deref(), Some("café 值"), "{result:?}");
+}
+
+#[cfg(windows)]
+#[test]
+fn shell_profile_prepare_timeout_cleans_up_whole_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let helper = shell_tree_helper();
+    let markers = ShellTreeMarkers::in_dir(tmp.path(), "prepare-timeout");
+    // The init snippet hangs (helper keepalive plus an infinite loop), with a
+    // descendant holding the capture pipes; the 30s prepare timeout must
+    // terminate the whole tree.
+    let init_script = format!(
+        "{};\nwhile ($true) {{ Start-Sleep -Seconds 1 }}",
+        markers.keepalive_command(&helper)
+    );
+    let shell = shell_with_profiles(
+        Some("test"),
+        vec![(
+            "test",
+            ShellProfileConfig {
+                init_script: Some(init_script),
+                ..ShellProfileConfig::default()
+            },
+        )],
+    );
+    let start = Instant::now();
+    let result = run_shell_with_profiles(
+        1,
+        &unrestricted_test_policy(),
+        &shell,
+        tmp.path(),
+        &PreparedShellProfileCache::default(),
+        Some(tmp.path().to_string_lossy().as_ref()),
+        "true",
+        None,
+        10,
+        None,
+    );
+    assert!(
+        wait_until_file(&markers.parent, Duration::from_secs(15)),
+        "prepare tree markers were never written: {result:?}"
+    );
+    let err = result.error.expect("prepare should time out");
+    assert!(
+        err.contains("profile prepare timed out after 30 seconds"),
+        "{err}"
+    );
+    assert!(
+        start.elapsed() >= Duration::from_secs(29),
+        "prepare timed out too early: {:?}",
+        start.elapsed()
+    );
+    markers.assert_tree_dead("prepare-timeout");
+}
+
+#[cfg(windows)]
+#[test]
+fn shell_profile_prepare_stop_cleans_up_whole_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let helper = shell_tree_helper();
+    let markers = ShellTreeMarkers::in_dir(tmp.path(), "prepare-stop");
+    let pid_file = tmp.path().join("prepare-stop.pid");
+    // Write the prepare process pid, hang the direct prepare process, and
+    // keep a descendant holding the capture pipes. The helper writes its own
+    // parent marker after spawning the descendant.
+    let init_script = format!(
+        "[IO.File]::WriteAllText({}, [string]$PID); \
+         {}; \
+         while ($true) {{ Start-Sleep -Seconds 1 }}",
+        shell_tree_quote(&pid_file.to_string_lossy()),
+        markers.keepalive_command(&helper)
+    );
+    let shell = shell_with_profiles(
+        Some("test"),
+        vec![(
+            "test",
+            ShellProfileConfig {
+                init_script: Some(init_script),
+                ..ShellProfileConfig::default()
+            },
+        )],
+    );
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::clone(&stop_requested);
+    // Wait for the helper's parent marker (written after the descendant is
+    // spawned and the pid file exists) so the stop lands after every marker
+    // this test asserts on is on disk.
+    let stop_marker = markers.parent.clone();
+    let stopper = std::thread::spawn(move || {
+        let written = wait_until_file(&stop_marker, Duration::from_secs(15));
+        stop_flag.store(true, Ordering::SeqCst);
+        written
+    });
+
+    let result = run_shell_with_profiles(
+        1,
+        &unrestricted_test_policy(),
+        &shell,
+        tmp.path(),
+        &PreparedShellProfileCache::default(),
+        Some(tmp.path().to_string_lossy().as_ref()),
+        "true",
+        None,
+        10,
+        Some(stop_requested.as_ref()),
+    );
+
+    assert!(stopper.join().expect("stopper thread panicked"));
+    assert!(
+        result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("profile prepare stopped during runner shutdown"),
+        "{result:?}"
+    );
+    let prepare_pid = std::fs::read_to_string(&pid_file)
+        .expect("read prepare pid")
+        .trim()
+        .parse::<u32>()
+        .expect("parse prepare pid");
+    assert!(
+        wait_until_process_dead(prepare_pid, Duration::from_secs(10), "prepare"),
+        "profile prepare process survived stop"
+    );
+    markers.assert_tree_dead("prepare-stop");
 }
 
 #[test]
@@ -4729,13 +6212,12 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
     let stop_requested = Arc::new(AtomicBool::new(false));
     let mut running_command =
         configured_shell_job_command(&ShellConfig::default(), "sleep 60").unwrap();
+    running_command
+        .current_dir(tmp.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let running_child = Arc::new(Mutex::new(
-        running_command
-            .current_dir(tmp.path())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+        ManagedChild::spawn(&mut running_command).unwrap(),
     ));
     let running_pid = lock_unpoison(&running_child).id();
     jobs.jobs.lock().unwrap().insert(
@@ -4745,7 +6227,6 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
             agent_instance_id: "ws-instance".to_string(),
             snapshot: test_job_snapshot("running-job"),
             child: Some(Arc::clone(&running_child)),
-            process_group_id: Some(running_pid),
             stop_requested: stop_requested.clone(),
             slot_reserved: true,
         },
@@ -4786,7 +6267,7 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
         cfg.policy.clone(),
         cfg.shell.clone(),
         cfg.ssh.clone(),
-        projects_dir(&cfg),
+        projects_dir(&cfg).unwrap(),
         request,
     );
     match rx.try_recv().expect("queued status was sent") {
@@ -4816,7 +6297,7 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
         cfg.policy.clone(),
         cfg.shell.clone(),
         cfg.ssh.clone(),
-        projects_dir(&cfg),
+        projects_dir(&cfg).unwrap(),
         rejected_request,
     );
     assert!(jobs.queued.lock().unwrap().is_empty());
@@ -4933,7 +6414,7 @@ fn dispatch_request_edit_routes_to_file_handler() {
         job_context: None,
         persistent_shell: None,
     };
-    let pdir = projects_dir(&cfg);
+    let pdir = projects_dir(&cfg).unwrap();
     let lsp = webcodex_runner::LspSupervisor::default();
     let hot = runtime_config(&cfg);
     let persistent_shells = webcodex_runner::PersistentShellManager::new(
@@ -4973,7 +6454,7 @@ fn dispatch_request_rejects_unsupported_file_kinds_without_starting_command() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = test_config(tmp.path().join("config/projects.d"));
     let jobs = JobManager::new(max_concurrent_jobs(&cfg));
-    let pdir = projects_dir(&cfg);
+    let pdir = projects_dir(&cfg).unwrap();
     let hot = runtime_config(&cfg);
     let persistent_shells = webcodex_runner::PersistentShellManager::new(
         &cfg.shell,
@@ -5059,7 +6540,7 @@ fn dispatch_request_run_shell_sends_result_over_sink() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = test_config(tmp.path().join("config/projects.d"));
     let jobs = JobManager::new(max_concurrent_jobs(&cfg));
-    let pdir = projects_dir(&cfg);
+    let pdir = projects_dir(&cfg).unwrap();
     let hot = runtime_config(&cfg);
     let persistent_shells = webcodex_runner::PersistentShellManager::new(
         &cfg.shell,
@@ -5067,14 +6548,9 @@ fn dispatch_request_run_shell_sends_result_over_sink() {
     );
 
     type SinkFactory = fn(&str) -> (AgentSink, tokio::sync::mpsc::Receiver<AgentEnvelope>);
-    for (label, make_sink, client_id, cmd) in [
-        ("ws", ws_sink as SinkFactory, "ws-client", "printf wsok"),
-        (
-            "quic",
-            quic_sink as SinkFactory,
-            "quic-client",
-            "printf quic-ok",
-        ),
+    for (label, make_sink, client_id, expected_stdout) in [
+        ("ws", ws_sink as SinkFactory, "ws-client", "wsok"),
+        ("quic", quic_sink as SinkFactory, "quic-client", "quic-ok"),
     ] {
         let (sink, mut rx) = make_sink(client_id);
         let request = ShellAgentShellRequest {
@@ -5091,7 +6567,7 @@ fn dispatch_request_run_shell_sends_result_over_sink() {
             start_line: None,
             end_line: None,
             create_dirs: false,
-            command: cmd.to_string(),
+            command: shell_echo(expected_stdout),
             stdin: None,
             timeout_secs: 10,
             requested_by: "tester".to_string(),
@@ -5119,10 +6595,7 @@ fn dispatch_request_run_shell_sends_result_over_sink() {
             AgentEnvelope::Result { payload } => {
                 assert_eq!(payload.request_id, format!("req-{label}"));
                 assert_eq!(payload.exit_code, Some(0));
-                assert_eq!(
-                    payload.stdout.as_deref(),
-                    Some(cmd.split_whitespace().last().unwrap())
-                );
+                assert_eq!(payload.stdout.as_deref(), Some(expected_stdout));
             }
             other => panic!("{label}: expected result, got {:?}", other.kind()),
         }
@@ -5510,15 +6983,149 @@ fn resolve_or_register_project_rejects_invalid_non_directory_and_disallowed_path
         allowed_roots: Vec::new(),
         ..AgentPolicy::default()
     };
+    // Dangerous system roots are platform-specific: `/etc` on Unix,
+    // `C:\Windows` on Windows (drive roots are also rejected).
+    #[cfg(windows)]
+    let dangerous_path = "C:\\Windows";
+    #[cfg(not(windows))]
+    let dangerous_path = "/etc";
     let dangerous = project_error_value(handle_resolve_or_register_project(
         &unrestricted,
         &projects_dir,
         &project_request(
             "resolve_or_register_project",
-            serde_json::json!({"path": "/etc"}),
+            serde_json::json!({"path": dangerous_path}),
         ),
     ));
     assert_eq!(dangerous["error_kind"], "path_outside_allowed_roots");
+}
+
+#[cfg(windows)]
+#[test]
+fn resolve_or_register_project_rejects_unc_and_non_local_disk_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let projects_dir = tmp.path().join("projects.d");
+    let policy = project_policy(tmp.path());
+
+    // The raw path check must fire before canonicalization: these shares do
+    // not exist, but the error is the platform rule, not "path not found".
+    for unc_path in [
+        r"\\server\share\repo",
+        r"\\?\UNC\server\share\repo",
+        r"\\.\device\repo",
+        r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\repo",
+    ] {
+        let error = project_error_value(handle_resolve_or_register_project(
+            &policy,
+            &projects_dir,
+            &project_request(
+                "resolve_or_register_project",
+                serde_json::json!({"path": unc_path}),
+            ),
+        ));
+        assert_eq!(
+            error["error_kind"], "unc_project_path_unsupported",
+            "{unc_path} must fail closed as an unsupported non-local-disk path"
+        );
+        assert_eq!(error["state_changed"], false);
+    }
+    assert!(!projects_dir.exists(), "no registration may be attempted");
+
+    // An allowed_roots entry naming a UNC share must not bypass the rule.
+    let unc_allowed = AgentPolicy {
+        allow_cwd_anywhere: false,
+        allowed_roots: vec![PathBuf::from(r"\\server\share\repo")],
+        ..AgentPolicy::default()
+    };
+    let error = project_error_value(handle_resolve_or_register_project(
+        &unc_allowed,
+        &projects_dir,
+        &project_request(
+            "resolve_or_register_project",
+            serde_json::json!({"path": r"\\server\share\repo"}),
+        ),
+    ));
+    assert_eq!(
+        error["error_kind"], "unc_project_path_unsupported",
+        "a UNC allowed_root must not make a UNC project root acceptable"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn resolve_or_register_project_accepts_local_drive_and_verbatim_disk_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("repo");
+    let projects_dir = tmp.path().join("projects.d");
+    std::fs::create_dir(&project_dir).unwrap();
+    let policy = project_policy(tmp.path());
+
+    // Plain local-drive path registers normally.
+    let plain = project_dir.to_string_lossy().to_string();
+    assert!(Path::new(&plain).is_absolute());
+    let first = project_ok(handle_resolve_or_register_project(
+        &policy,
+        &projects_dir,
+        &project_request(
+            "resolve_or_register_project",
+            serde_json::json!({"path": plain}),
+        ),
+    ));
+    assert_eq!(first["outcome"], "auto_registered");
+    let project_id = first["agent_project_id"].as_str().unwrap().to_string();
+
+    // The canonicalized `\\?\C:\...` spelling of the same directory must
+    // reuse the registration instead of minting a duplicate identity. The
+    // verbatim form is built from the plain path: `canonicalize()` already
+    // returns `\\?\`-prefixed paths on modern Rust, so re-prefixing those
+    // would double the prefix.
+    let raw = project_dir.to_string_lossy().to_string();
+    let verbatim = if raw.starts_with(r"\\?\") {
+        raw
+    } else {
+        // `\\?\` + the raw path: the prefix itself ends with a backslash.
+        format!(r"\\?\{raw}")
+    };
+    let second = project_ok(handle_resolve_or_register_project(
+        &policy,
+        &projects_dir,
+        &project_request(
+            "resolve_or_register_project",
+            serde_json::json!({"path": verbatim}),
+        ),
+    ));
+    assert_eq!(second["outcome"], "reused_existing_registration");
+    assert_eq!(second["agent_project_id"], project_id);
+    assert_eq!(
+        std::fs::read_dir(&projects_dir).unwrap().count(),
+        1,
+        "the \\\\?\\ spelling created a duplicate project identity"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn register_project_rejects_unc_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let projects_dir = tmp.path().join("projects.d");
+    let policy = project_policy(tmp.path());
+
+    let error = project_error_value(handle_project_op(
+        &policy,
+        &projects_dir,
+        &project_request(
+            "register_project",
+            serde_json::json!({
+                "id": "demo",
+                "name": "Demo",
+                "path": r"\\server\share\repo",
+                "description": "UNC project",
+                "allow_patch": false
+            }),
+        ),
+    ));
+    assert_eq!(error["error_code"], "unc_project_path_unsupported");
+    assert!(!projects_dir.exists());
 }
 
 #[test]
@@ -5574,10 +7181,13 @@ fn auto_project_id_collision_extends_hash_without_overwriting() {
     std::fs::create_dir(&other_dir).unwrap();
     std::fs::create_dir(&projects_dir).unwrap();
     let canonical = project_dir.canonicalize().unwrap();
-    let digest = format!(
-        "{:x}",
-        Sha256::digest(canonical.to_string_lossy().as_bytes())
-    );
+    // Match the Runner's project identity: raw bytes on Unix, normalized
+    // (lowercased, `\\?\` stripped) on Windows.
+    #[cfg(windows)]
+    let identity = webcodex_agent_config::paths::normalize_path_identity(&canonical);
+    #[cfg(not(windows))]
+    let identity = canonical.to_string_lossy().to_string();
+    let digest = format!("{:x}", Sha256::digest(identity.as_bytes()));
     let colliding_id = format!("repo-{}", &digest[..8]);
     let colliding_config = format!(
         "id = {:?}\npath = {:?}\n",
@@ -5686,7 +7296,7 @@ fn managed_temporary_project_is_registered_persistent_and_ordinary_project_compa
         &policy,
         &ShellConfig::default(),
         Some(path.to_string_lossy().as_ref()),
-        "printf managed-shell",
+        &shell_echo("managed-shell"),
         None,
         10,
         None,
@@ -6015,18 +7625,33 @@ fn register_project_rejects_dangerous_subpaths_without_explicit_root() {
         ..AgentPolicy::default()
     };
 
-    for path in [
+    // Dangerous system roots are platform-specific: the well-known Unix trees,
+    // or the Windows OS trees (which must still be local-disk paths to reach
+    // the dangerous-root check at all).
+    #[cfg(windows)]
+    let dangerous_paths: &[&str] = &[
+        r"C:\Windows\System32\drivers\etc",
+        r"C:\Program Files\WebCodex",
+        r"C:\Program Files (x86)\something",
+    ];
+    #[cfg(not(windows))]
+    let dangerous_paths: &[&str] = &[
         "/etc/nginx",
         "/usr/local",
         "/var/lib",
         "/proc/self",
         "/dev/shm",
-    ] {
+    ];
+    for path in dangerous_paths {
         let err = validate_project_path_policy(&policy, Path::new(path)).unwrap_err();
         assert!(err.contains("dangerous system root"), "{path}: {err}");
     }
 
-    validate_project_path_policy(&policy, Path::new("/usr2/local")).unwrap();
+    #[cfg(windows)]
+    let safe_path = r"C:\Users\alice\projects";
+    #[cfg(not(windows))]
+    let safe_path = "/usr2/local";
+    validate_project_path_policy(&policy, Path::new(safe_path)).unwrap();
 }
 
 #[test]
@@ -6123,8 +7748,12 @@ fn load_config_explicit_allowed_roots_override_home_default() {
 #[test]
 fn load_config_empty_roots_without_home_and_no_cwd_anywhere_errors() {
     let _guard = agent_init::TEST_ENV_LOCK.lock().unwrap();
-    let saved = std::env::var_os("HOME");
-    std::env::remove_var("HOME");
+    // Windows derives the allowed-root default from USERPROFILE, so both
+    // home sources must be absent to exercise the fail-closed branch.
+    let _env = EnvGuard::new()
+        .remove("HOME")
+        .remove("USERPROFILE")
+        .remove("APPDATA");
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("agent.toml");
     std::fs::write(
@@ -6135,10 +7764,6 @@ fn load_config_empty_roots_without_home_and_no_cwd_anywhere_errors() {
     .unwrap();
     let err = load_config(&path).unwrap_err();
     assert!(err.contains("allowed_roots is empty"));
-    match saved {
-        Some(v) => std::env::set_var("HOME", v),
-        None => std::env::remove_var("HOME"),
-    }
 }
 
 #[test]

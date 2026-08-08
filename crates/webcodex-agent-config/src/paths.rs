@@ -1,0 +1,673 @@
+//! Central platform directory policy shared by `webcodex-cli` and
+//! `webcodex-runner`.
+//!
+//! Both binaries must agree on where per-user configuration, credentials,
+//! runner state and logs live, and the rules differ per platform:
+//!
+//! - **Unix**: XDG-style layout rooted at `$HOME` (`~/.config/webcodex`,
+//!   `~/.local/state/webcodex`), with `/etc/webcodex` for effective-root.
+//!   Existing behavior is preserved exactly.
+//! - **Windows**: configuration and credentials live in `%APPDATA%\webcodex`
+//!   (Roaming profile, follows the user) with `%USERPROFILE%\.config\webcodex`
+//!   as the fallback; runner state/logs live in `%LOCALAPPDATA%\webcodex`
+//!   (machine-local) with `%USERPROFILE%\.local\state\webcodex` and finally
+//!   `%TEMP%\webcodex` as fallbacks. `HOME` and the XDG variables are
+//!   deliberately *not* consulted on Windows: `HOME` is either absent or a Git
+//!   Bash/MSYS POSIX-style path like `/c/Users/...` that Windows APIs cannot
+//!   consume, and `APPDATA`/`LOCALAPPDATA` are the OS-native equivalents of
+//!   the XDG homes.
+//!
+//! Each platform's derivation lives on its own `cfg` side; there is no shared
+//! cross-platform fallback chain. No derivation in this module ever falls back
+//! to the current working directory; when no usable per-user directory exists
+//! the caller gets a `Result` error instead of silently writing into a
+//! relative path.
+
+use std::path::{Path, PathBuf};
+
+/// Per-user home directory.
+///
+/// - Windows: `USERPROFILE` (set by the OS at logon; `HOME` is ignored).
+/// - Unix: `HOME`.
+pub fn home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        // `HOME` is never consulted on Windows: it is either absent or a Git
+        // Bash/MSYS POSIX-style path (`/c/Users/...`) that Windows APIs cannot
+        // consume, and in Win32 format it would be a *second* home that can
+        // disagree with `USERPROFILE`.
+        std::env::var_os("USERPROFILE")
+            .filter(|value| !value.as_os_str().is_empty())
+            .map(PathBuf::from)
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME")
+            .filter(|value| !value.as_os_str().is_empty())
+            .map(PathBuf::from)
+    }
+}
+
+/// Effective-root detection. Only meaningful on Unix; on Windows always
+/// `false` (there is no `/etc/webcodex` system scope).
+pub fn is_effective_root() -> bool {
+    #[cfg(unix)]
+    {
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("Uid:") {
+                    let mut parts = rest.split_whitespace();
+                    let _real = parts.next();
+                    if let Some(effective) = parts.next() {
+                        return effective == "0";
+                    }
+                }
+            }
+        }
+        std::env::var("USER").is_ok_and(|u| u == "root")
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Base directory for per-user WebCodex configuration and credentials
+/// (client profiles, `agent.toml`, `projects.d`, token files).
+///
+/// - Unix (root): `/etc/webcodex`
+/// - Unix (user): `$XDG_CONFIG_HOME/webcodex`, else `$HOME/.config/webcodex`.
+///   When `HOME` is also missing the caller gets an error (never `.`).
+/// - Windows: `%APPDATA%\webcodex`, else `%USERPROFILE%\.config\webcodex`,
+///   else an error. `HOME` and `XDG_CONFIG_HOME` are ignored.
+pub fn default_client_config_base_dir() -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    {
+        // `APPDATA` must work on its own (a plain Windows logon always sets it
+        // together with `USERPROFILE`, but either may be absent or unusable in
+        // stripped-down environments and the two must not depend on each
+        // other).
+        if let Some(appdata) = std::env::var_os("APPDATA").filter(|value| !value.is_empty()) {
+            return Ok(PathBuf::from(appdata).join("webcodex"));
+        }
+        if let Some(profile) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+            return Ok(PathBuf::from(profile).join(".config/webcodex"));
+        }
+        Err(
+            "cannot determine the WebCodex config directory: set APPDATA or USERPROFILE"
+                .to_string(),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        // An explicit XDG_CONFIG_HOME wins even for root, matching the historical
+        // CLI behavior (see `omitted_scope_hosted_status_keeps_xdg_profile_paths_for_root`).
+        if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+            return Ok(PathBuf::from(config_home).join("webcodex"));
+        }
+        if is_effective_root() {
+            return Ok(PathBuf::from("/etc/webcodex"));
+        }
+        let home = home_dir().ok_or_else(|| {
+            "cannot determine user home: set HOME to derive the WebCodex config directory"
+                .to_string()
+        })?;
+        Ok(home.join(".config/webcodex"))
+    }
+}
+
+/// Base directory for per-user WebCodex state: hosted Runner state
+/// (`runner.toml`), Runner logs, checkpoints and recovery data.
+///
+/// - Unix: `$XDG_STATE_HOME/webcodex`, else `$HOME/.local/state/webcodex`,
+///   else `$TMPDIR/webcodex` (existing behavior preserved).
+/// - Windows: `%LOCALAPPDATA%\webcodex`, else
+///   `%USERPROFILE%\.local\state\webcodex`, else `%TEMP%\webcodex`. `HOME` and
+///   `XDG_STATE_HOME` are ignored.
+pub fn default_client_state_base_dir() -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    {
+        // `LOCALAPPDATA` must work on its own, exactly like `APPDATA` above.
+        if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
+            return Ok(PathBuf::from(local_appdata).join("webcodex"));
+        }
+        if let Some(profile) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+            return Ok(PathBuf::from(profile).join(".local/state/webcodex"));
+        }
+        // A volatile temp location is better than a relative path for state
+        // that can be regenerated.
+        Ok(std::env::temp_dir().join("webcodex"))
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(state_home) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
+            return Ok(PathBuf::from(state_home).join("webcodex"));
+        }
+        if let Some(home) = home_dir() {
+            return Ok(home.join(".local/state/webcodex"));
+        }
+        // Existing Unix behavior: a volatile temp location is better than a
+        // relative path for state that can be regenerated.
+        Ok(std::env::temp_dir().join("webcodex"))
+    }
+}
+
+/// The per-user home as an absolute path, for deriving systemd user service
+/// paths. Mirrors the historical `current_user_home` contract.
+pub fn user_home() -> Result<PathBuf, String> {
+    let home =
+        home_dir().ok_or_else(|| "HOME is required to derive user service paths".to_string())?;
+    if !home.is_absolute() {
+        return Err("HOME must be an absolute path to derive user service paths".to_string());
+    }
+    Ok(home)
+}
+
+/// The per-user config root (`~/.config` equivalent), absolute.
+pub fn user_config_home() -> Result<PathBuf, String> {
+    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        let config_home = PathBuf::from(config_home);
+        if !config_home.is_absolute() {
+            return Err(
+                "XDG_CONFIG_HOME must be an absolute path to derive user service paths".to_string(),
+            );
+        }
+        return Ok(config_home);
+    }
+    Ok(user_home()?.join(".config"))
+}
+
+/// Compare two paths for equality under the filesystem's case rules.
+/// Windows filesystems are case-insensitive; Unix comparisons are exact.
+pub fn paths_equal(a: &Path, b: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let a = normalize_path_identity(a);
+        let b = normalize_path_identity(b);
+        a == b
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
+}
+
+/// True when `path` equals `root` or lives underneath it, honoring Windows
+/// case-insensitivity and `\\?\` extended-length prefixes.
+///
+/// The comparison is component-wise: `C:\Users\Alice2` is *not* under
+/// `C:\Users\Alice`, even though the string starts with it.
+pub fn path_is_within(path: &Path, root: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let path_components = normalized_components(path);
+        let root_components = normalized_components(root);
+        path_components.len() >= root_components.len()
+            && path_components[..root_components.len()] == root_components[..]
+    }
+    #[cfg(not(windows))]
+    {
+        path == root || path.starts_with(root)
+    }
+}
+
+#[cfg(windows)]
+fn normalized_components(path: &Path) -> Vec<String> {
+    let stripped = normalize_path_identity(path);
+    Path::new(&stripped)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+        .collect()
+}
+
+/// True when `path` is a Windows absolute path rooted on a local disk drive:
+/// `C:\...` or its canonicalized `\\?\C:\...` form. Every other Windows prefix
+/// — `\\server\share` (UNC), `\\?\UNC\server\share` (verbatim UNC),
+/// `\\.\device` (device namespace) and arbitrary `\\?\` verbatim paths — is
+/// `false`.
+///
+/// This is the Windows **path prefix** rule, not a string prefix check:
+/// `std::path` parses the path grammar, so `\\server\share\repo` is
+/// classified by its `Prefix::UNC` component rather than by text matching.
+#[cfg(windows)]
+pub fn is_windows_local_disk_path(path: &Path) -> bool {
+    let mut components = path.components();
+    match components.next() {
+        Some(std::path::Component::Prefix(prefix)) => matches!(
+            prefix.kind(),
+            std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
+        ),
+        _ => false,
+    }
+}
+
+/// Stable filesystem-independent identity string for a path, used for project
+/// id hashing and registry comparisons.
+///
+/// - Unix: the raw path bytes (unchanged historical behavior).
+/// - Windows: strips `\\?\` / `\\?\UNC\` extended-length prefixes, normalizes
+///   separators to `\`, and lowercases (Windows filesystems are
+///   case-insensitive, so `C:\Foo` and `c:\foo` are the same directory).
+pub fn normalize_path_identity(path: &Path) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        String::from_utf8_lossy(path.as_os_str().as_bytes()).into_owned()
+    }
+    #[cfg(not(unix))]
+    {
+        let mut text = path.to_string_lossy().replace('/', "\\");
+        if let Some(rest) = text.strip_prefix("\\\\?\\UNC\\") {
+            text = format!("\\\\{}", rest);
+        } else if let Some(rest) = text.strip_prefix("\\\\?\\") {
+            text = rest.to_string();
+        }
+        while text.len() > 1 && text.ends_with('\\') {
+            text.pop();
+        }
+        text.to_lowercase()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Single shared env-test lock for the whole crate: `lib.rs` tests and
+    // `paths` tests both mutate process environment variables and must
+    // serialize against each other.
+    use crate::TEST_ENV_LOCK;
+
+    /// RAII restore for environment variables: restores the previous value
+    /// (or removes the variable) on drop, even if the test panics.
+    struct EnvVarRestore {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarRestore {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, value);
+            EnvVarRestore { name, previous }
+        }
+
+        fn remove(name: &'static str) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::remove_var(name);
+            EnvVarRestore { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarRestore {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
+    #[test]
+    fn home_dir_prefers_home_on_unix_and_ignores_home_on_windows() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _h = EnvVarRestore::set("HOME", "/home/alice");
+        let _u = EnvVarRestore::remove("USERPROFILE");
+        #[cfg(unix)]
+        assert_eq!(home_dir(), Some(PathBuf::from("/home/alice")));
+        #[cfg(windows)]
+        assert_eq!(
+            home_dir(),
+            None,
+            "MSYS-style HOME must not be used on Windows"
+        );
+
+        // Even a Win32-format HOME must never win on Windows: `USERPROFILE` is
+        // the OS-owned home and `HOME` is a foreign variable that can disagree
+        // with it. On Unix `USERPROFILE` is equally foreign and `HOME` wins.
+        let _h2 = EnvVarRestore::set("HOME", "C:\\Users\\alice");
+        let _u2 = EnvVarRestore::set("USERPROFILE", "D:\\Users\\alice");
+        #[cfg(unix)]
+        assert_eq!(home_dir(), Some(PathBuf::from("C:\\Users\\alice")));
+        #[cfg(windows)]
+        assert_eq!(
+            home_dir(),
+            Some(PathBuf::from("D:\\Users\\alice")),
+            "USERPROFILE must win over HOME on Windows"
+        );
+
+        // No USERPROFILE: Windows has no home at all, even with HOME set.
+        let _u3 = EnvVarRestore::remove("USERPROFILE");
+        #[cfg(windows)]
+        assert_eq!(home_dir(), None, "HOME must not substitute for USERPROFILE");
+        #[cfg(unix)]
+        assert_eq!(home_dir(), Some(PathBuf::from("C:\\Users\\alice")));
+    }
+
+    #[test]
+    fn home_dir_uses_userprofile_when_home_is_absent() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _h = EnvVarRestore::remove("HOME");
+        let _u = EnvVarRestore::set("USERPROFILE", "C:\\Users\\alice");
+        #[cfg(windows)]
+        assert_eq!(home_dir(), Some(PathBuf::from("C:\\Users\\alice")));
+        #[cfg(not(windows))]
+        assert_eq!(home_dir(), None);
+    }
+
+    #[test]
+    fn config_base_never_falls_back_to_current_directory() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _h = EnvVarRestore::remove("HOME");
+        let _u = EnvVarRestore::remove("USERPROFILE");
+        let _a = EnvVarRestore::remove("APPDATA");
+        let _x = EnvVarRestore::remove("XDG_CONFIG_HOME");
+        #[cfg(windows)]
+        assert!(
+            default_client_config_base_dir().is_err(),
+            "no usable per-user directory must be an error, never CWD"
+        );
+        // On Unix, effective root intentionally uses the system config scope
+        // even without HOME; non-root must still fail closed rather than use CWD.
+        #[cfg(not(windows))]
+        if is_effective_root() {
+            assert_eq!(
+                default_client_config_base_dir().unwrap(),
+                PathBuf::from("/etc/webcodex")
+            );
+        } else {
+            assert!(default_client_config_base_dir().is_err());
+        }
+    }
+
+    #[test]
+    fn windows_config_base_uses_appdata_then_userprofile() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _h = EnvVarRestore::remove("HOME");
+        let _u = EnvVarRestore::set("USERPROFILE", "C:\\Users\\alice");
+        let _x = EnvVarRestore::remove("XDG_CONFIG_HOME");
+        #[cfg(windows)]
+        {
+            let _a = EnvVarRestore::set("APPDATA", "C:\\Users\\alice\\AppData\\Roaming");
+            assert_eq!(
+                default_client_config_base_dir().unwrap(),
+                PathBuf::from("C:\\Users\\alice\\AppData\\Roaming\\webcodex")
+            );
+        }
+        let _a2 = EnvVarRestore::remove("APPDATA");
+        #[cfg(windows)]
+        assert_eq!(
+            default_client_config_base_dir().unwrap(),
+            PathBuf::from("C:\\Users\\alice\\.config\\webcodex")
+        );
+    }
+
+    #[test]
+    fn windows_state_base_uses_localappdata_then_userprofile() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _h = EnvVarRestore::remove("HOME");
+        let _u = EnvVarRestore::set("USERPROFILE", "C:\\Users\\alice");
+        let _x = EnvVarRestore::remove("XDG_STATE_HOME");
+        #[cfg(windows)]
+        {
+            let _l = EnvVarRestore::set("LOCALAPPDATA", "C:\\Users\\alice\\AppData\\Local");
+            assert_eq!(
+                default_client_state_base_dir().unwrap(),
+                PathBuf::from("C:\\Users\\alice\\AppData\\Local\\webcodex")
+            );
+        }
+        let _l2 = EnvVarRestore::remove("LOCALAPPDATA");
+        #[cfg(windows)]
+        assert_eq!(
+            default_client_state_base_dir().unwrap(),
+            PathBuf::from("C:\\Users\\alice\\.local\\state\\webcodex")
+        );
+    }
+
+    #[test]
+    fn config_base_honors_xdg_on_unix_and_ignores_it_on_windows() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _h = EnvVarRestore::set("HOME", "/home/alice");
+        let _u = EnvVarRestore::set("USERPROFILE", "C:\\Users\\alice");
+        let _a = EnvVarRestore::set("APPDATA", "C:\\Users\\alice\\AppData\\Roaming");
+        let _x = EnvVarRestore::set("XDG_CONFIG_HOME", "/tmp/cfg");
+        #[cfg(unix)]
+        assert_eq!(
+            default_client_config_base_dir().unwrap(),
+            PathBuf::from("/tmp/cfg/webcodex")
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            default_client_config_base_dir().unwrap(),
+            PathBuf::from("C:\\Users\\alice\\AppData\\Roaming\\webcodex"),
+            "XDG_CONFIG_HOME must be ignored on Windows"
+        );
+        let _x2 = EnvVarRestore::remove("XDG_CONFIG_HOME");
+        #[cfg(unix)]
+        if is_effective_root() {
+            assert_eq!(
+                default_client_config_base_dir().unwrap(),
+                PathBuf::from("/etc/webcodex")
+            );
+        } else {
+            assert_eq!(
+                default_client_config_base_dir().unwrap(),
+                PathBuf::from("/home/alice/.config/webcodex")
+            );
+        }
+        #[cfg(windows)]
+        assert_eq!(
+            default_client_config_base_dir().unwrap(),
+            PathBuf::from("C:\\Users\\alice\\AppData\\Roaming\\webcodex")
+        );
+    }
+
+    #[test]
+    fn state_base_honors_xdg_on_unix_and_ignores_it_on_windows() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _h = EnvVarRestore::set("HOME", "/home/alice");
+        let _u = EnvVarRestore::set("USERPROFILE", "C:\\Users\\alice");
+        let _l = EnvVarRestore::set("LOCALAPPDATA", "C:\\Users\\alice\\AppData\\Local");
+        let _x = EnvVarRestore::set("XDG_STATE_HOME", "/tmp/state");
+        #[cfg(unix)]
+        assert_eq!(
+            default_client_state_base_dir().unwrap(),
+            PathBuf::from("/tmp/state/webcodex")
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            default_client_state_base_dir().unwrap(),
+            PathBuf::from("C:\\Users\\alice\\AppData\\Local\\webcodex"),
+            "XDG_STATE_HOME must be ignored on Windows"
+        );
+        let _x2 = EnvVarRestore::remove("XDG_STATE_HOME");
+        #[cfg(unix)]
+        assert_eq!(
+            default_client_state_base_dir().unwrap(),
+            PathBuf::from("/home/alice/.local/state/webcodex")
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            default_client_state_base_dir().unwrap(),
+            PathBuf::from("C:\\Users\\alice\\AppData\\Local\\webcodex")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_appdata_and_localappdata_work_without_userprofile() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _h = EnvVarRestore::remove("HOME");
+        let _u = EnvVarRestore::remove("USERPROFILE");
+        let _x = EnvVarRestore::remove("XDG_CONFIG_HOME");
+        let _s = EnvVarRestore::remove("XDG_STATE_HOME");
+
+        let _a = EnvVarRestore::set("APPDATA", "C:\\Users\\alice\\AppData\\Roaming");
+        assert_eq!(
+            default_client_config_base_dir().unwrap(),
+            PathBuf::from("C:\\Users\\alice\\AppData\\Roaming\\webcodex"),
+            "APPDATA alone must be enough for the config base"
+        );
+        let _l = EnvVarRestore::set("LOCALAPPDATA", "C:\\Users\\alice\\AppData\\Local");
+        assert_eq!(
+            default_client_state_base_dir().unwrap(),
+            PathBuf::from("C:\\Users\\alice\\AppData\\Local\\webcodex"),
+            "LOCALAPPDATA alone must be enough for the state base"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_ignores_win32_home_when_userprofile_is_absent() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Even a perfectly Win32-shaped HOME must not be consulted.
+        let _h = EnvVarRestore::set("HOME", "C:\\Users\\alice");
+        let _u = EnvVarRestore::remove("USERPROFILE");
+        let _a = EnvVarRestore::remove("APPDATA");
+        let _x = EnvVarRestore::remove("XDG_CONFIG_HOME");
+        assert!(
+            default_client_config_base_dir().is_err(),
+            "config base must not derive from HOME on Windows"
+        );
+        let _l = EnvVarRestore::remove("LOCALAPPDATA");
+        let _s = EnvVarRestore::remove("XDG_STATE_HOME");
+        assert_eq!(
+            default_client_state_base_dir().unwrap(),
+            std::env::temp_dir().join("webcodex"),
+            "state base must fall back to TEMP, not HOME, on Windows"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_userprofile_fallbacks_are_dot_config_and_dot_local_state() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _h = EnvVarRestore::remove("HOME");
+        let _u = EnvVarRestore::set("USERPROFILE", "C:\\Users\\alice");
+        let _a = EnvVarRestore::remove("APPDATA");
+        let _l = EnvVarRestore::remove("LOCALAPPDATA");
+        let _x = EnvVarRestore::remove("XDG_CONFIG_HOME");
+        let _s = EnvVarRestore::remove("XDG_STATE_HOME");
+        assert_eq!(
+            default_client_config_base_dir().unwrap(),
+            PathBuf::from("C:\\Users\\alice\\.config\\webcodex")
+        );
+        assert_eq!(
+            default_client_state_base_dir().unwrap(),
+            PathBuf::from("C:\\Users\\alice\\.local\\state\\webcodex")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_local_disk_prefix_classification_is_grammar_based() {
+        // Local disk paths, plain and canonicalized.
+        for accepted in [
+            r"C:\repo",
+            r"c:\repo",
+            r"\\?\C:\repo",
+            r"C:\Users\alice\proj\",
+        ] {
+            assert!(
+                is_windows_local_disk_path(Path::new(accepted)),
+                "{accepted} must be accepted as a local disk path"
+            );
+        }
+        // Everything else is fail-closed, whatever it starts with.
+        for rejected in [
+            r"\\server\share\repo",
+            r"\\?\UNC\server\share\repo",
+            r"\\server\share",
+            r"\\.\device\repo",
+            r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\repo",
+            r"\repo",
+            r"repo",
+        ] {
+            assert!(
+                !is_windows_local_disk_path(Path::new(rejected)),
+                "{rejected} must be rejected as a non-local-disk path"
+            );
+        }
+    }
+
+    #[test]
+    fn state_base_falls_back_to_temp_only_when_no_home_anywhere() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _h = EnvVarRestore::remove("HOME");
+        let _x = EnvVarRestore::remove("XDG_STATE_HOME");
+        let _u = EnvVarRestore::remove("USERPROFILE");
+        let _l = EnvVarRestore::remove("LOCALAPPDATA");
+        let _a = EnvVarRestore::remove("APPDATA");
+        let base = default_client_state_base_dir().unwrap();
+        assert!(base.is_absolute(), "state fallback must stay absolute");
+        assert_eq!(base, std::env::temp_dir().join("webcodex"));
+    }
+
+    #[test]
+    fn user_config_home_requires_absolute_home() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _x = EnvVarRestore::remove("XDG_CONFIG_HOME");
+        let _u = EnvVarRestore::remove("USERPROFILE");
+        let _h = EnvVarRestore::set("HOME", "/c/Users/alice");
+        #[cfg(windows)]
+        assert!(
+            user_config_home().is_err(),
+            "MSYS-style HOME is relative on Windows and must not be used"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            user_config_home().unwrap(),
+            PathBuf::from("/c/Users/alice/.config")
+        );
+    }
+
+    #[test]
+    fn path_identity_is_case_insensitive_on_windows() {
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                normalize_path_identity(Path::new(r"C:\Foo\Bar")),
+                normalize_path_identity(Path::new(r"c:\foo\bar")),
+            );
+            assert_eq!(
+                normalize_path_identity(Path::new(r"C:\Foo\Bar")),
+                normalize_path_identity(Path::new(r"\\?\C:\Foo\Bar")),
+            );
+            assert_eq!(
+                normalize_path_identity(Path::new(r"\\?\C:\Foo\Bar\")),
+                normalize_path_identity(Path::new(r"C:\Foo\Bar")),
+            );
+            assert!(paths_equal(
+                Path::new(r"C:\Foo\Bar"),
+                Path::new(r"c:\foo\bar")
+            ));
+            assert!(path_is_within(
+                Path::new(r"C:\Users\Alice\proj"),
+                Path::new(r"c:\users\alice")
+            ));
+            assert!(!path_is_within(
+                Path::new(r"C:\Users\Alice2\proj"),
+                Path::new(r"c:\users\alice")
+            ));
+            assert_eq!(
+                normalize_path_identity(Path::new(r"\\server\share\dir")),
+                normalize_path_identity(Path::new(r"\\?\UNC\server\share\dir")),
+            );
+        }
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                normalize_path_identity(Path::new("/home/alice/proj")),
+                "/home/alice/proj"
+            );
+            assert!(paths_equal(
+                Path::new("/home/alice/proj"),
+                Path::new("/home/alice/proj")
+            ));
+            assert!(!paths_equal(
+                Path::new("/home/alice/proj"),
+                Path::new("/HOME/ALICE/PROJ")
+            ));
+        }
+    }
+}

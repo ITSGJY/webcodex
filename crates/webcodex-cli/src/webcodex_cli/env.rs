@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use webcodex_agent_config::paths;
+
 use crate::ServerInitOptions;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8,41 +10,25 @@ pub(crate) struct ServerPathDefaults {
     pub(crate) env_file: PathBuf,
 }
 
-pub(crate) fn default_server_paths() -> ServerPathDefaults {
-    if is_effective_root() {
-        return ServerPathDefaults {
+pub(crate) fn default_server_paths() -> Result<ServerPathDefaults, String> {
+    if paths::is_effective_root() {
+        return Ok(ServerPathDefaults {
             data_dir: PathBuf::from("/var/lib/webcodex"),
             env_file: PathBuf::from("/etc/webcodex/webcodex.env"),
-        };
+        });
     }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    ServerPathDefaults {
+    let home = paths::home_dir().ok_or_else(|| {
+        "cannot determine user home: set HOME (Unix) or USERPROFILE (Windows) to derive the Server env file path"
+            .to_string()
+    })?;
+    Ok(ServerPathDefaults {
         data_dir: home.join(".local/share/webcodex"),
         env_file: home.join(".config/webcodex/webcodex.env"),
-    }
+    })
 }
 
-#[cfg(unix)]
 pub(crate) fn is_effective_root() -> bool {
-    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-        for line in status.lines() {
-            if let Some(rest) = line.strip_prefix("Uid:") {
-                let mut parts = rest.split_whitespace();
-                let _real = parts.next();
-                if let Some(effective) = parts.next() {
-                    return effective == "0";
-                }
-            }
-        }
-    }
-    std::env::var("USER").is_ok_and(|u| u == "root")
-}
-
-#[cfg(not(unix))]
-pub(crate) fn is_effective_root() -> bool {
-    false
+    paths::is_effective_root()
 }
 
 pub(crate) fn render_server_env(opts: &ServerInitOptions, token: &str) -> String {

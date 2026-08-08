@@ -395,7 +395,15 @@ function extractTarGz(archive, destDir, options = {}) {
   }
 }
 
-function versionIdentity(binary, name, expectedVersion) {
+function versionIdentity(binary, name, expectedVersion, options = {}) {
+  // Narrow, test-only seam: a caller-provided identity provider lets tests
+  // run on platforms without a C toolchain (Windows CI has no compiler for
+  // fake PE fixtures). Production never passes one, so the spawn-based
+  // validation below is the only path in real installs; the Windows
+  // real-binary smoke covers this function against actual build output.
+  if (options.versionIdentity) {
+    return options.versionIdentity(binary, name, expectedVersion);
+  }
   const result = childProcess.spawnSync(binary, ["--version"], {
     encoding: "utf8",
     windowsHide: true,
@@ -418,7 +426,7 @@ function versionIdentity(binary, name, expectedVersion) {
   return identity;
 }
 
-function validateBinarySet(dir, expectedVersion = PACKAGE_VERSION, platform = process.platform) {
+function validateBinarySet(dir, expectedVersion = PACKAGE_VERSION, platform = process.platform, options = {}) {
   const identities = [];
   for (const name of RUNTIME_BINARIES) {
     const file = path.join(dir, exeName(name, platform));
@@ -434,7 +442,7 @@ function validateBinarySet(dir, expectedVersion = PACKAGE_VERSION, platform = pr
     if (platform !== "win32") {
       fs.chmodSync(file, 0o755);
     }
-    identities.push(versionIdentity(file, name, expectedVersion));
+    identities.push(versionIdentity(file, name, expectedVersion, options));
   }
   if (!identities.every((identity) => identity === identities[0])) {
     throw new Error("Installed WebCodex binaries are not from the same build");
@@ -479,7 +487,7 @@ function installBinarySet(populate, options = {}) {
   const stagedDir = fs.mkdtempSync(path.join(parent, ".bin-staging-"));
   try {
     populate(stagedDir);
-    const identity = validateBinarySet(stagedDir, expectedVersion, platform);
+    const identity = validateBinarySet(stagedDir, expectedVersion, platform, options);
     replaceDirectoryAtomically(stagedDir, destinationDir, options.onWarning);
     return identity;
   } finally {

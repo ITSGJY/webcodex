@@ -1660,6 +1660,8 @@ mod tests {
         assert!(error.len() < 1000, "{}", error.len());
     }
 
+    /// Unix-only: systemd unit encoders validate Unix absolute-path rules.
+    #[cfg(unix)]
     #[test]
     fn systemd_encoders_keep_distinct_program_argument_and_path_rules() {
         assert_eq!(

@@ -596,7 +596,7 @@ new file mode 100644\n\
         tokio::task::yield_now().await;
     }
     let check_req = check_req.expect("apply_patch should enqueue git apply --check for the agent");
-    assert_eq!(check_req.command, "git apply --check - && echo OK");
+    assert_eq!(check_req.command, "git apply --check -");
     assert!(check_req
         .stdin
         .as_deref()
@@ -680,12 +680,12 @@ async fn apply_patch_agent_command_excludes_patch_content_and_uses_stdin_and_cwd
     let apply_task =
         tokio::spawn(async move { runtime_for_task.apply_patch(project, patch_for_apply).await });
 
-    // 1) preflight check: `git apply --check - && echo OK`
+    // 1) preflight check: `git apply --check -`
     let check_req = next_patch_agent_request(&runtime, "patcher")
         .await
         .expect("apply_patch should enqueue a git apply --check request");
     assert_safe_patch_command(&check_req.command, marker);
-    assert_eq!(check_req.command, "git apply --check - && echo OK");
+    assert_eq!(check_req.command, "git apply --check -");
     assert_eq!(check_req.stdin.as_deref(), Some(patch.as_str()));
     assert_eq!(check_req.cwd.as_deref(), Some("/tmp/agent-proj"));
     complete_patch_agent_request(&runtime, "patcher", &check_req.request_id, 0, "OK\n", "").await;
@@ -810,7 +810,7 @@ async fn apply_patch_checked_applies_large_patch_over_command_limit_via_stdin() 
         .await
         .expect("apply check request");
     assert_safe_patch_command(&apply_check_req.command, marker);
-    assert_eq!(apply_check_req.command, "git apply --check - && echo OK");
+    assert_eq!(apply_check_req.command, "git apply --check -");
     assert_eq!(apply_check_req.stdin.as_deref(), Some(patch.as_str()));
     complete_patch_agent_request(
         &runtime,

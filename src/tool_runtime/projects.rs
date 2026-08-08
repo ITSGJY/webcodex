@@ -573,7 +573,10 @@ fn validate_project_op_description(desc: &str) -> Result<(), String> {
 }
 
 /// Validate the project `path` field server-side: non-empty, absolute, no NUL.
-/// The agent does the authoritative existence/policy/canonicalization check.
+/// The Server may route to an agent on a different OS, so this check must accept
+/// both POSIX and Windows absolute-path shapes without applying host-local path
+/// semantics. The agent remains authoritative for existence, policy (including
+/// current UNC support), and canonicalization.
 fn validate_project_op_path(path: &str) -> Result<(), String> {
     if path.is_empty() {
         return Err("path cannot be empty".to_string());
@@ -581,7 +584,14 @@ fn validate_project_op_path(path: &str) -> Result<(), String> {
     if path.contains('\0') {
         return Err("path must not contain NUL".to_string());
     }
-    if !path.starts_with('/') {
+    let bytes = path.as_bytes();
+    let posix_absolute = path.starts_with('/');
+    let windows_drive_absolute = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    let windows_unc_or_verbatim_absolute = path.starts_with("\\\\");
+    if !(posix_absolute || windows_drive_absolute || windows_unc_or_verbatim_absolute) {
         return Err("path must be an absolute path".to_string());
     }
     Ok(())
@@ -714,8 +724,15 @@ mod tests {
     }
 
     #[test]
-    fn validate_path_accepts_absolute() {
+    fn validate_path_accepts_cross_platform_absolute_shapes() {
         assert!(validate_project_op_path("/root/git/my-project").is_ok());
+        assert!(validate_project_op_path(r"C:\repo").is_ok());
+        assert!(validate_project_op_path("c:/repo").is_ok());
+        assert!(validate_project_op_path(r"\\?\C:\repo").is_ok());
+        assert!(validate_project_op_path(r"\\server\share\repo").is_ok());
+        assert!(validate_project_op_path(r"C:repo").is_err());
+        assert!(validate_project_op_path(r"\repo").is_err());
+        assert!(validate_project_op_path(r"relative\repo").is_err());
     }
 
     #[test]

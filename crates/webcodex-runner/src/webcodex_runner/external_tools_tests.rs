@@ -22,6 +22,24 @@ fn permissive_test_policy() -> AgentPolicy {
 
 static FAKE_SERVER: OnceLock<Mutex<Weak<FakeBinary>>> = OnceLock::new();
 
+// Toolhelp thread snapshots are a system-wide resource. Running many
+// CREATE_SUSPENDED fake MCP fixtures concurrently on Windows can consume the
+// intentionally tight one-second protocol budget even though each fixture is
+// correct in isolation. Serialize only these test functions; concurrency
+// exercised inside an individual test remains unchanged.
+#[cfg(windows)]
+static FAKE_MCP_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(windows)]
+fn serialize_fake_mcp_test() -> std::sync::MutexGuard<'static, ()> {
+    FAKE_MCP_TEST_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(not(windows))]
+fn serialize_fake_mcp_test() {}
+
 struct FakeBinary {
     _temp: TempDir,
     path: PathBuf,
@@ -73,7 +91,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(scenario: &str) -> Self {
-        Self::with_timeout(scenario, 1)
+        // The fake server binary is compiled on first use and spawned fresh;
+        // under parallel full-suite load a 1s MCP timeout flakes. The
+        // timeout-specific tests pass an explicit short timeout.
+        Self::with_timeout(scenario, 10)
     }
 
     fn with_timeout(scenario: &str, timeout_secs: u64) -> Self {
@@ -187,7 +208,10 @@ fn agent_request(
         create_dirs: false,
         command: String::new(),
         stdin: None,
-        timeout_secs: 1,
+        // The effective MCP deadline is min(request, policy, config); a 1s
+        // request pin would ignore the fixture's generous spawn budget and
+        // flake under parallel load (first call races server startup).
+        timeout_secs: 10,
         requested_by: "test".to_string(),
         created_at: 0,
         validation: None,
@@ -288,6 +312,7 @@ fn real_tool_name(
 
 #[test]
 fn provider_is_disabled_by_default_and_missing_command_is_nonfatal() {
+    let _serial = serialize_fake_mcp_test();
     let parsed: ToolProvidersConfig = toml::from_str(
         r#"
 strategy = "claude_code_then_native"
@@ -329,6 +354,7 @@ search_project_text = "project_search"
 
 #[test]
 fn status_reports_discovery_mapping_process_and_bounded_error() {
+    let _serial = serialize_fake_mcp_test();
     let fixture = Fixture::new("normal");
     assert_eq!(fixture.provider.status().process_state, "not_started");
     let output = call_search(&fixture).unwrap();
@@ -387,6 +413,7 @@ fn status_reports_discovery_mapping_process_and_bounded_error() {
 
 #[test]
 fn search_mapping_normalizes_results() {
+    let _serial = serialize_fake_mcp_test();
     let fixture = Fixture::new("normal");
     let router = ExternalToolRouter::new(&ToolProvidersConfig {
         strategy: ToolProviderStrategy::ClaudeCode,
@@ -415,6 +442,7 @@ fn search_mapping_normalizes_results() {
 
 #[test]
 fn fallback_and_failure_routes_record_bounded_last_call_evidence() {
+    let _serial = serialize_fake_mcp_test();
     let fixture = Fixture::new("normal");
     let mut unmapped_search = fixture.config.clone();
     unmapped_search.mapping.remove("search_project_text");
@@ -454,6 +482,7 @@ fn fallback_and_failure_routes_record_bounded_last_call_evidence() {
 
 #[test]
 fn search_falls_back_before_submission() {
+    let _serial = serialize_fake_mcp_test();
     let fixture = Fixture::new("normal");
     let mut unmapped_search = fixture.config.clone();
     unmapped_search.mapping.remove("search_project_text");
@@ -486,6 +515,7 @@ fn search_falls_back_before_submission() {
 
 #[test]
 fn status_revisions_are_changed_only_and_registration_reads_latest_snapshot() {
+    let _serial = serialize_fake_mcp_test();
     let fixture = Fixture::new("normal");
     let router = ExternalToolRouter::new(&ToolProvidersConfig {
         strategy: ToolProviderStrategy::ClaudeCode,
@@ -534,6 +564,7 @@ fn status_revisions_are_changed_only_and_registration_reads_latest_snapshot() {
 
 #[test]
 fn router_rejects_absolute_parent_and_symlink_escape_paths() {
+    let _serial = serialize_fake_mcp_test();
     let fixture = Fixture::new("normal");
     let router = ExternalToolRouter::new(&ToolProvidersConfig {
         strategy: ToolProviderStrategy::ClaudeCode,
@@ -581,6 +612,7 @@ fn search_request_with_path(path: &str) -> Value {
 
 #[test]
 fn protocol_failures_are_bounded_and_unknown_ids_are_ignored() {
+    let _serial = serialize_fake_mcp_test();
     for (scenario, expected) in [
         ("invalid_json", "mcp_invalid_json"),
         ("oversized", "mcp_message_too_large"),
@@ -607,6 +639,7 @@ fn protocol_failures_are_bounded_and_unknown_ids_are_ignored() {
 
 #[test]
 fn process_exit_clears_pending_and_next_call_restarts_lazily() {
+    let _serial = serialize_fake_mcp_test();
     let fixture = Fixture::new("restart_once");
     assert!(call_search(&fixture).is_err());
     assert!(wait_until(Duration::from_secs(1), || {
@@ -624,6 +657,7 @@ fn process_exit_clears_pending_and_next_call_restarts_lazily() {
 
 #[test]
 fn timeout_removes_pending_request() {
+    let _serial = serialize_fake_mcp_test();
     let fixture = Fixture::new("timeout");
     let error = call_search(&fixture).unwrap_err();
     assert_eq!(error.code, "mcp_request_timeout");
@@ -655,12 +689,13 @@ fn timeout_removes_pending_request() {
 #[cfg(unix)]
 #[test]
 fn provider_shutdown_reaps_a_normally_terminating_process_once() {
+    let _serial = serialize_fake_mcp_test();
     let fixture = Fixture::new("normal");
     let client = fixture
         .provider
         .project_client(&fixture.root, Instant::now() + Duration::from_secs(1))
         .unwrap();
-    let process_group = client.connection.process_group_id;
+    let pid = client.connection.child.lock().unwrap().id();
 
     let outcome = fixture
         .provider
@@ -668,10 +703,8 @@ fn provider_shutdown_reaps_a_normally_terminating_process_once() {
     assert_eq!(outcome.connections, 1);
     assert_eq!(outcome.timed_out, 0);
     assert!(
-        wait_until(Duration::from_secs(1), || !process_group_exists(
-            process_group
-        )),
-        "provider process group remained after shutdown"
+        wait_until(Duration::from_secs(1), || !process_exists(pid)),
+        "provider process remained after shutdown"
     );
 
     let repeated = Instant::now();
@@ -688,13 +721,14 @@ fn provider_shutdown_reaps_a_normally_terminating_process_once() {
 #[cfg(unix)]
 #[test]
 fn unresponsive_provider_is_killed_reaped_and_wakes_pending_request() {
+    let _serial = serialize_fake_mcp_test();
     let fixture = Fixture::with_timeout("ignore_term", 5);
     let client = fixture
         .provider
         .project_client(&fixture.root, Instant::now() + Duration::from_secs(1))
         .unwrap();
     let connection = Arc::clone(&client.connection);
-    let process_group = connection.process_group_id;
+    let pid = connection.child.lock().unwrap().id();
     let request_connection = Arc::clone(&connection);
     let request = std::thread::spawn(move || {
         request_connection.request(
@@ -722,23 +756,22 @@ fn unresponsive_provider_is_killed_reaped_and_wakes_pending_request() {
     assert_eq!(error.code, "mcp_connection_closed");
     assert_eq!(lock_unpoison(&connection.pending).len(), 0);
     assert!(
-        wait_until(Duration::from_secs(1), || !process_group_exists(
-            process_group
-        )),
-        "SIGTERM-ignoring provider process group survived SIGKILL"
+        wait_until(Duration::from_secs(1), || !process_exists(pid)),
+        "SIGTERM-ignoring provider process survived SIGKILL"
     );
 }
 
 #[cfg(unix)]
 #[test]
 fn provider_request_timeout_racing_shutdown_is_idempotent() {
+    let _serial = serialize_fake_mcp_test();
     let fixture = Fixture::with_timeout("ignore_term", 1);
     let client = fixture
         .provider
         .project_client(&fixture.root, Instant::now() + Duration::from_secs(1))
         .unwrap();
     let connection = Arc::clone(&client.connection);
-    let process_group = connection.process_group_id;
+    let pid = connection.child.lock().unwrap().id();
     let request_connection = Arc::clone(&connection);
     let request = std::thread::spawn(move || {
         request_connection.request(
@@ -764,9 +797,7 @@ fn provider_request_timeout_racing_shutdown_is_idempotent() {
         error.code
     );
     assert!(
-        wait_until(Duration::from_secs(1), || !process_group_exists(
-            process_group
-        )),
+        wait_until(Duration::from_secs(1), || !process_exists(pid)),
         "provider process survived concurrent timeout and shutdown"
     );
     let repeated = Instant::now();
@@ -778,6 +809,7 @@ fn provider_request_timeout_racing_shutdown_is_idempotent() {
 
 #[test]
 fn native_strategy_does_not_start_claude() {
+    let _serial = serialize_fake_mcp_test();
     let fixture = Fixture::new("normal");
     let router = ExternalToolRouter::new(&ToolProvidersConfig {
         strategy: ToolProviderStrategy::Native,
@@ -796,6 +828,7 @@ fn native_strategy_does_not_start_claude() {
 #[cfg(unix)]
 #[test]
 fn retiring_router_keeps_inflight_search_alive_then_reaps_its_process() {
+    let _serial = serialize_fake_mcp_test();
     let fixture = Fixture::with_timeout("delayed", 2);
     let old = Arc::new(ExternalToolRouter::new(&ToolProvidersConfig {
         strategy: ToolProviderStrategy::ClaudeCode,
@@ -845,7 +878,71 @@ fn retiring_router_keeps_inflight_search_alive_then_reaps_its_process() {
 }
 
 #[test]
+fn shutdown_reaps_descendant_and_stdout_closes_without_leaks() {
+    let _serial = serialize_fake_mcp_test();
+    // The fake server spawns a descendant that inherits the piped stdout,
+    // then the direct child exits immediately. This exercises the core
+    // managed-tree semantic: the direct child exiting is NOT the whole tree
+    // exiting, and shutdown must terminate the descendant and close stdout.
+    let fixture = Fixture::new("spawn_descendant");
+    let client = fixture
+        .provider
+        .project_client(&fixture.root, Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    let connection = Arc::clone(&client.connection);
+
+    // Capture the descendant pid the fake server recorded before exiting.
+    let descendant_pid = {
+        let marker = fs::read_to_string(&fixture.marker).unwrap_or_default();
+        marker
+            .lines()
+            .find_map(|line| line.strip_prefix("GRANDCHILD_PID="))
+            .and_then(|value| value.trim().parse::<u32>().ok())
+    };
+    assert!(
+        descendant_pid.is_some(),
+        "fake server should have spawned a descendant before exiting"
+    );
+    let descendant_pid = descendant_pid.unwrap();
+    let direct_pid = connection.child.lock().unwrap().id();
+    assert_ne!(
+        direct_pid, descendant_pid,
+        "direct child and descendant must be distinct"
+    );
+
+    // The direct child exited on its own, but the tree (descendant) is alive
+    // and still holds the stdout write end, so the reader must stay alive.
+    assert!(wait_until(Duration::from_secs(1), || process_exists(
+        descendant_pid
+    )));
+    assert!(
+        connection.is_alive(),
+        "connection died while the descendant still owned stdout"
+    );
+
+    let outcome = fixture
+        .provider
+        .shutdown_until(Instant::now() + Duration::from_secs(2));
+    assert_eq!(outcome.connections, 1);
+    assert_eq!(
+        outcome.timed_out, 0,
+        "shutdown must reap within the deadline"
+    );
+    assert_eq!(outcome.failures, 0);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || !process_exists(descendant_pid)),
+        "descendant {descendant_pid} survived MCP shutdown"
+    );
+    assert!(
+        wait_until(Duration::from_secs(1), || !process_exists(direct_pid)),
+        "direct child {direct_pid} survived MCP shutdown"
+    );
+}
+
+#[test]
 fn opt_in_real_claude_mcp_probe() {
+    let _serial = serialize_fake_mcp_test();
     if env::var("WEBCODEX_PROBE_CLAUDE_PROVIDER").as_deref() != Ok("1") {
         return;
     }
@@ -868,6 +965,7 @@ fn opt_in_real_claude_mcp_probe() {
 
 #[test]
 fn opt_in_real_claude_mcp_smoke() {
+    let _serial = serialize_fake_mcp_test();
     if env::var("WEBCODEX_TEST_CLAUDE_MCP").as_deref() != Ok("1") {
         return;
     }
@@ -935,12 +1033,10 @@ fn opt_in_real_claude_mcp_smoke() {
     );
     provider.shutdown();
     #[cfg(unix)]
-    for process_group in process_groups {
+    for pid in process_groups {
         assert!(
-            wait_until(Duration::from_secs(2), || !process_group_exists(
-                process_group
-            )),
-            "Claude process group {process_group} remained after provider shutdown"
+            wait_until(Duration::from_secs(2), || !process_exists(pid)),
+            "Claude process {pid} remained after provider shutdown"
         );
     }
     eprintln!("claude_mcp_shutdown process_groups_reaped=true");
@@ -949,9 +1045,30 @@ fn opt_in_real_claude_mcp_smoke() {
     }
 }
 
+/// Whether a process with `pid` is still alive, probed natively (no tasklist,
+/// no shelling out).
 #[cfg(unix)]
-fn process_group_exists(process_group: u32) -> bool {
-    // SAFETY: signal 0 only probes the private process group captured above.
-    (unsafe { libc::kill(-(process_group as i32), 0) == 0 })
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+fn process_exists(pid: u32) -> bool {
+    // SAFETY: signal 0 is an existence probe; the pid comes from our own child.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn process_exists(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: OpenProcess returns a handle or NULL; NULL means the pid no
+    // longer exists (or is inaccessible, which also means not ours).
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let mut exit_code = 0u32;
+    // SAFETY: `handle` is valid; `exit_code` is a valid out-param.
+    let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+    // SAFETY: close the handle we opened.
+    unsafe { CloseHandle(handle) };
+    ok == 1 && exit_code == 259 // 259 == STILL_ACTIVE
 }

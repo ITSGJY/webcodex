@@ -6,7 +6,6 @@ use crate::validation_bridge::{
     VALIDATION_BRIDGE_PROTOCOL_VERSION,
 };
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -44,14 +43,90 @@ fn typecheck_request(project_id: &str) -> ValidationBridgeRequest {
     }
 }
 
-fn write_fake_pyright(bin_dir: &std::path::Path, script_body: &str) -> PathBuf {
+/// Spec for a fake `pyright` program. Payloads are written to sidecar files
+/// and emitted by the platform fixture, so tests never shell-escape JSON,
+/// quotes, `%`, or Unicode into a script body.
+struct FakePyrightSpec {
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+    delay_ms: u64,
+}
+
+impl FakePyrightSpec {
+    fn new(stdout: impl Into<String>, exit_code: i32) -> Self {
+        Self {
+            stdout: stdout.into(),
+            stderr: String::new(),
+            exit_code,
+            delay_ms: 0,
+        }
+    }
+
+    fn with_stderr(mut self, stderr: impl Into<String>) -> Self {
+        self.stderr = stderr.into();
+        self
+    }
+
+    fn with_delay(mut self, delay_ms: u64) -> Self {
+        self.delay_ms = delay_ms;
+        self
+    }
+}
+
+/// Write a platform-native fake `pyright` executable into `bin_dir`:
+///
+/// - Unix: a `pyright` shell script that cats the payload files.
+/// - Windows: a `pyright.cmd` batch script that `type`s the payload files
+///   under `chcp 65001` (UTF-8). Batch is the real npm-style layout for
+///   pyright on Windows and is resolved through the PATHEXT rules; no sh,
+///   Git Bash or WSL is involved.
+///
+/// Returns the resolved fixture path.
+fn write_fake_pyright(bin_dir: &std::path::Path, spec: &FakePyrightSpec) -> PathBuf {
     fs::create_dir_all(bin_dir).unwrap();
-    let path = bin_dir.join("pyright");
-    fs::write(&path, script_body).unwrap();
-    let mut perms = fs::metadata(&path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&path, perms).unwrap();
-    path
+    fs::write(bin_dir.join("pyright.stdout"), &spec.stdout).unwrap();
+    if !spec.stderr.is_empty() {
+        fs::write(bin_dir.join("pyright.stderr"), &spec.stderr).unwrap();
+    }
+    #[cfg(unix)]
+    {
+        let mut script = String::from("#!/bin/sh\n");
+        if spec.delay_ms > 0 {
+            script.push_str(&format!("sleep {}\n", (spec.delay_ms + 999) / 1000));
+        }
+        script.push_str("cat \"$(dirname \"$0\")/pyright.stdout\"\n");
+        if !spec.stderr.is_empty() {
+            script.push_str("cat \"$(dirname \"$0\")/pyright.stderr\" >&2\n");
+        }
+        script.push_str(&format!("exit {}\n", spec.exit_code));
+        let path = bin_dir.join("pyright");
+        fs::write(&path, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+    #[cfg(windows)]
+    {
+        // `type` reads the payload files with the current code page; chcp
+        // 65001 makes the bytes pass through as UTF-8. Delay uses ping (the
+        // classic batch sleep; `timeout.exe` needs stdin in pipelines).
+        let mut script = String::from("@echo off\r\nchcp 65001 >nul\r\n");
+        if spec.delay_ms > 0 {
+            let seconds = (spec.delay_ms + 999) / 1000;
+            script.push_str(&format!("ping -n {} 127.0.0.1 >nul\r\n", seconds + 1));
+        }
+        script.push_str("type \"%~dp0pyright.stdout\"\r\n");
+        if !spec.stderr.is_empty() {
+            script.push_str("type \"%~dp0pyright.stderr\" 1>&2\r\n");
+        }
+        script.push_str(&format!("exit /b {}\r\n", spec.exit_code));
+        let path = bin_dir.join("pyright.cmd");
+        fs::write(&path, script).unwrap();
+        path
+    }
 }
 
 fn with_path<T>(bin_dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
@@ -150,10 +225,8 @@ fn end_to_end_fake_pyright_success_and_diagnostics() {
     let abs_json = abs.to_string_lossy().replace('\\', "\\\\");
 
     let bin = tempfile::tempdir().unwrap();
-    let script = format!(
-        r#"#!/bin/sh
-cat <<'EOF'
-{{
+    let stdout = format!(
+        r#"{{
   "version": "1.1.382",
   "generalDiagnostics": [
     {{
@@ -174,12 +247,9 @@ cat <<'EOF'
     "informationCount": 0,
     "timeInSec": 0.01
   }}
-}}
-EOF
-exit 1
-"#
+}}"#
     );
-    write_fake_pyright(bin.path(), &script);
+    write_fake_pyright(bin.path(), &FakePyrightSpec::new(stdout, 1));
 
     let response = with_path(bin.path(), || {
         execute_validation_at_root(root, &typecheck_request("demo"), 120).unwrap()
@@ -220,11 +290,7 @@ fn end_to_end_exit_zero_no_diagnostics_is_success() {
     let root = project.path();
     fs::write(root.join("ok.py"), "x = 1\n").unwrap();
     let bin = tempfile::tempdir().unwrap();
-    write_fake_pyright(
-        bin.path(),
-        r#"#!/bin/sh
-cat <<'EOF'
-{
+    let stdout = r#"{
   "version": "1.1.382",
   "generalDiagnostics": [],
   "summary": {
@@ -235,10 +301,8 @@ cat <<'EOF'
     "timeInSec": 0.01
   }
 }
-EOF
-exit 0
-"#,
-    );
+"#;
+    write_fake_pyright(bin.path(), &FakePyrightSpec::new(stdout, 0));
     let response = with_path(bin.path(), || {
         execute_validation_at_root(root, &typecheck_request("demo"), 120).unwrap()
     });
@@ -271,7 +335,7 @@ fn fake_pyright_missing_reports_tool_unavailable() {
 fn invalid_cwd_reports_available_tool_without_starting_command() {
     let project = tempfile::tempdir().unwrap();
     let bin = tempfile::tempdir().unwrap();
-    write_fake_pyright(bin.path(), "#!/bin/sh\nexit 0\n");
+    write_fake_pyright(bin.path(), &FakePyrightSpec::new("", 0));
     let mut request = typecheck_request("demo");
     request.cwd = Some("missing-directory".to_string());
 
@@ -291,7 +355,17 @@ fn invalid_cwd_reports_available_tool_without_starting_command() {
 fn spawn_failure_does_not_report_command_started() {
     let project = tempfile::tempdir().unwrap();
     let bin = tempfile::tempdir().unwrap();
-    write_fake_pyright(bin.path(), "not a recognized executable format\n");
+    // A file that resolves as a program but cannot be executed: on Unix a
+    // non-shebang script, on Windows a non-PE `pyright.exe`.
+    #[cfg(unix)]
+    {
+        let path = bin.path().join("pyright");
+        fs::write(&path, "not a recognized executable format\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    #[cfg(windows)]
+    fs::write(bin.path().join("pyright.exe"), b"not a valid PE image\n").unwrap();
 
     let response = with_path(bin.path(), || {
         execute_validation_at_root(project.path(), &typecheck_request("demo"), 120).unwrap()
@@ -312,7 +386,8 @@ fn spawn_failure_does_not_report_command_started() {
 fn timeout_reports_started_and_available_tool() {
     let project = tempfile::tempdir().unwrap();
     let bin = tempfile::tempdir().unwrap();
-    write_fake_pyright(bin.path(), "#!/bin/sh\nwhile :; do :; done\n");
+    // Long enough to outlive the 1s request timeout on either platform.
+    write_fake_pyright(bin.path(), &FakePyrightSpec::new("", 0).with_delay(120_000));
     let mut request = typecheck_request("demo");
     request.timeout_secs = 1;
 
@@ -334,18 +409,10 @@ fn oversized_stdout_is_not_parsed() {
     let root = project.path();
     let bin = tempfile::tempdir().unwrap();
     let over = MAX_VALIDATION_STDOUT_BYTES + 8192;
-    // Pure shell: print 64-byte chunks until past the hard capture cap.
-    let script = format!(
-        r#"#!/bin/sh
-i=0
-while [ "$i" -lt {over} ]; do
-  printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-  i=$((i+64))
-done
-exit 0
-"#
-    );
-    write_fake_pyright(bin.path(), &script);
+    // Payload past the hard capture cap; emitted byte-for-byte by the
+    // platform fixture (no shell loop needed).
+    let payload = "a".repeat(over);
+    write_fake_pyright(bin.path(), &FakePyrightSpec::new(payload, 0));
     let response = with_path(bin.path(), || {
         execute_validation_at_root(root, &typecheck_request("demo"), 30).unwrap()
     });
@@ -367,24 +434,19 @@ fn oversized_stderr_is_capped_while_stdout_json_remains_parseable() {
     let project = tempfile::tempdir().unwrap();
     let bin = tempfile::tempdir().unwrap();
     let over = MAX_VALIDATION_STDERR_CAPTURE_BYTES + 8192;
-    let script = format!(
-        r#"#!/bin/sh
-i=0
-while [ "$i" -lt {over} ]; do
-  printf 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' >&2
-  i=$((i+64))
-done
-printf 'TAIL_MARKER_MUST_NOT_CROSS_BRIDGE' >&2
-cat <<'EOF'
-{{
+    let spec = FakePyrightSpec::new(
+        r#"{
   "generalDiagnostics": [],
-  "summary": {{ "errorCount": 0, "warningCount": 0, "informationCount": 0 }}
-}}
-EOF
-exit 0
-"#
-    );
-    write_fake_pyright(bin.path(), &script);
+  "summary": { "errorCount": 0, "warningCount": 0, "informationCount": 0 }
+}
+"#,
+        0,
+    )
+    .with_stderr(format!(
+        "{}TAIL_MARKER_MUST_NOT_CROSS_BRIDGE",
+        "e".repeat(over)
+    ));
+    write_fake_pyright(bin.path(), &spec);
 
     let response = with_path(bin.path(), || {
         execute_validation_at_root(project.path(), &typecheck_request("demo"), 120).unwrap()
@@ -407,13 +469,7 @@ fn malformed_json_is_structured_failure() {
     let project = tempfile::tempdir().unwrap();
     let root = project.path();
     let bin = tempfile::tempdir().unwrap();
-    write_fake_pyright(
-        bin.path(),
-        r#"#!/bin/sh
-echo 'not-json'
-exit 1
-"#,
-    );
+    write_fake_pyright(bin.path(), &FakePyrightSpec::new("not-json\n", 1));
     let response = with_path(bin.path(), || {
         execute_validation_at_root(root, &typecheck_request("demo"), 120).unwrap()
     });
@@ -442,11 +498,8 @@ fn bridge_response_free_text_is_sanitized_before_serialization() {
         r"\\server\share\secret.py",
     ];
     let bin = tempfile::tempdir().unwrap();
-    let script = format!(
-        r#"#!/bin/sh
-printf '%s\n' 'stderr /root/git/private-drop/src/app.py /etc/passwd C:\Users\alice\project\app.py \\server\share\secret.py' >&2
-cat <<'EOF'
-{{
+    let stdout = format!(
+        r#"{{
   "generalDiagnostics": [{{
     "file": "{abs_json}",
     "severity": "warning",
@@ -457,12 +510,11 @@ cat <<'EOF'
     }}
   }}],
   "summary": {{ "errorCount": 0, "warningCount": 1, "informationCount": 0 }}
-}}
-EOF
-exit 0
-"#
+}}"#
     );
-    write_fake_pyright(bin.path(), &script);
+    let stderr = r"stderr /root/git/private-drop/src/app.py /etc/passwd C:\Users\alice\project\app.py \\server\share\secret.py";
+    let spec = FakePyrightSpec::new(stdout, 0).with_stderr(stderr);
+    write_fake_pyright(bin.path(), &spec);
 
     let response = with_path(bin.path(), || {
         execute_validation_at_root(root, &typecheck_request("demo"), 120).unwrap()
@@ -492,7 +544,7 @@ fn malformed_json_containing_absolute_path_does_not_echo_it() {
     let injected = "/root/git/private-drop/private.py";
     write_fake_pyright(
         bin.path(),
-        &format!("#!/bin/sh\nprintf '%s' '{{\\\"generalDiagnostics\\\":[\\\"{injected}'\nexit 1\n"),
+        &FakePyrightSpec::new(format!("{{\"generalDiagnostics\":[\"{injected}"), 1),
     );
     let response = with_path(bin.path(), || {
         execute_validation_at_root(project.path(), &typecheck_request("demo"), 120).unwrap()
@@ -599,11 +651,10 @@ fn pyright_exit_code_and_diagnostics_status_matrix() {
             }
         });
         let bin = tempfile::tempdir().unwrap();
-        let script = format!(
-            "#!/bin/sh\ncat <<'EOF'\n{json}\nEOF\nexit {}\n",
-            case.exit_code
+        write_fake_pyright(
+            bin.path(),
+            &FakePyrightSpec::new(json.to_string(), case.exit_code),
         );
-        write_fake_pyright(bin.path(), &script);
         let response = with_path(bin.path(), || {
             execute_validation_at_root(root, &typecheck_request("demo"), 120).unwrap()
         });
@@ -646,8 +697,7 @@ fn missing_summary_counts_errors_before_diagnostic_truncation() {
     }));
     let json = serde_json::json!({ "generalDiagnostics": diagnostics });
     let bin = tempfile::tempdir().unwrap();
-    let script = format!("#!/bin/sh\ncat <<'EOF'\n{json}\nEOF\nexit 0\n");
-    write_fake_pyright(bin.path(), &script);
+    write_fake_pyright(bin.path(), &FakePyrightSpec::new(json.to_string(), 0));
 
     let response = with_path(bin.path(), || {
         execute_validation_at_root(root, &typecheck_request("demo"), 120).unwrap()
@@ -677,10 +727,8 @@ fn unicode_paths_and_messages_are_preserved_relative() {
     let abs = fs::canonicalize(&file).unwrap();
     let abs_json = abs.to_string_lossy().replace('\\', "\\\\");
     let bin = tempfile::tempdir().unwrap();
-    let script = format!(
-        r#"#!/bin/sh
-cat <<'EOF'
-{{
+    let stdout = format!(
+        r#"{{
   "generalDiagnostics": [
     {{
       "file": "{abs_json}",
@@ -694,12 +742,9 @@ cat <<'EOF'
     }}
   ],
   "summary": {{ "errorCount": 0, "warningCount": 0, "informationCount": 1 }}
-}}
-EOF
-exit 0
-"#
+}}"#
     );
-    write_fake_pyright(bin.path(), &script);
+    write_fake_pyright(bin.path(), &FakePyrightSpec::new(stdout, 0));
     let response = with_path(bin.path(), || {
         execute_validation_at_root(root, &typecheck_request("demo"), 120).unwrap()
     });

@@ -548,12 +548,16 @@ fn parse_login(args: &[String]) -> CliAction {
     let Some(code) = code else {
         return cli_parse_error("login needs --code with the pairing code".to_string());
     };
+    let base_dir = match base_dir_or_default(base_dir) {
+        Ok(dir) => dir,
+        Err(message) => return cli_parse_error(message),
+    };
     CliAction::Login(LoginOptions {
         server_url,
         code,
         device: device.unwrap_or_else(default_device_name),
         device_explicit,
-        base_dir: base_dir_or_default(base_dir),
+        base_dir,
         transport,
         allowed_roots,
         overwrite,
@@ -610,10 +614,14 @@ fn parse_logout(args: &[String]) -> CliAction {
     let Some(server_url) = server_url else {
         return cli_parse_error("logout needs a server URL".to_string());
     };
+    let base_dir = match base_dir_or_default(base_dir) {
+        Ok(dir) => dir,
+        Err(message) => return cli_parse_error(message),
+    };
     CliAction::Logout(LogoutOptions {
         server_url,
         username,
-        base_dir: base_dir_or_default(base_dir),
+        base_dir,
         yes,
         json,
     })
@@ -644,10 +652,11 @@ fn parse_status(args: &[String]) -> CliAction {
         }
         index += 1;
     }
-    CliAction::Status(StatusOptions {
-        base_dir: base_dir_or_default(base_dir),
-        json,
-    })
+    let base_dir = match base_dir_or_default(base_dir) {
+        Ok(dir) => dir,
+        Err(message) => return cli_parse_error(message),
+    };
+    CliAction::Status(StatusOptions { base_dir, json })
 }
 
 fn cli_parse_error(message: String) -> CliAction {
@@ -1231,12 +1240,13 @@ fn parse_agent_run(args: &[String]) -> Result<InternalRunOptions, String> {
         .as_deref()
         .map(validate_client_profile)
         .transpose()?;
-    let config = config.unwrap_or_else(|| {
-        profile
-            .as_deref()
-            .map(client_profile_agent_config)
-            .unwrap_or_else(|| PathBuf::from("/etc/webcodex/agent.toml"))
-    });
+    let config = match config {
+        Some(config) => config,
+        None => match profile.as_deref() {
+            Some(profile) => client_profile_agent_config(profile)?,
+            None => PathBuf::from("/etc/webcodex/agent.toml"),
+        },
+    };
     let bin = discover_internal_binary("webcodex-runner").ok_or_else(|| {
         "webcodex-runner was not found beside webcodex or in an absolute PATH entry".to_string()
     })?;
@@ -1362,24 +1372,28 @@ fn parse_agent_service_action(
         .and_then(|name| name.to_str())
         .unwrap_or(AGENT_SERVICE_UNIT)
         .to_string();
+    let local_profile = if scope_explicit {
+        None
+    } else {
+        match profile.as_deref() {
+            Some(profile) => Some(LocalProfileOptions {
+                config: client_profile_agent_config(profile)?,
+                state_dir: client_profile_state_dir(profile)?,
+            }),
+            None => None,
+        }
+    };
     Ok(ServiceActionOptions {
         scope,
         service_file,
         unit,
         kind: parse_service_kind(command, &remaining)?,
-        local_profile: if scope_explicit {
-            None
-        } else {
-            profile.as_deref().map(|profile| LocalProfileOptions {
-                config: client_profile_agent_config(profile),
-                state_dir: client_profile_state_dir(profile),
-            })
-        },
+        local_profile,
     })
 }
 
 fn parse_server_init(args: &[String]) -> Result<ServerInitOptions, String> {
-    let defaults = default_server_paths();
+    let defaults = default_server_paths()?;
     let mut opts = ServerInitOptions {
         listen: "127.0.0.1:8080".to_string(),
         data_dir: defaults.data_dir,
@@ -1629,7 +1643,7 @@ fn parse_agent_status_with_identity(
         .transpose()?;
     opts.config = match (config, profile.as_deref(), scope_explicit) {
         (Some(config), _, _) => config,
-        (None, Some(profile), false) => client_profile_agent_config(profile),
+        (None, Some(profile), false) => client_profile_agent_config(profile)?,
         (None, profile, _) => agent_config_for_scope(scope, profile)?,
     };
     opts.service_file = service_file
@@ -1638,20 +1652,20 @@ fn parse_agent_status_with_identity(
     validate_service_file_scope(scope, &opts.service_file)?;
     if let Some(profile) = profile {
         if !scope_explicit {
-            opts.local_state_dir = Some(client_profile_state_dir(&profile));
+            opts.local_state_dir = Some(client_profile_state_dir(&profile)?);
         }
         if opts.user_token_file.is_none() {
             opts.user_token_file = Some(if scope_explicit {
                 client_profile_user_token_file_for_scope(scope, &profile)?
             } else {
-                client_profile_user_token_file(&profile)
+                client_profile_user_token_file(&profile)?
             });
         }
         if opts.agent_token_file.is_none() {
             opts.agent_token_file = Some(if scope_explicit {
                 client_profile_agent_token_file_for_scope(scope, &profile)?
             } else {
-                client_profile_agent_token_file(&profile)
+                client_profile_agent_token_file(&profile)?
             });
         }
     }
@@ -1737,7 +1751,7 @@ fn parse_server_install_service(args: &[String]) -> Result<ServerInstallServiceO
 fn parse_server_status(args: &[String]) -> Result<ServerStatusOptions, String> {
     let mut opts = ServerStatusOptions {
         url: "http://127.0.0.1:8080".to_string(),
-        env_file: Some(default_server_paths().env_file),
+        env_file: Some(default_server_paths()?.env_file),
         env_file_explicit: false,
         token_file: None,
         json: false,
@@ -1865,7 +1879,7 @@ fn parse_client_enroll(args: &[String]) -> Result<ClientEnrollOptions, String> {
         output_dir
     } else {
         let profile = validate_client_profile(profile.as_deref().unwrap_or(&client_id))?;
-        default_client_output_dir_for_profile(&profile)
+        default_client_output_dir_for_profile(&profile)?
     };
     if output_dir.as_os_str().is_empty() {
         return Err("--output-dir cannot be empty".to_string());
@@ -1960,17 +1974,17 @@ fn parse_cli_agent_init(args: &[String]) -> Result<AgentInitOptions, String> {
         .transpose()?
     {
         if !output_explicit {
-            opts.output = client_profile_agent_config(&profile);
+            opts.output = client_profile_agent_config(&profile)?;
         }
         if !projects_dir_explicit {
-            opts.projects_dir = client_profile_projects_dir(&profile);
+            opts.projects_dir = client_profile_projects_dir(&profile)?;
         }
     } else {
         if !output_explicit && opts.output.as_os_str().is_empty() {
             let profile = validate_client_profile(&opts.client_id)?;
-            opts.output = client_profile_agent_config(&profile);
+            opts.output = client_profile_agent_config(&profile)?;
             if !projects_dir_explicit {
-                opts.projects_dir = client_profile_projects_dir(&profile);
+                opts.projects_dir = client_profile_projects_dir(&profile)?;
             }
         } else if !projects_dir_explicit {
             opts.projects_dir = PathBuf::from(DEFAULT_INIT_PROJECTS_DIR);
@@ -2074,9 +2088,42 @@ where
         .ok_or_else(|| format!("{} requires a value", flag))
 }
 
+/// Windows release boundary, evaluated before any command dispatch.
+///
+/// The supported Windows surface is the CLI + hosted/local-profile Runner
+/// talking to a remote Linux WebCodex Server. Operations that require a
+/// long-running local Windows Server (`webcodex server ...`, `webcodex
+/// share`) or a systemd-style service install (`webcodex agent install`)
+/// fail here with a clear platform message instead of reaching server or
+/// service logic that cannot work on Windows. `--help` is exempt so help
+/// output still renders normally; only real execution is blocked.
+#[cfg(windows)]
+fn windows_unsupported_platform_action(args: &[String]) -> Option<&'static str> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        return None;
+    }
+    match args.first().map(String::as_str) {
+        Some("server") | Some("share") => Some(
+            "Windows Server runtime is not supported in this release.\n\
+             Use `webcodex connect` with a remote WebCodex Server.",
+        ),
+        Some("agent") if args.get(1).map(String::as_str) == Some("install") => Some(
+            "Automatic Windows Runner startup is not supported yet.\n\
+             Use `webcodex connect` or `webcodex agent start --profile <name>.",
+        ),
+        _ => None,
+    }
+}
+
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    match cli_action(std::env::args().skip(1)) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(windows)]
+    if let Some(message) = windows_unsupported_platform_action(&args) {
+        eprintln!("{message}");
+        std::process::exit(1);
+    }
+    match cli_action(args) {
         CliAction::Project(args) => {
             let output = webcodex::run_project_command(args).await;
             if !output.stdout.is_empty() {

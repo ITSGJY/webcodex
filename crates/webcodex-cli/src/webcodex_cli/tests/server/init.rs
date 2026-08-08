@@ -114,8 +114,8 @@ fn agent_init_token_file_and_env_fallback() {
     let content = run_agent_init(opts).unwrap();
     assert!(content.contains("agent_fake_file_token"));
 
-    let _guard = admin_cli::TEST_ENV_LOCK.lock().unwrap();
-    std::env::set_var("WEBCODEX_AGENT_TOKEN", "agent_fake_env_token");
+    let _guard = env_test_guard();
+    let _env = EnvGuard::new().set("WEBCODEX_AGENT_TOKEN", "agent_fake_env_token");
     let opts = parse_cli_agent_init(&args(&[
         "--server-url",
         "https://v4.example.test",
@@ -131,7 +131,6 @@ fn agent_init_token_file_and_env_fallback() {
     .unwrap();
     let content = run_agent_init(opts).unwrap();
     assert!(content.contains("agent_fake_env_token"));
-    std::env::remove_var("WEBCODEX_AGENT_TOKEN");
 }
 
 #[test]
@@ -155,9 +154,12 @@ fn agent_init_empty_tokens_are_rejected() {
     assert!(err.contains("--token cannot be empty"), "{err}");
 }
 
+/// Unix-only: asserts the historical `$HOME` default for empty allowed_roots.
+/// Windows uses `USERPROFILE` instead (see `webcodex_agent_config::paths`).
+#[cfg(unix)]
 #[test]
 fn agent_init_allows_empty_allowed_roots_with_home_default() {
-    let _guard = agent_init::TEST_ENV_LOCK.lock().unwrap();
+    let _guard = env_test_guard();
     let home = std::env::var_os("HOME");
     if home.is_some() {
         let opts = parse_cli_agent_init(&args(&[

@@ -10,12 +10,14 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+use webcodex_agent_config::paths::paths_equal;
+use webcodex_process::{GracefulTermination, ManagedChild};
 
 const PROJECT_SCAN_CACHE_MS: u64 = 5000;
 const PROJECT_GIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -218,7 +220,10 @@ pub(crate) fn find_project_shell_context(
         .into_iter()
         .filter_map(|project| {
             let project_path = PathBuf::from(&project.path).canonicalize().ok()?;
-            if cwd == project_path || cwd.starts_with(&project_path) {
+            // Windows filesystems are case-insensitive and `canonicalize` may
+            // return `\\?\`-prefixed paths, so containment uses the shared
+            // path identity rules instead of raw `==`/`starts_with`.
+            if webcodex_agent_config::paths::path_is_within(&cwd, &project_path) {
                 Some((project_path.components().count(), project))
             } else {
                 None
@@ -273,48 +278,102 @@ fn spawn_bounded_git_reader(
     (rx, handle)
 }
 
-#[cfg(unix)]
-fn signal_project_git_group(process_group_id: u32, signal: i32) -> bool {
-    let Ok(process_group_id) = i32::try_from(process_group_id) else {
-        return false;
-    };
-    if process_group_id == 0 {
-        return false;
-    }
-    // SAFETY: each helper below places Git in a private process group.
-    (unsafe { libc::kill(-process_group_id, signal) }) == 0
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-}
-
-fn terminate_project_git_child(
-    child: &mut std::process::Child,
-    process_group_id: u32,
+/// Terminate the whole Git process tree within one shared cleanup deadline,
+/// then reap the direct child and confirm the complete tree exited.
+///
+/// The platform tree isolation lives in [`ManagedChild`]: a private process
+/// group on Unix, a kill-on-close Job Object on Windows. Phase 1 (Unix only)
+/// requests graceful tree termination and gives the tree a short bounded grace
+/// to exit on its own; Windows reports [`GracefulTermination::Unsupported`]
+/// and skips straight to phase 2. Phase 2 forcefully terminates any tree that
+/// is still alive. Then the direct child is reaped and the complete tree (not
+/// just the direct child) is confirmed exited — all within `deadline`. The
+/// direct child's `ExitStatus`, when it can still be obtained, is returned;
+/// failures are joined into one error string, but cleanup never gives up early
+/// because a graceful request failed.
+fn terminate_project_git_tree(
+    child: &mut ManagedChild,
     deadline: Instant,
-) {
-    #[cfg(unix)]
-    {
-        let _ = signal_project_git_group(process_group_id, libc::SIGTERM);
-        let grace = deadline.min(Instant::now() + Duration::from_millis(50));
-        while Instant::now() < grace {
-            if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
+) -> Result<Option<ExitStatus>, String> {
+    let mut errors = Vec::new();
+
+    match child.request_terminate_tree() {
+        Ok(GracefulTermination::Requested) => {
+            // The whole tree received a graceful termination request. Give it
+            // a short bounded grace to exit on its own; the grace never
+            // extends past the overall cleanup deadline.
+            let grace_deadline = deadline.min(Instant::now() + Duration::from_millis(50));
+            let remaining = grace_deadline.saturating_duration_since(Instant::now());
+            match child.wait_tree_exit(remaining) {
+                Ok(_) => {}
+                Err(error) => {
+                    errors.push(format!("git graceful termination wait failed: {error}"));
+                }
+            }
+        }
+        Ok(GracefulTermination::AlreadyExited) => {
+            // The owned tree was already fully gone; nothing to signal or wait for.
+        }
+        Ok(GracefulTermination::Unsupported) => {
+            // Windows: no generic graceful tree termination. Escalate below.
+        }
+        Err(error) => {
+            errors.push(format!("git graceful termination request failed: {error}"));
+        }
+    }
+
+    // Forceful phase: any tree still alive is terminated as a whole.
+    let tree_alive = match child.try_tree_exit() {
+        Ok(exited) => !exited,
+        Err(error) => {
+            errors.push(format!("git tree liveness probe failed: {error}"));
+            true
+        }
+    };
+    if tree_alive {
+        if let Err(error) = child.terminate_tree() {
+            errors.push(format!("git tree termination failed: {error}"));
+        }
+    }
+
+    // Reap the direct child within the remaining deadline.
+    let mut status = None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(exit_status)) => {
+                status = Some(exit_status);
                 break;
             }
-            thread::sleep(
-                Duration::from_millis(10).min(grace.saturating_duration_since(Instant::now())),
-            );
+            Ok(None) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    errors.push("git child reap timed out".to_string());
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10).min(remaining));
+            }
+            Err(error) => {
+                errors.push(format!("git child reap failed: {error}"));
+                break;
+            }
         }
-        let _ = signal_project_git_group(process_group_id, libc::SIGKILL);
     }
-    #[cfg(not(unix))]
-    let _ = child.kill();
 
-    while Instant::now() < deadline {
-        if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
-            return;
-        }
-        thread::sleep(
-            Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
-        );
+    // Confirm the complete tree exited, not just the direct child. Forceful
+    // termination can complete asynchronously (notably Job Object teardown on
+    // Windows), so use the remaining shared cleanup budget rather than a
+    // single instantaneous probe.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match child.wait_tree_exit(remaining) {
+        Ok(true) => {}
+        Ok(false) => errors.push("git process tree did not exit before deadline".to_string()),
+        Err(error) => errors.push(format!("git tree exit wait failed: {error}")),
+    }
+
+    if errors.is_empty() {
+        Ok(status)
+    } else {
+        Err(errors.join("; "))
     }
 }
 
@@ -324,40 +383,46 @@ fn run_git_bounded(
     timeout: Duration,
     shutdown: Option<&AtomicBool>,
 ) -> Result<BoundedGitOutput, String> {
+    run_git_bounded_with_program("git", path, args, timeout, shutdown)
+}
+
+/// Test seam over `run_git_bounded`: the program name is passed in instead of
+/// being hardcoded to `"git"`, so lifecycle tests can drive a cross-platform
+/// fixture binary through the same bounded tree lifecycle. Production always
+/// calls [`run_git_bounded`], which passes `"git"`.
+fn run_git_bounded_with_program(
+    program: &str,
+    path: &Path,
+    args: &[&str],
+    timeout: Duration,
+    shutdown: Option<&AtomicBool>,
+) -> Result<BoundedGitOutput, String> {
     if shutdown.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
         return Err("git stopped during runner shutdown".to_string());
     }
-    let mut command = Command::new("git");
+    let mut command = Command::new(program);
     command
         .args(args)
         .current_dir(path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("failed to spawn git: {error}"))?;
-    let process_group_id = child.id();
-    let Some(stdout) = child.stdout.take() else {
-        terminate_project_git_child(
-            &mut child,
-            process_group_id,
-            Instant::now() + PROJECT_GIT_CLEANUP_TIMEOUT,
-        );
+    // ManagedChild owns the whole Git process tree: a private process group on
+    // Unix, a kill-on-close Job Object on Windows. Spawn remains direct process
+    // spawning with the standard Command spawn failure semantics.
+    let mut child = match ManagedChild::spawn(&mut command) {
+        Ok(child) => child,
+        Err(error) => return Err(format!("failed to spawn git: {error}")),
+    };
+    let Some(stdout) = child.child_mut().stdout.take() else {
+        let cleanup_deadline = Instant::now() + PROJECT_GIT_CLEANUP_TIMEOUT;
+        let _ = terminate_project_git_tree(&mut child, cleanup_deadline);
         return Err("git stdout pipe was unavailable".to_string());
     };
-    let Some(stderr) = child.stderr.take() else {
+    let Some(stderr) = child.child_mut().stderr.take() else {
         drop(stdout);
-        terminate_project_git_child(
-            &mut child,
-            process_group_id,
-            Instant::now() + PROJECT_GIT_CLEANUP_TIMEOUT,
-        );
+        let cleanup_deadline = Instant::now() + PROJECT_GIT_CLEANUP_TIMEOUT;
+        let _ = terminate_project_git_tree(&mut child, cleanup_deadline);
         return Err("git stderr pipe was unavailable".to_string());
     };
     let (stdout_rx, stdout_reader) = spawn_bounded_git_reader(stdout);
@@ -369,9 +434,11 @@ fn run_git_bounded(
             Ok(None) => {
                 let stopping = shutdown.is_some_and(|flag| flag.load(Ordering::SeqCst));
                 if stopping || Instant::now() >= deadline {
-                    terminate_project_git_child(
+                    // Cleanup and then report the stopping cause: the cleanup
+                    // outcome is deliberately not allowed to replace the
+                    // user-visible timeout/shutdown error.
+                    let _ = terminate_project_git_tree(
                         &mut child,
-                        process_group_id,
                         Instant::now() + PROJECT_GIT_CLEANUP_TIMEOUT,
                     );
                     return Err(if stopping {
@@ -386,9 +453,8 @@ fn run_git_bounded(
                 );
             }
             Err(error) => {
-                terminate_project_git_child(
+                let _ = terminate_project_git_tree(
                     &mut child,
-                    process_group_id,
                     Instant::now() + PROJECT_GIT_CLEANUP_TIMEOUT,
                 );
                 return Err(format!("failed to wait for git: {error}"));
@@ -397,15 +463,21 @@ fn run_git_bounded(
     };
 
     // A helper descendant must not keep either pipe open after Git itself
-    // exits. The private group makes this cleanup local to this command.
-    #[cfg(unix)]
-    let _ = signal_project_git_group(process_group_id, libc::SIGKILL);
-    let drain_deadline = Instant::now() + PROJECT_GIT_CLEANUP_TIMEOUT;
+    // exits. Direct-child exit alone is not tree exit: if descendants remain,
+    // clean up the surviving tree, then drain the bounded readers — all within
+    // one shared cleanup deadline so no operation gets a fresh independent one.
+    let cleanup_deadline = Instant::now() + PROJECT_GIT_CLEANUP_TIMEOUT;
+    match child.try_tree_exit() {
+        Ok(true) => {}
+        Ok(false) | Err(_) => {
+            let _ = terminate_project_git_tree(&mut child, cleanup_deadline);
+        }
+    }
     let stdout = stdout_rx
-        .recv_timeout(drain_deadline.saturating_duration_since(Instant::now()))
+        .recv_timeout(cleanup_deadline.saturating_duration_since(Instant::now()))
         .map_err(|_| "git stdout reader timed out".to_string())?;
     let stderr = stderr_rx
-        .recv_timeout(drain_deadline.saturating_duration_since(Instant::now()))
+        .recv_timeout(cleanup_deadline.saturating_duration_since(Instant::now()))
         .map_err(|_| "git stderr reader timed out".to_string())?;
     if stdout_reader.is_finished() {
         let _ = stdout_reader.join();
@@ -590,7 +662,17 @@ fn load_agent_project_summaries(
     cfg: &AgentConfig,
     shutdown: Option<&AtomicBool>,
 ) -> Vec<ShellAgentProjectSummary> {
-    load_agent_project_summaries_from_dir_with_shutdown(&projects_dir(cfg), shutdown)
+    // Loaded configs always carry a materialized projects_dir; a bare
+    // test-built config that cannot derive one reports the error instead of
+    // silently scanning a relative path.
+    let dir = match projects_dir(cfg) {
+        Ok(dir) => dir,
+        Err(error) => {
+            eprintln!("webcodex-runner: {error}");
+            return Vec::new();
+        }
+    };
+    load_agent_project_summaries_from_dir_with_shutdown(&dir, shutdown)
 }
 
 impl AgentProjectCache {
@@ -624,9 +706,69 @@ impl AgentProjectCache {
 /// explicitly under an `allowed_roots` entry. Even when `allow_cwd_anywhere`
 /// is true, these roots are rejected to prevent accidental registration of
 /// critical system paths.
+///
+/// On Windows the Unix entries can never match (a canonical Windows path has a
+/// drive prefix) and the Windows entries guard the OS/Program Files trees; any
+/// drive root (`C:\`, `D:\`, ...) is rejected by `is_windows_drive_root`.
 const DANGEROUS_PROJECT_ROOTS: &[&str] = &[
-    "/", "/etc", "/bin", "/sbin", "/usr", "/var", "/proc", "/sys", "/dev", "/run", "/boot",
+    "/",
+    "/etc",
+    "/bin",
+    "/sbin",
+    "/usr",
+    "/var",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/run",
+    "/boot",
+    #[cfg(windows)]
+    "C:\\Windows",
+    #[cfg(windows)]
+    "C:\\Program Files",
+    #[cfg(windows)]
+    "C:\\Program Files (x86)",
 ];
+
+/// True when `canonical_path` is a drive root like `C:\` (any drive letter).
+#[cfg(windows)]
+fn is_windows_drive_root(canonical_path: &Path) -> bool {
+    let mut components = canonical_path.components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Prefix(_)), Some(std::path::Component::RootDir))
+            if components.next().is_none()
+    )
+}
+
+#[cfg(not(windows))]
+fn is_windows_drive_root(_canonical_path: &Path) -> bool {
+    false
+}
+
+/// Windows-only fail-closed rule: project roots must be on a local disk drive
+/// (`C:\repo`, `D:\repo`, or the canonicalized `\\?\C:\repo` form). UNC
+/// (`\\server\share\repo`), verbatim-UNC (`\\?\UNC\...`), device-namespace
+/// (`\\.\...`) and every other non-disk Windows path prefix is rejected with
+/// the stable `unc_project_path_unsupported` error before any filesystem
+/// access happens.
+///
+/// The classification is grammar-based — the shared
+/// `webcodex_agent_config::paths::is_windows_local_disk_path` parses the
+/// Windows path prefix — never a string `starts_with` check.
+#[cfg(windows)]
+fn validate_windows_project_root(path: &Path) -> Result<(), &'static str> {
+    if webcodex_agent_config::paths::is_windows_local_disk_path(path) {
+        Ok(())
+    } else {
+        Err("unc_project_path_unsupported")
+    }
+}
+
+#[cfg(not(windows))]
+fn validate_windows_project_root(_path: &Path) -> Result<(), &'static str> {
+    Ok(())
+}
 
 /// Escape a string for use as a TOML basic string (double-quoted). NUL is
 /// rejected up front by validation, so we only handle backslash, quote, and
@@ -756,10 +898,23 @@ pub(crate) fn validate_project_path_policy(
     canonical_path: &Path,
 ) -> Result<(), String> {
     let path_str = canonical_path.to_string_lossy().to_string();
+    // Backstop: registration handlers reject non-local-disk paths with the
+    // dedicated `unc_project_path_unsupported` code before this function is
+    // reached, but the policy check itself must never bless one either (for
+    // example through an `allowed_roots` entry that names a UNC share).
+    #[cfg(windows)]
+    if !webcodex_agent_config::paths::is_windows_local_disk_path(canonical_path) {
+        return Err(format!(
+            "path {} is not on a local disk drive; UNC and other Windows network/device paths are not supported for projects",
+            path_str
+        ));
+    }
     // If under an explicit allowed_root, always allow.
     for root in &policy.allowed_roots {
         if let Ok(canonical_root) = canonicalize_existing(root) {
-            if canonical_path == &canonical_root || canonical_path.starts_with(&canonical_root) {
+            // Case-insensitive component-wise containment on Windows so
+            // `C:\Users\Alice` roots match `c:\users\alice\proj` projects.
+            if webcodex_agent_config::paths::path_is_within(canonical_path, &canonical_root) {
                 return Ok(());
             }
         }
@@ -774,9 +929,9 @@ pub(crate) fn validate_project_path_policy(
     for &dangerous in DANGEROUS_PROJECT_ROOTS {
         let dangerous_root = Path::new(dangerous);
         let is_dangerous = if dangerous_root == Path::new("/") {
-            canonical_path == dangerous_root
+            paths_equal(canonical_path, dangerous_root)
         } else {
-            canonical_path == dangerous_root || canonical_path.starts_with(dangerous_root)
+            webcodex_agent_config::paths::path_is_within(canonical_path, dangerous_root)
         };
         if is_dangerous {
             return Err(format!(
@@ -784,6 +939,12 @@ pub(crate) fn validate_project_path_policy(
                 path_str
             ));
         }
+    }
+    if is_windows_drive_root(canonical_path) {
+        return Err(format!(
+            "path {} is a Windows drive root; register it under an explicit allowed_roots entry if intended",
+            path_str
+        ));
     }
     Ok(())
 }
@@ -833,9 +994,26 @@ fn sync_parent_dir(path: &Path) -> Result<(), String> {
     let dir = path
         .parent()
         .ok_or_else(|| "project config has no parent".to_string())?;
-    std::fs::File::open(dir)
-        .and_then(|file| file.sync_all())
-        .map_err(|e| format!("failed to sync project registry directory: {e}"))
+    sync_dir(dir)
+}
+
+fn sync_dir(dir: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        // Opening a directory with `File::open` fails on Windows (it needs
+        // FILE_FLAG_BACKUP_SEMANTICS, which std does not expose), and NTFS
+        // metadata durability does not rely on directory fsync the way
+        // POSIX filesystems do. The rename is already atomic; skip the
+        // directory sync here.
+        let _ = dir;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::File::open(dir)
+            .and_then(|file| file.sync_all())
+            .map_err(|e| format!("failed to sync project registry directory: {e}"))
+    }
 }
 
 fn unique_registry_temp(dir: &Path, id: &str, suffix: &str) -> PathBuf {
@@ -936,7 +1114,8 @@ fn projects_matching_canonical_path(
         .iter()
         .filter_map(|project| {
             let registered_path = canonicalize_existing(Path::new(&project.path)).ok()?;
-            (registered_path.is_dir() && registered_path == canonical_path).then(|| project.clone())
+            (registered_path.is_dir() && paths_equal(&registered_path, canonical_path))
+                .then(|| project.clone())
         })
         .collect()
 }
@@ -999,7 +1178,9 @@ fn canonical_project_path_hash(canonical_path: &Path) -> String {
     #[cfg(not(unix))]
     format!(
         "{:x}",
-        Sha256::digest(canonical_path.to_string_lossy().as_bytes())
+        Sha256::digest(
+            webcodex_agent_config::paths::normalize_path_identity(canonical_path).as_bytes()
+        )
     )
 }
 
@@ -1174,6 +1355,17 @@ pub(crate) fn handle_resolve_or_register_project(
             )
         }
     };
+    // The raw input path is checked before any filesystem access so a UNC
+    // path is rejected as `unc_project_path_unsupported` even when the share
+    // is unreachable (which would otherwise surface as `project_path_not_found`).
+    if let Err(error_kind) = validate_windows_project_root(Path::new(path)) {
+        return structured_project_error_cmd(
+            start,
+            error_kind,
+            false,
+            serde_json::json!({"field": "path"}),
+        );
+    }
     let canonical_path = match canonicalize_existing(Path::new(path)) {
         Ok(path) => path,
         Err(_) => {
@@ -1185,6 +1377,17 @@ pub(crate) fn handle_resolve_or_register_project(
             )
         }
     };
+    // The canonical form is checked too: Windows canonicalization rewrites
+    // reachable UNC paths into `\\?\UNC\...`, which the raw check may not
+    // have seen verbatim.
+    if let Err(error_kind) = validate_windows_project_root(&canonical_path) {
+        return structured_project_error_cmd(
+            start,
+            error_kind,
+            false,
+            serde_json::json!({"field": "path"}),
+        );
+    }
     if !canonical_path.is_dir() {
         return structured_project_error_cmd(
             start,
@@ -1350,9 +1553,7 @@ fn cleanup_unregister_tombstones(projects_dir: &Path, id: &str) -> Result<(), St
         }
     }
     if changed {
-        std::fs::File::open(projects_dir)
-            .and_then(|file| file.sync_all())
-            .map_err(|e| format!("failed to sync project registry directory: {e}"))?;
+        sync_dir(projects_dir)?;
     }
     Ok(())
 }
@@ -1473,6 +1674,9 @@ pub(crate) fn handle_project_lifecycle_op(
             Ok(v) if v.is_dir() => v,
             _ => return project_error_cmd(start, "project_not_found"),
         };
+        if let Err(error_kind) = validate_windows_project_root(&canonical) {
+            return project_error_cmd(start, error_kind);
+        }
         if let Err(_) = validate_project_path_policy(policy, &canonical) {
             return project_error_cmd(start, "path_outside_allowed_roots");
         }
@@ -1514,7 +1718,7 @@ fn matching_existing_project(
     let content = std::fs::read_to_string(&config_path).map_err(|_| "operation_failed")?;
     let project = parse_agent_project_toml(&content).map_err(|_| "operation_failed")?;
     let matches = project.id == id
-        && project.path == path
+        && paths_equal(Path::new(&project.path), Path::new(path))
         && project.name.as_deref() == Some(name)
         && project.description.as_deref() == description
         && project.allow_patch == allow_patch
@@ -1619,6 +1823,9 @@ fn handle_managed_temporary_project(
         Ok(root) if root.is_dir() => root,
         _ => return project_error_cmd(start, "temporary_projects_root_unavailable"),
     };
+    if let Err(error_kind) = validate_windows_project_root(&canonical_root) {
+        return project_error_cmd(start, error_kind);
+    }
     if validate_project_path_policy(policy, &canonical_root).is_err() {
         return project_error_cmd(start, "temporary_projects_root_outside_allowed_roots");
     }
@@ -1810,8 +2017,17 @@ pub(crate) fn handle_project_op_with_temporary_projects_root(
             return err_cmd(start, e);
         }
     }
-    if path.is_empty() || path.contains('\0') || !path.starts_with('/') {
+    // `Path::is_absolute` is platform-correct: drive-letter and UNC paths
+    // (`C:\foo`, `\\server\share`) are absolute on Windows; bare `foo` or
+    // drive-relative `/foo` are not.
+    if path.is_empty() || path.contains('\0') || !Path::new(&path).is_absolute() {
         return err_cmd(start, "path must be a non-empty absolute path".to_string());
+    }
+    // Windows supports local-drive project roots only; UNC and other
+    // non-disk prefixes fail closed here, before the directory is touched,
+    // so an unreachable share cannot masquerade as a missing directory.
+    if let Err(error_kind) = validate_windows_project_root(Path::new(&path)) {
+        return project_error_cmd(start, error_kind);
     }
 
     let client_id = request.client_id.clone();
@@ -1852,6 +2068,9 @@ pub(crate) fn handle_project_op_with_temporary_projects_root(
         };
         if !canonical.is_dir() {
             return err_cmd(start, format!("path {} is not a directory", path));
+        }
+        if let Err(error_kind) = validate_windows_project_root(&canonical) {
+            return project_error_cmd(start, error_kind);
         }
         if validate_project_path_policy(policy, &canonical).is_err() {
             return project_error_cmd(start, "path_outside_allowed_roots");
@@ -1950,6 +2169,9 @@ pub(crate) fn handle_project_op_with_temporary_projects_root(
             }
         }
     };
+    if let Err(error_kind) = validate_windows_project_root(&canonical_for_policy) {
+        return project_error_cmd(start, error_kind);
+    }
     if validate_project_path_policy(policy, &canonical_for_policy).is_err() {
         return project_error_cmd(start, "path_outside_allowed_roots");
     }
@@ -2119,6 +2341,11 @@ pub(crate) fn handle_project_op_with_temporary_projects_root(
 mod durability_tests {
     use super::*;
 
+    /// Unix-only: verifies the POSIX directory-fsync contract (opening a
+    /// directory as a file). On Windows directory sync is intentionally
+    /// skipped because std cannot open directories with the required
+    /// FILE_FLAG_BACKUP_SEMANTICS.
+    #[cfg(unix)]
     #[test]
     fn registry_parent_sync_failures_are_not_ignored() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2187,106 +2414,471 @@ mod durability_tests {
     }
 }
 
-#[cfg(all(test, unix))]
-mod shutdown_tests {
+#[cfg(test)]
+mod git_lifecycle_tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::SystemTime;
 
-    fn process_exists(pid: i32) -> bool {
-        // A Git descendant that ignored SIGTERM is SIGKILL'd by the private
-        // process-group cleanup; once its parent (the Git leader) exits, it
-        // lingers as a zombie until reaped. `kill(pid, 0)` still succeeds for a
-        // zombie because the PID entry persists, so it cannot tell a reaped
-        // leader from an unreaped zombie. Treat a zombie (state `Z`) as gone
-        // on Linux; on other Unixes fall back to the kill probe, which is the
-        // best liveness signal available without `/proc`.
-        #[cfg(target_os = "linux")]
-        {
-            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-                return false;
-            };
-            // /proc/<pid>/stat is `pid (comm) state ...`; `comm` may contain
-            // spaces or parens, so split on the last `") "`.
-            return stat
-                .rsplit_once(") ")
-                .and_then(|(_, rest)| rest.chars().next())
-                .is_some_and(|state| state != 'Z');
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            // SAFETY: signal 0 only probes a test child pid read from our fixture.
-            (unsafe { libc::kill(pid, 0) }) == 0
-                || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    // -----------------------------------------------------------------------
+    // Git lifecycle regression coverage for the run_git_bounded ManagedChild
+    // migration. The scenarios run the real `validation_tree_helper` fixture
+    // (compiled at test time with rustc, exactly like the validation and job
+    // tree tests) through the `run_git_bounded_with_program` seam, so the same
+    // tests run on Windows and Unix without cmd, PowerShell, or bash. Each
+    // test tracks the real parent/descendant pids written to marker files and
+    // probes them with platform-native APIs, and every test reaps the tree it
+    // starts before returning.
+    // -----------------------------------------------------------------------
+
+    /// Compiled copy of the `validation_tree_helper` fixture, kept alive for
+    /// the whole test process so its binary path never disappears under a
+    /// running descendant.
+    struct GitTreeHelper {
+        _temp: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    static GIT_TREE_HELPER: OnceLock<Arc<GitTreeHelper>> = OnceLock::new();
+
+    fn helper_binary() -> PathBuf {
+        GIT_TREE_HELPER
+            .get_or_init(|| {
+                let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/webcodex_runner/validation/validation_tree_helper.rs");
+                let temp = tempfile::tempdir().unwrap();
+                let output = temp
+                    .path()
+                    .join(format!("git-tree-helper{}", std::env::consts::EXE_SUFFIX));
+                let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+                let result = Command::new(rustc)
+                    .arg("--edition=2021")
+                    .arg("--crate-name=webcodex_git_tree_helper")
+                    .arg(&source)
+                    .arg("-o")
+                    .arg(&output)
+                    .output()
+                    .expect("run rustc for git tree helper");
+                assert!(
+                    result.status.success(),
+                    "git tree helper compilation failed: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                Arc::new(GitTreeHelper {
+                    _temp: temp,
+                    path: output,
+                })
+            })
+            .path
+            .clone()
+    }
+
+    fn str_args(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A unique temp file, removed on drop.
+    struct CleanupPath(PathBuf);
+
+    impl std::ops::Deref for CleanupPath {
+        type Target = PathBuf;
+        fn deref(&self) -> &PathBuf {
+            &self.0
         }
     }
 
-    #[test]
-    fn project_git_scan_shutdown_kills_hanging_process_group_and_returns_bounded() {
-        let root = tempfile::tempdir().unwrap();
-        let status = Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(root.path())
-            .status()
-            .unwrap();
-        assert!(status.success());
-
-        let pid_path = root.path().join("fsmonitor.pid");
-        let hook = root.path().join("hanging-fsmonitor");
-        std::fs::write(
-            &hook,
-            format!(
-                "#!/bin/sh\ntrap '' TERM\nprintf '%s' \"$$\" > '{}'\nwhile :; do sleep 1; done\n",
-                pid_path.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let status = Command::new("git")
-            .args(["config", "core.fsmonitor", hook.to_string_lossy().as_ref()])
-            .current_dir(root.path())
-            .status()
-            .unwrap();
-        assert!(status.success());
-
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let worker_shutdown = Arc::clone(&shutdown);
-        let project = root.path().to_path_buf();
-        let started = Instant::now();
-        let worker = thread::spawn(move || {
-            run_git_bounded(
-                &project,
-                &["status", "--short"],
-                Duration::from_secs(5),
-                Some(worker_shutdown.as_ref()),
-            )
-        });
-        let ready_deadline = Instant::now() + Duration::from_secs(1);
-        while !pid_path.exists() && Instant::now() < ready_deadline {
-            thread::sleep(Duration::from_millis(10));
+    impl Drop for CleanupPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
         }
-        let hook_started = pid_path.exists();
-        shutdown.store(true, Ordering::SeqCst);
-        let result = worker.join().unwrap();
-        assert!(hook_started, "Git did not start the hanging fixture hook");
-        assert!(result.is_err());
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "project Git scan ignored the shutdown flag"
-        );
+    }
 
-        let hook_pid = std::fs::read_to_string(&pid_path)
+    fn unique_temp_path(tag: &str) -> CleanupPath {
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
-            .trim()
-            .parse::<i32>()
-            .unwrap();
-        let gone_deadline = Instant::now() + Duration::from_secs(1);
-        while process_exists(hook_pid) && Instant::now() < gone_deadline {
-            thread::sleep(Duration::from_millis(10));
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "wc-project-git-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        CleanupPath(path)
+    }
+
+    fn wait_until_file(path: &Path, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if path.exists() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Parse `KEY=<pid>` from a marker file written by the helper.
+    fn read_pid(marker: &Path, key: &str) -> u32 {
+        let text = std::fs::read_to_string(marker).expect("read pid marker");
+        text.lines()
+            .find_map(|line| {
+                line.strip_prefix(key)
+                    .and_then(|rest| rest.strip_prefix('='))
+                    .and_then(|value| value.trim().parse().ok())
+            })
+            .unwrap_or_else(|| panic!("marker {marker:?} missing {key}: {text}"))
+    }
+
+    #[cfg(windows)]
+    fn process_alive(pid: u32) -> bool {
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: OpenProcess returns a handle or NULL; NULL means the pid no
+        // longer exists (or is inaccessible, which also means not ours).
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code = 0u32;
+        // SAFETY: `handle` is valid; `exit_code` is a valid out-param.
+        let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+        // SAFETY: close the handle we opened.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+        ok == 1 && exit_code == 259 // 259 == STILL_ACTIVE
+    }
+
+    #[cfg(unix)]
+    fn process_alive(pid: u32) -> bool {
+        // SAFETY: signal 0 is an existence probe; the pid comes from our own
+        // test helper.
+        (unsafe { libc::kill(pid as i32, 0) }) == 0
+    }
+
+    /// Upper bound for the whole test body including cleanup; the fixture
+    /// sleeps far longer (600s), so any run exceeding this is a cleanup hang,
+    /// not a slow exit.
+    const BOUNDEDNESS_LIMIT: Duration = Duration::from_secs(15);
+
+    /// A. Normal completion: a short-lived process exits successfully, its
+    /// stdout/stderr are collected, and no cleanup stall occurs.
+    #[test]
+    fn normal_completion_collects_output_and_returns_bounded() {
+        let cwd = tempfile::tempdir().unwrap();
+        let program = helper_binary();
+        let started = Instant::now();
+        let output = run_git_bounded_with_program(
+            &program.to_string_lossy(),
+            cwd.path(),
+            &["sleep", "0", "7"],
+            Duration::from_secs(10),
+            None,
+        )
+        .expect("normal completion must succeed");
+        assert_eq!(output.status.code(), Some(7));
+        assert!(!output.stdout_capped);
+        assert!(!output.stderr_capped);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("VALIDATION_HELPER_STDOUT"), "{stdout}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("VALIDATION_HELPER_STDERR"), "{stderr}");
         assert!(
-            !process_exists(hook_pid),
-            "hanging Git descendant survived process-group cleanup"
+            started.elapsed() < BOUNDEDNESS_LIMIT,
+            "normal completion was not bounded"
+        );
+    }
+
+    /// B. Explicit timeout kills the whole tree: the direct Git process and
+    /// its pipe-holding descendant must both die, with the timeout error
+    /// unchanged.
+    #[test]
+    fn timeout_terminates_whole_tree() {
+        let parent_marker = unique_temp_path("timeout-parent");
+        let alive_marker = unique_temp_path("timeout-desc");
+        let cwd = tempfile::tempdir().unwrap();
+        let program = helper_binary();
+        let args = str_args(&[
+            "spawn-descendant-keepalive",
+            parent_marker.to_str().unwrap(),
+            alive_marker.to_str().unwrap(),
+            "600",
+        ]);
+        let started = Instant::now();
+        let result = thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                run_git_bounded_with_program(
+                    &program.to_string_lossy(),
+                    cwd.path(),
+                    &args.iter().map(String::as_str).collect::<Vec<_>>(),
+                    Duration::from_secs(2),
+                    None,
+                )
+            });
+            assert!(
+                wait_until_file(&parent_marker, Duration::from_secs(5)),
+                "parent marker never appeared"
+            );
+            assert!(
+                wait_until_file(&alive_marker, Duration::from_secs(5)),
+                "descendant marker never appeared"
+            );
+            let parent_pid = read_pid(&parent_marker, "PARENT_PID");
+            let descendant_pid = read_pid(&parent_marker, "DESCENDANT_PID");
+            // Both sleep 600s while the timeout is 2s, so both must still be
+            // alive when the timeout fires.
+            assert!(process_alive(parent_pid), "parent not alive before timeout");
+            assert!(
+                process_alive(descendant_pid),
+                "descendant not alive before timeout"
+            );
+            handle.join().expect("run_git_bounded panicked")
+        });
+        let error = match result {
+            Ok(_) => panic!("run_git_bounded must report a timeout, not success"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "git command timed out");
+        assert!(
+            started.elapsed() < BOUNDEDNESS_LIMIT,
+            "timeout cleanup not bounded"
+        );
+        assert!(
+            !process_alive(read_pid(&parent_marker, "PARENT_PID")),
+            "Git parent survived timeout cleanup"
+        );
+        assert!(
+            !process_alive(read_pid(&parent_marker, "DESCENDANT_PID")),
+            "Git descendant survived timeout cleanup"
+        );
+    }
+
+    /// C. Runner shutdown terminates the whole tree with the shutdown error
+    /// unchanged. Works on Windows and Linux.
+    #[test]
+    fn runner_shutdown_terminates_whole_tree() {
+        let parent_marker = unique_temp_path("shutdown-parent");
+        let alive_marker = unique_temp_path("shutdown-desc");
+        let cwd = tempfile::tempdir().unwrap();
+        let program = helper_binary();
+        let args = str_args(&[
+            "spawn-descendant-keepalive",
+            parent_marker.to_str().unwrap(),
+            alive_marker.to_str().unwrap(),
+            "600",
+        ]);
+        let shutdown = AtomicBool::new(false);
+        let started = Instant::now();
+        let result = thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                run_git_bounded_with_program(
+                    &program.to_string_lossy(),
+                    cwd.path(),
+                    &args.iter().map(String::as_str).collect::<Vec<_>>(),
+                    Duration::from_secs(60),
+                    Some(&shutdown),
+                )
+            });
+            assert!(
+                wait_until_file(&parent_marker, Duration::from_secs(5)),
+                "parent marker never appeared"
+            );
+            assert!(
+                wait_until_file(&alive_marker, Duration::from_secs(5)),
+                "descendant marker never appeared"
+            );
+            let parent_pid = read_pid(&parent_marker, "PARENT_PID");
+            let descendant_pid = read_pid(&parent_marker, "DESCENDANT_PID");
+            assert!(
+                process_alive(parent_pid),
+                "parent not alive before shutdown"
+            );
+            assert!(
+                process_alive(descendant_pid),
+                "descendant not alive before shutdown"
+            );
+            shutdown.store(true, Ordering::SeqCst);
+            handle.join().expect("run_git_bounded panicked")
+        });
+        let error = match result {
+            Ok(_) => panic!("run_git_bounded must report shutdown, not success"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "git stopped during runner shutdown");
+        assert!(
+            started.elapsed() < BOUNDEDNESS_LIMIT,
+            "shutdown cleanup not bounded"
+        );
+        assert!(
+            !process_alive(read_pid(&parent_marker, "PARENT_PID")),
+            "Git parent survived runner shutdown"
+        );
+        assert!(
+            !process_alive(read_pid(&parent_marker, "DESCENDANT_PID")),
+            "Git descendant survived runner shutdown"
+        );
+    }
+
+    /// D. The direct Git process exits while its descendant survives and holds
+    /// the captured pipes. Direct-child exit alone must not finish cleanup:
+    /// the surviving tree is terminated, the readers reach EOF, and
+    /// run_git_bounded returns without an indefinite reader wait.
+    #[test]
+    fn parent_exit_alone_does_not_finish_cleanup() {
+        let parent_marker = unique_temp_path("parent-first");
+        let alive_marker = unique_temp_path("parent-first-desc");
+        let cwd = tempfile::tempdir().unwrap();
+        let program = helper_binary();
+        let args = str_args(&[
+            "spawn-descendant",
+            parent_marker.to_str().unwrap(),
+            alive_marker.to_str().unwrap(),
+            "600",
+        ]);
+        let started = Instant::now();
+        let output = thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                run_git_bounded_with_program(
+                    &program.to_string_lossy(),
+                    cwd.path(),
+                    &args.iter().map(String::as_str).collect::<Vec<_>>(),
+                    Duration::from_secs(30),
+                    None,
+                )
+            });
+            // The direct child exits almost immediately after spawning its
+            // descendant. The descendant's marker appears only if it actually
+            // ran, so its existence proves the descendant was alive after the
+            // direct child exited.
+            assert!(
+                wait_until_file(&alive_marker, Duration::from_secs(5)),
+                "descendant marker never appeared"
+            );
+            handle.join().expect("run_git_bounded panicked")
+        })
+        .expect("direct-parent exit must not turn into an error");
+        assert!(
+            output.status.success(),
+            "direct child exited 0; tree cleanup must not change its status"
+        );
+        // The captured stdout contains the helper's pid line only when the
+        // reader hit EOF, which requires every descendant holding the pipe to
+        // be gone. A cleanup that stops at the direct child leaves stdout
+        // stuck at the un-flushed line or empty.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("DESCENDANT_PID="),
+            "stdout reader never reached EOF: {stdout}"
+        );
+        assert!(
+            !process_alive(read_pid(&parent_marker, "DESCENDANT_PID")),
+            "descendant survived cleanup after direct child exit"
+        );
+        assert!(
+            started.elapsed() < BOUNDEDNESS_LIMIT,
+            "parent-exit cleanup not bounded"
+        );
+    }
+
+    /// E. A SIGTERM-resistant tree is escalated to force: the graceful request
+    /// gets a short bounded grace, then the whole tree is killed. Never
+    /// unbounded. (Windows has no generic graceful tree termination, so there
+    /// is nothing to escalate from there.)
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_resistant_tree_is_forcefully_escalated() {
+        let parent_marker = unique_temp_path("resist-parent");
+        let alive_marker = unique_temp_path("resist-desc");
+        let cwd = tempfile::tempdir().unwrap();
+        let program = helper_binary();
+        let args = str_args(&[
+            "ignore-term-keepalive",
+            parent_marker.to_str().unwrap(),
+            alive_marker.to_str().unwrap(),
+            "600",
+        ]);
+        let started = Instant::now();
+        let result = thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                run_git_bounded_with_program(
+                    &program.to_string_lossy(),
+                    cwd.path(),
+                    &args.iter().map(String::as_str).collect::<Vec<_>>(),
+                    Duration::from_secs(2),
+                    None,
+                )
+            });
+            assert!(
+                wait_until_file(&parent_marker, Duration::from_secs(5)),
+                "parent marker never appeared"
+            );
+            assert!(
+                wait_until_file(&alive_marker, Duration::from_secs(5)),
+                "descendant marker never appeared"
+            );
+            let parent_pid = read_pid(&parent_marker, "PARENT_PID");
+            let descendant_pid = read_pid(&parent_marker, "DESCENDANT_PID");
+            assert!(process_alive(parent_pid), "parent not alive before timeout");
+            assert!(
+                process_alive(descendant_pid),
+                "descendant not alive before timeout"
+            );
+            handle.join().expect("run_git_bounded panicked")
+        });
+        let error = match result {
+            Ok(_) => panic!("run_git_bounded must report a timeout, not success"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "git command timed out");
+        // Both processes ignore SIGTERM (inherited SIG_IGN), so only the
+        // forceful escalation can have ended them.
+        assert!(
+            !process_alive(read_pid(&parent_marker, "PARENT_PID")),
+            "SIGTERM-resistant parent survived escalation"
+        );
+        assert!(
+            !process_alive(read_pid(&parent_marker, "DESCENDANT_PID")),
+            "SIGTERM-resistant descendant survived escalation"
+        );
+        assert!(
+            started.elapsed() < BOUNDEDNESS_LIMIT,
+            "SIGTERM-resistant cleanup not bounded"
+        );
+    }
+
+    /// F. Spawn failure keeps the standard direct-spawn failure semantics with
+    /// the existing user-visible error prefix.
+    #[test]
+    fn spawn_failure_reports_spawn_error() {
+        let cwd = tempfile::tempdir().unwrap();
+        let error = match run_git_bounded_with_program(
+            "webcodex-git-command-that-does-not-exist-xyz",
+            cwd.path(),
+            &["--version"],
+            Duration::from_secs(5),
+            None,
+        ) {
+            Ok(_) => panic!("spawn of a nonexistent executable must fail"),
+            Err(error) => error,
+        };
+        assert!(
+            error.starts_with("failed to spawn git"),
+            "unexpected spawn error: {error}"
+        );
+    }
+
+    /// Keep at least one real Git smoke path: production `run_git_bounded`
+    /// with the hardcoded `"git"` program.
+    #[test]
+    fn real_git_smoke_runs_through_managed_spawn() {
+        let cwd = tempfile::tempdir().unwrap();
+        let output = run_git_bounded(cwd.path(), &["--version"], Duration::from_secs(5), None)
+            .expect("real git must run through the managed spawn");
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("git version"),
+            "unexpected git --version output"
         );
     }
 }

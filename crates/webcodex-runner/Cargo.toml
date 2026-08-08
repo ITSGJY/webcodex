@@ -8,6 +8,7 @@ edition.workspace = true
 webcodex-agent-config = { path = "../webcodex-agent-config" }
 webcodex-core = { path = "../webcodex-core" }
 webcodex-persistent-shell = { path = "../webcodex-persistent-shell" }
+webcodex-process = { path = "../webcodex-process" }
 webcodex-sandbox = { path = "../webcodex-sandbox" }
 webcodex-workspace = { path = "../webcodex-workspace" }
 base64 = "0.22"
@@ -33,3 +34,11 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Windows-native process liveness probe for MCP tests (OpenProcess +
+# GetExitCodeProcess), the same probe approach webcodex-process already uses.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }

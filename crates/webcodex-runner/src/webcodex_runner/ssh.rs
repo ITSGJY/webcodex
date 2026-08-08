@@ -67,7 +67,9 @@ pub(crate) struct PreparedSshCommand {
 }
 
 /// A ready-to-spawn long-lived SSH shell command paired with the pool entry it
-/// reuses and the resource's default remote cwd.
+/// reuses and the resource's default remote cwd. Used only by the Unix remote
+/// persistent-shell transport.
+#[cfg(unix)]
 pub(crate) struct PreparedPersistentShellCommand {
     pub(crate) command: Command,
     pub(crate) key: SshConnectionKey,
@@ -90,7 +92,7 @@ impl SshConnectionPool {
     }
 
     /// Resolve a named resource, establish/reuse its control transport, and
-    /// construct one independent remote exec command.
+    /// build a direct SSH command that owns its local process group itself.
     pub(crate) fn prepare_command(
         &self,
         generation: u64,
@@ -99,6 +101,49 @@ impl SshConnectionPool {
         session_id: &str,
         cwd: Option<&str>,
         command: &str,
+    ) -> Result<PreparedSshCommand, String> {
+        self.prepare_command_inner(
+            generation,
+            config,
+            resource_name,
+            session_id,
+            cwd,
+            command,
+            true,
+        )
+    }
+
+    /// Build an SSH command whose process tree is owned by JobManager's
+    /// ManagedChild rather than the legacy setsid hook.
+    pub(crate) fn prepare_job_command(
+        &self,
+        generation: u64,
+        config: &SshConfig,
+        resource_name: &str,
+        session_id: &str,
+        cwd: Option<&str>,
+        command: &str,
+    ) -> Result<PreparedSshCommand, String> {
+        self.prepare_command_inner(
+            generation,
+            config,
+            resource_name,
+            session_id,
+            cwd,
+            command,
+            false,
+        )
+    }
+
+    fn prepare_command_inner(
+        &self,
+        generation: u64,
+        config: &SshConfig,
+        resource_name: &str,
+        session_id: &str,
+        cwd: Option<&str>,
+        command: &str,
+        configure_process_group: bool,
     ) -> Result<PreparedSshCommand, String> {
         if !cfg!(unix) {
             return Err("ssh_shell_unavailable: this Runner host does not support SSH resources; command was not started".to_string());
@@ -146,7 +191,9 @@ impl SshConnectionPool {
             .arg(&connection.control_path)
             .arg(&connection.host)
             .arg(remote_script);
-        configure_private_process_group(&mut ssh);
+        if configure_process_group {
+            configure_private_process_group(&mut ssh);
+        }
         Ok(PreparedSshCommand {
             command: ssh,
             key: connection.key,
@@ -169,6 +216,7 @@ impl SshConnectionPool {
     /// binary (no `-c` script); the Runner drives it over stdin. The long-lived
     /// channel reuses the same authenticated control socket (`ControlMaster=no
     /// -S <path>`) and never creates a second master.
+    #[cfg(unix)]
     pub(crate) fn prepare_persistent_shell_command(
         &self,
         generation: u64,

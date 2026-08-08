@@ -84,11 +84,13 @@ pub(crate) async fn run_connect(opts: ConnectOptions) -> Result<ConnectResult, S
     let config_base = opts
         .config_base
         .clone()
-        .unwrap_or_else(default_client_base_dir);
+        .map(Ok)
+        .unwrap_or_else(default_client_base_dir)?;
     let state_base = opts
         .state_base
         .clone()
-        .unwrap_or_else(default_client_state_base_dir);
+        .map(Ok)
+        .unwrap_or_else(default_client_state_base_dir)?;
     let resolved_key = resolve_key(
         &opts,
         &config_base,
