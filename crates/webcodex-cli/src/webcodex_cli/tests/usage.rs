@@ -44,6 +44,10 @@ fn project_doctor_and_hosted_connect_dispatch() {
         CliAction::Project(args) if args == ["doctor"]
     ));
     assert!(matches!(
+        cli_action(["share", "--tunnel", "none"]),
+        CliAction::Project(args) if args == ["share", "--tunnel", "none"]
+    ));
+    assert!(matches!(
         cli_action(["connect", "https://example.test", "--key", "shared-secret"]),
         CliAction::Connect(_)
     ));
@@ -125,6 +129,7 @@ fn unified_project_and_auth_commands_dispatch() {
         &["doctor", "--help"][..],
         &["task", "--help"][..],
         &["run", "--help"][..],
+        &["share", "--help"][..],
     ] {
         assert!(matches!(
             cli_action(args.iter().copied()),

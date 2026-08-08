@@ -252,11 +252,7 @@ pub(crate) fn setup(options: &ProjectCommandOptions) -> Result<SetupReport, Prod
                 Some("Restore the existing authentication material or remove this incomplete profile, then run webcodex setup."),
             ));
         }
-        let value = format!(
-            "webcodex_{}{}",
-            Uuid::new_v4().simple(),
-            Uuid::new_v4().simple()
-        );
+        let value = generate_project_credential();
         write_new_private(&paths.connector_key, format!("{value}\n").as_bytes())?;
         changed.push("Connection".to_string());
     }
@@ -964,6 +960,14 @@ pub(super) fn read_toml_optional<T: for<'de> Deserialize<'de>>(
     }
 }
 
+pub(super) fn generate_project_credential() -> String {
+    format!(
+        "webcodex_{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    )
+}
+
 pub(super) fn read_private_value(path: &Path) -> Result<String, ProductError> {
     read_private_value_with_code(path, "project_registration_invalid")
 }
@@ -1030,7 +1034,7 @@ pub(super) fn create_private_dir(path: &Path) -> Result<(), ProductError> {
     Ok(())
 }
 
-fn write_new_private(path: &Path, content: &[u8]) -> Result<(), ProductError> {
+pub(super) fn write_new_private(path: &Path, content: &[u8]) -> Result<(), ProductError> {
     if let Some(parent) = path.parent() {
         create_private_dir(parent)?;
     }

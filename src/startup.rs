@@ -6,6 +6,7 @@ pub(crate) enum ProjectCliAction {
     Doctor(project_entry::ProjectCommandOptions),
     Status(project_entry::ProjectCommandOptions),
     Run(project_entry::ProjectCommandOptions),
+    Share(project_entry::ShareCommandOptions),
     Task(task_cli::TaskCliCommand),
     Exit {
         code: i32,
@@ -41,7 +42,7 @@ impl CliCommandOutput {
 
 pub fn is_project_command(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
-        Some("setup" | "doctor" | "status" | "run" | "task") => true,
+        Some("setup" | "doctor" | "status" | "run" | "share" | "task") => true,
         _ => false,
     }
 }
@@ -63,7 +64,7 @@ where
         };
     };
 
-    if matches!(command, "setup" | "doctor" | "status" | "run") {
+    if matches!(command, "setup" | "doctor" | "status" | "run" | "share") {
         if args.len() == 2 && matches!(args[1].as_str(), "--help" | "-h") {
             return ProjectCliAction::Exit {
                 code: 0,
@@ -71,14 +72,19 @@ where
                 stderr: String::new(),
             };
         }
-        return match project_entry::parse_options(&args[1..], command) {
-            Ok(options) => match command {
+        let parsed = if command == "share" {
+            project_entry::parse_share_options(&args[1..]).map(ProjectCliAction::Share)
+        } else {
+            project_entry::parse_options(&args[1..], command).map(|options| match command {
                 "setup" => ProjectCliAction::Setup(options),
                 "doctor" => ProjectCliAction::Doctor(options),
                 "status" => ProjectCliAction::Status(options),
                 "run" => ProjectCliAction::Run(options),
                 _ => unreachable!(),
-            },
+            })
+        };
+        return match parsed {
+            Ok(action) => action,
             Err(error) => ProjectCliAction::Exit {
                 code: 2,
                 stdout: String::new(),
@@ -184,6 +190,13 @@ pub async fn run_project_command(args: Vec<String>) -> CliCommandOutput {
                 format!("{}\n", project_entry::render_error(&error, false)),
             ),
         },
+        ProjectCliAction::Share(options) => match project_entry::share(&options).await {
+            Ok(()) => CliCommandOutput::success(String::new()),
+            Err(error) => CliCommandOutput::failure(
+                1,
+                format!("{}\n", project_entry::render_error(&error, false)),
+            ),
+        },
         ProjectCliAction::Task(command) => match task_cli::run(command) {
             Ok(stdout) => CliCommandOutput::success(format!("{stdout}\n")),
             Err(stderr) => CliCommandOutput::failure(1, format!("{stderr}\n")),
@@ -221,6 +234,17 @@ mod tests {
         assert!(matches!(
             project_cli_action(["run", "--root", "."]),
             ProjectCliAction::Run(_)
+        ));
+        assert!(matches!(
+            project_cli_action(["share", "--root", "."]),
+            ProjectCliAction::Share(_)
+        ));
+        assert!(matches!(
+            project_cli_action(["share", "--tunnel", "none"]),
+            ProjectCliAction::Share(project_entry::ShareCommandOptions {
+                tunnel: project_entry::TunnelProvider::None,
+                ..
+            })
         ));
     }
 

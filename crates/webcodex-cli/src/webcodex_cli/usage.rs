@@ -5,7 +5,8 @@ Project:\n\
   setup                         Configure the current Git project\n\
   doctor                        Diagnose project readiness\n\
   status                        Show concise project coding readiness\n\
-  run                           Run the current project runtime and local Agent\n\n\
+  run                           Run the current project runtime and local Agent\n\
+  share                         Temporarily share the local project over HTTPS\n\n\
 Account (quick start):\n\
   connect                       Connect a local project to a hosted Server\n\
   login                         Log this device into a server (one-time pairing code)\n\

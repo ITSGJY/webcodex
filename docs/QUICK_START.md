@@ -12,6 +12,7 @@ workflow session, executor reference, or internal config path.
   `webcodex-runner`).
 - Git available on `PATH`.
 - A Git project you can safely inspect and edit.
+- For the default `webcodex share` path only: `cloudflared` installed and available on `PATH`. If it is missing, install it from [Cloudflare's official downloads](https://developers.cloudflare.com/tunnel/downloads/); WebCodex does not silently install system packages.
 
 Install the packaged Linux x64 or macOS arm64 build:
 
@@ -57,12 +58,12 @@ missing, setup repairs only that component. If an existing field conflicts with
 the current Git root or profile, setup stops and names the conflicting field;
 it never overwrites the existing configuration.
 
-The Connector credential file and the Agent configuration contain the same
-secret and map to one stable, non-secret project grant identity. Both files are
+The persistent Connector credential and the Agent Token are separate secrets
+that map to the same stable, non-secret project grant identity. Their files are
 owner-only private state; plaintext is not written to the database. Runtime
-verification hashes the candidate and compares it in constant time. This path
-is separate from ordinary shared-key quick start: unknown Bearer values are
-rejected in project mode.
+verification hashes credential candidates and compares them in constant time.
+This path is separate from ordinary shared-key quick start: unknown Bearer
+values are rejected in project mode.
 
 Setup never rotates a surviving credential silently. If the credential is
 lost, restore both matching private files. If it is unrecoverable, stop the
@@ -81,7 +82,7 @@ action` with:
 
 ```text
 Next:
-  webcodex agent start
+  webcodex run
 ```
 
 Each finding has a stable `name`, `status`, `code`, `summary`, and
@@ -90,13 +91,13 @@ Each finding has a stable `name`, `status`, `code`, `summary`, and
 ## 3. Start the Local Runtime
 
 ```bash
-webcodex agent start
+webcodex run
 ```
 
-This explicit foreground action starts the project-bound loopback server and
+This canonical foreground action starts the project-bound loopback Server and
 local Agent. It does not install a service. Leave the terminal open; Ctrl-C
 stops both processes. Loopback does not bypass authentication: only the exact
-configured Project Credential can reach this project's Connector and Agent.
+configured Project Credential can reach this project's Connector.
 
 In another terminal, from the same project:
 
@@ -125,11 +126,55 @@ repository switches project context, and returning restores that repository's
 prior work. `task_list` and `task_resume` are only needed for explicit recovery
 when the client can no longer present its transport window identity.
 
-Hosted ChatGPT cannot reach a loopback address. An operator must provide an
-approved HTTPS endpoint and authentication without changing the project
-binding. See [DEPLOYMENT.md](DEPLOYMENT.md), [MCP.md](MCP.md), or
-[GPT_ACTIONS.md](GPT_ACTIONS.md). Setup deliberately does not create a tunnel
-or expose a port.
+### Install `cloudflared` for temporary sharing
+
+The default `webcodex share` path uses Cloudflare Quick Tunnel. Install
+`cloudflared` with Cloudflare's official package path if it is not already on
+`PATH`:
+
+```bash
+# macOS
+brew install cloudflared
+
+# Debian / Ubuntu: one copy-paste command using Cloudflare's official APT repository
+sudo mkdir -p --mode=0755 /usr/share/keyrings && curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null && echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" | sudo tee /etc/apt/sources.list.d/cloudflared.list >/dev/null && sudo apt-get update && sudo apt-get install -y cloudflared
+```
+
+See Cloudflare's [official downloads and installation instructions](https://developers.cloudflare.com/tunnel/downloads/) for other platforms.
+WebCodex never silently installs system packages or elevates privileges.
+
+Hosted ChatGPT cannot reach a loopback address. For temporary development or
+testing access from a hosted MCP client, stop `webcodex run` and run:
+
+```bash
+webcodex share
+```
+
+`share` reuses the same project-first setup and local runtime, but starts a
+Cloudflare Quick Tunnel and a separate temporary Connector credential. It
+prints a temporary `https://*.trycloudflare.com/mcp` URL and Bearer token; both
+stop being usable when the command exits.
+
+For ChatGPT Developer Mode, create a custom app with that `/mcp` URL. If the
+authentication menu offers **Access token/API key**, choose it, paste the
+printed temporary Bearer credential, and run **Scan Tools**. Anyone who has that
+credential can modify this project and run commands allowed by the share runtime
+while the session is active, so keep it private.
+
+`webcodex share --tunnel none` starts the same share runtime without a public
+tunnel for local debugging. Quick Tunnels are not a production deployment
+mechanism.
+
+If Quick Tunnel startup fails and this machine already has a Cloudflare Tunnel
+configuration at `~/.cloudflared/config.yaml`, note that Cloudflare Quick Tunnels
+do not support that configuration file. Use a separate Quick Tunnel environment
+(or temporarily move that config out of the way), or use `--tunnel none` for
+local-only debugging.
+
+For a stable long-lived endpoint, use a stable HTTPS domain/tunnel, service
+management, and OAuth or another production authentication path. See
+[DEPLOYMENT.md](DEPLOYMENT.md), [MCP.md](MCP.md), or
+[GPT_ACTIONS.md](GPT_ACTIONS.md).
 
 ## 5. Run the Golden Coding Path
 
@@ -260,8 +305,8 @@ Common stable codes:
 | `project_registration_invalid` | Existing state conflicts or is incomplete | Resolve the named field, then rerun setup |
 | `project_credential_invalid` | Private credential state is missing, unreadable, unsafe, malformed, or mismatched | Restore both matching private files or explicitly recreate the profile |
 | `project_credential_rejected` | The server rejected the locally configured credential | Restore the matching credential; do not treat this as Agent offline |
-| `server_unreachable` | The loopback runtime cannot be reached | `webcodex agent start`, or inspect doctor |
-| `agent_offline` | Server is reachable but the local Agent is unavailable | `webcodex agent start` |
+| `server_unreachable` | The loopback runtime cannot be reached | `webcodex run`, or inspect doctor |
+| `agent_offline` | Server is reachable but the local Agent is unavailable | `webcodex run` |
 | `required_capability_unavailable` | The installed Agent is too old/incomplete | Upgrade all WebCodex binaries |
 | `structured_validation_unavailable` | The Agent lacks structured validation | Upgrade all WebCodex binaries |
 | `workspace_unavailable` | Git or the configured project path is unavailable | Restore the path/Git workspace |
@@ -294,7 +339,7 @@ you cannot judge a command you cannot see. That has a consequence:
 - To turn previews off entirely:
 
   ```bash
-  WEBCODEX_ACTIVITY_COMMAND_PREVIEW=0 webcodex agent start
+  WEBCODEX_ACTIVITY_COMMAND_PREVIEW=0 webcodex run
   ```
 
   The tool, paths, and outcome are still recorded; only the command text is

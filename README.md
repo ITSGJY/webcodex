@@ -49,6 +49,51 @@ profile shown by the first run:
 webcodex agent start --profile <profile>
 ```
 
+### Temporary local sharing
+
+If you do not have a hosted Server and only need temporary access to the current
+computer, use `webcodex share`. The default path uses a Cloudflare Quick Tunnel,
+which does not require a Cloudflare account.
+
+Install `cloudflared` first if needed. These commands follow Cloudflare's
+[official installation instructions](https://developers.cloudflare.com/tunnel/downloads/):
+
+```bash
+# macOS
+brew install cloudflared
+
+# Debian / Ubuntu: one copy-paste command using Cloudflare's official APT repository
+sudo mkdir -p --mode=0755 /usr/share/keyrings && curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null && echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" | sudo tee /etc/apt/sources.list.d/cloudflared.list >/dev/null && sudo apt-get update && sudo apt-get install -y cloudflared
+```
+
+Then share the current project:
+
+```bash
+cd /path/to/your/repository
+webcodex share
+```
+
+`share` performs the idempotent project setup when needed, starts the local
+Server and Agent, creates a separate temporary Project Connector credential,
+and exposes `/mcp` through the Quick Tunnel. WebCodex does not silently install
+system packages. The printed HTTPS URL and Bearer credential are valid only for
+that share session; Ctrl-C stops the runtime and tunnel and removes the temporary
+credential.
+
+In ChatGPT Developer Mode, create a custom app with the printed `/mcp` URL. If
+your workspace offers **Access token/API key** authentication, choose it, paste
+the temporary Bearer credential, and run **Scan Tools**. ChatGPT UI labels and
+availability can vary by workspace and rollout. Treat this credential as live
+coding access: anyone who has it can modify this project and run commands allowed
+by the share runtime while the session is active. Keep it private and stop
+sharing when finished.
+
+Use `webcodex share --tunnel none` for local-only debugging. Quick Tunnels are
+for development and testing, not stable production deployment. If Quick Tunnel
+startup fails and `~/.cloudflared/config.yaml` already exists, Cloudflare does
+not currently support Quick Tunnels with that default config present; use a
+separate Quick Tunnel environment or temporarily move the file out of the way.
+
 See [AI Onboarding](docs/AI_ONBOARDING.md) for managed accounts, custom servers,
 and other connection paths.
 
@@ -89,10 +134,11 @@ travel through the connection.
 
 | Goal | Recommended path |
 | --- | --- |
-| Connect one project immediately | Use the hosted quick start with `webcodex connect`. |
+| Connect one project through the hosted service | Use `webcodex connect <server>`. Only the Runner runs locally. |
+| Temporarily expose the current local project to ChatGPT/MCP | Use `webcodex share`; it starts local Server + Agent and a temporary Quick Tunnel. |
+| Keep everything local without public access | Use `webcodex setup` + `webcodex run` (or `webcodex share --tunnel none` for share debugging). |
+| Run a stable long-lived deployment | Self-host the Server with a stable HTTPS domain/tunnel, service management, and OAuth as needed. |
 | Use managed users, device enrollment, revocation, and audit | Use `webcodex login` and the managed deployment flow. |
-| Control the Server and data yourself | Deploy the Server with Docker Compose or systemd. |
-| Keep everything on one machine | Follow the loopback setup in the Quick Start guide. |
 
 ## Self-host the Server with Docker
 
@@ -136,8 +182,10 @@ services and advanced overrides.
 ## Client access
 
 - **ChatGPT over MCP:** create a Developer Mode custom app that points to the
-  Server `/mcp` endpoint. OAuth is supported for managed and self-hosted HTTPS
-  Servers; the setup below shows the current ChatGPT flow.
+  Server `/mcp` endpoint. For `webcodex share`, choose **Access token/API key**
+  when that option is available and paste the temporary Bearer credential.
+  Managed and self-hosted HTTPS Servers can use OAuth; the setup below shows
+  that long-lived ChatGPT flow.
 - **Other MCP clients:** use the Server `/mcp` endpoint with the credential
   produced by the selected setup flow. See [MCP](docs/MCP.md).
 - **GPT Actions:** OpenAPI-based GPT Actions remain available as an alternative
