@@ -91,7 +91,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(scenario: &str) -> Self {
-        Self::with_timeout(scenario, 1)
+        // The fake server binary is compiled on first use and spawned fresh;
+        // under parallel full-suite load a 1s MCP timeout flakes. The
+        // timeout-specific tests pass an explicit short timeout.
+        Self::with_timeout(scenario, 10)
     }
 
     fn with_timeout(scenario: &str, timeout_secs: u64) -> Self {
