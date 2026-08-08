@@ -7643,7 +7643,13 @@ fn register_project_rejects_dangerous_subpaths_without_explicit_root() {
         r"C:\Program Files (x86)\something",
     ];
     #[cfg(not(windows))]
-    let dangerous_paths: &[&str] = &["/etc/nginx", "/usr/local", "/var/lib", "/proc/self", "/dev/shm"];
+    let dangerous_paths: &[&str] = &[
+        "/etc/nginx",
+        "/usr/local",
+        "/var/lib",
+        "/proc/self",
+        "/dev/shm",
+    ];
     for path in dangerous_paths {
         let err = validate_project_path_policy(&policy, Path::new(path)).unwrap_err();
         assert!(err.contains("dangerous system root"), "{path}: {err}");
