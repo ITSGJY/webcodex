@@ -5,6 +5,7 @@ use super::config::{
 use super::output::CommandResult;
 use super::projects::find_project_shell_context;
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -231,10 +232,34 @@ fn apply_env_snapshot(cmd: &mut Command, env_snapshot: &HashMap<String, String>)
     }
 }
 
+/// On Windows, resolve a bare shell program name through the platform rules
+/// so an extensionless POSIX shim shadowing the real executable is never
+/// selected (CreateProcess would fail with error 193). Path-qualified values
+/// are used verbatim; an unresolvable bare name falls back to the configured
+/// value so the spawn surfaces the real error.
+fn resolved_shell_program(program: &str) -> String {
+    #[cfg(windows)]
+    {
+        let path = Path::new(program);
+        if path.components().count() <= 1 && !path.is_absolute() {
+            if let Some(resolved) = super::util::resolve_program_in_path(
+                program,
+                std::env::var_os("PATH").as_deref().unwrap_or(OsStr::new("")),
+            ) {
+                return resolved.path().to_string_lossy().into_owned();
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = program;
+    program.to_string()
+}
+
 fn configured_shell_command(shell: &ShellConfig, command: &str) -> Result<Command, String> {
     validate_shell_config(shell)?;
     let dialect = resolve_dialect(&shell.program, shell.dialect);
-    let mut cmd = Command::new(&shell.program);
+    let program = resolved_shell_program(&shell.program);
+    let mut cmd = Command::new(program);
     for arg in &shell.args {
         cmd.arg(arg);
     }
@@ -268,7 +293,8 @@ pub(crate) fn configured_shell_job_command(
 ) -> Result<Command, String> {
     validate_shell_config(shell)?;
     let dialect = resolve_dialect(&shell.program, shell.dialect);
-    let mut cmd = Command::new(&shell.program);
+    let program = resolved_shell_program(&shell.program);
+    let mut cmd = Command::new(program);
     for arg in &shell.args {
         cmd.arg(arg);
     }
@@ -740,10 +766,12 @@ impl PreparedShellProfileCache {
                 prepare_cwd.display()
             )
         })?;
-        let program = profile
-            .program
-            .clone()
-            .unwrap_or_else(|| shell.program.clone());
+        let program = resolved_shell_program(
+            &profile
+                .program
+                .clone()
+                .unwrap_or_else(|| shell.program.clone()),
+        );
         let args = profile.args.clone().unwrap_or_else(|| shell.args.clone());
         // The profile inherits the parent shell dialect unless it (or the
         // parent) explicitly configures one; the prepare script and every
@@ -853,7 +881,8 @@ pub(crate) fn cwd_allowed(policy: &AgentPolicy, cwd: &Path) -> Result<(), String
     let cwd = canonicalize_existing(cwd)?;
     for root in &policy.allowed_roots {
         let root = canonicalize_existing(root)?;
-        if cwd == root || cwd.starts_with(&root) {
+        // Case-insensitive component-wise containment on Windows.
+        if webcodex_agent_config::paths::path_is_within(&cwd, &root) {
             return Ok(());
         }
     }

@@ -1,4 +1,4 @@
-use super::super::util::{find_executable_in_path, is_executable_file};
+use super::super::util::{find_executable_in_path, is_executable_file, resolve_program_in_path};
 use super::language::{profile_for_kind, LanguageProfile};
 use super::protocol::{read_message, write_message, FramingError, MAX_LSP_MESSAGE_BYTES};
 use serde_json::{json, Value};
@@ -998,10 +998,34 @@ impl LspSupervisor {
         let profile = profile_for_kind(kind);
         if let Some(program) = env_override {
             if !program.is_empty() {
-                return Some((
-                    command_with_default_args(program, profile),
-                    crate::lsp_bridge::LspCommandSource::Environment,
-                ));
+                #[cfg(windows)]
+                {
+                    // Resolve the override through the platform rules: bare
+                    // names are searched on PATH with PATHEXT, `.cmd` shims
+                    // resolve as batch programs, and extensionless POSIX
+                    // shims are never selected. An unresolvable override
+                    // means the tool is unavailable (fail closed rather than
+                    // spawning something that would error 193 at runtime).
+                    let ambient_path = env::var_os("PATH");
+                    let search_path = match path {
+                        Some(path) => path,
+                        None => ambient_path.as_deref().unwrap_or(OsStr::new("")),
+                    };
+                    let resolved = resolve_program_in_path(&program.to_string_lossy(), search_path)?;
+                    let resolved: OsString = resolved.path().as_os_str().to_os_string();
+                    return Some((
+                        command_with_default_args(resolved, profile),
+                        crate::lsp_bridge::LspCommandSource::Environment,
+                    ));
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = path;
+                    return Some((
+                        command_with_default_args(program, profile),
+                        crate::lsp_bridge::LspCommandSource::Environment,
+                    ));
+                }
             }
         }
         path.and_then(|path| find_executable_in_path(profile.executable, path))

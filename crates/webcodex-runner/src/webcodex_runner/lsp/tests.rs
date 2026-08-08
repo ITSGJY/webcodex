@@ -1150,11 +1150,18 @@ fn lsp_initialize_uses_constrained_typescript_profile() {
 fn lsp_default_args_apply_to_env_and_path_but_not_configured() {
     let _serial = super::super::serialize_fake_lsp_test();
     let supervisor = LspSupervisor::default();
+    // An env override must resolve to a concrete program: on Windows the
+    // file must exist and pass the native/PATHEXT rules (fail closed), on
+    // Unix any absolute path is accepted. A real temp-dir file is valid on
+    // both platforms.
+    let bin = tempfile::tempdir().unwrap();
+    let env_program = bin.path().join("pyright-langserver");
+    std::fs::write(&env_program, b"x").unwrap();
     // Pyright resolves from the env override with `--stdio` appended.
     let (from_env, source) = supervisor
         .resolve_command_from_sources(
             LspServerKind::Pyright,
-            Some(OsString::from("/opt/pyright-langserver")),
+            Some(OsString::from(&env_program)),
             Some(OsStr::new("")),
         )
         .unwrap();
@@ -1162,10 +1169,12 @@ fn lsp_default_args_apply_to_env_and_path_but_not_configured() {
     assert_eq!(from_env.args, vec![OsString::from("--stdio")]);
 
     // rust-analyzer declares no default args.
+    let rust_program = bin.path().join("rust-analyzer");
+    std::fs::write(&rust_program, b"x").unwrap();
     let (rust, _) = supervisor
         .resolve_command_from_sources(
             LspServerKind::RustAnalyzer,
-            Some(OsString::from("/opt/rust-analyzer")),
+            Some(OsString::from(&rust_program)),
             Some(OsStr::new("")),
         )
         .unwrap();

@@ -361,8 +361,20 @@ pub(crate) fn resolve_executable(env_override: &str, executable_name: &str) -> O
     if let Ok(value) = std::env::var(env_override) {
         let trimmed = value.trim();
         if !trimmed.is_empty() {
-            let path = PathBuf::from(trimmed);
-            return crate::webcodex_runner::util::is_executable_file(&path).then_some(path);
+            #[cfg(windows)]
+            {
+                // The override may be a bare name ("pyright"), a batch shim
+                // ("pyright.cmd") or a path; resolve through the platform
+                // rules so extensionless POSIX shims are never selected.
+                let path_var = std::env::var_os("PATH").unwrap_or_default();
+                return crate::webcodex_runner::util::resolve_program_in_path(trimmed, &path_var)
+                    .map(|program| program.path().to_path_buf());
+            }
+            #[cfg(not(windows))]
+            {
+                let path = PathBuf::from(trimmed);
+                return crate::webcodex_runner::util::is_executable_file(&path).then_some(path);
+            }
         }
     }
     let path_var = std::env::var_os("PATH")?;

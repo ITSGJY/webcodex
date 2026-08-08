@@ -7,6 +7,7 @@ use super::config::{ClaudeCodeMcpConfig, ToolProviderStrategy, ToolProvidersConf
 use super::files::sha256_hex_bytes;
 use super::output::CommandResult;
 use super::shell::cwd_allowed;
+use std::ffi::{OsStr, OsString};
 use super::shutdown::{lock_unpoison, SHUTDOWN_POLL_INTERVAL};
 use super::AgentPolicy;
 use crate::shell_protocol::{
@@ -1056,13 +1057,33 @@ struct McpShutdownResult {
     failures: usize,
 }
 
+/// Resolve the MCP program to a concrete path on Windows so an
+/// extensionless POSIX shim shadowing `claude.exe`/`claude.cmd` is never
+/// picked (CreateProcess would fail with error 193). Unix keeps the
+/// configured value verbatim.
+fn mcp_program(command: &str) -> OsString {
+    #[cfg(windows)]
+    {
+        if let Some(program) = super::util::resolve_program_in_path(
+            command,
+            std::env::var_os("PATH").as_deref().unwrap_or(OsStr::new("")),
+        ) {
+            return program.path().as_os_str().to_os_string();
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = command;
+    command.into()
+}
+
 impl McpConnection {
     fn spawn(
         root: &Path,
         config: &ClaudeCodeMcpConfig,
         state: Arc<ProviderState>,
     ) -> Result<Arc<Self>, ProviderError> {
-        let mut command = Command::new(&config.command);
+        let program = mcp_program(&config.command);
+        let mut command = Command::new(program);
         command
             .args(&config.args)
             .current_dir(root)
