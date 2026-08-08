@@ -6,6 +6,8 @@
 
 #[path = "project_entry_setup.rs"]
 mod setup_service;
+#[path = "project_entry_share.rs"]
+mod share_service;
 
 use setup_service::{
     create_private_dir, local_readiness, read_private_value, read_project_agent_token,
@@ -14,6 +16,9 @@ use setup_service::{
     validate_profile, ProjectConfig,
 };
 pub(crate) use setup_service::{resolve_local_task_state, setup};
+#[cfg(test)]
+pub(crate) use share_service::TunnelProvider;
+pub(crate) use share_service::{parse_share_options, share, ShareCommandOptions};
 
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -177,7 +182,7 @@ pub(crate) fn parse_options(
             "--root" => options.root = PathBuf::from(value(&mut index)?),
             "--profile" => options.profile = value(&mut index)?,
             "--state-dir" => options.state_dir = Some(PathBuf::from(value(&mut index)?)),
-            "--json" if command != "run" => options.json = true,
+            "--json" if !matches!(command, "run" | "share") => options.json = true,
             "--console-assets-dir" if command == "run" => {
                 let directory = PathBuf::from(value(&mut index)?);
                 if !directory.is_absolute() {
@@ -201,11 +206,14 @@ pub(crate) fn usage() -> &'static str {
        webcodex doctor [--root PATH] [--profile NAME] [--state-dir PATH] [--json]\n\
        webcodex status [--root PATH] [--profile NAME] [--state-dir PATH] [--json]\n\
        webcodex run [--root PATH] [--profile NAME] [--state-dir PATH]\n\
-                              [--console-assets-dir ABSOLUTE_PATH]\n\n\
+                              [--console-assets-dir ABSOLUTE_PATH]\n\
+       webcodex share [--root PATH] [--profile NAME] [--state-dir PATH]\n\
+                     [--tunnel cloudflare|none]\n\n\
 Run setup in a local Git project. It writes private WebCodex state outside the\n\
 checkout and never starts services, modifies Git content, or opens a network\n\
 port. `run` is the explicit foreground runtime step. Its optional\n\
-`--console-assets-dir` enables loopback-only development assets for that run.\n"
+`--console-assets-dir` enables loopback-only development assets for that run.\n\
+`share` starts the same local runtime with a temporary Connector credential.\n"
 }
 
 pub(crate) fn readiness_with_probe(
@@ -472,6 +480,14 @@ pub(crate) async fn collect_readiness(options: &ProjectCommandOptions) -> Projec
         Ok(key) => key,
         Err(_) => return readiness_with_probe(options, RemoteProbe::Unreachable),
     };
+    collect_readiness_from_remote(options, &config, &key).await
+}
+
+async fn collect_readiness_from_remote(
+    options: &ProjectCommandOptions,
+    config: &ProjectConfig,
+    key: &str,
+) -> ProjectReadiness {
     let url = format!("{}/api/connector/readiness", config.server_url());
     let response = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(1))
@@ -584,20 +600,59 @@ pub(crate) fn render_error(error: &ProductError, json: bool) -> String {
     }
 }
 
-pub(crate) async fn start_agent(options: &ProjectCommandOptions) -> Result<(), ProductError> {
-    let console_assets_dir = resolve_console_assets_directory(options)?;
-    let readiness = readiness_with_probe(options, RemoteProbe::Unreachable);
-    if readiness
-        .findings
-        .iter()
-        .any(|finding| finding.code == "project_not_configured")
-    {
-        return Err(ProductError::new(
-            "project_not_configured",
-            "the current project has not been set up",
-            Some("Run webcodex setup."),
-        ));
+#[derive(Debug, Clone)]
+pub(super) struct LocalRuntimeOptions {
+    pub(super) public_url: Option<String>,
+    pub(super) connector_credential_file: Option<PathBuf>,
+    pub(super) port_conflict_action: &'static str,
+}
+
+impl Default for LocalRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            public_url: None,
+            connector_credential_file: None,
+            port_conflict_action: "Stop the conflicting process, then run webcodex run.",
+        }
     }
+}
+
+pub(super) struct LocalRuntimeHandle {
+    pub(super) project_name: String,
+    pub(super) local_url: String,
+    pub(super) public_url: String,
+    pub(super) console_assets_dir: Option<PathBuf>,
+    server: Child,
+    agent: Child,
+}
+
+impl LocalRuntimeHandle {
+    pub(super) async fn wait_for_exit(&mut self) -> Result<(), ProductError> {
+        tokio::select! {
+            status = self.server.wait() => Err(ProductError::new(
+                "server_unreachable",
+                format!("WebCodex stopped unexpectedly ({:?})", status.ok()),
+                Some("Run webcodex doctor."),
+            )),
+            status = self.agent.wait() => Err(ProductError::new(
+                "agent_offline",
+                format!("the local Agent stopped unexpectedly ({:?})", status.ok()),
+                Some("Run webcodex doctor."),
+            )),
+        }
+    }
+
+    pub(super) async fn stop(&mut self) {
+        let _ = self.agent.start_kill();
+        let _ = self.server.start_kill();
+        let _ = self.agent.wait().await;
+        let _ = self.server.wait().await;
+    }
+}
+
+fn configured_project(
+    options: &ProjectCommandOptions,
+) -> Result<(ProjectConfig, setup_service::ProjectPaths), ProductError> {
     let (expected, paths) = ProjectConfig::resolve(options)?;
     let config = read_toml_optional::<ProjectConfig>(&paths.config)?.ok_or_else(|| {
         ProductError::new(
@@ -609,13 +664,30 @@ pub(crate) async fn start_agent(options: &ProjectCommandOptions) -> Result<(), P
     validate_product_config(&expected, &config)?;
     validate_existing_agent(&config, &paths)?;
     validate_existing_registration(&config, &paths)?;
-    if TcpListener::bind(("127.0.0.1", config.port)).is_err() {
+    Ok((config, paths))
+}
+
+pub(super) fn ensure_local_runtime_port_available(
+    port: u16,
+    port_conflict_action: &'static str,
+) -> Result<(), ProductError> {
+    if TcpListener::bind(("127.0.0.1", port)).is_err() {
         return Err(ProductError::new(
             "server_unreachable",
             "the configured loopback port is already in use",
-            Some("Stop the conflicting process, then run webcodex run."),
+            Some(port_conflict_action),
         ));
     }
+    Ok(())
+}
+
+pub(super) async fn start_local_runtime(
+    options: &ProjectCommandOptions,
+    runtime_options: LocalRuntimeOptions,
+) -> Result<LocalRuntimeHandle, ProductError> {
+    let console_assets_dir = resolve_console_assets_directory(options)?;
+    let (config, paths) = configured_project(options)?;
+    ensure_local_runtime_port_available(config.port, runtime_options.port_conflict_action)?;
     let agent_binary = locate_agent_binary().ok_or_else(|| {
         ProductError::new(
             "required_capability_unavailable",
@@ -624,21 +696,27 @@ pub(crate) async fn start_agent(options: &ProjectCommandOptions) -> Result<(), P
         )
     })?;
     let bootstrap = read_private_value(&paths.bootstrap_key)?;
-    let connector_key = read_project_credential(&paths.connector_key)?;
+    let credential_file = runtime_options
+        .connector_credential_file
+        .unwrap_or_else(|| paths.connector_key.clone());
+    let connector_key = read_project_credential(&credential_file)?;
     let _agent_token = read_project_agent_token(&paths.agent_token)?;
     validate_agent_authentication(&config, &paths)?;
-    let server_binary = std::env::current_exe().map_err(|error| {
+    let server_binary = locate_companion_binary("webcodex-server").ok_or_else(|| {
         ProductError::new(
             "required_capability_unavailable",
-            format!("cannot locate the WebCodex executable: {error}"),
-            Some("Reinstall WebCodex, then retry."),
+            "the WebCodex Server executable is unavailable",
+            Some("Install all WebCodex binaries, then run webcodex doctor."),
         )
     })?;
+    let local_url = config.server_url();
+    let public_url = runtime_options
+        .public_url
+        .unwrap_or_else(|| local_url.clone());
     let server_log = open_log(&paths.logs.join("server.log"))?;
     let server_error = server_log.try_clone().map_err(io_error)?;
     let mut server_command = Command::new(server_binary);
     server_command
-        .arg("serve")
         .current_dir(&paths.state)
         .env_remove("WEBCODEX_ENV_FILE")
         .env("WEBCODEX_ADDR", format!("127.0.0.1:{}", config.port))
@@ -646,7 +724,7 @@ pub(crate) async fn start_agent(options: &ProjectCommandOptions) -> Result<(), P
         .env("WEBCODEX_TOKEN", bootstrap)
         .env("WEBCODEX_SHARED_KEY_ENABLED", "false")
         .env("WEBCODEX_ALLOW_ANONYMOUS", "false")
-        .env("WEBCODEX_PUBLIC_URL", config.server_url())
+        .env("WEBCODEX_PUBLIC_URL", &public_url)
         .env("WEBCODEX_OAUTH2_ENABLED", "false")
         .env("WEBCODEX_QUIC_ENABLED", "false")
         .env("WEBCODEX_CONNECTOR_SURFACE", "task-v1")
@@ -654,7 +732,7 @@ pub(crate) async fn start_agent(options: &ProjectCommandOptions) -> Result<(), P
             "WEBCODEX_CONNECTOR_PROJECT_GRANT_ID",
             config.project_grant_id(&paths),
         )
-        .env("WEBCODEX_PROJECT_CREDENTIAL_FILE", &paths.connector_key)
+        .env("WEBCODEX_PROJECT_CREDENTIAL_FILE", &credential_file)
         .env("WEBCODEX_PROJECT_AGENT_TOKEN_FILE", &paths.agent_token)
         .env("WEBCODEX_CONNECTOR_PROJECT_ID", &config.logical_project_id)
         .env("WEBCODEX_CONNECTOR_PROJECT_NAME", &config.project_name)
@@ -679,7 +757,7 @@ pub(crate) async fn start_agent(options: &ProjectCommandOptions) -> Result<(), P
             Some("Run webcodex doctor."),
         )
     })?;
-    wait_for_server(&mut server, &config.server_url(), &connector_key).await?;
+    wait_for_server(&mut server, &local_url, &connector_key).await?;
 
     let agent_log = open_log(&paths.logs.join("agent.log"))?;
     let agent_error = agent_log.try_clone().map_err(io_error)?;
@@ -700,36 +778,41 @@ pub(crate) async fn start_agent(options: &ProjectCommandOptions) -> Result<(), P
                 Some("Run webcodex doctor."),
             )
         })?;
-    wait_for_ready(&mut server, &mut agent, options).await?;
+    wait_for_ready(&mut server, &mut agent, options, &config, &connector_key).await?;
+    Ok(LocalRuntimeHandle {
+        project_name: config.project_name,
+        local_url,
+        public_url,
+        console_assets_dir,
+        server,
+        agent,
+    })
+}
+
+pub(crate) async fn start_agent(options: &ProjectCommandOptions) -> Result<(), ProductError> {
+    let mut runtime = start_local_runtime(options, LocalRuntimeOptions::default()).await?;
     let mut started = format!(
         "Project: {}\nConnection: connected at {}\nConsole: {}/console\nConsole assets: {}",
-        config.project_name,
-        config.server_url(),
-        config.server_url(),
-        if console_assets_dir.is_some() {
+        runtime.project_name,
+        runtime.local_url,
+        runtime.local_url,
+        if runtime.console_assets_dir.is_some() {
             "local development"
         } else {
             "embedded"
         }
     );
-    if let Some(directory) = &console_assets_dir {
+    if let Some(directory) = &runtime.console_assets_dir {
         started.push_str(&format!("\nAssets directory: {}", directory.display()));
     }
     started.push_str("\nAgent: online\nCoding access: ready\n\nPress Ctrl-C to stop.");
     println!("{started}");
-    tokio::select! {
+    let outcome = tokio::select! {
         _ = tokio::signal::ctrl_c() => Ok(()),
-        status = server.wait() => Err(ProductError::new(
-            "server_unreachable",
-            format!("WebCodex stopped unexpectedly ({:?})", status.ok()),
-            Some("Run webcodex doctor."),
-        )),
-        status = agent.wait() => Err(ProductError::new(
-            "agent_offline",
-            format!("the local Agent stopped unexpectedly ({:?})", status.ok()),
-            Some("Run webcodex doctor."),
-        )),
-    }
+        result = runtime.wait_for_exit() => result,
+    };
+    runtime.stop().await;
+    outcome
 }
 
 fn resolve_console_assets_directory(
@@ -790,13 +873,17 @@ fn locate_agent_binary() -> Option<PathBuf> {
             return Some(path);
         }
     }
+    locate_companion_binary("webcodex-runner")
+}
+
+fn locate_companion_binary(name: &str) -> Option<PathBuf> {
     let current = std::env::current_exe().ok()?;
     let parent = current.parent()?;
     for candidate in [
-        parent.join(executable_name("webcodex-runner")),
+        parent.join(executable_name(name)),
         parent
             .parent()
-            .map(|path| path.join(executable_name("webcodex-runner")))
+            .map(|path| path.join(executable_name(name)))
             .unwrap_or_default(),
     ] {
         if candidate.is_file() {
@@ -805,11 +892,11 @@ fn locate_agent_binary() -> Option<PathBuf> {
     }
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
-        .map(|directory| directory.join(executable_name("webcodex-runner")))
+        .map(|directory| directory.join(executable_name(name)))
         .find(|candidate| candidate.is_file())
 }
 
-fn executable_name(name: &str) -> String {
+pub(super) fn executable_name(name: &str) -> String {
     if cfg!(windows) {
         format!("{name}.exe")
     } else {
@@ -896,6 +983,8 @@ async fn wait_for_ready(
     server: &mut Child,
     agent: &mut Child,
     options: &ProjectCommandOptions,
+    config: &ProjectConfig,
+    connector_key: &str,
 ) -> Result<(), ProductError> {
     let deadline = Instant::now() + START_TIMEOUT;
     while Instant::now() < deadline {
@@ -913,7 +1002,10 @@ async fn wait_for_ready(
                 Some("Run webcodex doctor."),
             ));
         }
-        if collect_readiness(options).await.ready {
+        if collect_readiness_from_remote(options, config, connector_key)
+            .await
+            .ready
+        {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(150)).await;

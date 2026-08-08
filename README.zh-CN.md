@@ -47,6 +47,37 @@ Git。关闭终端不会停止 Runner；机器重启后，重新运行同一条 
 webcodex agent start --profile <profile>
 ```
 
+### 临时分享本地项目
+
+如果没有 hosted Server，只想临时把当前电脑上的项目接给 ChatGPT 或其他 MCP
+client，可以直接使用 `webcodex share`。默认路径使用 Cloudflare Quick Tunnel，
+不要求 Cloudflare 账号。
+
+如果尚未安装 `cloudflared`，可以直接使用 Cloudflare
+[官方安装说明](https://developers.cloudflare.com/tunnel/downloads/)中的命令：
+
+```bash
+# macOS
+brew install cloudflared
+
+# Debian / Ubuntu：把 Cloudflare 官方 APT 安装步骤合并成一条可直接复制的命令
+sudo mkdir -p --mode=0755 /usr/share/keyrings && curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null && echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" | sudo tee /etc/apt/sources.list.d/cloudflared.list >/dev/null && sudo apt-get update && sudo apt-get install -y cloudflared
+```
+
+安装后直接分享当前项目：
+
+```bash
+cd /path/to/your/repository
+webcodex share
+```
+
+`share` 会在需要时执行幂等 project setup，启动本地 Server + Agent，创建一把独立的
+临时 Project Connector credential，并通过 Quick Tunnel 暴露 `/mcp`。WebCodex
+不会静默安装系统软件包。输出的 HTTPS URL 和 Bearer credential 只对本次 share
+session 有效；Ctrl-C 会停止 runtime 与 tunnel，并删除临时 credential。
+`webcodex share --tunnel none` 可用于纯本地 debug。Quick Tunnel 面向开发/测试，
+不适合作为长期生产部署。
+
 Managed account、自定义 Server 和其他接入方式见
 [AI 接入指南](docs/AI_ONBOARDING.zh-CN.md)。
 
@@ -84,10 +115,11 @@ Runner 机器完成。仓库和本地工具链留在 Runner 主机上，连接�
 
 | 目标 | 推荐方式 |
 | --- | --- |
-| 立即接入一个本地项目 | 使用 hosted `webcodex connect`。 |
+| 通过 hosted 服务接入一个项目 | 使用 `webcodex connect <server>`，本地只运行 Runner。 |
+| 临时把当前本地项目接给 ChatGPT/MCP client | 使用 `webcodex share`，启动本地 Server + Agent 与临时 Quick Tunnel。 |
+| 保持纯本地、不开放公网 | 使用 `webcodex setup` + `webcodex run`（share 调试也可用 `--tunnel none`）。 |
+| 长期稳定部署 | 自托管 Server，并配置 stable HTTPS domain/tunnel、service 与按需 OAuth。 |
 | 需要用户、设备 enrollment、撤销和审计 | 使用 managed `webcodex login` 流程。 |
-| 完全控制 Server 与数据 | 使用 Docker Compose 或 systemd 自托管。 |
-| 所有组件只在一台机器运行 | 使用快速开始文档中的 loopback 方式。 |
 
 ## 使用 Docker 自托管 Server
 

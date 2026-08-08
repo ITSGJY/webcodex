@@ -12,6 +12,7 @@ reference 或内部 config path。
   `webcodex-runner`；
 - `PATH` 中有 Git；
 - 一个可以安全查看和修改的 Git 项目。
+- 仅默认 `webcodex share` 路径需要：已安装 `cloudflared`，并可从 `PATH` 找到。若缺失，请从 [Cloudflare 官方下载页](https://developers.cloudflare.com/tunnel/downloads/)安装；WebCodex 不会静默安装系统软件包。
 
 安装 Linux x64 或 macOS arm64 package：
 
@@ -55,10 +56,11 @@ webcodex setup
 第二次返回 `already configured`。若一个生成组件缺失，只修复该组件。若已有字段
 与当前 Git root/profile 冲突，setup 会指出字段并停止，不覆盖现有配置。
 
-Connector credential file 与 Agent config 保存同一个 secret，并映射到同一个稳定、
-非秘密的 project grant identity。两个文件都属于 owner-only private state；数据库
-不保存明文。runtime 会 hash candidate 并使用 constant-time comparison。这条路径
-独立于普通 shared-key quick start：project mode 会拒绝任意未知 Bearer value。
+长期 Connector credential 与 Agent Token 是两把独立 secret，并映射到同一个稳定、
+非秘密的 project grant identity。对应文件都属于 owner-only private state；数据库
+不保存明文。runtime 会 hash credential candidate 并使用 constant-time comparison。
+这条路径独立于普通 shared-key quick start：project mode 会拒绝任意未知 Bearer
+value。
 
 Setup 不会静默轮换仍存在的 credential。credential 丢失时应恢复两份匹配的 private
 file；若无法恢复，先停止 runtime，明确退役整个 private project-state profile，再
@@ -75,7 +77,7 @@ Doctor 完全只读。Agent 尚未启动时，预期 verdict 是 `Needs action`�
 
 ```text
 Next:
-  webcodex agent start
+  webcodex run
 ```
 
 每条 finding 都有稳定 `name`、`status`、`code`、`summary` 和 `next_action`。
@@ -84,12 +86,13 @@ Next:
 ## 3. 启动本地 runtime
 
 ```bash
-webcodex agent start
+webcodex run
 ```
 
-这是显式 foreground action，会启动绑定当前项目的 loopback server 和本地 Agent；
-不会安装 system service。保持该终端运行，Ctrl-C 会停止两个进程。Loopback 不构成
-认证豁免；只有 setup 配置的精确 Project Credential 能访问该项目 Connector/Agent。
+这是 canonical foreground action，会启动绑定当前项目的 loopback Server 和本地
+Agent；不会安装 system service。保持该终端运行，Ctrl-C 会停止两个进程。
+Loopback 不构成认证豁免；只有 setup 配置的精确 Project Credential 能访问该项目
+Connector。
 
 在同一项目的另一个终端运行：
 
@@ -116,10 +119,43 @@ task_start
 之后切回会恢复该仓库之前的工作。只有 client 无法继续提供 transport 窗口身份
 时，才需要用 `task_list` 和 `task_resume` 做显式恢复。
 
-ChatGPT hosted client 无法访问 loopback address。operator 必须提供批准的 HTTPS
-endpoint 和认证，同时保持 project binding 不变。见
-[DEPLOYMENT.zh-CN.md](DEPLOYMENT.zh-CN.md)、[MCP.zh-CN.md](MCP.zh-CN.md) 或
-[GPT_ACTIONS.zh-CN.md](GPT_ACTIONS.zh-CN.md)。Setup 不创建 tunnel，也不暴露端口。
+### 为临时分享安装 `cloudflared`
+
+默认 `webcodex share` 使用 Cloudflare Quick Tunnel。如果 `PATH` 中还没有
+`cloudflared`，可以使用 Cloudflare 官方 package 安装方式：
+
+```bash
+# macOS
+brew install cloudflared
+
+# Debian / Ubuntu：把 Cloudflare 官方 APT 安装步骤合并成一条可直接复制的命令
+sudo mkdir -p --mode=0755 /usr/share/keyrings && curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null && echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" | sudo tee /etc/apt/sources.list.d/cloudflared.list >/dev/null && sudo apt-get update && sudo apt-get install -y cloudflared
+```
+
+其他平台见 Cloudflare [官方下载与安装说明](https://developers.cloudflare.com/tunnel/downloads/)。
+WebCodex 不会静默安装系统软件包，也不会自行提升权限。
+
+ChatGPT hosted client 无法访问 loopback address。如果只是开发/测试期间临时让
+hosted MCP client 访问当前项目，先停止 `webcodex run`，然后执行：
+
+```bash
+webcodex share
+```
+
+`share` 复用同一套 project-first setup 和 local runtime，但会启动 Cloudflare Quick
+Tunnel，并为本次 session 创建一把独立的临时 Connector credential。命令会输出
+临时 `https://*.trycloudflare.com/mcp` URL 和 Bearer token；命令退出后两者都失效。
+`webcodex share --tunnel none` 可在不创建公网 tunnel 的情况下启动同一 share
+runtime，便于本地 debug。Quick Tunnel 不是 production 部署方式。
+
+如果 Quick Tunnel 启动失败，并且机器上已经存在
+`~/.cloudflared/config.yaml`，需要注意 Cloudflare Quick Tunnel 不支持该配置文件。
+可以为 Quick Tunnel 使用独立环境（或临时移开该配置），也可以使用 `--tunnel none`
+进行纯本地 debug。
+
+需要长期稳定 endpoint 时，应使用 stable HTTPS domain/tunnel、service 管理以及
+OAuth 或其他生产认证方案。见 [DEPLOYMENT.zh-CN.md](DEPLOYMENT.zh-CN.md)、
+[MCP.zh-CN.md](MCP.zh-CN.md) 或 [GPT_ACTIONS.zh-CN.md](GPT_ACTIONS.zh-CN.md)。
 
 ## 5. 运行 golden coding path
 
@@ -236,8 +272,8 @@ webcodex doctor
 | `project_registration_invalid` | 现有 state 冲突或不完整 | 解决指出的字段后重新 setup |
 | `project_credential_invalid` | private credential 缺失、不可读、权限不安全、格式错误或两份不匹配 | 恢复两份匹配的 private file，或显式重建 profile |
 | `project_credential_rejected` | server 拒绝本地配置的 credential | 恢复匹配 credential；不得折叠成 Agent offline |
-| `server_unreachable` | loopback runtime 不可达 | `webcodex agent start` 或查看 doctor |
-| `agent_offline` | server 可达但本地 Agent 不可用 | `webcodex agent start` |
+| `server_unreachable` | loopback runtime 不可达 | `webcodex run` 或查看 doctor |
+| `agent_offline` | server 可达但本地 Agent 不可用 | `webcodex run` |
 | `required_capability_unavailable` | Agent 太旧或不完整 | 升级全部 WebCodex binaries |
 | `structured_validation_unavailable` | Agent 缺少 structured validation | 升级全部 WebCodex binaries |
 | `workspace_unavailable` | Git 或配置的项目路径不可用 | 恢复 path/Git workspace |
@@ -266,7 +302,7 @@ webcodex doctor
 - 需要完全关闭预览时：
 
   ```bash
-  WEBCODEX_ACTIVITY_COMMAND_PREVIEW=0 webcodex agent start
+  WEBCODEX_ACTIVITY_COMMAND_PREVIEW=0 webcodex run
   ```
 
   关闭后仍会记录工具名、路径和结果，只是命令文本存为空。

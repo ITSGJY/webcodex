@@ -13,15 +13,23 @@ Local clients can use:
 http://127.0.0.1:<configured-port>/mcp
 ```
 
-Hosted clients require an operator-managed HTTPS endpoint:
+Hosted clients need HTTPS. There are three paths:
+
+- **Hosted:** `webcodex connect <server>` uses an existing hosted Server; only the Runner runs locally.
+- **Local Share:** `webcodex share` starts the local Server + Agent and a Cloudflare Quick Tunnel, then prints a temporary HTTPS `/mcp` URL and a separate temporary Bearer credential. Ctrl-C revokes that access by stopping the runtime/tunnel and removing the temporary share state. The URL can change every run. Use `--tunnel none` only for local testing/debugging.
+- **Self-hosted:** use a stable HTTPS domain/tunnel, durable service management, and OAuth or scoped credentials for long-lived operation.
+
+Cloudflare Quick Tunnel is intended for development/testing, not production.
+For stable self-hosted access, an endpoint looks like:
 
 ```text
 https://your-domain.example/mcp
 ```
 
-Use either a scoped Bearer credential or OAuth issued for runtime/project
-access. Do not use or expose bootstrap/admin, account, or Agent credentials.
-Prefer the client secret store; never commit a token.
+Do not use or expose bootstrap/admin, account, Agent, or the persistent
+project-first Connector credential as a public sharing secret. `share` creates
+and prints its own temporary Connector credential. Prefer the client secret
+store; never commit a token.
 
 For ChatGPT Developer Mode, point the custom app at the public HTTPS `/mcp`
 endpoint and use a user-defined/custom OAuth client. WebCodex currently supports
@@ -32,9 +40,11 @@ WebCodex API permission, so do not put it in the OAuth client's
 `allowed_scopes` list. Dynamic client registration is not currently required or
 implemented by WebCodex.
 
-Canonical setup does not print credential values or secret paths, create a
-tunnel, or expose a public port. Production enrollment, scoped user tokens, and
-OAuth are described in [AUTH_MODEL.md](AUTH_MODEL.md),
+Canonical `webcodex setup` still does not print credential values or secret
+paths, create a tunnel, or expose a public port. `webcodex share` is the
+explicit temporary exception: it prints only its session-scoped credential,
+never the persistent project Connector credential. Production enrollment,
+scoped user tokens, and OAuth are described in [AUTH_MODEL.md](AUTH_MODEL.md),
 [DEPLOYMENT.md](DEPLOYMENT.md), and [OAUTH2_SMOKE_TEST.md](OAUTH2_SMOKE_TEST.md).
 
 ## Model Surface Selection
@@ -410,7 +420,7 @@ No project discovery or runtime identifier belongs in this prompt.
 | `project_credential_invalid` | The private Project Credential is missing, unsafe, malformed, or mismatched | Restore both matching private files or explicitly recreate the profile |
 | `project_credential_rejected` | The reachable server rejected the configured Project Credential | Restore the server-matching credential; do not treat this as Agent offline |
 | `workspace_unavailable` | The configured Git workspace is unavailable | Restore the workspace, then run doctor |
-| `server_unreachable` | The project runtime is unavailable | Run `webcodex agent start` |
+| `server_unreachable` | The project runtime is unavailable | Run `webcodex run` for local project-first mode |
 | `agent_offline` | The local Agent is not ready | Run `webcodex doctor` |
 | `required_capability_unavailable` | The Agent lacks a coding capability | Upgrade all binaries |
 | `structured_validation_unavailable` | The Agent cannot run structured checks | Upgrade all binaries |

@@ -310,7 +310,7 @@ where
             stdout: build_info::version_output("webcodex"),
             stderr: String::new(),
         },
-        "status" | "doctor" | "run" | "task" => CliAction::Project(args),
+        "status" | "doctor" | "run" | "share" | "task" => CliAction::Project(args),
         "setup" if args.get(1).map(String::as_str) != Some("single-user") => {
             CliAction::Project(args)
         }

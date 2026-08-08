@@ -13,15 +13,22 @@ client 能连接 project-bound WebCodex endpoint 时使用 MCP。先完成
 http://127.0.0.1:<configured-port>/mcp
 ```
 
-Hosted client 需要 operator 管理的 HTTPS endpoint：
+Hosted client 需要 HTTPS，目前有三条用户路径：
+
+- **Hosted：** `webcodex connect <server>` 使用现有 hosted Server，本地只运行 Runner。
+- **Local Share：** `webcodex share` 启动本地 Server + Agent 与 Cloudflare Quick Tunnel，并输出临时 HTTPS `/mcp` URL 和一把独立的临时 Bearer credential。Ctrl-C 会停止 runtime/tunnel 并删除临时 share state，因此访问随之失效；URL 每次运行都可能变化。`--tunnel none` 仅用于本地测试/debug。
+- **Self-hosted：** 长期运行时使用 stable HTTPS domain/tunnel、durable service 管理，以及 OAuth 或 scoped credential。
+
+Cloudflare Quick Tunnel 面向开发/测试，不是 production 部署方案。稳定自托管 endpoint
+通常形如：
 
 ```text
 https://your-domain.example/mcp
 ```
 
-runtime/project access 可以使用 scoped Bearer credential 或 OAuth。不要使用或暴露
-bootstrap/admin、account 或 Agent credential。优先使用 client secret store，
-不要提交 token。
+不要把 bootstrap/admin、account、Agent credential，或 project-first setup 的长期
+Connector credential 当成公网分享 secret。`share` 会创建并只打印本次 session 的
+临时 Connector credential。优先使用 client secret store，不要提交 token。
 
 ChatGPT Developer Mode 应指向公网 HTTPS `/mcp` endpoint，并选择用户自定义的
 OAuth client。WebCodex 当前支持 PKCE S256 与 `client_secret_post`；需要把 ChatGPT
@@ -30,8 +37,10 @@ OAuth client。WebCodex 当前支持 PKCE S256 与 `client_secret_post`；需要
 WebCodex API 权限，因此不要把它写入 OAuth client 的 `allowed_scopes`。WebCodex
 当前不要求、也未实现 Dynamic Client Registration。
 
-Canonical setup 不打印 credential value 或 secret path，不创建 tunnel，也不开放
-公网端口。production enrollment、scoped user token 和 OAuth 见
+Canonical `webcodex setup` 仍然不打印 credential value 或 secret path、不创建
+tunnel，也不开放公网端口。`webcodex share` 是显式的临时例外：它只打印本次
+session-scoped credential，绝不打印长期 project Connector credential。production
+enrollment、scoped user token 和 OAuth 见
 [AUTH_MODEL.zh-CN.md](AUTH_MODEL.zh-CN.md)、
 [DEPLOYMENT.zh-CN.md](DEPLOYMENT.zh-CN.md) 与
 [OAUTH2_SMOKE_TEST.md](OAUTH2_SMOKE_TEST.md)。
@@ -320,7 +329,7 @@ prompt 中不需要 project discovery 或 runtime identifier。
 | `project_credential_invalid` | private Project Credential 缺失、权限不安全、格式错误或两份不匹配 | 恢复两份匹配 private file，或显式重建 profile |
 | `project_credential_rejected` | 可达 server 拒绝已配置 Project Credential | 恢复与 server 匹配的 credential；不得折叠为 Agent offline |
 | `workspace_unavailable` | 配置的 Git workspace 不可用 | 恢复 workspace 后运行 doctor |
-| `server_unreachable` | project runtime 不可用 | `webcodex agent start` |
+| `server_unreachable` | project runtime 不可用 | 本地 project-first 模式运行 `webcodex run` |
 | `agent_offline` | 本地 Agent 未 ready | `webcodex doctor` |
 | `required_capability_unavailable` | Agent 缺少 coding capability | 升级全部 binaries |
 | `structured_validation_unavailable` | Agent 不能运行 structured checks | 升级全部 binaries |
