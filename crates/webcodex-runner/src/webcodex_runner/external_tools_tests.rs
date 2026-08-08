@@ -208,7 +208,10 @@ fn agent_request(
         create_dirs: false,
         command: String::new(),
         stdin: None,
-        timeout_secs: 1,
+        // The effective MCP deadline is min(request, policy, config); a 1s
+        // request pin would ignore the fixture's generous spawn budget and
+        // flake under parallel load (first call races server startup).
+        timeout_secs: 10,
         requested_by: "test".to_string(),
         created_at: 0,
         validation: None,
