@@ -33,7 +33,8 @@
 param(
     [string]$BinDir,
     [string]$OutDir,
-    [string]$Version
+    [string]$Version,
+    [switch]$AllowDevelopmentBuild
 )
 
 $ErrorActionPreference = "Stop"
@@ -61,7 +62,7 @@ if (-not $Version) {
         throw "cannot read package version from $packageJson"
     }
 }
-if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+') {
+if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$') {
     throw "invalid package version '$Version'"
 }
 
@@ -72,6 +73,9 @@ $BinaryNames = @("webcodex", "webcodex-server", "webcodex-runner")
 $ArchiveName = "webcodex-v$Version-win32-x64.tar.gz"
 $Archive = Join-Path $OutDir $ArchiveName
 $ArchiveTmp = "$Archive.tmp"
+if ((Test-Path -LiteralPath $Archive) -and -not $AllowDevelopmentBuild) {
+    throw "refusing to overwrite existing release artifact $Archive; remove it explicitly after verifying its provenance"
+}
 
 # Windows 10 1803+ / Windows 11 ship tar.exe (libarchive) at
 # %SystemRoot%\System32\tar.exe; it is the supported archiver. It is used
@@ -80,6 +84,34 @@ $ArchiveTmp = "$Archive.tmp"
 $Tar = Join-Path $env:SystemRoot "System32\tar.exe"
 if (-not (Test-Path -LiteralPath $Tar -PathType Leaf)) {
     throw "tar.exe was not found at $Tar. Windows 11 ships tar.exe in System32; restore it (Windows Features). Git Bash tar is not supported for Windows release artifacts."
+}
+
+$ReleaseTagCommit = $null
+if (-not $AllowDevelopmentBuild) {
+    $git = Get-Command git -ErrorAction SilentlyContinue
+    if (-not $git) {
+        throw "git is required to verify release artifact provenance against tag v$Version"
+    }
+    $tagCommitOutput = & $git.Source -C $Root rev-list -n 1 "v$Version" 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $tagCommitOutput) {
+        throw "release tag v$Version was not found; create the immutable release tag before packaging, or use -AllowDevelopmentBuild for local smoke only"
+    }
+    $ReleaseTagCommit = @($tagCommitOutput)[0].Trim()
+    $headCommitOutput = & $git.Source -C $Root rev-parse HEAD 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $headCommitOutput) {
+        throw "failed to resolve the packaging worktree HEAD while verifying v$Version"
+    }
+    $headCommit = @($headCommitOutput)[0].Trim()
+    if (-not $headCommit.Equals($ReleaseTagCommit, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "packaging worktree HEAD $headCommit is not release tag v$Version ($ReleaseTagCommit)"
+    }
+    $worktreeStatus = @(& $git.Source -C $Root status --porcelain --untracked-files=all)
+    if ($LASTEXITCODE -ne 0) {
+        throw "failed to inspect packaging worktree cleanliness for v$Version"
+    }
+    if ($worktreeStatus.Count -ne 0) {
+        throw "packaging worktree is not clean; release artifacts require a clean v$Version checkout"
+    }
 }
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
@@ -118,6 +150,26 @@ try {
     }
     if (@($identities | Select-Object -Unique).Count -ne 1) {
         throw "release binaries do not share one build identity: $($identities -join ' | ')"
+    }
+
+    # Release packaging is provenance-sensitive by default. A development smoke
+    # can opt out explicitly, but a release artifact must identify one clean
+    # commit and that commit must be the immutable v<VERSION> tag.
+    $identity = @($identities)[0]
+    if ($AllowDevelopmentBuild) {
+        Write-Warning "development artifact mode: release provenance checks are disabled; do not publish this archive"
+    } else {
+        $commitMatch = [regex]::Match($identity, '\(commit ([0-9A-Fa-f]{12,40})(?:,|\))')
+        if (-not $commitMatch.Success) {
+            throw "release build identity must contain a concrete git commit, got '$identity'. Use -AllowDevelopmentBuild only for local smoke artifacts."
+        }
+        if ($identity -notmatch ', dirty=false(?:,|\))') {
+            throw "release build identity must report dirty=false, got '$identity'"
+        }
+        $binaryCommit = $commitMatch.Groups[1].Value
+        if (-not $ReleaseTagCommit.StartsWith($binaryCommit, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "release binary commit $binaryCommit does not match tag v$Version ($ReleaseTagCommit)"
+        }
     }
 
     # 4. Archive only the three binaries, at the archive root.

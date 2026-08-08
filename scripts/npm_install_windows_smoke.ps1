@@ -77,7 +77,7 @@ try {
     # -----------------------------------------------------------------------
     Write-Host "creating Windows release artifact..."
     $artifactOutput = & (Join-Path $PSScriptRoot "package_release_artifact.ps1") `
-        -BinDir $BinDir -OutDir $ArtifactOut
+        -BinDir $BinDir -OutDir $ArtifactOut -AllowDevelopmentBuild
     if ($LASTEXITCODE -ne 0) {
         throw "package_release_artifact.ps1 failed with exit code $LASTEXITCODE"
     }
