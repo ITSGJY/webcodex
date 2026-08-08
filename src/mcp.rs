@@ -126,6 +126,20 @@ fn request_client_capabilities(params: &Value) -> Option<&Value> {
         .and_then(|meta| meta.get("io.modelcontextprotocol/clientCapabilities"))
 }
 
+fn request_client_info_is_valid(params: &Value) -> bool {
+    let Some(meta) = params.get("_meta").and_then(Value::as_object) else {
+        return true;
+    };
+    let Some(client_info) = meta.get("io.modelcontextprotocol/clientInfo") else {
+        return true;
+    };
+    let Some(client_info) = client_info.as_object() else {
+        return false;
+    };
+    client_info.get("name").is_some_and(Value::is_string)
+        && client_info.get("version").is_some_and(Value::is_string)
+}
+
 fn request_header<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
     req.headers()
         .get(name)
@@ -168,9 +182,7 @@ fn unsupported_protocol_version(id: Option<Value>, requested: &str) -> Value {
 }
 
 fn inferred_protocol_era(request: &JsonRpcRequest) -> McpProtocolEra {
-    if request.method == "server/discover"
-        || request_protocol_version(&request.params) == Some(MCP_STATELESS_PROTOCOL_VERSION)
-    {
+    if request_protocol_version(&request.params) == Some(MCP_STATELESS_PROTOCOL_VERSION) {
         McpProtocolEra::Stateless2026
     } else {
         McpProtocolEra::Legacy
@@ -187,14 +199,24 @@ fn validate_http_protocol(
     let header_version = request_header(req, MCP_PROTOCOL_VERSION_HEADER);
     let body_version = request_protocol_version(&request.params);
 
-    for requested in [header_version, body_version].into_iter().flatten() {
-        if !MCP_SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) {
-            return Err(unsupported_protocol_version(id, requested));
+    if let (Some(header), Some(body)) = (header_version, body_version) {
+        if header != body {
+            return Err(header_mismatch(
+                id.clone(),
+                format!(
+                    "Header mismatch: {MCP_PROTOCOL_VERSION_HEADER} header value '{header}' does not match params._meta protocolVersion '{body}'"
+                ),
+            ));
         }
     }
 
-    let stateless = request.method == "server/discover"
-        || header_version == Some(MCP_STATELESS_PROTOCOL_VERSION)
+    for requested in [header_version, body_version].into_iter().flatten() {
+        if !MCP_SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) {
+            return Err(unsupported_protocol_version(id.clone(), requested));
+        }
+    }
+
+    let stateless = header_version == Some(MCP_STATELESS_PROTOCOL_VERSION)
         || body_version == Some(MCP_STATELESS_PROTOCOL_VERSION);
     if !stateless {
         return Ok(McpProtocolEra::Legacy);
@@ -216,14 +238,21 @@ fn validate_http_protocol(
             ),
         ));
     }
-    if request.id.is_some()
-        && !request_client_capabilities(&request.params).is_some_and(Value::is_object)
-    {
-        return Err(rpc_error(
-            id,
-            -32602,
-            "Invalid params: MCP 2026-07-28 requests require params._meta clientCapabilities",
-        ));
+    if request.id.is_some() {
+        if !request_client_capabilities(&request.params).is_some_and(Value::is_object) {
+            return Err(rpc_error(
+                id.clone(),
+                -32602,
+                "Invalid params: MCP 2026-07-28 requests require params._meta clientCapabilities",
+            ));
+        }
+        if !request_client_info_is_valid(&request.params) {
+            return Err(rpc_error(
+                id,
+                -32602,
+                "Invalid params: params._meta clientInfo must contain string name and version fields when present",
+            ));
+        }
     }
 
     match request_header(req, MCP_METHOD_HEADER) {
@@ -853,7 +882,12 @@ async fn handle_mcp_request_with_lifecycle(
         return McpOutcome::Notification;
     }
 
-    if request.jsonrpc.as_deref().unwrap_or("2.0") != "2.0" {
+    let jsonrpc_valid = if stateless_2026 {
+        request.jsonrpc.as_deref() == Some("2.0")
+    } else {
+        request.jsonrpc.as_deref().unwrap_or("2.0") == "2.0"
+    };
+    if !jsonrpc_valid {
         return McpOutcome::BadRequest(rpc_error(request.id, -32600, "jsonrpc must be '2.0'"));
     }
 
@@ -867,7 +901,7 @@ async fn handle_mcp_request_with_lifecycle(
         // requests. WebCodex supports the stateless tools path required by
         // modern clients while retaining its existing 2025-06-18
         // initialize/session lifecycle for legacy clients.
-        "server/discover" => rpc_result(
+        "server/discover" if stateless_2026 => rpc_result(
             id,
             json!({
                 "resultType": "complete",

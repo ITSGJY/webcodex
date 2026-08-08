@@ -161,8 +161,12 @@ async fn mcp_2026_ping_is_removed() {
 async fn mcp_info_advertised_methods_match_dispatch() {
     let runtime = test_runtime();
     for method in MCP_INFO_METHODS {
-        let outcome =
-            handle_mcp_request(&runtime, rpc(method, Some(json!(1)), json!({})), None).await;
+        let params = if *method == "server/discover" {
+            mcp_2026_params(json!({}))
+        } else {
+            json!({})
+        };
+        let outcome = handle_mcp_request(&runtime, rpc(method, Some(json!(1)), params), None).await;
         assert!(
             !matches!(&outcome, McpOutcome::BadRequest(value) if value["error"]["code"] == -32601),
             "advertised method {method} must be dispatchable"
@@ -1034,6 +1038,21 @@ async fn mcp_server_discover_advertises_modern_and_legacy_protocols() {
 }
 
 #[tokio::test]
+async fn mcp_legacy_server_discover_is_method_not_found() {
+    let runtime = test_runtime();
+    let outcome = handle_mcp_request(
+        &runtime,
+        rpc("server/discover", Some(Value::from(61)), json!({})),
+        None,
+    )
+    .await;
+    match outcome {
+        McpOutcome::BadRequest(value) => assert_eq!(value["error"]["code"], -32601),
+        other => panic!("legacy server/discover must be method-not-found, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn mcp_stateless_tools_list_uses_2026_result_shape() {
     let runtime = test_runtime();
     let outcome = handle_mcp_request(
@@ -1595,6 +1614,70 @@ async fn http_mcp_2026_validates_headers_and_ignores_legacy_session_id() {
     );
     let missing_capabilities_body: Value = missing_capabilities.take_json().await.unwrap();
     assert_eq!(missing_capabilities_body["error"]["code"], -32602);
+
+    let mut version_mismatch = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header(MCP_PROTOCOL_VERSION_HEADER, "2099-01-01", true)
+        .add_header(MCP_METHOD_HEADER, "tools/list", true)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2022,
+            "method": "tools/list",
+            "params": params.clone()
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(effective_status(&version_mismatch), StatusCode::BAD_REQUEST);
+    let version_mismatch_body: Value = version_mismatch.take_json().await.unwrap();
+    assert_eq!(version_mismatch_body["error"]["code"], MCP_HEADER_MISMATCH);
+
+    let mut malformed_client_info = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_STATELESS_PROTOCOL_VERSION,
+            true,
+        )
+        .add_header(MCP_METHOD_HEADER, "tools/list", true)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2023,
+            "method": "tools/list",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MCP_STATELESS_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                    "io.modelcontextprotocol/clientInfo": {"name": "missing-version"}
+                }
+            }
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(
+        effective_status(&malformed_client_info),
+        StatusCode::BAD_REQUEST
+    );
+    let malformed_client_info_body: Value = malformed_client_info.take_json().await.unwrap();
+    assert_eq!(malformed_client_info_body["error"]["code"], -32602);
+
+    let mut missing_jsonrpc = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_STATELESS_PROTOCOL_VERSION,
+            true,
+        )
+        .add_header(MCP_METHOD_HEADER, "tools/list", true)
+        .json(&json!({
+            "id": 2024,
+            "method": "tools/list",
+            "params": params.clone()
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(effective_status(&missing_jsonrpc), StatusCode::BAD_REQUEST);
+    let missing_jsonrpc_body: Value = missing_jsonrpc.take_json().await.unwrap();
+    assert_eq!(missing_jsonrpc_body["error"]["code"], -32600);
 
     let unsupported_params = json!({
         "_meta": {
@@ -2426,8 +2509,7 @@ async fn oauth_mcp_request(
     method: &str,
     params: Value,
 ) -> (StatusCode, Value, Option<String>) {
-    let stateless_2026 = method == "server/discover"
-        || request_protocol_version(&params) == Some(MCP_STATELESS_PROTOCOL_VERSION);
+    let stateless_2026 = request_protocol_version(&params) == Some(MCP_STATELESS_PROTOCOL_VERSION);
     let tool_name = (method == "tools/call")
         .then(|| {
             params
