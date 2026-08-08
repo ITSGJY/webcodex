@@ -230,11 +230,11 @@ async function main() {
   assert.throws(() => install.platformKey("sunos", "x64"), /Unsupported/);
   assert.strictEqual(
     wrapper.nativePath({ packageRoot: "/tmp/package", platform: "linux" }),
-    path.normalize("/tmp/package/vendor/bin/webcodex")
+    path.posix.normalize("/tmp/package/vendor/bin/webcodex")
   );
   assert.strictEqual(
     wrapper.nativePath({ packageRoot: "C:\\package", platform: "win32" }),
-    path.normalize("C:\\package\\vendor\\bin\\webcodex.exe")
+    path.win32.normalize("C:\\package\\vendor\\bin\\webcodex.exe")
   );
 
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "webcodex-npm-test-"));
