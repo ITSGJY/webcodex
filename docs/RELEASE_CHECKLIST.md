@@ -96,10 +96,12 @@ For the planned v0.3.2 binary and npm release:
 - `Cargo.toml` and every local WebCodex workspace entry in `Cargo.lock` must be `0.3.2`.
 - `npm/webcodex/package.json`, `manifest.json`, `manifest.example.json`, and the npm self-test must agree on `0.3.2`.
 - The release-preparation/tag commit may keep `REPLACE_WITH_RELEASE_ARTIFACT_SHA256` for each planned platform in `manifest.json`. Never copy an earlier checksum or invent one to make prepublish checks pass.
-- The planned artifacts are `webcodex-v0.3.2-linux-x64.tar.gz`, `webcodex-v0.3.2-linux-arm64.tar.gz`, and `webcodex-v0.3.2-darwin-arm64.tar.gz`. Each contains `webcodex`, `webcodex-server`, and `webcodex-runner` built from the exact tagged source revision.
+- The planned artifacts are `webcodex-v0.3.2-linux-x64.tar.gz`, `webcodex-v0.3.2-linux-arm64.tar.gz`, `webcodex-v0.3.2-darwin-arm64.tar.gz`, and `webcodex-v0.3.2-win32-x64.tar.gz`. Each contains `webcodex`, `webcodex-server`, and `webcodex-runner` built from the exact tagged source revision.
 - Build Linux x64 on the release x64 Linux host, Linux arm64 on the release arm64 Linux host, and macOS arm64 on the release Mac. Do not rebuild any artifact on an intermediate packaging machine.
+- The Windows x64 artifact must be built on a **Windows release host** from the exact tag/revision using `scripts/package_release_artifact.ps1` (PowerShell + the built-in System32 `tar.exe`; no Git Bash, no WSL). A Linux cross-compiled binary cannot substitute for native Windows validation. The release build must pin `WEBCODEX_BUILT_AT` once so all three binaries report one shared `built_at` in their revision identity. The Windows artifact contains `webcodex.exe`, `webcodex-server.exe`, and `webcodex-runner.exe`; `webcodex-server.exe` is packaged only to keep the three-binary npm contract — a long-running Windows Server runtime is **not** supported.
+- Windows officially enters the published-supported platform list only in the release commit that carries a real Windows-built artifact and its checksum; before that, `manifest.json` must not contain a `win32-x64` entry and docs must not claim Windows is published.
 - After producing the exact tarballs, calculate each SHA-256, update the release manifest and platform-scope documentation in a clearly reported post-tag commit, and do not move the tag.
-- Artifact smoke must run `webcodex --version`, `webcodex-server --version`, and `webcodex-runner --version`; all three must report `0.3.2`, the same clean build revision, and `dirty=false`. The npm package exposes only the `webcodex` wrapper.
+- Artifact smoke must run `webcodex --version`, `webcodex-server --version`, and `webcodex-runner --version`; all three must report `0.3.2`, the same clean build revision, and `dirty=false`. The npm package exposes only the `webcodex` wrapper. On Windows this is `scripts/npm_install_windows_smoke.ps1` (artifact -> local manifest -> npm installer -> temp prefix -> wrapper), and `npm --prefix npm/webcodex test` must pass on native Windows.
 - Run `node npm/webcodex/test/release-manifest-check.js` only after all real checksums are present; it must reject placeholders, non-hex values, and all-zero values.
 - Run `bash scripts/npm_package_smoke.sh` before npm publication and verify the packed tarball identifies `@yyjeqhc/webcodex@0.3.2` and includes its README.
 - If publishing a container image, manual local builds and CI builds are both acceptable. Build from the exact immutable tag, verify the image runs as the non-root WebCodex user, confirm the health check, ensure the image contains the Server and administrative CLI but not the Runner, and record the registry, tags, and immutable digest in the GitHub Release.
@@ -109,8 +111,8 @@ For the planned v0.3.2 binary and npm release:
 1. Prepare and review one version/docs commit with placeholder checksums.
 2. Run all source, focused, E2E, documentation, security, and local npm package gates from the candidate commit.
 3. Only after explicit operator authorization, create the immutable annotated `v0.3.2` tag.
-4. Build and smoke the Linux x64, Linux arm64, and macOS arm64 artifacts from that exact tag, then upload the immutable tarballs.
-5. Calculate the checksums of the exact uploaded bytes and create the reported post-tag manifest commit without moving `v0.3.2`.
+4. Build and smoke the Linux x64, Linux arm64, and macOS arm64 artifacts from that exact tag, then upload the immutable tarballs. If Windows is included in this release, build and smoke the win32-x64 artifact on a Windows release host from the same exact tag (see section 8) and upload it too.
+5. Calculate the checksums of the exact uploaded bytes and create the reported post-tag manifest commit without moving `v0.3.2`. Only add the `win32-x64` manifest entry when its real Windows-built artifact and checksum exist.
 6. Re-run the manifest check and npm package smoke, then publish npm only after explicit authorization.
 7. Create or finalize the GitHub Release from `docs/RELEASE_NOTES_v0.3.2.md`, record artifact/checksum and optional container-digest results, and perform post-deployment acceptance.
 
