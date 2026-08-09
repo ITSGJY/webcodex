@@ -29,6 +29,8 @@ pub(crate) const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "list_project_tracked_files",
             "read_file",
             "read_files",
+            "run_process",
+            "run_script",
             "run_shell",
             "search_project_text",
             "search_project_texts",
@@ -120,6 +122,8 @@ pub(crate) const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "cargo_fmt",
             "cargo_check",
             "cargo_test",
+            "run_process",
+            "run_script",
             "run_shell",
             "open_session_shell",
             "session_shell_exec",
@@ -139,6 +143,7 @@ pub(crate) const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "stop_job",
             "job_status",
             "job_log",
+            "observe_jobs",
             "list_jobs",
         ],
     },
@@ -194,7 +199,7 @@ pub(crate) const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
 pub(crate) const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
     ToolRecommendedFlow {
         name: "discovery",
-        summary: "Discovery: list_projects, project_overview, and read_file/read_files; use search_project_text for bounded code search and search_project_texts for independent batches. run_shell with rg or git grep remains the diagnostic escape hatch.",
+        summary: "Discovery: use search_project_text for bounded code search after list_projects/project_overview. Prefer run_process for native argv and run_script for typed scripts; run_shell with rg or git grep remains the diagnostic escape hatch.",
         manifest_purpose:
             "Resolve the project, inspect bounded structure, then search code with search_project_text or search_project_texts.",
         tools: &[
@@ -204,12 +209,14 @@ pub(crate) const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
             "read_files",
             "search_project_text",
             "search_project_texts",
+            "run_process",
+            "run_script",
             "run_shell",
         ],
     },
     ToolRecommendedFlow {
         name: "inspect",
-        summary: "Inspect: use search_project_text and read_file before editing; use search_project_texts and read_files for bounded batches. run_shell with rg or git grep is the diagnostic escape hatch, and show_changes reviews the worktree.",
+        summary: "Inspect: use search_project_text and read_file before editing. Prefer run_process for native argv and run_script for typed scripts; run_shell with rg or git grep is the diagnostic escape hatch; show_changes reviews.",
         manifest_purpose:
             "Use bounded structured search and file reads for code inspection, then review the worktree.",
         tools: &[
@@ -217,6 +224,8 @@ pub(crate) const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
             "search_project_texts",
             "read_file",
             "read_files",
+            "run_process",
+            "run_script",
             "run_shell",
             "show_changes",
         ],
@@ -236,15 +245,18 @@ pub(crate) const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
     ToolRecommendedFlow {
         name: "validate",
         summary:
-            "Validate: use cargo_check / cargo_test / validate_patch. A long validation continues as a Job — poll job_status / validation_summary instead of re-running. raw run_shell is a bounded escape hatch, not the primary editing or validation path.",
+            "Validate: use cargo_check / cargo_test / validate_patch; long validation continues as a Job. Prefer run_process for native argv and run_script for typed scripts. Raw run_shell is a bounded escape hatch, not the primary validation path or editing path.",
         manifest_purpose:
-            "Use structured validation; a long check/test continues as a queryable Job instead of blocking or re-running. run_shell is a bounded diagnostics escape hatch, not the primary validation path.",
+            "Use structured validation; long checks become Jobs. Prefer run_process for native argv and run_script for typed scripts; run_shell is a command-string escape hatch, not the primary validation path.",
         tools: &[
             "cargo_check",
             "cargo_test",
+            "observe_jobs",
             "job_status",
             "validation_summary",
             "validate_patch",
+            "run_process",
+            "run_script",
             "run_shell",
         ],
     },
@@ -293,9 +305,12 @@ pub(crate) const LOCAL_CODING_TOOL_NAMES: &[&str] = &[
     // guarded edits
     "apply_text_edits",
     "apply_patch_checked",
-    // shell and jobs
+    // structured process, shell escape hatch, and jobs
+    "run_process",
+    "run_script",
     "run_shell",
     "run_job",
+    "observe_jobs",
     "job_status",
     "job_log",
     "list_jobs",
@@ -380,6 +395,7 @@ pub(crate) const TOOL_MANIFEST_INTENTS: &[ToolManifestIntent] = &[
             "cargo_check",
             "cargo_test",
             "validation_summary",
+            "observe_jobs",
             "list_jobs",
             "show_changes",
             "finish_coding_task",

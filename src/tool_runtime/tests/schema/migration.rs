@@ -118,6 +118,8 @@ fn tool_definition_runtime_tool_policy_inventory_is_stable() {
             "checkpoint",
             "current_session_fallback",
         ),
+        ("run_process", "job", "current_session_fallback"),
+        ("run_script", "job", "current_session_fallback"),
         ("run_shell", "job", "current_session_fallback"),
         ("open_session_shell", "job", "explicit_business_session"),
         ("session_shell_exec", "job", "explicit_business_session"),
@@ -153,6 +155,7 @@ fn tool_definition_runtime_tool_policy_inventory_is_stable() {
         ("stop_job", "job", "current_session_fallback"),
         ("job_status", "job", "none"),
         ("job_log", "job", "none"),
+        ("observe_jobs", "job", "none"),
         ("project_overview", "project", "current_session_fallback"),
         ("list_project_files", "file", "current_session_fallback"),
         (

@@ -20,6 +20,8 @@ fn session_tool_classification_uses_definition_policy() {
         ("start_session", "read_only"),
         ("write_project_file", "project_write"),
         ("apply_patch_checked", "project_write"),
+        ("run_process", "job_run"),
+        ("run_script", "job_run"),
         ("run_shell", "job_run"),
         ("cargo_test", "job_run"),
         ("definitely_not_a_tool", "unknown"),
@@ -321,6 +323,50 @@ fn exploration_input_audit_omits_queries_and_shell_commands() {
     assert_eq!(shell["command_present"], true);
     assert!(shell.get("command").is_none());
     assert!(shell.get("command_summary").is_none());
+
+    let process = session_input_summary_for_tool(
+        "run_process",
+        &json!({
+            "project": "demo",
+            "executable": "RAW_EXECUTABLE",
+            "args": ["RAW_ARG", "secret"],
+            "stdin": "RAW_STDIN",
+            "process_summary": "RAW_EXECUTABLE RAW_ARG",
+            "executable_present": true,
+            "arg_count": 2,
+            "stdin_present": true
+        }),
+    );
+    assert_eq!(process["executable_present"], true);
+    assert_eq!(process["arg_count"], 2);
+    assert_eq!(process["stdin_present"], true);
+    assert!(process.get("executable").is_none());
+    assert!(process.get("args").is_none());
+    assert!(process.get("stdin").is_none());
+    assert!(process.get("process_summary").is_none());
+
+    let script = session_input_summary_for_tool(
+        "run_script",
+        &json!({
+            "project": "demo",
+            "language": "bash",
+            "script": "RAW_SCRIPT_BODY",
+            "args": ["RAW_ARG", "secret"],
+            "stdin": "RAW_STDIN",
+            "script_summary": "bash script (15 bytes, 2 args)",
+            "script_bytes": 15,
+            "arg_count": 2,
+            "stdin_present": true
+        }),
+    );
+    assert_eq!(script["language"], "bash");
+    assert_eq!(script["script_bytes"], 15);
+    assert_eq!(script["arg_count"], 2);
+    assert_eq!(script["stdin_present"], true);
+    assert!(script.get("script").is_none());
+    assert!(script.get("args").is_none());
+    assert!(script.get("stdin").is_none());
+    assert!(script.get("script_summary").is_none());
 
     let persistent = session_input_summary_for_tool(
         "session_shell_exec",

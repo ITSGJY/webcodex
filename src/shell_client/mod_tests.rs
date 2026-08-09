@@ -123,6 +123,7 @@ fn runner_registration(
     ShellClientRegisterRequest {
         process_started_at: None,
         build: None,
+        job_concurrency_limit: None,
         job_inventory: None,
         client_id: client_id.to_string(),
         agent_instance_id: agent_instance_id.to_string(),
@@ -142,6 +143,46 @@ fn async_job_capabilities() -> ShellClientCapabilities {
     capabilities.async_shell_jobs = true;
     capabilities.jobs = true;
     capabilities
+}
+
+#[tokio::test]
+async fn registration_retains_reported_job_concurrency_and_preserves_legacy_unknown() {
+    let registry = ShellClientRegistry::default();
+    for limit in [1, 4, 8, 64] {
+        let client_id = format!("current-limit-{limit}");
+        let instance_id = format!("inst-current-{limit}");
+        let mut current = runner_registration(&client_id, &instance_id, Vec::new());
+        current.job_concurrency_limit = Some(limit);
+        let current_view = registry.register(current).await.unwrap();
+        assert_eq!(current_view.job_concurrency_limit, Some(limit));
+        assert_eq!(
+            registry
+                .get_client_view(&client_id)
+                .await
+                .unwrap()
+                .job_concurrency_limit,
+            Some(limit)
+        );
+    }
+
+    let legacy = registry
+        .register(runner_registration(
+            "legacy-limit",
+            "inst-legacy",
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(legacy.job_concurrency_limit, None);
+
+    for (client_id, limit) in [("invalid-limit-zero", 0), ("invalid-limit-high", 65)] {
+        let mut invalid = runner_registration(client_id, "inst-invalid", Vec::new());
+        invalid.job_concurrency_limit = Some(limit);
+        assert_eq!(
+            registry.register(invalid).await.unwrap_err(),
+            "job_concurrency_limit must be between 1 and 64"
+        );
+    }
 }
 
 fn file_request(op: &str) -> ShellFileOpRequest {
@@ -274,6 +315,7 @@ async fn registry_filters_lightweight_clients_by_auth_group() {
                 ShellClientRegisterRequest {
                     process_started_at: None,
                     build: None,
+                    job_concurrency_limit: None,
                     job_inventory: None,
                     client_id: client_id.to_string(),
                     agent_instance_id: format!("inst-{}", client_id),
@@ -294,6 +336,7 @@ async fn registry_filters_lightweight_clients_by_auth_group() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "managed".to_string(),
             agent_instance_id: "inst-managed".to_string(),
@@ -408,6 +451,7 @@ async fn same_client_id_in_different_project_grants_is_isolated() {
     let registration = |hostname: &str, project: &str| ShellClientRegisterRequest {
         process_started_at: None,
         build: None,
+        job_concurrency_limit: None,
         job_inventory: None,
         client_id: "same-project-agent".to_string(),
         agent_instance_id: "same-instance-id".to_string(),
@@ -467,6 +511,7 @@ async fn shared_key_client_id_collision_cannot_cross_group_or_revive_old_connect
         ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: client_id.to_string(),
             agent_instance_id: instance.to_string(),
@@ -1173,6 +1218,7 @@ async fn registry_registers_and_lists_client() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "xrh".to_string(),
             agent_instance_id: "inst".to_string(),
@@ -1200,6 +1246,7 @@ async fn registry_register_saves_projects() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "oe".to_string(),
             agent_instance_id: "inst".to_string(),
@@ -1229,6 +1276,7 @@ async fn registry_poll_updates_projects() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "oe".to_string(),
             agent_instance_id: "inst".to_string(),
@@ -1268,6 +1316,7 @@ async fn registry_project_owner_check_enforces_boundary() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "alice-client".to_string(),
             agent_instance_id: "inst".to_string(),
@@ -1285,6 +1334,7 @@ async fn registry_project_owner_check_enforces_boundary() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "bob-client".to_string(),
             agent_instance_id: "inst".to_string(),
@@ -1375,6 +1425,7 @@ async fn register_without_protocol_version_defaults_to_unknown() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "oe".to_string(),
             agent_instance_id: "inst".to_string(),
@@ -1399,6 +1450,7 @@ async fn register_with_protocol_version_is_exposed_in_view() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "xrh".to_string(),
             agent_instance_id: "inst".to_string(),
@@ -1427,6 +1479,7 @@ async fn register_blank_protocol_version_falls_back_to_unknown() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "oe".to_string(),
             agent_instance_id: "inst".to_string(),
@@ -1456,6 +1509,7 @@ async fn client_supports_reflects_registered_capabilities() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "oe".to_string(),
             agent_instance_id: "inst".to_string(),
@@ -1518,6 +1572,7 @@ async fn client_supports_recognizes_all_protocol_capability_names() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: Some(crate::shell_protocol::ShellJobInventory {
                 active_complete: true,
                 jobs: Vec::new(),
@@ -1539,6 +1594,9 @@ async fn client_supports_recognizes_all_protocol_capability_names() {
                 persistent_shell: true,
                 ssh_persistent_shell: true,
                 structured_validation_argv: true,
+                structured_process_argv: true,
+                structured_script_payload: true,
+                structured_execution_jobs: true,
                 lsp_read_only_navigation: true,
                 sandbox_inspect_commands: true,
                 project_lifecycle: true,
@@ -1567,6 +1625,7 @@ async fn registry_enqueues_polls_and_completes_shell_request() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "xrh".to_string(),
             agent_instance_id: "inst".to_string(),
@@ -1625,12 +1684,108 @@ async fn registry_enqueues_polls_and_completes_shell_request() {
 }
 
 #[tokio::test]
+async fn polling_out_of_order_results_resolve_only_their_original_waiters() {
+    let registry = ShellClientRegistry::default();
+    registry
+        .register(ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
+            job_concurrency_limit: None,
+            job_inventory: None,
+            client_id: "ordered".to_string(),
+            agent_instance_id: "inst".to_string(),
+            display_name: None,
+            owner: None,
+            hostname: None,
+            capabilities: None,
+            projects: None,
+            agent_protocol_version: None,
+            policy: None,
+        })
+        .await
+        .unwrap();
+    let (request_a, waiter_a) = registry
+        .enqueue_run(
+            ShellRunRequest {
+                client_id: "ordered".to_string(),
+                cwd: None,
+                command: "slow-a".to_string(),
+                stdin: None,
+                timeout_secs: 10,
+                wait_timeout_secs: 10,
+            },
+            "tester".to_string(),
+        )
+        .await
+        .unwrap();
+    let (request_b, waiter_b) = registry
+        .enqueue_run(
+            ShellRunRequest {
+                client_id: "ordered".to_string(),
+                cwd: None,
+                command: "fast-b".to_string(),
+                stdin: None,
+                timeout_secs: 10,
+                wait_timeout_secs: 10,
+            },
+            "tester".to_string(),
+        )
+        .await
+        .unwrap();
+
+    let polled_a = registry
+        .poll(ShellAgentPollRequest {
+            client_id: "ordered".to_string(),
+            agent_instance_id: "inst".to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let polled_b = registry
+        .poll(ShellAgentPollRequest {
+            client_id: "ordered".to_string(),
+            agent_instance_id: "inst".to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(polled_a.request_id, request_a);
+    assert_eq!(polled_b.request_id, request_b);
+
+    for (request_id, stdout) in [(&request_b, "result-b\n"), (&request_a, "result-a\n")] {
+        registry
+            .complete(ShellAgentResultRequest {
+                client_id: "ordered".to_string(),
+                agent_instance_id: "inst".to_string(),
+                request_id: request_id.clone(),
+                exit_code: Some(0),
+                stdout: Some(stdout.to_string()),
+                stderr: None,
+                duration_ms: Some(1),
+                error: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let response_b = waiter_b.await.unwrap();
+    let response_a = waiter_a.await.unwrap();
+    assert_eq!(response_b.request_id, request_b);
+    assert_eq!(response_b.stdout.as_deref(), Some("result-b\n"));
+    assert_eq!(response_a.request_id, request_a);
+    assert_eq!(response_a.stdout.as_deref(), Some("result-a\n"));
+}
+
+#[tokio::test]
 async fn registry_allows_session_scoped_run_without_ssh_resource() {
     let registry = ShellClientRegistry::default();
     registry
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "xrh".to_string(),
             agent_instance_id: "inst".to_string(),
@@ -1720,6 +1875,7 @@ async fn register_lsp_test_client(
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: client_id.to_string(),
             agent_instance_id: "inst".to_string(),
@@ -1848,6 +2004,7 @@ async fn register_quic_v1_client(registry: &ShellClientRegistry, client_id: &str
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: client_id.to_string(),
             agent_instance_id: "inst".to_string(),
@@ -1865,6 +2022,71 @@ async fn register_quic_v1_client(registry: &ShellClientRegistry, client_id: &str
         .set_transport(client_id, TRANSPORT_QUIC)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn raw_shell_run_wait_timeout_preserves_known_dispatch_evidence() {
+    use salvo::test::{ResponseExt, TestClient};
+    use salvo::Service;
+
+    let client_id = "raw-shell-timeout";
+    let registry = Arc::new(ShellClientRegistry::default());
+    let mut registration = runner_registration(
+        client_id,
+        "inst",
+        vec![project_summary("webcodex", "/tmp/webcodex")],
+    );
+    registration.capabilities = Some(ShellClientCapabilities {
+        shell: true,
+        ..Default::default()
+    });
+    registry.register(registration).await.unwrap();
+
+    let service = Service::new(
+        Router::new()
+            .hoop(affix_state::inject(registry.clone()))
+            .hoop(affix_state::inject(auth_context(None, true)))
+            .push(Router::with_path("api/shell/run").post(shell_run)),
+    );
+    let response = TestClient::post("http://localhost/api/shell/run")
+        .json(&json!({
+            "client_id": client_id,
+            "cwd": null,
+            "command": "echo hi",
+            "stdin": null,
+            "timeout_secs": 5,
+            "wait_timeout_secs": 1
+        }))
+        .send(&service);
+    let poll = async {
+        for _ in 0..200 {
+            if let Some(request) = registry
+                .poll(ShellAgentPollRequest {
+                    client_id: client_id.to_string(),
+                    agent_instance_id: "inst".to_string(),
+                    projects: None,
+                })
+                .await
+                .unwrap()
+            {
+                return request;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("raw shell request was not dispatched");
+    };
+    let (mut response, request) = tokio::join!(response, poll);
+    assert_eq!(request.kind, "run_shell");
+    assert_eq!(response.status_code, Some(StatusCode::REQUEST_TIMEOUT));
+    let body = response
+        .take_json::<serde_json::Value>()
+        .await
+        .expect("raw shell timeout JSON");
+    assert_eq!(body["request_dispatched"], true);
+    assert!(
+        body.get("command_execution_state").is_none(),
+        "the server must not fabricate Runner lifecycle evidence: {body}"
+    );
 }
 
 #[tokio::test]
@@ -2004,6 +2226,7 @@ async fn registry_allows_quic_v1_stop_job_delivery_queueing() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "quic-stop".to_string(),
             agent_instance_id: "inst".to_string(),
@@ -2093,6 +2316,7 @@ async fn terminal_observed_legacy_poll_complete_and_log() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "oe".to_string(),
             agent_instance_id: "inst".to_string(),
@@ -2208,6 +2432,7 @@ async fn terminal_observed_queued_stop_records_server_time() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "oe".to_string(),
             agent_instance_id: "inst".to_string(),
@@ -2269,6 +2494,7 @@ async fn registry_shell_job_stop_running_delivers_stop_to_client() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "oe".to_string(),
             agent_instance_id: "inst".to_string(),
@@ -2337,6 +2563,7 @@ async fn registry_marks_running_job_lost_when_client_stale() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "oe".to_string(),
             agent_instance_id: "inst".to_string(),
@@ -2395,6 +2622,7 @@ async fn touch_client_refreshes_stale_client_back_to_online() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "oe".to_string(),
             agent_instance_id: "inst".to_string(),
@@ -2434,6 +2662,7 @@ async fn touch_client_refreshes_websocket_transport_client() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "ws-1".to_string(),
             agent_instance_id: "inst".to_string(),
@@ -2757,6 +2986,7 @@ async fn registry_rejects_enqueue_when_queue_full() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "full".to_string(),
             agent_instance_id: "inst".to_string(),
@@ -2819,6 +3049,7 @@ async fn registry_rejects_enqueue_when_client_offline() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "stale".to_string(),
             agent_instance_id: "inst".to_string(),
@@ -2866,6 +3097,7 @@ async fn reconcile_disconnect_marks_running_jobs_lost() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "oe".to_string(),
             agent_instance_id: "inst".to_string(),
@@ -2922,6 +3154,7 @@ async fn reconcile_disconnect_fails_pending_sync_requests_fast() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "oe".to_string(),
             agent_instance_id: "inst".to_string(),
@@ -2968,9 +3201,48 @@ async fn reconcile_disconnect_fails_pending_sync_requests_fast() {
         error.contains("offline"),
         "error should classify as agent_offline: {error}"
     );
+    assert!(
+        !error.to_ascii_lowercase().contains("command"),
+        "generic sync disconnect errors must remain request-neutral: {error}"
+    );
+    assert_eq!(response.request_dispatched, Some(false));
+    assert_eq!(response.command_execution_state, None);
     // No dangling waiter or queue entry remains.
     let after = registry.get_client_view("oe").await.unwrap();
     assert_eq!(after.pending_requests, 0);
+}
+
+#[tokio::test]
+async fn dispatched_file_request_disconnect_remains_request_neutral() {
+    let registry = ShellClientRegistry::default();
+    register_quic_v1_client(&registry, "oe").await;
+    let (_request_id, rx) = registry
+        .enqueue_file_op(file_request("read"), "tester".to_string())
+        .await
+        .unwrap();
+    registry
+        .poll(ShellAgentPollRequest {
+            client_id: "oe".to_string(),
+            agent_instance_id: "inst".to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap()
+        .expect("file request should be dispatched");
+
+    registry.reconcile_disconnect("oe", "inst").await;
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+        .await
+        .expect("waiter must resolve promptly")
+        .expect("waiter must receive a response");
+    let error = response.error.as_deref().unwrap_or_default();
+    assert!(
+        !error.to_ascii_lowercase().contains("command"),
+        "generic sync disconnect errors must not invent command lifecycle prose: {error}"
+    );
+    assert_eq!(response.request_dispatched, Some(true));
+    assert_eq!(response.command_execution_state, None);
 }
 
 #[tokio::test]
@@ -3009,6 +3281,7 @@ async fn register_with_instance(
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: client_id.to_string(),
             agent_instance_id: instance.to_string(),
@@ -3039,6 +3312,7 @@ async fn register_with_connection(
             ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_concurrency_limit: None,
                 job_inventory: None,
                 client_id: client_id.to_string(),
                 agent_instance_id: instance.to_string(),
@@ -3089,6 +3363,7 @@ async fn lease_different_online_instance_rejected() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "oe".to_string(),
             agent_instance_id: "inst-b".to_string(),
@@ -3296,6 +3571,7 @@ async fn lease_stale_instance_job_update_rejected() {
             exit_code: None,
             duration_ms: None,
             error: None,
+            command_execution_state: None,
             validation_progress: None,
             finished: false,
         })
@@ -3324,6 +3600,7 @@ async fn lease_stale_instance_job_update_rejected() {
             exit_code: None,
             duration_ms: None,
             error: None,
+            command_execution_state: None,
             validation_progress: None,
             finished: false,
         })
@@ -3353,6 +3630,7 @@ async fn lease_stale_instance_job_update_rejected() {
             exit_code: Some(0),
             duration_ms: Some(1),
             error: None,
+            command_execution_state: None,
             validation_progress: None,
             finished: true,
         })
@@ -3503,6 +3781,7 @@ async fn lease_reconcile_disconnect_stale_instance_is_noop() {
             exit_code: None,
             duration_ms: None,
             error: None,
+            command_execution_state: None,
             validation_progress: None,
             finished: false,
         })
@@ -3558,6 +3837,7 @@ async fn lease_register_rejects_empty_instance_id() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "oe".to_string(),
             agent_instance_id: "".to_string(),
@@ -3873,6 +4153,7 @@ async fn stale_connection_runtime_metadata_does_not_overwrite_current() {
                 ShellClientRegisterRequest {
                     process_started_at: None,
                     build: None,
+                    job_concurrency_limit: None,
                     job_inventory: None,
                     client_id: "oe".to_string(),
                     agent_instance_id: "inst-x".to_string(),
@@ -4100,7 +4381,8 @@ async fn late_result_on_stale_connection_is_accepted_without_refreshing_liveness
                 stderr: None,
                 duration_ms: Some(1),
                 error: None,
-            },
+            }
+            .into(),
             "conn-a",
         )
         .await
@@ -4230,6 +4512,7 @@ async fn late_job_update_on_stale_connection_is_accepted_without_refreshing_live
                 exit_code: None,
                 duration_ms: None,
                 error: None,
+                command_execution_state: None,
                 validation_progress: None,
                 finished: false,
             },
@@ -4271,6 +4554,7 @@ async fn late_job_update_on_stale_connection_is_accepted_without_refreshing_live
             exit_code: Some(0),
             duration_ms: Some(1),
             error: None,
+            command_execution_state: None,
             validation_progress: None,
             finished: true,
         })
@@ -4324,6 +4608,7 @@ fn wait_job_update(
         exit_code: finished.then_some(0),
         duration_ms: finished.then_some(2_000),
         error: None,
+        command_execution_state: None,
         validation_progress: None,
         finished,
     }
@@ -4334,6 +4619,7 @@ async fn register_sequenced(registry: &ShellClientRegistry, instance: &str) {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: Some(crate::shell_protocol::ShellJobInventory {
                 active_complete: true,
                 jobs: Vec::new(),
@@ -4629,6 +4915,7 @@ async fn job_log_wait_sequenced_update_changes_token_even_when_tail_is_same() {
             exit_code: None,
             duration_ms: None,
             error: None,
+            command_execution_state: None,
             validation_progress: None,
             finished: false,
         })
@@ -4656,6 +4943,7 @@ async fn job_log_wait_sequenced_update_changes_token_even_when_tail_is_same() {
             exit_code: None,
             duration_ms: None,
             error: None,
+            command_execution_state: None,
             validation_progress: None,
             finished: false,
         })
@@ -4712,6 +5000,7 @@ async fn job_log_wait_legacy_update_between_calls_and_noop_replacement() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "legacy".to_string(),
             agent_instance_id: "legacy-inst".to_string(),
@@ -4760,6 +5049,7 @@ async fn job_log_wait_legacy_update_between_calls_and_noop_replacement() {
         exit_code: None,
         duration_ms: None,
         error: None,
+        command_execution_state: None,
         validation_progress: None,
         finished: false,
     };

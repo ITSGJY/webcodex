@@ -1,6 +1,7 @@
 //! Runtime dispatch adapter for shell tool calls.
 
 use super::{ToolCall, ToolResult, ToolRuntime};
+use crate::auth::AuthContext;
 
 impl ToolRuntime {
     pub(crate) async fn dispatch_shell_tool(
@@ -8,8 +9,61 @@ impl ToolRuntime {
         call: ToolCall,
         sandbox: Option<&str>,
         ssh_resource: Option<&str>,
+        auth: Option<&AuthContext>,
     ) -> ToolResult {
         match call {
+            ToolCall::RunProcess {
+                project,
+                executable,
+                args,
+                stdin,
+                session_id,
+                timeout_secs,
+                cwd,
+                purpose,
+            } => {
+                self.run_process_with_contract_in_sandbox(
+                    project,
+                    executable,
+                    args,
+                    stdin,
+                    timeout_secs,
+                    cwd,
+                    purpose,
+                    sandbox,
+                    ssh_resource,
+                    session_id,
+                    auth,
+                )
+                .await
+            }
+            ToolCall::RunScript {
+                project,
+                language,
+                script,
+                args,
+                stdin,
+                session_id,
+                timeout_secs,
+                cwd,
+                purpose,
+            } => {
+                self.run_script_with_contract_in_sandbox(
+                    project,
+                    language,
+                    script,
+                    args,
+                    stdin,
+                    timeout_secs,
+                    cwd,
+                    purpose,
+                    sandbox,
+                    ssh_resource,
+                    session_id,
+                    auth,
+                )
+                .await
+            }
             ToolCall::RunShell {
                 project,
                 command,

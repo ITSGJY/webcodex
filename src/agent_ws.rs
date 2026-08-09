@@ -359,6 +359,7 @@ mod tests {
             payload: ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_concurrency_limit: None,
                 job_inventory: None,
                 client_id: client_id.to_string(),
                 agent_instance_id: instance_id.to_string(),
@@ -377,6 +378,9 @@ mod tests {
                     persistent_shell: false,
                     ssh_persistent_shell: false,
                     structured_validation_argv: true,
+                    structured_process_argv: true,
+                    structured_script_payload: false,
+                    structured_execution_jobs: false,
                     lsp_read_only_navigation: false,
                     sandbox_inspect_commands: false,
                     project_lifecycle: false,
@@ -638,7 +642,8 @@ mod tests {
                     stderr: None,
                     duration_ms: Some(1),
                     error: None,
-                },
+                }
+                .into(),
             }
             .to_json()
             .unwrap()
@@ -664,7 +669,8 @@ mod tests {
                     stderr: None,
                     duration_ms: Some(1),
                     error: None,
-                },
+                }
+                .into(),
             }
             .to_json()
             .unwrap()
@@ -747,7 +753,8 @@ mod tests {
                 stderr: None,
                 duration_ms: Some(1),
                 error: None,
-            },
+            }
+            .into(),
         };
         ws.send(TungsteniteMessage::Text(
             result_env.to_json().unwrap().into(),
@@ -1120,7 +1127,8 @@ mod tests {
                     stderr: None,
                     duration_ms: Some(1),
                     error: None,
-                },
+                }
+                .into(),
             }
             .to_json()
             .unwrap()

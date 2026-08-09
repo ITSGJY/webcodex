@@ -179,6 +179,9 @@ async fn cargo_check_failure_includes_stderr_tail_or_guidance() {
     assert!(error.contains("stdout_tail/stderr_tail"));
     assert!(error.contains("narrower cargo filter"));
     assert_eq!(result.output["passed"], false);
+    assert_eq!(result.output["execution_state"], "completed");
+    assert_eq!(result.output["command_started"], true);
+    assert_eq!(result.output["command_completed"], true);
     assert_eq!(result.output["failure_kind"], "validation_failed");
     assert!(result.output["stderr_tail"]
         .as_str()
@@ -499,6 +502,9 @@ async fn cargo_test_agent_timeout_is_not_validation_failed() {
 
     let result = task.await.unwrap();
     assert!(!result.success);
+    assert_eq!(result.output["execution_state"], "timed_out");
+    assert_eq!(result.output["command_started"], true);
+    assert_eq!(result.output["command_completed"], false);
     assert_eq!(result.output["failure_kind"], "timeout");
 }
 
@@ -550,6 +556,7 @@ async fn apply_patch_agent_does_not_require_server_local_project_root() {
         .register(ShellClientRegisterRequest {
             process_started_at: None,
             build: None,
+            job_concurrency_limit: None,
             job_inventory: None,
             client_id: "patcher".to_string(),
             agent_instance_id: "inst".to_string(),

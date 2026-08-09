@@ -13,11 +13,18 @@ WebCodex 是面向 coding assistant 的远程、可审计、有界执行层。�
 
 ## 下一阶段优先级
 
-1. 改善任务续接和 operator 可见性，同时避免无必要扩大公开 capability surface。
-2. 完善自托管安装、升级、回滚和混合版本诊断。
-3. 在保持协议兼容的前提下继续减少重复 projection 和过大返回体。
-4. 扩展认证、transport 恢复、validation provenance 和进程清理的端到端覆盖。
-5. 只在能够保持 project、permission、timeout 和 audit 边界时评估更多 provider 集成。
+本次 execution cycle 以 **降低模型执行摩擦** 为中心，而不是继续扩张 fleet/运维能力；A–F 已完成最终验收，后续只做 maintenance/stabilization。设计约束见 [MODEL_EXECUTION.md](MODEL_EXECUTION.md)。
+
+1. Execution Phase A–F 已完成实现和最终验收：可信 lifecycle、structured process/script、同一次执行 Job handoff、有界 batch observation、non-pinning polling、实用 Job concurrency/observability，以及 Windows 本地 process output normalization 均已通过 Linux 回归与真实 Windows/MSVC service-context 验证。
+2. 本轮后续 execution 工作只做 maintenance/stabilization：只修有证据的 regression，保留 Linux/Windows acceptance evidence；没有新的具体需求时不再增加 execution feature phase。
+3. 继续保持 structured MCP result，并允许可选的 conversation-level Orchestrator，但不让 UI 或可选 MCP 2026 extension 成为 execution truth 的一部分。
+
+## 暂缓，直到出现当前需求
+
+- Runner drain/maintenance/self-upgrade 与更完整的 fleet dashboard。
+- Windows SCM service lifecycle 产品化；当前 dogfood 可以继续使用外部/手工 service wrapper。
+- 通用 process/service management API、batch Job launch、PTY terminal UX 或精细化 MCP App UI。
+- 在目标 Host 尚未形成稳定产品合同前依赖 MCP Tasks、MRTR、elicitation 或 progress extension。
 
 ## 完成标准
 

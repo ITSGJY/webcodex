@@ -61,6 +61,9 @@ pub(in crate::tool_runtime::tests) fn sample_tool_args_for_spec(spec: &ToolSpec)
         "work_on_project" => {
             args.insert("project".to_string(), json!(SAMPLE_PROJECT));
         }
+        "observe_jobs" => {
+            args.insert("items".to_string(), json!([{"job_id": "job_123"}]));
+        }
         _ => {}
     }
     Value::Object(args)
@@ -70,6 +73,9 @@ pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
     match field {
         "project" => json!(SAMPLE_PROJECT),
         "command" => json!("true"),
+        "executable" => json!("git"),
+        "language" => json!("sh"),
+        "script" => json!("true"),
         "patch" => json!("diff --git a/a b/a\n"),
         "paths" => json!(["old.txt"]),
         "items" => json!([{"path": "src/lib.rs"}]),

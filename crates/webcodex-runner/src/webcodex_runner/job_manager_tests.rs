@@ -286,12 +286,10 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
 #[test]
 fn job_reconciliation_utf8_log_tail_is_bounded_with_absolute_cursor() {
     let emoji = "🙂".as_bytes();
-    let mut split_scalar = emoji[..2].to_vec();
-    assert!(take_utf8_output(&mut split_scalar, false).is_empty());
-    assert_eq!(split_scalar, emoji[..2]);
-    split_scalar.extend_from_slice(&emoji[2..]);
-    assert_eq!(take_utf8_output(&mut split_scalar, false), "🙂");
-    assert!(split_scalar.is_empty());
+    let mut decoder = OutputTextDecoder::new(OutputTextSource::LocalProcess);
+    assert!(decoder.push(&emoji[..2], false).is_empty());
+    assert_eq!(decoder.push(&emoji[2..], false), "🙂");
+    assert!(decoder.push(&[], true).is_empty());
 
     let mut stream = ShellJobStreamSnapshot::default();
     let chunk = "🙂\n".repeat(JOB_SNAPSHOT_STREAM_MAX_BYTES / 2);
@@ -532,7 +530,6 @@ struct FailFastAttempt {
 /// The deadline is wall-clock rather than a sleep count: under a loaded machine
 /// a 10ms sleep is not 10ms, so a counting loop silently shortens its own
 /// patience exactly when the job needs more of it.
-#[cfg(unix)]
 fn collect_job_updates(
     rx: &mut tokio::sync::mpsc::Receiver<AgentEnvelope>,
     deadline: Duration,
@@ -551,6 +548,1280 @@ fn collect_job_updates(
         std::thread::sleep(Duration::from_millis(10));
     }
     updates
+}
+
+/// Standalone native-argv helper used by the typed Job tests. The fixture can
+/// append a PID/nonce marker before sleeping, so any cancel-and-restart
+/// promotion would leave two durable start lines.
+struct StructuredProcessHelper {
+    _temp: TempDir,
+    path: PathBuf,
+}
+
+static STRUCTURED_PROCESS_HELPER: OnceLock<Arc<StructuredProcessHelper>> = OnceLock::new();
+
+fn structured_process_helper() -> Arc<StructuredProcessHelper> {
+    STRUCTURED_PROCESS_HELPER
+        .get_or_init(|| {
+            let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/process_argv_helper.rs");
+            let temp = tempfile::tempdir().unwrap();
+            let output = temp.path().join(format!(
+                "structured-process-helper{}",
+                std::env::consts::EXE_SUFFIX
+            ));
+            let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
+            let result = Command::new(rustc)
+                .arg("--edition=2021")
+                .arg("--crate-name=webcodex_structured_process_helper")
+                .arg(source)
+                .arg("-o")
+                .arg(&output)
+                .output()
+                .expect("run rustc for structured process helper");
+            assert!(
+                result.status.success(),
+                "structured process helper compilation failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            Arc::new(StructuredProcessHelper {
+                _temp: temp,
+                path: output,
+            })
+        })
+        .clone()
+}
+
+fn structured_process_context(
+    cwd: &Path,
+    arg_count: usize,
+    stdin_present: bool,
+) -> ShellJobContext {
+    let mut context = test_job_context(cwd, Vec::new());
+    context.shell = Some("direct_argv".to_string());
+    context.command_preview = "structured process test".to_string();
+    context.structured_execution = Some(shell_protocol::ShellJobStructuredExecutionMetadata {
+        execution_source: "run_process".to_string(),
+        language: None,
+        script_bytes: None,
+        arg_count,
+        stdin_present,
+    });
+    context
+}
+
+fn structured_script_context(
+    cwd: &Path,
+    language: shell_protocol::ShellScriptLanguage,
+    script_bytes: usize,
+    arg_count: usize,
+    stdin_present: bool,
+) -> ShellJobContext {
+    let mut context = test_job_context(cwd, Vec::new());
+    context.shell = Some(language.as_str().to_string());
+    context.command_preview = format!(
+        "{} script ({script_bytes} bytes, {arg_count} args)",
+        language.as_str()
+    );
+    context.structured_execution = Some(shell_protocol::ShellJobStructuredExecutionMetadata {
+        execution_source: "run_script".to_string(),
+        language: Some(language),
+        script_bytes: Some(script_bytes),
+        arg_count,
+        stdin_present,
+    });
+    context
+}
+
+fn structured_test_sink(
+    client_id: &str,
+    instance_id: &str,
+) -> (AgentSink, tokio::sync::mpsc::Receiver<AgentEnvelope>) {
+    let (tx, rx) = tokio::sync::mpsc::channel(256);
+    (
+        AgentSink::WebSocket {
+            tx,
+            client_id: client_id.to_string(),
+            agent_instance_id: instance_id.to_string(),
+        },
+        rx,
+    )
+}
+
+fn enqueue_structured_process_job(
+    manager: &JobManager,
+    sink: AgentSink,
+    cwd: &Path,
+    job_id: &str,
+    executable: &Path,
+    args: Vec<String>,
+    stdin: Option<String>,
+    timeout_secs: u64,
+    sandbox: Option<&str>,
+) {
+    let context = structured_process_context(cwd, args.len(), stdin.is_some());
+    manager.enqueue(
+        sink,
+        1,
+        AgentPolicy {
+            allow_cwd_anywhere: true,
+            ..AgentPolicy::default()
+        },
+        ShellConfig::default(),
+        SshConfig::default(),
+        cwd.join("projects.d"),
+        serde_json::from_value(json!({
+            "request_id": format!("request-{job_id}"),
+            "client_id": "structured-agent",
+            "kind": "start_process_job",
+            "job_id": job_id,
+            "cwd": cwd,
+            "command": "",
+            "process": {
+                "executable": executable,
+                "args": args,
+            },
+            "stdin": stdin,
+            "timeout_secs": timeout_secs,
+            "requested_by": "test",
+            "created_at": chrono::Utc::now().timestamp(),
+            "sandbox": sandbox,
+            "job_context": context,
+        }))
+        .unwrap(),
+    );
+}
+
+struct GatedStructuredJob {
+    job_id: String,
+    started: PathBuf,
+    active: PathBuf,
+    release: PathBuf,
+}
+
+impl GatedStructuredJob {
+    fn new(root: &Path, job_id: &str) -> Self {
+        Self {
+            job_id: job_id.to_string(),
+            started: root.join(format!("{job_id}.started")),
+            active: root.join(format!("{job_id}.active")),
+            release: root.join(format!("{job_id}.release")),
+        }
+    }
+
+    fn args(&self) -> Vec<String> {
+        vec![
+            "gate".to_string(),
+            self.started.to_string_lossy().into_owned(),
+            self.active.to_string_lossy().into_owned(),
+            self.release.to_string_lossy().into_owned(),
+            self.job_id.clone(),
+        ]
+    }
+
+    fn release(&self) {
+        std::fs::write(&self.release, "release\n").unwrap();
+    }
+}
+
+fn enqueue_gated_structured_job(
+    manager: &JobManager,
+    sink: &AgentSink,
+    cwd: &Path,
+    helper: &StructuredProcessHelper,
+    job: &GatedStructuredJob,
+) {
+    enqueue_structured_process_job(
+        manager,
+        sink.clone(),
+        cwd,
+        &job.job_id,
+        &helper.path,
+        job.args(),
+        None,
+        20,
+        None,
+    );
+}
+
+fn active_gated_children(jobs: &[GatedStructuredJob]) -> usize {
+    jobs.iter().filter(|job| job.active.exists()).count()
+}
+
+fn wait_for_all_started(jobs: &[GatedStructuredJob]) {
+    assert!(
+        wait_until(Duration::from_secs(10), || jobs
+            .iter()
+            .all(|job| job.started.exists())),
+        "gated children did not all start: {:?}",
+        jobs.iter()
+            .map(|job| (&job.job_id, job.started.exists()))
+            .collect::<Vec<_>>()
+    );
+}
+
+fn wait_for_job_workers(manager: &JobManager) {
+    assert!(
+        manager.wait_for_workers(Instant::now() + Duration::from_secs(10)),
+        "Job workers did not finish"
+    );
+}
+
+fn assert_gated_job_started_once(job: &GatedStructuredJob) {
+    let starts = std::fs::read_to_string(&job.started).unwrap();
+    assert_eq!(
+        starts.lines().count(),
+        1,
+        "{} started more than once",
+        job.job_id
+    );
+    assert!(starts.contains(&job.job_id));
+}
+
+#[test]
+fn phase_e2_default_four_gates_fifth_and_promotes_same_job_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let helper = structured_process_helper();
+    let (sink, _rx) = structured_test_sink("structured-agent", "structured-instance");
+    let manager = JobManager::new(DEFAULT_MAX_CONCURRENT_JOBS);
+    let jobs = (1..=5)
+        .map(|index| GatedStructuredJob::new(temp.path(), &format!("default-{index}")))
+        .collect::<Vec<_>>();
+
+    for job in &jobs {
+        enqueue_gated_structured_job(&manager, &sink, temp.path(), &helper, job);
+    }
+    wait_for_all_started(&jobs[..4]);
+    assert_eq!(active_gated_children(&jobs), 4);
+    assert!(
+        !jobs[4].started.exists(),
+        "the fifth child started before a Job slot opened"
+    );
+    let queued = manager
+        .inventory()
+        .jobs
+        .into_iter()
+        .find(|snapshot| snapshot.job_id == jobs[4].job_id)
+        .expect("original fifth Job remains queryable");
+    assert_eq!(queued.status, "agent_queued");
+    assert_eq!(queued.request_id, "request-default-5");
+
+    jobs[0].release();
+    assert!(
+        wait_until(Duration::from_secs(10), || jobs[4].active.exists()),
+        "the original fifth Job was not promoted"
+    );
+    assert!(!jobs[0].active.exists());
+    assert_eq!(
+        active_gated_children(&jobs),
+        4,
+        "simultaneously started children exceeded or failed to reach the default"
+    );
+    let promoted = manager
+        .inventory()
+        .jobs
+        .into_iter()
+        .find(|snapshot| snapshot.job_id == jobs[4].job_id)
+        .expect("promoted fifth Job retains its record");
+    assert_eq!(promoted.status, "running");
+    assert_eq!(promoted.request_id, "request-default-5");
+
+    for job in &jobs[1..] {
+        job.release();
+    }
+    wait_for_job_workers(&manager);
+    for job in &jobs {
+        assert_gated_job_started_once(job);
+        let snapshot = manager
+            .inventory()
+            .jobs
+            .into_iter()
+            .find(|snapshot| snapshot.job_id == job.job_id)
+            .unwrap();
+        assert_eq!(snapshot.status, "completed");
+        assert_eq!(snapshot.request_id, format!("request-{}", job.job_id));
+    }
+}
+
+#[test]
+fn phase_e2_explicit_limit_one_serializes_jobs_strictly() {
+    let temp = tempfile::tempdir().unwrap();
+    let helper = structured_process_helper();
+    let (sink, _rx) = structured_test_sink("structured-agent", "structured-instance");
+    let manager = JobManager::new(1);
+    let first = GatedStructuredJob::new(temp.path(), "serial-a");
+    let second = GatedStructuredJob::new(temp.path(), "serial-b");
+
+    enqueue_gated_structured_job(&manager, &sink, temp.path(), &helper, &first);
+    enqueue_gated_structured_job(&manager, &sink, temp.path(), &helper, &second);
+    wait_for_all_started(std::slice::from_ref(&first));
+    assert!(first.active.exists());
+    assert!(!second.active.exists());
+    assert!(!second.started.exists());
+
+    first.release();
+    wait_for_all_started(std::slice::from_ref(&second));
+    assert!(!first.active.exists());
+    assert_eq!(
+        usize::from(second.active.exists()),
+        1,
+        "limit=1 did not serialize execution"
+    );
+    second.release();
+    wait_for_job_workers(&manager);
+    assert_gated_job_started_once(&first);
+    assert_gated_job_started_once(&second);
+}
+
+#[test]
+fn phase_e2_explicit_higher_limit_starts_all_eight_children() {
+    let temp = tempfile::tempdir().unwrap();
+    let helper = structured_process_helper();
+    let (sink, _rx) = structured_test_sink("structured-agent", "structured-instance");
+    let manager = JobManager::new(8);
+    let jobs = (1..=8)
+        .map(|index| GatedStructuredJob::new(temp.path(), &format!("higher-{index}")))
+        .collect::<Vec<_>>();
+
+    for job in &jobs {
+        enqueue_gated_structured_job(&manager, &sink, temp.path(), &helper, job);
+    }
+    wait_for_all_started(&jobs);
+    assert_eq!(
+        active_gated_children(&jobs),
+        8,
+        "explicit limit=8 was capped at a smaller default"
+    );
+    for job in &jobs {
+        job.release();
+    }
+    wait_for_job_workers(&manager);
+    for job in &jobs {
+        assert_gated_job_started_once(job);
+    }
+}
+
+#[test]
+fn phase_e2_single_client_queue_promotes_fifo() {
+    let temp = tempfile::tempdir().unwrap();
+    let helper = structured_process_helper();
+    let (sink, _rx) = structured_test_sink("structured-agent", "structured-instance");
+    let manager = JobManager::new(1);
+    let first = GatedStructuredJob::new(temp.path(), "fifo-a");
+    let second = GatedStructuredJob::new(temp.path(), "fifo-b");
+    let third = GatedStructuredJob::new(temp.path(), "fifo-c");
+
+    for job in [&first, &second, &third] {
+        enqueue_gated_structured_job(&manager, &sink, temp.path(), &helper, job);
+    }
+    wait_for_all_started(std::slice::from_ref(&first));
+    assert!(!second.started.exists());
+    assert!(!third.started.exists());
+
+    first.release();
+    wait_for_all_started(std::slice::from_ref(&second));
+    assert!(!third.started.exists(), "C started before queued B");
+    second.release();
+    wait_for_all_started(std::slice::from_ref(&third));
+    third.release();
+    wait_for_job_workers(&manager);
+    for job in [&first, &second, &third] {
+        assert_gated_job_started_once(job);
+    }
+}
+
+#[test]
+fn phase_e2_prestart_structured_failure_releases_slot_for_queued_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let helper = structured_process_helper();
+    let (sink, _rx) = structured_test_sink("structured-agent", "structured-instance");
+    let manager = JobManager::new(1);
+    manager.install_sink(sink.clone());
+
+    let failed_job_id = "prestart-failure";
+    let mut failed_snapshot = test_job_snapshot(failed_job_id);
+    failed_snapshot.status = "agent_queued".to_string();
+    failed_snapshot.started_at = None;
+    failed_snapshot.update_seq = 1;
+    failed_snapshot.context = structured_process_context(temp.path(), 0, false);
+    lock_unpoison(&manager.jobs).insert(
+        failed_job_id.to_string(),
+        RunningJob {
+            client_id: "structured-agent".to_string(),
+            agent_instance_id: "structured-instance".to_string(),
+            snapshot: failed_snapshot,
+            child: None,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            slot_reserved: true,
+        },
+    );
+
+    let queued = GatedStructuredJob::new(temp.path(), "after-prestart-failure");
+    enqueue_gated_structured_job(&manager, &sink, temp.path(), &helper, &queued);
+    assert!(!queued.started.exists());
+    let failed_request: ShellAgentShellRequest = serde_json::from_value(json!({
+        "request_id": "request-prestart-failure",
+        "client_id": "structured-agent",
+        "kind": "start_process_job",
+        "job_id": failed_job_id,
+        "cwd": temp.path(),
+        "command": "",
+        "timeout_secs": 20,
+        "requested_by": "test",
+        "created_at": chrono::Utc::now().timestamp(),
+        "job_context": structured_process_context(temp.path(), 0, false),
+    }))
+    .unwrap();
+    manager.start_structured_job(
+        1,
+        AgentPolicy {
+            allow_cwd_anywhere: true,
+            ..AgentPolicy::default()
+        },
+        ShellConfig::default(),
+        temp.path().join("projects.d"),
+        failed_request,
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(10), || queued.started.exists()),
+        "queued Job stayed blocked after the reserved pre-start slot failed"
+    );
+    let failed = manager
+        .inventory()
+        .jobs
+        .into_iter()
+        .find(|snapshot| snapshot.job_id == failed_job_id)
+        .unwrap();
+    assert_eq!(failed.status, "failed");
+    assert_eq!(
+        failed.command_execution_state,
+        Some(ShellCommandExecutionState::NotStarted)
+    );
+    assert!(
+        !lock_unpoison(&manager.jobs)
+            .get(failed_job_id)
+            .unwrap()
+            .slot_reserved
+    );
+
+    queued.release();
+    wait_for_job_workers(&manager);
+    assert_gated_job_started_once(&queued);
+}
+
+#[test]
+fn phase_e2_stopped_queued_job_never_executes_after_slot_release() {
+    let temp = tempfile::tempdir().unwrap();
+    let helper = structured_process_helper();
+    let (sink, _rx) = structured_test_sink("structured-agent", "structured-instance");
+    let manager = JobManager::new(1);
+    let first = GatedStructuredJob::new(temp.path(), "queued-stop-a");
+    let stopped = GatedStructuredJob::new(temp.path(), "queued-stop-b");
+
+    enqueue_gated_structured_job(&manager, &sink, temp.path(), &helper, &first);
+    enqueue_gated_structured_job(&manager, &sink, temp.path(), &helper, &stopped);
+    wait_for_all_started(std::slice::from_ref(&first));
+    assert!(!stopped.started.exists());
+    manager.stop(&stopped.job_id).unwrap();
+    let stopped_snapshot = manager
+        .inventory()
+        .jobs
+        .into_iter()
+        .find(|snapshot| snapshot.job_id == stopped.job_id)
+        .unwrap();
+    assert_eq!(stopped_snapshot.status, "stopped");
+    assert_eq!(
+        stopped_snapshot.command_execution_state,
+        Some(ShellCommandExecutionState::NotStarted)
+    );
+
+    first.release();
+    wait_for_job_workers(&manager);
+    assert!(
+        !stopped.started.exists(),
+        "stopped queued Job spawned after a slot opened"
+    );
+    assert!(!stopped.active.exists());
+    assert!(lock_unpoison(&manager.queued)
+        .iter()
+        .all(|entry| entry.6.job_id.as_deref() != Some(stopped.job_id.as_str())));
+}
+
+#[cfg(unix)]
+#[test]
+fn phase_e2_validation_job_shares_the_same_job_manager_slot_limit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let helper = structured_process_helper();
+    let (sink, _rx) = structured_test_sink("structured-agent", "structured-instance");
+    let manager = JobManager::new(1);
+    let blocker = GatedStructuredJob::new(temp.path(), "validation-slot-blocker");
+    enqueue_gated_structured_job(&manager, &sink, temp.path(), &helper, &blocker);
+    wait_for_all_started(std::slice::from_ref(&blocker));
+
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let cargo = bin.join("cargo");
+    let validation_marker = temp.path().join("validation.started");
+    std::fs::write(
+        &cargo,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' validation > \"{}\"\n",
+            validation_marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let steps = vec![ShellJobValidationStep {
+        name: "check".to_string(),
+        program: "cargo".to_string(),
+        args: vec!["check".to_string(), "--all-targets".to_string()],
+        env: Vec::new(),
+    }];
+    let mut shell = ShellConfig::default();
+    shell.path_prepend.push(bin);
+    manager.enqueue(
+        sink,
+        1,
+        AgentPolicy {
+            allow_cwd_anywhere: true,
+            ..AgentPolicy::default()
+        },
+        shell,
+        SshConfig::default(),
+        temp.path().join("projects.d"),
+        serde_json::from_value(json!({
+            "request_id": "request-validation-shared-slot",
+            "client_id": "structured-agent",
+            "kind": "start_validation_job",
+            "job_id": "validation-shared-slot",
+            "cwd": temp.path(),
+            "command": serde_json::to_string(&steps).unwrap(),
+            "timeout_secs": 20,
+            "requested_by": "test",
+            "created_at": chrono::Utc::now().timestamp(),
+            "job_context": test_job_context(temp.path(), vec!["check".to_string()]),
+        }))
+        .unwrap(),
+    );
+    assert!(!validation_marker.exists());
+    assert_eq!(
+        manager
+            .inventory()
+            .jobs
+            .iter()
+            .find(|snapshot| snapshot.job_id == "validation-shared-slot")
+            .unwrap()
+            .status,
+        "agent_queued"
+    );
+
+    blocker.release();
+    assert!(
+        wait_until(Duration::from_secs(10), || validation_marker.exists()),
+        "validation Job did not start after the shared slot opened"
+    );
+    wait_for_job_workers(&manager);
+    let validation = manager
+        .inventory()
+        .jobs
+        .into_iter()
+        .find(|snapshot| snapshot.job_id == "validation-shared-slot")
+        .unwrap();
+    assert_eq!(validation.status, "completed");
+    assert_eq!(
+        validation.validation_progress,
+        Some(ShellJobValidationProgress {
+            completed: 1,
+            current_step: None,
+            failed_step: None,
+        })
+    );
+}
+
+#[test]
+fn structured_process_job_executes_exactly_once_and_reconciles_the_same_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let helper = structured_process_helper();
+    let marker = temp.path().join("started.log");
+    let nonce = format!("nonce-{}", uuid::Uuid::new_v4());
+    let (sink, mut rx) = structured_test_sink("structured-agent", "structured-instance");
+    let manager = JobManager::new(1);
+    enqueue_structured_process_job(
+        &manager,
+        sink,
+        temp.path(),
+        "structured-once",
+        &helper.path,
+        vec![
+            "mark-sleep".to_string(),
+            marker.to_string_lossy().into_owned(),
+            nonce.clone(),
+            "250".to_string(),
+        ],
+        None,
+        5,
+        None,
+    );
+
+    assert!(wait_until(Duration::from_secs(5), || marker.exists()));
+    let active = manager.inventory();
+    let active = active
+        .jobs
+        .iter()
+        .find(|snapshot| snapshot.job_id == "structured-once")
+        .expect("same active Job is in reconciliation inventory");
+    assert_eq!(active.status, "running");
+    assert_eq!(active.command_execution_state, None);
+    assert_eq!(
+        active
+            .context
+            .structured_execution
+            .as_ref()
+            .unwrap()
+            .execution_source,
+        "run_process"
+    );
+
+    let updates = collect_job_updates(&mut rx, Duration::from_secs(10));
+    let final_update = updates.last().expect("structured process terminal update");
+    assert!(final_update.finished, "{final_update:?}");
+    assert_eq!(final_update.status, "completed", "{final_update:?}");
+    assert_eq!(final_update.exit_code, Some(0), "{final_update:?}");
+    assert_eq!(
+        final_update.command_execution_state,
+        Some(ShellCommandExecutionState::Completed)
+    );
+    assert!(final_update
+        .log_snapshot
+        .as_ref()
+        .unwrap()
+        .stdout
+        .tail
+        .contains(&nonce));
+    let starts = std::fs::read_to_string(&marker).unwrap();
+    let lines = starts.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1, "the process was started more than once");
+    assert!(lines[0].ends_with(&format!(":{nonce}")));
+
+    let retained = manager
+        .inventory()
+        .jobs
+        .into_iter()
+        .find(|snapshot| snapshot.job_id == "structured-once")
+        .unwrap();
+    assert_eq!(retained.status, "completed");
+    assert_eq!(
+        retained.command_execution_state,
+        Some(ShellCommandExecutionState::Completed)
+    );
+    assert_eq!(retained.request_id, "request-structured-once");
+}
+
+#[test]
+fn structured_process_job_preserves_large_literal_argv_without_shell_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    let helper = structured_process_helper();
+    let shell_marker = temp.path().join("shell-marker");
+    let values = vec![
+        "a".repeat(4_500),
+        "b".repeat(4_500),
+        format!("$(touch {})", shell_marker.display()),
+        format!("; touch {}", shell_marker.display()),
+    ];
+    let mut args = vec!["argv".to_string()];
+    args.extend(values.clone());
+    let (sink, mut rx) = structured_test_sink("structured-agent", "structured-instance");
+    let manager = JobManager::new(1);
+    enqueue_structured_process_job(
+        &manager,
+        sink,
+        temp.path(),
+        "structured-large-argv",
+        &helper.path,
+        args,
+        None,
+        5,
+        None,
+    );
+    let updates = collect_job_updates(&mut rx, Duration::from_secs(10));
+    let final_update = updates.last().expect("large argv terminal update");
+    assert_eq!(final_update.status, "completed", "{final_update:?}");
+    assert_eq!(
+        final_update.command_execution_state,
+        Some(ShellCommandExecutionState::Completed)
+    );
+    let stdout = &final_update.log_snapshot.as_ref().unwrap().stdout.tail;
+    for value in &values {
+        assert!(stdout.contains(value));
+    }
+    assert!(!shell_marker.exists(), "shell-looking argv was interpreted");
+}
+
+#[test]
+fn structured_process_job_terminal_lifecycle_distinguishes_prestart_nonzero_and_timeout() {
+    let temp = tempfile::tempdir().unwrap();
+    let helper = structured_process_helper();
+    for (job_id, executable, args, timeout_secs, status, state, exit_code) in [
+        (
+            "structured-missing",
+            temp.path().join("missing-executable"),
+            Vec::new(),
+            5,
+            "failed",
+            ShellCommandExecutionState::NotStarted,
+            None,
+        ),
+        (
+            "structured-nonzero",
+            helper.path.clone(),
+            vec!["exit".to_string(), "19".to_string()],
+            5,
+            "failed",
+            ShellCommandExecutionState::Completed,
+            Some(19),
+        ),
+        (
+            "structured-timeout",
+            helper.path.clone(),
+            vec!["sleep".to_string(), "3000".to_string()],
+            1,
+            "timeout",
+            ShellCommandExecutionState::TimedOut,
+            Some(-1),
+        ),
+    ] {
+        let (sink, mut rx) = structured_test_sink("structured-agent", "structured-instance");
+        let manager = JobManager::new(1);
+        let started = Instant::now();
+        enqueue_structured_process_job(
+            &manager,
+            sink,
+            temp.path(),
+            job_id,
+            &executable,
+            args,
+            None,
+            timeout_secs,
+            None,
+        );
+        let updates = collect_job_updates(&mut rx, Duration::from_secs(10));
+        let final_update = updates.last().expect("terminal lifecycle update");
+        assert_eq!(final_update.status, status, "{final_update:?}");
+        assert_eq!(
+            final_update.command_execution_state,
+            Some(state),
+            "{final_update:?}"
+        );
+        assert_eq!(final_update.exit_code, exit_code, "{final_update:?}");
+        if state == ShellCommandExecutionState::TimedOut {
+            assert!(
+                started.elapsed() < Duration::from_millis(2_200),
+                "the one-second original timeout budget was reset or extended"
+            );
+        }
+        if state == ShellCommandExecutionState::NotStarted {
+            assert!(
+                !updates.iter().any(|update| update.status == "running"),
+                "pre-spawn failure must never claim the child started"
+            );
+        }
+    }
+}
+
+#[test]
+fn structured_process_job_handoff_observation_does_not_reset_the_original_total_timeout() {
+    let temp = tempfile::tempdir().unwrap();
+    let helper = structured_process_helper();
+    let marker = temp.path().join("timeout-started.log");
+    let nonce = format!("timeout-{}", uuid::Uuid::new_v4());
+    let (sink, mut rx) = structured_test_sink("structured-agent", "structured-instance");
+    let manager = JobManager::new(1);
+    let original_start = Instant::now();
+    enqueue_structured_process_job(
+        &manager,
+        sink,
+        temp.path(),
+        "structured-original-timeout",
+        &helper.path,
+        vec![
+            "mark-sleep".to_string(),
+            marker.to_string_lossy().into_owned(),
+            nonce.clone(),
+            "3000".to_string(),
+        ],
+        None,
+        1,
+        None,
+    );
+    assert!(wait_until(Duration::from_secs(5), || marker.exists()));
+
+    // Model the Server's short sync grace ending by observing the retained
+    // active Job after the one child has already started. This observation is
+    // deliberately read-only: it cannot replace the process or its deadline.
+    std::thread::sleep(Duration::from_millis(300));
+    let handoff = manager
+        .inventory()
+        .jobs
+        .into_iter()
+        .find(|snapshot| snapshot.job_id == "structured-original-timeout")
+        .expect("the same active Job is exposed at handoff");
+    assert_eq!(handoff.status, "running");
+    assert_eq!(handoff.command_execution_state, None);
+
+    let updates = collect_job_updates(&mut rx, Duration::from_secs(10));
+    let final_update = updates.last().expect("original timeout terminal update");
+    assert_eq!(final_update.status, "timeout", "{final_update:?}");
+    assert_eq!(
+        final_update.command_execution_state,
+        Some(ShellCommandExecutionState::TimedOut)
+    );
+    let duration_ms = final_update.duration_ms.expect("timeout duration");
+    assert!(
+        (850..=1_250).contains(&duration_ms),
+        "the one-second original timeout was reset at handoff: {duration_ms} ms"
+    );
+    assert!(
+        original_start.elapsed() < Duration::from_millis(1_500),
+        "handoff extended the original total timeout"
+    );
+    let starts = std::fs::read_to_string(marker).unwrap();
+    assert_eq!(starts.lines().count(), 1);
+    assert!(starts.contains(&nonce));
+}
+
+#[test]
+fn stop_terminates_a_structured_process_job_without_replacement() {
+    let temp = tempfile::tempdir().unwrap();
+    let helper = structured_process_helper();
+    let marker = temp.path().join("stop-started.log");
+    let nonce = format!("stop-{}", uuid::Uuid::new_v4());
+    let (sink, mut rx) = structured_test_sink("structured-agent", "structured-instance");
+    let manager = JobManager::new(1);
+    enqueue_structured_process_job(
+        &manager,
+        sink,
+        temp.path(),
+        "structured-stop",
+        &helper.path,
+        vec![
+            "mark-sleep".to_string(),
+            marker.to_string_lossy().into_owned(),
+            nonce.clone(),
+            "5000".to_string(),
+        ],
+        None,
+        30,
+        None,
+    );
+    assert!(wait_until(Duration::from_secs(5), || marker.exists()));
+    manager.stop("structured-stop").unwrap();
+    let updates = collect_job_updates(&mut rx, Duration::from_secs(10));
+    let final_update = updates.last().expect("structured stop terminal update");
+    assert_eq!(final_update.status, "stopped", "{final_update:?}");
+    assert_eq!(
+        final_update.command_execution_state,
+        Some(ShellCommandExecutionState::Completed)
+    );
+    assert_eq!(std::fs::read_to_string(marker).unwrap().lines().count(), 1);
+    assert_eq!(
+        updates.iter().filter(|update| update.finished).count(),
+        1,
+        "stop must terminate the existing execution once"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn phase_f_windows_structured_job_normalizes_oem_stdout_and_stderr() {
+    let temp = tempfile::tempdir().unwrap();
+    let helper = structured_process_helper();
+    let expected_path = temp.path().join("expected-oem.txt");
+    let (sink, mut rx) = structured_test_sink("structured-agent", "structured-instance");
+    let manager = JobManager::new(1);
+    enqueue_structured_process_job(
+        &manager,
+        sink,
+        temp.path(),
+        "phase-f-oem-job",
+        &helper.path,
+        vec![
+            "windows-oem-output".to_string(),
+            expected_path.to_string_lossy().into_owned(),
+        ],
+        None,
+        10,
+        None,
+    );
+    let updates = collect_job_updates(&mut rx, Duration::from_secs(10));
+    let final_update = updates.last().expect("OEM Job terminal update");
+    let expected = std::fs::read_to_string(expected_path).unwrap();
+    let logs = final_update.log_snapshot.as_ref().unwrap();
+    assert_eq!(final_update.status, "failed");
+    assert_eq!(final_update.exit_code, Some(23));
+    assert_eq!(
+        final_update.command_execution_state,
+        Some(ShellCommandExecutionState::Completed)
+    );
+    assert_eq!(logs.stdout.tail, expected);
+    assert_eq!(logs.stderr.tail, expected);
+}
+
+#[cfg(windows)]
+#[test]
+fn phase_f_windows_shell_job_stream_reconstructs_split_utf8_and_oem() {
+    let temp = tempfile::tempdir().unwrap();
+    let helper = structured_process_helper();
+    let marker = temp.path().join("split-started");
+    let (sink, mut rx) = structured_test_sink("structured-agent", "structured-instance");
+    let manager = JobManager::new(1);
+    let helper = helper.path.to_string_lossy().replace('\'', "''");
+    let marker_arg = marker.to_string_lossy().replace('\'', "''");
+    manager.enqueue(
+        sink,
+        1,
+        AgentPolicy {
+            allow_cwd_anywhere: true,
+            ..AgentPolicy::default()
+        },
+        ShellConfig::default(),
+        SshConfig::default(),
+        temp.path().join("projects.d"),
+        serde_json::from_value(json!({
+            "request_id": "request-phase-f-stream",
+            "client_id": "structured-agent",
+            "kind": "start_job",
+            "job_id": "phase-f-stream",
+            "cwd": temp.path(),
+            "command": format!("& '{helper}' windows-utf8-split-output '{marker_arg}'"),
+            "timeout_secs": 10,
+            "requested_by": "test",
+            "created_at": chrono::Utc::now().timestamp(),
+            "job_context": test_job_context(temp.path(), Vec::new()),
+        }))
+        .unwrap(),
+    );
+    let updates = collect_job_updates(&mut rx, Duration::from_secs(10));
+    let final_update = updates.last().expect("stream Job terminal update");
+    assert_eq!(final_update.status, "completed", "{final_update:?}");
+    assert_eq!(
+        final_update.log_snapshot.as_ref().unwrap().stdout.tail,
+        "split 中 🙂\n"
+    );
+    assert!(marker.exists());
+
+    let expected_path = temp.path().join("split-oem-expected");
+    let oem_marker = temp.path().join("split-oem-started");
+    let (sink, mut rx) = structured_test_sink("structured-agent", "structured-instance");
+    let manager = JobManager::new(1);
+    let expected_arg = expected_path.to_string_lossy().replace('\'', "''");
+    let marker_arg = oem_marker.to_string_lossy().replace('\'', "''");
+    manager.enqueue(
+        sink,
+        1,
+        AgentPolicy {
+            allow_cwd_anywhere: true,
+            ..AgentPolicy::default()
+        },
+        ShellConfig::default(),
+        SshConfig::default(),
+        temp.path().join("projects.d"),
+        serde_json::from_value(json!({
+            "request_id": "request-phase-f-oem-stream",
+            "client_id": "structured-agent",
+            "kind": "start_job",
+            "job_id": "phase-f-oem-stream",
+            "cwd": temp.path(),
+            "command": format!(
+                "& '{helper}' windows-oem-split-output '{expected_arg}' '{marker_arg}'"
+            ),
+            "timeout_secs": 10,
+            "requested_by": "test",
+            "created_at": chrono::Utc::now().timestamp(),
+            "job_context": test_job_context(temp.path(), Vec::new()),
+        }))
+        .unwrap(),
+    );
+    let updates = collect_job_updates(&mut rx, Duration::from_secs(10));
+    let final_update = updates.last().expect("OEM stream Job terminal update");
+    let logs = final_update.log_snapshot.as_ref().unwrap();
+    let expected = std::fs::read_to_string(expected_path).unwrap();
+    assert_eq!(final_update.status, "completed", "{final_update:?}");
+    assert_eq!(logs.stdout.tail, expected);
+    assert_eq!(logs.stderr.tail, expected);
+    assert!(oem_marker.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn phase_f_windows_structured_job_stop_retains_unicode_and_runs_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let helper = structured_process_helper();
+    let marker = temp.path().join("stop-output-started.log");
+    let (sink, mut rx) = structured_test_sink("structured-agent", "structured-instance");
+    let manager = JobManager::new(1);
+    enqueue_structured_process_job(
+        &manager,
+        sink,
+        temp.path(),
+        "phase-f-stop",
+        &helper.path,
+        vec![
+            "windows-mark-output-sleep".to_string(),
+            marker.to_string_lossy().into_owned(),
+            "10000".to_string(),
+        ],
+        None,
+        30,
+        None,
+    );
+    assert!(wait_until(Duration::from_secs(5), || marker.exists()));
+    manager.stop("phase-f-stop").unwrap();
+    let updates = collect_job_updates(&mut rx, Duration::from_secs(10));
+    let final_update = updates.last().expect("stop terminal update");
+    let logs = final_update.log_snapshot.as_ref().unwrap();
+    assert_eq!(final_update.status, "stopped", "{final_update:?}");
+    assert_eq!(
+        final_update.command_execution_state,
+        Some(ShellCommandExecutionState::Completed)
+    );
+    assert!(logs.stdout.tail.contains("partial 中文 🙂\n"));
+    assert!(logs.stderr.tail.contains("partial 中文 🙂\n"));
+    assert_eq!(std::fs::read_to_string(marker).unwrap().lines().count(), 1);
+    assert_eq!(updates.iter().filter(|update| update.finished).count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn structured_script_job_keeps_its_temporary_file_until_terminal_then_removes_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("script-started.log");
+    let observed_path = temp.path().join("script-path");
+    let script = "printf '%s\\n' \"$$\" >> \"$1\"\nprintf '%s' \"$0\" > \"$2\"\nsleep 1\ntest -f \"$0\"\nprintf 'same-script-complete\\n'\n";
+    let args = vec![
+        marker.to_string_lossy().into_owned(),
+        observed_path.to_string_lossy().into_owned(),
+    ];
+    let context = structured_script_context(
+        temp.path(),
+        shell_protocol::ShellScriptLanguage::Sh,
+        script.len(),
+        args.len(),
+        false,
+    );
+    let (sink, mut rx) = structured_test_sink("structured-agent", "structured-instance");
+    let manager = JobManager::new(1);
+    let request: ShellAgentShellRequest = serde_json::from_value(json!({
+        "request_id": "request-structured-script",
+        "client_id": "structured-agent",
+        "kind": "start_script_job",
+        "job_id": "structured-script",
+        "cwd": temp.path(),
+        "command": "",
+        "script": {
+            "language": "sh",
+            "script": script,
+            "args": args,
+        },
+        "timeout_secs": 5,
+        "requested_by": "test",
+        "created_at": chrono::Utc::now().timestamp(),
+        "job_context": context,
+    }))
+    .unwrap();
+    assert!(request.command.is_empty());
+    assert!(request.process.is_none());
+    assert_eq!(request.script.as_ref().unwrap().script, script);
+    manager.enqueue(
+        sink,
+        1,
+        AgentPolicy {
+            allow_cwd_anywhere: true,
+            ..AgentPolicy::default()
+        },
+        ShellConfig::default(),
+        SshConfig::default(),
+        temp.path().join("projects.d"),
+        request,
+    );
+
+    assert!(wait_until(Duration::from_secs(5), || {
+        marker.exists() && observed_path.exists()
+    }));
+    let temporary_script = PathBuf::from(std::fs::read_to_string(&observed_path).unwrap());
+    assert!(
+        temporary_script.exists(),
+        "the Runner-owned script file was removed while its one execution was still running"
+    );
+    assert_eq!(std::fs::read_to_string(&marker).unwrap().lines().count(), 1);
+    let active = manager
+        .inventory()
+        .jobs
+        .into_iter()
+        .find(|snapshot| snapshot.job_id == "structured-script")
+        .unwrap();
+    assert_eq!(active.status, "running");
+    let durable = serde_json::to_string(&active).unwrap();
+    assert!(!durable.contains(script));
+    assert!(!durable.contains(marker.to_string_lossy().as_ref()));
+
+    let updates = collect_job_updates(&mut rx, Duration::from_secs(10));
+    let final_update = updates.last().expect("script terminal update");
+    assert_eq!(final_update.status, "completed", "{final_update:?}");
+    assert_eq!(
+        final_update.command_execution_state,
+        Some(ShellCommandExecutionState::Completed)
+    );
+    assert!(final_update
+        .log_snapshot
+        .as_ref()
+        .unwrap()
+        .stdout
+        .tail
+        .contains("same-script-complete"));
+    assert!(
+        !temporary_script.exists(),
+        "the Runner-owned script file was not removed after terminal completion"
+    );
+    assert_eq!(std::fs::read_to_string(marker).unwrap().lines().count(), 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn structured_process_and_script_jobs_preserve_the_inspect_sandbox() {
+    if crate::command_sandbox::inspect_sandbox_available().is_err() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let blocked = project.join("blocked");
+    let touch = if Path::new("/usr/bin/touch").exists() {
+        PathBuf::from("/usr/bin/touch")
+    } else {
+        PathBuf::from("/bin/touch")
+    };
+    let (sink, mut process_rx) = structured_test_sink("structured-agent", "structured-instance");
+    let process_manager = JobManager::new(1);
+    enqueue_structured_process_job(
+        &process_manager,
+        sink,
+        &project,
+        "inspect-structured-process",
+        &touch,
+        vec![blocked.to_string_lossy().into_owned()],
+        None,
+        5,
+        Some(crate::command_sandbox::INSPECT_SANDBOX_MODE),
+    );
+    let process_updates = collect_job_updates(&mut process_rx, Duration::from_secs(10));
+    let process_final = process_updates.last().unwrap();
+    assert_eq!(
+        process_final.command_execution_state,
+        Some(ShellCommandExecutionState::Completed)
+    );
+    assert_eq!(process_final.status, "failed");
+    assert!(!blocked.exists());
+
+    let script = "set -eu\ntest -f \"$0\"\nprintf proof > \"$TMPDIR/proof\"\nsleep 1\ntest -f \"$0\"\ntest \"$(cat \"$TMPDIR/proof\")\" = proof\n";
+    let context = structured_script_context(
+        &project,
+        shell_protocol::ShellScriptLanguage::Sh,
+        script.len(),
+        0,
+        false,
+    );
+    let (sink, mut script_rx) = structured_test_sink("structured-agent", "structured-instance");
+    let script_manager = JobManager::new(1);
+    script_manager.enqueue(
+        sink,
+        1,
+        AgentPolicy {
+            allow_cwd_anywhere: true,
+            ..AgentPolicy::default()
+        },
+        ShellConfig::default(),
+        SshConfig::default(),
+        temp.path().join("projects.d"),
+        serde_json::from_value(json!({
+            "request_id": "request-inspect-structured-script",
+            "client_id": "structured-agent",
+            "kind": "start_script_job",
+            "job_id": "inspect-structured-script",
+            "cwd": project,
+            "command": "",
+            "script": {
+                "language": "sh",
+                "script": script,
+                "args": [],
+            },
+            "timeout_secs": 5,
+            "requested_by": "test",
+            "created_at": chrono::Utc::now().timestamp(),
+            "sandbox": crate::command_sandbox::INSPECT_SANDBOX_MODE,
+            "job_context": context,
+        }))
+        .unwrap(),
+    );
+    let script_updates = collect_job_updates(&mut script_rx, Duration::from_secs(10));
+    let script_final = script_updates.last().unwrap();
+    assert_eq!(script_final.status, "completed", "{script_final:?}");
+    assert_eq!(
+        script_final.command_execution_state,
+        Some(ShellCommandExecutionState::Completed)
+    );
+    assert!(!project.join("proof").exists());
+}
+
+#[test]
+fn structured_job_snapshot_preserves_post_spawn_outcome_unknown() {
+    let manager = JobManager::new(1);
+    let mut snapshot = test_job_snapshot("structured-uncertain");
+    snapshot.status = "running".to_string();
+    snapshot.started_at = Some(snapshot.created_at + 1);
+    snapshot.context.structured_execution =
+        Some(shell_protocol::ShellJobStructuredExecutionMetadata {
+            execution_source: "run_process".to_string(),
+            language: None,
+            script_bytes: None,
+            arg_count: 0,
+            stdin_present: false,
+        });
+    lock_unpoison(&manager.jobs).insert(
+        snapshot.job_id.clone(),
+        RunningJob {
+            client_id: "structured-agent".to_string(),
+            agent_instance_id: "structured-instance".to_string(),
+            snapshot,
+            child: None,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            slot_reserved: true,
+        },
+    );
+    manager.update_and_send(
+        "structured-uncertain",
+        RunnerJobDelta {
+            status: "lost".to_string(),
+            error: Some("post-spawn result unavailable".to_string()),
+            command_execution_state: Some(ShellCommandExecutionState::OutcomeUnknown),
+            finished: true,
+            ..Default::default()
+        },
+    );
+    let retained = manager
+        .inventory()
+        .jobs
+        .into_iter()
+        .find(|snapshot| snapshot.job_id == "structured-uncertain")
+        .unwrap();
+    assert_eq!(retained.status, "lost");
+    assert_eq!(
+        retained.command_execution_state,
+        Some(ShellCommandExecutionState::OutcomeUnknown)
+    );
+    assert!(retained.started_at.is_some());
 }
 
 #[cfg(target_os = "linux")]
@@ -1236,7 +2507,12 @@ fn job_cleanup_after_parent_exit_terminates_descendant_and_reaches_eof() {
     let mut managed = ManagedChild::spawn(&mut cmd).expect("spawn job tree helper");
     let (tx, rx) = mpsc::sync_channel::<OutputChunk>(64);
     let stdout = managed.child_mut().stdout.take().expect("piped stdout");
-    let readers = vec![spawn_reader(stdout, tx.clone(), true)];
+    let readers = vec![spawn_reader(
+        stdout,
+        tx.clone(),
+        true,
+        OutputTextSource::LocalProcess,
+    )];
     drop(tx);
     let child = Arc::new(Mutex::new(managed));
 

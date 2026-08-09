@@ -1,6 +1,7 @@
 use super::super::input_schemas::{
     job_log_input_schema, job_status_input_schema, list_jobs_input_schema,
-    open_session_shell_input_schema, run_job_input_schema, run_shell_input_schema,
+    observe_jobs_input_schema, open_session_shell_input_schema, run_job_input_schema,
+    run_process_input_schema, run_script_input_schema, run_shell_input_schema,
     session_shell_exec_input_schema, session_shell_identity_input_schema, stop_job_input_schema,
 };
 use super::tool_spec;
@@ -8,6 +9,16 @@ use crate::tool_runtime::tool_spec::ToolSpec;
 
 pub(super) fn tool_specs() -> Vec<ToolSpec> {
     vec![
+        tool_spec(
+            "run_process",
+            "Execute one bounded native process from typed executable/argv without shell parsing. Short work returns terminal output; longer work may return the same execution as a durable Job. Windows .cmd/.bat files are rejected; use run_shell for batch files or shell syntax.",
+            run_process_input_schema(),
+        ),
+        tool_spec(
+            "run_script",
+            "Execute bounded sh, bash, or PowerShell content as typed data from a Runner-owned temporary file. Short work returns terminal output; longer work may return the same execution as a durable Job. The body never enters command or -c/-Command.",
+            run_script_input_schema(),
+        ),
         tool_spec(
             "run_shell",
             "Bounded command escape hatch for validation, builds, tests, or diagnostics only. Do not use as the primary file editing path; prefer cargo_* / validate_patch for common checks and apply_text_edits for source edits.",
@@ -52,6 +63,11 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
             "job_log",
             "Read stdout/stderr for a runtime job. With after_observation_token and wait_secs (1..=60), waits once for progress or a terminal state; never a subscription.",
             job_log_input_schema(),
+        ),
+        tool_spec(
+            "observe_jobs",
+            "Observe 1 to 8 existing Jobs in input order with bounded tails and isolated item failures. When every active item has a current token, one shared wait returns on any Job change; never launches, retries, stops, or subscribes.",
+            observe_jobs_input_schema(),
         ),
         tool_spec(
             "list_jobs",

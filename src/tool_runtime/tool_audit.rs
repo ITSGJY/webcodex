@@ -13,6 +13,59 @@ pub(crate) fn session_log_arguments_for_tool_request(tool_name: &str, arguments:
         out.insert("project".to_string(), project);
     }
     match tool_name {
+        "run_process" => {
+            out.insert(
+                "executable_present".to_string(),
+                Value::Bool(obj.contains_key("executable")),
+            );
+            out.insert(
+                "stdin_present".to_string(),
+                Value::Bool(obj.contains_key("stdin")),
+            );
+            let args = obj.get("args").and_then(Value::as_array);
+            out.insert(
+                "arg_count".to_string(),
+                Value::from(args.map(Vec::len).unwrap_or_default()),
+            );
+            copy_keys(obj, &mut out, &["timeout_secs", "cwd", "purpose"]);
+            if let Some(executable) = obj.get("executable").and_then(Value::as_str) {
+                out.insert(
+                    "process_summary".to_string(),
+                    Value::String(crate::shell_client::process_preview(
+                        executable,
+                        args.into_iter().flatten().filter_map(Value::as_str),
+                    )),
+                );
+            }
+        }
+        "run_script" => {
+            if let Some(language) = obj.get("language").cloned() {
+                out.insert("language".to_string(), language);
+            }
+            out.insert(
+                "script_bytes".to_string(),
+                Value::from(
+                    obj.get("script")
+                        .and_then(Value::as_str)
+                        .map(str::len)
+                        .unwrap_or_default(),
+                ),
+            );
+            out.insert(
+                "stdin_present".to_string(),
+                Value::Bool(obj.get("stdin").is_some_and(|value| !value.is_null())),
+            );
+            out.insert(
+                "arg_count".to_string(),
+                Value::from(
+                    obj.get("args")
+                        .and_then(Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or_default(),
+                ),
+            );
+            copy_keys(obj, &mut out, &["timeout_secs", "cwd", "purpose"]);
+        }
         "run_shell" | "run_job" | "session_shell_exec" => {
             out.insert(
                 "command_present".to_string(),
@@ -34,6 +87,35 @@ pub(crate) fn session_log_arguments_for_tool_request(tool_name: &str, arguments:
         }
         "session_shell_status" | "close_session_shell" => {
             copy_keys(obj, &mut out, &["session_id", "shell_id"]);
+        }
+        "observe_jobs" => {
+            let items = obj.get("items").and_then(Value::as_array);
+            out.insert(
+                "item_count".to_string(),
+                Value::from(items.map(Vec::len).unwrap_or_default()),
+            );
+            out.insert(
+                "token_count".to_string(),
+                Value::from(
+                    items
+                        .into_iter()
+                        .flatten()
+                        .filter(|item| item.get("after_observation_token").is_some())
+                        .count(),
+                ),
+            );
+            out.insert(
+                "job_ids".to_string(),
+                Value::Array(
+                    items
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|item| item.get("job_id").and_then(Value::as_str))
+                        .map(|job_id| Value::String(job_id.to_string()))
+                        .collect(),
+                ),
+            );
+            copy_keys(obj, &mut out, &["tail_lines", "wait_secs"]);
         }
         "start_session" | "start_coding_task" | "update_session_context" => {
             copy_keys(
@@ -260,6 +342,48 @@ fn copy_keys(
 impl ToolCall {
     pub(crate) fn session_log_arguments(&self) -> Value {
         match self {
+            Self::RunProcess {
+                project,
+                executable,
+                args,
+                stdin,
+                timeout_secs,
+                cwd,
+                purpose,
+                ..
+            } => serde_json::json!({
+                "project": project,
+                "executable_present": true,
+                "arg_count": args.len(),
+                "stdin_present": stdin.is_some(),
+                "process_summary": crate::shell_client::process_preview(
+                    executable,
+                    args.iter().map(String::as_str),
+                ),
+                "timeout_secs": timeout_secs,
+                "cwd": cwd,
+                "purpose": purpose,
+            }),
+            Self::RunScript {
+                project,
+                language,
+                script,
+                args,
+                stdin,
+                timeout_secs,
+                cwd,
+                purpose,
+                ..
+            } => serde_json::json!({
+                "project": project,
+                "language": language,
+                "script_bytes": script.len(),
+                "arg_count": args.len(),
+                "stdin_present": stdin.is_some(),
+                "timeout_secs": timeout_secs,
+                "cwd": cwd,
+                "purpose": purpose,
+            }),
             Self::RunShell {
                 project,
                 command,
@@ -344,6 +468,23 @@ impl ToolCall {
                 "project": project,
                 "job_id": job_id,
                 "confirm": confirm,
+            }),
+            Self::ObserveJobs {
+                items,
+                tail_lines,
+                wait_secs,
+            } => serde_json::json!({
+                "item_count": items.len(),
+                "token_count": items
+                    .iter()
+                    .filter(|item| item.after_observation_token.is_some())
+                    .count(),
+                "job_ids": items
+                    .iter()
+                    .map(|item| item.job_id.as_str())
+                    .collect::<Vec<_>>(),
+                "tail_lines": tail_lines,
+                "wait_secs": wait_secs,
             }),
             Self::ApplyPatch { project, .. } => serde_json::json!({
                 "project": project,

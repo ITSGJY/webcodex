@@ -9,15 +9,27 @@ WebCodex is a remote, auditable, bounded execution layer for coding assistants. 
 - Server, CLI, and runner share code through workspace library crates with enforced package boundaries.
 - Authentication, project grants, allowed roots, path policy, authority mode, and audit evidence remain explicit boundaries.
 - Structured validation supports Rust, Node, Python, and Go recipes without installing dependencies or running networked setup hooks.
+- Typed process/script execution can continue as the same durable Job, and models can observe up to eight existing local or Agent Jobs through one bounded read-only batch wait.
+- Normal polling dispatch is bounded to two in-flight workers with no local pending queue, so one ordinary long request no longer blocks the next poll or replays execution.
+- Runner Job execution defaults to four concurrent Jobs, normalizes operator configuration to the effective range 1 through 64, and exposes authorization-safe running/queued/limit facts through existing runtime observability. The 64 ceiling is the unchanged active Job inventory hard bound, not a new scheduling policy; polling dispatch remains independently fixed at two.
 - The review console, reconnect continuity, read-only LSP navigation, shell profiles, and transport fallbacks are available.
 
 ## Next priorities
 
-1. Improve task continuation and operator visibility without expanding the public capability surface unnecessarily.
-2. Tighten installation, upgrade, rollback, and mixed-version diagnostics for self-hosted deployments.
-3. Continue reducing duplicated projections and oversized responses while preserving protocol compatibility.
-4. Extend end-to-end coverage for authentication, transport recovery, validation provenance, and process cleanup.
-5. Evaluate additional provider integrations only when they preserve project, permission, timeout, and audit boundaries.
+The execution cycle remains centered on **model execution friction**, not
+fleet-management breadth. See [MODEL_EXECUTION.md](MODEL_EXECUTION.md) for the
+design contract.
+
+1. Execution Phases A–F are code-complete and final acceptance is complete: lifecycle truth, structured process and script payloads, same-execution Job handoff, bounded batch observation, non-pinning polling dispatch, practical Job concurrency/observability, and bounded Windows local process-output normalization have passed Linux regression and real Windows/MSVC service-context validation.
+2. Further execution work in this cycle is maintenance/stabilization only: fix demonstrated regressions, preserve Linux/Windows acceptance evidence, and do not add another execution feature phase without a new concrete need.
+3. Preserve structured MCP results and allow an optional conversation-level Orchestrator without making UI or optional MCP 2026 extensions part of execution truth.
+
+## Deferred until there is a current need
+
+- Runner drain/maintenance/self-upgrade and richer fleet dashboards.
+- Productized Windows SCM service lifecycle; external/manual service wrapping is sufficient for current dogfood.
+- A generic process/service management API, batch Job launch, PTY terminal UX, or polished MCP App UI.
+- Depending on MCP Tasks, MRTR, elicitation, or progress extensions before the target host makes them a dependable product contract.
 
 ## Completion criteria
 

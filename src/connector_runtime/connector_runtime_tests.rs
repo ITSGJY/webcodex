@@ -22,6 +22,7 @@ async fn register_agent(registry: &ShellClientRegistry, project_id: &str, path: 
             ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_concurrency_limit: None,
                 job_inventory: None,
                 client_id: "hosted".to_string(),
                 agent_instance_id: "instance".to_string(),
@@ -40,6 +41,9 @@ async fn register_agent(registry: &ShellClientRegistry, project_id: &str, path: 
                     persistent_shell: false,
                     ssh_persistent_shell: false,
                     structured_validation_argv: true,
+                    structured_process_argv: true,
+                    structured_script_payload: false,
+                    structured_execution_jobs: false,
                     lsp_read_only_navigation: false,
                     sandbox_inspect_commands: false,
                     project_lifecycle: false,
@@ -1010,6 +1014,7 @@ async fn writable_start_registers_and_releases_a_reusable_git_worktree() {
                         exit_code: Some(0),
                         duration_ms: Some(1),
                         error: None,
+                        command_execution_state: None,
                         validation_progress: Some(
                             crate::shell_protocol::ShellJobValidationProgress {
                                 completed: 1,

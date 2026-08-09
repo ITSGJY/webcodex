@@ -1,5 +1,9 @@
+use crate::shell_protocol::{ShellScriptLanguage, ShellScriptPayload};
 use serde_json::json;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
@@ -255,6 +259,518 @@ pub(crate) async fn run_command_sync_bounded_with_shell_and_sandbox(
     }
 }
 
+/// Maximum retained bytes per stream for one local synchronous direct process.
+/// Reader threads continuously drain the pipes, retaining only the tail, so a
+/// noisy child cannot deadlock on a full pipe or turn `run_process` into an
+/// unbounded output channel.
+const LOCAL_PROCESS_OUTPUT_MAX_BYTES: usize = 256 * 1024;
+type LocalProcessResult = (i32, String, String, u64);
+
+pub(crate) async fn run_process_sync_bounded_with_sandbox(
+    executable: String,
+    args: Vec<String>,
+    stdin: Option<String>,
+    cwd: PathBuf,
+    timeout_secs: u64,
+    sandbox: Option<String>,
+) -> Result<(i32, String, String, u64), LocalRunFailure> {
+    let bound_secs = timeout_secs.saturating_add(LOCAL_RUN_HARD_GRACE_SECS);
+    let task = tokio::task::spawn_blocking(move || {
+        run_process_sync_with_sandbox(
+            &executable,
+            &args,
+            stdin.as_deref(),
+            &cwd,
+            timeout_secs,
+            sandbox.as_deref(),
+        )
+    });
+    match tokio::time::timeout(Duration::from_secs(bound_secs), task).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => Err(LocalRunFailure::Join(error.to_string())),
+        Err(_) => Err(LocalRunFailure::HardTimeout { bound_secs }),
+    }
+}
+
+pub(crate) async fn run_script_sync_bounded_with_sandbox(
+    payload: ShellScriptPayload,
+    stdin: Option<String>,
+    cwd: PathBuf,
+    timeout_secs: u64,
+    sandbox: Option<String>,
+) -> Result<LocalProcessResult, LocalRunFailure> {
+    let bound_secs = timeout_secs.saturating_add(LOCAL_RUN_HARD_GRACE_SECS);
+    let task = tokio::task::spawn_blocking(move || {
+        run_script_sync_with_sandbox(
+            &payload,
+            stdin.as_deref(),
+            &cwd,
+            timeout_secs,
+            sandbox.as_deref(),
+        )
+    });
+    match tokio::time::timeout(Duration::from_secs(bound_secs), task).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => Err(LocalRunFailure::Join(error.to_string())),
+        Err(_) => Err(LocalRunFailure::HardTimeout { bound_secs }),
+    }
+}
+
+fn run_process_sync_with_sandbox(
+    executable: &str,
+    args: &[String],
+    stdin: Option<&str>,
+    cwd: &Path,
+    timeout_secs: u64,
+    sandbox: Option<&str>,
+) -> LocalProcessResult {
+    let start = Instant::now();
+    let mut command = Command::new(executable);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let _scratch = match create_local_inspect_scratch(sandbox, start) {
+        Ok(scratch) => scratch,
+        Err(result) => return result,
+    };
+    if let Err(result) = sandbox_local_command(&mut command, _scratch.as_ref(), start) {
+        return result;
+    }
+    execute_local_process_command(command, stdin, timeout_secs, start)
+}
+
+fn execute_local_process_command(
+    mut command: Command,
+    stdin: Option<&str>,
+    timeout_secs: u64,
+    start: Instant,
+) -> LocalProcessResult {
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return (
+                -1,
+                String::new(),
+                format!("Failed to execute process: {error}"),
+                start.elapsed().as_millis() as u64,
+            )
+        }
+    };
+    let pgid = child.id();
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            terminate_local_direct_process(&mut child, pgid);
+            return (
+                -1,
+                String::new(),
+                "Failed to collect process output: stdout pipe missing".to_string(),
+                start.elapsed().as_millis() as u64,
+            );
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            terminate_local_direct_process(&mut child, pgid);
+            return (
+                -1,
+                String::new(),
+                "Failed to collect process output: stderr pipe missing".to_string(),
+                start.elapsed().as_millis() as u64,
+            );
+        }
+    };
+    let stdout_reader = spawn_bounded_process_reader(stdout);
+    let stderr_reader = spawn_bounded_process_reader(stderr);
+    let stdin_writer = stdin.map(|input| {
+        let input = input.as_bytes().to_vec();
+        let child_stdin = child.stdin.take();
+        std::thread::spawn(move || match child_stdin {
+            Some(mut child_stdin) => child_stdin.write_all(&input),
+            None => Err(std::io::Error::other("stdin pipe missing")),
+        })
+    });
+
+    let timeout = Duration::from_secs(timeout_secs);
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if start.elapsed() >= timeout => {
+                timed_out = true;
+                break None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(error) => {
+                terminate_local_direct_process(&mut child, pgid);
+                return (
+                    -1,
+                    String::new(),
+                    format!("Failed to wait for process: {error}"),
+                    start.elapsed().as_millis() as u64,
+                );
+            }
+        }
+    };
+    let status = if timed_out {
+        terminate_local_direct_process(&mut child, pgid);
+        None
+    } else {
+        // The direct child is terminal, but descendants may still own output
+        // pipes. Unix process-group ownership lets us close that whole tree.
+        reap_process_group(pgid);
+        status
+    };
+    let stdout = finish_bounded_process_reader(stdout_reader);
+    let stderr = finish_bounded_process_reader(stderr_reader);
+    let elapsed = start.elapsed().as_millis() as u64;
+    let stdin_error = stdin_writer
+        .and_then(|writer| writer.join().ok())
+        .and_then(Result::err)
+        .filter(|error| error.kind() != std::io::ErrorKind::BrokenPipe);
+    match (stdout, stderr, stdin_error) {
+        (_, _, Some(error)) => (
+            -1,
+            String::new(),
+            format!("Failed to write process stdin: {error}"),
+            elapsed,
+        ),
+        (Err(error), _, _) | (_, Err(error), _) => (
+            -1,
+            String::new(),
+            format!("Failed to collect process output: {error}"),
+            elapsed,
+        ),
+        (Ok(stdout), Ok(mut stderr), None) if timed_out => {
+            if !stderr.is_empty() && !stderr.ends_with('\n') {
+                stderr.push('\n');
+            }
+            stderr.push_str(&format!("Command timed out after {timeout_secs} seconds"));
+            (-1, stdout, stderr, elapsed)
+        }
+        (Ok(stdout), Ok(stderr), None) => (
+            status.and_then(|status| status.code()).unwrap_or(-1),
+            stdout,
+            stderr,
+            elapsed,
+        ),
+    }
+}
+
+fn create_local_inspect_scratch(
+    sandbox: Option<&str>,
+    start: Instant,
+) -> Result<Option<crate::command_sandbox::InspectScratch>, LocalProcessResult> {
+    match sandbox {
+        None => Ok(None),
+        Some(crate::command_sandbox::INSPECT_SANDBOX_MODE) => {
+            crate::command_sandbox::InspectScratch::create()
+                .map(Some)
+                .map_err(|error| {
+                    (
+                        -1,
+                        String::new(),
+                        format!("Failed to configure inspect sandbox: {error}"),
+                        start.elapsed().as_millis() as u64,
+                    )
+                })
+        }
+        Some(other) => Err((
+            -1,
+            String::new(),
+            format!("Failed to configure inspect sandbox: unknown sandbox mode '{other}'"),
+            start.elapsed().as_millis() as u64,
+        )),
+    }
+}
+
+fn sandbox_local_command(
+    command: &mut Command,
+    scratch: Option<&crate::command_sandbox::InspectScratch>,
+    start: Instant,
+) -> Result<(), LocalProcessResult> {
+    let Some(scratch) = scratch else {
+        return Ok(());
+    };
+    crate::command_sandbox::sandbox_command_inspect(command, scratch).map_err(|error| {
+        (
+            -1,
+            String::new(),
+            format!("Failed to configure inspect sandbox: {error}"),
+            start.elapsed().as_millis() as u64,
+        )
+    })
+}
+
+fn run_script_sync_with_sandbox(
+    payload: &ShellScriptPayload,
+    stdin: Option<&str>,
+    cwd: &Path,
+    timeout_secs: u64,
+    sandbox: Option<&str>,
+) -> LocalProcessResult {
+    let start = Instant::now();
+    let interpreter = match find_local_script_interpreter(payload.language) {
+        Some(interpreter) => interpreter,
+        None => {
+            return (
+                -1,
+                String::new(),
+                format!(
+                "interpreter_unavailable: {} interpreter is unavailable; command was not started",
+                payload.language.as_str()
+            ),
+                start.elapsed().as_millis() as u64,
+            )
+        }
+    };
+    let scratch = match create_local_inspect_scratch(sandbox, start) {
+        Ok(scratch) => scratch,
+        Err(result) => return result,
+    };
+    let mut builder = tempfile::Builder::new();
+    builder
+        .prefix("webcodex-script-")
+        .suffix(payload.language.file_extension());
+    let mut file = match match scratch.as_ref() {
+        Some(scratch) => builder.tempfile_in(scratch.path()),
+        None => builder.tempfile(),
+    } {
+        Ok(file) => file,
+        Err(error) => return local_script_setup_failure("create", &error, start),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = file
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+        {
+            return local_script_setup_failure("secure", &error, start);
+        }
+    }
+    if payload.language == ShellScriptLanguage::Powershell {
+        if let Err(error) = file.write_all(&[0xEF, 0xBB, 0xBF]) {
+            return local_script_setup_failure("write", &error, start);
+        }
+    }
+    if let Err(error) = file
+        .write_all(payload.script.as_bytes())
+        .and_then(|_| file.flush())
+    {
+        return local_script_setup_failure("write", &error, start);
+    }
+    let original_path = file.path().to_path_buf();
+    // Windows PowerShell 5.1 can reject the extended `\\?\` path prefix that
+    // `canonicalize` commonly returns. Tempfile paths are normally absolute;
+    // make a relative platform temp setting absolute without canonicalizing.
+    let absolute_path = if file.path().is_absolute() {
+        file.path().to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(file.path()),
+            Err(error) => return local_script_setup_failure("resolve", &error, start),
+        }
+    };
+    let temporary_path = file.into_temp_path();
+    let mut command =
+        build_local_script_command(interpreter, payload.language, &absolute_path, &payload.args);
+    command
+        .current_dir(cwd)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    if let Err(result) = sandbox_local_command(&mut command, scratch.as_ref(), start) {
+        return result;
+    }
+    let mut result = execute_local_process_command(command, stdin, timeout_secs, start);
+    redact_local_script_paths(&mut result, &[original_path.as_path(), &absolute_path]);
+    if let Err(error) = temporary_path.close() {
+        tracing::warn!(
+            language = payload.language.as_str(),
+            error_kind = ?error.kind(),
+            "failed to remove Server-owned compatibility temporary script file"
+        );
+    }
+    result
+}
+
+fn local_script_setup_failure(
+    action: &str,
+    error: &std::io::Error,
+    start: Instant,
+) -> LocalProcessResult {
+    (
+        -1,
+        String::new(),
+        format!(
+            "script_setup_failed: failed to {action} Server-owned temporary script file ({:?}); command was not started",
+            error.kind()
+        ),
+        start.elapsed().as_millis() as u64,
+    )
+}
+
+fn build_local_script_command(
+    interpreter: PathBuf,
+    language: ShellScriptLanguage,
+    script_path: &Path,
+    args: &[String],
+) -> Command {
+    let mut command = Command::new(interpreter);
+    match language {
+        ShellScriptLanguage::Sh | ShellScriptLanguage::Bash => {
+            command.arg(script_path);
+        }
+        ShellScriptLanguage::Powershell => {
+            command.arg("-NoProfile").arg("-NonInteractive");
+            if cfg!(windows) {
+                command.arg("-ExecutionPolicy").arg("Bypass");
+            }
+            command.arg("-File").arg(script_path);
+        }
+    }
+    command.args(args);
+    command
+}
+
+fn find_local_script_interpreter(language: ShellScriptLanguage) -> Option<PathBuf> {
+    let candidates: &[&str] = match language {
+        ShellScriptLanguage::Sh => {
+            if cfg!(windows) {
+                &["sh.exe"]
+            } else {
+                &["sh"]
+            }
+        }
+        ShellScriptLanguage::Bash => {
+            if cfg!(windows) {
+                &["bash.exe"]
+            } else {
+                &["bash"]
+            }
+        }
+        ShellScriptLanguage::Powershell => {
+            if cfg!(windows) {
+                &["pwsh.exe", "powershell.exe"]
+            } else {
+                &["pwsh"]
+            }
+        }
+    };
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for directory in std::env::split_paths(&path) {
+        for candidate in candidates {
+            let path = directory.join(candidate);
+            if local_executable_file(&path) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn local_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn redact_local_script_paths(result: &mut LocalProcessResult, paths: &[&Path]) {
+    for value in [&mut result.1, &mut result.2] {
+        for path in paths {
+            let rendered = path.to_string_lossy();
+            if !rendered.is_empty() {
+                *value = value.replace(rendered.as_ref(), "<temporary-script>");
+                let alternate = if rendered.contains('\\') {
+                    rendered.replace('\\', "/")
+                } else {
+                    rendered.replace('/', "\\")
+                };
+                if alternate != rendered {
+                    *value = value.replace(&alternate, "<temporary-script>");
+                }
+            }
+        }
+    }
+}
+
+fn terminate_local_direct_process(child: &mut Child, pgid: u32) {
+    reap_process_group(pgid);
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+fn spawn_bounded_process_reader(
+    mut pipe: impl Read + Send + 'static,
+) -> mpsc::Receiver<Result<String, String>> {
+    let (tx, rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut retained = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        let result = loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break Ok(String::from_utf8_lossy(&retained).to_string()),
+                Ok(count) => {
+                    retained.extend_from_slice(&chunk[..count]);
+                    if retained.len() > LOCAL_PROCESS_OUTPUT_MAX_BYTES {
+                        let discard = retained.len() - LOCAL_PROCESS_OUTPUT_MAX_BYTES;
+                        retained.drain(..discard);
+                    }
+                }
+                Err(error) => break Err(error.to_string()),
+            }
+        };
+        let _ = tx.send(result);
+    });
+    rx
+}
+
+fn finish_bounded_process_reader(
+    reader: mpsc::Receiver<Result<String, String>>,
+) -> Result<String, String> {
+    reader
+        .recv_timeout(Duration::from_secs(1))
+        .map_err(|_| "process output reader did not finish".to_string())?
+}
+
 pub(crate) fn resolve_local_cwd(
     proj: &crate::projects::ProjectConfig,
     cwd: Option<&str>,
@@ -505,6 +1021,7 @@ pub(crate) fn sync_timeout_out_of_range_result(
             "command_completed": false,
             "command_ok": false,
             "exit_code": null,
+            "execution_state": "not_started",
             "failure_kind": "invalid_arguments",
             "tool_failure": true,
         }),
@@ -519,6 +1036,13 @@ pub(crate) fn command_rejected_message(
         "Rejected before starting command: {}.\nNo command was started.\nNo files were modified.\nRetry guidance: {}",
         reason.as_ref(),
         guidance.as_ref()
+    )
+}
+
+pub(crate) fn command_outcome_unknown_message(reason: impl AsRef<str>) -> String {
+    format!(
+        "Command execution outcome is unknown: {}.\nThe command may have started or produced side effects, but WebCodex did not receive a terminal result.\nDo not automatically retry a potentially side-effecting command.\nRetry guidance: inspect the actual Job, process, service, or target state as appropriate before deciding whether retry is safe.",
+        reason.as_ref()
     )
 }
 
@@ -542,7 +1066,7 @@ pub(crate) fn command_timeout_message(
     stderr_tail: &str,
 ) -> String {
     format!(
-        "Command timed out after {}s.\nCommand was started.\nOutput tails before timeout:\nstdout_tail:\n{}\nstderr_tail:\n{}\nRetry guidance: use run_job for longer commands or rerun with a narrower test filter.",
+        "Command timed out after {}s.\nCommand definitely started, but WebCodex cannot prove its side effects ended with the timeout.\nOutput tails before timeout:\nstdout_tail:\n{}\nstderr_tail:\n{}\nRetry guidance: do not blindly retry. First inspect the actual process, service, and target state. If validation is safe and idempotent, use run_job for longer observation or a narrower invocation.",
         timeout_secs, stdout_tail, stderr_tail
     )
 }
@@ -553,7 +1077,9 @@ pub(crate) fn looks_like_command_timeout(
     timeout_secs: u64,
 ) -> bool {
     exit_code == Some(-1)
-        && stderr.contains(&format!("Command timed out after {} seconds", timeout_secs))
+        && stderr
+            .to_ascii_lowercase()
+            .contains(&format!("command timed out after {} seconds", timeout_secs))
 }
 
 pub(crate) fn is_safe_job_id(job_id: &str) -> bool {

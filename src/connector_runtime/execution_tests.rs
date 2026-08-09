@@ -103,6 +103,7 @@ pub(crate) async fn console_fixture() -> ConsoleFixture {
             ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_concurrency_limit: None,
                 job_inventory: None,
                 client_id: "laptop".into(),
                 agent_instance_id: "instance-b".into(),
@@ -159,6 +160,7 @@ async fn fixture_built(
             ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_concurrency_limit: None,
                 job_inventory: None,
                 client_id: "hosted".into(),
                 agent_instance_id: "instance".into(),
@@ -401,6 +403,7 @@ async fn update_job(
             exit_code,
             duration_ms: Some(1),
             error: None,
+            command_execution_state: None,
             validation_progress: None,
             finished: matches!(status, "completed" | "failed" | "stopped"),
         })
@@ -442,6 +445,7 @@ fn validation_job_update(
         exit_code: None,
         duration_ms: Some(1),
         error: None,
+        command_execution_state: None,
         validation_progress: Some(progress),
         finished: matches!(status, "completed" | "failed" | "stopped"),
     }
@@ -545,6 +549,7 @@ async fn connector_readiness_uses_registered_agent_capabilities() {
             ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_concurrency_limit: None,
                 job_inventory: None,
                 client_id: "hosted".into(),
                 agent_instance_id: "instance".into(),
@@ -1708,6 +1713,8 @@ async fn structured_progress_rejects_invalid_order_and_preserves_fail_fast_plan(
         validation: None,
         sandbox: None,
         visibility: crate::shell_client::ShellJobVisibility::Public,
+        structured_execution: None,
+        stdin: None,
     };
     let duplicate = fixture
         .registry
@@ -1821,6 +1828,7 @@ async fn structured_progress_rejects_invalid_order_and_preserves_fail_fast_plan(
             exit_code,
             duration_ms: Some(1),
             error: None,
+            command_execution_state: None,
             validation_progress: progress,
             finished: matches!(status, "completed" | "failed"),
         };
@@ -1857,6 +1865,7 @@ async fn ordinary_jobs_reject_validation_progress_without_changing_normal_update
             exit_code: None,
             duration_ms: None,
             error: None,
+            command_execution_state: None,
             validation_progress: None,
             finished: false,
         })
@@ -1889,6 +1898,7 @@ async fn old_agent_cannot_receive_a_structured_validation_job() {
             ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_concurrency_limit: None,
                 job_inventory: None,
                 client_id: "hosted".into(),
                 agent_instance_id: "instance".into(),
@@ -3117,6 +3127,7 @@ async fn read_only_commands_run_is_denied_even_when_agent_advertises_sandbox() {
             ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_concurrency_limit: None,
                 job_inventory: None,
                 client_id: "hosted".into(),
                 agent_instance_id: "instance".into(),
@@ -3173,6 +3184,7 @@ async fn enable_inspect_sandbox(fixture: &Fixture) {
             ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_concurrency_limit: None,
                 job_inventory: None,
                 client_id: "hosted".into(),
                 agent_instance_id: "instance".into(),
@@ -3671,6 +3683,7 @@ async fn manifestless_python_unittest_checks_finish_with_clean_result() {
             ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_concurrency_limit: None,
                 job_inventory: None,
                 client_id: "hosted".into(),
                 agent_instance_id: "instance".into(),

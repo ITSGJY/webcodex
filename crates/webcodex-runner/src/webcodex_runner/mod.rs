@@ -6,6 +6,7 @@ pub(crate) mod external_tools;
 pub(crate) mod files;
 pub(crate) mod lsp;
 pub(crate) mod output;
+pub(crate) mod output_text;
 pub(crate) mod patches;
 pub(crate) mod persistent_shell;
 pub(crate) mod projects;
@@ -26,15 +27,15 @@ pub(crate) use artifacts::{handle_artifact_file_request, is_artifact_request_kin
 pub(crate) use checkpoints::{handle_checkpoint_file_request, is_checkpoint_request_kind};
 pub(crate) use config::SshConfig;
 pub(crate) use config::{
-    client_profile_agent_config, default_config_path, hostname, load_config, projects_dir,
-    validate_client_profile, AgentConfig, AgentPolicy, HotAgentConfig, ReloadableAgentConfig,
-    ShellConfig,
+    client_profile_agent_config, default_config_path, hostname, load_config, max_concurrent_jobs,
+    projects_dir, validate_client_profile, AgentConfig, AgentPolicy, HotAgentConfig,
+    ReloadableAgentConfig, ShellConfig,
 };
 #[cfg(test)]
 pub(crate) use config::{
     default_quic_alpn, default_quic_connect_timeout_secs, default_quic_keepalive_interval_secs,
-    default_websocket_connect_timeout_secs, max_concurrent_jobs, QuicClientConfig,
-    ShellProfileConfig, CLIENT_PROFILE_ERROR, DEFAULT_MAX_CONCURRENT_JOBS,
+    default_websocket_connect_timeout_secs, QuicClientConfig, ShellProfileConfig,
+    CLIENT_PROFILE_ERROR, DEFAULT_MAX_CONCURRENT_JOBS,
 };
 pub(super) use dispatch::{dispatch_request, is_project_op};
 #[cfg(test)]
@@ -43,7 +44,7 @@ pub(crate) use files::{
     handle_basic_file_request, is_basic_file_request_kind, resolve_requested_path,
 };
 pub(crate) use lsp::LspSupervisor;
-pub(crate) use output::{err_cmd, ok_cmd, CommandResult};
+pub(crate) use output::{err_cmd, ok_cmd, CommandResult, ShellCommandResult};
 pub(crate) use patches::{
     handle_apply_text_edits_file_request, handle_write_project_file_request,
     is_structured_edit_request_kind, validate_structured_edit_agent_path,
@@ -68,9 +69,14 @@ pub(crate) use shell::run_shell_with_profiles;
 pub(crate) use shell::{
     configured_prepared_shell_job_command, configured_shell_job_command,
     configured_validation_job_command, cwd_allowed, resolve_prepared_shell_profile,
-    run_shell_with_profiles_in_sandbox, PreparedShellProfile, PreparedShellProfileCache,
+    run_process_with_profiles_in_sandbox_and_execution_state,
+    run_process_with_profiles_in_sandbox_and_execution_state_with_start_hook,
+    run_script_with_profiles_in_sandbox_and_execution_state,
+    run_script_with_profiles_in_sandbox_and_execution_state_with_start_hook,
+    run_shell_with_profiles_in_sandbox, run_shell_with_profiles_in_sandbox_and_execution_state,
+    PreparedShellProfile, PreparedShellProfileCache,
 };
-pub(crate) use ssh::{is_transport_failure, run_ssh_shell, SshConnectionPool};
+pub(crate) use ssh::{is_transport_failure, run_ssh_shell_with_execution_state, SshConnectionPool};
 #[cfg(test)]
 pub(crate) use transport::{
     auto_transport_plan, build_ws_request, effective_transport, non_empty_token,

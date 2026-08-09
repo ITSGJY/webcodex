@@ -5,6 +5,7 @@ use crate::auth::AuthContext;
 use crate::shell_protocol::{
     SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL, SHELL_CLIENT_CAPABILITY_SSH_SHELL,
 };
+use serde_json::json;
 
 /// The capability an agent-backed tool variant requires from the agent
 /// client. Non-agent tools (and tools without a project) require nothing.
@@ -47,6 +48,31 @@ impl ToolRuntime {
                 &resolved
             }
         };
+        if matches!(
+            call,
+            ToolCall::RunProcess { .. } | ToolCall::RunScript { .. }
+        ) && ssh_resource.is_some()
+        {
+            let (tool, representation) = if matches!(call, ToolCall::RunScript { .. }) {
+                ("run_script", "typed script payloads")
+            } else {
+                ("run_process", "native argv boundaries")
+            };
+            return Err(ToolResult::err_with_output(
+                format!(
+                    "{tool} is unavailable for named Session SSH resources because the current SSH transport cannot preserve {representation}; execution was not started. Use run_shell explicitly for remote shell semantics."
+                ),
+                json!({
+                    "command_started": false,
+                    "command_completed": false,
+                    "command_ok": false,
+                    "exit_code": null,
+                    "execution_state": "not_started",
+                    "failure_kind": "unsupported_resource",
+                    "tool_failure": true,
+                }),
+            ));
+        }
         if !proj.is_agent() {
             if ssh_resource.is_some() {
                 return Err(ToolResult::err(
@@ -106,6 +132,32 @@ impl ToolRuntime {
                             "agent_capability_unavailable: {}",
                             message
                         )));
+                    }
+                    if matches!(
+                        required,
+                        AgentCapability::StructuredProcess | AgentCapability::StructuredScript
+                    ) {
+                        let noun = if matches!(required, AgentCapability::StructuredScript) {
+                            "script"
+                        } else {
+                            "process"
+                        };
+                        return Err(ToolResult::err_with_output(
+                            format!(
+                                "capability_unavailable: agent client {} does not support {}; no {noun} was started and no shell fallback was attempted",
+                                client_id,
+                                required.label()
+                            ),
+                            json!({
+                                "command_started": false,
+                                "command_completed": false,
+                                "command_ok": false,
+                                "exit_code": null,
+                                "execution_state": "not_started",
+                                "failure_kind": "capability_unavailable",
+                                "tool_failure": true,
+                            }),
+                        ));
                     }
                     return Err(ToolResult::err(message));
                 }

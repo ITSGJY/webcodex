@@ -5,7 +5,10 @@ use super::super::kernel::{ToolCallContext, ToolCallRequest, ToolTransport};
 use super::super::ToolRuntime;
 use super::super::*;
 use super::support::*;
-use crate::shell_protocol::{ShellClientCapabilities, ShellClientRegisterRequest};
+use crate::shell_protocol::{
+    ShellAgentJobUpdateRequest, ShellAgentResultPayload, ShellAgentResultRequest,
+    ShellClientCapabilities, ShellClientRegisterRequest, ShellCommandExecutionState,
+};
 use serde_json::json;
 use std::fs;
 use std::io::Write;
@@ -500,6 +503,45 @@ async fn run_shell_via_agent(
     task.await.unwrap()
 }
 
+async fn run_shell_via_agent_lifecycle_error(
+    client_id: &str,
+    error: &str,
+    execution_state: ShellCommandExecutionState,
+) -> ToolResult {
+    let runtime = runtime_with_agent_project(client_id);
+    let mut caps = ShellClientCapabilities::default();
+    caps.shell = true;
+    register_agent(&runtime, client_id, None, caps).await;
+    let project = agent_test_project_id(client_id);
+    let runtime_for_task = runtime.clone();
+    let task = tokio::spawn(async move {
+        runtime_for_task
+            .run_shell(project, "printf lifecycle".to_string(), Some(30), None)
+            .await
+    });
+    let request = next_patch_agent_request(&runtime, client_id)
+        .await
+        .expect("run_shell should be dispatched");
+    runtime
+        .shell_clients
+        .complete(ShellAgentResultPayload {
+            result: ShellAgentResultRequest {
+                client_id: client_id.to_string(),
+                agent_instance_id: "inst".to_string(),
+                request_id: request.request_id,
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+                duration_ms: Some(1),
+                error: Some(error.to_string()),
+            },
+            command_execution_state: Some(execution_state),
+        })
+        .await
+        .unwrap();
+    task.await.unwrap()
+}
+
 #[tokio::test]
 async fn run_shell_failure_reports_command_started_and_output_tail() {
     let result = run_shell_via_agent(
@@ -522,6 +564,7 @@ async fn run_shell_failure_reports_command_started_and_output_tail() {
     assert_eq!(result.output["command_started"], true);
     assert_eq!(result.output["command_completed"], true);
     assert_eq!(result.output["command_ok"], false);
+    assert_eq!(result.output["execution_state"], "completed");
     assert_eq!(result.output["failure_kind"], "command_exit_nonzero");
     assert_eq!(result.output["tool_failure"], false);
 }
@@ -545,8 +588,47 @@ async fn run_shell_rejection_reports_not_started_and_no_files_modified() {
     assert_eq!(result.output["command_started"], false);
     assert_eq!(result.output["command_completed"], false);
     assert_eq!(result.output["command_ok"], false);
+    assert_eq!(result.output["execution_state"], "not_started");
     assert_eq!(result.output["failure_kind"], "agent_offline");
     assert_eq!(result.output["tool_failure"], true);
+}
+
+#[tokio::test]
+async fn run_shell_runner_pre_spawn_error_reports_not_started() {
+    let result = run_shell_via_agent_lifecycle_error(
+        "shell-pre-spawn-error",
+        "failed to spawn command: executable not found",
+        ShellCommandExecutionState::NotStarted,
+    )
+    .await;
+
+    assert!(!result.success);
+    let error = result.error.as_deref().unwrap_or_default();
+    assert_eq!(result.output["command_started"], false);
+    assert_eq!(result.output["command_completed"], false);
+    assert_eq!(result.output["execution_state"], "not_started");
+    assert!(error.contains("No command was started"));
+    assert!(error.contains("No files were modified"));
+}
+
+#[tokio::test]
+async fn run_shell_runner_post_spawn_output_error_reports_unknown() {
+    let result = run_shell_via_agent_lifecycle_error(
+        "shell-post-spawn-error",
+        "stdout reader did not finish before cleanup deadline",
+        ShellCommandExecutionState::OutcomeUnknown,
+    )
+    .await;
+
+    assert!(!result.success);
+    let error = result.error.as_deref().unwrap_or_default();
+    assert_eq!(result.output["command_started"], true);
+    assert_eq!(result.output["command_completed"], false);
+    assert_eq!(result.output["execution_state"], "outcome_unknown");
+    assert_eq!(result.output["failure_kind"], "outcome_unknown");
+    assert!(error.contains("Do not automatically retry"));
+    assert!(!error.contains("No command was started"));
+    assert!(!error.contains("No files were modified"));
 }
 
 #[tokio::test]
@@ -635,6 +717,11 @@ async fn run_shell_exit_codes_report_structured_command_results() {
             case.name
         );
         assert_eq!(
+            result.output["execution_state"], "completed",
+            "[{}] execution_state",
+            case.name
+        );
+        assert_eq!(
             result.output["command_ok"], case.expect_command_ok,
             "[{}] command_ok",
             case.name
@@ -661,18 +748,110 @@ async fn run_shell_exit_codes_report_structured_command_results() {
 }
 
 #[tokio::test]
-async fn run_shell_timeout_reports_structured_timeout_failure_kind() {
+async fn run_shell_result_wait_timeout_reports_unknown_outcome() {
     // The enqueued agent request is intentionally never completed, so the
-    // 1-second run_shell timeout fires while the command is still pending.
+    // result wait expires after dispatch without proving the command's final
+    // outcome.
     let result = run_shell_via_agent("shell-timeout", "sleep 2", Some(1), None).await;
 
     assert!(!result.success);
+    let error = result.error.as_deref().unwrap_or_default();
+    assert!(error.contains("Command execution outcome is unknown"));
+    assert!(error.contains("Do not automatically retry"));
+    assert!(error.contains("inspect the actual Job, process, service, or target state"));
+    assert!(!error.contains("No command was started"));
+    assert!(!error.contains("No files were modified"));
     assert_eq!(result.output["command_started"], true);
     assert_eq!(result.output["command_completed"], false);
     assert_eq!(result.output["command_ok"], false);
     assert!(result.output["exit_code"].is_null());
-    assert_eq!(result.output["failure_kind"], "timeout");
+    assert_eq!(result.output["execution_state"], "outcome_unknown");
+    assert_eq!(result.output["failure_kind"], "outcome_unknown");
     assert_eq!(result.output["tool_failure"], true);
+}
+
+#[tokio::test]
+async fn run_shell_runner_timeout_preserves_known_timeout_state() {
+    let client_id = "shell-runner-timeout";
+    let runtime = runtime_with_agent_project(client_id);
+    let mut caps = ShellClientCapabilities::default();
+    caps.shell = true;
+    register_agent(&runtime, client_id, None, caps).await;
+    let project = agent_test_project_id(client_id);
+    let runtime_for_task = runtime.clone();
+    let task = tokio::spawn(async move {
+        runtime_for_task
+            .run_shell(project, "sleep 2".to_string(), Some(1), None)
+            .await
+    });
+    let request = next_patch_agent_request(&runtime, client_id)
+        .await
+        .expect("run_shell should be dispatched");
+    runtime
+        .shell_clients
+        .complete(ShellAgentResultPayload {
+            result: ShellAgentResultRequest {
+                client_id: client_id.to_string(),
+                agent_instance_id: "inst".to_string(),
+                request_id: request.request_id,
+                exit_code: Some(-1),
+                stdout: Some("partial output".to_string()),
+                stderr: Some("runner stopped the process at its deadline".to_string()),
+                duration_ms: Some(1_000),
+                error: Some("runner timeout".to_string()),
+            },
+            command_execution_state: Some(ShellCommandExecutionState::TimedOut),
+        })
+        .await
+        .unwrap();
+
+    let result = task.await.unwrap();
+    assert!(!result.success);
+    assert_eq!(result.output["command_started"], true);
+    assert_eq!(result.output["command_completed"], false);
+    assert_eq!(result.output["execution_state"], "timed_out");
+    assert_eq!(result.output["failure_kind"], "timeout");
+    assert_eq!(result.output["tool_failure"], false);
+    let error = result.error.as_deref().unwrap_or_default();
+    assert!(error.contains("Command timed out after 1s"));
+    assert!(error.contains("do not blindly retry"));
+    assert!(error.contains("First inspect the actual process, service, and target state"));
+}
+
+#[tokio::test]
+async fn run_shell_transport_disconnect_after_dispatch_reports_unknown_outcome() {
+    let client_id = "shell-disconnect";
+    let runtime = runtime_with_agent_project(client_id);
+    let mut caps = ShellClientCapabilities::default();
+    caps.shell = true;
+    register_agent(&runtime, client_id, None, caps).await;
+    let project = agent_test_project_id(client_id);
+    let runtime_for_task = runtime.clone();
+    let task = tokio::spawn(async move {
+        runtime_for_task
+            .run_shell(project, "printf possibly-ran".to_string(), Some(30), None)
+            .await
+    });
+    next_patch_agent_request(&runtime, client_id)
+        .await
+        .expect("run_shell should be dispatched before disconnect");
+
+    runtime
+        .shell_clients
+        .reconcile_disconnect(client_id, "inst")
+        .await;
+
+    let result = task.await.unwrap();
+    let error = result.error.as_deref().unwrap_or_default();
+    assert!(!result.success);
+    assert_eq!(result.output["command_started"], true);
+    assert_eq!(result.output["command_completed"], false);
+    assert_eq!(result.output["execution_state"], "outcome_unknown");
+    assert_eq!(result.output["failure_kind"], "outcome_unknown");
+    assert!(error.contains("Command execution outcome is unknown"));
+    assert!(error.contains("Do not automatically retry"));
+    assert!(!error.contains("No command was started"));
+    assert!(!error.contains("No files were modified"));
 }
 
 #[tokio::test]
@@ -1608,6 +1787,7 @@ async fn register_job_agent_for_auth(
             ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_concurrency_limit: Some(4),
                 job_inventory: None,
                 client_id: client_id.to_string(),
                 agent_instance_id: "inst".to_string(),
@@ -1650,6 +1830,37 @@ async fn start_agent_runtime_job(
         .await;
     assert!(result.success, "{:?}", result.error);
     result.output["job_id"].as_str().unwrap().to_string()
+}
+
+async fn mark_next_agent_job_running(runtime: &ToolRuntime, client_id: &str) -> String {
+    let request = next_agent_request_for_instance(runtime, client_id, "inst")
+        .await
+        .expect("Agent Job request should be queued");
+    let job_id = request.job_id.clone().expect("Job request id");
+    runtime
+        .shell_clients
+        .update_job(ShellAgentJobUpdateRequest {
+            client_id: client_id.to_string(),
+            agent_instance_id: "inst".to_string(),
+            job_id: job_id.clone(),
+            request_id: Some(request.request_id),
+            update_seq: None,
+            status: "running".to_string(),
+            stdout_chunk: None,
+            stderr_chunk: None,
+            stdout_tail: None,
+            stderr_tail: None,
+            log_snapshot: None,
+            exit_code: None,
+            duration_ms: None,
+            error: None,
+            command_execution_state: None,
+            validation_progress: None,
+            finished: false,
+        })
+        .await
+        .unwrap();
+    job_id
 }
 
 fn listed_job_ids(result: &ToolResult) -> Vec<String> {
@@ -1959,7 +2170,7 @@ async fn lightweight_auth_cannot_enumerate_unrelated_local_jobs() {
 }
 
 #[tokio::test]
-async fn runtime_status_filters_job_counts_by_auth_group() {
+async fn runtime_status_and_list_agents_filter_concurrency_counts_by_auth_group() {
     let runtime = test_runtime();
     let shared_a = shared_key_auth_context("hash-a");
     let shared_b = shared_key_auth_context("hash-b");
@@ -1970,8 +2181,18 @@ async fn runtime_status_filters_job_counts_by_auth_group() {
     register_job_agent_for_auth(&runtime, "status-b", "proj-b", &shared_b).await;
     register_job_agent_for_auth(&runtime, "status-open", "proj-open", &open).await;
 
-    let _job_a = start_agent_runtime_job(&runtime, "status-a", "proj-a", &shared_a).await;
-    let _job_b = start_agent_runtime_job(&runtime, "status-b", "proj-b", &shared_b).await;
+    let job_a_running = start_agent_runtime_job(&runtime, "status-a", "proj-a", &shared_a).await;
+    assert_eq!(
+        mark_next_agent_job_running(&runtime, "status-a").await,
+        job_a_running
+    );
+    let _job_a_queued = start_agent_runtime_job(&runtime, "status-a", "proj-a", &shared_a).await;
+    let job_b_running = start_agent_runtime_job(&runtime, "status-b", "proj-b", &shared_b).await;
+    assert_eq!(
+        mark_next_agent_job_running(&runtime, "status-b").await,
+        job_b_running
+    );
+    let _job_b_queued = start_agent_runtime_job(&runtime, "status-b", "proj-b", &shared_b).await;
     let _job_open = start_agent_runtime_job(&runtime, "status-open", "proj-open", &open).await;
 
     let status_a = runtime
@@ -1984,8 +2205,51 @@ async fn runtime_status_filters_job_counts_by_auth_group() {
         )
         .await;
     assert!(status_a.success, "{:?}", status_a.error);
-    assert_eq!(status_a.output["jobs"]["agent_known_count"], 1);
-    assert_eq!(status_a.output["jobs"]["active_count"], 1);
+    assert_eq!(status_a.output["jobs"]["agent_known_count"], 2);
+    assert_eq!(status_a.output["jobs"]["active_count"], 2);
+    assert_eq!(status_a.output["jobs"]["running_count"], 1);
+    assert_eq!(status_a.output["jobs"]["queued_count"], 1);
+    assert_eq!(
+        status_a.output["agents"]["clients"][0]["job_concurrency"],
+        json!({"limit": 4, "running": 1, "queued": 1})
+    );
+    assert!(status_a.output["agents"]["clients"][0]
+        .get("available_slots")
+        .is_none());
+    assert!(status_a.output["agents"]["clients"][0]
+        .get("saturated")
+        .is_none());
+
+    let agents_a = runtime
+        .dispatch_with_auth(ToolCall::ListAgents, Some(&shared_a))
+        .await;
+    assert!(agents_a.success, "{:?}", agents_a.error);
+    assert_eq!(agents_a.output["count"], 1);
+    assert_eq!(agents_a.output["agents"][0]["client_id"], "status-a");
+    assert_eq!(
+        agents_a.output["agents"][0]["job_concurrency"],
+        json!({"limit": 4, "running": 1, "queued": 1})
+    );
+    assert_eq!(
+        agents_a.output["clients"][0]["job_concurrency"],
+        json!({"limit": 4, "running": 1, "queued": 1})
+    );
+    let new_observability = agents_a.output["agents"][0]["job_concurrency"]
+        .as_object()
+        .unwrap();
+    assert_eq!(new_observability.len(), 3);
+    for forbidden in [
+        "stdout",
+        "stderr",
+        "script",
+        "argv",
+        "stdin",
+        "command",
+        "token",
+        "credentials",
+    ] {
+        assert!(new_observability.get(forbidden).is_none(), "{forbidden}");
+    }
 
     let status_open = runtime
         .dispatch_with_auth(
@@ -1999,6 +2263,8 @@ async fn runtime_status_filters_job_counts_by_auth_group() {
     assert!(status_open.success, "{:?}", status_open.error);
     assert_eq!(status_open.output["jobs"]["agent_known_count"], 1);
     assert_eq!(status_open.output["jobs"]["active_count"], 1);
+    assert_eq!(status_open.output["jobs"]["running_count"], 0);
+    assert_eq!(status_open.output["jobs"]["queued_count"], 1);
 
     let status_bootstrap = runtime
         .dispatch_with_auth(
@@ -2010,8 +2276,53 @@ async fn runtime_status_filters_job_counts_by_auth_group() {
         )
         .await;
     assert!(status_bootstrap.success, "{:?}", status_bootstrap.error);
-    assert_eq!(status_bootstrap.output["jobs"]["agent_known_count"], 3);
-    assert_eq!(status_bootstrap.output["jobs"]["active_count"], 3);
+    assert_eq!(status_bootstrap.output["jobs"]["agent_known_count"], 5);
+    assert_eq!(status_bootstrap.output["jobs"]["active_count"], 5);
+    assert_eq!(status_bootstrap.output["jobs"]["running_count"], 2);
+    assert_eq!(status_bootstrap.output["jobs"]["queued_count"], 3);
+    assert_eq!(status_bootstrap.output["agents"]["count"], 3);
+
+    let compact_a = runtime
+        .dispatch_with_auth(
+            ToolCall::RuntimeStatus {
+                compact: true,
+                summary_only: false,
+            },
+            Some(&shared_a),
+        )
+        .await;
+    assert_eq!(
+        compact_a.output["jobs"],
+        json!({"active_count": 2, "running_count": 1, "queued_count": 1})
+    );
+}
+
+#[tokio::test]
+async fn runtime_concurrency_counts_cover_all_visible_jobs_beyond_list_pagination() {
+    let runtime = test_runtime();
+    let auth = bootstrap_auth_context();
+    register_job_agent_for_auth(&runtime, "count-all", "proj-all", &auth).await;
+    for _ in 0..21 {
+        start_agent_runtime_job(&runtime, "count-all", "proj-all", &auth).await;
+    }
+
+    let status = runtime
+        .dispatch_with_auth(
+            ToolCall::RuntimeStatus {
+                compact: false,
+                summary_only: false,
+            },
+            Some(&auth),
+        )
+        .await;
+    assert_eq!(status.output["jobs"]["agent_known_count"], 21);
+    assert_eq!(status.output["jobs"]["active_count"], 21);
+    assert_eq!(status.output["jobs"]["running_count"], 0);
+    assert_eq!(status.output["jobs"]["queued_count"], 21);
+    assert_eq!(
+        status.output["agents"]["clients"][0]["job_concurrency"],
+        json!({"limit": 4, "running": 0, "queued": 21})
+    );
 }
 
 #[tokio::test]

@@ -9,7 +9,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing_subscriber::EnvFilter;
 use webcodex_process::{GracefulTermination, ManagedChild};
-use webcodex_runner::shutdown::{lock_unpoison, ActivityTracker};
+use webcodex_runner::shutdown::{lock_unpoison, ActivityTracker, BackgroundThreads};
 
 #[cfg(test)]
 #[path = "webcodex_runner/job_manager_tests.rs"]
@@ -27,13 +27,13 @@ use shell_protocol::{
     validation_infrastructure_failure_code, AgentPolicySummary, ShellAgentJobUpdateRequest,
     ShellAgentPollPayload, ShellAgentPollRequest, ShellAgentPollResponse, ShellAgentProjectSummary,
     ShellAgentShellRequest, ShellClientCapabilities, ShellClientRegisterRequest,
-    ShellClientRegisterResponse, ShellJobContext, ShellJobInventory, ShellJobLogSnapshot,
-    ShellJobSnapshot, ShellJobStreamSnapshot, ShellJobValidationProgress, ShellJobValidationStep,
-    ShellProfileSummaryEntry, ShellProfilesSummary, AGENT_PROTOCOL_VERSION_POLLING_V1,
-    JOB_INVENTORY_MAX_ACTIVE_JOBS, JOB_INVENTORY_MAX_SERIALIZED_BYTES,
-    JOB_INVENTORY_MAX_TERMINAL_JOBS, JOB_SNAPSHOT_STREAM_MAX_BYTES, JOB_TERMINAL_RETENTION_SECS,
-    VALIDATION_STEP_SPAWN_FAILED_CODE, VALIDATION_STEP_WAIT_FAILED_CODE,
-    VALIDATION_TOOL_UNAVAILABLE_CODE,
+    ShellClientRegisterResponse, ShellCommandExecutionState, ShellJobContext, ShellJobInventory,
+    ShellJobLogSnapshot, ShellJobSnapshot, ShellJobStreamSnapshot, ShellJobValidationProgress,
+    ShellJobValidationStep, ShellProfileSummaryEntry, ShellProfilesSummary,
+    AGENT_PROTOCOL_VERSION_POLLING_V1, JOB_INVENTORY_MAX_ACTIVE_JOBS,
+    JOB_INVENTORY_MAX_SERIALIZED_BYTES, JOB_INVENTORY_MAX_TERMINAL_JOBS,
+    JOB_SNAPSHOT_STREAM_MAX_BYTES, JOB_TERMINAL_RETENTION_SECS, VALIDATION_STEP_SPAWN_FAILED_CODE,
+    VALIDATION_STEP_WAIT_FAILED_CODE, VALIDATION_TOOL_UNAVAILABLE_CODE,
 };
 
 #[cfg(test)]
@@ -47,6 +47,7 @@ use std::collections::BTreeMap;
 #[cfg(test)]
 use std::net::SocketAddr;
 use webcodex_runner::contains_any;
+use webcodex_runner::output_text::{OutputTextDecoder, OutputTextSource};
 #[cfg(test)]
 use webcodex_runner::QuicClientConfig;
 #[cfg(test)]
@@ -54,12 +55,11 @@ use webcodex_runner::{
     agent_project_summary, auto_transport_plan, build_ws_request, default_quic_alpn,
     default_quic_connect_timeout_secs, default_quic_keepalive_interval_secs,
     default_websocket_connect_timeout_secs, effective_transport, handle_project_op,
-    load_agent_project_summaries_from_dir, max_concurrent_jobs, non_empty_token,
-    parse_agent_project_toml, quic_client_bind_addr_for, resolve_quic_config,
-    resolve_quic_server_addrs, run_shell, run_shell_with_profiles,
-    run_shell_with_profiles_in_sandbox, server_url_to_ws, sha256_hex_bytes,
-    validate_project_path_policy, websocket_session, AgentRuntimeState, ShellProfileConfig,
-    CLIENT_PROFILE_ERROR, DEFAULT_MAX_CONCURRENT_JOBS, WS_OUTGOING_CAPACITY,
+    load_agent_project_summaries_from_dir, non_empty_token, parse_agent_project_toml,
+    quic_client_bind_addr_for, resolve_quic_config, resolve_quic_server_addrs, run_shell,
+    run_shell_with_profiles, run_shell_with_profiles_in_sandbox, server_url_to_ws,
+    sha256_hex_bytes, validate_project_path_policy, websocket_session, AgentRuntimeState,
+    ShellProfileConfig, CLIENT_PROFILE_ERROR, DEFAULT_MAX_CONCURRENT_JOBS, WS_OUTGOING_CAPACITY,
 };
 use webcodex_runner::{
     client_profile_agent_config, configured_prepared_shell_job_command,
@@ -68,13 +68,17 @@ use webcodex_runner::{
     handle_artifact_file_request, handle_basic_file_request, handle_checkpoint_file_request,
     handle_write_project_file_request, hostname, is_artifact_request_kind,
     is_basic_file_request_kind, is_checkpoint_request_kind, is_project_op,
-    is_structured_edit_request_kind, load_config, ok_cmd, projects_dir,
+    is_structured_edit_request_kind, load_config, max_concurrent_jobs, ok_cmd, projects_dir,
     resolve_prepared_shell_profile, resolve_requested_path, run_agent, validate_client_profile,
     validate_structured_edit_agent_path, AgentConfig, AgentPolicy, AgentProjectCache, AgentSink,
     CommandResult, HotAgentConfig, HttpSendConfig, PreparedShellProfile, PreparedShellProfileCache,
     ReloadableAgentConfig, ShellConfig, SubmitResultError,
 };
 use webcodex_runner::{is_transport_failure, SshConfig, SshConnectionPool};
+use webcodex_runner::{
+    run_process_with_profiles_in_sandbox_and_execution_state_with_start_hook,
+    run_script_with_profiles_in_sandbox_and_execution_state_with_start_hook,
+};
 
 const JOB_UPDATE_INTERVAL_MS: u64 = 250;
 const AGENT_REGISTER_PATH: &str = "/api/shell/agent/register";
@@ -201,6 +205,7 @@ fn test_job_snapshot(job_id: &str) -> ShellJobSnapshot {
         exit_code: None,
         duration_ms: None,
         error: None,
+        command_execution_state: None,
         context: shell_protocol::ShellJobContext {
             runtime_project_id: None,
             workflow_session_id: None,
@@ -212,6 +217,7 @@ fn test_job_snapshot(job_id: &str) -> ShellJobSnapshot {
             command_preview: "test job".to_string(),
             validation_steps: Vec::new(),
             validation: None,
+            structured_execution: None,
         },
         stdout: ShellJobStreamSnapshot::default(),
         stderr: ShellJobStreamSnapshot::default(),
@@ -232,6 +238,7 @@ fn test_job_context(cwd: &Path, validation_steps: Vec<String>) -> shell_protocol
         command_preview: "test command".to_string(),
         validation_steps,
         validation: None,
+        structured_execution: None,
     }
 }
 
@@ -798,6 +805,282 @@ impl std::fmt::Display for PollError {
     }
 }
 
+/// Polling needs enough independent dispatch capacity for one long ordinary
+/// request plus a later request (notably a Job start/stop or persistent-shell
+/// close), but E1 deliberately does not introduce deployment tuning. Two is
+/// the smallest bound that removes the one-request starvation failure while
+/// keeping the process-local OS-thread surface conservative.
+pub(crate) const POLLING_DISPATCH_MAX_IN_FLIGHT: usize = 2;
+
+struct PollingDispatch {
+    request_id: String,
+    project_cache_invalidation_required: bool,
+    sink: AgentSink,
+    config: Arc<HotAgentConfig>,
+    runtime: Arc<ReloadableAgentConfig>,
+    jobs: JobManager,
+    persistent_shells: webcodex_runner::PersistentShellManager,
+    projects_dir: PathBuf,
+    lsp: webcodex_runner::LspSupervisor,
+    request: ShellAgentShellRequest,
+}
+
+impl PollingDispatch {
+    fn run(self) -> Result<bool, SubmitResultError> {
+        dispatch_request(
+            &self.sink,
+            &self.config,
+            &self.runtime,
+            &self.jobs,
+            &self.persistent_shells,
+            &self.projects_dir,
+            &self.lsp,
+            self.request,
+        )
+    }
+}
+
+struct PollingDispatchCompletion {
+    request_id: String,
+    project_cache_invalidation_required: bool,
+    dispatch_result: Result<bool, SubmitResultError>,
+}
+
+/// Sends a completion even if a worker unwinds. It is declared before the
+/// ActivityGuard in the worker so reverse drop order releases the activity
+/// slot only after dispatch and result submission, then publishes completion.
+struct PollingDispatchCompletionOnDrop {
+    completion_tx: mpsc::SyncSender<PollingDispatchCompletion>,
+    request_id: String,
+    project_cache_invalidation_required: bool,
+    dispatch_result: Option<Result<bool, SubmitResultError>>,
+}
+
+impl PollingDispatchCompletionOnDrop {
+    fn new(
+        completion_tx: mpsc::SyncSender<PollingDispatchCompletion>,
+        request_id: String,
+        project_cache_invalidation_required: bool,
+    ) -> Self {
+        Self {
+            completion_tx,
+            request_id,
+            project_cache_invalidation_required,
+            dispatch_result: None,
+        }
+    }
+
+    fn complete(&mut self, result: Result<bool, SubmitResultError>) {
+        self.dispatch_result = Some(result);
+    }
+}
+
+impl Drop for PollingDispatchCompletionOnDrop {
+    fn drop(&mut self) {
+        let dispatch_result = self.dispatch_result.take().unwrap_or_else(|| {
+            Err(SubmitResultError::TransportClosed(
+                "polling dispatch worker closed unexpectedly".to_string(),
+            ))
+        });
+        let _ = self.completion_tx.send(PollingDispatchCompletion {
+            request_id: std::mem::take(&mut self.request_id),
+            project_cache_invalidation_required: self.project_cache_invalidation_required,
+            dispatch_result,
+        });
+    }
+}
+
+/// Process-local coordination for normal polling dispatches. The Server queue
+/// remains the only pending-work queue: this supervisor admits at most two
+/// already-dequeued requests, creates no local holding queue, and returns
+/// worker completion/fatal submission outcomes to the polling control loop.
+pub(crate) struct PollingDispatchSupervisor {
+    completion_tx: mpsc::SyncSender<PollingDispatchCompletion>,
+    completion_rx: mpsc::Receiver<PollingDispatchCompletion>,
+    in_flight: usize,
+    background_threads: Arc<BackgroundThreads>,
+    dispatches: ActivityTracker,
+}
+
+impl PollingDispatchSupervisor {
+    pub(crate) fn new(
+        background_threads: Arc<BackgroundThreads>,
+        dispatches: ActivityTracker,
+    ) -> Self {
+        let (completion_tx, completion_rx) = mpsc::sync_channel(POLLING_DISPATCH_MAX_IN_FLIGHT);
+        Self {
+            completion_tx,
+            completion_rx,
+            in_flight: 0,
+            background_threads,
+            dispatches,
+        }
+    }
+
+    fn has_capacity(&self) -> bool {
+        self.in_flight < POLLING_DISPATCH_MAX_IN_FLIGHT
+    }
+
+    fn spawn(&mut self, dispatch: PollingDispatch) -> Result<(), PollError> {
+        if !self.has_capacity() {
+            return Err(PollError::new(
+                PollErrorKind::Config,
+                "polling dispatch capacity invariant violated",
+            ));
+        }
+        let completion_tx = self.completion_tx.clone();
+        let dispatch_guard = self.dispatches.enter();
+        let request_id = dispatch.request_id.clone();
+        let project_cache_invalidation_required = dispatch.project_cache_invalidation_required;
+        let handle = std::thread::Builder::new()
+            .name("webcodex-poll-dispatch".to_string())
+            .spawn(move || {
+                let mut completion = PollingDispatchCompletionOnDrop::new(
+                    completion_tx,
+                    request_id,
+                    project_cache_invalidation_required,
+                );
+                let _dispatch_guard = dispatch_guard;
+                completion.complete(dispatch.run());
+            })
+            .map_err(|error| {
+                PollError::new(
+                    PollErrorKind::Config,
+                    format!("failed to start polling dispatch worker: {error}"),
+                )
+            })?;
+        self.in_flight += 1;
+        self.background_threads.register(handle);
+        Ok(())
+    }
+
+    fn record_completion(
+        &mut self,
+        project_cache: &mut AgentProjectCache,
+        completion: PollingDispatchCompletion,
+    ) -> Result<bool, SubmitResultError> {
+        self.in_flight = self.in_flight.checked_sub(1).unwrap_or_else(|| {
+            debug_assert!(false, "polling completion without an in-flight dispatch");
+            0
+        });
+        let _request_id = completion.request_id;
+        if completion.project_cache_invalidation_required && completion.dispatch_result.is_ok() {
+            project_cache.invalidate();
+        }
+        completion.dispatch_result
+    }
+
+    /// Inspect every completion currently available. This is called before
+    /// each poll and after each poll/dispatch turn, so a fatal result delivery
+    /// failure cannot be silently discarded by background dispatch.
+    pub(crate) fn drain_completed(
+        &mut self,
+        project_cache: &mut AgentProjectCache,
+    ) -> Result<(), PollError> {
+        loop {
+            match self.completion_rx.try_recv() {
+                Ok(completion) => {
+                    let result = self
+                        .record_completion(project_cache, completion)
+                        .map(|_| ())
+                        .map_err(PollError::from_submit);
+                    let _ = self.background_threads.reap_finished();
+                    result?;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    let _ = self.background_threads.reap_finished();
+                    return Ok(());
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(PollError::from_submit(SubmitResultError::TransportClosed(
+                        "polling dispatch completion channel closed".to_string(),
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Apply backpressure before another Server dequeue. There is no local
+    /// pending queue: when both slots are occupied the control loop waits for
+    /// one worker completion (or shutdown) and only then polls again.
+    pub(crate) fn wait_for_capacity_or_shutdown(
+        &mut self,
+        project_cache: &mut AgentProjectCache,
+        shutdown: &AtomicBool,
+    ) -> Result<(), PollError> {
+        while !self.has_capacity() {
+            if shutdown.load(Ordering::SeqCst) {
+                return Err(PollError::from_submit(SubmitResultError::Shutdown(
+                    "process shutdown".to_string(),
+                )));
+            }
+            match self.completion_rx.recv_timeout(Duration::from_millis(25)) {
+                Ok(completion) => {
+                    let result = self
+                        .record_completion(project_cache, completion)
+                        .map(|_| ())
+                        .map_err(PollError::from_submit);
+                    let _ = self.background_threads.reap_finished();
+                    result?;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(PollError::from_submit(SubmitResultError::TransportClosed(
+                        "polling dispatch completion channel closed".to_string(),
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Preserve the former synchronous dispatch's bounded shutdown race:
+    /// already-returned fatal auth/protocol/config outcomes win over clean
+    /// shutdown. A worker-reported Shutdown is remembered while remaining
+    /// completions get a short chance to expose a sibling fatal outcome.
+    pub(crate) fn wait_for_shutdown_outcome(
+        &mut self,
+        project_cache: &mut AgentProjectCache,
+        wait: Duration,
+    ) -> Result<(), PollError> {
+        let deadline = Instant::now() + wait;
+        let mut shutdown_error = None;
+        while self.in_flight > 0 && Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self
+                .completion_rx
+                .recv_timeout(remaining.min(Duration::from_millis(25)))
+            {
+                Ok(completion) => {
+                    match self.record_completion(project_cache, completion) {
+                        Ok(_) => {}
+                        Err(error @ SubmitResultError::Shutdown(_)) => {
+                            shutdown_error = Some(error);
+                        }
+                        Err(error) => {
+                            let _ = self.background_threads.reap_finished();
+                            return Err(PollError::from_submit(error));
+                        }
+                    }
+                    let _ = self.background_threads.reap_finished();
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(PollError::from_submit(SubmitResultError::TransportClosed(
+                        "polling dispatch completion channel closed".to_string(),
+                    )));
+                }
+            }
+        }
+        let _ = self.background_threads.reap_finished();
+        if let Some(error) = shutdown_error {
+            Err(PollError::from_submit(error))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 fn http_status_summary(status: reqwest::StatusCode) -> String {
     match status.canonical_reason() {
         Some(reason) => format!("HTTP {} {}", status.as_u16(), reason),
@@ -1263,6 +1546,9 @@ fn agent_register_capabilities(cfg: &AgentConfig) -> ShellClientCapabilities {
     // inferred from `ssh_shell` + `persistent_shell`.
     capabilities.ssh_persistent_shell = SshConnectionPool::is_available() && cfg!(unix);
     capabilities.structured_validation_argv = true;
+    capabilities.structured_process_argv = true;
+    capabilities.structured_script_payload = true;
+    capabilities.structured_execution_jobs = true;
     capabilities.project_lifecycle = true;
     // This binary implements resolve_or_register_project; do not trust config to
     // advertise a capability that the binary does not implement.
@@ -1344,6 +1630,7 @@ fn build_register_request_with_provider_status(
             )),
             process_started_at: Some(process_started_at()),
             build: Some(runner_build_info()),
+            job_concurrency_limit: Some(max_concurrent_jobs(cfg)),
             // A legacy runner (capability disabled for E2E) must not send a job
             // inventory: the server rejects inventory without the capability and
             // vice-versa, so a true legacy client advertises neither.
@@ -1625,17 +1912,18 @@ fn spawn_reader<R: Read + Send + 'static>(
     mut reader: R,
     tx: mpsc::SyncSender<OutputChunk>,
     stdout: bool,
+    source: OutputTextSource,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         // A bounded channel plus fixed-size reads prevents a fast child (or
         // one enormous line) from retaining unbounded output in the runner
         // while a transport send is slow.
         let mut buf = [0_u8; 8 * 1024];
-        let mut utf8_pending = Vec::with_capacity(buf.len() + 3);
+        let mut decoder = OutputTextDecoder::new(source);
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => {
-                    let text = take_utf8_output(&mut utf8_pending, true);
+                    let text = decoder.push(&[], true);
                     if !text.is_empty() {
                         let _ = if stdout {
                             tx.send(OutputChunk::Stdout(text))
@@ -1646,8 +1934,7 @@ fn spawn_reader<R: Read + Send + 'static>(
                     break;
                 }
                 Ok(read) => {
-                    utf8_pending.extend_from_slice(&buf[..read]);
-                    let text = take_utf8_output(&mut utf8_pending, false);
+                    let text = decoder.push(&buf[..read], false);
                     if !text.is_empty() {
                         let _ = if stdout {
                             tx.send(OutputChunk::Stdout(text))
@@ -1657,7 +1944,7 @@ fn spawn_reader<R: Read + Send + 'static>(
                     }
                 }
                 Err(_) => {
-                    let text = take_utf8_output(&mut utf8_pending, true);
+                    let text = decoder.push(&[], true);
                     if !text.is_empty() {
                         let _ = if stdout {
                             tx.send(OutputChunk::Stdout(text))
@@ -1670,43 +1957,6 @@ fn spawn_reader<R: Read + Send + 'static>(
             }
         }
     })
-}
-
-/// Drain every complete UTF-8 sequence from `pending`, retaining only a
-/// trailing incomplete scalar between reads. Truly invalid bytes keep the
-/// runner's historical lossy-decoding behavior, but a valid scalar split at
-/// the fixed read boundary is never replaced or cut.
-fn take_utf8_output(pending: &mut Vec<u8>, end_of_stream: bool) -> String {
-    let mut output = String::new();
-    loop {
-        match std::str::from_utf8(pending) {
-            Ok(text) => {
-                output.push_str(text);
-                pending.clear();
-                break;
-            }
-            Err(error) => {
-                let valid_up_to = error.valid_up_to();
-                if valid_up_to > 0 {
-                    let valid = std::str::from_utf8(&pending[..valid_up_to])
-                        .expect("valid_up_to always identifies valid UTF-8");
-                    output.push_str(valid);
-                    pending.drain(..valid_up_to);
-                }
-                if let Some(error_len) = error.error_len() {
-                    pending.drain(..error_len);
-                    output.push('\u{fffd}');
-                    continue;
-                }
-                if end_of_stream {
-                    output.push_str(&String::from_utf8_lossy(pending));
-                    pending.clear();
-                }
-                break;
-            }
-        }
-    }
-    output
 }
 
 /// Join the output reader threads until `deadline`. Returns the number of
@@ -1962,6 +2212,7 @@ struct RunnerJobDelta {
     exit_code: Option<i32>,
     duration_ms: Option<u64>,
     error: Option<String>,
+    command_execution_state: Option<ShellCommandExecutionState>,
     validation_progress: Option<ShellJobValidationProgress>,
     finished: bool,
 }
@@ -1975,6 +2226,16 @@ fn runner_job_is_terminal(status: &str) -> bool {
 
 fn runner_job_is_active(status: &str) -> bool {
     matches!(status, "agent_queued" | "running" | "stop_requested")
+}
+
+fn structured_prestart_lifecycle(
+    request: &ShellAgentShellRequest,
+) -> Option<ShellCommandExecutionState> {
+    matches!(
+        request.kind.as_str(),
+        "start_process_job" | "start_script_job"
+    )
+    .then_some(ShellCommandExecutionState::NotStarted)
 }
 
 fn job_update_from_snapshot(
@@ -2000,6 +2261,7 @@ fn job_update_from_snapshot(
         exit_code: snapshot.exit_code,
         duration_ms: snapshot.duration_ms,
         error: snapshot.error.clone(),
+        command_execution_state: snapshot.command_execution_state,
         validation_progress: snapshot.validation_progress.clone(),
         finished: runner_job_is_terminal(&snapshot.status),
     }
@@ -2155,11 +2417,12 @@ fn validate_runner_job_context(
     }) {
         return Err("job recovery context purpose is invalid".to_string());
     }
-    if context
-        .shell
-        .as_deref()
-        .is_some_and(|shell| !matches!(shell, "sh" | "bash" | "configured" | "custom" | "remote"))
-    {
+    if context.shell.as_deref().is_some_and(|shell| {
+        !matches!(
+            shell,
+            "sh" | "bash" | "powershell" | "configured" | "custom" | "remote" | "direct_argv"
+        )
+    }) {
         return Err("job recovery context shell is invalid".to_string());
     }
     let validation_context = request.kind == "start_validation_job";
@@ -2190,6 +2453,56 @@ fn validate_runner_job_context(
     }) {
         return Err("job recovery context validation metadata is invalid".to_string());
     }
+    let expected_structured = match request.kind.as_str() {
+        "start_process_job" => {
+            if !request.command.is_empty()
+                || request.script.is_some()
+                || request.process.is_none()
+                || context.ssh_resource.is_some()
+            {
+                return Err("typed process Job request shape is invalid".to_string());
+            }
+            let process = request.process.as_ref().expect("checked process payload");
+            shell_protocol::validate_process_argv(process)?;
+            validate_runner_structured_common(request)?;
+            Some(shell_protocol::ShellJobStructuredExecutionMetadata {
+                execution_source: "run_process".to_string(),
+                language: None,
+                script_bytes: None,
+                arg_count: process.args.len(),
+                stdin_present: request.stdin.is_some(),
+            })
+        }
+        "start_script_job" => {
+            if !request.command.is_empty()
+                || request.process.is_some()
+                || request.script.is_none()
+                || context.ssh_resource.is_some()
+            {
+                return Err("typed script Job request shape is invalid".to_string());
+            }
+            let script = request.script.as_ref().expect("checked script payload");
+            shell_protocol::validate_script_request(
+                script,
+                request.stdin.as_deref(),
+                request.cwd.as_deref(),
+                request.timeout_secs,
+            )?;
+            Some(shell_protocol::ShellJobStructuredExecutionMetadata {
+                execution_source: "run_script".to_string(),
+                language: Some(script.language),
+                script_bytes: Some(script.script.len()),
+                arg_count: script.args.len(),
+                stdin_present: request.stdin.is_some(),
+            })
+        }
+        _ => None,
+    };
+    if context.structured_execution != expected_structured {
+        return Err(
+            "job recovery context structured execution metadata does not match request".to_string(),
+        );
+    }
     if let Some(project_id) = context.runtime_project_id.as_deref() {
         let prefix = format!("agent:{client_id}:");
         if !bounded(project_id, MAX_CONTEXT_FIELD_CHARS)
@@ -2212,6 +2525,42 @@ fn validate_runner_job_context(
         {
             return Err("job recovery context workflow_session_id is invalid".to_string());
         }
+    }
+    Ok(())
+}
+
+fn validate_runner_structured_common(request: &ShellAgentShellRequest) -> Result<(), String> {
+    if let Some(stdin) = request.stdin.as_deref() {
+        if stdin.len() > shell_protocol::PROCESS_STDIN_MAX_BYTES {
+            return Err(format!(
+                "stdin is too large; maximum is {} bytes",
+                shell_protocol::PROCESS_STDIN_MAX_BYTES
+            ));
+        }
+        if stdin.contains('\0') {
+            return Err("stdin cannot contain NUL bytes".to_string());
+        }
+    }
+    if let Some(cwd) = request.cwd.as_deref() {
+        if cwd.len() > shell_protocol::PROCESS_CWD_MAX_BYTES {
+            return Err(format!(
+                "cwd is too long; maximum is {} bytes",
+                shell_protocol::PROCESS_CWD_MAX_BYTES
+            ));
+        }
+        if cwd.contains('\0') {
+            return Err("cwd cannot contain NUL bytes".to_string());
+        }
+    }
+    if !(shell_protocol::STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS
+        ..=shell_protocol::STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS)
+        .contains(&request.timeout_secs)
+    {
+        return Err(format!(
+            "timeout_secs must be between {} and {}",
+            shell_protocol::STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS,
+            shell_protocol::STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS
+        ));
     }
     Ok(())
 }
@@ -2260,7 +2609,12 @@ impl JobManager {
                     job.snapshot.status = incoming_status.to_string();
                 }
             }
+            if delta.command_execution_state.is_some() {
+                job.snapshot.command_execution_state = delta.command_execution_state;
+            }
             if job.snapshot.started_at.is_none()
+                && job.snapshot.command_execution_state
+                    != Some(ShellCommandExecutionState::NotStarted)
                 && matches!(
                     job.snapshot.status.as_str(),
                     "running"
@@ -2348,6 +2702,7 @@ impl JobManager {
                 status: "failed".to_string(),
                 duration_ms: Some(0),
                 error: Some(error),
+                command_execution_state: structured_prestart_lifecycle(request),
                 validation_progress,
                 finished: true,
                 ..Default::default()
@@ -2594,6 +2949,7 @@ impl JobManager {
             return;
         };
         let Some(context) = request.job_context.clone() else {
+            let command_execution_state = structured_prestart_lifecycle(&request);
             let _ = sink.send_job_update(&ShellAgentJobUpdateRequest {
                 client_id: sink.client_id().to_string(),
                 agent_instance_id: sink.agent_instance_id().to_string(),
@@ -2609,12 +2965,14 @@ impl JobManager {
                 exit_code: None,
                 duration_ms: Some(0),
                 error: Some("job start request is missing recovery context".to_string()),
+                command_execution_state,
                 validation_progress: None,
                 finished: true,
             });
             return;
         };
         if let Err(error) = validate_runner_job_context(&context, &request, sink.client_id()) {
+            let command_execution_state = structured_prestart_lifecycle(&request);
             let _ = sink.send_job_update(&ShellAgentJobUpdateRequest {
                 client_id: sink.client_id().to_string(),
                 agent_instance_id: sink.agent_instance_id().to_string(),
@@ -2630,6 +2988,7 @@ impl JobManager {
                 exit_code: None,
                 duration_ms: Some(0),
                 error: Some(error),
+                command_execution_state,
                 validation_progress: None,
                 finished: true,
             });
@@ -2692,6 +3051,9 @@ impl JobManager {
                         exit_code: None,
                         duration_ms: terminal.then_some(0),
                         error: immediate_failure.clone(),
+                        command_execution_state: terminal
+                            .then(|| structured_prestart_lifecycle(&request))
+                            .flatten(),
                         context,
                         stdout: ShellJobStreamSnapshot::default(),
                         stderr: ShellJobStreamSnapshot::default(),
@@ -2749,7 +3111,14 @@ impl JobManager {
             self.shutdown_rejection(&request);
             return;
         }
-        self.start_shell_job(sink, generation, policy, shell, ssh, projects_dir, request);
+        if matches!(
+            request.kind.as_str(),
+            "start_process_job" | "start_script_job"
+        ) {
+            self.start_structured_job(generation, policy, shell, projects_dir, request);
+        } else {
+            self.start_shell_job(sink, generation, policy, shell, ssh, projects_dir, request);
+        }
     }
 
     fn start_available_queued(&self) {
@@ -2799,6 +3168,130 @@ impl JobManager {
             };
             self.start_now(sink, generation, policy, shell, ssh, projects_dir, request);
         }
+    }
+
+    fn start_structured_job(
+        &self,
+        generation: u64,
+        policy: AgentPolicy,
+        shell: ShellConfig,
+        projects_dir: PathBuf,
+        request: ShellAgentShellRequest,
+    ) {
+        let Some(job_id) = request.job_id.clone() else {
+            return;
+        };
+        let stop_requested = {
+            let _lifecycle = lock_unpoison(&self.lifecycle);
+            if self.shutting_down.load(Ordering::SeqCst) {
+                None
+            } else {
+                let mut jobs = lock_unpoison(&self.jobs);
+                let Some(job) = jobs.get_mut(&job_id) else {
+                    return;
+                };
+                job.slot_reserved = true;
+                Some(Arc::clone(&job.stop_requested))
+            }
+        };
+        let Some(stop_requested) = stop_requested else {
+            self.shutdown_rejection(&request);
+            return;
+        };
+        if (request.kind == "start_process_job" && request.process.is_none())
+            || (request.kind == "start_script_job" && request.script.is_none())
+        {
+            self.fail_job(
+                &request,
+                "typed structured Job request is missing its payload".to_string(),
+                None,
+            );
+            return;
+        }
+        let manager = self.clone_for_worker();
+        let worker_guard = self.workers.enter();
+        std::thread::spawn(move || {
+            let _worker_guard = worker_guard;
+            let started_manager = manager.clone_for_worker();
+            let started_job_id = job_id.clone();
+            let on_started = || {
+                started_manager.update_and_send(
+                    &started_job_id,
+                    RunnerJobDelta {
+                        status: "running".to_string(),
+                        ..Default::default()
+                    },
+                );
+            };
+            let result = match request.kind.as_str() {
+                "start_process_job" => {
+                    let process = request.process.as_ref().expect("validated process payload");
+                    run_process_with_profiles_in_sandbox_and_execution_state_with_start_hook(
+                        generation,
+                        &policy,
+                        &shell,
+                        &projects_dir,
+                        &manager.prepared_profiles,
+                        request.cwd.as_deref(),
+                        &process.executable,
+                        &process.args,
+                        request.stdin.as_deref(),
+                        request.timeout_secs,
+                        Some(stop_requested.as_ref()),
+                        request.sandbox.as_deref(),
+                        Some(&on_started),
+                    )
+                }
+                "start_script_job" => {
+                    let script = request.script.as_ref().expect("validated script payload");
+                    run_script_with_profiles_in_sandbox_and_execution_state_with_start_hook(
+                        generation,
+                        &policy,
+                        &shell,
+                        &projects_dir,
+                        &manager.prepared_profiles,
+                        request.cwd.as_deref(),
+                        script,
+                        request.stdin.as_deref(),
+                        request.timeout_secs,
+                        Some(stop_requested.as_ref()),
+                        request.sandbox.as_deref(),
+                        Some(&on_started),
+                    )
+                }
+                _ => unreachable!("structured Job dispatcher received legacy request"),
+            };
+            let execution_state = result.execution_state;
+            let stopped = stop_requested.load(Ordering::SeqCst)
+                && execution_state == ShellCommandExecutionState::Completed;
+            let status = match execution_state {
+                ShellCommandExecutionState::NotStarted => "failed",
+                ShellCommandExecutionState::OutcomeUnknown => "lost",
+                ShellCommandExecutionState::TimedOut => "timeout",
+                ShellCommandExecutionState::Completed if stopped => "stopped",
+                ShellCommandExecutionState::Completed
+                    if result.result.exit_code == Some(0) && result.result.error.is_none() =>
+                {
+                    "completed"
+                }
+                ShellCommandExecutionState::Completed => "failed",
+            };
+            manager.update_and_send(
+                &job_id,
+                RunnerJobDelta {
+                    status: status.to_string(),
+                    stdout_chunk: result.result.stdout,
+                    stderr_chunk: result.result.stderr,
+                    exit_code: result.result.exit_code,
+                    duration_ms: result.result.duration_ms,
+                    error: result.result.error,
+                    command_execution_state: Some(execution_state),
+                    finished: true,
+                    ..Default::default()
+                },
+            );
+            manager.start_available_queued();
+        });
     }
 
     fn start_shell_job(
@@ -3098,10 +3591,20 @@ impl JobManager {
                 let (tx, rx) = mpsc::sync_channel::<OutputChunk>(OUTPUT_CHANNEL_CAPACITY);
                 let mut readers = Vec::new();
                 if let Some(stdout) = stdout {
-                    readers.push(spawn_reader(stdout, tx.clone(), true));
+                    readers.push(spawn_reader(
+                        stdout,
+                        tx.clone(),
+                        true,
+                        OutputTextSource::LocalProcess,
+                    ));
                 }
                 if let Some(stderr) = stderr {
-                    readers.push(spawn_reader(stderr, tx.clone(), false));
+                    readers.push(spawn_reader(
+                        stderr,
+                        tx.clone(),
+                        false,
+                        OutputTextSource::LocalProcess,
+                    ));
                 }
                 drop(tx);
                 let step_status = loop {
@@ -3492,10 +3995,20 @@ impl JobManager {
             let (tx, rx) = mpsc::sync_channel::<OutputChunk>(OUTPUT_CHANNEL_CAPACITY);
             let mut readers = Vec::new();
             if let Some(stdout) = stdout.take() {
-                readers.push(spawn_reader(stdout, tx.clone(), true));
+                readers.push(spawn_reader(
+                    stdout,
+                    tx.clone(),
+                    true,
+                    OutputTextSource::RemoteSsh,
+                ));
             }
             if let Some(stderr) = stderr.take() {
-                readers.push(spawn_reader(stderr, tx.clone(), false));
+                readers.push(spawn_reader(
+                    stderr,
+                    tx.clone(),
+                    false,
+                    OutputTextSource::RemoteSsh,
+                ));
             }
             drop(tx);
             let timeout_secs = request.timeout_secs.min(policy.max_timeout_secs).max(1);
@@ -3632,7 +4145,7 @@ impl JobManager {
                 None
             }
         };
-        if let Some((_sink, _generation, _policy, _shell, _ssh, _projects_dir, _request)) =
+        if let Some((_sink, _generation, _policy, _shell, _ssh, _projects_dir, request)) =
             queued_job
         {
             self.update_and_send(
@@ -3643,6 +4156,7 @@ impl JobManager {
                     exit_code: Some(-1),
                     duration_ms: Some(0),
                     error: Some("job stopped before start".to_string()),
+                    command_execution_state: structured_prestart_lifecycle(&request),
                     finished: true,
                     ..Default::default()
                 },
@@ -3713,6 +4227,7 @@ fn handle_one_poll(
     lsp: &webcodex_runner::LspSupervisor,
     shutdown: &Arc<AtomicBool>,
     dispatches: &ActivityTracker,
+    polling_dispatches: &mut PollingDispatchSupervisor,
     once: bool,
 ) -> Result<bool, PollError> {
     let metadata_config = runtime.snapshot();
@@ -3781,30 +4296,41 @@ fn handle_one_poll(
         Err(error) => return Err(PollError::new(PollErrorKind::Config, error)),
     };
     let lsp = lsp.clone();
-    let dispatch_guard = dispatches.enter();
-    let persistent_shell_background = request.kind == "persistent_shell" && !once;
-    let (result_tx, result_rx) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let _dispatch_guard = dispatch_guard;
-        let result = dispatch_request(
-            &sink,
-            &hot,
-            &runtime,
-            &jobs,
-            &persistent_shells,
-            &projects_dir,
-            &lsp,
-            request,
-        );
-        let _ = result_tx.send(result);
-    });
-    // Persistent-shell operations must not pin the polling loop behind a
-    // long-running command. A later close request needs its own poll turn so
-    // it can terminate the process group; the dispatch tracker keeps the
-    // worker accounted for during normal shutdown.
-    if persistent_shell_background {
+    let dispatch = PollingDispatch {
+        request_id: request.request_id.clone(),
+        project_cache_invalidation_required: project_op,
+        sink,
+        config: hot,
+        runtime,
+        jobs,
+        persistent_shells,
+        projects_dir,
+        lsp,
+        request,
+    };
+    if !once {
+        polling_dispatches.spawn(dispatch)?;
         return Ok(true);
     }
+
+    // `--once` deliberately retains its existing synchronous contract: the
+    // one delivered ordinary request stays tracked until dispatch and result
+    // submission finish, and the caller still drains any Job work afterward.
+    let dispatch_guard = dispatches.enter();
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let handle = std::thread::Builder::new()
+        .name("webcodex-poll-dispatch-once".to_string())
+        .spawn(move || {
+            let _dispatch_guard = dispatch_guard;
+            let _ = result_tx.send(dispatch.run());
+        })
+        .map_err(|error| {
+            PollError::new(
+                PollErrorKind::Config,
+                format!("failed to start polling dispatch worker: {error}"),
+            )
+        })?;
+    polling_dispatches.background_threads.register(handle);
     let result = loop {
         match result_rx.recv_timeout(Duration::from_millis(25)) {
             Ok(result) => break result,
@@ -3836,6 +4362,7 @@ fn handle_one_poll(
     if project_op && result.is_ok() {
         project_cache.invalidate();
     }
+    let _ = polling_dispatches.background_threads.reap_finished();
     result.map_err(PollError::from_submit)
 }
 

@@ -1,7 +1,8 @@
 use super::state::{ShellClientRegistryInner, ShellJobLogState, ShellJobRecord};
 use super::{now_ts, CLIENT_ONLINE_WINDOW_SECS, MAX_OUTPUT_BYTES, MAX_QUEUED_REQUESTS_PER_CLIENT};
 use crate::shell_protocol::{
-    ShellAgentJobResult, ShellAgentShellJobResult, ShellJobInfo, ShellJobStreamSnapshot,
+    ShellAgentJobResult, ShellAgentShellJobResult, ShellAgentShellRequest,
+    ShellCommandExecutionState, ShellJobInfo, ShellJobStreamSnapshot,
 };
 use std::collections::VecDeque;
 use std::fmt;
@@ -55,6 +56,98 @@ pub(crate) fn command_preview(command: &str) -> String {
     }
 }
 
+/// Bounded human-readable process summary. Argument boundaries are used only
+/// for display; this string is never executable input or a retry source.
+pub(crate) fn process_preview<'a>(
+    executable: &'a str,
+    args: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let mut summary = String::new();
+    let mut truncated = false;
+    let push = |summary: &mut String, character: char| {
+        if summary.chars().count() >= COMMAND_PREVIEW_MAX_CHARS {
+            false
+        } else {
+            summary.push(character);
+            true
+        }
+    };
+    for value in std::iter::once(executable).chain(args) {
+        if !summary.is_empty() && !push(&mut summary, ' ') {
+            truncated = true;
+            break;
+        }
+        let simple = !value.is_empty()
+            && value.chars().all(|character| {
+                character.is_alphanumeric() || matches!(character, '_' | '-' | '.' | '/' | '\\')
+            });
+        if !simple && !push(&mut summary, '"') {
+            truncated = true;
+            break;
+        }
+        for character in value.chars() {
+            let escaped = match character {
+                '"' => Some(['\\', '"']),
+                '\\' if !simple => Some(['\\', '\\']),
+                _ => None,
+            };
+            if let Some(escaped) = escaped {
+                if escaped
+                    .into_iter()
+                    .any(|character| !push(&mut summary, character))
+                {
+                    truncated = true;
+                    break;
+                }
+            } else if !push(
+                &mut summary,
+                if character.is_control() {
+                    '�'
+                } else {
+                    character
+                },
+            ) {
+                truncated = true;
+                break;
+            }
+        }
+        if truncated {
+            break;
+        }
+        if !simple && !push(&mut summary, '"') {
+            truncated = true;
+            break;
+        }
+    }
+    if crate::action_audit_sessions::secret_like_value(&summary) {
+        return "[redacted]".to_string();
+    }
+    if truncated {
+        summary.push('…');
+    }
+    summary
+}
+
+/// Bounded, body-free script summary used for activity and Session evidence.
+/// It is presentation metadata only and can never be replayed as execution.
+pub(crate) fn script_preview(language: &str, script_bytes: usize, arg_count: usize) -> String {
+    format!("{language} script ({script_bytes} bytes, {arg_count} args)")
+}
+
+pub(super) fn request_preview(request: &ShellAgentShellRequest) -> String {
+    if let Some(script) = request.script.as_ref() {
+        script_preview(
+            script.language.as_str(),
+            script.script.len(),
+            script.args.len(),
+        )
+    } else if let Some(process) = request.process.as_ref() {
+        process_preview(&process.executable, process.args.iter().map(String::as_str))
+    } else {
+        command_preview(&request.command)
+    }
+}
+
 #[cfg(test)]
 mod command_preview_tests {
     use super::*;
@@ -67,6 +160,21 @@ mod command_preview_tests {
         );
         assert_eq!(command_preview("echo token=example"), "[redacted]");
         assert_eq!(command_preview("cargo test focused"), "cargo test focused");
+    }
+
+    #[test]
+    fn process_preview_is_bounded_readable_and_never_an_execution_encoding() {
+        let preview = process_preview(
+            "git",
+            ["status", "two words", "$(literal)", &"x".repeat(200)].into_iter(),
+        );
+        assert!(preview.starts_with("git status \"two words\" \"$(literal)\""));
+        assert!(preview.chars().count() <= COMMAND_PREVIEW_MAX_CHARS + 1);
+        assert!(preview.ends_with('…'));
+        assert_eq!(
+            process_preview("tool", ["Authorization: Bearer example"].into_iter()),
+            "[redacted]"
+        );
     }
 }
 
@@ -207,6 +315,8 @@ pub(super) fn job_view(job: &ShellJobRecord) -> ShellJobInfo {
         duration_ms: job.duration_ms,
         elapsed_secs,
         error: job.error.clone(),
+        command_execution_state: job.command_execution_state,
+        structured_execution: job.structured_execution.clone(),
         codex: job.codex.clone(),
         result,
         validation_progress: job.validation_progress.clone(),
@@ -307,6 +417,24 @@ pub(super) fn append_log_limited(target: &mut ShellJobLogState, chunk: Option<St
         .saturating_add(retained_line_count(&target.tail));
 }
 
+fn has_leading_transport_truncation_marker(value: &str) -> bool {
+    if value.starts_with("[output truncated]\n") || value.starts_with("[...]\n") {
+        return true;
+    }
+
+    let Some(rest) = value.strip_prefix("[output truncated to last ") else {
+        return false;
+    };
+    let Some(newline) = rest.find('\n') else {
+        return false;
+    };
+    let marker_tail = &rest[..newline];
+    let Some(byte_count) = marker_tail.strip_suffix(" bytes]") else {
+        return false;
+    };
+    !byte_count.is_empty() && byte_count.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 pub(super) fn replace_log_limited(target: &mut ShellJobLogState, value: Option<String>) {
     let Some(value) = value else {
         return;
@@ -315,7 +443,34 @@ pub(super) fn replace_log_limited(target: &mut ShellJobLogState, value: Option<S
     target.tail = value;
     target.first_retained_line = 1;
     target.next_line = 1usize.saturating_add(retained_line_count(&target.tail));
-    target.truncated = target.tail.starts_with("[output truncated to last ");
+    target.truncated = has_leading_transport_truncation_marker(&target.tail);
+}
+
+#[cfg(test)]
+mod replace_log_limited_tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_all_supported_transport_truncation_markers() {
+        for marker in [
+            "[output truncated to last 12000 bytes]\n",
+            "[output truncated]\n",
+            "[...]\n",
+        ] {
+            let mut log = ShellJobLogState::default();
+            replace_log_limited(&mut log, Some(format!("{marker}retained\n")));
+            assert!(log.truncated, "marker {marker:?}");
+        }
+    }
+
+    #[test]
+    fn ordinary_or_middle_marker_text_is_not_truncated() {
+        for value in ["ordinary output\n", "ordinary\n[output truncated]\n"] {
+            let mut log = ShellJobLogState::default();
+            replace_log_limited(&mut log, Some(value.to_string()));
+            assert!(!log.truncated, "value {value:?}");
+        }
+    }
 }
 
 pub(super) fn replace_log_from_snapshot(
@@ -432,6 +587,13 @@ pub(super) fn mark_job_lost(job: &mut ShellJobRecord, now: i64, reason_code: &st
         job.ended_at = Some(now);
     }
     job.error = Some(message.to_string());
+    if job.structured_execution.is_some() {
+        job.command_execution_state = Some(if job.started_at.is_some() {
+            ShellCommandExecutionState::OutcomeUnknown
+        } else {
+            ShellCommandExecutionState::NotStarted
+        });
+    }
     job.recovery_state = matches!(
         reason_code,
         "runner_inventory_missing"

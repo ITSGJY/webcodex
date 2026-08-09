@@ -1,19 +1,22 @@
 use super::jobs::{
     command_preview, ensure_dispatch_supported_locked, ensure_queue_capacity_locked,
-    PendingRequestEnqueueError,
+    request_preview, PendingRequestEnqueueError,
 };
 use super::projects::ShellClientLookupError;
 use super::state::{PendingShellRequest, ShellClientRegistryInner};
 use super::validation::{
-    validate_file_request, validate_id, validate_run_request, MAX_COMMAND_LEN,
+    validate_file_request, validate_id, validate_process_request, validate_run_request,
+    validate_script_enqueue_request, MAX_COMMAND_LEN,
 };
 use super::{now_ts, ShellClientRegistry, CLIENT_ONLINE_WINDOW_SECS};
 use crate::lsp_bridge::{AgentLspPayload, AGENT_LSP_REQUEST_KIND};
 use crate::shell_protocol::{
     PersistentShellRequest, PersistentShellResult, ShellAgentShellRequest, ShellFileOpRequest,
-    ShellJobContext, ShellRunRequest, ShellRunResponse,
+    ShellJobContext, ShellProcessArgv, ShellRunRequest, ShellRunResponse, ShellScriptPayload,
     SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION, SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL,
     SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS, SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL,
+    SHELL_CLIENT_CAPABILITY_STRUCTURED_PROCESS_ARGV,
+    SHELL_CLIENT_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD,
 };
 use std::fmt;
 use tokio::sync::oneshot;
@@ -176,12 +179,14 @@ pub(super) fn resolve_disconnected_sync_requests_locked(
                 request_id: request_id.clone(),
                 client_id: client_id.to_string(),
                 cwd: pending.request.cwd.clone(),
-                command_preview: command_preview(&pending.request.command),
+                command_preview: request_preview(&pending.request),
                 exit_code: None,
                 stdout: None,
                 stderr: None,
                 duration_ms: None,
                 error: Some(error.to_string()),
+                request_dispatched: Some(pending.dispatched),
+                command_execution_state: None,
             };
             // The receiver may already be gone if the caller timed out first;
             // a failed send is expected and safe to ignore.
@@ -216,6 +221,8 @@ impl ShellClientRegistry {
             end_line: body.end_line,
             create_dirs: body.create_dirs,
             command: String::new(),
+            process: None,
+            script: None,
             stdin: None,
             timeout_secs: 30,
             requested_by,
@@ -246,6 +253,170 @@ impl ShellClientRegistry {
     ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
         self.enqueue_run_with_sandbox(body, requested_by, None)
             .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn enqueue_process_with_sandbox(
+        &self,
+        client_id: String,
+        cwd: Option<String>,
+        process: ShellProcessArgv,
+        stdin: Option<String>,
+        timeout_secs: u64,
+        wait_timeout_secs: u64,
+        requested_by: String,
+        sandbox: Option<String>,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+        validate_process_request(
+            &client_id,
+            cwd.as_deref(),
+            &process,
+            stdin.as_deref(),
+            timeout_secs,
+            wait_timeout_secs,
+        )?;
+        let normalized_cwd = cwd.map(|cwd| cwd.trim().to_string());
+        let request_id = next_request_id();
+        let (tx, rx) = oneshot::channel();
+        let request = ShellAgentShellRequest {
+            request_id: request_id.clone(),
+            client_id: client_id.clone(),
+            kind: "run_process".to_string(),
+            job_id: None,
+            cwd: normalized_cwd,
+            path: None,
+            content: None,
+            max_bytes: None,
+            expected_sha256: None,
+            expected_prefix: None,
+            start_line: None,
+            end_line: None,
+            create_dirs: false,
+            command: String::new(),
+            process: Some(process),
+            script: None,
+            stdin,
+            timeout_secs,
+            requested_by,
+            created_at: now_ts(),
+            validation: None,
+            lsp: None,
+            sandbox: sandbox.clone(),
+            job_context: None,
+            persistent_shell: None,
+        };
+        let mut inner = self.inner.lock().await;
+        let Some(client) = inner.clients.get(&client_id) else {
+            return Err(format!("unknown shell client: {client_id}"));
+        };
+        if !client.capabilities.structured_process_argv {
+            return Err(format!(
+                "capability_unavailable: agent client {client_id} does not support {SHELL_CLIENT_CAPABILITY_STRUCTURED_PROCESS_ARGV}"
+            ));
+        }
+        if let Some(mode) = sandbox.as_deref() {
+            if mode != crate::command_sandbox::INSPECT_SANDBOX_MODE {
+                return Err(format!("unknown sandbox mode '{mode}'"));
+            }
+            if !client.capabilities.sandbox_inspect_commands {
+                return Err(format!(
+                    "{}: agent client {} cannot enforce the inspect sandbox",
+                    SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS, client_id
+                ));
+            }
+        }
+        enqueue_pending_request_locked(
+            &mut inner,
+            &client_id,
+            request_id.clone(),
+            request,
+            Some(tx),
+            None,
+        )?;
+        notify_client_locked(&inner, &client_id);
+        Ok((request_id, rx))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn enqueue_script_with_sandbox(
+        &self,
+        client_id: String,
+        cwd: Option<String>,
+        script: ShellScriptPayload,
+        stdin: Option<String>,
+        timeout_secs: u64,
+        wait_timeout_secs: u64,
+        requested_by: String,
+        sandbox: Option<String>,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+        validate_script_enqueue_request(
+            &client_id,
+            cwd.as_deref(),
+            &script,
+            stdin.as_deref(),
+            timeout_secs,
+            wait_timeout_secs,
+        )?;
+        let normalized_cwd = cwd.map(|cwd| cwd.trim().to_string());
+        let request_id = next_request_id();
+        let (tx, rx) = oneshot::channel();
+        let request = ShellAgentShellRequest {
+            request_id: request_id.clone(),
+            client_id: client_id.clone(),
+            kind: "run_script".to_string(),
+            job_id: None,
+            cwd: normalized_cwd,
+            path: None,
+            content: None,
+            max_bytes: None,
+            expected_sha256: None,
+            expected_prefix: None,
+            start_line: None,
+            end_line: None,
+            create_dirs: false,
+            command: String::new(),
+            process: None,
+            script: Some(script),
+            stdin,
+            timeout_secs,
+            requested_by,
+            created_at: now_ts(),
+            validation: None,
+            lsp: None,
+            sandbox: sandbox.clone(),
+            job_context: None,
+            persistent_shell: None,
+        };
+        let mut inner = self.inner.lock().await;
+        let Some(client) = inner.clients.get(&client_id) else {
+            return Err(format!("unknown shell client: {client_id}"));
+        };
+        if !client.capabilities.structured_script_payload {
+            return Err(format!(
+                "capability_unavailable: agent client {client_id} does not support {SHELL_CLIENT_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD}"
+            ));
+        }
+        if let Some(mode) = sandbox.as_deref() {
+            if mode != crate::command_sandbox::INSPECT_SANDBOX_MODE {
+                return Err(format!("unknown sandbox mode '{mode}'"));
+            }
+            if !client.capabilities.sandbox_inspect_commands {
+                return Err(format!(
+                    "{}: agent client {} cannot enforce the inspect sandbox",
+                    SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS, client_id
+                ));
+            }
+        }
+        enqueue_pending_request_locked(
+            &mut inner,
+            &client_id,
+            request_id.clone(),
+            request,
+            Some(tx),
+            None,
+        )?;
+        notify_client_locked(&inner, &client_id);
+        Ok((request_id, rx))
     }
 
     pub(crate) async fn enqueue_run_with_sandbox(
@@ -291,6 +462,7 @@ impl ShellClientRegistry {
                 command_preview: command_preview(&body.command),
                 validation_steps: Vec::new(),
                 validation: None,
+                structured_execution: None,
             });
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
@@ -309,6 +481,8 @@ impl ShellClientRegistry {
             end_line: None,
             create_dirs: false,
             command: body.command.clone(),
+            process: None,
+            script: None,
             stdin: body.stdin.clone(),
             timeout_secs: body.timeout_secs,
             requested_by,
@@ -365,10 +539,19 @@ impl ShellClientRegistry {
     /// already polled it. This lets timeout callers distinguish queue timeout
     /// from an actually started command without retaining expired requests.
     pub async fn cancel_request(&self, request_id: &str) -> bool {
+        self.cancel_request_dispatch_state(request_id)
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Cancel a pending synchronous request while preserving the distinction
+    /// between an undispatched request and one whose registry record was
+    /// already consumed. A missing record cannot prove that execution did not
+    /// start, so lifecycle-sensitive callers must treat `None` conservatively.
+    pub(crate) async fn cancel_request_dispatch_state(&self, request_id: &str) -> Option<bool> {
         let mut inner = self.inner.lock().await;
         inner.persistent_waiters.remove(request_id);
-        remove_pending_request_locked(&mut inner, request_id)
-            .is_some_and(|pending| pending.dispatched)
+        remove_pending_request_locked(&mut inner, request_id).map(|pending| pending.dispatched)
     }
 
     /// Enqueue one explicit persistent-shell lifecycle operation. Capability
@@ -434,6 +617,8 @@ impl ShellClientRegistry {
             end_line: None,
             create_dirs: false,
             command: request.command.clone().unwrap_or_default(),
+            process: None,
+            script: None,
             stdin: None,
             timeout_secs: request.timeout_secs.unwrap_or(30),
             requested_by,
@@ -524,6 +709,8 @@ impl ShellClientRegistry {
             end_line: None,
             create_dirs: false,
             command: String::new(),
+            process: None,
+            script: None,
             stdin: Some(payload),
             timeout_secs: 30,
             requested_by,
@@ -585,6 +772,8 @@ impl ShellClientRegistry {
             end_line: None,
             create_dirs: false,
             command: String::new(),
+            process: None,
+            script: None,
             stdin: None,
             timeout_secs: timeout_secs.max(1),
             requested_by,

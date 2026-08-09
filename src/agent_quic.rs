@@ -565,6 +565,7 @@ mod tests {
             payload: ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
+                job_concurrency_limit: None,
                 job_inventory: None,
                 client_id: client_id.to_string(),
                 agent_instance_id: instance.to_string(),
@@ -583,6 +584,9 @@ mod tests {
                     persistent_shell: false,
                     ssh_persistent_shell: false,
                     structured_validation_argv: true,
+                    structured_process_argv: true,
+                    structured_script_payload: false,
+                    structured_execution_jobs: false,
                     lsp_read_only_navigation: false,
                     sandbox_inspect_commands: false,
                     project_lifecycle: false,
@@ -898,7 +902,8 @@ mod tests {
                     stderr: Some(String::new()),
                     duration_ms: Some(2),
                     error: None,
-                },
+                }
+                .into(),
             },
         )
         .await
@@ -1005,6 +1010,7 @@ mod tests {
                     exit_code: None,
                     duration_ms: None,
                     error: None,
+                    command_execution_state: None,
                     validation_progress: None,
                     finished: false,
                 },

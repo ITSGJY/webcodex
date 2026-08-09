@@ -1,6 +1,8 @@
 use crate::shell_protocol::{
-    AgentConfigReloadStatus, ProviderCallSummary, ShellAgentProjectSummary, ShellFileOpRequest,
-    ShellRunRequest, ToolProvidersStatus,
+    validate_process_argv, validate_script_request, AgentConfigReloadStatus, ProviderCallSummary,
+    ShellAgentProjectSummary, ShellFileOpRequest, ShellProcessArgv, ShellRunRequest,
+    ShellScriptPayload, ToolProvidersStatus, PROCESS_CWD_MAX_BYTES, PROCESS_STDIN_MAX_BYTES,
+    STRUCTURED_EXECUTION_LEGACY_SYNC_TIMEOUT_MAX_SECS,
 };
 use sha2::{Digest, Sha256};
 
@@ -485,6 +487,72 @@ pub(super) fn validate_run_request(body: &ShellRunRequest) -> Result<(), String>
         return Err(format!(
             "wait_timeout_secs must be <= {} for synchronous runShell",
             MAX_SYNC_WAIT_SECS
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_process_request(
+    client_id: &str,
+    cwd: Option<&str>,
+    process: &ShellProcessArgv,
+    stdin: Option<&str>,
+    timeout_secs: u64,
+    wait_timeout_secs: u64,
+) -> Result<(), String> {
+    validate_id(client_id, "client_id")?;
+    validate_process_argv(process)?;
+    if let Some(stdin) = stdin {
+        if stdin.len() > PROCESS_STDIN_MAX_BYTES {
+            return Err(format!(
+                "stdin is too large; maximum is {PROCESS_STDIN_MAX_BYTES} bytes"
+            ));
+        }
+        if stdin.contains('\0') {
+            return Err("stdin cannot contain NUL bytes".to_string());
+        }
+    }
+    if let Some(cwd) = cwd {
+        if cwd.len() > PROCESS_CWD_MAX_BYTES {
+            return Err(format!(
+                "cwd is too long; maximum is {PROCESS_CWD_MAX_BYTES} bytes"
+            ));
+        }
+        if cwd.contains('\0') {
+            return Err("cwd cannot contain NUL bytes".to_string());
+        }
+    }
+    if timeout_secs == 0 || timeout_secs > STRUCTURED_EXECUTION_LEGACY_SYNC_TIMEOUT_MAX_SECS {
+        return Err(format!(
+            "timeout_secs must be between 1 and {STRUCTURED_EXECUTION_LEGACY_SYNC_TIMEOUT_MAX_SECS}"
+        ));
+    }
+    if wait_timeout_secs > MAX_SYNC_WAIT_SECS {
+        return Err(format!(
+            "wait_timeout_secs must be <= {MAX_SYNC_WAIT_SECS} for synchronous run_process"
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_script_enqueue_request(
+    client_id: &str,
+    cwd: Option<&str>,
+    script: &ShellScriptPayload,
+    stdin: Option<&str>,
+    timeout_secs: u64,
+    wait_timeout_secs: u64,
+) -> Result<(), String> {
+    validate_id(client_id, "client_id")?;
+    validate_script_request(script, stdin, cwd, timeout_secs)?;
+    if timeout_secs > STRUCTURED_EXECUTION_LEGACY_SYNC_TIMEOUT_MAX_SECS {
+        return Err(format!(
+            "timeout_secs must be between 1 and {STRUCTURED_EXECUTION_LEGACY_SYNC_TIMEOUT_MAX_SECS}"
+        ));
+    }
+    if wait_timeout_secs > MAX_SYNC_WAIT_SECS {
+        return Err(format!(
+            "wait_timeout_secs must be <= {MAX_SYNC_WAIT_SECS} for synchronous run_script"
         ));
     }
     Ok(())

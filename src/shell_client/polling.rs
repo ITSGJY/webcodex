@@ -1,5 +1,5 @@
 use super::jobs::{
-    assert_active_instance_locked, command_preview, observe_job_terminal, replace_log_limited,
+    assert_active_instance_locked, observe_job_terminal, replace_log_limited, request_preview,
     truncate_output, truncate_output_to,
 };
 use super::requests::{remove_pending_request_locked, take_pending_request_locked};
@@ -9,8 +9,8 @@ use super::validation::{
 };
 use super::{now_ts, ShellClientRegistry};
 use crate::shell_protocol::{
-    ShellAgentPersistentShellResultRequest, ShellAgentPollRequest, ShellAgentResultRequest,
-    ShellAgentShellRequest, ShellRunResponse,
+    ShellAgentPersistentShellResultRequest, ShellAgentPollRequest, ShellAgentResultPayload,
+    ShellAgentResultRequest, ShellAgentShellRequest, ShellCommandExecutionState, ShellRunResponse,
 };
 
 impl ShellClientRegistry {
@@ -103,7 +103,13 @@ impl ShellClientRegistry {
                 if let Some(job) = inner.jobs_by_id.get_mut(&job_id) {
                     if job.status == "queued" {
                         job.status = "agent_queued".to_string();
-                        job.started_at = Some(now_ts());
+                        // Dispatch proves only that the Runner accepted the
+                        // Job request. A typed structured Job becomes started
+                        // only when the Runner reports `running` after a
+                        // successful child spawn.
+                        if job.structured_execution.is_none() {
+                            job.started_at = Some(now_ts());
+                        }
                         super::jobs::notify_job_update(job);
                     }
                 }
@@ -115,8 +121,13 @@ impl ShellClientRegistry {
     /// Polling-transport result entry point. Requires the public
     /// `client_id` / `agent_instance_id` lease and refreshes `last_seen` for
     /// the active instance. Used by the HTTP `/result` handler.
-    pub async fn complete(&self, body: ShellAgentResultRequest) -> Result<(), String> {
-        self.complete_checked(body, None).await
+    pub async fn complete(
+        &self,
+        payload: impl Into<ShellAgentResultPayload>,
+    ) -> Result<(), String> {
+        let payload = payload.into();
+        self.complete_checked(payload.result, payload.command_execution_state, None)
+            .await
     }
 
     /// Connection-scoped result entry point for long-lived transports. A
@@ -128,15 +139,21 @@ impl ShellClientRegistry {
     /// connection that currently holds the lease refreshes liveness.
     pub(crate) async fn complete_for_connection(
         &self,
-        body: ShellAgentResultRequest,
+        payload: ShellAgentResultPayload,
         connection_id: &str,
     ) -> Result<(), String> {
-        self.complete_checked(body, Some(connection_id)).await
+        self.complete_checked(
+            payload.result,
+            payload.command_execution_state,
+            Some(connection_id),
+        )
+        .await
     }
 
     async fn complete_checked(
         &self,
         body: ShellAgentResultRequest,
+        command_execution_state: Option<ShellCommandExecutionState>,
         expected_connection_id: Option<&str>,
     ) -> Result<(), String> {
         validate_id(&body.client_id, "client_id")?;
@@ -182,11 +199,16 @@ impl ShellClientRegistry {
             truncate_output(body.stdout)
         };
         let stderr = truncate_output(body.stderr);
+        let success = matches!(
+            command_execution_state,
+            None | Some(ShellCommandExecutionState::Completed)
+        ) && error.is_none()
+            && body.exit_code == Some(0);
         if let Some(job_id) = pending.job_id.clone() {
             inner.request_to_job.remove(&request_id);
             if let Some(job) = inner.jobs_by_id.get_mut(&job_id) {
                 let terminal_now = now_ts();
-                job.status = if error.is_none() && body.exit_code == Some(0) {
+                job.status = if success {
                     "completed".to_string()
                 } else {
                     "failed".to_string()
@@ -201,17 +223,20 @@ impl ShellClientRegistry {
                 super::jobs::notify_job_update(job);
             }
         }
+        let request_preview = request_preview(&pending.request);
         let response = ShellRunResponse {
-            success: error.is_none() && body.exit_code == Some(0),
+            success,
             request_id,
             client_id,
             cwd: pending.request.cwd,
-            command_preview: command_preview(&pending.request.command),
+            command_preview: request_preview,
             exit_code: body.exit_code,
             stdout,
             stderr,
             duration_ms: body.duration_ms,
             error,
+            request_dispatched: Some(pending.dispatched),
+            command_execution_state,
         };
         if let Some(waiter) = pending.waiter.take() {
             let _ = waiter.send(response);
