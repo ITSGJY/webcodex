@@ -5,8 +5,9 @@ use super::events::{
     session_input_summary_for_tool, SessionToolClassification,
 };
 use super::model::{
-    PersistedSessionLedger, PersistedSessionRecord, SessionLifecycle, MAX_OBSERVED_PATHS_PER_EVENT,
-    MAX_VALIDATION_EXCERPT_CHARS, MESSAGE_ID_PREFIX, SESSION_ID_PREFIX, SESSION_LEDGER_VERSION,
+    PersistedCurrentBindings, PersistedSessionLedger, PersistedSessionRecord, SessionLifecycle,
+    MAX_OBSERVED_PATHS_PER_EVENT, MAX_VALIDATION_EXCERPT_CHARS, MESSAGE_ID_PREFIX,
+    SESSION_ID_PREFIX, SESSION_LEDGER_VERSION,
 };
 use super::persistence::write_ledger_atomic;
 use super::*;
@@ -468,7 +469,13 @@ fn session_store_persists_and_restores_basic_session() {
         Some("persistent work".to_string()),
     );
 
-    let restored = flush_and_restore(&store, ledger);
+    store.flush_persistence();
+    let raw = std::fs::read_to_string(&ledger).unwrap();
+    assert!(
+        !raw.contains('\n'),
+        "production ledger should use compact JSON"
+    );
+    let restored = SessionStore::with_persistence(ledger, 10, 10);
     let status = restored.status();
     assert_eq!(status.persistence, "enabled");
     assert_eq!(status.restored_sessions, 1);
@@ -481,6 +488,36 @@ fn session_store_persists_and_restores_basic_session() {
     assert_eq!(
         summary.execution_context,
         SessionExecutionContext::default()
+    );
+}
+
+#[test]
+fn write_ledger_atomic_cleans_up_temp_file_when_rename_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger_path = tmp.path().join("sessions.json");
+    std::fs::create_dir(&ledger_path).unwrap();
+    let ledger = PersistedSessionLedger {
+        version: SESSION_LEDGER_VERSION,
+        sessions: Vec::new(),
+        durable_current_bindings: PersistedCurrentBindings::default(),
+    };
+
+    let err = write_ledger_atomic(&ledger_path, &ledger).unwrap_err();
+    assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+
+    let temp_files: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".sessions.json.tmp-")
+        })
+        .collect();
+    assert!(
+        temp_files.is_empty(),
+        "failed write left a temporary ledger"
     );
 }
 
@@ -1445,6 +1482,89 @@ fn corrupted_ledger_does_not_panic() {
         .unwrap()
         .contains("restore_failed"));
     assert!(store.summary("wc_sess_missing", None).is_none());
+}
+
+#[test]
+fn persistence_snapshot_shares_payload_and_stays_stable_across_message_cow() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("sessions.json");
+    let store = persistent_store(ledger.clone());
+    let session = store.start_session(None, Some("shared snapshot".to_string()));
+    assert!(store
+        .record_tool_call_started(
+            Some(&session.session_id),
+            SessionTransport::Api,
+            "read_file",
+            &json!({
+                "project": "demo",
+                "path": "src/lib.rs",
+                "query": "snapshot payload"
+            }),
+        )
+        .is_some());
+    let message = post_message(
+        &store,
+        &session.session_id,
+        SessionMessageKind::Todo,
+        "snapshot message payload",
+    );
+    store.flush_persistence();
+
+    let (snapshot_ready_tx, snapshot_ready_rx) = std::sync::mpsc::channel();
+    let (allow_old_write_tx, allow_old_write_rx) = std::sync::mpsc::channel();
+    let snapshot_session_id = session.session_id.clone();
+    let delayed_store = store.clone();
+    let delayed_write = std::thread::spawn(move || {
+        delayed_store.persist_after_mutation_with(|path, ledger| {
+            let snapshot = ledger
+                .sessions
+                .iter()
+                .filter_map(|snapshot| snapshot.hot())
+                .find(|record| record.session_id == snapshot_session_id)
+                .unwrap();
+            let event = snapshot.events.last().unwrap();
+            let message = snapshot.messages.last().unwrap();
+            assert_eq!(std::sync::Arc::strong_count(event), 2);
+            assert_eq!(std::sync::Arc::strong_count(message), 2);
+            assert_eq!(message.status, SessionMessageStatus::Open);
+
+            snapshot_ready_tx.send(()).unwrap();
+            allow_old_write_rx.recv().unwrap();
+
+            assert_eq!(std::sync::Arc::strong_count(message), 1);
+            assert_eq!(message.status, SessionMessageStatus::Open);
+            assert_eq!(message.resolution, None);
+            write_ledger_atomic(path, ledger)
+        });
+    });
+    snapshot_ready_rx.recv().unwrap();
+
+    let resolved = store
+        .resolve_message(
+            &session.session_id,
+            &message.message_id,
+            Some("resolved after snapshot".to_string()),
+        )
+        .unwrap();
+    assert_eq!(resolved.status, SessionMessageStatus::Resolved);
+    assert_eq!(
+        resolved.resolution.as_deref(),
+        Some("resolved after snapshot")
+    );
+
+    allow_old_write_tx.send(()).unwrap();
+    delayed_write.join().unwrap();
+
+    let restored = flush_and_restore(&store, ledger);
+    let messages = restored
+        .list_messages(&session.session_id, ListSessionMessagesFilter::default())
+        .unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].status, SessionMessageStatus::Resolved);
+    assert_eq!(
+        messages[0].resolution.as_deref(),
+        Some("resolved after snapshot")
+    );
 }
 
 #[test]
@@ -2433,7 +2553,10 @@ fn persisted_session_record_serde_defaults_missing_lifecycle() {
     let ledger: PersistedSessionLedger = serde_json::from_str(&ledger_json).unwrap();
     assert_eq!(ledger.version, SESSION_LEDGER_VERSION);
     assert_eq!(ledger.sessions.len(), 1);
-    assert_eq!(ledger.sessions[0].lifecycle, SessionLifecycle::Active);
+    assert_eq!(
+        ledger.sessions[0].hot().unwrap().lifecycle,
+        SessionLifecycle::Active
+    );
     assert!(ledger.durable_current_bindings.records.is_empty());
     assert_eq!(ledger.durable_current_bindings.malformed_count, 0);
 }
@@ -2482,6 +2605,266 @@ fn active_to_closed_succeeds_and_emits_session_closed_event() {
     assert_eq!(closed_events.len(), 1);
     assert_eq!(closed_events[0].tool_name, "close_session");
     assert_eq!(closed_events[0].status.as_deref(), Some("succeeded"));
+}
+
+#[test]
+fn closed_session_coldifies_payload_and_queries_without_reheating() {
+    let store = SessionStore::default();
+    let session = store.start_session(None, Some("cold history".to_string()));
+    post_message(
+        &store,
+        &session.session_id,
+        SessionMessageKind::Todo,
+        "retained closed message",
+    );
+    let start = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "read_file",
+        &json!({"project": "demo", "path": "src/lib.rs"}),
+    );
+    store.record_tool_call_finished(start, true, &json!({"content": "retained"}), None, None);
+    assert!(store
+        .hot_payload_entry_count_for_test(&session.session_id)
+        .is_some_and(|entries| entries > 0));
+
+    let outcome = store.close_session(&session.session_id).unwrap();
+    assert!(!outcome.already_closed);
+    assert_eq!(
+        store.hot_payload_entry_count_for_test(&session.session_id),
+        None
+    );
+    assert!(store
+        .cold_payload_bytes_for_test(&session.session_id)
+        .is_some_and(|bytes| bytes > 0));
+
+    let other = store.start_session(None, Some("other cold history".to_string()));
+    store.close_session(&other.session_id).unwrap();
+    assert!(store
+        .cold_payload_bytes_for_test(&other.session_id)
+        .is_some());
+
+    let summary = store.summary(&session.session_id, Some(50)).unwrap();
+    assert_eq!(summary.lifecycle, SessionLifecycle::Closed);
+    assert!(summary
+        .events
+        .iter()
+        .any(|event| event.kind == "session_closed"));
+    let messages = store
+        .list_messages(&session.session_id, ListSessionMessagesFilter::default())
+        .unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].message, "retained closed message");
+    assert_eq!(
+        store.hot_payload_entry_count_for_test(&session.session_id),
+        None,
+        "cold queries must not install a hot SessionRecord"
+    );
+    assert_eq!(
+        store.hot_payload_entry_count_for_test(&other.session_id),
+        None,
+        "querying one cold Session must not heat another historical Session"
+    );
+
+    let query_start = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "session_summary",
+        &json!({"session_id": session.session_id.clone()}),
+    );
+    store.record_tool_call_finished(query_start, true, &json!({"success": true}), None, None);
+    assert_eq!(
+        store.hot_payload_entry_count_for_test(&session.session_id),
+        None,
+        "closed recorder events must rewrite the cold payload in place"
+    );
+
+    let repeated = store.close_session(&session.session_id).unwrap();
+    assert!(repeated.already_closed);
+    let summary = store.summary(&session.session_id, Some(100)).unwrap();
+    assert_eq!(
+        summary
+            .events
+            .iter()
+            .filter(|event| event.kind == "session_closed")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn close_cleanup_evidence_rewrites_cold_payload_without_reheating() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("sessions.json");
+    let store = persistent_store(ledger.clone());
+    let session = store.start_session(None, Some("cold close evidence".to_string()));
+    store.close_session(&session.session_id).unwrap();
+    assert!(store
+        .cold_payload_bytes_for_test(&session.session_id)
+        .is_some());
+
+    store.record_session_close_persistent_shell_evidence(
+        &session.session_id,
+        "wc_shell_cold_close",
+        "closed",
+        "completed",
+        None,
+        false,
+    );
+    assert_eq!(
+        store.hot_payload_entry_count_for_test(&session.session_id),
+        None
+    );
+
+    let restored = flush_and_restore(&store, ledger);
+    assert!(restored
+        .cold_payload_bytes_for_test(&session.session_id)
+        .is_some());
+    let summary = restored.summary(&session.session_id, Some(50)).unwrap();
+    let evidence = summary
+        .events
+        .iter()
+        .find(|event| event.kind == "session_closed")
+        .and_then(|event| event.persistent_shell.as_ref())
+        .expect("close cleanup evidence must survive cold persistence");
+    assert_eq!(evidence.shell_id.as_deref(), Some("wc_shell_cold_close"));
+    assert_eq!(evidence.shell_state.as_deref(), Some("closed"));
+    assert_eq!(evidence.execution_state.as_deref(), Some("completed"));
+}
+
+#[test]
+fn closed_cold_round_trip_preserves_evidence_and_active_stays_hot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("sessions.json");
+    let store = SessionStore::with_persistence(&ledger, 10, 20);
+    let closed = store.start_session(Some("proj".to_string()), Some("historical".to_string()));
+    post_message(
+        &store,
+        &closed.session_id,
+        SessionMessageKind::Note,
+        "durable historical message",
+    );
+    let start = store.record_tool_call_started(
+        Some(&closed.session_id),
+        SessionTransport::Api,
+        "read_file",
+        &json!({"project": "proj", "path": "history.rs"}),
+    );
+    store.record_tool_call_finished(
+        start,
+        true,
+        &json!({"content": "history evidence"}),
+        None,
+        None,
+    );
+    store.close_session(&closed.session_id).unwrap();
+
+    let active = store.start_session(Some("proj".to_string()), Some("active".to_string()));
+    post_message(
+        &store,
+        &active.session_id,
+        SessionMessageKind::Progress,
+        "active message",
+    );
+    assert_eq!(
+        store.hot_payload_entry_count_for_test(&closed.session_id),
+        None
+    );
+    assert!(store
+        .hot_payload_entry_count_for_test(&active.session_id)
+        .is_some());
+    assert_eq!(store.cold_payload_bytes_for_test(&active.session_id), None);
+
+    let before_summary = store.summary(&closed.session_id, Some(100)).unwrap();
+    let before_messages = store
+        .list_messages(&closed.session_id, ListSessionMessagesFilter::default())
+        .unwrap();
+    store.flush_persistence();
+    let raw = std::fs::read_to_string(&ledger).unwrap();
+    let ledger_value: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(ledger_value["version"], SESSION_LEDGER_VERSION);
+    let closed_json = ledger_value["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["session_id"] == closed.session_id)
+        .unwrap();
+    assert_eq!(closed_json["lifecycle"], "closed");
+    assert!(closed_json["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["message"] == "durable historical message"));
+
+    drop(store);
+    let restored = SessionStore::with_persistence(&ledger, 10, 20);
+    assert_eq!(
+        restored.hot_payload_entry_count_for_test(&closed.session_id),
+        None,
+        "restored closed session must not keep the parsed event/message graph"
+    );
+    assert!(restored
+        .cold_payload_bytes_for_test(&closed.session_id)
+        .is_some_and(|bytes| bytes > 0));
+    assert!(restored
+        .hot_payload_entry_count_for_test(&active.session_id)
+        .is_some());
+    assert_eq!(
+        restored.cold_payload_bytes_for_test(&active.session_id),
+        None
+    );
+
+    let after_summary = restored.summary(&closed.session_id, Some(100)).unwrap();
+    let after_messages = restored
+        .list_messages(&closed.session_id, ListSessionMessagesFilter::default())
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&after_summary).unwrap(),
+        serde_json::to_value(&before_summary).unwrap()
+    );
+    assert_eq!(after_messages.len(), before_messages.len());
+    assert_eq!(after_messages[0].message, before_messages[0].message);
+    assert_eq!(after_summary.lifecycle, SessionLifecycle::Closed);
+    assert_eq!(
+        restored.hot_payload_entry_count_for_test(&closed.session_id),
+        None,
+        "restart query must materialize only a temporary target record"
+    );
+    assert_eq!(
+        restored
+            .summary(&active.session_id, Some(10))
+            .unwrap()
+            .lifecycle,
+        SessionLifecycle::Active
+    );
+}
+
+#[test]
+fn cold_session_query_touch_preserves_lru_capacity_order() {
+    let store = SessionStore::new(2, 10);
+    let first = store.start_session(None, Some("cold survivor".to_string()));
+    store.close_session(&first.session_id).unwrap();
+    let second = store.start_session(None, Some("old active".to_string()));
+
+    assert!(store
+        .cold_payload_bytes_for_test(&first.session_id)
+        .is_some());
+    store.summary(&first.session_id, Some(10)).unwrap();
+    let third = store.start_session(None, Some("new active".to_string()));
+
+    assert!(store.contains_session(&first.session_id));
+    assert!(!store.contains_session(&second.session_id));
+    assert!(store.contains_session(&third.session_id));
+    assert_eq!(
+        store.lifecycle_state(&first.session_id),
+        Some(SessionLifecycle::Closed)
+    );
+    assert!(store
+        .cold_payload_bytes_for_test(&first.session_id)
+        .is_some());
+    assert!(store
+        .hot_payload_entry_count_for_test(&third.session_id)
+        .is_some());
 }
 
 #[test]
