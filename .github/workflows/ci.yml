@@ -126,7 +126,7 @@ jobs:
           }
 
       - name: Build native ARM64 binaries
-        run: cargo build --locked --release --target aarch64-pc-windows-msvc -p webcodex -p webcodex-runner
+        run: cargo build --locked --release --target aarch64-pc-windows-msvc -p webcodex -p webcodex-cli -p webcodex-runner
 
       - name: Verify ARM64 PE binaries and execute
         shell: pwsh
