@@ -1,7 +1,6 @@
 use super::*;
 use crate::shell_client::ShellClientRegistry;
 use crate::test_support::{seed_oauth_client, seed_user, test_config, test_config_oauth2, test_db};
-use crate::CodexConfig;
 use salvo::test::{ResponseExt, TestClient};
 use salvo::Service;
 use std::time::Duration;
@@ -84,7 +83,6 @@ fn runtime_with_local_project(root: &std::path::Path, project_id: &str) -> ToolR
     let _ = (root, project_id);
     ToolRuntime::new(
         Arc::new(ShellClientRegistry::default()),
-        Arc::new(CodexConfig::default()),
         Arc::new(crate::tool_runtime::RuntimeInfo::default()),
     )
 }
@@ -333,7 +331,7 @@ async fn all_project_endpoints_require_bearer_auth() {
         ),
     ];
     for (path, body) in &endpoints {
-        let resp = TestClient::post(&format!("http://localhost{path}"))
+        let resp = TestClient::post(format!("http://localhost{path}"))
             .json(body)
             .send(&service)
             .await;
@@ -1521,7 +1519,7 @@ async fn http_tools_call_unknown_tool_returns_useful_error() {
         "secret",
     ] {
         assert!(
-            !lower.contains(&forbidden),
+            !lower.contains(forbidden),
             "unknown-tool error must not leak '{}': {}",
             forbidden,
             err

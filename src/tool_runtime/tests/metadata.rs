@@ -22,7 +22,6 @@ fn shared_key_auth(hash: &str) -> crate::auth::AuthContext {
         user_id: None,
         username: None,
         api_key_id: None,
-        api_key_name: None,
         role: Some("shared-key".to_string()),
         scopes: vec![
             crate::auth::SCOPE_RUNTIME_READ.to_string(),
@@ -45,7 +44,6 @@ fn open_auth() -> crate::auth::AuthContext {
         user_id: None,
         username: None,
         api_key_id: None,
-        api_key_name: None,
         role: Some("open".to_string()),
         scopes: vec![
             crate::auth::SCOPE_RUNTIME_READ.to_string(),
@@ -68,7 +66,6 @@ fn bootstrap_auth() -> crate::auth::AuthContext {
         user_id: None,
         username: None,
         api_key_id: None,
-        api_key_name: None,
         role: Some("admin".to_string()),
         scopes: vec![crate::auth::SCOPE_ADMIN.to_string()],
         is_bootstrap: true,
@@ -660,11 +657,7 @@ async fn runtime_status_shell_profiles_summary_is_sanitized() {
         })
         .await
         .unwrap();
-    let runtime = ToolRuntime::new(
-        registry,
-        Arc::new(CodexConfig::default()),
-        Arc::new(RuntimeInfo::default()),
-    );
+    let runtime = ToolRuntime::new(registry, Arc::new(RuntimeInfo::default()));
     let result = runtime.dispatch(runtime_status_call()).await;
     assert!(result.success);
     let client = &result.output["agents"]["clients"][0];
@@ -742,8 +735,10 @@ async fn unique_short_agent_project_id_is_resolved_by_runtime_surface() {
 #[tokio::test]
 async fn agent_run_shell_without_shell_capability_is_rejected() {
     let runtime = runtime_with_agent_project("oe");
-    let mut caps = ShellClientCapabilities::default();
-    caps.shell = false;
+    let caps = ShellClientCapabilities {
+        shell: false,
+        ..Default::default()
+    };
     register_agent(&runtime, "oe", None, caps).await;
     let bootstrap = auth_context(None, true);
     let result = runtime
@@ -818,9 +813,16 @@ async fn agent_run_job_without_async_capability_is_rejected() {
 #[tokio::test]
 async fn agent_git_status_without_shell_or_git_is_rejected() {
     let runtime = runtime_with_agent_project("oe");
-    let mut caps = ShellClientCapabilities::default();
-    caps.shell = false; // git stays false by default
-    register_agent(&runtime, "oe", None, caps).await;
+    register_agent(
+        &runtime,
+        "oe",
+        None,
+        ShellClientCapabilities {
+            shell: false,
+            ..Default::default()
+        },
+    )
+    .await;
     let bootstrap = auth_context(None, true);
     let result = runtime
         .dispatch_with_auth(
@@ -866,8 +868,10 @@ async fn agent_tool_unknown_client_returns_unknown_project_error() {
 #[tokio::test]
 async fn agent_tool_rejects_non_owner_api_key() {
     let runtime = runtime_with_agent_project("oe");
-    let mut caps = ShellClientCapabilities::default();
-    caps.async_shell_jobs = true;
+    let caps = ShellClientCapabilities {
+        async_shell_jobs: true,
+        ..Default::default()
+    };
     register_agent(&runtime, "oe", Some("alice"), caps).await;
     let bob = auth_context(Some("bob"), false);
     // Use run_job (async) so the test does not hang if owner check leaked.
@@ -894,8 +898,10 @@ async fn agent_tool_rejects_non_owner_api_key() {
 #[tokio::test]
 async fn agent_tool_rejects_missing_auth_context() {
     let runtime = runtime_with_agent_project("oe");
-    let mut caps = ShellClientCapabilities::default();
-    caps.shell = true;
+    let caps = ShellClientCapabilities {
+        shell: true,
+        ..Default::default()
+    };
     register_agent(&runtime, "oe", Some("alice"), caps).await;
     // dispatch_with_auth(None): no owner can be proven for an owned agent.
     let result = runtime
@@ -924,8 +930,10 @@ async fn agent_tool_rejects_missing_auth_context() {
 #[tokio::test]
 async fn agent_tool_allows_owner_api_key_for_run_job() {
     let runtime = runtime_with_agent_project("oe");
-    let mut caps = ShellClientCapabilities::default();
-    caps.async_shell_jobs = true;
+    let caps = ShellClientCapabilities {
+        async_shell_jobs: true,
+        ..Default::default()
+    };
     register_agent(&runtime, "oe", Some("alice"), caps).await;
     let alice = auth_context(Some("alice"), false);
     let result = runtime
@@ -949,8 +957,10 @@ async fn agent_tool_allows_owner_api_key_for_run_job() {
 #[tokio::test]
 async fn agent_tool_allows_bootstrap_token_for_run_job() {
     let runtime = runtime_with_agent_project("oe");
-    let mut caps = ShellClientCapabilities::default();
-    caps.async_shell_jobs = true;
+    let caps = ShellClientCapabilities {
+        async_shell_jobs: true,
+        ..Default::default()
+    };
     register_agent(&runtime, "oe", Some("alice"), caps).await;
     let bootstrap = auth_context(None, true);
     let result = runtime
@@ -1863,11 +1873,7 @@ async fn runtime_status_agent_summary_includes_protocol_version() {
         })
         .await
         .unwrap();
-    let runtime = ToolRuntime::new(
-        registry,
-        Arc::new(CodexConfig::default()),
-        Arc::new(RuntimeInfo::default()),
-    );
+    let runtime = ToolRuntime::new(registry, Arc::new(RuntimeInfo::default()));
     let result = runtime.dispatch(runtime_status_call()).await;
     assert!(result.success);
     let agents = &result.output["agents"];
@@ -1998,11 +2004,7 @@ async fn runtime_status_includes_sanitized_policy_summary() {
         .update_tool_providers("policy-agent", "inst-p", Some(current_provider))
         .await
         .unwrap();
-    let runtime = ToolRuntime::new(
-        registry,
-        Arc::new(CodexConfig::default()),
-        Arc::new(RuntimeInfo::default()),
-    );
+    let runtime = ToolRuntime::new(registry, Arc::new(RuntimeInfo::default()));
     let result = runtime.dispatch(runtime_status_call()).await;
     assert!(result.success);
     let clients = result.output["agents"]["clients"].as_array().unwrap();
@@ -2101,11 +2103,7 @@ async fn external_provider_discovery_cannot_change_public_tool_or_openapi_surfac
         })
         .await
         .unwrap();
-    let runtime = ToolRuntime::new(
-        registry,
-        Arc::new(CodexConfig::default()),
-        Arc::new(RuntimeInfo::default()),
-    );
+    let runtime = ToolRuntime::new(registry, Arc::new(RuntimeInfo::default()));
     let status = runtime.dispatch(runtime_status_call()).await;
     let public_names = status.output["tools"]["names"]
         .as_array()
@@ -2164,11 +2162,7 @@ async fn runtime_status_policy_summary_is_null_for_older_agents() {
         })
         .await
         .unwrap();
-    let runtime = ToolRuntime::new(
-        registry,
-        Arc::new(CodexConfig::default()),
-        Arc::new(RuntimeInfo::default()),
-    );
+    let runtime = ToolRuntime::new(registry, Arc::new(RuntimeInfo::default()));
     let result = runtime.dispatch(runtime_status_call()).await;
     assert!(result.success);
     let clients = result.output["agents"]["clients"].as_array().unwrap();
@@ -2210,11 +2204,7 @@ async fn list_agents_includes_sanitized_policy_summary() {
         })
         .await
         .unwrap();
-    let runtime = ToolRuntime::new(
-        registry,
-        Arc::new(CodexConfig::default()),
-        Arc::new(RuntimeInfo::default()),
-    );
+    let runtime = ToolRuntime::new(registry, Arc::new(RuntimeInfo::default()));
     let result = runtime.dispatch(ToolCall::ListAgents).await;
     assert!(result.success);
     assert_eq!(result.output["count"], 1);
@@ -2282,11 +2272,7 @@ async fn runtime_status_distinguishes_stale_registration_from_transport_connecti
     let stale_ts = chrono::Utc::now().timestamp() - 120;
     registry.set_last_seen_for_test("ws-stale", stale_ts).await;
 
-    let runtime = ToolRuntime::new(
-        registry,
-        Arc::new(CodexConfig::default()),
-        Arc::new(RuntimeInfo::default()),
-    );
+    let runtime = ToolRuntime::new(registry, Arc::new(RuntimeInfo::default()));
     let result = runtime.dispatch(runtime_status_call()).await;
     assert!(result.success);
     let agents = &result.output["agents"];
@@ -2321,11 +2307,7 @@ async fn runtime_status_distinguishes_stale_registration_from_transport_connecti
 #[tokio::test]
 async fn runtime_status_reflects_websocket_transport_label() {
     let registry = Arc::new(ShellClientRegistry::default());
-    let runtime = ToolRuntime::new(
-        registry.clone(),
-        Arc::new(CodexConfig::default()),
-        Arc::new(RuntimeInfo::default()),
-    );
+    let runtime = ToolRuntime::new(registry.clone(), Arc::new(RuntimeInfo::default()));
     registry
         .register(ShellClientRegisterRequest {
             process_started_at: None,
@@ -2458,7 +2440,7 @@ async fn runtime_status_tools_summary_lists_names() {
     assert!(result.success);
     let tools = &result.output["tools"];
     let names = tools["names"].as_array().unwrap();
-    assert!(names.len() > 0);
+    assert!(!names.is_empty());
     assert!(
         names.iter().any(|n| n == "runtime_status"),
         "tools.names must include runtime_status: {:?}",

@@ -1114,10 +1114,7 @@ fn startup_verdict(
             "pass the explicit Workflow Session id on subsequent project tools",
         );
     }
-    if continuation_actions
-        .iter()
-        .any(|action| *action == EXPLORATION_CONTINUITY_ACTION)
-    {
+    if continuation_actions.contains(&EXPLORATION_CONTINUITY_ACTION) {
         push_unique(&mut actions, EXPLORATION_CONTINUITY_ACTION);
     }
     if actions.is_empty() {
@@ -1681,7 +1678,7 @@ mod tests {
 
     fn failure(index: usize) -> Value {
         json!({
-            "kind": if index % 2 == 0 { "test" } else { "diagnostic" },
+            "kind": if index.is_multiple_of(2) { "test" } else { "diagnostic" },
             "name": format!("very_long_failure_name_{index}_{}", "x".repeat(180)),
             "file": format!("src/generated/{index}/{}.rs", "y".repeat(180)),
             "line": index + 1,

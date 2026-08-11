@@ -17,7 +17,6 @@ fn auth_context(username: Option<&str>, is_bootstrap: bool) -> crate::auth::Auth
         user_id: username.map(|username| format!("user-{}", username)),
         username: username.map(str::to_string),
         api_key_id: username.map(|username| format!("key-{}", username)),
-        api_key_name: username.map(|username| format!("{} key", username)),
         role: Some(role),
         scopes,
         is_bootstrap,
@@ -44,7 +43,6 @@ fn agent_auth_context(
         user_id: Some(format!("user-{}", username)),
         username: Some(username.to_string()),
         api_key_id: Some("key-agent".to_string()),
-        api_key_name: Some("agent key".to_string()),
         role: Some("user".to_string()),
         scopes: scopes.into_iter().map(str::to_string).collect(),
         is_bootstrap: false,
@@ -65,7 +63,6 @@ fn oauth_bridge_auth_context(hash: &str, scopes: Vec<&str>) -> crate::auth::Auth
         user_id: None,
         username: None,
         api_key_id: Some("oauth-access-token".to_string()),
-        api_key_name: None,
         role: Some("shared-key".to_string()),
         scopes: scopes.into_iter().map(str::to_string).collect(),
         is_bootstrap: false,
@@ -85,7 +82,6 @@ fn managed_oauth_auth_context(
         user_id: Some(format!("user-{}", username)),
         username: Some(username.to_string()),
         api_key_id: Some("oauth-access-token".to_string()),
-        api_key_name: None,
         role: Some("user".to_string()),
         scopes: Vec::new(),
         is_bootstrap: false,
@@ -138,11 +134,12 @@ fn runner_registration(
 }
 
 fn async_job_capabilities() -> ShellClientCapabilities {
-    let mut capabilities = ShellClientCapabilities::default();
-    capabilities.async_jobs = true;
-    capabilities.async_shell_jobs = true;
-    capabilities.jobs = true;
-    capabilities
+    ShellClientCapabilities {
+        async_jobs: true,
+        async_shell_jobs: true,
+        jobs: true,
+        ..Default::default()
+    }
 }
 
 #[tokio::test]
@@ -1538,11 +1535,13 @@ async fn register_blank_protocol_version_falls_back_to_unknown() {
 #[tokio::test]
 async fn client_supports_reflects_registered_capabilities() {
     let registry = ShellClientRegistry::default();
-    let mut caps = ShellClientCapabilities::default();
-    caps.shell = true;
-    caps.file_read = true;
-    caps.async_shell_jobs = true;
-    caps.project_path_registration = true;
+    let caps = ShellClientCapabilities {
+        shell: true,
+        file_read: true,
+        async_shell_jobs: true,
+        project_path_registration: true,
+        ..Default::default()
+    };
     registry
         .register(ShellClientRegisterRequest {
             process_started_at: None,
@@ -4614,13 +4613,14 @@ async fn late_job_update_on_stale_connection_is_accepted_without_refreshing_live
 // advancement, log growth, and terminal transitions.
 
 fn sequenced_job_capabilities() -> ShellClientCapabilities {
-    let mut capabilities = ShellClientCapabilities::default();
-    capabilities.async_jobs = true;
-    capabilities.async_shell_jobs = true;
-    capabilities.jobs = true;
-    capabilities.job_state_reconciliation = true;
-    capabilities.structured_validation_argv = true;
-    capabilities
+    ShellClientCapabilities {
+        async_jobs: true,
+        async_shell_jobs: true,
+        jobs: true,
+        job_state_reconciliation: true,
+        structured_validation_argv: true,
+        ..Default::default()
+    }
 }
 
 fn wait_job_update(
@@ -5030,10 +5030,12 @@ async fn job_log_wait_recovery_transition_between_calls_is_immediate() {
 #[tokio::test]
 async fn job_log_wait_legacy_update_between_calls_and_noop_replacement() {
     let registry = ShellClientRegistry::default();
-    let mut capabilities = ShellClientCapabilities::default();
-    capabilities.async_jobs = true;
-    capabilities.async_shell_jobs = true;
-    capabilities.jobs = true;
+    let capabilities = ShellClientCapabilities {
+        async_jobs: true,
+        async_shell_jobs: true,
+        jobs: true,
+        ..Default::default()
+    };
     registry
         .register(ShellClientRegisterRequest {
             process_started_at: None,

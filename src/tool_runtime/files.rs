@@ -170,7 +170,7 @@ fn map_agent_read_error(resp: &ShellRunResponse) -> ReadFileReason {
     let text = resp
         .error
         .as_deref()
-        .or_else(|| resp.stderr.as_deref())
+        .or(resp.stderr.as_deref())
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
@@ -771,7 +771,7 @@ pub(crate) const DEFAULT_SEARCH_HEAD_ABSOLUTE_CANDIDATES: &[&str] = &["/usr/bin/
 ///
 /// Runtime shell commands re-implement the same policy (agent PATH may differ
 /// from the server). This helper is the testable mirror of that policy.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn resolve_search_head_command(
     path_env: Option<&str>,
     absolute_candidates: &[&str],
@@ -793,7 +793,7 @@ pub(crate) fn resolve_search_head_command(
     None
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn is_executable_file(path: &Path) -> bool {
     if !path.is_file() {
         return false;
@@ -1993,10 +1993,10 @@ fn validate_artifact_mime_for_path(
     mime_type: Option<&str>,
 ) -> Result<Option<String>, String> {
     let mime_type = validate_artifact_mime(mime_type)?;
-    if matches!(mime_type.as_deref(), Some("application/octet-stream")) {
-        if !has_safe_octet_stream_artifact_extension(path) {
-            return Err(octet_stream_safe_extension_error());
-        }
+    if matches!(mime_type.as_deref(), Some("application/octet-stream"))
+        && !has_safe_octet_stream_artifact_extension(path)
+    {
+        return Err(octet_stream_safe_extension_error());
     }
     Ok(mime_type)
 }
@@ -4342,7 +4342,7 @@ mod tests {
 
     #[test]
     fn parse_search_context_matches_returns_context_line_numbers() {
-        let stdout = "src/lib.rs\01-one\nsrc/lib.rs\02-two\nsrc/lib.rs\03:needle\nsrc/lib.rs\04-four\nsrc/lib.rs\05-five\n";
+        let stdout = "src/lib.rs\x001-one\nsrc/lib.rs\x002-two\nsrc/lib.rs\x003:needle\nsrc/lib.rs\x004-four\nsrc/lib.rs\x005-five\n";
         let options = SearchOptions::normalize(SearchRequest {
             pattern: "needle".to_string(),
             path: None,
@@ -4500,7 +4500,7 @@ mod tests {
             timeout_secs: None,
         })
         .unwrap();
-        let count_suffix = "\02\n";
+        let count_suffix = "\x002\n";
         let path = format!(
             "src/{}",
             "a".repeat(SEARCH_OUTPUT_BYTE_BUDGET - "src/".len() - count_suffix.len())

@@ -688,11 +688,11 @@ fn parse_fixed_decimal(bytes: &[u8]) -> Option<usize> {
     std::str::from_utf8(bytes).ok()?.parse().ok()
 }
 
-fn parse_show_changes_wire_block<'a>(
-    stdout: &'a str,
+fn parse_show_changes_wire_block(
+    stdout: &str,
     end: usize,
     kind: u8,
-) -> Option<(&'a str, &'a str, usize)> {
+) -> Option<(&str, &str, usize)> {
     let bytes = stdout.as_bytes();
     let trailer_start = end.checked_sub(SHOW_CHANGES_BLOCK_TRAILER_BYTES)?;
     let trailer = bytes.get(trailer_start..end)?;
@@ -1074,7 +1074,7 @@ fn parse_show_changes_head(head: &str) -> serde_json::Value {
 }
 
 fn frame_bytes_match(value: &str, reported: Option<usize>, budget: usize) -> bool {
-    let actual = value.as_bytes().len();
+    let actual = value.len();
     actual <= budget && reported == Some(actual)
 }
 
@@ -1675,60 +1675,6 @@ pub(crate) fn parse_show_changes_output_with_observation(
 
     set_show_changes_verdict(&mut output);
     output
-}
-
-/// Parse a transport-side untracked-preview JSON frame. Retained for
-/// backward compatibility with already-enqueued requests; the production path
-/// now collects previews via the local/agent probe helpers above.
-#[allow(dead_code)]
-fn parse_untracked_previews_stdout(preview_stdout: &str) -> Result<(Vec<Value>, bool), String> {
-    let preview_stdout = preview_stdout.trim();
-    if preview_stdout.is_empty() {
-        return Ok((Vec::new(), false));
-    }
-    let value: Value = serde_json::from_str(preview_stdout)
-        .map_err(|e| format!("failed to parse untracked preview JSON: {}", e))?;
-    match value {
-        Value::Array(entries) => Ok((entries, false)),
-        Value::Object(mut object) => {
-            let previews = object
-                .remove("previews")
-                .and_then(|previews| match previews {
-                    Value::Array(entries) => Some(entries),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            let truncated = object
-                .remove("truncated")
-                .and_then(|truncated| truncated.as_bool())
-                .unwrap_or(false);
-            Ok((previews, truncated))
-        }
-        _ => Err("untracked preview JSON must be an array or object".to_string()),
-    }
-}
-
-/// Layer a transport-side untracked-preview frame onto an output payload.
-/// Retained for backward compatibility; the production path collects previews
-/// via the local/agent probe helpers instead of a transport frame.
-#[allow(dead_code)]
-pub(crate) fn apply_show_changes_untracked_previews(output: &mut Value, preview_stdout: &str) {
-    match parse_untracked_previews_stdout(preview_stdout) {
-        Ok((previews, truncated)) => {
-            output["untracked_previews"] = json!(previews);
-            output["untracked_previews_truncated"] = json!(truncated);
-        }
-        Err(error) => {
-            output["untracked_previews"] = json!([]);
-            output["untracked_previews_truncated"] = json!(false);
-            if let Some(warnings) = output["warnings"].as_array_mut() {
-                warnings.push(json!({
-                    "kind": "untracked_preview_parse_failed",
-                    "message": error,
-                }));
-            }
-        }
-    }
 }
 
 fn skipped_untracked_preview(path: &str, reason: &str, byte_count: Option<u64>) -> Value {
@@ -2548,12 +2494,6 @@ pub(crate) fn parse_porcelain_summary(porcelain: &str) -> PorcelainSummary {
     }
     summary.changed_files_count = summary.changed_files.len();
     summary
-}
-
-/// Backward-compatible helper for older tests/callers that only need all paths.
-#[allow(dead_code)]
-pub(crate) fn parse_porcelain_files(porcelain: &str) -> Vec<String> {
-    parse_porcelain_summary(porcelain).changed_files
 }
 
 impl ToolRuntime {

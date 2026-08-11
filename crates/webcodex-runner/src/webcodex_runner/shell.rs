@@ -710,7 +710,7 @@ fn run_prepare_command(
     }
     // ManagedChild owns the whole profile-prepare process tree: a private
     // process group on Unix, a kill-on-close Job Object on Windows.
-    let mut child = ManagedChild::spawn(&mut cmd.stdout(Stdio::piped()).stderr(Stdio::piped()))
+    let mut child = ManagedChild::spawn(cmd.stdout(Stdio::piped()).stderr(Stdio::piped()))
         .map_err(|e| format!("failed to spawn profile prepare command: {}", e))?;
     let stdout = match child.child_mut().stdout.take() {
         Some(stdout) => stdout,
@@ -1966,6 +1966,7 @@ pub(crate) fn run_shell_with_profiles(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_shell_with_profiles_in_sandbox(
     generation: u64,
@@ -3140,8 +3141,10 @@ done
         let cwd = tempfile::tempdir().unwrap();
         let marker = cwd.path().join("marker");
         let projects_dir = tempfile::tempdir().unwrap();
-        let mut shell = ShellConfig::default();
-        shell.program = "custom-shell".to_string();
+        let mut shell = ShellConfig {
+            program: "custom-shell".to_string(),
+            ..Default::default()
+        };
         shell.env.insert("PATH".to_string(), String::new());
         let result = run_script_with_profiles_in_sandbox_and_execution_state(
             1,
@@ -3189,8 +3192,10 @@ done
         .unwrap();
         std::fs::set_permissions(&custom_shell, std::fs::Permissions::from_mode(0o700)).unwrap();
         let projects_dir = tempfile::tempdir().unwrap();
-        let mut shell = ShellConfig::default();
-        shell.program = custom_shell.to_string_lossy().into_owned();
+        let mut shell = ShellConfig {
+            program: custom_shell.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
         shell.env.insert("PATH".to_string(), String::new());
         let result = run_script_with_profiles_in_sandbox_and_execution_state(
             1,

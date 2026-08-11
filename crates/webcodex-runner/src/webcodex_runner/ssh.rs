@@ -66,13 +66,11 @@ pub(crate) struct PreparedSshCommand {
     pub(crate) key: SshConnectionKey,
 }
 
-/// A ready-to-spawn long-lived SSH shell command paired with the pool entry it
-/// reuses and the resource's default remote cwd. Used only by the Unix remote
-/// persistent-shell transport.
+/// A ready-to-spawn long-lived SSH shell command with the resource's default
+/// remote cwd. Used only by the Unix remote persistent-shell transport.
 #[cfg(unix)]
 pub(crate) struct PreparedPersistentShellCommand {
     pub(crate) command: Command,
-    pub(crate) key: SshConnectionKey,
     pub(crate) default_cwd: Option<String>,
 }
 
@@ -269,7 +267,6 @@ impl SshConnectionPool {
         configure_private_process_group(&mut ssh);
         Ok(PreparedPersistentShellCommand {
             command: ssh,
-            key: connection.key,
             default_cwd: connection.default_cwd.clone(),
         })
     }
@@ -409,6 +406,7 @@ impl Drop for SshConnectionPool {
 }
 
 /// Execute a short remote shell command through a Session-bound SSH resource.
+#[cfg(test)]
 pub(crate) fn run_ssh_shell(
     pool: &SshConnectionPool,
     generation: u64,
@@ -1842,7 +1840,7 @@ mod tests {
             Some("shell_reset_required"),
             "{reset:?}"
         );
-        assert_eq!(reset.command_started, false, "{reset:?}");
+        assert!(!reset.command_started, "{reset:?}");
         assert_eq!(reset.stdout, "", "{reset:?}");
 
         // The old shell is closed and can no longer run user commands; a
@@ -1859,7 +1857,7 @@ mod tests {
             stale.error_code.is_some(),
             "closed old shell must reject further execs: {stale:?}"
         );
-        assert_eq!(stale.command_started, false, "{stale:?}");
+        assert!(!stale.command_started, "{stale:?}");
         assert_eq!(stale.stdout, "", "{stale:?}");
         assert_eq!(manager.active_count(), 0, "{stale:?}");
 
