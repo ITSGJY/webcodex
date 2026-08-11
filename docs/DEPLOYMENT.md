@@ -118,7 +118,7 @@ The documented distribution path uses the npm thin installer/wrapper:
 ```bash
 npm install -g @yyjeqhc/webcodex
 ```
-The npm wrapper currently supports `linux-x64`, `linux-arm64`, `darwin-arm64`, and `win32-x64`. Windows x64 supports the CLI + Runner workflow against a remote Linux Server; the long-running Windows Server/service path remains unsupported. Release checksums are generated on OE and embedded in the published npm package rather than committed to the source tree.
+The release artifact matrix is `linux-x64`, `linux-arm64`, `darwin-arm64`, and `win32-x64`. Windows x64 supports the CLI + Runner workflow natively; Windows ARM64 hosts use the same `win32-x64` artifact through Windows 11 x64 emulation. The long-running Windows Server/service path remains unsupported, and no native `win32-arm64` artifact is published. Release checksums are generated on OE and embedded in the published npm package rather than committed to the source tree.
 
 Initialize the env file:
 

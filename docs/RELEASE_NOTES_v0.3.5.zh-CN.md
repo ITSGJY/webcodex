@@ -11,6 +11,7 @@ WebCodex 0.3.5 是一次兼容性与维护发布。它发布 0.3.4 之后当前 
 - **降低 Session persistence 内存压力。** Closed Session history 与 persistence path 减少不必要的内存重复，同时保持 durable Session contract 不变。
 - **Rust 维护清理。** 减少 dead-code 与 Clippy noise，不改变预期的公开 runtime contract。
 - **Security 文档更新。** GitHub Security Policy 页面直接渲染的 `SECURITY.md` 已把受支持的 security-fix 版本线从过期的 0.2.x 更新为 0.3.x。
+- **Windows ARM64 npm 宿主兼容。** Native ARM64 Node/npm 现在会选择已发布的 `win32-x64` artifact，并通过 Windows 11 x64 仿真运行。release matrix 不变，仍不发布 native `win32-arm64` artifact。
 
 ## 破坏性变更与兼容性
 
@@ -26,6 +27,7 @@ Linux arm64 仍保留在发布矩阵中，但本版本暂时不对它做同样�
 2. 确认所有 binary 都报告 `0.3.5`、同一个具体 commit，并且 `dirty=false`。
 3. 之前因为 glibc requirement 高于 2.17 而无法运行的 Linux x64 用户，可以使用 v0.3.5 native artifact；如果通过 npm 安装，宿主还需要可用且兼容的 Node.js 18+ runtime。
 4. Linux arm64 用户不要把本版本的 x64 glibc 2.17 保证直接类推到 arm64。
+5. Windows ARM64 npm 用户会获得 `win32-x64` binaries，并依赖 Windows 11 x64 仿真；本版本不增加 native ARM64 Windows artifact。
 
 ## Binary packaging
 
@@ -42,11 +44,11 @@ Linux arm64 仍保留在发布矩阵中，但本版本暂时不对它做同样�
 
 - glibc 2.17 release floor 当前只对 `linux-x64` 做保证；`linux-arm64` release builder 后续单独处理。
 - Node.js compatibility 与 native ELF compatibility 是两件事；npm 安装路径仍要求 Node.js 18 或更新版本。
-- macOS x64、Windows ARM64 和其他未发布 targets 仍不在 release artifact matrix 中。
+- macOS x64 和其他未发布 targets 仍不在 release artifact matrix 中。Windows ARM64 宿主通过 x64 仿真获得支持，但 native Windows ARM64 artifact 仍未发布。
 
 ## 发布验证
 
-本次 release-prep 不新增 runtime feature code。验证重点包括 Cargo/npm version 一致性、npm self-test、Markdown link、clean release provenance、已有 source/CI gate，以及新的 Linux x64 `GLIBC_* <= 2.17` artifact 检查。
+验证重点包括 Cargo/npm version 一致性、npm self-test、Markdown link、clean release provenance、已有 source/CI gate、新的 Linux x64 `GLIBC_* <= 2.17` artifact 检查，以及 GitHub native ARM64 Windows runner 上的 Windows ARM64 npm-to-x64 compatibility smoke。
 
 ## 后续
 

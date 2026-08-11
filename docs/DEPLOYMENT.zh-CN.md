@@ -105,7 +105,7 @@ token、`userinfo_endpoint`、`client_credentials` grant、device code 流程，
 npm install -g @yyjeqhc/webcodex
 ```
 
-npm wrapper 当前支持 `linux-x64`、`linux-arm64`、`darwin-arm64` 和 `win32-x64`。Windows x64 支持 CLI + Runner 连接远端 Linux Server；长期运行的 Windows Server/service 路径仍不支持。release checksum 由 OE 动态生成并写入最终 npm package，不再提交到源码树。
+release artifact matrix 为 `linux-x64`、`linux-arm64`、`darwin-arm64` 和 `win32-x64`。Windows x64 原生支持 CLI + Runner 连接远端 Linux Server；Windows ARM64 宿主通过 Windows 11 x64 仿真复用同一个 `win32-x64` artifact。长期运行的 Windows Server/service 路径仍不支持，也不发布 native `win32-arm64` artifact。release checksum 由 OE 动态生成并写入最终 npm package，不再提交到源码树。
 
 初始化 env 文件：
 

@@ -11,6 +11,7 @@ WebCodex 0.3.5 is a compatibility and maintenance release. It publishes the curr
 - **Lower Session persistence memory pressure.** Closed Session history and persistence paths reduce unnecessary in-memory duplication while preserving the durable Session contract.
 - **Rust maintenance cleanup.** Dead-code and Clippy noise was reduced without changing the intended public runtime contract.
 - **Security documentation refresh.** `SECURITY.md`, which GitHub renders as the repository Security Policy, now identifies 0.3.x as the supported security-fix line instead of the stale 0.2.x text.
+- **Windows ARM64 npm host compatibility.** Native ARM64 Node/npm now selects the published `win32-x64` artifact and runs it through Windows 11 x64 emulation. The release matrix remains unchanged; there is still no native `win32-arm64` artifact.
 
 ## Breaking changes and compatibility
 
@@ -26,6 +27,7 @@ The Linux arm64 artifact remains in the published matrix, but it does not yet ca
 2. Verify all installed binaries report `0.3.5`, the same concrete commit, and `dirty=false`.
 3. Linux x64 operators that were blocked by a glibc requirement newer than 2.17 should use the v0.3.5 native artifact or the npm wrapper on a host with a compatible Node.js 18+ runtime.
 4. Linux arm64 users should not infer the x64 glibc 2.17 guarantee for arm64 in this release.
+5. Windows ARM64 npm users receive the `win32-x64` binaries and rely on Windows 11 x64 emulation; this release does not add a native ARM64 Windows artifact.
 
 ## Binary packaging
 
@@ -42,11 +44,11 @@ All artifacts must be built natively from the exact immutable `v0.3.5` tag and c
 
 - The glibc 2.17 release floor is currently guaranteed only for `linux-x64`; the `linux-arm64` release builder will be addressed separately.
 - Node.js compatibility is separate from native ELF compatibility. The npm installation path still requires Node.js 18 or newer.
-- macOS x64, Windows ARM64, and other unpublished targets remain outside the release artifact matrix.
+- macOS x64 and other unpublished targets remain outside the release artifact matrix. Windows ARM64 hosts are supported through x64 emulation, but a native Windows ARM64 artifact remains unpublished.
 
 ## Release validation
 
-This release-prep change does not add new runtime feature code. Validation should cover version consistency across Cargo/npm metadata, npm self-tests, Markdown links, clean release provenance, the existing source/CI gates, and the new Linux x64 `GLIBC_* <= 2.17` artifact check.
+Validation should cover version consistency across Cargo/npm metadata, npm self-tests, Markdown links, clean release provenance, the existing source/CI gates, the Linux x64 `GLIBC_* <= 2.17` artifact check, and the Windows ARM64 npm-to-x64 compatibility smoke on GitHub's native ARM64 Windows runner.
 
 ## Next steps
 

@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, agent/windows-arm64-emulation-smoke]
+    branches: [main]
   pull_request:
 
 env:

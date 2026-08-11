@@ -70,15 +70,15 @@ binary、npm 命令、systemd unit 与 QUIC ALPN（`webcodex-runner/1`）统一�
 npm install -g @yyjeqhc/webcodex
 ```
 
-npm wrapper 当前支持 `linux-x64`、`linux-arm64`、`darwin-arm64` 和 `win32-x64`；目前不发布 `darwin-x64`、Windows ARM64 和其他 targets。从 v0.3.5 起，native `linux-x64` artifact 以 glibc 2.17 或更新版本为兼容基线；这个兼容性下限暂时不适用于 `linux-arm64`。npm wrapper 仍要求 Node.js 18 或更新版本，因此 npm 安装还取决于宿主机上可用的 Node.js build。release checksum 在 tag 创建后由 OE 根据四台 native host 生成的 exact artifacts 动态计算；publish-ready `manifest.json` 属于 release metadata，不再提交进 Git。
+release artifact matrix 仍然是 `linux-x64`、`linux-arm64`、`darwin-arm64` 和 `win32-x64`。Windows ARM64 宿主由 npm wrapper 支持：installer 会选择已发布的 `win32-x64` artifact，并通过 Windows 11 的 x64 仿真运行；目前不单独发布 native `win32-arm64` artifact。`darwin-x64` 和其他 targets 仍未发布。从 v0.3.5 起，native `linux-x64` artifact 以 glibc 2.17 或更新版本为兼容基线；这个兼容性下限暂时不适用于 `linux-arm64`。npm wrapper 仍要求 Node.js 18 或更新版本，因此 npm 安装还取决于宿主机上可用的 Node.js build。release checksum 在 tag 创建后由 OE 根据四台 native host 生成的 exact artifacts 动态计算；publish-ready `manifest.json` 属于 release metadata，不再提交进 Git。
 
-### Windows x64 支持范围
+### Windows client + Runner 支持范围
 
-Windows x64 的支持目标是 **client + Runner**：包括 `webcodex` CLI、作为 hosted/local-profile Runner 的 `webcodex-runner`、Windows 本地仓库操作，以及通过 `webcodex connect <server>` 连接远端 Linux WebCodex Server。Runner 使用 `webcodex agent status|start|stop|restart|logs --profile <name>` 管理；机器重启后需要再次执行 `webcodex connect ...` 或 `webcodex agent start --profile <name>`，当前还没有登录/开机自动启动。
+Windows x64 使用 native binary；Windows ARM64 具有相同的 **client + Runner** 支持范围，但 npm installer 会有意复用 `win32-x64` binaries，并通过 Windows 11 x64 仿真运行。支持内容包括 `webcodex` CLI、作为 hosted/local-profile Runner 的 `webcodex-runner`、Windows 本地仓库操作，以及通过 `webcodex connect <server>` 连接远端 Linux WebCodex Server。Runner 使用 `webcodex agent status|start|stop|restart|logs --profile <name>` 管理；机器重启后需要再次执行 `webcodex connect ...` 或 `webcodex agent start --profile <name>`，当前还没有登录/开机自动启动。
 
-Windows 暂不支持长期运行的本地 WebCodex Server（`webcodex server ...`、`webcodex share`）、`webcodex agent install`（systemd service 安装）、persistent shell、SSH resource、config hot reload、AppContainer sandbox、ARM64 和 UNC project root。Windows artifact 中仍包含 `webcodex-server.exe`，只是为了保持 npm 三 binary contract，并不表示 Windows Server runtime 已受支持。
+Windows 暂不支持长期运行的本地 WebCodex Server（`webcodex server ...`、`webcodex share`）、`webcodex agent install`（systemd service 安装）、persistent shell、SSH resource、config hot reload、AppContainer sandbox 和 UNC project root；同时也不发布 native Windows ARM64 artifact。Windows artifact 中仍包含 `webcodex-server.exe`，只是为了保持 npm 三 binary contract，并不表示 Windows Server runtime 已受支持。
 
-从 v0.3.3 起，Windows x64 已正式作为 client + Runner 平台发布。后续 Windows release artifact 仍必须在 native Windows host 上从 exact immutable tag 构建，并使用 `scripts/package_release_artifact.ps1` 默认的 provenance-safe 模式；它要求 concrete commit、`dirty=false`、clean tag worktree 和一致的 binary provenance。`-AllowDevelopmentBuild` 仍然只用于本地/CI smoke，不能上传。native Windows 验证包括 `npm --prefix npm/webcodex test` 和 `scripts/npm_install_windows_smoke.ps1`。
+从 v0.3.3 起，Windows x64 已正式作为 client + Runner artifact 平台发布。后续 Windows release artifact 仍必须在 native Windows host 上从 exact immutable tag 构建，并使用 `scripts/package_release_artifact.ps1` 默认的 provenance-safe 模式；它要求 concrete commit、`dirty=false`、clean tag worktree 和一致的 binary provenance。`-AllowDevelopmentBuild` 仍然只用于本地/CI smoke，不能上传。Windows 验证包括 `npm --prefix npm/webcodex test`、x64 上的 `scripts/npm_install_windows_smoke.ps1`，以及 GitHub Windows ARM64 runner 上的 `scripts/npm_install_windows_arm64_compat_smoke.ps1`。
 
 npm package 是 native release artifacts 的 thin wrapper。安装时会下载匹配的 GitHub Release artifact，并使用生成的 release manifest 中的 SHA-256 checksum 验证。正式发布时由 OE 在四个平台 artifacts 就绪后创建临时 staging：
 
