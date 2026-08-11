@@ -1,6 +1,9 @@
 name: Windows ARM64 x64 emulation smoke
 
 on:
+  push:
+    branches:
+      - agent/windows-arm64-emulation-smoke
   pull_request:
   workflow_dispatch:
 
