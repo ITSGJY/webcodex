@@ -456,24 +456,51 @@ function defaultWarning(message) {
   console.warn(message);
 }
 
-function replaceDirectoryAtomically(stagedDir, finalDir, onWarning = defaultWarning) {
+const WINDOWS_RENAME_RETRY_DELAYS_MS = Object.freeze([50, 100, 200, 400, 800]);
+
+function renameDirectoryWithRetry(source, destination, platform = process.platform) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      fs.renameSync(source, destination);
+      return;
+    } catch (err) {
+      const retryable = platform === "win32" &&
+        err && ["EPERM", "EBUSY", "EACCES"].includes(err.code) &&
+        attempt < WINDOWS_RENAME_RETRY_DELAYS_MS.length;
+      if (!retryable) throw err;
+      const delayMs = WINDOWS_RENAME_RETRY_DELAYS_MS[attempt];
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
+    }
+  }
+}
+
+function removeDirectoryWithRetry(target, platform = process.platform) {
+  const options = { recursive: true, force: true };
+  if (platform === "win32") {
+    options.maxRetries = 5;
+    options.retryDelay = 100;
+  }
+  fs.rmSync(target, options);
+}
+
+function replaceDirectoryAtomically(stagedDir, finalDir, onWarning = defaultWarning, platform = process.platform) {
   const parent = path.dirname(finalDir);
   const backup = path.join(parent, `.bin-backup-${process.pid}-${Date.now()}`);
   const hadPrevious = fs.existsSync(finalDir);
   if (hadPrevious) {
-    fs.renameSync(finalDir, backup);
+    renameDirectoryWithRetry(finalDir, backup, platform);
   }
   try {
-    fs.renameSync(stagedDir, finalDir);
+    renameDirectoryWithRetry(stagedDir, finalDir, platform);
   } catch (err) {
     if (hadPrevious && fs.existsSync(backup) && !fs.existsSync(finalDir)) {
-      fs.renameSync(backup, finalDir);
+      renameDirectoryWithRetry(backup, finalDir, platform);
     }
     throw err;
   }
   if (hadPrevious) {
     try {
-      fs.rmSync(backup, { recursive: true, force: true });
+      removeDirectoryWithRetry(backup, platform);
     } catch (_err) {
       onWarning("WebCodex installation succeeded, but the previous binary backup could not be removed.");
     }
@@ -487,13 +514,21 @@ function installBinarySet(populate, options = {}) {
   const parent = path.dirname(destinationDir);
   fs.mkdirSync(parent, { recursive: true });
   const stagedDir = fs.mkdtempSync(path.join(parent, ".bin-staging-"));
+  let primaryError = null;
   try {
     populate(stagedDir);
     const identity = validateBinarySet(stagedDir, expectedVersion, platform, options);
-    replaceDirectoryAtomically(stagedDir, destinationDir, options.onWarning);
+    replaceDirectoryAtomically(stagedDir, destinationDir, options.onWarning, platform);
     return identity;
+  } catch (err) {
+    primaryError = err;
+    throw err;
   } finally {
-    fs.rmSync(stagedDir, { recursive: true, force: true });
+    try {
+      removeDirectoryWithRetry(stagedDir, platform);
+    } catch (cleanupError) {
+      if (!primaryError) throw cleanupError;
+    }
   }
 }
 
