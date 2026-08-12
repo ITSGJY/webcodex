@@ -1553,8 +1553,8 @@ async fn runtime_status_includes_build_metadata() {
 
 #[tokio::test]
 async fn runtime_status_defaults_to_local_coding_surface() {
-    let _guard = crate::admin_cli::TEST_ENV_LOCK.lock().unwrap();
-    std::env::remove_var(crate::model_surface::MCP_MODEL_SURFACE_ENV);
+    // ToolRuntime::new_for_tests defaults to local_coding; keep this as a real
+    // default-constructor check rather than overriding the value under test.
     let runtime = test_runtime();
     let result = runtime.dispatch(runtime_status_call()).await;
     assert!(result.success, "{:?}", result.error);

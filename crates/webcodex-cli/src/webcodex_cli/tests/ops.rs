@@ -180,6 +180,10 @@ async fn ops_rejects_agent_token_from_env_file_without_leaking_it() {
     assert!(!error.contains(secret));
 }
 
+// `WEBCODEX_TOKEN` from the process env is the tested product behavior: it
+// must stay set (and serialized against other env-mutating tests) for the
+// whole async operation, so the env lock is held across the awaits by contract.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "current_thread")]
 async fn ops_rejects_agent_token_from_process_env_without_leaking_it() {
     let _guard = env_test_guard();
