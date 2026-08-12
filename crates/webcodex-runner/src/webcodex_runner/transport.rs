@@ -219,6 +219,7 @@ impl AgentRuntimeState {
         }
     }
 
+    #[cfg(any(unix, test))]
     fn register_reload_thread(&self, handle: std::thread::JoinHandle<()>) {
         self.reload_threads.register(handle);
     }
@@ -2715,15 +2716,9 @@ fn first_nonempty_env_value_with<F>(names: &[&str], get_env: &mut F) -> Option<s
 where
     F: FnMut(&str) -> Option<std::ffi::OsString>,
 {
-    names.iter().find_map(|name| {
-        get_env(name).and_then(|value| {
-            if value.as_os_str().is_empty() {
-                None
-            } else {
-                Some(value)
-            }
-        })
-    })
+    names
+        .iter()
+        .find_map(|name| get_env(name).filter(|value| !value.as_os_str().is_empty()))
 }
 
 fn split_no_proxy_host_port(entry: &str) -> (&str, Option<u16>) {

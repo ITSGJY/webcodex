@@ -17,16 +17,20 @@ pub(crate) enum ResolvedProgram {
     /// Native executable (`.exe`, `.com`, or an extensionless PE image).
     Native(PathBuf),
     /// Batch script (`.cmd` / `.bat`), which requires shell/script semantics.
+    /// Only Windows resolution can produce batch scripts.
+    #[cfg(windows)]
     Batch(PathBuf),
 }
 
 impl ResolvedProgram {
+    #[cfg(windows)]
     pub(crate) fn path(&self) -> &Path {
         match self {
             ResolvedProgram::Native(path) | ResolvedProgram::Batch(path) => path,
         }
     }
 
+    #[cfg(all(test, windows))]
     pub(crate) fn is_batch(&self) -> bool {
         matches!(self, ResolvedProgram::Batch(_))
     }
@@ -382,7 +386,7 @@ mod tests {
         let executable = spaced.join("probe.exe");
         std::fs::write(&executable, pe_bytes()).unwrap();
         assert_eq!(
-            resolve_program_in_path(&executable.to_string_lossy(), &OsStr::new("")),
+            resolve_program_in_path(&executable.to_string_lossy(), OsStr::new("")),
             Some(ResolvedProgram::Native(executable))
         );
     }
@@ -393,7 +397,7 @@ mod tests {
         let script = temp.path().join("run.cmd");
         std::fs::write(&script, b"@echo off\r\n").unwrap();
         assert_eq!(
-            resolve_program_in_path(&script.to_string_lossy(), &OsStr::new("")),
+            resolve_program_in_path(&script.to_string_lossy(), OsStr::new("")),
             Some(ResolvedProgram::Batch(script))
         );
     }
@@ -539,7 +543,7 @@ mod tests {
         std::fs::create_dir_all(script.parent().unwrap()).unwrap();
         std::fs::write(&script, b"@echo off\r\n").unwrap();
         assert_eq!(
-            resolve_program_in_path(&script.to_string_lossy(), &OsStr::new("")),
+            resolve_program_in_path(&script.to_string_lossy(), OsStr::new("")),
             Some(ResolvedProgram::Batch(script))
         );
     }
