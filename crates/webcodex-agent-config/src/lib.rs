@@ -208,10 +208,14 @@ pub fn generated_agent_config_toml(opts: &AgentInitOptions) -> Result<String, St
             persistent_shell: false,
             ssh_persistent_shell: false,
             structured_validation_argv: true,
+            // The running binary advertises this process-lifetime protocol
+            // capability after installing its exact Go argv boundary.
+            structured_go_test_json: false,
             structured_process_argv: true,
             structured_script_payload: true,
             structured_execution_jobs: true,
             lsp_read_only_navigation: true,
+            lsp_call_hierarchy: true,
             sandbox_inspect_commands: false,
             project_lifecycle: false,
             project_path_registration: false,
@@ -406,6 +410,7 @@ mod tests {
                 .map(|value| value.as_str().unwrap().to_string())
                 .collect::<Vec<_>>();
             assert_eq!(rendered_roots, vec![home.to_string_lossy().to_string()]);
+            assert!(!content.contains("structured_go_test_json"));
             assert!(!content.contains("job_state_reconciliation"));
         }
     }

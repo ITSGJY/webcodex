@@ -1552,6 +1552,10 @@ fn agent_register_capabilities(cfg: &AgentConfig) -> ShellClientCapabilities {
     // inferred from `ssh_shell` + `persistent_shell`.
     capabilities.ssh_persistent_shell = SshConnectionPool::is_available() && cfg!(unix);
     capabilities.structured_validation_argv = true;
+    // This binary accepts both legacy Go validation argv from old Servers and
+    // the current machine-readable JSON argv. Do not trust static config or
+    // infer this from generic structured validation support.
+    capabilities.structured_go_test_json = true;
     capabilities.structured_process_argv = true;
     capabilities.structured_script_payload = true;
     capabilities.structured_execution_jobs = true;
@@ -1570,6 +1574,9 @@ fn agent_register_capabilities(cfg: &AgentConfig) -> ShellClientCapabilities {
     // New agents always advertise read-only LSP navigation. Older agents omit
     // the field and deserialize as false on the server.
     capabilities.lsp_read_only_navigation = true;
+    // Advertise the distinct capability only because this binary installs the
+    // bounded typed prepare/incoming/outgoing traversal implementation.
+    capabilities.lsp_call_hierarchy = true;
     // Advertise only after a real child-process enforcement probe proves Linux
     // Landlock ABI v3 (including TRUNCATE) works on this host. Every request
     // still applies the policy again in pre_exec and fails closed on error.

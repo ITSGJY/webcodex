@@ -226,6 +226,7 @@ async fn authenticated_project_fixture_for(recipe: &str) -> AuthenticatedProject
                     async_jobs: true,
                     async_shell_jobs: true,
                     structured_validation_argv: true,
+                    structured_go_test_json: true,
                     ..Default::default()
                 }),
                 projects: Some(vec![ShellAgentProjectSummary {
@@ -1974,7 +1975,7 @@ async fn console_accept_requires_result_id_and_stale_identity_has_no_effect() {
 #[test]
 fn console_is_not_a_model_facing_capability() {
     let names = crate::connector_runtime::surface::CAPABILITY_NAMES;
-    assert_eq!(names.len(), 12);
+    assert_eq!(names.len(), 14);
     assert!(names
         .iter()
         .all(|name| !crate::connector_runtime::surface::route_for(name)

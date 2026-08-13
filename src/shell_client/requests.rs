@@ -2,20 +2,20 @@ use super::jobs::{
     command_preview, ensure_dispatch_supported_locked, ensure_queue_capacity_locked,
     request_preview, PendingRequestEnqueueError,
 };
-use super::projects::ShellClientLookupError;
+use super::projects::{capability_enabled, ShellClientLookupError};
 use super::state::{PendingShellRequest, ShellClientRegistryInner};
 use super::validation::{
     validate_file_request, validate_id, validate_process_request, validate_run_request,
     validate_script_enqueue_request, MAX_COMMAND_LEN,
 };
 use super::{now_ts, ShellClientRegistry, CLIENT_ONLINE_WINDOW_SECS};
-use crate::lsp_bridge::{AgentLspPayload, AGENT_LSP_REQUEST_KIND};
+use crate::lsp_bridge::{AgentLspPayload, AgentLspRequest, AGENT_LSP_REQUEST_KIND};
 use crate::shell_protocol::{
     PersistentShellRequest, PersistentShellResult, ShellAgentShellRequest, ShellFileOpRequest,
     ShellJobContext, ShellProcessArgv, ShellRunRequest, ShellRunResponse, ShellScriptPayload,
-    SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION, SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL,
-    SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS, SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL,
-    SHELL_CLIENT_CAPABILITY_STRUCTURED_PROCESS_ARGV,
+    SHELL_CLIENT_CAPABILITY_LSP_CALL_HIERARCHY, SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
+    SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL, SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS,
+    SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL, SHELL_CLIENT_CAPABILITY_STRUCTURED_PROCESS_ARGV,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD,
 };
 use std::fmt;
@@ -24,11 +24,23 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EnqueueLspError {
-    InvalidRequest { message: String },
-    UnknownClient { client_id: String },
-    ClientOffline { client_id: String },
-    UnsupportedCapability { client_id: String },
-    QueueFull { client_id: String, limit: usize },
+    InvalidRequest {
+        message: String,
+    },
+    UnknownClient {
+        client_id: String,
+    },
+    ClientOffline {
+        client_id: String,
+    },
+    UnsupportedCapability {
+        client_id: String,
+        capability: &'static str,
+    },
+    QueueFull {
+        client_id: String,
+        limit: usize,
+    },
 }
 
 impl fmt::Display for EnqueueLspError {
@@ -43,10 +55,12 @@ impl fmt::Display for EnqueueLspError {
                 "shell client {client_id} is offline (no keepalive within \
                  {CLIENT_ONLINE_WINDOW_SECS}s); reconnect the agent before retrying"
             ),
-            Self::UnsupportedCapability { client_id } => write!(
+            Self::UnsupportedCapability {
+                client_id,
+                capability,
+            } => write!(
                 formatter,
-                "agent client {client_id} does not support \
-                 {SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION}"
+                "agent client {client_id} does not support {capability}"
             ),
             Self::QueueFull { client_id, limit } => write!(
                 formatter,
@@ -748,13 +762,12 @@ impl ShellClientRegistry {
             .map_err(|message| EnqueueLspError::InvalidRequest { message })?;
         // Capability gate before enqueue so old agents never receive unknown
         // LSP kinds that could fall into shell fallback.
-        if !self
-            .client_supports(&client_id, SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION)
-            .await
-            .map_err(EnqueueLspError::from)?
-        {
-            return Err(EnqueueLspError::UnsupportedCapability { client_id });
-        }
+        let required_capability =
+            if matches!(&payload.request, AgentLspRequest::CallHierarchy { .. }) {
+                SHELL_CLIENT_CAPABILITY_LSP_CALL_HIERARCHY
+            } else {
+                SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION
+            };
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
         let request = ShellAgentShellRequest {
@@ -785,6 +798,22 @@ impl ShellClientRegistry {
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
+        self.prune_expired_shared_key_clients_locked(&mut inner, now_ts());
+        // This check is the authoritative TOCTOU fence: capability validation
+        // and pending-request admission happen under the same registry lock.
+        let current =
+            inner
+                .clients
+                .get(&client_id)
+                .ok_or_else(|| EnqueueLspError::UnknownClient {
+                    client_id: client_id.clone(),
+                })?;
+        if !capability_enabled(&current.capabilities, required_capability) {
+            return Err(EnqueueLspError::UnsupportedCapability {
+                client_id,
+                capability: required_capability,
+            });
+        }
         enqueue_pending_request_locked(
             &mut inner,
             &client_id,

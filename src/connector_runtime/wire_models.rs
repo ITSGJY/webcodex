@@ -8,6 +8,9 @@
 //! host/http layers reference them directly; the rest are `pub(super)` for the
 //! runtime module's own dispatch.
 
+use crate::lsp_bridge::{
+    CallHierarchyDirection, DEFAULT_CALL_HIERARCHY_DEPTH, DEFAULT_CALL_HIERARCHY_LIMIT,
+};
 use crate::tool_runtime::validation_profile::{RecipeId, SemanticCheck};
 use crate::tool_runtime::{ApplyFileChangeInput, SearchResultMode};
 use serde::{Deserialize, Serialize};
@@ -39,6 +42,7 @@ pub(super) fn sanitize_value(
                 "agent_instance_id",
                 "executor",
                 "executor_id",
+                "execution_executor_ref",
                 "request_id",
                 "runtime_project_id",
             ] {
@@ -139,6 +143,74 @@ pub(super) struct FilesSearchInput {
     pub(super) result_mode: Option<SearchResultMode>,
     #[serde(default)]
     pub(super) cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CodeNavigateInput {
+    pub(super) task_id: String,
+    pub(super) operation: CodeNavigateOperation,
+    #[serde(default)]
+    pub(super) path: Option<String>,
+    #[serde(default)]
+    pub(super) query: Option<String>,
+    #[serde(default)]
+    pub(super) line: Option<usize>,
+    #[serde(default)]
+    pub(super) column: Option<usize>,
+    #[serde(default)]
+    pub(super) include_declaration: Option<bool>,
+    #[serde(default)]
+    pub(super) limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum CodeNavigateOperation {
+    Status,
+    DocumentSymbols,
+    WorkspaceSymbols,
+    Definition,
+    References,
+    Diagnostics,
+    Hover,
+}
+
+impl CodeNavigateOperation {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::DocumentSymbols => "document_symbols",
+            Self::WorkspaceSymbols => "workspace_symbols",
+            Self::Definition => "definition",
+            Self::References => "references",
+            Self::Diagnostics => "diagnostics",
+            Self::Hover => "hover",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CodeImpactInput {
+    pub(super) task_id: String,
+    pub(super) path: String,
+    pub(super) line: usize,
+    pub(super) column: usize,
+    #[serde(default)]
+    pub(super) direction: CallHierarchyDirection,
+    #[serde(default = "default_code_impact_depth")]
+    pub(super) depth: usize,
+    #[serde(default = "default_code_impact_limit")]
+    pub(super) limit: usize,
+}
+
+fn default_code_impact_depth() -> usize {
+    DEFAULT_CALL_HIERARCHY_DEPTH
+}
+
+fn default_code_impact_limit() -> usize {
+    DEFAULT_CALL_HIERARCHY_LIMIT
 }
 
 #[derive(Debug, Deserialize)]

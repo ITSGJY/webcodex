@@ -115,6 +115,10 @@ pub const SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL: &str = "persistent_shell";
 /// must reject the request rather than silently opening a local shell.
 pub const SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL: &str = "ssh_persistent_shell";
 pub const SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV: &str = "structured_validation_argv";
+/// The Runner accepts the canonical machine-readable Go validation argv
+/// `go test -json ./...`. Missing on older Runners and never inferred from
+/// generic structured validation support.
+pub const SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_JSON: &str = "structured_go_test_json";
 /// General model-facing native process execution with a typed executable and
 /// argv. This is deliberately independent from structured Cargo validation:
 /// older Runners may support validation argv without accepting arbitrary
@@ -134,6 +138,9 @@ pub const SHELL_CLIENT_CAPABILITY_STRUCTURED_EXECUTION_JOBS: &str = "structured_
 /// older agents and defaults to `false` so the server never dispatches typed
 /// LSP requests to agents that cannot handle them.
 pub const SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION: &str = "lsp_read_only_navigation";
+/// Bounded typed call-hierarchy traversal. Missing on older Runners and false;
+/// never inferred from general LSP navigation or protocol version.
+pub const SHELL_CLIENT_CAPABILITY_LSP_CALL_HIERARCHY: &str = "lsp_call_hierarchy";
 /// Linux Landlock ABI v3 inspect-command write sandbox.
 pub const SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS: &str = "sandbox_inspect_commands";
 pub const SHELL_CLIENT_CAPABILITY_PROJECT_LIFECYCLE: &str = "project_lifecycle";
@@ -156,10 +163,12 @@ pub const SHELL_CLIENT_CAPABILITY_NAMES: &[&str] = &[
     SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL,
     SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV,
+    SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_JSON,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_PROCESS_ARGV,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_EXECUTION_JOBS,
     SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
+    SHELL_CLIENT_CAPABILITY_LSP_CALL_HIERARCHY,
     SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS,
     SHELL_CLIENT_CAPABILITY_PROJECT_LIFECYCLE,
     SHELL_CLIENT_CAPABILITY_PROJECT_PATH_REGISTRATION,
@@ -217,6 +226,11 @@ pub struct ShellClientCapabilities {
     /// Missing on older agents and therefore fail-closed.
     #[serde(default)]
     pub structured_validation_argv: bool,
+    /// Machine-readable `go test -json ./...` validation. Missing on older
+    /// Runners and false; never inferred from structured_validation_argv or
+    /// agent_protocol_version.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub structured_go_test_json: bool,
     /// General native executable + argv requests. Missing on older agents and
     /// therefore false; the Server must fail closed without a shell fallback.
     #[serde(default)]
@@ -235,6 +249,9 @@ pub struct ShellClientCapabilities {
     /// false for wire compatibility with older agents.
     #[serde(default)]
     pub lsp_read_only_navigation: bool,
+    /// The Runner implements the bounded typed call-hierarchy operation.
+    #[serde(default)]
+    pub lsp_call_hierarchy: bool,
     /// The runner can fail-closed enforce the Linux Landlock ABI v3 write
     /// sandbox used by inspect commands.
     #[serde(default)]
@@ -292,10 +309,12 @@ impl Default for ShellClientCapabilities {
             persistent_shell: false,
             ssh_persistent_shell: false,
             structured_validation_argv: false,
+            structured_go_test_json: false,
             structured_process_argv: false,
             structured_script_payload: false,
             structured_execution_jobs: false,
             lsp_read_only_navigation: false,
+            lsp_call_hierarchy: false,
             sandbox_inspect_commands: false,
             project_lifecycle: false,
             project_path_registration: false,
@@ -1346,7 +1365,7 @@ impl ShellJobValidationStep {
             ("check", "cargo") => is_canonical_cargo_check_args(&args),
             ("test", "cargo") => is_canonical_cargo_test_args(&args),
             ("check", "go") => args == ["vet", "./..."],
-            ("test", "go") => args == ["test", "./..."],
+            ("test", "go") => args == ["test", "./..."] || args == ["test", "-json", "./..."],
             ("format", "python") => {
                 args == ["-m", "ruff", "format", "--check"] || args == ["-m", "black", "--check"]
             }
@@ -2260,10 +2279,12 @@ mod envelope_tests {
                 persistent_shell: true,
                 ssh_persistent_shell: true,
                 structured_validation_argv: true,
+                structured_go_test_json: true,
                 structured_process_argv: true,
                 structured_script_payload: true,
                 structured_execution_jobs: true,
                 lsp_read_only_navigation: false,
+                lsp_call_hierarchy: false,
                 sandbox_inspect_commands: false,
                 project_lifecycle: false,
                 project_path_registration: false,
@@ -2687,6 +2708,7 @@ mod envelope_tests {
             )
             .unwrap();
         assert!(capabilities.structured_validation_argv);
+        assert!(!capabilities.structured_go_test_json);
         assert!(capabilities.structured_process_argv);
         assert!(capabilities.structured_script_payload);
         assert!(capabilities.async_jobs);
@@ -2700,6 +2722,7 @@ mod envelope_tests {
         let capabilities: ShellClientCapabilities =
             serde_json::from_str(r#"{"shell":true,"structured_validation_argv":true}"#).unwrap();
         assert!(capabilities.structured_validation_argv);
+        assert!(!capabilities.structured_go_test_json);
         assert!(!capabilities.structured_process_argv);
         assert!(!capabilities.structured_script_payload);
         assert!(!capabilities.structured_execution_jobs);
@@ -3353,6 +3376,22 @@ mod filter_canonical_tests {
             !step.is_canonical(),
             "non-allowlisted env keys must break canonicality"
         );
+    }
+
+    #[test]
+    fn canonical_go_test_accepts_only_legacy_and_json_argv() {
+        let step = |args: &[&str]| ShellJobValidationStep {
+            name: "test".to_string(),
+            program: "go".to_string(),
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            env: Vec::new(),
+        };
+        assert!(step(&["test", "./..."]).is_canonical());
+        assert!(step(&["test", "-json", "./..."]).is_canonical());
+        assert!(!step(&["test", "-json", "./pkg"]).is_canonical());
+        assert!(!step(&["test", "-json", "-run", "TestOne", "./..."]).is_canonical());
+        assert!(!step(&["test", "-v", "./..."]).is_canonical());
+        assert!(!step(&["run", "./..."]).is_canonical());
     }
 
     #[test]

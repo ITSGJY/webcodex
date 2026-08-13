@@ -1406,6 +1406,7 @@ fn protocol_async_capability_defaults_false() {
     assert!(!capabilities.async_jobs);
     assert!(!capabilities.async_shell_jobs);
     assert!(!capabilities.structured_validation_argv);
+    assert!(!capabilities.structured_go_test_json);
 
     let request: ShellClientRegisterRequest = serde_json::from_str(
         r#"{
@@ -1419,6 +1420,7 @@ fn protocol_async_capability_defaults_false() {
     assert!(!capabilities.async_jobs);
     assert!(!capabilities.async_shell_jobs);
     assert!(!capabilities.structured_validation_argv);
+    assert!(!capabilities.structured_go_test_json);
 }
 
 #[test]
@@ -1540,6 +1542,7 @@ async fn client_supports_reflects_registered_capabilities() {
         file_read: true,
         async_shell_jobs: true,
         project_path_registration: true,
+        structured_go_test_json: true,
         ..Default::default()
     };
     registry
@@ -1574,6 +1577,10 @@ async fn client_supports_reflects_registered_capabilities() {
         .unwrap());
     assert!(registry
         .client_supports("oe", SHELL_CLIENT_CAPABILITY_PROJECT_PATH_REGISTRATION)
+        .await
+        .unwrap());
+    assert!(registry
+        .client_supports("oe", SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_JSON)
         .await
         .unwrap());
     assert!(!registry
@@ -1631,10 +1638,12 @@ async fn client_supports_recognizes_all_protocol_capability_names() {
                 persistent_shell: true,
                 ssh_persistent_shell: true,
                 structured_validation_argv: true,
+                structured_go_test_json: true,
                 structured_process_argv: true,
                 structured_script_payload: true,
                 structured_execution_jobs: true,
                 lsp_read_only_navigation: true,
+                lsp_call_hierarchy: true,
                 sandbox_inspect_commands: true,
                 project_lifecycle: true,
                 project_path_registration: true,
@@ -1908,6 +1917,15 @@ async fn register_lsp_test_client(
     client_id: &str,
     lsp_capable: bool,
 ) {
+    register_lsp_test_client_capabilities(registry, client_id, lsp_capable, lsp_capable).await;
+}
+
+async fn register_lsp_test_client_capabilities(
+    registry: &ShellClientRegistry,
+    client_id: &str,
+    lsp_capable: bool,
+    call_hierarchy_capable: bool,
+) {
     registry
         .register(ShellClientRegisterRequest {
             process_started_at: None,
@@ -1921,6 +1939,7 @@ async fn register_lsp_test_client(
             hostname: None,
             capabilities: Some(ShellClientCapabilities {
                 lsp_read_only_navigation: lsp_capable,
+                lsp_call_hierarchy: call_hierarchy_capable,
                 ..Default::default()
             }),
             projects: None,
@@ -1929,6 +1948,130 @@ async fn register_lsp_test_client(
         })
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn enqueue_call_hierarchy_uses_only_its_distinct_capability() {
+    let registry = ShellClientRegistry::default();
+    register_lsp_test_client_capabilities(&registry, "hierarchy", false, true).await;
+    let payload = AgentLspPayload {
+        project_id: "demo".to_string(),
+        request: AgentLspRequest::CallHierarchy {
+            path: "src/main.rs".to_string(),
+            line: 1,
+            column: 1,
+            direction: crate::lsp_bridge::CallHierarchyDirection::Both,
+            depth: 1,
+            limit: 50,
+        },
+    };
+    registry
+        .enqueue_lsp("hierarchy".to_string(), payload, "test".to_string(), 5)
+        .await
+        .expect("distinct call hierarchy capability should authorize enqueue");
+}
+
+#[tokio::test]
+async fn enqueue_lsp_rechecks_call_hierarchy_capability_atomically_after_downgrade() {
+    let registry = ShellClientRegistry::default();
+    register_lsp_test_client_capabilities(&registry, "hierarchy-fence", true, true).await;
+    assert!(registry
+        .client_supports(
+            "hierarchy-fence",
+            crate::shell_protocol::SHELL_CLIENT_CAPABILITY_LSP_CALL_HIERARCHY,
+        )
+        .await
+        .unwrap());
+
+    // Same instance re-registers without the hierarchy capability after an
+    // earlier observer saw it as enabled.
+    register_lsp_test_client_capabilities(&registry, "hierarchy-fence", true, false).await;
+    let error = registry
+        .enqueue_lsp(
+            "hierarchy-fence".to_string(),
+            AgentLspPayload {
+                project_id: "demo".to_string(),
+                request: AgentLspRequest::CallHierarchy {
+                    path: "src/main.rs".to_string(),
+                    line: 1,
+                    column: 1,
+                    direction: crate::lsp_bridge::CallHierarchyDirection::Both,
+                    depth: 1,
+                    limit: 50,
+                },
+            },
+            "test".to_string(),
+            5,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        EnqueueLspError::UnsupportedCapability {
+            client_id: "hierarchy-fence".to_string(),
+            capability: crate::shell_protocol::SHELL_CLIENT_CAPABILITY_LSP_CALL_HIERARCHY,
+        }
+    );
+
+    let inner = registry.inner.lock().await;
+    assert!(inner
+        .queues_by_client
+        .get("hierarchy-fence")
+        .is_none_or(|queue| queue.is_empty()));
+    assert!(inner
+        .pending_by_id
+        .values()
+        .all(|pending| pending.request.client_id != "hierarchy-fence"));
+}
+
+#[tokio::test]
+async fn enqueue_lsp_prunes_expired_shared_key_registration_before_admission() {
+    let ttl_secs = 10;
+    let registry = ShellClientRegistry::with_shared_key_limits_for_test(1, 4, ttl_secs);
+    let auth = crate::auth::shared_key::shared_key_context("ttl-lsp");
+    let mut registration = runner_registration("ttl-lsp", "inst", Vec::new());
+    registration.capabilities = Some(ShellClientCapabilities {
+        lsp_call_hierarchy: true,
+        ..Default::default()
+    });
+    registry
+        .register_with_auth(registration, Some(&auth))
+        .await
+        .unwrap();
+    registry
+        .set_last_seen_for_test(
+            "ttl-lsp",
+            now_ts() - ttl_secs - CLIENT_ONLINE_WINDOW_SECS - 10,
+        )
+        .await;
+
+    let error = registry
+        .enqueue_lsp(
+            "ttl-lsp".to_string(),
+            AgentLspPayload {
+                project_id: "demo".to_string(),
+                request: AgentLspRequest::CallHierarchy {
+                    path: "src/main.rs".to_string(),
+                    line: 1,
+                    column: 1,
+                    direction: crate::lsp_bridge::CallHierarchyDirection::Both,
+                    depth: 1,
+                    limit: 50,
+                },
+            },
+            "test".to_string(),
+            5,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        EnqueueLspError::UnknownClient {
+            client_id: "ttl-lsp".to_string(),
+        }
+    );
+    let inner = registry.inner.lock().await;
+    assert!(!inner.clients.contains_key("ttl-lsp"));
 }
 
 #[tokio::test]
@@ -1970,7 +2113,8 @@ async fn enqueue_lsp_returns_structured_unsupported_capability_error() {
     assert_eq!(
         error,
         EnqueueLspError::UnsupportedCapability {
-            client_id: "legacy".to_string()
+            client_id: "legacy".to_string(),
+            capability: crate::shell_protocol::SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
         }
     );
     assert_eq!(
