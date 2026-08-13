@@ -332,8 +332,18 @@ fn mcp_stateless_result(mut result: Value, cacheable: bool) -> Value {
 }
 
 /// MCP tools/list payload for the immutable startup-selected model surface.
+///
+/// Env adapter: resolves the `WEBCODEX_MCP_COMPACT_SCHEMAS` switch and
+/// delegates to the pure renderer.
 fn mcp_tools_list_payload(model_surface: ModelSurface) -> Value {
-    let compact = crate::config::mcp_compact_schemas_enabled();
+    mcp_tools_list_payload_with_compact(model_surface, crate::config::mcp_compact_schemas_enabled())
+}
+
+/// Pure tools/list rendering with an explicit compact switch; no env access.
+/// Production resolves the switch from the env adapter above; tests pass an
+/// explicit bool so they never need process-global env. The schema shape is
+/// identical to the adapter path: `compact` only omits `outputSchema`.
+fn mcp_tools_list_payload_with_compact(model_surface: ModelSurface, compact: bool) -> Value {
     let specs = match model_surface {
         ModelSurface::CanonicalConnector => crate::connector_runtime::surface::capability_specs(),
         ModelSurface::LocalCoding => crate::model_surface::local_coding_tool_specs(),

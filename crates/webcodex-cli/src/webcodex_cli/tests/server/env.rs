@@ -346,6 +346,10 @@ async fn agent_token_create_local_does_not_send_plaintext_token_to_server() {
     handle.join().unwrap();
 }
 
+// `WEBCODEX_ACCOUNT_CREDENTIAL` is the tested product behavior: it must stay
+// set (and serialized against other env-mutating tests) for the whole async
+// operation, so the env lock is held across the awaits by contract.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "current_thread")]
 async fn agent_token_create_local_prefers_admin_token_over_default_account_credential() {
     let _guard = env_test_guard();
@@ -387,6 +391,10 @@ async fn agent_token_create_local_prefers_admin_token_over_default_account_crede
     handle.join().unwrap();
 }
 
+// `WEBCODEX_ACCOUNT_CREDENTIAL` is the tested product behavior: it must stay
+// set (and serialized against other env-mutating tests) for the whole async
+// operation, so the env lock is held across the awaits by contract.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "current_thread")]
 async fn agent_token_create_local_uses_default_account_credential() {
     let _guard = env_test_guard();
@@ -492,6 +500,10 @@ fn server_http_proxy_validation_and_flag_conflict_are_fail_closed() {
     ));
 }
 
+// The ambient HTTP_PROXY/NO_PROXY env is the tested product behavior: it must
+// stay stable (and serialized against other env-mutating tests) for the whole
+// async operation, so the env lock is held across the awaits by contract.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "current_thread")]
 async fn default_server_http_uses_ambient_http_proxy() {
     let _guard = env_test_guard();
@@ -529,6 +541,10 @@ async fn default_server_http_uses_ambient_http_proxy() {
     handle.join().unwrap();
 }
 
+// The ambient HTTP_PROXY/NO_PROXY env is the tested product behavior: it must
+// stay stable (and serialized against other env-mutating tests) for the whole
+// async operation, so the env lock is held across the awaits by contract.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "current_thread")]
 async fn ambient_no_proxy_bypasses_system_proxy() {
     let _guard = env_test_guard();
@@ -565,6 +581,11 @@ async fn ambient_no_proxy_bypasses_system_proxy() {
     handle.join().unwrap();
 }
 
+// The ambient HTTP_PROXY/NO_PROXY env is part of the tested product behavior:
+// it must stay stable (and serialized against other env-mutating tests) for
+// the whole async operation, so the env lock is held across the awaits by
+// contract.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "current_thread")]
 async fn explicit_proxy_overrides_ambient_system_proxy() {
     let _guard = env_test_guard();
@@ -606,6 +627,11 @@ async fn explicit_proxy_overrides_ambient_system_proxy() {
     handle.join().unwrap();
 }
 
+// The ambient HTTP_PROXY/NO_PROXY env is part of the tested product behavior:
+// it must stay stable (and serialized against other env-mutating tests) for
+// the whole async operation, so the env lock is held across the awaits by
+// contract.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "current_thread")]
 async fn no_system_proxy_forces_direct_connection() {
     let _guard = env_test_guard();
@@ -646,6 +672,10 @@ async fn no_system_proxy_forces_direct_connection() {
     handle.join().unwrap();
 }
 
+// The ambient HTTP_PROXY env is part of the tested product behavior: it must
+// stay stable (and serialized against other env-mutating tests) for the whole
+// async operation, so the env lock is held across the awaits by contract.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "current_thread")]
 async fn authenticated_explicit_proxy_request_redacts_bearer_from_error() {
     let _guard = env_test_guard();

@@ -1321,19 +1321,21 @@ async fn arbitrary_shared_key_cannot_access_project_connector() {
         .send(&fixture.service)
         .await;
 
-    let conn = fixture.db.conn_for_tests();
-    let task_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM wc_tasks", [], |row| row.get(0))
-        .unwrap();
-    let execution_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM wc_executions", [], |row| row.get(0))
-        .unwrap();
-    let binding_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM wc_connector_grants", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    drop(conn);
+    // End the connection guard structurally inside the block so it is not
+    // held across the registry await below.
+    let (task_count, execution_count, binding_count) = {
+        let conn = fixture.db.conn_for_tests();
+        (
+            conn.query_row("SELECT COUNT(*) FROM wc_tasks", [], |row| row.get(0))
+                .unwrap(),
+            conn.query_row("SELECT COUNT(*) FROM wc_executions", [], |row| row.get(0))
+                .unwrap(),
+            conn.query_row("SELECT COUNT(*) FROM wc_connector_grants", [], |row| {
+                row.get(0)
+            })
+            .unwrap(),
+        )
+    };
     let pending = fixture
         .registry
         .get_client_view_for_auth(&fixture.client_id, Some(&fixture.agent_auth))
@@ -1432,24 +1434,25 @@ async fn connector_credential_cannot_cross_agent_auth_group() {
         responses.push(post_connector(&fixture, path, &wrong_project_credential, body).await);
     }
 
-    let conn = fixture.db.conn_for_tests();
-    let task_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM wc_tasks", [], |row| row.get(0))
-        .unwrap();
-    let execution_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM wc_executions", [], |row| row.get(0))
-        .unwrap();
-    let binding_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM wc_connector_grants", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    let edit_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM wc_edit_operations", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    drop(conn);
+    // End the connection guard structurally inside the block so it is not
+    // held across the registry await below.
+    let (task_count, execution_count, binding_count, edit_count) = {
+        let conn = fixture.db.conn_for_tests();
+        (
+            conn.query_row("SELECT COUNT(*) FROM wc_tasks", [], |row| row.get(0))
+                .unwrap(),
+            conn.query_row("SELECT COUNT(*) FROM wc_executions", [], |row| row.get(0))
+                .unwrap(),
+            conn.query_row("SELECT COUNT(*) FROM wc_connector_grants", [], |row| {
+                row.get(0)
+            })
+            .unwrap(),
+            conn.query_row("SELECT COUNT(*) FROM wc_edit_operations", [], |row| {
+                row.get(0)
+            })
+            .unwrap(),
+        )
+    };
     let agent = fixture
         .registry
         .get_client_view_for_auth(&fixture.client_id, Some(&fixture.agent_auth))
