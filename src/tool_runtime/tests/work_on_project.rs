@@ -261,6 +261,7 @@ fn valid_work_on_project_projection_input() -> serde_json::Value {
             "clean": true,
             "conflicts": 0,
         },
+        "workflow": crate::tool_runtime::startup_brief::builtin_coding_workflow_projection(),
         "instructions": {
             "status": "loaded",
             "sources": [],
@@ -328,14 +329,21 @@ fn work_on_project_schema_and_registration() {
     assert!(definition.creates_or_binds_session());
     assert!(!definition.requires_explicit_business_session());
 
-    // Schema requires instruction plus exactly one project source; session_id
-    // is optional with the existing wc_sess_* format constraint.
+    // Keep the model-facing schema simple enough for reliable host projection.
+    // Project-source exclusivity remains authoritative in ToolCall/runtime parsing.
     let spec = spec_named(&specs, "work_on_project");
+    assert_eq!(spec.input_schema["type"], "object");
     assert_eq!(required_fields(spec), vec!["instruction"]);
+    assert_eq!(spec.input_schema["additionalProperties"], false);
     let props = spec.input_schema["properties"].as_object().unwrap();
+    for field in ["project", "client_id", "path", "instruction", "session_id"] {
+        assert!(
+            props.contains_key(field),
+            "missing explicit {field} property"
+        );
+    }
     assert_eq!(props["project"]["minLength"], 1);
     assert_eq!(props["path"]["pattern"], "^/");
-    assert_eq!(spec.input_schema["oneOf"].as_array().unwrap().len(), 2);
     assert_eq!(props["instruction"]["minLength"], 1);
     assert_eq!(
         props["instruction"]["maxLength"],
@@ -343,6 +351,21 @@ fn work_on_project_schema_and_registration() {
     );
     assert_eq!(props["session_id"]["type"], "string");
     assert_eq!(props["session_id"]["pattern"], "^wc_sess_[A-Za-z0-9_]+$");
+    for keyword in [
+        "oneOf",
+        "anyOf",
+        "allOf",
+        "not",
+        "dependentRequired",
+        "if",
+        "then",
+        "else",
+    ] {
+        assert!(
+            spec.input_schema.get(keyword).is_none(),
+            "work_on_project model schema must not use top-level {keyword}"
+        );
+    }
     let schema_accepts = |value: Value| {
         crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
             &value,
@@ -358,14 +381,21 @@ fn work_on_project_schema_and_registration() {
         "path": "/root/git/example",
         "instruction": "do it"
     })));
-    for invalid in [
-        json!({"path": "/root/git/example", "instruction": "do it"}),
-        json!({"client_id": "special", "instruction": "do it"}),
-        json!({"project": SAMPLE_PROJECT, "client_id": "special", "path": "/root/git/example", "instruction": "do it"}),
-    ] {
+    assert!(
+        schema_accepts(json!({"instruction": "runtime must select the source"})),
+        "model schema intentionally advertises a safe source-selection superset"
+    );
+    assert!(schema_accepts(json!({
+        "project": SAMPLE_PROJECT,
+        "client_id": "special",
+        "path": "/root/git/example",
+        "instruction": "runtime must reject ambiguity"
+    })));
+    let accepted = crate::tool_runtime::registry::accepted_flattened_args_for_spec(spec);
+    for field in ["project", "client_id", "path", "instruction", "session_id"] {
         assert!(
-            !schema_accepts(invalid.clone()),
-            "work_on_project schema accepted conflicting path source: {invalid}"
+            accepted.contains(&field.to_string()),
+            "flattened Action projection missing {field}"
         );
     }
 
@@ -402,6 +432,7 @@ fn work_on_project_schema_and_registration() {
         "readiness",
         "workspace",
         "repository",
+        "workflow",
         "instructions",
         "semantic_navigation",
         "jobs",
@@ -454,15 +485,21 @@ fn work_on_project_schema_and_registration() {
 }
 
 #[test]
-fn work_on_project_tool_call_requires_project_and_instruction() {
+fn work_on_project_tool_call_enforces_authoritative_source_contract() {
     assert!(
         ToolCall::from_tool_name("work_on_project", json!({})).is_err(),
-        "project and instruction are required"
+        "project source and instruction are required"
     );
     assert!(
         ToolCall::from_tool_name("work_on_project", json!({"project": SAMPLE_PROJECT})).is_err(),
         "instruction is required"
     );
+    let project_call = ToolCall::from_tool_name(
+        "work_on_project",
+        json!({"project": SAMPLE_PROJECT, "instruction": "do it"}),
+    )
+    .unwrap();
+    assert_eq!(project_call.project(), Some(SAMPLE_PROJECT));
     let path_call = ToolCall::from_tool_name(
         "work_on_project",
         json!({
@@ -473,6 +510,19 @@ fn work_on_project_tool_call_requires_project_and_instruction() {
     )
     .unwrap();
     assert!(path_call.project().is_none());
+    for invalid in [
+        json!({"instruction": "no source"}),
+        json!({"project": SAMPLE_PROJECT, "client_id": "special", "instruction": "mixed"}),
+        json!({"project": SAMPLE_PROJECT, "path": "/root/git/example", "instruction": "mixed"}),
+        json!({"project": SAMPLE_PROJECT, "client_id": "special", "path": "/root/git/example", "instruction": "mixed"}),
+        json!({"client_id": "special", "instruction": "missing path"}),
+        json!({"path": "/root/git/example", "instruction": "missing client"}),
+    ] {
+        assert!(
+            ToolCall::from_tool_name("work_on_project", invalid.clone()).is_err(),
+            "authoritative parser accepted invalid source form: {invalid}"
+        );
+    }
     // The schema declares additionalProperties: false so advanced
     // start_coding_task controls are not part of the wrapper surface.
     let spec = registered_tool_specs()
@@ -540,6 +590,24 @@ fn work_on_project_projection_fails_closed_for_wrong_field_type() {
 }
 
 #[test]
+fn work_on_project_projection_fails_closed_for_noncanonical_workflow() {
+    let mut output = valid_work_on_project_projection_input();
+    output["workflow"]["version"] = json!(2);
+
+    let result = crate::tool_runtime::coding_task::project_work_on_project_output(
+        SAMPLE_PROJECT.to_string(),
+        output,
+    );
+    assert!(!result.success);
+    assert_eq!(
+        result.output["error_kind"],
+        "work_on_project_projection_failed"
+    );
+    assert_eq!(result.output["field"], "workflow");
+    assert_eq!(result.output["state_changed"], true);
+}
+
+#[test]
 fn work_on_project_projection_does_not_default_missing_instruction_sources() {
     let mut output = valid_work_on_project_projection_input();
     output["instructions"]
@@ -592,6 +660,11 @@ async fn work_on_project_creates_a_new_normal_session_without_binding() {
         project
     );
     assert_eq!(result.output["continuation"], "created");
+    assert_eq!(
+        result.output["workflow"],
+        crate::tool_runtime::startup_brief::builtin_coding_workflow_projection()
+    );
+    assert!(result.output["instructions"].is_object());
     for hidden in [
         "runtime_status",
         "connection_state",
@@ -1176,6 +1249,11 @@ async fn work_on_project_continues_exact_session_and_appends_instruction() {
     assert!(continued.success, "{:?}", continued.error);
     assert_eq!(continued.output["session_id"], session_id);
     assert_eq!(continued.output["continuation"], "resumed_explicitly");
+    assert_eq!(first.output["workflow"], continued.output["workflow"]);
+    assert_eq!(
+        continued.output["workflow"],
+        crate::tool_runtime::startup_brief::builtin_coding_workflow_projection()
+    );
 
     // Same single session reused: no second session, no current binding.
     assert_eq!(
@@ -1197,6 +1275,15 @@ async fn work_on_project_continues_exact_session_and_appends_instruction() {
     );
     let summary = runtime.sessions.summary(&session_id, Some(50)).unwrap();
     assert_eq!(summary.title.as_deref(), Some("root objective"));
+    assert_eq!(summary.mode, SessionMode::Normal);
+    assert!(!summary.guards.deny_write_tools);
+    assert!(!summary.guards.deny_shell_tools);
+    assert!(
+        !serde_json::to_string(&summary)
+            .unwrap()
+            .contains("webcodex.coding_workflow"),
+        "workflow projection must not become Session state"
+    );
 }
 
 #[tokio::test]

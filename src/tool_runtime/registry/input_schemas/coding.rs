@@ -48,7 +48,7 @@ pub(crate) fn start_coding_task_input_schema() -> Value {
                 "type": "string",
                 "enum": ["minimal", "standard", "full"],
                 "default": "standard",
-                "description": "Startup projection detail. minimal returns the strict model-facing session/project/workspace/blocker essentials, instruction status without rule content, and at most 3 validated project-relative exploration paths; standard is the default bounded Coding brief with repository rules, continuation evidence (including at most 12 attempt-scoped exploration paths), semantic-navigation readiness, blockers, warnings, and concrete next actions; full preserves the complete diagnostic runtime, connection, authority, binding, Git/recent-commit, rules-summary, manifest, and recommended-flow blocks and also embeds the same startup_brief core. Exploration is a read-only ledger projection and never executes tools or includes search/file/LSP content, commands/output, or absolute roots."
+                "description": "Startup projection detail. Every detail includes the bounded WebCodex built-in coding workflow separately from project instructions. minimal returns strict session/project/workspace/blocker essentials, instruction status without rule content, and at most 3 validated project-relative exploration paths; standard adds bounded repository rules, continuation evidence, semantic-navigation readiness, and actions; full preserves diagnostic runtime/authority/Git/manifest blocks and embeds the same startup_brief core."
             },
             "resume_session_id": {
                 "type": "string",
@@ -114,18 +114,18 @@ pub(crate) fn work_on_project_input_schema() -> Value {
             "project": {
                 "type": "string",
                 "minLength": 1,
-                "description": "Existing runtime project id, such as agent:<client_id>:<project_id>. Mutually exclusive with client_id + path."
+                "description": "Existing runtime project id. Use project + instruction for an existing project; do not combine project with client_id or path."
             },
             "client_id": {
                 "type": "string",
                 "minLength": 1,
-                "description": "Runner client_id that owns path. Required exactly with path."
+                "description": "Runner client_id for the path form. Use client_id + path + instruction together; do not combine with project."
             },
             "path": {
                 "type": "string",
                 "minLength": 1,
                 "pattern": "^/",
-                "description": "Existing absolute directory path on the selected Runner. The Runner authoritatively resolves or permanently registers it before exact Workflow Session handling."
+                "description": "Runner-owned absolute directory path for the path form. Use with client_id + instruction; do not combine with project. The Runner authoritatively resolves or permanently registers it before exact Workflow Session handling."
             },
             "instruction": {
                 "type": "string",
@@ -140,21 +140,6 @@ pub(crate) fn work_on_project_input_schema() -> Value {
             }
         },
         "required": ["instruction"],
-        "oneOf": [
-            {
-                "required": ["project"],
-                "not": {
-                    "anyOf": [
-                        {"required": ["client_id"]},
-                        {"required": ["path"]}
-                    ]
-                }
-            },
-            {
-                "required": ["client_id", "path"],
-                "not": {"required": ["project"]}
-            }
-        ],
         "additionalProperties": false,
     })
 }

@@ -2984,6 +2984,42 @@ async fn mcp_tools_list_exposes_coding_task_and_runtime_status_ux_flags() {
             .find(|tool| tool["name"] == name)
             .unwrap_or_else(|| panic!("missing MCP tool {name}"))
     };
+    for name in ["start_coding_task", "work_on_project"] {
+        let description = tool(name)["description"].as_str().unwrap();
+        assert!(
+            description.contains("built-in workflow guidance"),
+            "{name}: {description}"
+        );
+        assert!(
+            description.contains("project-local instructions"),
+            "{name}: {description}"
+        );
+    }
+
+    let work_schema = &tool("work_on_project")["inputSchema"];
+    let work_props = work_schema["properties"]
+        .as_object()
+        .expect("work_on_project MCP properties");
+    for field in ["project", "client_id", "path", "instruction", "session_id"] {
+        assert!(work_props.contains_key(field), "MCP schema missing {field}");
+    }
+    assert_eq!(work_schema["required"], json!(["instruction"]));
+    assert_eq!(work_schema["additionalProperties"], false);
+    for keyword in [
+        "oneOf",
+        "anyOf",
+        "allOf",
+        "not",
+        "dependentRequired",
+        "if",
+        "then",
+        "else",
+    ] {
+        assert!(
+            work_schema.get(keyword).is_none(),
+            "work_on_project MCP schema must not expose top-level {keyword}"
+        );
+    }
 
     let finish_props = tool("finish_coding_task")["inputSchema"]["properties"]
         .as_object()
@@ -3248,6 +3284,7 @@ async fn local_coding_tools_list_returns_exact_ordered_surface() {
         "read_files",
         "search_project_texts",
         "apply_text_edits",
+        "go_test",
         "finish_coding_task",
     ] {
         assert!(names.contains(&required), "missing {required}: {names:?}");
@@ -3272,6 +3309,57 @@ async fn local_coding_tools_list_returns_exact_ordered_surface() {
             !names.contains(&forbidden),
             "local_coding must not expose {forbidden}: {names:?}"
         );
+    }
+
+    let work = tools
+        .iter()
+        .find(|tool| tool["name"] == "work_on_project")
+        .expect("local_coding work_on_project");
+    let schema = &work["inputSchema"];
+    let props = schema["properties"].as_object().unwrap();
+    for field in ["project", "client_id", "path", "instruction", "session_id"] {
+        assert!(props.contains_key(field), "local_coding missing {field}");
+    }
+    assert_eq!(schema["required"], json!(["instruction"]));
+    assert_eq!(schema["additionalProperties"], false);
+    assert!(schema.get("oneOf").is_none());
+    assert!(schema.get("not").is_none());
+}
+
+#[tokio::test]
+async fn apply_text_edits_discriminated_schema_reaches_full_and_local_coding_mcp_surfaces() {
+    let expected = registered_tool_specs()
+        .into_iter()
+        .find(|spec| spec.name == "apply_text_edits")
+        .expect("apply_text_edits ToolSpec")
+        .input_schema;
+    assert_eq!(
+        expected["properties"]["changes"]["items"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+
+    for surface in [ModelSurface::FullOperatorRuntime, ModelSurface::LocalCoding] {
+        let runtime = test_runtime_with_surface(surface);
+        let outcome = handle_mcp_request(
+            &runtime,
+            rpc("tools/list", Some(Value::from(601)), json!({})),
+            None,
+        )
+        .await;
+        let value = match outcome {
+            McpOutcome::Ok(value) => value,
+            other => panic!("expected tools/list success for {surface:?}, got {other:?}"),
+        };
+        let schema = &value["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "apply_text_edits")
+            .unwrap_or_else(|| panic!("missing apply_text_edits on {surface:?}"))["inputSchema"];
+        assert_eq!(schema, &expected, "schema drift on {surface:?}");
     }
 }
 

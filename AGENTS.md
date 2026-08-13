@@ -33,6 +33,11 @@ Product direction: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - If guidance conflicts with current code or repository conventions, make the smallest adjustment that still satisfies the task.
 - Do not knowingly create a bug, inconsistent state, resource leak, compatibility hazard, or false validation result.
 - Prefer the smallest coherent change. Follow existing architecture and naming; avoid speculative compatibility, duplicate representations, unrelated cleanup, and broad refactors without a named current need.
+- For explicit cross-layer feature work, map the complete authoritative vertical slice before editing and close the existing architecture end to end before local hardening.
+- Minimize new concepts rather than the number of touched files. A coherent vertical slice may update several existing layers when each is part of the same current capability.
+- Use compiler, type, schema, and exhaustiveness failures to find missing enum, registry, adapter, and projection closure before broadening validation.
+- After focused tests pass, perform a separate completeness audit and then a trust/bounds/privacy/replay audit before considering the implementation finished.
+- Implementation ownership and independent adversarial review are separate passes. In an implementation-owner pass, prioritize a complete authoritative vertical slice and strong first delivery within the current contract; resolve known correctness issues, but do not fragment the implementation around speculative reviewer concerns. A later review pass independently challenges the resulting design and implementation.
 - Keep only the interfaces actually affected by the change consistent. Do not touch or revalidate unrelated projections merely because they exist.
 - Add focused tests for changed behavior when practical. Update documentation when public behavior or operations change.
 - Ask only when required information cannot be discovered, instructions materially conflict, or proceeding could destroy work. Otherwise continue and report any material deviation.
@@ -59,6 +64,9 @@ Testing guidance: [`docs/TESTING.md`](docs/TESTING.md).
 - Do not weaken meaningful authentication, authorization, validation, schemas, sandboxing, or tests merely to obtain a green result.
 - Do not force-push, move published tags, overwrite releases, destructively reset other work, or rewrite published history without an explicit request naming the operation and target.
 - Push, publish, tag, release, deploy, restart services, or alter external systems only when the task explicitly includes it and identifies the destination.
+- An explicit development/dogfood deployment of a reviewed commit to named targets is not a release rollout. It may install and restart that exact development build without a version bump, Git tag, GitHub Release, npm publication, or release-artifact preparation.
+- For a development/dogfood deployment, change only the named targets, record the requested source commit and the existing build identity (`git_commit`, `git_dirty`, `built_at`), never hide dirty build state, preserve a rollback path, and run focused post-deployment smoke.
+- Release or publication rollouts still follow the immutable version/tag/artifact contract in the release guidance below.
 - Review status and diff before committing. Do not mix unrelated work or amend an unrelated commit.
 
 Release guidance: [`docs/agent/release-process.md`](docs/agent/release-process.md) and [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md).

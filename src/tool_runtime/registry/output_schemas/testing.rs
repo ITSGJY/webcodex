@@ -6,7 +6,7 @@ use super::common::{
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
-        "cargo_fmt" | "cargo_check" | "cargo_test" => Some(cargo_output_schema(name)),
+        "cargo_fmt" | "cargo_check" | "cargo_test" | "go_test" => Some(cargo_output_schema(name)),
         _ => None,
     }
 }
@@ -14,7 +14,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
 fn cargo_output_schema(tool_name: &str) -> Value {
     let mut fields = vec![
             ("project", schema_type("string", "Runtime project id.")),
-            ("command_summary", schema_type("string", "Bounded Cargo command summary.")),
+            ("command_summary", schema_type("string", "Bounded structured validation command summary.")),
             ("shell", schema_type("string", "Executor command mode.")),
             ("executor", schema_type("string", "local or agent executor.")),
             (
@@ -23,7 +23,7 @@ fn cargo_output_schema(tool_name: &str) -> Value {
             ),
             (
                 "exit_code",
-                nullable_schema("integer", "Cargo command exit code."),
+                nullable_schema("integer", "Validation command exit code."),
             ),
             (
                 "duration_ms",
@@ -57,7 +57,7 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                 "failure_kind",
                 schema_type(
                     "string",
-                    "Stable failure kind. Non-zero cargo_fmt, cargo_check, and cargo_test command exits use validation_failed; outcome_unknown, pre-start rejection, guard denial, timeout, and runtime errors remain distinct.",
+                    "Stable failure kind. Non-zero cargo_fmt, cargo_check, cargo_test, and go_test command exits use validation_failed; outcome_unknown, pre-start rejection, guard denial, timeout, and runtime errors remain distinct.",
                 ),
             ),
             (
@@ -70,11 +70,11 @@ fn cargo_output_schema(tool_name: &str) -> Value {
             ),
             (
                 "tests_passed",
-                nullable_schema("integer", "Parsed passed test count for cargo_test."),
+                nullable_schema("integer", "Parsed passed test count for structured test validation."),
             ),
             (
                 "tests_failed",
-                nullable_schema("integer", "Parsed failed test count for cargo_test."),
+                nullable_schema("integer", "Parsed failed test count for structured test validation."),
             ),
             (
                 "execution_source",
@@ -95,6 +95,14 @@ fn cargo_output_schema(tool_name: &str) -> Value {
             (
                 "job_status",
                 nullable_schema("string", "Job status when the validation continues as a Job."),
+            ),
+            (
+                "observation_token",
+                json!({
+                    "type": "string",
+                    "maxLength": crate::job_observation::MAX_JOB_OBSERVATION_TOKEN_LEN,
+                    "description": "Current opaque observation token for the exact public Job snapshot returned by a promoted validation handoff."
+                }),
             ),
             (
                 "promoted_to_job",
@@ -121,35 +129,35 @@ fn cargo_output_schema(tool_name: &str) -> Value {
             ("session_hint", session_hint_schema()),
             ("permission", permission_decision_schema()),
     ];
-    if matches!(tool_name, "cargo_check" | "cargo_test") {
+    if matches!(tool_name, "cargo_check" | "cargo_test" | "go_test") {
         fields.push((
             "diagnostics",
             cargo_test_diagnostics_schema(
-                "Deterministic structured validation evidence extracted from bounded Cargo output.",
+                "Deterministic structured validation evidence extracted from bounded validation output.",
             ),
         ));
     }
-    if tool_name == "cargo_test" {
+    if matches!(tool_name, "cargo_test" | "go_test") {
         fields.extend([
             (
                 "tests_detected",
                 schema_type(
                     "boolean",
-                    "Whether cargo_test parsed at least one Rust test harness running N test(s) section.",
+                    "Whether structured test output proved at least one test result/count section.",
                 ),
             ),
             (
                 "tests_run_count",
                 nullable_schema(
                     "integer",
-                    "Total tests from all parsed cargo_test Rust test harness running N test(s) sections.",
+                    "Total tests represented by the structured test evidence.",
                 ),
             ),
             (
                 "zero_tests_run",
                 nullable_schema(
                     "boolean",
-                    "True when cargo_test parsed test harness sections and their summed tests_run_count is zero.",
+                    "True when structured test evidence is available and its tests_run_count is zero.",
                 ),
             ),
         ]);
@@ -187,7 +195,7 @@ fn cargo_output_schema(tool_name: &str) -> Value {
         "cargo_check" => {
             terminal_required.extend(["warnings_count", "errors_count", "diagnostics"])
         }
-        "cargo_test" => terminal_required.extend([
+        "cargo_test" | "go_test" => terminal_required.extend([
             "tests_detected",
             "tests_run_count",
             "tests_passed",
@@ -238,7 +246,7 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                             "project", "command_summary", "cwd", "shell", "executor",
                             "execution_source", "purpose", "promoted_to_job", "terminal",
                             "command_started", "command_completed", "execution_state", "job_id",
-                            "job_status", "effective_timeout_secs", "sync_wait_secs",
+                            "job_status", "observation_token", "effective_timeout_secs", "sync_wait_secs",
                             "stdout_tail", "stderr_tail", "stdout_lines", "stderr_lines",
                             "stdout_truncated", "stderr_truncated"
                         ],
@@ -249,6 +257,7 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                             "execution_state": {"enum": ["queued", "running"]},
                             "job_id": {"type": "string", "minLength": 1},
                             "job_status": {"type": "string", "minLength": 1},
+                            "observation_token": {"type": "string", "minLength": 1, "maxLength": crate::job_observation::MAX_JOB_OBSERVATION_TOKEN_LEN},
                             "passed": {"enum": []},
                             "failure_kind": {"enum": []},
                             "warnings_count": {"enum": []},
@@ -278,7 +287,8 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                             "passed": {"const": true},
                             "failure_kind": {"enum": []},
                             "job_id": {"enum": []},
-                            "job_status": {"enum": []}
+                            "job_status": {"enum": []},
+                            "observation_token": {"enum": []}
                         }
                     }
                 }
@@ -299,7 +309,8 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                             "passed": {"const": false},
                             "failure_kind": {"const": "timeout"},
                             "job_id": {"enum": []},
-                            "job_status": {"enum": []}
+                            "job_status": {"enum": []},
+                            "observation_token": {"enum": []}
                         }
                     }
                 }
@@ -320,7 +331,8 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                             "passed": {"const": false},
                             "failure_kind": {"const": "outcome_unknown"},
                             "job_id": {"enum": []},
-                            "job_status": {"enum": []}
+                            "job_status": {"enum": []},
+                            "observation_token": {"enum": []}
                         }
                     }
                 }
@@ -341,7 +353,8 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                             "passed": {"const": false},
                             "failure_kind": {"enum": ["permission_denied", "project_not_found", "cwd_invalid", "sandbox_unavailable", "executor_unavailable"]},
                             "job_id": {"enum": []},
-                            "job_status": {"enum": []}
+                            "job_status": {"enum": []},
+                            "observation_token": {"enum": []}
                         }
                     }
                 }
@@ -362,7 +375,8 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                             "passed": {"const": false},
                             "failure_kind": {"enum": ["validation_failed", "process_exit"]},
                             "job_id": {"enum": []},
-                            "job_status": {"enum": []}
+                            "job_status": {"enum": []},
+                            "observation_token": {"enum": []}
                         }
                     }
                 }
@@ -380,6 +394,7 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                             "failure_kind": {"enum": ["invalid_arguments", "capability_unavailable", "permission_denied", "project_not_found", "cwd_invalid", "sandbox_unavailable", "executor_unavailable"]},
                             "job_id": {"enum": []},
                             "job_status": {"enum": []},
+                            "observation_token": {"enum": []},
                             "passed": {"enum": []},
                             "promoted_to_job": {"enum": []},
                             "terminal": {"enum": []}
@@ -419,7 +434,7 @@ fn cargo_test_diagnostics_schema(description: &str) -> Value {
                 "type": "array",
                 "maxItems": 20,
                 "items": cargo_diagnostic_schema(),
-                "description": "Bounded sorted, deduplicated rustc diagnostics from the captured excerpt."
+                "description": "Bounded sorted, deduplicated compiler diagnostics when the validation parser provides them."
             },
             "returned_diagnostic_count": {
                 "type": "integer",
@@ -437,7 +452,7 @@ fn cargo_test_diagnostics_schema(description: &str) -> Value {
             },
             "test_summary": {
                 "type": "object",
-                "description": "Aggregated cargo test result summary counts across all harnesses in the bounded tails.",
+                "description": "Aggregated structured test result summary counts from bounded validation evidence.",
                 "properties": {
                     "passed": nullable_schema("integer", "Aggregated passed test count."),
                     "failed": nullable_schema("integer", "Aggregated failed test count."),
