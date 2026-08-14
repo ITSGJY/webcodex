@@ -2229,6 +2229,25 @@ fn wait_for_job_stdout(rx: &mut tokio::sync::mpsc::Receiver<AgentEnvelope>) -> S
     panic!("timed out waiting for job completion; stdout so far: {stdout:?}");
 }
 
+fn wait_for_job_envelope(
+    rx: &mut tokio::sync::mpsc::Receiver<AgentEnvelope>,
+    message: &str,
+) -> AgentEnvelope {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match rx.try_recv() {
+            Ok(envelope) => return envelope,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => panic!("{message}"),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                panic!("{message}: channel disconnected")
+            }
+        }
+    }
+}
+
 fn file_read_request(
     cwd: &Path,
     path: &str,
@@ -2595,6 +2614,96 @@ fn json_file_op_request(
         job_context: None,
         persistent_shell: None,
     }
+}
+
+#[test]
+fn structured_delete_project_files_is_os_neutral_file_only_and_bounded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    std::fs::write(tmp.path().join("delete-me.txt"), "content").unwrap();
+
+    let request = json_file_op_request(
+        tmp.path(),
+        "file_delete_project_files",
+        ".",
+        serde_json::json!({"paths": ["delete-me.txt", "missing.txt"]}),
+    );
+    assert!(request.command.is_empty());
+    let result = handle_file_request(&policy, &request);
+    assert_eq!(result.exit_code, Some(0), "{:?}", result.error);
+    assert!(!tmp.path().join("delete-me.txt").exists());
+    let output: serde_json::Value =
+        serde_json::from_str(result.stdout.as_deref().expect("structured JSON result")).unwrap();
+    assert_eq!(
+        output["deleted_paths"],
+        serde_json::json!(["delete-me.txt", "missing.txt"])
+    );
+    assert_eq!(output["missing_paths"], serde_json::json!([]));
+    assert_eq!(output["refused_paths"], serde_json::json!([]));
+
+    std::fs::create_dir(tmp.path().join("directory-target")).unwrap();
+    let directory = json_file_op_request(
+        tmp.path(),
+        "file_delete_project_files",
+        ".",
+        serde_json::json!({"paths": ["directory-target"]}),
+    );
+    let result = handle_file_request(&policy, &directory);
+    assert_eq!(
+        result.error.as_deref(),
+        Some("delete_project_files refuses directory targets")
+    );
+    assert!(tmp.path().join("directory-target").is_dir());
+
+    for path in [".", "../escape", ".env", "target/cache"] {
+        let refused = json_file_op_request(
+            tmp.path(),
+            "file_delete_project_files",
+            ".",
+            serde_json::json!({"paths": [path]}),
+        );
+        let result = handle_file_request(&policy, &refused);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("delete_project_files request contains a refused path"),
+            "{path}"
+        );
+    }
+
+    let too_many = (0..65)
+        .map(|index| format!("file-{index}.txt"))
+        .collect::<Vec<_>>();
+    let request = json_file_op_request(
+        tmp.path(),
+        "file_delete_project_files",
+        ".",
+        serde_json::json!({"paths": too_many}),
+    );
+    let result = handle_file_request(&policy, &request);
+    assert_eq!(
+        result.error.as_deref(),
+        Some("delete_project_files request contains a refused path")
+    );
+}
+
+#[test]
+fn structured_delete_project_files_errors_do_not_leak_absolute_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    let absolute = tmp.path().join("secret.txt").to_string_lossy().to_string();
+    let request = json_file_op_request(
+        tmp.path(),
+        "file_delete_project_files",
+        ".",
+        serde_json::json!({"paths": [absolute]}),
+    );
+    let result = handle_file_request(&policy, &request);
+    let error = result.error.expect("absolute path must be rejected");
+    assert_eq!(
+        error,
+        "delete_project_files request contains a refused path"
+    );
+    assert!(!error.contains(&tmp.path().to_string_lossy().to_string()));
 }
 
 fn fake_zip_eocd_with_entries(entries: u16) -> Vec<u8> {
@@ -6048,6 +6157,8 @@ fn register_request_announces_correct_protocol_version() {
         let body = build_register_request(&cfg, Vec::new(), version, "inst-1", 0);
         let caps = body.capabilities.as_ref().expect("transport capabilities");
         assert!(caps.structured_go_test_tool, "{expected_str}");
+        assert!(caps.structured_go_test_packages, "{expected_str}");
+        assert!(caps.structured_file_delete, "{expected_str}");
         assert_eq!(body.agent_instance_id, "inst-1");
         assert_eq!(
             body.agent_protocol_version.as_deref(),
@@ -6068,11 +6179,13 @@ fn register_request_announces_correct_protocol_version() {
     assert!(caps.shell);
     assert!(caps.file_read);
     assert!(caps.file_write);
+    assert!(caps.structured_file_delete);
     assert!(caps.async_jobs);
     assert!(caps.async_shell_jobs);
     assert!(caps.structured_validation_argv);
     assert!(caps.structured_go_test_json);
     assert!(caps.structured_go_test_tool);
+    assert!(caps.structured_go_test_packages);
     assert!(caps.structured_process_argv);
     assert!(caps.structured_script_payload);
     assert!(caps.structured_execution_jobs);
@@ -6318,6 +6431,54 @@ fn sink_send_job_update_sends_job_update_envelope() {
     }
 }
 
+#[test]
+fn sink_try_send_job_update_preserves_full_ws_and_quic_queue_for_retry() {
+    for label in ["ws", "quic"] {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(AgentEnvelope::Ping { ts: 11 }).unwrap();
+        let sink = match label {
+            "ws" => AgentSink::WebSocket {
+                tx,
+                client_id: "stream-client".to_string(),
+                agent_instance_id: "stream-instance".to_string(),
+            },
+            "quic" => AgentSink::Quic {
+                tx,
+                client_id: "stream-client".to_string(),
+                agent_instance_id: "stream-instance".to_string(),
+            },
+            _ => unreachable!(),
+        };
+        let body = ShellAgentJobUpdateRequest {
+            client_id: "stream-client".to_string(),
+            agent_instance_id: "stream-instance".to_string(),
+            job_id: "job-full".to_string(),
+            request_id: Some("request-full".to_string()),
+            update_seq: Some(2),
+            status: "running".to_string(),
+            stdout_chunk: None,
+            stderr_chunk: None,
+            stdout_tail: None,
+            stderr_tail: None,
+            log_snapshot: None,
+            exit_code: None,
+            duration_ms: None,
+            error: None,
+            command_execution_state: None,
+            validation_progress: None,
+            finished: false,
+        };
+
+        assert_eq!(sink.try_send_job_update(&body), Ok(false), "{label}");
+        assert!(matches!(rx.try_recv(), Ok(AgentEnvelope::Ping { ts: 11 })));
+        assert_eq!(sink.try_send_job_update(&body), Ok(true), "{label}");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AgentEnvelope::JobUpdate { payload }) if payload.job_id == "job-full"
+        ));
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
@@ -6389,7 +6550,7 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
             request,
         },
     );
-    match rx.try_recv().expect("queued status was sent") {
+    match wait_for_job_envelope(&mut rx, "queued status was sent") {
         AgentEnvelope::JobUpdate { payload } => {
             assert_eq!(payload.job_id, "queued-job");
             assert_eq!(payload.status, "agent_queued");
@@ -6424,7 +6585,7 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
     assert!(jobs.queued.lock().unwrap().is_empty());
     let rejected = (0..2)
         .find_map(
-            |_| match rejected_rx.try_recv().expect("shutdown update was sent") {
+            |_| match wait_for_job_envelope(&mut rejected_rx, "shutdown update was sent") {
                 AgentEnvelope::JobUpdate { payload } if payload.finished => Some(payload),
                 AgentEnvelope::JobUpdate { .. } => None,
                 other => panic!("expected job_update, got {:?}", other.kind()),
@@ -6444,6 +6605,7 @@ fn file_request_kind_includes_edit_and_basic_ops() {
         "file_write",
         "file_list",
         "file_project_overview",
+        "file_delete_project_files",
         "file_write_project_file",
         "file_apply_text_edits",
     ] {

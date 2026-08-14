@@ -4,7 +4,9 @@ use super::super::*;
 use super::support::*;
 use crate::auth::AuthContext;
 use crate::shell_protocol::ShellClientCapabilities;
-use crate::tool_runtime::handoff::apply_compact_workflow_outcomes;
+use crate::tool_runtime::handoff::{
+    apply_compact_workflow_outcomes, VALIDATION_IDENTITY_REUSE_ACTION,
+};
 use crate::tool_runtime::kernel::{ToolCallContext, ToolCallRequest, ToolTransport};
 use crate::tool_runtime::sessions::SessionTransport;
 use crate::tool_runtime::validation_events::validation_summary_for_session;
@@ -37,7 +39,7 @@ fn closeout_projection_classifies_workspace_conflicts_as_hard_blockers() {
         "suggested_next_actions": []
     });
 
-    apply_compact_workflow_outcomes(&mut output, true, None, 0);
+    apply_compact_workflow_outcomes(&mut output, true, None);
 
     assert!(output["hard_blockers"]
         .as_array()
@@ -380,7 +382,7 @@ async fn expected_stop_job_failures_are_classified_without_permission_noise() {
 }
 
 #[tokio::test]
-async fn unexpected_failure_remains_actionable_in_handoff() {
+async fn failure_history_read_only_failure_is_non_actionable_in_handoff() {
     let runtime = test_runtime();
     let session = runtime
         .sessions
@@ -401,11 +403,24 @@ async fn unexpected_failure_remains_actionable_in_handoff() {
     assert!(handoff.success, "{:?}", handoff.error);
     assert_eq!(handoff.output["tool_failures"]["unexpected_count"], 1);
     assert_eq!(
+        handoff.output["tool_failures"]["historical_non_actionable_count"],
+        1
+    );
+    assert_eq!(
+        handoff.output["tool_failures"]["actionable_unexpected_count"],
+        0
+    );
+    assert_eq!(
         handoff.output["unexpected_failed_tool_calls"][0]["tool_name"],
         "job_status"
     );
+    assert_reason_list_not_contains(
+        &handoff.output["verdict"],
+        "blocking_reasons",
+        "unexpected_tool_failures",
+    );
     let actions = handoff.output["suggested_next_actions"].as_array().unwrap();
-    assert!(actions.iter().any(|action| {
+    assert!(!actions.iter().any(|action| {
         action.as_str().unwrap_or("") == "review unexpected failed tool calls before proceeding"
     }));
 }
@@ -450,6 +465,8 @@ async fn expectation_mismatch_and_unexpected_success_are_visible() {
         handoff.output["tool_failures"]["expectation_mismatch_count"],
         1
     );
+    assert_eq!(handoff.output["evidence_integrity"]["status"], "error");
+    assert_eq!(handoff.output["task_outcome"]["blocking"], true);
     assert_eq!(
         handoff.output["expectation_mismatches"][0]["actual_failure_kind"],
         "confirmation_required"
@@ -727,6 +744,14 @@ async fn direct_typed_dispatch_preserves_failure_expectation_metadata() {
     assert_eq!(handoff.output["tool_failures"]["expected_count"], 0);
     assert_eq!(handoff.output["tool_failures"]["unexpected_count"], 1);
     assert_eq!(
+        handoff.output["tool_failures"]["historical_non_actionable_count"],
+        1
+    );
+    assert_eq!(
+        handoff.output["tool_failures"]["actionable_unexpected_count"],
+        0
+    );
+    assert_eq!(
         handoff.output["tool_failures"]["expectation_mismatch_count"],
         1
     );
@@ -735,7 +760,7 @@ async fn direct_typed_dispatch_preserves_failure_expectation_metadata() {
         1
     );
     let actions = handoff.output["suggested_next_actions"].as_array().unwrap();
-    assert!(actions.iter().any(|action| {
+    assert!(!actions.iter().any(|action| {
         action.as_str().unwrap_or("") == "review unexpected failed tool calls before proceeding"
     }));
     assert!(actions.iter().any(|action| {
@@ -746,7 +771,7 @@ async fn direct_typed_dispatch_preserves_failure_expectation_metadata() {
             == "review expected-failure assertions that unexpectedly succeeded"
     }));
     assert_eq!(handoff.output["verdict"]["status"], "fail");
-    assert_reason_list_contains(
+    assert_reason_list_not_contains(
         &handoff.output["verdict"],
         "blocking_reasons",
         "unexpected_tool_failures",
@@ -2178,6 +2203,89 @@ async fn session_handoff_does_not_resolve_a_different_validation_identity() {
     assert_eq!(verdict["status"], "fail");
     assert_eq!(verdict["blocking"], true);
     assert_reason_list_contains(verdict, "blocking_reasons", "validation_mixed");
+    assert_action_list_contains(
+        &result.output["suggested_next_actions"],
+        VALIDATION_IDENTITY_REUSE_ACTION,
+    );
+}
+
+#[tokio::test]
+async fn session_handoff_command_derived_unresolved_does_not_claim_original_assertion_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "hello\n", "initial");
+    let runtime = test_runtime();
+    let project = register_agent_project_at_path(
+        &runtime,
+        "handoff-command-derived-unresolved",
+        "demo",
+        tmp.path(),
+    )
+    .await;
+    let session = runtime.sessions.start_session(
+        Some(project.clone()),
+        Some("command-derived unresolved handoff".to_string()),
+    );
+    let sid = session.session_id.clone();
+
+    // No assertion_name anywhere: the validation identity is command-derived
+    // (purpose + normalized command), so no original assertion_name exists to
+    // reuse when rerunning it.
+    record_handoff_tool_event(
+        &runtime,
+        &sid,
+        "cargo_test",
+        json!({"project": project.clone()}),
+        false,
+        json!({
+            "exit_code": 101,
+            "failure_kind": "validation_failed"
+        }),
+    );
+    record_handoff_tool_event(
+        &runtime,
+        &sid,
+        "cargo_check",
+        json!({"project": project}),
+        true,
+        json!({"exit_code": 0}),
+    );
+
+    let result = dispatch_handoff_summary_only_with_agent(
+        &runtime,
+        "handoff-command-derived-unresolved",
+        sid,
+        Some(project),
+        true,
+        false,
+    )
+    .await;
+
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["validation"]["status"], "mixed");
+    assert_eq!(
+        result.output["validation"]["historical_failures"]["unresolved"],
+        true
+    );
+    // The unresolved command-derived failure still gets actionable
+    // validation-identity reuse guidance...
+    assert_action_list_contains(
+        &result.output["suggested_next_actions"],
+        VALIDATION_IDENTITY_REUSE_ACTION,
+    );
+    // ...but it must never claim an original assertion_name exists.
+    for actions in [
+        &result.output["suggested_next_actions"],
+        &result.output["verdict"]["suggested_next_actions"],
+    ] {
+        for action in actions.as_array().unwrap() {
+            let action = action.as_str().unwrap_or_default();
+            assert!(
+                !action.contains("with its original assertion_name"),
+                "guidance falsely claims an original assertion_name: {action}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -2242,6 +2350,14 @@ async fn session_handoff_summary_only_passes_with_resolved_unexpected_cargo_test
     assert_eq!(result.output["workspace_clean"], true);
     assert_eq!(result.output["hygiene_clean"], true);
     assert_eq!(result.output["tool_failures"]["unexpected_count"], 1);
+    assert_eq!(
+        result.output["tool_failures"]["historical_non_actionable_count"],
+        1
+    );
+    assert_eq!(
+        result.output["tool_failures"]["actionable_unexpected_count"],
+        0
+    );
     assert_eq!(result.output["validation"]["latest_status"], "passed");
     assert_eq!(
         result.output["validation"]["historical_failures"]["resolved"],
@@ -2284,6 +2400,14 @@ async fn session_handoff_summary_only_passes_with_resolved_unexpected_cargo_test
     assert_action_list_not_contains(
         &result.output["verdict"]["suggested_next_actions"],
         "review unexpected failed tool calls before proceeding",
+    );
+    assert_action_list_not_contains(
+        &result.output["suggested_next_actions"],
+        VALIDATION_IDENTITY_REUSE_ACTION,
+    );
+    assert_action_list_not_contains(
+        &result.output["verdict"]["suggested_next_actions"],
+        VALIDATION_IDENTITY_REUSE_ACTION,
     );
     assert_eq!(full.output["task_outcome"], result.output["task_outcome"]);
     assert_eq!(full.output["verdict"], result.output["verdict"]);

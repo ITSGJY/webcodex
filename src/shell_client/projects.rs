@@ -12,7 +12,9 @@ use crate::shell_protocol::{
     SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS, SHELL_CLIENT_CAPABILITY_SHELL,
     SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL, SHELL_CLIENT_CAPABILITY_SSH_SHELL,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_EXECUTION_JOBS,
+    SHELL_CLIENT_CAPABILITY_STRUCTURED_FILE_DELETE,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_JSON,
+    SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_PACKAGES,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_TOOL,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_PROCESS_ARGV,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD,
@@ -42,6 +44,7 @@ pub(super) fn capability_enabled(caps: &ShellClientCapabilities, capability: &st
         SHELL_CLIENT_CAPABILITY_SHELL => caps.shell,
         SHELL_CLIENT_CAPABILITY_FILE_READ => caps.file_read,
         SHELL_CLIENT_CAPABILITY_FILE_WRITE => caps.file_write,
+        SHELL_CLIENT_CAPABILITY_STRUCTURED_FILE_DELETE => caps.structured_file_delete,
         SHELL_CLIENT_CAPABILITY_GIT => caps.git,
         SHELL_CLIENT_CAPABILITY_JOBS => caps.jobs,
         SHELL_CLIENT_CAPABILITY_ASYNC_JOBS => caps.async_jobs,
@@ -52,6 +55,7 @@ pub(super) fn capability_enabled(caps: &ShellClientCapabilities, capability: &st
         SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV => caps.structured_validation_argv,
         SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_JSON => caps.structured_go_test_json,
         SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_TOOL => caps.structured_go_test_tool,
+        SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_PACKAGES => caps.structured_go_test_packages,
         SHELL_CLIENT_CAPABILITY_STRUCTURED_PROCESS_ARGV => caps.structured_process_argv,
         SHELL_CLIENT_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD => caps.structured_script_payload,
         SHELL_CLIENT_CAPABILITY_STRUCTURED_EXECUTION_JOBS => caps.structured_execution_jobs,
@@ -99,6 +103,7 @@ impl ShellClientRegistry {
 
     /// Check whether a registered agent client supports a named capability.
     /// Recognized capability names: `shell`, `file_read`, `file_write`,
+    /// `structured_file_delete`,
     /// `git`, `jobs`, `async_jobs`, `async_shell_jobs`,
     /// `ssh_shell`, `persistent_shell`, `structured_validation_argv`,
     /// `structured_go_test_json`, `structured_go_test_tool`,

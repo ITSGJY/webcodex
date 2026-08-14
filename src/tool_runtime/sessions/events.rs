@@ -252,6 +252,15 @@ pub(super) fn tool_failure_event_summary(event: &SessionEvent) -> Value {
     })
 }
 
+pub(super) fn sanitize_tool_execution_state(value: &str) -> Option<String> {
+    match value.trim() {
+        "not_started" | "started" | "outcome_unknown" | "completed" | "cancelled" | "timed_out" => {
+            Some(value.trim().to_string())
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SessionToolClassification {
     pub(crate) risk_class: &'static str,
@@ -426,6 +435,9 @@ pub(crate) fn session_input_summary_for_tool(tool_name: &str, arguments: &Value)
         "run_shell" | "run_job" | "session_shell_exec" => {
             object.remove("command");
             object.remove("command_summary");
+        }
+        "git_diff_hunks" => {
+            object.remove("continuation");
         }
         "observe_jobs" => {
             if let Some(items) = object.get_mut("items").and_then(Value::as_array_mut) {

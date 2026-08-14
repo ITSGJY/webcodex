@@ -78,6 +78,13 @@ pub const RUST_TEST_FILTER_MAX_BYTES: usize = 200;
 /// `-p`). Matches the `is_canonical` per-argument bound.
 pub const CARGO_VALUE_MAX_BYTES: usize = 500;
 
+/// Maximum number of project-relative package patterns accepted by the
+/// first-class focused `go_test` validation tool.
+pub const GO_TEST_PACKAGE_MAX_ITEMS: usize = 8;
+
+/// Maximum byte length of one focused `go_test` package pattern.
+pub const GO_TEST_PACKAGE_MAX_BYTES: usize = 256;
+
 /// Protocol version announced by `webcodex-runner` builds that connect over
 /// WebSocket. Kept in the shared protocol module so both the server and the
 /// agent binary reference the same literal.
@@ -97,6 +104,10 @@ pub const AGENT_QUIC_ALPN_V1: &str = "webcodex-runner/1";
 pub const SHELL_CLIENT_CAPABILITY_SHELL: &str = "shell";
 pub const SHELL_CLIENT_CAPABILITY_FILE_READ: &str = "file_read";
 pub const SHELL_CLIENT_CAPABILITY_FILE_WRITE: &str = "file_write";
+/// The Runner implements bounded, project-root-enforced structured file deletion.
+/// Missing on older Runners and false; never inferred from file_write, shell,
+/// protocol version, transport, or operating system.
+pub const SHELL_CLIENT_CAPABILITY_STRUCTURED_FILE_DELETE: &str = "structured_file_delete";
 pub const SHELL_CLIENT_CAPABILITY_GIT: &str = "git";
 pub const SHELL_CLIENT_CAPABILITY_JOBS: &str = "jobs";
 pub const SHELL_CLIENT_CAPABILITY_ASYNC_JOBS: &str = "async_jobs";
@@ -115,9 +126,9 @@ pub const SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL: &str = "persistent_shell";
 /// must reject the request rather than silently opening a local shell.
 pub const SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL: &str = "ssh_persistent_shell";
 pub const SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV: &str = "structured_validation_argv";
-/// The Runner accepts the canonical machine-readable Go validation argv
-/// `go test -json ./...`. Missing on older Runners and never inferred from
-/// generic structured validation support.
+/// The Runner accepts the canonical machine-readable `go test -json` validation
+/// shape. Older implementations may support only the historical fixed `./...`
+/// scope; expanded caller-selected packages are fenced separately.
 pub const SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_JSON: &str = "structured_go_test_json";
 /// The Runner understands the first-class model-facing `go_test` tool identity
 /// and its durable `ShellJobValidationMetadata` contract. This is deliberately
@@ -125,6 +136,11 @@ pub const SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_JSON: &str = "structured_go
 /// `structured_go_test_json` for Connector validation without understanding
 /// first-class `validation.tool = "go_test"` metadata.
 pub const SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_TOOL: &str = "structured_go_test_tool";
+/// The Runner accepts the expanded first-class `go_test` argv shape with
+/// caller-selected bounded project-relative package patterns. Older Runners
+/// already advertised the JSON/tool capabilities for fixed `./...`, so this
+/// must remain a separate additive rolling-upgrade fence.
+pub const SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_PACKAGES: &str = "structured_go_test_packages";
 /// General model-facing native process execution with a typed executable and
 /// argv. This is deliberately independent from structured Cargo validation:
 /// older Runners may support validation argv without accepting arbitrary
@@ -161,6 +177,7 @@ pub const SHELL_CLIENT_CAPABILITY_NAMES: &[&str] = &[
     SHELL_CLIENT_CAPABILITY_SHELL,
     SHELL_CLIENT_CAPABILITY_FILE_READ,
     SHELL_CLIENT_CAPABILITY_FILE_WRITE,
+    SHELL_CLIENT_CAPABILITY_STRUCTURED_FILE_DELETE,
     SHELL_CLIENT_CAPABILITY_GIT,
     SHELL_CLIENT_CAPABILITY_JOBS,
     SHELL_CLIENT_CAPABILITY_ASYNC_JOBS,
@@ -171,6 +188,7 @@ pub const SHELL_CLIENT_CAPABILITY_NAMES: &[&str] = &[
     SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_JSON,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_TOOL,
+    SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_PACKAGES,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_PROCESS_ARGV,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_EXECUTION_JOBS,
@@ -208,6 +226,10 @@ pub struct ShellClientCapabilities {
     pub file_read: bool,
     #[serde(default)]
     pub file_write: bool,
+    /// Bounded structured file deletion with Runner-authoritative project-root
+    /// containment and file-only semantics. Missing on older Runners is false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub structured_file_delete: bool,
     #[serde(default)]
     pub git: bool,
     #[serde(default)]
@@ -233,9 +255,9 @@ pub struct ShellClientCapabilities {
     /// Missing on older agents and therefore fail-closed.
     #[serde(default)]
     pub structured_validation_argv: bool,
-    /// Machine-readable `go test -json ./...` validation. Missing on older
-    /// Runners and false; never inferred from structured_validation_argv or
-    /// agent_protocol_version.
+    /// Machine-readable canonical `go test -json` validation. Older Runners may
+    /// support only the historical fixed `./...` scope; focused package argv is
+    /// an independent additive capability.
     #[serde(default, skip_serializing_if = "is_false")]
     pub structured_go_test_json: bool,
     /// First-class `go_test` tool plus its durable validation metadata identity.
@@ -243,6 +265,11 @@ pub struct ShellClientCapabilities {
     /// generic structured validation, protocol version, or executable presence.
     #[serde(default, skip_serializing_if = "is_false")]
     pub structured_go_test_tool: bool,
+    /// Expanded first-class `go_test` package argv beyond the historical fixed
+    /// `./...` shape. Missing on older Runners and false; never inferred from
+    /// the existing Go JSON or first-class tool capabilities.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub structured_go_test_packages: bool,
     /// General native executable + argv requests. Missing on older agents and
     /// therefore false; the Server must fail closed without a shell fallback.
     #[serde(default)]
@@ -313,6 +340,7 @@ impl Default for ShellClientCapabilities {
             shell: true,
             file_read: false,
             file_write: false,
+            structured_file_delete: false,
             git: false,
             jobs: false,
             async_jobs: false,
@@ -323,6 +351,7 @@ impl Default for ShellClientCapabilities {
             structured_validation_argv: false,
             structured_go_test_json: false,
             structured_go_test_tool: false,
+            structured_go_test_packages: false,
             structured_process_argv: false,
             structured_script_payload: false,
             structured_execution_jobs: false,
@@ -1378,7 +1407,7 @@ impl ShellJobValidationStep {
             ("check", "cargo") => is_canonical_cargo_check_args(&args),
             ("test", "cargo") => is_canonical_cargo_test_args(&args),
             ("check", "go") => args == ["vet", "./..."],
-            ("test", "go") => args == ["test", "./..."] || args == ["test", "-json", "./..."],
+            ("test", "go") => args == ["test", "./..."] || self.is_structured_go_test_json(),
             ("format", "python") => {
                 args == ["-m", "ruff", "format", "--check"] || args == ["-m", "black", "--check"]
             }
@@ -1394,6 +1423,18 @@ impl ShellJobValidationStep {
             }
             _ => false,
         }
+    }
+
+    /// True only for the first-class machine-readable Go test shape. Package
+    /// patterns are checked by the same bounded normalizer used by the runtime
+    /// command builders; validation steps with environment overrides are not
+    /// part of this contract.
+    pub fn is_structured_go_test_json(&self) -> bool {
+        if self.name != "test" || self.program != "go" || !self.env.is_empty() {
+            return false;
+        }
+        let args = self.args.iter().map(String::as_str).collect::<Vec<_>>();
+        is_canonical_go_test_json_args(&args)
     }
 }
 
@@ -1454,6 +1495,93 @@ pub fn normalize_cargo_value(raw: &str) -> Result<Option<String>, &'static str> 
         return Err("exceeds 500 bytes");
     }
     Ok(Some(trimmed.to_string()))
+}
+
+/// Normalize the optional package scope of the first-class `go_test` tool.
+/// Omission preserves the historical `./...` scope; an explicit list must
+/// contain one to eight already-normalized project-relative patterns.
+pub fn normalize_go_test_packages(
+    packages: Option<&[String]>,
+) -> Result<Vec<String>, &'static str> {
+    let Some(packages) = packages else {
+        return Ok(vec!["./...".to_string()]);
+    };
+    if packages.is_empty() || packages.len() > GO_TEST_PACKAGE_MAX_ITEMS {
+        return Err("packages must contain between 1 and 8 items");
+    }
+    packages
+        .iter()
+        .map(|package| normalize_go_test_package(package))
+        .collect()
+}
+
+fn normalize_go_test_package(raw: &str) -> Result<String, &'static str> {
+    if raw.is_empty() {
+        return Err("package pattern cannot be empty");
+    }
+    if raw.len() > GO_TEST_PACKAGE_MAX_BYTES {
+        return Err("package pattern exceeds 256 bytes");
+    }
+    if !raw.is_ascii() {
+        return Err("package pattern must be ASCII");
+    }
+    if raw
+        .bytes()
+        .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err("package pattern cannot contain whitespace or control characters");
+    }
+    if raw.contains('\\') {
+        return Err("package pattern cannot contain backslashes");
+    }
+    if raw == "." {
+        return Ok(raw.to_string());
+    }
+    let Some(rest) = raw.strip_prefix("./") else {
+        return Err("package pattern must be '.' or start with './'");
+    };
+    if rest.is_empty() {
+        return Err("package pattern must name a package path");
+    }
+    let segments = rest.split('/').collect::<Vec<_>>();
+    for (index, segment) in segments.iter().enumerate() {
+        if segment.is_empty() {
+            return Err("package pattern contains an empty segment");
+        }
+        if *segment == "." || *segment == ".." {
+            return Err("package pattern contains an interior '.' or '..' segment");
+        }
+        if *segment == "..." {
+            if index + 1 != segments.len() {
+                return Err("'...' is only allowed as the final complete segment");
+            }
+            continue;
+        }
+        if segment.contains("...") {
+            return Err("'...' is only allowed as the final complete segment");
+        }
+        if !segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        {
+            return Err("package pattern contains invalid characters");
+        }
+    }
+    Ok(raw.to_string())
+}
+
+fn is_canonical_go_test_json_args(args: &[&str]) -> bool {
+    if args.len() < 3 || args[0] != "test" || args[1] != "-json" {
+        return false;
+    }
+    let packages = args[2..]
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect::<Vec<_>>();
+    matches!(
+        normalize_go_test_packages(Some(&packages)),
+        Ok(normalized) if normalized == packages
+    )
 }
 
 /// Validate the read-only Cargo flag tail shared by `cargo check` and
@@ -1584,13 +1712,7 @@ impl ShellJobValidationMetadata {
                 self.kind == "check" && step.name == "check" && step.program == "cargo"
             }
             "cargo_test" => self.kind == "test" && step.name == "test" && step.program == "cargo",
-            "go_test" => {
-                self.kind == "test"
-                    && step.name == "test"
-                    && step.program == "go"
-                    && step.args == ["test", "-json", "./..."]
-                    && step.env.is_empty()
-            }
+            "go_test" => self.kind == "test" && step.is_structured_go_test_json(),
             _ => false,
         }
     }
@@ -2300,6 +2422,7 @@ mod envelope_tests {
                 shell: true,
                 file_read: true,
                 file_write: false,
+                structured_file_delete: false,
                 git: false,
                 jobs: true,
                 async_jobs: true,
@@ -2310,6 +2433,7 @@ mod envelope_tests {
                 structured_validation_argv: true,
                 structured_go_test_json: true,
                 structured_go_test_tool: true,
+                structured_go_test_packages: true,
                 structured_process_argv: true,
                 structured_script_payload: true,
                 structured_execution_jobs: true,
@@ -2391,8 +2515,18 @@ mod envelope_tests {
         assert!(!capabilities.ssh_persistent_shell);
         assert!(!capabilities.structured_execution_jobs);
         assert!(!capabilities.project_path_registration);
+        assert!(!capabilities.structured_file_delete);
         assert!(!ShellClientCapabilities::default().ssh_persistent_shell);
         assert!(!ShellClientCapabilities::default().project_path_registration);
+    }
+
+    #[test]
+    fn structured_file_delete_capability_deserializes_only_when_present() {
+        let missing: ShellClientCapabilities = serde_json::from_str(r#"{"shell":true}"#).unwrap();
+        assert!(!missing.structured_file_delete);
+        let present: ShellClientCapabilities =
+            serde_json::from_str(r#"{"structured_file_delete":true}"#).unwrap();
+        assert!(present.structured_file_delete);
     }
 
     #[test]
@@ -3409,7 +3543,7 @@ mod filter_canonical_tests {
     }
 
     #[test]
-    fn canonical_go_test_accepts_only_legacy_and_json_argv() {
+    fn canonical_go_test_accepts_legacy_and_bounded_json_packages() {
         let step = |args: &[&str]| ShellJobValidationStep {
             name: "test".to_string(),
             program: "go".to_string(),
@@ -3418,7 +3552,8 @@ mod filter_canonical_tests {
         };
         assert!(step(&["test", "./..."]).is_canonical());
         assert!(step(&["test", "-json", "./..."]).is_canonical());
-        assert!(!step(&["test", "-json", "./pkg"]).is_canonical());
+        assert!(step(&["test", "-json", "./pkg"]).is_canonical());
+        assert!(step(&["test", "-json", ".", "./pkg", "./internal/..."]).is_canonical());
         assert!(!step(&["test", "-json", "-run", "TestOne", "./..."]).is_canonical());
         assert!(!step(&["test", "-v", "./..."]).is_canonical());
         assert!(!step(&["run", "./..."]).is_canonical());
@@ -3505,7 +3640,10 @@ mod filter_canonical_tests {
         env_injected.steps[0]
             .env
             .push(("CARGO_TARGET_DIR".to_string(), "/tmp/cache".to_string()));
-        assert!(env_injected.steps[0].is_canonical());
+        assert!(
+            !env_injected.steps[0].is_canonical(),
+            "structured go_test rejects per-step environment overrides"
+        );
         assert!(!env_injected.is_valid());
     }
 
@@ -3746,6 +3884,90 @@ mod filter_canonical_tests {
             normalize_cargo_value(&max_len_value).unwrap(),
             Some(max_len_value.clone())
         );
+    }
+
+    #[test]
+    fn go_test_package_scope_is_narrow_bounded_and_canonical() {
+        assert_eq!(
+            normalize_go_test_packages(None).unwrap(),
+            vec!["./...".to_string()]
+        );
+        for package in [".", "./...", "./pkg", "./pkg/...", "./a_b-C.d/sub"] {
+            assert_eq!(
+                normalize_go_test_packages(Some(&[package.to_string()])).unwrap(),
+                vec![package.to_string()]
+            );
+        }
+
+        let eight = (0..GO_TEST_PACKAGE_MAX_ITEMS)
+            .map(|index| format!("./pkg{index}"))
+            .collect::<Vec<_>>();
+        assert_eq!(normalize_go_test_packages(Some(&eight)).unwrap(), eight);
+        assert!(normalize_go_test_packages(Some(&[])).is_err());
+        let nine = (0..=GO_TEST_PACKAGE_MAX_ITEMS)
+            .map(|index| format!("./pkg{index}"))
+            .collect::<Vec<_>>();
+        assert!(normalize_go_test_packages(Some(&nine)).is_err());
+
+        let max = format!("./{}", "a".repeat(GO_TEST_PACKAGE_MAX_BYTES - 2));
+        assert!(normalize_go_test_packages(Some(&[max])).is_ok());
+        let over = format!("./{}", "a".repeat(GO_TEST_PACKAGE_MAX_BYTES - 1));
+        assert!(normalize_go_test_packages(Some(&[over])).is_err());
+
+        for invalid in [
+            "../...",
+            "/abs",
+            "pkg",
+            "./",
+            "./foo/../bar",
+            "./foo/./bar",
+            "./foo//bar",
+            "./foo\\bar",
+            "./foo bar",
+            "./foo\tbar",
+            "./foo\nbar",
+            "./foo\0bar",
+            "./foo;bar",
+            "./foo$bar",
+            "./foo/.../bar",
+            "./foo...",
+            "./....",
+            "--exec=/tmp/x",
+        ] {
+            assert!(
+                normalize_go_test_packages(Some(&[invalid.to_string()])).is_err(),
+                "expected invalid package pattern {invalid:?}"
+            );
+        }
+
+        let focused = ShellJobValidationStep {
+            name: "test".to_string(),
+            program: "go".to_string(),
+            args: vec![
+                "test".to_string(),
+                "-json".to_string(),
+                "./internal/control".to_string(),
+                "./internal/node".to_string(),
+            ],
+            env: Vec::new(),
+        };
+        assert!(focused.is_structured_go_test_json());
+        assert!(focused.is_canonical());
+
+        for args in [
+            vec!["test", "-json", "./pkg", "-exec"],
+            vec!["test", "-json", "./pkg;go", "./other"],
+            vec!["test", "-json", "../..."],
+        ] {
+            let step = ShellJobValidationStep {
+                name: "test".to_string(),
+                program: "go".to_string(),
+                args: args.into_iter().map(str::to_string).collect(),
+                env: Vec::new(),
+            };
+            assert!(!step.is_structured_go_test_json());
+            assert!(!step.is_canonical());
+        }
     }
 
     #[test]
