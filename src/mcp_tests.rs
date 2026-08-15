@@ -213,7 +213,7 @@ async fn mcp_2026_computer_app_is_minimal_handshake_and_snapshot_only() {
     let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
     // The URI is a host cache key. Bump it whenever the App delivery contract
     // changes so a previously failed/blank iframe cannot pin the old resource.
-    assert_eq!(MCP_COMPUTER_UI_RESOURCE_URI, "ui://webcodex/computer/v7");
+    assert_eq!(MCP_COMPUTER_UI_RESOURCE_URI, "ui://webcodex/computer/v8");
     let expected_resource_meta = json!({
         "ui": {
             "prefersBorder": true,
@@ -222,8 +222,7 @@ async fn mcp_2026_computer_app_is_minimal_handshake_and_snapshot_only() {
                 "connectDomains": [],
                 "resourceDomains": []
             }
-        },
-        "openai/widgetDomain": MCP_COMPUTER_UI_DOMAIN
+        }
     });
 
     let discover = handle_mcp_request(
@@ -355,10 +354,7 @@ async fn mcp_2026_computer_app_is_minimal_handshake_and_snapshot_only() {
     );
     assert_eq!(resource["result"]["cacheScope"], "private");
     assert_eq!(resource_meta, &expected_resource_meta);
-    assert_eq!(
-        resource_meta["openai/widgetDomain"],
-        resource_meta["ui"]["domain"]
-    );
+    assert!(resource_meta.get("openai/widgetDomain").is_none());
     let html = resource["result"]["contents"][0]["text"].as_str().unwrap();
     assert!(html.starts_with("<div id=\"app\""));
     for expected in [
@@ -5283,6 +5279,9 @@ async fn http_mcp_2026_reads_computer_app_template_with_cache_contract() {
         body["result"]["contents"][0]["mimeType"],
         MCP_UI_RESOURCE_MIME_TYPE
     );
+    assert!(body["result"]["contents"][0]["_meta"]
+        .get("openai/widgetDomain")
+        .is_none());
     let html = body["result"]["contents"][0]["text"].as_str().unwrap();
     assert!(html.starts_with("<div id=\"app\""));
     assert!(html.contains("HTML loaded"));
