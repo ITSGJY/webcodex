@@ -407,6 +407,9 @@ pub struct OAuth2Config {
     /// Whether the public shared-key OAuth bridge authorize flow is enabled.
     /// Default `false`.
     pub shared_key_bridge_enabled: bool,
+    /// Exact server-generated OAuth client IDs whose active registrations may
+    /// use the ChatGPT MCP host-file import path. Empty by default.
+    pub trusted_mcp_file_client_ids: Vec<String>,
 }
 
 impl Default for OAuth2Config {
@@ -419,8 +422,22 @@ impl Default for OAuth2Config {
             authorization_code_ttl_secs: 300,
             require_pkce: true,
             shared_key_bridge_enabled: false,
+            trusted_mcp_file_client_ids: Vec::new(),
         }
     }
+}
+
+fn normalize_trusted_mcp_file_client_id(value: &str) -> Option<String> {
+    let value = crate::auth::validate_allowed_client_id(value).ok()?;
+    let random = value.strip_prefix("wc_client_")?;
+    if random.len() != 64
+        || !random
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    Some(value)
 }
 
 impl OAuth2Config {
@@ -453,6 +470,22 @@ impl OAuth2Config {
         let require_pkce = env_flag("WEBCODEX_OAUTH2_REQUIRE_PKCE").unwrap_or(true);
         let shared_key_bridge_enabled =
             env_flag("WEBCODEX_OAUTH2_SHARED_KEY_BRIDGE").unwrap_or(false);
+        let trusted_mcp_file_client_ids =
+            std::env::var("WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS")
+                .ok()
+                .map(|value| {
+                    let mut client_ids = Vec::new();
+                    for value in value.split(',') {
+                        let Some(client_id) = normalize_trusted_mcp_file_client_id(value) else {
+                            continue;
+                        };
+                        if !client_ids.contains(&client_id) {
+                            client_ids.push(client_id);
+                        }
+                    }
+                    client_ids
+                })
+                .unwrap_or_default();
         Self {
             issuer,
             enabled,
@@ -461,6 +494,7 @@ impl OAuth2Config {
             authorization_code_ttl_secs,
             require_pkce,
             shared_key_bridge_enabled,
+            trusted_mcp_file_client_ids,
         }
     }
 }
@@ -729,6 +763,7 @@ mod tests {
         std::env::remove_var("WEBCODEX_OAUTH2_AUTH_CODE_TTL_SECS");
         std::env::remove_var("WEBCODEX_OAUTH2_REQUIRE_PKCE");
         std::env::remove_var("WEBCODEX_OAUTH2_SHARED_KEY_BRIDGE");
+        std::env::remove_var("WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS");
 
         let cfg = OAuth2Config::from_env();
         assert!(!cfg.enabled);
@@ -738,6 +773,7 @@ mod tests {
         assert_eq!(cfg.authorization_code_ttl_secs, 300);
         assert!(cfg.require_pkce);
         assert!(!cfg.shared_key_bridge_enabled);
+        assert!(cfg.trusted_mcp_file_client_ids.is_empty());
     }
 
     #[test]
@@ -750,6 +786,15 @@ mod tests {
         std::env::set_var("WEBCODEX_OAUTH2_AUTH_CODE_TTL_SECS", "600");
         std::env::set_var("WEBCODEX_OAUTH2_REQUIRE_PKCE", "false");
         env.enable_oauth2_shared_key_bridge();
+        let trusted_a = format!("wc_client_{}", "a".repeat(64));
+        let trusted_b = format!("wc_client_{}", "b".repeat(64));
+        std::env::set_var(
+            "WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS",
+            format!(
+                " {trusted_a} , invalid-client, {trusted_a}, {trusted_b}, wc_client_{} ",
+                "A".repeat(64)
+            ),
+        );
 
         let cfg = OAuth2Config::from_env();
         assert!(cfg.enabled);
@@ -759,6 +804,7 @@ mod tests {
         assert_eq!(cfg.authorization_code_ttl_secs, 600);
         assert!(!cfg.require_pkce);
         assert!(cfg.shared_key_bridge_enabled);
+        assert_eq!(cfg.trusted_mcp_file_client_ids, vec![trusted_a, trusted_b]);
 
         std::env::remove_var("WEBCODEX_OAUTH2_ENABLED");
         std::env::remove_var("WEBCODEX_OAUTH2_ISSUER");
@@ -766,6 +812,7 @@ mod tests {
         std::env::remove_var("WEBCODEX_OAUTH2_REFRESH_TOKEN_TTL_SECS");
         std::env::remove_var("WEBCODEX_OAUTH2_AUTH_CODE_TTL_SECS");
         std::env::remove_var("WEBCODEX_OAUTH2_REQUIRE_PKCE");
+        std::env::remove_var("WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS");
     }
 
     #[test]

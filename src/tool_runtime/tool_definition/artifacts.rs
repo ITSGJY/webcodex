@@ -4,7 +4,7 @@ use super::{def, requires_artifact_upload_path_binding, ToolDefinition, TOOL_CAT
 use crate::tool_runtime::metadata::{
     ToolPathHint::Artifact,
     ToolRisk::{ProjectWrite, ReadOnly},
-    PROJECT_READ, PROJECT_WRITE, TOOL_PROVIDER_AGENT,
+    PROJECT_READ, PROJECT_WRITE, TOOL_PROVIDER_AGENT, TOOL_PROVIDER_CONTROL,
 };
 
 pub(super) const DEFINITIONS: &[ToolDefinition] = &[
@@ -16,6 +16,32 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         TOOL_PROVIDER_AGENT,
         ProjectWrite,
         Some(PROJECT_WRITE),
+        true,
+        Artifact,
+        false,
+        false,
+    ),
+    def(
+        "import_conversation_files_to_project",
+        ModelVisible,
+        TOOL_CATEGORY_ARTIFACT,
+        Some(FileWrite),
+        TOOL_PROVIDER_CONTROL,
+        ProjectWrite,
+        Some(PROJECT_WRITE),
+        true,
+        Artifact,
+        false,
+        false,
+    ),
+    def(
+        "export_project_artifact",
+        ModelVisible,
+        TOOL_CATEGORY_ARTIFACT,
+        Some(FileRead),
+        TOOL_PROVIDER_CONTROL,
+        ReadOnly,
+        Some(PROJECT_READ),
         true,
         Artifact,
         false,

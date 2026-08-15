@@ -267,6 +267,23 @@ curl -fsS -X POST https://your-domain.example/api/oauth/clients/create \
   -d '{"name":"ChatGPT MCP","redirect_uris":["https://chatgpt.com/connector/oauth/<callback-id>"],"allowed_scopes":["runtime:read","project:read","project:write","job:run"]}'
 ```
 
+ChatGPT MCP host-file imports use a separate operator trust anchor because their
+host-provided temporary download URLs are not restricted to the GPT Action
+`files.oaiusercontent.com` hostname policy. After creating the ChatGPT OAuth
+client above, take the returned server-generated `wc_client_*` ID and configure
+that exact ID (comma-separated for multiple trusted registrations):
+
+```text
+WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS=wc_client_<server-generated-id>
+```
+
+The server requires the request's OAuth access token to resolve through
+`allowed_client_id` to that exact configured, still-active OAuth client record.
+Redirect URIs and client display names are not trust identities. Reprovisioning
+a ChatGPT OAuth client generates a new client ID and is therefore an explicit
+trust rotation: update this setting to the new ID. Ordinary API-token/raw MCP
+callers remain ineligible.
+
 List and revoke clients with `POST /api/oauth/clients/list` and
 `POST /api/oauth/clients/revoke`. OAuth uses the authorization-code flow;
 dynamic client registration, OIDC, and the device-code flow are not

@@ -2718,6 +2718,131 @@ fn fake_zip_eocd_with_entries(entries: u16) -> Vec<u8> {
     bytes
 }
 
+fn append_fake_zip_entry(
+    bytes: &mut Vec<u8>,
+    central_directory: &mut Vec<u8>,
+    name: &str,
+    content: &[u8],
+    deflate: bool,
+) {
+    use flate2::{write::DeflateEncoder, Compression};
+    use std::io::Write as _;
+
+    let compression_method = if deflate { 8_u16 } else { 0_u16 };
+    let compressed = if deflate {
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(content).unwrap();
+        encoder.finish().unwrap()
+    } else {
+        content.to_vec()
+    };
+    let local_offset = u32::try_from(bytes.len()).unwrap();
+    let compressed_size = u32::try_from(compressed.len()).unwrap();
+    let uncompressed_size = u32::try_from(content.len()).unwrap();
+    let name_len = u16::try_from(name.len()).unwrap();
+
+    bytes.extend_from_slice(b"PK\x03\x04");
+    bytes.extend_from_slice(&20_u16.to_le_bytes());
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    bytes.extend_from_slice(&compression_method.to_le_bytes());
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    bytes.extend_from_slice(&compressed_size.to_le_bytes());
+    bytes.extend_from_slice(&uncompressed_size.to_le_bytes());
+    bytes.extend_from_slice(&name_len.to_le_bytes());
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    bytes.extend_from_slice(name.as_bytes());
+    bytes.extend_from_slice(&compressed);
+
+    central_directory.extend_from_slice(b"PK\x01\x02");
+    central_directory.extend_from_slice(&20_u16.to_le_bytes());
+    central_directory.extend_from_slice(&20_u16.to_le_bytes());
+    central_directory.extend_from_slice(&0_u16.to_le_bytes());
+    central_directory.extend_from_slice(&compression_method.to_le_bytes());
+    central_directory.extend_from_slice(&0_u16.to_le_bytes());
+    central_directory.extend_from_slice(&0_u16.to_le_bytes());
+    central_directory.extend_from_slice(&0_u32.to_le_bytes());
+    central_directory.extend_from_slice(&compressed_size.to_le_bytes());
+    central_directory.extend_from_slice(&uncompressed_size.to_le_bytes());
+    central_directory.extend_from_slice(&name_len.to_le_bytes());
+    central_directory.extend_from_slice(&0_u16.to_le_bytes());
+    central_directory.extend_from_slice(&0_u16.to_le_bytes());
+    central_directory.extend_from_slice(&0_u16.to_le_bytes());
+    central_directory.extend_from_slice(&0_u16.to_le_bytes());
+    central_directory.extend_from_slice(&0_u32.to_le_bytes());
+    central_directory.extend_from_slice(&local_offset.to_le_bytes());
+    central_directory.extend_from_slice(name.as_bytes());
+}
+
+fn fake_ooxml_zip(
+    main_part: &str,
+    main_content_type: &str,
+    malformed_content_types: bool,
+) -> Vec<u8> {
+    let content_types = if malformed_content_types {
+        b"<Types".to_vec()
+    } else {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/{main_part}" ContentType="{main_content_type}"/></Types>"#
+        )
+        .into_bytes()
+    };
+    let mut bytes = Vec::new();
+    let mut central_directory = Vec::new();
+    append_fake_zip_entry(
+        &mut bytes,
+        &mut central_directory,
+        "[Content_Types].xml",
+        &content_types,
+        true,
+    );
+    append_fake_zip_entry(
+        &mut bytes,
+        &mut central_directory,
+        main_part,
+        b"<root/>",
+        false,
+    );
+    let central_offset = u32::try_from(bytes.len()).unwrap();
+    let central_size = u32::try_from(central_directory.len()).unwrap();
+    bytes.extend_from_slice(&central_directory);
+    bytes.extend_from_slice(b"PK\x05\x06");
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    bytes.extend_from_slice(&2_u16.to_le_bytes());
+    bytes.extend_from_slice(&2_u16.to_le_bytes());
+    bytes.extend_from_slice(&central_size.to_le_bytes());
+    bytes.extend_from_slice(&central_offset.to_le_bytes());
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    bytes
+}
+
+fn fake_zip_central_entry_offset(bytes: &[u8], expected_name: &str) -> usize {
+    let eocd = bytes
+        .windows(4)
+        .rposition(|window| window == b"PK\x05\x06")
+        .unwrap();
+    let entry_count = u16::from_le_bytes(bytes[eocd + 10..eocd + 12].try_into().unwrap());
+    let mut cursor = u32::from_le_bytes(bytes[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+    for _ in 0..entry_count {
+        assert_eq!(&bytes[cursor..cursor + 4], b"PK\x01\x02");
+        let name_len =
+            u16::from_le_bytes(bytes[cursor + 28..cursor + 30].try_into().unwrap()) as usize;
+        let extra_len =
+            u16::from_le_bytes(bytes[cursor + 30..cursor + 32].try_into().unwrap()) as usize;
+        let comment_len =
+            u16::from_le_bytes(bytes[cursor + 32..cursor + 34].try_into().unwrap()) as usize;
+        let name_start = cursor + 46;
+        let name_end = name_start + name_len;
+        if &bytes[name_start..name_end] == expected_name.as_bytes() {
+            return cursor;
+        }
+        cursor = name_end + extra_len + comment_len;
+    }
+    panic!("missing fake ZIP central entry {expected_name}");
+}
+
 fn artifact_upload_temp_paths(
     root: &Path,
     artifact_path: &str,
@@ -2835,6 +2960,70 @@ fn file_save_project_artifact_writes_binary_and_blocks_overwrite() {
 }
 
 #[test]
+fn file_save_and_upload_begin_accept_office_mimes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    let cases = [
+        (
+            "artifacts/imports/report.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+        (
+            "artifacts/imports/deck.pptx",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ),
+        (
+            "artifacts/imports/book.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ),
+    ];
+
+    for (path, mime) in cases {
+        let content_base64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            b"office-artifact",
+        );
+        let saved = line_edit_json(handle_file_request(
+            &policy,
+            &json_file_op_request(
+                tmp.path(),
+                "file_save_project_artifact",
+                path,
+                serde_json::json!({
+                    "path": path,
+                    "content_base64": content_base64,
+                    "mime_type": mime,
+                    "overwrite": false,
+                    "max_bytes": 1024,
+                }),
+            ),
+        ));
+        assert_eq!(saved["mime_type"], mime, "{path}");
+
+        let upload_path = path.replacen("artifacts/imports/", "artifacts/uploads/", 1);
+        let upload = line_edit_json(handle_file_request(
+            &policy,
+            &json_file_op_request(
+                tmp.path(),
+                "file_artifact_upload_begin",
+                &upload_path,
+                serde_json::json!({
+                    "path": upload_path,
+                    "expected_bytes": 0,
+                    "expected_sha256": null,
+                    "mime_type": mime,
+                    "overwrite": false,
+                    "max_bytes": 1024,
+                }),
+            ),
+        ));
+        assert_eq!(upload["mime_type"], mime, "{path}");
+        let upload_id = upload["upload_id"].as_str().unwrap();
+        assert_upload_temp_files_exist(tmp.path(), &upload_path, upload_id);
+    }
+}
+
+#[test]
 fn file_read_project_artifact_metadata_counts_zip_without_extracting() {
     let tmp = tempfile::tempdir().unwrap();
     let policy = project_policy(tmp.path());
@@ -2862,6 +3051,162 @@ fn file_read_project_artifact_metadata_counts_zip_without_extracting() {
 }
 
 #[test]
+fn file_read_project_artifact_detects_ooxml_mime_from_package_content() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    let cases = [
+        (
+            "sample.docx",
+            "word/document.xml",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+        (
+            "sample.pptx",
+            "ppt/presentation.xml",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ),
+        (
+            "sample.xlsx",
+            "xl/workbook.xml",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ),
+    ];
+
+    for (path, main_part, main_content_type, expected_mime) in cases {
+        let bytes = fake_ooxml_zip(main_part, main_content_type, false);
+        std::fs::write(tmp.path().join(path), &bytes).unwrap();
+        let metadata = line_edit_json(handle_file_request(
+            &policy,
+            &json_file_op_request(
+                tmp.path(),
+                "file_read_project_artifact_metadata",
+                path,
+                serde_json::json!({"path": path, "max_bytes": 64 * 1024}),
+            ),
+        ));
+        assert_eq!(metadata["mime_type"], expected_mime, "{path}");
+        assert!(metadata.get("archive_entries_count").is_none(), "{path}");
+
+        let read = line_edit_json(handle_file_request(
+            &policy,
+            &json_file_op_request(
+                tmp.path(),
+                "file_read_project_artifact",
+                path,
+                serde_json::json!({
+                    "path": path,
+                    "offset": 0,
+                    "length": 16,
+                    "max_file_bytes": 64 * 1024,
+                }),
+            ),
+        ));
+        assert_eq!(read["mime_type"], expected_mime, "{path}");
+        assert_eq!(read["file_bytes"], bytes.len(), "{path}");
+        assert_eq!(read["bytes_returned"], 16, "{path}");
+    }
+}
+
+#[test]
+fn file_read_project_artifact_does_not_trust_ooxml_extension_or_malformed_package() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+
+    std::fs::write(tmp.path().join("spoof.docx"), fake_zip_eocd_with_entries(0)).unwrap();
+    let spoof = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_read_project_artifact_metadata",
+            "spoof.docx",
+            serde_json::json!({"path": "spoof.docx", "max_bytes": 1024}),
+        ),
+    ));
+    assert_eq!(spoof["mime_type"], "application/zip");
+
+    std::fs::write(tmp.path().join("not-a-zip.docx"), b"plain bytes").unwrap();
+    let non_zip = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_read_project_artifact_metadata",
+            "not-a-zip.docx",
+            serde_json::json!({"path": "not-a-zip.docx", "max_bytes": 1024}),
+        ),
+    ));
+    assert!(non_zip["mime_type"].is_null());
+
+    let malformed = fake_ooxml_zip(
+        "word/document.xml",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+        true,
+    );
+    std::fs::write(tmp.path().join("broken.docx"), malformed).unwrap();
+    let broken = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_read_project_artifact_metadata",
+            "broken.docx",
+            serde_json::json!({"path": "broken.docx", "max_bytes": 64 * 1024}),
+        ),
+    ));
+    assert_eq!(broken["mime_type"], "application/zip");
+}
+
+#[test]
+fn file_read_project_artifact_rejects_ooxml_main_part_with_invalid_local_structure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    let main_part = "word/document.xml";
+    let main_content_type =
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml";
+
+    let mut invalid_offset = fake_ooxml_zip(main_part, main_content_type, false);
+    let central_entry = fake_zip_central_entry_offset(&invalid_offset, main_part);
+    invalid_offset[central_entry + 42..central_entry + 46].copy_from_slice(&1_u32.to_le_bytes());
+    std::fs::write(tmp.path().join("bad-offset.docx"), invalid_offset).unwrap();
+    let bad_offset = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_read_project_artifact_metadata",
+            "bad-offset.docx",
+            serde_json::json!({"path": "bad-offset.docx", "max_bytes": 64 * 1024}),
+        ),
+    ));
+    assert_eq!(bad_offset["mime_type"], "application/zip");
+
+    let mut mismatched_name = fake_ooxml_zip(main_part, main_content_type, false);
+    let central_entry = fake_zip_central_entry_offset(&mismatched_name, main_part);
+    let local_offset = u32::from_le_bytes(
+        mismatched_name[central_entry + 42..central_entry + 46]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let local_name_start = local_offset + 30;
+    assert_eq!(
+        &mismatched_name[local_name_start..local_name_start + main_part.len()],
+        main_part.as_bytes()
+    );
+    mismatched_name[local_name_start] = b'v';
+    std::fs::write(tmp.path().join("bad-local-name.docx"), mismatched_name).unwrap();
+    let bad_name = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_read_project_artifact_metadata",
+            "bad-local-name.docx",
+            serde_json::json!({"path": "bad-local-name.docx", "max_bytes": 64 * 1024}),
+        ),
+    ));
+    assert_eq!(bad_name["mime_type"], "application/zip");
+}
+
+#[test]
 fn file_read_project_artifact_reads_binary_chunks() {
     let tmp = tempfile::tempdir().unwrap();
     let policy = project_policy(tmp.path());
@@ -2878,6 +3223,10 @@ fn file_read_project_artifact_reads_binary_chunks() {
         ),
     ));
     assert_eq!(first["file_bytes"], bytes.len());
+    assert!(first["sha256"]
+        .as_str()
+        .is_some_and(|value| value.len() == 64));
+    assert!(first.get("mime_type").is_some());
     assert_eq!(first["offset"], 0);
     assert_eq!(first["bytes_returned"], 4);
     assert_eq!(first["next_offset"], 4);
@@ -2921,6 +3270,127 @@ fn file_read_project_artifact_reads_binary_chunks() {
     assert_eq!(at_eof["next_offset"], bytes.len());
     assert_eq!(at_eof["truncated"], false);
     assert_eq!(at_eof["eof"], true);
+}
+
+#[test]
+fn file_read_project_artifact_export_chunk_reads_only_requested_segments() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    let bytes = vec![0x5a; 70 * 1024];
+    std::fs::write(tmp.path().join("export.bin"), &bytes).unwrap();
+
+    let first = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_read_project_artifact_export_chunk",
+            "export.bin",
+            serde_json::json!({
+                "path": "export.bin",
+                "expected_file_bytes": bytes.len(),
+                "offset": 0,
+                "length": 64 * 1024
+            }),
+        ),
+    ));
+    assert_eq!(first["file_bytes"], bytes.len());
+    assert_eq!(first["offset"], 0);
+    assert_eq!(first["bytes_returned"], 64 * 1024);
+    assert_eq!(first["next_offset"], 64 * 1024);
+    assert_eq!(first["truncated"], true);
+    assert_eq!(first["eof"], false);
+    assert!(first.get("sha256").is_none());
+    assert!(first.get("mime_type").is_none());
+    let first_bytes = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        first["content_base64"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first_bytes, bytes[..64 * 1024]);
+
+    let final_chunk = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_read_project_artifact_export_chunk",
+            "export.bin",
+            serde_json::json!({
+                "path": "export.bin",
+                "expected_file_bytes": bytes.len(),
+                "offset": 64 * 1024,
+                "length": 64 * 1024
+            }),
+        ),
+    ));
+    assert_eq!(final_chunk["offset"], 64 * 1024);
+    assert_eq!(final_chunk["bytes_returned"], 6 * 1024);
+    assert_eq!(final_chunk["next_offset"], bytes.len());
+    assert_eq!(final_chunk["truncated"], false);
+    assert_eq!(final_chunk["eof"], true);
+    let final_bytes = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        final_chunk["content_base64"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(final_bytes, bytes[64 * 1024..]);
+
+    let wrong_size = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_read_project_artifact_export_chunk",
+            "export.bin",
+            serde_json::json!({
+                "path": "export.bin",
+                "expected_file_bytes": bytes.len() - 1,
+                "offset": 0,
+                "length": 1
+            }),
+        ),
+    ));
+    assert_eq!(wrong_size["error_kind"], "snapshot_changed");
+
+    let ten_mib = 10 * 1024 * 1024;
+    let boundary = std::fs::File::create(tmp.path().join("boundary.bin")).unwrap();
+    boundary.set_len(ten_mib as u64).unwrap();
+    let boundary_read = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_read_project_artifact_export_chunk",
+            "boundary.bin",
+            serde_json::json!({
+                "path": "boundary.bin",
+                "expected_file_bytes": ten_mib,
+                "offset": ten_mib - 1,
+                "length": 64 * 1024
+            }),
+        ),
+    ));
+    assert_eq!(boundary_read["bytes_returned"], 1);
+    assert_eq!(boundary_read["next_offset"], ten_mib);
+    assert_eq!(boundary_read["eof"], true);
+
+    let oversized = std::fs::File::create(tmp.path().join("oversized.bin")).unwrap();
+    oversized.set_len((ten_mib + 1) as u64).unwrap();
+    let oversized_read = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_read_project_artifact_export_chunk",
+            "oversized.bin",
+            serde_json::json!({
+                "path": "oversized.bin",
+                "expected_file_bytes": ten_mib + 1,
+                "offset": 0,
+                "length": 1
+            }),
+        ),
+    ));
+    assert!(oversized_read["error"]
+        .as_str()
+        .unwrap()
+        .contains("maximum"));
 }
 
 #[test]
@@ -3721,6 +4191,23 @@ fn file_project_artifact_ops_reject_symlink_escape() {
     ));
     assert_eq!(read["error"], "artifact path escapes project root");
     assert!(!read.to_string().contains("outside-secret-content"));
+
+    let export_chunk = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            root.path(),
+            "file_read_project_artifact_export_chunk",
+            "leak.bin",
+            serde_json::json!({
+                "path":"leak.bin",
+                "expected_file_bytes":8,
+                "offset":0,
+                "length":8
+            }),
+        ),
+    ));
+    assert_eq!(export_chunk["error"], "artifact path escapes project root");
+    assert!(!export_chunk.to_string().contains("outside-secret-content"));
 
     let metadata = line_edit_json(handle_file_request(
         &policy,
@@ -6183,6 +6670,7 @@ fn computer_register_request_announces_platform_capability_and_protocol_version(
     assert!(caps.shell);
     assert!(caps.file_read);
     assert!(caps.file_write);
+    assert!(caps.artifact_export_chunk_read);
     assert!(caps.structured_file_delete);
     assert!(caps.async_jobs);
     assert!(caps.async_shell_jobs);

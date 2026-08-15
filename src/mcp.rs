@@ -7,21 +7,41 @@ use crate::tool_request_trace::{
     estimate_json_bytes, jsonrpc_id_safe, new_trace_id, ToolRequestLifecycle,
 };
 use crate::tool_runtime::kernel::{
-    ToolCallContext, ToolCallErrorStatus, ToolCallRequest as KernelToolCallRequest, ToolTransport,
+    HostFileImportTrust, ToolCallContext, ToolCallErrorStatus,
+    ToolCallRequest as KernelToolCallRequest, ToolTransport,
 };
 use crate::tool_runtime::tool_definition::LOCAL_CODING_TOOL_NAMES;
-use crate::tool_runtime::{registered_tool_specs, ToolResult, ToolRuntime, ToolSpec};
+use crate::tool_runtime::{
+    registered_tool_specs, validate_project_artifact_export_snapshot,
+    ProjectArtifactExportSnapshot, ToolResult, ToolRuntime, ToolSpec, MAX_PROJECT_ARTIFACT_BYTES,
+    MAX_READ_PROJECT_ARTIFACT_LENGTH,
+};
 use base64::{engine::general_purpose, Engine as _};
+use futures_util::future::join_all;
 use salvo::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const MCP_STATELESS_PROTOCOL_VERSION: &str = "2026-07-28";
 const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 const MCP_METHOD_HEADER: &str = "mcp-method";
 const MCP_NAME_HEADER: &str = "mcp-name";
+const MCP_ARTIFACT_EXPORT_URI_PREFIX: &str = "webcodex-artifact://export/";
+const MCP_ARTIFACT_EXPORT_ID_PREFIX: &str = "wc_export_";
+const MCP_ARTIFACT_EXPORT_TTL: Duration = Duration::from_secs(5 * 60);
+const MCP_ARTIFACT_EXPORT_ADMISSION_TIMEOUT: Duration = Duration::from_secs(5);
+const MCP_ARTIFACT_EXPORT_READ_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_MCP_ARTIFACT_EXPORT_READS: usize = 2;
+const MAX_MCP_ARTIFACT_EXPORT_CHUNK_READS: usize = 4;
+const MAX_MCP_ARTIFACT_EXPORTS: usize = 128;
+const MAX_MCP_ARTIFACT_EXPORTS_PER_CALLER: usize = 16;
+const MCP_ARTIFACT_EXPORT_BUSY_CODE: i64 = -32029;
 const MCP_HEADER_MISMATCH: i64 = -32020;
 const MCP_UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 const MCP_SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
@@ -376,13 +396,22 @@ fn mcp_tools_list_payload(model_surface: ModelSurface) -> Value {
 /// explicit bool so they never need process-global env. The schema shape is
 /// identical to the adapter path: `compact` only omits `outputSchema`.
 fn mcp_tools_list_payload_with_compact(model_surface: ModelSurface, compact: bool) -> Value {
-    mcp_tools_list_payload_with_compact_and_app(model_surface, compact, false)
+    mcp_tools_list_payload_with_features(model_surface, compact, false, false)
 }
 
 fn mcp_tools_list_payload_with_compact_and_app(
     model_surface: ModelSurface,
     compact: bool,
     app_enabled: bool,
+) -> Value {
+    mcp_tools_list_payload_with_features(model_surface, compact, app_enabled, true)
+}
+
+fn mcp_tools_list_payload_with_features(
+    model_surface: ModelSurface,
+    compact: bool,
+    app_enabled: bool,
+    artifact_export_enabled: bool,
 ) -> Value {
     let specs = match model_surface {
         ModelSurface::CanonicalConnector => crate::connector_runtime::surface::capability_specs(),
@@ -391,6 +420,7 @@ fn mcp_tools_list_payload_with_compact_and_app(
     };
     let tools: Vec<Value> = specs
         .into_iter()
+        .filter(|spec| artifact_export_enabled || spec.name != "export_project_artifact")
         .map(|spec| mcp_tool_spec_json(spec, compact, app_enabled))
         .collect();
     json!({ "tools": tools })
@@ -423,6 +453,14 @@ fn mcp_tool_spec_json(mut spec: ToolSpec, compact: bool, app_enabled: bool) -> V
         // Match ToolSpec's camelCase serde so default behavior is unchanged.
         serde_json::to_value(spec).unwrap_or_else(|_| json!({}))
     };
+    if tool_name == "import_conversation_files_to_project" {
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "_meta".to_string(),
+                json!({"openai/fileParams": ["openaiFileIdRefs"]}),
+            );
+        }
+    }
     if app_enabled && tool_name == "computer_snapshot" {
         if let Some(object) = value.as_object_mut() {
             object.insert(
@@ -484,6 +522,293 @@ fn mcp_computer_app_resource_read(uri: &str) -> Option<Value> {
             }]
         })
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum McpArtifactExportCallerBinding {
+    Bootstrap,
+    ApiToken {
+        api_key_id: String,
+    },
+    AgentToken {
+        api_key_id: String,
+    },
+    AccountCredential {
+        user_id: String,
+    },
+    OAuthUser {
+        user_id: String,
+        client_id: String,
+    },
+    OAuthSharedKey {
+        shared_key_hash: String,
+        client_id: String,
+    },
+    SharedKey {
+        shared_key_hash: String,
+    },
+    ProjectCredential {
+        project_grant_id: String,
+    },
+}
+
+fn mcp_artifact_export_caller_binding(
+    auth: Option<&AuthContext>,
+) -> Result<McpArtifactExportCallerBinding, &'static str> {
+    let auth = auth.ok_or("authenticated caller identity is unavailable")?;
+    match auth.kind {
+        crate::auth::AuthKind::Bootstrap => Ok(McpArtifactExportCallerBinding::Bootstrap),
+        crate::auth::AuthKind::ApiToken => auth
+            .api_key_id
+            .as_ref()
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .map(|api_key_id| McpArtifactExportCallerBinding::ApiToken { api_key_id })
+            .ok_or("API token identity is unavailable"),
+        crate::auth::AuthKind::AgentToken => auth
+            .api_key_id
+            .as_ref()
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .map(|api_key_id| McpArtifactExportCallerBinding::AgentToken { api_key_id })
+            .ok_or("agent token identity is unavailable"),
+        crate::auth::AuthKind::AccountCredential => auth
+            .user_id
+            .as_ref()
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .map(|user_id| McpArtifactExportCallerBinding::AccountCredential { user_id })
+            .ok_or("account identity is unavailable"),
+        crate::auth::AuthKind::OAuth2Token => {
+            let client_id = auth
+                .allowed_client_id
+                .as_ref()
+                .filter(|value| !value.is_empty())
+                .cloned()
+                .ok_or("OAuth client identity is unavailable")?;
+            if auth.is_oauth_shared_key_subject() {
+                let shared_key_hash = auth
+                    .shared_key_hash
+                    .as_ref()
+                    .filter(|value| !value.is_empty())
+                    .cloned()
+                    .ok_or("OAuth shared-key subject identity is unavailable")?;
+                Ok(McpArtifactExportCallerBinding::OAuthSharedKey {
+                    shared_key_hash,
+                    client_id,
+                })
+            } else if auth.token_kind.as_deref() == Some("oauth2") {
+                let user_id = auth
+                    .user_id
+                    .as_ref()
+                    .filter(|value| !value.is_empty())
+                    .cloned()
+                    .ok_or("OAuth user identity is unavailable")?;
+                Ok(McpArtifactExportCallerBinding::OAuthUser { user_id, client_id })
+            } else {
+                Err("unsupported OAuth subject identity")
+            }
+        }
+        crate::auth::AuthKind::SharedKey => auth
+            .shared_key_hash
+            .as_ref()
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .map(|shared_key_hash| McpArtifactExportCallerBinding::SharedKey { shared_key_hash })
+            .ok_or("shared-key identity is unavailable"),
+        crate::auth::AuthKind::ProjectCredential => auth
+            .project_grant_id
+            .as_ref()
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .map(
+                |project_grant_id| McpArtifactExportCallerBinding::ProjectCredential {
+                    project_grant_id,
+                },
+            )
+            .ok_or("project credential identity is unavailable"),
+        crate::auth::AuthKind::OpenAnonymous => {
+            Err("anonymous MCP callers cannot create artifact export resources")
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct McpArtifactExportRecord {
+    caller: McpArtifactExportCallerBinding,
+    project: String,
+    snapshot: ProjectArtifactExportSnapshot,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct McpArtifactExportRegistry {
+    entries: HashMap<String, McpArtifactExportRecord>,
+    order: VecDeque<String>,
+}
+
+impl McpArtifactExportRegistry {
+    fn cleanup(&mut self, now: Instant) {
+        self.entries.retain(|_, record| record.expires_at > now);
+        self.order.retain(|id| self.entries.contains_key(id));
+    }
+
+    fn insert(&mut self, record: McpArtifactExportRecord) -> String {
+        self.cleanup(Instant::now());
+        while self
+            .entries
+            .values()
+            .filter(|existing| existing.caller == record.caller)
+            .count()
+            >= MAX_MCP_ARTIFACT_EXPORTS_PER_CALLER
+        {
+            let Some(position) = self.order.iter().position(|id| {
+                self.entries
+                    .get(id)
+                    .is_some_and(|existing| existing.caller == record.caller)
+            }) else {
+                break;
+            };
+            if let Some(id) = self.order.remove(position) {
+                self.entries.remove(&id);
+            }
+        }
+        while self.entries.len() >= MAX_MCP_ARTIFACT_EXPORTS {
+            if let Some(id) = self.order.pop_front() {
+                self.entries.remove(&id);
+            } else {
+                break;
+            }
+        }
+        let id = loop {
+            let candidate = format!(
+                "{MCP_ARTIFACT_EXPORT_ID_PREFIX}{}",
+                uuid::Uuid::new_v4().simple()
+            );
+            if !self.entries.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        self.order.push_back(id.clone());
+        self.entries.insert(id.clone(), record);
+        format!("{MCP_ARTIFACT_EXPORT_URI_PREFIX}{id}")
+    }
+
+    fn get_for_caller(
+        &mut self,
+        uri: &str,
+        caller: &McpArtifactExportCallerBinding,
+    ) -> Option<McpArtifactExportRecord> {
+        self.cleanup(Instant::now());
+        let id = mcp_artifact_export_id_from_uri(uri)?;
+        self.entries
+            .get(id)
+            .filter(|record| &record.caller == caller)
+            .cloned()
+    }
+}
+
+static MCP_ARTIFACT_EXPORT_REGISTRY: OnceLock<Mutex<McpArtifactExportRegistry>> = OnceLock::new();
+static MCP_ARTIFACT_EXPORT_READ_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+
+fn mcp_artifact_export_registry() -> &'static Mutex<McpArtifactExportRegistry> {
+    MCP_ARTIFACT_EXPORT_REGISTRY.get_or_init(|| Mutex::new(McpArtifactExportRegistry::default()))
+}
+
+fn mcp_artifact_export_read_semaphore() -> &'static Semaphore {
+    MCP_ARTIFACT_EXPORT_READ_SEMAPHORE.get_or_init(|| Semaphore::new(MAX_MCP_ARTIFACT_EXPORT_READS))
+}
+
+fn mcp_artifact_export_id_from_uri(uri: &str) -> Option<&str> {
+    let id = uri.strip_prefix(MCP_ARTIFACT_EXPORT_URI_PREFIX)?;
+    let hex = id.strip_prefix(MCP_ARTIFACT_EXPORT_ID_PREFIX)?;
+    (hex.len() == 32
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+    .then_some(id)
+}
+
+fn mcp_issue_artifact_export(
+    caller: McpArtifactExportCallerBinding,
+    result: &ToolResult,
+) -> Result<(String, ProjectArtifactExportSnapshot), String> {
+    let project = result
+        .output
+        .get("project")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "export result is missing canonical project identity".to_string())?
+        .to_string();
+    let path = result
+        .output
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "export result is missing artifact path".to_string())?;
+    let snapshot = validate_project_artifact_export_snapshot(path, &result.output)?;
+    if result.output.get("name").and_then(Value::as_str) != Some(snapshot.name.as_str()) {
+        return Err(
+            "export result basename does not match validated artifact metadata".to_string(),
+        );
+    }
+    let record = McpArtifactExportRecord {
+        caller,
+        project,
+        snapshot: snapshot.clone(),
+        expires_at: Instant::now() + MCP_ARTIFACT_EXPORT_TTL,
+    };
+    let uri = mcp_artifact_export_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(record);
+    Ok((uri, snapshot))
+}
+
+fn mcp_artifact_export_tool_result(
+    result: ToolResult,
+    caller: McpArtifactExportCallerBinding,
+) -> Value {
+    if !result.success {
+        return mcp_runtime_tool_result("export_project_artifact", false, result);
+    }
+    let (uri, snapshot) = match mcp_issue_artifact_export(caller, &result) {
+        Ok(value) => value,
+        Err(error) => {
+            return mcp_runtime_tool_result(
+                "export_project_artifact",
+                false,
+                ToolResult::err(format!("cannot frame artifact export resource: {error}")),
+            )
+        }
+    };
+    json!({
+        "content": [{
+            "type": "resource_link",
+            "uri": uri,
+            "name": snapshot.name,
+            "mimeType": snapshot.mime_type,
+            "description": "Short-lived authenticated WebCodex project artifact export. Read this URI with MCP resources/read to retrieve the complete bounded binary."
+        }],
+        "structuredContent": {
+            "success": true,
+            "output": result.output,
+            "error": Value::Null,
+        },
+        "isError": false
+    })
+}
+
+#[cfg(test)]
+fn mcp_expire_artifact_export_for_test(uri: &str) {
+    if let Some(id) = mcp_artifact_export_id_from_uri(uri) {
+        let mut registry = mcp_artifact_export_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(record) = registry.entries.get_mut(id) {
+            record.expires_at = Instant::now();
+        }
+    }
 }
 
 pub(crate) fn mcp_runtime_tool_result(
@@ -638,6 +963,424 @@ fn mcp_native_image_tool_result(tool_name: &str, result: &mut ToolResult) -> Res
         },
         "isError": false
     }))
+}
+
+#[derive(Debug)]
+enum McpArtifactExportReadError {
+    Unavailable,
+    Forbidden {
+        required_scope: Option<&'static str>,
+        description: String,
+    },
+    SnapshotChanged,
+    Unsafe,
+    Busy,
+    Timeout,
+}
+
+fn mcp_artifact_export_lookup(
+    uri: &str,
+    auth: Option<&AuthContext>,
+) -> Result<McpArtifactExportRecord, McpArtifactExportReadError> {
+    let caller = mcp_artifact_export_caller_binding(auth)
+        .map_err(|_| McpArtifactExportReadError::Unavailable)?;
+    mcp_artifact_export_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_for_caller(uri, &caller)
+        .ok_or(McpArtifactExportReadError::Unavailable)
+}
+
+async fn mcp_artifact_export_metadata_recheck(
+    runtime: &ToolRuntime,
+    record: &McpArtifactExportRecord,
+    auth: Option<&AuthContext>,
+) -> Result<ProjectArtifactExportSnapshot, McpArtifactExportReadError> {
+    let outcome = runtime
+        .call_tool_with_context(
+            KernelToolCallRequest {
+                tool_name: "read_project_artifact_metadata".to_string(),
+                arguments: json!({
+                    "project": record.project,
+                    "path": record.snapshot.path,
+                    "allow_missing": false,
+                }),
+            },
+            ToolCallContext {
+                transport: ToolTransport::Mcp,
+                session_id: None,
+                auth,
+                window: None,
+                record_oauth_scope_denials: false,
+                host_file_import_trust: HostFileImportTrust::Untrusted,
+            },
+        )
+        .await;
+    if let Some(error_status) = outcome.error_status {
+        return match error_status {
+            ToolCallErrorStatus::InsufficientScope {
+                required_scope,
+                description,
+            } => Err(McpArtifactExportReadError::Forbidden {
+                required_scope,
+                description,
+            }),
+            ToolCallErrorStatus::InvalidArguments { .. } => Err(McpArtifactExportReadError::Unsafe),
+        };
+    }
+    let result = outcome.result.ok_or(McpArtifactExportReadError::Unsafe)?;
+    if !result.success {
+        return Err(McpArtifactExportReadError::Unavailable);
+    }
+    let snapshot = validate_project_artifact_export_snapshot(&record.snapshot.path, &result.output)
+        .map_err(|_| McpArtifactExportReadError::Unsafe)?;
+    if snapshot != record.snapshot {
+        return Err(McpArtifactExportReadError::SnapshotChanged);
+    }
+    Ok(snapshot)
+}
+
+fn mcp_artifact_export_decode_chunk(
+    record: &McpArtifactExportRecord,
+    offset: usize,
+    length: usize,
+    output: &Value,
+    require_complete_metadata: bool,
+) -> Result<Vec<u8>, McpArtifactExportReadError> {
+    if output.get("error_kind").and_then(Value::as_str) == Some("snapshot_changed") {
+        return Err(McpArtifactExportReadError::SnapshotChanged);
+    }
+    if output.get("error").and_then(Value::as_str).is_some() {
+        return Err(McpArtifactExportReadError::Unsafe);
+    }
+    if output.get("path").and_then(Value::as_str) != Some(record.snapshot.path.as_str())
+        || output.get("file_bytes").and_then(Value::as_u64) != Some(record.snapshot.bytes as u64)
+    {
+        return Err(McpArtifactExportReadError::SnapshotChanged);
+    }
+    if require_complete_metadata
+        && (output.get("mime_type").and_then(Value::as_str)
+            != Some(record.snapshot.mime_type.as_str())
+            || output.get("sha256").and_then(Value::as_str)
+                != Some(record.snapshot.sha256.as_str()))
+    {
+        return Err(McpArtifactExportReadError::SnapshotChanged);
+    }
+    if output.get("offset").and_then(Value::as_u64) != Some(offset as u64) {
+        return Err(McpArtifactExportReadError::Unsafe);
+    }
+    let encoded = output
+        .get("content_base64")
+        .and_then(Value::as_str)
+        .ok_or(McpArtifactExportReadError::Unsafe)?;
+    let decoded = general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| McpArtifactExportReadError::Unsafe)?;
+    let bytes_returned = output
+        .get("bytes_returned")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or(McpArtifactExportReadError::Unsafe)?;
+    let next_offset = output
+        .get("next_offset")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or(McpArtifactExportReadError::Unsafe)?;
+    let eof = output
+        .get("eof")
+        .and_then(Value::as_bool)
+        .ok_or(McpArtifactExportReadError::Unsafe)?;
+    let truncated = output
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .ok_or(McpArtifactExportReadError::Unsafe)?;
+    let expected_next = offset
+        .checked_add(decoded.len())
+        .ok_or(McpArtifactExportReadError::Unsafe)?;
+    if decoded.len() != bytes_returned
+        || decoded.len() > length
+        || expected_next != next_offset
+        || next_offset > record.snapshot.bytes
+        || (decoded.is_empty() && offset < record.snapshot.bytes)
+        || eof != (next_offset == record.snapshot.bytes)
+        || truncated == eof
+    {
+        return Err(McpArtifactExportReadError::Unsafe);
+    }
+    Ok(decoded)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpArtifactExportChunkRoute {
+    Optimized,
+    Legacy,
+}
+
+async fn mcp_artifact_export_read_optimized_chunk(
+    runtime: &ToolRuntime,
+    record: &McpArtifactExportRecord,
+    auth: Option<&AuthContext>,
+    offset: usize,
+    length: usize,
+) -> Result<Option<Vec<u8>>, McpArtifactExportReadError> {
+    match runtime
+        .read_project_artifact_export_chunk_internal(
+            &record.project,
+            &record.snapshot.path,
+            record.snapshot.bytes,
+            offset,
+            length,
+            auth,
+        )
+        .await
+    {
+        Ok(Some(output)) => {
+            mcp_artifact_export_decode_chunk(record, offset, length, &output, false).map(Some)
+        }
+        Ok(None) => Ok(None),
+        Err(_) => Err(McpArtifactExportReadError::Unavailable),
+    }
+}
+
+async fn mcp_artifact_export_read_legacy_chunk(
+    runtime: &ToolRuntime,
+    record: &McpArtifactExportRecord,
+    auth: Option<&AuthContext>,
+    offset: usize,
+    length: usize,
+) -> Result<Vec<u8>, McpArtifactExportReadError> {
+    let outcome = runtime
+        .call_tool_with_context(
+            KernelToolCallRequest {
+                tool_name: "read_project_artifact".to_string(),
+                arguments: json!({
+                    "project": record.project,
+                    "path": record.snapshot.path,
+                    "encoding": "base64",
+                    "offset": offset,
+                    "length": length,
+                    "max_bytes": length,
+                }),
+            },
+            ToolCallContext {
+                transport: ToolTransport::Mcp,
+                session_id: None,
+                auth,
+                window: None,
+                record_oauth_scope_denials: false,
+                host_file_import_trust: HostFileImportTrust::Untrusted,
+            },
+        )
+        .await;
+    if let Some(error_status) = outcome.error_status {
+        return match error_status {
+            ToolCallErrorStatus::InsufficientScope {
+                required_scope,
+                description,
+            } => Err(McpArtifactExportReadError::Forbidden {
+                required_scope,
+                description,
+            }),
+            ToolCallErrorStatus::InvalidArguments { .. } => Err(McpArtifactExportReadError::Unsafe),
+        };
+    }
+    let result = outcome.result.ok_or(McpArtifactExportReadError::Unsafe)?;
+    if !result.success {
+        return Err(McpArtifactExportReadError::Unavailable);
+    }
+    mcp_artifact_export_decode_chunk(record, offset, length, &result.output, true)
+}
+
+async fn mcp_artifact_export_read_chunk(
+    runtime: &ToolRuntime,
+    record: &McpArtifactExportRecord,
+    auth: Option<&AuthContext>,
+    offset: usize,
+    length: usize,
+) -> Result<(Vec<u8>, McpArtifactExportChunkRoute), McpArtifactExportReadError> {
+    if let Some(chunk) =
+        mcp_artifact_export_read_optimized_chunk(runtime, record, auth, offset, length).await?
+    {
+        return Ok((chunk, McpArtifactExportChunkRoute::Optimized));
+    }
+
+    // Rolling-upgrade compatibility: an old Runner cannot receive the optimized
+    // request kind because capability check + enqueue are atomic. Observe that
+    // route once on the first chunk; the resource read then stays sequential on
+    // this public compatibility path rather than amplifying legacy whole-file
+    // work with Control-side concurrency.
+    let chunk =
+        mcp_artifact_export_read_legacy_chunk(runtime, record, auth, offset, length).await?;
+    Ok((chunk, McpArtifactExportChunkRoute::Legacy))
+}
+
+async fn mcp_artifact_export_resource_read_inner(
+    runtime: &ToolRuntime,
+    uri: &str,
+    auth: Option<&AuthContext>,
+    record: McpArtifactExportRecord,
+) -> Result<Value, McpArtifactExportReadError> {
+    let snapshot = mcp_artifact_export_metadata_recheck(runtime, &record, auth).await?;
+    let mut bytes = Vec::with_capacity(snapshot.bytes);
+    let max_chunks = MAX_PROJECT_ARTIFACT_BYTES
+        .div_ceil(MAX_READ_PROJECT_ARTIFACT_LENGTH)
+        .saturating_add(1);
+    let mut offset = 0usize;
+    let mut chunks = 0usize;
+    let mut route = None;
+
+    if offset < snapshot.bytes {
+        chunks = 1;
+        let length = snapshot.bytes.min(MAX_READ_PROJECT_ARTIFACT_LENGTH);
+        let (chunk, first_route) =
+            mcp_artifact_export_read_chunk(runtime, &record, auth, offset, length).await?;
+        offset = offset
+            .checked_add(chunk.len())
+            .ok_or(McpArtifactExportReadError::Unsafe)?;
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() > snapshot.bytes {
+            return Err(McpArtifactExportReadError::Unsafe);
+        }
+        route = Some(first_route);
+    }
+
+    match route {
+        Some(McpArtifactExportChunkRoute::Legacy) => {
+            while offset < snapshot.bytes {
+                if chunks >= max_chunks {
+                    return Err(McpArtifactExportReadError::Unsafe);
+                }
+                chunks = chunks.saturating_add(1);
+                let length = (snapshot.bytes - offset).min(MAX_READ_PROJECT_ARTIFACT_LENGTH);
+                let chunk =
+                    mcp_artifact_export_read_legacy_chunk(runtime, &record, auth, offset, length)
+                        .await?;
+                offset = offset
+                    .checked_add(chunk.len())
+                    .ok_or(McpArtifactExportReadError::Unsafe)?;
+                bytes.extend_from_slice(&chunk);
+                if bytes.len() > snapshot.bytes {
+                    return Err(McpArtifactExportReadError::Unsafe);
+                }
+            }
+        }
+        Some(McpArtifactExportChunkRoute::Optimized) => {
+            while offset < snapshot.bytes {
+                let mut batch = Vec::with_capacity(MAX_MCP_ARTIFACT_EXPORT_CHUNK_READS);
+                let mut batch_offset = offset;
+                while batch.len() < MAX_MCP_ARTIFACT_EXPORT_CHUNK_READS
+                    && batch_offset < snapshot.bytes
+                {
+                    if chunks >= max_chunks {
+                        return Err(McpArtifactExportReadError::Unsafe);
+                    }
+                    chunks = chunks.saturating_add(1);
+                    let length =
+                        (snapshot.bytes - batch_offset).min(MAX_READ_PROJECT_ARTIFACT_LENGTH);
+                    batch.push((batch_offset, length));
+                    batch_offset = batch_offset
+                        .checked_add(length)
+                        .ok_or(McpArtifactExportReadError::Unsafe)?;
+                }
+
+                let runtime = runtime;
+                let record = &record;
+                let results = join_all(batch.iter().map(|&(batch_offset, length)| async move {
+                    mcp_artifact_export_read_optimized_chunk(
+                        runtime,
+                        record,
+                        auth,
+                        batch_offset,
+                        length,
+                    )
+                    .await
+                }))
+                .await;
+
+                // `join_all` drains every already-dispatched request in this
+                // bounded batch and preserves input order. Only after the full
+                // batch is drained do we surface the first deterministic error
+                // in requested-offset order or append successful bytes.
+                for ((requested_offset, _), result) in batch.into_iter().zip(results) {
+                    if requested_offset != offset {
+                        return Err(McpArtifactExportReadError::Unsafe);
+                    }
+                    let chunk = result?.ok_or(McpArtifactExportReadError::Unavailable)?;
+                    offset = offset
+                        .checked_add(chunk.len())
+                        .ok_or(McpArtifactExportReadError::Unsafe)?;
+                    bytes.extend_from_slice(&chunk);
+                    if bytes.len() > snapshot.bytes {
+                        return Err(McpArtifactExportReadError::Unsafe);
+                    }
+                }
+            }
+        }
+        None => {}
+    }
+    if bytes.len() != snapshot.bytes {
+        return Err(McpArtifactExportReadError::Unsafe);
+    }
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    if sha256 != snapshot.sha256 {
+        return Err(McpArtifactExportReadError::SnapshotChanged);
+    }
+    Ok(json!({
+        "contents": [{
+            "uri": uri,
+            "mimeType": snapshot.mime_type,
+            "blob": general_purpose::STANDARD.encode(bytes),
+        }]
+    }))
+}
+
+async fn mcp_artifact_export_resource_read_with_gate(
+    runtime: &ToolRuntime,
+    uri: &str,
+    auth: Option<&AuthContext>,
+    gate: &Semaphore,
+    admission_timeout: Duration,
+) -> Result<Value, McpArtifactExportReadError> {
+    let record = mcp_artifact_export_lookup(uri, auth)?;
+    if auth.is_some_and(|auth| auth.is_oauth_token())
+        && !auth.is_some_and(|auth| auth.has_scope(crate::auth::SCOPE_PROJECT_READ))
+    {
+        return Err(McpArtifactExportReadError::Forbidden {
+            required_scope: Some(crate::auth::SCOPE_PROJECT_READ),
+            description: format!(
+                "missing required scope: {}",
+                crate::auth::SCOPE_PROJECT_READ
+            ),
+        });
+    }
+    let _permit = match tokio::time::timeout(admission_timeout, gate.acquire()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) | Err(_) => return Err(McpArtifactExportReadError::Busy),
+    };
+    match tokio::time::timeout(
+        MCP_ARTIFACT_EXPORT_READ_TIMEOUT,
+        mcp_artifact_export_resource_read_inner(runtime, uri, auth, record),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(McpArtifactExportReadError::Timeout),
+    }
+}
+
+async fn mcp_artifact_export_resource_read(
+    runtime: &ToolRuntime,
+    uri: &str,
+    auth: Option<&AuthContext>,
+) -> Result<Value, McpArtifactExportReadError> {
+    mcp_artifact_export_resource_read_with_gate(
+        runtime,
+        uri,
+        auth,
+        mcp_artifact_export_read_semaphore(),
+        MCP_ARTIFACT_EXPORT_ADMISSION_TIMEOUT,
+    )
+    .await
 }
 
 /// Outcome of handling a single MCP JSON-RPC request.
@@ -832,7 +1575,7 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
     let audit = if request.method == "tools/call" && request.id.is_some() {
         Some((
             ActionAudit::start(req, depot, "/mcp", "toolsCall"),
-            tool_name.unwrap_or_else(|| "unknown".to_string()),
+            tool_name.clone().unwrap_or_else(|| "unknown".to_string()),
             project_from_tool_call_params(&request.params),
         ))
     } else {
@@ -849,6 +1592,14 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
     };
 
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
+    let host_file_import_trust =
+        if tool_name.as_deref() == Some("import_conversation_files_to_project") {
+            let decision = mcp_host_file_import_trust_decision(depot, auth.as_ref());
+            log_mcp_host_file_import_trust_decision(auth.as_ref(), &decision);
+            decision.trust
+        } else {
+            HostFileImportTrust::Untrusted
+        };
     // Defense-in-depth backstop: every tool bounds its own agent/subprocess
     // waits at <= 124s, so this outer limit never preempts a legitimate inner
     // timeout. It only fires if a dispatch path hangs without a bound (the
@@ -863,6 +1614,7 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
             request,
             auth.as_ref(),
             protocol_era,
+            host_file_import_trust,
             window.identity.as_ref(),
             Some(&mut guard),
         ),
@@ -994,7 +1746,17 @@ async fn handle_mcp_request(
     auth: Option<&AuthContext>,
 ) -> McpOutcome {
     let protocol_era = inferred_protocol_era(&request);
-    handle_mcp_request_with_lifecycle(runtime, None, request, auth, protocol_era, None, None).await
+    handle_mcp_request_with_lifecycle(
+        runtime,
+        None,
+        request,
+        auth,
+        protocol_era,
+        HostFileImportTrust::Untrusted,
+        None,
+        None,
+    )
+    .await
 }
 
 async fn handle_mcp_request_with_lifecycle(
@@ -1003,11 +1765,19 @@ async fn handle_mcp_request_with_lifecycle(
     request: JsonRpcRequest,
     auth: Option<&AuthContext>,
     protocol_era: McpProtocolEra,
+    host_file_import_trust: HostFileImportTrust,
     window: Option<&crate::client_window::ClientWindow>,
     mut lifecycle: Option<&mut ToolRequestLifecycle>,
 ) -> McpOutcome {
     let is_oauth2 = auth.is_some_and(|ctx| ctx.is_oauth_token());
     let stateless_2026 = protocol_era == McpProtocolEra::Stateless2026;
+    let artifact_export_resource_read = stateless_2026
+        && request.method == "resources/read"
+        && request
+            .params
+            .get("uri")
+            .and_then(Value::as_str)
+            .is_some_and(|uri| uri.starts_with(MCP_ARTIFACT_EXPORT_URI_PREFIX));
     let mcp_app_enabled = stateless_2026
         && model_surface_supports_computer_app(runtime.model_surface())
         && request_supports_mcp_apps(&request.params);
@@ -1015,12 +1785,13 @@ async fn handle_mcp_request_with_lifecycle(
     if is_oauth2
         && (matches!(
             request.method.as_str(),
-            "server/discover" | "tools/list" | "resources/list" | "resources/read"
-        ) || (!stateless_2026
-            && matches!(
-                request.method.as_str(),
-                "initialize" | "ping" | "notifications/initialized"
-            )))
+            "server/discover" | "tools/list" | "resources/list"
+        ) || (request.method == "resources/read" && !artifact_export_resource_read)
+            || (!stateless_2026
+                && matches!(
+                    request.method.as_str(),
+                    "initialize" | "ping" | "notifications/initialized"
+                )))
     {
         if let Some(outcome) = require_mcp_oauth_scope(auth, crate::auth::SCOPE_RUNTIME_READ) {
             return outcome;
@@ -1143,6 +1914,58 @@ async fn handle_mcp_request_with_lifecycle(
             rpc_result(id, mcp_stateless_result(result, true))
         }
         "resources/read" if stateless_2026 => {
+            let Some(uri) = request.params.get("uri").and_then(Value::as_str) else {
+                return McpOutcome::BadRequest(rpc_error(
+                    id,
+                    -32602,
+                    "Invalid params: uri is required",
+                ));
+            };
+            if uri.starts_with(MCP_ARTIFACT_EXPORT_URI_PREFIX) {
+                let result = match mcp_artifact_export_resource_read(runtime, uri, auth).await {
+                    Ok(result) => result,
+                    Err(McpArtifactExportReadError::Forbidden {
+                        required_scope,
+                        description,
+                    }) => return oauth_forbidden(required_scope, description),
+                    Err(McpArtifactExportReadError::Unavailable) => {
+                        return McpOutcome::BadRequest(rpc_error(
+                            id,
+                            -32602,
+                            "Artifact export resource is unavailable",
+                        ))
+                    }
+                    Err(McpArtifactExportReadError::SnapshotChanged) => {
+                        return McpOutcome::BadRequest(rpc_error(
+                            id,
+                            -32602,
+                            "Exported artifact no longer matches its snapshot",
+                        ))
+                    }
+                    Err(McpArtifactExportReadError::Unsafe) => {
+                        return McpOutcome::BadRequest(rpc_error(
+                            id,
+                            -32603,
+                            "Artifact export resource failed bounded safety validation",
+                        ))
+                    }
+                    Err(McpArtifactExportReadError::Busy) => {
+                        return McpOutcome::BadRequest(rpc_error(
+                            id,
+                            MCP_ARTIFACT_EXPORT_BUSY_CODE,
+                            "Artifact export is temporarily busy; retry later",
+                        ))
+                    }
+                    Err(McpArtifactExportReadError::Timeout) => {
+                        return McpOutcome::BadRequest(rpc_error(
+                            id,
+                            -32603,
+                            "Artifact export resource read timed out",
+                        ))
+                    }
+                };
+                return McpOutcome::Ok(rpc_result(id, mcp_stateless_result(result, false)));
+            }
             // Tool descriptors on the full-operator surface advertise the App
             // resource independently of whether a later resource fetch repeats
             // the UI client-capability metadata. Keep resources/list negotiated,
@@ -1154,13 +1977,6 @@ async fn handle_mcp_request_with_lifecycle(
                     "MCP App resource is unavailable on this model surface",
                 ));
             }
-            let Some(uri) = request.params.get("uri").and_then(Value::as_str) else {
-                return McpOutcome::BadRequest(rpc_error(
-                    id,
-                    -32602,
-                    "Invalid params: uri is required",
-                ));
-            };
             let Some(result) = mcp_computer_app_resource_read(uri) else {
                 return McpOutcome::BadRequest(rpc_error(
                     id,
@@ -1207,6 +2023,27 @@ async fn handle_mcp_request_with_lifecycle(
                     ),
                 ));
             }
+            let artifact_export_caller = if params.name == "export_project_artifact" {
+                if !stateless_2026 || runtime.model_surface() != ModelSurface::FullOperatorRuntime {
+                    return McpOutcome::BadRequest(rpc_error(
+                        id,
+                        -32602,
+                        "export_project_artifact requires the stateless-2026 full-operator MCP surface",
+                    ));
+                }
+                match mcp_artifact_export_caller_binding(auth) {
+                    Ok(caller) => Some(caller),
+                    Err(error) => {
+                        return McpOutcome::BadRequest(rpc_error(
+                            id,
+                            -32602,
+                            format!("export_project_artifact cannot bind this caller: {error}"),
+                        ))
+                    }
+                }
+            } else {
+                None
+            };
             if runtime.model_surface() == ModelSurface::CanonicalConnector {
                 let connector = connector.expect("validated canonical Connector state");
                 if !stateless_2026 && params.name == "task_start" && window.is_none() {
@@ -1290,6 +2127,7 @@ async fn handle_mcp_request_with_lifecycle(
                         auth,
                         window,
                         record_oauth_scope_denials: false,
+                        host_file_import_trust,
                     },
                 )
                 .await;
@@ -1330,7 +2168,14 @@ async fn handle_mcp_request_with_lifecycle(
                     lc.dispatch_finished(true, Some(false), category);
                 }
             }
-            let result = mcp_runtime_tool_result(&params.name, as_image_requested, result);
+            let result = if params.name == "export_project_artifact" {
+                mcp_artifact_export_tool_result(
+                    result,
+                    artifact_export_caller.expect("validated artifact export caller binding"),
+                )
+            } else {
+                mcp_runtime_tool_result(&params.name, as_image_requested, result)
+            };
             rpc_result(
                 id,
                 if stateless_2026 {
@@ -1351,6 +2196,248 @@ async fn handle_mcp_request_with_lifecycle(
         }
     };
     McpOutcome::Ok(response)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostFileImportTrustReason {
+    Trusted,
+    MissingConfig,
+    MissingDatabase,
+    MissingAuth,
+    NotOAuthToken,
+    MissingAllowedClientId,
+    OAuthDisabled,
+    ClientIdNotConfigured,
+    ClientRegistrationMissingOrRevoked,
+    ClientRegistrationLookupFailed,
+}
+
+impl HostFileImportTrustReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Trusted => "trusted",
+            Self::MissingConfig => "missing_config",
+            Self::MissingDatabase => "missing_database",
+            Self::MissingAuth => "missing_auth",
+            Self::NotOAuthToken => "not_oauth_token",
+            Self::MissingAllowedClientId => "missing_allowed_client_id",
+            Self::OAuthDisabled => "oauth_disabled",
+            Self::ClientIdNotConfigured => "client_id_not_configured",
+            Self::ClientRegistrationMissingOrRevoked => "client_registration_missing_or_revoked",
+            Self::ClientRegistrationLookupFailed => "client_registration_lookup_failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostFileImportTrustDecision {
+    trust: HostFileImportTrust,
+    reason: HostFileImportTrustReason,
+    config_present: bool,
+    database_present: bool,
+    oauth_enabled: bool,
+    configured_trusted_client_count: usize,
+    client_id_configured: Option<bool>,
+    active_client_registration_found: Option<bool>,
+}
+
+#[cfg(test)]
+static LAST_MCP_HOST_FILE_IMPORT_TRUST_DECISION: std::sync::OnceLock<
+    std::sync::Mutex<Option<HostFileImportTrustDecision>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn take_last_mcp_host_file_import_trust_decision() -> Option<HostFileImportTrustDecision> {
+    LAST_MCP_HOST_FILE_IMPORT_TRUST_DECISION
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap()
+        .take()
+}
+
+impl HostFileImportTrustDecision {
+    fn unavailable(reason: HostFileImportTrustReason) -> Self {
+        Self {
+            trust: HostFileImportTrust::Untrusted,
+            reason,
+            config_present: false,
+            database_present: false,
+            oauth_enabled: false,
+            configured_trusted_client_count: 0,
+            client_id_configured: None,
+            active_client_registration_found: None,
+        }
+    }
+
+    fn from_config(reason: HostFileImportTrustReason, config: &crate::Config) -> Self {
+        Self {
+            trust: HostFileImportTrust::Untrusted,
+            reason,
+            config_present: true,
+            database_present: false,
+            oauth_enabled: config.oauth2.enabled,
+            configured_trusted_client_count: config.oauth2.trusted_mcp_file_client_ids.len(),
+            client_id_configured: None,
+            active_client_registration_found: None,
+        }
+    }
+}
+
+fn mcp_host_file_import_trust_decision_from_state(
+    config: &crate::Config,
+    db: &crate::Database,
+    auth: Option<&AuthContext>,
+) -> HostFileImportTrustDecision {
+    let base = HostFileImportTrustDecision {
+        trust: HostFileImportTrust::Untrusted,
+        reason: HostFileImportTrustReason::MissingAuth,
+        config_present: true,
+        database_present: true,
+        oauth_enabled: config.oauth2.enabled,
+        configured_trusted_client_count: config.oauth2.trusted_mcp_file_client_ids.len(),
+        client_id_configured: None,
+        active_client_registration_found: None,
+    };
+    let Some(auth) = auth else {
+        return base;
+    };
+    if !auth.is_oauth_token() {
+        return HostFileImportTrustDecision {
+            reason: HostFileImportTrustReason::NotOAuthToken,
+            ..base
+        };
+    }
+    let Some(client_id) = auth
+        .allowed_client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|client_id| !client_id.is_empty())
+    else {
+        return HostFileImportTrustDecision {
+            reason: HostFileImportTrustReason::MissingAllowedClientId,
+            ..base
+        };
+    };
+    if !config.oauth2.enabled {
+        return HostFileImportTrustDecision {
+            reason: HostFileImportTrustReason::OAuthDisabled,
+            ..base
+        };
+    }
+    let client_id_configured = config
+        .oauth2
+        .trusted_mcp_file_client_ids
+        .iter()
+        .any(|trusted_client_id| trusted_client_id == client_id);
+    if !client_id_configured {
+        return HostFileImportTrustDecision {
+            reason: HostFileImportTrustReason::ClientIdNotConfigured,
+            client_id_configured: Some(false),
+            ..base
+        };
+    }
+    match db.get_oauth_client_by_client_id(client_id) {
+        Ok(Some(client)) if client.client_id == client_id => HostFileImportTrustDecision {
+            trust: HostFileImportTrust::TrustedOAuthClient,
+            reason: HostFileImportTrustReason::Trusted,
+            client_id_configured: Some(true),
+            active_client_registration_found: Some(true),
+            ..base
+        },
+        Ok(_) => HostFileImportTrustDecision {
+            reason: HostFileImportTrustReason::ClientRegistrationMissingOrRevoked,
+            client_id_configured: Some(true),
+            active_client_registration_found: Some(false),
+            ..base
+        },
+        Err(_) => HostFileImportTrustDecision {
+            reason: HostFileImportTrustReason::ClientRegistrationLookupFailed,
+            client_id_configured: Some(true),
+            active_client_registration_found: None,
+            ..base
+        },
+    }
+}
+
+#[cfg(test)]
+fn mcp_host_file_import_trust_from_state(
+    config: &crate::Config,
+    db: &crate::Database,
+    auth: Option<&AuthContext>,
+) -> HostFileImportTrust {
+    mcp_host_file_import_trust_decision_from_state(config, db, auth).trust
+}
+
+fn mcp_host_file_import_trust_decision(
+    depot: &Depot,
+    auth: Option<&AuthContext>,
+) -> HostFileImportTrustDecision {
+    let Some(config) = crate::auth::get_config(depot) else {
+        return HostFileImportTrustDecision::unavailable(HostFileImportTrustReason::MissingConfig);
+    };
+    let Some(db) = crate::auth::get_db(depot) else {
+        return HostFileImportTrustDecision::from_config(
+            HostFileImportTrustReason::MissingDatabase,
+            config.as_ref(),
+        );
+    };
+    mcp_host_file_import_trust_decision_from_state(config.as_ref(), db.as_ref(), auth)
+}
+
+fn mcp_auth_kind_classification(auth: Option<&AuthContext>) -> &'static str {
+    match auth.map(|auth| auth.kind) {
+        None => "none",
+        Some(crate::auth::AuthKind::OAuth2Token) => "oauth2",
+        Some(crate::auth::AuthKind::ApiToken) => "api_token",
+        Some(crate::auth::AuthKind::Bootstrap) => "bootstrap",
+        Some(crate::auth::AuthKind::AgentToken) => "agent_token",
+        Some(crate::auth::AuthKind::AccountCredential) => "account_credential",
+        Some(crate::auth::AuthKind::SharedKey) => "shared_key",
+        Some(crate::auth::AuthKind::ProjectCredential) => "project_credential",
+        Some(crate::auth::AuthKind::OpenAnonymous) => "open_anonymous",
+    }
+}
+
+fn mcp_token_kind_classification(auth: Option<&AuthContext>) -> &'static str {
+    match auth.and_then(|auth| auth.token_kind.as_deref()) {
+        None => "none",
+        Some("oauth2") => "oauth2",
+        Some("oauth2_shared_key") => "oauth2_shared_key",
+        Some("user") => "user",
+        Some("agent") => "agent",
+        Some(_) => "other",
+    }
+}
+
+fn log_mcp_host_file_import_trust_decision(
+    auth: Option<&AuthContext>,
+    decision: &HostFileImportTrustDecision,
+) {
+    #[cfg(test)]
+    {
+        *LAST_MCP_HOST_FILE_IMPORT_TRUST_DECISION
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap() = Some(*decision);
+    }
+    let allowed_client_id_present = auth
+        .and_then(|auth| auth.allowed_client_id.as_deref())
+        .is_some_and(|client_id| !client_id.trim().is_empty());
+    tracing::info!(
+        target: "webcodex::mcp",
+        trust = decision.trust.is_trusted(),
+        reason = decision.reason.as_str(),
+        auth_kind = mcp_auth_kind_classification(auth),
+        token_kind = mcp_token_kind_classification(auth),
+        allowed_client_id_present,
+        config_present = decision.config_present,
+        database_present = decision.database_present,
+        oauth_enabled = decision.oauth_enabled,
+        configured_trusted_client_count = decision.configured_trusted_client_count,
+        client_id_configured = ?decision.client_id_configured,
+        active_client_registration_found = ?decision.active_client_registration_found,
+        "mcp_host_file_import_trust_decision"
+    );
 }
 
 fn require_mcp_oauth_scope(auth: Option<&AuthContext>, scope: &'static str) -> Option<McpOutcome> {

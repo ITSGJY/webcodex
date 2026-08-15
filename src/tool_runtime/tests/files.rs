@@ -904,6 +904,111 @@ async fn artifact_upload_chunk_session_log_arguments_do_not_store_base64() {
     );
 }
 
+#[test]
+fn conversation_import_session_log_arguments_do_not_store_host_file_refs() {
+    let download_url = "https://files.oaiusercontent.com/NEVER_PERSIST_IMPORT_URL";
+    let file_id = "NEVER_PERSIST_IMPORT_FILE_ID";
+    let arguments = serde_json::json!({
+        "project": "agent:test:demo",
+        "openaiFileIdRefs": [{
+            "download_url": download_url,
+            "file_id": file_id,
+            "mime_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "file_name": "private-name.pptx"
+        }],
+        "output_dir": "paper/export",
+        "targets": ["import-test.pptx"],
+        "overwrite": false
+    });
+
+    let raw_summary = super::super::tool_audit::session_log_arguments_for_tool_request(
+        "import_conversation_files_to_project",
+        &arguments,
+    );
+    assert_eq!(raw_summary["project"], "agent:test:demo");
+    assert_eq!(raw_summary["file_count"], 1);
+    assert_eq!(raw_summary["targets_count"], 1);
+    let raw_json = serde_json::to_string(&raw_summary).unwrap();
+    assert!(!raw_json.contains(download_url));
+    assert!(!raw_json.contains(file_id));
+    assert!(!raw_json.contains("private-name.pptx"));
+
+    let call = ToolCall::from_tool_name("import_conversation_files_to_project", arguments).unwrap();
+    let typed_summary = call.session_log_arguments();
+    assert_eq!(typed_summary["project"], "agent:test:demo");
+    assert_eq!(typed_summary["file_count"], 1);
+    assert_eq!(typed_summary["targets_count"], 1);
+    let typed_json = serde_json::to_string(&typed_summary).unwrap();
+    assert!(!typed_json.contains(download_url));
+    assert!(!typed_json.contains(file_id));
+    assert!(!typed_json.contains("private-name.pptx"));
+}
+
+#[tokio::test]
+async fn conversation_import_durable_session_events_do_not_store_host_file_refs() {
+    use crate::tool_runtime::kernel::{
+        HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolTransport,
+    };
+
+    let runtime = runtime_with_agent_project("telemetry-conversation-import");
+    register_agent(
+        &runtime,
+        "telemetry-conversation-import",
+        None,
+        ShellClientCapabilities {
+            file_write: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id("telemetry-conversation-import");
+    let session = runtime.sessions.start_session(Some(project.clone()), None);
+    let download_url = "https://download.example/NEVER_PERSIST_DURABLE_IMPORT_URL";
+    let file_id = "NEVER_PERSIST_DURABLE_IMPORT_FILE_ID";
+    let auth = auth_context(None, true);
+    let outcome = runtime
+        .call_tool_with_context(
+            ToolCallRequest {
+                tool_name: "import_conversation_files_to_project".to_string(),
+                arguments: serde_json::json!({
+                    "project": project,
+                    "openaiFileIdRefs": [{
+                        "download_url": download_url,
+                        "file_id": file_id,
+                        "mime_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                        "file_name": "private-durable-name.pptx"
+                    }],
+                    "targets": ["import-test.pptx"]
+                }),
+            },
+            ToolCallContext {
+                transport: ToolTransport::Mcp,
+                session_id: Some(&session.session_id),
+                auth: Some(&auth),
+                window: None,
+                record_oauth_scope_denials: false,
+                host_file_import_trust: HostFileImportTrust::Untrusted,
+            },
+        )
+        .await;
+    let result = outcome.result.expect("tool result");
+    assert!(!result.success);
+    assert!(result
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("explicitly trusted OAuth MCP client"));
+
+    let summary = runtime
+        .sessions
+        .summary(&session.session_id, Some(20))
+        .unwrap();
+    let serialized = serde_json::to_string(&summary.events).unwrap();
+    assert!(!serialized.contains(download_url));
+    assert!(!serialized.contains(file_id));
+    assert!(!serialized.contains("private-durable-name.pptx"));
+}
+
 #[tokio::test]
 async fn read_project_artifact_metadata_allow_missing_does_not_count_as_failed() {
     let runtime = runtime_with_agent_project("artifact-missing-session");
@@ -3861,6 +3966,143 @@ async fn read_project_artifact_rejects_invalid_length_before_resolving_project()
         .await;
     assert!(!out.success);
     assert!(out.error.unwrap().contains("length too large"));
+}
+
+#[tokio::test]
+async fn office_artifact_mime_policy_accepts_matching_save_and_upload_paths() {
+    let runtime = test_runtime();
+    let missing_project = "agent:missing:missing".to_string();
+    let cases = [
+        (
+            "docs/report.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "docs/report.pptx",
+        ),
+        (
+            "slides/deck.pptx",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "slides/deck.xlsx",
+        ),
+        (
+            "data/book.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "data/book.docx",
+        ),
+    ];
+
+    for (path, mime, mismatched_path) in cases {
+        let save = runtime
+            .save_project_artifact(
+                missing_project.clone(),
+                path.to_string(),
+                "YQ==".to_string(),
+                Some(mime.to_string()),
+                Some(false),
+            )
+            .await;
+        assert!(!save.success, "{path}");
+        assert!(
+            !save
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("unsupported mime_type")
+                && !save
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("requires a matching"),
+            "matching Office MIME should pass policy before project resolution: {:?}",
+            save.error
+        );
+
+        let upload = runtime
+            .artifact_upload_begin(
+                missing_project.clone(),
+                path.to_string(),
+                Some(1),
+                None,
+                Some(mime.to_string()),
+                Some(false),
+            )
+            .await;
+        assert!(!upload.success, "{path}");
+        assert!(
+            !upload
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("unsupported mime_type")
+                && !upload
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("requires a matching"),
+            "matching Office upload MIME should pass policy before project resolution: {:?}",
+            upload.error
+        );
+
+        let octet = runtime
+            .artifact_upload_begin(
+                missing_project.clone(),
+                path.to_string(),
+                Some(1),
+                None,
+                Some("application/octet-stream".to_string()),
+                Some(false),
+            )
+            .await;
+        assert!(!octet.success, "{path}");
+        assert!(
+            !octet
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("only allowed for safe artifact extensions"),
+            "Office extensions should be safe octet-stream artifact paths: {:?}",
+            octet.error
+        );
+
+        let mismatched = runtime
+            .save_project_artifact(
+                missing_project.clone(),
+                mismatched_path.to_string(),
+                "YQ==".to_string(),
+                Some(mime.to_string()),
+                Some(false),
+            )
+            .await;
+        assert!(!mismatched.success);
+        assert!(
+            mismatched
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("requires a matching"),
+            "{:?}",
+            mismatched.error
+        );
+    }
+
+    let unsupported = runtime
+        .save_project_artifact(
+            missing_project,
+            "docs/report.docx".to_string(),
+            "YQ==".to_string(),
+            Some("application/msword".to_string()),
+            Some(false),
+        )
+        .await;
+    assert!(!unsupported.success);
+    assert!(
+        unsupported
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("unsupported mime_type"),
+        "{:?}",
+        unsupported.error
+    );
 }
 
 #[tokio::test]

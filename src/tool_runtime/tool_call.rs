@@ -227,6 +227,17 @@ where
     Ok(queries)
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OpenAiHostFileRef {
+    pub(crate) download_url: String,
+    pub(crate) file_id: String,
+    #[serde(default)]
+    pub(crate) mime_type: Option<String>,
+    #[serde(default)]
+    pub(crate) file_name: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "tool", content = "params", rename_all = "snake_case")]
 pub enum ToolCall {
@@ -1061,6 +1072,37 @@ pub enum ToolCall {
         overwrite: Option<bool>,
     },
 
+    /// Import host-provided ChatGPT conversation attachments without routing
+    /// temporary OpenAI download URLs or raw attachment bytes to the model or Runner.
+    ImportConversationFilesToProject {
+        project: String,
+        #[serde(rename = "openaiFileIdRefs")]
+        openai_file_id_refs: Vec<OpenAiHostFileRef>,
+        #[serde(default)]
+        output_dir: Option<String>,
+        #[serde(default)]
+        targets: Option<Vec<String>>,
+        #[serde(default)]
+        overwrite: Option<bool>,
+        #[serde(default)]
+        session_id: Option<String>,
+        /// Internal provenance bit set only by the MCP HTTP adapter after
+        /// authenticating the OAuth client registration. Never deserialized
+        /// from model/caller arguments and never serialized back out.
+        #[serde(skip)]
+        trusted_mcp_host_file_import: bool,
+    },
+
+    /// Prepare one project artifact for standards-native MCP resource export.
+    /// The runtime returns only stable metadata; the MCP transport owns the
+    /// short-lived resource handle and complete binary framing.
+    ExportProjectArtifact {
+        project: String,
+        path: String,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+
     /// Read bounded metadata for a binary project artifact. Zip files are
     /// counted but never extracted.
     ReadProjectArtifactMetadata {
@@ -1763,6 +1805,8 @@ impl ToolCall {
             Self::JobTail { .. } => "job_tail",
             Self::WriteProjectFile { .. } => "write_project_file",
             Self::SaveProjectArtifact { .. } => "save_project_artifact",
+            Self::ImportConversationFilesToProject { .. } => "import_conversation_files_to_project",
+            Self::ExportProjectArtifact { .. } => "export_project_artifact",
             Self::ReadProjectArtifactMetadata { .. } => "read_project_artifact_metadata",
             Self::ReadProjectArtifact { .. } => "read_project_artifact",
             Self::ArtifactUploadBegin { .. } => "artifact_upload_begin",
@@ -1825,6 +1869,7 @@ impl ToolCall {
             | Self::ShowChanges { session_id, .. }
             | Self::WriteProjectFile { session_id, .. }
             | Self::SaveProjectArtifact { session_id, .. }
+            | Self::ExportProjectArtifact { session_id, .. }
             | Self::ReadProjectArtifactMetadata { session_id, .. }
             | Self::ReadProjectArtifact { session_id, .. }
             | Self::ArtifactUploadBegin { session_id, .. }
@@ -1845,6 +1890,7 @@ impl ToolCall {
             | Self::WorkspaceSymbols { session_id, .. }
             | Self::GotoDefinition { session_id, .. }
             | Self::FindReferences { session_id, .. } => session_id.as_deref(),
+            Self::ImportConversationFilesToProject { session_id, .. } => session_id.as_deref(),
             Self::CallHierarchy { session_id, .. } => session_id.as_deref(),
             Self::SessionHandoffSummary { session_id, .. } => Some(session_id.as_str()),
             Self::WorkOnProject { session_id, .. } => session_id.as_deref(),
@@ -1888,6 +1934,7 @@ impl ToolCall {
             | Self::ShowChanges { session_id, .. }
             | Self::WriteProjectFile { session_id, .. }
             | Self::SaveProjectArtifact { session_id, .. }
+            | Self::ExportProjectArtifact { session_id, .. }
             | Self::ReadProjectArtifactMetadata { session_id, .. }
             | Self::ReadProjectArtifact { session_id, .. }
             | Self::ArtifactUploadBegin { session_id, .. }
@@ -1911,6 +1958,9 @@ impl ToolCall {
             | Self::CallHierarchy { session_id, .. }
                 if session_id.is_none() =>
             {
+                *session_id = Some(effective_session_id);
+            }
+            Self::ImportConversationFilesToProject { session_id, .. } if session_id.is_none() => {
                 *session_id = Some(effective_session_id);
             }
             _ => {}
@@ -1979,6 +2029,8 @@ impl ToolCall {
             | Self::ShowChanges { project, .. }
             | Self::WriteProjectFile { project, .. }
             | Self::SaveProjectArtifact { project, .. }
+            | Self::ImportConversationFilesToProject { project, .. }
+            | Self::ExportProjectArtifact { project, .. }
             | Self::ReadProjectArtifactMetadata { project, .. }
             | Self::ReadProjectArtifact { project, .. }
             | Self::ArtifactUploadBegin { project, .. }

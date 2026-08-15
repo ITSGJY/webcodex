@@ -706,6 +706,11 @@ impl ToolRuntime {
             | ToolCall::ApplyPatchChecked { .. }
             | ToolCall::ValidatePatch { .. }) => self.dispatch_patch_tool(call).await,
 
+            call @ ToolCall::ImportConversationFilesToProject { .. } => {
+                self.dispatch_conversation_import_tool(call, auth, transport)
+                    .await
+            }
+
             call @ (ToolCall::DeleteProjectFiles { .. }
             | ToolCall::ReadFile { .. }
             | ToolCall::ReadFiles { .. }
@@ -716,6 +721,7 @@ impl ToolRuntime {
             | ToolCall::SearchProjectTexts { .. }
             | ToolCall::WriteProjectFile { .. }
             | ToolCall::SaveProjectArtifact { .. }
+            | ToolCall::ExportProjectArtifact { .. }
             | ToolCall::ReadProjectArtifactMetadata { .. }
             | ToolCall::ReadProjectArtifact { .. }
             | ToolCall::ArtifactUploadBegin { .. }
