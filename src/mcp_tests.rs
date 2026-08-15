@@ -601,7 +601,7 @@ async fn mcp_2026_computer_app_probe_is_mcp_only_tiny_result_control() {
         panic!("expected UI resources/list");
     };
     let resources = resources["result"]["resources"].as_array().unwrap();
-    assert_eq!(resources.len(), 3);
+    assert_eq!(resources.len(), 4);
     let probe_resource = resources
         .iter()
         .find(|resource| resource["uri"] == MCP_COMPUTER_APP_PROBE_RESOURCE_URI)
@@ -824,7 +824,7 @@ async fn mcp_2026_computer_app_image_probe_uses_snapshot_native_image_framing() 
         panic!("expected UI resources/list");
     };
     let resources = resources["result"]["resources"].as_array().unwrap();
-    assert_eq!(resources.len(), 3);
+    assert_eq!(resources.len(), 4);
     let image_resource = resources
         .iter()
         .find(|resource| resource["uri"] == MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI)
@@ -962,6 +962,207 @@ async fn mcp_2026_computer_app_image_probe_uses_snapshot_native_image_framing() 
 }
 
 #[tokio::test]
+async fn mcp_2026_computer_app_snapshot_probe_delegates_to_real_snapshot_contract() {
+    let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
+    assert_eq!(
+        MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI,
+        "ui://webcodex/computer-snapshot-probe/v1"
+    );
+    assert!(registered_tool_specs()
+        .iter()
+        .all(|spec| spec.name != MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME));
+    assert_eq!(
+        MCP_COMPUTER_APP_SNAPSHOT_PROBE_HTML,
+        MCP_COMPUTER_APP_HTML,
+        "snapshot probe v1 must pin the exact production Computer App HTML used for this experiment"
+    );
+    let snapshot_spec = registered_tool_specs()
+        .into_iter()
+        .find(|spec| spec.name == "computer_snapshot")
+        .expect("computer_snapshot runtime spec");
+
+    let legacy_tools = handle_mcp_request(
+        &runtime,
+        rpc("tools/list", Some(json!(2130)), json!({})),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(legacy_tools) = legacy_tools else {
+        panic!("expected legacy tools/list");
+    };
+    assert!(legacy_tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|tool| tool["name"] != MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME));
+
+    let tools = handle_mcp_request(
+        &runtime,
+        rpc("tools/list", Some(json!(2131)), mcp_2026_params(json!({}))),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(tools) = tools else {
+        panic!("expected stateless tools/list");
+    };
+    let snapshot_probe = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME)
+        .expect("MCP-only computer app snapshot probe");
+    assert_eq!(snapshot_probe["inputSchema"], snapshot_spec.input_schema);
+    assert_eq!(snapshot_probe["outputSchema"], snapshot_spec.output_schema);
+    assert_eq!(
+        snapshot_probe["annotations"]["title"],
+        "Computer App Snapshot Probe"
+    );
+    assert_eq!(snapshot_probe["annotations"]["readOnlyHint"], true);
+    assert_eq!(
+        snapshot_probe["_meta"],
+        json!({
+            "ui": {
+                "resourceUri": MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI,
+                "visibility": ["model", "app"]
+            },
+            "openai/outputTemplate": MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI
+        })
+    );
+
+    let compact =
+        mcp_tools_list_payload_with_compact_and_app(ModelSurface::FullOperatorRuntime, true, true);
+    let compact_probe = compact["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME)
+        .expect("compact MCP-only computer app snapshot probe");
+    assert!(compact_probe.get("outputSchema").is_none());
+    assert_eq!(compact_probe["inputSchema"], snapshot_probe["inputSchema"]);
+    assert_eq!(compact_probe["_meta"], snapshot_probe["_meta"]);
+
+    let resources = handle_mcp_request(
+        &runtime,
+        rpc(
+            "resources/list",
+            Some(json!(2132)),
+            mcp_2026_ui_params(json!({})),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(resources) = resources else {
+        panic!("expected UI resources/list");
+    };
+    let resources = resources["result"]["resources"].as_array().unwrap();
+    assert_eq!(resources.len(), 4);
+    let snapshot_resource = resources
+        .iter()
+        .find(|resource| resource["uri"] == MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI)
+        .expect("snapshot probe resource");
+    assert_eq!(snapshot_resource["mimeType"], MCP_UI_RESOURCE_MIME_TYPE);
+    assert_eq!(snapshot_resource["_meta"], mcp_computer_app_resource_meta());
+
+    let resource = handle_mcp_request(
+        &runtime,
+        rpc(
+            "resources/read",
+            Some(json!(2133)),
+            mcp_2026_params(json!({ "uri": MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI })),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(resource) = resource else {
+        panic!("expected snapshot probe resources/read without repeated UI capability");
+    };
+    assert_eq!(
+        resource["result"]["ttlMs"],
+        Value::from(MCP_COMPUTER_UI_RESOURCE_TTL_MS)
+    );
+    assert_eq!(resource["result"]["cacheScope"], "private");
+    assert_eq!(
+        resource["result"]["contents"][0]["uri"],
+        MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI
+    );
+    assert_eq!(
+        resource["result"]["contents"][0]["text"].as_str(),
+        Some(MCP_COMPUTER_APP_SNAPSHOT_PROBE_HTML),
+        "fresh snapshot probe must serve its immutable pinned template"
+    );
+
+    let invalid = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(2134)),
+            mcp_2026_params(json!({
+                "name": MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME,
+                "arguments": {}
+            })),
+        ),
+        None,
+    )
+    .await;
+    match invalid {
+        McpOutcome::BadRequest(value) => assert_eq!(value["error"]["code"], -32602),
+        other => {
+            panic!("snapshot probe must reuse computer_snapshot argument validation, got {other:?}")
+        }
+    }
+
+    let call = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(2135)),
+            mcp_2026_params(json!({
+                "name": MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME,
+                "arguments": {
+                    "client_id": "missing-runner",
+                    "surface_id": "surface_test"
+                }
+            })),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(call) = call else {
+        panic!("valid snapshot probe arguments must delegate to ToolRuntime");
+    };
+    assert_eq!(call["result"]["resultType"], "complete");
+    assert_eq!(call["result"]["isError"], true);
+    assert_eq!(call["result"]["structuredContent"]["success"], false);
+    assert!(call["result"]["structuredContent"]["output"]["error_kind"].is_string());
+    assert!(call["result"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item["type"] != "image"));
+
+    let legacy_call = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(2136)),
+            json!({
+                "name": MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME,
+                "arguments": {
+                    "client_id": "missing-runner",
+                    "surface_id": "surface_test"
+                }
+            }),
+        ),
+        None,
+    )
+    .await;
+    match legacy_call {
+        McpOutcome::BadRequest(value) => assert_eq!(value["error"]["code"], -32602),
+        other => panic!("snapshot probe must remain stateless-2026-only, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn mcp_info_advertised_methods_match_dispatch() {
     let runtime = test_runtime();
     for method in MCP_INFO_METHODS {
@@ -1014,6 +1215,7 @@ async fn mcp_tools_list_returns_same_names_as_runtime() {
     let mut stateless_mcp_names = runtime_names.clone();
     stateless_mcp_names.push(MCP_COMPUTER_APP_PROBE_TOOL_NAME.to_string());
     stateless_mcp_names.push(MCP_COMPUTER_APP_IMAGE_PROBE_TOOL_NAME.to_string());
+    stateless_mcp_names.push(MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME.to_string());
 
     for compact in [false, true] {
         if compact {
@@ -6747,7 +6949,40 @@ async fn oauth2_mcp_computer_snapshot_keeps_computer_read_scope() {
         &service,
         &token,
         "tools/call",
-        json!({ "name": "computer_snapshot", "arguments": arguments }),
+        json!({ "name": "computer_snapshot", "arguments": arguments.clone() }),
+    )
+    .await;
+    assert_ne!(status, StatusCode::FORBIDDEN, "body: {body:?}");
+
+    let (_tmp, service, token) =
+        oauth_mcp_service_with_surface("runtime:read", ModelSurface::FullOperatorRuntime);
+    let (status, body, challenge) = oauth_mcp_request(
+        &service,
+        &token,
+        "tools/call",
+        mcp_2026_ui_params(json!({
+            "name": MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME,
+            "arguments": arguments.clone()
+        })),
+    )
+    .await;
+    assert_mcp_oauth_scope_rejected(
+        status,
+        &body,
+        challenge.as_deref(),
+        Some(crate::auth::SCOPE_COMPUTER_READ),
+    );
+
+    let (_tmp, service, token) =
+        oauth_mcp_service_with_surface("computer:read", ModelSurface::FullOperatorRuntime);
+    let (status, body, _) = oauth_mcp_request(
+        &service,
+        &token,
+        "tools/call",
+        mcp_2026_ui_params(json!({
+            "name": MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME,
+            "arguments": arguments
+        })),
     )
     .await;
     assert_ne!(status, StatusCode::FORBIDDEN, "body: {body:?}");
