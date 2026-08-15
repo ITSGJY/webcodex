@@ -66,6 +66,17 @@ const MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI: &str = "ui://webcodex/computer-
 const MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME: &str = "computer_app_snapshot_probe";
 const MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI: &str =
     "ui://webcodex/computer-snapshot-probe/v1";
+const MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_TOOL_NAME: &str = "computer_app_image_size_probe";
+const MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_RESOURCE_URI: &str =
+    "ui://webcodex/computer-image-size-probe/v1";
+const MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_CHOICES: &[(&str, usize)] = &[
+    ("1k", 1024),
+    ("16k", 16 * 1024),
+    ("64k", 64 * 1024),
+    ("128k", 128 * 1024),
+    ("256k", 256 * 1024),
+    ("512k", 512 * 1024),
+];
 const MCP_COMPUTER_APP_IMAGE_PROBE_PNG_BASE64: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z0GkAAAAASUVORK5CYII=";
 const MCP_COMPUTER_APP_IMAGE_PROBE_PNG_BYTES: u64 = 68;
@@ -78,6 +89,8 @@ const MCP_COMPUTER_APP_PROBE_HTML: &str = include_str!("mcp_computer_probe_app.h
 const MCP_COMPUTER_APP_IMAGE_PROBE_HTML: &str = include_str!("mcp_computer_image_probe_app.html");
 const MCP_COMPUTER_APP_SNAPSHOT_PROBE_HTML: &str =
     include_str!("mcp_computer_snapshot_probe_app.html");
+const MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_HTML: &str =
+    include_str!("mcp_computer_image_size_probe_app.html");
 
 /// Single source of truth for the JSON-RPC methods advertised by `GET /mcp`.
 /// Must match the dispatch arms in `handle_mcp_request_with_lifecycle`;
@@ -449,6 +462,7 @@ fn mcp_tools_list_payload_with_features(
         tools.push(mcp_computer_app_probe_tool_spec(compact));
         tools.push(mcp_computer_app_image_probe_tool_spec(compact));
         tools.push(mcp_computer_app_snapshot_probe_tool_spec(compact));
+        tools.push(mcp_computer_app_image_size_probe_tool_spec(compact));
     }
     json!({ "tools": tools })
 }
@@ -646,6 +660,69 @@ fn mcp_computer_app_snapshot_probe_tool_spec(compact: bool) -> Value {
     value
 }
 
+fn mcp_computer_app_image_size_probe_tool_spec(compact: bool) -> Value {
+    let mut value = json!({
+        "name": MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_TOOL_NAME,
+        "description": "Experimental MCP-only native-image payload-size control probe. Returns a deterministic 1x1 PNG at one of six exact decoded byte sizes through the same MCP image framing used by computer_snapshot, without contacting a Runner.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "size": {
+                    "type": "string",
+                    "enum": ["1k", "16k", "64k", "128k", "256k", "512k"],
+                    "description": "Exact decoded PNG payload size to return."
+                }
+            },
+            "required": ["size"],
+            "additionalProperties": false
+        },
+        "annotations": {
+            "title": "Computer App Image Size Probe",
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
+        },
+        "_meta": {
+            "ui": {
+                "resourceUri": MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_RESOURCE_URI,
+                "visibility": ["model", "app"]
+            },
+            "openai/outputTemplate": MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_RESOURCE_URI
+        }
+    });
+    if !compact {
+        value["outputSchema"] = json!({
+            "type": "object",
+            "properties": {
+                "success": { "type": "boolean" },
+                "output": {
+                    "type": "object",
+                    "properties": {
+                        "probe": { "type": "string" },
+                        "size": { "type": "string" },
+                        "runner_used": { "type": "boolean" },
+                        "client_id": { "type": "string" },
+                        "surface": { "type": "object" },
+                        "width": { "type": "integer" },
+                        "height": { "type": "integer" },
+                        "mime_type": { "type": "string" },
+                        "file_bytes": { "type": "integer" },
+                        "sha256": { "type": "string" },
+                        "content_delivery": { "type": "string" }
+                    },
+                    "required": ["probe", "size", "runner_used", "client_id", "surface", "width", "height", "mime_type", "file_bytes", "sha256", "content_delivery"],
+                    "additionalProperties": false
+                },
+                "error": {}
+            },
+            "required": ["success", "output", "error"],
+            "additionalProperties": false
+        });
+    }
+    value
+}
+
 fn mcp_computer_app_resource_meta() -> Value {
     json!({
         "ui": {
@@ -689,6 +766,13 @@ fn mcp_computer_app_resources_list() -> Value {
                 "description": "Experimental control card that reuses the production Computer App HTML while rendering a real Runner screenshot through a fresh tool and resource binding.",
                 "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
                 "_meta": mcp_computer_app_resource_meta()
+            },
+            {
+                "uri": MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_RESOURCE_URI,
+                "name": "WebCodex Computer App Image Size Probe",
+                "description": "Experimental control card that renders a deterministic 1x1 PNG at one selected decoded payload size through native MCP image content without Runner access.",
+                "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
+                "_meta": mcp_computer_app_resource_meta()
             }
         ]
     })
@@ -699,6 +783,7 @@ fn is_mcp_computer_app_resource_uri(uri: &str) -> bool {
         || uri == MCP_COMPUTER_APP_PROBE_RESOURCE_URI
         || uri == MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI
         || uri == MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI
+        || uri == MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_RESOURCE_URI
         || MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS.contains(&uri)
 }
 
@@ -711,6 +796,8 @@ fn mcp_computer_app_resource_read(uri: &str) -> Option<Value> {
         MCP_COMPUTER_APP_PROBE_HTML
     } else if uri == MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI {
         MCP_COMPUTER_APP_IMAGE_PROBE_HTML
+    } else if uri == MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_RESOURCE_URI {
+        MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_HTML
     } else if uri == MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI {
         MCP_COMPUTER_APP_SNAPSHOT_PROBE_HTML
     } else if uri == MCP_COMPUTER_UI_RESOURCE_URI
@@ -1065,6 +1152,116 @@ fn mcp_computer_app_image_probe_tool_result() -> Value {
             MCP_COMPUTER_APP_IMAGE_PROBE_TOOL_NAME,
             false,
             ToolResult::err(format!("cannot frame built-in image probe: {error}")),
+        ),
+    }
+}
+
+fn mcp_computer_app_image_size_probe_target(size: &str) -> Option<usize> {
+    MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_CHOICES
+        .iter()
+        .find_map(|(label, bytes)| (*label == size).then_some(*bytes))
+}
+
+fn mcp_png_crc32(parts: &[&[u8]]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for part in parts {
+        for &byte in *part {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+            }
+        }
+    }
+    !crc
+}
+
+fn mcp_computer_app_image_size_probe_png(target_bytes: usize) -> Result<Vec<u8>, String> {
+    const PNG_CHUNK_OVERHEAD: usize = 12;
+    const PNG_IEND_CHUNK_BYTES: usize = 12;
+    const PADDING_CHUNK_TYPE: &[u8; 4] = b"vpAg";
+
+    if target_bytes > crate::artifact_policy::MAX_MCP_IMAGE_BYTES {
+        return Err("requested image-size probe payload exceeds the MCP image bound".to_string());
+    }
+    let base = general_purpose::STANDARD
+        .decode(MCP_COMPUTER_APP_IMAGE_PROBE_PNG_BASE64)
+        .map_err(|error| format!("cannot decode built-in PNG: {error}"))?;
+    let iend_offset = base
+        .len()
+        .checked_sub(PNG_IEND_CHUNK_BYTES)
+        .ok_or_else(|| "built-in PNG is too short".to_string())?;
+    if &base[iend_offset + 4..iend_offset + 8] != b"IEND" {
+        return Err("built-in PNG does not end with IEND".to_string());
+    }
+    let padding_len = target_bytes
+        .checked_sub(base.len() + PNG_CHUNK_OVERHEAD)
+        .ok_or_else(|| "requested image-size probe payload is too small".to_string())?;
+    let padding_len_u32 = u32::try_from(padding_len)
+        .map_err(|_| "image-size probe padding is too large".to_string())?;
+
+    let mut png = Vec::with_capacity(target_bytes);
+    png.extend_from_slice(&base[..iend_offset]);
+    png.extend_from_slice(&padding_len_u32.to_be_bytes());
+    png.extend_from_slice(PADDING_CHUNK_TYPE);
+    let padding_start = png.len();
+    png.resize(padding_start + padding_len, 0);
+    let crc = mcp_png_crc32(&[PADDING_CHUNK_TYPE, &png[padding_start..]]);
+    png.extend_from_slice(&crc.to_be_bytes());
+    png.extend_from_slice(&base[iend_offset..]);
+    if png.len() != target_bytes {
+        return Err("image-size probe payload length mismatch".to_string());
+    }
+    Ok(png)
+}
+
+fn mcp_computer_app_image_size_probe_tool_result(size: &str) -> Value {
+    let Some(target_bytes) = mcp_computer_app_image_size_probe_target(size) else {
+        return mcp_runtime_tool_result(
+            MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_TOOL_NAME,
+            false,
+            ToolResult::err("unsupported image-size probe choice"),
+        );
+    };
+    let png = match mcp_computer_app_image_size_probe_png(target_bytes) {
+        Ok(png) => png,
+        Err(error) => {
+            return mcp_runtime_tool_result(
+                MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_TOOL_NAME,
+                false,
+                ToolResult::err(format!("cannot build image-size probe PNG: {error}")),
+            )
+        }
+    };
+    let sha256 = format!("{:x}", Sha256::digest(&png));
+    let content_base64 = general_purpose::STANDARD.encode(&png);
+    let mut result = ToolResult::ok(json!({
+        "probe": "image_size",
+        "size": size,
+        "runner_used": false,
+        "client_id": "control-plane",
+        "surface": {
+            "surface_id": "image_size_probe",
+            "application": "WebCodex",
+            "title": "Synthetic PNG payload size probe",
+            "width": 1,
+            "height": 1,
+            "focused": false,
+            "active": false
+        },
+        "width": 1,
+        "height": 1,
+        "mime_type": "image/png",
+        "file_bytes": png.len() as u64,
+        "sha256": sha256,
+        "content_base64": content_base64
+    }));
+    match mcp_native_image_tool_result("computer_snapshot", &mut result) {
+        Ok(value) => value,
+        Err(error) => mcp_runtime_tool_result(
+            MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_TOOL_NAME,
+            false,
+            ToolResult::err(format!("cannot frame image-size probe: {error}")),
         ),
     }
 }
@@ -2363,6 +2560,7 @@ async fn handle_mcp_request_with_lifecycle(
                 || uri == MCP_COMPUTER_APP_PROBE_RESOURCE_URI
                 || uri == MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI
                 || uri == MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI
+                || uri == MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_RESOURCE_URI
             {
                 result["ttlMs"] = Value::from(MCP_COMPUTER_UI_RESOURCE_TTL_MS);
             }
@@ -2490,6 +2688,57 @@ async fn handle_mcp_request_with_lifecycle(
                     id,
                     mcp_stateless_result(mcp_computer_app_image_probe_tool_result(), false),
                 ));
+            }
+            if params.name == MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_TOOL_NAME {
+                if !stateless_2026 || runtime.model_surface() != ModelSurface::FullOperatorRuntime {
+                    if let Some(lc) = lifecycle.as_deref() {
+                        lc.dispatch_failed("surface_denied");
+                        lc.dispatch_finished(false, Some(false), "surface_denied");
+                    }
+                    return McpOutcome::BadRequest(rpc_error(
+                        id,
+                        -32602,
+                        "computer_app_image_size_probe requires the stateless-2026 full-operator MCP surface",
+                    ));
+                }
+                let size = params.arguments.as_object().and_then(|arguments| {
+                    if arguments.len() != 1 {
+                        return None;
+                    }
+                    arguments
+                        .get("size")
+                        .and_then(Value::as_str)
+                        .filter(|size| mcp_computer_app_image_size_probe_target(size).is_some())
+                        .map(str::to_string)
+                });
+                let Some(size) = size else {
+                    if let Some(lc) = lifecycle.as_deref() {
+                        lc.dispatch_failed("invalid_arguments");
+                        lc.dispatch_finished(false, Some(false), "invalid_arguments");
+                    }
+                    return McpOutcome::BadRequest(rpc_error(
+                        id,
+                        -32602,
+                        "computer_app_image_size_probe requires exactly one supported size",
+                    ));
+                };
+                if let Some(outcome) = require_mcp_scope(auth, crate::auth::SCOPE_RUNTIME_READ) {
+                    if let Some(lc) = lifecycle.as_deref() {
+                        lc.dispatch_failed("forbidden");
+                        lc.dispatch_finished(false, Some(false), "forbidden");
+                    }
+                    return outcome;
+                }
+                let result = mcp_computer_app_image_size_probe_tool_result(&size);
+                let success = result.get("isError").and_then(Value::as_bool) == Some(false);
+                if let Some(lc) = lifecycle.as_deref() {
+                    lc.dispatch_finished(
+                        true,
+                        Some(success),
+                        if success { "success" } else { "tool_error" },
+                    );
+                }
+                return McpOutcome::Ok(rpc_result(id, mcp_stateless_result(result, false)));
             }
             if params.name == MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME {
                 if !stateless_2026 || runtime.model_surface() != ModelSurface::FullOperatorRuntime {
