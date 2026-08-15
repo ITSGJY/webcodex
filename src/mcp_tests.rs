@@ -213,7 +213,7 @@ async fn mcp_2026_computer_app_is_minimal_handshake_and_snapshot_only() {
     let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
     // The URI is a host cache key. Bump it whenever the App delivery contract
     // changes so a previously failed/blank iframe cannot pin the old resource.
-    assert_eq!(MCP_COMPUTER_UI_RESOURCE_URI, "ui://webcodex/computer/v8");
+    assert_eq!(MCP_COMPUTER_UI_RESOURCE_URI, "ui://webcodex/computer/v9");
     let expected_resource_meta = json!({
         "ui": {
             "prefersBorder": true,
@@ -266,20 +266,14 @@ async fn mcp_2026_computer_app_is_minimal_handshake_and_snapshot_only() {
         .find(|tool| tool["name"] == "computer_snapshot")
         .unwrap();
     assert_eq!(
-        snapshot["_meta"]["ui"]["resourceUri"],
-        MCP_COMPUTER_UI_RESOURCE_URI
-    );
-    assert_eq!(
-        snapshot["_meta"]["ui"]["visibility"],
-        json!(["model", "app"])
-    );
-    assert_eq!(
-        snapshot["_meta"]["ui/resourceUri"],
-        MCP_COMPUTER_UI_RESOURCE_URI
-    );
-    assert_eq!(
-        snapshot["_meta"]["openai/outputTemplate"],
-        MCP_COMPUTER_UI_RESOURCE_URI
+        snapshot["_meta"],
+        json!({
+            "ui": {
+                "resourceUri": MCP_COMPUTER_UI_RESOURCE_URI,
+                "visibility": ["model", "app"]
+            },
+            "openai/outputTemplate": MCP_COMPUTER_UI_RESOURCE_URI
+        })
     );
     let list_windows = tools
         .iter()
@@ -296,16 +290,14 @@ async fn mcp_2026_computer_app_is_minimal_handshake_and_snapshot_only() {
         .find(|tool| tool["name"] == "computer_snapshot")
         .unwrap();
     assert_eq!(
-        compact_snapshot["_meta"]["ui"]["resourceUri"],
-        MCP_COMPUTER_UI_RESOURCE_URI
-    );
-    assert_eq!(
-        compact_snapshot["_meta"]["ui/resourceUri"],
-        MCP_COMPUTER_UI_RESOURCE_URI
-    );
-    assert_eq!(
-        compact_snapshot["_meta"]["openai/outputTemplate"],
-        MCP_COMPUTER_UI_RESOURCE_URI
+        compact_snapshot["_meta"],
+        json!({
+            "ui": {
+                "resourceUri": MCP_COMPUTER_UI_RESOURCE_URI,
+                "visibility": ["model", "app"]
+            },
+            "openai/outputTemplate": MCP_COMPUTER_UI_RESOURCE_URI
+        })
     );
 
     let resources = handle_mcp_request(
@@ -468,16 +460,14 @@ async fn mcp_2026_computer_app_is_minimal_handshake_and_snapshot_only() {
         .find(|tool| tool["name"] == "computer_snapshot")
         .unwrap();
     assert_eq!(
-        snapshot["_meta"]["ui"]["resourceUri"],
-        MCP_COMPUTER_UI_RESOURCE_URI
-    );
-    assert_eq!(
-        snapshot["_meta"]["ui/resourceUri"],
-        MCP_COMPUTER_UI_RESOURCE_URI
-    );
-    assert_eq!(
-        snapshot["_meta"]["openai/outputTemplate"],
-        MCP_COMPUTER_UI_RESOURCE_URI
+        snapshot["_meta"],
+        json!({
+            "ui": {
+                "resourceUri": MCP_COMPUTER_UI_RESOURCE_URI,
+                "visibility": ["model", "app"]
+            },
+            "openai/outputTemplate": MCP_COMPUTER_UI_RESOURCE_URI
+        })
     );
 
     let no_ui_resources = handle_mcp_request(
