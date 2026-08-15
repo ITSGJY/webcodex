@@ -63,6 +63,9 @@ const MCP_COMPUTER_APP_PROBE_TOOL_NAME: &str = "computer_app_probe";
 const MCP_COMPUTER_APP_PROBE_RESOURCE_URI: &str = "ui://webcodex/computer-probe/v1";
 const MCP_COMPUTER_APP_IMAGE_PROBE_TOOL_NAME: &str = "computer_app_image_probe";
 const MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI: &str = "ui://webcodex/computer-image-probe/v1";
+const MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME: &str = "computer_app_snapshot_probe";
+const MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI: &str =
+    "ui://webcodex/computer-snapshot-probe/v1";
 const MCP_COMPUTER_APP_IMAGE_PROBE_PNG_BASE64: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z0GkAAAAASUVORK5CYII=";
 const MCP_COMPUTER_APP_IMAGE_PROBE_PNG_BYTES: u64 = 68;
@@ -73,6 +76,8 @@ const MCP_UI_RESOURCE_MIME_TYPE: &str = "text/html;profile=mcp-app";
 const MCP_COMPUTER_APP_HTML: &str = include_str!("mcp_computer_app.html");
 const MCP_COMPUTER_APP_PROBE_HTML: &str = include_str!("mcp_computer_probe_app.html");
 const MCP_COMPUTER_APP_IMAGE_PROBE_HTML: &str = include_str!("mcp_computer_image_probe_app.html");
+const MCP_COMPUTER_APP_SNAPSHOT_PROBE_HTML: &str =
+    include_str!("mcp_computer_snapshot_probe_app.html");
 
 /// Single source of truth for the JSON-RPC methods advertised by `GET /mcp`.
 /// Must match the dispatch arms in `handle_mcp_request_with_lifecycle`;
@@ -443,6 +448,7 @@ fn mcp_tools_list_payload_with_features(
     if app_enabled && model_surface == ModelSurface::FullOperatorRuntime {
         tools.push(mcp_computer_app_probe_tool_spec(compact));
         tools.push(mcp_computer_app_image_probe_tool_spec(compact));
+        tools.push(mcp_computer_app_snapshot_probe_tool_spec(compact));
     }
     json!({ "tools": tools })
 }
@@ -602,6 +608,44 @@ fn mcp_computer_app_image_probe_tool_spec(compact: bool) -> Value {
     value
 }
 
+fn mcp_computer_app_snapshot_probe_tool_spec(compact: bool) -> Value {
+    let mut spec = registered_tool_specs()
+        .into_iter()
+        .find(|spec| spec.name == "computer_snapshot")
+        .expect("computer_snapshot runtime spec");
+    spec.name = MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME.to_string();
+    spec.description = "Experimental MCP-only real-screenshot control probe. Delegates to the existing computer_snapshot ToolRuntime path, but uses a fresh MCP App tool name and resource binding.".to_string();
+    if let Some(annotations) = spec.annotations.as_object_mut() {
+        annotations.insert(
+            "title".to_string(),
+            Value::String("Computer App Snapshot Probe".to_string()),
+        );
+    }
+    let mut value = if compact {
+        json!({
+            "name": spec.name,
+            "description": spec.description,
+            "inputSchema": spec.input_schema,
+            "annotations": spec.annotations,
+        })
+    } else {
+        serde_json::to_value(spec).unwrap_or_else(|_| json!({}))
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "_meta".to_string(),
+            json!({
+                "ui": {
+                    "resourceUri": MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI,
+                    "visibility": ["model", "app"]
+                },
+                "openai/outputTemplate": MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI
+            }),
+        );
+    }
+    value
+}
+
 fn mcp_computer_app_resource_meta() -> Value {
     json!({
         "ui": {
@@ -638,6 +682,13 @@ fn mcp_computer_app_resources_list() -> Value {
                 "description": "Experimental control card that performs the same minimal MCP Apps handshake and renders one built-in 1x1 PNG delivered through native MCP image content without Runner access.",
                 "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
                 "_meta": mcp_computer_app_resource_meta()
+            },
+            {
+                "uri": MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI,
+                "name": "WebCodex Computer App Snapshot Probe",
+                "description": "Experimental control card that reuses the production Computer App HTML while rendering a real Runner screenshot through a fresh tool and resource binding.",
+                "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
+                "_meta": mcp_computer_app_resource_meta()
             }
         ]
     })
@@ -647,6 +698,7 @@ fn is_mcp_computer_app_resource_uri(uri: &str) -> bool {
     uri == MCP_COMPUTER_UI_RESOURCE_URI
         || uri == MCP_COMPUTER_APP_PROBE_RESOURCE_URI
         || uri == MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI
+        || uri == MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI
         || MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS.contains(&uri)
 }
 
@@ -659,6 +711,8 @@ fn mcp_computer_app_resource_read(uri: &str) -> Option<Value> {
         MCP_COMPUTER_APP_PROBE_HTML
     } else if uri == MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI {
         MCP_COMPUTER_APP_IMAGE_PROBE_HTML
+    } else if uri == MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI {
+        MCP_COMPUTER_APP_SNAPSHOT_PROBE_HTML
     } else if uri == MCP_COMPUTER_UI_RESOURCE_URI
         || MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS.contains(&uri)
     {
@@ -2308,6 +2362,7 @@ async fn handle_mcp_request_with_lifecycle(
             if uri == MCP_COMPUTER_UI_RESOURCE_URI
                 || uri == MCP_COMPUTER_APP_PROBE_RESOURCE_URI
                 || uri == MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI
+                || uri == MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI
             {
                 result["ttlMs"] = Value::from(MCP_COMPUTER_UI_RESOURCE_TTL_MS);
             }
@@ -2435,6 +2490,69 @@ async fn handle_mcp_request_with_lifecycle(
                     id,
                     mcp_stateless_result(mcp_computer_app_image_probe_tool_result(), false),
                 ));
+            }
+            if params.name == MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME {
+                if !stateless_2026 || runtime.model_surface() != ModelSurface::FullOperatorRuntime {
+                    if let Some(lc) = lifecycle.as_deref() {
+                        lc.dispatch_failed("surface_denied");
+                        lc.dispatch_finished(false, Some(false), "surface_denied");
+                    }
+                    return McpOutcome::BadRequest(rpc_error(
+                        id,
+                        -32602,
+                        "computer_app_snapshot_probe requires the stateless-2026 full-operator MCP surface",
+                    ));
+                }
+                let session_id = strip_reserved_session_id(&mut params.arguments);
+                let outcome = runtime
+                    .call_tool_with_context(
+                        KernelToolCallRequest {
+                            tool_name: "computer_snapshot".to_string(),
+                            arguments: params.arguments,
+                        },
+                        ToolCallContext {
+                            transport: ToolTransport::Mcp,
+                            session_id: session_id.as_deref(),
+                            auth,
+                            window,
+                            record_oauth_scope_denials: false,
+                            host_file_import_trust,
+                        },
+                    )
+                    .await;
+                let result = match outcome.error_status {
+                    Some(ToolCallErrorStatus::InsufficientScope {
+                        required_scope,
+                        description,
+                    }) => {
+                        if let Some(lc) = lifecycle.as_deref() {
+                            lc.dispatch_failed("forbidden");
+                            lc.dispatch_finished(false, Some(false), "forbidden");
+                        }
+                        return scope_forbidden(auth, required_scope, description);
+                    }
+                    Some(ToolCallErrorStatus::InvalidArguments { message }) => {
+                        if let Some(lc) = lifecycle.as_deref() {
+                            lc.dispatch_failed("invalid_arguments");
+                            lc.dispatch_finished(false, Some(false), "invalid_arguments");
+                        }
+                        return McpOutcome::BadRequest(rpc_error(id, -32602, message));
+                    }
+                    None => outcome
+                        .result
+                        .expect("tool kernel outcome without error must include result"),
+                };
+                debug_assert_eq!(outcome.success, result.success);
+                if let Some(lc) = lifecycle.as_deref() {
+                    let category = if result.success {
+                        "success"
+                    } else {
+                        "tool_error"
+                    };
+                    lc.dispatch_finished(true, Some(result.success), category);
+                }
+                let result = mcp_runtime_tool_result("computer_snapshot", false, result);
+                return McpOutcome::Ok(rpc_result(id, mcp_stateless_result(result, false)));
             }
             let artifact_export_caller = if params.name == "export_project_artifact" {
                 if !stateless_2026 || runtime.model_surface() != ModelSurface::FullOperatorRuntime {
