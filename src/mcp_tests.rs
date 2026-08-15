@@ -601,7 +601,7 @@ async fn mcp_2026_computer_app_probe_is_mcp_only_tiny_result_control() {
         panic!("expected UI resources/list");
     };
     let resources = resources["result"]["resources"].as_array().unwrap();
-    assert_eq!(resources.len(), 2);
+    assert_eq!(resources.len(), 3);
     let probe_resource = resources
         .iter()
         .find(|resource| resource["uri"] == MCP_COMPUTER_APP_PROBE_RESOURCE_URI)
@@ -731,6 +731,237 @@ async fn mcp_2026_computer_app_probe_is_mcp_only_tiny_result_control() {
 }
 
 #[tokio::test]
+async fn mcp_2026_computer_app_image_probe_uses_snapshot_native_image_framing() {
+    let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
+    assert_eq!(
+        MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI,
+        "ui://webcodex/computer-image-probe/v1"
+    );
+    assert!(registered_tool_specs()
+        .iter()
+        .all(|spec| spec.name != MCP_COMPUTER_APP_IMAGE_PROBE_TOOL_NAME));
+
+    let image_bytes = general_purpose::STANDARD
+        .decode(MCP_COMPUTER_APP_IMAGE_PROBE_PNG_BASE64)
+        .expect("built-in image probe PNG base64");
+    assert_eq!(
+        image_bytes.len() as u64,
+        MCP_COMPUTER_APP_IMAGE_PROBE_PNG_BYTES
+    );
+    assert_eq!(&image_bytes[..8], b"\x89PNG\r\n\x1a\n");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&image_bytes)),
+        MCP_COMPUTER_APP_IMAGE_PROBE_PNG_SHA256
+    );
+
+    let legacy_tools = handle_mcp_request(
+        &runtime,
+        rpc("tools/list", Some(json!(2120)), json!({})),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(legacy_tools) = legacy_tools else {
+        panic!("expected legacy tools/list");
+    };
+    assert!(legacy_tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|tool| tool["name"] != MCP_COMPUTER_APP_IMAGE_PROBE_TOOL_NAME));
+
+    let tools = handle_mcp_request(
+        &runtime,
+        rpc("tools/list", Some(json!(2121)), mcp_2026_params(json!({}))),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(tools) = tools else {
+        panic!("expected stateless tools/list");
+    };
+    let image_probe = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == MCP_COMPUTER_APP_IMAGE_PROBE_TOOL_NAME)
+        .expect("MCP-only computer app image probe");
+    assert_eq!(
+        image_probe["_meta"],
+        json!({
+            "ui": {
+                "resourceUri": MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI,
+                "visibility": ["model", "app"]
+            },
+            "openai/outputTemplate": MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI
+        })
+    );
+    assert_eq!(image_probe["inputSchema"]["additionalProperties"], false);
+    assert!(image_probe["outputSchema"].is_object());
+    assert_eq!(image_probe["annotations"]["readOnlyHint"], true);
+    assert_eq!(image_probe["annotations"]["openWorldHint"], false);
+
+    let compact =
+        mcp_tools_list_payload_with_compact_and_app(ModelSurface::FullOperatorRuntime, true, true);
+    let compact_probe = compact["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == MCP_COMPUTER_APP_IMAGE_PROBE_TOOL_NAME)
+        .expect("compact MCP-only computer app image probe");
+    assert!(compact_probe.get("outputSchema").is_none());
+    assert_eq!(compact_probe["_meta"], image_probe["_meta"]);
+
+    let resources = handle_mcp_request(
+        &runtime,
+        rpc(
+            "resources/list",
+            Some(json!(2122)),
+            mcp_2026_ui_params(json!({})),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(resources) = resources else {
+        panic!("expected UI resources/list");
+    };
+    let resources = resources["result"]["resources"].as_array().unwrap();
+    assert_eq!(resources.len(), 3);
+    let image_resource = resources
+        .iter()
+        .find(|resource| resource["uri"] == MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI)
+        .expect("image probe resource");
+    assert_eq!(image_resource["mimeType"], MCP_UI_RESOURCE_MIME_TYPE);
+    assert_eq!(image_resource["_meta"], mcp_computer_app_resource_meta());
+
+    let resource = handle_mcp_request(
+        &runtime,
+        rpc(
+            "resources/read",
+            Some(json!(2123)),
+            mcp_2026_params(json!({ "uri": MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI })),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(resource) = resource else {
+        panic!("expected image probe resources/read without repeated UI capability");
+    };
+    assert_eq!(
+        resource["result"]["ttlMs"],
+        Value::from(MCP_COMPUTER_UI_RESOURCE_TTL_MS)
+    );
+    assert_eq!(resource["result"]["cacheScope"], "private");
+    assert_eq!(
+        resource["result"]["contents"][0]["uri"],
+        MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI
+    );
+    assert_eq!(
+        resource["result"]["contents"][0]["text"].as_str(),
+        Some(MCP_COMPUTER_APP_IMAGE_PROBE_HTML)
+    );
+    let html = resource["result"]["contents"][0]["text"].as_str().unwrap();
+    for expected in [
+        "HTML loaded",
+        "ui/initialize",
+        "2026-01-26",
+        "ui/notifications/initialized",
+        "ui/notifications/tool-result",
+        "<img id=\"image\"",
+        "native image received",
+        "Tiny native image rendered successfully.",
+        "content_delivery",
+        ";base64,",
+        "no Runner",
+    ] {
+        assert!(
+            html.contains(expected),
+            "missing {expected} in image probe App HTML"
+        );
+    }
+    for forbidden in [
+        "computer_snapshot",
+        "content_base64",
+        "tools/call",
+        "ui/request-display-mode",
+        "ui/update-model-context",
+        "ui/message",
+    ] {
+        assert!(
+            !html.contains(forbidden),
+            "image probe App HTML must not contain {forbidden}"
+        );
+    }
+
+    let call = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(2124)),
+            mcp_2026_params(json!({
+                "name": MCP_COMPUTER_APP_IMAGE_PROBE_TOOL_NAME,
+                "arguments": {}
+            })),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(call) = call else {
+        panic!("expected image probe tools/call");
+    };
+    assert_eq!(call["result"]["resultType"], "complete");
+    assert_eq!(call["result"]["isError"], false);
+    let content = call["result"]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["mimeType"], "image/png");
+    assert_eq!(content[1]["data"], MCP_COMPUTER_APP_IMAGE_PROBE_PNG_BASE64);
+    let output = &call["result"]["structuredContent"]["output"];
+    assert_eq!(call["result"]["structuredContent"]["success"], true);
+    assert_eq!(output["probe"], "image");
+    assert_eq!(output["runner_used"], false);
+    assert_eq!(output["content_delivery"], "mcp_image");
+    assert_eq!(output["mime_type"], "image/png");
+    assert_eq!(output["width"], 1);
+    assert_eq!(output["height"], 1);
+    assert_eq!(output["file_bytes"], MCP_COMPUTER_APP_IMAGE_PROBE_PNG_BYTES);
+    assert_eq!(output["sha256"], MCP_COMPUTER_APP_IMAGE_PROBE_PNG_SHA256);
+    assert!(output.get("content_base64").is_none());
+
+    let invalid = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(2125)),
+            mcp_2026_params(json!({
+                "name": MCP_COMPUTER_APP_IMAGE_PROBE_TOOL_NAME,
+                "arguments": { "unexpected": true }
+            })),
+        ),
+        None,
+    )
+    .await;
+    match invalid {
+        McpOutcome::BadRequest(value) => assert_eq!(value["error"]["code"], -32602),
+        other => panic!("image probe must reject arguments, got {other:?}"),
+    }
+
+    let legacy_call = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(2126)),
+            json!({ "name": MCP_COMPUTER_APP_IMAGE_PROBE_TOOL_NAME, "arguments": {} }),
+        ),
+        None,
+    )
+    .await;
+    match legacy_call {
+        McpOutcome::BadRequest(value) => assert_eq!(value["error"]["code"], -32602),
+        other => panic!("image probe must remain stateless-2026-only, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn mcp_info_advertised_methods_match_dispatch() {
     let runtime = test_runtime();
     for method in MCP_INFO_METHODS {
@@ -782,6 +1013,7 @@ async fn mcp_tools_list_returns_same_names_as_runtime() {
         .collect();
     let mut stateless_mcp_names = runtime_names.clone();
     stateless_mcp_names.push(MCP_COMPUTER_APP_PROBE_TOOL_NAME.to_string());
+    stateless_mcp_names.push(MCP_COMPUTER_APP_IMAGE_PROBE_TOOL_NAME.to_string());
 
     for compact in [false, true] {
         if compact {
@@ -5542,6 +5774,56 @@ async fn http_mcp_2026_calls_computer_app_probe_with_tiny_result() {
         .unwrap()
         .iter()
         .all(|item| item["type"] != "image"));
+}
+
+#[tokio::test]
+async fn http_mcp_2026_calls_computer_app_image_probe_with_tiny_native_image() {
+    let config = test_config(Some("secret"));
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let service = Service::new(build_test_router(config, db, runtime));
+    let params = mcp_2026_ui_params(json!({
+        "name": MCP_COMPUTER_APP_IMAGE_PROBE_TOOL_NAME,
+        "arguments": {}
+    }));
+
+    let mut response = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_STATELESS_PROTOCOL_VERSION,
+            true,
+        )
+        .add_header(MCP_METHOD_HEADER, "tools/call", true)
+        .add_header(
+            MCP_NAME_HEADER,
+            MCP_COMPUTER_APP_IMAGE_PROBE_TOOL_NAME,
+            true,
+        )
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2062,
+            "method": "tools/call",
+            "params": params
+        }))
+        .send(&service)
+        .await;
+
+    assert_eq!(effective_status(&response), StatusCode::OK);
+    let body: Value = response.take_json().await.unwrap();
+    assert_eq!(body["result"]["resultType"], "complete");
+    assert_eq!(body["result"]["isError"], false);
+    let content = body["result"]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["mimeType"], "image/png");
+    assert_eq!(content[1]["data"], MCP_COMPUTER_APP_IMAGE_PROBE_PNG_BASE64);
+    assert_eq!(body["result"]["structuredContent"]["success"], true);
+    let output = &body["result"]["structuredContent"]["output"];
+    assert_eq!(output["probe"], "image");
+    assert_eq!(output["runner_used"], false);
+    assert_eq!(output["content_delivery"], "mcp_image");
+    assert!(output.get("content_base64").is_none());
 }
 
 #[tokio::test]
