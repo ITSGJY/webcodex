@@ -601,7 +601,7 @@ async fn mcp_2026_computer_app_probe_is_mcp_only_tiny_result_control() {
         panic!("expected UI resources/list");
     };
     let resources = resources["result"]["resources"].as_array().unwrap();
-    assert_eq!(resources.len(), 4);
+    assert_eq!(resources.len(), 5);
     let probe_resource = resources
         .iter()
         .find(|resource| resource["uri"] == MCP_COMPUTER_APP_PROBE_RESOURCE_URI)
@@ -824,7 +824,7 @@ async fn mcp_2026_computer_app_image_probe_uses_snapshot_native_image_framing() 
         panic!("expected UI resources/list");
     };
     let resources = resources["result"]["resources"].as_array().unwrap();
-    assert_eq!(resources.len(), 4);
+    assert_eq!(resources.len(), 5);
     let image_resource = resources
         .iter()
         .find(|resource| resource["uri"] == MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI)
@@ -962,6 +962,249 @@ async fn mcp_2026_computer_app_image_probe_uses_snapshot_native_image_framing() 
 }
 
 #[tokio::test]
+async fn mcp_2026_computer_app_image_size_probe_ladders_exact_native_png_payloads() {
+    let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
+    assert_eq!(
+        MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_RESOURCE_URI,
+        "ui://webcodex/computer-image-size-probe/v1"
+    );
+    assert!(registered_tool_specs()
+        .iter()
+        .all(|spec| spec.name != MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_TOOL_NAME));
+
+    let tools = handle_mcp_request(
+        &runtime,
+        rpc("tools/list", Some(json!(2127)), mcp_2026_params(json!({}))),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(tools) = tools else {
+        panic!("expected stateless tools/list");
+    };
+    let size_probe = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_TOOL_NAME)
+        .expect("MCP-only computer app image size probe");
+    assert_eq!(
+        size_probe["inputSchema"]["properties"]["size"]["enum"],
+        json!(["1k", "16k", "64k", "128k", "256k", "512k"])
+    );
+    assert_eq!(size_probe["inputSchema"]["required"], json!(["size"]));
+    assert_eq!(size_probe["inputSchema"]["additionalProperties"], false);
+    assert_eq!(size_probe["annotations"]["readOnlyHint"], true);
+    assert_eq!(
+        size_probe["_meta"],
+        json!({
+            "ui": {
+                "resourceUri": MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_RESOURCE_URI,
+                "visibility": ["model", "app"]
+            },
+            "openai/outputTemplate": MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_RESOURCE_URI
+        })
+    );
+    assert!(size_probe["outputSchema"].is_object());
+
+    let compact =
+        mcp_tools_list_payload_with_compact_and_app(ModelSurface::FullOperatorRuntime, true, true);
+    let compact_probe = compact["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_TOOL_NAME)
+        .expect("compact image size probe");
+    assert!(compact_probe.get("outputSchema").is_none());
+    assert_eq!(compact_probe["inputSchema"], size_probe["inputSchema"]);
+    assert_eq!(compact_probe["_meta"], size_probe["_meta"]);
+
+    let resources = handle_mcp_request(
+        &runtime,
+        rpc(
+            "resources/list",
+            Some(json!(2128)),
+            mcp_2026_ui_params(json!({})),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(resources) = resources else {
+        panic!("expected UI resources/list");
+    };
+    let resources = resources["result"]["resources"].as_array().unwrap();
+    assert_eq!(resources.len(), 5);
+    let size_resource = resources
+        .iter()
+        .find(|resource| resource["uri"] == MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_RESOURCE_URI)
+        .expect("image size probe resource");
+    assert_eq!(size_resource["mimeType"], MCP_UI_RESOURCE_MIME_TYPE);
+    assert_eq!(size_resource["_meta"], mcp_computer_app_resource_meta());
+
+    let resource = handle_mcp_request(
+        &runtime,
+        rpc(
+            "resources/read",
+            Some(json!(2129)),
+            mcp_2026_params(json!({ "uri": MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_RESOURCE_URI })),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(resource) = resource else {
+        panic!("expected image size probe resource read");
+    };
+    assert_eq!(
+        resource["result"]["ttlMs"],
+        Value::from(MCP_COMPUTER_UI_RESOURCE_TTL_MS)
+    );
+    assert_eq!(resource["result"]["cacheScope"], "private");
+    assert_eq!(
+        resource["result"]["contents"][0]["text"].as_str(),
+        Some(MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_HTML)
+    );
+    let html = MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_HTML;
+    for expected in [
+        "HTML loaded",
+        "ui/initialize",
+        "2026-01-26",
+        "ui/notifications/initialized",
+        "ui/notifications/tool-result",
+        "image_size",
+        "payload-size ladder",
+        "Synthetic native image rendered successfully.",
+        "512 * 1024",
+        "no Runner",
+    ] {
+        assert!(
+            html.contains(expected),
+            "missing {expected} in size probe App HTML"
+        );
+    }
+    for forbidden in [
+        "computer_snapshot",
+        "content_base64",
+        "tools/call",
+        "ui/request-display-mode",
+        "ui/update-model-context",
+        "ui/message",
+    ] {
+        assert!(
+            !html.contains(forbidden),
+            "image size probe App HTML must not contain {forbidden}"
+        );
+    }
+
+    let base = general_purpose::STANDARD
+        .decode(MCP_COMPUTER_APP_IMAGE_PROBE_PNG_BASE64)
+        .expect("built-in PNG");
+    let iend_offset = base.len() - 12;
+    for &(size, target_bytes) in MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_CHOICES {
+        let generated = mcp_computer_app_image_size_probe_png(target_bytes)
+            .expect("deterministic size-probe PNG");
+        assert_eq!(generated.len(), target_bytes, "size={size}");
+        assert_eq!(&generated[..8], b"\x89PNG\r\n\x1a\n", "size={size}");
+        let padding_len =
+            u32::from_be_bytes(generated[iend_offset..iend_offset + 4].try_into().unwrap())
+                as usize;
+        assert_eq!(padding_len, target_bytes - base.len() - 12, "size={size}");
+        assert_eq!(&generated[iend_offset + 4..iend_offset + 8], b"vpAg");
+        let padding_start = iend_offset + 8;
+        let crc_offset = padding_start + padding_len;
+        let stored_crc =
+            u32::from_be_bytes(generated[crc_offset..crc_offset + 4].try_into().unwrap());
+        assert_eq!(
+            stored_crc,
+            mcp_png_crc32(&[b"vpAg", &generated[padding_start..crc_offset]]),
+            "size={size}"
+        );
+        assert_eq!(&generated[crc_offset + 4..], &base[iend_offset..]);
+
+        let call = handle_mcp_request(
+            &runtime,
+            rpc(
+                "tools/call",
+                Some(json!(2130)),
+                mcp_2026_params(json!({
+                    "name": MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_TOOL_NAME,
+                    "arguments": { "size": size }
+                })),
+            ),
+            None,
+        )
+        .await;
+        let McpOutcome::Ok(call) = call else {
+            panic!("expected image size probe tools/call for {size}");
+        };
+        assert_eq!(call["result"]["resultType"], "complete");
+        assert_eq!(call["result"]["isError"], false);
+        let content = call["result"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["mimeType"], "image/png");
+        let delivered = general_purpose::STANDARD
+            .decode(content[1]["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(delivered, generated, "size={size}");
+        let output = &call["result"]["structuredContent"]["output"];
+        assert_eq!(output["probe"], "image_size");
+        assert_eq!(output["size"], size);
+        assert_eq!(output["runner_used"], false);
+        assert_eq!(output["content_delivery"], "mcp_image");
+        assert_eq!(output["mime_type"], "image/png");
+        assert_eq!(output["width"], 1);
+        assert_eq!(output["height"], 1);
+        assert_eq!(output["file_bytes"], target_bytes as u64);
+        assert_eq!(
+            output["sha256"],
+            format!("{:x}", Sha256::digest(&delivered))
+        );
+        assert!(output.get("content_base64").is_none());
+    }
+
+    for arguments in [
+        json!({}),
+        json!({ "size": "2k" }),
+        json!({ "size": "1k", "unexpected": true }),
+    ] {
+        let invalid = handle_mcp_request(
+            &runtime,
+            rpc(
+                "tools/call",
+                Some(json!(2131)),
+                mcp_2026_params(json!({
+                    "name": MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_TOOL_NAME,
+                    "arguments": arguments
+                })),
+            ),
+            None,
+        )
+        .await;
+        match invalid {
+            McpOutcome::BadRequest(value) => assert_eq!(value["error"]["code"], -32602),
+            other => panic!("size probe must reject invalid arguments, got {other:?}"),
+        }
+    }
+
+    let legacy_call = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(2132)),
+            json!({
+                "name": MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_TOOL_NAME,
+                "arguments": { "size": "1k" }
+            }),
+        ),
+        None,
+    )
+    .await;
+    match legacy_call {
+        McpOutcome::BadRequest(value) => assert_eq!(value["error"]["code"], -32602),
+        other => panic!("size probe must remain stateless-2026-only, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn mcp_2026_computer_app_snapshot_probe_delegates_to_real_snapshot_contract() {
     let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
     assert_eq!(
@@ -1055,7 +1298,7 @@ async fn mcp_2026_computer_app_snapshot_probe_delegates_to_real_snapshot_contrac
         panic!("expected UI resources/list");
     };
     let resources = resources["result"]["resources"].as_array().unwrap();
-    assert_eq!(resources.len(), 4);
+    assert_eq!(resources.len(), 5);
     let snapshot_resource = resources
         .iter()
         .find(|resource| resource["uri"] == MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI)
@@ -1216,6 +1459,7 @@ async fn mcp_tools_list_returns_same_names_as_runtime() {
     stateless_mcp_names.push(MCP_COMPUTER_APP_PROBE_TOOL_NAME.to_string());
     stateless_mcp_names.push(MCP_COMPUTER_APP_IMAGE_PROBE_TOOL_NAME.to_string());
     stateless_mcp_names.push(MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME.to_string());
+    stateless_mcp_names.push(MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_TOOL_NAME.to_string());
 
     for compact in [false, true] {
         if compact {
@@ -6024,6 +6268,63 @@ async fn http_mcp_2026_calls_computer_app_image_probe_with_tiny_native_image() {
     let output = &body["result"]["structuredContent"]["output"];
     assert_eq!(output["probe"], "image");
     assert_eq!(output["runner_used"], false);
+    assert_eq!(output["content_delivery"], "mcp_image");
+    assert!(output.get("content_base64").is_none());
+}
+
+#[tokio::test]
+async fn http_mcp_2026_calls_computer_app_image_size_probe_with_512k_native_image() {
+    let config = test_config(Some("secret"));
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let service = Service::new(build_test_router(config, db, runtime));
+    let params = mcp_2026_ui_params(json!({
+        "name": MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_TOOL_NAME,
+        "arguments": { "size": "512k" }
+    }));
+
+    let mut response = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_STATELESS_PROTOCOL_VERSION,
+            true,
+        )
+        .add_header(MCP_METHOD_HEADER, "tools/call", true)
+        .add_header(
+            MCP_NAME_HEADER,
+            MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_TOOL_NAME,
+            true,
+        )
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2063,
+            "method": "tools/call",
+            "params": params
+        }))
+        .send(&service)
+        .await;
+
+    assert_eq!(effective_status(&response), StatusCode::OK);
+    let body: Value = response.take_json().await.unwrap();
+    assert_eq!(body["result"]["resultType"], "complete");
+    assert_eq!(body["result"]["isError"], false);
+    let content = body["result"]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["mimeType"], "image/png");
+    assert_eq!(
+        general_purpose::STANDARD
+            .decode(content[1]["data"].as_str().unwrap())
+            .unwrap()
+            .len(),
+        512 * 1024
+    );
+    let output = &body["result"]["structuredContent"]["output"];
+    assert_eq!(output["probe"], "image_size");
+    assert_eq!(output["size"], "512k");
+    assert_eq!(output["runner_used"], false);
+    assert_eq!(output["file_bytes"], 512 * 1024);
     assert_eq!(output["content_delivery"], "mcp_image");
     assert!(output.get("content_base64").is_none());
 }
