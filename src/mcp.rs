@@ -47,12 +47,14 @@ const MCP_UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 const MCP_SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
     &[MCP_STATELESS_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION];
 const MCP_UI_EXTENSION: &str = "io.modelcontextprotocol/ui";
-const MCP_COMPUTER_UI_RESOURCE_URI: &str = "ui://webcodex/computer/v4";
+const MCP_COMPUTER_UI_RESOURCE_URI: &str = "ui://webcodex/computer/v5";
 const MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS: &[&str] = &[
     "ui://webcodex/computer/v1",
     "ui://webcodex/computer/v2",
     "ui://webcodex/computer/v3",
+    "ui://webcodex/computer/v4",
 ];
+const MCP_COMPUTER_UI_RESOURCE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const MCP_COMPUTER_UI_DOMAIN: &str = "https://sg4.yyjeqhc.cn";
 const MCP_UI_RESOURCE_MIME_TYPE: &str = "text/html;profile=mcp-app";
 const MCP_COMPUTER_APP_HTML: &str = include_str!("mcp_computer_app.html");
@@ -505,13 +507,16 @@ fn mcp_computer_app_resources_list() -> Value {
     })
 }
 
+fn is_mcp_computer_app_resource_uri(uri: &str) -> bool {
+    uri == MCP_COMPUTER_UI_RESOURCE_URI || MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS.contains(&uri)
+}
+
 fn mcp_computer_app_resource_read(uri: &str) -> Option<Value> {
     // ChatGPT can retain an older tool descriptor across connector refreshes.
     // Keep prior computer App URIs as hidden read aliases so an already-bound
     // card can fetch the current safe template. resources/list and tools/list
     // still advertise only the canonical URI above.
-    let supported =
-        uri == MCP_COMPUTER_UI_RESOURCE_URI || MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS.contains(&uri);
+    let supported = is_mcp_computer_app_resource_uri(uri);
     supported.then(|| {
         json!({
             "contents": [{
@@ -1435,6 +1440,53 @@ enum McpOutcome {
     },
 }
 
+fn mcp_protocol_era_label(protocol_era: McpProtocolEra) -> &'static str {
+    match protocol_era {
+        McpProtocolEra::Legacy => "legacy",
+        McpProtocolEra::Stateless2026 => "stateless_2026",
+    }
+}
+
+fn log_mcp_computer_app_resource_delivery(
+    uri: &str,
+    protocol_era: &str,
+    ui_capability_present: bool,
+    http_status: u16,
+    mcp_error_code: Option<i64>,
+) {
+    tracing::info!(
+        target: "webcodex::mcp",
+        uri,
+        protocol_era,
+        ui_capability_present,
+        http_status,
+        mcp_error_code = mcp_error_code.unwrap_or(-1),
+        "mcp_computer_app_resource_delivery"
+    );
+}
+
+fn log_mcp_computer_app_resource_outcome(
+    uri: &str,
+    protocol_era: McpProtocolEra,
+    ui_capability_present: bool,
+    outcome: &McpOutcome,
+) {
+    let (http_status, mcp_error_code) = match outcome {
+        McpOutcome::Ok(_) => (200, None),
+        McpOutcome::BadRequest(body) => (400, body["error"]["code"].as_i64()),
+        McpOutcome::NotFound(body) => (404, body["error"]["code"].as_i64()),
+        McpOutcome::Notification => (202, None),
+        McpOutcome::Forbidden { .. } => (403, None),
+    };
+    log_mcp_computer_app_resource_delivery(
+        uri,
+        mcp_protocol_era_label(protocol_era),
+        ui_capability_present,
+        http_status,
+        mcp_error_code,
+    );
+}
+
 #[handler]
 pub async fn mcp_info(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     if let Err((status, _, message)) = crate::auth::require_same_origin(req) {
@@ -1570,10 +1622,30 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
         None
     };
     guard.set_tool_name(tool_name.clone());
+    let computer_app_resource_uri = if request.method == "resources/read" {
+        request
+            .params
+            .get("uri")
+            .and_then(Value::as_str)
+            .filter(|uri| is_mcp_computer_app_resource_uri(uri))
+            .map(str::to_string)
+    } else {
+        None
+    };
+    let computer_app_ui_capability_present = request_supports_mcp_apps(&request.params);
     let protocol_era = match validate_http_protocol(req, &request) {
         Ok(protocol_era) => protocol_era,
         Err(body) => {
             guard.parsed("protocol_error");
+            if let Some(uri) = computer_app_resource_uri.as_deref() {
+                log_mcp_computer_app_resource_delivery(
+                    uri,
+                    "validation_failed",
+                    computer_app_ui_capability_present,
+                    400,
+                    body["error"]["code"].as_i64(),
+                );
+            }
             let estimated = estimate_json_bytes(&body);
             guard.response_serialized(400, estimated, Some(false), None, "protocol_error");
             res.status_code(StatusCode::BAD_REQUEST);
@@ -1657,6 +1729,15 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
                     MCP_DISPATCH_HARD_TIMEOUT.as_secs()
                 ),
             );
+            if let Some(uri) = computer_app_resource_uri.as_deref() {
+                log_mcp_computer_app_resource_delivery(
+                    uri,
+                    mcp_protocol_era_label(protocol_era),
+                    computer_app_ui_capability_present,
+                    500,
+                    Some(-32000),
+                );
+            }
             record_audit(
                 false,
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1670,6 +1751,15 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
             return;
         }
     };
+
+    if let Some(uri) = computer_app_resource_uri.as_deref() {
+        log_mcp_computer_app_resource_outcome(
+            uri,
+            protocol_era,
+            computer_app_ui_capability_present,
+            &outcome,
+        );
+    }
 
     if matches!(outcome, McpOutcome::Ok(_)) {
         if let Some(session_id) = window.issued_session_id.as_deref() {
@@ -2010,7 +2100,13 @@ async fn handle_mcp_request_with_lifecycle(
                     format!("Resource not found: {uri}"),
                 ));
             };
-            rpc_result(id, mcp_stateless_result(result, true))
+            let mut result = mcp_stateless_result(result, true);
+            // Only the canonical versioned URI is immutable for caching. Hidden
+            // legacy URIs intentionally alias the current HTML and remain stale.
+            if uri == MCP_COMPUTER_UI_RESOURCE_URI {
+                result["ttlMs"] = Value::from(MCP_COMPUTER_UI_RESOURCE_TTL_MS);
+            }
+            rpc_result(id, result)
         }
         "tools/call" => {
             let mut params: McpToolCallParams = match serde_json::from_value(request.params) {
