@@ -209,11 +209,11 @@ fn mcp_2026_ui_capability_detection_is_explicit_and_mime_aware() {
 }
 
 #[tokio::test]
-async fn mcp_2026_computer_app_is_minimal_and_snapshot_only() {
+async fn mcp_2026_computer_app_is_minimal_handshake_and_snapshot_only() {
     let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
     // The URI is a host cache key. Bump it whenever the App delivery contract
     // changes so a previously failed/blank iframe cannot pin the old resource.
-    assert_eq!(MCP_COMPUTER_UI_RESOURCE_URI, "ui://webcodex/computer/v6");
+    assert_eq!(MCP_COMPUTER_UI_RESOURCE_URI, "ui://webcodex/computer/v7");
     let expected_resource_meta = json!({
         "ui": {
             "prefersBorder": true,
@@ -363,8 +363,14 @@ async fn mcp_2026_computer_app_is_minimal_and_snapshot_only() {
     assert!(html.starts_with("<div id=\"app\""));
     for expected in [
         "HTML loaded",
-        "Minimal screenshot-only MCP App",
+        "Minimal MCP Apps handshake",
+        "ui/initialize",
+        "2026-01-26",
+        "appCapabilities: {}",
+        "ui/notifications/initialized",
         "ui/notifications/tool-result",
+        "pending.set(id",
+        "window.parent.postMessage",
         "content_delivery",
         "mcp_image",
         ";base64,",
@@ -378,16 +384,14 @@ async fn mcp_2026_computer_app_is_minimal_and_snapshot_only() {
     for forbidden in [
         "<!DOCTYPE html>",
         "<script type=\"module\">",
-        "ui/initialize",
-        "ui/notifications/initialized",
         "ui/notifications/tool-input",
         "hostCapabilities",
+        "availableDisplayModes",
         "tools/call",
         "ui/request-display-mode",
         "ui/update-model-context",
         "ui/message",
         "ui/resource-teardown",
-        "window.parent.postMessage",
         "atob(",
         "computer_list_windows",
         "content_base64",
@@ -5282,8 +5286,11 @@ async fn http_mcp_2026_reads_computer_app_template_with_cache_contract() {
     let html = body["result"]["contents"][0]["text"].as_str().unwrap();
     assert!(html.starts_with("<div id=\"app\""));
     assert!(html.contains("HTML loaded"));
+    assert!(html.contains("ui/initialize"));
+    assert!(html.contains("ui/notifications/initialized"));
     assert!(html.contains("ui/notifications/tool-result"));
-    assert!(!html.contains("ui/initialize"));
+    assert!(!html.contains("tools/call"));
+    assert!(!html.contains("ui/request-display-mode"));
 }
 
 #[tokio::test]
