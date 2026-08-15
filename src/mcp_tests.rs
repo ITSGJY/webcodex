@@ -209,11 +209,11 @@ fn mcp_2026_ui_capability_detection_is_explicit_and_mime_aware() {
 }
 
 #[tokio::test]
-async fn mcp_2026_computer_app_is_progressive_and_snapshot_only() {
+async fn mcp_2026_computer_app_is_minimal_and_snapshot_only() {
     let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
     // The URI is a host cache key. Bump it whenever the App delivery contract
     // changes so a previously failed/blank iframe cannot pin the old resource.
-    assert_eq!(MCP_COMPUTER_UI_RESOURCE_URI, "ui://webcodex/computer/v5");
+    assert_eq!(MCP_COMPUTER_UI_RESOURCE_URI, "ui://webcodex/computer/v6");
     let expected_resource_meta = json!({
         "ui": {
             "prefersBorder": true,
@@ -278,7 +278,10 @@ async fn mcp_2026_computer_app_is_progressive_and_snapshot_only() {
         snapshot["_meta"]["ui/resourceUri"],
         MCP_COMPUTER_UI_RESOURCE_URI
     );
-    assert!(snapshot["_meta"].get("openai/outputTemplate").is_none());
+    assert_eq!(
+        snapshot["_meta"]["openai/outputTemplate"],
+        MCP_COMPUTER_UI_RESOURCE_URI
+    );
     let list_windows = tools
         .iter()
         .find(|tool| tool["name"] == "computer_list_windows")
@@ -301,9 +304,10 @@ async fn mcp_2026_computer_app_is_progressive_and_snapshot_only() {
         compact_snapshot["_meta"]["ui/resourceUri"],
         MCP_COMPUTER_UI_RESOURCE_URI
     );
-    assert!(compact_snapshot["_meta"]
-        .get("openai/outputTemplate")
-        .is_none());
+    assert_eq!(
+        compact_snapshot["_meta"]["openai/outputTemplate"],
+        MCP_COMPUTER_UI_RESOURCE_URI
+    );
 
     let resources = handle_mcp_request(
         &runtime,
@@ -356,28 +360,13 @@ async fn mcp_2026_computer_app_is_progressive_and_snapshot_only() {
         resource_meta["ui"]["domain"]
     );
     let html = resource["result"]["contents"][0]["text"].as_str().unwrap();
-    assert!(html.starts_with("<!DOCTYPE html>"));
-    assert!(html.contains("<script type=\"module\">"));
-    assert!(html.contains(
-        "pending.set(id, { resolve, reject, timeout });\n      try {\n        window.parent.postMessage"
-    ));
+    assert!(html.starts_with("<div id=\"app\""));
     for expected in [
-        "ui/initialize",
-        "2026-01-26",
-        "ui/notifications/initialized",
-        "ui/notifications/tool-input",
+        "HTML loaded",
+        "Minimal screenshot-only MCP App",
         "ui/notifications/tool-result",
-        "hostCapabilities.serverTools",
-        "hostCapabilities.message.text",
-        "hostCapabilities.updateModelContext.text",
-        "hostCapabilities.updateModelContext.structuredContent",
-        "tools/call",
-        "computer_snapshot",
-        "stale_surface",
-        "ui/request-display-mode",
-        "ui/update-model-context",
-        "ui/message",
-        "ui/resource-teardown",
+        "content_delivery",
+        "mcp_image",
         ";base64,",
         "output.client_id",
     ] {
@@ -386,11 +375,20 @@ async fn mcp_2026_computer_app_is_progressive_and_snapshot_only() {
             "missing {expected} in computer app HTML"
         );
     }
-    assert!(
-        html.contains("content: [{"),
-        "ui/message content must use the MCP Apps ContentBlock[] wire shape"
-    );
     for forbidden in [
+        "<!DOCTYPE html>",
+        "<script type=\"module\">",
+        "ui/initialize",
+        "ui/notifications/initialized",
+        "ui/notifications/tool-input",
+        "hostCapabilities",
+        "tools/call",
+        "ui/request-display-mode",
+        "ui/update-model-context",
+        "ui/message",
+        "ui/resource-teardown",
+        "window.parent.postMessage",
+        "atob(",
         "computer_list_windows",
         "content_base64",
         "innerHTML",
@@ -400,10 +398,11 @@ async fn mcp_2026_computer_app_is_progressive_and_snapshot_only() {
         "URL.createObjectURL",
         "URL.revokeObjectURL",
         "new Blob",
+        "<button",
     ] {
         assert!(
             !html.contains(forbidden),
-            "computer app HTML must not contain {forbidden}"
+            "minimal computer app HTML must not contain {forbidden}"
         );
     }
 
@@ -476,7 +475,10 @@ async fn mcp_2026_computer_app_is_progressive_and_snapshot_only() {
         snapshot["_meta"]["ui/resourceUri"],
         MCP_COMPUTER_UI_RESOURCE_URI
     );
-    assert!(snapshot["_meta"].get("openai/outputTemplate").is_none());
+    assert_eq!(
+        snapshot["_meta"]["openai/outputTemplate"],
+        MCP_COMPUTER_UI_RESOURCE_URI
+    );
 
     let no_ui_resources = handle_mcp_request(
         &runtime,
@@ -5278,8 +5280,10 @@ async fn http_mcp_2026_reads_computer_app_template_with_cache_contract() {
         MCP_UI_RESOURCE_MIME_TYPE
     );
     let html = body["result"]["contents"][0]["text"].as_str().unwrap();
-    assert!(html.starts_with("<!DOCTYPE html>"));
-    assert!(html.contains("ui/initialize"));
+    assert!(html.starts_with("<div id=\"app\""));
+    assert!(html.contains("HTML loaded"));
+    assert!(html.contains("ui/notifications/tool-result"));
+    assert!(!html.contains("ui/initialize"));
 }
 
 #[tokio::test]
