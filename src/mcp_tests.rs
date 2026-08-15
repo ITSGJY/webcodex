@@ -1474,6 +1474,94 @@ async fn mcp_tools_call_records_event_with_session_id() {
 }
 
 #[tokio::test]
+async fn mcp_tools_list_hides_testing_metadata_while_raw_call_records_it() {
+    let runtime = test_runtime();
+    let listed = handle_mcp_request(
+        &runtime,
+        rpc("tools/list", Some(Value::from(330)), json!({})),
+        None,
+    )
+    .await;
+    let listed = match listed {
+        McpOutcome::Ok(value) => value,
+        other => panic!("expected tools/list Ok, got {other:?}"),
+    };
+    let job_status = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "job_status")
+        .expect("job_status must be model-visible on local_coding");
+    let properties = job_status["inputSchema"]["properties"].as_object().unwrap();
+    for field in [
+        "expected_failure",
+        "expected_failure_kind",
+        "assertion_name",
+    ] {
+        assert!(
+            !properties.contains_key(field),
+            "MCP tools/list must not publish recorder metadata field {field}"
+        );
+    }
+
+    let session = runtime
+        .sessions
+        .start_session(None, Some("hidden metadata compatibility".to_string()));
+    let outcome = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(Value::from(331)),
+            json!({
+                "name": "job_status",
+                "arguments": {
+                    MCP_RESERVED_SESSION_ID_FIELD: &session.session_id,
+                    "job_id": "missing-job",
+                    "expected_failure": true,
+                    "expected_failure_kind": "job_not_found",
+                    "assertion_name": "mcp hidden metadata compatibility"
+                }
+            }),
+        ),
+        None,
+    )
+    .await;
+    let value = match outcome {
+        McpOutcome::Ok(value) => value,
+        other => panic!("expected tools/call result, got {other:?}"),
+    };
+    assert_eq!(value["result"]["isError"], true);
+
+    let summary = runtime
+        .sessions
+        .summary(&session.session_id, Some(10))
+        .unwrap();
+    let finished = summary
+        .events
+        .iter()
+        .find(|event| event.kind == "tool_call_finished")
+        .expect("raw MCP call must be recorded");
+    assert_eq!(finished.tool_name, "job_status");
+    assert_eq!(finished.expected_failure, Some(true));
+    assert_eq!(
+        finished.expected_failure_kind.as_deref(),
+        Some("job_not_found")
+    );
+    assert_eq!(
+        finished.assertion_name.as_deref(),
+        Some("mcp hidden metadata compatibility")
+    );
+    assert_eq!(
+        finished.actual_failure_kind.as_deref(),
+        Some("job_not_found")
+    );
+    assert_eq!(
+        finished.failure_expectation_result.as_deref(),
+        Some("matched_expected_failure")
+    );
+}
+
+#[tokio::test]
 async fn mcp_show_changes_distinguishes_reserved_session_id_from_query_session_id() {
     use crate::shell_protocol::{
         ShellAgentPollRequest, ShellAgentProjectSummary, ShellAgentResultRequest,
@@ -1845,7 +1933,11 @@ async fn mcp_tools_list_parity_with_rest_tools_list() {
     let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
     let mcp_outcome = handle_mcp_request(
         &runtime,
-        rpc("tools/list", Some(Value::from(8)), json!({})),
+        rpc(
+            "tools/list",
+            Some(Value::from(8)),
+            mcp_2026_params(json!({})),
+        ),
         None,
     )
     .await;
@@ -3326,6 +3418,115 @@ async fn mcp_artifact_export_optimized_pipeline_is_four_way_bounded_and_offset_o
             .unwrap()
             .pending_requests,
         0
+    );
+}
+
+#[tokio::test]
+async fn mcp_artifact_export_total_timeout_cleans_abandoned_pending_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (runtime, registry) = mcp_export_runtime(tmp.path(), Some("alice")).await;
+    let auth = mcp_export_api_auth("key-pipeline-timeout", "alice");
+    let path = "paper/pipeline-timeout.pdf";
+    let bytes: Vec<u8> = (0..MAX_READ_PROJECT_ARTIFACT_LENGTH * 5)
+        .map(|index| (index % 233) as u8)
+        .collect();
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let export = issue_mcp_artifact_export(
+        runtime.clone(),
+        registry.clone(),
+        auth.clone(),
+        path,
+        &bytes,
+        "application/pdf",
+    )
+    .await;
+    let uri = export["result"]["content"][0]["uri"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let gate = Arc::new(Semaphore::new(1));
+    let read = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        let gate = gate.clone();
+        async move {
+            mcp_artifact_export_resource_read_with_gate_timeout(
+                &runtime,
+                &uri,
+                Some(&auth),
+                gate.as_ref(),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .await
+        }
+    });
+
+    complete_mcp_export_metadata(
+        registry.clone(),
+        path,
+        bytes.len(),
+        &sha256,
+        "application/pdf",
+    )
+    .await;
+    let first = poll_mcp_export_request(&registry).await;
+    complete_mcp_export_optimized_chunk(&registry, first, path, &bytes).await;
+
+    let mut inflight = Vec::new();
+    for _ in 0..MAX_MCP_ARTIFACT_EXPORT_CHUNK_READS {
+        inflight.push(poll_mcp_export_request(&registry).await);
+    }
+    assert!(matches!(
+        read.await.unwrap(),
+        Err(McpArtifactExportReadError::Timeout)
+    ));
+    assert_eq!(gate.available_permits(), 1);
+    for request in inflight {
+        assert!(
+            !registry.cancel_request(&request.request_id).await,
+            "resource timeout must remove every abandoned optimized chunk request"
+        );
+    }
+
+    let export = issue_mcp_artifact_export(
+        runtime.clone(),
+        registry.clone(),
+        auth.clone(),
+        "paper/metadata-timeout.pdf",
+        &bytes,
+        "application/pdf",
+    )
+    .await;
+    let uri = export["result"]["content"][0]["uri"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let read = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        let gate = gate.clone();
+        async move {
+            mcp_artifact_export_resource_read_with_gate_timeout(
+                &runtime,
+                &uri,
+                Some(&auth),
+                gate.as_ref(),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .await
+        }
+    });
+    let metadata = poll_mcp_export_request(&registry).await;
+    assert_eq!(metadata.kind, "file_read_project_artifact_metadata");
+    assert!(matches!(
+        read.await.unwrap(),
+        Err(McpArtifactExportReadError::Timeout)
+    ));
+    assert!(
+        !registry.cancel_request(&metadata.request_id).await,
+        "resource timeout must also remove an abandoned metadata recheck"
     );
 }
 
@@ -6264,6 +6465,15 @@ async fn mcp_tools_list_exposes_coding_task_and_runtime_status_ux_flags() {
         "start_coding_task must not grow a role wire field"
     );
     let work_schema = &tool("work_on_project")["inputSchema"];
+    for (name, schema) in [
+        ("start_coding_task", start_schema),
+        ("work_on_project", work_schema),
+    ] {
+        assert!(
+            schema["properties"]["path"].get("pattern").is_none(),
+            "{name} path schema must not encode Control-host POSIX path semantics"
+        );
+    }
     let work_props = work_schema["properties"]
         .as_object()
         .expect("work_on_project MCP properties");
@@ -6730,7 +6940,11 @@ async fn full_operator_explicit_surface_lists_full_runtime_and_dispatches() {
     let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
     let listed = handle_mcp_request(
         &runtime,
-        rpc("tools/list", Some(Value::from(72)), json!({})),
+        rpc(
+            "tools/list",
+            Some(Value::from(72)),
+            mcp_2026_params(json!({})),
+        ),
         None,
     )
     .await;
@@ -6874,8 +7088,12 @@ async fn selected_surface_is_immutable_after_environment_changes() {
     with_model_surface_env(Some("broken-after-startup"), || {
         assert_eq!(full.model_surface(), ModelSurface::FullOperatorRuntime);
     });
-    let listed =
-        handle_mcp_request(&full, rpc("tools/list", Some(json!(82)), json!({})), None).await;
+    let listed = handle_mcp_request(
+        &full,
+        rpc("tools/list", Some(json!(82)), mcp_2026_params(json!({}))),
+        None,
+    )
+    .await;
     let McpOutcome::Ok(value) = listed else {
         panic!("full operator tools/list must remain available");
     };

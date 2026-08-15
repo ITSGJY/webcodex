@@ -178,6 +178,16 @@ fn tool_definition_runtime_tool_policy_inventory_is_stable() {
         ("job_tail", "job", "none"),
         ("write_project_file", "edit", "current_session_fallback"),
         (
+            "import_conversation_files_to_project",
+            "artifact",
+            "current_session_fallback",
+        ),
+        (
+            "export_project_artifact",
+            "artifact",
+            "current_session_fallback",
+        ),
+        (
             "save_project_artifact",
             "artifact",
             "current_session_fallback",
@@ -213,6 +223,13 @@ fn tool_definition_runtime_tool_policy_inventory_is_stable() {
             "current_session_fallback",
         ),
         ("apply_text_edits", "edit", "current_session_fallback"),
+        ("computer_list_targets", "computer", "none"),
+        ("computer_list_windows", "computer", "none"),
+        ("computer_accessibility_status", "computer", "none"),
+        ("computer_accessibility_tree", "computer", "none"),
+        ("computer_control", "computer", "none"),
+        ("computer_input_text", "computer", "none"),
+        ("computer_snapshot", "computer", "none"),
         ("list_projects", "project", "none"),
         ("register_project", "project", "none"),
         ("create_project", "project", "none"),
@@ -624,9 +641,6 @@ fn tool_definition_surface_counts_stay_fixed_during_fallback_migration() {
         .as_object()
         .expect("ToolCallRequest properties");
     for field in [
-        "expected_failure",
-        "expected_failure_kind",
-        "assertion_name",
         "summary_only",
         "include_command_preview",
         "detail",
@@ -637,7 +651,17 @@ fn tool_definition_surface_counts_stay_fixed_during_fallback_migration() {
             "callRuntimeTool must keep flattened GPT Action field {field}"
         );
     }
-    assert!(!tool_call_properties.contains_key("test_expect_failure_kind"));
+    for field in [
+        "expected_failure",
+        "expected_failure_kind",
+        "assertion_name",
+        "test_expect_failure_kind",
+    ] {
+        assert!(
+            !tool_call_properties.contains_key(field),
+            "callRuntimeTool model-facing schema must not publish testing metadata field {field}"
+        );
+    }
     let tool_description = tool_call_properties["tool"]["description"]
         .as_str()
         .unwrap();

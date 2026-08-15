@@ -16,6 +16,29 @@ mod projects_tests;
 
 #[test]
 fn computer_action_audit_projection_omits_sensitive_observation_payloads() {
+    let targets_output = serde_json::json!({
+        "targets": [{
+            "client_id": "private-runner",
+            "display_name": "Private Desktop",
+            "connected": true,
+            "capabilities": {
+                "computer_observe": true,
+                "computer_accessibility_observe": true
+            }
+        }],
+        "count": 1,
+        "total_count": 1,
+        "truncated": false
+    });
+    let targets_audit = action_audit_output_for_tool("computer_list_targets", &targets_output);
+    assert_eq!(
+        targets_audit,
+        serde_json::json!({"count": 1, "total_count": 1, "truncated": false})
+    );
+    let targets_serialized = serde_json::to_string(&targets_audit).unwrap();
+    assert!(!targets_serialized.contains("private-runner"));
+    assert!(!targets_serialized.contains("Private Desktop"));
+
     let list_output = serde_json::json!({
         "windows": [{
             "surface_id": "surface_secret",
@@ -313,12 +336,33 @@ fn spawn_startup_agent_executor(registry: Arc<ShellClientRegistry>) -> tokio::ta
         if request.kind == "file_read" {
             return (1, String::new(), "No such file or directory".to_string());
         }
-        let output = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&request.command)
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = std::process::Command::new("powershell.exe");
+            command
+                .args(["-NoProfile", "-NonInteractive", "-Command"])
+                .arg(&request.command);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = std::process::Command::new("sh");
+            command.arg("-c").arg(&request.command);
+            command
+        };
+        let output = match command
             .current_dir(Path::new(request.cwd.as_deref().unwrap_or(".")))
             .output()
-            .unwrap();
+        {
+            Ok(output) => output,
+            Err(error) => {
+                return (
+                    -1,
+                    String::new(),
+                    format!("failed to execute test agent shell: {error}"),
+                );
+            }
+        };
         (
             output.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&output.stdout).to_string(),
@@ -1273,7 +1317,7 @@ async fn api_tools_call_records_success_event_with_session_id() {
 }
 
 #[tokio::test]
-async fn api_tools_call_records_failure_event_with_session_id() {
+async fn api_tools_call_accepts_hidden_testing_metadata_and_records_expectation() {
     let (_tmp, service) = phase2_service();
     let mut resp = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
@@ -1286,9 +1330,12 @@ async fn api_tools_call_records_failure_event_with_session_id() {
     let mut resp = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
         .json(&json!({
-            "tool": "read_file",
+            "tool": "job_status",
             TOOL_CALL_RECORDING_SESSION_ID_FIELD: session_id,
-            "params": {"project": "demo", "path": "missing.txt"}
+            "job_id": "missing-job",
+            "expected_failure": true,
+            "expected_failure_kind": "job_not_found",
+            "assertion_name": "api hidden metadata compatibility"
         }))
         .send(&service)
         .await;
@@ -1304,10 +1351,16 @@ async fn api_tools_call_records_failure_event_with_session_id() {
     assert_eq!(body["output"]["counts"]["tool_calls"], 1);
     assert_eq!(body["output"]["counts"]["failed"], 1);
     let event = &body["output"]["events"].as_array().unwrap()[1];
-    assert_eq!(event["tool_name"], "read_file");
+    assert_eq!(event["tool_name"], "job_status");
     assert_eq!(event["status"], "failed");
-    assert_eq!(event["error_kind"], "runtime_error");
-    assert!(event["error_message_summary"].as_str().unwrap().len() <= 243);
+    assert_eq!(event["expected_failure"], true);
+    assert_eq!(event["expected_failure_kind"], "job_not_found");
+    assert_eq!(event["assertion_name"], "api hidden metadata compatibility");
+    assert_eq!(event["actual_failure_kind"], "job_not_found");
+    assert_eq!(
+        event["failure_expectation_result"],
+        "matched_expected_failure"
+    );
 }
 
 #[tokio::test]

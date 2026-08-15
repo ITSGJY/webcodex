@@ -51,6 +51,13 @@ pub(crate) const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "git_log",
             "workspace_checkpoint_list",
             "workspace_checkpoint_show",
+            "computer_list_targets",
+            "computer_list_windows",
+            "computer_accessibility_status",
+            "computer_accessibility_tree",
+            "computer_control",
+            "computer_input_text",
+            "computer_snapshot",
         ],
     },
     ToolDiscoveryGroup {
@@ -112,6 +119,8 @@ pub(crate) const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "save_project_artifact",
             "read_project_artifact_metadata",
             "read_project_artifact",
+            "import_conversation_files_to_project",
+            "export_project_artifact",
             "artifact_upload_begin",
             "artifact_upload_chunk",
             "artifact_upload_finish",
@@ -261,6 +270,19 @@ pub(crate) const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
             "run_process",
             "run_script",
             "run_shell",
+        ],
+    },
+    ToolRecommendedFlow {
+        name: "computer_observe",
+        summary: "Computer observe: discover a caller-visible capable Runner, list its exact windows, then inspect accessibility or capture one exact surface. Read-only; no control actions.",
+        manifest_purpose:
+            "Discover a Computer-capable Runner, list its windows, then inspect accessibility or capture one exact surface.",
+        tools: &[
+            "computer_list_targets",
+            "computer_list_windows",
+            "computer_accessibility_status",
+            "computer_accessibility_tree",
+            "computer_snapshot",
         ],
     },
     ToolRecommendedFlow {

@@ -179,9 +179,9 @@ fn resolve_project_source(
                 json!({"conflicting_fields": ["path", "temporary_project_name"]}),
             ));
         }
-        if !Path::new(&path).is_absolute() {
+        if let Err(error) = super::projects::validate_project_op_path(&path) {
             return Err(invalid_project_source(
-                "path must be an absolute path",
+                error,
                 json!({"field": "path", "expected": "absolute_path"}),
             ));
         }
@@ -1483,8 +1483,6 @@ impl ToolRuntime {
             output["warning_kind"] = json!(SESSION_PROJECT_MISMATCH_KIND);
             output["session_project"] = json!(mismatch.session_project);
             output["request_project"] = json!(mismatch.request_project);
-            output["allow_cross_project_session_required"] = json!(true);
-            output["allow_cross_project_session"] = json!(false);
         }
         output["tool_failures"] = project_tool_failure_actionability(
             output.get("tool_failures").unwrap_or(&Value::Null),

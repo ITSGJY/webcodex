@@ -2,13 +2,10 @@ use salvo::prelude::*;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-use crate::tool_runtime::sessions::{
-    TOOL_ASSERTION_NAME_FIELD, TOOL_CALL_RECORDING_SESSION_ID_FIELD, TOOL_EXPECTED_FAILURE_FIELD,
-    TOOL_EXPECTED_FAILURE_KIND_FIELD,
-};
+use crate::tool_runtime::sessions::TOOL_CALL_RECORDING_SESSION_ID_FIELD;
 use crate::tool_runtime::{
-    accepted_flattened_args_for_spec, registered_tool_specs, ALLOW_CROSS_PROJECT_SESSION_FIELD,
-    TOOL_CALL_ARGUMENTS_FIELD, TOOL_CALL_PARAMS_FIELD, TOOL_CALL_TOOL_FIELD,
+    accepted_flattened_args_for_spec, registered_tool_specs, TOOL_CALL_ARGUMENTS_FIELD,
+    TOOL_CALL_PARAMS_FIELD, TOOL_CALL_TOOL_FIELD,
 };
 
 const PATCH_FIELD_DESCRIPTION: &str = "raw standard unified diff only. Do not include Codex apply_patch wrapper syntax, shell heredocs, \"*** Begin Patch\", \"*** Update File\", or \"*** End Patch\". The first non-empty line should be \"diff --git ...\", \"--- ...\", or another git-apply-compatible unified diff header.";
@@ -1102,10 +1099,6 @@ fn schemas() -> Value {
             "required": [TOOL_CALL_TOOL_FIELD],
             "description": "Generic runtime tool call. `tool` is the runtime tool name. GPT Actions should pass tool-specific arguments as flattened top-level fields because some Action runtimes reject free-form params/arguments objects. `params` and `arguments` remain accepted for non-Action clients, with non-null `params` taking precedence; null wrappers do not suppress flattened arguments. Top-level `session_id` is ordinary project-tool business input; `resume_session_id` is the distinct start_coding_task input that resumes one known active Workflow Session and never creates on failure; use `recording_session_id` to record this wrapper call in the session ledger and enforce that recorder Session's guards. When no explicit tool session_id is provided, project tools may use the exact window/caller/transport/project/canonical-root current Session ensured by start_coding_task (default bind_current=true) or established manually by bind_current_session. Its process-local cache can be restored after restart from a hashed durable projection when the client retains the same stable window identity. Explicit session_id or recording_session_id still wins over current-session lookup; missing identity never falls back to a credential-wide binding. Explicit resume can still continue without a window, but cannot establish a current binding and later project tools must pass session_id. Ordinary project-bound Connector continuity is handled separately by task_start. For daily discovery prefer tool_manifest; it exposes accepted_flattened_args for GPT Action top-level calls. Use list_tools with summary_only/category/features/limit only for focused discovery.",
             "properties": {
-                ALLOW_CROSS_PROJECT_SESSION_FIELD: {
-                    "type": "boolean",
-                    "description": "Advanced/debug escape hatch for callRuntimeTool. When true, allow recording a project tool call into a session whose associated project differs from the request project; session_project_mismatch warning metadata is still returned. Used only when `params` and `arguments` are absent, or inside params/arguments for non-Action clients."
-                },
                 "session_id": {
                     "type": "string",
                     "description": "Flattened tool-specific argument. For session_summary and message-board tools this is the required business session id to read or update in the session ledger; for project tools it is the explicit tool session that wins over current-session binding. Use recording_session_id to record the wrapper call itself."
@@ -2098,27 +2091,6 @@ fn insert_tool_call_request_reserved_properties(schemas: &mut Value) {
         json!({
             "type": "string",
             "description": "Optional recorder metadata for the generic wrapper call. Pass an explicit wc_sess_* id from start_session to record this call in the session ledger and enforce that recorder session's guards. This field is stripped before concrete tool dispatch. Use top-level session_id for ordinary tool input such as session_summary.session_id or post_session_message.session_id."
-        }),
-    );
-    properties.insert(
-        TOOL_EXPECTED_FAILURE_FIELD.to_string(),
-        json!({
-            "type": "boolean",
-            "description": "Flattened testing/smoke metadata only. When true, a failed runtime tool call is classified as an expected failure in session_handoff_summary/finish_coding_task. Does not change authorization, permission decisions, execution, hard guards, command_started, or the immediate success/error result."
-        }),
-    );
-    properties.insert(
-        TOOL_EXPECTED_FAILURE_KIND_FIELD.to_string(),
-        json!({
-            "type": "string",
-            "description": "Flattened testing/smoke metadata only. Expected structured failure_kind or error_kind when expected_failure=true. Mismatches are surfaced in handoff/finish summaries and do not change tool behavior."
-        }),
-    );
-    properties.insert(
-        TOOL_ASSERTION_NAME_FIELD.to_string(),
-        json!({
-            "type": "string",
-            "description": "Flattened testing/smoke assertion label recorded in the session ledger. Does not change tool behavior or safety decisions."
         }),
     );
 }

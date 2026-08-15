@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 fn from_tool_name_parses_unit_tools_without_arguments() {
     for name in [
         "list_tools",
+        "computer_list_targets",
         "list_projects",
         "list_agents",
         "runtime_status",
@@ -17,6 +18,7 @@ fn from_tool_name_parses_unit_tools_without_arguments() {
             matches!(
                 call,
                 ToolCall::ListTools { .. }
+                    | ToolCall::ComputerListTargets
                     | ToolCall::ListProjects
                     | ToolCall::ListAgents
                     | ToolCall::RuntimeStatus { .. }
@@ -62,8 +64,8 @@ fn from_tool_name_parses_bounded_list_tools_options() {
 }
 
 #[test]
-fn from_tool_name_strips_testing_metadata_before_parsing() {
-    let call = ToolCall::from_tool_name(
+fn from_tool_name_records_and_strips_testing_metadata_before_parsing() {
+    let (call, metadata) = ToolCall::from_tool_name_with_recorder_metadata(
         "job_status",
         json!({
             "job_id": "abc",
@@ -80,6 +82,15 @@ fn from_tool_name_strips_testing_metadata_before_parsing() {
             include_command_preview: false,
         } if job_id == "abc"
     ));
+    assert!(metadata.expectation.expected_failure);
+    assert_eq!(
+        metadata.expectation.expected_failure_kind.as_deref(),
+        Some("job_not_found")
+    );
+    assert_eq!(
+        metadata.expectation.assertion_name.as_deref(),
+        Some("missing job negative path")
+    );
 }
 
 #[test]
@@ -704,6 +715,24 @@ fn coding_task_entries_parse_path_source_and_reject_ambiguous_sources() {
     assert!(work_audit.get("path").is_none());
     assert!(!work_audit.to_string().contains("/root/git/example"));
 
+    for path in [
+        r"C:\repo",
+        "c:/repo",
+        r"\\?\C:\repo",
+        r"\\server\share\repo",
+    ] {
+        ToolCall::from_tool_name(
+            "start_coding_task",
+            json!({"client_id": "runner-1", "path": path}),
+        )
+        .unwrap_or_else(|error| panic!("start_coding_task rejected {path:?}: {error}"));
+        ToolCall::from_tool_name(
+            "work_on_project",
+            json!({"client_id": "runner-1", "path": path, "instruction": "implement it"}),
+        )
+        .unwrap_or_else(|error| panic!("work_on_project rejected {path:?}: {error}"));
+    }
+
     for (tool, arguments) in [
         (
             "start_coding_task",
@@ -717,6 +746,10 @@ fn coding_task_entries_parse_path_source_and_reject_ambiguous_sources() {
         (
             "start_coding_task",
             json!({"client_id": "x", "path": "relative/repo"}),
+        ),
+        (
+            "start_coding_task",
+            json!({"client_id": "x", "path": r"C:repo"}),
         ),
         ("start_coding_task", json!({"client_id": "x", "path": ""})),
         (
@@ -733,6 +766,10 @@ fn coding_task_entries_parse_path_source_and_reject_ambiguous_sources() {
         ),
         (
             "work_on_project",
+            json!({"client_id": "x", "path": r"\repo", "instruction": "x"}),
+        ),
+        (
+            "work_on_project",
             json!({"client_id": "", "path": "/tmp/y", "instruction": "x"}),
         ),
     ] {
@@ -740,7 +777,7 @@ fn coding_task_entries_parse_path_source_and_reject_ambiguous_sources() {
         assert!(
             error.contains("conflicting fields")
                 || error.contains("missing ")
-                || error.contains("must be absolute")
+                || error.contains("must be an absolute")
                 || error.contains("must not be empty"),
             "{error}"
         );
