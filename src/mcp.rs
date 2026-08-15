@@ -47,13 +47,14 @@ const MCP_UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 const MCP_SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
     &[MCP_STATELESS_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION];
 const MCP_UI_EXTENSION: &str = "io.modelcontextprotocol/ui";
-const MCP_COMPUTER_UI_RESOURCE_URI: &str = "ui://webcodex/computer/v6";
+const MCP_COMPUTER_UI_RESOURCE_URI: &str = "ui://webcodex/computer/v7";
 const MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS: &[&str] = &[
     "ui://webcodex/computer/v1",
     "ui://webcodex/computer/v2",
     "ui://webcodex/computer/v3",
     "ui://webcodex/computer/v4",
     "ui://webcodex/computer/v5",
+    "ui://webcodex/computer/v6",
 ];
 const MCP_COMPUTER_UI_RESOURCE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const MCP_COMPUTER_UI_DOMAIN: &str = "https://sg4.yyjeqhc.cn";
@@ -501,7 +502,7 @@ fn mcp_computer_app_resources_list() -> Value {
         "resources": [{
             "uri": MCP_COMPUTER_UI_RESOURCE_URI,
             "name": "WebCodex Computer",
-            "description": "Minimal read-only WebCodex Computer screenshot card that renders the native computer_snapshot image without initiating host requests.",
+            "description": "Minimal read-only WebCodex Computer screenshot card that performs only the standard MCP Apps handshake and renders the native computer_snapshot image.",
             "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
             "_meta": mcp_computer_app_resource_meta()
         }]
