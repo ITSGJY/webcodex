@@ -601,7 +601,7 @@ async fn mcp_2026_computer_app_probe_is_mcp_only_tiny_result_control() {
         panic!("expected UI resources/list");
     };
     let resources = resources["result"]["resources"].as_array().unwrap();
-    assert_eq!(resources.len(), 6);
+    assert_eq!(resources.len(), 7);
     let probe_resource = resources
         .iter()
         .find(|resource| resource["uri"] == MCP_COMPUTER_APP_PROBE_RESOURCE_URI)
@@ -824,7 +824,7 @@ async fn mcp_2026_computer_app_image_probe_uses_snapshot_native_image_framing() 
         panic!("expected UI resources/list");
     };
     let resources = resources["result"]["resources"].as_array().unwrap();
-    assert_eq!(resources.len(), 6);
+    assert_eq!(resources.len(), 7);
     let image_resource = resources
         .iter()
         .find(|resource| resource["uri"] == MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI)
@@ -1032,7 +1032,7 @@ async fn mcp_2026_computer_app_image_size_probe_ladders_exact_native_png_payload
         panic!("expected UI resources/list");
     };
     let resources = resources["result"]["resources"].as_array().unwrap();
-    assert_eq!(resources.len(), 6);
+    assert_eq!(resources.len(), 7);
     let size_resource = resources
         .iter()
         .find(|resource| resource["uri"] == MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_RESOURCE_URI)
@@ -1282,7 +1282,7 @@ async fn mcp_2026_computer_app_image_dimension_probe_keeps_fixed_bytes_across_di
         panic!("expected UI resources/list");
     };
     let resources = resources["result"]["resources"].as_array().unwrap();
-    assert_eq!(resources.len(), 6);
+    assert_eq!(resources.len(), 7);
     let dimension_resource = resources
         .iter()
         .find(|resource| resource["uri"] == MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_RESOURCE_URI)
@@ -1554,6 +1554,373 @@ async fn mcp_2026_computer_app_image_dimension_probe_keeps_fixed_bytes_across_di
 }
 
 #[tokio::test]
+async fn mcp_2026_computer_app_image_matrix_probe_covers_codec_dimension_payload_matrix() {
+    fn jpeg_sof_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+        let offset = data
+            .windows(2)
+            .position(|bytes| bytes == [0xff, 0xc0] || bytes == [0xff, 0xc1])?;
+        if offset + 9 > data.len() {
+            return None;
+        }
+        let segment_len = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
+        if segment_len < 8 || offset + 2 + segment_len > data.len() {
+            return None;
+        }
+        let height = u16::from_be_bytes([data[offset + 5], data[offset + 6]]) as u32;
+        let width = u16::from_be_bytes([data[offset + 7], data[offset + 8]]) as u32;
+        Some((width, height))
+    }
+
+    let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
+    assert_eq!(
+        MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_RESOURCE_URI,
+        "ui://webcodex/computer-image-matrix-probe/v1"
+    );
+    assert!(registered_tool_specs()
+        .iter()
+        .all(|spec| spec.name != MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_TOOL_NAME));
+
+    let tools = handle_mcp_request(
+        &runtime,
+        rpc("tools/list", Some(json!(2140)), mcp_2026_params(json!({}))),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(tools) = tools else {
+        panic!("expected stateless tools/list");
+    };
+    let matrix_probe = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_TOOL_NAME)
+        .expect("MCP-only computer app image matrix probe");
+    assert_eq!(
+        matrix_probe["inputSchema"]["properties"]["codec"]["enum"],
+        json!(["png", "jpeg"])
+    );
+    assert_eq!(
+        matrix_probe["inputSchema"]["properties"]["dimension"]["enum"],
+        json!(["640x360", "1280x720", "1920x1080", "2560x1440", "3840x2160"])
+    );
+    assert_eq!(
+        matrix_probe["inputSchema"]["properties"]["payload"]["enum"],
+        json!(["64k", "128k", "256k", "512k"])
+    );
+    assert_eq!(
+        matrix_probe["inputSchema"]["required"],
+        json!(["codec", "dimension", "payload"])
+    );
+    assert_eq!(matrix_probe["inputSchema"]["additionalProperties"], false);
+    assert_eq!(matrix_probe["annotations"]["readOnlyHint"], true);
+    assert_eq!(
+        matrix_probe["_meta"],
+        json!({
+            "ui": {
+                "resourceUri": MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_RESOURCE_URI,
+                "visibility": ["model", "app"]
+            },
+            "openai/outputTemplate": MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_RESOURCE_URI
+        })
+    );
+    assert!(matrix_probe["outputSchema"].is_object());
+
+    let compact =
+        mcp_tools_list_payload_with_compact_and_app(ModelSurface::FullOperatorRuntime, true, true);
+    let compact_probe = compact["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_TOOL_NAME)
+        .expect("compact image matrix probe");
+    assert!(compact_probe.get("outputSchema").is_none());
+    assert_eq!(compact_probe["inputSchema"], matrix_probe["inputSchema"]);
+    assert_eq!(compact_probe["_meta"], matrix_probe["_meta"]);
+
+    let resources = handle_mcp_request(
+        &runtime,
+        rpc(
+            "resources/list",
+            Some(json!(2141)),
+            mcp_2026_ui_params(json!({})),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(resources) = resources else {
+        panic!("expected UI resources/list");
+    };
+    let resources = resources["result"]["resources"].as_array().unwrap();
+    assert_eq!(resources.len(), 7);
+    let matrix_resource = resources
+        .iter()
+        .find(|resource| resource["uri"] == MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_RESOURCE_URI)
+        .expect("image matrix probe resource");
+    assert_eq!(matrix_resource["mimeType"], MCP_UI_RESOURCE_MIME_TYPE);
+    assert_eq!(matrix_resource["_meta"], mcp_computer_app_resource_meta());
+
+    let resource = handle_mcp_request(
+        &runtime,
+        rpc(
+            "resources/read",
+            Some(json!(2142)),
+            mcp_2026_params(json!({
+                "uri": MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_RESOURCE_URI
+            })),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(resource) = resource else {
+        panic!("expected image matrix probe resource read");
+    };
+    assert_eq!(
+        resource["result"]["ttlMs"],
+        Value::from(MCP_COMPUTER_UI_RESOURCE_TTL_MS)
+    );
+    assert_eq!(resource["result"]["cacheScope"], "private");
+    assert_eq!(
+        resource["result"]["contents"][0]["text"].as_str(),
+        Some(MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_HTML)
+    );
+    let html = MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_HTML;
+    for expected in [
+        "HTML loaded",
+        "ui/initialize",
+        "2026-01-26",
+        "ui/notifications/initialized",
+        "ui/notifications/tool-result",
+        "image_matrix",
+        "image/png",
+        "image/jpeg",
+        "64k",
+        "512k",
+        "3840x2160",
+        "native image decoded",
+        "Synthetic matrix image decoded successfully.",
+        "naturalWidth",
+        "naturalHeight",
+        "imageEl.onload",
+        "imageEl.onerror",
+        "Browser failed to decode the synthetic matrix image.",
+        "stateEl.textContent !== \"native image decoded\"",
+        "no Runner",
+    ] {
+        assert!(
+            html.contains(expected),
+            "missing {expected} in matrix probe App HTML"
+        );
+    }
+    for forbidden in [
+        "computer_snapshot",
+        "content_base64",
+        "tools/call",
+        "ui/request-display-mode",
+        "ui/update-model-context",
+        "ui/message",
+    ] {
+        assert!(
+            !html.contains(forbidden),
+            "image matrix probe App HTML must not contain {forbidden}"
+        );
+    }
+
+    let baseline_pins = [
+        (
+            "640x360",
+            1124usize,
+            "5fc2ffb5227ea64482cc9342c22bf1d69c18ca2e53b619c3d175bab091586ceb",
+        ),
+        (
+            "1280x720",
+            3824usize,
+            "e5f4624d01c635857ee3783b5e5051d3a6889ef7e04a0aeebcb13e72fdf1b4bb",
+        ),
+        (
+            "1920x1080",
+            8324usize,
+            "a2aeeb326fbb55fbc66179c26c0016aa51a61e31164c8c0f468afa382e798c46",
+        ),
+        (
+            "2560x1440",
+            14624usize,
+            "c2f7c2eaf32ff53d1d05aadedaac4fb7174674c0c439a735d898b79ee3882e13",
+        ),
+        (
+            "3840x2160",
+            32624usize,
+            "e507eb6bb86d442792650ae229e3d385b940569a1dcb0c1d47236276f43c0847",
+        ),
+    ];
+    for &(dimension, width, height, base) in MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_JPEG_BASES {
+        let (_, expected_len, expected_sha) = baseline_pins
+            .iter()
+            .find(|(label, _, _)| *label == dimension)
+            .expect("JPEG baseline pin");
+        assert_eq!(base.len(), *expected_len, "dimension={dimension}");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(base)),
+            *expected_sha,
+            "dimension={dimension}"
+        );
+        assert!(
+            base.starts_with(&[0xff, 0xd8, 0xff]),
+            "dimension={dimension}"
+        );
+        assert!(base.ends_with(&[0xff, 0xd9]), "dimension={dimension}");
+        assert_eq!(
+            jpeg_sof_dimensions(base),
+            Some((width, height)),
+            "dimension={dimension}"
+        );
+    }
+
+    for codec in ["png", "jpeg"] {
+        for &(dimension, expected_width, expected_height, _) in
+            MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_CHOICES
+        {
+            for &(payload, expected_bytes) in MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_PAYLOAD_CHOICES {
+                let (image, width, height, mime_type) =
+                    mcp_computer_app_image_matrix_probe_image(codec, dimension, payload)
+                        .expect("deterministic image-matrix cell");
+                assert_eq!(image.len(), expected_bytes, "{codec}/{dimension}/{payload}");
+                assert_eq!((width, height), (expected_width, expected_height));
+                match codec {
+                    "png" => {
+                        assert_eq!(mime_type, "image/png");
+                        assert_eq!(&image[..8], b"\x89PNG\r\n\x1a\n");
+                        assert_eq!(&image[12..16], b"IHDR");
+                        assert_eq!(u32::from_be_bytes(image[16..20].try_into().unwrap()), width);
+                        assert_eq!(
+                            u32::from_be_bytes(image[20..24].try_into().unwrap()),
+                            height
+                        );
+                    }
+                    "jpeg" => {
+                        assert_eq!(mime_type, "image/jpeg");
+                        assert_eq!(jpeg_sof_dimensions(&image), Some((width, height)));
+                        let (_, _, base) =
+                            mcp_computer_app_image_matrix_probe_jpeg_base(dimension).unwrap();
+                        assert_eq!(&image[..base.len() - 2], &base[..base.len() - 2]);
+                        let mut offset = base.len() - 2;
+                        while offset < image.len() - 2 {
+                            assert_eq!(&image[offset..offset + 2], &[0xff, 0xef]);
+                            let length = u16::from_be_bytes(
+                                image[offset + 2..offset + 4].try_into().unwrap(),
+                            ) as usize;
+                            assert!(length >= 2);
+                            let next = offset + 2 + length;
+                            assert!(next <= image.len() - 2);
+                            assert!(image[offset + 4..next].iter().all(|byte| *byte == 0));
+                            offset = next;
+                        }
+                        assert_eq!(offset, image.len() - 2);
+                        assert_eq!(&image[image.len() - 2..], &[0xff, 0xd9]);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    for (codec, payload, expected_mime, expected_bytes) in [
+        ("png", "512k", "image/png", 512 * 1024usize),
+        ("jpeg", "64k", "image/jpeg", 64 * 1024usize),
+    ] {
+        let call = handle_mcp_request(
+            &runtime,
+            rpc(
+                "tools/call",
+                Some(json!(2143)),
+                mcp_2026_params(json!({
+                    "name": MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_TOOL_NAME,
+                    "arguments": {
+                        "codec": codec,
+                        "dimension": "3840x2160",
+                        "payload": payload
+                    }
+                })),
+            ),
+            None,
+        )
+        .await;
+        let McpOutcome::Ok(call) = call else {
+            panic!("expected matrix probe tools/call for {codec}/{payload}");
+        };
+        assert_eq!(call["result"]["resultType"], "complete");
+        assert_eq!(call["result"]["isError"], false);
+        let content = call["result"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["mimeType"], expected_mime);
+        let delivered = general_purpose::STANDARD
+            .decode(content[1]["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(delivered.len(), expected_bytes);
+        let output = &call["result"]["structuredContent"]["output"];
+        assert_eq!(output["probe"], "image_matrix");
+        assert_eq!(output["codec"], codec);
+        assert_eq!(output["dimension"], "3840x2160");
+        assert_eq!(output["payload"], payload);
+        assert_eq!(output["runner_used"], false);
+        assert_eq!(output["content_delivery"], "mcp_image");
+        assert_eq!(output["mime_type"], expected_mime);
+        assert_eq!(output["width"], 3840);
+        assert_eq!(output["height"], 2160);
+        assert_eq!(output["file_bytes"], expected_bytes as u64);
+        assert_eq!(
+            output["sha256"],
+            format!("{:x}", Sha256::digest(&delivered))
+        );
+        assert!(output.get("content_base64").is_none());
+    }
+
+    for arguments in [
+        json!({}),
+        json!({ "codec": "webp", "dimension": "640x360", "payload": "64k" }),
+        json!({ "codec": "jpeg", "dimension": "800x600", "payload": "64k" }),
+        json!({ "codec": "jpeg", "dimension": "640x360", "payload": "1k" }),
+        json!({ "codec": "jpeg", "dimension": "640x360", "payload": "64k", "unexpected": true }),
+    ] {
+        let invalid = handle_mcp_request(
+            &runtime,
+            rpc(
+                "tools/call",
+                Some(json!(2144)),
+                mcp_2026_params(json!({
+                    "name": MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_TOOL_NAME,
+                    "arguments": arguments
+                })),
+            ),
+            None,
+        )
+        .await;
+        match invalid {
+            McpOutcome::BadRequest(value) => assert_eq!(value["error"]["code"], -32602),
+            other => panic!("matrix probe must reject invalid arguments, got {other:?}"),
+        }
+    }
+
+    let legacy_call = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(2145)),
+            json!({
+                "name": MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_TOOL_NAME,
+                "arguments": { "codec": "jpeg", "dimension": "640x360", "payload": "64k" }
+            }),
+        ),
+        None,
+    )
+    .await;
+    match legacy_call {
+        McpOutcome::BadRequest(value) => assert_eq!(value["error"]["code"], -32602),
+        other => panic!("matrix probe must remain stateless-2026-only, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn mcp_2026_computer_app_snapshot_probe_delegates_to_real_snapshot_contract() {
     let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
     assert_eq!(
@@ -1647,7 +2014,7 @@ async fn mcp_2026_computer_app_snapshot_probe_delegates_to_real_snapshot_contrac
         panic!("expected UI resources/list");
     };
     let resources = resources["result"]["resources"].as_array().unwrap();
-    assert_eq!(resources.len(), 6);
+    assert_eq!(resources.len(), 7);
     let snapshot_resource = resources
         .iter()
         .find(|resource| resource["uri"] == MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI)
@@ -1810,6 +2177,7 @@ async fn mcp_tools_list_returns_same_names_as_runtime() {
     stateless_mcp_names.push(MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME.to_string());
     stateless_mcp_names.push(MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_TOOL_NAME.to_string());
     stateless_mcp_names.push(MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_TOOL_NAME.to_string());
+    stateless_mcp_names.push(MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_TOOL_NAME.to_string());
 
     for compact in [false, true] {
         if compact {
@@ -6741,6 +7109,67 @@ async fn http_mcp_2026_calls_computer_app_image_dimension_probe_with_4k_fixed_na
 }
 
 #[tokio::test]
+async fn http_mcp_2026_calls_computer_app_image_matrix_probe_with_4k_64k_jpeg() {
+    let config = test_config(Some("secret"));
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let service = Service::new(build_test_router(config, db, runtime));
+    let params = mcp_2026_ui_params(json!({
+        "name": MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_TOOL_NAME,
+        "arguments": { "codec": "jpeg", "dimension": "3840x2160", "payload": "64k" }
+    }));
+
+    let mut response = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_STATELESS_PROTOCOL_VERSION,
+            true,
+        )
+        .add_header(MCP_METHOD_HEADER, "tools/call", true)
+        .add_header(
+            MCP_NAME_HEADER,
+            MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_TOOL_NAME,
+            true,
+        )
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2065,
+            "method": "tools/call",
+            "params": params
+        }))
+        .send(&service)
+        .await;
+
+    assert_eq!(effective_status(&response), StatusCode::OK);
+    let body: Value = response.take_json().await.unwrap();
+    assert_eq!(body["result"]["resultType"], "complete");
+    assert_eq!(body["result"]["isError"], false);
+    let content = body["result"]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["mimeType"], "image/jpeg");
+    let jpeg = general_purpose::STANDARD
+        .decode(content[1]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(jpeg.len(), 64 * 1024);
+    assert!(jpeg.starts_with(&[0xff, 0xd8, 0xff]));
+    assert!(jpeg.ends_with(&[0xff, 0xd9]));
+    let output = &body["result"]["structuredContent"]["output"];
+    assert_eq!(output["probe"], "image_matrix");
+    assert_eq!(output["codec"], "jpeg");
+    assert_eq!(output["dimension"], "3840x2160");
+    assert_eq!(output["payload"], "64k");
+    assert_eq!(output["runner_used"], false);
+    assert_eq!(output["width"], 3840);
+    assert_eq!(output["height"], 2160);
+    assert_eq!(output["mime_type"], "image/jpeg");
+    assert_eq!(output["file_bytes"], 64 * 1024);
+    assert_eq!(output["content_delivery"], "mcp_image");
+    assert!(output.get("content_base64").is_none());
+}
+
+#[tokio::test]
 async fn http_mcp_2026_validates_resource_name_header_before_resource_contract() {
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
@@ -7623,6 +8052,52 @@ async fn oauth2_mcp_computer_app_resources_require_runtime_read() {
         &token,
         "resources/list",
         mcp_2026_ui_params(json!({})),
+    )
+    .await;
+    assert_mcp_oauth_scope_rejected(
+        status,
+        &body,
+        challenge.as_deref(),
+        Some(crate::auth::SCOPE_RUNTIME_READ),
+    );
+}
+
+#[tokio::test]
+async fn oauth2_mcp_computer_app_image_matrix_probe_requires_runtime_read() {
+    let arguments = json!({
+        "codec": "jpeg",
+        "dimension": "640x360",
+        "payload": "64k"
+    });
+    let (_tmp, service, token) =
+        oauth_mcp_service_with_surface("runtime:read", ModelSurface::FullOperatorRuntime);
+    let (status, body, _) = oauth_mcp_request(
+        &service,
+        &token,
+        "tools/call",
+        mcp_2026_ui_params(json!({
+            "name": MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_TOOL_NAME,
+            "arguments": arguments.clone()
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    assert_eq!(body["result"]["isError"], false);
+    assert_eq!(
+        body["result"]["structuredContent"]["output"]["probe"],
+        "image_matrix"
+    );
+
+    let (_tmp, service, token) =
+        oauth_mcp_service_with_surface("project:read", ModelSurface::FullOperatorRuntime);
+    let (status, body, challenge) = oauth_mcp_request(
+        &service,
+        &token,
+        "tools/call",
+        mcp_2026_ui_params(json!({
+            "name": MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_TOOL_NAME,
+            "arguments": arguments
+        })),
     )
     .await;
     assert_mcp_oauth_scope_rejected(

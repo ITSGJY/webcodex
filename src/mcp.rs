@@ -88,6 +88,47 @@ const MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_CHOICES: &[(&str, u32, u32, &str)] 
     ("2560x1440", 2560, 1440, "eNrtwTEBAAAAwqD1T20ND6AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAdwMOCQAB"),
     ("3840x2160", 3840, 2160, "eNrtwQEBAAAAgiD/r25IQAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADArwHbUQAB"),
 ];
+const MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_TOOL_NAME: &str = "computer_app_image_matrix_probe";
+const MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_RESOURCE_URI: &str =
+    "ui://webcodex/computer-image-matrix-probe/v1";
+const MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_PAYLOAD_CHOICES: &[(&str, usize)] = &[
+    ("64k", 64 * 1024),
+    ("128k", 128 * 1024),
+    ("256k", 256 * 1024),
+    ("512k", 512 * 1024),
+];
+const MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_JPEG_BASES: &[(&str, u32, u32, &[u8])] = &[
+    (
+        "640x360",
+        640,
+        360,
+        include_bytes!("mcp_probe_assets/matrix-jpeg-640x360.jpg"),
+    ),
+    (
+        "1280x720",
+        1280,
+        720,
+        include_bytes!("mcp_probe_assets/matrix-jpeg-1280x720.jpg"),
+    ),
+    (
+        "1920x1080",
+        1920,
+        1080,
+        include_bytes!("mcp_probe_assets/matrix-jpeg-1920x1080.jpg"),
+    ),
+    (
+        "2560x1440",
+        2560,
+        1440,
+        include_bytes!("mcp_probe_assets/matrix-jpeg-2560x1440.jpg"),
+    ),
+    (
+        "3840x2160",
+        3840,
+        2160,
+        include_bytes!("mcp_probe_assets/matrix-jpeg-3840x2160.jpg"),
+    ),
+];
 const MCP_COMPUTER_APP_IMAGE_PROBE_PNG_BASE64: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z0GkAAAAASUVORK5CYII=";
 const MCP_COMPUTER_APP_IMAGE_PROBE_PNG_BYTES: u64 = 68;
@@ -104,6 +145,8 @@ const MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_HTML: &str =
     include_str!("mcp_computer_image_size_probe_app.html");
 const MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_HTML: &str =
     include_str!("mcp_computer_image_dimension_probe_app.html");
+const MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_HTML: &str =
+    include_str!("mcp_computer_image_matrix_probe_app.html");
 
 /// Single source of truth for the JSON-RPC methods advertised by `GET /mcp`.
 /// Must match the dispatch arms in `handle_mcp_request_with_lifecycle`;
@@ -477,6 +520,7 @@ fn mcp_tools_list_payload_with_features(
         tools.push(mcp_computer_app_snapshot_probe_tool_spec(compact));
         tools.push(mcp_computer_app_image_size_probe_tool_spec(compact));
         tools.push(mcp_computer_app_image_dimension_probe_tool_spec(compact));
+        tools.push(mcp_computer_app_image_matrix_probe_tool_spec(compact));
     }
     json!({ "tools": tools })
 }
@@ -800,6 +844,66 @@ fn mcp_computer_app_image_dimension_probe_tool_spec(compact: bool) -> Value {
     value
 }
 
+fn mcp_computer_app_image_matrix_probe_tool_spec(compact: bool) -> Value {
+    let mut value = json!({
+        "name": MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_TOOL_NAME,
+        "description": "Experimental MCP-only synthetic native-image matrix probe. Returns deterministic PNG or JPEG content at one selected intrinsic dimension and exact decoded payload size through the same MCP image framing used by computer_snapshot, without contacting a Runner.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "codec": { "type": "string", "enum": ["png", "jpeg"], "description": "Synthetic image codec." },
+                "dimension": { "type": "string", "enum": ["640x360", "1280x720", "1920x1080", "2560x1440", "3840x2160"], "description": "Intrinsic image dimensions." },
+                "payload": { "type": "string", "enum": ["64k", "128k", "256k", "512k"], "description": "Exact decoded image-file size to return." }
+            },
+            "required": ["codec", "dimension", "payload"],
+            "additionalProperties": false
+        },
+        "annotations": {
+            "title": "Computer App Image Matrix Probe",
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
+        },
+        "_meta": {
+            "ui": { "resourceUri": MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_RESOURCE_URI, "visibility": ["model", "app"] },
+            "openai/outputTemplate": MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_RESOURCE_URI
+        }
+    });
+    if !compact {
+        value["outputSchema"] = json!({
+            "type": "object",
+            "properties": {
+                "success": { "type": "boolean" },
+                "output": {
+                    "type": "object",
+                    "properties": {
+                        "probe": { "type": "string" },
+                        "codec": { "type": "string" },
+                        "dimension": { "type": "string" },
+                        "payload": { "type": "string" },
+                        "runner_used": { "type": "boolean" },
+                        "client_id": { "type": "string" },
+                        "surface": { "type": "object" },
+                        "width": { "type": "integer" },
+                        "height": { "type": "integer" },
+                        "mime_type": { "type": "string" },
+                        "file_bytes": { "type": "integer" },
+                        "sha256": { "type": "string" },
+                        "content_delivery": { "type": "string" }
+                    },
+                    "required": ["probe", "codec", "dimension", "payload", "runner_used", "client_id", "surface", "width", "height", "mime_type", "file_bytes", "sha256", "content_delivery"],
+                    "additionalProperties": false
+                },
+                "error": {}
+            },
+            "required": ["success", "output", "error"],
+            "additionalProperties": false
+        });
+    }
+    value
+}
+
 fn mcp_computer_app_resource_meta() -> Value {
     json!({
         "ui": {
@@ -857,6 +961,13 @@ fn mcp_computer_app_resources_list() -> Value {
                 "description": "Experimental control card that renders a deterministic black PNG at one selected intrinsic dimension while keeping the decoded native-image payload exactly 256 KiB and avoiding Runner access.",
                 "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
                 "_meta": mcp_computer_app_resource_meta()
+            },
+            {
+                "uri": MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_RESOURCE_URI,
+                "name": "WebCodex Computer App Image Matrix Probe",
+                "description": "Experimental control card that decodes a selected synthetic PNG or JPEG across a closed dimension and exact-payload matrix without Runner access.",
+                "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
+                "_meta": mcp_computer_app_resource_meta()
             }
         ]
     })
@@ -869,6 +980,7 @@ fn is_mcp_computer_app_resource_uri(uri: &str) -> bool {
         || uri == MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI
         || uri == MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_RESOURCE_URI
         || uri == MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_RESOURCE_URI
+        || uri == MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_RESOURCE_URI
         || MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS.contains(&uri)
 }
 
@@ -885,6 +997,8 @@ fn mcp_computer_app_resource_read(uri: &str) -> Option<Value> {
         MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_HTML
     } else if uri == MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_RESOURCE_URI {
         MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_HTML
+    } else if uri == MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_RESOURCE_URI {
+        MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_HTML
     } else if uri == MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI {
         MCP_COMPUTER_APP_SNAPSHOT_PROBE_HTML
     } else if uri == MCP_COMPUTER_UI_RESOURCE_URI
@@ -1377,15 +1491,16 @@ fn mcp_computer_app_image_dimension_probe_target(
         })
 }
 
-fn mcp_computer_app_image_dimension_probe_png(
+fn mcp_computer_app_image_dimension_probe_png_with_bytes(
     dimension: &str,
+    target_bytes: usize,
 ) -> Result<(Vec<u8>, u32, u32), String> {
     const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
     const PNG_CHUNK_OVERHEAD: usize = 12;
     const PNG_IEND_CHUNK_BYTES: usize = 12;
     const PADDING_CHUNK_TYPE: &[u8; 4] = b"vpAg";
 
-    if MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_BYTES > crate::artifact_policy::MAX_MCP_IMAGE_BYTES {
+    if target_bytes > crate::artifact_policy::MAX_MCP_IMAGE_BYTES {
         return Err("dimension probe payload exceeds the MCP image bound".to_string());
     }
     let Some((width, height, idat_base64)) =
@@ -1406,12 +1521,12 @@ fn mcp_computer_app_image_dimension_probe_png(
     ihdr[11] = 0;
     ihdr[12] = 0;
 
-    let mut png = Vec::with_capacity(MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_BYTES);
+    let mut png = Vec::with_capacity(target_bytes);
     png.extend_from_slice(PNG_SIGNATURE);
     mcp_png_append_chunk(&mut png, b"IHDR", &ihdr)?;
     mcp_png_append_chunk(&mut png, b"IDAT", &idat)?;
 
-    let padding_len = MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_BYTES
+    let padding_len = target_bytes
         .checked_sub(png.len() + PNG_CHUNK_OVERHEAD + PNG_IEND_CHUNK_BYTES)
         .ok_or_else(|| "dimension probe PNG does not fit the fixed payload size".to_string())?;
     let padding_len_u32 = u32::try_from(padding_len)
@@ -1424,10 +1539,19 @@ fn mcp_computer_app_image_dimension_probe_png(
     png.extend_from_slice(&padding_crc.to_be_bytes());
     mcp_png_append_chunk(&mut png, b"IEND", &[])?;
 
-    if png.len() != MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_BYTES {
+    if png.len() != target_bytes {
         return Err("dimension probe payload length mismatch".to_string());
     }
     Ok((png, width, height))
+}
+
+fn mcp_computer_app_image_dimension_probe_png(
+    dimension: &str,
+) -> Result<(Vec<u8>, u32, u32), String> {
+    mcp_computer_app_image_dimension_probe_png_with_bytes(
+        dimension,
+        MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_BYTES,
+    )
 }
 
 fn mcp_computer_app_image_dimension_probe_tool_result(dimension: &str) -> Value {
@@ -1470,6 +1594,152 @@ fn mcp_computer_app_image_dimension_probe_tool_result(dimension: &str) -> Value 
             MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_TOOL_NAME,
             false,
             ToolResult::err(format!("cannot frame image-dimension probe: {error}")),
+        ),
+    }
+}
+
+fn mcp_computer_app_image_matrix_probe_payload_bytes(payload: &str) -> Option<usize> {
+    MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_PAYLOAD_CHOICES
+        .iter()
+        .find_map(|(label, bytes)| (*label == payload).then_some(*bytes))
+}
+
+fn mcp_computer_app_image_matrix_probe_jpeg_base(
+    dimension: &str,
+) -> Option<(u32, u32, &'static [u8])> {
+    MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_JPEG_BASES
+        .iter()
+        .find_map(|(label, width, height, jpeg)| {
+            (*label == dimension).then_some((*width, *height, *jpeg))
+        })
+}
+
+fn mcp_computer_app_image_matrix_probe_jpeg(
+    dimension: &str,
+    target_bytes: usize,
+) -> Result<(Vec<u8>, u32, u32), String> {
+    const JPEG_EOI: &[u8; 2] = &[0xff, 0xd9];
+    const APP15_MARKER: &[u8; 2] = &[0xff, 0xef];
+    const MAX_APP15_DATA_BYTES: usize = u16::MAX as usize - 2;
+    const MAX_APP15_SEGMENT_BYTES: usize = MAX_APP15_DATA_BYTES + 4;
+    const MIN_APP15_SEGMENT_BYTES: usize = 4;
+
+    if target_bytes > crate::artifact_policy::MAX_MCP_IMAGE_BYTES {
+        return Err("matrix JPEG payload exceeds the MCP image bound".to_string());
+    }
+    let Some((width, height, base)) = mcp_computer_app_image_matrix_probe_jpeg_base(dimension)
+    else {
+        return Err("unsupported matrix JPEG dimension".to_string());
+    };
+    if !base.starts_with(&[0xff, 0xd8, 0xff]) || !base.ends_with(JPEG_EOI) {
+        return Err("matrix JPEG baseline is malformed".to_string());
+    }
+    let padding_bytes = target_bytes
+        .checked_sub(base.len())
+        .ok_or_else(|| "matrix JPEG baseline exceeds the selected payload size".to_string())?;
+    if padding_bytes == 0 {
+        return Ok((base.to_vec(), width, height));
+    }
+    let segment_count = (padding_bytes + MAX_APP15_SEGMENT_BYTES - 1) / MAX_APP15_SEGMENT_BYTES;
+    if padding_bytes < segment_count * MIN_APP15_SEGMENT_BYTES {
+        return Err("matrix JPEG padding cannot be represented by APP15 segments".to_string());
+    }
+    let segment_base_bytes = padding_bytes / segment_count;
+    let segment_extra = padding_bytes % segment_count;
+
+    let mut jpeg = Vec::with_capacity(target_bytes);
+    jpeg.extend_from_slice(&base[..base.len() - JPEG_EOI.len()]);
+    for index in 0..segment_count {
+        let segment_bytes = segment_base_bytes + usize::from(index < segment_extra);
+        let data_bytes = segment_bytes
+            .checked_sub(MIN_APP15_SEGMENT_BYTES)
+            .ok_or_else(|| "matrix JPEG APP15 segment is too small".to_string())?;
+        if data_bytes > MAX_APP15_DATA_BYTES {
+            return Err("matrix JPEG APP15 segment exceeds the JPEG length bound".to_string());
+        }
+        let length_field = u16::try_from(data_bytes + 2)
+            .map_err(|_| "matrix JPEG APP15 length does not fit u16".to_string())?;
+        jpeg.extend_from_slice(APP15_MARKER);
+        jpeg.extend_from_slice(&length_field.to_be_bytes());
+        let data_start = jpeg.len();
+        jpeg.resize(data_start + data_bytes, 0);
+    }
+    jpeg.extend_from_slice(JPEG_EOI);
+    if jpeg.len() != target_bytes {
+        return Err("matrix JPEG payload length mismatch".to_string());
+    }
+    Ok((jpeg, width, height))
+}
+
+fn mcp_computer_app_image_matrix_probe_image(
+    codec: &str,
+    dimension: &str,
+    payload: &str,
+) -> Result<(Vec<u8>, u32, u32, &'static str), String> {
+    let target_bytes = mcp_computer_app_image_matrix_probe_payload_bytes(payload)
+        .ok_or_else(|| "unsupported image-matrix payload choice".to_string())?;
+    match codec {
+        "png" => {
+            let (image, width, height) =
+                mcp_computer_app_image_dimension_probe_png_with_bytes(dimension, target_bytes)?;
+            Ok((image, width, height, "image/png"))
+        }
+        "jpeg" => {
+            let (image, width, height) =
+                mcp_computer_app_image_matrix_probe_jpeg(dimension, target_bytes)?;
+            Ok((image, width, height, "image/jpeg"))
+        }
+        _ => Err("unsupported image-matrix codec".to_string()),
+    }
+}
+
+fn mcp_computer_app_image_matrix_probe_tool_result(
+    codec: &str,
+    dimension: &str,
+    payload: &str,
+) -> Value {
+    let (image, width, height, mime_type) =
+        match mcp_computer_app_image_matrix_probe_image(codec, dimension, payload) {
+            Ok(value) => value,
+            Err(error) => {
+                return mcp_runtime_tool_result(
+                    MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_TOOL_NAME,
+                    false,
+                    ToolResult::err(format!("cannot build image-matrix probe: {error}")),
+                )
+            }
+        };
+    let sha256 = format!("{:x}", Sha256::digest(&image));
+    let content_base64 = general_purpose::STANDARD.encode(&image);
+    let mut result = ToolResult::ok(json!({
+        "probe": "image_matrix",
+        "codec": codec,
+        "dimension": dimension,
+        "payload": payload,
+        "runner_used": false,
+        "client_id": "control-plane",
+        "surface": {
+            "surface_id": "image_matrix_probe",
+            "application": "WebCodex",
+            "title": "Synthetic native-image matrix probe",
+            "width": width,
+            "height": height,
+            "focused": false,
+            "active": false
+        },
+        "width": width,
+        "height": height,
+        "mime_type": mime_type,
+        "file_bytes": image.len() as u64,
+        "sha256": sha256,
+        "content_base64": content_base64
+    }));
+    match mcp_native_image_tool_result("computer_snapshot", &mut result) {
+        Ok(value) => value,
+        Err(error) => mcp_runtime_tool_result(
+            MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_TOOL_NAME,
+            false,
+            ToolResult::err(format!("cannot frame image-matrix probe: {error}")),
         ),
     }
 }
@@ -2770,6 +3040,7 @@ async fn handle_mcp_request_with_lifecycle(
                 || uri == MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI
                 || uri == MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_RESOURCE_URI
                 || uri == MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_RESOURCE_URI
+                || uri == MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_RESOURCE_URI
             {
                 result["ttlMs"] = Value::from(MCP_COMPUTER_UI_RESOURCE_TTL_MS);
             }
@@ -2992,6 +3263,67 @@ async fn handle_mcp_request_with_lifecycle(
                     return outcome;
                 }
                 let result = mcp_computer_app_image_dimension_probe_tool_result(&dimension);
+                let success = result.get("isError").and_then(Value::as_bool) == Some(false);
+                if let Some(lc) = lifecycle.as_deref() {
+                    lc.dispatch_finished(
+                        true,
+                        Some(success),
+                        if success { "success" } else { "tool_error" },
+                    );
+                }
+                return McpOutcome::Ok(rpc_result(id, mcp_stateless_result(result, false)));
+            }
+            if params.name == MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_TOOL_NAME {
+                if !stateless_2026 || runtime.model_surface() != ModelSurface::FullOperatorRuntime {
+                    if let Some(lc) = lifecycle.as_deref() {
+                        lc.dispatch_failed("surface_denied");
+                        lc.dispatch_finished(false, Some(false), "surface_denied");
+                    }
+                    return McpOutcome::BadRequest(rpc_error(
+                        id,
+                        -32602,
+                        "computer_app_image_matrix_probe requires the stateless-2026 full-operator MCP surface",
+                    ));
+                }
+                let matrix = params.arguments.as_object().and_then(|arguments| {
+                    if arguments.len() != 3 {
+                        return None;
+                    }
+                    let codec = arguments.get("codec").and_then(Value::as_str)?;
+                    let dimension = arguments.get("dimension").and_then(Value::as_str)?;
+                    let payload = arguments.get("payload").and_then(Value::as_str)?;
+                    if !matches!(codec, "png" | "jpeg")
+                        || mcp_computer_app_image_dimension_probe_target(dimension).is_none()
+                        || mcp_computer_app_image_matrix_probe_payload_bytes(payload).is_none()
+                    {
+                        return None;
+                    }
+                    Some((
+                        codec.to_string(),
+                        dimension.to_string(),
+                        payload.to_string(),
+                    ))
+                });
+                let Some((codec, dimension, payload)) = matrix else {
+                    if let Some(lc) = lifecycle.as_deref() {
+                        lc.dispatch_failed("invalid_arguments");
+                        lc.dispatch_finished(false, Some(false), "invalid_arguments");
+                    }
+                    return McpOutcome::BadRequest(rpc_error(
+                        id,
+                        -32602,
+                        "computer_app_image_matrix_probe requires exactly one supported codec, dimension, and payload",
+                    ));
+                };
+                if let Some(outcome) = require_mcp_scope(auth, crate::auth::SCOPE_RUNTIME_READ) {
+                    if let Some(lc) = lifecycle.as_deref() {
+                        lc.dispatch_failed("forbidden");
+                        lc.dispatch_finished(false, Some(false), "forbidden");
+                    }
+                    return outcome;
+                }
+                let result =
+                    mcp_computer_app_image_matrix_probe_tool_result(&codec, &dimension, &payload);
                 let success = result.get("isError").and_then(Value::as_bool) == Some(false);
                 if let Some(lc) = lifecycle.as_deref() {
                     lc.dispatch_finished(
