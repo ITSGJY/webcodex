@@ -601,7 +601,7 @@ async fn mcp_2026_computer_app_probe_is_mcp_only_tiny_result_control() {
         panic!("expected UI resources/list");
     };
     let resources = resources["result"]["resources"].as_array().unwrap();
-    assert_eq!(resources.len(), 5);
+    assert_eq!(resources.len(), 6);
     let probe_resource = resources
         .iter()
         .find(|resource| resource["uri"] == MCP_COMPUTER_APP_PROBE_RESOURCE_URI)
@@ -824,7 +824,7 @@ async fn mcp_2026_computer_app_image_probe_uses_snapshot_native_image_framing() 
         panic!("expected UI resources/list");
     };
     let resources = resources["result"]["resources"].as_array().unwrap();
-    assert_eq!(resources.len(), 5);
+    assert_eq!(resources.len(), 6);
     let image_resource = resources
         .iter()
         .find(|resource| resource["uri"] == MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI)
@@ -1032,7 +1032,7 @@ async fn mcp_2026_computer_app_image_size_probe_ladders_exact_native_png_payload
         panic!("expected UI resources/list");
     };
     let resources = resources["result"]["resources"].as_array().unwrap();
-    assert_eq!(resources.len(), 5);
+    assert_eq!(resources.len(), 6);
     let size_resource = resources
         .iter()
         .find(|resource| resource["uri"] == MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_RESOURCE_URI)
@@ -1205,6 +1205,355 @@ async fn mcp_2026_computer_app_image_size_probe_ladders_exact_native_png_payload
 }
 
 #[tokio::test]
+async fn mcp_2026_computer_app_image_dimension_probe_keeps_fixed_bytes_across_dimensions() {
+    let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
+    assert_eq!(
+        MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_RESOURCE_URI,
+        "ui://webcodex/computer-image-dimension-probe/v1"
+    );
+    assert_eq!(MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_BYTES, 256 * 1024);
+    assert!(registered_tool_specs()
+        .iter()
+        .all(|spec| { spec.name != MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_TOOL_NAME }));
+
+    let tools = handle_mcp_request(
+        &runtime,
+        rpc("tools/list", Some(json!(2133)), mcp_2026_params(json!({}))),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(tools) = tools else {
+        panic!("expected stateless tools/list");
+    };
+    let dimension_probe = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_TOOL_NAME)
+        .expect("MCP-only computer app image dimension probe");
+    assert_eq!(
+        dimension_probe["inputSchema"]["properties"]["dimension"]["enum"],
+        json!(["640x360", "1280x720", "1920x1080", "2560x1440", "3840x2160"])
+    );
+    assert_eq!(
+        dimension_probe["inputSchema"]["required"],
+        json!(["dimension"])
+    );
+    assert_eq!(
+        dimension_probe["inputSchema"]["additionalProperties"],
+        false
+    );
+    assert_eq!(dimension_probe["annotations"]["readOnlyHint"], true);
+    assert_eq!(
+        dimension_probe["_meta"],
+        json!({
+            "ui": {
+                "resourceUri": MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_RESOURCE_URI,
+                "visibility": ["model", "app"]
+            },
+            "openai/outputTemplate": MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_RESOURCE_URI
+        })
+    );
+    assert!(dimension_probe["outputSchema"].is_object());
+
+    let compact =
+        mcp_tools_list_payload_with_compact_and_app(ModelSurface::FullOperatorRuntime, true, true);
+    let compact_probe = compact["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_TOOL_NAME)
+        .expect("compact image dimension probe");
+    assert!(compact_probe.get("outputSchema").is_none());
+    assert_eq!(compact_probe["inputSchema"], dimension_probe["inputSchema"]);
+    assert_eq!(compact_probe["_meta"], dimension_probe["_meta"]);
+
+    let resources = handle_mcp_request(
+        &runtime,
+        rpc(
+            "resources/list",
+            Some(json!(2134)),
+            mcp_2026_ui_params(json!({})),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(resources) = resources else {
+        panic!("expected UI resources/list");
+    };
+    let resources = resources["result"]["resources"].as_array().unwrap();
+    assert_eq!(resources.len(), 6);
+    let dimension_resource = resources
+        .iter()
+        .find(|resource| resource["uri"] == MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_RESOURCE_URI)
+        .expect("image dimension probe resource");
+    assert_eq!(dimension_resource["mimeType"], MCP_UI_RESOURCE_MIME_TYPE);
+    assert_eq!(
+        dimension_resource["_meta"],
+        mcp_computer_app_resource_meta()
+    );
+
+    let resource = handle_mcp_request(
+        &runtime,
+        rpc(
+            "resources/read",
+            Some(json!(2135)),
+            mcp_2026_params(json!({
+                "uri": MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_RESOURCE_URI
+            })),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(resource) = resource else {
+        panic!("expected image dimension probe resource read");
+    };
+    assert_eq!(
+        resource["result"]["ttlMs"],
+        Value::from(MCP_COMPUTER_UI_RESOURCE_TTL_MS)
+    );
+    assert_eq!(resource["result"]["cacheScope"], "private");
+    assert_eq!(
+        resource["result"]["contents"][0]["text"].as_str(),
+        Some(MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_HTML)
+    );
+    let html = MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_HTML;
+    for expected in [
+        "HTML loaded",
+        "ui/initialize",
+        "2026-01-26",
+        "ui/notifications/initialized",
+        "ui/notifications/tool-result",
+        "image_dimension",
+        "fixed 256 KiB",
+        "dimension ladder",
+        "native image decoded",
+        "Synthetic dimension image decoded successfully.",
+        "naturalWidth",
+        "naturalHeight",
+        "imageEl.onload",
+        "imageEl.onerror",
+        "Browser failed to decode the synthetic dimension image.",
+        "stateEl.textContent !== \"native image decoded\"",
+        "3840x2160",
+        "no Runner",
+    ] {
+        assert!(
+            html.contains(expected),
+            "missing {expected} in dimension probe App HTML"
+        );
+    }
+    for forbidden in [
+        "computer_snapshot",
+        "content_base64",
+        "tools/call",
+        "ui/request-display-mode",
+        "ui/update-model-context",
+        "ui/message",
+    ] {
+        assert!(
+            !html.contains(forbidden),
+            "image dimension probe App HTML must not contain {forbidden}"
+        );
+    }
+
+    for &(dimension, expected_width, expected_height, expected_idat_base64) in
+        MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_CHOICES
+    {
+        let (generated, width, height) = mcp_computer_app_image_dimension_probe_png(dimension)
+            .expect("deterministic dimension-probe PNG");
+        assert_eq!(width, expected_width, "dimension={dimension}");
+        assert_eq!(height, expected_height, "dimension={dimension}");
+        assert_eq!(
+            generated.len(),
+            MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_BYTES,
+            "dimension={dimension}"
+        );
+        assert_eq!(
+            &generated[..8],
+            b"\x89PNG\r\n\x1a\n",
+            "dimension={dimension}"
+        );
+
+        let expected_idat = general_purpose::STANDARD
+            .decode(expected_idat_base64)
+            .expect("precomputed dimension IDAT");
+        let (expected_idat_len, expected_idat_sha256) = match dimension {
+            "640x360" => (
+                50,
+                "a54424abdd2459732b94285f2d587d9f565db746e1be9a67a47bf89a8396cfed",
+            ),
+            "1280x720" => (
+                135,
+                "51c76e6f4ce0da938f7b780ecfcff78c13c5de1f3d3198bbd1663c427a3e3dd3",
+            ),
+            "1920x1080" => (
+                275,
+                "647f8531b1877f7b47e1ad514e6d690cfc4247dae693e94d8274b3defe0a4c7b",
+            ),
+            "2560x1440" => (
+                471,
+                "4f41524892c5530b0907e6a9744c09d8e5cb197f3ced522ed9e997b9e00acf73",
+            ),
+            "3840x2160" => (
+                1029,
+                "6ea17bfe5b422cd9e10e4520b3dac5e69477771b239d9787e4eb657ca7b4e4db",
+            ),
+            other => panic!("unexpected dimension {other}"),
+        };
+        assert_eq!(
+            expected_idat.len(),
+            expected_idat_len,
+            "dimension={dimension}"
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&expected_idat)),
+            expected_idat_sha256,
+            "dimension={dimension}"
+        );
+        let raw_scanline_bytes = (1 + (expected_width as usize + 7) / 8) * expected_height as usize;
+        let expected_adler32 = (((raw_scanline_bytes % 65_521) as u32) << 16) | 1;
+        let stored_adler32 =
+            u32::from_be_bytes(expected_idat[expected_idat.len() - 4..].try_into().unwrap());
+        assert_eq!(stored_adler32, expected_adler32, "dimension={dimension}");
+        let mut offset = 8usize;
+        let mut chunk_types = Vec::new();
+        while offset < generated.len() {
+            let length =
+                u32::from_be_bytes(generated[offset..offset + 4].try_into().unwrap()) as usize;
+            let chunk_type: [u8; 4] = generated[offset + 4..offset + 8].try_into().unwrap();
+            let data_start = offset + 8;
+            let crc_offset = data_start + length;
+            let next_offset = crc_offset + 4;
+            assert!(next_offset <= generated.len(), "dimension={dimension}");
+            let data = &generated[data_start..crc_offset];
+            let stored_crc =
+                u32::from_be_bytes(generated[crc_offset..next_offset].try_into().unwrap());
+            assert_eq!(
+                stored_crc,
+                mcp_png_crc32(&[&chunk_type, data]),
+                "CRC mismatch for {:?}, dimension={dimension}",
+                std::str::from_utf8(&chunk_type).unwrap_or("????")
+            );
+            match &chunk_type {
+                b"IHDR" => {
+                    assert_eq!(data.len(), 13, "dimension={dimension}");
+                    assert_eq!(
+                        u32::from_be_bytes(data[..4].try_into().unwrap()),
+                        expected_width,
+                        "dimension={dimension}"
+                    );
+                    assert_eq!(
+                        u32::from_be_bytes(data[4..8].try_into().unwrap()),
+                        expected_height,
+                        "dimension={dimension}"
+                    );
+                    assert_eq!(&data[8..], &[1, 0, 0, 0, 0], "dimension={dimension}");
+                }
+                b"IDAT" => assert_eq!(data, expected_idat, "dimension={dimension}"),
+                b"vpAg" => assert!(data.iter().all(|byte| *byte == 0), "dimension={dimension}"),
+                b"IEND" => assert!(data.is_empty(), "dimension={dimension}"),
+                other => panic!("unexpected PNG chunk {other:?} for {dimension}"),
+            }
+            chunk_types.push(chunk_type);
+            offset = next_offset;
+        }
+        assert_eq!(offset, generated.len(), "dimension={dimension}");
+        assert_eq!(
+            chunk_types,
+            vec![*b"IHDR", *b"IDAT", *b"vpAg", *b"IEND"],
+            "dimension={dimension}"
+        );
+
+        let call = handle_mcp_request(
+            &runtime,
+            rpc(
+                "tools/call",
+                Some(json!(2136)),
+                mcp_2026_params(json!({
+                    "name": MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_TOOL_NAME,
+                    "arguments": { "dimension": dimension }
+                })),
+            ),
+            None,
+        )
+        .await;
+        let McpOutcome::Ok(call) = call else {
+            panic!("expected image dimension probe tools/call for {dimension}");
+        };
+        assert_eq!(call["result"]["resultType"], "complete");
+        assert_eq!(call["result"]["isError"], false);
+        let content = call["result"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["mimeType"], "image/png");
+        let delivered = general_purpose::STANDARD
+            .decode(content[1]["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(delivered, generated, "dimension={dimension}");
+        let output = &call["result"]["structuredContent"]["output"];
+        assert_eq!(output["probe"], "image_dimension");
+        assert_eq!(output["dimension"], dimension);
+        assert_eq!(output["runner_used"], false);
+        assert_eq!(output["content_delivery"], "mcp_image");
+        assert_eq!(output["mime_type"], "image/png");
+        assert_eq!(output["width"], expected_width);
+        assert_eq!(output["height"], expected_height);
+        assert_eq!(
+            output["file_bytes"],
+            MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_BYTES as u64
+        );
+        assert_eq!(
+            output["sha256"],
+            format!("{:x}", Sha256::digest(&delivered))
+        );
+        assert!(output.get("content_base64").is_none());
+    }
+
+    for arguments in [
+        json!({}),
+        json!({ "dimension": "800x600" }),
+        json!({ "dimension": "640x360", "unexpected": true }),
+    ] {
+        let invalid = handle_mcp_request(
+            &runtime,
+            rpc(
+                "tools/call",
+                Some(json!(2137)),
+                mcp_2026_params(json!({
+                    "name": MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_TOOL_NAME,
+                    "arguments": arguments
+                })),
+            ),
+            None,
+        )
+        .await;
+        match invalid {
+            McpOutcome::BadRequest(value) => assert_eq!(value["error"]["code"], -32602),
+            other => panic!("dimension probe must reject invalid arguments, got {other:?}"),
+        }
+    }
+
+    let legacy_call = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(2138)),
+            json!({
+                "name": MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_TOOL_NAME,
+                "arguments": { "dimension": "640x360" }
+            }),
+        ),
+        None,
+    )
+    .await;
+    match legacy_call {
+        McpOutcome::BadRequest(value) => assert_eq!(value["error"]["code"], -32602),
+        other => panic!("dimension probe must remain stateless-2026-only, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn mcp_2026_computer_app_snapshot_probe_delegates_to_real_snapshot_contract() {
     let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
     assert_eq!(
@@ -1298,7 +1647,7 @@ async fn mcp_2026_computer_app_snapshot_probe_delegates_to_real_snapshot_contrac
         panic!("expected UI resources/list");
     };
     let resources = resources["result"]["resources"].as_array().unwrap();
-    assert_eq!(resources.len(), 5);
+    assert_eq!(resources.len(), 6);
     let snapshot_resource = resources
         .iter()
         .find(|resource| resource["uri"] == MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI)
@@ -1460,6 +1809,7 @@ async fn mcp_tools_list_returns_same_names_as_runtime() {
     stateless_mcp_names.push(MCP_COMPUTER_APP_IMAGE_PROBE_TOOL_NAME.to_string());
     stateless_mcp_names.push(MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME.to_string());
     stateless_mcp_names.push(MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_TOOL_NAME.to_string());
+    stateless_mcp_names.push(MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_TOOL_NAME.to_string());
 
     for compact in [false, true] {
         if compact {
@@ -6325,6 +6675,67 @@ async fn http_mcp_2026_calls_computer_app_image_size_probe_with_512k_native_imag
     assert_eq!(output["size"], "512k");
     assert_eq!(output["runner_used"], false);
     assert_eq!(output["file_bytes"], 512 * 1024);
+    assert_eq!(output["content_delivery"], "mcp_image");
+    assert!(output.get("content_base64").is_none());
+}
+
+#[tokio::test]
+async fn http_mcp_2026_calls_computer_app_image_dimension_probe_with_4k_fixed_native_image() {
+    let config = test_config(Some("secret"));
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let service = Service::new(build_test_router(config, db, runtime));
+    let params = mcp_2026_ui_params(json!({
+        "name": MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_TOOL_NAME,
+        "arguments": { "dimension": "3840x2160" }
+    }));
+
+    let mut response = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_STATELESS_PROTOCOL_VERSION,
+            true,
+        )
+        .add_header(MCP_METHOD_HEADER, "tools/call", true)
+        .add_header(
+            MCP_NAME_HEADER,
+            MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_TOOL_NAME,
+            true,
+        )
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2064,
+            "method": "tools/call",
+            "params": params
+        }))
+        .send(&service)
+        .await;
+
+    assert_eq!(effective_status(&response), StatusCode::OK);
+    let body: Value = response.take_json().await.unwrap();
+    assert_eq!(body["result"]["resultType"], "complete");
+    assert_eq!(body["result"]["isError"], false);
+    let content = body["result"]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["mimeType"], "image/png");
+    let png = general_purpose::STANDARD
+        .decode(content[1]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(png.len(), 256 * 1024);
+    assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    assert_eq!(&png[12..16], b"IHDR");
+    assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), 3840);
+    assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()), 2160);
+    assert_eq!(&png[24..29], &[1, 0, 0, 0, 0]);
+    let output = &body["result"]["structuredContent"]["output"];
+    assert_eq!(output["probe"], "image_dimension");
+    assert_eq!(output["dimension"], "3840x2160");
+    assert_eq!(output["runner_used"], false);
+    assert_eq!(output["width"], 3840);
+    assert_eq!(output["height"], 2160);
+    assert_eq!(output["file_bytes"], 256 * 1024);
     assert_eq!(output["content_delivery"], "mcp_image");
     assert!(output.get("content_base64").is_none());
 }
