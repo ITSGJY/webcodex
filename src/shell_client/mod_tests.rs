@@ -1687,6 +1687,10 @@ async fn client_supports_recognizes_all_protocol_capability_names() {
                 sandbox_inspect_commands: true,
                 project_lifecycle: true,
                 project_path_registration: true,
+                computer_observe: true,
+                computer_accessibility_observe: true,
+                computer_control: true,
+                computer_text_input: true,
                 job_state_reconciliation: true,
             }),
             projects: None,
@@ -1943,6 +1947,375 @@ async fn registry_rejects_unknown_client_run() {
         .await
         .unwrap_err();
     assert!(err.contains("unknown shell client"));
+}
+
+async fn register_computer_test_client(
+    registry: &ShellClientRegistry,
+    client_id: &str,
+    owner: &str,
+    observe_capable: bool,
+    accessibility_capable: bool,
+    control_capable: bool,
+    text_input_capable: bool,
+) {
+    registry
+        .register(ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
+            job_concurrency_limit: None,
+            job_inventory: None,
+            client_id: client_id.to_string(),
+            agent_instance_id: "computer-inst".to_string(),
+            display_name: None,
+            owner: Some(owner.to_string()),
+            hostname: None,
+            capabilities: Some(ShellClientCapabilities {
+                shell: true,
+                file_read: true,
+                computer_observe: observe_capable,
+                computer_accessibility_observe: accessibility_capable,
+                computer_control: control_capable,
+                computer_text_input: text_input_capable,
+                ..Default::default()
+            }),
+            projects: None,
+            agent_protocol_version: None,
+            policy: None,
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn computer_enqueue_requires_exact_owner_and_distinct_capability() {
+    let registry = ShellClientRegistry::default();
+    register_computer_test_client(
+        &registry,
+        "computer-owned",
+        "alice",
+        false,
+        false,
+        false,
+        false,
+    )
+    .await;
+    let alice = auth_context(Some("alice"), false);
+    let error = registry
+        .enqueue_computer(
+            "computer-owned".to_string(),
+            "computer_list_windows",
+            r#"{"limit":1}"#.to_string(),
+            "alice".to_string(),
+            Some(&alice),
+            5,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("does not support computer_observe"));
+
+    register_computer_test_client(
+        &registry,
+        "computer-owned",
+        "alice",
+        true,
+        false,
+        false,
+        false,
+    )
+    .await;
+    let bob = auth_context(Some("bob"), false);
+    let error = registry
+        .enqueue_computer(
+            "computer-owned".to_string(),
+            "computer_list_windows",
+            r#"{"limit":1}"#.to_string(),
+            "bob".to_string(),
+            Some(&bob),
+            5,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("owned by alice"));
+
+    let (_request_id, _rx) = registry
+        .enqueue_computer(
+            "computer-owned".to_string(),
+            "computer_snapshot",
+            r#"{"surface_id":"surface_test"}"#.to_string(),
+            "alice".to_string(),
+            Some(&alice),
+            5,
+        )
+        .await
+        .unwrap();
+    let request = registry
+        .poll(ShellAgentPollRequest {
+            client_id: "computer-owned".to_string(),
+            agent_instance_id: "computer-inst".to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap()
+        .expect("queued computer request");
+    assert_eq!(request.kind, "computer_snapshot");
+    assert!(request.command.is_empty());
+    assert!(request.process.is_none());
+    assert!(request.script.is_none());
+}
+
+#[tokio::test]
+async fn computer_accessibility_enqueue_requires_distinct_capability() {
+    let registry = ShellClientRegistry::default();
+    register_computer_test_client(&registry, "computer-ax", "alice", true, false, false, false)
+        .await;
+    let alice = auth_context(Some("alice"), false);
+    let error = registry
+        .enqueue_computer(
+            "computer-ax".to_string(),
+            "computer_accessibility_status",
+            "{}".to_string(),
+            "alice".to_string(),
+            Some(&alice),
+            5,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("does not support computer_accessibility_observe"));
+
+    register_computer_test_client(&registry, "computer-ax", "alice", true, true, false, false)
+        .await;
+    let (_request_id, _rx) = registry
+        .enqueue_computer(
+            "computer-ax".to_string(),
+            "computer_accessibility_tree",
+            r#"{"surface_id":"surface_test","max_depth":2,"max_nodes":8}"#.to_string(),
+            "alice".to_string(),
+            Some(&alice),
+            5,
+        )
+        .await
+        .unwrap();
+    let request = registry
+        .poll(ShellAgentPollRequest {
+            client_id: "computer-ax".to_string(),
+            agent_instance_id: "computer-inst".to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap()
+        .expect("queued accessibility request");
+    assert_eq!(request.kind, "computer_accessibility_tree");
+    assert!(request.command.is_empty());
+}
+
+#[tokio::test]
+async fn computer_control_enqueue_requires_independent_capability() {
+    // CU-AX2 control remains independently fenced from CU-AX3 text input.
+    let registry = ShellClientRegistry::default();
+    let alice = auth_context(Some("alice"), false);
+    register_computer_test_client(
+        &registry,
+        "computer-control",
+        "alice",
+        true,
+        true,
+        false,
+        false,
+    )
+    .await;
+    let payload = r#"{"surface_id":"surface_test","element_id":"element_test","action":"focus"}"#;
+    let error = registry
+        .enqueue_computer(
+            "computer-control".to_string(),
+            "computer_control",
+            payload.to_string(),
+            "alice".to_string(),
+            Some(&alice),
+            5,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("does not support computer_control"));
+
+    register_computer_test_client(
+        &registry,
+        "computer-control",
+        "alice",
+        true,
+        true,
+        true,
+        false,
+    )
+    .await;
+    let (_request_id, _rx) = registry
+        .enqueue_computer(
+            "computer-control".to_string(),
+            "computer_control",
+            payload.to_string(),
+            "alice".to_string(),
+            Some(&alice),
+            5,
+        )
+        .await
+        .unwrap();
+    let request = registry
+        .poll(ShellAgentPollRequest {
+            client_id: "computer-control".to_string(),
+            agent_instance_id: "computer-inst".to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap()
+        .expect("queued computer control request");
+    assert_eq!(request.kind, "computer_control");
+    assert_eq!(request.stdin.as_deref(), Some(payload));
+    assert!(request.command.is_empty());
+    assert!(request.process.is_none());
+    assert!(request.script.is_none());
+}
+
+#[tokio::test]
+async fn computer_text_input_enqueue_requires_exact_owner_and_independent_capability() {
+    let registry = ShellClientRegistry::default();
+    let alice = auth_context(Some("alice"), false);
+    let bob = auth_context(Some("bob"), false);
+    let text = "隐私输入🙂";
+    let payload = serde_json::json!({
+        "surface_id": "surface_test",
+        "element_id": "element_test",
+        "text": text,
+    })
+    .to_string();
+
+    register_computer_test_client(
+        &registry,
+        "computer-input",
+        "alice",
+        true,
+        true,
+        true,
+        false,
+    )
+    .await;
+    let error = registry
+        .enqueue_computer(
+            "computer-input".to_string(),
+            "computer_input_text",
+            payload.clone(),
+            "alice".to_string(),
+            Some(&alice),
+            5,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("does not support computer_text_input"));
+
+    register_computer_test_client(&registry, "computer-input", "alice", true, true, true, true)
+        .await;
+    let error = registry
+        .enqueue_computer(
+            "computer-input".to_string(),
+            "computer_input_text",
+            payload.clone(),
+            "bob".to_string(),
+            Some(&bob),
+            5,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("owned by alice"));
+
+    let (_request_id, _rx) = registry
+        .enqueue_computer(
+            "computer-input".to_string(),
+            "computer_input_text",
+            payload.clone(),
+            "alice".to_string(),
+            Some(&alice),
+            5,
+        )
+        .await
+        .unwrap();
+    let request = registry
+        .poll(ShellAgentPollRequest {
+            client_id: "computer-input".to_string(),
+            agent_instance_id: "computer-inst".to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap()
+        .expect("queued computer text input request");
+    assert_eq!(request.kind, "computer_input_text");
+    assert_eq!(request.stdin.as_deref(), Some(payload.as_str()));
+    assert!(request.command.is_empty());
+    let preview = super::jobs::request_preview(&request);
+    assert!(preview.is_empty());
+    assert!(!preview.contains(text));
+}
+
+#[tokio::test]
+async fn computer_text_input_enqueue_preserves_max_utf8_text_after_json_escaping() {
+    let registry = ShellClientRegistry::default();
+    let alice = auth_context(Some("alice"), false);
+    register_computer_test_client(
+        &registry,
+        "computer-input-escaped",
+        "alice",
+        true,
+        true,
+        true,
+        true,
+    )
+    .await;
+
+    let text = "\u{1}".repeat(2048);
+    let payload = serde_json::json!({
+        "surface_id": "surface_test",
+        "element_id": "element_test",
+        "text": text,
+    })
+    .to_string();
+    assert!(payload.len() > crate::shell_protocol::SHELL_COMPUTER_REQUEST_PAYLOAD_MAX_BYTES);
+    assert!(payload.len() <= crate::shell_protocol::SHELL_COMPUTER_TEXT_INPUT_PAYLOAD_MAX_BYTES);
+
+    let (_request_id, _rx) = registry
+        .enqueue_computer(
+            "computer-input-escaped".to_string(),
+            "computer_input_text",
+            payload,
+            "alice".to_string(),
+            Some(&alice),
+            5,
+        )
+        .await
+        .unwrap();
+    let request = registry
+        .poll(ShellAgentPollRequest {
+            client_id: "computer-input-escaped".to_string(),
+            agent_instance_id: "computer-inst".to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap()
+        .expect("queued escaped computer text input request");
+    let decoded: serde_json::Value =
+        serde_json::from_str(request.stdin.as_deref().expect("computer input payload")).unwrap();
+    assert_eq!(decoded["text"].as_str(), Some(text.as_str()));
+
+    let oversized =
+        "x".repeat(crate::shell_protocol::SHELL_COMPUTER_TEXT_INPUT_PAYLOAD_MAX_BYTES + 1);
+    let error = registry
+        .enqueue_computer(
+            "computer-input-escaped".to_string(),
+            "computer_input_text",
+            oversized,
+            "alice".to_string(),
+            Some(&alice),
+            5,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("payload is invalid or too large"));
 }
 
 fn lsp_status_payload() -> AgentLspPayload {

@@ -3,7 +3,7 @@ use crate::shell_protocol::{
     ShellAgentPollRequest, ShellAgentProjectSummary, ShellAgentResultRequest,
     ShellClientCapabilities, ShellClientRegisterRequest,
 };
-use base64::{engine::general_purpose, Engine as _};
+use base64::engine::general_purpose;
 use sha2::{Digest, Sha256};
 
 fn test_runtime() -> ToolRuntime {
@@ -74,6 +74,26 @@ fn mcp_2026_params(mut params: Value) -> Value {
             json!({
                 "io.modelcontextprotocol/protocolVersion": MCP_STATELESS_PROTOCOL_VERSION,
                 "io.modelcontextprotocol/clientCapabilities": {}
+            }),
+        );
+    params
+}
+
+fn mcp_2026_ui_params(mut params: Value) -> Value {
+    params
+        .as_object_mut()
+        .expect("MCP params must be an object")
+        .insert(
+            "_meta".to_string(),
+            json!({
+                "io.modelcontextprotocol/protocolVersion": MCP_STATELESS_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {
+                    "extensions": {
+                        MCP_UI_EXTENSION: {
+                            "mimeTypes": [MCP_UI_RESOURCE_MIME_TYPE]
+                        }
+                    }
+                }
             }),
         );
     params
@@ -155,14 +175,350 @@ async fn mcp_2026_ping_is_removed() {
     }
 }
 
+#[test]
+fn mcp_2026_ui_capability_detection_is_explicit_and_mime_aware() {
+    assert!(!request_supports_mcp_apps(&mcp_2026_params(json!({}))));
+    assert!(request_supports_mcp_apps(&mcp_2026_ui_params(json!({}))));
+    let extension_without_mime = json!({
+        "_meta": {
+            "io.modelcontextprotocol/clientCapabilities": {
+                "extensions": { MCP_UI_EXTENSION: {} }
+            }
+        }
+    });
+    assert!(!request_supports_mcp_apps(&extension_without_mime));
+    let incompatible = json!({
+        "_meta": {
+            "io.modelcontextprotocol/clientCapabilities": {
+                "extensions": {
+                    MCP_UI_EXTENSION: { "mimeTypes": ["text/plain"] }
+                }
+            }
+        }
+    });
+    assert!(!request_supports_mcp_apps(&incompatible));
+    assert!(model_surface_supports_computer_app(
+        ModelSurface::FullOperatorRuntime
+    ));
+    assert!(!model_surface_supports_computer_app(
+        ModelSurface::LocalCoding
+    ));
+    assert!(!model_surface_supports_computer_app(
+        ModelSurface::CanonicalConnector
+    ));
+}
+
+#[tokio::test]
+async fn mcp_2026_computer_app_is_progressive_and_snapshot_only() {
+    let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
+    // The URI is a host cache key. Bump it whenever the App delivery contract
+    // changes so a previously failed/blank iframe cannot pin the old resource.
+    assert_eq!(MCP_COMPUTER_UI_RESOURCE_URI, "ui://webcodex/computer/v4");
+    let expected_resource_meta = json!({
+        "ui": {
+            "prefersBorder": true,
+            "domain": MCP_COMPUTER_UI_DOMAIN,
+            "csp": {
+                "connectDomains": [],
+                "resourceDomains": []
+            }
+        },
+        "openai/widgetDomain": MCP_COMPUTER_UI_DOMAIN
+    });
+
+    let discover = handle_mcp_request(
+        &runtime,
+        rpc(
+            "server/discover",
+            Some(json!(2101)),
+            mcp_2026_ui_params(json!({})),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(discover) = discover else {
+        panic!("expected modern discovery");
+    };
+    assert_eq!(
+        discover["result"]["capabilities"]["resources"]["listChanged"],
+        false
+    );
+    assert_eq!(
+        discover["result"]["capabilities"]["extensions"][MCP_UI_EXTENSION]["mimeTypes"][0],
+        MCP_UI_RESOURCE_MIME_TYPE
+    );
+
+    let tools = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/list",
+            Some(json!(2102)),
+            mcp_2026_ui_params(json!({})),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(tools) = tools else {
+        panic!("expected UI-enabled tools/list");
+    };
+    let tools = tools["result"]["tools"].as_array().unwrap();
+    let snapshot = tools
+        .iter()
+        .find(|tool| tool["name"] == "computer_snapshot")
+        .unwrap();
+    assert_eq!(
+        snapshot["_meta"]["ui"]["resourceUri"],
+        MCP_COMPUTER_UI_RESOURCE_URI
+    );
+    assert_eq!(
+        snapshot["_meta"]["ui"]["visibility"],
+        json!(["model", "app"])
+    );
+    assert_eq!(
+        snapshot["_meta"]["ui/resourceUri"],
+        MCP_COMPUTER_UI_RESOURCE_URI
+    );
+    assert_eq!(
+        snapshot["_meta"]["openai/outputTemplate"],
+        MCP_COMPUTER_UI_RESOURCE_URI
+    );
+    let list_windows = tools
+        .iter()
+        .find(|tool| tool["name"] == "computer_list_windows")
+        .unwrap();
+    assert!(list_windows.get("_meta").is_none());
+
+    let compact =
+        mcp_tools_list_payload_with_compact_and_app(ModelSurface::FullOperatorRuntime, true, true);
+    let compact_snapshot = compact["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "computer_snapshot")
+        .unwrap();
+    assert_eq!(
+        compact_snapshot["_meta"]["ui"]["resourceUri"],
+        MCP_COMPUTER_UI_RESOURCE_URI
+    );
+
+    let resources = handle_mcp_request(
+        &runtime,
+        rpc(
+            "resources/list",
+            Some(json!(2103)),
+            mcp_2026_ui_params(json!({})),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(resources) = resources else {
+        panic!("expected UI resources/list");
+    };
+    assert_eq!(
+        resources["result"]["resources"][0]["uri"],
+        MCP_COMPUTER_UI_RESOURCE_URI
+    );
+    assert_eq!(
+        resources["result"]["resources"][0]["mimeType"],
+        MCP_UI_RESOURCE_MIME_TYPE
+    );
+    assert_eq!(
+        resources["result"]["resources"][0]["_meta"],
+        expected_resource_meta
+    );
+
+    let resource = handle_mcp_request(
+        &runtime,
+        rpc(
+            "resources/read",
+            Some(json!(2104)),
+            mcp_2026_ui_params(json!({ "uri": MCP_COMPUTER_UI_RESOURCE_URI })),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(resource) = resource else {
+        panic!("expected UI resources/read");
+    };
+    let resource_meta = &resource["result"]["contents"][0]["_meta"];
+    assert_eq!(resource_meta, &expected_resource_meta);
+    assert_eq!(
+        resource_meta["openai/widgetDomain"],
+        resource_meta["ui"]["domain"]
+    );
+    let html = resource["result"]["contents"][0]["text"].as_str().unwrap();
+    assert!(html.starts_with("<!DOCTYPE html>"));
+    assert!(html.contains("<script type=\"module\">"));
+    assert!(html.contains(
+        "pending.set(id, { resolve, reject, timeout });\n      try {\n        window.parent.postMessage"
+    ));
+    for expected in [
+        "ui/initialize",
+        "2026-01-26",
+        "ui/notifications/initialized",
+        "ui/notifications/tool-input",
+        "ui/notifications/tool-result",
+        "hostCapabilities.serverTools",
+        "hostCapabilities.message.text",
+        "hostCapabilities.updateModelContext.text",
+        "hostCapabilities.updateModelContext.structuredContent",
+        "tools/call",
+        "computer_snapshot",
+        "stale_surface",
+        "ui/request-display-mode",
+        "ui/update-model-context",
+        "ui/message",
+        "ui/resource-teardown",
+        ";base64,",
+        "output.client_id",
+    ] {
+        assert!(
+            html.contains(expected),
+            "missing {expected} in computer app HTML"
+        );
+    }
+    assert!(
+        html.contains("content: [{"),
+        "ui/message content must use the MCP Apps ContentBlock[] wire shape"
+    );
+    for forbidden in [
+        "computer_list_windows",
+        "content_base64",
+        "innerHTML",
+        "localStorage",
+        "indexedDB",
+        "console.log",
+        "URL.createObjectURL",
+        "URL.revokeObjectURL",
+        "new Blob",
+    ] {
+        assert!(
+            !html.contains(forbidden),
+            "computer app HTML must not contain {forbidden}"
+        );
+    }
+
+    for legacy_uri in MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS {
+        let legacy = handle_mcp_request(
+            &runtime,
+            rpc(
+                "resources/read",
+                Some(json!(21041)),
+                mcp_2026_params(json!({ "uri": legacy_uri })),
+            ),
+            None,
+        )
+        .await;
+        let McpOutcome::Ok(legacy) = legacy else {
+            panic!("legacy advertised UI resource must remain readable: {legacy_uri}");
+        };
+        assert_eq!(legacy["result"]["contents"][0]["uri"], *legacy_uri);
+        assert_eq!(
+            legacy["result"]["contents"][0]["mimeType"],
+            MCP_UI_RESOURCE_MIME_TYPE
+        );
+        assert_eq!(
+            legacy["result"]["contents"][0]["_meta"],
+            expected_resource_meta
+        );
+        assert_eq!(
+            legacy["result"]["contents"][0]["text"].as_str(),
+            Some(MCP_COMPUTER_APP_HTML)
+        );
+    }
+
+    let unknown = handle_mcp_request(
+        &runtime,
+        rpc(
+            "resources/read",
+            Some(json!(2105)),
+            mcp_2026_ui_params(json!({ "uri": "ui://webcodex/computer/unknown" })),
+        ),
+        None,
+    )
+    .await;
+    match unknown {
+        McpOutcome::BadRequest(value) => assert_eq!(value["error"]["code"], -32602),
+        other => panic!("unknown UI resource must fail closed, got {other:?}"),
+    }
+
+    let tools_without_ui_capability = handle_mcp_request(
+        &runtime,
+        rpc("tools/list", Some(json!(2106)), mcp_2026_params(json!({}))),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(tools_without_ui_capability) = tools_without_ui_capability else {
+        panic!("expected tools/list without UI capability metadata");
+    };
+    let snapshot = tools_without_ui_capability["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "computer_snapshot")
+        .unwrap();
+    assert_eq!(
+        snapshot["_meta"]["ui"]["resourceUri"],
+        MCP_COMPUTER_UI_RESOURCE_URI
+    );
+    assert_eq!(
+        snapshot["_meta"]["openai/outputTemplate"],
+        MCP_COMPUTER_UI_RESOURCE_URI
+    );
+
+    let no_ui_resources = handle_mcp_request(
+        &runtime,
+        rpc(
+            "resources/list",
+            Some(json!(2107)),
+            mcp_2026_params(json!({})),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(no_ui_resources) = no_ui_resources else {
+        panic!("expected non-UI resources/list");
+    };
+    assert!(no_ui_resources["result"]["resources"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    let resource_without_repeated_ui_capability = handle_mcp_request(
+        &runtime,
+        rpc(
+            "resources/read",
+            Some(json!(2108)),
+            mcp_2026_params(json!({ "uri": MCP_COMPUTER_UI_RESOURCE_URI })),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(resource_without_repeated_ui_capability) =
+        resource_without_repeated_ui_capability
+    else {
+        panic!(
+            "advertised UI resource must remain readable without repeated UI capability metadata"
+        );
+    };
+    assert_eq!(
+        resource_without_repeated_ui_capability["result"]["contents"][0]["uri"],
+        MCP_COMPUTER_UI_RESOURCE_URI
+    );
+    assert_eq!(
+        resource_without_repeated_ui_capability["result"]["contents"][0]["mimeType"],
+        MCP_UI_RESOURCE_MIME_TYPE
+    );
+}
+
 #[tokio::test]
 async fn mcp_info_advertised_methods_match_dispatch() {
     let runtime = test_runtime();
     for method in MCP_INFO_METHODS {
-        let params = if *method == "server/discover" {
-            mcp_2026_params(json!({}))
-        } else {
-            json!({})
+        let params = match *method {
+            "server/discover" | "resources/list" => mcp_2026_ui_params(json!({})),
+            "resources/read" => mcp_2026_ui_params(json!({ "uri": MCP_COMPUTER_UI_RESOURCE_URI })),
+            _ => json!({}),
         };
         let outcome = handle_mcp_request(&runtime, rpc(method, Some(json!(1)), params), None).await;
         assert!(
@@ -478,6 +834,45 @@ async fn mcp_image_call_returns_native_image_for_remote_agent_project() {
         structured["output"].get("content_base64").is_none(),
         "structuredContent must not duplicate the image base64"
     );
+}
+
+#[test]
+fn computer_snapshot_frames_native_image_without_structured_base64() {
+    let image_bytes = vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46];
+    let image_base64 = general_purpose::STANDARD.encode(&image_bytes);
+    let result = ToolResult::ok(json!({
+        "client_id": "msi",
+        "surface": {
+            "surface_id": "surface_test",
+            "application": "Test App",
+            "title": "Test Window",
+            "width": 640,
+            "height": 480,
+            "focused": true,
+            "active": true
+        },
+        "width": 640,
+        "height": 480,
+        "mime_type": "image/jpeg",
+        "file_bytes": image_bytes.len(),
+        "content_base64": image_base64
+    }));
+
+    let value = crate::mcp::mcp_runtime_tool_result("computer_snapshot", false, result);
+    assert_eq!(value["isError"], false);
+    let content = value["content"].as_array().expect("native content");
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["mimeType"], "image/jpeg");
+    assert_eq!(content[1]["data"], image_base64);
+    assert_eq!(
+        value["structuredContent"]["output"]["content_delivery"],
+        "mcp_image"
+    );
+    assert_eq!(value["structuredContent"]["output"]["client_id"], "msi");
+    assert!(value["structuredContent"]["output"]
+        .get("content_base64")
+        .is_none());
 }
 
 #[test]
@@ -1814,11 +2209,11 @@ async fn http_mcp_2026_unknown_method_is_404_jsonrpc_method_not_found() {
             MCP_STATELESS_PROTOCOL_VERSION,
             true,
         )
-        .add_header(MCP_METHOD_HEADER, "resources/list", true)
+        .add_header(MCP_METHOD_HEADER, "prompts/list", true)
         .json(&json!({
             "jsonrpc": "2.0",
             "id": 206,
-            "method": "resources/list",
+            "method": "prompts/list",
             "params": mcp_2026_params(json!({}))
         }))
         .send(&service)
@@ -1829,7 +2224,7 @@ async fn http_mcp_2026_unknown_method_is_404_jsonrpc_method_not_found() {
 }
 
 #[tokio::test]
-async fn http_mcp_2026_validates_name_header_before_rejecting_unimplemented_named_method() {
+async fn http_mcp_2026_validates_resource_name_header_before_resource_contract() {
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
     let runtime = Arc::new(test_runtime());
@@ -1873,9 +2268,9 @@ async fn http_mcp_2026_validates_name_header_before_rejecting_unimplemented_name
         }))
         .send(&service)
         .await;
-    assert_eq!(effective_status(&unsupported), StatusCode::NOT_FOUND);
+    assert_eq!(effective_status(&unsupported), StatusCode::BAD_REQUEST);
     let unsupported_body: Value = unsupported.take_json().await.unwrap();
-    assert_eq!(unsupported_body["error"]["code"], -32601);
+    assert_eq!(unsupported_body["error"]["code"], -32602);
 }
 
 #[tokio::test]
@@ -2659,6 +3054,74 @@ async fn oauth2_mcp_tools_list_requires_runtime_read() {
 }
 
 #[tokio::test]
+async fn oauth2_mcp_computer_app_resources_require_runtime_read() {
+    let (_tmp, service, token) =
+        oauth_mcp_service_with_surface("runtime:read", ModelSurface::FullOperatorRuntime);
+    let (status, body, _) = oauth_mcp_request(
+        &service,
+        &token,
+        "resources/list",
+        mcp_2026_ui_params(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    assert_eq!(
+        body["result"]["resources"][0]["uri"],
+        MCP_COMPUTER_UI_RESOURCE_URI
+    );
+
+    let (_tmp, service, token) =
+        oauth_mcp_service_with_surface("project:read", ModelSurface::FullOperatorRuntime);
+    let (status, body, challenge) = oauth_mcp_request(
+        &service,
+        &token,
+        "resources/list",
+        mcp_2026_ui_params(json!({})),
+    )
+    .await;
+    assert_mcp_oauth_scope_rejected(
+        status,
+        &body,
+        challenge.as_deref(),
+        Some(crate::auth::SCOPE_RUNTIME_READ),
+    );
+}
+
+#[tokio::test]
+async fn oauth2_mcp_computer_snapshot_keeps_computer_read_scope() {
+    let arguments = json!({
+        "client_id": "missing-runner",
+        "surface_id": "surface_test"
+    });
+    let (_tmp, service, token) =
+        oauth_mcp_service_with_surface("runtime:read", ModelSurface::FullOperatorRuntime);
+    let (status, body, challenge) = oauth_mcp_request(
+        &service,
+        &token,
+        "tools/call",
+        json!({ "name": "computer_snapshot", "arguments": arguments.clone() }),
+    )
+    .await;
+    assert_mcp_oauth_scope_rejected(
+        status,
+        &body,
+        challenge.as_deref(),
+        Some(crate::auth::SCOPE_COMPUTER_READ),
+    );
+
+    let (_tmp, service, token) =
+        oauth_mcp_service_with_surface("computer:read", ModelSurface::FullOperatorRuntime);
+    let (status, body, _) = oauth_mcp_request(
+        &service,
+        &token,
+        "tools/call",
+        json!({ "name": "computer_snapshot", "arguments": arguments }),
+    )
+    .await;
+    assert_ne!(status, StatusCode::FORBIDDEN, "body: {body:?}");
+}
+
+#[tokio::test]
 async fn oauth2_mcp_server_discover_requires_runtime_read_and_advertises_both_versions() {
     let (_tmp, service, token) = oauth_mcp_service("runtime:read");
     let (status, body, _) = oauth_mcp_request(
@@ -2701,7 +3164,7 @@ async fn oauth2_mcp_unknown_method_keeps_legacy_fail_closed_but_modern_returns_4
     let (_tmp, service, token) = oauth_mcp_service("runtime:read");
 
     let (legacy_status, legacy_body, legacy_challenge) =
-        oauth_mcp_request(&service, &token, "resources/list", json!({})).await;
+        oauth_mcp_request(&service, &token, "prompts/list", json!({})).await;
     assert_mcp_oauth_scope_rejected(
         legacy_status,
         &legacy_body,
@@ -2709,13 +3172,8 @@ async fn oauth2_mcp_unknown_method_keeps_legacy_fail_closed_but_modern_returns_4
         None,
     );
 
-    let (modern_status, modern_body, _) = oauth_mcp_request(
-        &service,
-        &token,
-        "resources/list",
-        mcp_2026_params(json!({})),
-    )
-    .await;
+    let (modern_status, modern_body, _) =
+        oauth_mcp_request(&service, &token, "prompts/list", mcp_2026_params(json!({}))).await;
     assert_eq!(
         modern_status,
         StatusCode::NOT_FOUND,

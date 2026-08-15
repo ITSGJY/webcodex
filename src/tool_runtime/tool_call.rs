@@ -1264,6 +1264,50 @@ pub enum ToolCall {
         session_id: Option<String>,
     },
 
+    /// Enumerate bounded top-level windows on one exact Runner.
+    ComputerListWindows {
+        client_id: String,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+
+    /// Read the exact Runner's macOS Accessibility trust status without prompting.
+    ComputerAccessibilityStatus {
+        client_id: String,
+    },
+
+    /// Inspect one exact previously listed macOS surface as a bounded AX tree.
+    ComputerAccessibilityTree {
+        client_id: String,
+        surface_id: String,
+        #[serde(default)]
+        max_depth: Option<usize>,
+        #[serde(default)]
+        max_nodes: Option<usize>,
+    },
+
+    /// Perform one bounded control action on an exact registered AX element.
+    ComputerControl {
+        client_id: String,
+        surface_id: String,
+        element_id: String,
+        action: String,
+    },
+
+    /// Set bounded text on an already-focused, empty exact registered AX text element.
+    ComputerInputText {
+        client_id: String,
+        surface_id: String,
+        element_id: String,
+        text: String,
+    },
+
+    /// Capture one opaque process-local window surface on one exact Runner.
+    ComputerSnapshot {
+        client_id: String,
+        surface_id: String,
+    },
+
     ListProjects,
 
     /// Register an existing directory as a WebCodex project on a selected
@@ -1734,6 +1778,12 @@ impl ToolCall {
             Self::GotoDefinition { .. } => "goto_definition",
             Self::FindReferences { .. } => "find_references",
             Self::CallHierarchy { .. } => "call_hierarchy",
+            Self::ComputerListWindows { .. } => "computer_list_windows",
+            Self::ComputerAccessibilityStatus { .. } => "computer_accessibility_status",
+            Self::ComputerAccessibilityTree { .. } => "computer_accessibility_tree",
+            Self::ComputerControl { .. } => "computer_control",
+            Self::ComputerInputText { .. } => "computer_input_text",
+            Self::ComputerSnapshot { .. } => "computer_snapshot",
             Self::ListProjects => "list_projects",
             Self::RegisterProject { .. } => "register_project",
             Self::CreateProject { .. } => "create_project",

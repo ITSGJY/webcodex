@@ -228,6 +228,18 @@ pub fn generated_agent_config_toml(opts: &AgentInitOptions) -> Result<String, St
             sandbox_inspect_commands: false,
             project_lifecycle: false,
             project_path_registration: false,
+            // Desktop observation is a runtime/platform capability and is never
+            // claimed by generated static config.
+            computer_observe: false,
+            // Semantic accessibility inspection is also a runtime/platform
+            // capability and remains distinct from screenshot observation.
+            computer_accessibility_observe: false,
+            // Control authority is runtime/platform-specific and is never
+            // implied by either observation capability in generated config.
+            computer_control: false,
+            // Text input is another runtime/platform capability and must never
+            // be inferred from computer_control in generated static config.
+            computer_text_input: false,
             job_state_reconciliation: false,
         },
         policy: GeneratedAgentPolicy {

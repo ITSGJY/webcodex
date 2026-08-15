@@ -88,6 +88,41 @@ pub(crate) fn session_log_arguments_for_tool_request(tool_name: &str, arguments:
         "session_shell_status" | "close_session_shell" => {
             copy_keys(obj, &mut out, &["session_id", "shell_id"]);
         }
+        "computer_list_windows" => {
+            copy_keys(obj, &mut out, &["client_id", "limit"]);
+        }
+        "computer_accessibility_status" => {
+            copy_keys(obj, &mut out, &["client_id"]);
+        }
+        "computer_accessibility_tree" => {
+            copy_keys(
+                obj,
+                &mut out,
+                &["client_id", "surface_id", "max_depth", "max_nodes"],
+            );
+        }
+        "computer_control" => {
+            copy_keys(
+                obj,
+                &mut out,
+                &["client_id", "surface_id", "element_id", "action"],
+            );
+        }
+        "computer_input_text" => {
+            copy_keys(obj, &mut out, &["client_id", "surface_id", "element_id"]);
+            out.insert(
+                "text_bytes".to_string(),
+                Value::from(
+                    obj.get("text")
+                        .and_then(Value::as_str)
+                        .map(str::len)
+                        .unwrap_or_default(),
+                ),
+            );
+        }
+        "computer_snapshot" => {
+            copy_keys(obj, &mut out, &["client_id", "surface_id"]);
+        }
         "observe_jobs" => {
             let items = obj.get("items").and_then(Value::as_array);
             out.insert(
@@ -353,6 +388,46 @@ pub(crate) fn session_log_arguments_for_tool_request(tool_name: &str, arguments:
     Value::Object(out)
 }
 
+pub(crate) fn session_log_result_for_tool(tool_name: &str, output: &Value) -> Value {
+    match tool_name {
+        "computer_list_windows" => serde_json::json!({
+            "count": output.get("count").cloned().unwrap_or(Value::Null),
+            "truncated": output.get("truncated").cloned().unwrap_or(Value::Null),
+        }),
+        "computer_snapshot" => serde_json::json!({
+            "surface_id": output.pointer("/surface/surface_id").cloned().unwrap_or(Value::Null),
+            "width": output.get("width").cloned().unwrap_or(Value::Null),
+            "height": output.get("height").cloned().unwrap_or(Value::Null),
+            "mime_type": output.get("mime_type").cloned().unwrap_or(Value::Null),
+            "file_bytes": output.get("file_bytes").cloned().unwrap_or(Value::Null),
+        }),
+        "computer_accessibility_status" => serde_json::json!({
+            "platform": output.get("platform").cloned().unwrap_or(Value::Null),
+            "trusted": output.get("trusted").cloned().unwrap_or(Value::Null),
+        }),
+        "computer_accessibility_tree" => serde_json::json!({
+            "surface_id": output.get("surface_id").cloned().unwrap_or(Value::Null),
+            "node_count": output.get("node_count").cloned().unwrap_or(Value::Null),
+            "truncated": output.get("truncated").cloned().unwrap_or(Value::Null),
+            "max_depth": output.get("max_depth").cloned().unwrap_or(Value::Null),
+            "max_nodes": output.get("max_nodes").cloned().unwrap_or(Value::Null),
+        }),
+        "computer_control" => serde_json::json!({
+            "surface_id": output.get("surface_id").cloned().unwrap_or(Value::Null),
+            "element_id": output.get("element_id").cloned().unwrap_or(Value::Null),
+            "action": output.get("action").cloned().unwrap_or(Value::Null),
+            "success": output.get("success").cloned().unwrap_or(Value::Null),
+        }),
+        "computer_input_text" => serde_json::json!({
+            "surface_id": output.get("surface_id").cloned().unwrap_or(Value::Null),
+            "element_id": output.get("element_id").cloned().unwrap_or(Value::Null),
+            "text_bytes": output.get("text_bytes").cloned().unwrap_or(Value::Null),
+            "success": output.get("success").cloned().unwrap_or(Value::Null),
+        }),
+        _ => output.clone(),
+    }
+}
+
 fn copy_keys(
     obj: &serde_json::Map<String, Value>,
     out: &mut serde_json::Map<String, Value>,
@@ -362,6 +437,169 @@ fn copy_keys(
         if let Some(value) = obj.get(*key).cloned() {
             out.insert((*key).to_string(), value);
         }
+    }
+}
+
+#[cfg(test)]
+mod computer_privacy_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn computer_list_ledger_result_omits_window_content() {
+        let output = json!({
+            "windows": [{
+                "surface_id": "surface_secret",
+                "application": "Private App",
+                "title": "Confidential Window Title",
+                "width": 1200,
+                "height": 800,
+                "focused": true,
+                "active": true
+            }],
+            "count": 1,
+            "truncated": false
+        });
+        let summary = session_log_result_for_tool("computer_list_windows", &output);
+        let serialized = serde_json::to_string(&summary).unwrap();
+        assert_eq!(summary, json!({"count": 1, "truncated": false}));
+        assert!(!serialized.contains("Confidential"));
+        assert!(!serialized.contains("Private App"));
+        assert!(!serialized.contains("surface_secret"));
+    }
+
+    #[test]
+    fn computer_accessibility_tree_ledger_result_omits_semantic_content() {
+        let output = json!({
+            "platform": "macos",
+            "surface_id": "surface_safe",
+            "nodes": [{
+                "element_id": "element_secret",
+                "parent_element_id": null,
+                "depth": 0,
+                "role": "AXWindow",
+                "subrole": null,
+                "title": "Private Chat",
+                "description": "Confidential",
+                "value": "SUPER_SECRET_MESSAGE",
+                "placeholder": null,
+                "enabled": true,
+                "focused": false,
+                "child_count": 2
+            }],
+            "node_count": 1,
+            "truncated": true,
+            "max_depth": 6,
+            "max_nodes": 128
+        });
+        let summary = session_log_result_for_tool("computer_accessibility_tree", &output);
+        let serialized = serde_json::to_string(&summary).unwrap();
+        assert_eq!(summary["surface_id"], "surface_safe");
+        assert_eq!(summary["node_count"], 1);
+        assert!(!serialized.contains("SUPER_SECRET"));
+        assert!(!serialized.contains("Private Chat"));
+        assert!(!serialized.contains("element_secret"));
+    }
+
+    #[test]
+    fn computer_control_ledger_result_is_metadata_only() {
+        // Control remains metadata-only independently of CU-AX3.
+        let output = json!({
+            "platform": "macos",
+            "surface_id": "surface_safe",
+            "element_id": "element_safe",
+            "action": "press",
+            "success": true,
+            "title": "PRIVATE CONTROL TARGET",
+            "value": "SUPER_SECRET_VALUE"
+        });
+        let summary = session_log_result_for_tool("computer_control", &output);
+        let serialized = serde_json::to_string(&summary).unwrap();
+        assert_eq!(summary["surface_id"], "surface_safe");
+        assert_eq!(summary["element_id"], "element_safe");
+        assert_eq!(summary["action"], "press");
+        assert_eq!(summary["success"], true);
+        assert!(!serialized.contains("PRIVATE CONTROL TARGET"));
+        assert!(!serialized.contains("SUPER_SECRET_VALUE"));
+    }
+
+    #[test]
+    fn computer_text_input_request_and_result_never_persist_text() {
+        let secret = "不要记录我🙂";
+        let request = json!({
+            "client_id": "mini",
+            "surface_id": "surface_safe",
+            "element_id": "element_safe",
+            "text": secret,
+        });
+        let request_summary =
+            session_log_arguments_for_tool_request("computer_input_text", &request);
+        let request_serialized = serde_json::to_string(&request_summary).unwrap();
+        assert_eq!(request_summary["client_id"], "mini");
+        assert_eq!(request_summary["surface_id"], "surface_safe");
+        assert_eq!(request_summary["element_id"], "element_safe");
+        assert_eq!(request_summary["text_bytes"], secret.len());
+        assert!(!request_serialized.contains(secret));
+        assert!(request_summary.get("text").is_none());
+
+        let typed = ToolCall::ComputerInputText {
+            client_id: "mini".to_string(),
+            surface_id: "surface_safe".to_string(),
+            element_id: "element_safe".to_string(),
+            text: secret.to_string(),
+        };
+        let typed_summary = typed.session_log_arguments();
+        let typed_serialized = serde_json::to_string(&typed_summary).unwrap();
+        assert_eq!(typed_summary["text_bytes"], secret.len());
+        assert!(!typed_serialized.contains(secret));
+        assert!(typed_summary.get("text").is_none());
+
+        let output = json!({
+            "platform": "macos",
+            "surface_id": "surface_safe",
+            "element_id": "element_safe",
+            "text_bytes": secret.len(),
+            "success": true,
+            "text": secret,
+            "value": secret,
+        });
+        let result_summary = session_log_result_for_tool("computer_input_text", &output);
+        let result_serialized = serde_json::to_string(&result_summary).unwrap();
+        assert_eq!(result_summary["text_bytes"], secret.len());
+        assert_eq!(result_summary["success"], true);
+        assert!(!result_serialized.contains(secret));
+        assert!(result_summary.get("text").is_none());
+        assert!(result_summary.get("value").is_none());
+    }
+
+    #[test]
+    fn computer_snapshot_ledger_result_omits_image_and_titles() {
+        // Snapshot privacy remains unchanged.
+        let output = json!({
+            "surface": {
+                "surface_id": "surface_safe",
+                "application": "Private App",
+                "title": "Confidential Window Title",
+                "width": 1200,
+                "height": 800,
+                "focused": null,
+                "active": null
+            },
+            "width": 900,
+            "height": 600,
+            "mime_type": "image/jpeg",
+            "file_bytes": 12345,
+            "content_base64": "SUPER_SECRET_SCREENSHOT_BYTES"
+        });
+        let summary = session_log_result_for_tool("computer_snapshot", &output);
+        let serialized = serde_json::to_string(&summary).unwrap();
+        assert_eq!(summary["surface_id"], "surface_safe");
+        assert_eq!(summary["width"], 900);
+        assert_eq!(summary["height"], 600);
+        assert_eq!(summary["file_bytes"], 12345);
+        assert!(!serialized.contains("SUPER_SECRET"));
+        assert!(!serialized.contains("Confidential"));
+        assert!(!serialized.contains("Private App"));
     }
 }
 
@@ -484,6 +722,53 @@ impl ToolCall {
                 "project": project,
                 "session_id": session_id,
                 "shell_id": shell_id,
+            }),
+            Self::ComputerListWindows { client_id, limit } => serde_json::json!({
+                "client_id": client_id,
+                "limit": limit,
+            }),
+            Self::ComputerAccessibilityStatus { client_id } => serde_json::json!({
+                "client_id": client_id,
+            }),
+            Self::ComputerAccessibilityTree {
+                client_id,
+                surface_id,
+                max_depth,
+                max_nodes,
+            } => serde_json::json!({
+                "client_id": client_id,
+                "surface_id": surface_id,
+                "max_depth": max_depth,
+                "max_nodes": max_nodes,
+            }),
+            Self::ComputerControl {
+                client_id,
+                surface_id,
+                element_id,
+                action,
+            } => serde_json::json!({
+                "client_id": client_id,
+                "surface_id": surface_id,
+                "element_id": element_id,
+                "action": action,
+            }),
+            Self::ComputerInputText {
+                client_id,
+                surface_id,
+                element_id,
+                text,
+            } => serde_json::json!({
+                "client_id": client_id,
+                "surface_id": surface_id,
+                "element_id": element_id,
+                "text_bytes": text.len(),
+            }),
+            Self::ComputerSnapshot {
+                client_id,
+                surface_id,
+            } => serde_json::json!({
+                "client_id": client_id,
+                "surface_id": surface_id,
             }),
             Self::StopJob {
                 project,

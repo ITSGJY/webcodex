@@ -1,3 +1,4 @@
+use super::auth::assert_shell_client_access;
 use super::jobs::{
     command_preview, ensure_dispatch_supported_locked, ensure_queue_capacity_locked,
     request_preview, PendingRequestEnqueueError,
@@ -11,11 +12,14 @@ use super::validation::{
 use super::{now_ts, ShellClientRegistry, CLIENT_ONLINE_WINDOW_SECS};
 use crate::lsp_bridge::{AgentLspPayload, AgentLspRequest, AGENT_LSP_REQUEST_KIND};
 use crate::shell_protocol::{
-    PersistentShellRequest, PersistentShellResult, ShellAgentShellRequest, ShellFileOpRequest,
-    ShellJobContext, ShellProcessArgv, ShellRunRequest, ShellRunResponse, ShellScriptPayload,
-    SHELL_CLIENT_CAPABILITY_LSP_CALL_HIERARCHY, SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
-    SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL, SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS,
-    SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL, SHELL_CLIENT_CAPABILITY_STRUCTURED_FILE_DELETE,
+    shell_computer_request_payload_max_bytes, PersistentShellRequest, PersistentShellResult,
+    ShellAgentShellRequest, ShellFileOpRequest, ShellJobContext, ShellProcessArgv, ShellRunRequest,
+    ShellRunResponse, ShellScriptPayload, SHELL_CLIENT_CAPABILITY_COMPUTER_ACCESSIBILITY_OBSERVE,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_CONTROL, SHELL_CLIENT_CAPABILITY_COMPUTER_OBSERVE,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_TEXT_INPUT, SHELL_CLIENT_CAPABILITY_LSP_CALL_HIERARCHY,
+    SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION, SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL,
+    SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS, SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL,
+    SHELL_CLIENT_CAPABILITY_STRUCTURED_FILE_DELETE,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_PROCESS_ARGV,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD,
 };
@@ -821,6 +825,89 @@ impl ShellClientRegistry {
             Some(tx),
             None,
         )?;
+        notify_client_locked(&inner, &client_id);
+        Ok((request_id, rx))
+    }
+
+    /// Enqueue one typed bounded computer request. The payload is bounded JSON
+    /// in stdin and command is always empty. Owner/auth and the exact per-kind
+    /// computer capability are rechecked under the registry lock so a concurrent
+    /// re-registration cannot create a TOCTOU escape.
+    pub async fn enqueue_computer(
+        &self,
+        client_id: String,
+        kind: &'static str,
+        payload: String,
+        requested_by: String,
+        auth: Option<&crate::auth::AuthContext>,
+        timeout_secs: u64,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+        validate_id(&client_id, "client_id")?;
+        let required_capability = match kind {
+            "computer_list_windows" | "computer_snapshot" => {
+                SHELL_CLIENT_CAPABILITY_COMPUTER_OBSERVE
+            }
+            "computer_accessibility_status" | "computer_accessibility_tree" => {
+                SHELL_CLIENT_CAPABILITY_COMPUTER_ACCESSIBILITY_OBSERVE
+            }
+            "computer_control" => SHELL_CLIENT_CAPABILITY_COMPUTER_CONTROL,
+            "computer_input_text" => SHELL_CLIENT_CAPABILITY_COMPUTER_TEXT_INPUT,
+            _ => return Err("invalid computer request kind".to_string()),
+        };
+        if payload.len() > shell_computer_request_payload_max_bytes(kind) || payload.contains('\0')
+        {
+            return Err("computer request payload is invalid or too large".to_string());
+        }
+        let request_id = next_request_id();
+        let (tx, rx) = oneshot::channel();
+        let request = ShellAgentShellRequest {
+            request_id: request_id.clone(),
+            client_id: client_id.clone(),
+            kind: kind.to_string(),
+            job_id: None,
+            cwd: None,
+            path: None,
+            content: None,
+            max_bytes: None,
+            expected_sha256: None,
+            expected_prefix: None,
+            start_line: None,
+            end_line: None,
+            create_dirs: false,
+            command: String::new(),
+            process: None,
+            script: None,
+            stdin: Some(payload),
+            timeout_secs: timeout_secs.max(1),
+            requested_by,
+            created_at: now_ts(),
+            validation: None,
+            lsp: None,
+            sandbox: None,
+            job_context: None,
+            persistent_shell: None,
+        };
+        let mut inner = self.inner.lock().await;
+        self.prune_expired_shared_key_clients_locked(&mut inner, now_ts());
+        let current = inner
+            .clients
+            .get(&client_id)
+            .ok_or_else(|| format!("unknown shell client: {client_id}"))?;
+        assert_shell_client_access(auth, current)?;
+        if !capability_enabled(&current.capabilities, required_capability) {
+            return Err(format!(
+                "agent client {client_id} does not support {required_capability}"
+            ));
+        }
+        enqueue_pending_request_locked(
+            &mut inner,
+            &client_id,
+            request_id.clone(),
+            request,
+            Some(tx),
+            None,
+        )
+        .map_err(|error| error.to_string())?;
         notify_client_locked(&inner, &client_id);
         Ok((request_id, rx))
     }

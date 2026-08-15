@@ -6138,13 +6138,17 @@ fn shell_profile_prepare_stop_cleans_up_whole_tree() {
 }
 
 #[test]
-fn register_request_announces_correct_protocol_version() {
+fn computer_register_request_announces_platform_capability_and_protocol_version() {
     let tmp = tempfile::tempdir().unwrap();
     let mut cfg = test_config(tmp.path().join("config/projects.d"));
     // A stale or hand-edited config cannot force capability advertisement:
     // registration replaces it with the result of the real host probe.
     cfg.capabilities = Some(ShellClientCapabilities {
         sandbox_inspect_commands: true,
+        computer_observe: true,
+        computer_accessibility_observe: true,
+        computer_control: true,
+        computer_text_input: true,
         project_lifecycle: false,
         project_path_registration: false,
         ..Default::default()
@@ -6193,6 +6197,26 @@ fn register_request_announces_correct_protocol_version() {
     assert!(caps.lsp_call_hierarchy);
     assert!(caps.project_lifecycle);
     assert!(caps.project_path_registration);
+    assert_eq!(
+        caps.computer_observe,
+        cfg!(any(target_os = "macos", windows)),
+        "computer observation is advertised only when this Runner binary has a supported native implementation"
+    );
+    assert_eq!(
+        caps.computer_accessibility_observe,
+        cfg!(target_os = "macos"),
+        "computer accessibility observation is advertised only by the macOS native implementation"
+    );
+    assert_eq!(
+        caps.computer_control,
+        cfg!(target_os = "macos"),
+        "computer control is independently advertised only by the macOS native implementation"
+    );
+    assert_eq!(
+        caps.computer_text_input,
+        cfg!(target_os = "macos"),
+        "computer text input is independently advertised only by the macOS native implementation"
+    );
     assert_eq!(
         caps.sandbox_inspect_commands,
         crate::command_sandbox::inspect_sandbox_available().is_ok()
