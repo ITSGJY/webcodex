@@ -213,7 +213,7 @@ async fn mcp_2026_computer_app_is_progressive_and_snapshot_only() {
     let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
     // The URI is a host cache key. Bump it whenever the App delivery contract
     // changes so a previously failed/blank iframe cannot pin the old resource.
-    assert_eq!(MCP_COMPUTER_UI_RESOURCE_URI, "ui://webcodex/computer/v4");
+    assert_eq!(MCP_COMPUTER_UI_RESOURCE_URI, "ui://webcodex/computer/v5");
     let expected_resource_meta = json!({
         "ui": {
             "prefersBorder": true,
@@ -341,6 +341,11 @@ async fn mcp_2026_computer_app_is_progressive_and_snapshot_only() {
         panic!("expected UI resources/read");
     };
     let resource_meta = &resource["result"]["contents"][0]["_meta"];
+    assert_eq!(
+        resource["result"]["ttlMs"],
+        Value::from(MCP_COMPUTER_UI_RESOURCE_TTL_MS)
+    );
+    assert_eq!(resource["result"]["cacheScope"], "private");
     assert_eq!(resource_meta, &expected_resource_meta);
     assert_eq!(
         resource_meta["openai/widgetDomain"],
@@ -413,6 +418,8 @@ async fn mcp_2026_computer_app_is_progressive_and_snapshot_only() {
             panic!("legacy advertised UI resource must remain readable: {legacy_uri}");
         };
         assert_eq!(legacy["result"]["contents"][0]["uri"], *legacy_uri);
+        assert_eq!(legacy["result"]["ttlMs"], 0);
+        assert_eq!(legacy["result"]["cacheScope"], "private");
         assert_eq!(
             legacy["result"]["contents"][0]["mimeType"],
             MCP_UI_RESOURCE_MIME_TYPE
@@ -5221,6 +5228,53 @@ async fn http_mcp_2026_unknown_method_is_404_jsonrpc_method_not_found() {
     assert_eq!(effective_status(&resp), StatusCode::NOT_FOUND);
     let body: Value = resp.take_json().await.unwrap();
     assert_eq!(body["error"]["code"], -32601);
+}
+
+#[tokio::test]
+async fn http_mcp_2026_reads_computer_app_template_with_cache_contract() {
+    let config = test_config(Some("secret"));
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let service = Service::new(build_test_router(config, db, runtime));
+    let params = mcp_2026_ui_params(json!({"uri": MCP_COMPUTER_UI_RESOURCE_URI}));
+
+    let mut response = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_STATELESS_PROTOCOL_VERSION,
+            true,
+        )
+        .add_header(MCP_METHOD_HEADER, "resources/read", true)
+        .add_header(MCP_NAME_HEADER, MCP_COMPUTER_UI_RESOURCE_URI, true)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2060,
+            "method": "resources/read",
+            "params": params
+        }))
+        .send(&service)
+        .await;
+
+    assert_eq!(effective_status(&response), StatusCode::OK);
+    let body: Value = response.take_json().await.unwrap();
+    assert_eq!(body["result"]["resultType"], "complete");
+    assert_eq!(
+        body["result"]["ttlMs"],
+        Value::from(MCP_COMPUTER_UI_RESOURCE_TTL_MS)
+    );
+    assert_eq!(body["result"]["cacheScope"], "private");
+    assert_eq!(
+        body["result"]["contents"][0]["uri"],
+        MCP_COMPUTER_UI_RESOURCE_URI
+    );
+    assert_eq!(
+        body["result"]["contents"][0]["mimeType"],
+        MCP_UI_RESOURCE_MIME_TYPE
+    );
+    let html = body["result"]["contents"][0]["text"].as_str().unwrap();
+    assert!(html.starts_with("<!DOCTYPE html>"));
+    assert!(html.contains("ui/initialize"));
 }
 
 #[tokio::test]
