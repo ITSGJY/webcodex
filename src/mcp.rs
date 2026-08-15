@@ -61,10 +61,18 @@ const MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS: &[&str] = &[
 const MCP_COMPUTER_UI_RESOURCE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const MCP_COMPUTER_APP_PROBE_TOOL_NAME: &str = "computer_app_probe";
 const MCP_COMPUTER_APP_PROBE_RESOURCE_URI: &str = "ui://webcodex/computer-probe/v1";
+const MCP_COMPUTER_APP_IMAGE_PROBE_TOOL_NAME: &str = "computer_app_image_probe";
+const MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI: &str = "ui://webcodex/computer-image-probe/v1";
+const MCP_COMPUTER_APP_IMAGE_PROBE_PNG_BASE64: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z0GkAAAAASUVORK5CYII=";
+const MCP_COMPUTER_APP_IMAGE_PROBE_PNG_BYTES: u64 = 68;
+const MCP_COMPUTER_APP_IMAGE_PROBE_PNG_SHA256: &str =
+    "61576be28adeae2826f68b41489eb35502cd873c884ad2acc50b327566503c1c";
 const MCP_COMPUTER_UI_DOMAIN: &str = "https://sg4.yyjeqhc.cn";
 const MCP_UI_RESOURCE_MIME_TYPE: &str = "text/html;profile=mcp-app";
 const MCP_COMPUTER_APP_HTML: &str = include_str!("mcp_computer_app.html");
 const MCP_COMPUTER_APP_PROBE_HTML: &str = include_str!("mcp_computer_probe_app.html");
+const MCP_COMPUTER_APP_IMAGE_PROBE_HTML: &str = include_str!("mcp_computer_image_probe_app.html");
 
 /// Single source of truth for the JSON-RPC methods advertised by `GET /mcp`.
 /// Must match the dispatch arms in `handle_mcp_request_with_lifecycle`;
@@ -434,6 +442,7 @@ fn mcp_tools_list_payload_with_features(
         .collect();
     if app_enabled && model_surface == ModelSurface::FullOperatorRuntime {
         tools.push(mcp_computer_app_probe_tool_spec(compact));
+        tools.push(mcp_computer_app_image_probe_tool_spec(compact));
     }
     json!({ "tools": tools })
 }
@@ -538,6 +547,61 @@ fn mcp_computer_app_probe_tool_spec(compact: bool) -> Value {
     value
 }
 
+fn mcp_computer_app_image_probe_tool_spec(compact: bool) -> Value {
+    let mut value = json!({
+        "name": MCP_COMPUTER_APP_IMAGE_PROBE_TOOL_NAME,
+        "description": "Experimental MCP-only native-image control probe for the WebCodex Computer App. Returns one built-in 1x1 PNG through the same MCP image framing used by computer_snapshot, without contacting a Runner.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        },
+        "annotations": {
+            "title": "Computer App Image Probe",
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
+        },
+        "_meta": {
+            "ui": {
+                "resourceUri": MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI,
+                "visibility": ["model", "app"]
+            },
+            "openai/outputTemplate": MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI
+        }
+    });
+    if !compact {
+        value["outputSchema"] = json!({
+            "type": "object",
+            "properties": {
+                "success": { "type": "boolean" },
+                "output": {
+                    "type": "object",
+                    "properties": {
+                        "probe": { "type": "string" },
+                        "runner_used": { "type": "boolean" },
+                        "client_id": { "type": "string" },
+                        "surface": { "type": "object" },
+                        "width": { "type": "integer" },
+                        "height": { "type": "integer" },
+                        "mime_type": { "type": "string" },
+                        "file_bytes": { "type": "integer" },
+                        "sha256": { "type": "string" },
+                        "content_delivery": { "type": "string" }
+                    },
+                    "required": ["probe", "runner_used", "client_id", "surface", "width", "height", "mime_type", "file_bytes", "sha256", "content_delivery"],
+                    "additionalProperties": false
+                },
+                "error": {}
+            },
+            "required": ["success", "output", "error"],
+            "additionalProperties": false
+        });
+    }
+    value
+}
+
 fn mcp_computer_app_resource_meta() -> Value {
     json!({
         "ui": {
@@ -567,6 +631,13 @@ fn mcp_computer_app_resources_list() -> Value {
                 "description": "Experimental control card that performs the same minimal MCP Apps handshake and renders one tiny deterministic tool result without Runner or image content.",
                 "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
                 "_meta": mcp_computer_app_resource_meta()
+            },
+            {
+                "uri": MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI,
+                "name": "WebCodex Computer App Image Probe",
+                "description": "Experimental control card that performs the same minimal MCP Apps handshake and renders one built-in 1x1 PNG delivered through native MCP image content without Runner access.",
+                "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
+                "_meta": mcp_computer_app_resource_meta()
             }
         ]
     })
@@ -575,6 +646,7 @@ fn mcp_computer_app_resources_list() -> Value {
 fn is_mcp_computer_app_resource_uri(uri: &str) -> bool {
     uri == MCP_COMPUTER_UI_RESOURCE_URI
         || uri == MCP_COMPUTER_APP_PROBE_RESOURCE_URI
+        || uri == MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI
         || MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS.contains(&uri)
 }
 
@@ -585,6 +657,8 @@ fn mcp_computer_app_resource_read(uri: &str) -> Option<Value> {
     // still advertise only canonical URIs.
     let text = if uri == MCP_COMPUTER_APP_PROBE_RESOURCE_URI {
         MCP_COMPUTER_APP_PROBE_HTML
+    } else if uri == MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI {
+        MCP_COMPUTER_APP_IMAGE_PROBE_HTML
     } else if uri == MCP_COMPUTER_UI_RESOURCE_URI
         || MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS.contains(&uri)
     {
@@ -906,6 +980,39 @@ fn mcp_computer_app_probe_tool_result() -> Value {
         },
         "isError": false
     })
+}
+
+fn mcp_computer_app_image_probe_tool_result() -> Value {
+    let mut result = ToolResult::ok(json!({
+        "probe": "image",
+        "runner_used": false,
+        "client_id": "control-plane",
+        "surface": {
+            "surface_id": "image_probe",
+            "application": "WebCodex",
+            "title": "Built-in tiny PNG",
+            "width": 1,
+            "height": 1,
+            "focused": false,
+            "active": false
+        },
+        "width": 1,
+        "height": 1,
+        "mime_type": "image/png",
+        "file_bytes": MCP_COMPUTER_APP_IMAGE_PROBE_PNG_BYTES,
+        "sha256": MCP_COMPUTER_APP_IMAGE_PROBE_PNG_SHA256,
+        "content_base64": MCP_COMPUTER_APP_IMAGE_PROBE_PNG_BASE64
+    }));
+    // Deliberately exercise the exact Computer snapshot image framing branch;
+    // only the image bytes are synthetic and no Runner is contacted.
+    match mcp_native_image_tool_result("computer_snapshot", &mut result) {
+        Ok(value) => value,
+        Err(error) => mcp_runtime_tool_result(
+            MCP_COMPUTER_APP_IMAGE_PROBE_TOOL_NAME,
+            false,
+            ToolResult::err(format!("cannot frame built-in image probe: {error}")),
+        ),
+    }
 }
 
 pub(crate) fn mcp_runtime_tool_result(
@@ -2198,7 +2305,10 @@ async fn handle_mcp_request_with_lifecycle(
             let mut result = mcp_stateless_result(result, true);
             // Canonical versioned App URIs are immutable for caching. Hidden
             // legacy Computer URIs intentionally alias the current HTML and remain stale.
-            if uri == MCP_COMPUTER_UI_RESOURCE_URI || uri == MCP_COMPUTER_APP_PROBE_RESOURCE_URI {
+            if uri == MCP_COMPUTER_UI_RESOURCE_URI
+                || uri == MCP_COMPUTER_APP_PROBE_RESOURCE_URI
+                || uri == MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI
+            {
                 result["ttlMs"] = Value::from(MCP_COMPUTER_UI_RESOURCE_TTL_MS);
             }
             rpc_result(id, result)
@@ -2281,6 +2391,49 @@ async fn handle_mcp_request_with_lifecycle(
                 return McpOutcome::Ok(rpc_result(
                     id,
                     mcp_stateless_result(mcp_computer_app_probe_tool_result(), false),
+                ));
+            }
+            if params.name == MCP_COMPUTER_APP_IMAGE_PROBE_TOOL_NAME {
+                if !stateless_2026 || runtime.model_surface() != ModelSurface::FullOperatorRuntime {
+                    if let Some(lc) = lifecycle.as_deref() {
+                        lc.dispatch_failed("surface_denied");
+                        lc.dispatch_finished(false, Some(false), "surface_denied");
+                    }
+                    return McpOutcome::BadRequest(rpc_error(
+                        id,
+                        -32602,
+                        "computer_app_image_probe requires the stateless-2026 full-operator MCP surface",
+                    ));
+                }
+                let arguments_valid = params.arguments.is_null()
+                    || params
+                        .arguments
+                        .as_object()
+                        .is_some_and(|arguments| arguments.is_empty());
+                if !arguments_valid {
+                    if let Some(lc) = lifecycle.as_deref() {
+                        lc.dispatch_failed("invalid_arguments");
+                        lc.dispatch_finished(false, Some(false), "invalid_arguments");
+                    }
+                    return McpOutcome::BadRequest(rpc_error(
+                        id,
+                        -32602,
+                        "computer_app_image_probe accepts no arguments",
+                    ));
+                }
+                if let Some(outcome) = require_mcp_scope(auth, crate::auth::SCOPE_RUNTIME_READ) {
+                    if let Some(lc) = lifecycle.as_deref() {
+                        lc.dispatch_failed("forbidden");
+                        lc.dispatch_finished(false, Some(false), "forbidden");
+                    }
+                    return outcome;
+                }
+                if let Some(lc) = lifecycle.as_deref() {
+                    lc.dispatch_finished(true, Some(true), "success");
+                }
+                return McpOutcome::Ok(rpc_result(
+                    id,
+                    mcp_stateless_result(mcp_computer_app_image_probe_tool_result(), false),
                 ));
             }
             let artifact_export_caller = if params.name == "export_project_artifact" {
