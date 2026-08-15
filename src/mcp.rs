@@ -59,9 +59,12 @@ const MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS: &[&str] = &[
     "ui://webcodex/computer/v8",
 ];
 const MCP_COMPUTER_UI_RESOURCE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+const MCP_COMPUTER_APP_PROBE_TOOL_NAME: &str = "computer_app_probe";
+const MCP_COMPUTER_APP_PROBE_RESOURCE_URI: &str = "ui://webcodex/computer-probe/v1";
 const MCP_COMPUTER_UI_DOMAIN: &str = "https://sg4.yyjeqhc.cn";
 const MCP_UI_RESOURCE_MIME_TYPE: &str = "text/html;profile=mcp-app";
 const MCP_COMPUTER_APP_HTML: &str = include_str!("mcp_computer_app.html");
+const MCP_COMPUTER_APP_PROBE_HTML: &str = include_str!("mcp_computer_probe_app.html");
 
 /// Single source of truth for the JSON-RPC methods advertised by `GET /mcp`.
 /// Must match the dispatch arms in `handle_mcp_request_with_lifecycle`;
@@ -424,11 +427,14 @@ fn mcp_tools_list_payload_with_features(
         ModelSurface::LocalCoding => crate::model_surface::local_coding_tool_specs(),
         ModelSurface::FullOperatorRuntime => registered_tool_specs(),
     };
-    let tools: Vec<Value> = specs
+    let mut tools: Vec<Value> = specs
         .into_iter()
         .filter(|spec| artifact_export_enabled || spec.name != "export_project_artifact")
         .map(|spec| mcp_tool_spec_json(spec, compact, app_enabled))
         .collect();
+    if app_enabled && model_surface == ModelSurface::FullOperatorRuntime {
+        tools.push(mcp_computer_app_probe_tool_spec(compact));
+    }
     json!({ "tools": tools })
 }
 
@@ -484,6 +490,54 @@ fn mcp_tool_spec_json(mut spec: ToolSpec, compact: bool, app_enabled: bool) -> V
     value
 }
 
+fn mcp_computer_app_probe_tool_spec(compact: bool) -> Value {
+    let mut value = json!({
+        "name": MCP_COMPUTER_APP_PROBE_TOOL_NAME,
+        "description": "Experimental MCP-only control probe for the WebCodex Computer App. Returns one tiny deterministic result without contacting a Runner or producing image content.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        },
+        "annotations": {
+            "title": "Computer App Probe",
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
+        },
+        "_meta": {
+            "ui": {
+                "resourceUri": MCP_COMPUTER_APP_PROBE_RESOURCE_URI,
+                "visibility": ["model", "app"]
+            },
+            "openai/outputTemplate": MCP_COMPUTER_APP_PROBE_RESOURCE_URI
+        }
+    });
+    if !compact {
+        value["outputSchema"] = json!({
+            "type": "object",
+            "properties": {
+                "success": { "type": "boolean" },
+                "output": {
+                    "type": "object",
+                    "properties": {
+                        "probe": { "type": "string" },
+                        "payload": { "type": "string" },
+                        "runner_used": { "type": "boolean" }
+                    },
+                    "required": ["probe", "payload", "runner_used"],
+                    "additionalProperties": false
+                },
+                "error": {}
+            },
+            "required": ["success", "output", "error"],
+            "additionalProperties": false
+        });
+    }
+    value
+}
+
 fn mcp_computer_app_resource_meta() -> Value {
     json!({
         "ui": {
@@ -499,36 +553,53 @@ fn mcp_computer_app_resource_meta() -> Value {
 
 fn mcp_computer_app_resources_list() -> Value {
     json!({
-        "resources": [{
-            "uri": MCP_COMPUTER_UI_RESOURCE_URI,
-            "name": "WebCodex Computer",
-            "description": "Minimal read-only WebCodex Computer screenshot card that performs only the standard MCP Apps handshake and renders the native computer_snapshot image.",
-            "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
-            "_meta": mcp_computer_app_resource_meta()
-        }]
+        "resources": [
+            {
+                "uri": MCP_COMPUTER_UI_RESOURCE_URI,
+                "name": "WebCodex Computer",
+                "description": "Minimal read-only WebCodex Computer screenshot card that performs only the standard MCP Apps handshake and renders the native computer_snapshot image.",
+                "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
+                "_meta": mcp_computer_app_resource_meta()
+            },
+            {
+                "uri": MCP_COMPUTER_APP_PROBE_RESOURCE_URI,
+                "name": "WebCodex Computer App Probe",
+                "description": "Experimental control card that performs the same minimal MCP Apps handshake and renders one tiny deterministic tool result without Runner or image content.",
+                "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
+                "_meta": mcp_computer_app_resource_meta()
+            }
+        ]
     })
 }
 
 fn is_mcp_computer_app_resource_uri(uri: &str) -> bool {
-    uri == MCP_COMPUTER_UI_RESOURCE_URI || MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS.contains(&uri)
+    uri == MCP_COMPUTER_UI_RESOURCE_URI
+        || uri == MCP_COMPUTER_APP_PROBE_RESOURCE_URI
+        || MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS.contains(&uri)
 }
 
 fn mcp_computer_app_resource_read(uri: &str) -> Option<Value> {
     // ChatGPT can retain an older tool descriptor across connector refreshes.
     // Keep prior computer App URIs as hidden read aliases so an already-bound
     // card can fetch the current safe template. resources/list and tools/list
-    // still advertise only the canonical URI above.
-    let supported = is_mcp_computer_app_resource_uri(uri);
-    supported.then(|| {
-        json!({
-            "contents": [{
-                "uri": uri,
-                "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
-                "text": MCP_COMPUTER_APP_HTML,
-                "_meta": mcp_computer_app_resource_meta()
-            }]
-        })
-    })
+    // still advertise only canonical URIs.
+    let text = if uri == MCP_COMPUTER_APP_PROBE_RESOURCE_URI {
+        MCP_COMPUTER_APP_PROBE_HTML
+    } else if uri == MCP_COMPUTER_UI_RESOURCE_URI
+        || MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS.contains(&uri)
+    {
+        MCP_COMPUTER_APP_HTML
+    } else {
+        return None;
+    };
+    Some(json!({
+        "contents": [{
+            "uri": uri,
+            "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
+            "text": text,
+            "_meta": mcp_computer_app_resource_meta()
+        }]
+    }))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -816,6 +887,25 @@ fn mcp_expire_artifact_export_for_test(uri: &str) {
             record.expires_at = Instant::now();
         }
     }
+}
+
+fn mcp_computer_app_probe_tool_result() -> Value {
+    json!({
+        "content": [{
+            "type": "text",
+            "text": "WebCodex Computer App probe OK"
+        }],
+        "structuredContent": {
+            "success": true,
+            "output": {
+                "probe": "ok",
+                "payload": "tiny",
+                "runner_used": false
+            },
+            "error": Value::Null
+        },
+        "isError": false
+    })
 }
 
 pub(crate) fn mcp_runtime_tool_result(
@@ -2106,9 +2196,9 @@ async fn handle_mcp_request_with_lifecycle(
                 ));
             };
             let mut result = mcp_stateless_result(result, true);
-            // Only the canonical versioned URI is immutable for caching. Hidden
-            // legacy URIs intentionally alias the current HTML and remain stale.
-            if uri == MCP_COMPUTER_UI_RESOURCE_URI {
+            // Canonical versioned App URIs are immutable for caching. Hidden
+            // legacy Computer URIs intentionally alias the current HTML and remain stale.
+            if uri == MCP_COMPUTER_UI_RESOURCE_URI || uri == MCP_COMPUTER_APP_PROBE_RESOURCE_URI {
                 result["ttlMs"] = Value::from(MCP_COMPUTER_UI_RESOURCE_TTL_MS);
             }
             rpc_result(id, result)
@@ -2148,6 +2238,49 @@ async fn handle_mcp_request_with_lifecycle(
                         "tool '{}' is not available on the local_coding MCP surface; the full operator runtime must be selected explicitly with WEBCODEX_MCP_MODEL_SURFACE=full-operator-v1",
                         params.name
                     ),
+                ));
+            }
+            if params.name == MCP_COMPUTER_APP_PROBE_TOOL_NAME {
+                if !stateless_2026 || runtime.model_surface() != ModelSurface::FullOperatorRuntime {
+                    if let Some(lc) = lifecycle.as_deref() {
+                        lc.dispatch_failed("surface_denied");
+                        lc.dispatch_finished(false, Some(false), "surface_denied");
+                    }
+                    return McpOutcome::BadRequest(rpc_error(
+                        id,
+                        -32602,
+                        "computer_app_probe requires the stateless-2026 full-operator MCP surface",
+                    ));
+                }
+                let arguments_valid = params.arguments.is_null()
+                    || params
+                        .arguments
+                        .as_object()
+                        .is_some_and(|arguments| arguments.is_empty());
+                if !arguments_valid {
+                    if let Some(lc) = lifecycle.as_deref() {
+                        lc.dispatch_failed("invalid_arguments");
+                        lc.dispatch_finished(false, Some(false), "invalid_arguments");
+                    }
+                    return McpOutcome::BadRequest(rpc_error(
+                        id,
+                        -32602,
+                        "computer_app_probe accepts no arguments",
+                    ));
+                }
+                if let Some(outcome) = require_mcp_scope(auth, crate::auth::SCOPE_RUNTIME_READ) {
+                    if let Some(lc) = lifecycle.as_deref() {
+                        lc.dispatch_failed("forbidden");
+                        lc.dispatch_finished(false, Some(false), "forbidden");
+                    }
+                    return outcome;
+                }
+                if let Some(lc) = lifecycle.as_deref() {
+                    lc.dispatch_finished(true, Some(true), "success");
+                }
+                return McpOutcome::Ok(rpc_result(
+                    id,
+                    mcp_stateless_result(mcp_computer_app_probe_tool_result(), false),
                 ));
             }
             let artifact_export_caller = if params.name == "export_project_artifact" {

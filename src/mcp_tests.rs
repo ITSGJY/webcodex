@@ -516,6 +516,221 @@ async fn mcp_2026_computer_app_is_minimal_handshake_and_snapshot_only() {
 }
 
 #[tokio::test]
+async fn mcp_2026_computer_app_probe_is_mcp_only_tiny_result_control() {
+    let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
+    assert_eq!(
+        MCP_COMPUTER_APP_PROBE_RESOURCE_URI,
+        "ui://webcodex/computer-probe/v1"
+    );
+    assert!(registered_tool_specs()
+        .iter()
+        .all(|spec| spec.name != MCP_COMPUTER_APP_PROBE_TOOL_NAME));
+
+    let legacy_tools = handle_mcp_request(
+        &runtime,
+        rpc("tools/list", Some(json!(2110)), json!({})),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(legacy_tools) = legacy_tools else {
+        panic!("expected legacy tools/list");
+    };
+    assert!(legacy_tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|tool| tool["name"] != MCP_COMPUTER_APP_PROBE_TOOL_NAME));
+
+    let tools = handle_mcp_request(
+        &runtime,
+        rpc("tools/list", Some(json!(2111)), mcp_2026_params(json!({}))),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(tools) = tools else {
+        panic!("expected stateless tools/list");
+    };
+    let probe = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == MCP_COMPUTER_APP_PROBE_TOOL_NAME)
+        .expect("MCP-only computer app probe");
+    assert_eq!(
+        probe["_meta"],
+        json!({
+            "ui": {
+                "resourceUri": MCP_COMPUTER_APP_PROBE_RESOURCE_URI,
+                "visibility": ["model", "app"]
+            },
+            "openai/outputTemplate": MCP_COMPUTER_APP_PROBE_RESOURCE_URI
+        })
+    );
+    assert_eq!(probe["inputSchema"]["type"], "object");
+    assert!(probe["inputSchema"]["properties"]
+        .as_object()
+        .unwrap()
+        .is_empty());
+    assert_eq!(probe["inputSchema"]["additionalProperties"], false);
+    assert!(probe["outputSchema"].is_object());
+    assert_eq!(probe["annotations"]["readOnlyHint"], true);
+    assert_eq!(probe["annotations"]["openWorldHint"], false);
+
+    let compact =
+        mcp_tools_list_payload_with_compact_and_app(ModelSurface::FullOperatorRuntime, true, true);
+    let compact_probe = compact["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == MCP_COMPUTER_APP_PROBE_TOOL_NAME)
+        .expect("compact MCP-only computer app probe");
+    assert!(compact_probe.get("outputSchema").is_none());
+    assert_eq!(compact_probe["_meta"], probe["_meta"]);
+
+    let resources = handle_mcp_request(
+        &runtime,
+        rpc(
+            "resources/list",
+            Some(json!(2112)),
+            mcp_2026_ui_params(json!({})),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(resources) = resources else {
+        panic!("expected UI resources/list");
+    };
+    let resources = resources["result"]["resources"].as_array().unwrap();
+    assert_eq!(resources.len(), 2);
+    let probe_resource = resources
+        .iter()
+        .find(|resource| resource["uri"] == MCP_COMPUTER_APP_PROBE_RESOURCE_URI)
+        .expect("probe resource");
+    assert_eq!(probe_resource["mimeType"], MCP_UI_RESOURCE_MIME_TYPE);
+    assert_eq!(probe_resource["_meta"], mcp_computer_app_resource_meta());
+
+    let resource = handle_mcp_request(
+        &runtime,
+        rpc(
+            "resources/read",
+            Some(json!(2113)),
+            mcp_2026_params(json!({ "uri": MCP_COMPUTER_APP_PROBE_RESOURCE_URI })),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(resource) = resource else {
+        panic!("expected probe resources/read without repeated UI capability");
+    };
+    assert_eq!(
+        resource["result"]["ttlMs"],
+        Value::from(MCP_COMPUTER_UI_RESOURCE_TTL_MS)
+    );
+    assert_eq!(resource["result"]["cacheScope"], "private");
+    assert_eq!(
+        resource["result"]["contents"][0]["uri"],
+        MCP_COMPUTER_APP_PROBE_RESOURCE_URI
+    );
+    assert_eq!(
+        resource["result"]["contents"][0]["text"].as_str(),
+        Some(MCP_COMPUTER_APP_PROBE_HTML)
+    );
+    let html = resource["result"]["contents"][0]["text"].as_str().unwrap();
+    for expected in [
+        "HTML loaded",
+        "ui/initialize",
+        "2026-01-26",
+        "ui/notifications/initialized",
+        "ui/notifications/tool-result",
+        "probe result received",
+        "Tiny tool result rendered successfully.",
+        "no Runner",
+    ] {
+        assert!(
+            html.contains(expected),
+            "missing {expected} in probe App HTML"
+        );
+    }
+    for forbidden in [
+        "<img",
+        ";base64,",
+        "content_delivery",
+        "computer_snapshot",
+        "tools/call",
+        "ui/request-display-mode",
+        "ui/update-model-context",
+        "ui/message",
+    ] {
+        assert!(
+            !html.contains(forbidden),
+            "probe App HTML must not contain {forbidden}"
+        );
+    }
+
+    let call = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(2114)),
+            mcp_2026_params(json!({
+                "name": MCP_COMPUTER_APP_PROBE_TOOL_NAME,
+                "arguments": {}
+            })),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(call) = call else {
+        panic!("expected probe tools/call");
+    };
+    assert_eq!(call["result"]["resultType"], "complete");
+    assert_eq!(call["result"]["isError"], false);
+    assert_eq!(
+        call["result"]["content"],
+        json!([{ "type": "text", "text": "WebCodex Computer App probe OK" }])
+    );
+    assert_eq!(call["result"]["structuredContent"]["success"], true);
+    assert_eq!(
+        call["result"]["structuredContent"]["output"],
+        json!({ "probe": "ok", "payload": "tiny", "runner_used": false })
+    );
+    assert!(call["result"]["structuredContent"]["error"].is_null());
+
+    let invalid = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(2115)),
+            mcp_2026_params(json!({
+                "name": MCP_COMPUTER_APP_PROBE_TOOL_NAME,
+                "arguments": { "unexpected": true }
+            })),
+        ),
+        None,
+    )
+    .await;
+    match invalid {
+        McpOutcome::BadRequest(value) => assert_eq!(value["error"]["code"], -32602),
+        other => panic!("probe must reject arguments, got {other:?}"),
+    }
+
+    let legacy_call = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(2116)),
+            json!({ "name": MCP_COMPUTER_APP_PROBE_TOOL_NAME, "arguments": {} }),
+        ),
+        None,
+    )
+    .await;
+    match legacy_call {
+        McpOutcome::BadRequest(value) => assert_eq!(value["error"]["code"], -32602),
+        other => panic!("probe must remain stateless-2026-only, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn mcp_info_advertised_methods_match_dispatch() {
     let runtime = test_runtime();
     for method in MCP_INFO_METHODS {
@@ -565,6 +780,8 @@ async fn mcp_tools_list_returns_same_names_as_runtime() {
         .filter(|name| name.as_str() != "export_project_artifact")
         .cloned()
         .collect();
+    let mut stateless_mcp_names = runtime_names.clone();
+    stateless_mcp_names.push(MCP_COMPUTER_APP_PROBE_TOOL_NAME.to_string());
 
     for compact in [false, true] {
         if compact {
@@ -613,8 +830,8 @@ async fn mcp_tools_list_returns_same_names_as_runtime() {
             .map(|tool| tool["name"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(
-            stateless_names, runtime_names,
-            "stateless-2026 tools/list must match the full runtime registry (compact={compact})"
+            stateless_names, stateless_mcp_names,
+            "stateless-2026 tools/list must match the full runtime registry plus explicit MCP-only adapters (compact={compact})"
         );
         // Exercise the real env adapter, not just the pure renderer: compact
         // must change outputSchema shape while preserving the common fields.
@@ -5280,6 +5497,51 @@ async fn http_mcp_2026_reads_computer_app_template_with_cache_contract() {
     assert!(html.contains("ui/notifications/tool-result"));
     assert!(!html.contains("tools/call"));
     assert!(!html.contains("ui/request-display-mode"));
+}
+
+#[tokio::test]
+async fn http_mcp_2026_calls_computer_app_probe_with_tiny_result() {
+    let config = test_config(Some("secret"));
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let service = Service::new(build_test_router(config, db, runtime));
+    let params = mcp_2026_ui_params(json!({
+        "name": MCP_COMPUTER_APP_PROBE_TOOL_NAME,
+        "arguments": {}
+    }));
+
+    let mut response = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_STATELESS_PROTOCOL_VERSION,
+            true,
+        )
+        .add_header(MCP_METHOD_HEADER, "tools/call", true)
+        .add_header(MCP_NAME_HEADER, MCP_COMPUTER_APP_PROBE_TOOL_NAME, true)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2061,
+            "method": "tools/call",
+            "params": params
+        }))
+        .send(&service)
+        .await;
+
+    assert_eq!(effective_status(&response), StatusCode::OK);
+    let body: Value = response.take_json().await.unwrap();
+    assert_eq!(body["result"]["resultType"], "complete");
+    assert_eq!(body["result"]["isError"], false);
+    assert_eq!(body["result"]["structuredContent"]["success"], true);
+    assert_eq!(
+        body["result"]["structuredContent"]["output"],
+        json!({ "probe": "ok", "payload": "tiny", "runner_used": false })
+    );
+    assert!(body["result"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item["type"] != "image"));
 }
 
 #[tokio::test]
