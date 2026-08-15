@@ -472,8 +472,7 @@ fn mcp_tool_spec_json(mut spec: ToolSpec, compact: bool, app_enabled: bool) -> V
                         "resourceUri": MCP_COMPUTER_UI_RESOURCE_URI,
                         "visibility": ["model", "app"]
                     },
-                    "ui/resourceUri": MCP_COMPUTER_UI_RESOURCE_URI,
-                    "openai/outputTemplate": MCP_COMPUTER_UI_RESOURCE_URI
+                    "ui/resourceUri": MCP_COMPUTER_UI_RESOURCE_URI
                 }),
             );
         }

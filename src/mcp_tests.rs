@@ -278,10 +278,7 @@ async fn mcp_2026_computer_app_is_progressive_and_snapshot_only() {
         snapshot["_meta"]["ui/resourceUri"],
         MCP_COMPUTER_UI_RESOURCE_URI
     );
-    assert_eq!(
-        snapshot["_meta"]["openai/outputTemplate"],
-        MCP_COMPUTER_UI_RESOURCE_URI
-    );
+    assert!(snapshot["_meta"].get("openai/outputTemplate").is_none());
     let list_windows = tools
         .iter()
         .find(|tool| tool["name"] == "computer_list_windows")
@@ -300,6 +297,13 @@ async fn mcp_2026_computer_app_is_progressive_and_snapshot_only() {
         compact_snapshot["_meta"]["ui"]["resourceUri"],
         MCP_COMPUTER_UI_RESOURCE_URI
     );
+    assert_eq!(
+        compact_snapshot["_meta"]["ui/resourceUri"],
+        MCP_COMPUTER_UI_RESOURCE_URI
+    );
+    assert!(compact_snapshot["_meta"]
+        .get("openai/outputTemplate")
+        .is_none());
 
     let resources = handle_mcp_request(
         &runtime,
@@ -469,9 +473,10 @@ async fn mcp_2026_computer_app_is_progressive_and_snapshot_only() {
         MCP_COMPUTER_UI_RESOURCE_URI
     );
     assert_eq!(
-        snapshot["_meta"]["openai/outputTemplate"],
+        snapshot["_meta"]["ui/resourceUri"],
         MCP_COMPUTER_UI_RESOURCE_URI
     );
+    assert!(snapshot["_meta"].get("openai/outputTemplate").is_none());
 
     let no_ui_resources = handle_mcp_request(
         &runtime,
