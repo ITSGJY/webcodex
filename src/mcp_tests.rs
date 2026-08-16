@@ -1920,6 +1920,60 @@ async fn mcp_2026_computer_app_image_matrix_probe_covers_codec_dimension_payload
     }
 }
 
+#[test]
+fn mcp_computer_snapshot_output_schema_matches_native_image_framing() {
+    let runtime_spec = registered_tool_specs()
+        .into_iter()
+        .find(|spec| spec.name == "computer_snapshot")
+        .expect("computer_snapshot runtime spec");
+    let runtime_properties = runtime_spec.output_schema["properties"]["output"]["properties"]
+        .as_object()
+        .expect("runtime computer_snapshot output properties");
+    assert!(runtime_properties.contains_key("content_base64"));
+    assert!(!runtime_properties.contains_key("content_delivery"));
+
+    let legacy = mcp_tools_list_payload_with_compact_and_app(
+        ModelSurface::FullOperatorRuntime,
+        false,
+        false,
+    );
+    let stateless_with_app =
+        mcp_tools_list_payload_with_compact_and_app(ModelSurface::FullOperatorRuntime, false, true);
+    for payload in [&legacy, &stateless_with_app] {
+        let tool = payload["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "computer_snapshot")
+            .expect("MCP computer_snapshot descriptor");
+        let properties = tool["outputSchema"]["properties"]["output"]["properties"]
+            .as_object()
+            .expect("MCP computer_snapshot output properties");
+        assert!(!properties.contains_key("content_base64"));
+        assert_eq!(properties["content_delivery"]["type"], "string");
+        assert_eq!(properties["content_delivery"]["const"], "mcp_image");
+    }
+
+    for tool in stateless_with_app["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|tool| {
+            matches!(
+                tool["name"].as_str(),
+                Some(MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME)
+                    | Some(MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_TOOL_NAME)
+            )
+        })
+    {
+        let properties = tool["outputSchema"]["properties"]["output"]["properties"]
+            .as_object()
+            .expect("snapshot probe MCP output properties");
+        assert!(!properties.contains_key("content_base64"));
+        assert_eq!(properties["content_delivery"]["const"], "mcp_image");
+    }
+}
+
 #[tokio::test]
 async fn mcp_2026_computer_app_snapshot_probe_delegates_to_real_snapshot_contract() {
     let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
@@ -1971,7 +2025,12 @@ async fn mcp_2026_computer_app_snapshot_probe_delegates_to_real_snapshot_contrac
         .find(|tool| tool["name"] == MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME)
         .expect("MCP-only computer app snapshot probe");
     assert_eq!(snapshot_probe["inputSchema"], snapshot_spec.input_schema);
-    assert_eq!(snapshot_probe["outputSchema"], snapshot_spec.output_schema);
+    let mut expected_snapshot_probe_spec = snapshot_spec.clone();
+    adapt_computer_snapshot_output_schema_for_mcp(&mut expected_snapshot_probe_spec);
+    assert_eq!(
+        snapshot_probe["outputSchema"],
+        expected_snapshot_probe_spec.output_schema
+    );
     assert_eq!(
         snapshot_probe["annotations"]["title"],
         "Computer App Snapshot Probe"
@@ -2187,7 +2246,12 @@ async fn mcp_2026_computer_app_snapshot_decode_probe_delegates_to_real_snapshot_
         .find(|tool| tool["name"] == MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_TOOL_NAME)
         .expect("MCP-only computer snapshot decode probe");
     assert_eq!(decode_probe["inputSchema"], snapshot_spec.input_schema);
-    assert_eq!(decode_probe["outputSchema"], snapshot_spec.output_schema);
+    let mut expected_decode_probe_spec = snapshot_spec.clone();
+    adapt_computer_snapshot_output_schema_for_mcp(&mut expected_decode_probe_spec);
+    assert_eq!(
+        decode_probe["outputSchema"],
+        expected_decode_probe_spec.output_schema
+    );
     assert_eq!(
         decode_probe["annotations"]["title"],
         "Computer Snapshot Decode Probe"
