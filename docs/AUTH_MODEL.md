@@ -177,6 +177,14 @@ metadata. Dynamic client registration, OIDC, JWKS/JWT ID tokens, and the
 device-code flow are not implemented. OAuth setup steps are in
 [Deployment](DEPLOYMENT.md#oauth2).
 
+An OAuth client's `allowed_scopes` is a registration-time delegation ceiling and
+is never automatically widened when WebCodex adds a new permission such as
+`computer:control`. First-party operators may explicitly replace an active client's
+complete allow-list with `POST /api/oauth/clients/update_scopes`. A real change
+atomically revokes that client's existing access tokens, refresh tokens, and
+outstanding authorization codes, so the client must complete OAuth authorization
+again before using the new scope set.
+
 ## Scope enforcement and credential surfaces
 
 WebCodex treats scope permission and credential identity as separate checks.
@@ -210,34 +218,59 @@ an OAuth error. This changes only response framing, not the required scope.
 
 `computer:read` is the dedicated scope for read-only desktop/window observation.
 It authorizes the model-facing `computer_list_targets`, `computer_list_windows`,
-`computer_accessibility_status`, `computer_accessibility_tree`, and
-`computer_snapshot` tools; it is separate from `runtime:read`, `project:read`,
+`computer_accessibility_status`, `computer_accessibility_tree`,
+`computer_find_elements`, `computer_element_state`, and `computer_snapshot` tools; it is separate from
+`runtime:read`, `project:read`,
 `job:run`, and `computer:control`, and none of those scopes imply it.
+
+`computer_save_snapshot` is intentionally not a read-only Computer tool even though its capture phase is observational. It persists a bounded image into a project and therefore requires **both** `computer:read` and `project:write`. The Server reuses the exact Computer snapshot capability checks for the source Runner and independently requires the target project Runner to retain `file_write` at write admission. The operation is create-only; a lost response after possible artifact dispatch is `outcome_unknown` and is reconciled against the exact project/path with `read_project_artifact_metadata` and the expected digest, byte count, and MIME before any retry.
 
 `computer_list_targets` closes the target-discovery loop without widening
 `runtime:read`: it returns only caller-visible Runners that advertise
 `computer_observe` and/or `computer_accessibility_observe`, projected to the
-minimum client identity, connection state, and those two capability facts. It
+minimum client identity, connection state, plus the additive
+`computer_snapshot_region` capability fact. It
 does not expose the broader projects, policy, jobs, host, or provider inventory
 from `list_agents`.
 
-`computer:control` is the separate effect scope for `computer_control` and
-`computer_input_text`. `computer_control` is deliberately closed to native macOS
-Accessibility press and focus actions. `computer_input_text` writes bounded text
-through native AXValue only to an already focused, enabled when known, empty,
-non-secure, unprotected supported text element. There is no coordinate-click,
-keypress, scrolling, dragging, clipboard, app-launch, AppleScript, shell,
-paste, or synthetic-keystroke fallback in this contract. A lost response after
-an effect may have been dispatched is reported as an unknown outcome and must be
-reconciled by observing current UI state before any retry.
+`computer:control` is the separate effect scope for `computer_activate_window`,
+`computer_control`, `computer_scroll_to_element`, `computer_key_input`, and `computer_input_text`.
+`computer_activate_window` may activate/raise only an exact previously observed
+`surface_id`; it cannot select or launch an application by name, PID, bundle,
+executable, path, or command. `computer_control` remains deliberately closed to
+native macOS Accessibility press and focus actions. `computer_scroll_to_element`
+is a separate semantic effect that revalidates one exact observed element and
+uses native AX scroll-to-visible only when that element supports it; callers do
+not supply wheel deltas, direction, distance, or coordinates. `computer_key_input`
+is a separate closed effect for Enter, Escape, Tab, arrows, paging/home/end plus
+bounded modifiers. The exact `surface_id` must still be the frontmost focused
+window, and the Runner does not focus or activate it implicitly. Ordinary text,
+arbitrary characters/keycodes, repeat counts, or held-key state are not accepted.
+`computer_input_text` writes bounded text through native AXValue only to an already
+focused, enabled when known, empty, non-secure, unprotected supported text element.
+There is no coordinate-click, generic wheel, open-ended key input, dragging,
+clipboard, app-launch, AppleScript, shell, paste, or implicit-focus fallback in this contract. A
+lost response after an effect may have been dispatched is reported as an
+unknown outcome and must be reconciled by observing current UI state before any
+retry. A native key press is delivered as two adjacent PID-targeted key-down and
+key-up posts after all preflight work is complete; Quartz exposes no batch post,
+so Runner termination in the narrow interval between them is a partial
+`outcome_unknown`, not a caller-controlled held-key mode.
 
 Scopes are only one layer of the check. After target discovery, observation and
 effect calls name one exact Runner `client_id`, and the Server also requires
 caller access/ownership for that Runner plus the independently advertised
-capability for the requested operation: `computer_observe` for window
-observation/snapshot, `computer_accessibility_observe` for Accessibility
-observation, `computer_control` for press/focus, and `computer_text_input` for
-bounded text input. The existing shared-key OAuth bridge/default Connector scope
+capabilities for the requested operation: `computer_observe` for window
+observation and all window snapshots, with `computer_snapshot_region`
+additionally required for snapshot requests that add a surface-relative region
+and/or output dimension bound; `computer_accessibility_observe` for Accessibility tree observation,
+`computer_element_state` for normalized state of one exact observed
+element, `computer_window_activate` for exact window activation/raise,
+`computer_control` for press/focus, `computer_scroll_to_element` for native
+semantic scroll-to-visible, `computer_key_input` for closed focused-window key
+input, and `computer_text_input` for bounded text input.
+Element-state observation re-resolves the existing ephemeral handle and
+returns no AXValue; protected/secure elements suppress even `value_empty`. The existing shared-key OAuth bridge/default Connector scope
 intentionally grants neither Computer scope, and these Computer tools are
 exposed only on `full_operator_runtime`, not the canonical Connector surface.
 

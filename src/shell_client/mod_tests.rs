@@ -1,7 +1,8 @@
 use super::*;
 use crate::lsp_bridge::{AgentLspPayload, AgentLspRequest};
 use crate::shell_protocol::{
-    AGENT_PROTOCOL_VERSION_QUIC_V1, SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_PACKAGES,
+    ShellCommandExecutionState, AGENT_PROTOCOL_VERSION_QUIC_V1,
+    SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_PACKAGES,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_TOOL,
 };
 
@@ -1705,8 +1706,13 @@ async fn client_supports_recognizes_all_protocol_capability_names() {
                 project_lifecycle: true,
                 project_path_registration: true,
                 computer_observe: true,
+                computer_snapshot_region: true,
                 computer_accessibility_observe: true,
+                computer_element_state: true,
                 computer_control: true,
+                computer_scroll_to_element: true,
+                computer_key_input: true,
+                computer_window_activate: true,
                 computer_text_input: true,
                 job_state_reconciliation: true,
             }),
@@ -1996,6 +2002,7 @@ async fn register_computer_test_client(
                 computer_observe: observe_capable,
                 computer_accessibility_observe: accessibility_capable,
                 computer_control: control_capable,
+                computer_window_activate: false,
                 computer_text_input: text_input_capable,
                 ..Default::default()
             }),
@@ -2085,6 +2092,428 @@ async fn computer_enqueue_requires_exact_owner_and_distinct_capability() {
 }
 
 #[tokio::test]
+async fn computer_snapshot_artifact_requires_current_target_project_and_file_write_under_registry_lock(
+) {
+    let registry = ShellClientRegistry::default();
+    let alice = auth_context(Some("alice"), false);
+    let request = |client_id: &str| {
+        ShellFileOpRequest {
+        op: "save_project_artifact".to_string(),
+        client_id: client_id.to_string(),
+        path: "artifacts/ui.jpg".to_string(),
+        cwd: Some("/tmp/project".to_string()),
+        content: Some(
+            r#"{"path":"artifacts/ui.jpg","content_base64":"/9j/4A==","mime_type":"image/jpeg","overwrite":false,"max_bytes":1048576}"#
+                .to_string(),
+        ),
+        max_bytes: None,
+        old_text: None,
+        pattern: None,
+        expected_sha256: None,
+        expected_prefix: None,
+        start_line: None,
+        end_line: None,
+        line: None,
+        create_dirs: false,
+        wait_timeout_secs: 60,
+    }
+    };
+    let register = |client_id: &str, instance_id: &str, file_write: bool, project_path: &str| {
+        ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
+            job_concurrency_limit: None,
+            job_inventory: None,
+            client_id: client_id.to_string(),
+            agent_instance_id: instance_id.to_string(),
+            display_name: None,
+            owner: Some("alice".to_string()),
+            hostname: None,
+            host_context: None,
+            capabilities: Some(ShellClientCapabilities {
+                shell: true,
+                file_read: true,
+                file_write,
+                ..Default::default()
+            }),
+            projects: Some(vec![project_summary("demo", project_path)]),
+            agent_protocol_version: None,
+            policy: None,
+        }
+    };
+
+    registry
+        .register(register(
+            "computer-artifact-no-write",
+            "artifact-no-write-inst",
+            false,
+            "/tmp/project",
+        ))
+        .await
+        .unwrap();
+    let error = registry
+        .enqueue_computer_snapshot_artifact(
+            request("computer-artifact-no-write"),
+            "demo",
+            "/tmp/project",
+            "alice".to_string(),
+            Some(&alice),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("file_write"), "{error}");
+
+    registry
+        .register(register(
+            "computer-artifact-write",
+            "artifact-inst",
+            true,
+            "/tmp/project",
+        ))
+        .await
+        .unwrap();
+    let (request_id, _rx) = registry
+        .enqueue_computer_snapshot_artifact(
+            request("computer-artifact-write"),
+            "demo",
+            "/tmp/project",
+            "alice".to_string(),
+            Some(&alice),
+        )
+        .await
+        .unwrap();
+    let queued = registry
+        .poll(ShellAgentPollRequest {
+            client_id: "computer-artifact-write".to_string(),
+            agent_instance_id: "artifact-inst".to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap()
+        .expect("snapshot artifact request should be queued");
+    assert_eq!(queued.request_id, request_id);
+    assert_eq!(queued.kind, "file_save_project_artifact");
+    assert_eq!(queued.path.as_deref(), Some("artifacts/ui.jpg"));
+    assert_eq!(queued.cwd.as_deref(), Some("/tmp/project"));
+    assert!(queued.command.is_empty());
+
+    registry
+        .register(register(
+            "computer-artifact-poll-change",
+            "artifact-poll-inst",
+            true,
+            "/tmp/project",
+        ))
+        .await
+        .unwrap();
+    let (_request_id, response_rx) = registry
+        .enqueue_computer_snapshot_artifact(
+            request("computer-artifact-poll-change"),
+            "demo",
+            "/tmp/project",
+            "alice".to_string(),
+            Some(&alice),
+        )
+        .await
+        .unwrap();
+    // Poll may refresh project projection for the same process. The pending
+    // placement fence is checked after that refresh but before dispatched=true.
+    assert!(registry
+        .poll(ShellAgentPollRequest {
+            client_id: "computer-artifact-poll-change".to_string(),
+            agent_instance_id: "artifact-poll-inst".to_string(),
+            projects: Some(vec![project_summary("demo", "/tmp/replaced")]),
+        })
+        .await
+        .unwrap()
+        .is_none());
+    let response = tokio::time::timeout(std::time::Duration::from_secs(1), response_rx)
+        .await
+        .expect("stale placement response timed out")
+        .expect("stale placement response channel closed");
+    assert!(!response.success);
+    assert_eq!(response.request_dispatched, Some(false));
+    assert_eq!(
+        response.command_execution_state,
+        Some(ShellCommandExecutionState::NotStarted)
+    );
+    assert!(
+        response
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("stale_project"),
+        "{response:?}"
+    );
+
+    registry
+        .register(register(
+            "computer-artifact-cap-change",
+            "artifact-cap-inst",
+            true,
+            "/tmp/project",
+        ))
+        .await
+        .unwrap();
+    let (_request_id, response_rx) = registry
+        .enqueue_computer_snapshot_artifact(
+            request("computer-artifact-cap-change"),
+            "demo",
+            "/tmp/project",
+            "alice".to_string(),
+            Some(&alice),
+        )
+        .await
+        .unwrap();
+    registry
+        .register(register(
+            "computer-artifact-cap-change",
+            "artifact-cap-inst",
+            false,
+            "/tmp/project",
+        ))
+        .await
+        .unwrap();
+    assert!(registry
+        .poll(ShellAgentPollRequest {
+            client_id: "computer-artifact-cap-change".to_string(),
+            agent_instance_id: "artifact-cap-inst".to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap()
+        .is_none());
+    let response = tokio::time::timeout(std::time::Duration::from_secs(1), response_rx)
+        .await
+        .expect("capability downgrade response timed out")
+        .expect("capability downgrade response channel closed");
+    assert_eq!(response.request_dispatched, Some(false));
+    assert_eq!(
+        response.command_execution_state,
+        Some(ShellCommandExecutionState::NotStarted)
+    );
+    assert!(
+        response
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("stale_authority"),
+        "{response:?}"
+    );
+
+    registry
+        .register(register(
+            "computer-artifact-owner-change",
+            "artifact-owner-inst",
+            true,
+            "/tmp/project",
+        ))
+        .await
+        .unwrap();
+    let (_request_id, response_rx) = registry
+        .enqueue_computer_snapshot_artifact(
+            request("computer-artifact-owner-change"),
+            "demo",
+            "/tmp/project",
+            "alice".to_string(),
+            Some(&alice),
+        )
+        .await
+        .unwrap();
+    let mut changed_owner = register(
+        "computer-artifact-owner-change",
+        "artifact-owner-inst",
+        true,
+        "/tmp/project",
+    );
+    changed_owner.owner = Some("bob".to_string());
+    registry.register(changed_owner).await.unwrap();
+    assert!(registry
+        .poll(ShellAgentPollRequest {
+            client_id: "computer-artifact-owner-change".to_string(),
+            agent_instance_id: "artifact-owner-inst".to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap()
+        .is_none());
+    let response = tokio::time::timeout(std::time::Duration::from_secs(1), response_rx)
+        .await
+        .expect("owner change response timed out")
+        .expect("owner change response channel closed");
+    assert_eq!(response.request_dispatched, Some(false));
+    assert_eq!(
+        response.command_execution_state,
+        Some(ShellCommandExecutionState::NotStarted)
+    );
+    assert!(
+        response
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("stale_authority"),
+        "{response:?}"
+    );
+
+    registry
+        .register(register(
+            "computer-artifact-replaced",
+            "artifact-replaced-inst",
+            true,
+            "/tmp/project",
+        ))
+        .await
+        .unwrap();
+    // Model a placement captured before a reconnect: by admission time the same
+    // Runner identity reports the project at a different path.
+    registry
+        .register(register(
+            "computer-artifact-replaced",
+            "artifact-replaced-inst",
+            true,
+            "/tmp/replaced",
+        ))
+        .await
+        .unwrap();
+    let error = registry
+        .enqueue_computer_snapshot_artifact(
+            request("computer-artifact-replaced"),
+            "demo",
+            "/tmp/project",
+            "alice".to_string(),
+            Some(&alice),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("stale_project"), "{error}");
+    assert!(registry
+        .poll(ShellAgentPollRequest {
+            client_id: "computer-artifact-replaced".to_string(),
+            agent_instance_id: "artifact-replaced-inst".to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn computer_snapshot_region_requires_additive_capability() {
+    let registry = ShellClientRegistry::default();
+    let alice = auth_context(Some("alice"), false);
+    register_computer_test_client(
+        &registry,
+        "computer-region-old",
+        "alice",
+        true,
+        false,
+        false,
+        false,
+    )
+    .await;
+    let payload = r#"{"surface_id":"surface_test","region":{"x":0,"y":0,"width":10,"height":10},"max_width":null,"max_height":null}"#;
+    let error = registry
+        .enqueue_computer(
+            "computer-region-old".to_string(),
+            "computer_snapshot_region",
+            payload.to_string(),
+            "alice".to_string(),
+            Some(&alice),
+            5,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("does not support computer_snapshot_region"));
+
+    registry
+        .register(ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
+            job_concurrency_limit: None,
+            job_inventory: None,
+            client_id: "computer-region-only".to_string(),
+            agent_instance_id: "computer-inst".to_string(),
+            display_name: None,
+            owner: Some("alice".to_string()),
+            hostname: None,
+            host_context: None,
+            capabilities: Some(ShellClientCapabilities {
+                shell: true,
+                file_read: true,
+                computer_observe: false,
+                computer_snapshot_region: true,
+                ..Default::default()
+            }),
+            projects: None,
+            agent_protocol_version: None,
+            policy: None,
+        })
+        .await
+        .unwrap();
+    let error = registry
+        .enqueue_computer(
+            "computer-region-only".to_string(),
+            "computer_snapshot_region",
+            payload.to_string(),
+            "alice".to_string(),
+            Some(&alice),
+            5,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("does not support computer_observe"));
+
+    registry
+        .register(ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
+            job_concurrency_limit: None,
+            job_inventory: None,
+            client_id: "computer-region-new".to_string(),
+            agent_instance_id: "computer-inst".to_string(),
+            display_name: None,
+            owner: Some("alice".to_string()),
+            hostname: None,
+            host_context: None,
+            capabilities: Some(ShellClientCapabilities {
+                shell: true,
+                file_read: true,
+                computer_observe: true,
+                computer_snapshot_region: true,
+                ..Default::default()
+            }),
+            projects: None,
+            agent_protocol_version: None,
+            policy: None,
+        })
+        .await
+        .unwrap();
+    let (_request_id, _rx) = registry
+        .enqueue_computer(
+            "computer-region-new".to_string(),
+            "computer_snapshot_region",
+            payload.to_string(),
+            "alice".to_string(),
+            Some(&alice),
+            5,
+        )
+        .await
+        .unwrap();
+    let request = registry
+        .poll(ShellAgentPollRequest {
+            client_id: "computer-region-new".to_string(),
+            agent_instance_id: "computer-inst".to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap()
+        .expect("queued region snapshot request");
+    assert_eq!(request.kind, "computer_snapshot_region");
+    assert_eq!(request.stdin.as_deref(), Some(payload));
+    assert!(request.command.is_empty());
+}
+
+#[tokio::test]
 async fn computer_accessibility_enqueue_requires_distinct_capability() {
     let registry = ShellClientRegistry::default();
     register_computer_test_client(&registry, "computer-ax", "alice", true, false, false, false)
@@ -2126,6 +2555,85 @@ async fn computer_accessibility_enqueue_requires_distinct_capability() {
         .unwrap()
         .expect("queued accessibility request");
     assert_eq!(request.kind, "computer_accessibility_tree");
+    assert!(request.command.is_empty());
+}
+
+#[tokio::test]
+async fn computer_element_state_requires_its_own_additive_capability() {
+    let registry = ShellClientRegistry::default();
+    let alice = auth_context(Some("alice"), false);
+    register_computer_test_client(
+        &registry,
+        "computer-state",
+        "alice",
+        true,
+        true,
+        false,
+        false,
+    )
+    .await;
+    let payload = r#"{"surface_id":"surface_test","element_id":"element_test"}"#;
+    let error = registry
+        .enqueue_computer(
+            "computer-state".to_string(),
+            "computer_element_state",
+            payload.to_string(),
+            "alice".to_string(),
+            Some(&alice),
+            5,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("does not support computer_element_state"));
+
+    registry
+        .register(ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
+            job_concurrency_limit: None,
+            job_inventory: None,
+            client_id: "computer-state-capable".to_string(),
+            agent_instance_id: "computer-inst".to_string(),
+            display_name: None,
+            owner: Some("alice".to_string()),
+            hostname: None,
+            host_context: None,
+            capabilities: Some(ShellClientCapabilities {
+                shell: true,
+                file_read: true,
+                computer_observe: true,
+                computer_accessibility_observe: true,
+                computer_element_state: true,
+                ..Default::default()
+            }),
+            projects: None,
+            agent_protocol_version: None,
+            policy: None,
+        })
+        .await
+        .unwrap();
+    let (_request_id, _rx) = registry
+        .enqueue_computer(
+            "computer-state-capable".to_string(),
+            "computer_element_state",
+            payload.to_string(),
+            "alice".to_string(),
+            Some(&alice),
+            5,
+        )
+        .await
+        .unwrap();
+    let request = registry
+        .poll(ShellAgentPollRequest {
+            client_id: "computer-state-capable".to_string(),
+            agent_instance_id: "computer-inst".to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap()
+        .expect("queued computer element-state request");
+    assert_eq!(request.kind, "computer_element_state");
+    assert_eq!(request.stdin.as_deref(), Some(payload));
     assert!(request.command.is_empty());
 }
 
@@ -2189,6 +2697,244 @@ async fn computer_control_enqueue_requires_independent_capability() {
         .unwrap()
         .expect("queued computer control request");
     assert_eq!(request.kind, "computer_control");
+    assert_eq!(request.stdin.as_deref(), Some(payload));
+    assert!(request.command.is_empty());
+    assert!(request.process.is_none());
+    assert!(request.script.is_none());
+}
+
+#[tokio::test]
+async fn computer_scroll_to_element_requires_independent_capability() {
+    let registry = ShellClientRegistry::default();
+    let alice = auth_context(Some("alice"), false);
+    register_computer_test_client(
+        &registry,
+        "computer-scroll-control-only",
+        "alice",
+        true,
+        true,
+        true,
+        false,
+    )
+    .await;
+    let payload = r#"{"surface_id":"surface_test","element_id":"element_test"}"#;
+    let error = registry
+        .enqueue_computer(
+            "computer-scroll-control-only".to_string(),
+            "computer_scroll_to_element",
+            payload.to_string(),
+            "alice".to_string(),
+            Some(&alice),
+            5,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("does not support computer_scroll_to_element"));
+
+    registry
+        .register(ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
+            job_concurrency_limit: None,
+            job_inventory: None,
+            client_id: "computer-scroll-capable".to_string(),
+            agent_instance_id: "computer-scroll-inst".to_string(),
+            display_name: None,
+            owner: Some("alice".to_string()),
+            hostname: None,
+            host_context: None,
+            capabilities: Some(ShellClientCapabilities {
+                computer_control: true,
+                computer_scroll_to_element: true,
+                ..Default::default()
+            }),
+            projects: None,
+            agent_protocol_version: None,
+            policy: None,
+        })
+        .await
+        .unwrap();
+    let (_request_id, _rx) = registry
+        .enqueue_computer(
+            "computer-scroll-capable".to_string(),
+            "computer_scroll_to_element",
+            payload.to_string(),
+            "alice".to_string(),
+            Some(&alice),
+            5,
+        )
+        .await
+        .unwrap();
+    let request = registry
+        .poll(ShellAgentPollRequest {
+            client_id: "computer-scroll-capable".to_string(),
+            agent_instance_id: "computer-scroll-inst".to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap()
+        .expect("queued computer scroll request");
+    assert_eq!(request.kind, "computer_scroll_to_element");
+    assert_eq!(request.stdin.as_deref(), Some(payload));
+    assert!(request.command.is_empty());
+    assert!(request.process.is_none());
+    assert!(request.script.is_none());
+}
+
+#[tokio::test]
+async fn computer_key_input_requires_independent_capability() {
+    let registry = ShellClientRegistry::default();
+    let alice = auth_context(Some("alice"), false);
+    register_computer_test_client(
+        &registry,
+        "computer-key-control-only",
+        "alice",
+        true,
+        true,
+        true,
+        false,
+    )
+    .await;
+    let payload = r#"{"surface_id":"surface_test","key":"tab","modifiers":["shift"]}"#;
+    let error = registry
+        .enqueue_computer(
+            "computer-key-control-only".to_string(),
+            "computer_key_input",
+            payload.to_string(),
+            "alice".to_string(),
+            Some(&alice),
+            5,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("does not support computer_key_input"));
+
+    registry
+        .register(ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
+            job_concurrency_limit: None,
+            job_inventory: None,
+            client_id: "computer-key-capable".to_string(),
+            agent_instance_id: "computer-key-inst".to_string(),
+            display_name: None,
+            owner: Some("alice".to_string()),
+            hostname: None,
+            host_context: None,
+            capabilities: Some(ShellClientCapabilities {
+                computer_control: true,
+                computer_key_input: true,
+                ..Default::default()
+            }),
+            projects: None,
+            agent_protocol_version: None,
+            policy: None,
+        })
+        .await
+        .unwrap();
+    let (_request_id, _rx) = registry
+        .enqueue_computer(
+            "computer-key-capable".to_string(),
+            "computer_key_input",
+            payload.to_string(),
+            "alice".to_string(),
+            Some(&alice),
+            5,
+        )
+        .await
+        .unwrap();
+    let request = registry
+        .poll(ShellAgentPollRequest {
+            client_id: "computer-key-capable".to_string(),
+            agent_instance_id: "computer-key-inst".to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap()
+        .expect("queued computer key-input request");
+    assert_eq!(request.kind, "computer_key_input");
+    assert_eq!(request.stdin.as_deref(), Some(payload));
+    assert!(request.command.is_empty());
+    assert!(request.process.is_none());
+    assert!(request.script.is_none());
+}
+
+#[tokio::test]
+async fn computer_window_activation_requires_its_own_additive_capability() {
+    let registry = ShellClientRegistry::default();
+    let alice = auth_context(Some("alice"), false);
+    register_computer_test_client(
+        &registry,
+        "computer-activate",
+        "alice",
+        true,
+        true,
+        true,
+        false,
+    )
+    .await;
+    let payload = r#"{"surface_id":"surface_test"}"#;
+    let error = registry
+        .enqueue_computer(
+            "computer-activate".to_string(),
+            "computer_activate_window",
+            payload.to_string(),
+            "alice".to_string(),
+            Some(&alice),
+            5,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("does not support computer_window_activate"));
+
+    registry
+        .register(ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
+            job_concurrency_limit: None,
+            job_inventory: None,
+            client_id: "computer-activate".to_string(),
+            agent_instance_id: "computer-inst".to_string(),
+            display_name: None,
+            owner: Some("alice".to_string()),
+            hostname: None,
+            host_context: None,
+            capabilities: Some(ShellClientCapabilities {
+                shell: true,
+                file_read: true,
+                computer_observe: true,
+                computer_accessibility_observe: true,
+                computer_control: true,
+                computer_window_activate: true,
+                ..Default::default()
+            }),
+            projects: None,
+            agent_protocol_version: None,
+            policy: None,
+        })
+        .await
+        .unwrap();
+    let (_request_id, _rx) = registry
+        .enqueue_computer(
+            "computer-activate".to_string(),
+            "computer_activate_window",
+            payload.to_string(),
+            "alice".to_string(),
+            Some(&alice),
+            5,
+        )
+        .await
+        .unwrap();
+    let request = registry
+        .poll(ShellAgentPollRequest {
+            client_id: "computer-activate".to_string(),
+            agent_instance_id: "computer-inst".to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap()
+        .expect("queued computer window activation request");
+    assert_eq!(request.kind, "computer_activate_window");
     assert_eq!(request.stdin.as_deref(), Some(payload));
     assert!(request.command.is_empty());
     assert!(request.process.is_none());

@@ -3,13 +3,14 @@ use super::{err_cmd, ok_cmd, CommandResult};
 use crate::artifact_policy::MAX_MCP_IMAGE_BYTES;
 use crate::shell_protocol::{shell_computer_request_payload_max_bytes, ShellAgentShellRequest};
 use base64::{engine::general_purpose, Engine as _};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
 #[cfg(any(test, target_os = "macos"))]
 use std::time::Duration;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const MAX_WINDOWS: usize = 64;
@@ -18,6 +19,44 @@ const MAX_SURFACE_ID_BYTES: usize = 128;
 const MAX_ELEMENT_ID_BYTES: usize = 128;
 const MAX_ELEMENT_REGISTRY: usize = 1024;
 const MAX_INPUT_TEXT_BYTES: usize = 2048;
+const COMPUTER_KEY_INPUT_KEYS: &[&str] = &[
+    "enter",
+    "escape",
+    "tab",
+    "arrow_up",
+    "arrow_down",
+    "arrow_left",
+    "arrow_right",
+    "page_up",
+    "page_down",
+    "home",
+    "end",
+];
+const COMPUTER_KEY_INPUT_MODIFIERS: &[&str] = &["shift", "control", "option", "command"];
+
+fn validate_key_modifiers(modifiers: &[String]) -> Result<(), String> {
+    if modifiers.len() > COMPUTER_KEY_INPUT_MODIFIERS.len() {
+        return Err("invalid_request: computer key input has too many modifiers".to_string());
+    }
+    for (index, modifier) in modifiers.iter().enumerate() {
+        if !COMPUTER_KEY_INPUT_MODIFIERS.contains(&modifier.as_str())
+            || modifiers[..index].contains(modifier)
+        {
+            return Err(
+                "invalid_request: computer key input modifiers are invalid or duplicated"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_key_input(key: &str, modifiers: &[String]) -> Result<(), String> {
+    if !COMPUTER_KEY_INPUT_KEYS.contains(&key) {
+        return Err("invalid_request: computer key is outside the closed vocabulary".to_string());
+    }
+    validate_key_modifiers(modifiers)
+}
 const MAX_ACCESSIBILITY_DEPTH: usize = 8;
 const MAX_ACCESSIBILITY_NODES: usize = 256;
 const DEFAULT_ACCESSIBILITY_DEPTH: usize = 6;
@@ -29,7 +68,7 @@ const RGBA_BYTES_PER_PIXEL: u64 = 4;
 /// 8K UHD (7680x4320x4) fits while malformed/extreme dimensions fail closed
 /// before xcap is allowed to allocate the native capture image.
 const MAX_RAW_CAPTURE_BYTES: u64 = 128 * 1024 * 1024;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(test, target_os = "macos", windows))]
 const MAX_IMAGE_DIMENSION: u32 = 4096;
 
 #[cfg(any(test, target_os = "macos"))]
@@ -260,6 +299,20 @@ fn validate_text_input_target(element: &ElementRecord) -> Result<&ElementFingerp
 }
 
 #[cfg(any(test, target_os = "macos"))]
+fn validate_element_state_target(element: &ElementRecord) -> Result<&ElementFingerprint, String> {
+    let target = element
+        .target_fingerprint()
+        .ok_or_else(|| "stale_element: AX element correlation lineage is incomplete".to_string())?;
+    if !target.has_positive_evidence() {
+        return Err(
+            "stale_element: AX element lacks positive correlation evidence for state observation"
+                .to_string(),
+        );
+    }
+    Ok(target)
+}
+
+#[cfg(any(test, target_os = "macos"))]
 fn validate_text_input_preflight(
     enabled: Option<bool>,
     focused: Option<bool>,
@@ -309,19 +362,40 @@ struct AccessibilityTreeResult {
 struct ElementRegistry {
     entries: HashMap<String, ElementRecord>,
     order: VecDeque<String>,
+    surface_generations: HashMap<String, u32>,
 }
 
 impl ElementRegistry {
     fn clear(&mut self) {
         self.entries.clear();
         self.order.clear();
+        self.surface_generations.clear();
     }
 
     fn get(&self, element_id: &str) -> Option<ElementRecord> {
         self.entries.get(element_id).cloned()
     }
 
-    fn replace_surface(&mut self, surface_id: &str, elements: Vec<(String, ElementRecord)>) {
+    fn get_with_generation(&self, element_id: &str) -> Option<(ElementRecord, u32)> {
+        let record = self.entries.get(element_id)?.clone();
+        let generation = *self.surface_generations.get(&record.surface_id)?;
+        Some((record, generation))
+    }
+
+    fn replace_surface(
+        &mut self,
+        surface_id: &str,
+        elements: Vec<(String, ElementRecord)>,
+    ) -> Result<u32, String> {
+        // Compute the next generation before mutating the registry so an exhausted
+        // counter fails without invalidating the currently usable handles.
+        let generation = self
+            .surface_generations
+            .get(surface_id)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| "computer_state_error: observation generation exhausted".to_string())?;
         let stale_ids: Vec<String> = self
             .entries
             .iter()
@@ -346,6 +420,9 @@ impl ElementRegistry {
             };
             self.entries.remove(&oldest);
         }
+        self.surface_generations
+            .insert(surface_id.to_string(), generation);
+        Ok(generation)
     }
 }
 
@@ -358,6 +435,15 @@ struct SurfaceOutput<'a> {
     height: u32,
     focused: Option<bool>,
     active: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotRegion {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
 }
 
 struct ComputerObserver {
@@ -440,7 +526,10 @@ impl ComputerObserver {
             .get(surface_id)
             .cloned()
             .ok_or_else(|| "stale_surface: unknown or stale surface_id".to_string())?;
-        let tree = platform::accessibility_tree(surface_id, &record, max_depth, max_nodes)?;
+        let AccessibilityTreeResult {
+            mut output,
+            elements,
+        } = platform::accessibility_tree(surface_id, &record, max_depth, max_nodes)?;
         let surface_registry = self
             .surfaces
             .lock()
@@ -451,12 +540,74 @@ impl ComputerObserver {
                     .to_string(),
             );
         }
+        let Some(object) = output.as_object_mut() else {
+            return Err(
+                "computer_state_error: Accessibility tree output is not an object".to_string(),
+            );
+        };
         let mut element_registry = self
             .elements
             .lock()
             .map_err(|_| "computer_state_error: element registry lock poisoned".to_string())?;
-        element_registry.replace_surface(surface_id, tree.elements);
-        Ok(tree.output)
+        let observation_generation = element_registry.replace_surface(surface_id, elements)?;
+        object.insert(
+            "observation_generation".to_string(),
+            json!(observation_generation),
+        );
+        Ok(output)
+    }
+
+    fn element_state(&self, surface_id: &str, element_id: &str) -> Result<Value, String> {
+        if surface_id.is_empty() || surface_id.len() > MAX_SURFACE_ID_BYTES {
+            return Err("invalid_request: surface_id is invalid".to_string());
+        }
+        if !element_id.starts_with("element_")
+            || element_id.len() <= "element_".len()
+            || element_id.len() > MAX_ELEMENT_ID_BYTES
+        {
+            return Err("invalid_request: element_id is invalid".to_string());
+        }
+        // Hold the surface registry guard through native re-resolution. Tree/list
+        // observations take the same guard before replacing element generations,
+        // so this state read cannot return a handle that was concurrently retired.
+        let surface_registry = self
+            .surfaces
+            .lock()
+            .map_err(|_| "computer_state_error: surface registry lock poisoned".to_string())?;
+        let record = surface_registry
+            .get(surface_id)
+            .cloned()
+            .ok_or_else(|| "stale_surface: unknown or stale surface_id".to_string())?;
+        let (element, observation_generation) = self
+            .elements
+            .lock()
+            .map_err(|_| "computer_state_error: element registry lock poisoned".to_string())?
+            .get_with_generation(element_id)
+            .ok_or_else(|| "stale_element: unknown, evicted, or stale element_id".to_string())?;
+        if element.surface_id != surface_id {
+            return Err("stale_element: element_id belongs to a different surface".to_string());
+        }
+        platform::element_state(
+            surface_id,
+            element_id,
+            observation_generation,
+            &record,
+            &element,
+        )
+    }
+
+    fn activate_window(&self, surface_id: &str) -> Result<Value, String> {
+        if surface_id.is_empty() || surface_id.len() > MAX_SURFACE_ID_BYTES {
+            return Err("invalid_request: surface_id is invalid".to_string());
+        }
+        let record = self
+            .surfaces
+            .lock()
+            .map_err(|_| "computer_state_error: surface registry lock poisoned".to_string())?
+            .get(surface_id)
+            .cloned()
+            .ok_or_else(|| "stale_surface: unknown or stale surface_id".to_string())?;
+        platform::activate_window(surface_id, &record)
     }
 
     fn control(
@@ -494,6 +645,57 @@ impl ComputerObserver {
         platform::control(surface_id, element_id, &record, &element, action)
     }
 
+    fn scroll_to_element(&self, surface_id: &str, element_id: &str) -> Result<Value, String> {
+        if surface_id.is_empty() || surface_id.len() > MAX_SURFACE_ID_BYTES {
+            return Err("invalid_request: surface_id is invalid".to_string());
+        }
+        if !element_id.starts_with("element_")
+            || element_id.len() <= "element_".len()
+            || element_id.len() > MAX_ELEMENT_ID_BYTES
+        {
+            return Err("invalid_request: element_id is invalid".to_string());
+        }
+        let surface_registry = self
+            .surfaces
+            .lock()
+            .map_err(|_| "computer_state_error: surface registry lock poisoned".to_string())?;
+        let record = surface_registry
+            .get(surface_id)
+            .cloned()
+            .ok_or_else(|| "stale_surface: unknown or stale surface_id".to_string())?;
+        let element = self
+            .elements
+            .lock()
+            .map_err(|_| "computer_state_error: element registry lock poisoned".to_string())?
+            .get(element_id)
+            .ok_or_else(|| "stale_element: unknown, evicted, or stale element_id".to_string())?;
+        if element.surface_id != surface_id {
+            return Err("stale_element: element_id belongs to a different surface".to_string());
+        }
+        platform::scroll_to_element(surface_id, element_id, &record, &element)
+    }
+
+    fn key_input(
+        &self,
+        surface_id: &str,
+        key: &str,
+        modifiers: &[String],
+    ) -> Result<Value, String> {
+        if surface_id.is_empty() || surface_id.len() > MAX_SURFACE_ID_BYTES {
+            return Err("invalid_request: surface_id is invalid".to_string());
+        }
+        validate_key_input(key, modifiers)?;
+        let surface_registry = self
+            .surfaces
+            .lock()
+            .map_err(|_| "computer_state_error: surface registry lock poisoned".to_string())?;
+        let record = surface_registry
+            .get(surface_id)
+            .cloned()
+            .ok_or_else(|| "stale_surface: unknown or stale surface_id".to_string())?;
+        platform::key_input(surface_id, &record, key, modifiers)
+    }
+
     fn input_text(&self, surface_id: &str, element_id: &str, text: &str) -> Result<Value, String> {
         if surface_id.is_empty() || surface_id.len() > MAX_SURFACE_ID_BYTES {
             return Err("invalid_request: surface_id is invalid".to_string());
@@ -525,7 +727,13 @@ impl ComputerObserver {
         platform::input_text(surface_id, element_id, &record, &element, text)
     }
 
-    fn snapshot(&self, surface_id: &str) -> Result<Value, String> {
+    fn snapshot(
+        &self,
+        surface_id: &str,
+        region: Option<SnapshotRegion>,
+        max_width: Option<u32>,
+        max_height: Option<u32>,
+    ) -> Result<Value, String> {
         if surface_id.is_empty() || surface_id.len() > MAX_SURFACE_ID_BYTES {
             return Err("invalid_request: surface_id is invalid".to_string());
         }
@@ -536,9 +744,25 @@ impl ComputerObserver {
             .get(surface_id)
             .cloned()
             .ok_or_else(|| "stale_surface: unknown or stale surface_id".to_string())?;
+        if max_width.is_some_and(|value| value == 0 || value > MAX_IMAGE_DIMENSION)
+            || max_height.is_some_and(|value| value == 0 || value > MAX_IMAGE_DIMENSION)
+        {
+            return Err("invalid_request: snapshot output dimension bound is invalid".to_string());
+        }
+        let region = resolve_snapshot_region(record.width, record.height, region)?;
         let image = platform::capture_window(&record)?;
+        let captured_at_unix_ms = current_unix_ms()?;
+        let (image, region) = transform_snapshot_image(
+            image,
+            record.width,
+            record.height,
+            Some(region),
+            max_width,
+            max_height,
+        )?;
         let encoded = encode_bounded_jpeg(image)?;
         let file_bytes = encoded.bytes.len();
+        let sha256 = sha256_hex(&encoded.bytes);
         Ok(json!({
             "surface": SurfaceOutput {
                 surface_id,
@@ -549,10 +773,15 @@ impl ComputerObserver {
                 focused: None,
                 active: None,
             },
+            "source_width": record.width,
+            "source_height": record.height,
+            "region": region,
             "width": encoded.width,
             "height": encoded.height,
             "mime_type": "image/jpeg",
             "file_bytes": file_bytes,
+            "sha256": sha256,
+            "captured_at_unix_ms": captured_at_unix_ms,
             "content_base64": general_purpose::STANDARD.encode(encoded.bytes),
         }))
     }
@@ -562,6 +791,298 @@ struct EncodedImage {
     bytes: Vec<u8>,
     width: u32,
     height: u32,
+}
+
+fn current_unix_ms() -> Result<u64, String> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "computer_state_error: system clock is before Unix epoch".to_string())?
+        .as_millis();
+    let millis = u64::try_from(millis)
+        .map_err(|_| "computer_state_error: capture timestamp overflow".to_string())?;
+    if millis > 9_007_199_254_740_991 {
+        return Err(
+            "computer_state_error: capture timestamp exceeds exact JSON integer range".to_string(),
+        );
+    }
+    Ok(millis)
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    Sha256::digest(data)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn resolve_snapshot_region(
+    source_width: u32,
+    source_height: u32,
+    region: Option<SnapshotRegion>,
+) -> Result<SnapshotRegion, String> {
+    if source_width == 0 || source_height == 0 {
+        return Err("capture_failed: revalidated surface has zero dimensions".to_string());
+    }
+    let region = region.unwrap_or(SnapshotRegion {
+        x: 0,
+        y: 0,
+        width: source_width,
+        height: source_height,
+    });
+    if region.width == 0 || region.height == 0 {
+        return Err("invalid_request: snapshot region must have positive dimensions".to_string());
+    }
+    let right = region
+        .x
+        .checked_add(region.width)
+        .ok_or_else(|| "invalid_request: snapshot region horizontal bound overflow".to_string())?;
+    let bottom = region
+        .y
+        .checked_add(region.height)
+        .ok_or_else(|| "invalid_request: snapshot region vertical bound overflow".to_string())?;
+    if right > source_width || bottom > source_height {
+        return Err(
+            "invalid_request: snapshot region must fit fully inside the revalidated surface"
+                .to_string(),
+        );
+    }
+    Ok(region)
+}
+
+#[cfg(any(test, target_os = "macos", windows))]
+fn mapped_crop_bounds(
+    region: SnapshotRegion,
+    source_width: u32,
+    source_height: u32,
+    captured_width: u32,
+    captured_height: u32,
+) -> Result<(u32, u32, u32, u32), String> {
+    if captured_width == 0 || captured_height == 0 {
+        return Err("capture_failed: captured image has zero dimensions".to_string());
+    }
+    let floor_scaled = |value: u32, captured: u32, source: u32| -> u32 {
+        ((u64::from(value) * u64::from(captured)) / u64::from(source)) as u32
+    };
+    let ceil_scaled = |value: u32, captured: u32, source: u32| -> u32 {
+        let numerator = u64::from(value) * u64::from(captured);
+        let denominator = u64::from(source);
+        (numerator / denominator + u64::from(numerator % denominator != 0)) as u32
+    };
+    let right_source = region.x + region.width;
+    let bottom_source = region.y + region.height;
+    let left = floor_scaled(region.x, captured_width, source_width);
+    let top = floor_scaled(region.y, captured_height, source_height);
+    let right = ceil_scaled(right_source, captured_width, source_width).min(captured_width);
+    let bottom = ceil_scaled(bottom_source, captured_height, source_height).min(captured_height);
+    let width = right.saturating_sub(left);
+    let height = bottom.saturating_sub(top);
+    if width == 0 || height == 0 {
+        return Err("capture_failed: snapshot region maps to an empty captured image".to_string());
+    }
+    Ok((left, top, width, height))
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn transform_snapshot_image(
+    image: image::RgbaImage,
+    source_width: u32,
+    source_height: u32,
+    region: Option<SnapshotRegion>,
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+) -> Result<(image::RgbaImage, SnapshotRegion), String> {
+    use image::imageops::FilterType;
+
+    if max_width.is_some_and(|value| value == 0 || value > MAX_IMAGE_DIMENSION)
+        || max_height.is_some_and(|value| value == 0 || value > MAX_IMAGE_DIMENSION)
+    {
+        return Err("invalid_request: snapshot output dimension bound is invalid".to_string());
+    }
+    let region = resolve_snapshot_region(source_width, source_height, region)?;
+    let (x, y, width, height) = mapped_crop_bounds(
+        region,
+        source_width,
+        source_height,
+        image.width(),
+        image.height(),
+    )?;
+    let mut image = if x == 0 && y == 0 && width == image.width() && height == image.height() {
+        image
+    } else {
+        image::imageops::crop_imm(&image, x, y, width, height).to_image()
+    };
+
+    let width_scale = max_width
+        .map(|bound| bound as f64 / image.width() as f64)
+        .unwrap_or(1.0);
+    let height_scale = max_height
+        .map(|bound| bound as f64 / image.height() as f64)
+        .unwrap_or(1.0);
+    let scale = 1.0f64.min(width_scale).min(height_scale);
+    if scale < 1.0 {
+        let target_width = ((image.width() as f64 * scale).floor() as u32)
+            .max(1)
+            .min(max_width.unwrap_or(u32::MAX));
+        let target_height = ((image.height() as f64 * scale).floor() as u32)
+            .max(1)
+            .min(max_height.unwrap_or(u32::MAX));
+        image = image::imageops::resize(&image, target_width, target_height, FilterType::Triangle);
+    }
+    Ok((image, region))
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn transform_snapshot_image(
+    _image: (),
+    _source_width: u32,
+    _source_height: u32,
+    _region: Option<SnapshotRegion>,
+    _max_width: Option<u32>,
+    _max_height: Option<u32>,
+) -> Result<((), SnapshotRegion), String> {
+    Err("unsupported_platform: computer observation is unavailable on this platform".to_string())
+}
+
+#[cfg(test)]
+mod snapshot_region_tests {
+    use super::*;
+
+    #[test]
+    fn computer_snapshot_region_is_surface_relative_and_fully_bounded() {
+        assert_eq!(
+            resolve_snapshot_region(100, 50, None).unwrap(),
+            SnapshotRegion {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 50,
+            }
+        );
+        assert!(resolve_snapshot_region(
+            100,
+            50,
+            Some(SnapshotRegion {
+                x: 90,
+                y: 0,
+                width: 11,
+                height: 10,
+            })
+        )
+        .is_err());
+        assert!(resolve_snapshot_region(
+            100,
+            50,
+            Some(SnapshotRegion {
+                x: u32::MAX,
+                y: 0,
+                width: 2,
+                height: 10,
+            })
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn computer_snapshot_region_maps_surface_coordinates_to_capture_pixels() {
+        let mapped = mapped_crop_bounds(
+            SnapshotRegion {
+                x: 10,
+                y: 5,
+                width: 20,
+                height: 10,
+            },
+            100,
+            50,
+            200,
+            100,
+        )
+        .unwrap();
+        assert_eq!(mapped, (20, 10, 40, 20));
+    }
+
+    #[test]
+    fn computer_snapshot_region_payload_is_closed_and_typed() {
+        let exact = json!({
+            "surface_id": "surface_test",
+            "region": {"x": 1, "y": 2, "width": 3, "height": 4},
+            "max_width": 100,
+            "max_height": null
+        });
+        assert!(ensure_exact_payload_fields(
+            &exact,
+            &["surface_id", "region", "max_width", "max_height"]
+        )
+        .is_ok());
+        assert_eq!(
+            optional_snapshot_region(&exact).unwrap(),
+            Some(SnapshotRegion {
+                x: 1,
+                y: 2,
+                width: 3,
+                height: 4,
+            })
+        );
+        assert_eq!(
+            optional_snapshot_dimension(&exact, "max_width").unwrap(),
+            Some(100)
+        );
+        assert_eq!(
+            optional_snapshot_dimension(&exact, "max_height").unwrap(),
+            None
+        );
+
+        let extra = json!({
+            "surface_id": "surface_test",
+            "region": {"x": 1, "y": 2, "width": 3, "height": 4},
+            "max_width": 100,
+            "max_height": null,
+            "quality": 99
+        });
+        assert!(ensure_exact_payload_fields(
+            &extra,
+            &["surface_id", "region", "max_width", "max_height"]
+        )
+        .is_err());
+        let nested_extra = json!({
+            "region": {"x": 1, "y": 2, "width": 3, "height": 4, "global": true}
+        });
+        assert!(optional_snapshot_region(&nested_extra).is_err());
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn computer_snapshot_region_downscale_preserves_aspect_and_never_upscales() {
+        let image = image::RgbaImage::new(200, 100);
+        let (image, region) = transform_snapshot_image(
+            image,
+            100,
+            50,
+            Some(SnapshotRegion {
+                x: 10,
+                y: 5,
+                width: 20,
+                height: 10,
+            }),
+            Some(20),
+            Some(20),
+        )
+        .unwrap();
+        assert_eq!((image.width(), image.height()), (20, 10));
+        assert_eq!(
+            region,
+            SnapshotRegion {
+                x: 10,
+                y: 5,
+                width: 20,
+                height: 10,
+            }
+        );
+
+        let image = image::RgbaImage::new(10, 5);
+        let (image, _) =
+            transform_snapshot_image(image, 10, 5, None, Some(100), Some(100)).unwrap();
+        assert_eq!((image.width(), image.height()), (10, 5));
+    }
 }
 
 #[cfg(any(target_os = "macos", windows))]
@@ -830,6 +1351,19 @@ mod element_registry_tests {
     }
 
     #[test]
+    fn computer_element_state_requires_positive_correlation_evidence() {
+        let element = ElementRecord {
+            surface_id: "surface_test".to_string(),
+            path: Vec::new(),
+            lineage: vec![fingerprint("")],
+        };
+        assert_eq!(
+            validate_element_state_target(&element).unwrap_err(),
+            "stale_element: AX element lacks positive correlation evidence for state observation"
+        );
+    }
+
+    #[test]
     fn computer_element_registry_is_bounded_and_evicts_oldest() {
         let mut registry = ElementRegistry::default();
         let elements = (0..=MAX_ELEMENT_REGISTRY)
@@ -841,7 +1375,10 @@ mod element_registry_tests {
                 )
             })
             .collect();
-        registry.replace_surface("surface_test", elements);
+        assert_eq!(
+            registry.replace_surface("surface_test", elements).unwrap(),
+            1
+        );
         assert_eq!(registry.entries.len(), MAX_ELEMENT_REGISTRY);
         assert!(registry.get("element_0").is_none());
         assert!(registry
@@ -852,37 +1389,82 @@ mod element_registry_tests {
     #[test]
     fn computer_element_registry_replaces_same_surface_generation() {
         let mut registry = ElementRegistry::default();
-        registry.replace_surface(
-            "surface_test",
-            vec![(
-                "element_old".to_string(),
-                record("surface_test", "old", vec![0]),
-            )],
-        );
-        registry.replace_surface(
-            "surface_test",
-            vec![(
-                "element_new".to_string(),
-                record("surface_test", "new", vec![1]),
-            )],
-        );
+        let first = registry
+            .replace_surface(
+                "surface_test",
+                vec![(
+                    "element_old".to_string(),
+                    record("surface_test", "old", vec![0]),
+                )],
+            )
+            .unwrap();
+        let second = registry
+            .replace_surface(
+                "surface_test",
+                vec![(
+                    "element_new".to_string(),
+                    record("surface_test", "new", vec![1]),
+                )],
+            )
+            .unwrap();
+        assert_eq!((first, second), (1, 2));
         assert!(registry.get("element_old").is_none());
-        assert!(registry.get("element_new").is_some());
+        assert_eq!(registry.get_with_generation("element_new").unwrap().1, 2);
+    }
+
+    #[test]
+    fn computer_element_registry_generation_exhaustion_preserves_current_handles() {
+        let mut registry = ElementRegistry::default();
+        registry
+            .replace_surface(
+                "surface_test",
+                vec![(
+                    "element_old".to_string(),
+                    record("surface_test", "old", vec![0]),
+                )],
+            )
+            .unwrap();
+        registry
+            .surface_generations
+            .insert("surface_test".to_string(), u32::MAX);
+
+        let error = registry
+            .replace_surface(
+                "surface_test",
+                vec![(
+                    "element_new".to_string(),
+                    record("surface_test", "new", vec![1]),
+                )],
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "computer_state_error: observation generation exhausted"
+        );
+        assert!(registry.get("element_old").is_some());
+        assert!(registry.get("element_new").is_none());
+        assert_eq!(
+            registry.surface_generations.get("surface_test"),
+            Some(&u32::MAX)
+        );
     }
 
     #[test]
     fn computer_element_registry_clear_invalidates_all_handles() {
         let mut registry = ElementRegistry::default();
-        registry.replace_surface(
-            "surface_test",
-            vec![(
-                "element_test".to_string(),
-                record("surface_test", "test", vec![]),
-            )],
-        );
+        registry
+            .replace_surface(
+                "surface_test",
+                vec![(
+                    "element_test".to_string(),
+                    record("surface_test", "test", vec![]),
+                )],
+            )
+            .unwrap();
         registry.clear();
         assert!(registry.entries.is_empty());
         assert!(registry.order.is_empty());
+        assert!(registry.surface_generations.is_empty());
     }
 
     #[test]
@@ -917,6 +1499,36 @@ mod element_registry_tests {
         assert!(element.contains_protected_content());
         element.lineage.pop();
         assert!(element.target_fingerprint().is_none());
+    }
+
+    #[test]
+    fn computer_element_state_payload_is_exact_surface_and_element_only() {
+        let exact = json!({
+            "surface_id": "surface_test",
+            "element_id": "element_test"
+        });
+        assert!(ensure_exact_payload_fields(&exact, &["surface_id", "element_id"]).is_ok());
+        for extra in [
+            json!({"surface_id": "surface_test", "element_id": "element_test", "value": true}),
+            json!({"surface_id": "surface_test", "element_id": "element_test", "action": "focus"}),
+            json!({"surface_id": "surface_test", "element_id": "element_test", "refresh": true}),
+        ] {
+            assert!(ensure_exact_payload_fields(&extra, &["surface_id", "element_id"]).is_err());
+        }
+    }
+
+    #[test]
+    fn computer_activate_window_payload_is_exact_surface_only() {
+        let exact = json!({"surface_id": "surface_test"});
+        assert!(ensure_exact_payload_fields(&exact, &["surface_id"]).is_ok());
+        for extra in [
+            json!({"surface_id": "surface_test", "application": "Finder"}),
+            json!({"surface_id": "surface_test", "pid": 42}),
+            json!({"surface_id": "surface_test", "path": "/Applications/Finder.app"}),
+            json!({"surface_id": "surface_test", "command": "open -a Finder"}),
+        ] {
+            assert!(ensure_exact_payload_fields(&extra, &["surface_id"]).is_err());
+        }
     }
 
     #[test]
@@ -1056,9 +1668,14 @@ pub(crate) fn is_computer_request_kind(kind: &str) -> bool {
         kind,
         "computer_list_windows"
             | "computer_snapshot"
+            | "computer_snapshot_region"
             | "computer_accessibility_status"
             | "computer_accessibility_tree"
+            | "computer_element_state"
+            | "computer_activate_window"
             | "computer_control"
+            | "computer_scroll_to_element"
+            | "computer_key_input"
             | "computer_input_text"
     )
 }
@@ -1072,6 +1689,82 @@ fn ensure_exact_payload_fields(payload: &Value, expected: &[&str]) -> Result<(),
         return Err("invalid_request: computer payload contains unsupported fields".to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod scroll_wire_contract_tests {
+    use super::*;
+
+    #[test]
+    fn scroll_to_element_is_a_distinct_strict_request_kind() {
+        assert!(is_computer_request_kind("computer_scroll_to_element"));
+        assert!(ensure_exact_payload_fields(
+            &json!({"surface_id": "surface_test", "element_id": "element_test"}),
+            &["surface_id", "element_id"],
+        )
+        .is_ok());
+        let error = ensure_exact_payload_fields(
+            &json!({
+                "surface_id": "surface_test",
+                "element_id": "element_test",
+                "delta": 1
+            }),
+            &["surface_id", "element_id"],
+        )
+        .unwrap_err();
+        assert!(error.contains("unsupported fields"));
+    }
+}
+
+#[cfg(test)]
+mod key_input_wire_contract_tests {
+    use super::*;
+
+    #[test]
+    fn key_input_is_a_distinct_strict_closed_request_kind() {
+        assert!(is_computer_request_kind("computer_key_input"));
+        let exact = json!({
+            "surface_id": "surface_test",
+            "key": "tab",
+            "modifiers": ["shift"]
+        });
+        assert!(ensure_exact_payload_fields(&exact, &["surface_id", "key", "modifiers"]).is_ok());
+        assert!(validate_key_input("tab", &["shift".to_string()]).is_ok());
+        assert!(validate_key_input("a", &[]).is_err());
+        assert!(validate_key_input("enter", &["shift".to_string(), "shift".to_string()]).is_err());
+        for extra in ["text", "keycode", "repeat", "held", "element_id"] {
+            let mut extra_payload = exact.clone();
+            extra_payload
+                .as_object_mut()
+                .unwrap()
+                .insert(extra.to_string(), Value::from(1));
+            assert!(
+                ensure_exact_payload_fields(&extra_payload, &["surface_id", "key", "modifiers"])
+                    .is_err(),
+                "extra field {extra}"
+            );
+        }
+    }
+}
+
+fn optional_snapshot_region(payload: &Value) -> Result<Option<SnapshotRegion>, String> {
+    match payload.get("region") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(|_| "invalid_request: snapshot region is invalid".to_string()),
+    }
+}
+
+fn optional_snapshot_dimension(payload: &Value, field: &str) -> Result<Option<u32>, String> {
+    match payload.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| format!("invalid_request: snapshot {field} is invalid")),
+    }
 }
 
 pub(crate) fn handle_computer_request(request: &ShellAgentShellRequest) -> CommandResult {
@@ -1142,6 +1835,27 @@ pub(crate) fn handle_computer_request(request: &ShellAgentShellRequest) -> Comma
                 ComputerObserver::global().accessibility_tree(surface_id, max_depth, max_nodes)
             })
         }
+        "computer_element_state" => {
+            ensure_exact_payload_fields(&payload, &["surface_id", "element_id"]).and_then(|()| {
+                let surface_id = payload
+                    .get("surface_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "invalid_request: surface_id is required".to_string())?;
+                let element_id = payload
+                    .get("element_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "invalid_request: element_id is required".to_string())?;
+                ComputerObserver::global().element_state(surface_id, element_id)
+            })
+        }
+        "computer_activate_window" => ensure_exact_payload_fields(&payload, &["surface_id"])
+            .and_then(|()| {
+                payload
+                    .get("surface_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "invalid_request: surface_id is required".to_string())
+            })
+            .and_then(|surface_id| ComputerObserver::global().activate_window(surface_id)),
         "computer_control" => {
             ensure_exact_payload_fields(&payload, &["surface_id", "element_id", "action"]).and_then(
                 |()| {
@@ -1165,6 +1879,46 @@ pub(crate) fn handle_computer_request(request: &ShellAgentShellRequest) -> Comma
                             })
                         })
                     })
+                },
+            )
+        }
+        "computer_scroll_to_element" => {
+            ensure_exact_payload_fields(&payload, &["surface_id", "element_id"]).and_then(|()| {
+                let surface_id = payload
+                    .get("surface_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "invalid_request: surface_id is required".to_string())?;
+                let element_id = payload
+                    .get("element_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "invalid_request: element_id is required".to_string())?;
+                ComputerObserver::global().scroll_to_element(surface_id, element_id)
+            })
+        }
+        "computer_key_input" => {
+            ensure_exact_payload_fields(&payload, &["surface_id", "key", "modifiers"]).and_then(
+                |()| {
+                    let surface_id = payload
+                        .get("surface_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "invalid_request: surface_id is required".to_string())?;
+                    let key = payload
+                        .get("key")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "invalid_request: key is required".to_string())?;
+                    let modifier_values = payload
+                        .get("modifiers")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| "invalid_request: modifiers must be an array".to_string())?;
+                    let modifiers = modifier_values
+                        .iter()
+                        .map(|value| {
+                            value.as_str().map(str::to_string).ok_or_else(|| {
+                                "invalid_request: each modifier must be a string".to_string()
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    ComputerObserver::global().key_input(surface_id, key, &modifiers)
                 },
             )
         }
@@ -1193,11 +1947,36 @@ pub(crate) fn handle_computer_request(request: &ShellAgentShellRequest) -> Comma
                 },
             )
         }
-        "computer_snapshot" => payload
-            .get("surface_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "invalid_request: surface_id is required".to_string())
-            .and_then(|surface_id| ComputerObserver::global().snapshot(surface_id)),
+        "computer_snapshot" => ensure_exact_payload_fields(&payload, &["surface_id"])
+            .and_then(|()| {
+                payload
+                    .get("surface_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "invalid_request: surface_id is required".to_string())
+            })
+            .and_then(|surface_id| {
+                ComputerObserver::global().snapshot(surface_id, None, None, None)
+            }),
+        "computer_snapshot_region" => ensure_exact_payload_fields(
+            &payload,
+            &["surface_id", "region", "max_width", "max_height"],
+        )
+        .and_then(|()| {
+            let surface_id = payload
+                .get("surface_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "invalid_request: surface_id is required".to_string())?;
+            let region = optional_snapshot_region(&payload)?;
+            let max_width = optional_snapshot_dimension(&payload, "max_width")?;
+            let max_height = optional_snapshot_dimension(&payload, "max_height")?;
+            if region.is_none() && max_width.is_none() && max_height.is_none() {
+                return Err(
+                    "invalid_request: region snapshot requires a region or output dimension bound"
+                        .to_string(),
+                );
+            }
+            ComputerObserver::global().snapshot(surface_id, region, max_width, max_height)
+        }),
         _ => Err("invalid_request: unsupported computer request kind".to_string()),
     };
     match result {
@@ -1251,6 +2030,29 @@ mod platform {
         )
     }
 
+    pub(super) fn element_state(
+        _surface_id: &str,
+        _element_id: &str,
+        _observation_generation: u32,
+        _surface: &SurfaceRecord,
+        _element: &ElementRecord,
+    ) -> Result<serde_json::Value, String> {
+        Err(
+            "unsupported_platform: computer element state is unavailable on this platform"
+                .to_string(),
+        )
+    }
+
+    pub(super) fn activate_window(
+        _surface_id: &str,
+        _surface: &SurfaceRecord,
+    ) -> Result<serde_json::Value, String> {
+        Err(
+            "unsupported_platform: computer window activation is unavailable on this platform"
+                .to_string(),
+        )
+    }
+
     pub(super) fn control(
         _surface_id: &str,
         _element_id: &str,
@@ -1259,6 +2061,24 @@ mod platform {
         _action: ComputerAction,
     ) -> Result<serde_json::Value, String> {
         Err("unsupported_platform: computer control is unavailable on this platform".to_string())
+    }
+
+    pub(super) fn scroll_to_element(
+        _surface_id: &str,
+        _element_id: &str,
+        _surface: &SurfaceRecord,
+        _element: &ElementRecord,
+    ) -> Result<serde_json::Value, String> {
+        Err("unsupported_platform: computer scroll is unavailable on this platform".to_string())
+    }
+
+    pub(super) fn key_input(
+        _surface_id: &str,
+        _surface: &SurfaceRecord,
+        _key: &str,
+        _modifiers: &[String],
+    ) -> Result<serde_json::Value, String> {
+        Err("unsupported_platform: computer key input is unavailable on this platform".to_string())
     }
 
     pub(super) fn input_text(
@@ -1376,9 +2196,11 @@ mod platform {
     };
     #[cfg(target_os = "macos")]
     use super::{
-        ensure_correlated_fingerprint, select_exact_ax_window_index, validate_input_text,
-        validate_text_input_preflight, validate_text_input_target, AxObservationDeadline,
-        ElementFingerprint,
+        ensure_correlated_fingerprint, is_secure_text_fingerprint,
+        is_supported_text_input_fingerprint, select_exact_ax_window_index,
+        validate_element_state_target, validate_input_text, validate_key_input,
+        validate_key_modifiers, validate_text_input_preflight, validate_text_input_target,
+        AxObservationDeadline, ElementFingerprint,
     };
     use serde_json::{json, Value};
     use sha2::{Digest, Sha256};
@@ -1392,6 +2214,8 @@ mod platform {
     use objc2_core_foundation::{
         CFArray, CFBoolean, CFIndex, CFRetained, CFString, CFType, CGPoint, CGSize,
     };
+    #[cfg(target_os = "macos")]
+    use objc2_core_graphics::{CGEvent, CGEventFlags, CGKeyCode, CGPreflightPostEventAccess};
     #[cfg(target_os = "macos")]
     use std::collections::VecDeque;
     #[cfg(target_os = "macos")]
@@ -1455,6 +2279,91 @@ mod platform {
     }
 
     #[cfg(target_os = "macos")]
+    fn checked_surface_pid(surface: &SurfaceRecord) -> Result<libc::pid_t, String> {
+        libc::pid_t::try_from(surface.pid)
+            .map_err(|_| "stale_surface: surface PID exceeds native range".to_string())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn key_code(key: &str) -> Result<CGKeyCode, String> {
+        match key {
+            "enter" => Ok(0x24),
+            "tab" => Ok(0x30),
+            "escape" => Ok(0x35),
+            "home" => Ok(0x73),
+            "page_up" => Ok(0x74),
+            "end" => Ok(0x77),
+            "page_down" => Ok(0x79),
+            "arrow_left" => Ok(0x7b),
+            "arrow_right" => Ok(0x7c),
+            "arrow_down" => Ok(0x7d),
+            "arrow_up" => Ok(0x7e),
+            _ => Err("invalid_request: computer key is outside the closed vocabulary".to_string()),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn key_modifier_flags(modifiers: &[String]) -> Result<CGEventFlags, String> {
+        validate_key_modifiers(modifiers)?;
+        let mut flags = CGEventFlags::empty();
+        for modifier in modifiers {
+            flags |= match modifier.as_str() {
+                "shift" => CGEventFlags::MaskShift,
+                "control" => CGEventFlags::MaskControl,
+                "option" => CGEventFlags::MaskAlternate,
+                "command" => CGEventFlags::MaskCommand,
+                _ => unreachable!("validate_key_input closed modifier vocabulary"),
+            };
+        }
+        Ok(flags)
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    mod key_input_native_contract_tests {
+        use super::*;
+
+        #[test]
+        fn closed_key_codes_and_modifier_flags_are_stable() {
+            for (key, expected) in [
+                ("enter", 0x24),
+                ("tab", 0x30),
+                ("escape", 0x35),
+                ("home", 0x73),
+                ("page_up", 0x74),
+                ("end", 0x77),
+                ("page_down", 0x79),
+                ("arrow_left", 0x7b),
+                ("arrow_right", 0x7c),
+                ("arrow_down", 0x7d),
+                ("arrow_up", 0x7e),
+            ] {
+                assert_eq!(key_code(key).unwrap(), expected, "{key}");
+            }
+            assert!(key_code("a").is_err());
+
+            let flags = key_modifier_flags(&["shift".to_string(), "command".to_string()]).unwrap();
+            assert!(flags.contains(CGEventFlags::MaskShift));
+            assert!(flags.contains(CGEventFlags::MaskCommand));
+            assert!(!flags.contains(CGEventFlags::MaskAlternate));
+
+            let mut surface = SurfaceRecord {
+                native_id: 1,
+                pid: 1,
+                identity_hash: [0; 32],
+                application: "test".to_string(),
+                title: "test".to_string(),
+                width: 1,
+                height: 1,
+            };
+            assert_eq!(checked_surface_pid(&surface).unwrap(), 1);
+            surface.pid = u32::MAX;
+            assert!(checked_surface_pid(&surface)
+                .unwrap_err()
+                .starts_with("stale_surface:"));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     fn control_attempt_error(operation: &str, error: AXError) -> String {
         if error == AXError::APIDisabled {
             "permission_denied: macOS Accessibility permission is not granted".to_string()
@@ -1475,6 +2384,88 @@ mod platform {
                 "outcome_unknown: {operation} returned AXError({}) after the native action was attempted",
                 error.0
             )
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn scroll_attempt_error(operation: &str, error: AXError) -> String {
+        if error == AXError::APIDisabled {
+            "permission_denied: macOS Accessibility permission is not granted".to_string()
+        } else if matches!(
+            error,
+            AXError::IllegalArgument
+                | AXError::InvalidUIElement
+                | AXError::AttributeUnsupported
+                | AXError::ActionUnsupported
+                | AXError::NotImplemented
+        ) {
+            format!(
+                "scroll_failed: {operation} was rejected with AXError({})",
+                error.0
+            )
+        } else {
+            format!(
+                "outcome_unknown: {operation} returned AXError({}) after the native action was attempted",
+                error.0
+            )
+        }
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    mod scroll_attempt_tests {
+        use super::*;
+
+        #[test]
+        fn rejected_scroll_action_is_definite_but_unclassified_native_error_is_unknown() {
+            let rejected = scroll_attempt_error(
+                "AXUIElementPerformAction(AXScrollToVisible)",
+                AXError::ActionUnsupported,
+            );
+            assert!(rejected.starts_with("scroll_failed:"), "{rejected}");
+
+            let uncertain = scroll_attempt_error(
+                "AXUIElementPerformAction(AXScrollToVisible)",
+                AXError::NoValue,
+            );
+            assert!(uncertain.starts_with("outcome_unknown:"), "{uncertain}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn window_activation_attempt_error(
+        operation: &str,
+        error: AXError,
+        prior_effect_succeeded: bool,
+    ) -> String {
+        if prior_effect_succeeded {
+            format!(
+                "outcome_unknown: {operation} returned AXError({}) after application activation had already succeeded",
+                error.0
+            )
+        } else {
+            control_attempt_error(operation, error)
+        }
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    mod window_activation_tests {
+        use super::*;
+
+        #[test]
+        fn partial_window_activation_failure_is_always_outcome_unknown() {
+            let partial = window_activation_attempt_error(
+                "AXUIElementPerformAction(AXRaise)",
+                AXError::ActionUnsupported,
+                true,
+            );
+            assert!(partial.starts_with("outcome_unknown:"), "{partial}");
+
+            let not_started = window_activation_attempt_error(
+                "AXUIElementPerformAction(AXRaise)",
+                AXError::ActionUnsupported,
+                false,
+            );
+            assert!(not_started.starts_with("control_failed:"), "{not_started}");
         }
     }
 
@@ -1859,7 +2850,8 @@ mod platform {
         let y = native_window.y().map_err(map_error)?;
         let width = native_window.width().map_err(map_error)?;
         let height = native_window.height().map_err(map_error)?;
-        let application = unsafe { AXUIElement::new_application(surface.pid as _) };
+        let pid = checked_surface_pid(surface)?;
+        let application = unsafe { AXUIElement::new_application(pid) };
         let window_count = ax_array_count(deadline, &application, "AXWindows")?;
         if window_count == 0 || window_count > MAX_AX_WINDOWS {
             return Err(
@@ -2066,6 +3058,126 @@ mod platform {
     }
 
     #[cfg(target_os = "macos")]
+    pub(super) fn element_state(
+        surface_id: &str,
+        element_id: &str,
+        observation_generation: u32,
+        surface: &SurfaceRecord,
+        element: &ElementRecord,
+    ) -> Result<Value, String> {
+        if !unsafe { AXIsProcessTrusted() } {
+            return Err(
+                "permission_denied: macOS Accessibility permission is not granted".to_string(),
+            );
+        }
+        let target = validate_element_state_target(element)?;
+        let deadline = AxObservationDeadline::new();
+        let current = resolve_correlated_element(surface, element, &deadline)?;
+        let enabled = optional_ax_bool(&deadline, &current, "AXEnabled")?;
+        let focused = optional_ax_bool(&deadline, &current, "AXFocused")?;
+        let protected = element.contains_protected_content()
+            || element.lineage.iter().any(is_secure_text_fingerprint);
+        let enabled_for_effect = enabled != Some(false);
+        let can_press =
+            !protected && enabled_for_effect && ax_supports_action(&deadline, &current, "AXPress")?;
+        let can_focus = !protected
+            && enabled_for_effect
+            && ax_attribute_settable(&deadline, &current, "AXFocused")?;
+
+        let supported_text = !protected && is_supported_text_input_fingerprint(target);
+        let (value_empty, can_input_text) = if supported_text {
+            let value_settable = ax_attribute_settable(&deadline, &current, "AXValue")?;
+            let current_value = optional_ax_string(&deadline, &current, "AXValue")?;
+            let value_empty = current_value.as_deref().map(str::is_empty);
+            let can_input_text = enabled != Some(false)
+                && focused == Some(true)
+                && value_settable
+                && value_empty == Some(true);
+            (value_empty, can_input_text)
+        } else {
+            (None, false)
+        };
+        Ok(json!({
+            "platform": "macos",
+            "surface_id": surface_id,
+            "element_id": element_id,
+            "observation_generation": observation_generation,
+            "enabled": enabled,
+            "focused": focused,
+            "protected": protected,
+            "value_empty": value_empty,
+            "can_press": can_press,
+            "can_focus": can_focus,
+            "can_input_text": can_input_text,
+        }))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn activate_window(
+        surface_id: &str,
+        surface: &SurfaceRecord,
+    ) -> Result<Value, String> {
+        if !unsafe { AXIsProcessTrusted() } {
+            return Err(
+                "permission_denied: macOS Accessibility permission is not granted".to_string(),
+            );
+        }
+
+        // Re-resolve the native surface and exact AX window immediately before
+        // any effect so an opaque stale surface cannot drift to another window.
+        let deadline = AxObservationDeadline::new();
+        let window = exact_ax_window(surface, &deadline)?;
+        let application = unsafe { AXUIElement::new_application(surface.pid as _) };
+        let frontmost = optional_ax_bool(&deadline, &application, "AXFrontmost")?;
+        if frontmost != Some(true)
+            && !ax_attribute_settable(&deadline, &application, "AXFrontmost")?
+        {
+            return Err(
+                "control_failed: AX application does not allow AXFrontmost to be set".to_string(),
+            );
+        }
+        if !ax_supports_action(&deadline, &window, "AXRaise")? {
+            return Err("control_failed: exact AX window does not support AXRaise".to_string());
+        }
+
+        // Prepare both native call sites before the first mutation. After the
+        // application becomes frontmost, any later failure is a partial effect.
+        prepare_ax_call(&deadline, &application)?;
+        prepare_ax_call(&deadline, &window)?;
+        let mut application_activated = false;
+        if frontmost != Some(true) {
+            let error = unsafe {
+                application.set_attribute_value(
+                    &CFString::from_static_str("AXFrontmost"),
+                    CFBoolean::new(true),
+                )
+            };
+            if error != AXError::Success {
+                return Err(window_activation_attempt_error(
+                    "AXUIElementSetAttributeValue(AXFrontmost)",
+                    error,
+                    false,
+                ));
+            }
+            application_activated = true;
+        }
+
+        let error = unsafe { window.perform_action(&CFString::from_static_str("AXRaise")) };
+        if error != AXError::Success {
+            return Err(window_activation_attempt_error(
+                "AXUIElementPerformAction(AXRaise)",
+                error,
+                application_activated,
+            ));
+        }
+        Ok(json!({
+            "platform": "macos",
+            "surface_id": surface_id,
+            "success": true,
+        }))
+    }
+
+    #[cfg(target_os = "macos")]
     pub(super) fn control(
         surface_id: &str,
         element_id: &str,
@@ -2141,6 +3253,150 @@ mod platform {
     }
 
     #[cfg(target_os = "macos")]
+    pub(super) fn scroll_to_element(
+        surface_id: &str,
+        element_id: &str,
+        surface: &SurfaceRecord,
+        element: &ElementRecord,
+    ) -> Result<Value, String> {
+        if !unsafe { AXIsProcessTrusted() } {
+            return Err(
+                "permission_denied: macOS Accessibility permission is not granted".to_string(),
+            );
+        }
+        let target_fingerprint = element.target_fingerprint().ok_or_else(|| {
+            "stale_element: AX element correlation lineage is incomplete".to_string()
+        })?;
+        if element.contains_protected_content() {
+            return Err(
+                "permission_denied: macOS Accessibility protected content cannot be scrolled"
+                    .to_string(),
+            );
+        }
+        if !target_fingerprint.has_positive_evidence() {
+            return Err(
+                "stale_element: AX element lacks positive correlation evidence for scrolling"
+                    .to_string(),
+            );
+        }
+        let deadline = AxObservationDeadline::new();
+        let current = resolve_correlated_element(surface, element, &deadline)?;
+        if !ax_supports_action(&deadline, &current, "AXScrollToVisible")? {
+            return Err(
+                "scroll_failed: AX element does not support the AXScrollToVisible action"
+                    .to_string(),
+            );
+        }
+        prepare_ax_call(&deadline, &current)?;
+        let error =
+            unsafe { current.perform_action(&CFString::from_static_str("AXScrollToVisible")) };
+        if error != AXError::Success {
+            return Err(scroll_attempt_error(
+                "AXUIElementPerformAction(AXScrollToVisible)",
+                error,
+            ));
+        }
+        Ok(json!({
+            "platform": "macos",
+            "surface_id": surface_id,
+            "element_id": element_id,
+            "success": true,
+        }))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn validate_key_input_target(
+        deadline: &AxObservationDeadline,
+        application: &AXUIElement,
+        exact_window: &CFRetained<AXUIElement>,
+    ) -> Result<(), String> {
+        if optional_ax_bool(deadline, application, "AXFrontmost")? != Some(true) {
+            return Err(
+                "key_input_failed: exact surface application must already be frontmost".to_string(),
+            );
+        }
+        let focused_window = optional_ax_value(deadline, application, "AXFocusedWindow")?
+            .ok_or_else(|| {
+                "key_input_failed: exact surface application has no focused window".to_string()
+            })?
+            .downcast::<AXUIElement>()
+            .map_err(|_| {
+                "accessibility_failed: AXFocusedWindow is not an AXUIElement".to_string()
+            })?;
+        if &focused_window != exact_window {
+            return Err(
+                "key_input_failed: exact surface must already be the focused window".to_string(),
+            );
+        }
+
+        if let Some(focused_value) = optional_ax_value(deadline, application, "AXFocusedUIElement")?
+        {
+            let focused_element = focused_value.downcast::<AXUIElement>().map_err(|_| {
+                "accessibility_failed: AXFocusedUIElement is not an AXUIElement".to_string()
+            })?;
+            let fingerprint = element_fingerprint(deadline, &focused_element, false)?;
+            if fingerprint.protected || is_secure_text_fingerprint(&fingerprint) {
+                return Err(
+                    "permission_denied: protected or secure Accessibility content cannot receive key input"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn key_input(
+        surface_id: &str,
+        surface: &SurfaceRecord,
+        key: &str,
+        modifiers: &[String],
+    ) -> Result<Value, String> {
+        validate_key_input(key, modifiers)?;
+        if !unsafe { AXIsProcessTrusted() } {
+            return Err(
+                "permission_denied: macOS Accessibility permission is not granted".to_string(),
+            );
+        }
+        if !CGPreflightPostEventAccess() {
+            return Err(
+                "permission_denied: macOS event-posting permission is not granted".to_string(),
+            );
+        }
+
+        let pid = checked_surface_pid(surface)?;
+        let deadline = AxObservationDeadline::new();
+        let exact_window = exact_ax_window(surface, &deadline)?;
+        let application = unsafe { AXUIElement::new_application(pid) };
+
+        let key_code = key_code(key)?;
+        let flags = key_modifier_flags(modifiers)?;
+        let key_down = CGEvent::new_keyboard_event(None, key_code, true).ok_or_else(|| {
+            "key_input_failed: could not create native key-down event".to_string()
+        })?;
+        let key_up = CGEvent::new_keyboard_event(None, key_code, false)
+            .ok_or_else(|| "key_input_failed: could not create native key-up event".to_string())?;
+        CGEvent::set_flags(Some(&key_down), flags);
+        CGEvent::set_flags(Some(&key_up), flags);
+
+        // This is the final authority/privacy check before the first effect. Quartz
+        // posts keyboard events to a process rather than a specific window, so keep
+        // the exact focused-window check as close to dispatch as possible.
+        validate_key_input_target(&deadline, &application, &exact_window)?;
+        deadline.ensure_remaining()?;
+
+        CGEvent::post_to_pid(pid, Some(&key_down));
+        CGEvent::post_to_pid(pid, Some(&key_up));
+        Ok(json!({
+            "platform": "macos",
+            "surface_id": surface_id,
+            "key": key,
+            "modifiers": modifiers,
+            "success": true,
+        }))
+    }
+
+    #[cfg(target_os = "macos")]
     pub(super) fn input_text(
         surface_id: &str,
         element_id: &str,
@@ -2198,6 +3454,31 @@ mod platform {
     }
 
     #[cfg(windows)]
+    pub(super) fn element_state(
+        _surface_id: &str,
+        _element_id: &str,
+        _observation_generation: u32,
+        _surface: &SurfaceRecord,
+        _element: &ElementRecord,
+    ) -> Result<Value, String> {
+        Err(
+            "unsupported_platform: computer element state is unavailable on this platform"
+                .to_string(),
+        )
+    }
+
+    #[cfg(windows)]
+    pub(super) fn activate_window(
+        _surface_id: &str,
+        _surface: &SurfaceRecord,
+    ) -> Result<Value, String> {
+        Err(
+            "unsupported_platform: computer window activation is unavailable on this platform"
+                .to_string(),
+        )
+    }
+
+    #[cfg(windows)]
     pub(super) fn control(
         _surface_id: &str,
         _element_id: &str,
@@ -2206,6 +3487,26 @@ mod platform {
         _action: ComputerAction,
     ) -> Result<Value, String> {
         Err("unsupported_platform: computer control is unavailable on this platform".to_string())
+    }
+
+    #[cfg(windows)]
+    pub(super) fn scroll_to_element(
+        _surface_id: &str,
+        _element_id: &str,
+        _surface: &SurfaceRecord,
+        _element: &ElementRecord,
+    ) -> Result<Value, String> {
+        Err("unsupported_platform: computer scroll is unavailable on this platform".to_string())
+    }
+
+    #[cfg(windows)]
+    pub(super) fn key_input(
+        _surface_id: &str,
+        _surface: &SurfaceRecord,
+        _key: &str,
+        _modifiers: &[String],
+    ) -> Result<Value, String> {
+        Err("unsupported_platform: computer key input is unavailable on this platform".to_string())
     }
 
     #[cfg(windows)]

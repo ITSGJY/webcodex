@@ -148,6 +148,7 @@ pub(crate) enum OAuthBodyAwarePolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OAuthToolScopePolicy {
     Require(&'static str),
+    RequireAll(&'static [&'static str]),
     /// Reserved fail-closed policy for a runtime tool that may be exposed only
     /// to first-party credentials; no current tool definition selects it.
     #[allow(dead_code)]
@@ -182,6 +183,7 @@ pub(crate) fn oauth_route_scope_policy_for_path_method(
         // `account:manage`.
         ("POST", "/api/oauth/clients/create")
         | ("POST", "/api/oauth/clients/list")
+        | ("POST", "/api/oauth/clients/update_scopes")
         | ("POST", "/api/oauth/clients/revoke") => OAuthRouteScopePolicy::FirstPartyOnly,
 
         ("GET", "/mcp") => OAuthRouteScopePolicy::Require(SCOPE_RUNTIME_READ),
@@ -274,6 +276,9 @@ pub(crate) fn oauth_route_scope_policy_for_path_method(
 }
 
 pub(crate) fn oauth_scope_policy_for_runtime_tool(tool_name: &str) -> OAuthToolScopePolicy {
+    if tool_name == "computer_save_snapshot" {
+        return OAuthToolScopePolicy::RequireAll(&[SCOPE_PROJECT_WRITE, SCOPE_COMPUTER_READ]);
+    }
     lookup_tool_metadata(tool_name)
         .and_then(|metadata| metadata.oauth_scope)
         .map(OAuthToolScopePolicy::Require)
@@ -449,6 +454,7 @@ mod tests {
         for path in [
             "/api/oauth/clients/create",
             "/api/oauth/clients/list",
+            "/api/oauth/clients/update_scopes",
             "/api/oauth/clients/revoke",
         ] {
             assert_eq!(
@@ -747,6 +753,7 @@ mod tests {
             ("POST", "/oauth/authorize/consent"),
             ("POST", "/api/oauth/clients/create"),
             ("POST", "/api/oauth/clients/list"),
+            ("POST", "/api/oauth/clients/update_scopes"),
             ("POST", "/api/oauth/clients/revoke"),
         ] {
             assert_ne!(
@@ -866,6 +873,10 @@ mod tests {
                 "computer_snapshot",
                 OAuthToolScopePolicy::Require(SCOPE_COMPUTER_READ),
             ),
+            (
+                "computer_save_snapshot",
+                OAuthToolScopePolicy::RequireAll(&[SCOPE_PROJECT_WRITE, SCOPE_COMPUTER_READ]),
+            ),
             ("run_shell", OAuthToolScopePolicy::Require(SCOPE_JOB_RUN)),
             ("stop_job", OAuthToolScopePolicy::Require(SCOPE_JOB_RUN)),
             ("cargo_test", OAuthToolScopePolicy::Require(SCOPE_JOB_RUN)),
@@ -903,6 +914,9 @@ mod tests {
             "artifact_upload_abort",
             "apply_patch_checked",
             "computer_list_windows",
+            "computer_find_elements",
+            "computer_element_state",
+            "computer_activate_window",
             "computer_snapshot",
             "run_shell",
             "cargo_test",
@@ -920,9 +934,14 @@ mod tests {
     fn oauth_route_policy_tool_scope_policy_covers_metadata_for_known_tools() {
         for tool in known_tool_names() {
             let metadata = lookup_tool_metadata(tool).unwrap();
+            let expected = if tool == "computer_save_snapshot" {
+                OAuthToolScopePolicy::RequireAll(&[SCOPE_PROJECT_WRITE, SCOPE_COMPUTER_READ])
+            } else {
+                OAuthToolScopePolicy::Require(metadata.oauth_scope.unwrap())
+            };
             assert_eq!(
                 oauth_scope_policy_for_runtime_tool(tool),
-                OAuthToolScopePolicy::Require(metadata.oauth_scope.unwrap()),
+                expected,
                 "{tool}"
             );
         }

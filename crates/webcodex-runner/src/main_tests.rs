@@ -6689,8 +6689,13 @@ fn computer_register_request_announces_platform_capability_and_protocol_version(
     cfg.capabilities = Some(ShellClientCapabilities {
         sandbox_inspect_commands: true,
         computer_observe: true,
+        computer_snapshot_region: true,
         computer_accessibility_observe: true,
+        computer_element_state: true,
         computer_control: true,
+        computer_scroll_to_element: true,
+        computer_key_input: true,
+        computer_window_activate: true,
         computer_text_input: true,
         project_lifecycle: false,
         project_path_registration: false,
@@ -6747,14 +6752,39 @@ fn computer_register_request_announces_platform_capability_and_protocol_version(
         "computer observation is advertised only when this Runner binary has a supported native implementation"
     );
     assert_eq!(
+        caps.computer_snapshot_region,
+        cfg!(any(target_os = "macos", windows)),
+        "computer region snapshot is independently advertised only when native window capture is supported"
+    );
+    assert_eq!(
         caps.computer_accessibility_observe,
         cfg!(target_os = "macos"),
         "computer accessibility observation is advertised only by the macOS native implementation"
     );
     assert_eq!(
+        caps.computer_element_state,
+        cfg!(target_os = "macos"),
+        "computer element state is independently advertised only by the macOS native implementation"
+    );
+    assert_eq!(
         caps.computer_control,
         cfg!(target_os = "macos"),
         "computer control is independently advertised only by the macOS native implementation"
+    );
+    assert_eq!(
+        caps.computer_scroll_to_element,
+        cfg!(target_os = "macos"),
+        "computer scroll-to-element is independently advertised only by the macOS native implementation"
+    );
+    assert_eq!(
+        caps.computer_key_input,
+        cfg!(target_os = "macos"),
+        "computer key input is independently advertised only by the macOS native implementation"
+    );
+    assert_eq!(
+        caps.computer_window_activate,
+        cfg!(target_os = "macos"),
+        "computer window activation is independently advertised only by the macOS native implementation"
     );
     assert_eq!(
         caps.computer_text_input,

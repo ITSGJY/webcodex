@@ -238,6 +238,15 @@ pub(crate) struct OpenAiHostFileRef {
     pub(crate) file_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ComputerSnapshotRegion {
+    pub(crate) x: u32,
+    pub(crate) y: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "tool", content = "params", rename_all = "snake_case")]
 pub enum ToolCall {
@@ -1331,12 +1340,59 @@ pub enum ToolCall {
         max_nodes: Option<usize>,
     },
 
+    /// Find a bounded set of semantic elements on one exact macOS surface.
+    ComputerFindElements {
+        client_id: String,
+        surface_id: String,
+        #[serde(default)]
+        role: Option<String>,
+        #[serde(default)]
+        subrole: Option<String>,
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(default)]
+        focused: Option<bool>,
+        #[serde(default)]
+        enabled: Option<bool>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+
+    /// Revalidate one exact observed element and return normalized read-only state.
+    ComputerElementState {
+        client_id: String,
+        surface_id: String,
+        element_id: String,
+    },
+
+    /// Activate and raise one exact previously observed macOS window surface.
+    ComputerActivateWindow {
+        client_id: String,
+        surface_id: String,
+    },
+
     /// Perform one bounded control action on an exact registered AX element.
     ComputerControl {
         client_id: String,
         surface_id: String,
         element_id: String,
         action: String,
+    },
+
+    /// Semantically scroll one exact registered AX element into view.
+    ComputerScrollToElement {
+        client_id: String,
+        surface_id: String,
+        element_id: String,
+    },
+
+    /// Post one closed navigation/action key to one exact already-focused window.
+    ComputerKeyInput {
+        client_id: String,
+        surface_id: String,
+        key: String,
+        #[serde(default)]
+        modifiers: Option<Vec<String>>,
     },
 
     /// Set bounded text on an already-focused, empty exact registered AX text element.
@@ -1347,10 +1403,32 @@ pub enum ToolCall {
         text: String,
     },
 
-    /// Capture one opaque process-local window surface on one exact Runner.
+    /// Capture one opaque process-local window surface, optionally narrowed to a bounded region.
     ComputerSnapshot {
         client_id: String,
         surface_id: String,
+        #[serde(default)]
+        region: Option<ComputerSnapshotRegion>,
+        #[serde(default)]
+        max_width: Option<u32>,
+        #[serde(default)]
+        max_height: Option<u32>,
+    },
+
+    /// Capture one exact window snapshot and persist it directly as a create-only project artifact.
+    ComputerSaveSnapshot {
+        project: String,
+        path: String,
+        client_id: String,
+        surface_id: String,
+        #[serde(default)]
+        region: Option<ComputerSnapshotRegion>,
+        #[serde(default)]
+        max_width: Option<u32>,
+        #[serde(default)]
+        max_height: Option<u32>,
+        #[serde(default)]
+        session_id: Option<String>,
     },
 
     ListProjects,
@@ -1824,9 +1902,15 @@ impl ToolCall {
             Self::ComputerListWindows { .. } => "computer_list_windows",
             Self::ComputerAccessibilityStatus { .. } => "computer_accessibility_status",
             Self::ComputerAccessibilityTree { .. } => "computer_accessibility_tree",
+            Self::ComputerFindElements { .. } => "computer_find_elements",
+            Self::ComputerElementState { .. } => "computer_element_state",
+            Self::ComputerActivateWindow { .. } => "computer_activate_window",
             Self::ComputerControl { .. } => "computer_control",
+            Self::ComputerScrollToElement { .. } => "computer_scroll_to_element",
+            Self::ComputerKeyInput { .. } => "computer_key_input",
             Self::ComputerInputText { .. } => "computer_input_text",
             Self::ComputerSnapshot { .. } => "computer_snapshot",
+            Self::ComputerSaveSnapshot { .. } => "computer_save_snapshot",
             Self::ListProjects => "list_projects",
             Self::RegisterProject { .. } => "register_project",
             Self::CreateProject { .. } => "create_project",
@@ -1868,6 +1952,7 @@ impl ToolCall {
             | Self::ShowChanges { session_id, .. }
             | Self::WriteProjectFile { session_id, .. }
             | Self::SaveProjectArtifact { session_id, .. }
+            | Self::ComputerSaveSnapshot { session_id, .. }
             | Self::ExportProjectArtifact { session_id, .. }
             | Self::ReadProjectArtifactMetadata { session_id, .. }
             | Self::ReadProjectArtifact { session_id, .. }
@@ -1933,6 +2018,7 @@ impl ToolCall {
             | Self::ShowChanges { session_id, .. }
             | Self::WriteProjectFile { session_id, .. }
             | Self::SaveProjectArtifact { session_id, .. }
+            | Self::ComputerSaveSnapshot { session_id, .. }
             | Self::ExportProjectArtifact { session_id, .. }
             | Self::ReadProjectArtifactMetadata { session_id, .. }
             | Self::ReadProjectArtifact { session_id, .. }
@@ -2028,6 +2114,7 @@ impl ToolCall {
             | Self::ShowChanges { project, .. }
             | Self::WriteProjectFile { project, .. }
             | Self::SaveProjectArtifact { project, .. }
+            | Self::ComputerSaveSnapshot { project, .. }
             | Self::ImportConversationFilesToProject { project, .. }
             | Self::ExportProjectArtifact { project, .. }
             | Self::ReadProjectArtifactMetadata { project, .. }

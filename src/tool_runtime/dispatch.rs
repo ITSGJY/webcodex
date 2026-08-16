@@ -681,9 +681,17 @@ impl ToolRuntime {
             | ToolCall::ComputerListWindows { .. }
             | ToolCall::ComputerAccessibilityStatus { .. }
             | ToolCall::ComputerAccessibilityTree { .. }
+            | ToolCall::ComputerFindElements { .. }
+            | ToolCall::ComputerElementState { .. }
+            | ToolCall::ComputerActivateWindow { .. }
             | ToolCall::ComputerControl { .. }
+            | ToolCall::ComputerScrollToElement { .. }
+            | ToolCall::ComputerKeyInput { .. }
             | ToolCall::ComputerInputText { .. }
-            | ToolCall::ComputerSnapshot { .. }) => self.dispatch_computer_tool(call, auth).await,
+            | ToolCall::ComputerSnapshot { .. }
+            | ToolCall::ComputerSaveSnapshot { .. }) => {
+                self.dispatch_computer_tool(call, auth).await
+            }
 
             call @ (ToolCall::ListProjects
             | ToolCall::RegisterProject { .. }

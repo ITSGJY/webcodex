@@ -234,12 +234,26 @@ pub fn generated_agent_config_toml(opts: &AgentInitOptions) -> Result<String, St
             // Desktop observation is a runtime/platform capability and is never
             // claimed by generated static config.
             computer_observe: false,
+            // Region/downscale snapshot support is advertised only by the running binary.
+            computer_snapshot_region: false,
             // Semantic accessibility inspection is also a runtime/platform
             // capability and remains distinct from screenshot observation.
             computer_accessibility_observe: false,
+            // The running binary advertises normalized element-state support
+            // only after installing the native handler.
+            computer_element_state: false,
             // Control authority is runtime/platform-specific and is never
             // implied by either observation capability in generated config.
             computer_control: false,
+            // Semantic scroll-to-element is an independently advertised native
+            // capability and is never inferred from computer_control.
+            computer_scroll_to_element: false,
+            // Closed key input is independently advertised only by a running native
+            // implementation and is never inferred from computer_control.
+            computer_key_input: false,
+            // Exact window activation is independently advertised only by the
+            // running binary after the native handler is installed.
+            computer_window_activate: false,
             // Text input is another runtime/platform capability and must never
             // be inferred from computer_control in generated static config.
             computer_text_input: false,

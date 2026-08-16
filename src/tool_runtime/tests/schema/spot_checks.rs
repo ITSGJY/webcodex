@@ -107,6 +107,305 @@ fn tool_specs_structured_validation_schema_and_output() {
 }
 
 #[test]
+fn tool_specs_computer_find_elements_is_bounded_semantic_observation() {
+    let specs = registered_tool_specs();
+    let spec = spec_named(&specs, "computer_find_elements");
+    assert_eq!(
+        required_fields(spec),
+        vec!["client_id".to_string(), "surface_id".to_string()]
+    );
+    let props = spec.input_schema["properties"].as_object().unwrap();
+    assert_schema_fields!(
+        props,
+        "computer_find_elements input schema",
+        present: ["client_id", "surface_id", "role", "subrole", "label", "focused", "enabled", "limit"]
+    );
+    assert_eq!(props["limit"]["minimum"], 1);
+    assert_eq!(props["limit"]["maximum"], 32);
+    assert!(props["label"]["description"]
+        .as_str()
+        .is_some_and(|description| description.contains("AXValue is never searched")));
+
+    let output = spec.output_schema["properties"]["output"]["properties"]
+        .as_object()
+        .unwrap();
+    assert_schema_fields!(
+        output,
+        "computer_find_elements output schema",
+        present: ["platform", "surface_id", "observation_generation", "elements", "count", "scanned_nodes", "truncated"]
+    );
+    let element = &output["elements"]["items"];
+    assert!(element["properties"].get("value").is_none());
+    assert_eq!(output["elements"]["maxItems"], 32);
+}
+
+#[test]
+fn tool_specs_computer_element_state_is_exact_read_only_normalized_state() {
+    let specs = registered_tool_specs();
+    let spec = spec_named(&specs, "computer_element_state");
+    assert_eq!(
+        required_fields(spec),
+        vec![
+            "client_id".to_string(),
+            "surface_id".to_string(),
+            "element_id".to_string(),
+        ]
+    );
+    let props = spec.input_schema["properties"].as_object().unwrap();
+    assert_schema_fields!(
+        props,
+        "computer_element_state input schema",
+        present: ["client_id", "surface_id", "element_id"]
+    );
+
+    let output = spec.output_schema["properties"]["output"]["properties"]
+        .as_object()
+        .unwrap();
+    assert_schema_fields!(
+        output,
+        "computer_element_state output schema",
+        present: [
+            "platform",
+            "surface_id",
+            "element_id",
+            "observation_generation",
+            "enabled",
+            "focused",
+            "protected",
+            "value_empty",
+            "can_press",
+            "can_focus",
+            "can_input_text"
+        ],
+        absent: ["value", "title", "description", "placeholder"]
+    );
+    assert_eq!(output["observation_generation"]["minimum"], 1);
+}
+
+#[test]
+fn tool_specs_computer_snapshot_has_bounded_region_without_format_controls() {
+    let specs = registered_tool_specs();
+    let spec = spec_named(&specs, "computer_snapshot");
+    assert_eq!(
+        required_fields(spec),
+        vec!["client_id".to_string(), "surface_id".to_string()]
+    );
+    let props = spec.input_schema["properties"].as_object().unwrap();
+    assert_schema_fields!(
+        props,
+        "computer_snapshot input schema",
+        present: ["client_id", "surface_id", "region", "max_width", "max_height"],
+        absent: ["format", "quality", "save", "display_id"]
+    );
+    assert_eq!(props["max_width"]["maximum"], 4096);
+    assert_eq!(props["max_height"]["maximum"], 4096);
+    let region = props["region"]["properties"].as_object().unwrap();
+    assert_schema_fields!(
+        region,
+        "computer_snapshot region schema",
+        present: ["x", "y", "width", "height"]
+    );
+    assert_eq!(props["region"]["additionalProperties"], false);
+
+    let output = spec.output_schema["properties"]["output"]["properties"]
+        .as_object()
+        .unwrap();
+    assert_schema_fields!(
+        output,
+        "computer_snapshot output schema",
+        present: [
+            "surface",
+            "source_width",
+            "source_height",
+            "region",
+            "width",
+            "height",
+            "mime_type",
+            "file_bytes",
+            "sha256",
+            "captured_at_unix_ms",
+            "content_base64"
+        ]
+    );
+}
+
+#[test]
+fn tool_specs_computer_save_snapshot_is_create_only_and_returns_metadata_only() {
+    let specs = registered_tool_specs();
+    let spec = spec_named(&specs, "computer_save_snapshot");
+    assert_eq!(
+        required_fields(spec),
+        vec![
+            "project".to_string(),
+            "path".to_string(),
+            "client_id".to_string(),
+            "surface_id".to_string(),
+        ]
+    );
+    let props = spec.input_schema["properties"].as_object().unwrap();
+    assert_schema_fields!(
+        props,
+        "computer_save_snapshot input schema",
+        present: [
+            "project",
+            "path",
+            "client_id",
+            "surface_id",
+            "region",
+            "max_width",
+            "max_height",
+            "session_id"
+        ],
+        absent: ["overwrite", "format", "quality", "mime_type", "content_base64", "save"]
+    );
+    assert_eq!(props["region"]["additionalProperties"], false);
+
+    let output = spec.output_schema["properties"]["output"]["properties"]
+        .as_object()
+        .unwrap();
+    assert_schema_fields!(
+        output,
+        "computer_save_snapshot output schema",
+        present: [
+            "project",
+            "path",
+            "client_id",
+            "surface_id",
+            "source_width",
+            "source_height",
+            "region",
+            "width",
+            "height",
+            "mime_type",
+            "file_bytes",
+            "sha256",
+            "saved"
+        ],
+        absent: ["content_base64", "surface", "captured_at_unix_ms"]
+    );
+}
+
+#[test]
+fn tool_specs_computer_activate_window_is_exact_surface_only() {
+    let specs = registered_tool_specs();
+    let spec = spec_named(&specs, "computer_activate_window");
+    assert_eq!(
+        required_fields(spec),
+        vec!["client_id".to_string(), "surface_id".to_string()]
+    );
+    let props = spec.input_schema["properties"].as_object().unwrap();
+    assert_schema_fields!(
+        props,
+        "computer_activate_window input schema",
+        present: ["client_id", "surface_id"]
+    );
+    for forbidden in [
+        "application",
+        "pid",
+        "path",
+        "bundle_id",
+        "command",
+        "action",
+    ] {
+        assert!(
+            props.get(forbidden).is_none(),
+            "forbidden activation field: {forbidden}"
+        );
+    }
+
+    let output = spec.output_schema["properties"]["output"]["properties"]
+        .as_object()
+        .unwrap();
+    assert_schema_fields!(
+        output,
+        "computer_activate_window output schema",
+        present: ["platform", "surface_id", "success"]
+    );
+}
+
+#[test]
+fn tool_specs_computer_scroll_to_element_is_semantic_and_exact() {
+    let specs = registered_tool_specs();
+    let spec = spec_named(&specs, "computer_scroll_to_element");
+    assert_eq!(
+        required_fields(spec),
+        vec![
+            "client_id".to_string(),
+            "surface_id".to_string(),
+            "element_id".to_string(),
+        ]
+    );
+    let props = spec.input_schema["properties"].as_object().unwrap();
+    assert_schema_fields!(
+        props,
+        "computer_scroll_to_element input schema",
+        present: ["client_id", "surface_id", "element_id"],
+        absent: ["action", "delta", "distance", "x", "y", "wheel", "direction"]
+    );
+    assert_eq!(spec.input_schema["additionalProperties"], false);
+
+    let output = spec.output_schema["properties"]["output"]["properties"]
+        .as_object()
+        .unwrap();
+    assert_schema_fields!(
+        output,
+        "computer_scroll_to_element output schema",
+        present: ["platform", "surface_id", "element_id", "success"],
+        absent: ["action", "title", "value", "coordinates"]
+    );
+}
+
+#[test]
+fn tool_specs_computer_key_input_is_closed_and_exact() {
+    let specs = registered_tool_specs();
+    let spec = spec_named(&specs, "computer_key_input");
+    assert_eq!(
+        required_fields(spec),
+        vec![
+            "client_id".to_string(),
+            "surface_id".to_string(),
+            "key".to_string(),
+        ]
+    );
+    let props = spec.input_schema["properties"].as_object().unwrap();
+    assert_schema_fields!(
+        props,
+        "computer_key_input input schema",
+        present: ["client_id", "surface_id", "key", "modifiers"],
+        absent: ["element_id", "text", "keycode", "repeat", "held", "action", "x", "y"]
+    );
+    assert_eq!(spec.input_schema["additionalProperties"], false);
+    assert_eq!(props["modifiers"]["maxItems"], 4);
+    assert_eq!(props["modifiers"]["uniqueItems"], true);
+    assert_eq!(
+        props["key"]["enum"],
+        json!([
+            "enter",
+            "escape",
+            "tab",
+            "arrow_up",
+            "arrow_down",
+            "arrow_left",
+            "arrow_right",
+            "page_up",
+            "page_down",
+            "home",
+            "end"
+        ])
+    );
+
+    let output = spec.output_schema["properties"]["output"]["properties"]
+        .as_object()
+        .unwrap();
+    assert_schema_fields!(
+        output,
+        "computer_key_input output schema",
+        present: ["platform", "surface_id", "key", "modifiers", "success"],
+        absent: ["element_id", "text", "keycode", "repeat", "held", "title", "value"]
+    );
+}
+
+#[test]
 fn tool_specs_schema_spot_checks() {
     // Table-driven: (tool_name, required_fields, forbidden_fields).
     // Required fields are checked via exact equality to catch unexpected additions.

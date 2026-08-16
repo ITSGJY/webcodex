@@ -59,12 +59,14 @@ pub(crate) use super::tool_policy::{
 use crate::shell_protocol::{
     SHELL_CLIENT_CAPABILITY_ASYNC_JOBS, SHELL_CLIENT_CAPABILITY_ASYNC_SHELL_JOBS,
     SHELL_CLIENT_CAPABILITY_COMPUTER_ACCESSIBILITY_OBSERVE,
-    SHELL_CLIENT_CAPABILITY_COMPUTER_CONTROL, SHELL_CLIENT_CAPABILITY_COMPUTER_OBSERVE,
-    SHELL_CLIENT_CAPABILITY_COMPUTER_TEXT_INPUT, SHELL_CLIENT_CAPABILITY_FILE_READ,
-    SHELL_CLIENT_CAPABILITY_FILE_WRITE, SHELL_CLIENT_CAPABILITY_GIT,
-    SHELL_CLIENT_CAPABILITY_LSP_CALL_HIERARCHY, SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
-    SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL, SHELL_CLIENT_CAPABILITY_SHELL,
-    SHELL_CLIENT_CAPABILITY_STRUCTURED_PROCESS_ARGV,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_CONTROL, SHELL_CLIENT_CAPABILITY_COMPUTER_ELEMENT_STATE,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_KEY_INPUT, SHELL_CLIENT_CAPABILITY_COMPUTER_OBSERVE,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_SCROLL_TO_ELEMENT,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_TEXT_INPUT, SHELL_CLIENT_CAPABILITY_COMPUTER_WINDOW_ACTIVATE,
+    SHELL_CLIENT_CAPABILITY_FILE_READ, SHELL_CLIENT_CAPABILITY_FILE_WRITE,
+    SHELL_CLIENT_CAPABILITY_GIT, SHELL_CLIENT_CAPABILITY_LSP_CALL_HIERARCHY,
+    SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION, SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL,
+    SHELL_CLIENT_CAPABILITY_SHELL, SHELL_CLIENT_CAPABILITY_STRUCTURED_PROCESS_ARGV,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD,
 };
 
@@ -98,8 +100,16 @@ pub(crate) enum AgentCapability {
     ComputerObserve,
     /// Native read-only semantic accessibility inspection on the exact Runner.
     ComputerAccessibilityObserve,
+    /// Native read-only normalized state for one exact observed element.
+    ComputerElementState,
     /// Native bounded accessibility control on the exact target Runner.
     ComputerControl,
+    /// Native semantic scroll-to-visible on one exact observed Accessibility element.
+    ComputerScrollToElement,
+    /// Native closed-vocabulary key input on one exact already-focused window.
+    ComputerKeyInput,
+    /// Native activation/raise of one exact previously observed window.
+    ComputerWindowActivate,
     /// Native bounded Accessibility text input on the exact target Runner.
     ComputerTextInput,
     /// Read-only agent-side semantic navigation through constrained LSP profiles.
@@ -124,7 +134,11 @@ impl AgentCapability {
             Self::ComputerAccessibilityObserve => {
                 SHELL_CLIENT_CAPABILITY_COMPUTER_ACCESSIBILITY_OBSERVE
             }
+            Self::ComputerElementState => SHELL_CLIENT_CAPABILITY_COMPUTER_ELEMENT_STATE,
             Self::ComputerControl => SHELL_CLIENT_CAPABILITY_COMPUTER_CONTROL,
+            Self::ComputerScrollToElement => SHELL_CLIENT_CAPABILITY_COMPUTER_SCROLL_TO_ELEMENT,
+            Self::ComputerKeyInput => SHELL_CLIENT_CAPABILITY_COMPUTER_KEY_INPUT,
+            Self::ComputerWindowActivate => SHELL_CLIENT_CAPABILITY_COMPUTER_WINDOW_ACTIVATE,
             Self::ComputerTextInput => SHELL_CLIENT_CAPABILITY_COMPUTER_TEXT_INPUT,
             Self::LspReadOnlyNavigation => SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
             Self::LspCallHierarchy => SHELL_CLIENT_CAPABILITY_LSP_CALL_HIERARCHY,
@@ -149,7 +163,11 @@ impl AgentCapability {
             Self::ComputerAccessibilityObserve => {
                 &[SHELL_CLIENT_CAPABILITY_COMPUTER_ACCESSIBILITY_OBSERVE]
             }
+            Self::ComputerElementState => &[SHELL_CLIENT_CAPABILITY_COMPUTER_ELEMENT_STATE],
             Self::ComputerControl => &[SHELL_CLIENT_CAPABILITY_COMPUTER_CONTROL],
+            Self::ComputerScrollToElement => &[SHELL_CLIENT_CAPABILITY_COMPUTER_SCROLL_TO_ELEMENT],
+            Self::ComputerKeyInput => &[SHELL_CLIENT_CAPABILITY_COMPUTER_KEY_INPUT],
+            Self::ComputerWindowActivate => &[SHELL_CLIENT_CAPABILITY_COMPUTER_WINDOW_ACTIVATE],
             Self::ComputerTextInput => &[SHELL_CLIENT_CAPABILITY_COMPUTER_TEXT_INPUT],
             Self::LspReadOnlyNavigation => &[SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION],
             Self::LspCallHierarchy => &[SHELL_CLIENT_CAPABILITY_LSP_CALL_HIERARCHY],

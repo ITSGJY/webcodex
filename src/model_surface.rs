@@ -138,9 +138,15 @@ mod tests {
             "computer_list_windows",
             "computer_accessibility_status",
             "computer_accessibility_tree",
+            "computer_find_elements",
+            "computer_element_state",
+            "computer_activate_window",
             "computer_control",
+            "computer_scroll_to_element",
+            "computer_key_input",
             "computer_input_text",
             "computer_snapshot",
+            "computer_save_snapshot",
         ] {
             assert!(
                 full_names.contains(&name),

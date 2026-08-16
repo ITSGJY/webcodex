@@ -210,13 +210,28 @@ pub const SHELL_CLIENT_CAPABILITY_PROJECT_PATH_REGISTRATION: &str = "project_pat
 /// Read-only native desktop/window observation. Missing on older Runners and
 /// false; never inferred from shell or file capabilities.
 pub const SHELL_CLIENT_CAPABILITY_COMPUTER_OBSERVE: &str = "computer_observe";
+/// Bounded surface-relative region/downscale snapshot requests. Missing on older
+/// Runners is false and is never inferred from whole-window observation support.
+pub const SHELL_CLIENT_CAPABILITY_COMPUTER_SNAPSHOT_REGION: &str = "computer_snapshot_region";
 /// Native read-only semantic accessibility inspection. Missing on older Runners
 /// is false and is never inferred from screenshot/window observation.
 pub const SHELL_CLIENT_CAPABILITY_COMPUTER_ACCESSIBILITY_OBSERVE: &str =
     "computer_accessibility_observe";
+/// Native read-only normalized state for one exact observed Accessibility element.
+/// Missing on older Runners is false and is never inferred from tree observation.
+pub const SHELL_CLIENT_CAPABILITY_COMPUTER_ELEMENT_STATE: &str = "computer_element_state";
 /// Native bounded accessibility control. Missing on older Runners is false and
 /// is never inferred from either observation capability.
 pub const SHELL_CLIENT_CAPABILITY_COMPUTER_CONTROL: &str = "computer_control";
+/// Native semantic scroll-to-visible on one exact observed Accessibility element.
+/// Missing on older Runners is false and is never inferred from computer_control.
+pub const SHELL_CLIENT_CAPABILITY_COMPUTER_SCROLL_TO_ELEMENT: &str = "computer_scroll_to_element";
+/// Native closed-vocabulary key input to one exact already-focused window surface.
+/// Missing on older Runners is false and is never inferred from computer_control.
+pub const SHELL_CLIENT_CAPABILITY_COMPUTER_KEY_INPUT: &str = "computer_key_input";
+/// Native exact-window activation/raise. Missing on older Runners is false and
+/// is never inferred from accessibility control, observation, or platform.
+pub const SHELL_CLIENT_CAPABILITY_COMPUTER_WINDOW_ACTIVATE: &str = "computer_window_activate";
 /// Native bounded Accessibility text input. Missing on older Runners is false
 /// and is never inferred from accessibility observation or computer control.
 pub const SHELL_CLIENT_CAPABILITY_COMPUTER_TEXT_INPUT: &str = "computer_text_input";
@@ -260,9 +275,14 @@ pub const SHELL_CLIENT_CAPABILITY_NAMES: &[&str] = &[
     SHELL_CLIENT_CAPABILITY_PROJECT_LIFECYCLE,
     SHELL_CLIENT_CAPABILITY_PROJECT_PATH_REGISTRATION,
     SHELL_CLIENT_CAPABILITY_COMPUTER_OBSERVE,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_SNAPSHOT_REGION,
     SHELL_CLIENT_CAPABILITY_COMPUTER_ACCESSIBILITY_OBSERVE,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_ELEMENT_STATE,
     SHELL_CLIENT_CAPABILITY_JOB_STATE_RECONCILIATION,
     SHELL_CLIENT_CAPABILITY_COMPUTER_CONTROL,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_SCROLL_TO_ELEMENT,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_KEY_INPUT,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_WINDOW_ACTIVATE,
     SHELL_CLIENT_CAPABILITY_COMPUTER_TEXT_INPUT,
 ];
 
@@ -378,15 +398,35 @@ pub struct ShellClientCapabilities {
     /// and therefore fail-closed.
     #[serde(default, skip_serializing_if = "is_false")]
     pub computer_observe: bool,
+    /// The Runner supports bounded region/max-output snapshot transforms while
+    /// preserving the existing whole-window snapshot wire for older Runners.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub computer_snapshot_region: bool,
     /// Native read-only semantic accessibility inspection. Missing on older
     /// Runners is false; future computer control requires a distinct capability.
     #[serde(default, skip_serializing_if = "is_false")]
     pub computer_accessibility_observe: bool,
+    /// The Runner can revalidate one exact element and return normalized read-only
+    /// affordances without exposing its true value. Missing on older Runners is false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub computer_element_state: bool,
     /// The runner retains bounded active and recent terminal job snapshots and
     /// Native bounded accessibility control. Missing on older Runners is false
     /// and never follows from desktop or accessibility observation authority.
     #[serde(default, skip_serializing_if = "is_false")]
     pub computer_control: bool,
+    /// The Runner can semantically scroll one exact observed Accessibility element
+    /// into view. Missing on older Runners is false and never follows from control.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub computer_scroll_to_element: bool,
+    /// The Runner can post one closed navigation/action key to one exact already-focused
+    /// native window. Missing on older Runners is false and never follows from control.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub computer_key_input: bool,
+    /// The Runner can activate/raise one exact previously observed native window.
+    /// Missing on older Runners is false and never follows from computer_control.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub computer_window_activate: bool,
     /// The Runner implements bounded native Accessibility text input. Missing on
     /// older Runners is false and never follows from computer_control.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -448,8 +488,13 @@ impl Default for ShellClientCapabilities {
             project_lifecycle: false,
             project_path_registration: false,
             computer_observe: false,
+            computer_snapshot_region: false,
             computer_accessibility_observe: false,
+            computer_element_state: false,
             computer_control: false,
+            computer_scroll_to_element: false,
+            computer_key_input: false,
+            computer_window_activate: false,
             computer_text_input: false,
             job_state_reconciliation: false,
         }
@@ -2692,8 +2737,13 @@ mod envelope_tests {
                 project_lifecycle: false,
                 project_path_registration: false,
                 computer_observe: false,
+                computer_snapshot_region: false,
                 computer_accessibility_observe: false,
+                computer_element_state: false,
                 computer_control: false,
+                computer_scroll_to_element: false,
+                computer_key_input: false,
+                computer_window_activate: false,
                 computer_text_input: false,
                 job_state_reconciliation: false,
             }),
@@ -2771,13 +2821,19 @@ mod envelope_tests {
         assert!(!capabilities.structured_file_delete);
         assert!(!capabilities.computer_observe);
         assert!(!capabilities.computer_accessibility_observe);
+        assert!(!capabilities.computer_element_state);
         assert!(!capabilities.computer_control);
+        assert!(!capabilities.computer_key_input);
+        assert!(!capabilities.computer_window_activate);
         assert!(!ShellClientCapabilities::default().ssh_persistent_shell);
         assert!(!capabilities.computer_text_input);
         assert!(!ShellClientCapabilities::default().project_path_registration);
         assert!(!ShellClientCapabilities::default().computer_observe);
         assert!(!ShellClientCapabilities::default().computer_accessibility_observe);
+        assert!(!ShellClientCapabilities::default().computer_element_state);
         assert!(!ShellClientCapabilities::default().computer_control);
+        assert!(!ShellClientCapabilities::default().computer_key_input);
+        assert!(!ShellClientCapabilities::default().computer_window_activate);
         assert!(!ShellClientCapabilities::default().computer_text_input);
     }
 
@@ -2806,11 +2862,39 @@ mod envelope_tests {
     }
 
     #[test]
+    fn computer_snapshot_region_capability_deserializes_only_when_present() {
+        let capabilities: ShellClientCapabilities =
+            serde_json::from_str(r#"{"computer_observe":true}"#).unwrap();
+        assert!(capabilities.computer_observe);
+        assert!(!capabilities.computer_snapshot_region);
+
+        let capabilities: ShellClientCapabilities =
+            serde_json::from_str(r#"{"computer_snapshot_region":true}"#).unwrap();
+        assert!(capabilities.computer_snapshot_region);
+        assert!(!capabilities.computer_observe);
+        assert!(!capabilities.computer_accessibility_observe);
+    }
+
+    #[test]
     fn computer_accessibility_observe_capability_deserializes_only_when_present() {
         let capabilities: ShellClientCapabilities =
             serde_json::from_str(r#"{"computer_accessibility_observe":true}"#).unwrap();
         assert!(capabilities.computer_accessibility_observe);
         assert!(!capabilities.computer_observe);
+    }
+
+    #[test]
+    fn computer_element_state_capability_deserializes_only_when_present() {
+        let capabilities: ShellClientCapabilities =
+            serde_json::from_str(r#"{"computer_accessibility_observe":true}"#).unwrap();
+        assert!(capabilities.computer_accessibility_observe);
+        assert!(!capabilities.computer_element_state);
+
+        let capabilities: ShellClientCapabilities =
+            serde_json::from_str(r#"{"computer_element_state":true}"#).unwrap();
+        assert!(capabilities.computer_element_state);
+        assert!(!capabilities.computer_accessibility_observe);
+        assert!(!capabilities.computer_control);
     }
 
     #[test]
@@ -2820,6 +2904,48 @@ mod envelope_tests {
         assert!(capabilities.computer_control);
         assert!(!capabilities.computer_observe);
         assert!(!capabilities.computer_accessibility_observe);
+    }
+
+    #[test]
+    fn computer_scroll_to_element_capability_is_distinct_from_control() {
+        let capabilities: ShellClientCapabilities =
+            serde_json::from_str(r#"{"computer_control":true}"#).unwrap();
+        assert!(capabilities.computer_control);
+        assert!(!capabilities.computer_scroll_to_element);
+
+        let capabilities: ShellClientCapabilities =
+            serde_json::from_str(r#"{"computer_scroll_to_element":true}"#).unwrap();
+        assert!(capabilities.computer_scroll_to_element);
+        assert!(!capabilities.computer_control);
+        assert!(!capabilities.computer_observe);
+    }
+
+    #[test]
+    fn computer_key_input_capability_is_distinct_from_control() {
+        let capabilities: ShellClientCapabilities =
+            serde_json::from_str(r#"{"computer_control":true}"#).unwrap();
+        assert!(capabilities.computer_control);
+        assert!(!capabilities.computer_key_input);
+
+        let capabilities: ShellClientCapabilities =
+            serde_json::from_str(r#"{"computer_key_input":true}"#).unwrap();
+        assert!(capabilities.computer_key_input);
+        assert!(!capabilities.computer_control);
+        assert!(!capabilities.computer_observe);
+    }
+
+    #[test]
+    fn computer_window_activate_capability_deserializes_only_when_present() {
+        let capabilities: ShellClientCapabilities =
+            serde_json::from_str(r#"{"computer_control":true}"#).unwrap();
+        assert!(capabilities.computer_control);
+        assert!(!capabilities.computer_window_activate);
+
+        let capabilities: ShellClientCapabilities =
+            serde_json::from_str(r#"{"computer_window_activate":true}"#).unwrap();
+        assert!(capabilities.computer_window_activate);
+        assert!(!capabilities.computer_control);
+        assert!(!capabilities.computer_observe);
     }
 
     #[test]

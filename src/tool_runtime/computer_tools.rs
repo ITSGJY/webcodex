@@ -1,12 +1,19 @@
+use super::files::{validate_artifact_file_path, validate_artifact_mime_for_path};
+use super::shell::{agent_command_lifecycle, dispatch_uncertainty_lifecycle};
+use super::tool_call::ComputerSnapshotRegion;
 use super::{ToolCall, ToolResult, ToolRuntime};
 use crate::artifact_policy::MAX_MCP_IMAGE_BYTES;
 use crate::auth::AuthContext;
 use crate::shell_protocol::{
-    SHELL_CLIENT_CAPABILITY_COMPUTER_CONTROL, SHELL_CLIENT_CAPABILITY_COMPUTER_OBSERVE,
-    SHELL_CLIENT_CAPABILITY_COMPUTER_TEXT_INPUT,
+    ShellCommandExecutionState, ShellFileOpRequest, SHELL_CLIENT_CAPABILITY_COMPUTER_CONTROL,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_ELEMENT_STATE, SHELL_CLIENT_CAPABILITY_COMPUTER_KEY_INPUT,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_OBSERVE, SHELL_CLIENT_CAPABILITY_COMPUTER_SCROLL_TO_ELEMENT,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_SNAPSHOT_REGION, SHELL_CLIENT_CAPABILITY_COMPUTER_TEXT_INPUT,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_WINDOW_ACTIVATE,
 };
 use base64::{engine::general_purpose, Engine as _};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -23,6 +30,49 @@ const MAX_ACCESSIBILITY_CHILD_COUNT: u64 = 1_000_000;
 const MAX_IMAGE_DIMENSION: u64 = 4096;
 const COMPUTER_WAIT_SECS: u64 = 30;
 const MAX_COMPUTER_TARGETS: usize = 64;
+const DEFAULT_FIND_ELEMENTS_LIMIT: usize = 8;
+const MAX_FIND_ELEMENTS_LIMIT: usize = 32;
+const COMPUTER_KEY_INPUT_KEYS: &[&str] = &[
+    "enter",
+    "escape",
+    "tab",
+    "arrow_up",
+    "arrow_down",
+    "arrow_left",
+    "arrow_right",
+    "page_up",
+    "page_down",
+    "home",
+    "end",
+];
+const COMPUTER_KEY_INPUT_MODIFIERS: &[&str] = &["shift", "control", "option", "command"];
+
+fn normalize_computer_key_input(
+    key: &str,
+    modifiers: Option<Vec<String>>,
+) -> Result<Vec<String>, &'static str> {
+    if !COMPUTER_KEY_INPUT_KEYS.contains(&key) {
+        return Err("computer key input key is outside the closed vocabulary");
+    }
+    let mut modifiers = modifiers.unwrap_or_default();
+    if modifiers.len() > COMPUTER_KEY_INPUT_MODIFIERS.len() {
+        return Err("computer key input has too many modifiers");
+    }
+    for (index, modifier) in modifiers.iter().enumerate() {
+        if !COMPUTER_KEY_INPUT_MODIFIERS.contains(&modifier.as_str())
+            || modifiers[..index].contains(modifier)
+        {
+            return Err("computer key input modifiers are invalid or duplicated");
+        }
+    }
+    modifiers.sort_by_key(|modifier| {
+        COMPUTER_KEY_INPUT_MODIFIERS
+            .iter()
+            .position(|allowed| *allowed == modifier)
+            .unwrap_or(COMPUTER_KEY_INPUT_MODIFIERS.len())
+    });
+    Ok(modifiers)
+}
 
 fn validate_input_text(text: &str) -> Result<usize, &'static str> {
     let text_bytes = text.len();
@@ -97,6 +147,120 @@ impl ToolRuntime {
                 )
                 .await
             }
+            ToolCall::ComputerFindElements {
+                client_id,
+                surface_id,
+                role,
+                subrole,
+                label,
+                focused,
+                enabled,
+                limit,
+            } => {
+                if surface_id.is_empty() || surface_id.len() > MAX_SURFACE_ID_BYTES {
+                    return computer_error("invalid_surface", "surface_id is invalid");
+                }
+                for (name, value) in [
+                    ("role", role.as_deref()),
+                    ("subrole", subrole.as_deref()),
+                    ("label", label.as_deref()),
+                ] {
+                    if let Some(value) = value {
+                        if value.is_empty() || value.len() > MAX_TEXT_BYTES || value.contains('\0')
+                        {
+                            return computer_error(
+                                "invalid_request",
+                                &format!("computer element finder {name} filter is invalid"),
+                            );
+                        }
+                    }
+                }
+                if role.is_none()
+                    && subrole.is_none()
+                    && label.is_none()
+                    && focused.is_none()
+                    && enabled.is_none()
+                {
+                    return computer_error(
+                        "invalid_request",
+                        "computer element finder requires at least one semantic or state filter",
+                    );
+                }
+                let limit = limit
+                    .unwrap_or(DEFAULT_FIND_ELEMENTS_LIMIT)
+                    .clamp(1, MAX_FIND_ELEMENTS_LIMIT);
+                let tree = self
+                    .dispatch_computer_request(
+                        &client_id,
+                        "computer_accessibility_tree",
+                        json!({
+                            "surface_id": surface_id,
+                            "max_depth": MAX_ACCESSIBILITY_DEPTH,
+                            "max_nodes": MAX_ACCESSIBILITY_NODES,
+                        }),
+                        auth,
+                        None,
+                        Some(surface_id.as_str()),
+                        Some((MAX_ACCESSIBILITY_DEPTH, MAX_ACCESSIBILITY_NODES)),
+                    )
+                    .await;
+                if !tree.success {
+                    return tree;
+                }
+                filter_accessibility_tree(
+                    tree.output,
+                    &surface_id,
+                    role.as_deref(),
+                    subrole.as_deref(),
+                    label.as_deref(),
+                    focused,
+                    enabled,
+                    limit,
+                )
+            }
+            ToolCall::ComputerElementState {
+                client_id,
+                surface_id,
+                element_id,
+            } => {
+                if surface_id.is_empty() || surface_id.len() > MAX_SURFACE_ID_BYTES {
+                    return computer_error("invalid_surface", "surface_id is invalid");
+                }
+                if !element_id.starts_with("element_")
+                    || element_id.len() <= "element_".len()
+                    || element_id.len() > MAX_ELEMENT_ID_BYTES
+                {
+                    return computer_error("invalid_element", "element_id is invalid");
+                }
+                self.dispatch_computer_request(
+                    &client_id,
+                    "computer_element_state",
+                    json!({"surface_id": surface_id, "element_id": element_id}),
+                    auth,
+                    None,
+                    Some(surface_id.as_str()),
+                    None,
+                )
+                .await
+            }
+            ToolCall::ComputerActivateWindow {
+                client_id,
+                surface_id,
+            } => {
+                if surface_id.is_empty() || surface_id.len() > MAX_SURFACE_ID_BYTES {
+                    return computer_error("invalid_surface", "surface_id is invalid");
+                }
+                self.dispatch_computer_request(
+                    &client_id,
+                    "computer_activate_window",
+                    json!({"surface_id": surface_id}),
+                    auth,
+                    None,
+                    Some(surface_id.as_str()),
+                    None,
+                )
+                .await
+            }
             ToolCall::ComputerControl {
                 client_id,
                 surface_id,
@@ -123,6 +287,55 @@ impl ToolRuntime {
                         "element_id": element_id,
                         "action": action,
                     }),
+                    auth,
+                    None,
+                    Some(surface_id.as_str()),
+                    None,
+                )
+                .await
+            }
+            ToolCall::ComputerScrollToElement {
+                client_id,
+                surface_id,
+                element_id,
+            } => {
+                if surface_id.is_empty() || surface_id.len() > MAX_SURFACE_ID_BYTES {
+                    return computer_error("invalid_surface", "surface_id is invalid");
+                }
+                if !element_id.starts_with("element_")
+                    || element_id.len() <= "element_".len()
+                    || element_id.len() > MAX_ELEMENT_ID_BYTES
+                {
+                    return computer_error("invalid_element", "element_id is invalid");
+                }
+                self.dispatch_computer_request(
+                    &client_id,
+                    "computer_scroll_to_element",
+                    json!({"surface_id": surface_id, "element_id": element_id}),
+                    auth,
+                    None,
+                    Some(surface_id.as_str()),
+                    None,
+                )
+                .await
+            }
+            ToolCall::ComputerKeyInput {
+                client_id,
+                surface_id,
+                key,
+                modifiers,
+            } => {
+                if surface_id.is_empty() || surface_id.len() > MAX_SURFACE_ID_BYTES {
+                    return computer_error("invalid_surface", "surface_id is invalid");
+                }
+                let modifiers = match normalize_computer_key_input(&key, modifiers) {
+                    Ok(modifiers) => modifiers,
+                    Err(message) => return computer_error("invalid_request", message),
+                };
+                self.dispatch_computer_request(
+                    &client_id,
+                    "computer_key_input",
+                    json!({"surface_id": surface_id, "key": key, "modifiers": modifiers}),
                     auth,
                     None,
                     Some(surface_id.as_str()),
@@ -166,23 +379,404 @@ impl ToolRuntime {
             ToolCall::ComputerSnapshot {
                 client_id,
                 surface_id,
+                region,
+                max_width,
+                max_height,
             } => {
-                if surface_id.is_empty() || surface_id.len() > MAX_SURFACE_ID_BYTES {
-                    return computer_error("invalid_surface", "surface_id is invalid");
-                }
-                self.dispatch_computer_request(
+                self.capture_computer_snapshot(
                     &client_id,
-                    "computer_snapshot",
-                    json!({"surface_id": surface_id}),
+                    &surface_id,
+                    region,
+                    max_width,
+                    max_height,
                     auth,
-                    None,
-                    Some(surface_id.as_str()),
-                    None,
+                )
+                .await
+            }
+            ToolCall::ComputerSaveSnapshot {
+                project,
+                path,
+                client_id,
+                surface_id,
+                region,
+                max_width,
+                max_height,
+                ..
+            } => {
+                self.save_computer_snapshot_artifact(
+                    project, path, client_id, surface_id, region, max_width, max_height, auth,
                 )
                 .await
             }
             _ => ToolResult::err("invalid computer tool dispatch".to_string()),
         }
+    }
+
+    async fn capture_computer_snapshot(
+        &self,
+        client_id: &str,
+        surface_id: &str,
+        region: Option<ComputerSnapshotRegion>,
+        max_width: Option<u32>,
+        max_height: Option<u32>,
+        auth: Option<&AuthContext>,
+    ) -> ToolResult {
+        if surface_id.is_empty() || surface_id.len() > MAX_SURFACE_ID_BYTES {
+            return computer_error("invalid_surface", "surface_id is invalid");
+        }
+        if let Some(region) = region.as_ref() {
+            if region.width == 0
+                || region.height == 0
+                || region.x.checked_add(region.width).is_none()
+                || region.y.checked_add(region.height).is_none()
+            {
+                return computer_error("invalid_request", "snapshot region is invalid");
+            }
+        }
+        if max_width.is_some_and(|value| value == 0 || value > MAX_IMAGE_DIMENSION as u32)
+            || max_height.is_some_and(|value| value == 0 || value > MAX_IMAGE_DIMENSION as u32)
+        {
+            return computer_error(
+                "invalid_request",
+                "snapshot output dimension bound is invalid",
+            );
+        }
+        let advanced = region.is_some() || max_width.is_some() || max_height.is_some();
+        let (kind, payload) = if advanced {
+            (
+                "computer_snapshot_region",
+                json!({
+                    "surface_id": surface_id,
+                    "region": region,
+                    "max_width": max_width,
+                    "max_height": max_height,
+                }),
+            )
+        } else {
+            ("computer_snapshot", json!({"surface_id": surface_id}))
+        };
+        self.dispatch_computer_request(client_id, kind, payload, auth, None, Some(surface_id), None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn save_computer_snapshot_artifact(
+        &self,
+        project: String,
+        path: String,
+        client_id: String,
+        surface_id: String,
+        region: Option<ComputerSnapshotRegion>,
+        max_width: Option<u32>,
+        max_height: Option<u32>,
+        auth: Option<&AuthContext>,
+    ) -> ToolResult {
+        if let Err(error) = validate_artifact_file_path(&path) {
+            return ToolResult::err_with_output(
+                error.clone(),
+                json!({"error_kind": "artifact_policy", "project": project, "path": path, "message": bounded_text(&error)}),
+            );
+        }
+        let resolved = match self.resolve_project_input_for_auth(&project, auth).await {
+            Ok(resolved) => resolved,
+            Err(error) => return error.into_tool_result(),
+        };
+        if !resolved.config.is_agent() {
+            return ToolResult::err("computer_save_snapshot requires an agent-registered project");
+        }
+        let target_client_id = match resolved.config.agent_client_id() {
+            Ok(client_id) => client_id.to_string(),
+            Err(error) => return ToolResult::err(error),
+        };
+        let target_cwd = resolved.config.path.clone();
+        let project_id = resolved.resolved_id;
+        let expected_project_prefix = format!("agent:{target_client_id}:");
+        let target_agent_project_id = match project_id.strip_prefix(&expected_project_prefix) {
+            Some(project_id) if !project_id.is_empty() => project_id.to_string(),
+            _ => {
+                return ToolResult::err(
+                    "computer_save_snapshot resolved target project identity is invalid",
+                )
+            }
+        };
+
+        let capture = self
+            .capture_computer_snapshot(&client_id, &surface_id, region, max_width, max_height, auth)
+            .await;
+        if !capture.success {
+            return capture;
+        }
+        let snapshot = capture.output;
+        let content_base64 = match snapshot.get("content_base64").and_then(Value::as_str) {
+            Some(content) => content.to_string(),
+            None => {
+                return computer_error(
+                    "invalid_runner_response",
+                    "validated snapshot content is missing",
+                )
+            }
+        };
+        let decoded = match general_purpose::STANDARD.decode(content_base64.as_bytes()) {
+            Ok(bytes) if !bytes.is_empty() && bytes.len() <= MAX_MCP_IMAGE_BYTES => bytes,
+            _ => {
+                return computer_error(
+                    "invalid_runner_response",
+                    "validated snapshot content is inconsistent",
+                )
+            }
+        };
+        let mime_type = match snapshot.get("mime_type").and_then(Value::as_str) {
+            Some(mime) => mime.to_string(),
+            None => {
+                return computer_error(
+                    "invalid_runner_response",
+                    "validated snapshot MIME is missing",
+                )
+            }
+        };
+        if let Err(error) = validate_artifact_mime_for_path(&path, Some(&mime_type)) {
+            return ToolResult::err_with_output(
+                error.clone(),
+                json!({"error_kind": "artifact_policy", "project": project_id, "path": path, "message": bounded_text(&error)}),
+            );
+        }
+        let file_bytes = decoded.len();
+        let sha256 = snapshot
+            .get("sha256")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| sha256_hex(&decoded));
+        let Some(surface) = snapshot.get("surface") else {
+            return computer_error(
+                "invalid_runner_response",
+                "validated snapshot surface is missing",
+            );
+        };
+        let source_width = snapshot
+            .get("source_width")
+            .and_then(Value::as_u64)
+            .or_else(|| surface.get("width").and_then(Value::as_u64))
+            .unwrap_or_default();
+        let source_height = snapshot
+            .get("source_height")
+            .and_then(Value::as_u64)
+            .or_else(|| surface.get("height").and_then(Value::as_u64))
+            .unwrap_or_default();
+        let width = snapshot
+            .get("width")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let height = snapshot
+            .get("height")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let captured_region = snapshot.get("region").cloned().unwrap_or_else(
+            || json!({"x": 0, "y": 0, "width": source_width, "height": source_height}),
+        );
+
+        let payload = json!({
+            "path": path.clone(),
+            "content_base64": content_base64,
+            "mime_type": mime_type,
+            "overwrite": false,
+            "max_bytes": MAX_MCP_IMAGE_BYTES,
+        });
+        let serialized = match serde_json::to_string(&payload) {
+            Ok(serialized) => serialized,
+            Err(_) => {
+                return computer_error(
+                    "invalid_request",
+                    "could not encode snapshot artifact request",
+                )
+            }
+        };
+        let wait_timeout = 60_u64;
+        let request = ShellFileOpRequest {
+            op: "save_project_artifact".to_string(),
+            client_id: target_client_id,
+            path: path.clone(),
+            cwd: Some(target_cwd.clone()),
+            content: Some(serialized),
+            max_bytes: None,
+            old_text: None,
+            pattern: None,
+            expected_sha256: None,
+            expected_prefix: None,
+            start_line: None,
+            end_line: None,
+            line: None,
+            create_dirs: false,
+            wait_timeout_secs: wait_timeout,
+        };
+        let requested_by = crate::shell_client::requested_by_from_auth(auth);
+        let (request_id, receiver) = match self
+            .shell_clients
+            .enqueue_computer_snapshot_artifact(
+                request,
+                &target_agent_project_id,
+                &target_cwd,
+                requested_by,
+                auth,
+            )
+            .await
+        {
+            Ok(request) => request,
+            Err(error) => {
+                return computer_snapshot_artifact_lifecycle_failure(
+                    &format!("snapshot artifact write was not dispatched: {error}"),
+                    ShellCommandExecutionState::NotStarted,
+                    &project_id,
+                    &path,
+                    &sha256,
+                    file_bytes,
+                    &mime_type,
+                )
+            }
+        };
+        let response = match tokio::time::timeout(Duration::from_secs(wait_timeout + 4), receiver)
+            .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => {
+                let state = dispatch_uncertainty_lifecycle(
+                    self.shell_clients
+                        .cancel_request_dispatch_state(&request_id)
+                        .await,
+                );
+                return computer_snapshot_artifact_lifecycle_failure(
+                    "snapshot artifact response channel closed before a terminal result was received",
+                    state,
+                    &project_id,
+                    &path,
+                    &sha256,
+                    file_bytes,
+                    &mime_type,
+                );
+            }
+            Err(_) => {
+                let state = dispatch_uncertainty_lifecycle(
+                    self.shell_clients
+                        .cancel_request_dispatch_state(&request_id)
+                        .await,
+                );
+                return computer_snapshot_artifact_lifecycle_failure(
+                    "timed out waiting for snapshot artifact write result",
+                    state,
+                    &project_id,
+                    &path,
+                    &sha256,
+                    file_bytes,
+                    &mime_type,
+                );
+            }
+        };
+        let state = agent_command_lifecycle(&response, wait_timeout);
+        if state == ShellCommandExecutionState::NotStarted {
+            return computer_snapshot_artifact_lifecycle_failure(
+                "snapshot artifact write did not start",
+                state,
+                &project_id,
+                &path,
+                &sha256,
+                file_bytes,
+                &mime_type,
+            );
+        }
+        if state != ShellCommandExecutionState::Completed {
+            return computer_snapshot_artifact_lifecycle_failure(
+                "snapshot artifact write did not return a definite terminal result",
+                ShellCommandExecutionState::OutcomeUnknown,
+                &project_id,
+                &path,
+                &sha256,
+                file_bytes,
+                &mime_type,
+            );
+        }
+        if let Some(error) = response.error.as_deref() {
+            return computer_snapshot_artifact_definite_failure(
+                error,
+                &project_id,
+                &path,
+                &sha256,
+                file_bytes,
+                &mime_type,
+            );
+        }
+        if response.exit_code != Some(0) {
+            return computer_snapshot_artifact_definite_failure(
+                response
+                    .stderr
+                    .as_deref()
+                    .unwrap_or("snapshot artifact write failed"),
+                &project_id,
+                &path,
+                &sha256,
+                file_bytes,
+                &mime_type,
+            );
+        }
+        let output: Value = match response
+            .stdout
+            .as_deref()
+            .map(str::trim)
+            .map(serde_json::from_str)
+            .transpose()
+        {
+            Ok(Some(output)) => output,
+            _ => {
+                return computer_snapshot_artifact_lifecycle_failure(
+                    "snapshot artifact write returned invalid JSON after possible commit",
+                    ShellCommandExecutionState::OutcomeUnknown,
+                    &project_id,
+                    &path,
+                    &sha256,
+                    file_bytes,
+                    &mime_type,
+                )
+            }
+        };
+        if let Some(error) = output.get("error").and_then(Value::as_str) {
+            return computer_snapshot_artifact_definite_failure(
+                error,
+                &project_id,
+                &path,
+                &sha256,
+                file_bytes,
+                &mime_type,
+            );
+        }
+        let metadata_matches = output.get("path").and_then(Value::as_str) == Some(path.as_str())
+            && output.get("bytes_written").and_then(Value::as_u64) == Some(file_bytes as u64)
+            && output.get("sha256").and_then(Value::as_str) == Some(sha256.as_str())
+            && output.get("mime_type").and_then(Value::as_str) == Some(mime_type.as_str());
+        if !metadata_matches {
+            return computer_snapshot_artifact_lifecycle_failure(
+                "snapshot artifact write returned inconsistent success metadata after possible commit",
+                ShellCommandExecutionState::OutcomeUnknown,
+                &project_id,
+                &path,
+                &sha256,
+                file_bytes,
+                &mime_type,
+            );
+        }
+
+        ToolResult::ok(json!({
+            "project": project_id,
+            "path": path,
+            "client_id": client_id,
+            "surface_id": surface_id,
+            "source_width": source_width,
+            "source_height": source_height,
+            "region": captured_region,
+            "width": width,
+            "height": height,
+            "mime_type": mime_type,
+            "file_bytes": file_bytes,
+            "sha256": sha256,
+            "saved": true,
+        }))
     }
 
     async fn computer_list_targets(&self, auth: Option<&AuthContext>) -> ToolResult {
@@ -191,6 +785,7 @@ impl ToolRuntime {
         let mut targets = Vec::new();
         for client in clients {
             let computer_observe = client.capabilities.computer_observe;
+            let computer_snapshot_region = client.capabilities.computer_snapshot_region;
             let computer_accessibility_observe = client.capabilities.computer_accessibility_observe;
             if !computer_observe && !computer_accessibility_observe {
                 continue;
@@ -205,6 +800,7 @@ impl ToolRuntime {
                 "connected": client.connected,
                 "capabilities": {
                     "computer_observe": computer_observe,
+                    "computer_snapshot_region": computer_snapshot_region,
                     "computer_accessibility_observe": computer_accessibility_observe,
                 },
             }));
@@ -231,30 +827,40 @@ impl ToolRuntime {
         if client_id.is_empty() || client_id.len() > 128 {
             return computer_error("invalid_client", "client_id is invalid");
         }
-        let required_capability = match kind {
+        let required_capabilities: &[&str] = match kind {
             "computer_list_windows" | "computer_snapshot" => {
-                SHELL_CLIENT_CAPABILITY_COMPUTER_OBSERVE
+                &[SHELL_CLIENT_CAPABILITY_COMPUTER_OBSERVE]
             }
+            "computer_snapshot_region" => &[
+                SHELL_CLIENT_CAPABILITY_COMPUTER_OBSERVE,
+                SHELL_CLIENT_CAPABILITY_COMPUTER_SNAPSHOT_REGION,
+            ],
             "computer_accessibility_status" | "computer_accessibility_tree" => {
-                crate::shell_protocol::SHELL_CLIENT_CAPABILITY_COMPUTER_ACCESSIBILITY_OBSERVE
+                &[crate::shell_protocol::SHELL_CLIENT_CAPABILITY_COMPUTER_ACCESSIBILITY_OBSERVE]
             }
-            "computer_control" => SHELL_CLIENT_CAPABILITY_COMPUTER_CONTROL,
-            "computer_input_text" => SHELL_CLIENT_CAPABILITY_COMPUTER_TEXT_INPUT,
+            "computer_element_state" => &[SHELL_CLIENT_CAPABILITY_COMPUTER_ELEMENT_STATE],
+            "computer_control" => &[SHELL_CLIENT_CAPABILITY_COMPUTER_CONTROL],
+            "computer_scroll_to_element" => &[SHELL_CLIENT_CAPABILITY_COMPUTER_SCROLL_TO_ELEMENT],
+            "computer_key_input" => &[SHELL_CLIENT_CAPABILITY_COMPUTER_KEY_INPUT],
+            "computer_activate_window" => &[SHELL_CLIENT_CAPABILITY_COMPUTER_WINDOW_ACTIVATE],
+            "computer_input_text" => &[SHELL_CLIENT_CAPABILITY_COMPUTER_TEXT_INPUT],
             _ => return computer_error("invalid_request", "unsupported computer request kind"),
         };
-        match self
-            .shell_clients
-            .client_supports_for_auth(client_id, required_capability, auth)
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                return computer_error(
-                    "capability_unavailable",
-                    &format!("target Runner does not support {required_capability}"),
-                )
+        for required_capability in required_capabilities {
+            match self
+                .shell_clients
+                .client_supports_for_auth(client_id, required_capability, auth)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    return computer_error(
+                        "capability_unavailable",
+                        &format!("target Runner does not support {required_capability}"),
+                    )
+                }
+                Err(error) => return computer_error("client_access_denied", &error),
             }
-            Err(error) => return computer_error("client_access_denied", &error),
         }
         let expected_element_id = payload
             .get("element_id")
@@ -264,7 +870,22 @@ impl ToolRuntime {
             .get("action")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let expected_key = payload
+            .get("key")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let expected_key_modifiers = payload
+            .get("modifiers")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
         let expected_text_bytes = payload.get("text").and_then(Value::as_str).map(str::len);
+        let snapshot_advanced = kind == "computer_snapshot_region";
+        let expected_snapshot_region = payload
+            .get("region")
+            .filter(|value| !value.is_null())
+            .cloned();
+        let expected_snapshot_max_width = payload.get("max_width").and_then(Value::as_u64);
+        let expected_snapshot_max_height = payload.get("max_height").and_then(Value::as_u64);
         let payload = match serde_json::to_string(&payload) {
             Ok(payload) => payload,
             Err(_) => {
@@ -287,7 +908,7 @@ impl ToolRuntime {
             Ok(value) => value,
             Err(error) => return computer_error("dispatch_denied", &error),
         };
-        let is_effect = matches!(kind, "computer_control" | "computer_input_text");
+        let is_effect = computer_request_is_effect(kind);
         let is_text_input = kind == "computer_input_text";
         let response = match tokio::time::timeout(
             Duration::from_secs(COMPUTER_WAIT_SECS + 2),
@@ -337,7 +958,10 @@ impl ToolRuntime {
             if is_effect && error_kind == "runner_error" {
                 return computer_effect_delivery_failure(error, response.request_dispatched);
             }
-            return computer_error(error_kind, error);
+            return computer_error(
+                error_kind,
+                &computer_error_recovery_message(error_kind, error),
+            );
         }
         if response.exit_code != Some(0) {
             if is_effect {
@@ -372,9 +996,15 @@ impl ToolRuntime {
             "computer_list_windows" => {
                 validate_window_list(output, list_limit.unwrap_or(MAX_WINDOWS))
             }
-            "computer_snapshot" => {
-                validate_snapshot(output, expected_surface_id.unwrap_or_default(), client_id)
-            }
+            "computer_snapshot" | "computer_snapshot_region" => validate_snapshot(
+                output,
+                expected_surface_id.unwrap_or_default(),
+                client_id,
+                snapshot_advanced,
+                expected_snapshot_region.as_ref(),
+                expected_snapshot_max_width,
+                expected_snapshot_max_height,
+            ),
             "computer_accessibility_status" => validate_accessibility_status(output),
             "computer_accessibility_tree" => {
                 let (max_depth, max_nodes) = accessibility_bounds.unwrap_or((0, 0));
@@ -385,6 +1015,18 @@ impl ToolRuntime {
                     max_nodes,
                 )
             }
+            "computer_element_state" => validate_computer_element_state(
+                output,
+                expected_surface_id.unwrap_or_default(),
+                expected_element_id.as_deref().unwrap_or_default(),
+            ),
+            "computer_activate_window" => computer_effect_validated_result(
+                validate_computer_activate_window(
+                    output,
+                    expected_surface_id.unwrap_or_default(),
+                ),
+                "Runner reported successful computer window activation but returned inconsistent metadata; inspect current UI state before retrying",
+            ),
             "computer_control" => computer_effect_validated_result(
                 validate_computer_control(
                     output,
@@ -393,6 +1035,23 @@ impl ToolRuntime {
                     expected_action.as_deref().unwrap_or_default(),
                 ),
                 "Runner reported successful computer control but returned inconsistent metadata; inspect current UI state before retrying",
+            ),
+            "computer_scroll_to_element" => computer_effect_validated_result(
+                validate_computer_scroll_to_element(
+                    output,
+                    expected_surface_id.unwrap_or_default(),
+                    expected_element_id.as_deref().unwrap_or_default(),
+                ),
+                "Runner reported successful computer scroll but returned inconsistent metadata; inspect current UI state before retrying",
+            ),
+            "computer_key_input" => computer_effect_validated_result(
+                validate_computer_key_input(
+                    output,
+                    expected_surface_id.unwrap_or_default(),
+                    expected_key.as_deref().unwrap_or_default(),
+                    &expected_key_modifiers,
+                ),
+                "Runner reported successful computer key input but returned inconsistent metadata; inspect current UI state before retrying",
             ),
             "computer_input_text" => computer_effect_validated_result(
                 validate_computer_input_text(
@@ -406,6 +1065,198 @@ impl ToolRuntime {
             _ => computer_error("invalid_request", "unsupported computer request kind"),
         }
     }
+}
+
+fn computer_snapshot_artifact_lifecycle_failure(
+    message: &str,
+    state: ShellCommandExecutionState,
+    project: &str,
+    path: &str,
+    sha256: &str,
+    file_bytes: usize,
+    mime_type: &str,
+) -> ToolResult {
+    if state == ShellCommandExecutionState::NotStarted {
+        return ToolResult::err_with_output(
+            message.to_string(),
+            json!({
+                "error_kind": "not_started",
+                "message": bounded_text(message),
+                "execution_state": "not_started",
+                "state_changed": false,
+                "project": project,
+                "path": path,
+                "expected_sha256": sha256,
+                "expected_file_bytes": file_bytes,
+                "expected_mime_type": mime_type,
+            }),
+        );
+    }
+    let message = format!(
+        "{message}; the create-only artifact may already exist. Read metadata for this exact project/path and compare SHA-256, byte count, and MIME before deciding whether another attempt is safe"
+    );
+    ToolResult::err_with_output(
+        message.clone(),
+        json!({
+            "error_kind": "outcome_unknown",
+            "message": bounded_text(&message),
+            "execution_state": "outcome_unknown",
+            "project": project,
+            "path": path,
+            "expected_sha256": sha256,
+            "expected_file_bytes": file_bytes,
+            "expected_mime_type": mime_type,
+            "reconcile_with": "read_project_artifact_metadata",
+        }),
+    )
+}
+
+fn computer_snapshot_artifact_definite_failure(
+    message: &str,
+    project: &str,
+    path: &str,
+    sha256: &str,
+    file_bytes: usize,
+    mime_type: &str,
+) -> ToolResult {
+    ToolResult::err_with_output(
+        message.to_string(),
+        json!({
+            "error_kind": "artifact_write_failed",
+            "message": bounded_text(message),
+            "execution_state": "completed",
+            "state_changed": false,
+            "project": project,
+            "path": path,
+            "expected_sha256": sha256,
+            "expected_file_bytes": file_bytes,
+            "expected_mime_type": mime_type,
+        }),
+    )
+}
+
+fn computer_error_recovery_message(error_kind: &str, error: &str) -> String {
+    match error_kind {
+        "stale_element" => format!(
+            "{error}; reacquire a fresh element_id with computer_find_elements on the same surface"
+        ),
+        "stale_surface" => format!(
+            "{error}; reacquire a fresh surface_id with computer_list_windows before continuing"
+        ),
+        _ => error.to_string(),
+    }
+}
+
+fn computer_request_is_effect(kind: &str) -> bool {
+    matches!(
+        kind,
+        "computer_activate_window"
+            | "computer_control"
+            | "computer_scroll_to_element"
+            | "computer_key_input"
+            | "computer_input_text"
+    )
+}
+
+fn node_matches_find_query(
+    node: &Value,
+    role: Option<&str>,
+    subrole: Option<&str>,
+    label: Option<&str>,
+    focused: Option<bool>,
+    enabled: Option<bool>,
+) -> bool {
+    if role.is_some_and(|expected| node.get("role").and_then(Value::as_str) != Some(expected)) {
+        return false;
+    }
+    if subrole.is_some_and(|expected| node.get("subrole").and_then(Value::as_str) != Some(expected))
+    {
+        return false;
+    }
+    if label.is_some_and(|expected| {
+        !["title", "description", "placeholder"]
+            .into_iter()
+            .filter_map(|field| node.get(field).and_then(Value::as_str))
+            .any(|value| value.contains(expected))
+    }) {
+        return false;
+    }
+    if focused
+        .is_some_and(|expected| node.get("focused").and_then(Value::as_bool) != Some(expected))
+    {
+        return false;
+    }
+    if enabled
+        .is_some_and(|expected| node.get("enabled").and_then(Value::as_bool) != Some(expected))
+    {
+        return false;
+    }
+    true
+}
+
+fn filter_accessibility_tree(
+    tree: Value,
+    expected_surface_id: &str,
+    role: Option<&str>,
+    subrole: Option<&str>,
+    label: Option<&str>,
+    focused: Option<bool>,
+    enabled: Option<bool>,
+    limit: usize,
+) -> ToolResult {
+    let nodes = match tree.get("nodes").and_then(Value::as_array) {
+        Some(nodes) => nodes,
+        None => {
+            return computer_error(
+                "invalid_runner_response",
+                "validated Accessibility tree is missing nodes",
+            )
+        }
+    };
+    let source_truncated = tree
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let observation_generation = match tree.get("observation_generation").and_then(Value::as_u64) {
+        Some(value) if value > 0 && value <= u32::MAX as u64 => value,
+        _ => {
+            return computer_error(
+                "invalid_runner_response",
+                "validated Accessibility tree is missing observation_generation",
+            )
+        }
+    };
+    let mut total_matches = 0usize;
+    let mut elements = Vec::with_capacity(limit.min(nodes.len()));
+    for node in nodes {
+        if !node_matches_find_query(node, role, subrole, label, focused, enabled) {
+            continue;
+        }
+        total_matches = total_matches.saturating_add(1);
+        if elements.len() >= limit {
+            continue;
+        }
+        elements.push(json!({
+            "element_id": node.get("element_id").cloned().unwrap_or(Value::Null),
+            "role": node.get("role").cloned().unwrap_or(Value::Null),
+            "subrole": node.get("subrole").cloned().unwrap_or(Value::Null),
+            "title": node.get("title").cloned().unwrap_or(Value::Null),
+            "description": node.get("description").cloned().unwrap_or(Value::Null),
+            "placeholder": node.get("placeholder").cloned().unwrap_or(Value::Null),
+            "enabled": node.get("enabled").cloned().unwrap_or(Value::Null),
+            "focused": node.get("focused").cloned().unwrap_or(Value::Null),
+        }));
+    }
+    let count = elements.len();
+    ToolResult::ok(json!({
+        "platform": "macos",
+        "surface_id": expected_surface_id,
+        "observation_generation": observation_generation,
+        "elements": elements,
+        "count": count,
+        "scanned_nodes": nodes.len(),
+        "truncated": source_truncated || total_matches > count,
+    }))
 }
 
 fn computer_error(kind: &str, message: &str) -> ToolResult {
@@ -494,6 +1345,8 @@ fn classify_runner_error(error: &str) -> &'static str {
         "capture_failed",
         "accessibility_failed",
         "control_failed",
+        "scroll_failed",
+        "key_input_failed",
         "input_failed",
         "outcome_unknown",
         "image_too_large",
@@ -745,6 +1598,7 @@ fn validate_accessibility_tree(
         "truncated",
         "max_depth",
         "max_nodes",
+        "observation_generation",
     ];
     if object.len() != allowed.len() || object.keys().any(|key| !allowed.contains(&key.as_str())) {
         return computer_error(
@@ -757,6 +1611,10 @@ fn validate_accessibility_tree(
         || output.get("max_depth").and_then(Value::as_u64) != Some(max_depth as u64)
         || output.get("max_nodes").and_then(Value::as_u64) != Some(max_nodes as u64)
         || output.get("truncated").and_then(Value::as_bool).is_none()
+        || !output
+            .get("observation_generation")
+            .and_then(Value::as_u64)
+            .is_some_and(|value| value > 0 && value <= u32::MAX as u64)
     {
         return computer_error(
             "invalid_runner_response",
@@ -788,6 +1646,103 @@ fn validate_accessibility_tree(
     ToolResult::ok(output)
 }
 
+fn validate_computer_element_state(
+    output: Value,
+    expected_surface_id: &str,
+    expected_element_id: &str,
+) -> ToolResult {
+    let object = match output.as_object() {
+        Some(object) => object,
+        None => {
+            return computer_error(
+                "invalid_runner_response",
+                "computer element state is not an object",
+            )
+        }
+    };
+    let allowed = [
+        "platform",
+        "surface_id",
+        "element_id",
+        "observation_generation",
+        "enabled",
+        "focused",
+        "protected",
+        "value_empty",
+        "can_press",
+        "can_focus",
+        "can_input_text",
+    ];
+    let bool_or_null = |field: &str| {
+        output
+            .get(field)
+            .is_some_and(|value| value.is_boolean() || value.is_null())
+    };
+    if object.len() != allowed.len()
+        || object.keys().any(|key| !allowed.contains(&key.as_str()))
+        || output.get("platform").and_then(Value::as_str) != Some("macos")
+        || output.get("surface_id").and_then(Value::as_str) != Some(expected_surface_id)
+        || output.get("element_id").and_then(Value::as_str) != Some(expected_element_id)
+        || !output
+            .get("observation_generation")
+            .and_then(Value::as_u64)
+            .is_some_and(|value| value > 0 && value <= u32::MAX as u64)
+        || !bool_or_null("enabled")
+        || !bool_or_null("focused")
+        || output.get("protected").and_then(Value::as_bool).is_none()
+        || !bool_or_null("value_empty")
+        || output.get("can_press").and_then(Value::as_bool).is_none()
+        || output.get("can_focus").and_then(Value::as_bool).is_none()
+        || output
+            .get("can_input_text")
+            .and_then(Value::as_bool)
+            .is_none()
+        || (output.get("protected").and_then(Value::as_bool) == Some(true)
+            && (output.get("value_empty") != Some(&Value::Null)
+                || output.get("can_press").and_then(Value::as_bool) != Some(false)
+                || output.get("can_focus").and_then(Value::as_bool) != Some(false)
+                || output.get("can_input_text").and_then(Value::as_bool) != Some(false)))
+        || (output.get("enabled").and_then(Value::as_bool) == Some(false)
+            && (output.get("can_press").and_then(Value::as_bool) != Some(false)
+                || output.get("can_focus").and_then(Value::as_bool) != Some(false)
+                || output.get("can_input_text").and_then(Value::as_bool) != Some(false)))
+        || (output.get("can_input_text").and_then(Value::as_bool) == Some(true)
+            && (output.get("focused").and_then(Value::as_bool) != Some(true)
+                || output.get("value_empty").and_then(Value::as_bool) != Some(true)))
+    {
+        return computer_error(
+            "invalid_runner_response",
+            "computer element state metadata is inconsistent",
+        );
+    }
+    ToolResult::ok(output)
+}
+
+fn validate_computer_activate_window(output: Value, expected_surface_id: &str) -> ToolResult {
+    let object = match output.as_object() {
+        Some(object) => object,
+        None => {
+            return computer_error(
+                "invalid_runner_response",
+                "computer window activation result is not an object",
+            )
+        }
+    };
+    let allowed = ["platform", "surface_id", "success"];
+    if object.len() != allowed.len()
+        || object.keys().any(|key| !allowed.contains(&key.as_str()))
+        || output.get("platform").and_then(Value::as_str) != Some("macos")
+        || output.get("surface_id").and_then(Value::as_str) != Some(expected_surface_id)
+        || output.get("success").and_then(Value::as_bool) != Some(true)
+    {
+        return computer_error(
+            "invalid_runner_response",
+            "computer window activation result metadata is inconsistent",
+        );
+    }
+    ToolResult::ok(output)
+}
+
 fn validate_computer_control(
     output: Value,
     expected_surface_id: &str,
@@ -815,6 +1770,68 @@ fn validate_computer_control(
         return computer_error(
             "invalid_runner_response",
             "computer control result is inconsistent",
+        );
+    }
+    ToolResult::ok(output)
+}
+
+fn validate_computer_scroll_to_element(
+    output: Value,
+    expected_surface_id: &str,
+    expected_element_id: &str,
+) -> ToolResult {
+    let object = match output.as_object() {
+        Some(object) => object,
+        None => {
+            return computer_error(
+                "invalid_runner_response",
+                "computer scroll result is not an object",
+            )
+        }
+    };
+    let allowed = ["platform", "surface_id", "element_id", "success"];
+    if object.len() != allowed.len()
+        || object.keys().any(|key| !allowed.contains(&key.as_str()))
+        || output.get("platform").and_then(Value::as_str) != Some("macos")
+        || output.get("surface_id").and_then(Value::as_str) != Some(expected_surface_id)
+        || output.get("element_id").and_then(Value::as_str) != Some(expected_element_id)
+        || output.get("success").and_then(Value::as_bool) != Some(true)
+    {
+        return computer_error(
+            "invalid_runner_response",
+            "computer scroll result is inconsistent",
+        );
+    }
+    ToolResult::ok(output)
+}
+
+fn validate_computer_key_input(
+    output: Value,
+    expected_surface_id: &str,
+    expected_key: &str,
+    expected_modifiers: &Value,
+) -> ToolResult {
+    let object = match output.as_object() {
+        Some(object) => object,
+        None => {
+            return computer_error(
+                "invalid_runner_response",
+                "computer key input result is not an object",
+            )
+        }
+    };
+    let allowed = ["platform", "surface_id", "key", "modifiers", "success"];
+    if object.len() != allowed.len()
+        || object.keys().any(|key| !allowed.contains(&key.as_str()))
+        || output.get("platform").and_then(Value::as_str) != Some("macos")
+        || output.get("surface_id").and_then(Value::as_str) != Some(expected_surface_id)
+        || output.get("key").and_then(Value::as_str) != Some(expected_key)
+        || output.get("modifiers") != Some(expected_modifiers)
+        || output.get("success").and_then(Value::as_bool) != Some(true)
+    {
+        return computer_error(
+            "invalid_runner_response",
+            "computer key input result is inconsistent",
         );
     }
     ToolResult::ok(output)
@@ -870,7 +1887,69 @@ fn sniff_mime(data: &[u8]) -> Option<&'static str> {
     }
 }
 
-fn validate_snapshot(mut output: Value, expected_surface_id: &str, client_id: &str) -> ToolResult {
+fn snapshot_region_values(region: &Value) -> Option<(u64, u64, u64, u64)> {
+    let object = region.as_object()?;
+    let allowed = ["x", "y", "width", "height"];
+    if object.len() != allowed.len() || object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return None;
+    }
+    Some((
+        region.get("x")?.as_u64()?,
+        region.get("y")?.as_u64()?,
+        region.get("width")?.as_u64()?,
+        region.get("height")?.as_u64()?,
+    ))
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    Sha256::digest(data)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn validate_snapshot(
+    mut output: Value,
+    expected_surface_id: &str,
+    client_id: &str,
+    advanced: bool,
+    expected_region: Option<&Value>,
+    expected_max_width: Option<u64>,
+    expected_max_height: Option<u64>,
+) -> ToolResult {
+    let Some(object) = output.as_object() else {
+        return computer_error(
+            "invalid_runner_response",
+            "Runner snapshot output is not an object",
+        );
+    };
+    let metadata_fields = [
+        "source_width",
+        "source_height",
+        "region",
+        "sha256",
+        "captured_at_unix_ms",
+    ];
+    let metadata_present = metadata_fields
+        .iter()
+        .any(|field| object.contains_key(*field));
+    if advanced && !metadata_present {
+        return computer_error(
+            "invalid_runner_response",
+            "Runner advanced snapshot metadata is missing",
+        );
+    }
+    if metadata_present
+        && metadata_fields
+            .iter()
+            .any(|field| !object.contains_key(*field))
+    {
+        return computer_error(
+            "invalid_runner_response",
+            "Runner snapshot metadata is incomplete",
+        );
+    }
+
     let surface = match output.get("surface") {
         Some(surface) => surface,
         None => {
@@ -883,6 +1962,8 @@ fn validate_snapshot(mut output: Value, expected_surface_id: &str, client_id: &s
     if let Err(error) = validate_surface(surface, Some(expected_surface_id)) {
         return computer_error("invalid_runner_response", &error);
     }
+    let surface_width = surface.get("width").and_then(Value::as_u64).unwrap_or(0);
+    let surface_height = surface.get("height").and_then(Value::as_u64).unwrap_or(0);
     let width = output.get("width").and_then(Value::as_u64).unwrap_or(0);
     let height = output.get("height").and_then(Value::as_u64).unwrap_or(0);
     if width == 0 || height == 0 || width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION {
@@ -891,6 +1972,15 @@ fn validate_snapshot(mut output: Value, expected_surface_id: &str, client_id: &s
             "Runner snapshot dimensions exceed bound",
         );
     }
+    if expected_max_width.is_some_and(|bound| width > bound)
+        || expected_max_height.is_some_and(|bound| height > bound)
+    {
+        return computer_error(
+            "invalid_runner_response",
+            "Runner snapshot exceeds requested output dimensions",
+        );
+    }
+
     let mime = output
         .get("mime_type")
         .and_then(Value::as_str)
@@ -937,11 +2027,59 @@ fn validate_snapshot(mut output: Value, expected_surface_id: &str, client_id: &s
             "Runner snapshot byte count is inconsistent",
         );
     }
+
+    if metadata_present {
+        if output.get("source_width").and_then(Value::as_u64) != Some(surface_width)
+            || output.get("source_height").and_then(Value::as_u64) != Some(surface_height)
+        {
+            return computer_error(
+                "invalid_runner_response",
+                "Runner snapshot source dimensions are inconsistent",
+            );
+        }
+        let actual_region = output.get("region").and_then(snapshot_region_values);
+        let expected_region = expected_region
+            .and_then(snapshot_region_values)
+            .or_else(|| Some((0, 0, surface_width, surface_height)));
+        let Some((x, y, region_width, region_height)) = actual_region else {
+            return computer_error(
+                "invalid_runner_response",
+                "Runner snapshot region metadata is invalid",
+            );
+        };
+        if region_width == 0
+            || region_height == 0
+            || x.checked_add(region_width)
+                .is_none_or(|right| right > surface_width)
+            || y.checked_add(region_height)
+                .is_none_or(|bottom| bottom > surface_height)
+            || actual_region != expected_region
+        {
+            return computer_error(
+                "invalid_runner_response",
+                "Runner snapshot region metadata is inconsistent",
+            );
+        }
+        if output.get("sha256").and_then(Value::as_str) != Some(sha256_hex(&decoded).as_str()) {
+            return computer_error(
+                "invalid_runner_response",
+                "Runner snapshot SHA-256 is inconsistent",
+            );
+        }
+        const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+        if !matches!(
+            output.get("captured_at_unix_ms").and_then(Value::as_u64),
+            Some(value) if value > 0 && value <= MAX_SAFE_JSON_INTEGER
+        ) {
+            return computer_error(
+                "invalid_runner_response",
+                "Runner snapshot capture timestamp is invalid",
+            );
+        }
+    }
+
     let Some(object) = output.as_object_mut() else {
-        return computer_error(
-            "invalid_runner_response",
-            "Runner snapshot output is not an object",
-        );
+        unreachable!("snapshot object shape checked above")
     };
     object.insert("client_id".to_string(), json!(client_id));
     ToolResult::ok(output)
@@ -1000,7 +2138,8 @@ mod tests {
             "node_count": 2,
             "truncated": false,
             "max_depth": 2,
-            "max_nodes": 8
+            "max_nodes": 8,
+            "observation_generation": 7
         })
     }
 
@@ -1018,6 +2157,180 @@ mod tests {
         let result = validate_accessibility_tree(tree, "surface_test", 2, 8);
         assert!(!result.success);
         assert_eq!(result.output["error_kind"], "invalid_runner_response");
+    }
+
+    #[test]
+    fn computer_find_elements_matches_closed_semantic_fields_without_value_search() {
+        let mut node = accessibility_tree()["nodes"][1].clone();
+        node["subrole"] = json!("AXSearchField");
+        node["description"] = json!("Find messages");
+        node["placeholder"] = json!("Search conversations");
+        node["value"] = json!("SUPER_SECRET_VALUE");
+        node["focused"] = Value::Null;
+
+        assert!(node_matches_find_query(
+            &node,
+            Some("AXButton"),
+            Some("AXSearchField"),
+            Some("Search"),
+            None,
+            Some(true),
+        ));
+        assert!(node_matches_find_query(
+            &node,
+            None,
+            None,
+            Some("messages"),
+            None,
+            None,
+        ));
+        assert!(!node_matches_find_query(
+            &node,
+            None,
+            None,
+            Some("SUPER_SECRET_VALUE"),
+            None,
+            None,
+        ));
+        assert!(!node_matches_find_query(
+            &node,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+        ));
+        assert!(!node_matches_find_query(
+            &node,
+            Some("AXTextField"),
+            None,
+            None,
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn computer_find_elements_is_ordered_bounded_and_omits_ax_value() {
+        let result = filter_accessibility_tree(
+            accessibility_tree(),
+            "surface_test",
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+            1,
+        );
+        assert!(result.success, "{:?}", result.output);
+        assert_eq!(result.output["surface_id"], "surface_test");
+        assert_eq!(result.output["observation_generation"], 7);
+        assert_eq!(result.output["scanned_nodes"], 2);
+        assert_eq!(result.output["count"], 1);
+        assert_eq!(result.output["truncated"], true);
+        assert_eq!(result.output["elements"][0]["element_id"], "element_root");
+        assert!(result.output["elements"][0].get("value").is_none());
+    }
+
+    #[test]
+    fn computer_element_state_validator_enforces_normalized_privacy_and_affordances() {
+        let valid = validate_computer_element_state(
+            json!({
+                "platform": "macos",
+                "surface_id": "surface_test",
+                "element_id": "element_child",
+                "observation_generation": 7,
+                "enabled": true,
+                "focused": true,
+                "protected": false,
+                "value_empty": true,
+                "can_press": false,
+                "can_focus": true,
+                "can_input_text": true
+            }),
+            "surface_test",
+            "element_child",
+        );
+        assert!(valid.success, "{:?}", valid.output);
+
+        let protected_leak = validate_computer_element_state(
+            json!({
+                "platform": "macos",
+                "surface_id": "surface_test",
+                "element_id": "element_child",
+                "observation_generation": 7,
+                "enabled": true,
+                "focused": true,
+                "protected": true,
+                "value_empty": true,
+                "can_press": false,
+                "can_focus": false,
+                "can_input_text": false
+            }),
+            "surface_test",
+            "element_child",
+        );
+        assert!(!protected_leak.success);
+        assert_eq!(
+            protected_leak.output["error_kind"],
+            "invalid_runner_response"
+        );
+
+        let disabled_action = validate_computer_element_state(
+            json!({
+                "platform": "macos",
+                "surface_id": "surface_test",
+                "element_id": "element_child",
+                "observation_generation": 7,
+                "enabled": false,
+                "focused": false,
+                "protected": false,
+                "value_empty": null,
+                "can_press": true,
+                "can_focus": false,
+                "can_input_text": false
+            }),
+            "surface_test",
+            "element_child",
+        );
+        assert!(!disabled_action.success);
+        assert_eq!(
+            disabled_action.output["error_kind"],
+            "invalid_runner_response"
+        );
+    }
+
+    #[test]
+    fn computer_activate_window_validator_is_exact_and_post_dispatch_mismatch_is_unknown() {
+        let valid = validate_computer_activate_window(
+            json!({
+                "platform": "macos",
+                "surface_id": "surface_test",
+                "success": true
+            }),
+            "surface_test",
+        );
+        assert!(valid.success, "{:?}", valid.output);
+
+        let invalid = validate_computer_activate_window(
+            json!({
+                "platform": "macos",
+                "surface_id": "surface_other",
+                "success": true,
+                "title": "MUST_NOT_SURVIVE"
+            }),
+            "surface_test",
+        );
+        assert!(!invalid.success);
+        let unknown = computer_effect_validated_result(
+            invalid,
+            "inconsistent window activation result; observe before retrying",
+        );
+        assert_eq!(unknown.output["error_kind"], "outcome_unknown");
+        assert_eq!(unknown.output["execution_state"], "outcome_unknown");
+        assert!(!serde_json::to_string(&unknown.output)
+            .unwrap()
+            .contains("MUST_NOT_SURVIVE"));
     }
 
     #[test]
@@ -1073,6 +2386,106 @@ mod tests {
             semantic_extra.output["error_kind"],
             "invalid_runner_response"
         );
+    }
+
+    #[test]
+    fn computer_scroll_validator_is_exact_and_post_dispatch_mismatch_is_unknown() {
+        let valid = validate_computer_scroll_to_element(
+            json!({
+                "platform": "macos",
+                "surface_id": "surface_test",
+                "element_id": "element_child",
+                "success": true
+            }),
+            "surface_test",
+            "element_child",
+        );
+        assert!(valid.success, "{:?}", valid.output);
+
+        let invalid = validate_computer_scroll_to_element(
+            json!({
+                "platform": "macos",
+                "surface_id": "surface_test",
+                "element_id": "element_other",
+                "success": true,
+                "title": "MUST_NOT_SURVIVE"
+            }),
+            "surface_test",
+            "element_child",
+        );
+        assert!(!invalid.success);
+        let unknown = computer_effect_validated_result(
+            invalid,
+            "inconsistent scroll result; observe before retrying",
+        );
+        assert_eq!(unknown.output["error_kind"], "outcome_unknown");
+        assert_eq!(unknown.output["execution_state"], "outcome_unknown");
+        assert!(!serde_json::to_string(&unknown.output)
+            .unwrap()
+            .contains("MUST_NOT_SURVIVE"));
+    }
+
+    #[test]
+    fn computer_key_input_normalizes_closed_vocabulary_and_modifiers() {
+        assert_eq!(
+            normalize_computer_key_input(
+                "tab",
+                Some(vec!["command".to_string(), "shift".to_string()]),
+            )
+            .unwrap(),
+            vec!["shift".to_string(), "command".to_string()]
+        );
+        assert!(normalize_computer_key_input("a", None).is_err());
+        assert!(normalize_computer_key_input(
+            "enter",
+            Some(vec!["shift".to_string(), "shift".to_string()]),
+        )
+        .is_err());
+        assert!(
+            normalize_computer_key_input("enter", Some(vec!["caps_lock".to_string()]),).is_err()
+        );
+    }
+
+    #[test]
+    fn computer_key_input_validator_is_exact_and_post_dispatch_mismatch_is_unknown() {
+        let expected_modifiers = json!(["shift", "command"]);
+        let valid = validate_computer_key_input(
+            json!({
+                "platform": "macos",
+                "surface_id": "surface_test",
+                "key": "tab",
+                "modifiers": ["shift", "command"],
+                "success": true
+            }),
+            "surface_test",
+            "tab",
+            &expected_modifiers,
+        );
+        assert!(valid.success, "{:?}", valid.output);
+
+        let invalid = validate_computer_key_input(
+            json!({
+                "platform": "macos",
+                "surface_id": "surface_test",
+                "key": "tab",
+                "modifiers": ["command", "shift"],
+                "success": true,
+                "text": "MUST_NOT_SURVIVE"
+            }),
+            "surface_test",
+            "tab",
+            &expected_modifiers,
+        );
+        assert!(!invalid.success);
+        let unknown = computer_effect_validated_result(
+            invalid,
+            "inconsistent key input result; observe before retrying",
+        );
+        assert_eq!(unknown.output["error_kind"], "outcome_unknown");
+        assert_eq!(unknown.output["execution_state"], "outcome_unknown");
+        assert!(!serde_json::to_string(&unknown.output)
+            .unwrap()
+            .contains("MUST_NOT_SURVIVE"));
     }
 
     #[test]
@@ -1179,8 +2592,25 @@ mod tests {
     }
 
     #[test]
+    fn computer_activate_window_uses_effect_delivery_semantics() {
+        assert!(computer_request_is_effect("computer_activate_window"));
+        assert!(computer_request_is_effect("computer_control"));
+        assert!(computer_request_is_effect("computer_scroll_to_element"));
+        assert!(computer_request_is_effect("computer_key_input"));
+        assert!(computer_request_is_effect("computer_input_text"));
+        for read_only in [
+            "computer_list_windows",
+            "computer_accessibility_tree",
+            "computer_snapshot",
+            "computer_snapshot_region",
+        ] {
+            assert!(!computer_request_is_effect(read_only), "{read_only}");
+        }
+    }
+
+    #[test]
     fn computer_control_transport_failure_is_retryable_only_when_undispatched() {
-        // The same narrow delivery fence is shared by computer_input_text.
+        // The same narrow delivery fence is shared by activate-window, scroll-to-element, key input, and text input.
         let not_started = computer_effect_delivery_failure("transport lost", Some(false));
         assert!(!not_started.success);
         assert_eq!(not_started.output["error_kind"], "not_started");
@@ -1218,6 +2648,10 @@ mod tests {
         }
         let unknown = "outcome_unknown: AXPress messaging failed after dispatch";
         assert_eq!(classify_runner_error(unknown), "outcome_unknown");
+        assert_eq!(
+            classify_runner_error("key_input_failed: exact surface is not focused"),
+            "key_input_failed"
+        );
         let result = computer_effect_outcome_unknown(unknown);
         assert!(!result.success);
         assert_eq!(result.output["error_kind"], "outcome_unknown");
@@ -1247,6 +2681,72 @@ mod tests {
     }
 
     #[test]
+    fn computer_snapshot_validator_accepts_advanced_region_metadata_and_rejects_mismatch() {
+        let image = [0xff, 0xd8, 0xff, 0xe0];
+        let region = json!({"x": 10, "y": 20, "width": 100, "height": 80});
+        let output = json!({
+            "surface": surface("surface_test"),
+            "source_width": 1280,
+            "source_height": 720,
+            "region": region.clone(),
+            "width": 50,
+            "height": 40,
+            "mime_type": "image/jpeg",
+            "file_bytes": image.len(),
+            "sha256": sha256_hex(&image),
+            "captured_at_unix_ms": 1_700_000_000_000u64,
+            "content_base64": general_purpose::STANDARD.encode(image)
+        });
+        let result = validate_snapshot(
+            output.clone(),
+            "surface_test",
+            "mini",
+            true,
+            Some(&region),
+            Some(60),
+            Some(50),
+        );
+        assert!(result.success, "{:?}", result.output);
+        assert_eq!(result.output["client_id"], "mini");
+
+        let wrong_region = json!({"x": 11, "y": 20, "width": 100, "height": 80});
+        let result = validate_snapshot(
+            output,
+            "surface_test",
+            "mini",
+            true,
+            Some(&wrong_region),
+            Some(60),
+            Some(50),
+        );
+        assert!(!result.success);
+        assert_eq!(result.output["error_kind"], "invalid_runner_response");
+    }
+
+    #[test]
+    fn computer_snapshot_validator_requires_complete_advanced_metadata() {
+        let image = [0xff, 0xd8, 0xff, 0xe0];
+        let result = validate_snapshot(
+            json!({
+                "surface": surface("surface_test"),
+                "width": 40,
+                "height": 30,
+                "mime_type": "image/jpeg",
+                "file_bytes": image.len(),
+                "content_base64": general_purpose::STANDARD.encode(image)
+            }),
+            "surface_test",
+            "mini",
+            true,
+            None,
+            Some(40),
+            Some(30),
+        );
+        assert!(!result.success);
+        assert_eq!(result.output["error_kind"], "invalid_runner_response");
+    }
+
+    #[test]
     fn computer_snapshot_validator_rejects_decoded_image_over_mcp_bound() {
         let encoded = "AAAA".repeat((MAX_MCP_IMAGE_BYTES / 3) + 1);
         let result = validate_snapshot(
@@ -1260,9 +2760,69 @@ mod tests {
             }),
             "surface_test",
             "msi",
+            false,
+            None,
+            None,
+            None,
         );
         assert!(!result.success);
         assert_eq!(result.output["error_kind"], "image_too_large");
+    }
+
+    #[test]
+    fn computer_save_snapshot_lifecycle_distinguishes_not_started_from_unknown() {
+        let not_started = computer_snapshot_artifact_lifecycle_failure(
+            "not dispatched",
+            ShellCommandExecutionState::NotStarted,
+            "agent:target:demo",
+            "artifacts/ui.jpg",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            1234,
+            "image/jpeg",
+        );
+        assert!(!not_started.success);
+        assert_eq!(not_started.output["error_kind"], "not_started");
+        assert_eq!(not_started.output["execution_state"], "not_started");
+        assert_eq!(not_started.output["state_changed"], false);
+        assert!(not_started.output.get("reconcile_with").is_none());
+
+        let unknown = computer_snapshot_artifact_lifecycle_failure(
+            "response lost",
+            ShellCommandExecutionState::OutcomeUnknown,
+            "agent:target:demo",
+            "artifacts/ui.jpg",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            4321,
+            "image/jpeg",
+        );
+        assert!(!unknown.success);
+        assert_eq!(unknown.output["error_kind"], "outcome_unknown");
+        assert_eq!(unknown.output["execution_state"], "outcome_unknown");
+        assert_eq!(
+            unknown.output["reconcile_with"],
+            "read_project_artifact_metadata"
+        );
+        assert_eq!(unknown.output["project"], "agent:target:demo");
+        assert_eq!(unknown.output["path"], "artifacts/ui.jpg");
+        assert_eq!(unknown.output["expected_file_bytes"], 4321);
+        assert_eq!(unknown.output["expected_mime_type"], "image/jpeg");
+    }
+
+    #[test]
+    fn computer_save_snapshot_definite_write_failure_is_not_retry_uncertainty() {
+        let result = computer_snapshot_artifact_definite_failure(
+            "file exists and overwrite is false",
+            "agent:target:demo",
+            "artifacts/ui.jpg",
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            99,
+            "image/jpeg",
+        );
+        assert!(!result.success);
+        assert_eq!(result.output["error_kind"], "artifact_write_failed");
+        assert_eq!(result.output["execution_state"], "completed");
+        assert_eq!(result.output["state_changed"], false);
+        assert!(result.output.get("reconcile_with").is_none());
     }
 
     #[test]
@@ -1279,6 +2839,10 @@ mod tests {
             }),
             "surface_test",
             "msi",
+            false,
+            None,
+            None,
+            None,
         );
         assert!(result.success);
         assert_eq!(result.output["client_id"], "msi");

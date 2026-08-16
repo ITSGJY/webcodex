@@ -14,9 +14,10 @@ fn target_schema() -> Value {
                 "additionalProperties": false,
                 "properties": {
                     "computer_observe": {"type": "boolean"},
+                    "computer_snapshot_region": {"type": "boolean"},
                     "computer_accessibility_observe": {"type": "boolean"}
                 },
-                "required": ["computer_observe", "computer_accessibility_observe"]
+                "required": ["computer_observe", "computer_snapshot_region", "computer_accessibility_observe"]
             }
         },
         "required": ["client_id", "display_name", "connected", "capabilities"]
@@ -68,6 +69,38 @@ fn accessibility_node_schema() -> Value {
     })
 }
 
+fn accessibility_match_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "element_id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "role": {"type": "string", "minLength": 1, "maxLength": 256},
+            "subrole": {"anyOf": [{"type": "string", "maxLength": 256}, {"type": "null"}]},
+            "title": {"anyOf": [{"type": "string", "maxLength": 256}, {"type": "null"}]},
+            "description": {"anyOf": [{"type": "string", "maxLength": 256}, {"type": "null"}]},
+            "placeholder": {"anyOf": [{"type": "string", "maxLength": 256}, {"type": "null"}]},
+            "enabled": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
+            "focused": {"anyOf": [{"type": "boolean"}, {"type": "null"}]}
+        },
+        "required": ["element_id", "role", "subrole", "title", "description", "placeholder", "enabled", "focused"]
+    })
+}
+
+fn snapshot_region_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "x": {"type": "integer", "minimum": 0, "maximum": 4294967295u64},
+            "y": {"type": "integer", "minimum": 0, "maximum": 4294967295u64},
+            "width": {"type": "integer", "minimum": 1, "maximum": 4294967295u64},
+            "height": {"type": "integer", "minimum": 1, "maximum": 4294967295u64}
+        },
+        "required": ["x", "y", "width", "height"]
+    })
+}
+
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
         "computer_list_targets" => Some(wrapped_output_schema(vec![
@@ -104,6 +137,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 json!({"type": "string", "minLength": 1, "maxLength": 128}),
             ),
             (
+                "observation_generation",
+                json!({"type": "integer", "minimum": 1, "maximum": 4294967295u64}),
+            ),
+            (
                 "nodes",
                 json!({"type": "array", "maxItems": 256, "items": accessibility_node_schema()}),
             ),
@@ -121,6 +158,69 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 json!({"type": "integer", "minimum": 1, "maximum": 256}),
             ),
         ])),
+        "computer_find_elements" => Some(wrapped_output_schema(vec![
+            ("platform", json!({"type": "string", "enum": ["macos"]})),
+            (
+                "surface_id",
+                json!({"type": "string", "minLength": 1, "maxLength": 128}),
+            ),
+            (
+                "observation_generation",
+                json!({"type": "integer", "minimum": 1, "maximum": 4294967295u64}),
+            ),
+            (
+                "elements",
+                json!({"type": "array", "maxItems": 32, "items": accessibility_match_schema()}),
+            ),
+            (
+                "count",
+                json!({"type": "integer", "minimum": 0, "maximum": 32}),
+            ),
+            (
+                "scanned_nodes",
+                json!({"type": "integer", "minimum": 1, "maximum": 256}),
+            ),
+            ("truncated", json!({"type": "boolean"})),
+        ])),
+        "computer_element_state" => Some(wrapped_output_schema(vec![
+            ("platform", json!({"type": "string", "enum": ["macos"]})),
+            (
+                "surface_id",
+                json!({"type": "string", "minLength": 1, "maxLength": 128}),
+            ),
+            (
+                "element_id",
+                json!({"type": "string", "minLength": 1, "maxLength": 128}),
+            ),
+            (
+                "observation_generation",
+                json!({"type": "integer", "minimum": 1, "maximum": 4294967295u64}),
+            ),
+            (
+                "enabled",
+                json!({"anyOf": [{"type": "boolean"}, {"type": "null"}]}),
+            ),
+            (
+                "focused",
+                json!({"anyOf": [{"type": "boolean"}, {"type": "null"}]}),
+            ),
+            ("protected", json!({"type": "boolean"})),
+            (
+                "value_empty",
+                json!({"anyOf": [{"type": "boolean"}, {"type": "null"}]}),
+            ),
+            ("can_press", json!({"type": "boolean"})),
+            ("can_focus", json!({"type": "boolean"})),
+            ("can_input_text", json!({"type": "boolean"})),
+        ])),
+        "computer_activate_window" => Some(wrapped_output_schema(vec![
+            ("platform", json!({"type": "string", "enum": ["macos"]})),
+            (
+                "surface_id",
+                json!({"type": "string", "minLength": 1, "maxLength": 128}),
+            ),
+            ("success", json!({"type": "boolean", "const": true})),
+        ])),
         "computer_control" => Some(wrapped_output_schema(vec![
             ("platform", json!({"type": "string", "enum": ["macos"]})),
             (
@@ -134,6 +234,34 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             (
                 "action",
                 json!({"type": "string", "enum": ["press", "focus"]}),
+            ),
+            ("success", json!({"type": "boolean", "const": true})),
+        ])),
+        "computer_scroll_to_element" => Some(wrapped_output_schema(vec![
+            ("platform", json!({"type": "string", "enum": ["macos"]})),
+            (
+                "surface_id",
+                json!({"type": "string", "minLength": 1, "maxLength": 128}),
+            ),
+            (
+                "element_id",
+                json!({"type": "string", "minLength": 1, "maxLength": 128}),
+            ),
+            ("success", json!({"type": "boolean", "const": true})),
+        ])),
+        "computer_key_input" => Some(wrapped_output_schema(vec![
+            ("platform", json!({"type": "string", "enum": ["macos"]})),
+            (
+                "surface_id",
+                json!({"type": "string", "minLength": 1, "maxLength": 128}),
+            ),
+            (
+                "key",
+                json!({"type": "string", "enum": ["enter", "escape", "tab", "arrow_up", "arrow_down", "arrow_left", "arrow_right", "page_up", "page_down", "home", "end"]}),
+            ),
+            (
+                "modifiers",
+                json!({"type": "array", "maxItems": 4, "uniqueItems": true, "items": {"type": "string", "enum": ["shift", "control", "option", "command"]}}),
             ),
             ("success", json!({"type": "boolean", "const": true})),
         ])),
@@ -160,6 +288,15 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             ("surface", surface_schema()),
             (
+                "source_width",
+                json!({"type": "integer", "minimum": 1, "maximum": 4294967295u64}),
+            ),
+            (
+                "source_height",
+                json!({"type": "integer", "minimum": 1, "maximum": 4294967295u64}),
+            ),
+            ("region", snapshot_region_schema()),
+            (
                 "width",
                 json!({"type": "integer", "minimum": 1, "maximum": 4096}),
             ),
@@ -175,7 +312,60 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "file_bytes",
                 json!({"type": "integer", "minimum": 1, "maximum": 1048576}),
             ),
+            (
+                "sha256",
+                json!({"type": "string", "pattern": "^[0-9a-f]{64}$"}),
+            ),
+            (
+                "captured_at_unix_ms",
+                json!({"type": "integer", "minimum": 1, "maximum": 9007199254740991u64}),
+            ),
             ("content_base64", json!({"type": "string"})),
+        ])),
+        "computer_save_snapshot" => Some(wrapped_output_schema(vec![
+            ("project", json!({"type": "string", "minLength": 1})),
+            (
+                "path",
+                json!({"type": "string", "minLength": 1, "maxLength": 4096}),
+            ),
+            (
+                "client_id",
+                json!({"type": "string", "minLength": 1, "maxLength": 128}),
+            ),
+            (
+                "surface_id",
+                json!({"type": "string", "minLength": 1, "maxLength": 128}),
+            ),
+            (
+                "source_width",
+                json!({"type": "integer", "minimum": 1, "maximum": 4294967295u64}),
+            ),
+            (
+                "source_height",
+                json!({"type": "integer", "minimum": 1, "maximum": 4294967295u64}),
+            ),
+            ("region", snapshot_region_schema()),
+            (
+                "width",
+                json!({"type": "integer", "minimum": 1, "maximum": 4096}),
+            ),
+            (
+                "height",
+                json!({"type": "integer", "minimum": 1, "maximum": 4096}),
+            ),
+            (
+                "mime_type",
+                json!({"type": "string", "enum": ["image/png", "image/jpeg", "image/webp"]}),
+            ),
+            (
+                "file_bytes",
+                json!({"type": "integer", "minimum": 1, "maximum": 1048576}),
+            ),
+            (
+                "sha256",
+                json!({"type": "string", "pattern": "^[0-9a-f]{64}$"}),
+            ),
+            ("saved", json!({"type": "boolean", "const": true})),
         ])),
         _ => None,
     }
