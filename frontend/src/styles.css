@@ -370,6 +370,172 @@ input[type="text"] {
   overflow-wrap: anywhere;
 }
 
+.workflow-sessions-grid {
+  display: grid;
+  grid-template-columns: minmax(240px, 320px) 1fr;
+  gap: 14px;
+  align-items: start;
+}
+
+.workflow-session-detail {
+  min-width: 0;
+}
+
+.workflow-session-title {
+  margin: 0 0 10px;
+  color: var(--text);
+  font-size: 1rem;
+  text-transform: none;
+  letter-spacing: normal;
+  overflow-wrap: anywhere;
+}
+
+.workflow-session-activity-preview {
+  display: flex;
+  gap: 6px;
+  margin-top: 5px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.workflow-session-activity-label {
+  flex: 0 0 auto;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.workflow-session-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.workflow-session-summary-fact {
+  font-size: 0.68rem;
+}
+
+.workflow-session-summary-runtime {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.workflow-session-summary-pass {
+  color: var(--pass);
+  border-color: var(--pass);
+}
+
+.workflow-session-summary-warn {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+
+.workflow-session-summary-fail {
+  color: var(--fail);
+  border-color: var(--fail);
+}
+
+.workflow-session-overview {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.workflow-session-overview-card {
+  min-width: 0;
+  padding: 8px 10px;
+  border-left: 3px solid var(--border);
+  background: var(--bg);
+}
+
+.workflow-session-overview-runtime {
+  border-left-color: var(--accent);
+}
+
+.workflow-session-overview-validation {
+  border-left-color: var(--border);
+}
+
+.workflow-session-overview-pass {
+  border-left-color: var(--pass);
+}
+
+.workflow-session-overview-warn {
+  border-left-color: var(--warn);
+}
+
+.workflow-session-overview-fail {
+  border-left-color: var(--fail);
+}
+
+.workflow-session-overview-muted,
+.workflow-session-overview-progress-card {
+  border-left-color: var(--muted);
+}
+
+.workflow-session-overview-progress-card {
+  opacity: 0.82;
+}
+
+.workflow-session-overview-label {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.workflow-session-overview-value {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+  font-size: 0.82rem;
+}
+
+.workflow-session-overview-note {
+  margin: 2px 0 0;
+}
+
+.workflow-session-timeline-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 12px;
+  margin-bottom: 6px;
+}
+
+.workflow-session-jump-latest {
+  padding: 4px 8px;
+  font-size: 0.75rem;
+}
+
+.workflow-session-timeline {
+  max-height: 360px;
+}
+
+.workflow-session-running {
+  border-left-color: var(--accent);
+}
+
+.workflow-session-job,
+.workflow-session-uncertain {
+  border-left-color: var(--warn);
+}
+
+.workflow-session-failed {
+  border-left-color: var(--fail);
+}
+
+.workflow-session-exploration {
+  border-left-color: var(--muted);
+}
+
+.workflow-session-progress {
+  border-left-color: var(--muted);
+  opacity: 0.8;
+}
+
 .activity {
   max-height: 320px;
 }
@@ -507,7 +673,12 @@ input[type="text"] {
     align-items: flex-start;
   }
 
+  .workflow-sessions-grid,
   .workbench {
+    grid-template-columns: 1fr;
+  }
+
+  .workflow-session-overview {
     grid-template-columns: 1fr;
   }
 

@@ -1111,6 +1111,1254 @@ fn malicious_persisted_validation_output_summary_is_resanitized_on_restore() {
 }
 
 #[test]
+fn tool_call_start_and_finish_share_one_call_id() {
+    let store = SessionStore::new_in_memory(10, 20);
+    let session = store.start_session(
+        Some("agent:eval:demo".to_string()),
+        Some("correlation".to_string()),
+    );
+    let start = store
+        .record_tool_call_started(
+            Some(&session.session_id),
+            SessionTransport::Api,
+            "read_file",
+            &json!({"project": "agent:eval:demo", "path": "src/lib.rs"}),
+        )
+        .expect("start recorded");
+    let call_id = start.call_id.clone();
+    assert!(call_id.starts_with("wc_call_"));
+    store.record_tool_call_finished(
+        Some(start),
+        true,
+        &json!({"content": "omitted"}),
+        None,
+        None,
+    );
+    let summary = store.summary(&session.session_id, Some(20)).unwrap();
+    let tool_events = summary
+        .events
+        .iter()
+        .filter(|event| event.kind.starts_with("tool_call_"))
+        .collect::<Vec<_>>();
+    assert_eq!(tool_events.len(), 2);
+    assert_eq!(tool_events[0].call_id.as_deref(), Some(call_id.as_str()));
+    assert_eq!(tool_events[1].call_id.as_deref(), Some(call_id.as_str()));
+}
+
+#[test]
+fn legacy_session_events_without_call_id_restore() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("sessions.json");
+    let store = persistent_store(ledger.clone());
+    let session = store.start_session(
+        Some("agent:eval:demo".to_string()),
+        Some("legacy correlation".to_string()),
+    );
+    let start = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "read_file",
+        &json!({"project": "agent:eval:demo", "path": "src/legacy.rs"}),
+    );
+    store.record_tool_call_finished(start, true, &json!({"content": "omitted"}), None, None);
+    store.flush_persistence();
+
+    let mut ledger_value: Value =
+        serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+    for event in ledger_value["sessions"][0]["events"]
+        .as_array_mut()
+        .unwrap()
+    {
+        event.as_object_mut().unwrap().remove("call_id");
+    }
+    std::fs::write(&ledger, serde_json::to_vec_pretty(&ledger_value).unwrap()).unwrap();
+    drop(store);
+
+    let restored = SessionStore::with_persistence(ledger, 10, 20);
+    let summary = restored.summary(&session.session_id, Some(20)).unwrap();
+    assert_eq!(summary.counts.tool_calls, 1);
+    assert!(summary.events.iter().all(|event| event.call_id.is_none()));
+    let detail = restored
+        .console_detail_for_project("agent:eval:demo", &session.session_id, Some(20))
+        .unwrap();
+    assert_eq!(detail.activity.len(), 1);
+    assert_eq!(detail.activity[0].state, "succeeded");
+    assert!(!detail.running_call);
+}
+
+fn record_console_tool(
+    store: &SessionStore,
+    session_id: &str,
+    project: &str,
+    tool: &str,
+    input: Value,
+    success: bool,
+    output: Value,
+) {
+    let start =
+        store.record_tool_call_started(Some(session_id), SessionTransport::Api, tool, &input);
+    store.record_tool_call_finished(
+        start,
+        success,
+        &output,
+        (!success).then_some("tool failed"),
+        (!success).then_some("validation_failed"),
+    );
+    debug_assert_eq!(input.get("project").and_then(Value::as_str), Some(project));
+}
+
+fn record_console_validation(
+    store: &SessionStore,
+    session_id: &str,
+    project: &str,
+    success: bool,
+    tests_run_count: u64,
+) {
+    record_console_tool(
+        store,
+        session_id,
+        project,
+        "cargo_test",
+        json!({"project": project}),
+        success,
+        json!({
+            "exit_code": if success { 0 } else { 101 },
+            "execution_state": "completed",
+            "command_started": true,
+            "command_completed": true,
+            "tests_detected": true,
+            "tests_run_count": tests_run_count,
+            "zero_tests_run": tests_run_count == 0,
+            "stdout_tail": if success { "test result: ok" } else { "test result: FAILED" },
+            "stderr_tail": "",
+            "stdout_lines": 1,
+            "stderr_lines": 0,
+            "failure_kind": if success { Value::Null } else { json!("test_failure") }
+        }),
+    );
+}
+
+#[test]
+fn console_overview_counts_runtime_work_attention_and_sanitizes_reported_progress() {
+    let store = SessionStore::new_in_memory(10, 80);
+    let project = "agent:eval:demo";
+    let session = store.start_session(Some(project.to_string()), Some("overview".to_string()));
+
+    for (tool, input, output) in [
+        (
+            "read_file",
+            json!({"project": project, "path": "src/lib.rs"}),
+            json!({"content": "RAW_FILE_CONTENT"}),
+        ),
+        (
+            "search_project_text",
+            json!({"project": project, "pattern": "SECRET_PATTERN", "path": "src"}),
+            json!({"matches": [{"path": "src/lib.rs"}]}),
+        ),
+        (
+            "goto_definition",
+            json!({"project": project, "path": "src/lib.rs", "line": 1, "column": 1}),
+            json!({"locations": [{"path": "src/lib.rs"}]}),
+        ),
+        (
+            "apply_text_edits",
+            json!({"project": project, "changes": [{"kind": "edit", "path": "src/lib.rs", "text": "SECRET_DIFF"}]}),
+            json!({"changed_paths": ["src/lib.rs"]}),
+        ),
+        (
+            "git_status",
+            json!({"project": project}),
+            json!({"status": "clean"}),
+        ),
+    ] {
+        record_console_tool(
+            &store,
+            &session.session_id,
+            project,
+            tool,
+            input,
+            true,
+            output,
+        );
+    }
+    record_console_validation(&store, &session.session_id, project, true, 3);
+    record_console_tool(
+        &store,
+        &session.session_id,
+        project,
+        "run_shell",
+        json!({"project": project, "command": "printf SECRET_COMMAND"}),
+        true,
+        json!({
+            "exit_code": 0,
+            "execution_state": "completed",
+            "command_started": true,
+            "command_completed": true,
+            "stdout_tail": "SECRET_STDOUT",
+            "stderr_tail": "",
+            "stdout_lines": 1,
+            "stderr_lines": 0
+        }),
+    );
+
+    post_message(
+        &store,
+        &session.session_id,
+        SessionMessageKind::Guidance,
+        "PRIVATE_GUIDANCE_BODY",
+    );
+    post_message(
+        &store,
+        &session.session_id,
+        SessionMessageKind::Question,
+        "PRIVATE_QUESTION_BODY",
+    );
+    post_message(
+        &store,
+        &session.session_id,
+        SessionMessageKind::Risk,
+        "PRIVATE_RISK_BODY",
+    );
+    let resolved_todo = post_message(
+        &store,
+        &session.session_id,
+        SessionMessageKind::Todo,
+        "PRIVATE_RESOLVED_TODO_BODY",
+    );
+    store
+        .resolve_message(&session.session_id, &resolved_todo.message_id, None)
+        .unwrap();
+    post_message(
+        &store,
+        &session.session_id,
+        SessionMessageKind::Todo,
+        "PRIVATE_OPEN_TODO_BODY",
+    );
+    post_message(
+        &store,
+        &session.session_id,
+        SessionMessageKind::Progress,
+        "working in /root/private/work.rs",
+    );
+
+    let list = store.console_list_for_project(project, Some(10));
+    let row = list
+        .sessions
+        .iter()
+        .find(|row| row.session_id == session.session_id)
+        .unwrap();
+    assert_eq!(row.overview.work.exploration, 3);
+    assert_eq!(row.overview.work.edits, 1);
+    assert_eq!(row.overview.work.reviews, 1);
+    assert_eq!(row.overview.work.validations, 1);
+    assert_eq!(row.overview.work.runs, 1);
+    assert!(row.overview.work.history_complete);
+    assert!(!row.overview.work.history_truncated);
+    assert_eq!(row.overview.validation.state, "passed");
+    assert_eq!(row.overview.validation.latest_kind.as_deref(), Some("test"));
+    assert_eq!(row.overview.validation.tests_run_count, Some(3));
+    assert_eq!(row.overview.validation.unresolved_failure_count, 0);
+    assert_eq!(row.overview.attention.open_guidance, 1);
+    assert_eq!(row.overview.attention.open_questions, 1);
+    assert_eq!(row.overview.attention.open_risks, 1);
+    assert_eq!(row.overview.attention.open_todos, 1);
+    assert!(row.overview.reported_progress.is_none());
+    let list_serialized = serde_json::to_string(&list).unwrap();
+    for hidden in [
+        "PRIVATE_GUIDANCE_BODY",
+        "PRIVATE_QUESTION_BODY",
+        "PRIVATE_RISK_BODY",
+        "PRIVATE_RESOLVED_TODO_BODY",
+        "PRIVATE_OPEN_TODO_BODY",
+        "working in /root/private/work.rs",
+    ] {
+        assert!(
+            !list_serialized.contains(hidden),
+            "list leaked message body {hidden}: {list_serialized}"
+        );
+    }
+
+    let detail = store
+        .console_detail_for_project(project, &session.session_id, Some(100))
+        .unwrap();
+    let progress = detail.overview.reported_progress.as_ref().unwrap();
+    assert!(
+        progress.text.contains("[private path]"),
+        "{}",
+        progress.text
+    );
+    assert_eq!(detail.overview.validation.state, "passed");
+
+    post_message(
+        &store,
+        &session.session_id,
+        SessionMessageKind::Progress,
+        "token=SUPER_SECRET_VALUE",
+    );
+    let detail = store
+        .console_detail_for_project(project, &session.session_id, Some(100))
+        .unwrap();
+    assert_eq!(
+        detail
+            .overview
+            .reported_progress
+            .as_ref()
+            .map(|progress| progress.text.as_str()),
+        Some("[redacted]")
+    );
+    assert_eq!(detail.overview.validation.state, "passed");
+
+    let serialized = serde_json::to_string(&detail).unwrap();
+    for hidden in [
+        "RAW_FILE_CONTENT",
+        "SECRET_PATTERN",
+        "SECRET_DIFF",
+        "SECRET_COMMAND",
+        "SECRET_STDOUT",
+        "SUPER_SECRET_VALUE",
+        "stdout_tail",
+        "stderr_tail",
+        "command_summary",
+        "validation_output_summary",
+    ] {
+        assert!(
+            !serialized.contains(hidden),
+            "{hidden} leaked: {serialized}"
+        );
+    }
+}
+
+#[test]
+fn console_overview_marks_retained_event_history_truncated_without_claiming_totals() {
+    let store = SessionStore::new_in_memory(10, 4);
+    let project = "agent:eval:demo";
+    let session = store.start_session(Some(project.to_string()), Some("recent work".to_string()));
+    for path in ["src/a.rs", "src/b.rs", "src/c.rs"] {
+        record_console_tool(
+            &store,
+            &session.session_id,
+            project,
+            "read_file",
+            json!({"project": project, "path": path}),
+            true,
+            json!({"content": "omitted"}),
+        );
+    }
+
+    let detail = store
+        .console_detail_for_project(project, &session.session_id, Some(100))
+        .unwrap();
+    assert!(detail.overview.work.history_truncated);
+    assert!(!detail.overview.work.history_complete);
+    assert_eq!(detail.overview.work.exploration, 2);
+    assert_eq!(detail.overview.validation.state, "unavailable");
+    assert!(detail.overview.validation.history_truncated);
+    assert!(!detail.overview.validation.history_complete);
+}
+
+#[test]
+fn console_overview_validation_reuses_terminal_and_failure_resolution_semantics() {
+    let store = SessionStore::new_in_memory(10, 80);
+    let project = "agent:eval:demo";
+
+    let not_run = store.start_session(Some(project.to_string()), Some("not run".to_string()));
+    let detail = store
+        .console_detail_for_project(project, &not_run.session_id, Some(20))
+        .unwrap();
+    assert_eq!(detail.overview.validation.state, "not_run");
+    assert_eq!(detail.overview.validation.unresolved_failure_count, 0);
+
+    let passed = store.start_session(Some(project.to_string()), Some("passed".to_string()));
+    record_console_validation(&store, &passed.session_id, project, true, 4);
+    let detail = store
+        .console_detail_for_project(project, &passed.session_id, Some(20))
+        .unwrap();
+    assert_eq!(detail.overview.validation.state, "passed");
+    assert_eq!(
+        detail.overview.validation.latest_kind.as_deref(),
+        Some("test")
+    );
+    assert_eq!(detail.overview.validation.tests_run_count, Some(4));
+    assert!(detail.overview.validation.latest_at.is_some());
+
+    let failed = store.start_session(Some(project.to_string()), Some("failed".to_string()));
+    record_console_validation(&store, &failed.session_id, project, false, 1);
+    let detail = store
+        .console_detail_for_project(project, &failed.session_id, Some(20))
+        .unwrap();
+    assert_eq!(detail.overview.validation.state, "failed");
+    assert_eq!(detail.overview.validation.unresolved_failure_count, 1);
+
+    let resolved = store.start_session(Some(project.to_string()), Some("resolved".to_string()));
+    record_console_validation(&store, &resolved.session_id, project, false, 1);
+    record_console_validation(&store, &resolved.session_id, project, true, 5);
+    let detail = store
+        .console_detail_for_project(project, &resolved.session_id, Some(20))
+        .unwrap();
+    assert_eq!(detail.overview.validation.state, "passed");
+    assert_eq!(detail.overview.validation.unresolved_failure_count, 0);
+    assert_eq!(detail.overview.validation.tests_run_count, Some(5));
+}
+
+#[test]
+fn console_overview_running_validation_job_handoff_is_work_not_validation_outcome() {
+    let store = SessionStore::new_in_memory(10, 40);
+    let project = "agent:eval:demo";
+    let session = store.start_session(Some(project.to_string()), Some("handoff".to_string()));
+    let start = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "cargo_test",
+        &json!({"project": project}),
+    );
+    store.record_tool_call_finished(
+        start,
+        true,
+        &json!({
+            "execution_state": "running",
+            "job_id": "11111111-2222-3333-4444-555555555555",
+            "job_status": "running",
+            "promoted_to_job": true,
+            "command_started": true,
+            "command_completed": false,
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "stdout_lines": 0,
+            "stderr_lines": 0
+        }),
+        None,
+        None,
+    );
+    post_message(
+        &store,
+        &session.session_id,
+        SessionMessageKind::Progress,
+        "validation passed according to the model",
+    );
+
+    let detail = store
+        .console_detail_for_project(project, &session.session_id, Some(20))
+        .unwrap();
+    assert_eq!(detail.overview.work.validations, 1);
+    assert_eq!(detail.overview.validation.state, "unavailable");
+    assert_eq!(detail.overview.validation.unresolved_failure_count, 0);
+    assert!(detail.overview.reported_progress.is_some());
+}
+
+#[test]
+fn console_overview_unfinished_validation_call_is_current_without_terminal_evidence() {
+    let store = SessionStore::new_in_memory(10, 40);
+    let project = "agent:eval:demo";
+    let session = store.start_session(
+        Some(project.to_string()),
+        Some("unfinished validation".to_string()),
+    );
+    let start = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "cargo_test",
+        &json!({"project": project}),
+    );
+    assert!(start.is_some());
+
+    let list = store.console_list_for_project(project, Some(10));
+    let row = list
+        .sessions
+        .iter()
+        .find(|row| row.session_id == session.session_id)
+        .unwrap();
+    assert!(row.running_call);
+    let current = row.current_activity.as_ref().unwrap();
+    assert_eq!(current.kind, "Tested");
+    assert_eq!(current.state, "running");
+    assert_eq!(row.overview.work.validations, 0);
+    assert_eq!(row.overview.validation.state, "unavailable");
+    assert_eq!(row.overview.validation.unresolved_failure_count, 0);
+}
+
+#[test]
+fn console_projection_is_bounded_semantic_and_progress_is_informational() {
+    let store = SessionStore::new_in_memory(20, 80);
+    let project = "agent:eval:demo";
+    let session = store.start_session(Some(project.to_string()), Some("observe work".to_string()));
+
+    let completed = [
+        (
+            "read_file",
+            json!({"project": project, "path": "src/lib.rs"}),
+            json!({"content": "RAW_FILE_CONTENT"}),
+        ),
+        (
+            "search_project_text",
+            json!({"project": project, "pattern": "SECRET_PATTERN", "path": "src"}),
+            json!({"matches": [{"path": "src/lib.rs"}]}),
+        ),
+        (
+            "apply_text_edits",
+            json!({"project": project, "changes": [{"kind": "edit", "path": "src/lib.rs"}]}),
+            json!({"changed_paths": ["src/lib.rs"]}),
+        ),
+        (
+            "cargo_test",
+            json!({"project": project}),
+            json!({"exit_code": 0, "stdout_tail": "test result: ok", "stderr_tail": "", "stdout_lines": 1, "stderr_lines": 0}),
+        ),
+    ];
+    for (tool, input, output) in completed {
+        let start = store.record_tool_call_started(
+            Some(&session.session_id),
+            SessionTransport::Api,
+            tool,
+            &input,
+        );
+        store.record_tool_call_finished(start, true, &output, None, None);
+    }
+    let running = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "goto_definition",
+        &json!({"project": project, "path": "src/lib.rs", "line": 1, "column": 1}),
+    );
+    assert!(running.is_some());
+    store
+        .post_message(PostSessionMessageInput {
+            session_id: session.session_id.clone(),
+            kind: SessionMessageKind::Progress,
+            message: "validation is next".to_string(),
+            tags: Vec::new(),
+            reply_to: None,
+            priority: SessionMessagePriority::Normal,
+        })
+        .unwrap();
+
+    let detail = store
+        .console_detail_for_project(project, &session.session_id, Some(200))
+        .unwrap();
+    let kinds = detail
+        .activity
+        .iter()
+        .map(|item| item.kind.as_str())
+        .collect::<Vec<_>>();
+    for expected in ["Edited", "Tested", "Navigated", "Progress"] {
+        assert!(kinds.contains(&expected), "missing {expected}: {kinds:?}");
+    }
+    if let Some(explored) = detail.activity.iter().find(|item| item.kind == "Explored") {
+        assert_eq!(explored.group_count, Some(2));
+        assert_eq!(explored.group_kinds, vec!["Read", "Searched"]);
+        assert!(explored.group_tools.contains(&"read_file".to_string()));
+        assert!(explored
+            .group_tools
+            .contains(&"search_project_text".to_string()));
+    } else {
+        // If Progress shares this coarse timestamp, conservative grouping keeps
+        // the exploration facts separate rather than crossing an unordered
+        // Progress boundary.
+        assert!(kinds.contains(&"Read"));
+        assert!(kinds.contains(&"Searched"));
+    }
+    assert!(detail.running_call);
+    let progress = detail
+        .activity
+        .iter()
+        .find(|item| item.kind == "Progress")
+        .unwrap();
+    assert_eq!(progress.state, "info");
+    let serialized = serde_json::to_string(&detail).unwrap();
+    for secret in [
+        "RAW_FILE_CONTENT",
+        "SECRET_PATTERN",
+        "stdout_tail",
+        "stderr_tail",
+    ] {
+        assert!(
+            !serialized.contains(secret),
+            "{secret} leaked: {serialized}"
+        );
+    }
+
+    let bounded = store
+        .console_detail_for_project(project, &session.session_id, Some(2))
+        .unwrap();
+    assert_eq!(bounded.activity_returned, 2);
+    assert!(bounded.activity_total > bounded.activity_returned);
+    assert!(bounded.activity_truncated);
+
+    let other = store.start_session(
+        Some("agent:elsewhere:hidden".to_string()),
+        Some("hidden".to_string()),
+    );
+    assert!(store
+        .console_detail_for_project(project, &other.session_id, Some(20))
+        .is_none());
+    let _second_visible = store.start_session(
+        Some(project.to_string()),
+        Some("second visible".to_string()),
+    );
+    let list = store.console_list_for_project(project, Some(1));
+    assert_eq!(list.returned, 1);
+    assert_eq!(list.total, 2);
+    assert!(list.truncated);
+    assert!(list
+        .sessions
+        .iter()
+        .all(|row| row.session_id != other.session_id));
+}
+
+#[test]
+fn console_list_orders_recent_activity_first_with_deterministic_session_id_ties() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("sessions.json");
+    let project = "agent:eval:ordering";
+    let older = "wc_sess_order_old";
+    let tie_a = "wc_sess_order_tie_a";
+    let tie_z = "wc_sess_order_tie_z";
+    let record = |session_id: &str, created_at: i64, updated_at: i64| {
+        json!({
+            "session_id": session_id,
+            "project": project,
+            "title": session_id,
+            "mode": "normal",
+            "guards": {"deny_write_tools": false, "deny_shell_tools": false},
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "events": [],
+            "messages": []
+        })
+    };
+    std::fs::write(
+        &ledger,
+        serde_json::to_vec_pretty(&json!({
+            "version": SESSION_LEDGER_VERSION,
+            "sessions": [
+                record(older, 1, 10),
+                record(tie_a, 2, 20),
+                record(tie_z, 3, 20)
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let store = persistent_store(ledger);
+
+    let initial = store.console_list_for_project(project, Some(10));
+    assert_eq!(
+        initial
+            .sessions
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![tie_z, tie_a, older],
+        "equal updated_at must keep the existing descending session-id tie-break"
+    );
+
+    let activity = store
+        .record_tool_call_started(
+            Some(older),
+            SessionTransport::Api,
+            "read_file",
+            &json!({"project": project, "path": "src/lib.rs"}),
+        )
+        .expect("older Session activity should be recorded");
+    assert_eq!(activity.session_id, older);
+
+    let refreshed = store.console_list_for_project(project, Some(10));
+    assert_eq!(refreshed.sessions[0].session_id, older);
+    assert!(refreshed.sessions[0].updated_at > refreshed.sessions[1].updated_at);
+    assert_eq!(refreshed.sessions[1].session_id, tie_z);
+    assert_eq!(refreshed.sessions[2].session_id, tie_a);
+}
+
+#[test]
+fn console_list_uses_only_unfinished_call_as_now_and_keeps_job_handoff_as_last() {
+    let store = SessionStore::new_in_memory(10, 40);
+    let project = "agent:eval:demo";
+    let session = store.start_session(Some(project.to_string()), Some("live list".to_string()));
+
+    let read = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "read_file",
+        &json!({"project": project, "path": "src/lib.rs"}),
+    );
+    store.record_tool_call_finished(read, true, &json!({"content": "omitted"}), None, None);
+
+    let job_id = "11111111-2222-3333-4444-555555555555";
+    let cargo = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "cargo_test",
+        &json!({"project": project}),
+    );
+    store.record_tool_call_finished(
+        cargo,
+        true,
+        &json!({
+            "execution_state": "running",
+            "job_id": job_id,
+            "job_status": "running",
+            "promoted_to_job": true,
+            "command_started": true,
+            "command_completed": false,
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "stdout_lines": 0,
+            "stderr_lines": 0
+        }),
+        None,
+        None,
+    );
+    store
+        .post_message(PostSessionMessageInput {
+            session_id: session.session_id.clone(),
+            kind: SessionMessageKind::Progress,
+            message: "this message must not replace runtime activity".to_string(),
+            tags: Vec::new(),
+            reply_to: None,
+            priority: SessionMessagePriority::Normal,
+        })
+        .unwrap();
+
+    let list = store.console_list_for_project(project, Some(10));
+    let row = list
+        .sessions
+        .iter()
+        .find(|row| row.session_id == session.session_id)
+        .unwrap();
+    assert!(!row.running_call);
+    assert!(row.current_activity.is_none());
+    let last = row.last_activity.as_ref().unwrap();
+    assert_eq!(last.tool.as_deref(), Some("cargo_test"));
+    assert_eq!(last.state, "running");
+    assert_eq!(last.execution_state.as_deref(), Some("running"));
+    assert!(last.job_handoff);
+    assert_eq!(last.job_id.as_deref(), Some(job_id));
+    assert!(last
+        .summary
+        .as_deref()
+        .unwrap_or_default()
+        .contains("handed off to Job"));
+
+    let running = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "goto_definition",
+        &json!({"project": project, "path": "src/lib.rs", "line": 1, "column": 1}),
+    );
+    assert!(running.is_some());
+    let list = store.console_list_for_project(project, Some(10));
+    let row = list
+        .sessions
+        .iter()
+        .find(|row| row.session_id == session.session_id)
+        .unwrap();
+    assert!(row.running_call);
+    assert_eq!(
+        row.current_activity.as_ref().unwrap().tool.as_deref(),
+        Some("goto_definition")
+    );
+    assert_eq!(row.current_activity.as_ref().unwrap().state, "running");
+    assert_eq!(
+        row.last_activity.as_ref().unwrap().tool.as_deref(),
+        Some("cargo_test")
+    );
+}
+
+#[test]
+fn console_list_keeps_started_run_job_handoff_historical_and_later_activity_becomes_last() {
+    let store = SessionStore::new_in_memory(10, 30);
+    let project = "agent:eval:demo";
+    let session = store.start_session(Some(project.to_string()), Some("async job".to_string()));
+    let job_id = "12345678-1234-5678-9abc-123456789abc";
+    let start = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "run_job",
+        &json!({"project": project}),
+    );
+    store.record_tool_call_finished(
+        start,
+        true,
+        &json!({
+            "execution_state": "started",
+            "job_id": job_id,
+            "status": "running",
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "stdout_lines": 0,
+            "stderr_lines": 0
+        }),
+        None,
+        None,
+    );
+
+    let list = store.console_list_for_project(project, Some(10));
+    let row = list
+        .sessions
+        .iter()
+        .find(|row| row.session_id == session.session_id)
+        .unwrap();
+    assert!(row.current_activity.is_none());
+    let last = row.last_activity.as_ref().unwrap();
+    assert_eq!(last.tool.as_deref(), Some("run_job"));
+    assert!(last.job_handoff);
+    assert_eq!(last.state, "running");
+    assert_eq!(last.execution_state.as_deref(), Some("started"));
+    assert_eq!(last.job_id.as_deref(), Some(job_id));
+
+    // A later authoritative Job observation may say terminal completed while
+    // the original handoff event remains the historical `started` snapshot.
+    let observed = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "job_status",
+        &json!({"project": project, "job_id": job_id}),
+    );
+    store.record_tool_call_finished(
+        observed,
+        true,
+        &json!({"job_id": job_id, "status": "completed", "execution_state": "completed"}),
+        None,
+        None,
+    );
+
+    let detail = store
+        .console_detail_for_project(project, &session.session_id, Some(20))
+        .unwrap();
+    let handoff = detail
+        .activity
+        .iter()
+        .find(|activity| activity.tool.as_deref() == Some("run_job"))
+        .unwrap();
+    assert_eq!(handoff.execution_state.as_deref(), Some("started"));
+
+    let list = store.console_list_for_project(project, Some(10));
+    let row = list
+        .sessions
+        .iter()
+        .find(|row| row.session_id == session.session_id)
+        .unwrap();
+    assert!(row.current_activity.is_none());
+    assert_eq!(
+        row.last_activity.as_ref().unwrap().tool.as_deref(),
+        Some("job_status")
+    );
+
+    store.close_session(&session.session_id).unwrap();
+    let list = store.console_list_for_project(project, Some(10));
+    let row = list
+        .sessions
+        .iter()
+        .find(|row| row.session_id == session.session_id)
+        .unwrap();
+    assert_eq!(row.lifecycle, "closed");
+    assert!(row.current_activity.is_none());
+    assert_eq!(
+        row.last_activity.as_ref().unwrap().tool.as_deref(),
+        Some("job_status")
+    );
+}
+
+#[test]
+fn console_list_without_running_work_shows_last_meaningful_activity() {
+    let store = SessionStore::new_in_memory(10, 20);
+    let project = "agent:eval:demo";
+    let session = store.start_session(Some(project.to_string()), Some("last activity".to_string()));
+    for (tool, input, output) in [
+        (
+            "read_file",
+            json!({"project": project, "path": "src/lib.rs"}),
+            json!({"content": "omitted"}),
+        ),
+        (
+            "git_status",
+            json!({"project": project}),
+            json!({"status": "clean"}),
+        ),
+    ] {
+        let start = store.record_tool_call_started(
+            Some(&session.session_id),
+            SessionTransport::Api,
+            tool,
+            &input,
+        );
+        store.record_tool_call_finished(start, true, &output, None, None);
+    }
+    store
+        .post_message(PostSessionMessageInput {
+            session_id: session.session_id.clone(),
+            kind: SessionMessageKind::Progress,
+            message: "done inspecting".to_string(),
+            tags: Vec::new(),
+            reply_to: None,
+            priority: SessionMessagePriority::Normal,
+        })
+        .unwrap();
+    store.close_session(&session.session_id).unwrap();
+    let list = store.console_list_for_project(project, Some(10));
+    let row = list
+        .sessions
+        .iter()
+        .find(|row| row.session_id == session.session_id)
+        .unwrap();
+    assert_eq!(row.lifecycle, "closed");
+    assert!(row.current_activity.is_none());
+    assert_eq!(
+        row.last_activity.as_ref().unwrap().tool.as_deref(),
+        Some("git_status")
+    );
+    assert_eq!(row.last_activity.as_ref().unwrap().kind, "Reviewed");
+}
+
+#[test]
+fn console_exploration_grouping_is_ordered_bounded_and_stops_at_fact_barriers() {
+    let store = SessionStore::new_in_memory(10, 80);
+    let project = "agent:eval:demo";
+    let session = store.start_session(
+        Some(project.to_string()),
+        Some("group activity".to_string()),
+    );
+
+    for (tool, input, output) in [
+        (
+            "read_file",
+            json!({"project": project, "path": "src/a.rs"}),
+            json!({"content": "PRIVATE_CONTENT_A"}),
+        ),
+        (
+            "search_project_text",
+            json!({"project": project, "pattern": "PRIVATE_PATTERN", "path": "src"}),
+            json!({"matches": [{"path": "src/b.rs"}]}),
+        ),
+        (
+            "goto_definition",
+            json!({"project": project, "path": "src/c.rs", "line": 1, "column": 1}),
+            json!({"locations": [{"path": "src/c.rs"}]}),
+        ),
+    ] {
+        let start = store.record_tool_call_started(
+            Some(&session.session_id),
+            SessionTransport::Api,
+            tool,
+            &input,
+        );
+        store.record_tool_call_finished(start, true, &output, None, None);
+    }
+
+    let edit = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "apply_text_edits",
+        &json!({"project": project, "changes": [{"kind": "edit", "path": "src/a.rs"}]}),
+    );
+    store.record_tool_call_finished(
+        edit,
+        true,
+        &json!({"changed_paths": ["src/a.rs"]}),
+        None,
+        None,
+    );
+
+    let read = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "read_file",
+        &json!({"project": project, "path": "src/d.rs"}),
+    );
+    store.record_tool_call_finished(
+        read,
+        true,
+        &json!({"content": "PRIVATE_CONTENT_D"}),
+        None,
+        None,
+    );
+    let failed = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "search_project_text",
+        &json!({"project": project, "pattern": "PRIVATE_FAILED_PATTERN", "path": "src"}),
+    );
+    store.record_tool_call_finished(
+        failed,
+        false,
+        &json!({"failure_kind": "search_failed"}),
+        Some("search failed"),
+        Some("search_failed"),
+    );
+
+    let job_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let job = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "cargo_check",
+        &json!({"project": project}),
+    );
+    store.record_tool_call_finished(
+        job,
+        true,
+        &json!({
+            "execution_state": "running",
+            "job_id": job_id,
+            "promoted_to_job": true,
+            "command_started": true,
+            "command_completed": false,
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "stdout_lines": 0,
+            "stderr_lines": 0
+        }),
+        None,
+        None,
+    );
+    // Without an unordered Progress message, adjacent successful exploration
+    // groups normally and concrete fact barriers remain separate.
+    let detail = store
+        .console_detail_for_project(project, &session.session_id, Some(20))
+        .unwrap();
+    let kinds = detail
+        .activity
+        .iter()
+        .map(|activity| activity.kind.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec!["Explored", "Edited", "Read", "Searched", "Tested"]
+    );
+    let group = &detail.activity[0];
+    assert_eq!(group.group_count, Some(3));
+    assert_eq!(group.group_kinds, vec!["Read", "Searched", "Navigated"]);
+    assert_eq!(
+        group.group_tools,
+        vec!["read_file", "search_project_text", "goto_definition"]
+    );
+    assert_eq!(group.paths, vec!["src/a.rs", "src/b.rs", "src/c.rs"]);
+    assert_eq!(detail.activity[3].state, "failed");
+    assert!(detail.activity[4].job_handoff);
+    assert_eq!(
+        detail.activity[4].execution_state.as_deref(),
+        Some("running")
+    );
+    assert_eq!(detail.activity[4].job_id.as_deref(), Some(job_id));
+
+    let bounded = store
+        .console_detail_for_project(project, &session.session_id, Some(3))
+        .unwrap();
+    assert_eq!(bounded.activity.len(), 3);
+    assert!(bounded.activity_truncated);
+
+    store
+        .post_message(PostSessionMessageInput {
+            session_id: session.session_id.clone(),
+            kind: SessionMessageKind::Progress,
+            message: "waiting for validation".to_string(),
+            tags: Vec::new(),
+            reply_to: None,
+            priority: SessionMessagePriority::Normal,
+        })
+        .unwrap();
+    let with_progress = store
+        .console_detail_for_project(project, &session.session_id, Some(20))
+        .unwrap();
+    let progress = with_progress
+        .activity
+        .iter()
+        .find(|activity| activity.kind == "Progress")
+        .unwrap();
+    assert_eq!(progress.state, "info");
+    let serialized = serde_json::to_string(&with_progress).unwrap();
+    for hidden in [
+        "PRIVATE_CONTENT_A",
+        "PRIVATE_CONTENT_D",
+        "PRIVATE_PATTERN",
+        "PRIVATE_FAILED_PATTERN",
+    ] {
+        assert!(
+            !serialized.contains(hidden),
+            "{hidden} leaked: {serialized}"
+        );
+    }
+}
+
+#[test]
+fn console_projection_preserves_job_backed_execution_truth_and_safe_job_ids() {
+    let store = SessionStore::new_in_memory(10, 40);
+    let project = "agent:eval:demo";
+    let session = store.start_session(Some(project.to_string()), Some("job facts".to_string()));
+    let real_job_id = "11111111-2222-3333-4444-555555555555";
+
+    for (tool, output) in [
+        (
+            "cargo_test",
+            json!({
+                "execution_state": "running",
+                "job_id": real_job_id,
+                "job_status": "running",
+                "promoted_to_job": true,
+                "command_started": true,
+                "command_completed": false,
+                "stdout_tail": "",
+                "stderr_tail": "",
+                "stdout_lines": 0,
+                "stderr_lines": 0
+            }),
+        ),
+        (
+            "run_process",
+            json!({
+                "execution_state": "completed",
+                "command_started": true,
+                "command_completed": true,
+                "exit_code": 0,
+                "stdout_tail": "",
+                "stderr_tail": "",
+                "stdout_lines": 0,
+                "stderr_lines": 0
+            }),
+        ),
+        (
+            "run_process",
+            json!({
+                "execution_state": "outcome_unknown",
+                "command_started": true,
+                "command_completed": false,
+                "stdout_tail": "",
+                "stderr_tail": "",
+                "stdout_lines": 0,
+                "stderr_lines": 0
+            }),
+        ),
+        (
+            "run_process",
+            json!({
+                "execution_state": "timed_out",
+                "command_started": true,
+                "command_completed": false,
+                "stdout_tail": "",
+                "stderr_tail": "",
+                "stdout_lines": 0,
+                "stderr_lines": 0
+            }),
+        ),
+        (
+            "run_job",
+            json!({
+                "execution_state": "running",
+                "job_id": "../unsafe-job",
+                "command_started": true,
+                "command_completed": false,
+                "stdout_tail": "",
+                "stderr_tail": "",
+                "stdout_lines": 0,
+                "stderr_lines": 0
+            }),
+        ),
+    ] {
+        let start = store.record_tool_call_started(
+            Some(&session.session_id),
+            SessionTransport::Api,
+            tool,
+            &json!({"project": project}),
+        );
+        store.record_tool_call_finished(start, true, &output, None, None);
+    }
+
+    let detail = store
+        .console_detail_for_project(project, &session.session_id, Some(40))
+        .unwrap();
+    let states = detail
+        .activity
+        .iter()
+        .map(|activity| activity.state.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        states,
+        vec![
+            "running",
+            "succeeded",
+            "outcome_unknown",
+            "timed_out",
+            "running"
+        ]
+    );
+    assert_eq!(detail.activity[0].job_id.as_deref(), Some(real_job_id));
+    assert!(detail.activity[4].job_id.is_none());
+    let serialized = serde_json::to_string(&detail).unwrap();
+    assert!(!serialized.contains("../unsafe-job"));
+}
+
+#[test]
+fn console_title_and_progress_redact_absolute_private_paths() {
+    let store = SessionStore::new_in_memory(10, 20);
+    let project = "agent:eval:demo";
+    let session = store.start_session(
+        Some(project.to_string()),
+        Some("inspect /etc/passwd /opt/tool C:\\Users\\alice\\secret \\\\server\\share\\x file:///tmp/item".to_string()),
+    );
+    store
+        .post_message(PostSessionMessageInput {
+            session_id: session.session_id.clone(),
+            kind: SessionMessageKind::Progress,
+            message: "checked path=/etc/hosts /opt/config D:/private/data \\\\host\\share\\file file:///var/tmp/x".to_string(),
+            tags: Vec::new(),
+            reply_to: None,
+            priority: SessionMessagePriority::Normal,
+        })
+        .unwrap();
+    let detail = store
+        .console_detail_for_project(project, &session.session_id, Some(20))
+        .unwrap();
+    let serialized = serde_json::to_string(&detail).unwrap();
+    for private in [
+        "/etc/passwd",
+        "/opt/tool",
+        "C:\\\\Users",
+        "\\\\\\\\server",
+        "file:///tmp/item",
+        "/etc/hosts",
+        "/opt/config",
+        "D:/private/data",
+        "\\\\\\\\host",
+        "file:///var/tmp/x",
+    ] {
+        assert!(
+            !serialized.contains(private),
+            "private path leaked: {serialized}"
+        );
+    }
+    assert!(serialized.contains("[private path]"));
+}
+
+#[test]
+fn console_title_and_progress_redact_json_wrapped_private_paths() {
+    let store = SessionStore::new_in_memory(10, 20);
+    let project = "agent:eval:demo";
+    let session = store.start_session(
+        Some(project.to_string()),
+        Some(r#"inspect {"path":"/etc/passwd"}"#.to_string()),
+    );
+    store
+        .post_message(PostSessionMessageInput {
+            session_id: session.session_id.clone(),
+            kind: SessionMessageKind::Progress,
+            message: r#"checked {"cwd":"C:\\Users\\alice\\secret"}"#.to_string(),
+            tags: Vec::new(),
+            reply_to: None,
+            priority: SessionMessagePriority::Normal,
+        })
+        .unwrap();
+    let detail = store
+        .console_detail_for_project(project, &session.session_id, Some(20))
+        .unwrap();
+    let serialized = serde_json::to_string(&detail).unwrap();
+    for private in ["/etc/passwd", "C:\\\\Users"] {
+        assert!(
+            !serialized.contains(private),
+            "JSON-wrapped private path leaked: {serialized}"
+        );
+    }
+    assert!(serialized.contains("[private path]"));
+}
+
+#[test]
 fn legacy_session_events_without_validation_output_summary_restore() {
     let tmp = tempfile::tempdir().unwrap();
     let ledger = tmp.path().join("sessions.json");

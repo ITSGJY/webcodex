@@ -253,6 +253,215 @@ function createReviewController(options) {
     };
 }
 
+// DOM-free selection, response fencing, timeline-follow state, and narrow
+// human-facing overview formatting for Workflow Sessions.
+const FOLLOW_BOTTOM_THRESHOLD_PX = 24;
+function overviewCount(value) {
+    return typeof value === "number" && Number.isFinite(value) && value > 0
+        ? Math.floor(value)
+        : 0;
+}
+function countLabel(count, singular, plural = singular + "s") {
+    return count + " " + (count === 1 ? singular : plural);
+}
+function validationOverviewFact(validation) {
+    const state = String((validation && validation.state) || "unavailable");
+    const retained = !!(validation && validation.history_truncated);
+    const unresolved = overviewCount(validation && validation.unresolved_failure_count);
+    if (state === "failed") {
+        return {
+            text: unresolved
+                ? (retained ? "Retained: " : "") + countLabel(unresolved, "unresolved validation failure")
+                : retained
+                    ? "Latest retained validation failed"
+                    : "Latest validation failed",
+            tone: "fail",
+        };
+    }
+    if (state === "passed") {
+        return {
+            text: retained ? "Latest retained validation passed" : "Latest validation passed",
+            tone: "pass",
+        };
+    }
+    if (state === "not_run") {
+        return { text: "Validation not run", tone: "muted" };
+    }
+    return {
+        text: retained
+            ? "Retained terminal validation evidence unavailable"
+            : "Terminal validation evidence unavailable",
+        tone: "muted",
+    };
+}
+function attentionOverviewParts(attention) {
+    const parts = [];
+    for (const [key, singular] of [
+        ["open_risks", "risk"],
+        ["open_todos", "todo"],
+        ["open_questions", "question"],
+        ["open_guidance", "guidance"],
+    ]) {
+        const count = overviewCount(attention && attention[key]);
+        if (count) {
+            parts.push(countLabel(count, singular));
+        }
+    }
+    return parts;
+}
+function workOverviewParts(work, limit = 5) {
+    const parts = [];
+    for (const [key, singular, plural] of [
+        ["edits", "edit", "edits"],
+        ["validations", "validation", "validations"],
+        ["exploration", "exploration", "exploration"],
+        ["reviews", "review", "reviews"],
+        ["runs", "run", "runs"],
+    ]) {
+        const count = overviewCount(work && work[key]);
+        if (count) {
+            parts.push(countLabel(count, singular, plural));
+        }
+        if (parts.length >= limit) {
+            break;
+        }
+    }
+    return parts;
+}
+function workflowSessionListOverviewFacts(overview) {
+    if (!overview || typeof overview !== "object") {
+        return [];
+    }
+    const facts = [validationOverviewFact(overview.validation)];
+    const attention = attentionOverviewParts(overview.attention);
+    if (attention.length) {
+        facts.push({
+            text: "Retained: " + attention.slice(0, 2).join(" · "),
+            tone: overviewCount(overview.attention && overview.attention.open_risks) ? "fail" : "warn",
+        });
+    }
+    const work = workOverviewParts(overview.work, 2);
+    if (work.length) {
+        facts.push({
+            text: (overview.work && overview.work.history_truncated ? "Recent " : "") + work.join(" · "),
+            tone: "runtime",
+        });
+    }
+    return facts.slice(0, 3);
+}
+function workflowSessionOverviewPresentation(overview) {
+    const value = overview && typeof overview === "object" ? overview : {};
+    const work = workOverviewParts(value.work);
+    const workText = work.length
+        ? (value.work && value.work.history_truncated ? "Recent observed work: " : "Observed work: ") +
+            work.join(" · ")
+        : value.work && value.work.history_truncated
+            ? "No work observations in retained events."
+            : "No tool activity observed.";
+    const validationFact = validationOverviewFact(value.validation);
+    const validationParts = [validationFact.text];
+    if (value.validation && value.validation.latest_kind) {
+        validationParts.push("latest " + String(value.validation.latest_kind));
+    }
+    const testsRun = overviewCount(value.validation && value.validation.tests_run_count);
+    if (testsRun || (value.validation && value.validation.tests_run_count === 0)) {
+        validationParts.push(countLabel(testsRun, "test"));
+    }
+    const unresolved = overviewCount(value.validation && value.validation.unresolved_failure_count);
+    if (unresolved && !validationFact.text.includes("unresolved validation failure")) {
+        validationParts.push(countLabel(unresolved, "unresolved failure"));
+    }
+    const attention = attentionOverviewParts(value.attention);
+    const attentionText = attention.length
+        ? "Retained open messages: " + attention.join(" · ")
+        : "No retained open guidance, questions, risks, or todos.";
+    const progress = value.reported_progress && typeof value.reported_progress === "object"
+        ? value.reported_progress
+        : null;
+    return {
+        workText,
+        validationText: validationParts.join(" · "),
+        validationTone: validationFact.tone,
+        validationAt: value.validation && typeof value.validation.latest_at === "number"
+            ? value.validation.latest_at
+            : null,
+        attentionText,
+        attentionTone: overviewCount(value.attention && value.attention.open_risks)
+            ? "fail"
+            : attention.length
+                ? "warn"
+                : "muted",
+        progressText: progress && progress.text ? String(progress.text) : "No retained model-reported progress.",
+        progressAt: progress && typeof progress.reported_at === "number" ? progress.reported_at : null,
+    };
+}
+function initialWorkflowSessionState() {
+    return {
+        selectedSessionId: "",
+        detailGeneration: 0,
+        snapshot: null,
+        followLatest: true,
+    };
+}
+function selectWorkflowSession(state, sessionId) {
+    state.selectedSessionId = sessionId;
+    state.detailGeneration += 1;
+    state.snapshot = null;
+    state.followLatest = true;
+    return workflowSessionDetailRequest(state);
+}
+function refreshWorkflowSessionDetail(state) {
+    if (!state.selectedSessionId) {
+        return null;
+    }
+    state.detailGeneration += 1;
+    return workflowSessionDetailRequest(state);
+}
+function clearWorkflowSessionSelection(state) {
+    state.selectedSessionId = "";
+    state.detailGeneration += 1;
+    state.snapshot = null;
+    state.followLatest = true;
+}
+function workflowSessionDetailRequest(state) {
+    if (!state.selectedSessionId) {
+        return null;
+    }
+    return {
+        sessionId: state.selectedSessionId,
+        generation: state.detailGeneration,
+    };
+}
+function isCurrentWorkflowSessionDetailRequest(state, request) {
+    return !!request &&
+        request.sessionId === state.selectedSessionId &&
+        request.generation === state.detailGeneration;
+}
+function adoptWorkflowSessionDetail(state, request, detail) {
+    if (!isCurrentWorkflowSessionDetailRequest(state, request)) {
+        return false;
+    }
+    state.snapshot = detail;
+    return true;
+}
+function updateWorkflowSessionFollowFromScroll(state, scrollTop, clientHeight, scrollHeight) {
+    const distanceFromBottom = Math.max(0, scrollHeight - scrollTop - clientHeight);
+    state.followLatest = distanceFromBottom <= FOLLOW_BOTTOM_THRESHOLD_PX;
+    return state.followLatest;
+}
+function workflowSessionScrollTopAfterRender(state, previousScrollTop, clientHeight, scrollHeight) {
+    if (shouldFollowWorkflowSessionLatest(state)) {
+        return Math.max(0, scrollHeight - clientHeight);
+    }
+    return Math.min(Math.max(0, previousScrollTop), Math.max(0, scrollHeight - clientHeight));
+}
+function jumpWorkflowSessionToLatest(state) {
+    state.followLatest = true;
+}
+function shouldFollowWorkflowSessionLatest(state) {
+    return state.followLatest !== false;
+}
+
 // WebCodex host-local review console.
 //
 // The page lets the same-host human review, accept, reject, and cancel
@@ -277,9 +486,11 @@ let showCompleted = false;
 let timer = 0;
 let reviewLoop = null;
 let projectName = "";
-// The single review-identity/concurrency state object (pure logic in the
-// review_state module operates on it).
+let workflowSessionDetailAbort = null;
+// Connector Task review and Workflow Session observability remain separate
+// state machines. Neither identity is inferred from the other.
 const state = initialState();
+const workflowSessionState = initialWorkflowSessionState();
 function el(id) {
     return document.getElementById(id);
 }
@@ -343,6 +554,7 @@ function hideError() {
 function lock(message) {
     token = "";
     reset(state);
+    clearWorkflowSessionDetailSelection();
     if (reviewLoop) {
         reviewLoop.stop();
     }
@@ -446,6 +658,323 @@ function renderReadiness(readiness) {
     setText("capabilities", readiness.capabilities);
     setText("coding", readiness.ready ? "Ready" : "Needs action");
     setText("next-action", readiness.next_action || "No action needed");
+}
+async function fetchWorkflowSessions() {
+    const res = await api("workflow-sessions", { limit: 20 });
+    if (!res) {
+        return;
+    }
+    if (res.status === 401) {
+        lock("Credential rejected. Re-enter it.");
+        return;
+    }
+    if (!res.ok || !res.data) {
+        return;
+    }
+    const sessions = Array.isArray(res.data.sessions) ? res.data.sessions : [];
+    renderWorkflowSessionList(sessions, res.data);
+    const request = refreshWorkflowSessionDetail(workflowSessionState);
+    if (request) {
+        await fetchWorkflowSessionDetail(request);
+    }
+}
+function renderWorkflowSessionList(sessions, payload) {
+    const node = el("workflow-session-list");
+    if (!node) {
+        return;
+    }
+    clearNode(node);
+    show("workflow-sessions-empty", sessions.length === 0);
+    const total = typeof payload.total === "number" ? payload.total : sessions.length;
+    setText("workflow-sessions-count", total ? "(" + sessions.length + (payload.truncated ? " of " + total : "") + ")" : "");
+    const selectedWorkflowSessionId = String(workflowSessionState.selectedSessionId || "");
+    if (selectedWorkflowSessionId &&
+        !sessions.some((session) => String(session.session_id || "") === selectedWorkflowSessionId)) {
+        clearWorkflowSessionDetailSelection();
+    }
+    for (const session of sessions) {
+        const id = String(session.session_id || "");
+        if (!id) {
+            continue;
+        }
+        const item = document.createElement("li");
+        item.className = "task" + (id === selectedWorkflowSessionId ? " task-selected" : "");
+        const title = document.createElement("div");
+        title.className = "task-goal";
+        title.textContent = session.title ? String(session.title) : id;
+        const meta = document.createElement("div");
+        meta.className = "task-meta muted small";
+        appendChip(meta, String(session.lifecycle || "unknown"));
+        appendChip(meta, "mode " + String(session.mode || "unknown"));
+        if (session.running_call) {
+            appendChip(meta, "running");
+        }
+        appendChip(meta, updatedLabel(session.updated_at));
+        item.appendChild(title);
+        item.appendChild(meta);
+        const summaryFacts = workflowSessionListOverviewFacts(session.overview);
+        if (summaryFacts.length) {
+            const summary = document.createElement("div");
+            summary.className = "workflow-session-summary";
+            for (const fact of summaryFacts) {
+                const chip = document.createElement("span");
+                chip.className = "chip workflow-session-summary-fact workflow-session-summary-" + fact.tone;
+                chip.textContent = fact.text;
+                summary.appendChild(chip);
+            }
+            item.appendChild(summary);
+        }
+        appendWorkflowSessionActivityPreview(item, "Now", session.current_activity);
+        appendWorkflowSessionActivityPreview(item, "Last", session.last_activity);
+        item.addEventListener("click", () => {
+            const request = selectWorkflowSessionDetail(id);
+            renderWorkflowSessionList(sessions, payload);
+            void fetchWorkflowSessionDetail(request);
+        });
+        node.appendChild(item);
+    }
+}
+function workflowActivityKindLabel(activity) {
+    const kind = String((activity && activity.kind) || "Activity");
+    if (activity && activity.job_handoff) {
+        if (kind === "Tested") {
+            return "Test";
+        }
+        if (kind === "Ran") {
+            return "Command";
+        }
+    }
+    if (kind === "Explored" && activity && typeof activity.group_count === "number") {
+        return "Explored ×" + activity.group_count;
+    }
+    return kind;
+}
+function workflowActivityFacts(activity, includeTiming) {
+    const facts = [];
+    if (activity && typeof activity.group_count === "number") {
+        if (Array.isArray(activity.group_kinds) && activity.group_kinds.length) {
+            facts.push(activity.group_kinds.map((kind) => String(kind)).join(" / "));
+        }
+        if (Array.isArray(activity.group_tools) && activity.group_tools.length) {
+            facts.push(activity.group_tools.map((tool) => String(tool)).join(", "));
+        }
+    }
+    else if (activity && activity.tool) {
+        facts.push(String(activity.tool));
+    }
+    if (activity && activity.kind === "Progress") {
+        facts.push("informational");
+    }
+    else if (activity && activity.job_handoff) {
+        facts.push("handed off");
+        if (activity.execution_state) {
+            facts.push("execution " + String(activity.execution_state));
+        }
+    }
+    else if (activity && activity.state) {
+        facts.push(String(activity.state));
+    }
+    if (includeTiming && activity && typeof activity.duration_ms === "number") {
+        facts.push(durationLabel(activity.duration_ms));
+    }
+    if (activity && typeof activity.exit_code === "number") {
+        facts.push("exit " + activity.exit_code);
+    }
+    if (activity && activity.job_id) {
+        facts.push("job " + String(activity.job_id));
+    }
+    if (includeTiming && activity && typeof activity.started_at === "number") {
+        facts.push(new Date(activity.started_at * 1000).toLocaleTimeString());
+    }
+    return facts;
+}
+function workflowActivityDescription(activity) {
+    if (!activity) {
+        return "";
+    }
+    const parts = [workflowActivityKindLabel(activity), ...workflowActivityFacts(activity, false)];
+    if (activity.summary && !activity.job_handoff) {
+        parts.push(String(activity.summary));
+    }
+    return parts.join(" · ");
+}
+function appendWorkflowSessionActivityPreview(parent, label, activity) {
+    if (!activity) {
+        return;
+    }
+    const row = document.createElement("div");
+    row.className = "workflow-session-activity-preview muted small";
+    const prefix = document.createElement("span");
+    prefix.className = "workflow-session-activity-label";
+    prefix.textContent = label;
+    const text = document.createElement("span");
+    text.textContent = workflowActivityDescription(activity);
+    row.appendChild(prefix);
+    row.appendChild(text);
+    parent.appendChild(row);
+}
+function setWorkflowSessionOverviewTone(id, tone) {
+    const node = el(id);
+    if (!node) {
+        return;
+    }
+    for (const name of ["pass", "warn", "fail", "muted"]) {
+        node.classList.toggle("workflow-session-overview-" + name, tone === name);
+    }
+}
+function renderWorkflowSessionOverview(overview) {
+    const view = workflowSessionOverviewPresentation(overview);
+    setText("workflow-session-overview-work", view.workText);
+    setText("workflow-session-overview-validation", view.validationText +
+        (typeof view.validationAt === "number"
+            ? " · " + new Date(view.validationAt * 1000).toLocaleTimeString()
+            : ""));
+    setWorkflowSessionOverviewTone("workflow-session-overview-validation-card", view.validationTone);
+    setText("workflow-session-overview-attention", view.attentionText);
+    setWorkflowSessionOverviewTone("workflow-session-overview-attention-card", view.attentionTone);
+    setText("workflow-session-overview-progress", view.progressText +
+        (typeof view.progressAt === "number"
+            ? " · reported " + new Date(view.progressAt * 1000).toLocaleTimeString()
+            : ""));
+}
+function syncWorkflowSessionFollowUi() {
+    const selected = !!workflowSessionState.selectedSessionId;
+    show("workflow-session-jump-latest", selected && !shouldFollowWorkflowSessionLatest(workflowSessionState));
+}
+function scrollWorkflowSessionTimelineToLatest() {
+    const node = el("workflow-session-timeline");
+    if (node) {
+        node.scrollTop = node.scrollHeight;
+    }
+    syncWorkflowSessionFollowUi();
+}
+function hideWorkflowSessionDetail() {
+    show("workflow-session-detail", false);
+    show("workflow-session-detail-empty", true);
+    show("workflow-session-jump-latest", false);
+}
+function abortWorkflowSessionDetailRequest() {
+    if (workflowSessionDetailAbort) {
+        workflowSessionDetailAbort.abort();
+        workflowSessionDetailAbort = null;
+    }
+}
+function clearWorkflowSessionDetailSelection() {
+    abortWorkflowSessionDetailRequest();
+    clearWorkflowSessionSelection(workflowSessionState);
+    hideWorkflowSessionDetail();
+}
+function selectWorkflowSessionDetail(sessionId) {
+    abortWorkflowSessionDetailRequest();
+    const request = selectWorkflowSession(workflowSessionState, sessionId);
+    // Never present the previous Session detail under the newly selected row.
+    hideWorkflowSessionDetail();
+    return request;
+}
+async function fetchWorkflowSessionDetail(request) {
+    if (!request) {
+        return;
+    }
+    abortWorkflowSessionDetailRequest();
+    const controller = new AbortController();
+    workflowSessionDetailAbort = controller;
+    const res = await api("workflow-session", { session_id: request.sessionId, limit: 100 }, controller.signal);
+    if (workflowSessionDetailAbort === controller) {
+        workflowSessionDetailAbort = null;
+    }
+    if (!res || !isCurrentWorkflowSessionDetailRequest(workflowSessionState, request)) {
+        return;
+    }
+    if (res.status === 401) {
+        lock("Credential rejected. Re-enter it.");
+        return;
+    }
+    if (res.status === 404) {
+        clearWorkflowSessionDetailSelection();
+        return;
+    }
+    if (!res.ok || !res.data) {
+        return;
+    }
+    if (!adoptWorkflowSessionDetail(workflowSessionState, request, res.data)) {
+        return;
+    }
+    renderWorkflowSessionDetail(res.data);
+}
+function renderWorkflowSessionDetail(detail) {
+    show("workflow-session-detail-empty", false);
+    show("workflow-session-detail", true);
+    setText("workflow-session-title", detail.title);
+    setText("workflow-session-lifecycle", detail.lifecycle);
+    setText("workflow-session-mode", "mode " + String(detail.mode || "unknown"));
+    setText("workflow-session-running", detail.running_call ? "running call" : "no running call");
+    setText("workflow-session-updated", updatedLabel(detail.updated_at));
+    renderWorkflowSessionOverview(detail.overview);
+    const activities = Array.isArray(detail.activity) ? detail.activity : [];
+    const node = el("workflow-session-timeline");
+    const previousScrollTop = node ? node.scrollTop : 0;
+    clearNode(node);
+    show("workflow-session-timeline-empty", activities.length === 0);
+    if (!node) {
+        syncWorkflowSessionFollowUi();
+        return;
+    }
+    for (const activity of activities) {
+        const item = document.createElement("li");
+        item.className = "timeline-event";
+        if (activity && activity.kind === "Progress") {
+            item.classList.add("workflow-session-progress");
+        }
+        else if (activity && (activity.state === "failed" || activity.state === "timed_out")) {
+            item.classList.add("workflow-session-failed");
+        }
+        else if (activity &&
+            ["outcome_unknown", "cancelled", "not_started"].includes(String(activity.state || ""))) {
+            item.classList.add("workflow-session-uncertain");
+        }
+        else if (activity && activity.job_handoff) {
+            item.classList.add("workflow-session-job");
+        }
+        else if (activity && ["queued", "running"].includes(String(activity.state || ""))) {
+            item.classList.add("workflow-session-running");
+        }
+        else if (activity && activity.kind === "Explored") {
+            item.classList.add("workflow-session-exploration");
+        }
+        const head = document.createElement("div");
+        head.className = "timeline-head";
+        const kind = document.createElement("span");
+        kind.className = "timeline-kind";
+        kind.textContent = workflowActivityKindLabel(activity);
+        const meta = document.createElement("span");
+        meta.className = "muted small";
+        meta.textContent = workflowActivityFacts(activity, true).join(" · ");
+        head.appendChild(kind);
+        head.appendChild(meta);
+        item.appendChild(head);
+        const bodyParts = [];
+        if (activity && activity.summary) {
+            bodyParts.push(String(activity.summary));
+        }
+        if (activity && Array.isArray(activity.paths) && activity.paths.length) {
+            bodyParts.push(activity.paths.map((path) => String(path)).join(", "));
+        }
+        if (bodyParts.length) {
+            const body = document.createElement("div");
+            body.className = "timeline-payload muted small";
+            body.textContent = bodyParts.join(" — ");
+            item.appendChild(body);
+        }
+        node.appendChild(item);
+    }
+    node.scrollTop = workflowSessionScrollTopAfterRender(workflowSessionState, previousScrollTop, node.clientHeight, node.scrollHeight);
+    syncWorkflowSessionFollowUi();
+}
+function durationLabel(durationMs) {
+    if (durationMs < 1000) {
+        return durationMs + " ms";
+    }
+    return (durationMs / 1000).toFixed(durationMs < 10000 ? 1 : 0) + " s";
 }
 async function fetchTasks() {
     if (!beginRefresh(state, "tasks")) {
@@ -1002,6 +1531,7 @@ async function tick() {
     try {
         await fetchReadiness();
         await fetchTasks();
+        await fetchWorkflowSessions();
         await fetchApprovals();
         await fetchActivity();
         await fetchDevices();
@@ -1369,6 +1899,18 @@ function init() {
     });
     el("activity-filter-clear")?.addEventListener("click", () => {
         setActivityClientFilter(activityClientFilter);
+    });
+    el("workflow-session-timeline")?.addEventListener("scroll", () => {
+        const timeline = el("workflow-session-timeline");
+        if (!timeline) {
+            return;
+        }
+        updateWorkflowSessionFollowFromScroll(workflowSessionState, timeline.scrollTop, timeline.clientHeight, timeline.scrollHeight);
+        syncWorkflowSessionFollowUi();
+    });
+    el("workflow-session-jump-latest")?.addEventListener("click", () => {
+        jumpWorkflowSessionToLatest(workflowSessionState);
+        scrollWorkflowSessionTimelineToLatest();
     });
     el("guide-btn")?.addEventListener("click", () => {
         void sendGuidance();

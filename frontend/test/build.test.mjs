@@ -20,6 +20,11 @@ const buildScript = resolve(frontendRoot, "scripts/build.mjs");
 const requiredAssets = [
   "console.html",
   "app.js",
+  "workflow_session_state.js",
+  "runtime_console_state.js",
+  "runtime.html",
+  "runtime.js",
+  "runtime.css",
   "styles.css",
   "admin.html",
   "admin.js",
@@ -52,6 +57,42 @@ async function assertRequiredAssets(outputDirectory) {
   }
   const app = await readFile(resolve(outputDirectory, "app.js"), "utf8");
   assert.equal(app.includes("interface Review"), false);
+  assert.equal(/\.innerHTML\b|\binnerHTML\s*=/.test(app), false);
+  assert.match(app, /workflow-session/);
+  assert.match(app, /textContent/);
+  assert.match(app, /workflow-session-overview-validation/);
+  assert.match(app, /workflow-session-overview-progress/);
+  const consoleHtml = await readFile(resolve(outputDirectory, "console.html"), "utf8");
+  assert.match(consoleHtml, /workflow-session-overview-work/);
+  assert.match(consoleHtml, /Reported progress/);
+  assert.match(consoleHtml, /Model-reported; informational only\./);
+  assert.match(consoleHtml, /WebCodex — Project Review Console/);
+  assert.match(consoleHtml, /Project review console/);
+  const runtimeHtml = await readFile(resolve(outputDirectory, "runtime.html"), "utf8");
+  assert.match(runtimeHtml, /WebCodex Runtime Console/);
+  assert.match(runtimeHtml, /runtime-device-select/);
+  assert.match(runtimeHtml, /runtime-project-select/);
+  assert.match(runtimeHtml, /runtime-token-form/);
+  assert.match(runtimeHtml, /Jump to latest/);
+  assert.match(runtimeHtml, /Reported progress/);
+  assert.match(runtimeHtml, /Model-reported; informational only\./);
+  const runtime = await readFile(resolve(outputDirectory, "runtime.js"), "utf8");
+  assert.match(runtime, /\/api\/runtime-console\//);
+  assert.match(runtime, /runtimeDeviceIds/);
+  assert.match(runtime, /runtimeProjectsForDevice/);
+  assert.match(runtime, /preferredRuntimeProjectSelection/);
+  assert.match(runtime, /workflowSessionListOverviewFacts/);
+  assert.match(runtime, /isCurrentRuntimeWorkflowSessionRequest/);
+  assert.match(runtime, /appendPreview\(item, "Now"/);
+  assert.match(runtime, /appendPreview\(item, "Last"/);
+  assert.match(runtime, /workflowSessionScrollTopAfterRender/);
+  assert.match(runtime, /jumpWorkflowSessionToLatest/);
+  assert.match(runtime, /textContent/);
+  assert.equal(/localStorage|sessionStorage|document\.cookie/.test(runtime), false);
+  assert.equal(/\.innerHTML\b|\binnerHTML\s*=/.test(runtime), false);
+  await exec(process.execPath, ["--check", resolve(outputDirectory, "runtime.js")]);
+  const styles = await readFile(resolve(outputDirectory, "styles.css"), "utf8");
+  assert.match(styles, /workflow-session-summary-runtime/);
   await exec(process.execPath, ["--check", resolve(outputDirectory, "app.js")]);
   const admin = await readFile(resolve(outputDirectory, "admin.js"), "utf8");
   await exec(process.execPath, ["--check", resolve(outputDirectory, "admin.js")]);
@@ -65,8 +106,13 @@ async function copySources(sourceDirectory) {
   for (const source of [
     "app.ts",
     "review_state.ts",
+    "workflow_session_state.ts",
     "styles.css",
     "console.html",
+    "runtime.ts",
+    "runtime_console_state.ts",
+    "runtime.css",
+    "runtime.html",
     "admin.ts",
     "admin_controller.ts",
     "admin_mutation_controller.ts",
