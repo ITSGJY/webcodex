@@ -67,8 +67,9 @@ A V1 correctness/reliability incident exists when all of the following are true:
 
 - the Job had been dispatched and was active (or retained terminal) before the
   Server restart;
-- the Runner process survived (`client_id`, `agent_instance_id`, and
-  `process_started_at` identify the same process);
+- the Runner process survived: the same `client_id` still reports the same
+  process-scoped `agent_instance_id`; reconciliation logs may use
+  `process_started_at` as a secondary cross-check;
 - the Runner advertises `job_state_reconciliation=true`;
 - the Job is present in the Runner inventory supplied after reconnect, or should
   have been present under the complete-active-inventory contract;
@@ -83,8 +84,10 @@ both as “retry the command” risks duplicate effects.
 Before retrying work, collect safe runtime facts:
 
 1. Use `runtime_status` / `list_agents` to establish the current Server build,
-   Runner connection state, `client_id`, `agent_instance_id`,
-   `process_started_at`, reconciliation capability, and Job concurrency state.
+   Runner connection state, `client_id`, process-scoped `agent_instance_id`,
+   reconciliation capability, and Job concurrency state. If reconciliation logs
+   are available, cross-check `process_started_at` there; it is not part of the
+   current `runtime_status` / `list_agents` projection.
 2. Determine whether the Runner process changed. If it changed, do not claim the
    same-process Server-restart recovery contract was violated.
 3. If the Runner process is unchanged, inspect the registration/reconciliation
@@ -141,7 +144,10 @@ Do not conflate the Job execution pool with other limits. In particular:
 
 Changing one does not redefine the others. `runtime_status` / `list_agents`
 should be used for current `job_concurrency { limit, running, queued }` facts
-instead of inferring capacity from the number of browser/model windows.
+instead of inferring capacity from the number of browser/model windows. These
+are bounded lifecycle-status counts, not an exact free-slot calculation:
+`stop_requested` can still own a Runner slot until it becomes terminal, so do
+not derive `available_slots` or saturation by subtracting `running` from `limit`.
 
 ## 5. Requirements for model-facing tool descriptions
 
@@ -149,24 +155,50 @@ Tool descriptions are part of the reliability contract because they influence
 whether a model observes an existing execution or accidentally creates another
 one. Keep descriptions concise, but preserve these semantic distinctions.
 
+### Description density and discovery hygiene
+
+The top-level tool description is primarily a **selection surface**, not a mini
+reference manual. It should answer what the tool does, when it wins over nearby
+choices, and any lifecycle fact that changes retry safety. Put detailed numeric
+bounds, wire rules, and field-specific behavior on the relevant input/output
+schema instead of repeating them in every top-level description.
+
+For ordinary tools, aim for roughly 80–220 characters of high-signal text. This
+is a review target rather than a wire limit; longer descriptions need a concrete
+selection reason. Avoid naming sibling tools merely to restate implementation or
+fallback details, because exact-name discovery may otherwise retrieve unrelated
+tools whose descriptions happen to mention the queried name. Prefer capability
+phrasing such as “shell command tool”, “structured validation”, or “asynchronous
+execution” unless the sibling tool name is itself needed to choose correctly.
+
+Generic lifecycle words such as `Job` should be concentrated on actual Job
+creation/observation tools. Structured validators and process adapters can say
+that long work continues as the **same execution** and returns `job_id`, while
+the timeout/output schema carries the detailed handoff contract. This keeps the
+retry guarantee without turning every validation description into a Job search
+hit.
+
 ### Job-producing execution tools
 
 For structured validation/process tools (`cargo_*`, `go_test`, `run_process`,
-`run_script`, `run_job`, and future equivalents), descriptions should make clear
-that:
+`run_script`, `run_job`, and future equivalents), the combined model-facing tool
+description plus lifecycle input/output schema should make clear that:
 
 - a long operation continues as the **same execution / same Job**;
 - handoff is not cancel-and-retry;
 - queued execution keeps the same `job_id`;
 - loss of the initiating request is not evidence that the Job did not start.
 
-Avoid wording that encourages “rerun if the call times out” without consulting
-structured lifecycle state.
+The top-level description normally carries only the selection-critical part of
+that contract, such as “same execution” or a stable `job_id`; field descriptions
+carry the detailed handoff and lifecycle rules. Avoid wording anywhere in the
+model-facing schema that encourages “rerun if the call times out” without
+consulting structured lifecycle state.
 
 ### Job observation tools
 
-For `job_status`, `job_log`, `job_tail`, and `observe_jobs`, descriptions should
-make clear that:
+For `job_status`, `job_log`, `job_tail`, and `observe_jobs`, the top-level
+description plus observation-field schemas should make clear that:
 
 - observation never launches or retries the Job;
 - `wait_secs` is one bounded wait, not a subscription;

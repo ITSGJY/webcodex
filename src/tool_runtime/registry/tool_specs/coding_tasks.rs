@@ -13,7 +13,7 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
         ),
         tool_spec(
             "work_on_project",
-            "Normal coding bootstrap. Use project + instruction or client_id + path + instruction; do not mix forms. Returns built-in workflow guidance and project-local instructions. Choose implementation_owner or independent_review in the task instruction; guidance grants no authority.",
+            "Bootstrap coding work via project or Runner path; Git not required. Returns built-in workflow guidance and project-local instructions. Select implementation/review in the task instruction; guidance grants no authority.",
             work_on_project_input_schema(),
         ),
         tool_spec(
