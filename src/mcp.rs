@@ -531,8 +531,28 @@ fn mcp_tools_list_payload_with_features(
     json!({ "tools": tools })
 }
 
+fn adapt_computer_snapshot_output_schema_for_mcp(spec: &mut ToolSpec) {
+    let properties = spec
+        .output_schema
+        .pointer_mut("/properties/output/properties")
+        .and_then(Value::as_object_mut)
+        .expect("computer_snapshot output schema properties");
+    properties.remove("content_base64");
+    properties.insert(
+        "content_delivery".to_string(),
+        json!({
+            "type": "string",
+            "const": "mcp_image",
+            "description": "MCP native-image delivery marker; binary image bytes are carried in the image ContentBlock rather than structuredContent."
+        }),
+    );
+}
+
 fn mcp_tool_spec_json(mut spec: ToolSpec, compact: bool, app_enabled: bool) -> Value {
     let tool_name = spec.name.clone();
+    if tool_name == "computer_snapshot" {
+        adapt_computer_snapshot_output_schema_for_mcp(&mut spec);
+    }
     if tool_name == "read_project_artifact" {
         if let Some(properties) = spec.input_schema["properties"].as_object_mut() {
             properties.insert(
@@ -692,6 +712,7 @@ fn mcp_computer_app_snapshot_probe_tool_spec(compact: bool) -> Value {
         .find(|spec| spec.name == "computer_snapshot")
         .expect("computer_snapshot runtime spec");
     spec.name = MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME.to_string();
+    adapt_computer_snapshot_output_schema_for_mcp(&mut spec);
     spec.description = "Experimental MCP-only real-screenshot control probe. Delegates to the existing computer_snapshot ToolRuntime path, but uses a fresh MCP App tool name and resource binding.".to_string();
     if let Some(annotations) = spec.annotations.as_object_mut() {
         annotations.insert(
@@ -730,6 +751,7 @@ fn mcp_computer_app_snapshot_decode_probe_tool_spec(compact: bool) -> Value {
         .find(|spec| spec.name == "computer_snapshot")
         .expect("computer_snapshot runtime spec");
     spec.name = MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_TOOL_NAME.to_string();
+    adapt_computer_snapshot_output_schema_for_mcp(&mut spec);
     spec.description = "Experimental MCP-only real-screenshot decode probe. Delegates to the existing computer_snapshot ToolRuntime path and native-image framing, while its fresh App waits for browser image decode and verifies intrinsic dimensions.".to_string();
     if let Some(annotations) = spec.annotations.as_object_mut() {
         annotations.insert(
