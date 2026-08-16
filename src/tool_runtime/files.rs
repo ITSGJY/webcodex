@@ -1839,10 +1839,16 @@ fn recoverable_write_rejection(reason: impl AsRef<str>) -> String {
     )
 }
 
-/// Maximum decoded size for one binary project artifact imported through GPT
-/// Actions/runtime tools. Keep bounded because artifact content travels to the
-/// owning agent as base64 in a JSON file-op payload.
+/// Maximum decoded size for whole-payload/model-facing artifact operations.
+/// These paths aggregate content or return it as base64/JSON, so they remain at
+/// 10 MiB even though data-plane upload/export paths admit larger files.
 pub(crate) const MAX_PROJECT_ARTIFACT_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+
+/// Maximum final size for one streaming artifact export.
+pub(crate) const MAX_PROJECT_ARTIFACT_EXPORT_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
+
+/// Maximum final size for one chunked artifact upload.
+pub(crate) const MAX_PROJECT_ARTIFACT_UPLOAD_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectArtifactExportSnapshot {
@@ -1861,13 +1867,15 @@ pub(crate) const DEFAULT_READ_PROJECT_ARTIFACT_LENGTH: usize = 32 * 1024; // 32 
 pub(crate) const MAX_READ_PROJECT_ARTIFACT_LENGTH: usize = 64 * 1024; // 64 KiB
 
 /// Maximum decoded size accepted for one `artifact_upload_chunk` request.
-pub(crate) const MAX_PROJECT_ARTIFACT_UPLOAD_CHUNK_BYTES: usize = 64 * 1024; // 64 KiB
+pub(crate) const MAX_PROJECT_ARTIFACT_UPLOAD_CHUNK_BYTES: usize = 1024 * 1024; // 1 MiB
 
 /// Hard cap for a base64-encoded artifact payload plus JSON overhead.
 pub(crate) const MAX_PROJECT_ARTIFACT_BASE64_BYTES: usize = 14 * 1024 * 1024; // ~10 MiB decoded
 
-/// Hard cap for a base64-encoded chunk plus JSON overhead.
-pub(crate) const MAX_PROJECT_ARTIFACT_UPLOAD_CHUNK_BASE64_BYTES: usize = 96 * 1024;
+/// Exact maximum standard-base64 length for one upload chunk. Transport JSON
+/// has separate bounded headroom and does not expand this decoded data limit.
+pub(crate) const MAX_PROJECT_ARTIFACT_UPLOAD_CHUNK_BASE64_BYTES: usize =
+    ((MAX_PROJECT_ARTIFACT_UPLOAD_CHUNK_BYTES + 2) / 3) * 4;
 
 fn sniff_supported_mcp_image_mime(data: &[u8]) -> Option<&'static str> {
     if data.starts_with(b"\x89PNG\r\n\x1a\n") {
@@ -2097,10 +2105,10 @@ pub(crate) fn validate_project_artifact_export_snapshot(
         .and_then(Value::as_u64)
         .and_then(|value| usize::try_from(value).ok())
         .ok_or_else(|| "artifact metadata did not report a valid byte count".to_string())?;
-    if bytes > MAX_PROJECT_ARTIFACT_BYTES {
+    if bytes > MAX_PROJECT_ARTIFACT_EXPORT_BYTES {
         return Err(format!(
             "artifact is too large to export; maximum is {} bytes",
-            MAX_PROJECT_ARTIFACT_BYTES
+            MAX_PROJECT_ARTIFACT_EXPORT_BYTES
         ));
     }
     let sha256 = output
@@ -2951,6 +2959,94 @@ impl ToolRuntime {
         })
     }
 
+    /// Internal-only large-file metadata transport for MCP artifact export.
+    /// The ShellClient registry atomically fences the additive streaming-metadata
+    /// capability with request admission. `Ok(None)` means only that the current
+    /// Runner predates bounded large-file metadata and the caller must use the
+    /// 10 MiB legacy metadata bound instead.
+    async fn run_agent_json_artifact_export_metadata_op(
+        &self,
+        client_id: String,
+        cwd: String,
+        path: String,
+        payload: Value,
+        auth: Option<&AuthContext>,
+    ) -> Result<Option<Value>, String> {
+        let serialized = serde_json::to_string(&payload).map_err(|error| {
+            format!("failed to serialize artifact export metadata payload: {error}")
+        })?;
+        let wait_timeout = 60_u64;
+        let request = ShellFileOpRequest {
+            op: "read_project_artifact_metadata".to_string(),
+            client_id,
+            path: path.clone(),
+            cwd: Some(cwd),
+            content: Some(serialized),
+            max_bytes: None,
+            old_text: None,
+            pattern: None,
+            expected_sha256: None,
+            expected_prefix: None,
+            start_line: None,
+            end_line: None,
+            line: None,
+            create_dirs: false,
+            wait_timeout_secs: wait_timeout,
+        };
+        let (request_id, rx) = match self
+            .shell_clients
+            .enqueue_artifact_export_metadata(
+                request,
+                "mcp_artifact_export".to_string(),
+                auth,
+            )
+            .await
+        {
+            Ok(request) => request,
+            Err(error)
+                if error.contains(
+                    crate::shell_protocol::SHELL_CLIENT_CAPABILITY_ARTIFACT_EXPORT_STREAMING_METADATA,
+                ) || error.contains(
+                    crate::shell_protocol::SHELL_CLIENT_CAPABILITY_ARTIFACT_EXPORT_CHUNK_READ,
+                ) =>
+            {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        };
+        let response = match tokio::time::timeout(Duration::from_secs(wait_timeout + 4), rx).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => {
+                self.shell_clients.cancel_request(&request_id).await;
+                return Err("agent export_project_artifact request was dropped".to_string());
+            }
+            Err(_) => {
+                self.shell_clients.cancel_request(&request_id).await;
+                return Err("timed out waiting for agent export_project_artifact".to_string());
+            }
+        };
+        if let Some(error) = response.error {
+            return Err(error);
+        }
+        if response.exit_code != Some(0) {
+            return Err(response.stderr.unwrap_or_else(|| {
+                format!(
+                    "agent export_project_artifact failed with code {:?}",
+                    response.exit_code
+                )
+            }));
+        }
+        let stdout = response.stdout.unwrap_or_default();
+        let stdout = stdout.trim();
+        let output = serde_json::from_str(stdout).map_err(|error| {
+            format!(
+                "agent export_project_artifact returned invalid JSON: {error} (got: {})",
+                &stdout[..stdout.len().min(200)]
+            )
+        })?;
+        Ok(Some(output))
+    }
+
     /// Internal-only optimized segment transport for MCP artifact export. This
     /// is not a ToolCall and has no model schema. Project ownership and Runner
     /// access are re-resolved for the authenticated caller before each enqueue;
@@ -2970,10 +3066,10 @@ impl ToolRuntime {
         if let Err(error) = validate_artifact_file_path(path) {
             return Err(error);
         }
-        if expected_file_bytes > MAX_PROJECT_ARTIFACT_BYTES {
+        if expected_file_bytes > MAX_PROJECT_ARTIFACT_EXPORT_BYTES {
             return Err(format!(
                 "artifact is too large to export; maximum is {} bytes",
-                MAX_PROJECT_ARTIFACT_BYTES
+                MAX_PROJECT_ARTIFACT_EXPORT_BYTES
             ));
         }
         if length == 0 || length > MAX_READ_PROJECT_ARTIFACT_LENGTH {
@@ -3286,6 +3382,7 @@ impl ToolRuntime {
         &self,
         resolved: &ResolvedProject,
         path: String,
+        auth: Option<&AuthContext>,
     ) -> ToolResult {
         if let Err(error) = validate_artifact_file_path(&path) {
             return artifact_policy_rejected_result(&path, error);
@@ -3297,23 +3394,43 @@ impl ToolRuntime {
             Ok(client_id) => client_id.to_string(),
             Err(error) => return ToolResult::err(error),
         };
-        let payload = json!({
+        let streaming_payload = json!({
             "path": path.clone(),
-            "max_bytes": MAX_PROJECT_ARTIFACT_BYTES,
+            "max_bytes": MAX_PROJECT_ARTIFACT_EXPORT_BYTES,
             "allow_missing": false,
         });
         let output = match self
-            .run_agent_json_file_op(
-                client_id,
+            .run_agent_json_artifact_export_metadata_op(
+                client_id.clone(),
                 resolved.config.path.clone(),
                 path.clone(),
-                "read_project_artifact_metadata",
-                payload,
-                "export_project_artifact",
+                streaming_payload,
+                auth,
             )
             .await
         {
-            Ok(output) => output,
+            Ok(Some(output)) => output,
+            Ok(None) => {
+                let legacy_payload = json!({
+                    "path": path.clone(),
+                    "max_bytes": MAX_PROJECT_ARTIFACT_BYTES,
+                    "allow_missing": false,
+                });
+                match self
+                    .run_agent_json_file_op(
+                        client_id,
+                        resolved.config.path.clone(),
+                        path.clone(),
+                        "read_project_artifact_metadata",
+                        legacy_payload,
+                        "export_project_artifact",
+                    )
+                    .await
+                {
+                    Ok(output) => output,
+                    Err(error) => return ToolResult::err(error),
+                }
+            }
             Err(error) => return ToolResult::err(error),
         };
         if let Some(error) = output
@@ -3348,6 +3465,23 @@ impl ToolRuntime {
             "mime_type": snapshot.mime_type,
             "name": snapshot.name,
         }))
+    }
+
+    pub(crate) async fn read_project_artifact_export_metadata_internal(
+        &self,
+        project: &str,
+        path: &str,
+        auth: Option<&AuthContext>,
+    ) -> ToolResult {
+        if let Err(error) = validate_artifact_file_path(path) {
+            return artifact_policy_rejected_result(path, error);
+        }
+        let resolved = match self.resolve_project_input_for_auth(project, auth).await {
+            Ok(resolved) => resolved,
+            Err(error) => return error.into_tool_result(),
+        };
+        self.export_project_artifact_metadata_resolved(&resolved, path.to_string(), auth)
+            .await
     }
 
     pub(crate) async fn read_project_artifact(
@@ -3510,10 +3644,10 @@ impl ToolRuntime {
             return artifact_policy_rejected_result(&path, e);
         }
         if let Some(bytes) = expected_bytes {
-            if bytes > MAX_PROJECT_ARTIFACT_BYTES {
+            if bytes > MAX_PROJECT_ARTIFACT_UPLOAD_BYTES {
                 return ToolResult::err(format!(
                     "expected_bytes too large; maximum is {} bytes",
-                    MAX_PROJECT_ARTIFACT_BYTES
+                    MAX_PROJECT_ARTIFACT_UPLOAD_BYTES
                 ));
             }
         }
@@ -3534,7 +3668,7 @@ impl ToolRuntime {
             "expected_sha256": expected_sha256,
             "mime_type": mime_type,
             "overwrite": overwrite.unwrap_or(false),
-            "max_bytes": MAX_PROJECT_ARTIFACT_BYTES,
+            "max_bytes": MAX_PROJECT_ARTIFACT_UPLOAD_BYTES,
         });
         self.run_project_artifact_write_file_op(
             project,

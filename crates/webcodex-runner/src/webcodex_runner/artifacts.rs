@@ -9,15 +9,29 @@ use base64::{engine::general_purpose, Engine as _};
 use flate2::read::DeflateDecoder;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use xml::reader::{EventReader, XmlEvent};
 
 const DEFAULT_MAX_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
+const MAX_ARTIFACT_EXPORT_BYTES: usize = 256 * 1024 * 1024;
+const MAX_ARTIFACT_UPLOAD_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_ARTIFACT_READ_LENGTH: usize = 32 * 1024;
 const MAX_ARTIFACT_EXPORT_CHUNK_BYTES: usize = 64 * 1024;
-const DEFAULT_MAX_ARTIFACT_UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_ARTIFACT_UPLOAD_CHUNK_BYTES: usize = 1024 * 1024;
+const ARTIFACT_UPLOAD_IDLE_TTL_SECS: u64 = 24 * 60 * 60;
+const MAX_ACTIVE_ARTIFACT_UPLOADS_PER_PROJECT: usize = 32;
+const MAX_ARTIFACT_UPLOAD_RESERVED_BYTES_PER_PROJECT: usize = 512 * 1024 * 1024;
+const MAX_ARTIFACT_UPLOAD_PROJECT_SCAN_ENTRIES: usize = 100_000;
+const MAX_ARTIFACT_UPLOAD_STATE_BYTES: usize = 4 * 1024;
+static ARTIFACT_UPLOAD_STATE_LOCK: Mutex<()> = Mutex::new(());
+const ARTIFACT_STREAM_BUFFER_BYTES: usize = 64 * 1024;
+const ZIP_EOCD_MAX_SEARCH_BYTES: usize = 65_557;
 const MAX_OOXML_ZIP_ENTRIES: usize = 4096;
 const MAX_OOXML_CENTRAL_DIRECTORY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_OOXML_CONTENT_TYPES_BYTES: usize = 256 * 1024;
@@ -270,6 +284,25 @@ fn write_bytes_atomic_strict(path: &Path, data: &[u8], overwrite: bool) -> Resul
     Err(last_error.unwrap_or_else(|| "could not create temporary artifact file".to_string()))
 }
 
+fn commit_artifact_upload_part(part: &Path, target: &Path, overwrite: bool) -> Result<(), String> {
+    if overwrite {
+        return std::fs::rename(part, target).map_err(|e| format!("upload finish failed: {e}"));
+    }
+    match std::fs::hard_link(part, target) {
+        Ok(()) => {
+            // The final target now exists without replacing any concurrent writer.
+            // If private-part cleanup fails, the target remains authoritative and a
+            // later upload sweep can remove the orphaned private link safely.
+            let _ = std::fs::remove_file(part);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err("file exists and overwrite is false".to_string())
+        }
+        Err(e) => Err(format!("upload finish failed: {e}")),
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct ArtifactUploadState {
     path: String,
@@ -309,14 +342,207 @@ fn write_upload_state(sidecar: &Path, state: &ArtifactUploadState) -> Result<(),
     Ok(())
 }
 
+fn read_upload_state_file(sidecar: &Path) -> Result<ArtifactUploadState, String> {
+    let file = File::open(sidecar).map_err(|e| format!("upload not found: {e}"))?;
+    let mut reader = file.take((MAX_ARTIFACT_UPLOAD_STATE_BYTES + 1) as u64);
+    let mut data = Vec::new();
+    reader
+        .read_to_end(&mut data)
+        .map_err(|e| format!("invalid upload state: {e}"))?;
+    if data.len() > MAX_ARTIFACT_UPLOAD_STATE_BYTES {
+        return Err("invalid upload state: sidecar too large".to_string());
+    }
+    serde_json::from_slice(&data).map_err(|e| format!("invalid upload state: {e}"))
+}
+
 fn read_upload_state(sidecar: &Path, requested_path: &str) -> Result<ArtifactUploadState, String> {
-    let data = std::fs::read(sidecar).map_err(|e| format!("upload not found: {e}"))?;
-    let state: ArtifactUploadState =
-        serde_json::from_slice(&data).map_err(|e| format!("invalid upload state: {e}"))?;
+    let state = read_upload_state_file(sidecar)?;
     if state.path != requested_path {
         return Err("upload_id does not belong to requested path".to_string());
     }
     Ok(state)
+}
+
+#[derive(Default)]
+struct ArtifactUploadTempFiles {
+    part: Option<PathBuf>,
+    sidecar: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ArtifactUploadProjectUsage {
+    active_uploads: usize,
+    reserved_bytes: usize,
+}
+
+fn upload_temp_id(name: &str, suffix: &str) -> Option<String> {
+    let upload_id = name.strip_prefix(".wc-upload-")?.strip_suffix(suffix)?;
+    validate_upload_id(upload_id).ok()?;
+    Some(upload_id.to_string())
+}
+
+fn remove_upload_temp_file(path: &Path) -> Result<bool, String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("upload cleanup failed: {e}")),
+    }
+}
+
+fn upload_pair_is_stale(
+    part_metadata: &std::fs::Metadata,
+    sidecar_metadata: &std::fs::Metadata,
+    now: SystemTime,
+    idle_ttl: Duration,
+) -> bool {
+    let newest_modified = match (part_metadata.modified(), sidecar_metadata.modified()) {
+        (Ok(part), Ok(sidecar)) => Some(if part >= sidecar { part } else { sidecar }),
+        (Ok(part), Err(_)) => Some(part),
+        (Err(_), Ok(sidecar)) => Some(sidecar),
+        (Err(_), Err(_)) => None,
+    };
+    newest_modified
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age >= idle_ttl)
+}
+
+fn upload_scan_skips_directory(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        ".git" | "target" | "node_modules" | "secrets" | "tokens"
+    )
+}
+
+fn sweep_artifact_upload_project(
+    root: &Path,
+    now: SystemTime,
+    idle_ttl: Duration,
+) -> Result<ArtifactUploadProjectUsage, String> {
+    let mut usage = ArtifactUploadProjectUsage::default();
+    let mut directories = vec![root.to_path_buf()];
+    let mut scanned_entries = 0usize;
+
+    while let Some(directory) = directories.pop() {
+        let entries =
+            std::fs::read_dir(&directory).map_err(|e| format!("upload cleanup failed: {e}"))?;
+        let mut uploads: BTreeMap<String, ArtifactUploadTempFiles> = BTreeMap::new();
+        for entry in entries {
+            scanned_entries = scanned_entries
+                .checked_add(1)
+                .ok_or_else(|| "artifact upload project scan count overflow".to_string())?;
+            if scanned_entries > MAX_ARTIFACT_UPLOAD_PROJECT_SCAN_ENTRIES {
+                return Err(format!(
+                    "artifact upload project has more than {MAX_ARTIFACT_UPLOAD_PROJECT_SCAN_ENTRIES} entries; refusing unbounded resource scan"
+                ));
+            }
+            let entry = entry.map_err(|e| format!("upload cleanup failed: {e}"))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if let Some(upload_id) = upload_temp_id(&name, ".part") {
+                uploads.entry(upload_id).or_default().part = Some(entry.path());
+                continue;
+            }
+            if let Some(upload_id) = upload_temp_id(&name, ".json") {
+                uploads.entry(upload_id).or_default().sidecar = Some(entry.path());
+                continue;
+            }
+            let file_type = entry
+                .file_type()
+                .map_err(|e| format!("upload cleanup failed: {e}"))?;
+            if file_type.is_dir() && !upload_scan_skips_directory(&name) {
+                directories.push(entry.path());
+            }
+        }
+
+        let mut cleaned = false;
+        for files in uploads.into_values() {
+            match (files.part, files.sidecar) {
+                (Some(part), Some(sidecar)) => {
+                    let part_metadata = match std::fs::metadata(&part) {
+                        Ok(metadata) => metadata,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            cleaned |= remove_upload_temp_file(&sidecar)?;
+                            continue;
+                        }
+                        Err(e) => return Err(format!("upload cleanup failed: {e}")),
+                    };
+                    let sidecar_metadata = match std::fs::metadata(&sidecar) {
+                        Ok(metadata) => metadata,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            cleaned |= remove_upload_temp_file(&part)?;
+                            continue;
+                        }
+                        Err(e) => return Err(format!("upload cleanup failed: {e}")),
+                    };
+                    if upload_pair_is_stale(&part_metadata, &sidecar_metadata, now, idle_ttl) {
+                        cleaned |= remove_upload_temp_file(&part)?;
+                        cleaned |= remove_upload_temp_file(&sidecar)?;
+                        continue;
+                    }
+                    let state = match read_upload_state_file(&sidecar) {
+                        Ok(state) => state,
+                        Err(_) => {
+                            cleaned |= remove_upload_temp_file(&part)?;
+                            cleaned |= remove_upload_temp_file(&sidecar)?;
+                            continue;
+                        }
+                    };
+                    usage.reserved_bytes = usage
+                        .reserved_bytes
+                        .checked_add(state.max_bytes)
+                        .ok_or_else(|| {
+                            "artifact upload reserved byte count overflow".to_string()
+                        })?;
+                    usage.active_uploads = usage
+                        .active_uploads
+                        .checked_add(1)
+                        .ok_or_else(|| "artifact upload count overflow".to_string())?;
+                }
+                (Some(part), None) => cleaned |= remove_upload_temp_file(&part)?,
+                (None, Some(sidecar)) => cleaned |= remove_upload_temp_file(&sidecar)?,
+                (None, None) => {}
+            }
+        }
+        if cleaned {
+            if let Ok(dir) = std::fs::File::open(&directory) {
+                let _ = dir.sync_all();
+            }
+        }
+    }
+
+    Ok(usage)
+}
+
+fn current_artifact_upload_project_usage(
+    root: &Path,
+) -> Result<ArtifactUploadProjectUsage, String> {
+    sweep_artifact_upload_project(
+        root,
+        SystemTime::now(),
+        Duration::from_secs(ARTIFACT_UPLOAD_IDLE_TTL_SECS),
+    )
+}
+
+fn enforce_artifact_upload_begin_admission(
+    usage: &ArtifactUploadProjectUsage,
+    requested_max_bytes: usize,
+) -> Result<(), String> {
+    if usage.active_uploads >= MAX_ACTIVE_ARTIFACT_UPLOADS_PER_PROJECT {
+        return Err(format!(
+            "artifact upload project reached active upload limit ({MAX_ACTIVE_ARTIFACT_UPLOADS_PER_PROJECT})"
+        ));
+    }
+    let next_reserved_bytes = usage
+        .reserved_bytes
+        .checked_add(requested_max_bytes)
+        .ok_or_else(|| "artifact upload reserved byte count overflow".to_string())?;
+    if next_reserved_bytes > MAX_ARTIFACT_UPLOAD_RESERVED_BYTES_PER_PROJECT {
+        return Err(format!(
+            "artifact upload project reserved byte quota exceeded ({MAX_ARTIFACT_UPLOAD_RESERVED_BYTES_PER_PROJECT})"
+        ));
+    }
+    Ok(())
 }
 
 fn save_error(path: Option<&str>, msg: impl Into<String>) -> Value {
@@ -714,6 +940,236 @@ fn ooxml_mime(data: &[u8]) -> Option<&'static str> {
     Some(mime)
 }
 
+fn read_file_range(file: &mut File, offset: u64, length: usize) -> Option<Vec<u8>> {
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut data = vec![0_u8; length];
+    file.read_exact(&mut data).ok()?;
+    Some(data)
+}
+
+fn validated_zip_entry_payload_from_file(
+    file: &mut File,
+    central_directory_offset: usize,
+    entry: ZipEntryMetadata,
+    expected_name: &[u8],
+    read_payload: bool,
+) -> Option<Vec<u8>> {
+    if entry.flags & 0x0001 != 0 || !matches!(entry.compression_method, 0 | 8) {
+        return None;
+    }
+    let local = entry.local_header_offset;
+    let header = read_file_range(file, u64::try_from(local).ok()?, 30)?;
+    if header.get(0..4)? != b"PK\x03\x04"
+        || le_u16(&header, 6)? != entry.flags
+        || le_u16(&header, 8)? != entry.compression_method
+    {
+        return None;
+    }
+    let local_compressed_size = usize::try_from(le_u32(&header, 18)?).ok()?;
+    let local_uncompressed_size = usize::try_from(le_u32(&header, 22)?).ok()?;
+    if entry.flags & 0x0008 == 0 {
+        if local_compressed_size != entry.compressed_size
+            || local_uncompressed_size != entry.uncompressed_size
+        {
+            return None;
+        }
+    } else if (local_compressed_size != 0 && local_compressed_size != entry.compressed_size)
+        || (local_uncompressed_size != 0 && local_uncompressed_size != entry.uncompressed_size)
+    {
+        return None;
+    }
+    let name_len = usize::from(le_u16(&header, 26)?);
+    let extra_len = usize::from(le_u16(&header, 28)?);
+    let name_start = local.checked_add(30)?;
+    let name_end = name_start.checked_add(name_len)?;
+    let compressed_start = name_end.checked_add(extra_len)?;
+    let compressed_end = compressed_start.checked_add(entry.compressed_size)?;
+    if compressed_end > central_directory_offset {
+        return None;
+    }
+    let name = read_file_range(file, u64::try_from(name_start).ok()?, name_len)?;
+    if name != expected_name {
+        return None;
+    }
+    if !read_payload {
+        return Some(Vec::new());
+    }
+    read_file_range(
+        file,
+        u64::try_from(compressed_start).ok()?,
+        entry.compressed_size,
+    )
+}
+
+fn ooxml_mime_from_file(path: &Path) -> Option<&'static str> {
+    let mut file = File::open(path).ok()?;
+    let file_bytes = usize::try_from(file.metadata().ok()?.len()).ok()?;
+    if file_bytes < 4 || read_file_range(&mut file, 0, 4)?.as_slice() != b"PK\x03\x04" {
+        return None;
+    }
+
+    let tail_len = file_bytes.min(ZIP_EOCD_MAX_SEARCH_BYTES);
+    let tail_start = file_bytes.checked_sub(tail_len)?;
+    let tail = read_file_range(&mut file, u64::try_from(tail_start).ok()?, tail_len)?;
+    let eocd_in_tail = zip_eocd_offset(&tail)?;
+    let eocd = tail_start.checked_add(eocd_in_tail)?;
+    if le_u16(&tail, eocd_in_tail + 4)? != 0 || le_u16(&tail, eocd_in_tail + 6)? != 0 {
+        return None;
+    }
+    let entries_on_disk = le_u16(&tail, eocd_in_tail + 8)?;
+    let total_entries = le_u16(&tail, eocd_in_tail + 10)?;
+    if entries_on_disk != total_entries || total_entries == u16::MAX {
+        return None;
+    }
+    let entry_count = usize::from(total_entries);
+    if entry_count == 0 || entry_count > MAX_OOXML_ZIP_ENTRIES {
+        return None;
+    }
+    let central_directory_size = usize::try_from(le_u32(&tail, eocd_in_tail + 12)?).ok()?;
+    let central_directory_offset = usize::try_from(le_u32(&tail, eocd_in_tail + 16)?).ok()?;
+    if central_directory_size > MAX_OOXML_CENTRAL_DIRECTORY_BYTES
+        || central_directory_size == u32::MAX as usize
+        || central_directory_offset == u32::MAX as usize
+    {
+        return None;
+    }
+    let central_directory_end = central_directory_offset.checked_add(central_directory_size)?;
+    if central_directory_end != eocd || central_directory_end > file_bytes {
+        return None;
+    }
+    let central_directory = read_file_range(
+        &mut file,
+        u64::try_from(central_directory_offset).ok()?,
+        central_directory_size,
+    )?;
+
+    let mut content_types_entry = None;
+    let mut word_document_entry = None;
+    let mut presentation_entry = None;
+    let mut workbook_entry = None;
+    let mut cursor = 0usize;
+    for _ in 0..entry_count {
+        if central_directory.get(cursor..cursor.checked_add(4)?)? != b"PK\x01\x02" {
+            return None;
+        }
+        let flags = le_u16(&central_directory, cursor + 8)?;
+        let compression_method = le_u16(&central_directory, cursor + 10)?;
+        let compressed_size = usize::try_from(le_u32(&central_directory, cursor + 20)?).ok()?;
+        let uncompressed_size = usize::try_from(le_u32(&central_directory, cursor + 24)?).ok()?;
+        let name_len = usize::from(le_u16(&central_directory, cursor + 28)?);
+        let extra_len = usize::from(le_u16(&central_directory, cursor + 30)?);
+        let comment_len = usize::from(le_u16(&central_directory, cursor + 32)?);
+        if le_u16(&central_directory, cursor + 34)? != 0 {
+            return None;
+        }
+        let local_header_offset = usize::try_from(le_u32(&central_directory, cursor + 42)?).ok()?;
+        if compressed_size == u32::MAX as usize
+            || uncompressed_size == u32::MAX as usize
+            || local_header_offset == u32::MAX as usize
+        {
+            return None;
+        }
+        let name_start = cursor.checked_add(46)?;
+        let name_end = name_start.checked_add(name_len)?;
+        let next = name_end.checked_add(extra_len)?.checked_add(comment_len)?;
+        if next > central_directory.len() {
+            return None;
+        }
+        let entry = ZipEntryMetadata {
+            flags,
+            compression_method,
+            compressed_size,
+            uncompressed_size,
+            local_header_offset,
+        };
+        match central_directory.get(name_start..name_end)? {
+            b"[Content_Types].xml" => {
+                if content_types_entry.replace(entry).is_some() {
+                    return None;
+                }
+            }
+            b"word/document.xml" => {
+                if word_document_entry.replace(entry).is_some() {
+                    return None;
+                }
+            }
+            b"ppt/presentation.xml" => {
+                if presentation_entry.replace(entry).is_some() {
+                    return None;
+                }
+            }
+            b"xl/workbook.xml" => {
+                if workbook_entry.replace(entry).is_some() {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        cursor = next;
+    }
+    if cursor != central_directory.len() {
+        return None;
+    }
+
+    let content_types_entry = content_types_entry?;
+    if content_types_entry.compressed_size > MAX_OOXML_CONTENT_TYPES_BYTES
+        || content_types_entry.uncompressed_size > MAX_OOXML_CONTENT_TYPES_BYTES
+    {
+        return None;
+    }
+    let compressed = validated_zip_entry_payload_from_file(
+        &mut file,
+        central_directory_offset,
+        content_types_entry,
+        b"[Content_Types].xml",
+        true,
+    )?;
+    let content_types = match content_types_entry.compression_method {
+        0 => {
+            if content_types_entry.compressed_size != content_types_entry.uncompressed_size {
+                return None;
+            }
+            compressed
+        }
+        8 => {
+            let decoder = DeflateDecoder::new(compressed.as_slice());
+            let mut limited = decoder.take((MAX_OOXML_CONTENT_TYPES_BYTES + 1) as u64);
+            let mut decoded = Vec::new();
+            limited.read_to_end(&mut decoded).ok()?;
+            if decoded.len() > MAX_OOXML_CONTENT_TYPES_BYTES {
+                return None;
+            }
+            decoded
+        }
+        _ => return None,
+    };
+    if content_types.len() != content_types_entry.uncompressed_size {
+        return None;
+    }
+    let (mime, main_part_entry, main_part_name) = match ooxml_content_type_mime(&content_types)? {
+        DOCX_MIME => (
+            DOCX_MIME,
+            word_document_entry?,
+            b"word/document.xml".as_slice(),
+        ),
+        PPTX_MIME => (
+            PPTX_MIME,
+            presentation_entry?,
+            b"ppt/presentation.xml".as_slice(),
+        ),
+        XLSX_MIME => (XLSX_MIME, workbook_entry?, b"xl/workbook.xml".as_slice()),
+        _ => return None,
+    };
+    validated_zip_entry_payload_from_file(
+        &mut file,
+        central_directory_offset,
+        main_part_entry,
+        main_part_name,
+        false,
+    )?;
+    Some(mime)
+}
+
 fn extension_mime(path: &str) -> Option<&'static str> {
     let lower = path.to_lowercase();
     if lower.ends_with(".png") {
@@ -751,6 +1207,67 @@ fn artifact_mime(path: &str, data: &[u8], sniff_json: bool) -> Option<String> {
         }
     }
     mime.map(str::to_string)
+}
+
+fn artifact_mime_from_file(path: &str, file_path: &Path, sniff_json: bool) -> Option<String> {
+    if let Some(mime) = ooxml_mime_from_file(file_path) {
+        return Some(mime.to_string());
+    }
+    let mut file = File::open(file_path).ok()?;
+    let prefix_len = usize::try_from(file.metadata().ok()?.len()).ok()?.min(32);
+    let prefix = read_file_range(&mut file, 0, prefix_len)?;
+    let mut mime = extension_mime(path);
+    if let Some(magic) = magic_mime(&prefix) {
+        mime = Some(magic);
+    } else if sniff_json {
+        let mut first = prefix
+            .iter()
+            .copied()
+            .find(|byte| !byte.is_ascii_whitespace());
+        if first.is_none() {
+            let mut buffer = [0_u8; ARTIFACT_STREAM_BUFFER_BYTES];
+            loop {
+                let read = file.read(&mut buffer).ok()?;
+                if read == 0 {
+                    break;
+                }
+                first = buffer[..read]
+                    .iter()
+                    .copied()
+                    .find(|byte| !byte.is_ascii_whitespace());
+                if first.is_some() {
+                    break;
+                }
+            }
+        }
+        if matches!(first, Some(b'{') | Some(b'[')) {
+            mime = Some("application/json");
+        }
+    }
+    mime.map(str::to_string)
+}
+
+fn verify_upload_file(path: &Path, max_bytes: usize) -> Result<(usize, String), String> {
+    let mut file = File::open(path).map_err(|e| format!("read failed: {e}"))?;
+    let mut buffer = [0_u8; ARTIFACT_STREAM_BUFFER_BYTES];
+    let mut bytes = 0usize;
+    let mut sha256 = Sha256::new();
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|e| format!("read failed: {e}"))?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes
+            .checked_add(read)
+            .ok_or_else(|| "artifact size overflow".to_string())?;
+        if bytes > max_bytes {
+            return Err("artifact too large to inspect".to_string());
+        }
+        sha256.update(&buffer[..read]);
+    }
+    Ok((bytes, format!("{:x}", sha256.finalize())))
 }
 
 fn png_size(data: &[u8]) -> Option<(u32, u32)> {
@@ -860,10 +1377,39 @@ pub(crate) fn handle_artifact_file_request(
         "file_read_project_artifact_export_chunk" => {
             handle_read_project_artifact_export_chunk(request, resolved, start)
         }
-        "file_artifact_upload_begin" => handle_artifact_upload_begin(request, resolved, start),
-        "file_artifact_upload_chunk" => handle_artifact_upload_chunk(request, resolved, start),
-        "file_artifact_upload_finish" => handle_artifact_upload_finish(request, resolved, start),
-        "file_artifact_upload_abort" => handle_artifact_upload_abort(request, resolved, start),
+        "file_artifact_upload_begin"
+        | "file_artifact_upload_chunk"
+        | "file_artifact_upload_finish"
+        | "file_artifact_upload_abort" => {
+            let _upload_guard = match ARTIFACT_UPLOAD_STATE_LOCK.lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    return line_edit_stdout(
+                        upload_error(
+                            request.path.as_deref(),
+                            None,
+                            "artifact upload state lock unavailable",
+                        ),
+                        start,
+                    )
+                }
+            };
+            match request.kind.as_str() {
+                "file_artifact_upload_begin" => {
+                    handle_artifact_upload_begin(request, resolved, start)
+                }
+                "file_artifact_upload_chunk" => {
+                    handle_artifact_upload_chunk(request, resolved, start)
+                }
+                "file_artifact_upload_finish" => {
+                    handle_artifact_upload_finish(request, resolved, start)
+                }
+                "file_artifact_upload_abort" => {
+                    handle_artifact_upload_abort(request, resolved, start)
+                }
+                _ => unreachable!("upload request kind already matched"),
+            }
+        }
         _ => CommandResult {
             exit_code: None,
             stdout: None,
@@ -989,7 +1535,7 @@ fn handle_artifact_upload_begin(
         Ok(root) => root,
         Err(e) => return line_edit_stdout(upload_error(Some(path), None, e), start),
     };
-    let max_bytes = match parse_usize_field(&payload, "max_bytes", DEFAULT_MAX_ARTIFACT_BYTES) {
+    let max_bytes = match parse_usize_field(&payload, "max_bytes", MAX_ARTIFACT_UPLOAD_BYTES) {
         Ok(value) if value > 0 => value,
         Ok(_) => {
             return line_edit_stdout(
@@ -999,6 +1545,16 @@ fn handle_artifact_upload_begin(
         }
         Err(e) => return line_edit_stdout(upload_error(Some(path), None, e), start),
     };
+    if max_bytes > MAX_ARTIFACT_UPLOAD_BYTES {
+        return line_edit_stdout(
+            upload_error(
+                Some(path),
+                None,
+                format!("max_bytes exceeds upload maximum ({MAX_ARTIFACT_UPLOAD_BYTES})"),
+            ),
+            start,
+        );
+    }
     let expected_bytes = match parse_optional_usize_field(&payload, "expected_bytes") {
         Ok(value) => value,
         Err(e) => return line_edit_stdout(upload_error(Some(path), None, e), start),
@@ -1089,6 +1645,13 @@ fn handle_artifact_upload_begin(
             )
         }
     };
+    let usage = match current_artifact_upload_project_usage(&root) {
+        Ok(usage) => usage,
+        Err(e) => return line_edit_stdout(upload_error(Some(path), None, e), start),
+    };
+    if let Err(e) = enforce_artifact_upload_begin_admission(&usage, max_bytes) {
+        return line_edit_stdout(upload_error(Some(path), None, e), start);
+    }
     let state = ArtifactUploadState {
         path: path.to_string(),
         expected_bytes,
@@ -1196,20 +1759,31 @@ fn handle_artifact_upload_chunk(
         }
         Err(e) => return line_edit_stdout(upload_error(Some(path), Some(&upload_id), e), start),
     };
-    let max_chunk_bytes = match parse_usize_field(
-        &payload,
-        "max_chunk_bytes",
-        DEFAULT_MAX_ARTIFACT_UPLOAD_CHUNK_BYTES,
-    ) {
-        Ok(value) if value > 0 => value,
-        Ok(_) => {
-            return line_edit_stdout(
-                upload_error(Some(path), Some(&upload_id), "max_chunk_bytes must be >= 1"),
-                start,
-            )
-        }
-        Err(e) => return line_edit_stdout(upload_error(Some(path), Some(&upload_id), e), start),
-    };
+    let max_chunk_bytes =
+        match parse_usize_field(&payload, "max_chunk_bytes", MAX_ARTIFACT_UPLOAD_CHUNK_BYTES) {
+            Ok(value) if value > 0 => value,
+            Ok(_) => {
+                return line_edit_stdout(
+                    upload_error(Some(path), Some(&upload_id), "max_chunk_bytes must be >= 1"),
+                    start,
+                )
+            }
+            Err(e) => {
+                return line_edit_stdout(upload_error(Some(path), Some(&upload_id), e), start)
+            }
+        };
+    if max_chunk_bytes > MAX_ARTIFACT_UPLOAD_CHUNK_BYTES {
+        return line_edit_stdout(
+            upload_error(
+                Some(path),
+                Some(&upload_id),
+                format!(
+                    "max_chunk_bytes exceeds upload chunk maximum ({MAX_ARTIFACT_UPLOAD_CHUNK_BYTES})"
+                ),
+            ),
+            start,
+        );
+    }
     let content_base64 = match payload.get("content_base64").and_then(Value::as_str) {
         Some(value) if !value.contains('\0') => value,
         _ => {
@@ -1273,6 +1847,16 @@ fn handle_artifact_upload_chunk(
         Ok(state) => state,
         Err(e) => return line_edit_stdout(upload_error(Some(path), Some(&upload_id), e), start),
     };
+    if state.max_bytes > MAX_ARTIFACT_UPLOAD_BYTES {
+        return line_edit_stdout(
+            upload_error(
+                Some(path),
+                Some(&upload_id),
+                "upload max_bytes exceeds per-file upload maximum",
+            ),
+            start,
+        );
+    }
     let received_bytes = match std::fs::metadata(&part) {
         Ok(metadata) => metadata.len() as usize,
         Err(e) => {
@@ -1412,11 +1996,10 @@ fn handle_artifact_upload_finish(
         Ok(state) => state,
         Err(e) => return line_edit_stdout(upload_error(Some(path), Some(&upload_id), e), start),
     };
-    let data = match read_limited(&part, state.max_bytes) {
-        Ok(data) => data,
+    let (bytes, sha256) = match verify_upload_file(&part, state.max_bytes) {
+        Ok(verification) => verification,
         Err(e) => return line_edit_stdout(upload_error(Some(path), Some(&upload_id), e), start),
     };
-    let bytes = data.len();
     if state
         .expected_bytes
         .is_some_and(|expected| expected != bytes)
@@ -1428,7 +2011,7 @@ fn handle_artifact_upload_finish(
                 "received_bytes": bytes,
                 "expected_bytes": state.expected_bytes,
                 "expected_sha256": state.expected_sha256,
-                "sha256": sha256_hex_bytes(&data),
+                "sha256": sha256,
                 "mime_type": state.mime_type,
                 "committed": false,
                 "error": "uploaded byte count does not match expected_bytes",
@@ -1436,7 +2019,6 @@ fn handle_artifact_upload_finish(
             start,
         );
     }
-    let sha256 = sha256_hex_bytes(&data);
     if state
         .expected_sha256
         .as_deref()
@@ -1457,6 +2039,11 @@ fn handle_artifact_upload_finish(
             start,
         );
     }
+    let detected_mime = if state.mime_type.is_none() {
+        artifact_mime_from_file(path, &part, true)
+    } else {
+        None
+    };
     let exists = std::fs::symlink_metadata(resolved).is_ok();
     if exists && !state.overwrite {
         return line_edit_stdout(
@@ -1482,15 +2069,8 @@ fn handle_artifact_upload_finish(
             start,
         );
     }
-    if let Err(e) = std::fs::rename(&part, resolved) {
-        return line_edit_stdout(
-            upload_error(
-                Some(path),
-                Some(&upload_id),
-                format!("upload finish failed: {e}"),
-            ),
-            start,
-        );
+    if let Err(e) = commit_artifact_upload_part(&part, resolved, state.overwrite) {
+        return line_edit_stdout(upload_error(Some(path), Some(&upload_id), e), start);
     }
     if let Ok(dir) = std::fs::File::open(parent) {
         let _ = dir.sync_all();
@@ -1505,7 +2085,7 @@ fn handle_artifact_upload_finish(
             "expected_bytes": state.expected_bytes,
             "expected_sha256": state.expected_sha256,
             "sha256": sha256,
-            "mime_type": state.mime_type.or_else(|| artifact_mime(path, &data, true)),
+            "mime_type": state.mime_type.or(detected_mime),
             "committed": true,
         }),
         start,
@@ -1636,6 +2216,83 @@ fn handle_read_project_artifact_metadata(
         Ok(value) => value,
         Err(e) => return line_edit_stdout(metadata_error(Some(path), e), start),
     };
+    if max_bytes > MAX_ARTIFACT_EXPORT_BYTES {
+        return line_edit_stdout(
+            metadata_error(
+                Some(path),
+                format!("artifact metadata maximum exceeds {MAX_ARTIFACT_EXPORT_BYTES} bytes"),
+            ),
+            start,
+        );
+    }
+    if max_bytes > DEFAULT_MAX_ARTIFACT_BYTES {
+        let initial_bytes = match std::fs::metadata(resolved)
+            .ok()
+            .and_then(|metadata| usize::try_from(metadata.len()).ok())
+        {
+            Some(bytes) => bytes,
+            None => {
+                return line_edit_stdout(
+                    metadata_error(Some(path), "artifact size does not fit this platform"),
+                    start,
+                )
+            }
+        };
+        if initial_bytes > max_bytes {
+            return line_edit_stdout(
+                metadata_error(Some(path), "artifact too large to inspect"),
+                start,
+            );
+        }
+        let (bytes, sha256) = match verify_upload_file(resolved, max_bytes) {
+            Ok(verification) => verification,
+            Err(e) => return line_edit_stdout(metadata_error(Some(path), e), start),
+        };
+        let final_metadata = match std::fs::metadata(resolved) {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                return line_edit_stdout(
+                    metadata_error(Some(path), format!("stat failed: {e}")),
+                    start,
+                )
+            }
+        };
+        let final_bytes = match usize::try_from(final_metadata.len()) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return line_edit_stdout(
+                    metadata_error(Some(path), "artifact size does not fit this platform"),
+                    start,
+                )
+            }
+        };
+        if bytes != initial_bytes || bytes != final_bytes {
+            return line_edit_stdout(
+                metadata_error(
+                    Some(path),
+                    "artifact size changed during metadata inspection",
+                ),
+                start,
+            );
+        }
+        let mime_type = artifact_mime_from_file(path, resolved, false);
+        let mut out = json!({
+            "path": path,
+            "exists": true,
+            "missing": false,
+            "bytes": bytes,
+            "sha256": sha256,
+            "mime_type": mime_type,
+        });
+        if let Ok(modified) = final_metadata.modified().and_then(|modified| {
+            modified
+                .duration_since(UNIX_EPOCH)
+                .map_err(std::io::Error::other)
+        }) {
+            out["modified_at"] = json!(modified.as_secs());
+        }
+        return line_edit_stdout(out, start);
+    }
     let data = match read_limited(resolved, max_bytes) {
         Ok(data) => data,
         Err(e) => return line_edit_stdout(metadata_error(Some(path), e), start),
@@ -1700,13 +2357,13 @@ fn handle_read_project_artifact_export_chunk(
         Ok(value) => value,
         Err(e) => return line_edit_stdout(read_error(Some(path), e), start),
     };
-    if expected_file_bytes > DEFAULT_MAX_ARTIFACT_BYTES {
+    if expected_file_bytes > MAX_ARTIFACT_EXPORT_BYTES {
         return line_edit_stdout(
             read_error(
                 Some(path),
                 format!(
                     "artifact is too large to export; maximum is {} bytes",
-                    DEFAULT_MAX_ARTIFACT_BYTES
+                    MAX_ARTIFACT_EXPORT_BYTES
                 ),
             ),
             start,
@@ -1753,13 +2410,13 @@ fn handle_read_project_artifact_export_chunk(
             )
         }
     };
-    if file_bytes > DEFAULT_MAX_ARTIFACT_BYTES {
+    if file_bytes > MAX_ARTIFACT_EXPORT_BYTES {
         return line_edit_stdout(
             read_error(
                 Some(path),
                 format!(
                     "artifact is too large to export; maximum is {} bytes",
-                    DEFAULT_MAX_ARTIFACT_BYTES
+                    MAX_ARTIFACT_EXPORT_BYTES
                 ),
             ),
             start,
@@ -1967,6 +2624,25 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"third");
     }
 
+    #[test]
+    fn artifact_upload_create_only_commit_never_replaces_existing_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let part = temp.path().join(".wc-upload-test.part");
+        let target = temp.path().join("artifact.bin");
+        std::fs::write(&part, b"upload").unwrap();
+        std::fs::write(&target, b"concurrent").unwrap();
+
+        let error = commit_artifact_upload_part(&part, &target, false).unwrap_err();
+        assert_eq!(error, "file exists and overwrite is false");
+        assert_eq!(std::fs::read(&target).unwrap(), b"concurrent");
+        assert_eq!(std::fs::read(&part).unwrap(), b"upload");
+
+        std::fs::remove_file(&target).unwrap();
+        commit_artifact_upload_part(&part, &target, false).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"upload");
+        assert!(!part.exists());
+    }
+
     fn artifact_request(
         root: &Path,
         kind: &str,
@@ -2022,6 +2698,286 @@ mod tests {
         ))
     }
 
+    fn test_upload_state(path: &str) -> ArtifactUploadState {
+        ArtifactUploadState {
+            path: path.to_string(),
+            expected_bytes: None,
+            expected_sha256: None,
+            mime_type: None,
+            overwrite: false,
+            max_bytes: MAX_ARTIFACT_UPLOAD_BYTES,
+        }
+    }
+
+    fn write_test_upload_pair(parent: &Path, upload_id: &str, path: &str, bytes: &[u8]) {
+        let (part, sidecar) = upload_paths(parent, upload_id);
+        std::fs::write(&part, bytes).unwrap();
+        write_upload_state(&sidecar, &test_upload_state(path)).unwrap();
+    }
+
+    #[test]
+    fn verify_upload_file_streams_across_multiple_buffers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("large.part");
+        let bytes = vec![b'x'; ARTIFACT_STREAM_BUFFER_BYTES * 2 + 17];
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (verified_bytes, sha256) = verify_upload_file(&path, bytes.len()).unwrap();
+        assert_eq!(verified_bytes, bytes.len());
+        assert_eq!(sha256, sha256_hex_bytes(&bytes));
+        assert_eq!(
+            verify_upload_file(&path, bytes.len() - 1).unwrap_err(),
+            "artifact too large to inspect"
+        );
+    }
+
+    #[test]
+    fn artifact_upload_project_sweep_cleans_orphans_and_stale_pairs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active_parent = tmp.path().join("artifacts/active");
+        let orphan_parent = tmp.path().join("artifacts/orphans");
+        std::fs::create_dir_all(&active_parent).unwrap();
+        std::fs::create_dir_all(&orphan_parent).unwrap();
+        let active_id = "wc_upload_active";
+        write_test_upload_pair(
+            &active_parent,
+            active_id,
+            "artifacts/active/active.bin",
+            b"abc",
+        );
+
+        let (orphan_part, _) = upload_paths(&orphan_parent, "wc_upload_orphan_part");
+        std::fs::write(&orphan_part, b"orphan").unwrap();
+        let (_, orphan_sidecar) = upload_paths(&orphan_parent, "wc_upload_orphan_sidecar");
+        write_upload_state(
+            &orphan_sidecar,
+            &test_upload_state("artifacts/orphans/orphan.bin"),
+        )
+        .unwrap();
+
+        let now = SystemTime::now();
+        let usage =
+            sweep_artifact_upload_project(tmp.path(), now, Duration::from_secs(60)).unwrap();
+        assert_eq!(
+            usage,
+            ArtifactUploadProjectUsage {
+                active_uploads: 1,
+                reserved_bytes: MAX_ARTIFACT_UPLOAD_BYTES,
+            }
+        );
+        assert!(!orphan_part.exists());
+        assert!(!orphan_sidecar.exists());
+
+        let future = now + Duration::from_secs(61);
+        let expired =
+            sweep_artifact_upload_project(tmp.path(), future, Duration::from_secs(60)).unwrap();
+        assert_eq!(expired, ArtifactUploadProjectUsage::default());
+        let (part, sidecar) = upload_paths(&active_parent, active_id);
+        assert!(!part.exists());
+        assert!(!sidecar.exists());
+    }
+
+    #[test]
+    fn artifact_upload_project_limits_bound_count_and_reserved_bytes() {
+        let at_count_limit = ArtifactUploadProjectUsage {
+            active_uploads: MAX_ACTIVE_ARTIFACT_UPLOADS_PER_PROJECT,
+            reserved_bytes: 0,
+        };
+        assert!(enforce_artifact_upload_begin_admission(&at_count_limit, 1)
+            .unwrap_err()
+            .contains("active upload limit"));
+
+        let nearly_full = ArtifactUploadProjectUsage {
+            active_uploads: 1,
+            reserved_bytes: MAX_ARTIFACT_UPLOAD_RESERVED_BYTES_PER_PROJECT - 1,
+        };
+        enforce_artifact_upload_begin_admission(&nearly_full, 1).unwrap();
+        assert!(enforce_artifact_upload_begin_admission(&nearly_full, 2)
+            .unwrap_err()
+            .contains("reserved byte quota exceeded"));
+    }
+
+    #[test]
+    fn artifact_upload_begin_enforces_per_file_maximum() {
+        let tmp = tempfile::tempdir().unwrap();
+        let accepted_path = "artifacts/imports/max-file.bin";
+        let accepted = run_artifact_request(
+            tmp.path(),
+            "file_artifact_upload_begin",
+            accepted_path,
+            json!({
+                "path": accepted_path,
+                "expected_bytes": null,
+                "expected_sha256": null,
+                "mime_type": null,
+                "overwrite": false,
+                "max_bytes": MAX_ARTIFACT_UPLOAD_BYTES,
+            }),
+        );
+        assert_eq!(accepted["max_bytes"], MAX_ARTIFACT_UPLOAD_BYTES);
+        let upload_id = accepted["upload_id"].as_str().unwrap().to_string();
+        let aborted = run_artifact_request(
+            tmp.path(),
+            "file_artifact_upload_abort",
+            accepted_path,
+            json!({"path": accepted_path, "upload_id": upload_id}),
+        );
+        assert_eq!(aborted["aborted"], true);
+
+        let rejected_path = "artifacts/imports/too-large-file.bin";
+        let rejected = run_artifact_request(
+            tmp.path(),
+            "file_artifact_upload_begin",
+            rejected_path,
+            json!({
+                "path": rejected_path,
+                "expected_bytes": null,
+                "expected_sha256": null,
+                "mime_type": null,
+                "overwrite": false,
+                "max_bytes": MAX_ARTIFACT_UPLOAD_BYTES + 1,
+            }),
+        );
+        assert_eq!(
+            rejected["error"],
+            format!("max_bytes exceeds upload maximum ({MAX_ARTIFACT_UPLOAD_BYTES})")
+        );
+    }
+
+    #[test]
+    fn artifact_upload_chunk_enforces_data_plane_maximum() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = "artifacts/imports/max-chunk.bin";
+        let begin = run_artifact_request(
+            tmp.path(),
+            "file_artifact_upload_begin",
+            path,
+            json!({
+                "path": path,
+                "expected_bytes": null,
+                "expected_sha256": null,
+                "mime_type": null,
+                "overwrite": false,
+                "max_bytes": MAX_ARTIFACT_UPLOAD_CHUNK_BYTES * 2,
+            }),
+        );
+        let upload_id = begin["upload_id"].as_str().unwrap().to_string();
+
+        let rejected = run_artifact_request(
+            tmp.path(),
+            "file_artifact_upload_chunk",
+            path,
+            json!({
+                "path": path,
+                "upload_id": upload_id.clone(),
+                "offset": 0,
+                "content_base64": "YQ==",
+                "max_chunk_bytes": MAX_ARTIFACT_UPLOAD_CHUNK_BYTES + 1,
+            }),
+        );
+        assert_eq!(
+            rejected["error"],
+            format!(
+                "max_chunk_bytes exceeds upload chunk maximum ({MAX_ARTIFACT_UPLOAD_CHUNK_BYTES})"
+            )
+        );
+        let (part, _) = upload_paths(tmp.path().join("artifacts/imports").as_path(), &upload_id);
+        assert_eq!(std::fs::metadata(&part).unwrap().len(), 0);
+
+        let bytes = vec![b'x'; MAX_ARTIFACT_UPLOAD_CHUNK_BYTES];
+        let accepted = run_artifact_request(
+            tmp.path(),
+            "file_artifact_upload_chunk",
+            path,
+            json!({
+                "path": path,
+                "upload_id": upload_id.clone(),
+                "offset": 0,
+                "content_base64": general_purpose::STANDARD.encode(&bytes),
+                "max_chunk_bytes": MAX_ARTIFACT_UPLOAD_CHUNK_BYTES,
+            }),
+        );
+        assert_eq!(accepted["received_bytes"], MAX_ARTIFACT_UPLOAD_CHUNK_BYTES);
+
+        let aborted = run_artifact_request(
+            tmp.path(),
+            "file_artifact_upload_abort",
+            path,
+            json!({"path": path, "upload_id": upload_id}),
+        );
+        assert_eq!(aborted["aborted"], true);
+    }
+
+    #[test]
+    fn artifact_upload_begin_rejects_project_active_upload_limit_across_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        for index in 0..MAX_ACTIVE_ARTIFACT_UPLOADS_PER_PROJECT {
+            let parent = tmp.path().join(format!("artifacts/set-{index}"));
+            std::fs::create_dir_all(&parent).unwrap();
+            let upload_id = format!("wc_upload_limit_{index}");
+            write_test_upload_pair(
+                &parent,
+                &upload_id,
+                &format!("artifacts/set-{index}/existing.bin"),
+                b"",
+            );
+        }
+
+        let path = "artifacts/imports/new.bin";
+        let output = run_artifact_request(
+            tmp.path(),
+            "file_artifact_upload_begin",
+            path,
+            json!({
+                "path": path,
+                "expected_bytes": null,
+                "expected_sha256": null,
+                "mime_type": null,
+                "overwrite": false,
+                "max_bytes": DEFAULT_MAX_ARTIFACT_BYTES,
+            }),
+        );
+        assert!(output["error"]
+            .as_str()
+            .unwrap()
+            .contains("active upload limit"));
+    }
+
+    #[test]
+    fn artifact_upload_begin_rejects_project_reserved_byte_quota() {
+        let tmp = tempfile::tempdir().unwrap();
+        for index in 0..2 {
+            let parent = tmp.path().join(format!("artifacts/quota-{index}"));
+            std::fs::create_dir_all(&parent).unwrap();
+            let upload_id = format!("wc_upload_quota_{index}");
+            write_test_upload_pair(
+                &parent,
+                &upload_id,
+                &format!("artifacts/quota-{index}/existing.bin"),
+                b"",
+            );
+        }
+
+        let path = "artifacts/imports/new.bin";
+        let output = run_artifact_request(
+            tmp.path(),
+            "file_artifact_upload_begin",
+            path,
+            json!({
+                "path": path,
+                "expected_bytes": null,
+                "expected_sha256": null,
+                "mime_type": null,
+                "overwrite": false,
+                "max_bytes": DEFAULT_MAX_ARTIFACT_BYTES,
+            }),
+        );
+        assert!(output["error"]
+            .as_str()
+            .unwrap()
+            .contains("reserved byte quota exceeded"));
+    }
+
     #[test]
     fn read_upload_state_rejects_requested_path_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2041,6 +2997,59 @@ mod tests {
 
         let err = read_upload_state(&sidecar, "artifacts/imports/b.bin").unwrap_err();
         assert_eq!(err, "upload_id does not belong to requested path");
+    }
+
+    #[test]
+    fn read_upload_state_rejects_oversized_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, sidecar) = upload_paths(tmp.path(), "wc_upload_oversized_state");
+        std::fs::write(&sidecar, vec![b'x'; MAX_ARTIFACT_UPLOAD_STATE_BYTES + 1]).unwrap();
+
+        let err = read_upload_state_file(&sidecar).unwrap_err();
+        assert_eq!(err, "invalid upload state: sidecar too large");
+    }
+
+    #[test]
+    fn artifact_upload_chunk_rejects_legacy_oversized_reservation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = "artifacts/imports/legacy-oversized.bin";
+        let parent = tmp.path().join("artifacts/imports");
+        std::fs::create_dir_all(&parent).unwrap();
+        let upload_id = "wc_upload_legacy_oversized";
+        let (part, sidecar) = upload_paths(&parent, upload_id);
+        std::fs::write(&part, b"").unwrap();
+        write_upload_state(
+            &sidecar,
+            &ArtifactUploadState {
+                path: path.to_string(),
+                expected_bytes: None,
+                expected_sha256: None,
+                mime_type: None,
+                overwrite: false,
+                max_bytes: MAX_ARTIFACT_UPLOAD_BYTES + 1,
+            },
+        )
+        .unwrap();
+
+        let output = run_artifact_request(
+            tmp.path(),
+            "file_artifact_upload_chunk",
+            path,
+            json!({
+                "path": path,
+                "upload_id": upload_id,
+                "offset": 0,
+                "content_base64": "YQ==",
+                "max_chunk_bytes": MAX_ARTIFACT_UPLOAD_CHUNK_BYTES,
+            }),
+        );
+        assert_eq!(
+            output["error"],
+            "upload max_bytes exceeds per-file upload maximum"
+        );
+        assert_eq!(std::fs::metadata(&part).unwrap().len(), 0);
+        assert!(sidecar.exists());
+        assert!(!tmp.path().join(path).exists());
     }
 
     #[test]

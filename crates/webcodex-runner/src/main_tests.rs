@@ -3427,26 +3427,127 @@ fn file_read_project_artifact_export_chunk_reads_only_requested_segments() {
     assert_eq!(boundary_read["next_offset"], ten_mib);
     assert_eq!(boundary_read["eof"], true);
 
-    let oversized = std::fs::File::create(tmp.path().join("oversized.bin")).unwrap();
-    oversized.set_len((ten_mib + 1) as u64).unwrap();
-    let oversized_read = line_edit_json(handle_file_request(
+    let above_whole_payload =
+        std::fs::File::create(tmp.path().join("above-whole-payload.bin")).unwrap();
+    above_whole_payload.set_len((ten_mib + 1) as u64).unwrap();
+    let above_whole_payload_read = line_edit_json(handle_file_request(
         &policy,
         &json_file_op_request(
             tmp.path(),
             "file_read_project_artifact_export_chunk",
-            "oversized.bin",
+            "above-whole-payload.bin",
             serde_json::json!({
-                "path": "oversized.bin",
+                "path": "above-whole-payload.bin",
                 "expected_file_bytes": ten_mib + 1,
+                "offset": ten_mib,
+                "length": 1
+            }),
+        ),
+    ));
+    assert_eq!(above_whole_payload_read["bytes_returned"], 1);
+    assert_eq!(above_whole_payload_read["next_offset"], ten_mib + 1);
+    assert_eq!(above_whole_payload_read["eof"], true);
+
+    let export_max = 256 * 1024 * 1024;
+    let max_file = std::fs::File::create(tmp.path().join("export-max.bin")).unwrap();
+    max_file.set_len(export_max as u64).unwrap();
+    let max_read = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_read_project_artifact_export_chunk",
+            "export-max.bin",
+            serde_json::json!({
+                "path": "export-max.bin",
+                "expected_file_bytes": export_max,
+                "offset": export_max - 1,
+                "length": 1
+            }),
+        ),
+    ));
+    assert_eq!(max_read["bytes_returned"], 1);
+    assert_eq!(max_read["next_offset"], export_max);
+    assert_eq!(max_read["eof"], true);
+
+    let too_large = std::fs::File::create(tmp.path().join("export-too-large.bin")).unwrap();
+    too_large.set_len((export_max + 1) as u64).unwrap();
+    let rejected = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_read_project_artifact_export_chunk",
+            "export-too-large.bin",
+            serde_json::json!({
+                "path": "export-too-large.bin",
+                "expected_file_bytes": export_max + 1,
                 "offset": 0,
                 "length": 1
             }),
         ),
     ));
-    assert!(oversized_read["error"]
+    assert!(rejected["error"].as_str().unwrap().contains("maximum"));
+}
+
+#[test]
+fn file_read_project_artifact_metadata_streams_above_whole_payload_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    let ten_mib = 10 * 1024 * 1024;
+    let export_max = 256 * 1024 * 1024;
+    let path = "large-export.pdf";
+    let file = std::fs::File::create(tmp.path().join(path)).unwrap();
+    file.set_len((ten_mib + 1) as u64).unwrap();
+
+    let metadata = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_read_project_artifact_metadata",
+            path,
+            serde_json::json!({
+                "path": path,
+                "max_bytes": export_max,
+                "allow_missing": false
+            }),
+        ),
+    ));
+    assert!(metadata.get("error").is_none(), "metadata: {metadata:?}");
+    assert_eq!(metadata["bytes"], ten_mib + 1);
+    assert_eq!(metadata["mime_type"], "application/pdf");
+    assert_eq!(metadata["sha256"].as_str().unwrap().len(), 64);
+
+    let whole_payload_bound = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_read_project_artifact_metadata",
+            path,
+            serde_json::json!({
+                "path": path,
+                "max_bytes": ten_mib,
+                "allow_missing": false
+            }),
+        ),
+    ));
+    assert!(whole_payload_bound["error"]
         .as_str()
         .unwrap()
-        .contains("maximum"));
+        .contains("too large"));
+
+    let invalid_max = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_read_project_artifact_metadata",
+            path,
+            serde_json::json!({
+                "path": path,
+                "max_bytes": export_max + 1,
+                "allow_missing": false
+            }),
+        ),
+    ));
+    assert!(invalid_max["error"].as_str().unwrap().contains("maximum"));
 }
 
 #[test]
@@ -3570,6 +3671,73 @@ fn file_artifact_upload_chunks_finish_and_abort() {
     assert_eq!(abort["aborted"], true);
     assert!(!tmp.path().join(abort_path).exists());
     assert_no_upload_temp_files(tmp.path(), abort_path);
+}
+
+#[test]
+fn file_artifact_upload_finish_detects_ooxml_mime_from_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    let path = "artifacts/imports/streamed.docx";
+    let bytes = fake_ooxml_zip(
+        "word/document.xml",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+        false,
+    );
+    let expected_sha256 = sha256_hex_bytes(&bytes);
+
+    let begin = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_artifact_upload_begin",
+            path,
+            serde_json::json!({
+                "path": path,
+                "expected_bytes": bytes.len(),
+                "expected_sha256": expected_sha256,
+                "mime_type": null,
+                "overwrite": false,
+                "max_bytes": bytes.len(),
+            }),
+        ),
+    ));
+    let upload_id = begin["upload_id"].as_str().unwrap().to_string();
+    let content_base64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
+    let chunk = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_artifact_upload_chunk",
+            path,
+            serde_json::json!({
+                "path": path,
+                "upload_id": upload_id.clone(),
+                "offset": 0,
+                "content_base64": content_base64,
+                "max_chunk_bytes": bytes.len(),
+            }),
+        ),
+    ));
+    assert_eq!(chunk["received_bytes"], bytes.len());
+
+    let finish = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_artifact_upload_finish",
+            path,
+            serde_json::json!({"path": path, "upload_id": upload_id}),
+        ),
+    ));
+    assert_eq!(finish["committed"], true);
+    assert_eq!(finish["bytes"], bytes.len());
+    assert_eq!(finish["sha256"], sha256_hex_bytes(&bytes));
+    assert_eq!(
+        finish["mime_type"],
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    );
+    assert_eq!(std::fs::read(tmp.path().join(path)).unwrap(), bytes);
+    assert_no_upload_temp_files(tmp.path(), path);
 }
 
 #[test]
@@ -6732,6 +6900,7 @@ fn computer_register_request_announces_platform_capability_and_protocol_version(
     assert!(caps.file_read);
     assert!(caps.file_write);
     assert!(caps.artifact_export_chunk_read);
+    assert!(caps.artifact_export_streaming_metadata);
     assert!(caps.structured_file_delete);
     assert!(caps.async_jobs);
     assert!(caps.async_shell_jobs);
