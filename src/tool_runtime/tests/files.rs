@@ -1351,7 +1351,7 @@ fn validate_project_relative_path_rejects_absolute_and_parent_traversal() {
 
 #[test]
 fn parse_search_matches_is_bounded_and_strips_dot_slash() {
-    let stdout = "./src/main.rs:10:fn main() {}\n./src/lib.rs:3:pub fn x()\n./src/a:1:1\n";
+    let stdout = "{\"webcodex_search\":{\"backend\":\"rg\"}}\n./src/main.rs:10:fn main() {}\n./src/lib.rs:3:pub fn x()\n./src/a:1:1\n";
     let options = SearchOptions::normalize(SearchRequest {
         limit: Some(2),
         ..raw_search_request()
@@ -1372,7 +1372,7 @@ fn parse_search_matches_is_bounded_and_strips_dot_slash() {
 #[test]
 fn parse_search_matches_skips_lines_without_line_number() {
     // Binary file matches or malformed lines are skipped, not counted.
-    let stdout = "binary:file\nsrc/main.rs:5:hit\n";
+    let stdout = "{\"webcodex_search\":{\"backend\":\"rg\"}}\nbinary:file\nsrc/main.rs:5:hit\n";
     let options = SearchOptions::normalize(SearchRequest {
         limit: Some(10),
         ..raw_search_request()
@@ -1814,6 +1814,26 @@ fn search_backend_exit_codes_map_to_results() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn search_markerless_output_cannot_be_reported_as_a_search_result() {
+    let options = SearchOptions::normalize(raw_search_request()).unwrap();
+    for (stdout, exit_code, stderr) in [
+        (
+            "",
+            Some(1),
+            "PowerShell parser rejected the generated POSIX search script",
+        ),
+        ("src/lib.rs:1:startup noise\n", Some(0), ""),
+        ("src/lib.rs:1:partial output\n", Some(1), ""),
+    ] {
+        let result = search_project_text_output("demo", &options, stdout, exit_code, stderr);
+        assert!(!result.success, "stdout={stdout:?} exit_code={exit_code:?}");
+        assert_search_output_keys_are_declared(&result.output);
+        assert_eq!(result.output["code"], "search_execution_failed");
+        assert!(result.output["backend"].is_null());
     }
 }
 
