@@ -47,7 +47,7 @@ const MCP_UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 const MCP_SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
     &[MCP_STATELESS_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION];
 const MCP_UI_EXTENSION: &str = "io.modelcontextprotocol/ui";
-const MCP_COMPUTER_UI_RESOURCE_URI: &str = "ui://webcodex/computer/v10";
+const MCP_COMPUTER_UI_RESOURCE_URI: &str = "ui://webcodex/computer/v11";
 const MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS: &[&str] = &[
     "ui://webcodex/computer/v1",
     "ui://webcodex/computer/v2",
@@ -58,8 +58,11 @@ const MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS: &[&str] = &[
     "ui://webcodex/computer/v7",
     "ui://webcodex/computer/v8",
     "ui://webcodex/computer/v9",
+    "ui://webcodex/computer/v10",
 ];
-const MCP_COMPUTER_UI_RESOURCE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+// Temporary gray-card diagnostic: force the host to re-read the canonical App
+// resource for every card so resource reuse/cache is not an unobserved variable.
+const MCP_COMPUTER_UI_RESOURCE_TTL_MS: u64 = 0;
 const MCP_COMPUTER_UI_DOMAIN: &str = "https://sg4.yyjeqhc.cn";
 const MCP_UI_RESOURCE_MIME_TYPE: &str = "text/html;profile=mcp-app";
 const MCP_COMPUTER_APP_HTML: &str = include_str!("mcp_computer_app.html");
@@ -1654,6 +1657,38 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
         None
     };
     let computer_app_ui_capability_present = request_supports_mcp_apps(&request.params);
+    // Computer App resource delivery is part of gray-card diagnosis, but its
+    // durable projection must remain metadata-only. Never persist App HTML,
+    // screenshot/tool-result content, tool arguments, window titles, or other
+    // request payload fields here.
+    let computer_app_resource_audit = computer_app_resource_uri.as_ref().and_then(|uri| {
+        request.id.as_ref().map(|_| {
+            (
+                ActionAudit::start(req, depot, "/mcp", "resourcesRead"),
+                uri.clone(),
+            )
+        })
+    });
+    let record_computer_app_resource_audit =
+        |protocol_era: &str, status: StatusCode, mcp_error_code: Option<i64>| {
+            if let Some((audit, uri)) = computer_app_resource_audit.as_ref() {
+                audit.record(
+                    ActionAuditRecord::new(
+                        "computer_app_resource_read",
+                        status.is_success(),
+                        status,
+                    )
+                    .summary(json!({
+                        "transport": "mcp",
+                        "resource_uri": uri,
+                        "resource_version": uri.rsplit('/').next().unwrap_or("unknown"),
+                        "protocol_era": protocol_era,
+                        "ui_capability_present": computer_app_ui_capability_present,
+                        "mcp_error_code": mcp_error_code,
+                    })),
+                );
+            }
+        };
     let protocol_era = match validate_http_protocol(req, &request) {
         Ok(protocol_era) => protocol_era,
         Err(body) => {
@@ -1664,6 +1699,11 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
                     "validation_failed",
                     computer_app_ui_capability_present,
                     400,
+                    body["error"]["code"].as_i64(),
+                );
+                record_computer_app_resource_audit(
+                    "validation_failed",
+                    StatusCode::BAD_REQUEST,
                     body["error"]["code"].as_i64(),
                 );
             }
@@ -1758,6 +1798,11 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
                     500,
                     Some(-32000),
                 );
+                record_computer_app_resource_audit(
+                    mcp_protocol_era_label(protocol_era),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Some(-32000),
+                );
             }
             record_audit(
                 false,
@@ -1779,6 +1824,20 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
             protocol_era,
             computer_app_ui_capability_present,
             &outcome,
+        );
+        let (status, mcp_error_code) = match &outcome {
+            McpOutcome::Ok(_) => (StatusCode::OK, None),
+            McpOutcome::BadRequest(body) => {
+                (StatusCode::BAD_REQUEST, body["error"]["code"].as_i64())
+            }
+            McpOutcome::NotFound(body) => (StatusCode::NOT_FOUND, body["error"]["code"].as_i64()),
+            McpOutcome::Notification => (StatusCode::ACCEPTED, None),
+            McpOutcome::Forbidden { .. } => (StatusCode::FORBIDDEN, None),
+        };
+        record_computer_app_resource_audit(
+            mcp_protocol_era_label(protocol_era),
+            status,
+            mcp_error_code,
         );
     }
 
@@ -2127,8 +2186,9 @@ async fn handle_mcp_request_with_lifecycle(
                 ));
             };
             let mut result = mcp_stateless_result(result, true);
-            // Only the canonical versioned URI is immutable for caching. Hidden
-            // legacy URIs intentionally alias the current HTML and remain stale.
+            // The canonical URI uses the current delivery TTL policy (temporarily
+            // zero during gray-card diagnosis). Hidden legacy aliases always stay
+            // zero-TTL because they intentionally serve the current HTML.
             if uri == MCP_COMPUTER_UI_RESOURCE_URI {
                 result["ttlMs"] = Value::from(MCP_COMPUTER_UI_RESOURCE_TTL_MS);
             }

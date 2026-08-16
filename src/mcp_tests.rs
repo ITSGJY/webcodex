@@ -213,8 +213,9 @@ async fn mcp_2026_computer_app_is_minimal_handshake_and_snapshot_only() {
     let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
     // The URI is a host cache key. Bump it whenever the App delivery contract
     // changes so a previously failed/blank iframe cannot pin the old resource.
-    assert_eq!(MCP_COMPUTER_UI_RESOURCE_URI, "ui://webcodex/computer/v10");
-    assert!(MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS.contains(&"ui://webcodex/computer/v9"));
+    assert_eq!(MCP_COMPUTER_UI_RESOURCE_URI, "ui://webcodex/computer/v11");
+    assert!(MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS.contains(&"ui://webcodex/computer/v10"));
+    assert_eq!(MCP_COMPUTER_UI_RESOURCE_TTL_MS, 0);
     let expected_resource_meta = json!({
         "ui": {
             "prefersBorder": true,
@@ -5266,7 +5267,7 @@ async fn http_mcp_2026_reads_computer_app_template_with_cache_contract() {
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
     let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
-    let service = Service::new(build_test_router(config, db, runtime));
+    let service = Service::new(build_test_router(config, db.clone(), runtime));
     let params = mcp_2026_ui_params(json!({"uri": MCP_COMPUTER_UI_RESOURCE_URI}));
 
     let mut response = TestClient::post("http://localhost/mcp")
@@ -5314,6 +5315,108 @@ async fn http_mcp_2026_reads_computer_app_template_with_cache_contract() {
     assert!(html.contains("ui/notifications/tool-result"));
     assert!(!html.contains("tools/call"));
     assert!(!html.contains("ui/request-display-mode"));
+
+    let (endpoint, action, operation, status, http_status, summary): (
+        String,
+        String,
+        String,
+        String,
+        i64,
+        String,
+    ) = {
+        let conn = db.conn_for_tests();
+        conn.query_row(
+            "SELECT endpoint, action_name, operation, status, http_status, summary_json FROM action_events ORDER BY started_at DESC LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap()
+    };
+    assert_eq!(endpoint, "/mcp");
+    assert_eq!(action, "resourcesRead");
+    assert_eq!(operation, "computer_app_resource_read");
+    assert_eq!(status, "success");
+    assert_eq!(http_status, 200);
+    let summary: Value = serde_json::from_str(&summary).unwrap();
+    assert_eq!(
+        summary,
+        json!({
+            "transport": "mcp",
+            "resource_uri": MCP_COMPUTER_UI_RESOURCE_URI,
+            "resource_version": "v11",
+            "protocol_era": "stateless_2026",
+            "ui_capability_present": true,
+            "mcp_error_code": Value::Null,
+        })
+    );
+    let durable = summary.to_string();
+    for forbidden in ["HTML loaded", "content_base64", "surface_", "Waiting for"] {
+        assert!(!durable.contains(forbidden));
+    }
+}
+
+#[tokio::test]
+async fn http_mcp_computer_app_resource_protocol_failure_is_audited_without_content() {
+    let config = test_config(Some("secret"));
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let service = Service::new(build_test_router(config, db.clone(), runtime));
+    let mut params = mcp_2026_ui_params(json!({"uri": MCP_COMPUTER_UI_RESOURCE_URI}));
+    params["_meta"]["io.modelcontextprotocol/protocolVersion"] = Value::from("2099-01-01");
+
+    let mut response = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header(MCP_PROTOCOL_VERSION_HEADER, "2099-01-01", true)
+        .add_header(MCP_METHOD_HEADER, "resources/read", true)
+        .add_header(MCP_NAME_HEADER, MCP_COMPUTER_UI_RESOURCE_URI, true)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 20601,
+            "method": "resources/read",
+            "params": params
+        }))
+        .send(&service)
+        .await;
+
+    assert_eq!(effective_status(&response), StatusCode::BAD_REQUEST);
+    let body: Value = response.take_json().await.unwrap();
+    assert_eq!(body["error"]["code"], MCP_UNSUPPORTED_PROTOCOL_VERSION);
+
+    let (action, operation, status, http_status, summary): (String, String, String, i64, String) = {
+        let conn = db.conn_for_tests();
+        conn.query_row(
+            "SELECT action_name, operation, status, http_status, summary_json FROM action_events ORDER BY started_at DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(action, "resourcesRead");
+    assert_eq!(operation, "computer_app_resource_read");
+    assert_eq!(status, "failed");
+    assert_eq!(http_status, 400);
+    let summary: Value = serde_json::from_str(&summary).unwrap();
+    assert_eq!(summary["resource_uri"], MCP_COMPUTER_UI_RESOURCE_URI);
+    assert_eq!(summary["resource_version"], "v11");
+    assert_eq!(summary["protocol_era"], "validation_failed");
+    assert_eq!(summary["ui_capability_present"], true);
+    assert_eq!(
+        summary["mcp_error_code"],
+        Value::from(MCP_UNSUPPORTED_PROTOCOL_VERSION)
+    );
+    let durable = summary.to_string();
+    for forbidden in ["HTML loaded", "content_base64", "surface_", "Waiting for"] {
+        assert!(!durable.contains(forbidden));
+    }
 }
 
 #[tokio::test]
