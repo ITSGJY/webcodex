@@ -601,7 +601,7 @@ async fn mcp_2026_computer_app_probe_is_mcp_only_tiny_result_control() {
         panic!("expected UI resources/list");
     };
     let resources = resources["result"]["resources"].as_array().unwrap();
-    assert_eq!(resources.len(), 7);
+    assert_eq!(resources.len(), 8);
     let probe_resource = resources
         .iter()
         .find(|resource| resource["uri"] == MCP_COMPUTER_APP_PROBE_RESOURCE_URI)
@@ -824,7 +824,7 @@ async fn mcp_2026_computer_app_image_probe_uses_snapshot_native_image_framing() 
         panic!("expected UI resources/list");
     };
     let resources = resources["result"]["resources"].as_array().unwrap();
-    assert_eq!(resources.len(), 7);
+    assert_eq!(resources.len(), 8);
     let image_resource = resources
         .iter()
         .find(|resource| resource["uri"] == MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI)
@@ -1032,7 +1032,7 @@ async fn mcp_2026_computer_app_image_size_probe_ladders_exact_native_png_payload
         panic!("expected UI resources/list");
     };
     let resources = resources["result"]["resources"].as_array().unwrap();
-    assert_eq!(resources.len(), 7);
+    assert_eq!(resources.len(), 8);
     let size_resource = resources
         .iter()
         .find(|resource| resource["uri"] == MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_RESOURCE_URI)
@@ -1282,7 +1282,7 @@ async fn mcp_2026_computer_app_image_dimension_probe_keeps_fixed_bytes_across_di
         panic!("expected UI resources/list");
     };
     let resources = resources["result"]["resources"].as_array().unwrap();
-    assert_eq!(resources.len(), 7);
+    assert_eq!(resources.len(), 8);
     let dimension_resource = resources
         .iter()
         .find(|resource| resource["uri"] == MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_RESOURCE_URI)
@@ -1651,7 +1651,7 @@ async fn mcp_2026_computer_app_image_matrix_probe_covers_codec_dimension_payload
         panic!("expected UI resources/list");
     };
     let resources = resources["result"]["resources"].as_array().unwrap();
-    assert_eq!(resources.len(), 7);
+    assert_eq!(resources.len(), 8);
     let matrix_resource = resources
         .iter()
         .find(|resource| resource["uri"] == MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_RESOURCE_URI)
@@ -2014,7 +2014,7 @@ async fn mcp_2026_computer_app_snapshot_probe_delegates_to_real_snapshot_contrac
         panic!("expected UI resources/list");
     };
     let resources = resources["result"]["resources"].as_array().unwrap();
-    assert_eq!(resources.len(), 7);
+    assert_eq!(resources.len(), 8);
     let snapshot_resource = resources
         .iter()
         .find(|resource| resource["uri"] == MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI)
@@ -2122,6 +2122,212 @@ async fn mcp_2026_computer_app_snapshot_probe_delegates_to_real_snapshot_contrac
 }
 
 #[tokio::test]
+async fn mcp_2026_computer_app_snapshot_decode_probe_delegates_to_real_snapshot_with_decode_aware_app(
+) {
+    let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
+    assert_eq!(
+        MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_RESOURCE_URI,
+        "ui://webcodex/computer-snapshot-decode-probe/v1"
+    );
+    assert!(registered_tool_specs()
+        .iter()
+        .all(|spec| spec.name != MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_TOOL_NAME));
+
+    let html = MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_HTML;
+    for expected in [
+        "ui/initialize",
+        "ui/notifications/initialized",
+        "ui/notifications/tool-result",
+        "native image received",
+        "native image decoded",
+        "image decode failed",
+        "screenshotEl.onload",
+        "screenshotEl.onerror",
+        "naturalWidth",
+        "naturalHeight",
+        "Browser failed to decode the real Runner JPEG",
+        "real Runner",
+    ] {
+        assert!(
+            html.contains(expected),
+            "missing {expected} in snapshot decode probe App"
+        );
+    }
+    for forbidden in [
+        "tools/call",
+        "content_base64",
+        "computer_app_image_matrix_probe",
+        "ui/request-display-mode",
+        "ui/update-model-context",
+        "ui/message",
+    ] {
+        assert!(
+            !html.contains(forbidden),
+            "snapshot decode probe App must not contain {forbidden}"
+        );
+    }
+
+    let snapshot_spec = registered_tool_specs()
+        .into_iter()
+        .find(|spec| spec.name == "computer_snapshot")
+        .expect("computer_snapshot runtime spec");
+    let tools = handle_mcp_request(
+        &runtime,
+        rpc("tools/list", Some(json!(2137)), mcp_2026_params(json!({}))),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(tools) = tools else {
+        panic!("expected stateless tools/list");
+    };
+    let decode_probe = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_TOOL_NAME)
+        .expect("MCP-only computer snapshot decode probe");
+    assert_eq!(decode_probe["inputSchema"], snapshot_spec.input_schema);
+    assert_eq!(decode_probe["outputSchema"], snapshot_spec.output_schema);
+    assert_eq!(
+        decode_probe["annotations"]["title"],
+        "Computer Snapshot Decode Probe"
+    );
+    assert_eq!(decode_probe["annotations"]["readOnlyHint"], true);
+    assert_eq!(
+        decode_probe["_meta"],
+        json!({
+            "ui": {
+                "resourceUri": MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_RESOURCE_URI,
+                "visibility": ["model", "app"]
+            },
+            "openai/outputTemplate": MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_RESOURCE_URI
+        })
+    );
+
+    let compact =
+        mcp_tools_list_payload_with_compact_and_app(ModelSurface::FullOperatorRuntime, true, true);
+    let compact_probe = compact["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_TOOL_NAME)
+        .expect("compact computer snapshot decode probe");
+    assert!(compact_probe.get("outputSchema").is_none());
+    assert_eq!(compact_probe["inputSchema"], decode_probe["inputSchema"]);
+    assert_eq!(compact_probe["_meta"], decode_probe["_meta"]);
+
+    let resources = handle_mcp_request(
+        &runtime,
+        rpc(
+            "resources/list",
+            Some(json!(2138)),
+            mcp_2026_ui_params(json!({})),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(resources) = resources else {
+        panic!("expected UI resources/list");
+    };
+    let resources = resources["result"]["resources"].as_array().unwrap();
+    assert_eq!(resources.len(), 8);
+    let decode_resource = resources
+        .iter()
+        .find(|resource| resource["uri"] == MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_RESOURCE_URI)
+        .expect("snapshot decode probe resource");
+    assert_eq!(decode_resource["mimeType"], MCP_UI_RESOURCE_MIME_TYPE);
+    assert_eq!(decode_resource["_meta"], mcp_computer_app_resource_meta());
+
+    let resource = handle_mcp_request(
+        &runtime,
+        rpc(
+            "resources/read",
+            Some(json!(2139)),
+            mcp_2026_params(json!({ "uri": MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_RESOURCE_URI })),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(resource) = resource else {
+        panic!("expected snapshot decode probe resources/read");
+    };
+    assert_eq!(
+        resource["result"]["ttlMs"],
+        Value::from(MCP_COMPUTER_UI_RESOURCE_TTL_MS)
+    );
+    assert_eq!(resource["result"]["cacheScope"], "private");
+    assert_eq!(
+        resource["result"]["contents"][0]["text"].as_str(),
+        Some(MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_HTML)
+    );
+
+    let invalid = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(2140)),
+            mcp_2026_params(json!({
+                "name": MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_TOOL_NAME,
+                "arguments": {}
+            })),
+        ),
+        None,
+    )
+    .await;
+    match invalid {
+        McpOutcome::BadRequest(value) => assert_eq!(value["error"]["code"], -32602),
+        other => {
+            panic!("decode probe must reuse computer_snapshot argument validation, got {other:?}")
+        }
+    }
+
+    let call = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(2141)),
+            mcp_2026_params(json!({
+                "name": MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_TOOL_NAME,
+                "arguments": {
+                    "client_id": "missing-runner",
+                    "surface_id": "surface_test"
+                }
+            })),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(call) = call else {
+        panic!("valid decode probe arguments must delegate to ToolRuntime");
+    };
+    assert_eq!(call["result"]["resultType"], "complete");
+    assert_eq!(call["result"]["isError"], true);
+    assert_eq!(call["result"]["structuredContent"]["success"], false);
+    assert!(call["result"]["structuredContent"]["output"]["error_kind"].is_string());
+
+    let legacy_call = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(2142)),
+            json!({
+                "name": MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_TOOL_NAME,
+                "arguments": {
+                    "client_id": "missing-runner",
+                    "surface_id": "surface_test"
+                }
+            }),
+        ),
+        None,
+    )
+    .await;
+    match legacy_call {
+        McpOutcome::BadRequest(value) => assert_eq!(value["error"]["code"], -32602),
+        other => panic!("snapshot decode probe must remain stateless-2026-only, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn mcp_info_advertised_methods_match_dispatch() {
     let runtime = test_runtime();
     for method in MCP_INFO_METHODS {
@@ -2175,6 +2381,7 @@ async fn mcp_tools_list_returns_same_names_as_runtime() {
     stateless_mcp_names.push(MCP_COMPUTER_APP_PROBE_TOOL_NAME.to_string());
     stateless_mcp_names.push(MCP_COMPUTER_APP_IMAGE_PROBE_TOOL_NAME.to_string());
     stateless_mcp_names.push(MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME.to_string());
+    stateless_mcp_names.push(MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_TOOL_NAME.to_string());
     stateless_mcp_names.push(MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_TOOL_NAME.to_string());
     stateless_mcp_names.push(MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_TOOL_NAME.to_string());
     stateless_mcp_names.push(MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_TOOL_NAME.to_string());
@@ -7170,6 +7377,47 @@ async fn http_mcp_2026_calls_computer_app_image_matrix_probe_with_4k_64k_jpeg() 
 }
 
 #[tokio::test]
+async fn http_mcp_2026_calls_computer_app_snapshot_decode_probe_and_reaches_runtime() {
+    let config = test_config(Some("secret"));
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let service = Service::new(build_test_router(config, db, runtime));
+    let params = mcp_2026_ui_params(json!({
+        "name": MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_TOOL_NAME,
+        "arguments": { "client_id": "missing-runner", "surface_id": "surface_test" }
+    }));
+
+    let mut response = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_STATELESS_PROTOCOL_VERSION,
+            true,
+        )
+        .add_header(MCP_METHOD_HEADER, "tools/call", true)
+        .add_header(
+            MCP_NAME_HEADER,
+            MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_TOOL_NAME,
+            true,
+        )
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2066,
+            "method": "tools/call",
+            "params": params
+        }))
+        .send(&service)
+        .await;
+
+    assert_eq!(effective_status(&response), StatusCode::OK);
+    let body: Value = response.take_json().await.unwrap();
+    assert_eq!(body["result"]["resultType"], "complete");
+    assert_eq!(body["result"]["isError"], true);
+    assert_eq!(body["result"]["structuredContent"]["success"], false);
+    assert!(body["result"]["structuredContent"]["output"]["error_kind"].is_string());
+}
+
+#[tokio::test]
 async fn http_mcp_2026_validates_resource_name_header_before_resource_contract() {
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
@@ -8168,6 +8416,46 @@ async fn oauth2_mcp_computer_snapshot_keeps_computer_read_scope() {
         "tools/call",
         mcp_2026_ui_params(json!({
             "name": MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME,
+            "arguments": arguments
+        })),
+    )
+    .await;
+    assert_ne!(status, StatusCode::FORBIDDEN, "body: {body:?}");
+}
+
+#[tokio::test]
+async fn oauth2_mcp_computer_app_snapshot_decode_probe_keeps_computer_read_scope() {
+    let arguments = json!({
+        "client_id": "missing-runner",
+        "surface_id": "surface_test"
+    });
+    let (_tmp, service, token) =
+        oauth_mcp_service_with_surface("runtime:read", ModelSurface::FullOperatorRuntime);
+    let (status, body, challenge) = oauth_mcp_request(
+        &service,
+        &token,
+        "tools/call",
+        mcp_2026_ui_params(json!({
+            "name": MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_TOOL_NAME,
+            "arguments": arguments.clone()
+        })),
+    )
+    .await;
+    assert_mcp_oauth_scope_rejected(
+        status,
+        &body,
+        challenge.as_deref(),
+        Some(crate::auth::SCOPE_COMPUTER_READ),
+    );
+
+    let (_tmp, service, token) =
+        oauth_mcp_service_with_surface("computer:read", ModelSurface::FullOperatorRuntime);
+    let (status, body, _) = oauth_mcp_request(
+        &service,
+        &token,
+        "tools/call",
+        mcp_2026_ui_params(json!({
+            "name": MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_TOOL_NAME,
             "arguments": arguments
         })),
     )
