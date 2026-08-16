@@ -66,6 +66,9 @@ const MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI: &str = "ui://webcodex/computer-
 const MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME: &str = "computer_app_snapshot_probe";
 const MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI: &str =
     "ui://webcodex/computer-snapshot-probe/v1";
+const MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_TOOL_NAME: &str = "computer_app_snapshot_decode_probe";
+const MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_RESOURCE_URI: &str =
+    "ui://webcodex/computer-snapshot-decode-probe/v1";
 const MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_TOOL_NAME: &str = "computer_app_image_size_probe";
 const MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_RESOURCE_URI: &str =
     "ui://webcodex/computer-image-size-probe/v1";
@@ -141,6 +144,8 @@ const MCP_COMPUTER_APP_PROBE_HTML: &str = include_str!("mcp_computer_probe_app.h
 const MCP_COMPUTER_APP_IMAGE_PROBE_HTML: &str = include_str!("mcp_computer_image_probe_app.html");
 const MCP_COMPUTER_APP_SNAPSHOT_PROBE_HTML: &str =
     include_str!("mcp_computer_snapshot_probe_app.html");
+const MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_HTML: &str =
+    include_str!("mcp_computer_snapshot_decode_probe_app.html");
 const MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_HTML: &str =
     include_str!("mcp_computer_image_size_probe_app.html");
 const MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_HTML: &str =
@@ -518,6 +523,7 @@ fn mcp_tools_list_payload_with_features(
         tools.push(mcp_computer_app_probe_tool_spec(compact));
         tools.push(mcp_computer_app_image_probe_tool_spec(compact));
         tools.push(mcp_computer_app_snapshot_probe_tool_spec(compact));
+        tools.push(mcp_computer_app_snapshot_decode_probe_tool_spec(compact));
         tools.push(mcp_computer_app_image_size_probe_tool_spec(compact));
         tools.push(mcp_computer_app_image_dimension_probe_tool_spec(compact));
         tools.push(mcp_computer_app_image_matrix_probe_tool_spec(compact));
@@ -712,6 +718,44 @@ fn mcp_computer_app_snapshot_probe_tool_spec(compact: bool) -> Value {
                     "visibility": ["model", "app"]
                 },
                 "openai/outputTemplate": MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI
+            }),
+        );
+    }
+    value
+}
+
+fn mcp_computer_app_snapshot_decode_probe_tool_spec(compact: bool) -> Value {
+    let mut spec = registered_tool_specs()
+        .into_iter()
+        .find(|spec| spec.name == "computer_snapshot")
+        .expect("computer_snapshot runtime spec");
+    spec.name = MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_TOOL_NAME.to_string();
+    spec.description = "Experimental MCP-only real-screenshot decode probe. Delegates to the existing computer_snapshot ToolRuntime path and native-image framing, while its fresh App waits for browser image decode and verifies intrinsic dimensions.".to_string();
+    if let Some(annotations) = spec.annotations.as_object_mut() {
+        annotations.insert(
+            "title".to_string(),
+            Value::String("Computer Snapshot Decode Probe".to_string()),
+        );
+    }
+    let mut value = if compact {
+        json!({
+            "name": spec.name,
+            "description": spec.description,
+            "inputSchema": spec.input_schema,
+            "annotations": spec.annotations,
+        })
+    } else {
+        serde_json::to_value(spec).unwrap_or_else(|_| json!({}))
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "_meta".to_string(),
+            json!({
+                "ui": {
+                    "resourceUri": MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_RESOURCE_URI,
+                    "visibility": ["model", "app"]
+                },
+                "openai/outputTemplate": MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_RESOURCE_URI
             }),
         );
     }
@@ -949,6 +993,13 @@ fn mcp_computer_app_resources_list() -> Value {
                 "_meta": mcp_computer_app_resource_meta()
             },
             {
+                "uri": MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_RESOURCE_URI,
+                "name": "WebCodex Computer Snapshot Decode Probe",
+                "description": "Experimental control card that renders a real Runner computer_snapshot and reports whether the browser actually decodes the delivered JPEG with matching intrinsic dimensions.",
+                "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
+                "_meta": mcp_computer_app_resource_meta()
+            },
+            {
                 "uri": MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_RESOURCE_URI,
                 "name": "WebCodex Computer App Image Size Probe",
                 "description": "Experimental control card that renders a deterministic 1x1 PNG at one selected decoded payload size through native MCP image content without Runner access.",
@@ -978,6 +1029,7 @@ fn is_mcp_computer_app_resource_uri(uri: &str) -> bool {
         || uri == MCP_COMPUTER_APP_PROBE_RESOURCE_URI
         || uri == MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI
         || uri == MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI
+        || uri == MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_RESOURCE_URI
         || uri == MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_RESOURCE_URI
         || uri == MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_RESOURCE_URI
         || uri == MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_RESOURCE_URI
@@ -999,6 +1051,8 @@ fn mcp_computer_app_resource_read(uri: &str) -> Option<Value> {
         MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_HTML
     } else if uri == MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_RESOURCE_URI {
         MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_HTML
+    } else if uri == MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_RESOURCE_URI {
+        MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_HTML
     } else if uri == MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI {
         MCP_COMPUTER_APP_SNAPSHOT_PROBE_HTML
     } else if uri == MCP_COMPUTER_UI_RESOURCE_URI
@@ -3038,6 +3092,7 @@ async fn handle_mcp_request_with_lifecycle(
                 || uri == MCP_COMPUTER_APP_PROBE_RESOURCE_URI
                 || uri == MCP_COMPUTER_APP_IMAGE_PROBE_RESOURCE_URI
                 || uri == MCP_COMPUTER_APP_SNAPSHOT_PROBE_RESOURCE_URI
+                || uri == MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_RESOURCE_URI
                 || uri == MCP_COMPUTER_APP_IMAGE_SIZE_PROBE_RESOURCE_URI
                 || uri == MCP_COMPUTER_APP_IMAGE_DIMENSION_PROBE_RESOURCE_URI
                 || uri == MCP_COMPUTER_APP_IMAGE_MATRIX_PROBE_RESOURCE_URI
@@ -3334,7 +3389,10 @@ async fn handle_mcp_request_with_lifecycle(
                 }
                 return McpOutcome::Ok(rpc_result(id, mcp_stateless_result(result, false)));
             }
-            if params.name == MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME {
+            if params.name == MCP_COMPUTER_APP_SNAPSHOT_PROBE_TOOL_NAME
+                || params.name == MCP_COMPUTER_APP_SNAPSHOT_DECODE_PROBE_TOOL_NAME
+            {
+                let snapshot_probe_name = params.name.clone();
                 if !stateless_2026 || runtime.model_surface() != ModelSurface::FullOperatorRuntime {
                     if let Some(lc) = lifecycle.as_deref() {
                         lc.dispatch_failed("surface_denied");
@@ -3343,7 +3401,9 @@ async fn handle_mcp_request_with_lifecycle(
                     return McpOutcome::BadRequest(rpc_error(
                         id,
                         -32602,
-                        "computer_app_snapshot_probe requires the stateless-2026 full-operator MCP surface",
+                        format!(
+                            "{snapshot_probe_name} requires the stateless-2026 full-operator MCP surface"
+                        ),
                     ));
                 }
                 let session_id = strip_reserved_session_id(&mut params.arguments);
