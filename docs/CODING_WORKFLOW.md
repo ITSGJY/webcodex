@@ -56,6 +56,28 @@ whether the change is acceptable.
 The role names belong in the instruction text. Do not look for a role parameter
 on `start_coding_task` or `work_on_project`.
 
+## Manual multi-window collaboration
+
+For a bounded independent subtask, keep the coordinator and worker in **separate**
+Workflow Sessions. The coordinator posts a `todo` to its own Session; the worker
+starts a fresh Session, reads the coordinator's `session_handoff_summary` plus the
+relevant open todo, performs the subtask under the worker Session, then posts a
+bounded `answer` with `reply_to=<todo_id>` and resolves that exact todo.
+
+The first version is intentionally manual. There is no automatic claim, worker
+scheduler, shared transcript, or implicit cross-Session authority. Assign one
+worker per todo. Prefer read-oriented workers when windows share a worktree, and
+explicitly isolated worktrees/projects when independent concurrent writes are
+intentional. A `read_only` request or Session mode is useful operating context,
+not authoritative proof of what happened for the worker's whole lifetime. The
+worker should accurately report material operations or deviations, while the
+coordinator relies on recorded tool/effect evidence and current workspace state.
+Return conclusions, load-bearing evidence, and result paths instead of injecting
+the worker transcript into the coordinator.
+
+See [Manual Multi-Window Collaboration](agent/manual-window-collaboration.md) for
+the detailed protocol and the dogfood gates for any future convenience primitive.
+
 ## Habits that make the workflow reliable
 
 **Reuse validation identity after a fix.** When a structured validation uses

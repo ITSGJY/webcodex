@@ -51,19 +51,19 @@ pub(crate) fn session_execution_context_schema(description: &str) -> Value {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 4096,
-                "description": "Optional cwd inherited by Session-aware shell execution. Without resource it is project-relative; with a named SSH resource it is a remote path verified by the remote shell instead of the Runner project-root policy."
+                "description": "Optional working-directory default for the closed set of Session-aware execution tools. Without resource it is project-relative. With a named SSH resource it becomes a remote-path default only for remote-capable shell execution; local structured process/script execution rejects that resource before start."
             },
             "default_shell": {
                 "type": "string",
                 "enum": ["sh", "bash"],
-                "description": "Optional explicit shell dialect inherited by Session-aware shell execution."
+                "description": "Optional explicit shell dialect inherited by Session-aware shell execution when the per-call shell is omitted. It does not affect structured process or script execution."
             },
             "resource": {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 80,
                 "pattern": "^[A-Za-z0-9_.-]+$",
-                "description": "Optional named SSH resource configured only on the Runner that owns this Session project. It changes Session-aware shell execution location only and never contains host, SSH configuration, key, password, or connection data."
+                "description": "Optional named SSH resource configured only on the Runner that owns this Session project. It routes supported one-shot, background, and persistent shell execution remotely; structured process/script and Cargo/Go validation reject it before execution. It never contains host, SSH configuration, key, password, or connection data."
             }
         }
     })
