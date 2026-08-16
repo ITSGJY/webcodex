@@ -47,7 +47,7 @@ const MCP_UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 const MCP_SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
     &[MCP_STATELESS_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION];
 const MCP_UI_EXTENSION: &str = "io.modelcontextprotocol/ui";
-const MCP_COMPUTER_UI_RESOURCE_URI: &str = "ui://webcodex/computer/v9";
+const MCP_COMPUTER_UI_RESOURCE_URI: &str = "ui://webcodex/computer/v10";
 const MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS: &[&str] = &[
     "ui://webcodex/computer/v1",
     "ui://webcodex/computer/v2",
@@ -57,6 +57,7 @@ const MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS: &[&str] = &[
     "ui://webcodex/computer/v6",
     "ui://webcodex/computer/v7",
     "ui://webcodex/computer/v8",
+    "ui://webcodex/computer/v9",
 ];
 const MCP_COMPUTER_UI_RESOURCE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const MCP_COMPUTER_UI_DOMAIN: &str = "https://sg4.yyjeqhc.cn";

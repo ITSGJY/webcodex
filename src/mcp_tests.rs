@@ -213,7 +213,8 @@ async fn mcp_2026_computer_app_is_minimal_handshake_and_snapshot_only() {
     let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
     // The URI is a host cache key. Bump it whenever the App delivery contract
     // changes so a previously failed/blank iframe cannot pin the old resource.
-    assert_eq!(MCP_COMPUTER_UI_RESOURCE_URI, "ui://webcodex/computer/v9");
+    assert_eq!(MCP_COMPUTER_UI_RESOURCE_URI, "ui://webcodex/computer/v10");
+    assert!(MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS.contains(&"ui://webcodex/computer/v9"));
     let expected_resource_meta = json!({
         "ui": {
             "prefersBorder": true,

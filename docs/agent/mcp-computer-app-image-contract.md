@@ -1,6 +1,6 @@
 # MCP Computer App image-result contract
 
-This note records the durable conclusion from the August 2026 Computer App gray-card investigation. It is intentionally short; the temporary diagnostic tools used during the investigation were removed after the fix was verified.
+This note records the durable findings from the August 2026 Computer App gray-card investigation. It is intentionally short; the temporary diagnostic tools used during the investigation were removed after their results were captured.
 
 ## Observed failure
 
@@ -19,15 +19,17 @@ The investigation progressively held the App/resource/result shape constant whil
 
 These controls ruled out JPEG as a type, 4K dimensions, ordinary native-image framing, and payload sizes through 512 KiB as the cause of the observed gray card.
 
-## Root cause and permanent invariant
+## Confirmed contract bug and permanent invariant
 
 The generic ToolRuntime `computer_snapshot` output contains `content_base64`. MCP native-image framing deliberately removes that field from `structuredContent.output`, adds `content_delivery = "mcp_image"`, and carries the binary bytes in an MCP image ContentBlock.
 
-The gray-card build advertised the generic **pre-framing** output schema in MCP `tools/list`, even though MCP returned the **post-framing** structured result. After the MCP-facing descriptor was changed to omit `content_base64` and declare `content_delivery = "mcp_image"`, both the decode-aware real-snapshot control and the production `computer_snapshot` card rendered the same real browser screenshot normally without refresh or retry.
+The gray-card build advertised the generic **pre-framing** output schema in MCP `tools/list`, even though MCP returned the **post-framing** structured result. This was a real transport-contract bug and was corrected by making the MCP-facing descriptor omit `content_base64` and declare `content_delivery = "mcp_image"` while leaving the generic ToolRuntime/API schema unchanged.
+
+That correction materially improved the observed behavior, but it is not proven to be the sole gray-card cause. In a later same-session production smoke test after the schema fix and probe cleanup, two consecutive `computer_snapshot` tool calls both completed successfully on the server; the first App card rendered normally and the second was gray. Therefore host/App binding or resource lifecycle/cache behavior remains a separate live hypothesis.
 
 **Invariant:** a transport adapter that rewrites structured output must advertise the post-adapter schema on that transport. Do not reuse a pre-adapter ToolRuntime schema when the fields actually delivered to the MCP client differ. Keep the generic ToolRuntime/API schema unchanged when only the MCP representation changes.
 
-The regression in `src/mcp_tests.rs` intentionally asserts both sides of this boundary: the runtime schema retains `content_base64`, while the MCP-facing `computer_snapshot` schema exposes `content_delivery = "mcp_image"` instead.
+The regression in `src/mcp_tests.rs` intentionally asserts both sides of this boundary: the runtime schema retains `content_base64`, while the MCP-facing `computer_snapshot` schema exposes `content_delivery = "mcp_image"` instead. The canonical Computer App resource was subsequently bumped from `v9` to `v10`, with `v9` retained as a zero-TTL hidden read alias, to isolate stale host resource/binding identity without changing the App HTML or snapshot result path.
 
 ## Separate macOS lock-screen observation
 
