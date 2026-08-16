@@ -1868,27 +1868,27 @@ fn agent_register_capabilities(cfg: &AgentConfig) -> ShellClientCapabilities {
     // old Runners that support only whole-window snapshots fail closed.
     capabilities.computer_snapshot_region = cfg!(any(target_os = "macos", windows));
     // Accessibility inspection is a separate read-only semantic capability.
-    // It is currently implemented only by the macOS Runner and never implies
-    // future computer-control authority.
-    capabilities.computer_accessibility_observe = cfg!(target_os = "macos");
+    // macOS AX and Windows UI Automation share the same model-facing tree;
+    // observation authority never implies computer-control authority.
+    capabilities.computer_accessibility_observe = cfg!(any(target_os = "macos", windows));
     // Normalized element-state observation is a separate rolling-upgrade wire
-    // capability and is currently implemented only on macOS.
-    capabilities.computer_element_state = cfg!(target_os = "macos");
-    // Accessibility control is independently fenced and currently implemented
-    // only by the macOS Runner; observation authority never implies it.
-    capabilities.computer_control = cfg!(target_os = "macos");
+    // capability implemented by the same native read-only backends.
+    capabilities.computer_element_state = cfg!(any(target_os = "macos", windows));
+    // Accessibility control is independently fenced and implemented by the
+    // native macOS AX and Windows UI Automation backends.
+    capabilities.computer_control = cfg!(any(target_os = "macos", windows));
     // Semantic AX scroll-to-visible is independently fenced for rolling upgrades;
     // existing computer_control support never implies it.
     capabilities.computer_scroll_to_element = cfg!(target_os = "macos");
     // Closed key input is a separate effect/wire capability. It is currently
     // implemented only by the macOS Runner and is never implied by control.
     capabilities.computer_key_input = cfg!(target_os = "macos");
-    // Exact window activation is a separate effect/wire capability. Old macOS
-    // Runners that only advertise computer_control must fail closed.
-    capabilities.computer_window_activate = cfg!(target_os = "macos");
+    // Exact window activation is a separate effect/wire capability. It is
+    // independently advertised by native macOS and Windows implementations.
+    capabilities.computer_window_activate = cfg!(any(target_os = "macos", windows));
     // Bounded Accessibility text input is a separate rolling-upgrade fence;
-    // older macOS Runners with computer_control must not be treated as capable.
-    capabilities.computer_text_input = cfg!(target_os = "macos");
+    // older native Runners with computer_control must not be treated as capable.
+    capabilities.computer_text_input = cfg!(any(target_os = "macos", windows));
     capabilities.job_state_reconciliation = !disable_job_state_reconciliation_for_test();
 
     // New agents always advertise read-only LSP navigation. Older agents omit

@@ -23,32 +23,32 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
         ),
         tool_spec(
             "computer_accessibility_status",
-            "Read the exact Runner's macOS Accessibility trust status without prompting or changing system permission state.",
+            "Read the exact Runner's native accessibility availability/trust status without prompting or changing system permission state. Supports macOS Accessibility and Windows UI Automation.",
             computer_accessibility_status_input_schema(),
         ),
         tool_spec(
             "computer_accessibility_tree",
-            "Inspect an exact macOS window as a bounded read-only Accessibility tree. element_id values are ephemeral process-local handles for computer_control; this tool performs no control action and has no AppleScript or shell fallback.",
+            "Inspect an exact macOS or Windows window as a bounded read-only native accessibility tree. element_id values are ephemeral process-local handles; this tool performs no control action and has no shell or platform-script fallback.",
             computer_accessibility_tree_input_schema(),
         ),
         tool_spec(
             "computer_find_elements",
-            "Find bounded semantic elements on an exact macOS window without parsing the full Accessibility tree. Requires at least one role, subrole, label, focused, or enabled filter. Matching is deterministic and read-only; returned element_id values are fresh ephemeral handles.",
+            "Find bounded semantic elements on an exact macOS or Windows window without parsing the full native accessibility tree. Requires at least one role, subrole, label, focused, or enabled filter. Matching is deterministic and read-only; returned element_id values are fresh ephemeral handles.",
             computer_find_elements_input_schema(),
         ),
         tool_spec(
             "computer_element_state",
-            "Revalidate one exact ephemeral macOS Accessibility element and return normalized read-only affordances plus observation generation. Never returns the element value; protected or secure targets suppress value_empty. Reacquire stale handles with computer_find_elements.",
+            "Revalidate an exact ephemeral accessibility element and return normalized read-only affordances plus observation generation. Supports macOS AX and Windows UIA; never returns element values. Protected or secure targets suppress value_empty. Reacquire stale handles with computer_find_elements.",
             computer_element_state_input_schema(),
         ),
         tool_spec(
             "computer_activate_window",
-            "Activate and raise one exact previously observed macOS window surface. The tool accepts no app name, PID, path, bundle, command, or fallback target. Stale surfaces fail closed; if delivery may have occurred but the response is lost, observe current UI state before retrying.",
+            "Activate and raise one exact previously observed macOS or Windows window surface. The tool accepts no app name, PID, path, bundle, command, or fallback target. Stale surfaces fail closed; if delivery may have occurred but the response is lost, observe current UI state before retrying.",
             computer_activate_window_input_schema(),
         ),
         tool_spec(
             "computer_control",
-            "Perform native macOS Accessibility press or focus on an exact reusable element_id. Stale or mismatched targets fail closed; no AppleScript or shell fallback. If delivery may have occurred but the response is lost, outcome is unknown; observe current UI state before retrying.",
+            "Perform native macOS Accessibility or Windows UI Automation press/focus on an exact reusable element_id. Stale, protected, disabled, or unsupported targets fail closed. There is no script, shell, coordinate, or generic fallback; uncertain post-dispatch outcomes require re-observation.",
             computer_control_input_schema(),
         ),
         tool_spec(
@@ -63,7 +63,7 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
         ),
         tool_spec(
             "computer_input_text",
-            "Write bounded text verbatim with native macOS AXValue to an exact reusable element_id. Target must already be focused, non-secure, unprotected, supported, enabled when known, and empty. No focus, paste, synthetic-key, or send fallback. If outcome is unknown, observe UI state before retrying.",
+            "Write bounded text via macOS AXValue or Windows UIA ValuePattern to an exact element_id. Target must be focused, non-secure, unprotected, supported, enabled, writable, and empty; Windows must be foreground. No focus/activation, paste, key, or send fallback. Re-observe unknown outcomes.",
             computer_input_text_input_schema(),
         ),
         tool_spec(

@@ -6927,18 +6927,18 @@ fn computer_register_request_announces_platform_capability_and_protocol_version(
     );
     assert_eq!(
         caps.computer_accessibility_observe,
-        cfg!(target_os = "macos"),
-        "computer accessibility observation is advertised only by the macOS native implementation"
+        cfg!(any(target_os = "macos", windows)),
+        "computer accessibility observation is advertised only by native AX/UIA implementations"
     );
     assert_eq!(
         caps.computer_element_state,
-        cfg!(target_os = "macos"),
-        "computer element state is independently advertised only by the macOS native implementation"
+        cfg!(any(target_os = "macos", windows)),
+        "computer element state is independently advertised only by native AX/UIA implementations"
     );
     assert_eq!(
         caps.computer_control,
-        cfg!(target_os = "macos"),
-        "computer control is independently advertised only by the macOS native implementation"
+        cfg!(any(target_os = "macos", windows)),
+        "computer control is independently advertised only by native macOS/Windows implementations"
     );
     assert_eq!(
         caps.computer_scroll_to_element,
@@ -6952,13 +6952,13 @@ fn computer_register_request_announces_platform_capability_and_protocol_version(
     );
     assert_eq!(
         caps.computer_window_activate,
-        cfg!(target_os = "macos"),
-        "computer window activation is independently advertised only by the macOS native implementation"
+        cfg!(any(target_os = "macos", windows)),
+        "computer window activation is independently advertised only by native macOS/Windows implementations"
     );
     assert_eq!(
         caps.computer_text_input,
-        cfg!(target_os = "macos"),
-        "computer text input is independently advertised only by the macOS native implementation"
+        cfg!(any(target_os = "macos", windows)),
+        "computer text input is independently advertised only by native macOS/Windows implementations"
     );
     assert_eq!(
         caps.sandbox_inspect_commands,
