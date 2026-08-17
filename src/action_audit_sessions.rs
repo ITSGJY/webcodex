@@ -10,6 +10,21 @@ pub const ACTION_SESSION_IDLE_TIMEOUT_SECS: i64 = 1800;
 const MAX_SUMMARY_TEXT: usize = 500;
 const MAX_PREVIEW_TEXT: usize = 120;
 
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ActionAttributionStats {
+    pub by_principal_kind: BTreeMap<String, i64>,
+    pub attributed_count: i64,
+    pub unattributed_count: i64,
+    pub by_oauth_client: Vec<OAuthClientActionStats>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OAuthClientActionStats {
+    pub client_id: String,
+    pub name: Option<String>,
+    pub count: i64,
+}
+
 /// Aggregate audit statistics over a set of decoded action events. Returned by
 /// the read-only `POST /api/audit/stats` endpoint.
 #[derive(Debug, Clone, Serialize)]
@@ -17,6 +32,7 @@ pub struct ActionSessionStats {
     pub by_endpoint: BTreeMap<String, i64>,
     pub by_project: BTreeMap<String, i64>,
     pub by_status: BTreeMap<String, i64>,
+    pub attribution: ActionAttributionStats,
     pub edit_count: i64,
     pub context_count: i64,
     pub job_count: i64,
@@ -27,6 +43,18 @@ pub struct ActionSessionStats {
     pub shell_count: i64,
     pub changed_files_distinct_count: usize,
     pub job_ids_distinct_count: usize,
+    /// Number of events actually included in the aggregate.
+    pub events_scanned: usize,
+    /// Number of events present in the selected session scope before per-session caps.
+    pub events_available: usize,
+    /// Number of selected sessions included in the aggregate.
+    pub sessions_scanned: usize,
+    /// Selected sessions whose event history exceeded the bounded scan cap.
+    pub truncated_sessions: usize,
+    /// True when the aggregate does not cover every event in the selected sessions.
+    pub partial: bool,
+    /// True when bounded event caps caused the partial result.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -400,12 +428,66 @@ pub fn decode_event(record: ActionEventRecord) -> ActionEventView {
     }
 }
 
+pub fn compute_attribution_stats(records: &[ActionEventRecord]) -> ActionAttributionStats {
+    let mut by_principal_kind = BTreeMap::new();
+    let mut oauth_client_counts = BTreeMap::new();
+    let mut attributed_count = 0i64;
+    let mut unattributed_count = 0i64;
+
+    for record in records {
+        if let Some(kind) = record
+            .principal_kind
+            .as_deref()
+            .map(str::trim)
+            .filter(|kind| !kind.is_empty())
+        {
+            *by_principal_kind.entry(kind.to_string()).or_insert(0) += 1;
+            attributed_count += 1;
+        } else {
+            unattributed_count += 1;
+        }
+        if let Some(client_id) = record
+            .oauth_client_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|client_id| !client_id.is_empty())
+        {
+            *oauth_client_counts
+                .entry(client_id.to_string())
+                .or_insert(0) += 1;
+        }
+    }
+
+    let mut by_oauth_client = oauth_client_counts
+        .into_iter()
+        .map(|(client_id, count)| OAuthClientActionStats {
+            client_id,
+            name: None,
+            count,
+        })
+        .collect::<Vec<_>>();
+    by_oauth_client.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.client_id.cmp(&right.client_id))
+    });
+
+    ActionAttributionStats {
+        by_principal_kind,
+        attributed_count,
+        unattributed_count,
+        by_oauth_client,
+    }
+}
+
 pub fn compute_stats(events: &[ActionEventView]) -> ActionSessionStats {
     let mut by_endpoint = BTreeMap::new();
     let mut by_project = BTreeMap::new();
     let mut by_status = BTreeMap::new();
     let mut changed_files = BTreeSet::new();
     let mut job_ids = BTreeSet::new();
+    let mut session_ids = BTreeSet::new();
     let mut edit_count = 0;
     let mut context_count = 0;
     let mut job_count = 0;
@@ -415,6 +497,7 @@ pub fn compute_stats(events: &[ActionEventView]) -> ActionSessionStats {
     let mut git_count = 0;
     let mut shell_count = 0;
     for event in events {
+        session_ids.insert(event.session_id.clone());
         *by_endpoint.entry(event.endpoint.clone()).or_insert(0) += 1;
         *by_status.entry(event.status.clone()).or_insert(0) += 1;
         if let Some(project) = &event.project {
@@ -463,6 +546,7 @@ pub fn compute_stats(events: &[ActionEventView]) -> ActionSessionStats {
         by_endpoint,
         by_project,
         by_status,
+        attribution: ActionAttributionStats::default(),
         edit_count,
         context_count,
         job_count,
@@ -473,6 +557,12 @@ pub fn compute_stats(events: &[ActionEventView]) -> ActionSessionStats {
         shell_count,
         changed_files_distinct_count: changed_files.len(),
         job_ids_distinct_count: job_ids.len(),
+        events_scanned: events.len(),
+        events_available: events.len(),
+        sessions_scanned: session_ids.len(),
+        truncated_sessions: 0,
+        partial: false,
+        truncated: false,
     }
 }
 
