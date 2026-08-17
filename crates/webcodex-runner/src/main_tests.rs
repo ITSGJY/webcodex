@@ -6942,13 +6942,13 @@ fn computer_register_request_announces_platform_capability_and_protocol_version(
     );
     assert_eq!(
         caps.computer_scroll_to_element,
-        cfg!(target_os = "macos"),
-        "computer scroll-to-element is independently advertised only by the macOS native implementation"
+        cfg!(any(target_os = "macos", windows)),
+        "computer scroll-to-element is independently advertised only by native macOS/Windows implementations"
     );
     assert_eq!(
         caps.computer_key_input,
-        cfg!(target_os = "macos"),
-        "computer key input is independently advertised only by the macOS native implementation"
+        cfg!(any(target_os = "macos", windows)),
+        "computer key input is independently advertised only by native macOS/Windows implementations"
     );
     assert_eq!(
         caps.computer_window_activate,

@@ -100,7 +100,7 @@ pub(crate) fn computer_scroll_to_element_input_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "client_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Exact Runner client_id whose macOS Accessibility element is scrolled into view."},
+            "client_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Exact Runner client_id whose macOS Accessibility or Windows UIA element is scrolled into view."},
             "surface_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Exact opaque surface_id used to obtain the element."},
             "element_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Opaque process-local element_id returned by computer_accessibility_tree or computer_find_elements."}
         },
@@ -113,10 +113,10 @@ pub(crate) fn computer_key_input_input_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "client_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Exact Runner client_id whose already-focused macOS window receives the key."},
+            "client_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Exact Runner client_id whose already-focused macOS or Windows window receives the key."},
             "surface_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Exact opaque process-local surface_id that must still be the frontmost focused window."},
             "key": {"type": "string", "enum": ["enter", "escape", "tab", "arrow_up", "arrow_down", "arrow_left", "arrow_right", "page_up", "page_down", "home", "end"], "description": "Closed navigation/action key vocabulary. Ordinary text must use computer_input_text."},
-            "modifiers": {"type": "array", "maxItems": 4, "uniqueItems": true, "items": {"type": "string", "enum": ["shift", "control", "option", "command"]}, "description": "Optional bounded modifier set. Modifiers apply only to this one key event pair and are never held across calls."}
+            "modifiers": {"type": "array", "maxItems": 4, "uniqueItems": true, "items": {"type": "string", "enum": ["shift", "control", "option", "command"]}, "description": "Optional bounded modifier set for this call only. On Windows, option maps to Alt and command fails closed before input."}
         },
         "required": ["client_id", "surface_id", "key"]
     })
