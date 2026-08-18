@@ -1,5 +1,5 @@
 use super::*;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::webcodex_runner::detached_job::{
     handoff_detached_job, DetachedJobPhase, DetachedJobStore, DetachedLaunchSpec,
     DetachedStartRequest,
@@ -351,7 +351,7 @@ fn validation_wait_failure_is_executor_owned_without_a_failed_check() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn detached_job_request(
     cwd: &std::path::Path,
     job_id: &str,
@@ -406,7 +406,7 @@ fn detached_job_request(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn detached_job_payload_subprocess_entrypoint() {
     let Ok(scenario) = std::env::var("WEBCODEX_DETACHED_JOB_MANAGER_SCENARIO") else {
@@ -441,7 +441,7 @@ fn detached_job_payload_subprocess_entrypoint() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn detached_recovery_uses_same_inventory_and_observes_terminal_output() {
     let temp = tempfile::tempdir().unwrap();
@@ -504,7 +504,7 @@ fn detached_recovery_uses_same_inventory_and_observes_terminal_output() {
     wait_for_job_workers(&manager);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn detached_recovery_runner_shutdown_preserves_supervisor_ownership() {
     let temp = tempfile::tempdir().unwrap();
@@ -559,7 +559,7 @@ fn detached_recovery_runner_shutdown_preserves_supervisor_ownership() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn detached_recovery_stop_uses_durable_control_without_managed_child() {
     let temp = tempfile::tempdir().unwrap();
@@ -602,7 +602,7 @@ fn detached_recovery_stop_uses_durable_control_without_managed_child() {
     wait_for_job_workers(&manager);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn detached_recovery_observer_start_failure_retains_durable_control_and_stop_routing() {
     let temp = tempfile::tempdir().unwrap();
@@ -659,7 +659,7 @@ fn detached_recovery_observer_start_failure_retains_durable_control_and_stop_rou
     wait_for_job_workers(&manager);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn detached_recovery_observer_marks_later_supervisor_loss() {
     let temp = tempfile::tempdir().unwrap();
@@ -1150,7 +1150,7 @@ fn enqueue_detached_process_job(
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn detached_process_jobmanager_initiation_handoffs_once_and_stops_via_durable_control() {
     let temp = tempfile::tempdir().unwrap();
@@ -3336,7 +3336,27 @@ pub(super) fn process_running(pid: u32) -> bool {
     ok == 1 && exit_code == 259 // 259 == STILL_ACTIVE
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+pub(super) fn process_running(pid: u32) -> bool {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size as libc::c_int,
+        )
+    };
+    if bytes == size as libc::c_int {
+        let info = unsafe { info.assume_init() };
+        return info.pbi_status != libc::SZOMB;
+    }
+    !(bytes == 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 pub(super) fn process_running(pid: u32) -> bool {
     // SAFETY: signal 0 is an existence probe; the pid comes from our own
     // helper subprocess.

@@ -202,9 +202,13 @@ impl Drop for ManagedChild {
 
 /// Signal a whole process group, reporting whether it still existed.
 ///
-/// Returns `Ok(true)` when the signal was delivered, `Ok(false)` for `ESRCH`
-/// (the group is already gone), and `Err` for any other failure.
+/// Returns `Ok(true)` when the signal was delivered and `Ok(false)` when the
+/// owned group has no member that can still execute. Normally that is `ESRCH`;
+/// Darwin can instead return `EPERM` for a zombie-only group, which is resolved
+/// through the native exact-group liveness probe before being treated as gone.
 fn signal_group(pgid: u32, signal: i32) -> io::Result<bool> {
+    #[cfg(target_os = "macos")]
+    let native_pgid = pgid;
     let pgid = i32::try_from(pgid).map_err(|_| {
         io::Error::new(io::ErrorKind::InvalidInput, "process group id out of range")
     })?;
@@ -215,6 +219,10 @@ fn signal_group(pgid: u32, signal: i32) -> io::Result<bool> {
     }
     let error = io::Error::last_os_error();
     if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(false);
+    }
+    #[cfg(target_os = "macos")]
+    if error.raw_os_error() == Some(libc::EPERM) && !darwin_group_has_live_members(native_pgid) {
         return Ok(false);
     }
     Err(error)
@@ -243,13 +251,11 @@ fn group_exists(pgid: u32) -> bool {
 /// Whether the group contains any member that can still execute code.
 ///
 /// `kill(-pgid, 0)` reports a zombie as a live member because it still occupies
-/// a process table entry — and in containers whose PID 1 does not reap orphaned
-/// grandchildren, a terminated grandchild can linger as a zombie
-/// indefinitely, so the group would appear non-empty forever. On Linux we
-/// therefore walk `/proc` and ignore zombies (`Z` / `X` states), matching the
-/// approach already used by `webcodex-persistent-shell`. On other Unix
-/// platforms zombies are reaped promptly by the nearest ancestor or PID 1, so
-/// the plain group-exists probe is sufficient.
+/// a process table entry. Linux therefore walks `/proc`, while macOS enumerates
+/// the exact process group through libproc; both backends ignore zombies when
+/// deciding whether any member can still execute code. Other Unix platforms
+/// retain the conservative group-exists probe until they have an equivalent
+/// native process-state implementation.
 fn group_has_live_members(pgid: u32) -> bool {
     if !group_exists(pgid) {
         return false;
@@ -287,8 +293,78 @@ fn group_has_live_members(pgid: u32) -> bool {
         }
         false
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        darwin_group_has_live_members(pgid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         true
     }
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_group_has_live_members(pgid: u32) -> bool {
+    const MAX_GROUP_PIDS: usize = 16 * 1024;
+
+    let Ok(pgid) = libc::pid_t::try_from(pgid) else {
+        return true;
+    };
+    // `proc_listpgrppids(..., NULL, 0)` returns a sizing count. It may be much
+    // larger than this private group's current membership, so cap allocation;
+    // a full buffer is treated as possibly truncated and therefore live.
+    let required = unsafe { libc::proc_listpgrppids(pgid, std::ptr::null_mut(), 0) };
+    if required <= 0 {
+        return true;
+    }
+    let capacity = usize::try_from(required)
+        .unwrap_or(MAX_GROUP_PIDS)
+        .clamp(1, MAX_GROUP_PIDS);
+    let mut pids = vec![0 as libc::pid_t; capacity];
+    let Some(buffer_bytes) = capacity
+        .checked_mul(std::mem::size_of::<libc::pid_t>())
+        .and_then(|bytes| libc::c_int::try_from(bytes).ok())
+    else {
+        return true;
+    };
+    let count = unsafe { libc::proc_listpgrppids(pgid, pids.as_mut_ptr().cast(), buffer_bytes) };
+    let Ok(count) = usize::try_from(count) else {
+        return true;
+    };
+    if count >= capacity {
+        return true;
+    }
+
+    for pid in pids.into_iter().take(count).filter(|pid| *pid > 0) {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>();
+        let bytes = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size as libc::c_int,
+            )
+        };
+        if bytes != size as libc::c_int {
+            let error = io::Error::last_os_error();
+            if bytes == 0 && error.raw_os_error() == Some(libc::ESRCH) {
+                // Darwin keeps an unreaped zombie in proc_listpgrppids but
+                // proc_pidinfo reports that zombie as ESRCH. The PID is still
+                // holding the group identity, yet it can no longer execute
+                // code, so it must not keep the owned tree live.
+                continue;
+            }
+            // Any other incomplete query is not proof that this member is
+            // dead/zombie. Retry on the next bounded poll instead of
+            // prematurely releasing the PGID identity.
+            return true;
+        }
+        let info = unsafe { info.assume_init() };
+        if info.pbi_pgid == pgid as u32 && info.pbi_status != libc::SZOMB {
+            return true;
+        }
+    }
+    false
 }

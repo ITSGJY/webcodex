@@ -127,8 +127,9 @@ pub(crate) struct DetachedProcessIdentity {
     /// never treated as a standalone liveness proof.
     pub(crate) creation_id: String,
     /// OS-native process birth identity used to fence PID reuse during restart
-    /// reconciliation. Linux records `/proc/<pid>/stat` starttime; later
-    /// platform backends must provide their equivalent before enabling handoff.
+    /// reconciliation. Linux records `/proc/<pid>/stat` starttime, macOS uses
+    /// `proc_pidinfo(PROC_PIDTBSDINFO)` birth time, and Windows uses process
+    /// creation time. A backend must provide an equivalent before advertising handoff.
     pub(crate) native_start_id: String,
     pub(crate) started_at_unix_ms: i64,
 }
@@ -380,7 +381,7 @@ impl DetachedJobStore {
         Ok(records)
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     pub(crate) fn reconcile_after_runner_restart(
         &self,
         record: DetachedJobRecord,
@@ -1011,6 +1012,12 @@ fn validate_process_identity(name: &str, identity: &DetachedProcessIdentity) -> 
             "invalid detached {name} Linux process start identity"
         ));
     }
+    #[cfg(target_os = "macos")]
+    if !identity.native_start_id.starts_with("macos_start_") {
+        return Err(format!(
+            "invalid detached {name} macOS process start identity"
+        ));
+    }
     #[cfg(windows)]
     if !identity.native_start_id.starts_with("windows_creation_") {
         return Err(format!(
@@ -1110,12 +1117,73 @@ fn detached_process_identity_is_live(
     }
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn macos_process_start_identity(pid: u32) -> Result<Option<String>, String> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    // SAFETY: `info` points to writable storage for exactly one proc_bsdinfo,
+    // and PROC_PIDTBSDINFO is the Darwin API for this PID's BSD process facts.
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size as libc::c_int,
+        )
+    };
+    if bytes != size as libc::c_int {
+        let error = io::Error::last_os_error();
+        if bytes == 0 && error.raw_os_error() == Some(libc::ESRCH) {
+            // Darwin reports an unreaped zombie as ESRCH here even while
+            // kill(pid, 0) can still succeed. A zombie cannot execute and its
+            // process-owned lifetime lock is already released, so this is
+            // definitive dead evidence for recovery without a PID-only probe.
+            return Ok(None);
+        }
+        return Err(format!(
+            "failed to read detached macOS process start identity for pid {pid}: returned {bytes} bytes ({error})"
+        ));
+    }
+    // SAFETY: proc_pidinfo reported that it initialized the complete structure.
+    let info = unsafe { info.assume_init() };
+    if info.pbi_start_tvsec == 0 && info.pbi_start_tvusec == 0 {
+        return Err("missing macOS process start identity".to_string());
+    }
+    Ok(Some(format!(
+        "macos_start_{}_{}",
+        info.pbi_start_tvsec, info.pbi_start_tvusec
+    )))
+}
+
+#[cfg(target_os = "macos")]
+fn native_process_start_identity(pid: u32) -> Result<String, String> {
+    macos_process_start_identity(pid)?.ok_or_else(|| {
+        format!("detached macOS process {pid} exited before its start identity was captured")
+    })
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn native_process_start_identity(_pid: u32) -> Result<String, String> {
     Err(
         "detached native process start identity is not implemented on this Unix platform"
             .to_string(),
     )
+}
+
+#[cfg(target_os = "macos")]
+fn detached_process_identity_is_live(
+    lock_path: &Path,
+    identity: &DetachedProcessIdentity,
+) -> Result<bool, String> {
+    validate_process_identity("recovery", identity)?;
+    let Some(current_start) = macos_process_start_identity(identity.pid)? else {
+        return Ok(false);
+    };
+    if current_start != identity.native_start_id {
+        return Ok(false);
+    }
+    lifetime_lock_is_held(lock_path, &identity.creation_id)
 }
 
 #[cfg(target_os = "linux")]
