@@ -2,6 +2,8 @@ use super::config::{
     max_concurrent_jobs, projects_dir, validate_quic_config, AgentConfig, HotAgentConfig,
     QuicClientConfig, ReloadableAgentConfig,
 };
+#[cfg(any(target_os = "linux", windows))]
+use super::detached_job::DetachedJobStore;
 use super::lsp::LspSupervisor;
 use super::projects::AgentProjectCache;
 use super::shutdown::{
@@ -157,7 +159,8 @@ impl AgentRuntimeState {
     }
 
     fn with_shutdown_budget(cfg: &AgentConfig, path: PathBuf, budget: Duration) -> Self {
-        let jobs = JobManager::new(max_concurrent_jobs(cfg));
+        let jobs = JobManager::new(max_concurrent_jobs(cfg))
+            .with_detached_profile_identity(&cfg.server_url);
         // Persistent shells reuse the same authenticated OpenSSH multiplex pool
         // as async jobs: one transport per (session, resource, generation),
         // never a second SSH configuration or connection pool.
@@ -1252,7 +1255,29 @@ pub(crate) fn run_agent(cfg: AgentConfig, config_path: PathBuf, once: bool) -> R
         .to_string();
     // The LSP supervisor belongs to the agent process rather than any server
     // transport session and is shared across reconnects.
-    let runtime = AgentRuntimeState::new(&cfg, config_path);
+    let runtime = AgentRuntimeState::new(&cfg, config_path.clone());
+    #[cfg(any(target_os = "linux", windows))]
+    match DetachedJobStore::default_root_for_runner(&cfg.client_id, &cfg.server_url) {
+        Ok(root) => match runtime.jobs.recover_detached_jobs(
+            DetachedJobStore::new(root),
+            &cfg.client_id,
+            &agent_instance_id,
+        ) {
+            Ok(count) if count > 0 => {
+                tracing::info!(count, "recovered detached Jobs before Runner registration");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                // Recovery is fail-closed for the detached records but must not
+                // brick ordinary Runner service. Omitting an untrusted/corrupt
+                // detached record lets normal Server reconciliation mark it lost.
+                tracing::error!(error = %error, "detached Job restart recovery failed closed");
+            }
+        },
+        Err(error) => {
+            tracing::error!(error = %error, "detached Job state root is unavailable");
+        }
+    }
     let shutdown_listener = install_shutdown_listener(runtime.clone())?;
     runtime.register_background_thread(shutdown_listener);
     #[cfg(unix)]

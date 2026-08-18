@@ -1,8 +1,9 @@
 use super::super::input_schemas::{
     job_log_input_schema, job_status_input_schema, list_jobs_input_schema,
-    observe_jobs_input_schema, open_session_shell_input_schema, run_job_input_schema,
-    run_process_input_schema, run_script_input_schema, run_shell_input_schema,
-    session_shell_exec_input_schema, session_shell_identity_input_schema, stop_job_input_schema,
+    observe_jobs_input_schema, open_session_shell_input_schema, run_detached_process_input_schema,
+    run_job_input_schema, run_process_input_schema, run_script_input_schema,
+    run_shell_input_schema, session_shell_exec_input_schema, session_shell_identity_input_schema,
+    stop_job_input_schema,
 };
 use super::tool_spec;
 use crate::tool_runtime::tool_spec::ToolSpec;
@@ -13,6 +14,11 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
             "run_process",
             "Run one native executable with literal argv and no shell parsing. Long work continues as the same execution; choose a shell command tool only when shell syntax or a Windows batch file is required.",
             run_process_input_schema(),
+        ),
+        tool_spec(
+            "run_detached_process",
+            "Start a detached process as a durable Job with literal argv and explicit detached authority. A bounded replay key blocks duplicate dispatch while the Job is active or retained; expired keys are not retry tokens. Observe or stop with Job tools. No shell, script, SSH-resource, or retry fallback.",
+            run_detached_process_input_schema(),
         ),
         tool_spec(
             "run_script",
