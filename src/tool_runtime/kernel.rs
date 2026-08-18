@@ -682,6 +682,37 @@ mod tests {
             Ok(())
         );
         assert_eq!(
+            check_runtime_tool_scope(Some(&allowed), "computer_list_applications"),
+            Ok(())
+        );
+        assert_eq!(
+            check_runtime_tool_scope(Some(&allowed), "computer_launch_application"),
+            Err(ToolCallErrorStatus::InsufficientScope {
+                required_scope: Some(crate::auth::SCOPE_COMPUTER_LAUNCH),
+                description: "missing required scope: computer:launch".to_string(),
+            })
+        );
+        let control_only = oauth(&["computer:control"]);
+        assert!(matches!(
+            check_runtime_tool_scope(Some(&control_only), "computer_launch_application"),
+            Err(ToolCallErrorStatus::InsufficientScope {
+                required_scope: Some(crate::auth::SCOPE_COMPUTER_LAUNCH),
+                ..
+            })
+        ));
+        let launch_only = oauth(&["computer:launch"]);
+        assert_eq!(
+            check_runtime_tool_scope(Some(&launch_only), "computer_launch_application"),
+            Ok(())
+        );
+        assert!(matches!(
+            check_runtime_tool_scope(Some(&launch_only), "computer_list_applications"),
+            Err(ToolCallErrorStatus::InsufficientScope {
+                required_scope: Some(crate::auth::SCOPE_COMPUTER_READ),
+                ..
+            })
+        ));
+        assert_eq!(
             check_runtime_tool_scope(Some(&allowed), "computer_list_targets"),
             Ok(())
         );
@@ -700,6 +731,138 @@ mod tests {
                 description: "missing required scope: runtime:read".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn computer_display_observation_requires_read_and_display_read() {
+        let read_only = oauth(&["computer:read"]);
+        assert_eq!(
+            check_runtime_tool_scope(Some(&read_only), "computer_list_displays"),
+            Err(ToolCallErrorStatus::InsufficientScope {
+                required_scope: Some(crate::auth::SCOPE_COMPUTER_DISPLAY_READ),
+                description: "missing required scope: computer:display_read".to_string(),
+            })
+        );
+        let display_only = oauth(&["computer:display_read"]);
+        assert_eq!(
+            check_runtime_tool_scope(Some(&display_only), "computer_snapshot_display"),
+            Err(ToolCallErrorStatus::InsufficientScope {
+                required_scope: Some(crate::auth::SCOPE_COMPUTER_READ),
+                description: "missing required scope: computer:read".to_string(),
+            })
+        );
+        let both = oauth(&["computer:read", "computer:display_read"]);
+        assert_eq!(
+            check_runtime_tool_scope(Some(&both), "computer_list_displays"),
+            Ok(())
+        );
+        assert_eq!(
+            check_runtime_tool_scope(Some(&both), "computer_snapshot_display"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn computer_clipboard_tools_require_independent_dual_scopes() {
+        let read_base = oauth(&["computer:read"]);
+        assert!(matches!(
+            check_runtime_tool_scope(Some(&read_base), "computer_read_clipboard"),
+            Err(ToolCallErrorStatus::InsufficientScope {
+                required_scope: Some(crate::auth::SCOPE_COMPUTER_CLIPBOARD_READ),
+                ..
+            })
+        ));
+        let clipboard_read_only = oauth(&["computer:clipboard_read"]);
+        assert!(matches!(
+            check_runtime_tool_scope(Some(&clipboard_read_only), "computer_read_clipboard"),
+            Err(ToolCallErrorStatus::InsufficientScope {
+                required_scope: Some(crate::auth::SCOPE_COMPUTER_READ),
+                ..
+            })
+        ));
+        let read_both = oauth(&["computer:read", "computer:clipboard_read"]);
+        assert_eq!(
+            check_runtime_tool_scope(Some(&read_both), "computer_read_clipboard"),
+            Ok(())
+        );
+        assert!(check_runtime_tool_scope(Some(&read_both), "computer_write_clipboard").is_err());
+
+        let control_base = oauth(&["computer:control"]);
+        assert!(matches!(
+            check_runtime_tool_scope(Some(&control_base), "computer_write_clipboard"),
+            Err(ToolCallErrorStatus::InsufficientScope {
+                required_scope: Some(crate::auth::SCOPE_COMPUTER_CLIPBOARD_WRITE),
+                ..
+            })
+        ));
+        let clipboard_write_only = oauth(&["computer:clipboard_write"]);
+        assert!(matches!(
+            check_runtime_tool_scope(Some(&clipboard_write_only), "computer_write_clipboard"),
+            Err(ToolCallErrorStatus::InsufficientScope {
+                required_scope: Some(crate::auth::SCOPE_COMPUTER_CONTROL),
+                ..
+            })
+        ));
+        let write_both = oauth(&["computer:control", "computer:clipboard_write"]);
+        assert_eq!(
+            check_runtime_tool_scope(Some(&write_both), "computer_write_clipboard"),
+            Ok(())
+        );
+        assert!(check_runtime_tool_scope(Some(&write_both), "computer_read_clipboard").is_err());
+    }
+
+    #[test]
+    fn computer_pointer_control_requires_all_four_independent_scopes() {
+        let cases = [
+            (
+                vec![
+                    "computer:display_read",
+                    "computer:control",
+                    "computer:pointer_control",
+                ],
+                crate::auth::SCOPE_COMPUTER_READ,
+            ),
+            (
+                vec![
+                    "computer:read",
+                    "computer:control",
+                    "computer:pointer_control",
+                ],
+                crate::auth::SCOPE_COMPUTER_DISPLAY_READ,
+            ),
+            (
+                vec![
+                    "computer:read",
+                    "computer:display_read",
+                    "computer:pointer_control",
+                ],
+                crate::auth::SCOPE_COMPUTER_CONTROL,
+            ),
+            (
+                vec!["computer:read", "computer:display_read", "computer:control"],
+                crate::auth::SCOPE_COMPUTER_POINTER_CONTROL,
+            ),
+        ];
+        for tool in ["computer_pointer_move", "computer_pointer_click"] {
+            for (scopes, missing) in &cases {
+                let context = oauth(scopes);
+                assert_eq!(
+                    check_runtime_tool_scope(Some(&context), tool),
+                    Err(ToolCallErrorStatus::InsufficientScope {
+                        required_scope: Some(*missing),
+                        description: format!("missing required scope: {missing}"),
+                    }),
+                    "{tool} missing {missing}"
+                );
+            }
+            let all = oauth(&[
+                "computer:read",
+                "computer:display_read",
+                "computer:control",
+                "computer:pointer_control",
+            ]);
+            assert_eq!(check_runtime_tool_scope(Some(&all), tool), Ok(()));
+        }
     }
 
     #[test]

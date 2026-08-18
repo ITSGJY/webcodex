@@ -18,6 +18,74 @@ The current contract deliberately keeps read observation separate from effects. 
 
 The roadmap preserves these invariants while reducing unnecessary model round-trips. The primary optimization target is redundant observation, not collapsing distinct effects into opaque workflows.
 
+### Windows application discovery and bounded launch
+
+Windows now exposes two narrow model-facing operations: `computer_list_applications(client_id, limit?)` and `computer_launch_application(client_id, application_id)`. Discovery is bounded to at most 64 returned entries and reports `applications`, `count`, and `truncated`; each entry contains only a fresh opaque `application_id` plus a bounded display name. The Runner uses the Windows AppsFolder Shell namespace rather than recursively scanning filesystems or `PATH`. There is no pagination, search DSL, executable-path result, package/AUMID result, or generic application framework.
+
+Every fresh list replaces the Runner's process-local application registry, so IDs from an earlier generation become stale. Runner restart also invalidates every prior ID. The private Windows record stores the native Shell identity needed for exact revalidation, but that identity never crosses the Runner boundary. Immediately before launch, the Runner performs another bounded AppsFolder enumeration and requires an exact native-identity match; disappearance or change returns `stale_application` before any native launch attempt.
+
+Launch accepts only `client_id` and the opaque `application_id`. The Windows backend submits the freshly revalidated Shell item by PIDL to the native Shell launch primitive. It accepts no executable/path, argv, cwd, environment, shell command, PowerShell/cmd/script, URL/protocol launcher, `run_process` fallback, focus, activation, or input. The launch request is not a promise to create a new process, window, or instance: Windows may route it to an already-running application. Success means only that the native launch request returned success; it does not mean a usable window is ready, and WebCodex does not additionally activate or focus anything.
+
+The canonical workflow is therefore:
+
+```text
+computer_list_applications
+  -> computer_launch_application
+  -> fresh computer_list_windows
+  -> identify the exact new/current surface
+  -> computer_activate_window only if needed
+  -> semantic work
+```
+
+Pre-native validation failures, including malformed or `stale_application` IDs and definite non-dispatch, are `not_started` with `state_changed=false`. Once native launch may have been dispatched, timeout, response loss, Runner interruption, ambiguous native failure, or inconsistent success metadata is `outcome_unknown`; there is no automatic replay or launch idempotency key, and callers must reconcile with a fresh `computer_list_windows` before deciding whether another launch is safe. The two additive Runner capabilities, `computer_application_discovery` and `computer_application_launch`, default false when missing and never imply one another or any existing observe/control capability. macOS and other unimplemented platforms do not advertise them and fail closed.
+
+Durable audit keeps discovery result metadata to `count`/`truncated` only; application names and native identities are omitted. Launch audit may retain the opaque `application_id` plus bounded lifecycle/success metadata, never the native PIDL, executable path, AUMID/package identity, or launch parameters.
+
+### Full-display discovery and exact display snapshot
+
+Full-display observation is a wider privacy authority than ordinary window observation. `computer_list_displays(client_id, limit?)` and `computer_snapshot_display(client_id, display_id, max_width?, max_height?)` therefore require both `computer:read` and the explicit `computer:display_read` scope, plus the independent Runner capability `computer_display_observe`. Missing capability fields are false and are never inferred from `computer_observe`, region snapshot support, or platform identity. The current exact implementation is Windows-only; macOS and other unproven backends keep the capability false and fail closed.
+
+Discovery returns at most 16 entries with only `display_id`, display-relative `width`/`height`, and `primary`, plus `count`/`truncated`. Every list creates fresh opaque process-local IDs and replaces the prior display registry, so previous IDs become stale and Runner restart invalidates all of them. Native monitor/interface identity, device paths, global desktop origin, scale/DPI mapping, and other topology remain Runner-private.
+
+`computer_snapshot_display` captures exactly one previously discovered display; there is no virtual-desktop mosaic, caller region, global coordinate, pointer/click input, activation, or fallback. On Windows the Runner re-enumerates native displays and requires an exact private monitor-interface identity plus unchanged display-relative source geometry before capture, verifies the captured pixel geometry, and revalidates identity again after capture so a hotplug/replacement race discards the bytes rather than accepting the wrong display. `max_width`/`max_height` reuse the existing bounded JPEG pipeline and only apply aspect-preserving downscale; they never upscale. The output separates `source_width`/`source_height` from encoded `width`/`height`, while global origin and native DPI mapping remain private.
+
+Each successful snapshot returns a positive process-local `snapshot_generation`. The Runner keeps a bounded binding from that generation to the exact opaque display handle, private native identity, and source geometry. Display list/snapshot remain read-only observations: malformed, stale, permission, capture, and transport failures do not use effect/outcome-unknown semantics; callers may safely reacquire a fresh display list and observe again.
+
+Durable audit keeps display-list results to minimal `count`/`truncated` metadata. Display snapshot audit may retain the opaque `display_id`, generation, source/encoded dimensions, MIME, digest, byte count, and capture timestamp, but never the image body, native monitor identity/device path, global origin, scale/DPI, or topology. Model/Server output validation rejects Runner fields outside the closed public shape.
+
+### Windows snapshot-fenced coordinate pointer
+
+Windows now exposes `computer_pointer_move(client_id, display_id, snapshot_generation, x, y)` and `computer_pointer_click(client_id, display_id, snapshot_generation, x, y)`. The click slice is deliberately fixed to one left click; there is no caller button, double/right/middle/X click, drag, wheel, button-down/up primitive, window-relative coordinate API, or global desktop coordinate API. `x`/`y` are integer coordinates in the exact display-local `source_width`/`source_height` space returned by `computer_snapshot_display`, never the downscaled JPEG dimensions.
+
+The `snapshot_generation` is a one-effect freshness fence, not presentation metadata. Pointer admission requires the generation to belong to the current Runner process, the exact current `display_id`, private native display identity, and source geometry; it must also be the latest successful snapshot generation for that display and still be unspent. A newer snapshot, fresh display list, Runner restart, display replacement/hotplug, geometry mismatch, or prior pointer use makes the generation stale. Native identity, topology, coordinate-space, and initial held-input checks happen before the effect boundary. Crossing that boundary marks the generation spent before the first `SendInput`, so success, definite non-insertion, partial insertion, or an unprovable postcondition cannot reuse it. Failures before the boundary leave it unspent. A click performs an additional held-input check after its exact move has been proven and before any button event is attempted.
+
+The Windows backend re-enumerates and exactly revalidates the private display identity and geometry, then privately maps display-local source coordinates into Windows virtual-desktop absolute input coordinates. The current xcap monitor rectangle union must exactly equal Windows virtual-desktop metrics; otherwise DPI/topology mapping is not proven and the effect fails closed rather than guessing. Negative or non-zero secondary-monitor origins are handled only inside this private mapping. Public results and durable audit never contain the native monitor identity, device path, global target, virtual-desktop bounds, DPI/scale, or transform.
+
+Pointer input uses the shared interactive desktop and does not isolate the agent from simultaneous human input. Before a move, every mouse button must be up so an agent move cannot extend a human drag. Before a click, every mouse button plus Shift, Control, Alt, and Windows keys must be up; the Runner never releases human-held state. A move is one absolute virtual-desktop `SendInput` event. A click is deliberately two-phase: first one absolute move `SendInput`, then an exact `GetCursorPos` proof; only after that proof and a fresh mouse/modifier/Windows-key held-state check does the Runner submit one bounded `LEFTDOWN` + `LEFTUP` `SendInput`. If the move inserts zero events, the spent effect is definite `not_started`. Once the move has been accepted, an unprovable exact position, changed held-input state, zero or partial button insertion, or a failed final postcondition is `outcome_unknown`; button events are never attempted when the exact move proof or second held-state check fails. Success additionally requires final read-back to prove the cursor remains at the exact target and the left button is not stuck down. An uncertain outcome is never repaired or retried automatically; obtain a fresh full-display snapshot before deciding on another effect.
+
+Canonical pointer flow:
+
+```text
+computer_list_displays
+  -> computer_snapshot_display
+  -> model computes source-space x/y
+  -> computer_pointer_move OR computer_pointer_click
+  -> fresh computer_snapshot_display / semantic observation
+  -> decide next effect
+```
+
+Pointer control requires all four scopes `computer:read`, `computer:display_read`, `computer:control`, and explicit `computer:pointer_control`, plus the independent `computer_pointer_control` Runner capability. The capability defaults false and is advertised only by the Windows implementation in this slice. The tools perform no implicit snapshot, display/window listing, activation, focus, retry, shell/script/process fallback, clipboard operation, OCR, or browser automation.
+
+### Windows bounded Unicode-text clipboard
+
+Windows now exposes two independent global clipboard tools: `computer_read_clipboard(client_id)` and `computer_write_clipboard(client_id, text)`. The first version supports only native `CF_UNICODETEXT`. It does not expose binary/image/HTML/RTF/file-drop/custom formats, native format IDs, clipboard history, delayed rendering, owner/window handles, sequence numbers, or arbitrary format enumeration. It has no clipboard generation/token framework. The independent Runner capabilities `computer_clipboard_read` and `computer_clipboard_write` default false, are not inferred from each other or from ordinary Computer observation/control, and are advertised only by the Windows implementation in this slice; non-Windows Runners remain false.
+
+Clipboard read is a pure observation requiring both `computer:read` and explicit `computer:clipboard_read`. It opens the global clipboard only for the duration of one bounded read, performs no internal retry, checks `CF_UNICODETEXT`, bounds native storage before locking it, requires a UTF-16 terminating NUL within that storage, converts to UTF-8, and rejects rather than truncates text beyond 16 KiB. Absence of readable Unicode text is returned as `available=false`; an existing empty Unicode string is `available=true` with empty `text`. The returned model text is the authorized data plane, but durable audit retains only bounded metadata such as `available` and `text_bytes`: clipboard text, raw UTF-16, hashes, owner HWNDs, HGLOBAL values, and other private Windows state never enter durable audit.
+
+Clipboard write is an independent effect requiring both `computer:control` and explicit `computer:clipboard_write`; write authority does not grant read authority. Caller text must be non-empty, NUL-free, and at most 16 KiB of UTF-8. UTF-16 conversion, terminating NUL construction, checked allocation sizing, movable global-memory allocation/copy, and creation of a short-lived invisible Runner-owned non-NULL message-only HWND all complete before native clipboard mutation. The Runner never borrows the foreground/application HWND and never activates or focuses UI. After `OpenClipboard(owner_hwnd)` succeeds, the first successful `EmptyClipboard` is the effect boundary: failure before that point is definite `not_started`; after the clipboard has been emptied, `SetClipboardData` failure, close failure, lost response, or otherwise unprovable completion is `outcome_unknown`. Successful `SetClipboardData(CF_UNICODETEXT, ...)` transfers HGLOBAL ownership to Windows. There is no retry, previous-content restore, hidden readback, second write, or repair sequence.
+
+`computer_write_clipboard` is intentionally a **replacement** operation: `EmptyClipboard` removes any previous image, rich-text, HTML/RTF, file-drop, or custom formats before installing the bounded Unicode text. It does not attempt to merge or preserve rich formats. Neither clipboard tool pastes anything, sends Ctrl+V, focuses/activates a target, or becomes a fallback for `computer_input_text`, key input, semantic control, or pointer operations. An `outcome_unknown` write is never blindly retried; a caller that separately holds clipboard-read authority may explicitly issue a fresh `computer_read_clipboard`, while a caller without that read scope must retain the unknown outcome rather than bypass authorization. This slice is implemented, independently reviewed, and **production-dogfood accepted on Windows**.
+
 ## Near-term slices
 
 ### CU-4 — semantic element finder
@@ -149,19 +217,21 @@ Windows `SendInput` uses the shared interactive-desktop input stream; the exact 
 
 ## Next capability sequence
 
-After the near-term slices are dogfooded, the expected order is:
+The planned mainline sequence is now complete on Windows:
 
 ```text
 Windows UIA parity
--> application discovery / bounded launch
+-> application discovery / bounded launch (implemented on Windows)
 -> full-display discovery and snapshot
 -> coordinate pointer
--> clipboard
+-> clipboard (Windows MVP implemented; independent review and production dogfood accepted)
 ```
 
 Windows parity should map UI Automation patterns into the same WebCodex semantic action/affordance vocabulary instead of exposing a second OS-specific model API.
 
-Full-display observation receives separate authority from single-window observation because it widens the privacy surface. Pointer actions remain late because they depend on fresh snapshot generation, correct surface-relative geometry, DPI/display handling, and post-effect reconciliation. Clipboard read/write remains separately scoped and bounded.
+Windows Computer Use current planned mainline capabilities are implemented, independently reviewed, production-dogfooded, and integrated-dogfooded; future work is dogfood-driven maintenance rather than checklist parity.
+
+Full-display observation receives separate authority from single-window observation because it widens the privacy surface. Pointer actions depend on fresh snapshot generation, correct display-local geometry, DPI/display handling, and post-effect reconciliation. Windows clipboard read/write is implemented, independently reviewed, and production-dogfood accepted as separately scoped bounded global authority.
 
 ## Explicitly deferred
 

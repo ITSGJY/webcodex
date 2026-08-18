@@ -5,9 +5,15 @@ use super::{ToolCall, ToolResult, ToolRuntime};
 use crate::artifact_policy::MAX_MCP_IMAGE_BYTES;
 use crate::auth::AuthContext;
 use crate::shell_protocol::{
-    ShellCommandExecutionState, ShellFileOpRequest, SHELL_CLIENT_CAPABILITY_COMPUTER_CONTROL,
+    ShellCommandExecutionState, ShellFileOpRequest,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_APPLICATION_DISCOVERY,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_APPLICATION_LAUNCH,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_CLIPBOARD_READ,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_CLIPBOARD_WRITE, SHELL_CLIENT_CAPABILITY_COMPUTER_CONTROL,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_DISPLAY_OBSERVE,
     SHELL_CLIENT_CAPABILITY_COMPUTER_ELEMENT_STATE, SHELL_CLIENT_CAPABILITY_COMPUTER_KEY_INPUT,
-    SHELL_CLIENT_CAPABILITY_COMPUTER_OBSERVE, SHELL_CLIENT_CAPABILITY_COMPUTER_SCROLL_TO_ELEMENT,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_OBSERVE, SHELL_CLIENT_CAPABILITY_COMPUTER_POINTER_CONTROL,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_SCROLL_TO_ELEMENT,
     SHELL_CLIENT_CAPABILITY_COMPUTER_SNAPSHOT_REGION, SHELL_CLIENT_CAPABILITY_COMPUTER_TEXT_INPUT,
     SHELL_CLIENT_CAPABILITY_COMPUTER_WINDOW_ACTIVATE,
 };
@@ -18,10 +24,16 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 const MAX_WINDOWS: usize = 64;
+const MAX_APPLICATIONS: usize = 64;
+const MAX_DISPLAYS: usize = 16;
+const MAX_APPLICATION_ID_BYTES: usize = 128;
+const MAX_DISPLAY_ID_BYTES: usize = 128;
+const MAX_RAW_CAPTURE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_TEXT_BYTES: usize = 256;
 const MAX_SURFACE_ID_BYTES: usize = 128;
 const MAX_ELEMENT_ID_BYTES: usize = 128;
 const MAX_INPUT_TEXT_BYTES: usize = 2048;
+const MAX_CLIPBOARD_TEXT_BYTES: usize = 16 * 1024;
 const MAX_ACCESSIBILITY_DEPTH: usize = 8;
 const MAX_ACCESSIBILITY_NODES: usize = 256;
 const DEFAULT_ACCESSIBILITY_DEPTH: usize = 6;
@@ -74,6 +86,41 @@ fn normalize_computer_key_input(
     Ok(modifiers)
 }
 
+fn validate_clipboard_write_text(text: &str) -> Result<usize, &'static str> {
+    if text.is_empty() {
+        return Err("clipboard text must not be empty");
+    }
+    if text.contains('\0') {
+        return Err("clipboard text must not contain NUL");
+    }
+    if text.len() > MAX_CLIPBOARD_TEXT_BYTES {
+        return Err("clipboard text exceeds the 16 KiB UTF-8 bound");
+    }
+    Ok(text.len())
+}
+
+fn valid_application_id(application_id: &str) -> bool {
+    let Some(suffix) = application_id.strip_prefix("application_") else {
+        return false;
+    };
+    application_id.len() <= MAX_APPLICATION_ID_BYTES
+        && suffix.len() == 32
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_display_id(display_id: &str) -> bool {
+    let Some(suffix) = display_id.strip_prefix("display_") else {
+        return false;
+    };
+    display_id.len() <= MAX_DISPLAY_ID_BYTES
+        && suffix.len() == 32
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn validate_input_text(text: &str) -> Result<usize, &'static str> {
     let text_bytes = text.len();
     if text_bytes == 0 || text_bytes > MAX_INPUT_TEXT_BYTES || text.contains('\0') {
@@ -100,6 +147,54 @@ impl ToolRuntime {
                     json!({"limit": limit}),
                     auth,
                     Some(limit),
+                    None,
+                    None,
+                )
+                .await
+            }
+            ToolCall::ComputerListDisplays { client_id, limit } => {
+                let limit = limit.unwrap_or(MAX_DISPLAYS).clamp(1, MAX_DISPLAYS);
+                self.dispatch_computer_request(
+                    &client_id,
+                    "computer_list_displays",
+                    json!({"limit": limit}),
+                    auth,
+                    Some(limit),
+                    None,
+                    None,
+                )
+                .await
+            }
+            ToolCall::ComputerListApplications { client_id, limit } => {
+                let limit = limit.unwrap_or(MAX_APPLICATIONS).clamp(1, MAX_APPLICATIONS);
+                self.dispatch_computer_request(
+                    &client_id,
+                    "computer_list_applications",
+                    json!({"limit": limit}),
+                    auth,
+                    Some(limit),
+                    None,
+                    None,
+                )
+                .await
+            }
+            ToolCall::ComputerLaunchApplication {
+                client_id,
+                application_id,
+            } => {
+                if !valid_application_id(&application_id) {
+                    return computer_application_effect_not_started(
+                        "invalid_application",
+                        "application_id is invalid",
+                        &application_id,
+                    );
+                }
+                self.dispatch_computer_request(
+                    &client_id,
+                    "computer_launch_application",
+                    json!({"application_id": application_id}),
+                    auth,
+                    None,
                     None,
                     None,
                 )
@@ -343,6 +438,109 @@ impl ToolRuntime {
                 )
                 .await
             }
+            ToolCall::ComputerReadClipboard { client_id } => {
+                self.dispatch_computer_request(
+                    &client_id,
+                    "computer_read_clipboard",
+                    json!({}),
+                    auth,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            }
+            ToolCall::ComputerWriteClipboard { client_id, text } => {
+                if let Err(message) = validate_clipboard_write_text(&text) {
+                    return computer_effect_not_started(message);
+                }
+                self.dispatch_computer_request(
+                    &client_id,
+                    "computer_write_clipboard",
+                    json!({"text": text}),
+                    auth,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            }
+            ToolCall::ComputerPointerMove {
+                client_id,
+                display_id,
+                snapshot_generation,
+                x,
+                y,
+            } => {
+                let context = PointerRequestContext {
+                    display_id: display_id.clone(),
+                    snapshot_generation,
+                    x,
+                    y,
+                };
+                if !valid_display_id(&display_id) {
+                    return computer_pointer_effect_not_started(
+                        "invalid_display",
+                        "display_id is invalid",
+                        &context,
+                    );
+                }
+                if snapshot_generation == 0 {
+                    return computer_pointer_effect_not_started(
+                        "invalid_request",
+                        "snapshot_generation must be positive",
+                        &context,
+                    );
+                }
+                self.dispatch_computer_request(
+                    &client_id,
+                    "computer_pointer_move",
+                    json!({"display_id": display_id, "snapshot_generation": snapshot_generation, "x": x, "y": y}),
+                    auth,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            }
+            ToolCall::ComputerPointerClick {
+                client_id,
+                display_id,
+                snapshot_generation,
+                x,
+                y,
+            } => {
+                let context = PointerRequestContext {
+                    display_id: display_id.clone(),
+                    snapshot_generation,
+                    x,
+                    y,
+                };
+                if !valid_display_id(&display_id) {
+                    return computer_pointer_effect_not_started(
+                        "invalid_display",
+                        "display_id is invalid",
+                        &context,
+                    );
+                }
+                if snapshot_generation == 0 {
+                    return computer_pointer_effect_not_started(
+                        "invalid_request",
+                        "snapshot_generation must be positive",
+                        &context,
+                    );
+                }
+                self.dispatch_computer_request(
+                    &client_id,
+                    "computer_pointer_click",
+                    json!({"display_id": display_id, "snapshot_generation": snapshot_generation, "x": x, "y": y}),
+                    auth,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            }
             ToolCall::ComputerInputText {
                 client_id,
                 surface_id,
@@ -390,6 +588,39 @@ impl ToolRuntime {
                     max_width,
                     max_height,
                     auth,
+                )
+                .await
+            }
+            ToolCall::ComputerSnapshotDisplay {
+                client_id,
+                display_id,
+                max_width,
+                max_height,
+            } => {
+                if !valid_display_id(&display_id) {
+                    return computer_error("invalid_display", "display_id is invalid");
+                }
+                if max_width.is_some_and(|value| value == 0 || value > MAX_IMAGE_DIMENSION as u32)
+                    || max_height
+                        .is_some_and(|value| value == 0 || value > MAX_IMAGE_DIMENSION as u32)
+                {
+                    return computer_error(
+                        "invalid_request",
+                        "display snapshot output dimension bound is invalid",
+                    );
+                }
+                self.dispatch_computer_request(
+                    &client_id,
+                    "computer_snapshot_display",
+                    json!({
+                        "display_id": display_id,
+                        "max_width": max_width,
+                        "max_height": max_height,
+                    }),
+                    auth,
+                    None,
+                    None,
+                    None,
                 )
                 .await
             }
@@ -785,9 +1016,23 @@ impl ToolRuntime {
         let mut targets = Vec::new();
         for client in clients {
             let computer_observe = client.capabilities.computer_observe;
+            let computer_application_discovery = client.capabilities.computer_application_discovery;
+            let computer_application_launch = client.capabilities.computer_application_launch;
+            let computer_display_observe = client.capabilities.computer_display_observe;
+            let computer_pointer_control = client.capabilities.computer_pointer_control;
+            let computer_clipboard_read = client.capabilities.computer_clipboard_read;
+            let computer_clipboard_write = client.capabilities.computer_clipboard_write;
             let computer_snapshot_region = client.capabilities.computer_snapshot_region;
             let computer_accessibility_observe = client.capabilities.computer_accessibility_observe;
-            if !computer_observe && !computer_accessibility_observe {
+            if !computer_observe
+                && !computer_accessibility_observe
+                && !computer_application_discovery
+                && !computer_application_launch
+                && !computer_display_observe
+                && !computer_pointer_control
+                && !computer_clipboard_read
+                && !computer_clipboard_write
+            {
                 continue;
             }
             total_count = total_count.saturating_add(1);
@@ -800,6 +1045,12 @@ impl ToolRuntime {
                 "connected": client.connected,
                 "capabilities": {
                     "computer_observe": computer_observe,
+                    "computer_application_discovery": computer_application_discovery,
+                    "computer_application_launch": computer_application_launch,
+                    "computer_display_observe": computer_display_observe,
+                    "computer_pointer_control": computer_pointer_control,
+                    "computer_clipboard_read": computer_clipboard_read,
+                    "computer_clipboard_write": computer_clipboard_write,
                     "computer_snapshot_region": computer_snapshot_region,
                     "computer_accessibility_observe": computer_accessibility_observe,
                 },
@@ -824,10 +1075,75 @@ impl ToolRuntime {
         expected_surface_id: Option<&str>,
         accessibility_bounds: Option<(usize, usize)>,
     ) -> ToolResult {
+        let expected_application_id = payload
+            .get("application_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let is_application_launch = kind == "computer_launch_application";
+        let expected_display_id = payload
+            .get("display_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let is_pointer = matches!(kind, "computer_pointer_move" | "computer_pointer_click");
+        let pointer_context = is_pointer.then(|| PointerRequestContext {
+            display_id: expected_display_id.clone().unwrap_or_default(),
+            snapshot_generation: payload
+                .get("snapshot_generation")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or_default(),
+            x: payload
+                .get("x")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or_default(),
+            y: payload
+                .get("y")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or_default(),
+        });
+        let is_clipboard_write = kind == "computer_write_clipboard";
+        let clipboard_write_context = is_clipboard_write.then(|| ClipboardWriteContext {
+            text_bytes: payload.get("text").and_then(Value::as_str).map(str::len),
+        });
         if client_id.is_empty() || client_id.len() > 128 {
+            if is_application_launch {
+                return computer_application_effect_not_started(
+                    "invalid_client",
+                    "client_id is invalid",
+                    expected_application_id.as_deref().unwrap_or_default(),
+                );
+            }
+            if let Some(context) = pointer_context.as_ref() {
+                return computer_pointer_effect_not_started(
+                    "invalid_client",
+                    "client_id is invalid",
+                    context,
+                );
+            }
+            if let Some(context) = clipboard_write_context.as_ref() {
+                return computer_clipboard_write_not_started(
+                    "invalid_client",
+                    "client_id is invalid",
+                    context,
+                );
+            }
             return computer_error("invalid_client", "client_id is invalid");
         }
         let required_capabilities: &[&str] = match kind {
+            "computer_list_applications" => {
+                &[SHELL_CLIENT_CAPABILITY_COMPUTER_APPLICATION_DISCOVERY]
+            }
+            "computer_launch_application" => &[SHELL_CLIENT_CAPABILITY_COMPUTER_APPLICATION_LAUNCH],
+            "computer_list_displays" | "computer_snapshot_display" => {
+                &[SHELL_CLIENT_CAPABILITY_COMPUTER_DISPLAY_OBSERVE]
+            }
+            "computer_read_clipboard" => &[SHELL_CLIENT_CAPABILITY_COMPUTER_CLIPBOARD_READ],
+            "computer_write_clipboard" => &[SHELL_CLIENT_CAPABILITY_COMPUTER_CLIPBOARD_WRITE],
+            "computer_pointer_move" | "computer_pointer_click" => {
+                &[SHELL_CLIENT_CAPABILITY_COMPUTER_POINTER_CONTROL]
+            }
             "computer_list_windows" | "computer_snapshot" => {
                 &[SHELL_CLIENT_CAPABILITY_COMPUTER_OBSERVE]
             }
@@ -854,10 +1170,54 @@ impl ToolRuntime {
             {
                 Ok(true) => {}
                 Ok(false) => {
+                    if is_application_launch {
+                        return computer_application_effect_not_started(
+                            "capability_unavailable",
+                            &format!("target Runner does not support {required_capability}"),
+                            expected_application_id.as_deref().unwrap_or_default(),
+                        );
+                    }
+                    if let Some(context) = pointer_context.as_ref() {
+                        return computer_pointer_effect_not_started(
+                            "capability_unavailable",
+                            &format!("target Runner does not support {required_capability}"),
+                            context,
+                        );
+                    }
+                    if let Some(context) = clipboard_write_context.as_ref() {
+                        return computer_clipboard_write_not_started(
+                            "capability_unavailable",
+                            &format!("target Runner does not support {required_capability}"),
+                            context,
+                        );
+                    }
                     return computer_error(
                         "capability_unavailable",
                         &format!("target Runner does not support {required_capability}"),
-                    )
+                    );
+                }
+                Err(_error) if is_application_launch => {
+                    return computer_application_effect_not_started(
+                        "client_access_denied",
+                        "caller cannot access the target Runner for application launch",
+                        expected_application_id.as_deref().unwrap_or_default(),
+                    );
+                }
+                Err(_error) if is_pointer => {
+                    return computer_pointer_effect_not_started(
+                        "client_access_denied",
+                        "caller cannot access the target Runner for pointer control",
+                        pointer_context.as_ref().expect("pointer context"),
+                    );
+                }
+                Err(_error) if is_clipboard_write => {
+                    return computer_clipboard_write_not_started(
+                        "client_access_denied",
+                        "caller cannot access the target Runner for clipboard write",
+                        clipboard_write_context
+                            .as_ref()
+                            .expect("clipboard write context"),
+                    );
                 }
                 Err(error) => return computer_error("client_access_denied", &error),
             }
@@ -888,6 +1248,29 @@ impl ToolRuntime {
         let expected_snapshot_max_height = payload.get("max_height").and_then(Value::as_u64);
         let payload = match serde_json::to_string(&payload) {
             Ok(payload) => payload,
+            Err(_) if is_application_launch => {
+                return computer_application_effect_not_started(
+                    "invalid_request",
+                    "could not encode application launch request",
+                    expected_application_id.as_deref().unwrap_or_default(),
+                );
+            }
+            Err(_) if is_pointer => {
+                return computer_pointer_effect_not_started(
+                    "invalid_request",
+                    "could not encode pointer control request",
+                    pointer_context.as_ref().expect("pointer context"),
+                );
+            }
+            Err(_) if is_clipboard_write => {
+                return computer_clipboard_write_not_started(
+                    "invalid_request",
+                    "could not encode clipboard write request",
+                    clipboard_write_context
+                        .as_ref()
+                        .expect("clipboard write context"),
+                );
+            }
             Err(_) => {
                 return computer_error("invalid_request", "could not encode computer request")
             }
@@ -906,6 +1289,29 @@ impl ToolRuntime {
             .await
         {
             Ok(value) => value,
+            Err(error) if kind == "computer_launch_application" => {
+                return computer_application_effect_not_started(
+                    "not_started",
+                    &format!("application launch request was not dispatched: {error}"),
+                    expected_application_id.as_deref().unwrap_or_default(),
+                )
+            }
+            Err(error) if is_pointer => {
+                return computer_pointer_effect_not_started(
+                    "not_started",
+                    &format!("pointer request was not dispatched: {error}"),
+                    pointer_context.as_ref().expect("pointer context"),
+                );
+            }
+            Err(error) if is_clipboard_write => {
+                return computer_clipboard_write_not_started(
+                    "not_started",
+                    &format!("clipboard write request was not dispatched: {error}"),
+                    clipboard_write_context
+                        .as_ref()
+                        .expect("clipboard write context"),
+                );
+            }
             Err(error) => return computer_error("dispatch_denied", &error),
         };
         let is_effect = computer_request_is_effect(kind);
@@ -922,6 +1328,27 @@ impl ToolRuntime {
                     .shell_clients
                     .cancel_request_dispatch_state(&request_id)
                     .await;
+                if is_application_launch {
+                    return computer_application_effect_delivery_failure(
+                        "Runner response channel closed before a terminal application launch result was received",
+                        request_dispatched,
+                        expected_application_id.as_deref().unwrap_or_default(),
+                    );
+                }
+                if is_pointer {
+                    return computer_pointer_effect_delivery_failure(
+                        "Runner response channel closed before a terminal pointer result was received",
+                        request_dispatched,
+                        pointer_context.as_ref().expect("pointer context"),
+                    );
+                }
+                if is_clipboard_write {
+                    return computer_clipboard_write_delivery_failure(
+                        "Runner response channel closed before a terminal clipboard write result was received",
+                        request_dispatched,
+                        clipboard_write_context.as_ref().expect("clipboard write context"),
+                    );
+                }
                 return computer_effect_delivery_failure(
                     "Runner response channel closed before a terminal computer effect result was received",
                     request_dispatched,
@@ -935,6 +1362,29 @@ impl ToolRuntime {
                     .shell_clients
                     .cancel_request_dispatch_state(&request_id)
                     .await;
+                if is_application_launch {
+                    return computer_application_effect_delivery_failure(
+                        "Runner did not return a terminal application launch result in time",
+                        request_dispatched,
+                        expected_application_id.as_deref().unwrap_or_default(),
+                    );
+                }
+                if is_pointer {
+                    return computer_pointer_effect_delivery_failure(
+                        "Runner did not return a terminal pointer result in time",
+                        request_dispatched,
+                        pointer_context.as_ref().expect("pointer context"),
+                    );
+                }
+                if is_clipboard_write {
+                    return computer_clipboard_write_delivery_failure(
+                        "Runner did not return a terminal clipboard write result in time",
+                        request_dispatched,
+                        clipboard_write_context
+                            .as_ref()
+                            .expect("clipboard write context"),
+                    );
+                }
                 return computer_effect_delivery_failure(
                     "Runner did not return a terminal computer effect result in time",
                     request_dispatched,
@@ -952,6 +1402,29 @@ impl ToolRuntime {
             if is_text_input {
                 return computer_text_input_runner_error(error, response.request_dispatched);
             }
+            if is_pointer {
+                return computer_pointer_runner_error(
+                    error,
+                    response.request_dispatched,
+                    pointer_context.as_ref().expect("pointer context"),
+                );
+            }
+            if is_clipboard_write {
+                return computer_clipboard_write_runner_error(
+                    error,
+                    response.request_dispatched,
+                    clipboard_write_context
+                        .as_ref()
+                        .expect("clipboard write context"),
+                );
+            }
+            if is_application_launch {
+                return computer_application_launch_runner_error(
+                    error,
+                    response.request_dispatched,
+                    expected_application_id.as_deref().unwrap_or_default(),
+                );
+            }
             if is_effect && error_kind == "outcome_unknown" {
                 return computer_effect_outcome_unknown(error);
             }
@@ -964,6 +1437,29 @@ impl ToolRuntime {
             );
         }
         if response.exit_code != Some(0) {
+            if is_pointer {
+                return computer_pointer_effect_delivery_failure(
+                    "Runner pointer effect ended without a structured terminal result",
+                    response.request_dispatched,
+                    pointer_context.as_ref().expect("pointer context"),
+                );
+            }
+            if is_application_launch {
+                return computer_application_effect_delivery_failure(
+                    "Runner application launch ended without a structured terminal result",
+                    response.request_dispatched,
+                    expected_application_id.as_deref().unwrap_or_default(),
+                );
+            }
+            if is_clipboard_write {
+                return computer_clipboard_write_delivery_failure(
+                    "Runner clipboard write ended without a structured terminal result",
+                    response.request_dispatched,
+                    clipboard_write_context
+                        .as_ref()
+                        .expect("clipboard write context"),
+                );
+            }
             if is_effect {
                 return computer_effect_delivery_failure(
                     "Runner computer effect ended without a structured terminal result",
@@ -979,6 +1475,29 @@ impl ToolRuntime {
             .transpose()
         {
             Ok(Some(output)) => output,
+            _ if is_pointer => {
+                return computer_pointer_effect_delivery_failure(
+                    "Runner returned invalid JSON after possible pointer dispatch",
+                    response.request_dispatched,
+                    pointer_context.as_ref().expect("pointer context"),
+                )
+            }
+            _ if is_application_launch => {
+                return computer_application_effect_delivery_failure(
+                    "Runner returned invalid JSON after possible application launch dispatch",
+                    response.request_dispatched,
+                    expected_application_id.as_deref().unwrap_or_default(),
+                )
+            }
+            _ if is_clipboard_write => {
+                return computer_clipboard_write_delivery_failure(
+                    "Runner returned invalid JSON after possible clipboard replacement",
+                    response.request_dispatched,
+                    clipboard_write_context
+                        .as_ref()
+                        .expect("clipboard write context"),
+                )
+            }
             _ if is_effect => {
                 return computer_effect_delivery_failure(
                     "Runner returned invalid JSON after computer effect execution",
@@ -996,6 +1515,40 @@ impl ToolRuntime {
             "computer_list_windows" => {
                 validate_window_list(output, list_limit.unwrap_or(MAX_WINDOWS))
             }
+            "computer_list_applications" => {
+                validate_application_list(output, list_limit.unwrap_or(MAX_APPLICATIONS))
+            }
+            "computer_list_displays" => {
+                validate_display_list(output, list_limit.unwrap_or(MAX_DISPLAYS))
+            }
+            "computer_read_clipboard" => validate_computer_read_clipboard(output),
+            "computer_write_clipboard" => {
+                let context = clipboard_write_context.as_ref().expect("clipboard write context");
+                let validated = validate_computer_write_clipboard(output, context);
+                if validated.success {
+                    validated
+                } else {
+                    computer_clipboard_write_outcome_unknown(
+                        "Runner reported successful clipboard replacement but returned inconsistent metadata",
+                        context,
+                        Some(true),
+                    )
+                }
+            }
+            "computer_launch_application" => {
+                let validated = validate_computer_launch_application(
+                    output,
+                    expected_application_id.as_deref().unwrap_or_default(),
+                );
+                if validated.success {
+                    validated
+                } else {
+                    computer_application_effect_outcome_unknown(
+                        "Runner reported successful application launch but returned inconsistent metadata",
+                        expected_application_id.as_deref().unwrap_or_default(),
+                    )
+                }
+            }
             "computer_snapshot" | "computer_snapshot_region" => validate_snapshot(
                 output,
                 expected_surface_id.unwrap_or_default(),
@@ -1005,6 +1558,25 @@ impl ToolRuntime {
                 expected_snapshot_max_width,
                 expected_snapshot_max_height,
             ),
+            "computer_snapshot_display" => validate_display_snapshot(
+                output,
+                expected_display_id.as_deref().unwrap_or_default(),
+                client_id,
+                expected_snapshot_max_width,
+                expected_snapshot_max_height,
+            ),
+            "computer_pointer_move" | "computer_pointer_click" => {
+                let context = pointer_context.as_ref().expect("pointer context");
+                let validated = validate_computer_pointer(output, context);
+                if validated.success {
+                    validated
+                } else {
+                    computer_pointer_effect_outcome_unknown(
+                        "Runner reported successful pointer input but returned inconsistent metadata",
+                        context,
+                    )
+                }
+            }
             "computer_accessibility_status" => validate_accessibility_status(output),
             "computer_accessibility_tree" => {
                 let (max_depth, max_nodes) = accessibility_bounds.unwrap_or((0, 0));
@@ -1143,6 +1715,12 @@ fn computer_error_recovery_message(error_kind: &str, error: &str) -> String {
         "stale_surface" => format!(
             "{error}; reacquire a fresh surface_id with computer_list_windows before continuing"
         ),
+        "stale_application" => format!(
+            "{error}; reacquire a fresh application_id with computer_list_applications before another launch"
+        ),
+        "stale_display" => format!(
+            "{error}; reacquire a fresh display_id with computer_list_displays before continuing"
+        ),
         _ => error.to_string(),
     }
 }
@@ -1155,6 +1733,10 @@ fn computer_request_is_effect(kind: &str) -> bool {
             | "computer_scroll_to_element"
             | "computer_key_input"
             | "computer_input_text"
+            | "computer_pointer_move"
+            | "computer_pointer_click"
+            | "computer_write_clipboard"
+            | "computer_launch_application"
     )
 }
 
@@ -1267,6 +1849,196 @@ fn computer_error(kind: &str, message: &str) -> ToolResult {
     )
 }
 
+#[derive(Clone, Debug)]
+struct PointerRequestContext {
+    display_id: String,
+    snapshot_generation: u32,
+    x: u32,
+    y: u32,
+}
+
+fn computer_pointer_effect_not_started(
+    error_kind: &str,
+    message: &str,
+    context: &PointerRequestContext,
+) -> ToolResult {
+    let mut output = json!({
+        "error_kind": error_kind,
+        "x": context.x,
+        "y": context.y,
+        "state_changed": false,
+        "execution_state": "not_started",
+    });
+    let object = output
+        .as_object_mut()
+        .expect("pointer not-started output is an object");
+    if valid_display_id(&context.display_id) {
+        object.insert("display_id".to_string(), json!(context.display_id));
+    }
+    if context.snapshot_generation > 0 {
+        object.insert(
+            "snapshot_generation".to_string(),
+            json!(context.snapshot_generation),
+        );
+    }
+    ToolResult::err_with_output(message.to_string(), output)
+}
+
+fn computer_pointer_effect_spent_not_started(
+    message: &str,
+    context: &PointerRequestContext,
+) -> ToolResult {
+    let safe_message = format!(
+        "{message}; snapshot_generation is spent. Reconcile with a fresh computer_snapshot_display observation before another pointer effect"
+    );
+    let mut result = computer_pointer_effect_not_started("not_started", &safe_message, context);
+    result
+        .output
+        .as_object_mut()
+        .expect("pointer spent not-started output is an object")
+        .insert(
+            "reconcile_with".to_string(),
+            json!("computer_snapshot_display"),
+        );
+    result
+}
+
+fn computer_pointer_effect_outcome_unknown(
+    message: &str,
+    context: &PointerRequestContext,
+) -> ToolResult {
+    let safe_message = format!(
+        "{message}; do not blindly retry. Reconcile with a fresh computer_snapshot_display observation first"
+    );
+    ToolResult::err_with_output(
+        safe_message.clone(),
+        json!({
+            "error_kind": "outcome_unknown",
+            "display_id": context.display_id,
+            "snapshot_generation": context.snapshot_generation,
+            "x": context.x,
+            "y": context.y,
+            "execution_state": "outcome_unknown",
+            "reconcile_with": "computer_snapshot_display",
+        }),
+    )
+}
+
+fn computer_pointer_effect_delivery_failure(
+    message: &str,
+    request_dispatched: Option<bool>,
+    context: &PointerRequestContext,
+) -> ToolResult {
+    if request_dispatched == Some(false) {
+        computer_pointer_effect_not_started("not_started", message, context)
+    } else {
+        computer_pointer_effect_outcome_unknown(message, context)
+    }
+}
+
+fn computer_pointer_runner_error(
+    error: &str,
+    request_dispatched: Option<bool>,
+    context: &PointerRequestContext,
+) -> ToolResult {
+    let error_kind = classify_runner_error(error);
+    match error_kind {
+        "outcome_unknown" => computer_pointer_effect_outcome_unknown(
+            "Runner reported an uncertain native pointer outcome",
+            context,
+        ),
+        "not_started" => computer_pointer_effect_spent_not_started(error, context),
+        "pointer_input_failed"
+        | "stale_snapshot_generation"
+        | "stale_display"
+        | "invalid_request"
+        | "unsupported_platform"
+        | "permission_denied" => computer_pointer_effect_not_started(error_kind, error, context),
+        _ => computer_pointer_effect_delivery_failure(
+            "Runner pointer effect ended without a recognized structured result",
+            request_dispatched,
+            context,
+        ),
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ClipboardWriteContext {
+    text_bytes: Option<usize>,
+}
+
+fn clipboard_write_output_base(context: &ClipboardWriteContext) -> serde_json::Map<String, Value> {
+    let mut output = serde_json::Map::new();
+    if let Some(text_bytes) = context
+        .text_bytes
+        .filter(|bytes| (1..=MAX_CLIPBOARD_TEXT_BYTES).contains(bytes))
+    {
+        output.insert("text_bytes".to_string(), json!(text_bytes));
+    }
+    output
+}
+
+fn computer_clipboard_write_not_started(
+    error_kind: &str,
+    message: &str,
+    context: &ClipboardWriteContext,
+) -> ToolResult {
+    let mut output = clipboard_write_output_base(context);
+    output.insert("error_kind".to_string(), json!(error_kind));
+    output.insert("execution_state".to_string(), json!("not_started"));
+    output.insert("state_changed".to_string(), json!(false));
+    ToolResult::err_with_output(message.to_string(), Value::Object(output))
+}
+
+fn computer_clipboard_write_outcome_unknown(
+    message: &str,
+    context: &ClipboardWriteContext,
+    state_changed: Option<bool>,
+) -> ToolResult {
+    let safe_message = format!(
+        "{message}; do not blindly retry. If separately authorized for computer:clipboard_read, the caller may explicitly use computer_read_clipboard to reconcile current state"
+    );
+    let mut output = clipboard_write_output_base(context);
+    output.insert("error_kind".to_string(), json!("outcome_unknown"));
+    output.insert("execution_state".to_string(), json!("outcome_unknown"));
+    if let Some(state_changed) = state_changed {
+        output.insert("state_changed".to_string(), json!(state_changed));
+    }
+    ToolResult::err_with_output(safe_message, Value::Object(output))
+}
+
+fn computer_clipboard_write_delivery_failure(
+    message: &str,
+    request_dispatched: Option<bool>,
+    context: &ClipboardWriteContext,
+) -> ToolResult {
+    if request_dispatched == Some(false) {
+        computer_clipboard_write_not_started("not_started", message, context)
+    } else {
+        computer_clipboard_write_outcome_unknown(message, context, None)
+    }
+}
+
+fn computer_clipboard_write_runner_error(
+    error: &str,
+    request_dispatched: Option<bool>,
+    context: &ClipboardWriteContext,
+) -> ToolResult {
+    let error_kind = classify_runner_error(error);
+    match error_kind {
+        "not_started" => computer_clipboard_write_not_started("not_started", error, context),
+        "outcome_unknown" => computer_clipboard_write_outcome_unknown(error, context, Some(true)),
+        "invalid_request" | "unsupported_platform" | "permission_denied" => {
+            computer_clipboard_write_not_started(error_kind, error, context)
+        }
+        _ => computer_clipboard_write_delivery_failure(
+            "Runner clipboard write ended without a recognized structured result",
+            request_dispatched,
+            context,
+        ),
+    }
+}
+
 fn computer_effect_not_started(message: &str) -> ToolResult {
     ToolResult::err_with_output(
         message.to_string(),
@@ -1308,6 +2080,90 @@ fn computer_effect_validated_result(result: ToolResult, inconsistent_message: &s
     }
 }
 
+fn computer_application_effect_not_started(
+    error_kind: &str,
+    message: &str,
+    application_id: &str,
+) -> ToolResult {
+    let application_id = valid_application_id(application_id).then(|| application_id.to_string());
+    ToolResult::err_with_output(
+        message.to_string(),
+        json!({
+            "error_kind": error_kind,
+            "message": bounded_text(message),
+            "application_id": application_id,
+            "state_changed": false,
+            "execution_state": "not_started",
+        }),
+    )
+}
+
+fn computer_application_effect_outcome_unknown(message: &str, application_id: &str) -> ToolResult {
+    let safe_message = format!(
+        "{message}; do not blindly retry. Reconcile with a fresh computer_list_windows observation first"
+    );
+    ToolResult::err_with_output(
+        safe_message.clone(),
+        json!({
+            "error_kind": "outcome_unknown",
+            "message": bounded_text(&safe_message),
+            "application_id": application_id,
+            "execution_state": "outcome_unknown",
+            "reconcile_with": "computer_list_windows",
+        }),
+    )
+}
+
+fn computer_application_effect_delivery_failure(
+    message: &str,
+    request_dispatched: Option<bool>,
+    application_id: &str,
+) -> ToolResult {
+    if request_dispatched == Some(false) {
+        computer_application_effect_not_started("not_started", message, application_id)
+    } else {
+        computer_application_effect_outcome_unknown(message, application_id)
+    }
+}
+
+fn computer_application_launch_runner_error(
+    error: &str,
+    request_dispatched: Option<bool>,
+    application_id: &str,
+) -> ToolResult {
+    match classify_runner_error(error) {
+        "stale_application" => computer_application_effect_not_started(
+            "stale_application",
+            "application_id is stale; run computer_list_applications again before another launch",
+            application_id,
+        ),
+        "invalid_request" => computer_application_effect_not_started(
+            "invalid_request",
+            "Runner rejected the application launch request before native dispatch",
+            application_id,
+        ),
+        "unsupported_platform" => computer_application_effect_not_started(
+            "unsupported_platform",
+            "application launch is unsupported by the target platform",
+            application_id,
+        ),
+        "application_failed" => computer_application_effect_not_started(
+            "application_failed",
+            "Windows application identity could not be revalidated before native dispatch",
+            application_id,
+        ),
+        "outcome_unknown" => computer_application_effect_outcome_unknown(
+            "Runner reported an uncertain native application launch outcome",
+            application_id,
+        ),
+        _ => computer_application_effect_delivery_failure(
+            "Runner application launch ended without a recognized structured result",
+            request_dispatched,
+            application_id,
+        ),
+    }
+}
+
 fn computer_text_input_runner_error(error: &str, request_dispatched: Option<bool>) -> ToolResult {
     let error_kind = classify_runner_error(error);
     match error_kind {
@@ -1342,12 +2198,23 @@ fn classify_runner_error(error: &str) -> &'static str {
         "permission_denied",
         "stale_surface",
         "stale_element",
+        "stale_application",
+        "stale_display",
+        "stale_snapshot_generation",
         "unsupported_platform",
+        "application_failed",
+        "display_failed",
         "capture_failed",
         "accessibility_failed",
         "control_failed",
         "scroll_failed",
         "key_input_failed",
+        "pointer_input_failed",
+        "clipboard_busy",
+        "clipboard_too_large",
+        "clipboard_malformed",
+        "clipboard_failed",
+        "not_started",
         "input_failed",
         "outcome_unknown",
         "image_too_large",
@@ -1421,6 +2288,445 @@ fn validate_surface(value: &Value, expected_id: Option<&str>) -> Result<(), Stri
         }
     }
     Ok(())
+}
+
+fn validate_application_list(output: Value, limit: usize) -> ToolResult {
+    let object = match output.as_object() {
+        Some(object) => object,
+        None => {
+            return computer_error(
+                "invalid_runner_response",
+                "Runner application list is not an object",
+            )
+        }
+    };
+    let allowed = ["applications", "count", "truncated"];
+    if object.len() != allowed.len() || object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return computer_error(
+            "invalid_runner_response",
+            "Runner application list fields are inconsistent",
+        );
+    }
+    let applications = match output.get("applications").and_then(Value::as_array) {
+        Some(applications)
+            if applications.len() <= limit && applications.len() <= MAX_APPLICATIONS =>
+        {
+            applications
+        }
+        _ => {
+            return computer_error(
+                "invalid_runner_response",
+                "Runner application list exceeds bound or is missing",
+            )
+        }
+    };
+    let mut seen = std::collections::HashSet::with_capacity(applications.len());
+    for application in applications {
+        let Some(entry) = application.as_object() else {
+            return computer_error(
+                "invalid_runner_response",
+                "Runner application entry is not an object",
+            );
+        };
+        let allowed_entry = ["application_id", "display_name"];
+        if entry.len() != allowed_entry.len()
+            || entry
+                .keys()
+                .any(|key| !allowed_entry.contains(&key.as_str()))
+        {
+            return computer_error(
+                "invalid_runner_response",
+                "Runner application entry fields are inconsistent",
+            );
+        }
+        let application_id = application
+            .get("application_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let display_name = application
+            .get("display_name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !valid_application_id(application_id)
+            || !seen.insert(application_id)
+            || display_name.is_empty()
+            || display_name.len() > MAX_TEXT_BYTES
+            || display_name.contains('\0')
+        {
+            return computer_error(
+                "invalid_runner_response",
+                "Runner application entry is invalid",
+            );
+        }
+    }
+    if output.get("count").and_then(Value::as_u64) != Some(applications.len() as u64)
+        || output.get("truncated").and_then(Value::as_bool).is_none()
+    {
+        return computer_error(
+            "invalid_runner_response",
+            "Runner application list metadata is inconsistent",
+        );
+    }
+    ToolResult::ok(output)
+}
+
+fn validate_display_list(output: Value, limit: usize) -> ToolResult {
+    let Some(object) = output.as_object() else {
+        return computer_error(
+            "invalid_runner_response",
+            "Runner display list is not an object",
+        );
+    };
+    let allowed = ["displays", "count", "truncated"];
+    if object.len() != allowed.len() || object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return computer_error(
+            "invalid_runner_response",
+            "Runner display list fields are inconsistent",
+        );
+    }
+    let Some(displays) = output.get("displays").and_then(Value::as_array) else {
+        return computer_error("invalid_runner_response", "Runner display list is missing");
+    };
+    if displays.len() > limit || displays.len() > MAX_DISPLAYS {
+        return computer_error(
+            "invalid_runner_response",
+            "Runner display list exceeds bound",
+        );
+    }
+    let mut seen = std::collections::HashSet::with_capacity(displays.len());
+    for display in displays {
+        let Some(entry) = display.as_object() else {
+            return computer_error(
+                "invalid_runner_response",
+                "Runner display entry is not an object",
+            );
+        };
+        let allowed_entry = ["display_id", "width", "height", "primary"];
+        if entry.len() != allowed_entry.len()
+            || entry
+                .keys()
+                .any(|key| !allowed_entry.contains(&key.as_str()))
+        {
+            return computer_error(
+                "invalid_runner_response",
+                "Runner display entry fields are inconsistent",
+            );
+        }
+        let display_id = display
+            .get("display_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let width = display
+            .get("width")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let height = display
+            .get("height")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        if !valid_display_id(display_id)
+            || !seen.insert(display_id)
+            || width == 0
+            || width > u32::MAX as u64
+            || height == 0
+            || height > u32::MAX as u64
+            || display.get("primary").and_then(Value::as_bool).is_none()
+        {
+            return computer_error("invalid_runner_response", "Runner display entry is invalid");
+        }
+    }
+    if output.get("count").and_then(Value::as_u64) != Some(displays.len() as u64)
+        || output.get("truncated").and_then(Value::as_bool).is_none()
+    {
+        return computer_error(
+            "invalid_runner_response",
+            "Runner display list metadata is inconsistent",
+        );
+    }
+    ToolResult::ok(output)
+}
+
+fn expected_display_snapshot_dimensions(
+    source_width: u64,
+    source_height: u64,
+    max_width: Option<u64>,
+    max_height: Option<u64>,
+) -> (u64, u64) {
+    let width_scale = max_width
+        .map(|bound| bound as f64 / source_width as f64)
+        .unwrap_or(1.0);
+    let height_scale = max_height
+        .map(|bound| bound as f64 / source_height as f64)
+        .unwrap_or(1.0);
+    let scale = 1.0f64.min(width_scale).min(height_scale);
+    if scale < 1.0 {
+        let width = ((source_width as f64 * scale).floor() as u64)
+            .max(1)
+            .min(max_width.unwrap_or(u64::MAX));
+        let height = ((source_height as f64 * scale).floor() as u64)
+            .max(1)
+            .min(max_height.unwrap_or(u64::MAX));
+        (width, height)
+    } else {
+        (source_width, source_height)
+    }
+}
+
+fn validate_display_snapshot(
+    mut output: Value,
+    expected_display_id: &str,
+    client_id: &str,
+    expected_max_width: Option<u64>,
+    expected_max_height: Option<u64>,
+) -> ToolResult {
+    let Some(object) = output.as_object() else {
+        return computer_error(
+            "invalid_runner_response",
+            "Runner display snapshot is not an object",
+        );
+    };
+    let allowed = [
+        "display_id",
+        "snapshot_generation",
+        "source_width",
+        "source_height",
+        "width",
+        "height",
+        "mime_type",
+        "file_bytes",
+        "sha256",
+        "captured_at_unix_ms",
+        "content_base64",
+    ];
+    if object.len() != allowed.len() || object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return computer_error(
+            "invalid_runner_response",
+            "Runner display snapshot fields are inconsistent",
+        );
+    }
+    if !valid_display_id(expected_display_id)
+        || output.get("display_id").and_then(Value::as_str) != Some(expected_display_id)
+    {
+        return computer_error(
+            "invalid_runner_response",
+            "Runner display snapshot identity is inconsistent",
+        );
+    }
+    let generation = output
+        .get("snapshot_generation")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let source_width = output
+        .get("source_width")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let source_height = output
+        .get("source_height")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    if generation == 0
+        || generation > u32::MAX as u64
+        || source_width == 0
+        || source_width > u32::MAX as u64
+        || source_height == 0
+        || source_height > u32::MAX as u64
+        || source_width
+            .checked_mul(source_height)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .is_none_or(|bytes| bytes > MAX_RAW_CAPTURE_BYTES)
+    {
+        return computer_error(
+            "invalid_runner_response",
+            "Runner display snapshot source geometry is invalid",
+        );
+    }
+    let width = output
+        .get("width")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let height = output
+        .get("height")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let expected_dimensions = expected_display_snapshot_dimensions(
+        source_width,
+        source_height,
+        expected_max_width,
+        expected_max_height,
+    );
+    if (width, height) != expected_dimensions
+        || width == 0
+        || height == 0
+        || width > MAX_IMAGE_DIMENSION
+        || height > MAX_IMAGE_DIMENSION
+    {
+        return computer_error(
+            "invalid_runner_response",
+            "Runner display snapshot dimensions are inconsistent",
+        );
+    }
+    if output.get("mime_type").and_then(Value::as_str) != Some("image/jpeg") {
+        return computer_error(
+            "invalid_runner_response",
+            "Runner display snapshot MIME is invalid",
+        );
+    }
+    let Some(encoded) = output.get("content_base64").and_then(Value::as_str) else {
+        return computer_error(
+            "invalid_runner_response",
+            "Runner display snapshot content is missing",
+        );
+    };
+    let decoded = match general_purpose::STANDARD.decode(encoded) {
+        Ok(decoded) if !decoded.is_empty() && decoded.len() <= MAX_MCP_IMAGE_BYTES => decoded,
+        _ => {
+            return computer_error(
+                "image_too_large",
+                "Runner display snapshot image is invalid or too large",
+            )
+        }
+    };
+    if sniff_mime(&decoded) != Some("image/jpeg")
+        || output.get("file_bytes").and_then(Value::as_u64) != Some(decoded.len() as u64)
+        || output.get("sha256").and_then(Value::as_str) != Some(sha256_hex(&decoded).as_str())
+    {
+        return computer_error(
+            "invalid_runner_response",
+            "Runner display snapshot image metadata is inconsistent",
+        );
+    }
+    const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+    if !matches!(
+        output.get("captured_at_unix_ms").and_then(Value::as_u64),
+        Some(value) if value > 0 && value <= MAX_SAFE_JSON_INTEGER
+    ) {
+        return computer_error(
+            "invalid_runner_response",
+            "Runner display snapshot timestamp is invalid",
+        );
+    }
+    output
+        .as_object_mut()
+        .expect("display snapshot object shape checked above")
+        .insert("client_id".to_string(), json!(client_id));
+    ToolResult::ok(output)
+}
+
+fn validate_computer_read_clipboard(output: Value) -> ToolResult {
+    let Some(object) = output.as_object() else {
+        return computer_error(
+            "invalid_runner_response",
+            "clipboard read result is not an object",
+        );
+    };
+    if output.get("platform").and_then(Value::as_str) != Some("windows") {
+        return computer_error(
+            "invalid_runner_response",
+            "clipboard read platform is inconsistent",
+        );
+    }
+    let Some(available) = output.get("available").and_then(Value::as_bool) else {
+        return computer_error(
+            "invalid_runner_response",
+            "clipboard read availability is missing",
+        );
+    };
+    let Some(text_bytes) = output.get("text_bytes").and_then(Value::as_u64) else {
+        return computer_error(
+            "invalid_runner_response",
+            "clipboard read byte count is missing",
+        );
+    };
+    if text_bytes > MAX_CLIPBOARD_TEXT_BYTES as u64 {
+        return computer_error(
+            "invalid_runner_response",
+            "clipboard read byte count exceeds bound",
+        );
+    }
+    if available {
+        let allowed = ["platform", "available", "text", "text_bytes"];
+        let Some(text) = output.get("text").and_then(Value::as_str) else {
+            return computer_error(
+                "invalid_runner_response",
+                "available clipboard text is missing",
+            );
+        };
+        if object.len() != allowed.len()
+            || object.keys().any(|key| !allowed.contains(&key.as_str()))
+            || text.len() != text_bytes as usize
+            || text.len() > MAX_CLIPBOARD_TEXT_BYTES
+            || text.contains('\0')
+        {
+            return computer_error(
+                "invalid_runner_response",
+                "clipboard read success metadata is inconsistent",
+            );
+        }
+    } else {
+        let allowed = ["platform", "available", "text_bytes"];
+        if object.len() != allowed.len()
+            || object.keys().any(|key| !allowed.contains(&key.as_str()))
+            || text_bytes != 0
+            || object.contains_key("text")
+        {
+            return computer_error(
+                "invalid_runner_response",
+                "unavailable clipboard result is inconsistent",
+            );
+        }
+    }
+    ToolResult::ok(output)
+}
+
+fn validate_computer_write_clipboard(output: Value, context: &ClipboardWriteContext) -> ToolResult {
+    let Some(object) = output.as_object() else {
+        return computer_error(
+            "invalid_runner_response",
+            "clipboard write result is not an object",
+        );
+    };
+    let allowed = ["platform", "text_bytes", "success"];
+    if object.len() != allowed.len()
+        || object.keys().any(|key| !allowed.contains(&key.as_str()))
+        || output.get("platform").and_then(Value::as_str) != Some("windows")
+        || output.get("success").and_then(Value::as_bool) != Some(true)
+        || output.get("text_bytes").and_then(Value::as_u64)
+            != context.text_bytes.map(|value| value as u64)
+    {
+        return computer_error(
+            "invalid_runner_response",
+            "clipboard write success metadata is inconsistent",
+        );
+    }
+    ToolResult::ok(output)
+}
+
+fn validate_computer_launch_application(
+    output: Value,
+    expected_application_id: &str,
+) -> ToolResult {
+    let object = match output.as_object() {
+        Some(object) => object,
+        None => {
+            return computer_error(
+                "invalid_runner_response",
+                "application launch result is not an object",
+            )
+        }
+    };
+    let allowed = ["platform", "application_id", "success"];
+    if object.len() != allowed.len()
+        || object.keys().any(|key| !allowed.contains(&key.as_str()))
+        || output.get("platform").and_then(Value::as_str) != Some("windows")
+        || output.get("application_id").and_then(Value::as_str) != Some(expected_application_id)
+        || output.get("success").and_then(Value::as_bool) != Some(true)
+    {
+        return computer_error(
+            "invalid_runner_response",
+            "application launch success metadata is inconsistent",
+        );
+    }
+    ToolResult::ok(output)
 }
 
 fn validate_window_list(output: Value, limit: usize) -> ToolResult {
@@ -1814,6 +3120,47 @@ fn validate_computer_scroll_to_element(
     ToolResult::ok(output)
 }
 
+fn validate_computer_pointer(mut output: Value, context: &PointerRequestContext) -> ToolResult {
+    let object = match output.as_object() {
+        Some(object) => object,
+        None => {
+            return computer_error(
+                "invalid_runner_response",
+                "computer pointer result is not an object",
+            )
+        }
+    };
+    let allowed = [
+        "platform",
+        "display_id",
+        "snapshot_generation",
+        "x",
+        "y",
+        "success",
+    ];
+    if object.len() != allowed.len()
+        || object.keys().any(|key| !allowed.contains(&key.as_str()))
+        || output.get("platform").and_then(Value::as_str) != Some("windows")
+        || output.get("display_id").and_then(Value::as_str) != Some(context.display_id.as_str())
+        || output.get("snapshot_generation").and_then(Value::as_u64)
+            != Some(u64::from(context.snapshot_generation))
+        || output.get("x").and_then(Value::as_u64) != Some(u64::from(context.x))
+        || output.get("y").and_then(Value::as_u64) != Some(u64::from(context.y))
+        || output.get("success").and_then(Value::as_bool) != Some(true)
+    {
+        return computer_error(
+            "invalid_runner_response",
+            "computer pointer result is inconsistent",
+        );
+    }
+    let object = output
+        .as_object_mut()
+        .expect("computer pointer output was validated as an object");
+    object.insert("execution_state".to_string(), json!("completed"));
+    object.insert("state_changed".to_string(), json!(true));
+    ToolResult::ok(output)
+}
+
 fn validate_computer_key_input(
     output: Value,
     expected_surface_id: &str,
@@ -2150,6 +3497,448 @@ mod tests {
             "max_nodes": 8,
             "observation_generation": 7
         })
+    }
+
+    fn application(id: &str, name: &str) -> Value {
+        json!({"application_id": id, "display_name": name})
+    }
+
+    const APPLICATION_ID: &str = "application_0123456789abcdef0123456789abcdef";
+    const APPLICATION_ID_2: &str = "application_fedcba9876543210fedcba9876543210";
+
+    #[test]
+    fn computer_application_id_and_public_argument_shape_are_closed() {
+        assert!(valid_application_id(APPLICATION_ID));
+        for invalid in [
+            "",
+            "application_",
+            "application_0123456789ABCDEF0123456789ABCDEF",
+            "application_0123456789abcdef0123456789abcdeg",
+            "surface_0123456789abcdef0123456789abcdef",
+        ] {
+            assert!(!valid_application_id(invalid), "{invalid}");
+        }
+
+        let list = ToolCall::from_tool_name(
+            "computer_list_applications",
+            json!({"client_id": "msi", "limit": 4}),
+        )
+        .unwrap();
+        assert!(matches!(list, ToolCall::ComputerListApplications { .. }));
+        let launch = ToolCall::from_tool_name(
+            "computer_launch_application",
+            json!({"client_id": "msi", "application_id": APPLICATION_ID}),
+        )
+        .unwrap();
+        assert!(matches!(launch, ToolCall::ComputerLaunchApplication { .. }));
+        for forbidden in [
+            "path",
+            "argv",
+            "cwd",
+            "environment",
+            "command",
+            "script",
+            "url",
+        ] {
+            let mut args = json!({"client_id": "msi", "application_id": APPLICATION_ID});
+            args.as_object_mut()
+                .unwrap()
+                .insert(forbidden.to_string(), json!("forbidden"));
+            let error = ToolCall::from_tool_name("computer_launch_application", args).unwrap_err();
+            assert!(error.contains("unknown field"), "{error}");
+        }
+    }
+
+    #[test]
+    fn computer_application_list_validator_is_bounded_exact_and_private() {
+        let valid = validate_application_list(
+            json!({
+                "applications": [application(APPLICATION_ID, "Editor")],
+                "count": 1,
+                "truncated": true
+            }),
+            1,
+        );
+        assert!(valid.success, "{:?}", valid.output);
+
+        let too_many = validate_application_list(
+            json!({
+                "applications": [
+                    application(APPLICATION_ID, "One"),
+                    application(APPLICATION_ID_2, "Two")
+                ],
+                "count": 2,
+                "truncated": false
+            }),
+            1,
+        );
+        assert!(!too_many.success);
+
+        let duplicate = validate_application_list(
+            json!({
+                "applications": [
+                    application(APPLICATION_ID, "One"),
+                    application(APPLICATION_ID, "Two")
+                ],
+                "count": 2,
+                "truncated": false
+            }),
+            2,
+        );
+        assert!(!duplicate.success);
+
+        for leak in [
+            json!({
+                "applications": [{
+                    "application_id": APPLICATION_ID,
+                    "display_name": "Editor",
+                    "path": "C:\\\\secret.exe"
+                }],
+                "count": 1,
+                "truncated": false
+            }),
+            json!({
+                "applications": [{
+                    "application_id": APPLICATION_ID,
+                    "display_name": "Editor",
+                    "native_identity": "AUMID-or-PIDL"
+                }],
+                "count": 1,
+                "truncated": false
+            }),
+        ] {
+            let result = validate_application_list(leak, 1);
+            assert!(!result.success);
+            assert_eq!(result.output["error_kind"], "invalid_runner_response");
+        }
+    }
+
+    #[test]
+    fn computer_application_launch_lifecycle_is_exact_and_never_blindly_retryable() {
+        assert!(computer_request_is_effect("computer_launch_application"));
+        assert!(!computer_request_is_effect("computer_list_applications"));
+
+        let valid = validate_computer_launch_application(
+            json!({"platform": "windows", "application_id": APPLICATION_ID, "success": true}),
+            APPLICATION_ID,
+        );
+        assert!(valid.success, "{:?}", valid.output);
+
+        let invalid = validate_computer_launch_application(
+            json!({
+                "platform": "windows",
+                "application_id": APPLICATION_ID_2,
+                "success": true,
+                "native_identity": "MUST_NOT_SURVIVE"
+            }),
+            APPLICATION_ID,
+        );
+        assert!(!invalid.success);
+        let unknown = computer_application_effect_outcome_unknown(
+            "Runner returned inconsistent successful launch metadata",
+            APPLICATION_ID,
+        );
+        assert_eq!(unknown.output["error_kind"], "outcome_unknown");
+        assert_eq!(unknown.output["execution_state"], "outcome_unknown");
+        assert_eq!(unknown.output["reconcile_with"], "computer_list_windows");
+        assert!(unknown.output.get("state_changed").is_none());
+        assert!(!serde_json::to_string(&unknown.output)
+            .unwrap()
+            .contains("MUST_NOT_SURVIVE"));
+
+        for (dispatched, expected) in [
+            (Some(false), "not_started"),
+            (Some(true), "outcome_unknown"),
+            (None, "outcome_unknown"),
+        ] {
+            let result = computer_application_effect_delivery_failure(
+                "launch transport lost",
+                dispatched,
+                APPLICATION_ID,
+            );
+            assert_eq!(result.output["error_kind"], expected);
+            if expected == "not_started" {
+                assert_eq!(result.output["state_changed"], false);
+            } else {
+                assert_eq!(result.output["reconcile_with"], "computer_list_windows");
+            }
+        }
+
+        for error in [
+            "stale_application: PRIVATE_NATIVE_ID",
+            "application_failed: PRIVATE_NATIVE_ID",
+        ] {
+            let result =
+                computer_application_launch_runner_error(error, Some(true), APPLICATION_ID);
+            assert_eq!(result.output["execution_state"], "not_started");
+            assert_eq!(result.output["state_changed"], false);
+            let serialized = serde_json::to_string(&result.output).unwrap();
+            assert!(!serialized.contains("PRIVATE_NATIVE_ID"));
+            assert!(!result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("PRIVATE_NATIVE_ID"));
+        }
+        let malformed = computer_application_effect_not_started(
+            "invalid_application",
+            "application_id is invalid",
+            &"x".repeat(512),
+        );
+        assert!(malformed.output["application_id"].is_null());
+        assert_eq!(malformed.output["execution_state"], "not_started");
+    }
+
+    const DISPLAY_ID: &str = "display_0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn computer_pointer_public_shape_and_effect_lifecycle_are_closed() {
+        let context = PointerRequestContext {
+            display_id: DISPLAY_ID.to_string(),
+            snapshot_generation: 7,
+            x: 123,
+            y: 456,
+        };
+        for tool in ["computer_pointer_move", "computer_pointer_click"] {
+            assert!(computer_request_is_effect(tool));
+            let call = ToolCall::from_tool_name(
+                tool,
+                json!({
+                    "client_id": "msi",
+                    "display_id": DISPLAY_ID,
+                    "snapshot_generation": 7,
+                    "x": 123,
+                    "y": 456
+                }),
+            )
+            .unwrap();
+            assert!(matches!(
+                call,
+                ToolCall::ComputerPointerMove { .. } | ToolCall::ComputerPointerClick { .. }
+            ));
+            for forbidden in ["global_x", "global_y", "button", "region", "surface_id"] {
+                let mut args = json!({
+                    "client_id": "msi",
+                    "display_id": DISPLAY_ID,
+                    "snapshot_generation": 7,
+                    "x": 123,
+                    "y": 456
+                });
+                args.as_object_mut()
+                    .unwrap()
+                    .insert(forbidden.to_string(), json!(1));
+                assert!(ToolCall::from_tool_name(tool, args)
+                    .unwrap_err()
+                    .contains("unknown field"));
+            }
+        }
+
+        let not_started =
+            computer_pointer_effect_delivery_failure("no dispatch", Some(false), &context);
+        assert!(!not_started.success);
+        assert_eq!(not_started.output["execution_state"], "not_started");
+        assert_eq!(not_started.output["state_changed"], false);
+        let spent_not_started = computer_pointer_runner_error(
+            "not_started: Windows pointer SendInput inserted no events",
+            Some(true),
+            &context,
+        );
+        assert!(!spent_not_started.success);
+        assert_eq!(spent_not_started.output["execution_state"], "not_started");
+        assert_eq!(spent_not_started.output["state_changed"], false);
+        assert_eq!(
+            spent_not_started.output["reconcile_with"],
+            "computer_snapshot_display"
+        );
+        assert!(spent_not_started
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("snapshot_generation is spent"));
+        let unknown =
+            computer_pointer_effect_delivery_failure("maybe dispatched", Some(true), &context);
+        assert!(!unknown.success);
+        assert_eq!(unknown.output["execution_state"], "outcome_unknown");
+        assert_eq!(
+            unknown.output["reconcile_with"],
+            "computer_snapshot_display"
+        );
+        assert!(unknown
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("do not blindly retry"));
+
+        let valid = validate_computer_pointer(
+            json!({
+                "platform": "windows",
+                "display_id": DISPLAY_ID,
+                "snapshot_generation": 7,
+                "x": 123,
+                "y": 456,
+                "success": true
+            }),
+            &context,
+        );
+        assert!(valid.success);
+        assert_eq!(valid.output["execution_state"], "completed");
+        assert_eq!(valid.output["state_changed"], true);
+
+        let leaked = validate_computer_pointer(
+            json!({
+                "platform": "windows",
+                "display_id": DISPLAY_ID,
+                "snapshot_generation": 7,
+                "x": 123,
+                "y": 456,
+                "success": true,
+                "global_x": -1797
+            }),
+            &context,
+        );
+        assert!(!leaked.success);
+        assert_eq!(leaked.output["error_kind"], "invalid_runner_response");
+    }
+
+    #[test]
+    fn computer_display_public_shape_and_read_only_semantics_are_closed() {
+        assert!(valid_display_id(DISPLAY_ID));
+        assert!(!computer_request_is_effect("computer_list_displays"));
+        assert!(!computer_request_is_effect("computer_snapshot_display"));
+        let list = ToolCall::from_tool_name(
+            "computer_list_displays",
+            json!({"client_id": "msi", "limit": 2}),
+        )
+        .unwrap();
+        assert!(matches!(list, ToolCall::ComputerListDisplays { .. }));
+        let snapshot = ToolCall::from_tool_name(
+            "computer_snapshot_display",
+            json!({"client_id": "msi", "display_id": DISPLAY_ID, "max_width": 960}),
+        )
+        .unwrap();
+        assert!(matches!(snapshot, ToolCall::ComputerSnapshotDisplay { .. }));
+        for forbidden in [
+            "region",
+            "x",
+            "y",
+            "global_x",
+            "pointer",
+            "click",
+            "monitor_id",
+        ] {
+            let mut args = json!({"client_id": "msi", "display_id": DISPLAY_ID});
+            args.as_object_mut()
+                .unwrap()
+                .insert(forbidden.to_string(), json!(1));
+            let error = ToolCall::from_tool_name("computer_snapshot_display", args).unwrap_err();
+            assert!(error.contains("unknown field"), "{error}");
+        }
+    }
+
+    #[test]
+    fn computer_display_list_validator_is_bounded_exact_and_private() {
+        let valid = validate_display_list(
+            json!({
+                "displays": [{
+                    "display_id": DISPLAY_ID,
+                    "width": 1920,
+                    "height": 1080,
+                    "primary": true
+                }],
+                "count": 1,
+                "truncated": false
+            }),
+            1,
+        );
+        assert!(valid.success, "{:?}", valid.output);
+
+        for output in [
+            json!({
+                "displays": [{
+                    "display_id": DISPLAY_ID,
+                    "width": 1920,
+                    "height": 1080,
+                    "primary": true,
+                    "device_path": "PRIVATE"
+                }],
+                "count": 1,
+                "truncated": false
+            }),
+            json!({
+                "displays": [{
+                    "display_id": DISPLAY_ID,
+                    "width": 1920,
+                    "height": 1080,
+                    "primary": true
+                }],
+                "count": 1,
+                "truncated": false,
+                "global_origin": {"x": 0, "y": 0}
+            }),
+        ] {
+            let result = validate_display_list(output, 1);
+            assert!(!result.success);
+            assert_eq!(result.output["error_kind"], "invalid_runner_response");
+        }
+    }
+
+    #[test]
+    fn computer_display_snapshot_validator_enforces_identity_geometry_and_privacy() {
+        let image = [0xff, 0xd8, 0xff, 0xe0];
+        let output = json!({
+            "display_id": DISPLAY_ID,
+            "snapshot_generation": 7,
+            "source_width": 1920,
+            "source_height": 1080,
+            "width": 960,
+            "height": 540,
+            "mime_type": "image/jpeg",
+            "file_bytes": image.len(),
+            "sha256": sha256_hex(&image),
+            "captured_at_unix_ms": 1_700_000_000_000u64,
+            "content_base64": general_purpose::STANDARD.encode(image)
+        });
+        let valid = validate_display_snapshot(output.clone(), DISPLAY_ID, "msi", Some(960), None);
+        assert!(valid.success, "{:?}", valid.output);
+        assert_eq!(valid.output["client_id"], "msi");
+
+        for (field, value) in [
+            ("native_identity", json!("PRIVATE")),
+            ("device_path", json!("PRIVATE")),
+            ("global_x", json!(0)),
+            ("scale_factor", json!(1.25)),
+        ] {
+            let mut leaked = output.clone();
+            leaked
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_string(), value);
+            let result = validate_display_snapshot(leaked, DISPLAY_ID, "msi", Some(960), None);
+            assert!(!result.success, "field {field}");
+            assert_eq!(result.output["error_kind"], "invalid_runner_response");
+        }
+
+        let mut wrong_generation = output.clone();
+        wrong_generation["snapshot_generation"] = json!(0);
+        assert!(
+            !validate_display_snapshot(wrong_generation, DISPLAY_ID, "msi", Some(960), None,)
+                .success
+        );
+
+        let mut wrong_dimensions = output.clone();
+        wrong_dimensions["height"] = json!(541);
+        assert!(
+            !validate_display_snapshot(wrong_dimensions, DISPLAY_ID, "msi", Some(960), None,)
+                .success
+        );
+
+        let mut oversized_source = output;
+        oversized_source["source_width"] = json!(10_000);
+        oversized_source["source_height"] = json!(10_000);
+        let result =
+            validate_display_snapshot(oversized_source, DISPLAY_ID, "msi", Some(960), None);
+        assert!(!result.success);
+        assert_eq!(result.output["error_kind"], "invalid_runner_response");
     }
 
     #[test]
@@ -2726,6 +4515,7 @@ mod tests {
 
     #[test]
     fn computer_activate_window_uses_effect_delivery_semantics() {
+        assert!(computer_request_is_effect("computer_launch_application"));
         assert!(computer_request_is_effect("computer_activate_window"));
         assert!(computer_request_is_effect("computer_control"));
         assert!(computer_request_is_effect("computer_scroll_to_element"));
@@ -2733,6 +4523,7 @@ mod tests {
         assert!(computer_request_is_effect("computer_input_text"));
         for read_only in [
             "computer_list_windows",
+            "computer_list_applications",
             "computer_accessibility_tree",
             "computer_snapshot",
             "computer_snapshot_region",
@@ -2900,6 +4691,96 @@ mod tests {
         );
         assert!(!result.success);
         assert_eq!(result.output["error_kind"], "image_too_large");
+    }
+
+    #[test]
+    fn computer_clipboard_public_validator_is_strict_and_read_is_not_an_effect() {
+        assert!(!computer_request_is_effect("computer_read_clipboard"));
+        assert!(computer_request_is_effect("computer_write_clipboard"));
+        assert_eq!(validate_clipboard_write_text("hello").unwrap(), 5);
+        assert!(validate_clipboard_write_text("").is_err());
+        assert!(validate_clipboard_write_text("bad\0text").is_err());
+        assert!(validate_clipboard_write_text(&"a".repeat(MAX_CLIPBOARD_TEXT_BYTES + 1)).is_err());
+
+        let unavailable = validate_computer_read_clipboard(json!({
+            "platform":"windows","available":false,"text_bytes":0
+        }));
+        assert!(unavailable.success);
+        assert!(unavailable.output.get("text").is_none());
+
+        let text = String::from_utf16(&[0x0041, 0x4E2D, 0xD83D, 0xDE00]).unwrap();
+        let available = validate_computer_read_clipboard(json!({
+            "platform":"windows","available":true,"text":text,"text_bytes":text.len()
+        }));
+        assert!(available.success);
+
+        let leaked = validate_computer_read_clipboard(json!({
+            "platform":"windows","available":true,"text":"safe","text_bytes":4,
+            "native_owner":"PRIVATE_OWNER"
+        }));
+        assert!(!leaked.success);
+        assert_eq!(leaked.output["error_kind"], "invalid_runner_response");
+
+        let context = ClipboardWriteContext {
+            text_bytes: Some(5),
+        };
+        let written = validate_computer_write_clipboard(
+            json!({"platform":"windows","text_bytes":5,"success":true}),
+            &context,
+        );
+        assert!(written.success);
+        let leaked_write = validate_computer_write_clipboard(
+            json!({
+                "platform":"windows","text_bytes":5,"success":true,
+                "hglobal":"PRIVATE_HGLOBAL"
+            }),
+            &context,
+        );
+        assert!(!leaked_write.success);
+    }
+
+    #[test]
+    fn computer_clipboard_write_lifecycle_preserves_not_started_and_unknown() {
+        let context = ClipboardWriteContext {
+            text_bytes: Some(5),
+        };
+        let not_started =
+            computer_clipboard_write_delivery_failure("not dispatched", Some(false), &context);
+        assert!(!not_started.success);
+        assert_eq!(not_started.output["execution_state"], "not_started");
+        assert_eq!(not_started.output["state_changed"], false);
+        assert_eq!(not_started.output["text_bytes"], 5);
+
+        let unknown = computer_clipboard_write_delivery_failure("response lost", None, &context);
+        assert!(!unknown.success);
+        assert_eq!(unknown.output["execution_state"], "outcome_unknown");
+        assert!(unknown.output.get("state_changed").is_none());
+        assert!(unknown
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("do not blindly retry"));
+        assert!(unknown
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("computer:clipboard_read"));
+
+        let native_unknown = computer_clipboard_write_runner_error(
+            "outcome_unknown: EmptyClipboard changed state before SetClipboardData failed",
+            Some(true),
+            &context,
+        );
+        assert_eq!(native_unknown.output["execution_state"], "outcome_unknown");
+        assert_eq!(native_unknown.output["state_changed"], true);
+
+        let native_not_started = computer_clipboard_write_runner_error(
+            "not_started: OpenClipboard failed",
+            Some(true),
+            &context,
+        );
+        assert_eq!(native_not_started.output["execution_state"], "not_started");
+        assert_eq!(native_not_started.output["state_changed"], false);
     }
 
     #[test]

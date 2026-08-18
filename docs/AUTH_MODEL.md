@@ -179,11 +179,15 @@ device-code flow are not implemented. OAuth setup steps are in
 
 An OAuth client's `allowed_scopes` is a registration-time delegation ceiling and
 is never automatically widened when WebCodex adds a new permission such as
-`computer:control`. First-party operators may explicitly replace an active client's
+`computer:control` or `computer:launch`. The omitted-or-empty default is the
+explicit closed legacy permission set that existed before application launch; it
+does not track the global supported-scope registry. `computer:launch` and future
+permission scopes therefore require explicit opt-in. First-party operators may explicitly replace an active client's
 complete allow-list with `POST /api/oauth/clients/update_scopes`. A real change
 atomically revokes that client's existing access tokens, refresh tokens, and
 outstanding authorization codes, so the client must complete OAuth authorization
 again before using the new scope set.
+`computer:display_read`, `computer:pointer_control`, `computer:clipboard_read`, and `computer:clipboard_write` follow that rule: all are outside the frozen legacy default and are available only through explicit client scope opt-in.
 
 The MCP Protected Resource Metadata intentionally omits `scopes_supported`
 because pre-registered clients can have different delegation ceilings. An MCP
@@ -210,11 +214,13 @@ and role checks rather than requiring that scope merely to manage the PAT's own
 account resources.
 
 The direct shared-key quick-start profile includes `computer:read` and
-`computer:control` so Computer Use is available through direct key authentication
-without requiring a separate delegated OAuth grant. It still does not implicitly
-gain `account:manage` or `admin`. Unknown authenticated routes and runtime tools
+`computer:control` so existing Computer observation/control remains available through
+direct key authentication, but it deliberately does **not** include `computer:launch`.
+Application launch therefore requires a principal that was explicitly granted that
+scope. The shared-key profile also does not implicitly gain `account:manage` or `admin`. Unknown authenticated routes and runtime tools
 fail closed for ordinary principals until a scope policy is declared; bootstrap
 retains setup/superuser compatibility.
+The direct shared-key profile, open-anonymous contexts, and project credentials do not include `computer:display_read`, `computer:pointer_control`, `computer:clipboard_read`, or `computer:clipboard_write`; full-display, pointer, and global clipboard authority are never inherited from their existing Computer/project authority. The shared-key OAuth bridge likewise keeps its closed legacy bridge scope set and does not accept pointer or clipboard permission scopes.
 
 Scope-denial wire formatting remains credential-aware. OAuth access tokens use
 the OAuth `insufficient_scope` response and `WWW-Authenticate` challenge. Other
@@ -223,22 +229,50 @@ an OAuth error. This changes only response framing, not the required scope.
 
 ## Computer observation and control authorization
 
-`computer:read` is the dedicated scope for read-only desktop/window observation.
+`computer:read` is the dedicated scope for read-only Computer observation.
 It authorizes the model-facing `computer_list_targets`, `computer_list_windows`,
-`computer_accessibility_status`, `computer_accessibility_tree`,
+`computer_list_applications`, `computer_accessibility_status`, `computer_accessibility_tree`,
 `computer_find_elements`, `computer_element_state`, and `computer_snapshot` tools; it is separate from
-`runtime:read`, `project:read`,
-`job:run`, and `computer:control`, and none of those scopes imply it.
+`runtime:read`, `project:read`, `job:run`, `computer:control`, and `computer:launch`,
+and none of those scopes imply it.
 
 `computer_save_snapshot` is intentionally not a read-only Computer tool even though its capture phase is observational. It persists a bounded image into a project and therefore requires **both** `computer:read` and `project:write`. The Server reuses the exact Computer snapshot capability checks for the source Runner and independently requires the target project Runner to retain `file_write` at write admission. The operation is create-only; a lost response after possible artifact dispatch is `outcome_unknown` and is reconciled against the exact project/path with `read_project_artifact_metadata` and the expected digest, byte count, and MIME before any retry.
 
 `computer_list_targets` closes the target-discovery loop without widening
-`runtime:read`: it returns only caller-visible Runners that advertise
-`computer_observe` and/or `computer_accessibility_observe`, projected to the
-minimum client identity, connection state, plus the additive
-`computer_snapshot_region` capability fact. It
-does not expose the broader projects, policy, jobs, host, or provider inventory
-from `list_agents`.
+`runtime:read`: it returns only caller-visible Runners that advertise a supported
+Computer observation/application capability, projected to minimum client identity,
+connection state, and bounded capability facts including `computer_observe`,
+`computer_snapshot_region`, `computer_accessibility_observe`,
+`computer_application_discovery`, and `computer_application_launch`. These fields
+are additive and independent; missing old-Runner fields deserialize false and are
+not inferred from platform, observation, or control.
+The same projection includes the independent `computer_display_observe`, `computer_pointer_control`, `computer_clipboard_read`, and `computer_clipboard_write` facts without exposing native display topology, pointer mapping, or clipboard content/state. These capability booleans do not grant authority; runtime calls still enforce their scopes. The projection does not expose
+the broader projects, policy, jobs, host, or provider inventory from `list_agents`.
+
+`computer:display_read` is a separate, wider privacy authority for full-display observation. Both `computer_list_displays` and `computer_snapshot_display` require **both** `computer:read` and `computer:display_read`; neither scope implies the other. Both tools also require the independent `computer_display_observe` Runner capability, which is missing/default false and is not inferred from window observation, region snapshots, or platform identity. The current exact backend advertises that capability only on Windows; unsupported or unproven platforms remain false.
+
+Display discovery returns only fresh process-local opaque `display_id`, display-relative width/height, primary status, count, and truncation. Native monitor identity/device paths, global origin, scale/DPI, and topology remain Runner-private. Snapshot revalidates the exact private native display identity and source geometry around capture, accepts no global coordinates or region, and returns bounded image metadata plus a positive process-local `snapshot_generation`. These operations are read-only observations and never enter effect/outcome-unknown retry semantics.
+
+`computer:pointer_control` is an additional consequential authority for `computer_pointer_move` and `computer_pointer_click`. Each pointer tool requires **all four** scopes: `computer:read`, `computer:display_read`, `computer:control`, and `computer:pointer_control`, plus the independent `computer_pointer_control` Runner capability. Neither ordinary Computer control nor display observation implies pointer authority. The scope is present in the global OAuth registry for explicit client allow-list opt-in but is excluded from the frozen legacy OAuth default, direct shared-key quick-start, open-anonymous, project credentials, and the shared-key OAuth bridge.
+
+`computer:clipboard_read` and `computer:clipboard_write` are separate global clipboard authorities. `computer_read_clipboard` requires **both** `computer:read` and `computer:clipboard_read`, plus the independent `computer_clipboard_read` Runner capability. `computer_write_clipboard` requires **both** `computer:control` and `computer:clipboard_write`, plus the independent `computer_clipboard_write` capability. Read does not imply write and write does not imply read. Both scopes are recognized for explicit OAuth client opt-in but are excluded from the frozen legacy client default, direct shared-key quick-start, open-anonymous contexts, project credentials, and the shared-key OAuth bridge. The two capability fields are additive, missing/default false, mutually independent, and currently advertised only by the Windows Runner implementation.
+
+The first clipboard slice exposes only bounded `CF_UNICODETEXT`. Read is a pure observation with a 16 KiB UTF-8 result ceiling and no truncation. Write is a global effect that replaces the entire clipboard: after all text conversion/allocation and a Runner-owned hidden non-NULL HWND are prepared, the first successful `EmptyClipboard` is the state-change boundary; any later uncertainty is `outcome_unknown`. It never borrows a foreground HWND, pastes, focuses/activates a window, retries, restores previous formats, or performs hidden readback. A caller may explicitly reconcile an unknown write with `computer_read_clipboard` only when that caller separately has clipboard-read authority. Clipboard text/raw bytes/body hashes/native handles are excluded from durable audit; successful model-facing read text is returned only because `computer:clipboard_read` explicitly authorizes that data plane.
+
+Pointer input is Windows-only in this slice and uses only a latest unspent `snapshot_generation` bound to the exact process-local display identity and source geometry. Public `x`/`y` are display-local source coordinates; native monitor identity, global desktop origin, virtual-desktop bounds, DPI/scale, and the private transform never leave the Runner. A generation is consumed once native effect admission begins, including a later definite-zero-input `not_started` or `outcome_unknown`; pre-effect validation failures do not consume it. Pointer outcome uncertainty must be reconciled with a fresh `computer_snapshot_display` and is never blindly retried.
+
+`computer:launch` is a separate consequential Computer authority for
+`computer_launch_application`; neither `computer:read` nor `computer:control` implies it.
+The launch tool requires the independent `computer_application_launch` Runner capability,
+while read-only `computer_list_applications` requires `computer:read` plus the independent
+`computer_application_discovery` capability. The model supplies only `client_id` and a fresh
+opaque `application_id` produced by bounded discovery. No executable/path, argv, cwd,
+environment, shell/script, URL/protocol launcher, or generic process launcher is authorized.
+A stale or otherwise pre-native failure is `not_started` with `state_changed=false`; after
+native dispatch may have occurred, loss/ambiguity/inconsistent success metadata is
+`outcome_unknown` and must be reconciled with fresh `computer_list_windows` before another
+launch is considered. Launch success does not imply a new process/window or window readiness,
+and WebCodex performs no implicit activation/focus.
 
 `computer:control` is the separate effect scope for `computer_activate_window`,
 `computer_control`, `computer_scroll_to_element`, `computer_key_input`, and `computer_input_text`.
@@ -262,8 +296,7 @@ window, and the Runner does not focus or activate it implicitly. On Windows,
 arbitrary characters/keycodes, repeat counts, or held-key state are not accepted.
 `computer_input_text` writes bounded text through native AXValue or Windows UIA ValuePattern only to an already
 focused, enabled, writable, empty, non-secure, unprotected supported text element; Windows also requires the exact surface to already be foreground.
-There is no coordinate-click, generic wheel, open-ended key input, dragging,
-clipboard, app-launch, AppleScript, shell, paste, or implicit-focus fallback in this contract. A
+There is no coordinate-click, generic wheel, open-ended key input, dragging, AppleScript, shell, paste, generic process launch, or implicit-focus fallback in this semantic control contract. Clipboard is not a fallback here: bounded Windows clipboard access is the separately scoped global read/write surface described above, and application launch is the separate bounded `computer:launch` surface described above. A
 lost response after an effect may have been dispatched is reported as an
 unknown outcome and must be reconciled by observing current UI state before any
 retry. On macOS a native key press is delivered as two adjacent PID-targeted
@@ -280,8 +313,9 @@ not provide concurrent-user desktop isolation.
 Scopes are only one layer of the check. After target discovery, observation and
 effect calls name one exact Runner `client_id`, and the Server also requires
 caller access/ownership for that Runner plus the independently advertised
-capabilities for the requested operation: `computer_observe` for window
-observation and all window snapshots, with `computer_snapshot_region`
+capabilities for the requested operation: `computer_application_discovery` for bounded
+application discovery, `computer_application_launch` for exact opaque-ID application launch,
+`computer_observe` for window observation and all window snapshots, with `computer_snapshot_region`
 additionally required for snapshot requests that add a surface-relative region
 and/or output dimension bound; `computer_accessibility_observe` for Accessibility tree observation,
 `computer_element_state` for normalized state of one exact observed

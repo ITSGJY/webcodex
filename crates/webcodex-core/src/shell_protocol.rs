@@ -221,6 +221,26 @@ pub const SHELL_CLIENT_CAPABILITY_PROJECT_PATH_REGISTRATION: &str = "project_pat
 /// Read-only native desktop/window observation. Missing on older Runners and
 /// false; never inferred from shell or file capabilities.
 pub const SHELL_CLIENT_CAPABILITY_COMPUTER_OBSERVE: &str = "computer_observe";
+/// Bounded installed-application discovery. Missing on older Runners is false
+/// and is never inferred from desktop observation or launch authority.
+pub const SHELL_CLIENT_CAPABILITY_COMPUTER_APPLICATION_DISCOVERY: &str =
+    "computer_application_discovery";
+/// Exact native application launch for a fresh opaque discovery handle. Missing
+/// on older Runners is false and is never inferred from discovery or control.
+pub const SHELL_CLIENT_CAPABILITY_COMPUTER_APPLICATION_LAUNCH: &str = "computer_application_launch";
+/// Exact full-display discovery and snapshot observation. Missing on older
+/// Runners is false and is never inferred from window observation, region
+/// snapshots, or platform identity.
+pub const SHELL_CLIENT_CAPABILITY_COMPUTER_DISPLAY_OBSERVE: &str = "computer_display_observe";
+/// Snapshot-fenced exact coordinate pointer input. Missing on older Runners is
+/// false and is never inferred from control, display observation, or platform.
+pub const SHELL_CLIENT_CAPABILITY_COMPUTER_POINTER_CONTROL: &str = "computer_pointer_control";
+/// Native bounded Unicode-text clipboard observation. Missing is false and is never
+/// inferred from Computer read/control/platform capabilities.
+pub const SHELL_CLIENT_CAPABILITY_COMPUTER_CLIPBOARD_READ: &str = "computer_clipboard_read";
+/// Native bounded Unicode-text clipboard replacement. Missing is false and is never
+/// inferred from clipboard read or other Computer effect capabilities.
+pub const SHELL_CLIENT_CAPABILITY_COMPUTER_CLIPBOARD_WRITE: &str = "computer_clipboard_write";
 /// Bounded surface-relative region/downscale snapshot requests. Missing on older
 /// Runners is false and is never inferred from whole-window observation support.
 pub const SHELL_CLIENT_CAPABILITY_COMPUTER_SNAPSHOT_REGION: &str = "computer_snapshot_region";
@@ -251,10 +271,15 @@ pub const SHELL_COMPUTER_REQUEST_PAYLOAD_MAX_BYTES: usize = 4096;
 /// Text input needs a larger wire envelope because valid caller text may expand
 /// under JSON escaping while its decoded UTF-8 body remains capped at 2048 bytes.
 pub const SHELL_COMPUTER_TEXT_INPUT_PAYLOAD_MAX_BYTES: usize = 16 * 1024;
+/// Clipboard write allows a 16 KiB decoded UTF-8 body; JSON escaping can expand
+/// control characters by up to six bytes each, so keep a separate bounded wire envelope.
+pub const SHELL_COMPUTER_CLIPBOARD_WRITE_PAYLOAD_MAX_BYTES: usize = 128 * 1024;
 
 pub fn shell_computer_request_payload_max_bytes(kind: &str) -> usize {
     if kind == "computer_input_text" {
         SHELL_COMPUTER_TEXT_INPUT_PAYLOAD_MAX_BYTES
+    } else if kind == "computer_write_clipboard" {
+        SHELL_COMPUTER_CLIPBOARD_WRITE_PAYLOAD_MAX_BYTES
     } else {
         SHELL_COMPUTER_REQUEST_PAYLOAD_MAX_BYTES
     }
@@ -288,6 +313,12 @@ pub const SHELL_CLIENT_CAPABILITY_NAMES: &[&str] = &[
     SHELL_CLIENT_CAPABILITY_PROJECT_LIFECYCLE,
     SHELL_CLIENT_CAPABILITY_PROJECT_PATH_REGISTRATION,
     SHELL_CLIENT_CAPABILITY_COMPUTER_OBSERVE,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_APPLICATION_DISCOVERY,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_APPLICATION_LAUNCH,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_DISPLAY_OBSERVE,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_POINTER_CONTROL,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_CLIPBOARD_READ,
+    SHELL_CLIENT_CAPABILITY_COMPUTER_CLIPBOARD_WRITE,
     SHELL_CLIENT_CAPABILITY_COMPUTER_SNAPSHOT_REGION,
     SHELL_CLIENT_CAPABILITY_COMPUTER_ACCESSIBILITY_OBSERVE,
     SHELL_CLIENT_CAPABILITY_COMPUTER_ELEMENT_STATE,
@@ -421,6 +452,28 @@ pub struct ShellClientCapabilities {
     /// and therefore fail-closed.
     #[serde(default, skip_serializing_if = "is_false")]
     pub computer_observe: bool,
+    /// The Runner can return a bounded process-local installed-application list.
+    /// Missing on older Runners is false and never follows from observation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub computer_application_discovery: bool,
+    /// The Runner can submit an exact native launch for a fresh application_id.
+    /// Missing on older Runners is false and never follows from discovery/control.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub computer_application_launch: bool,
+    /// The Runner can discover exact native displays and snapshot one fresh
+    /// opaque display handle. Missing is false and never follows from window observation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub computer_display_observe: bool,
+    /// The Runner implements snapshot-fenced exact coordinate pointer input.
+    /// Missing on older Runners is false and never follows from other Computer capabilities.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub computer_pointer_control: bool,
+    /// The Runner supports bounded native Unicode-text clipboard observation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub computer_clipboard_read: bool,
+    /// The Runner supports bounded native Unicode-text clipboard replacement.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub computer_clipboard_write: bool,
     /// The Runner supports bounded region/max-output snapshot transforms while
     /// preserving the existing whole-window snapshot wire for older Runners.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -513,7 +566,13 @@ impl Default for ShellClientCapabilities {
             project_lifecycle: false,
             project_path_registration: false,
             computer_observe: false,
+            computer_application_discovery: false,
+            computer_application_launch: false,
             computer_snapshot_region: false,
+            computer_display_observe: false,
+            computer_pointer_control: false,
+            computer_clipboard_read: false,
+            computer_clipboard_write: false,
             computer_accessibility_observe: false,
             computer_element_state: false,
             computer_control: false,
@@ -2764,6 +2823,12 @@ mod envelope_tests {
                 project_lifecycle: false,
                 project_path_registration: false,
                 computer_observe: false,
+                computer_application_discovery: false,
+                computer_application_launch: false,
+                computer_display_observe: false,
+                computer_pointer_control: false,
+                computer_clipboard_read: false,
+                computer_clipboard_write: false,
                 computer_snapshot_region: false,
                 computer_accessibility_observe: false,
                 computer_element_state: false,
@@ -2848,6 +2913,8 @@ mod envelope_tests {
         assert!(!capabilities.structured_file_delete);
         assert!(!capabilities.artifact_export_streaming_metadata);
         assert!(!capabilities.computer_observe);
+        assert!(!capabilities.computer_application_discovery);
+        assert!(!capabilities.computer_application_launch);
         assert!(!capabilities.computer_accessibility_observe);
         assert!(!capabilities.computer_element_state);
         assert!(!capabilities.computer_control);
@@ -2857,6 +2924,8 @@ mod envelope_tests {
         assert!(!capabilities.computer_text_input);
         assert!(!ShellClientCapabilities::default().project_path_registration);
         assert!(!ShellClientCapabilities::default().computer_observe);
+        assert!(!ShellClientCapabilities::default().computer_application_discovery);
+        assert!(!ShellClientCapabilities::default().computer_application_launch);
         assert!(!ShellClientCapabilities::default().computer_accessibility_observe);
         assert!(!ShellClientCapabilities::default().computer_element_state);
         assert!(!ShellClientCapabilities::default().computer_control);
@@ -2901,6 +2970,84 @@ mod envelope_tests {
             serde_json::from_str(r#"{"computer_observe":true}"#).unwrap();
         assert!(capabilities.computer_observe);
         assert!(!capabilities.file_read);
+    }
+
+    #[test]
+    fn computer_application_capabilities_are_additive_and_default_false() {
+        let legacy: ShellClientCapabilities =
+            serde_json::from_str(r#"{"computer_observe":true,"computer_control":true}"#).unwrap();
+        assert!(legacy.computer_observe);
+        assert!(legacy.computer_control);
+        assert!(!legacy.computer_application_discovery);
+        assert!(!legacy.computer_application_launch);
+        assert!(!legacy.computer_display_observe);
+        assert!(!legacy.computer_pointer_control);
+        assert!(!legacy.computer_clipboard_read);
+        assert!(!legacy.computer_clipboard_write);
+
+        let discovery: ShellClientCapabilities =
+            serde_json::from_str(r#"{"computer_application_discovery":true}"#).unwrap();
+        assert!(discovery.computer_application_discovery);
+        assert!(!discovery.computer_application_launch);
+        assert!(!discovery.computer_observe);
+        assert!(!discovery.computer_control);
+        assert!(!discovery.computer_display_observe);
+        assert!(!discovery.computer_pointer_control);
+
+        let launch: ShellClientCapabilities =
+            serde_json::from_str(r#"{"computer_application_launch":true}"#).unwrap();
+        assert!(launch.computer_application_launch);
+        assert!(!launch.computer_application_discovery);
+        assert!(!launch.computer_observe);
+        assert!(!launch.computer_control);
+        assert!(!launch.computer_display_observe);
+        assert!(!launch.computer_pointer_control);
+
+        let display: ShellClientCapabilities =
+            serde_json::from_str(r#"{"computer_display_observe":true}"#).unwrap();
+        assert!(display.computer_display_observe);
+        assert!(!display.computer_observe);
+        assert!(!display.computer_snapshot_region);
+        assert!(!display.computer_application_discovery);
+        assert!(!display.computer_application_launch);
+        assert!(!display.computer_pointer_control);
+
+        let pointer: ShellClientCapabilities =
+            serde_json::from_str(r#"{"computer_pointer_control":true}"#).unwrap();
+        assert!(pointer.computer_pointer_control);
+        assert!(!pointer.computer_control);
+        assert!(!pointer.computer_display_observe);
+        assert!(!pointer.computer_observe);
+        assert!(!pointer.computer_clipboard_read);
+        assert!(!pointer.computer_clipboard_write);
+
+        let clipboard_read: ShellClientCapabilities =
+            serde_json::from_str(r#"{"computer_clipboard_read":true}"#).unwrap();
+        assert!(clipboard_read.computer_clipboard_read);
+        assert!(!clipboard_read.computer_clipboard_write);
+        assert!(!clipboard_read.computer_control);
+        assert!(!clipboard_read.computer_observe);
+        assert!(!clipboard_read.computer_pointer_control);
+
+        let clipboard_write: ShellClientCapabilities =
+            serde_json::from_str(r#"{"computer_clipboard_write":true}"#).unwrap();
+        assert!(clipboard_write.computer_clipboard_write);
+        assert!(!clipboard_write.computer_clipboard_read);
+        assert!(!clipboard_write.computer_control);
+        assert!(!clipboard_write.computer_display_observe);
+
+        assert!(SHELL_CLIENT_CAPABILITY_NAMES
+            .contains(&SHELL_CLIENT_CAPABILITY_COMPUTER_APPLICATION_DISCOVERY));
+        assert!(SHELL_CLIENT_CAPABILITY_NAMES
+            .contains(&SHELL_CLIENT_CAPABILITY_COMPUTER_APPLICATION_LAUNCH));
+        assert!(SHELL_CLIENT_CAPABILITY_NAMES
+            .contains(&SHELL_CLIENT_CAPABILITY_COMPUTER_DISPLAY_OBSERVE));
+        assert!(SHELL_CLIENT_CAPABILITY_NAMES
+            .contains(&SHELL_CLIENT_CAPABILITY_COMPUTER_POINTER_CONTROL));
+        assert!(SHELL_CLIENT_CAPABILITY_NAMES
+            .contains(&SHELL_CLIENT_CAPABILITY_COMPUTER_CLIPBOARD_READ));
+        assert!(SHELL_CLIENT_CAPABILITY_NAMES
+            .contains(&SHELL_CLIENT_CAPABILITY_COMPUTER_CLIPBOARD_WRITE));
     }
 
     #[test]

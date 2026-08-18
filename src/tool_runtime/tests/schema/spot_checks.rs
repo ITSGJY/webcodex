@@ -230,6 +230,163 @@ fn tool_specs_computer_snapshot_has_bounded_region_without_format_controls() {
 }
 
 #[test]
+fn tool_specs_full_display_observation_is_closed_and_bounded() {
+    let specs = registered_tool_specs();
+    let list = spec_named(&specs, "computer_list_displays");
+    assert_eq!(list.input_schema["additionalProperties"], false);
+    assert_eq!(list.input_schema["properties"]["limit"]["maximum"], 16);
+    let display = &list.output_schema["properties"]["output"]["properties"]["displays"]["items"];
+    assert_eq!(display["additionalProperties"], false);
+    assert_schema_fields!(
+        display["properties"].as_object().unwrap(),
+        "computer display item schema",
+        present: ["display_id", "width", "height", "primary"],
+        absent: ["native_identity", "device_path", "x", "y", "scale_factor"]
+    );
+    assert_eq!(
+        list.output_schema["properties"]["output"]["additionalProperties"],
+        false
+    );
+
+    let snapshot = spec_named(&specs, "computer_snapshot_display");
+    let props = snapshot.input_schema["properties"].as_object().unwrap();
+    assert_schema_fields!(
+        props,
+        "computer_snapshot_display input schema",
+        present: ["client_id", "display_id", "max_width", "max_height"],
+        absent: ["region", "x", "y", "global_x", "pointer", "click", "monitor_id"]
+    );
+    assert_eq!(props["max_width"]["maximum"], 4096);
+    assert_eq!(props["max_height"]["maximum"], 4096);
+    let output = snapshot.output_schema["properties"]["output"]["properties"]
+        .as_object()
+        .unwrap();
+    assert_schema_fields!(
+        output,
+        "computer_snapshot_display output schema",
+        present: [
+            "client_id",
+            "display_id",
+            "snapshot_generation",
+            "source_width",
+            "source_height",
+            "width",
+            "height",
+            "mime_type",
+            "file_bytes",
+            "sha256",
+            "captured_at_unix_ms",
+            "content_base64"
+        ],
+        absent: ["native_identity", "device_path", "global_x", "global_y", "scale_factor", "region"]
+    );
+    assert_eq!(
+        snapshot.output_schema["properties"]["output"]["additionalProperties"],
+        false
+    );
+    assert_eq!(output["snapshot_generation"]["minimum"], 1);
+}
+
+#[test]
+fn tool_specs_clipboard_text_is_strict_bounded_and_private() {
+    let specs = registered_tool_specs();
+    let read = spec_named(&specs, "computer_read_clipboard");
+    assert_eq!(read.input_schema["additionalProperties"], false);
+    assert_eq!(required_fields(read), vec!["client_id".to_string()]);
+    let read_input = read.input_schema["properties"].as_object().unwrap();
+    assert_schema_fields!(
+        read_input,
+        "clipboard read input schema",
+        present: ["client_id"],
+        absent: ["text", "surface_id", "format", "hwnd", "sequence", "clipboard_generation"]
+    );
+    assert_eq!(
+        read.output_schema["properties"]["output"]["additionalProperties"],
+        false
+    );
+    let read_output = read.output_schema["properties"]["output"]["properties"]
+        .as_object()
+        .unwrap();
+    assert_schema_fields!(
+        read_output,
+        "clipboard read output schema",
+        present: ["platform", "available", "text", "text_bytes"],
+        absent: ["format", "hwnd", "native_owner", "hglobal", "sequence", "sha256"]
+    );
+
+    let write = spec_named(&specs, "computer_write_clipboard");
+    assert_eq!(write.input_schema["additionalProperties"], false);
+    assert_eq!(
+        required_fields(write),
+        vec!["client_id".to_string(), "text".to_string()]
+    );
+    let write_input = write.input_schema["properties"].as_object().unwrap();
+    assert_eq!(write_input["text"]["minLength"], 1);
+    assert_eq!(write_input["text"]["maxLength"], 16384);
+    assert_schema_fields!(
+        write_input,
+        "clipboard write input schema",
+        present: ["client_id", "text"],
+        absent: ["surface_id", "element_id", "paste", "format", "mime_type", "hwnd", "restore", "append", "clipboard_generation"]
+    );
+    assert_eq!(
+        write.output_schema["properties"]["output"]["additionalProperties"],
+        false
+    );
+    let write_output = write.output_schema["properties"]["output"]["properties"]
+        .as_object()
+        .unwrap();
+    assert_schema_fields!(
+        write_output,
+        "clipboard write output schema",
+        present: ["platform", "text_bytes", "success", "execution_state", "state_changed", "error_kind"],
+        absent: ["text", "sha256", "hglobal", "hwnd", "native_owner", "sequence"]
+    );
+}
+
+#[test]
+fn tool_specs_coordinate_pointer_is_snapshot_fenced_and_private() {
+    let specs = registered_tool_specs();
+    for name in ["computer_pointer_move", "computer_pointer_click"] {
+        let spec = spec_named(&specs, name);
+        assert_eq!(spec.input_schema["additionalProperties"], false);
+        assert_eq!(
+            required_fields(spec),
+            vec![
+                "client_id".to_string(),
+                "display_id".to_string(),
+                "snapshot_generation".to_string(),
+                "x".to_string(),
+                "y".to_string(),
+            ]
+        );
+        let input = spec.input_schema["properties"].as_object().unwrap();
+        assert_schema_fields!(
+            input,
+            "computer pointer input schema",
+            present: ["client_id", "display_id", "snapshot_generation", "x", "y"],
+            absent: ["global_x", "global_y", "button", "double_click", "region", "surface_id", "dpi", "monitor_id"]
+        );
+        assert_eq!(input["snapshot_generation"]["minimum"], 1);
+        assert_eq!(input["x"]["minimum"], 0);
+        assert_eq!(input["y"]["minimum"], 0);
+        assert_eq!(
+            spec.output_schema["properties"]["output"]["additionalProperties"],
+            false
+        );
+        let output = spec.output_schema["properties"]["output"]["properties"]
+            .as_object()
+            .unwrap();
+        assert_schema_fields!(
+            output,
+            "computer pointer output schema",
+            present: ["platform", "display_id", "snapshot_generation", "x", "y", "success", "execution_state", "state_changed", "error_kind", "reconcile_with"],
+            absent: ["native_identity", "device_path", "global_x", "global_y", "virtual_left", "virtual_top", "dpi", "scale_factor", "content_base64"]
+        );
+    }
+}
+
+#[test]
 fn tool_specs_computer_save_snapshot_is_create_only_and_returns_metadata_only() {
     let specs = registered_tool_specs();
     let spec = spec_named(&specs, "computer_save_snapshot");

@@ -92,6 +92,15 @@ pub(crate) fn session_log_arguments_for_tool_request(tool_name: &str, arguments:
         "computer_list_windows" => {
             copy_keys(obj, &mut out, &["client_id", "limit"]);
         }
+        "computer_list_applications" => {
+            copy_keys(obj, &mut out, &["client_id", "limit"]);
+        }
+        "computer_list_displays" => {
+            copy_keys(obj, &mut out, &["client_id", "limit"]);
+        }
+        "computer_launch_application" => {
+            copy_keys(obj, &mut out, &["client_id", "application_id"]);
+        }
         "computer_accessibility_status" => {
             copy_keys(obj, &mut out, &["client_id"]);
         }
@@ -138,6 +147,28 @@ pub(crate) fn session_log_arguments_for_tool_request(tool_name: &str, arguments:
                 &["client_id", "surface_id", "key", "modifiers"],
             );
         }
+        "computer_pointer_move" | "computer_pointer_click" => {
+            copy_keys(
+                obj,
+                &mut out,
+                &["client_id", "display_id", "snapshot_generation", "x", "y"],
+            );
+        }
+        "computer_read_clipboard" => {
+            copy_keys(obj, &mut out, &["client_id"]);
+        }
+        "computer_write_clipboard" => {
+            copy_keys(obj, &mut out, &["client_id"]);
+            out.insert(
+                "text_bytes".to_string(),
+                Value::from(
+                    obj.get("text")
+                        .and_then(Value::as_str)
+                        .map(str::len)
+                        .unwrap_or_default(),
+                ),
+            );
+        }
         "computer_input_text" => {
             copy_keys(obj, &mut out, &["client_id", "surface_id", "element_id"]);
             out.insert(
@@ -159,6 +190,13 @@ pub(crate) fn session_log_arguments_for_tool_request(tool_name: &str, arguments:
             out.insert(
                 "region_present".to_string(),
                 Value::Bool(obj.get("region").is_some_and(|value| !value.is_null())),
+            );
+        }
+        "computer_snapshot_display" => {
+            copy_keys(
+                obj,
+                &mut out,
+                &["client_id", "display_id", "max_width", "max_height"],
             );
         }
         "computer_save_snapshot" => {
@@ -476,6 +514,45 @@ pub(crate) fn session_log_result_for_tool(tool_name: &str, output: &Value) -> Va
             "count": output.get("count").cloned().unwrap_or(Value::Null),
             "truncated": output.get("truncated").cloned().unwrap_or(Value::Null),
         }),
+        "computer_list_applications" => serde_json::json!({
+            "count": output.get("count").cloned().unwrap_or(Value::Null),
+            "truncated": output.get("truncated").cloned().unwrap_or(Value::Null),
+        }),
+        "computer_list_displays" => serde_json::json!({
+            "count": output.get("count").cloned().unwrap_or(Value::Null),
+            "truncated": output.get("truncated").cloned().unwrap_or(Value::Null),
+        }),
+        "computer_launch_application" => serde_json::json!({
+            "application_id": output.get("application_id").cloned().unwrap_or(Value::Null),
+            "success": output.get("success").cloned().unwrap_or(Value::Null),
+            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
+            "execution_state": output.get("execution_state").cloned().unwrap_or(Value::Null),
+            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
+        }),
+        "computer_pointer_move" | "computer_pointer_click" => serde_json::json!({
+            "display_id": output.get("display_id").cloned().unwrap_or(Value::Null),
+            "snapshot_generation": output.get("snapshot_generation").cloned().unwrap_or(Value::Null),
+            "x": output.get("x").cloned().unwrap_or(Value::Null),
+            "y": output.get("y").cloned().unwrap_or(Value::Null),
+            "success": output.get("success").cloned().unwrap_or(Value::Null),
+            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
+            "execution_state": output.get("execution_state").cloned().unwrap_or(Value::Null),
+            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
+        }),
+        "computer_read_clipboard" => serde_json::json!({
+            "available": output.get("available").cloned().unwrap_or(Value::Null),
+            "text_bytes": output.get("text_bytes").cloned().unwrap_or(Value::Null),
+            "success": output.get("success").cloned().unwrap_or(Value::Null),
+            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
+            "execution_state": output.get("execution_state").cloned().unwrap_or(Value::Null),
+        }),
+        "computer_write_clipboard" => serde_json::json!({
+            "text_bytes": output.get("text_bytes").cloned().unwrap_or(Value::Null),
+            "success": output.get("success").cloned().unwrap_or(Value::Null),
+            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
+            "execution_state": output.get("execution_state").cloned().unwrap_or(Value::Null),
+            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
+        }),
         "computer_snapshot" => serde_json::json!({
             "surface_id": output.pointer("/surface/surface_id").cloned().unwrap_or(Value::Null),
             "source_width": output.get("source_width").cloned().unwrap_or(Value::Null),
@@ -485,6 +562,18 @@ pub(crate) fn session_log_result_for_tool(tool_name: &str, output: &Value) -> Va
             "height": output.get("height").cloned().unwrap_or(Value::Null),
             "mime_type": output.get("mime_type").cloned().unwrap_or(Value::Null),
             "file_bytes": output.get("file_bytes").cloned().unwrap_or(Value::Null),
+            "captured_at_unix_ms": output.get("captured_at_unix_ms").cloned().unwrap_or(Value::Null),
+        }),
+        "computer_snapshot_display" => serde_json::json!({
+            "display_id": output.get("display_id").cloned().unwrap_or(Value::Null),
+            "snapshot_generation": output.get("snapshot_generation").cloned().unwrap_or(Value::Null),
+            "source_width": output.get("source_width").cloned().unwrap_or(Value::Null),
+            "source_height": output.get("source_height").cloned().unwrap_or(Value::Null),
+            "width": output.get("width").cloned().unwrap_or(Value::Null),
+            "height": output.get("height").cloned().unwrap_or(Value::Null),
+            "mime_type": output.get("mime_type").cloned().unwrap_or(Value::Null),
+            "file_bytes": output.get("file_bytes").cloned().unwrap_or(Value::Null),
+            "sha256": output.get("sha256").cloned().unwrap_or(Value::Null),
             "captured_at_unix_ms": output.get("captured_at_unix_ms").cloned().unwrap_or(Value::Null),
         }),
         "computer_save_snapshot" => serde_json::json!({
@@ -572,6 +661,255 @@ fn copy_keys(
 mod computer_privacy_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn computer_application_list_ledger_omits_names_ids_and_native_identity() {
+        let output = json!({
+            "applications": [{
+                "application_id": "application_0123456789abcdef0123456789abcdef",
+                "display_name": "Private App",
+                "native_identity": "never-allowed"
+            }],
+            "count": 1,
+            "truncated": false
+        });
+        let summary = session_log_result_for_tool("computer_list_applications", &output);
+        let serialized = serde_json::to_string(&summary).unwrap();
+        assert_eq!(summary, json!({"count": 1, "truncated": false}));
+        assert!(!serialized.contains("Private App"));
+        assert!(!serialized.contains("application_"));
+        assert!(!serialized.contains("native_identity"));
+    }
+
+    #[test]
+    fn computer_display_list_ledger_omits_ids_and_native_topology() {
+        let output = json!({
+            "displays": [{
+                "display_id": "display_0123456789abcdef0123456789abcdef",
+                "width": 1920,
+                "height": 1080,
+                "primary": true,
+                "native_identity": "PRIVATE_NATIVE_ID",
+                "device_path": "PRIVATE_DEVICE_PATH",
+                "global_x": -1920
+            }],
+            "count": 1,
+            "truncated": false
+        });
+        let summary = session_log_result_for_tool("computer_list_displays", &output);
+        let serialized = serde_json::to_string(&summary).unwrap();
+        assert_eq!(summary, json!({"count": 1, "truncated": false}));
+        assert!(!serialized.contains("display_"));
+        assert!(!serialized.contains("PRIVATE_NATIVE_ID"));
+        assert!(!serialized.contains("PRIVATE_DEVICE_PATH"));
+        assert!(!serialized.contains("global_x"));
+    }
+
+    #[test]
+    fn computer_display_snapshot_ledger_omits_image_and_native_topology() {
+        let display_id = "display_0123456789abcdef0123456789abcdef";
+        let request = json!({
+            "client_id": "msi",
+            "display_id": display_id,
+            "max_width": 1024,
+            "max_height": 768,
+            "global_x": -1920
+        });
+        let request_summary =
+            session_log_arguments_for_tool_request("computer_snapshot_display", &request);
+        assert_eq!(request_summary["display_id"], display_id);
+        assert!(request_summary.get("global_x").is_none());
+
+        let output = json!({
+            "display_id": display_id,
+            "snapshot_generation": 9,
+            "source_width": 1920,
+            "source_height": 1080,
+            "width": 1024,
+            "height": 576,
+            "mime_type": "image/jpeg",
+            "file_bytes": 1234,
+            "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "captured_at_unix_ms": 1_700_000_000_000u64,
+            "content_base64": "PRIVATE_IMAGE_BODY",
+            "native_identity": "PRIVATE_NATIVE_ID",
+            "device_path": "PRIVATE_DEVICE_PATH",
+            "global_x": -1920,
+            "scale_factor": 1.25
+        });
+        let summary = session_log_result_for_tool("computer_snapshot_display", &output);
+        let serialized = serde_json::to_string(&summary).unwrap();
+        assert_eq!(summary["display_id"], display_id);
+        assert_eq!(summary["snapshot_generation"], 9);
+        assert_eq!(summary["sha256"], output["sha256"]);
+        assert!(!serialized.contains("PRIVATE_IMAGE_BODY"));
+        assert!(!serialized.contains("PRIVATE_NATIVE_ID"));
+        assert!(!serialized.contains("PRIVATE_DEVICE_PATH"));
+        assert!(!serialized.contains("global_x"));
+        assert!(!serialized.contains("scale_factor"));
+    }
+
+    #[test]
+    fn computer_clipboard_ledger_omits_body_hashes_and_native_state() {
+        const PRIVATE_TEXT: &str = "PRIVATE_CLIPBOARD_TEXT";
+        let read_request = json!({
+            "client_id": "msi",
+            "text": PRIVATE_TEXT,
+            "hwnd": "PRIVATE_HWND",
+        });
+        let read_request_summary =
+            session_log_arguments_for_tool_request("computer_read_clipboard", &read_request);
+        assert_eq!(read_request_summary, json!({"client_id":"msi"}));
+
+        let write_request = json!({
+            "client_id": "msi",
+            "text": PRIVATE_TEXT,
+            "sha256": "PRIVATE_CLIPBOARD_HASH",
+            "native_handle": "PRIVATE_HGLOBAL",
+        });
+        let write_request_summary =
+            session_log_arguments_for_tool_request("computer_write_clipboard", &write_request);
+        assert_eq!(write_request_summary["client_id"], "msi");
+        assert_eq!(write_request_summary["text_bytes"], PRIVATE_TEXT.len());
+        let request_serialized = serde_json::to_string(&write_request_summary).unwrap();
+        for secret in [PRIVATE_TEXT, "PRIVATE_CLIPBOARD_HASH", "PRIVATE_HGLOBAL"] {
+            assert!(!request_serialized.contains(secret));
+        }
+
+        let read_output = json!({
+            "available": true,
+            "text": PRIVATE_TEXT,
+            "text_bytes": PRIVATE_TEXT.len(),
+            "success": true,
+            "error_kind": null,
+            "execution_state": null,
+            "sha256": "PRIVATE_CLIPBOARD_HASH",
+            "hwnd": "PRIVATE_HWND",
+            "native_owner": "PRIVATE_OWNER",
+        });
+        let read_summary = session_log_result_for_tool("computer_read_clipboard", &read_output);
+        assert_eq!(read_summary["available"], true);
+        assert_eq!(read_summary["text_bytes"], PRIVATE_TEXT.len());
+        let read_serialized = serde_json::to_string(&read_summary).unwrap();
+        for secret in [
+            PRIVATE_TEXT,
+            "PRIVATE_CLIPBOARD_HASH",
+            "PRIVATE_HWND",
+            "PRIVATE_OWNER",
+        ] {
+            assert!(!read_serialized.contains(secret));
+        }
+
+        let write_output = json!({
+            "text_bytes": PRIVATE_TEXT.len(),
+            "success": true,
+            "error_kind": null,
+            "execution_state": "completed",
+            "state_changed": true,
+            "text": PRIVATE_TEXT,
+            "sha256": "PRIVATE_CLIPBOARD_HASH",
+            "hglobal": "PRIVATE_HGLOBAL",
+            "clipboard_owner": "PRIVATE_OWNER",
+        });
+        let write_summary = session_log_result_for_tool("computer_write_clipboard", &write_output);
+        assert_eq!(write_summary["text_bytes"], PRIVATE_TEXT.len());
+        assert_eq!(write_summary["success"], true);
+        let write_serialized = serde_json::to_string(&write_summary).unwrap();
+        for secret in [
+            PRIVATE_TEXT,
+            "PRIVATE_CLIPBOARD_HASH",
+            "PRIVATE_HGLOBAL",
+            "PRIVATE_OWNER",
+        ] {
+            assert!(!write_serialized.contains(secret));
+        }
+    }
+
+    #[test]
+    fn computer_pointer_ledger_keeps_only_source_space_and_opaque_lifecycle_metadata() {
+        let display_id = "display_0123456789abcdef0123456789abcdef";
+        let request = json!({
+            "client_id": "msi",
+            "display_id": display_id,
+            "snapshot_generation": 11,
+            "x": 321,
+            "y": 654,
+            "global_x": -1599,
+            "native_identity": "PRIVATE_NATIVE_ID"
+        });
+        let request_summary =
+            session_log_arguments_for_tool_request("computer_pointer_click", &request);
+        let request_serialized = serde_json::to_string(&request_summary).unwrap();
+        assert_eq!(request_summary["display_id"], display_id);
+        assert_eq!(request_summary["snapshot_generation"], 11);
+        assert_eq!(request_summary["x"], 321);
+        assert_eq!(request_summary["y"], 654);
+        assert!(!request_serialized.contains("global_x"));
+        assert!(!request_serialized.contains("PRIVATE_NATIVE_ID"));
+
+        let output = json!({
+            "display_id": display_id,
+            "snapshot_generation": 11,
+            "x": 321,
+            "y": 654,
+            "success": true,
+            "error_kind": null,
+            "execution_state": "completed",
+            "state_changed": true,
+            "content_base64": "PRIVATE_IMAGE_BODY",
+            "native_identity": "PRIVATE_NATIVE_ID",
+            "device_path": "PRIVATE_DEVICE_PATH",
+            "global_x": -1599,
+            "virtual_left": -1920,
+            "dpi_scale": 1.25
+        });
+        let summary = session_log_result_for_tool("computer_pointer_click", &output);
+        let serialized = serde_json::to_string(&summary).unwrap();
+        assert_eq!(summary["display_id"], display_id);
+        assert_eq!(summary["snapshot_generation"], 11);
+        assert_eq!(summary["x"], 321);
+        assert_eq!(summary["y"], 654);
+        for secret in [
+            "PRIVATE_IMAGE_BODY",
+            "PRIVATE_NATIVE_ID",
+            "PRIVATE_DEVICE_PATH",
+            "global_x",
+            "virtual_left",
+            "dpi_scale",
+        ] {
+            assert!(!serialized.contains(secret), "{secret}");
+        }
+    }
+
+    #[test]
+    fn computer_application_launch_ledger_keeps_only_opaque_lifecycle_metadata() {
+        let application_id = "application_0123456789abcdef0123456789abcdef";
+        let output = json!({
+            "application_id": application_id,
+            "success": true,
+            "error_kind": null,
+            "execution_state": null,
+            "state_changed": null,
+            "native_identity": "PRIVATE_NATIVE_ID",
+            "path": "C:\\Private\\app.exe",
+            "display_name": "Private App"
+        });
+        let summary = session_log_result_for_tool("computer_launch_application", &output);
+        assert_eq!(
+            summary,
+            json!({
+                "application_id": application_id,
+                "success": true,
+                "error_kind": null,
+                "execution_state": null,
+                "state_changed": null
+            })
+        );
+        let serialized = serde_json::to_string(&summary).unwrap();
+        assert!(!serialized.contains("PRIVATE_NATIVE_ID"));
+        assert!(!serialized.contains("Private App"));
+        assert!(!serialized.contains("app.exe"));
+    }
 
     #[test]
     fn computer_list_ledger_result_omits_window_content() {
@@ -1165,6 +1503,17 @@ impl ToolCall {
             Self::ComputerListWindows { client_id, limit } => serde_json::json!({
                 "client_id": client_id,
                 "limit": limit,
+            }),
+            Self::ComputerListApplications { client_id, limit } => serde_json::json!({
+                "client_id": client_id,
+                "limit": limit,
+            }),
+            Self::ComputerLaunchApplication {
+                client_id,
+                application_id,
+            } => serde_json::json!({
+                "client_id": client_id,
+                "application_id": application_id,
             }),
             Self::ComputerAccessibilityStatus { client_id } => serde_json::json!({
                 "client_id": client_id,

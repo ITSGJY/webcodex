@@ -13,6 +13,42 @@ pub(crate) fn computer_list_windows_input_schema() -> Value {
     })
 }
 
+pub(crate) fn computer_list_displays_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "client_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Exact Runner client_id whose full displays are observed."},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 16, "description": "Optional bounded display count; defaults to 16."}
+        },
+        "required": ["client_id"]
+    })
+}
+
+pub(crate) fn computer_list_applications_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "client_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Exact Runner client_id whose installed applications are discovered."},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 64, "description": "Optional bounded application count; defaults to 64."}
+        },
+        "required": ["client_id"]
+    })
+}
+
+pub(crate) fn computer_launch_application_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "client_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Exact Runner client_id that produced the application_id."},
+            "application_id": {"type": "string", "pattern": "^application_[0-9a-f]{32}$", "maxLength": 128, "description": "Fresh opaque process-local application_id returned by computer_list_applications."}
+        },
+        "required": ["client_id", "application_id"]
+    })
+}
+
 pub(crate) fn computer_accessibility_status_input_schema() -> Value {
     json!({
         "type": "object",
@@ -122,6 +158,29 @@ pub(crate) fn computer_key_input_input_schema() -> Value {
     })
 }
 
+pub(crate) fn computer_read_clipboard_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "client_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Exact Windows Runner whose global Unicode-text clipboard is observed."}
+        },
+        "required": ["client_id"]
+    })
+}
+
+pub(crate) fn computer_write_clipboard_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "client_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Exact Windows Runner whose global clipboard is replaced."},
+            "text": {"type": "string", "minLength": 1, "maxLength": 16384, "description": "Unicode text replacement. Runtime enforces non-empty, NUL-free UTF-8 of at most 16 KiB."}
+        },
+        "required": ["client_id", "text"]
+    })
+}
+
 pub(crate) fn computer_input_text_input_schema() -> Value {
     json!({
         "type": "object",
@@ -159,6 +218,35 @@ pub(crate) fn computer_snapshot_input_schema() -> Value {
             "max_height": {"type": "integer", "minimum": 1, "maximum": 4096, "description": "Optional upper bound on encoded output height. Never upscales."}
         },
         "required": ["client_id", "surface_id"]
+    })
+}
+
+pub(crate) fn computer_snapshot_display_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "client_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Exact Runner client_id that produced the display_id."},
+            "display_id": {"type": "string", "pattern": "^display_[0-9a-f]{32}$", "maxLength": 128, "description": "Fresh opaque process-local display_id returned by computer_list_displays."},
+            "max_width": {"type": "integer", "minimum": 1, "maximum": 4096, "description": "Optional upper bound on encoded output width. Never upscales."},
+            "max_height": {"type": "integer", "minimum": 1, "maximum": 4096, "description": "Optional upper bound on encoded output height. Never upscales."}
+        },
+        "required": ["client_id", "display_id"]
+    })
+}
+
+pub(crate) fn computer_pointer_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "client_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Exact Runner client_id that produced the display snapshot."},
+            "display_id": {"type": "string", "pattern": "^display_[0-9a-f]{32}$", "maxLength": 128, "description": "Exact opaque process-local display_id bound to snapshot_generation."},
+            "snapshot_generation": {"type": "integer", "minimum": 1, "maximum": 4294967295u64, "description": "Latest unspent successful full-display snapshot generation for this display."},
+            "x": {"type": "integer", "minimum": 0, "maximum": 4294967295u64, "description": "Display-local source-space x coordinate; must be less than the bound snapshot source_width."},
+            "y": {"type": "integer", "minimum": 0, "maximum": 4294967295u64, "description": "Display-local source-space y coordinate; must be less than the bound snapshot source_height."}
+        },
+        "required": ["client_id", "display_id", "snapshot_generation", "x", "y"]
     })
 }
 

@@ -3,8 +3,12 @@ use super::super::input_schemas::{
     computer_activate_window_input_schema, computer_control_input_schema,
     computer_element_state_input_schema, computer_find_elements_input_schema,
     computer_input_text_input_schema, computer_key_input_input_schema,
-    computer_list_windows_input_schema, computer_save_snapshot_input_schema,
-    computer_scroll_to_element_input_schema, computer_snapshot_input_schema, empty_input_schema,
+    computer_launch_application_input_schema, computer_list_applications_input_schema,
+    computer_list_displays_input_schema, computer_list_windows_input_schema,
+    computer_pointer_input_schema, computer_read_clipboard_input_schema,
+    computer_save_snapshot_input_schema, computer_scroll_to_element_input_schema,
+    computer_snapshot_display_input_schema, computer_snapshot_input_schema,
+    computer_write_clipboard_input_schema, empty_input_schema,
 };
 use super::tool_spec;
 use crate::tool_runtime::tool_spec::ToolSpec;
@@ -12,14 +16,49 @@ use crate::tool_runtime::tool_spec::ToolSpec;
 pub(super) fn tool_specs() -> Vec<ToolSpec> {
     vec![
         tool_spec(
+            "computer_read_clipboard",
+            "Read bounded CF_UNICODETEXT from the exact Windows Runner global clipboard. Returns UTF-8 text up to 16 KiB without truncation. This is an independent global privacy authority; it never enumerates formats, accesses windows/focus, pastes, retries, invokes shell fallback, or reads clipboard history.",
+            computer_read_clipboard_input_schema(),
+        ),
+        tool_spec(
+            "computer_write_clipboard",
+            "Replace the exact Windows Runner global clipboard with bounded CF_UNICODETEXT, clearing formats via EmptyClipboard. It never pastes, focuses, activates, restores old data, retries, or reads back implicitly. Unknown outcomes require explicit reconciliation under separate clipboard-read authority.",
+            computer_write_clipboard_input_schema(),
+        ),
+        tool_spec(
+            "computer_pointer_move",
+            "Move the Windows pointer to an exact display-local coordinate using the latest unspent display snapshot generation. The generation is single-use and spent at effect admission. No implicit observation, focus, drag, fallback, or retry. Reconcile unknown outcomes with a fresh snapshot.",
+            computer_pointer_input_schema(),
+        ),
+        tool_spec(
+            "computer_pointer_click",
+            "Send one Windows-native left click at an exact display-local coordinate using the latest unspent display snapshot generation. Held mouse/modifier state fails closed. No other buttons, double click, drag, implicit snapshot, fallback, or retry. Reconcile unknown outcomes with a fresh snapshot.",
+            computer_pointer_input_schema(),
+        ),
+        tool_spec(
             "computer_list_targets",
-            "List caller-visible Runner targets that advertise read-only Computer observation capabilities. Use this when client_id is unknown. Returns only minimal target identity, connection state, and Computer capability facts; no projects, policy, jobs, host details, or observation content.",
+            "List caller-visible Runners that advertise Computer observation or application capabilities. Use when client_id is unknown. Returns only target identity, connection state, and independent Computer capability facts; no projects, policy, jobs, host details, or observation content.",
             empty_input_schema(),
         ),
         tool_spec(
             "computer_list_windows",
             "List a bounded set of observable top-level windows on an exact Runner. surface_id values are opaque, process-local, and ephemeral. focused is exact-window focus when reliably known; active is the platform active/frontmost signal and may be application-level on macOS.",
             computer_list_windows_input_schema(),
+        ),
+        tool_spec(
+            "computer_list_displays",
+            "List bounded fresh full displays under separate display privacy authority. display_id values are opaque, process-local, ephemeral, and replaced on each list. Returns only display-relative dimensions and primary status; native identity, global origin, scale, and topology stay private.",
+            computer_list_displays_input_schema(),
+        ),
+        tool_spec(
+            "computer_list_applications",
+            "List a bounded fresh set of installed applications on an exact Windows Runner. application_id values are opaque, process-local, ephemeral, and replaced by each fresh list; executable paths and native launch identities are never exposed.",
+            computer_list_applications_input_schema(),
+        ),
+        tool_spec(
+            "computer_launch_application",
+            "Launch one fresh application_id through Windows native launch. Accepts no path, argv, cwd, environment, shell, URL, fallback, focus, or activation. Success means only that the OS accepted the request, not that a process/window is ready. Reconcile unknown outcomes with fresh computer_list_windows.",
+            computer_launch_application_input_schema(),
         ),
         tool_spec(
             "computer_accessibility_status",
@@ -70,6 +109,11 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
             "computer_snapshot",
             "Capture one exact listed window as a bounded image. Optional surface-relative region or max dimensions require the region-snapshot capability; whole-window capture stays rolling-compatible. Region must fit the revalidated surface. Encoding is system-selected; stale surfaces never fall back.",
             computer_snapshot_input_schema(),
+        ),
+        tool_spec(
+            "computer_snapshot_display",
+            "Capture one fresh discovered full display after private native-identity revalidation; stale or ambiguous displays fail closed. max_width/max_height only downscale. No global coordinates, regions, activation, input, shell, or fallback. Returns a positive snapshot_generation for freshness fencing.",
+            computer_snapshot_display_input_schema(),
         ),
         tool_spec(
             "computer_save_snapshot",

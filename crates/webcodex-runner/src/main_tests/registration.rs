@@ -9,6 +9,9 @@ fn computer_register_request_announces_platform_capability_and_protocol_version(
     cfg.capabilities = Some(ShellClientCapabilities {
         sandbox_inspect_commands: true,
         computer_observe: true,
+        computer_application_discovery: true,
+        computer_application_launch: true,
+        computer_display_observe: true,
         computer_snapshot_region: true,
         computer_accessibility_observe: true,
         computer_element_state: true,
@@ -72,6 +75,31 @@ fn computer_register_request_announces_platform_capability_and_protocol_version(
         caps.computer_observe,
         cfg!(any(target_os = "macos", windows)),
         "computer observation is advertised only when this Runner binary has a supported native implementation"
+    );
+    assert_eq!(
+        caps.computer_application_discovery,
+        cfg!(windows),
+        "computer application discovery is advertised only by the Windows native implementation"
+    );
+    assert_eq!(
+        caps.computer_application_launch,
+        cfg!(windows),
+        "computer application launch is independently advertised only by the Windows native implementation"
+    );
+    assert_eq!(
+        caps.computer_clipboard_read,
+        cfg!(windows),
+        "clipboard read is independently advertised only by the Windows native implementation"
+    );
+    assert_eq!(
+        caps.computer_clipboard_write,
+        cfg!(windows),
+        "clipboard write is independently advertised only by the Windows native implementation"
+    );
+    assert_eq!(
+        caps.computer_display_observe,
+        cfg!(windows),
+        "full-display observation is independently advertised only by the exact Windows display backend"
     );
     assert_eq!(
         caps.computer_snapshot_region,

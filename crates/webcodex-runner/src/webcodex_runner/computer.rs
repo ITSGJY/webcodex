@@ -14,11 +14,19 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const MAX_WINDOWS: usize = 64;
+const MAX_APPLICATIONS: usize = 64;
+const MAX_APPLICATION_SCAN: usize = 1024;
+const MAX_DISPLAYS: usize = 16;
+const MAX_APPLICATION_ID_BYTES: usize = 128;
+const MAX_DISPLAY_ID_BYTES: usize = 128;
+const MAX_DISPLAY_SNAPSHOT_BINDINGS: usize = 64;
 const MAX_TEXT_BYTES: usize = 256;
 const MAX_SURFACE_ID_BYTES: usize = 128;
 const MAX_ELEMENT_ID_BYTES: usize = 128;
 const MAX_ELEMENT_REGISTRY: usize = 1024;
 const MAX_INPUT_TEXT_BYTES: usize = 2048;
+const MAX_CLIPBOARD_TEXT_BYTES: usize = 16 * 1024;
+const MAX_CLIPBOARD_NATIVE_STORAGE_BYTES: usize = 64 * 1024;
 const COMPUTER_KEY_INPUT_KEYS: &[&str] = &[
     "enter",
     "escape",
@@ -33,6 +41,28 @@ const COMPUTER_KEY_INPUT_KEYS: &[&str] = &[
     "end",
 ];
 const COMPUTER_KEY_INPUT_MODIFIERS: &[&str] = &["shift", "control", "option", "command"];
+
+fn valid_application_id(application_id: &str) -> bool {
+    let Some(suffix) = application_id.strip_prefix("application_") else {
+        return false;
+    };
+    application_id.len() <= MAX_APPLICATION_ID_BYTES
+        && suffix.len() == 32
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_display_id(display_id: &str) -> bool {
+    let Some(suffix) = display_id.strip_prefix("display_") else {
+        return false;
+    };
+    display_id.len() <= MAX_DISPLAY_ID_BYTES
+        && suffix.len() == 32
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
 
 fn validate_key_modifiers(modifiers: &[String]) -> Result<(), String> {
     if modifiers.len() > COMPUTER_KEY_INPUT_MODIFIERS.len() {
@@ -249,6 +279,127 @@ fn validate_input_text(text: &str) -> Result<usize, String> {
     Ok(text_bytes)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreparedClipboardText {
+    utf16: Vec<u16>,
+    text_bytes: usize,
+    storage_bytes: usize,
+}
+
+fn prepare_clipboard_write_text(text: &str) -> Result<PreparedClipboardText, String> {
+    let text_bytes = text.len();
+    if text_bytes == 0 || text_bytes > MAX_CLIPBOARD_TEXT_BYTES || text.contains('\0') {
+        return Err(
+            "invalid_request: clipboard text must be non-empty, NUL-free, and within the 16 KiB UTF-8 byte limit"
+                .to_string(),
+        );
+    }
+    let mut utf16: Vec<u16> = text.encode_utf16().collect();
+    let units_with_nul = utf16
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| "invalid_request: clipboard UTF-16 length overflow".to_string())?;
+    let storage_bytes = units_with_nul
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| "invalid_request: clipboard native storage size overflow".to_string())?;
+    if storage_bytes > MAX_CLIPBOARD_NATIVE_STORAGE_BYTES {
+        return Err("invalid_request: clipboard native storage exceeds bound".to_string());
+    }
+    utf16.push(0);
+    Ok(PreparedClipboardText {
+        utf16,
+        text_bytes,
+        storage_bytes,
+    })
+}
+
+fn clipboard_read_result_from_utf16(
+    storage: Option<&[u16]>,
+    native_storage_bytes: usize,
+) -> Result<Value, String> {
+    let Some(storage) = storage else {
+        return Ok(json!({
+            "platform": "windows",
+            "available": false,
+            "text_bytes": 0,
+        }));
+    };
+    if native_storage_bytes == 0 {
+        return Err("clipboard_malformed: clipboard Unicode storage is empty".to_string());
+    }
+    if native_storage_bytes > MAX_CLIPBOARD_NATIVE_STORAGE_BYTES {
+        return Err(
+            "clipboard_too_large: clipboard Unicode storage exceeds the bounded native range"
+                .to_string(),
+        );
+    }
+    if native_storage_bytes % std::mem::size_of::<u16>() != 0 {
+        return Err(
+            "clipboard_malformed: clipboard Unicode storage has odd byte length".to_string(),
+        );
+    }
+    let expected_units = native_storage_bytes / std::mem::size_of::<u16>();
+    if storage.len() != expected_units {
+        return Err(
+            "clipboard_malformed: clipboard Unicode storage length is inconsistent".to_string(),
+        );
+    }
+    let end = storage.iter().position(|unit| *unit == 0).ok_or_else(|| {
+        "clipboard_malformed: clipboard Unicode text is not NUL terminated within bounded storage"
+            .to_string()
+    })?;
+    let text = String::from_utf16(&storage[..end])
+        .map_err(|_| "clipboard_malformed: clipboard Unicode text is invalid UTF-16".to_string())?;
+    let text_bytes = text.len();
+    if text_bytes > MAX_CLIPBOARD_TEXT_BYTES {
+        return Err(
+            "clipboard_too_large: clipboard UTF-8 text exceeds the 16 KiB bound".to_string(),
+        );
+    }
+    Ok(json!({
+        "platform": "windows",
+        "available": true,
+        "text": text,
+        "text_bytes": text_bytes,
+    }))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClipboardWriteEffectState {
+    NotStarted,
+    OutcomeUnknown,
+    Success,
+}
+
+fn run_clipboard_write_effect_steps(
+    empty_clipboard: impl FnOnce() -> bool,
+    set_clipboard_text: impl FnOnce() -> bool,
+    close_clipboard: impl FnOnce() -> bool,
+) -> ClipboardWriteEffectState {
+    if !empty_clipboard() {
+        let _ = close_clipboard();
+        return ClipboardWriteEffectState::NotStarted;
+    }
+    let set_succeeded = set_clipboard_text();
+    let close_succeeded = close_clipboard();
+    if !set_succeeded || !close_succeeded {
+        ClipboardWriteEffectState::OutcomeUnknown
+    } else {
+        ClipboardWriteEffectState::Success
+    }
+}
+
+fn finish_clipboard_read<T>(
+    read_result: Result<T, String>,
+    close_clipboard: impl FnOnce() -> bool,
+) -> Result<T, String> {
+    if !close_clipboard() {
+        Err("clipboard_failed: CloseClipboard failed after bounded read".to_string())
+    } else {
+        read_result
+    }
+}
+
 #[cfg(any(test, target_os = "macos"))]
 fn is_secure_text_fingerprint(fingerprint: &ElementFingerprint) -> bool {
     fingerprint.role == "AXSecureTextField"
@@ -447,9 +598,195 @@ struct SnapshotRegion {
     height: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlatformApplication {
+    display_name: String,
+    native_identity: Vec<u8>,
+}
+
+fn application_candidate_order(
+    left: &PlatformApplication,
+    right: &PlatformApplication,
+) -> std::cmp::Ordering {
+    left.display_name
+        .to_lowercase()
+        .cmp(&right.display_name.to_lowercase())
+        .then_with(|| left.display_name.cmp(&right.display_name))
+        .then_with(|| left.native_identity.cmp(&right.native_identity))
+}
+
+fn sort_application_candidates(applications: &mut [PlatformApplication]) {
+    applications.sort_by(application_candidate_order);
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ApplicationRecord {
+    display_name: String,
+    native_identity: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlatformDisplay {
+    native_identity: Vec<u8>,
+    width: u32,
+    height: u32,
+    primary: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DisplayRecord {
+    native_identity: Vec<u8>,
+    width: u32,
+    height: u32,
+    primary: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PointerAction {
+    Move,
+    Click,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PointerPlan {
+    global_x: i32,
+    global_y: i32,
+    normalized_x: i32,
+    normalized_y: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DisplaySnapshotBinding {
+    generation: u32,
+    display_id: String,
+    native_identity: Vec<u8>,
+    source_width: u32,
+    source_height: u32,
+    spent: bool,
+}
+
+#[derive(Default)]
+struct DisplaySnapshotRegistry {
+    next_generation: u32,
+    bindings: VecDeque<DisplaySnapshotBinding>,
+}
+
+impl DisplaySnapshotRegistry {
+    fn clear_bindings(&mut self) {
+        self.bindings.clear();
+    }
+
+    fn bind(&mut self, display_id: &str, display: &DisplayRecord) -> Result<u32, String> {
+        let generation = self.next_generation.checked_add(1).ok_or_else(|| {
+            "computer_state_error: display snapshot generation exhausted".to_string()
+        })?;
+        self.next_generation = generation;
+        self.bindings.push_back(DisplaySnapshotBinding {
+            generation,
+            display_id: display_id.to_string(),
+            native_identity: display.native_identity.clone(),
+            source_width: display.width,
+            source_height: display.height,
+            spent: false,
+        });
+        while self.bindings.len() > MAX_DISPLAY_SNAPSHOT_BINDINGS {
+            self.bindings.pop_front();
+        }
+        Ok(generation)
+    }
+
+    fn pointer_binding_index(
+        &self,
+        display_id: &str,
+        generation: u32,
+        display: &DisplayRecord,
+    ) -> Result<usize, String> {
+        let latest_generation = self
+            .bindings
+            .iter()
+            .rev()
+            .find(|binding| binding.display_id == display_id)
+            .map(|binding| binding.generation)
+            .ok_or_else(|| {
+                "stale_snapshot_generation: no successful full-display snapshot is bound to display_id"
+                    .to_string()
+            })?;
+        if latest_generation != generation {
+            return Err(
+                "stale_snapshot_generation: snapshot_generation is not the latest successful snapshot for display_id"
+                    .to_string(),
+            );
+        }
+        let index = self
+            .bindings
+            .iter()
+            .position(|binding| binding.generation == generation)
+            .ok_or_else(|| {
+                "stale_snapshot_generation: snapshot_generation is unknown or evicted".to_string()
+            })?;
+        let binding = &self.bindings[index];
+        if binding.display_id != display_id {
+            return Err(
+                "stale_snapshot_generation: snapshot_generation belongs to a different display_id"
+                    .to_string(),
+            );
+        }
+        if binding.native_identity != display.native_identity
+            || binding.source_width != display.width
+            || binding.source_height != display.height
+        {
+            return Err(
+                "stale_display: snapshot generation display identity or source geometry changed"
+                    .to_string(),
+            );
+        }
+        if binding.spent {
+            return Err(
+                "stale_snapshot_generation: snapshot_generation was already consumed by a pointer effect"
+                    .to_string(),
+            );
+        }
+        Ok(index)
+    }
+
+    fn validate_pointer(
+        &self,
+        display_id: &str,
+        generation: u32,
+        display: &DisplayRecord,
+    ) -> Result<(), String> {
+        self.pointer_binding_index(display_id, generation, display)
+            .map(|_| ())
+    }
+
+    fn spend_pointer(
+        &mut self,
+        display_id: &str,
+        generation: u32,
+        display: &DisplayRecord,
+    ) -> Result<(), String> {
+        let index = self.pointer_binding_index(display_id, generation, display)?;
+        self.bindings[index].spent = true;
+        Ok(())
+    }
+}
+fn dispatch_after_spending_pointer_generation(
+    snapshots: &mut DisplaySnapshotRegistry,
+    display_id: &str,
+    generation: u32,
+    display: &DisplayRecord,
+    dispatch: impl FnOnce(&DisplaySnapshotRegistry) -> Result<bool, String>,
+) -> Result<bool, String> {
+    snapshots.spend_pointer(display_id, generation, display)?;
+    dispatch(snapshots)
+}
+
 struct ComputerObserver {
     surfaces: Mutex<HashMap<String, SurfaceRecord>>,
     elements: Mutex<ElementRegistry>,
+    applications: Mutex<HashMap<String, ApplicationRecord>>,
+    displays: Mutex<HashMap<String, DisplayRecord>>,
+    display_snapshots: Mutex<DisplaySnapshotRegistry>,
 }
 
 impl ComputerObserver {
@@ -458,6 +795,9 @@ impl ComputerObserver {
         OBSERVER.get_or_init(|| ComputerObserver {
             surfaces: Mutex::new(HashMap::new()),
             elements: Mutex::new(ElementRegistry::default()),
+            applications: Mutex::new(HashMap::new()),
+            displays: Mutex::new(HashMap::new()),
+            display_snapshots: Mutex::new(DisplaySnapshotRegistry::default()),
         })
     }
 
@@ -500,6 +840,245 @@ impl ComputerObserver {
         *surface_registry = surfaces;
         element_registry.clear();
         Ok(json!({"windows": windows, "count": count, "truncated": truncated}))
+    }
+
+    fn replace_application_candidates(
+        &self,
+        candidates: Vec<PlatformApplication>,
+        limit: usize,
+    ) -> Result<Value, String> {
+        if !(1..=MAX_APPLICATIONS).contains(&limit) {
+            return Err("invalid_request: application discovery limit is invalid".to_string());
+        }
+        let truncated = candidates.len() > limit;
+        let mut applications = HashMap::new();
+        let mut output = Vec::with_capacity(limit.min(candidates.len()));
+        for candidate in candidates.into_iter().take(limit) {
+            let display_name = bounded_text(&candidate.display_name);
+            if display_name.is_empty()
+                || display_name.contains('\0')
+                || candidate.native_identity.is_empty()
+            {
+                return Err(
+                    "application_failed: native application metadata is invalid".to_string()
+                );
+            }
+            let application_id = format!("application_{}", Uuid::new_v4().simple());
+            applications.insert(
+                application_id.clone(),
+                ApplicationRecord {
+                    display_name: display_name.clone(),
+                    native_identity: candidate.native_identity,
+                },
+            );
+            output.push(json!({
+                "application_id": application_id,
+                "display_name": display_name,
+            }));
+        }
+        let count = output.len();
+        let mut registry = self
+            .applications
+            .lock()
+            .map_err(|_| "computer_state_error: application registry lock poisoned".to_string())?;
+        *registry = applications;
+        Ok(json!({"applications": output, "count": count, "truncated": truncated}))
+    }
+
+    fn list_applications(&self, limit: usize) -> Result<Value, String> {
+        let candidates = platform::list_applications(MAX_APPLICATION_SCAN)?;
+        self.replace_application_candidates(candidates, limit)
+    }
+
+    fn replace_display_candidates(
+        &self,
+        candidates: Vec<PlatformDisplay>,
+        limit: usize,
+    ) -> Result<Value, String> {
+        if !(1..=MAX_DISPLAYS).contains(&limit) {
+            return Err("invalid_request: display discovery limit is invalid".to_string());
+        }
+        let truncated = candidates.len() > limit;
+        let mut displays = HashMap::new();
+        let mut output = Vec::with_capacity(limit.min(candidates.len()));
+        for candidate in candidates.into_iter().take(limit) {
+            if candidate.native_identity.is_empty() || candidate.width == 0 || candidate.height == 0
+            {
+                return Err("display_failed: native display metadata is invalid".to_string());
+            }
+            let display_id = format!("display_{}", Uuid::new_v4().simple());
+            let record = DisplayRecord {
+                native_identity: candidate.native_identity,
+                width: candidate.width,
+                height: candidate.height,
+                primary: candidate.primary,
+            };
+            output.push(json!({
+                "display_id": display_id,
+                "width": record.width,
+                "height": record.height,
+                "primary": record.primary,
+            }));
+            displays.insert(display_id, record);
+        }
+        let count = output.len();
+        let mut display_registry = self
+            .displays
+            .lock()
+            .map_err(|_| "computer_state_error: display registry lock poisoned".to_string())?;
+        let mut snapshot_registry = self.display_snapshots.lock().map_err(|_| {
+            "computer_state_error: display snapshot registry lock poisoned".to_string()
+        })?;
+        *display_registry = displays;
+        snapshot_registry.clear_bindings();
+        Ok(json!({"displays": output, "count": count, "truncated": truncated}))
+    }
+
+    fn list_displays(&self, limit: usize) -> Result<Value, String> {
+        let candidates = platform::list_displays(MAX_DISPLAYS + 1)?;
+        self.replace_display_candidates(candidates, limit)
+    }
+
+    fn snapshot_display(
+        &self,
+        display_id: &str,
+        max_width: Option<u32>,
+        max_height: Option<u32>,
+    ) -> Result<Value, String> {
+        if !valid_display_id(display_id) {
+            return Err("invalid_request: display_id is invalid".to_string());
+        }
+        if max_width.is_some_and(|value| value == 0 || value > MAX_IMAGE_DIMENSION)
+            || max_height.is_some_and(|value| value == 0 || value > MAX_IMAGE_DIMENSION)
+        {
+            return Err(
+                "invalid_request: display snapshot output dimension bound is invalid".to_string(),
+            );
+        }
+        let display_registry = self
+            .displays
+            .lock()
+            .map_err(|_| "computer_state_error: display registry lock poisoned".to_string())?;
+        let record = display_registry
+            .get(display_id)
+            .cloned()
+            .ok_or_else(|| "stale_display: unknown or stale display_id".to_string())?;
+        ensure_raw_capture_bound(record.width, record.height)?;
+        let image = platform::capture_display(&record)?;
+        let captured_at_unix_ms = current_unix_ms()?;
+        let (image, _full_region) = transform_snapshot_image(
+            image,
+            record.width,
+            record.height,
+            None,
+            max_width,
+            max_height,
+        )?;
+        let encoded = encode_bounded_jpeg(image)?;
+        let file_bytes = encoded.bytes.len();
+        let sha256 = sha256_hex(&encoded.bytes);
+        let generation = self
+            .display_snapshots
+            .lock()
+            .map_err(|_| {
+                "computer_state_error: display snapshot registry lock poisoned".to_string()
+            })?
+            .bind(display_id, &record)?;
+        drop(display_registry);
+        Ok(json!({
+            "display_id": display_id,
+            "snapshot_generation": generation,
+            "source_width": record.width,
+            "source_height": record.height,
+            "width": encoded.width,
+            "height": encoded.height,
+            "mime_type": "image/jpeg",
+            "file_bytes": file_bytes,
+            "sha256": sha256,
+            "captured_at_unix_ms": captured_at_unix_ms,
+            "content_base64": general_purpose::STANDARD.encode(encoded.bytes),
+        }))
+    }
+
+    fn pointer_effect(
+        &self,
+        action: PointerAction,
+        display_id: &str,
+        snapshot_generation: u32,
+        x: u32,
+        y: u32,
+    ) -> Result<Value, String> {
+        if !valid_display_id(display_id) || snapshot_generation == 0 {
+            return Err(
+                "invalid_request: pointer display_id or snapshot_generation is invalid".to_string(),
+            );
+        }
+        let display_registry = self
+            .displays
+            .lock()
+            .map_err(|_| "computer_state_error: display registry lock poisoned".to_string())?;
+        let display = display_registry
+            .get(display_id)
+            .cloned()
+            .ok_or_else(|| "stale_display: unknown or stale display_id".to_string())?;
+        if x >= display.width || y >= display.height {
+            return Err(
+                "invalid_request: pointer coordinates are outside snapshot source geometry"
+                    .to_string(),
+            );
+        }
+        let mut snapshot_registry = self.display_snapshots.lock().map_err(|_| {
+            "computer_state_error: display snapshot registry lock poisoned".to_string()
+        })?;
+        snapshot_registry.validate_pointer(display_id, snapshot_generation, &display)?;
+
+        // Keep Windows topology metrics, exact native mapping, SendInput, and cursor
+        // reconciliation in one per-monitor-v2 physical coordinate context. The guard
+        // is established before pointer preflight and remains live across the effect.
+        #[cfg(windows)]
+        let _pointer_coordinate_context = platform::enter_pointer_coordinate_context()?;
+
+        // All native identity/mapping/shared-input checks occur before the effect boundary.
+        let plan = platform::prepare_pointer(&display, x, y, action)?;
+
+        // Crossing this boundary consumes the snapshot generation before the first native
+        // pointer effect, even if dispatch subsequently reports definite not_started or an uncertain outcome.
+        let result = dispatch_after_spending_pointer_generation(
+            &mut snapshot_registry,
+            display_id,
+            snapshot_generation,
+            &display,
+            |_| platform::dispatch_pointer(plan, action),
+        )?;
+        drop(snapshot_registry);
+        drop(display_registry);
+        Ok(json!({
+            "platform": "windows",
+            "display_id": display_id,
+            "snapshot_generation": snapshot_generation,
+            "x": x,
+            "y": y,
+            "success": result,
+        }))
+    }
+    fn launch_application(&self, application_id: &str) -> Result<Value, String> {
+        if !valid_application_id(application_id) {
+            return Err("invalid_request: application_id is invalid".to_string());
+        }
+        // Keep the process-local discovery generation fenced through exact native
+        // revalidation and dispatch. A concurrent fresh list cannot retire this id
+        // between lookup and the native launch attempt.
+        let registry = self
+            .applications
+            .lock()
+            .map_err(|_| "computer_state_error: application registry lock poisoned".to_string())?;
+        let record = registry
+            .get(application_id)
+            .cloned()
+            .ok_or_else(|| "stale_application: unknown or stale application_id".to_string())?;
+        let result = platform::launch_application(application_id, &record);
+        drop(registry);
+        result
     }
 
     fn accessibility_status(&self) -> Result<Value, String> {
@@ -1670,6 +2249,14 @@ pub(crate) fn is_computer_request_kind(kind: &str) -> bool {
     matches!(
         kind,
         "computer_list_windows"
+            | "computer_list_applications"
+            | "computer_launch_application"
+            | "computer_list_displays"
+            | "computer_snapshot_display"
+            | "computer_read_clipboard"
+            | "computer_write_clipboard"
+            | "computer_pointer_move"
+            | "computer_pointer_click"
             | "computer_snapshot"
             | "computer_snapshot_region"
             | "computer_accessibility_status"
@@ -1692,6 +2279,370 @@ fn ensure_exact_payload_fields(payload: &Value, expected: &[&str]) -> Result<(),
         return Err("invalid_request: computer payload contains unsupported fields".to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod application_wire_contract_tests {
+    use super::*;
+
+    fn candidate(name: &str, marker: u8) -> PlatformApplication {
+        PlatformApplication {
+            display_name: name.to_string(),
+            native_identity: vec![marker],
+        }
+    }
+
+    fn observer() -> ComputerObserver {
+        ComputerObserver {
+            surfaces: Mutex::new(HashMap::new()),
+            elements: Mutex::new(ElementRegistry::default()),
+            applications: Mutex::new(HashMap::new()),
+            displays: Mutex::new(HashMap::new()),
+            display_snapshots: Mutex::new(DisplaySnapshotRegistry::default()),
+        }
+    }
+
+    #[test]
+    fn application_requests_are_strict_and_ids_are_closed() {
+        assert!(is_computer_request_kind("computer_list_applications"));
+        assert!(is_computer_request_kind("computer_launch_application"));
+        assert!(ensure_exact_payload_fields(&json!({"limit": 2}), &["limit"]).is_ok());
+        assert!(ensure_exact_payload_fields(
+            &json!({"application_id": "application_0123456789abcdef0123456789abcdef"}),
+            &["application_id"],
+        )
+        .is_ok());
+        for invalid in [
+            "",
+            "application_",
+            "application_0123456789abcdef0123456789abcdeg",
+            "surface_0123456789abcdef0123456789abcdef",
+        ] {
+            assert!(!valid_application_id(invalid), "{invalid}");
+        }
+        assert!(valid_application_id(
+            "application_0123456789abcdef0123456789abcdef"
+        ));
+        for extra in ["path", "argv", "cwd", "environment", "command", "url"] {
+            let mut payload =
+                json!({"application_id": "application_0123456789abcdef0123456789abcdef"});
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert(extra.to_string(), json!("x"));
+            assert!(ensure_exact_payload_fields(&payload, &["application_id"]).is_err());
+        }
+    }
+
+    #[test]
+    fn application_candidates_have_stable_bounded_order() {
+        assert!(MAX_APPLICATION_SCAN > MAX_APPLICATIONS);
+        let mut applications = vec![
+            candidate("zeta", 4),
+            candidate("alpha", 3),
+            candidate("Beta", 2),
+            candidate("Alpha", 1),
+        ];
+        sort_application_candidates(&mut applications);
+        assert_eq!(
+            applications
+                .iter()
+                .map(|application| application.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Alpha", "alpha", "Beta", "zeta"]
+        );
+    }
+
+    #[test]
+    fn bounded_discovery_replaces_generation_and_stales_old_ids() {
+        let observer = observer();
+        let first = observer
+            .replace_application_candidates(
+                vec![
+                    candidate("One", 1),
+                    candidate("Two", 2),
+                    candidate("Three", 3),
+                ],
+                2,
+            )
+            .unwrap();
+        assert_eq!(first["count"], 2);
+        assert_eq!(first["truncated"], true);
+        let old_id = first["applications"][0]["application_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(first["applications"][0].get("native_identity").is_none());
+
+        let second = observer
+            .replace_application_candidates(vec![candidate("Four", 4)], 1)
+            .unwrap();
+        assert_eq!(second["count"], 1);
+        let error = observer.launch_application(&old_id).unwrap_err();
+        assert!(error.starts_with("stale_application:"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod display_wire_contract_tests {
+    use super::*;
+
+    fn display(marker: u8, width: u32, height: u32, primary: bool) -> PlatformDisplay {
+        PlatformDisplay {
+            native_identity: vec![marker],
+            width,
+            height,
+            primary,
+        }
+    }
+
+    fn observer() -> ComputerObserver {
+        ComputerObserver {
+            surfaces: Mutex::new(HashMap::new()),
+            elements: Mutex::new(ElementRegistry::default()),
+            applications: Mutex::new(HashMap::new()),
+            displays: Mutex::new(HashMap::new()),
+            display_snapshots: Mutex::new(DisplaySnapshotRegistry::default()),
+        }
+    }
+
+    #[test]
+    fn display_requests_are_strict_and_ids_are_closed() {
+        assert!(is_computer_request_kind("computer_list_displays"));
+        assert!(is_computer_request_kind("computer_snapshot_display"));
+        assert!(ensure_exact_payload_fields(&json!({"limit": 2}), &["limit"]).is_ok());
+        let exact = json!({
+            "display_id": "display_0123456789abcdef0123456789abcdef",
+            "max_width": 800,
+            "max_height": null,
+        });
+        assert!(
+            ensure_exact_payload_fields(&exact, &["display_id", "max_width", "max_height"]).is_ok()
+        );
+        assert!(valid_display_id("display_0123456789abcdef0123456789abcdef"));
+        for invalid in [
+            "",
+            "display_",
+            "display_0123456789abcdef0123456789abcdeg",
+            "surface_0123456789abcdef0123456789abcdef",
+        ] {
+            assert!(!valid_display_id(invalid), "{invalid}");
+        }
+        for extra in [
+            "region",
+            "x",
+            "y",
+            "global_x",
+            "pointer",
+            "click",
+            "monitor_id",
+        ] {
+            let mut payload = exact.clone();
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert(extra.to_string(), json!(1));
+            assert!(ensure_exact_payload_fields(
+                &payload,
+                &["display_id", "max_width", "max_height"]
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn display_discovery_replaces_ids_and_snapshot_generation_is_bounded_and_monotonic() {
+        let observer = observer();
+        let first = observer
+            .replace_display_candidates(
+                vec![display(1, 1920, 1080, true), display(2, 1280, 720, false)],
+                1,
+            )
+            .unwrap();
+        assert_eq!(first["count"], 1);
+        assert_eq!(first["truncated"], true);
+        assert!(first["displays"][0].get("native_identity").is_none());
+        let old_id = first["displays"][0]["display_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let record = observer
+            .displays
+            .lock()
+            .unwrap()
+            .get(&old_id)
+            .unwrap()
+            .clone();
+        {
+            let mut snapshots = observer.display_snapshots.lock().unwrap();
+            assert_eq!(snapshots.bind(&old_id, &record).unwrap(), 1);
+            assert_eq!(snapshots.bind(&old_id, &record).unwrap(), 2);
+            assert_eq!(snapshots.bindings.back().unwrap().native_identity, vec![1]);
+            assert_eq!(snapshots.bindings.back().unwrap().source_width, 1920);
+            assert_eq!(snapshots.bindings.back().unwrap().source_height, 1080);
+        }
+        observer
+            .replace_display_candidates(vec![display(3, 2560, 1440, true)], 1)
+            .unwrap();
+        assert!(observer
+            .display_snapshots
+            .lock()
+            .unwrap()
+            .bindings
+            .is_empty());
+        let error = observer
+            .snapshot_display(&old_id, Some(640), Some(480))
+            .unwrap_err();
+        assert!(error.starts_with("stale_display:"), "{error}");
+        let restarted = self::observer();
+        let restart_error = restarted
+            .snapshot_display(&old_id, Some(640), Some(480))
+            .unwrap_err();
+        assert!(
+            restart_error.starts_with("stale_display:"),
+            "{restart_error}"
+        );
+        let new_id = observer
+            .displays
+            .lock()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        let new_record = observer
+            .displays
+            .lock()
+            .unwrap()
+            .get(&new_id)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            observer
+                .display_snapshots
+                .lock()
+                .unwrap()
+                .bind(&new_id, &new_record)
+                .unwrap(),
+            3
+        );
+        let mut snapshots = DisplaySnapshotRegistry::default();
+        for expected in 1..=(MAX_DISPLAY_SNAPSHOT_BINDINGS as u32 + 1) {
+            assert_eq!(snapshots.bind(&new_id, &new_record).unwrap(), expected);
+        }
+        assert_eq!(snapshots.bindings.len(), MAX_DISPLAY_SNAPSHOT_BINDINGS);
+    }
+}
+
+#[cfg(test)]
+mod pointer_wire_contract_tests {
+    use super::*;
+
+    #[test]
+    fn pointer_requests_are_strict_snapshot_fenced_and_closed() {
+        for kind in ["computer_pointer_move", "computer_pointer_click"] {
+            assert!(is_computer_request_kind(kind));
+        }
+        let exact = json!({
+            "display_id": "display_0123456789abcdef0123456789abcdef",
+            "snapshot_generation": 7,
+            "x": 10,
+            "y": 20,
+        });
+        assert!(ensure_exact_payload_fields(
+            &exact,
+            &["display_id", "snapshot_generation", "x", "y"]
+        )
+        .is_ok());
+        for extra in [
+            "global_x",
+            "global_y",
+            "button",
+            "double_click",
+            "region",
+            "surface_id",
+        ] {
+            let mut payload = exact.clone();
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert(extra.to_string(), json!(1));
+            assert!(
+                ensure_exact_payload_fields(
+                    &payload,
+                    &["display_id", "snapshot_generation", "x", "y"]
+                )
+                .is_err(),
+                "extra field {extra}"
+            );
+        }
+    }
+
+    #[test]
+    fn pointer_generation_is_latest_exact_and_single_use() {
+        let display = DisplayRecord {
+            native_identity: vec![9],
+            width: 1920,
+            height: 1080,
+            primary: false,
+        };
+        let mut snapshots = DisplaySnapshotRegistry::default();
+        let display_id = "display_0123456789abcdef0123456789abcdef";
+        let first = snapshots.bind(display_id, &display).unwrap();
+        let second = snapshots.bind(display_id, &display).unwrap();
+        assert!(snapshots
+            .validate_pointer(display_id, first, &display)
+            .unwrap_err()
+            .starts_with("stale_snapshot_generation:"));
+        snapshots
+            .validate_pointer(display_id, second, &display)
+            .unwrap();
+        let dispatched = dispatch_after_spending_pointer_generation(
+            &mut snapshots,
+            display_id,
+            second,
+            &display,
+            |spent| {
+                assert!(spent
+                    .validate_pointer(display_id, second, &display)
+                    .unwrap_err()
+                    .contains("already consumed"));
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert!(dispatched);
+        assert!(snapshots
+            .validate_pointer(display_id, second, &display)
+            .unwrap_err()
+            .contains("already consumed"));
+
+        let mut changed_identity = display.clone();
+        changed_identity.native_identity = vec![10];
+        assert!(snapshots
+            .validate_pointer(display_id, second, &changed_identity)
+            .unwrap_err()
+            .starts_with("stale_display:"));
+
+        let mut fresh = DisplaySnapshotRegistry::default();
+        let generation = fresh.bind(display_id, &display).unwrap();
+        let mut changed_geometry = display.clone();
+        changed_geometry.width += 1;
+        assert!(fresh
+            .validate_pointer(display_id, generation, &changed_geometry)
+            .unwrap_err()
+            .starts_with("stale_display:"));
+        fresh.clear_bindings();
+        assert!(fresh
+            .validate_pointer(display_id, generation, &display)
+            .unwrap_err()
+            .starts_with("stale_snapshot_generation:"));
+        let restarted = DisplaySnapshotRegistry::default();
+        assert!(restarted
+            .validate_pointer(display_id, generation, &display)
+            .unwrap_err()
+            .starts_with("stale_snapshot_generation:"));
+    }
 }
 
 #[cfg(test)]
@@ -1747,6 +2698,222 @@ mod key_input_wire_contract_tests {
                 "extra field {extra}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod clipboard_contract_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    fn utf16_storage(value: &str) -> Vec<u16> {
+        let mut units: Vec<u16> = value.encode_utf16().collect();
+        units.push(0);
+        units
+    }
+
+    fn unicode_fixture() -> String {
+        String::from_utf16(&[0x0041, 0x4E2D, 0xD83D, 0xDE00]).unwrap()
+    }
+
+    #[test]
+    fn clipboard_wire_is_strict_and_write_preparation_is_bounded() {
+        assert!(is_computer_request_kind("computer_read_clipboard"));
+        assert!(is_computer_request_kind("computer_write_clipboard"));
+        assert!(ensure_exact_payload_fields(&json!({}), &[]).is_ok());
+        assert!(ensure_exact_payload_fields(&json!({"text":"hello"}), &["text"]).is_ok());
+        for forbidden in [
+            "surface_id",
+            "element_id",
+            "paste",
+            "format",
+            "mime_type",
+            "hwnd",
+            "sequence",
+            "restore",
+            "append",
+            "clipboard_generation",
+        ] {
+            let mut read = json!({});
+            read.as_object_mut()
+                .unwrap()
+                .insert(forbidden.to_string(), json!(1));
+            assert!(
+                ensure_exact_payload_fields(&read, &[]).is_err(),
+                "read extra {forbidden}"
+            );
+            let mut write = json!({"text":"hello"});
+            write
+                .as_object_mut()
+                .unwrap()
+                .insert(forbidden.to_string(), json!(1));
+            assert!(
+                ensure_exact_payload_fields(&write, &["text"]).is_err(),
+                "write extra {forbidden}"
+            );
+        }
+
+        for invalid in [
+            "".to_string(),
+            "nul\0text".to_string(),
+            "a".repeat(16 * 1024 + 1),
+        ] {
+            assert!(prepare_clipboard_write_text(&invalid).is_err());
+        }
+        let text = unicode_fixture();
+        let prepared = prepare_clipboard_write_text(&text).unwrap();
+        assert_eq!(prepared.text_bytes, text.len());
+        assert_eq!(prepared.utf16.last(), Some(&0));
+        assert_eq!(
+            prepared.storage_bytes,
+            prepared.utf16.len() * std::mem::size_of::<u16>()
+        );
+        assert!(prepared.storage_bytes <= MAX_CLIPBOARD_NATIVE_STORAGE_BYTES);
+    }
+
+    #[test]
+    fn clipboard_read_decodes_unicode_empty_and_unavailable_without_truncation() {
+        let unavailable = clipboard_read_result_from_utf16(None, 0).unwrap();
+        assert_eq!(
+            unavailable,
+            json!({"platform":"windows","available":false,"text_bytes":0})
+        );
+
+        let empty = [0u16];
+        assert_eq!(
+            clipboard_read_result_from_utf16(Some(&empty), 2).unwrap(),
+            json!({"platform":"windows","available":true,"text":"","text_bytes":0})
+        );
+
+        let text = unicode_fixture();
+        let units = utf16_storage(&text);
+        assert_eq!(
+            clipboard_read_result_from_utf16(Some(&units), units.len() * 2).unwrap(),
+            json!({"platform":"windows","available":true,"text":text,"text_bytes":text.len()})
+        );
+
+        let unterminated = [b'A' as u16, b'B' as u16];
+        assert!(clipboard_read_result_from_utf16(Some(&unterminated), 4)
+            .unwrap_err()
+            .starts_with("clipboard_malformed:"));
+        let malformed = [0xD800u16, 0];
+        assert!(clipboard_read_result_from_utf16(Some(&malformed), 4)
+            .unwrap_err()
+            .starts_with("clipboard_malformed:"));
+        assert!(clipboard_read_result_from_utf16(
+            Some(&[0]),
+            MAX_CLIPBOARD_NATIVE_STORAGE_BYTES + 2
+        )
+        .unwrap_err()
+        .starts_with("clipboard_too_large:"));
+
+        let two_byte = String::from_utf16(&[0x00E9]).unwrap();
+        let oversized_text = two_byte.repeat((MAX_CLIPBOARD_TEXT_BYTES / 2) + 1);
+        let oversized_units = utf16_storage(&oversized_text);
+        assert!(oversized_units.len() * 2 <= MAX_CLIPBOARD_NATIVE_STORAGE_BYTES);
+        assert!(clipboard_read_result_from_utf16(
+            Some(&oversized_units),
+            oversized_units.len() * 2
+        )
+        .unwrap_err()
+        .starts_with("clipboard_too_large:"));
+    }
+
+    #[test]
+    fn clipboard_read_cleanup_runs_once_on_success_and_error() {
+        let closes = Cell::new(0usize);
+        let result = finish_clipboard_read(Ok::<_, String>(7u8), || {
+            closes.set(closes.get() + 1);
+            true
+        });
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(closes.get(), 1);
+
+        let closes = Cell::new(0usize);
+        let result =
+            finish_clipboard_read::<u8>(Err("clipboard_malformed: bad".to_string()), || {
+                closes.set(closes.get() + 1);
+                true
+            });
+        assert!(result.unwrap_err().starts_with("clipboard_malformed:"));
+        assert_eq!(closes.get(), 1);
+
+        let closes = Cell::new(0usize);
+        let result = finish_clipboard_read::<u8>(Ok(1), || {
+            closes.set(closes.get() + 1);
+            false
+        });
+        assert!(result.unwrap_err().contains("CloseClipboard"));
+        assert_eq!(closes.get(), 1);
+    }
+
+    #[test]
+    fn clipboard_write_effect_boundary_is_one_shot_and_conservative() {
+        fn run(
+            empty: bool,
+            set: bool,
+            close: bool,
+        ) -> (ClipboardWriteEffectState, Vec<&'static str>) {
+            let calls = RefCell::new(Vec::new());
+            let state = run_clipboard_write_effect_steps(
+                || {
+                    calls.borrow_mut().push("empty");
+                    empty
+                },
+                || {
+                    calls.borrow_mut().push("set");
+                    set
+                },
+                || {
+                    calls.borrow_mut().push("close");
+                    close
+                },
+            );
+            (state, calls.into_inner())
+        }
+
+        assert_eq!(
+            run(false, true, true),
+            (
+                ClipboardWriteEffectState::NotStarted,
+                vec!["empty", "close"]
+            )
+        );
+        assert_eq!(
+            run(true, false, true),
+            (
+                ClipboardWriteEffectState::OutcomeUnknown,
+                vec!["empty", "set", "close"]
+            )
+        );
+        assert_eq!(
+            run(true, true, false),
+            (
+                ClipboardWriteEffectState::OutcomeUnknown,
+                vec!["empty", "set", "close"]
+            )
+        );
+        assert_eq!(
+            run(true, true, true),
+            (
+                ClipboardWriteEffectState::Success,
+                vec!["empty", "set", "close"]
+            )
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn clipboard_write_requires_non_null_runner_owned_hwnd_contract() {
+        assert!(!platform::clipboard_owner_hwnd_contract_for_test(false));
+        assert!(platform::clipboard_owner_hwnd_contract_for_test(true));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn clipboard_close_failure_keeps_best_effort_cleanup_armed() {
+        assert!(!platform::clipboard_close_cleanup_armed_for_test(true));
+        assert!(platform::clipboard_close_cleanup_armed_for_test(false));
     }
 }
 
@@ -1818,6 +2985,40 @@ pub(crate) fn handle_computer_request(request: &ShellAgentShellRequest) -> Comma
                 .clamp(1, MAX_WINDOWS);
             ComputerObserver::global().list_windows(limit)
         }
+        "computer_list_displays" => ensure_exact_payload_fields(&payload, &["limit"])
+            .and_then(|()| {
+                payload
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .filter(|limit| (1..=MAX_DISPLAYS).contains(limit))
+                    .ok_or_else(|| {
+                        "invalid_request: display discovery limit is invalid".to_string()
+                    })
+            })
+            .and_then(|limit| ComputerObserver::global().list_displays(limit)),
+        "computer_list_applications" => ensure_exact_payload_fields(&payload, &["limit"])
+            .and_then(|()| {
+                payload
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .filter(|limit| (1..=MAX_APPLICATIONS).contains(limit))
+                    .ok_or_else(|| {
+                        "invalid_request: application discovery limit is invalid".to_string()
+                    })
+            })
+            .and_then(|limit| ComputerObserver::global().list_applications(limit)),
+        "computer_launch_application" => ensure_exact_payload_fields(&payload, &["application_id"])
+            .and_then(|()| {
+                payload
+                    .get("application_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "invalid_request: application_id is required".to_string())
+            })
+            .and_then(|application_id| {
+                ComputerObserver::global().launch_application(application_id)
+            }),
         "computer_accessibility_status" => ComputerObserver::global().accessibility_status(),
         "computer_accessibility_tree" => {
             let surface_id = payload
@@ -1898,6 +3099,17 @@ pub(crate) fn handle_computer_request(request: &ShellAgentShellRequest) -> Comma
                 ComputerObserver::global().scroll_to_element(surface_id, element_id)
             })
         }
+        "computer_read_clipboard" => {
+            ensure_exact_payload_fields(&payload, &[]).and_then(|()| platform::read_clipboard())
+        }
+        "computer_write_clipboard" => ensure_exact_payload_fields(&payload, &["text"])
+            .and_then(|()| {
+                payload
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "invalid_request: clipboard text is required".to_string())
+            })
+            .and_then(platform::write_clipboard),
         "computer_key_input" => {
             ensure_exact_payload_fields(&payload, &["surface_id", "key", "modifiers"]).and_then(
                 |()| {
@@ -1925,6 +3137,46 @@ pub(crate) fn handle_computer_request(request: &ShellAgentShellRequest) -> Comma
                 },
             )
         }
+        "computer_pointer_move" | "computer_pointer_click" => {
+            ensure_exact_payload_fields(&payload, &["display_id", "snapshot_generation", "x", "y"])
+                .and_then(|()| {
+                    let display_id = payload
+                        .get("display_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "invalid_request: display_id is required".to_string())?;
+                    let snapshot_generation = payload
+                        .get("snapshot_generation")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| u32::try_from(value).ok())
+                        .filter(|value| *value > 0)
+                        .ok_or_else(|| {
+                            "invalid_request: snapshot_generation must be a positive u32"
+                                .to_string()
+                        })?;
+                    let x = payload
+                        .get("x")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| u32::try_from(value).ok())
+                        .ok_or_else(|| "invalid_request: x must be a u32".to_string())?;
+                    let y = payload
+                        .get("y")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| u32::try_from(value).ok())
+                        .ok_or_else(|| "invalid_request: y must be a u32".to_string())?;
+                    let action = if request.kind == "computer_pointer_move" {
+                        PointerAction::Move
+                    } else {
+                        PointerAction::Click
+                    };
+                    ComputerObserver::global().pointer_effect(
+                        action,
+                        display_id,
+                        snapshot_generation,
+                        x,
+                        y,
+                    )
+                })
+        }
         "computer_input_text" => {
             ensure_exact_payload_fields(&payload, &["surface_id", "element_id", "text"]).and_then(
                 |()| {
@@ -1949,6 +3201,18 @@ pub(crate) fn handle_computer_request(request: &ShellAgentShellRequest) -> Comma
                     })
                 },
             )
+        }
+        "computer_snapshot_display" => {
+            ensure_exact_payload_fields(&payload, &["display_id", "max_width", "max_height"])
+                .and_then(|()| {
+                    let display_id = payload
+                        .get("display_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "invalid_request: display_id is required".to_string())?;
+                    let max_width = optional_snapshot_dimension(&payload, "max_width")?;
+                    let max_height = optional_snapshot_dimension(&payload, "max_height")?;
+                    ComputerObserver::global().snapshot_display(display_id, max_width, max_height)
+                })
         }
         "computer_snapshot" => ensure_exact_payload_fields(&payload, &["surface_id"])
             .and_then(|()| {
@@ -2004,8 +3268,67 @@ struct PlatformWindow {
 #[cfg(not(any(target_os = "macos", windows)))]
 mod platform {
     use super::{
-        AccessibilityTreeResult, ComputerAction, ElementRecord, PlatformWindow, SurfaceRecord,
+        AccessibilityTreeResult, ApplicationRecord, ComputerAction, DisplayRecord, ElementRecord,
+        PlatformApplication, PlatformDisplay, PlatformWindow, PointerAction, PointerPlan,
+        SurfaceRecord,
     };
+
+    pub(super) fn read_clipboard() -> Result<serde_json::Value, String> {
+        Err("unsupported_platform: clipboard read is unavailable on this platform".to_string())
+    }
+
+    pub(super) fn write_clipboard(_text: &str) -> Result<serde_json::Value, String> {
+        Err("unsupported_platform: clipboard write is unavailable on this platform".to_string())
+    }
+
+    pub(super) fn prepare_pointer(
+        _display: &DisplayRecord,
+        _x: u32,
+        _y: u32,
+        _action: PointerAction,
+    ) -> Result<PointerPlan, String> {
+        Err(
+            "unsupported_platform: coordinate pointer control is unavailable on this platform"
+                .to_string(),
+        )
+    }
+
+    pub(super) fn dispatch_pointer(
+        _plan: PointerPlan,
+        _action: PointerAction,
+    ) -> Result<bool, String> {
+        Err(
+            "unsupported_platform: coordinate pointer control is unavailable on this platform"
+                .to_string(),
+        )
+    }
+    pub(super) fn list_applications(_limit: usize) -> Result<Vec<PlatformApplication>, String> {
+        Err(
+            "unsupported_platform: application discovery is unavailable on this platform"
+                .to_string(),
+        )
+    }
+
+    pub(super) fn launch_application(
+        _application_id: &str,
+        _application: &ApplicationRecord,
+    ) -> Result<serde_json::Value, String> {
+        Err("unsupported_platform: application launch is unavailable on this platform".to_string())
+    }
+
+    pub(super) fn list_displays(_limit: usize) -> Result<Vec<PlatformDisplay>, String> {
+        Err(
+            "unsupported_platform: full-display observation is unavailable on this platform"
+                .to_string(),
+        )
+    }
+
+    pub(super) fn capture_display(_display: &DisplayRecord) -> Result<(), String> {
+        Err(
+            "unsupported_platform: full-display observation is unavailable on this platform"
+                .to_string(),
+        )
+    }
 
     pub(super) fn list_windows(_limit: usize) -> Result<Vec<PlatformWindow>, String> {
         Err(
@@ -2196,8 +3519,11 @@ mod platform {
     #[cfg(any(target_os = "macos", windows))]
     use super::validate_key_input;
     use super::{
-        bounded_text, ensure_raw_capture_bound, validate_input_text, AccessibilityTreeResult,
-        ComputerAction, ElementRecord, PlatformWindow, SurfaceRecord,
+        bounded_text, clipboard_read_result_from_utf16, ensure_raw_capture_bound,
+        finish_clipboard_read, prepare_clipboard_write_text, run_clipboard_write_effect_steps,
+        validate_input_text, AccessibilityTreeResult, ApplicationRecord, ClipboardWriteEffectState,
+        ComputerAction, DisplayRecord, ElementRecord, PlatformApplication, PlatformDisplay,
+        PlatformWindow, PointerAction, PointerPlan, PreparedClipboardText, SurfaceRecord,
     };
     #[cfg(target_os = "macos")]
     use super::{
@@ -2209,7 +3535,7 @@ mod platform {
     use super::{is_supported_text_input_fingerprint, ElementFingerprint};
     use serde_json::{json, Value};
     use sha2::{Digest, Sha256};
-    use xcap::Window;
+    use xcap::{Monitor, Window};
 
     #[cfg(target_os = "macos")]
     use objc2_application_services::{
@@ -2240,13 +3566,24 @@ mod platform {
     };
     #[cfg(windows)]
     use windows::{
-        core::{IUnknown, Interface},
+        core::{w, IUnknown, Interface, PCWSTR},
         Win32::{
-            Foundation::{E_NOINTERFACE, E_POINTER, HWND as WinHwnd, RPC_E_CHANGED_MODE},
+            Foundation::{
+                GetLastError, GlobalFree, SetLastError, E_NOINTERFACE, E_POINTER, HANDLE, HGLOBAL,
+                HWND as WinHwnd, POINT, RPC_E_CHANGED_MODE, WIN32_ERROR,
+            },
+            Graphics::Gdi::{EnumDisplayDevicesW, DISPLAY_DEVICEW},
             System::Com::{
-                CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+                CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IBindCtx,
+                CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
                 COINIT_MULTITHREADED,
             },
+            System::DataExchange::{
+                CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable,
+                OpenClipboard, SetClipboardData,
+            },
+            System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE},
+            System::Ole::CF_UNICODETEXT,
             UI::Accessibility::{
                 CUIAutomation8, IUIAutomation2, IUIAutomationElement, IUIAutomationInvokePattern,
                 IUIAutomationScrollItemPattern, IUIAutomationTreeWalker, IUIAutomationValuePattern,
@@ -2265,14 +3602,32 @@ mod platform {
                 UIA_WindowControlTypeId, UIA_CONTROLTYPE_ID, UIA_E_ELEMENTNOTAVAILABLE,
                 UIA_E_NOTSUPPORTED, UIA_PATTERN_ID,
             },
-            UI::Input::KeyboardAndMouse::{
-                GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-                KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL,
-                VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT,
-                VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU,
-                VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_TAB, VK_UP,
+            UI::HiDpi::{
+                SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT,
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
             },
-            UI::WindowsAndMessaging::{GetForegroundWindow, IsIconic, ShowWindowAsync, SW_RESTORE},
+            UI::Input::KeyboardAndMouse::{
+                GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE,
+                KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
+                MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE,
+                MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY, VK_CONTROL,
+                VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LBUTTON, VK_LCONTROL, VK_LEFT, VK_LMENU,
+                VK_LSHIFT, VK_LWIN, VK_MBUTTON, VK_MENU, VK_NEXT, VK_PRIOR, VK_RBUTTON,
+                VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_TAB,
+                VK_UP, VK_XBUTTON1, VK_XBUTTON2,
+            },
+            UI::Shell::{
+                Common::ITEMIDLIST, FOLDERID_AppsFolder, IEnumIDList, ILCombine, ILGetSize,
+                IShellFolder, IShellItem, SHCreateItemFromIDList, SHGetDesktopFolder,
+                SHGetKnownFolderIDList, ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_IDLIST,
+                SHCONTF_FOLDERS, SHCONTF_NONFOLDERS, SHELLEXECUTEINFOW, SIGDN_NORMALDISPLAY,
+            },
+            UI::WindowsAndMessaging::{
+                CreateWindowExW, DestroyWindow, GetCursorPos, GetForegroundWindow,
+                GetSystemMetrics, IsIconic, ShowWindowAsync, EDD_GET_DEVICE_INTERFACE_NAME,
+                HWND_MESSAGE, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+                SM_YVIRTUALSCREEN, SW_RESTORE, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WINDOW_STYLE,
+            },
         },
     };
     #[cfg(windows)]
@@ -2286,6 +3641,1161 @@ mod platform {
         },
         Storage::Xps::PrintWindow,
     };
+
+    #[cfg(windows)]
+    const MAX_NATIVE_APPLICATION_IDENTITY_BYTES: usize = 64 * 1024;
+    #[cfg(windows)]
+    const MAX_NATIVE_DISPLAY_IDENTITY_BYTES: usize = 2048;
+    #[cfg(windows)]
+    const MAX_WINDOWS_DISPLAY_DEVICE_CHILDREN: u32 = 16;
+    #[cfg(windows)]
+    const MAX_WINDOWS_DISPLAY_SCAN: usize = 64;
+
+    #[cfg(windows)]
+    struct OwnedPidl(*mut ITEMIDLIST);
+
+    #[cfg(windows)]
+    impl OwnedPidl {
+        fn from_raw(raw: *mut ITEMIDLIST) -> Result<Self, String> {
+            if raw.is_null() {
+                Err(
+                    "application_failed: Windows Shell returned a null application identity"
+                        .to_string(),
+                )
+            } else {
+                Ok(Self(raw))
+            }
+        }
+
+        fn as_ptr(&self) -> *const ITEMIDLIST {
+            self.0.cast_const()
+        }
+
+        fn identity_bytes(&self) -> Result<Vec<u8>, String> {
+            let bytes = unsafe { ILGetSize(Some(self.as_ptr())) } as usize;
+            if bytes == 0 || bytes > MAX_NATIVE_APPLICATION_IDENTITY_BYTES {
+                return Err(
+                    "application_failed: Windows application identity exceeds bound".to_string(),
+                );
+            }
+            Ok(unsafe { std::slice::from_raw_parts(self.0.cast::<u8>(), bytes) }.to_vec())
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for OwnedPidl {
+        fn drop(&mut self) {
+            unsafe { CoTaskMemFree(Some(self.0 as *const std::ffi::c_void)) };
+        }
+    }
+
+    #[cfg(windows)]
+    struct NativeApplicationCandidate {
+        display_name: String,
+        native_identity: Vec<u8>,
+        pidl: OwnedPidl,
+    }
+
+    #[cfg(windows)]
+    struct ShellComInitialization;
+
+    #[cfg(windows)]
+    impl ShellComInitialization {
+        fn new() -> Result<Self, String> {
+            let result =
+                unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+            if result.is_ok() {
+                Ok(Self)
+            } else if result == RPC_E_CHANGED_MODE {
+                Err(
+                    "application_failed: Windows Shell requires a compatible STA COM apartment"
+                        .to_string(),
+                )
+            } else {
+                Err("application_failed: Windows Shell COM initialization failed".to_string())
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for ShellComInitialization {
+        fn drop(&mut self) {
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    #[cfg(windows)]
+    fn application_com() -> Result<ShellComInitialization, String> {
+        ShellComInitialization::new()
+    }
+
+    #[cfg(windows)]
+    fn windows_apps_folder() -> Result<(OwnedPidl, IShellFolder), String> {
+        let root = unsafe { SHGetKnownFolderIDList(&FOLDERID_AppsFolder, 0, None) }
+            .map_err(|_| "application_failed: Windows AppsFolder is unavailable".to_string())
+            .and_then(OwnedPidl::from_raw)?;
+        let desktop = unsafe { SHGetDesktopFolder() }.map_err(|_| {
+            "application_failed: Windows Shell desktop folder is unavailable".to_string()
+        })?;
+        let folder: IShellFolder = unsafe {
+            desktop.BindToObject(root.as_ptr(), None::<&IBindCtx>)
+        }
+        .map_err(|_| "application_failed: Windows AppsFolder could not be bound".to_string())?;
+        Ok((root, folder))
+    }
+
+    #[cfg(windows)]
+    fn display_name_for_application(pidl: &OwnedPidl) -> Result<String, String> {
+        let item: IShellItem = unsafe { SHCreateItemFromIDList(pidl.as_ptr()) }.map_err(|_| {
+            "application_failed: Windows application Shell item is unavailable".to_string()
+        })?;
+        let display = unsafe { item.GetDisplayName(SIGDN_NORMALDISPLAY) }.map_err(|_| {
+            "application_failed: Windows application display name is unavailable".to_string()
+        })?;
+        let text = unsafe { display.to_string() }.map_err(|_| {
+            "application_failed: Windows application display name is invalid".to_string()
+        });
+        unsafe { CoTaskMemFree(Some(display.0 as *const std::ffi::c_void)) };
+        let text = text?;
+        if text.is_empty() || text.contains('\0') {
+            Err("application_failed: Windows application display name is invalid".to_string())
+        } else {
+            Ok(text)
+        }
+    }
+
+    #[cfg(windows)]
+    fn enumerate_native_applications(
+        limit: usize,
+    ) -> Result<Vec<NativeApplicationCandidate>, String> {
+        let _com = application_com()?;
+        let (root, folder) = windows_apps_folder()?;
+        let mut enumerator: Option<IEnumIDList> = None;
+        let flags = (SHCONTF_FOLDERS.0 | SHCONTF_NONFOLDERS.0) as u32;
+        let hr =
+            unsafe { folder.EnumObjects(WinHwnd(std::ptr::null_mut()), flags, &mut enumerator) };
+        if hr.is_err() {
+            return Err("application_failed: Windows AppsFolder enumeration failed".to_string());
+        }
+        let Some(enumerator) = enumerator else {
+            return Ok(Vec::new());
+        };
+        let mut applications = Vec::with_capacity(limit.min(16));
+        while applications.len() < limit {
+            let mut items = [std::ptr::null_mut()];
+            let mut fetched = 0u32;
+            let hr = unsafe { enumerator.Next(&mut items, Some(&mut fetched)) };
+            if hr.is_err() {
+                return Err("application_failed: Windows AppsFolder enumeration failed".to_string());
+            }
+            if fetched == 0 {
+                break;
+            }
+            if fetched != 1 || items[0].is_null() {
+                return Err(
+                    "application_failed: Windows AppsFolder returned invalid enumeration metadata"
+                        .to_string(),
+                );
+            }
+            let relative = OwnedPidl::from_raw(items[0])?;
+            let absolute = OwnedPidl::from_raw(unsafe {
+                ILCombine(Some(root.as_ptr()), Some(relative.as_ptr()))
+            })?;
+            let native_identity = absolute.identity_bytes()?;
+            let display_name = display_name_for_application(&absolute)?;
+            applications.push(NativeApplicationCandidate {
+                display_name,
+                native_identity,
+                pidl: absolute,
+            });
+        }
+        Ok(applications)
+    }
+
+    #[cfg(windows)]
+    pub(super) fn list_applications(limit: usize) -> Result<Vec<PlatformApplication>, String> {
+        enumerate_native_applications(limit).map(|applications| {
+            let mut applications = applications
+                .into_iter()
+                .map(|application| PlatformApplication {
+                    display_name: application.display_name,
+                    native_identity: application.native_identity,
+                })
+                .collect::<Vec<_>>();
+            super::sort_application_candidates(&mut applications);
+            applications
+        })
+    }
+
+    #[cfg(windows)]
+    fn revalidate_application_identity(native_identity: &[u8]) -> Result<OwnedPidl, String> {
+        let applications = enumerate_native_applications(super::MAX_APPLICATION_SCAN)?;
+        applications
+            .into_iter()
+            .find(|candidate| candidate.native_identity == native_identity)
+            .map(|candidate| candidate.pidl)
+            .ok_or_else(|| {
+                "stale_application: native application identity changed or disappeared".to_string()
+            })
+    }
+
+    #[cfg(windows)]
+    fn shell_execute_info_for_application(pidl: *const ITEMIDLIST) -> SHELLEXECUTEINFOW {
+        let mut info = SHELLEXECUTEINFOW::default();
+        info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+        info.fMask = SEE_MASK_IDLIST | SEE_MASK_FLAG_NO_UI;
+        info.lpIDList = pidl as *mut std::ffi::c_void;
+        // Launch submission must not itself request window activation/focus.
+        info.nShow = SW_SHOWNOACTIVATE.0;
+        info
+    }
+
+    #[cfg(windows)]
+    pub(super) fn launch_application(
+        application_id: &str,
+        application: &ApplicationRecord,
+    ) -> Result<Value, String> {
+        // Hold a dedicated Shell-compatible STA COM apartment through exact
+        // revalidation and native dispatch. An incompatible pre-existing apartment
+        // fails closed before ShellExecuteExW is reached.
+        let _com = application_com()?;
+        // Every failure above ShellExecuteExW is definite pre-effect. Only the
+        // exact fresh PIDL returned by revalidation may reach native dispatch.
+        let pidl = revalidate_application_identity(&application.native_identity)?;
+        let mut info = shell_execute_info_for_application(pidl.as_ptr());
+        unsafe { ShellExecuteExW(&mut info) }.map_err(|_| {
+            "outcome_unknown: Windows application launch result was ambiguous after native dispatch attempt"
+                .to_string()
+        })?;
+        Ok(json!({
+            "platform": "windows",
+            "application_id": application_id,
+            "success": true,
+        }))
+    }
+
+    #[cfg(all(test, windows))]
+    pub(super) fn application_identity_revalidates_for_test(
+        native_identity: &[u8],
+    ) -> Result<(), String> {
+        revalidate_application_identity(native_identity).map(drop)
+    }
+
+    #[cfg(all(test, windows))]
+    pub(super) fn application_shell_execute_contract_for_test(
+        native_identity: &[u8],
+    ) -> Result<bool, String> {
+        let pidl = revalidate_application_identity(native_identity)?;
+        let info = shell_execute_info_for_application(pidl.as_ptr());
+        Ok(info.fMask & SEE_MASK_IDLIST != 0
+            && info.lpIDList == pidl.as_ptr() as *mut std::ffi::c_void
+            && info.lpFile.0.is_null()
+            && info.lpParameters.0.is_null()
+            && info.lpDirectory.0.is_null()
+            && info.nShow == SW_SHOWNOACTIVATE.0)
+    }
+
+    #[cfg(windows)]
+    struct ClipboardOpenGuard {
+        open: bool,
+    }
+
+    #[cfg(windows)]
+    impl ClipboardOpenGuard {
+        fn open(owner: Option<WinHwnd>, error: &'static str) -> Result<Self, String> {
+            unsafe { OpenClipboard(owner) }.map_err(|_| error.to_string())?;
+            Ok(Self { open: true })
+        }
+
+        fn close_once(&mut self) -> bool {
+            if !self.open {
+                return false;
+            }
+            let closed = unsafe { CloseClipboard() }.is_ok();
+            // A reported close failure still fails the operation, but keep Drop armed for
+            // one best-effort cleanup attempt so the shared clipboard is not deliberately
+            // left open for the lifetime of the Runner. This never retries clipboard data.
+            self.record_close_result(closed)
+        }
+
+        fn record_close_result(&mut self, closed: bool) -> bool {
+            if closed {
+                self.open = false;
+            }
+            closed
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for ClipboardOpenGuard {
+        fn drop(&mut self) {
+            if self.open {
+                self.open = false;
+                let _ = unsafe { CloseClipboard() };
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn unlock_clipboard_global(handle: HGLOBAL) -> Result<(), String> {
+        // GlobalUnlock returns zero both when the final lock is successfully released
+        // and on failure. Clear last-error first so the two cases remain distinguishable.
+        unsafe { SetLastError(WIN32_ERROR(0)) };
+        let result = unsafe { GlobalUnlock(handle) };
+        if result.is_ok() || unsafe { GetLastError() }.0 == 0 {
+            Ok(())
+        } else {
+            Err("clipboard_failed: GlobalUnlock failed".to_string())
+        }
+    }
+
+    #[cfg(windows)]
+    struct OwnedClipboardGlobal {
+        handle: Option<HGLOBAL>,
+    }
+
+    #[cfg(windows)]
+    impl OwnedClipboardGlobal {
+        fn allocate(prepared: &PreparedClipboardText) -> Result<Self, String> {
+            if prepared.storage_bytes == 0
+                || prepared.storage_bytes > super::MAX_CLIPBOARD_NATIVE_STORAGE_BYTES
+                || prepared.utf16.len().checked_mul(std::mem::size_of::<u16>())
+                    != Some(prepared.storage_bytes)
+            {
+                return Err(
+                    "not_started: clipboard native allocation metadata is invalid".to_string(),
+                );
+            }
+            let handle = unsafe { GlobalAlloc(GMEM_MOVEABLE, prepared.storage_bytes) }
+                .map_err(|_| "not_started: GlobalAlloc failed for clipboard text".to_string())?;
+            let owned = Self {
+                handle: Some(handle),
+            };
+            let locked = unsafe { GlobalLock(handle) };
+            if locked.is_null() {
+                return Err("not_started: GlobalLock failed for clipboard text".to_string());
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    prepared.utf16.as_ptr(),
+                    locked.cast::<u16>(),
+                    prepared.utf16.len(),
+                );
+            }
+            unlock_clipboard_global(handle).map_err(|_| {
+                "not_started: GlobalUnlock failed for prepared clipboard text".to_string()
+            })?;
+            Ok(owned)
+        }
+
+        fn data_handle(&self) -> HANDLE {
+            let handle = self.handle.expect("clipboard global memory ownership");
+            HANDLE(handle.0)
+        }
+
+        fn transfer_to_windows(&mut self) {
+            self.handle = None;
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for OwnedClipboardGlobal {
+        fn drop(&mut self) {
+            if let Some(handle) = self.handle.take() {
+                // GlobalFree returns NULL on successful free, while the windows crate
+                // Result wrapper treats NULL as an error. The call itself is authoritative;
+                // no retry is attempted here.
+                let _ = unsafe { GlobalFree(Some(handle)) };
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn validate_clipboard_owner_hwnd(owner: WinHwnd) -> Result<(), String> {
+        if owner.0.is_null() {
+            Err("not_started: Runner-owned clipboard HWND is null".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(all(test, windows))]
+    pub(super) fn clipboard_owner_hwnd_contract_for_test(non_null: bool) -> bool {
+        let raw = if non_null {
+            std::ptr::NonNull::<u8>::dangling()
+                .as_ptr()
+                .cast::<std::ffi::c_void>()
+        } else {
+            std::ptr::null_mut()
+        };
+        validate_clipboard_owner_hwnd(WinHwnd(raw)).is_ok()
+    }
+
+    #[cfg(all(test, windows))]
+    pub(super) fn clipboard_close_cleanup_armed_for_test(close_succeeded: bool) -> bool {
+        let mut guard = ClipboardOpenGuard { open: true };
+        let _ = guard.record_close_result(close_succeeded);
+        let cleanup_armed = guard.open;
+        // Prevent the synthetic test guard from touching the real process clipboard in Drop.
+        guard.open = false;
+        cleanup_armed
+    }
+
+    #[cfg(windows)]
+    struct OwnedClipboardWindow(WinHwnd);
+
+    #[cfg(windows)]
+    impl OwnedClipboardWindow {
+        fn new() -> Result<Self, String> {
+            // Use the system STATIC class as a short-lived message-only window. This
+            // creates a non-NULL Runner-owned HWND without activating/focusing user UI
+            // and requires no custom WndProc or message-loop framework.
+            let owner = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("STATIC"),
+                    w!(""),
+                    WINDOW_STYLE(0),
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(HWND_MESSAGE),
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .map_err(|_| {
+                "not_started: failed to create Runner-owned clipboard window".to_string()
+            })?;
+            validate_clipboard_owner_hwnd(owner)?;
+            Ok(Self(owner))
+        }
+
+        fn hwnd(&self) -> WinHwnd {
+            self.0
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for OwnedClipboardWindow {
+        fn drop(&mut self) {
+            let _ = unsafe { DestroyWindow(self.0) };
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn read_clipboard() -> Result<Value, String> {
+        let mut clipboard = ClipboardOpenGuard::open(
+            None,
+            "clipboard_busy: OpenClipboard failed for bounded clipboard read",
+        )?;
+        let read_result = (|| {
+            if unsafe { IsClipboardFormatAvailable(u32::from(CF_UNICODETEXT.0)) }.is_err() {
+                return clipboard_read_result_from_utf16(None, 0);
+            }
+            let data = unsafe { GetClipboardData(u32::from(CF_UNICODETEXT.0)) }.map_err(|_| {
+                "clipboard_failed: GetClipboardData(CF_UNICODETEXT) failed".to_string()
+            })?;
+            let global = HGLOBAL(data.0);
+            let native_storage_bytes = unsafe { GlobalSize(global) };
+            if native_storage_bytes == 0 {
+                return Err("clipboard_malformed: clipboard Unicode storage is empty".to_string());
+            }
+            if native_storage_bytes > super::MAX_CLIPBOARD_NATIVE_STORAGE_BYTES {
+                return Err(
+                    "clipboard_too_large: clipboard Unicode storage exceeds the bounded native range"
+                        .to_string(),
+                );
+            }
+            if native_storage_bytes % std::mem::size_of::<u16>() != 0 {
+                return Err(
+                    "clipboard_malformed: clipboard Unicode storage has odd byte length"
+                        .to_string(),
+                );
+            }
+            let locked = unsafe { GlobalLock(global) };
+            if locked.is_null() {
+                return Err("clipboard_failed: GlobalLock failed for clipboard read".to_string());
+            }
+            let units = native_storage_bytes / std::mem::size_of::<u16>();
+            let storage = unsafe { std::slice::from_raw_parts(locked.cast::<u16>(), units) };
+            let decoded = clipboard_read_result_from_utf16(Some(storage), native_storage_bytes);
+            let unlock = unlock_clipboard_global(global);
+            match (decoded, unlock) {
+                (_, Err(error)) => Err(error),
+                (result, Ok(())) => result,
+            }
+        })();
+        finish_clipboard_read(read_result, || clipboard.close_once())
+    }
+
+    #[cfg(windows)]
+    pub(super) fn write_clipboard(text: &str) -> Result<Value, String> {
+        // Everything below through owner creation is pre-effect preparation.
+        let prepared = prepare_clipboard_write_text(text)?;
+        let mut global = OwnedClipboardGlobal::allocate(&prepared)?;
+        let owner = OwnedClipboardWindow::new()?;
+        let mut clipboard = ClipboardOpenGuard::open(
+            Some(owner.hwnd()),
+            "not_started: OpenClipboard failed before clipboard state changed",
+        )?;
+
+        let effect = run_clipboard_write_effect_steps(
+            || unsafe { EmptyClipboard() }.is_ok(),
+            || {
+                let result = unsafe {
+                    SetClipboardData(u32::from(CF_UNICODETEXT.0), Some(global.data_handle()))
+                };
+                if result.is_ok() {
+                    // SetClipboardData success transfers HGLOBAL ownership to Windows.
+                    global.transfer_to_windows();
+                    true
+                } else {
+                    false
+                }
+            },
+            || clipboard.close_once(),
+        );
+
+        match effect {
+            ClipboardWriteEffectState::NotStarted => Err(
+                "not_started: EmptyClipboard failed before clipboard content changed".to_string(),
+            ),
+            ClipboardWriteEffectState::OutcomeUnknown => Err(
+                "outcome_unknown: clipboard state changed after EmptyClipboard but the complete CF_UNICODETEXT replacement could not be proven"
+                    .to_string(),
+            ),
+            ClipboardWriteEffectState::Success => Ok(json!({
+                "platform": "windows",
+                "text_bytes": prepared.text_bytes,
+                "success": true,
+            })),
+        }
+    }
+
+    #[cfg(windows)]
+    fn fixed_utf16_string(value: &[u16]) -> Result<String, String> {
+        let end = value
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(value.len());
+        String::from_utf16(&value[..end])
+            .map_err(|_| "display_failed: Windows display identity is invalid UTF-16".to_string())
+    }
+
+    #[cfg(windows)]
+    fn windows_display_identity(monitor: &Monitor) -> Result<Vec<u8>, String> {
+        let adapter = monitor.name().map_err(|_| {
+            "display_failed: Windows display adapter identity is unavailable".to_string()
+        })?;
+        if adapter.is_empty() || adapter.contains('\0') || adapter.len() > 512 {
+            return Err("display_failed: Windows display adapter identity is invalid".to_string());
+        }
+        let mut adapter_wide = adapter.encode_utf16().collect::<Vec<_>>();
+        adapter_wide.push(0);
+        let adapter_wide = PCWSTR(adapter_wide.as_ptr());
+        let mut interface_id: Option<String> = None;
+        for index in 0..MAX_WINDOWS_DISPLAY_DEVICE_CHILDREN {
+            let mut device = DISPLAY_DEVICEW::default();
+            device.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+            let found = unsafe {
+                EnumDisplayDevicesW(
+                    adapter_wide,
+                    index,
+                    &mut device,
+                    EDD_GET_DEVICE_INTERFACE_NAME,
+                )
+            }
+            .as_bool();
+            if !found {
+                break;
+            }
+            let candidate = fixed_utf16_string(&device.DeviceID)?;
+            if candidate.is_empty() {
+                continue;
+            }
+            if interface_id.is_some() {
+                return Err(
+                    "display_failed: Windows display adapter has ambiguous monitor identity"
+                        .to_string(),
+                );
+            }
+            interface_id = Some(candidate);
+        }
+        let interface_id = interface_id.ok_or_else(|| {
+            "display_failed: Windows display monitor interface identity is unavailable".to_string()
+        })?;
+        let mut identity = b"windows-display-v1\0".to_vec();
+        identity.extend_from_slice(adapter.to_ascii_lowercase().as_bytes());
+        identity.push(0);
+        identity.extend_from_slice(interface_id.to_ascii_lowercase().as_bytes());
+        if identity.len() > MAX_NATIVE_DISPLAY_IDENTITY_BYTES {
+            return Err("display_failed: Windows display identity exceeds bound".to_string());
+        }
+        Ok(identity)
+    }
+
+    #[cfg(windows)]
+    fn platform_display_from_monitor(monitor: &Monitor) -> Result<PlatformDisplay, String> {
+        let native_identity = windows_display_identity(monitor)?;
+        let width = monitor
+            .width()
+            .map_err(|_| "display_failed: Windows display width is unavailable".to_string())?;
+        let height = monitor
+            .height()
+            .map_err(|_| "display_failed: Windows display height is unavailable".to_string())?;
+        let primary = monitor.is_primary().map_err(|_| {
+            "display_failed: Windows display primary state is unavailable".to_string()
+        })?;
+        if width == 0 || height == 0 {
+            return Err("display_failed: Windows display geometry is invalid".to_string());
+        }
+        Ok(PlatformDisplay {
+            native_identity,
+            width,
+            height,
+            primary,
+        })
+    }
+
+    #[cfg(windows)]
+    fn windows_monitors() -> Result<Vec<Monitor>, String> {
+        let monitors = Monitor::all()
+            .map_err(|_| "display_failed: Windows display enumeration failed".to_string())?;
+        if monitors.len() > MAX_WINDOWS_DISPLAY_SCAN {
+            return Err(
+                "display_failed: Windows display count exceeds native scan bound".to_string(),
+            );
+        }
+        Ok(monitors)
+    }
+
+    #[cfg(windows)]
+    pub(super) fn list_displays(limit: usize) -> Result<Vec<PlatformDisplay>, String> {
+        if limit == 0 || limit > super::MAX_DISPLAYS + 1 {
+            return Err("invalid_request: display discovery native limit is invalid".to_string());
+        }
+        windows_monitors()?
+            .into_iter()
+            .take(limit)
+            .map(|monitor| platform_display_from_monitor(&monitor))
+            .collect()
+    }
+
+    #[cfg(windows)]
+    fn find_exact_display(display: &DisplayRecord) -> Result<Monitor, String> {
+        let mut exact = None;
+        for monitor in windows_monitors()? {
+            let candidate = platform_display_from_monitor(&monitor)?;
+            if candidate.native_identity != display.native_identity {
+                continue;
+            }
+            if candidate.width != display.width || candidate.height != display.height {
+                return Err(
+                    "stale_display: native display geometry changed after discovery".to_string(),
+                );
+            }
+            if exact.is_some() {
+                return Err(
+                    "stale_display: native display identity is no longer unique".to_string()
+                );
+            }
+            exact = Some(monitor);
+        }
+        exact.ok_or_else(|| {
+            "stale_display: native display identity changed or disappeared".to_string()
+        })
+    }
+
+    #[cfg(windows)]
+    pub(super) fn capture_display(display: &DisplayRecord) -> Result<image::RgbaImage, String> {
+        ensure_capture_permission()?;
+        let monitor = find_exact_display(display)?;
+        ensure_raw_capture_bound(display.width, display.height)?;
+        let image = monitor
+            .capture_image()
+            .map_err(|_| "capture_failed: Windows display capture failed".to_string())?;
+        if image.width() != display.width || image.height() != display.height {
+            return Err(
+                "capture_failed: Windows display capture geometry does not match the exact display"
+                    .to_string(),
+            );
+        }
+        // Revalidate again after capture so a hotplug/replacement racing the read
+        // causes the captured bytes to be discarded instead of accepted under a stale handle.
+        find_exact_display(display)?;
+        Ok(image)
+    }
+
+    #[cfg(windows)]
+    pub(super) struct PointerCoordinateContext {
+        previous: DPI_AWARENESS_CONTEXT,
+    }
+
+    #[cfg(windows)]
+    impl Drop for PointerCoordinateContext {
+        fn drop(&mut self) {
+            let restored = unsafe { SetThreadDpiAwarenessContext(self.previous) };
+            debug_assert!(!restored.0.is_null());
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn enter_pointer_coordinate_context() -> Result<PointerCoordinateContext, String> {
+        let previous =
+            unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        if previous.0.is_null() {
+            return Err(
+                "pointer_input_failed: Windows per-monitor DPI coordinate context is unavailable"
+                    .to_string(),
+            );
+        }
+        Ok(PointerCoordinateContext { previous })
+    }
+
+    #[cfg(windows)]
+    fn windows_virtual_desktop_metrics() -> Result<(i32, i32, u32, u32), String> {
+        let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+        let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+        let width =
+            u32::try_from(unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }).map_err(|_| {
+                "pointer_input_failed: Windows virtual desktop width is invalid".to_string()
+            })?;
+        let height =
+            u32::try_from(unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) }).map_err(|_| {
+                "pointer_input_failed: Windows virtual desktop height is invalid".to_string()
+            })?;
+        if width == 0 || height == 0 {
+            return Err(
+                "pointer_input_failed: Windows virtual desktop geometry is empty".to_string(),
+            );
+        }
+        Ok((left, top, width, height))
+    }
+
+    #[cfg(windows)]
+    fn windows_monitor_rect(monitor: &Monitor) -> Result<(i32, i32, u32, u32), String> {
+        let x = monitor.x().map_err(|_| {
+            "pointer_input_failed: Windows monitor x origin is unavailable".to_string()
+        })?;
+        let y = monitor.y().map_err(|_| {
+            "pointer_input_failed: Windows monitor y origin is unavailable".to_string()
+        })?;
+        let width = monitor.width().map_err(|_| {
+            "pointer_input_failed: Windows monitor width is unavailable".to_string()
+        })?;
+        let height = monitor.height().map_err(|_| {
+            "pointer_input_failed: Windows monitor height is unavailable".to_string()
+        })?;
+        if width == 0 || height == 0 {
+            return Err("pointer_input_failed: Windows monitor geometry is empty".to_string());
+        }
+        Ok((x, y, width, height))
+    }
+
+    #[cfg(windows)]
+    fn windows_xcap_virtual_bounds() -> Result<(i32, i32, u32, u32), String> {
+        let monitors = windows_monitors()?;
+        let mut left = i64::MAX;
+        let mut top = i64::MAX;
+        let mut right = i64::MIN;
+        let mut bottom = i64::MIN;
+        for monitor in monitors {
+            let (x, y, width, height) = windows_monitor_rect(&monitor)?;
+            let x = i64::from(x);
+            let y = i64::from(y);
+            left = left.min(x);
+            top = top.min(y);
+            right = right.max(x.checked_add(i64::from(width)).ok_or_else(|| {
+                "pointer_input_failed: Windows monitor right edge overflowed".to_string()
+            })?);
+            bottom = bottom.max(y.checked_add(i64::from(height)).ok_or_else(|| {
+                "pointer_input_failed: Windows monitor bottom edge overflowed".to_string()
+            })?);
+        }
+        if left == i64::MAX || top == i64::MAX || right <= left || bottom <= top {
+            return Err("pointer_input_failed: Windows display topology is empty".to_string());
+        }
+        let width = u32::try_from(right - left).map_err(|_| {
+            "pointer_input_failed: Windows display topology width is invalid".to_string()
+        })?;
+        let height = u32::try_from(bottom - top).map_err(|_| {
+            "pointer_input_failed: Windows display topology height is invalid".to_string()
+        })?;
+        Ok((
+            i32::try_from(left).map_err(|_| {
+                "pointer_input_failed: Windows topology left edge is invalid".to_string()
+            })?,
+            i32::try_from(top).map_err(|_| {
+                "pointer_input_failed: Windows topology top edge is invalid".to_string()
+            })?,
+            width,
+            height,
+        ))
+    }
+
+    #[cfg(windows)]
+    fn normalize_pointer_axis(offset: u32, extent: u32) -> Result<i32, String> {
+        if extent == 0 || offset >= extent {
+            return Err(
+                "pointer_input_failed: pointer coordinate is outside virtual desktop bounds"
+                    .to_string(),
+            );
+        }
+        if extent == 1 {
+            return Ok(0);
+        }
+        // A 16-bit normalized axis cannot uniquely address more than 65,536 pixels.
+        if extent > 65_536 {
+            return Err("pointer_input_failed: virtual desktop axis exceeds exact absolute-input addressability".to_string());
+        }
+        let denominator = u64::from(extent - 1);
+        let normalized = (u64::from(offset) * 65_535 + denominator / 2) / denominator;
+        i32::try_from(normalized).map_err(|_| {
+            "pointer_input_failed: normalized pointer coordinate is invalid".to_string()
+        })
+    }
+
+    #[cfg(windows)]
+    fn map_windows_pointer_coordinate(
+        monitor_x: i32,
+        monitor_y: i32,
+        source_width: u32,
+        source_height: u32,
+        virtual_left: i32,
+        virtual_top: i32,
+        virtual_width: u32,
+        virtual_height: u32,
+        x: u32,
+        y: u32,
+    ) -> Result<PointerPlan, String> {
+        if x >= source_width || y >= source_height {
+            return Err(
+                "invalid_request: pointer coordinate is outside snapshot source geometry"
+                    .to_string(),
+            );
+        }
+        let global_x = i64::from(monitor_x)
+            .checked_add(i64::from(x))
+            .ok_or_else(|| "pointer_input_failed: global x coordinate overflowed".to_string())?;
+        let global_y = i64::from(monitor_y)
+            .checked_add(i64::from(y))
+            .ok_or_else(|| "pointer_input_failed: global y coordinate overflowed".to_string())?;
+        let offset_x = global_x - i64::from(virtual_left);
+        let offset_y = global_y - i64::from(virtual_top);
+        if offset_x < 0
+            || offset_y < 0
+            || offset_x >= i64::from(virtual_width)
+            || offset_y >= i64::from(virtual_height)
+        {
+            return Err(
+                "pointer_input_failed: exact display lies outside Windows virtual desktop bounds"
+                    .to_string(),
+            );
+        }
+        Ok(PointerPlan {
+            global_x: i32::try_from(global_x)
+                .map_err(|_| "pointer_input_failed: global x coordinate is invalid".to_string())?,
+            global_y: i32::try_from(global_y)
+                .map_err(|_| "pointer_input_failed: global y coordinate is invalid".to_string())?,
+            normalized_x: normalize_pointer_axis(u32::try_from(offset_x).unwrap(), virtual_width)?,
+            normalized_y: normalize_pointer_axis(u32::try_from(offset_y).unwrap(), virtual_height)?,
+        })
+    }
+
+    #[cfg(windows)]
+    fn validate_windows_pointer_state_with(
+        action: PointerAction,
+        mut is_down: impl FnMut(VIRTUAL_KEY) -> bool,
+    ) -> Result<(), String> {
+        for key in [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2] {
+            if is_down(key) {
+                return Err(
+                    "pointer_input_failed: shared desktop mouse button is already down".to_string(),
+                );
+            }
+        }
+        if action == PointerAction::Click {
+            for key in [
+                VK_SHIFT,
+                VK_LSHIFT,
+                VK_RSHIFT,
+                VK_CONTROL,
+                VK_LCONTROL,
+                VK_RCONTROL,
+                VK_MENU,
+                VK_LMENU,
+                VK_RMENU,
+                VK_LWIN,
+                VK_RWIN,
+            ] {
+                if is_down(key) {
+                    return Err(
+                        "pointer_input_failed: modifier or Windows key is already down".to_string(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn validate_windows_pointer_state(action: PointerAction) -> Result<(), String> {
+        validate_windows_pointer_state_with(action, |key| unsafe {
+            GetAsyncKeyState(i32::from(key.0)) < 0
+        })
+    }
+
+    #[cfg(windows)]
+    fn validate_windows_pointer_coordinate_spaces(
+        virtual_metrics: (i32, i32, u32, u32),
+        xcap_bounds: (i32, i32, u32, u32),
+    ) -> Result<(), String> {
+        if virtual_metrics == xcap_bounds {
+            Ok(())
+        } else {
+            Err("pointer_input_failed: Windows DPI/topology coordinate spaces cannot be proven identical".to_string())
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn prepare_pointer(
+        display: &DisplayRecord,
+        x: u32,
+        y: u32,
+        action: PointerAction,
+    ) -> Result<PointerPlan, String> {
+        let monitor = find_exact_display(display)?;
+        let (monitor_x, monitor_y, monitor_width, monitor_height) = windows_monitor_rect(&monitor)?;
+        if monitor_width != display.width || monitor_height != display.height {
+            return Err(
+                "stale_display: native display source geometry changed before pointer input"
+                    .to_string(),
+            );
+        }
+        let virtual_metrics = windows_virtual_desktop_metrics()?;
+        let xcap_bounds = windows_xcap_virtual_bounds()?;
+        validate_windows_pointer_coordinate_spaces(virtual_metrics, xcap_bounds)?;
+        let plan = map_windows_pointer_coordinate(
+            monitor_x,
+            monitor_y,
+            display.width,
+            display.height,
+            virtual_metrics.0,
+            virtual_metrics.1,
+            virtual_metrics.2,
+            virtual_metrics.3,
+            x,
+            y,
+        )?;
+        let fresh = find_exact_display(display)?;
+        let fresh_rect = windows_monitor_rect(&fresh)?;
+        if fresh_rect != (monitor_x, monitor_y, monitor_width, monitor_height) {
+            return Err(
+                "stale_display: native display placement changed during pointer preflight"
+                    .to_string(),
+            );
+        }
+        validate_windows_pointer_state(action)?;
+        Ok(plan)
+    }
+
+    #[cfg(windows)]
+    fn windows_mouse_input(plan: PointerPlan, flags: MOUSE_EVENT_FLAGS) -> INPUT {
+        INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: plan.normalized_x,
+                    dy: plan.normalized_y,
+                    mouseData: 0,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows_pointer_move_inputs(plan: PointerPlan) -> [INPUT; 1] {
+        let move_flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+        [windows_mouse_input(plan, move_flags)]
+    }
+
+    #[cfg(windows)]
+    fn windows_pointer_click_button_inputs(plan: PointerPlan) -> [INPUT; 2] {
+        [
+            windows_mouse_input(plan, MOUSEEVENTF_LEFTDOWN),
+            windows_mouse_input(plan, MOUSEEVENTF_LEFTUP),
+        ]
+    }
+
+    #[cfg(windows)]
+    fn validate_windows_pointer_move_send_input_count(inserted: u32) -> Result<(), String> {
+        if inserted == 1 {
+            Ok(())
+        } else if inserted == 0 {
+            Err("not_started: Windows pointer move SendInput inserted no events".to_string())
+        } else {
+            Err(format!(
+                "outcome_unknown: Windows pointer move SendInput reported {inserted} inserted events for one prepared move"
+            ))
+        }
+    }
+
+    #[cfg(windows)]
+    fn validate_windows_pointer_button_send_input_count(inserted: u32) -> Result<(), String> {
+        if inserted == 2 {
+            Ok(())
+        } else {
+            Err(format!(
+                "outcome_unknown: Windows pointer click button SendInput inserted {inserted} of 2 events after the exact move"
+            ))
+        }
+    }
+
+    #[cfg(windows)]
+    fn validate_windows_pointer_postcondition(
+        plan: PointerPlan,
+        action: PointerAction,
+        cursor_x: i32,
+        cursor_y: i32,
+        left_button_down: bool,
+    ) -> Result<(), String> {
+        if cursor_x != plan.global_x || cursor_y != plan.global_y {
+            return Err("outcome_unknown: Windows pointer position postcondition could not prove the exact target".to_string());
+        }
+        if action == PointerAction::Click && left_button_down {
+            return Err(
+                "outcome_unknown: Windows left mouse button remained down after click sequence"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn dispatch_windows_pointer_with(
+        plan: PointerPlan,
+        action: PointerAction,
+        mut send_input: impl FnMut(&[INPUT]) -> u32,
+        mut cursor_position: impl FnMut() -> Result<(i32, i32), String>,
+        mut validate_click_state: impl FnMut() -> Result<(), String>,
+        mut left_button_down: impl FnMut() -> bool,
+    ) -> Result<bool, String> {
+        let move_inputs = windows_pointer_move_inputs(plan);
+        validate_windows_pointer_move_send_input_count(send_input(&move_inputs))?;
+        let (cursor_x, cursor_y) = cursor_position()?;
+        validate_windows_pointer_postcondition(
+            plan,
+            PointerAction::Move,
+            cursor_x,
+            cursor_y,
+            false,
+        )?;
+        if action == PointerAction::Move {
+            return Ok(true);
+        }
+
+        if validate_click_state().is_err() {
+            return Err(
+                "outcome_unknown: shared desktop input state changed after the exact pointer move; click button events were not attempted"
+                    .to_string(),
+            );
+        }
+        let button_inputs = windows_pointer_click_button_inputs(plan);
+        validate_windows_pointer_button_send_input_count(send_input(&button_inputs))?;
+        let (cursor_x, cursor_y) = cursor_position()?;
+        validate_windows_pointer_postcondition(
+            plan,
+            PointerAction::Click,
+            cursor_x,
+            cursor_y,
+            left_button_down(),
+        )?;
+        Ok(true)
+    }
+
+    #[cfg(windows)]
+    pub(super) fn dispatch_pointer(
+        plan: PointerPlan,
+        action: PointerAction,
+    ) -> Result<bool, String> {
+        let input_size = std::mem::size_of::<INPUT>() as i32;
+        dispatch_windows_pointer_with(
+            plan,
+            action,
+            |inputs| unsafe { SendInput(inputs, input_size) },
+            || {
+                let mut point = POINT::default();
+                unsafe { GetCursorPos(&mut point) }.map_err(|_| {
+                    "outcome_unknown: Windows cursor position postcondition is unavailable"
+                        .to_string()
+                })?;
+                Ok((point.x, point.y))
+            },
+            || validate_windows_pointer_state(PointerAction::Click),
+            || unsafe { GetAsyncKeyState(i32::from(VK_LBUTTON.0)) < 0 },
+        )
+    }
+    #[cfg(target_os = "macos")]
+    pub(super) fn read_clipboard() -> Result<Value, String> {
+        Err("unsupported_platform: clipboard read is unavailable on macOS".to_string())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn write_clipboard(_text: &str) -> Result<Value, String> {
+        Err("unsupported_platform: clipboard write is unavailable on macOS".to_string())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn list_displays(_limit: usize) -> Result<Vec<PlatformDisplay>, String> {
+        Err(
+            "unsupported_platform: exact full-display observation is unavailable on macOS"
+                .to_string(),
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn capture_display(_display: &DisplayRecord) -> Result<image::RgbaImage, String> {
+        Err(
+            "unsupported_platform: exact full-display observation is unavailable on macOS"
+                .to_string(),
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn prepare_pointer(
+        _display: &DisplayRecord,
+        _x: u32,
+        _y: u32,
+        _action: PointerAction,
+    ) -> Result<PointerPlan, String> {
+        Err("unsupported_platform: coordinate pointer control is unavailable on macOS".to_string())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn dispatch_pointer(
+        _plan: PointerPlan,
+        _action: PointerAction,
+    ) -> Result<bool, String> {
+        Err("unsupported_platform: coordinate pointer control is unavailable on macOS".to_string())
+    }
+    #[cfg(target_os = "macos")]
+    pub(super) fn list_applications(_limit: usize) -> Result<Vec<PlatformApplication>, String> {
+        Err("unsupported_platform: application discovery is unavailable on macOS".to_string())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn launch_application(
+        _application_id: &str,
+        _application: &ApplicationRecord,
+    ) -> Result<Value, String> {
+        Err("unsupported_platform: application launch is unavailable on macOS".to_string())
+    }
 
     #[cfg(target_os = "macos")]
     fn ensure_capture_permission() -> Result<(), String> {
@@ -5292,6 +7802,196 @@ mod platform {
             .map_err(|error| uia_error("IUIAutomationElement::CurrentIsOffscreen", &error))
     }
     #[cfg(all(test, windows))]
+    pub(super) fn test_windows_pointer_map(
+        monitor_x: i32,
+        monitor_y: i32,
+        source_width: u32,
+        source_height: u32,
+        virtual_left: i32,
+        virtual_top: i32,
+        virtual_width: u32,
+        virtual_height: u32,
+        x: u32,
+        y: u32,
+    ) -> Result<(i32, i32, i32, i32), String> {
+        map_windows_pointer_coordinate(
+            monitor_x,
+            monitor_y,
+            source_width,
+            source_height,
+            virtual_left,
+            virtual_top,
+            virtual_width,
+            virtual_height,
+            x,
+            y,
+        )
+        .map(|plan| {
+            (
+                plan.global_x,
+                plan.global_y,
+                plan.normalized_x,
+                plan.normalized_y,
+            )
+        })
+    }
+
+    #[cfg(all(test, windows))]
+    pub(super) fn test_windows_pointer_dpi_context_metrics() -> Result<
+        (
+            (i32, i32, u32, u32),
+            (i32, i32, u32, u32),
+            (i32, i32, u32, u32),
+            (i32, i32, u32, u32),
+        ),
+        String,
+    > {
+        let before = windows_virtual_desktop_metrics()?;
+        let (during, xcap_bounds) = {
+            let _context = enter_pointer_coordinate_context()?;
+            (
+                windows_virtual_desktop_metrics()?,
+                windows_xcap_virtual_bounds()?,
+            )
+        };
+        let after = windows_virtual_desktop_metrics()?;
+        Ok((before, during, xcap_bounds, after))
+    }
+
+    #[cfg(all(test, windows))]
+    pub(super) fn test_windows_pointer_coordinate_spaces(
+        virtual_metrics: (i32, i32, u32, u32),
+        xcap_bounds: (i32, i32, u32, u32),
+    ) -> Result<(), String> {
+        validate_windows_pointer_coordinate_spaces(virtual_metrics, xcap_bounds)
+    }
+
+    #[cfg(all(test, windows))]
+    pub(super) fn test_windows_pointer_state_guard(
+        action: PointerAction,
+        down_virtual_key: Option<u16>,
+    ) -> Result<(), String> {
+        validate_windows_pointer_state_with(action, |candidate| {
+            down_virtual_key == Some(candidate.0)
+        })
+    }
+
+    #[cfg(all(test, windows))]
+    pub(super) fn test_windows_pointer_move_send_input_count(inserted: u32) -> Result<(), String> {
+        validate_windows_pointer_move_send_input_count(inserted)
+    }
+
+    #[cfg(all(test, windows))]
+    pub(super) fn test_windows_pointer_button_send_input_count(
+        inserted: u32,
+    ) -> Result<(), String> {
+        validate_windows_pointer_button_send_input_count(inserted)
+    }
+
+    #[cfg(all(test, windows))]
+    pub(super) fn test_windows_pointer_postcondition(
+        global_x: i32,
+        global_y: i32,
+        cursor_x: i32,
+        cursor_y: i32,
+        action: PointerAction,
+        left_button_down: bool,
+    ) -> Result<(), String> {
+        validate_windows_pointer_postcondition(
+            PointerPlan {
+                global_x,
+                global_y,
+                normalized_x: 0,
+                normalized_y: 0,
+            },
+            action,
+            cursor_x,
+            cursor_y,
+            left_button_down,
+        )
+    }
+
+    #[cfg(all(test, windows))]
+    pub(super) fn test_windows_pointer_input_flags(action: PointerAction) -> Vec<u32> {
+        let plan = PointerPlan {
+            global_x: 10,
+            global_y: 20,
+            normalized_x: 100,
+            normalized_y: 200,
+        };
+        let mut flags: Vec<u32> = windows_pointer_move_inputs(plan)
+            .iter()
+            .map(|input| unsafe { input.Anonymous.mi.dwFlags.0 })
+            .collect();
+        if action == PointerAction::Click {
+            flags.extend(
+                windows_pointer_click_button_inputs(plan)
+                    .iter()
+                    .map(|input| unsafe { input.Anonymous.mi.dwFlags.0 }),
+            );
+        }
+        flags
+    }
+
+    #[cfg(all(test, windows))]
+    pub(super) fn test_windows_pointer_dispatch_trace(
+        action: PointerAction,
+        move_inserted: u32,
+        first_cursor: (i32, i32),
+        click_state_down_virtual_key: Option<u16>,
+        button_inserted: u32,
+        final_cursor: (i32, i32),
+        final_left_button_down: bool,
+    ) -> (Result<bool, String>, Vec<Vec<u32>>, usize) {
+        let plan = PointerPlan {
+            global_x: 10,
+            global_y: 20,
+            normalized_x: 100,
+            normalized_y: 200,
+        };
+        let mut send_calls = 0usize;
+        let mut sent_flags = Vec::new();
+        let mut cursor_calls = 0usize;
+        let mut click_state_checks = 0usize;
+        let result = dispatch_windows_pointer_with(
+            plan,
+            action,
+            |inputs| {
+                sent_flags.push(
+                    inputs
+                        .iter()
+                        .map(|input| unsafe { input.Anonymous.mi.dwFlags.0 })
+                        .collect(),
+                );
+                let inserted = if send_calls == 0 {
+                    move_inserted
+                } else {
+                    button_inserted
+                };
+                send_calls += 1;
+                inserted
+            },
+            || {
+                let point = if cursor_calls == 0 {
+                    first_cursor
+                } else {
+                    final_cursor
+                };
+                cursor_calls += 1;
+                Ok(point)
+            },
+            || {
+                click_state_checks += 1;
+                validate_windows_pointer_state_with(PointerAction::Click, |candidate| {
+                    click_state_down_virtual_key == Some(candidate.0)
+                })
+            },
+            || final_left_button_down,
+        );
+        (result, sent_flags, click_state_checks)
+    }
+
+    #[cfg(all(test, windows))]
     pub(super) fn test_windows_key_input_plan(
         key: &str,
         modifiers: &[String],
@@ -5348,6 +8048,68 @@ mod windows_uia_tests {
     };
     use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
+    #[test]
+    fn windows_application_discovery_is_bounded_and_identity_revalidation_is_exact() {
+        let applications = platform::list_applications(MAX_APPLICATION_SCAN)
+            .expect("Windows AppsFolder discovery");
+        assert!(applications.len() <= MAX_APPLICATION_SCAN);
+        assert!(applications.windows(2).all(|pair| {
+            application_candidate_order(&pair[0], &pair[1]) != std::cmp::Ordering::Greater
+        }));
+        for application in &applications {
+            assert!(!application.display_name.is_empty());
+            assert!(!application.native_identity.is_empty());
+        }
+        if let Some(application) = applications.first() {
+            platform::application_identity_revalidates_for_test(&application.native_identity)
+                .expect("fresh native application identity revalidates");
+            assert!(platform::application_shell_execute_contract_for_test(
+                &application.native_identity
+            )
+            .expect("construct exact PIDL ShellExecute contract"));
+
+            let mut changed = application.native_identity.clone();
+            changed[0] ^= 0xff;
+            let error = platform::application_identity_revalidates_for_test(&changed)
+                .expect_err("changed identity must fail closed before launch");
+            assert!(error.starts_with("stale_application:"), "{error}");
+        }
+    }
+
+    #[test]
+    fn windows_pointer_dpi_context_uses_physical_monitor_space_and_restores() {
+        let (before, during, xcap_bounds, after) =
+            platform::test_windows_pointer_dpi_context_metrics().unwrap();
+        assert_eq!(during, xcap_bounds);
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn windows_display_discovery_and_exact_capture_use_private_identity() {
+        let displays = platform::list_displays(2).expect("Windows display discovery");
+        assert!(displays.len() <= 2);
+        let Some(display) = displays.first() else {
+            return;
+        };
+        assert!(!display.native_identity.is_empty());
+        assert!(display.width > 0 && display.height > 0);
+        let record = DisplayRecord {
+            native_identity: display.native_identity.clone(),
+            width: display.width,
+            height: display.height,
+            primary: display.primary,
+        };
+        let image = platform::capture_display(&record).expect("exact Windows display capture");
+        assert_eq!(image.width(), record.width);
+        assert_eq!(image.height(), record.height);
+
+        let mut changed = record.clone();
+        changed.native_identity[0] ^= 0xff;
+        let error = platform::capture_display(&changed)
+            .expect_err("changed display identity must never capture another monitor");
+        assert!(error.starts_with("stale_display:"), "{error}");
+    }
+
     fn surface_record(candidate: PlatformWindow) -> SurfaceRecord {
         SurfaceRecord {
             native_id: candidate.native_id,
@@ -5358,6 +8120,180 @@ mod windows_uia_tests {
             width: candidate.width,
             height: candidate.height,
         }
+    }
+
+    #[test]
+    fn windows_pointer_mapping_is_display_local_and_virtual_desktop_exact() {
+        let left =
+            platform::test_windows_pointer_map(-1920, 0, 1920, 1080, -1920, 0, 3840, 1080, 0, 0)
+                .unwrap();
+        assert_eq!((left.0, left.1, left.2, left.3), (-1920, 0, 0, 0));
+
+        let left_bottom_right = platform::test_windows_pointer_map(
+            -1920, 0, 1920, 1080, -1920, 0, 3840, 1080, 1919, 1079,
+        )
+        .unwrap();
+        assert_eq!((left_bottom_right.0, left_bottom_right.1), (-1, 1079));
+        assert!(left_bottom_right.2 > 0 && left_bottom_right.2 < 65_535);
+        assert_eq!(left_bottom_right.3, 65_535);
+
+        let offset = platform::test_windows_pointer_map(
+            2560, -900, 1600, 900, 0, -900, 4160, 2340, 100, 200,
+        )
+        .unwrap();
+        assert_eq!((offset.0, offset.1), (2660, -700));
+        assert!(offset.2 > 0 && offset.3 > 0);
+
+        assert!(platform::test_windows_pointer_map(
+            -1920, 0, 1920, 1080, -1920, 0, 3840, 1080, 1920, 0,
+        )
+        .unwrap_err()
+        .starts_with("invalid_request:"));
+        assert!(platform::test_windows_pointer_map(
+            0, 0, 70_000, 1080, 0, 0, 70_000, 1080, 69_999, 0,
+        )
+        .unwrap_err()
+        .starts_with("pointer_input_failed:"));
+        assert!(platform::test_windows_pointer_coordinate_spaces(
+            (-1920, 0, 3840, 1080),
+            (0, 0, 1920, 1080),
+        )
+        .unwrap_err()
+        .contains("cannot be proven identical"));
+    }
+
+    #[test]
+    fn windows_pointer_shared_input_guards_fail_closed_without_releasing_state() {
+        assert!(platform::test_windows_pointer_state_guard(PointerAction::Move, None).is_ok());
+        assert!(platform::test_windows_pointer_state_guard(PointerAction::Move, Some(16)).is_ok());
+        for down in [1u16, 2, 4, 5, 6] {
+            assert!(
+                platform::test_windows_pointer_state_guard(PointerAction::Move, Some(down))
+                    .unwrap_err()
+                    .starts_with("pointer_input_failed:")
+            );
+        }
+        for down in [1u16, 16, 17, 18, 91, 92] {
+            assert!(
+                platform::test_windows_pointer_state_guard(PointerAction::Click, Some(down))
+                    .unwrap_err()
+                    .starts_with("pointer_input_failed:")
+            );
+        }
+    }
+
+    #[test]
+    fn windows_pointer_send_input_lifecycle_and_postconditions_are_closed() {
+        assert_eq!(
+            platform::test_windows_pointer_input_flags(PointerAction::Move),
+            vec![49_153]
+        );
+        assert_eq!(
+            platform::test_windows_pointer_input_flags(PointerAction::Click),
+            vec![49_153, 2, 4]
+        );
+        assert!(platform::test_windows_pointer_move_send_input_count(1).is_ok());
+        let zero = platform::test_windows_pointer_move_send_input_count(0).unwrap_err();
+        assert!(zero.starts_with("not_started:"), "{zero}");
+        assert!(platform::test_windows_pointer_button_send_input_count(2).is_ok());
+        for inserted in [0, 1] {
+            let error =
+                platform::test_windows_pointer_button_send_input_count(inserted).unwrap_err();
+            assert!(error.starts_with("outcome_unknown:"), "{error}");
+        }
+
+        assert!(platform::test_windows_pointer_postcondition(
+            -100,
+            50,
+            -100,
+            50,
+            PointerAction::Move,
+            false,
+        )
+        .is_ok());
+        let moved_elsewhere = platform::test_windows_pointer_postcondition(
+            -100,
+            50,
+            -99,
+            50,
+            PointerAction::Move,
+            false,
+        )
+        .unwrap_err();
+        assert!(moved_elsewhere.starts_with("outcome_unknown:"));
+        assert!(platform::test_windows_pointer_postcondition(
+            10,
+            20,
+            10,
+            20,
+            PointerAction::Click,
+            false,
+        )
+        .is_ok());
+        let stuck = platform::test_windows_pointer_postcondition(
+            10,
+            20,
+            10,
+            20,
+            PointerAction::Click,
+            true,
+        )
+        .unwrap_err();
+        assert!(stuck.starts_with("outcome_unknown:"));
+
+        let (mismatch, sent, state_checks) = platform::test_windows_pointer_dispatch_trace(
+            PointerAction::Click,
+            1,
+            (9, 20),
+            None,
+            2,
+            (10, 20),
+            false,
+        );
+        assert!(mismatch.unwrap_err().starts_with("outcome_unknown:"));
+        assert_eq!(sent, vec![vec![49_153]]);
+        assert_eq!(state_checks, 0);
+
+        for button_inserted in [0, 1] {
+            let (result, sent, state_checks) = platform::test_windows_pointer_dispatch_trace(
+                PointerAction::Click,
+                1,
+                (10, 20),
+                None,
+                button_inserted,
+                (10, 20),
+                false,
+            );
+            assert!(result.unwrap_err().starts_with("outcome_unknown:"));
+            assert_eq!(sent, vec![vec![49_153], vec![2, 4]]);
+            assert_eq!(state_checks, 1);
+        }
+
+        let (held, sent, state_checks) = platform::test_windows_pointer_dispatch_trace(
+            PointerAction::Click,
+            1,
+            (10, 20),
+            Some(16),
+            2,
+            (10, 20),
+            false,
+        );
+        assert!(held.unwrap_err().starts_with("outcome_unknown:"));
+        assert_eq!(sent, vec![vec![49_153]]);
+        assert_eq!(state_checks, 1);
+
+        let (success, sent, state_checks) = platform::test_windows_pointer_dispatch_trace(
+            PointerAction::Click,
+            1,
+            (10, 20),
+            None,
+            2,
+            (10, 20),
+            false,
+        );
+        assert_eq!(success.unwrap(), true);
+        assert_eq!(sent, vec![vec![49_153], vec![2, 4]]);
+        assert_eq!(state_checks, 1);
     }
 
     const WINDOWS_CONTROL_FIXTURE_TITLE: &str = "WebCodex Windows UIA Control Smoke";

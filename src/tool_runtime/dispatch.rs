@@ -679,6 +679,9 @@ impl ToolRuntime {
 
             call @ (ToolCall::ComputerListTargets
             | ToolCall::ComputerListWindows { .. }
+            | ToolCall::ComputerListApplications { .. }
+            | ToolCall::ComputerListDisplays { .. }
+            | ToolCall::ComputerLaunchApplication { .. }
             | ToolCall::ComputerAccessibilityStatus { .. }
             | ToolCall::ComputerAccessibilityTree { .. }
             | ToolCall::ComputerFindElements { .. }
@@ -687,8 +690,13 @@ impl ToolRuntime {
             | ToolCall::ComputerControl { .. }
             | ToolCall::ComputerScrollToElement { .. }
             | ToolCall::ComputerKeyInput { .. }
+            | ToolCall::ComputerReadClipboard { .. }
+            | ToolCall::ComputerWriteClipboard { .. }
             | ToolCall::ComputerInputText { .. }
             | ToolCall::ComputerSnapshot { .. }
+            | ToolCall::ComputerSnapshotDisplay { .. }
+            | ToolCall::ComputerPointerMove { .. }
+            | ToolCall::ComputerPointerClick { .. }
             | ToolCall::ComputerSaveSnapshot { .. }) => {
                 self.dispatch_computer_tool(call, auth).await
             }

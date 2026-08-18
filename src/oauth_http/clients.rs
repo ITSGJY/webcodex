@@ -28,10 +28,21 @@ struct UpdateOAuthClientScopesRequest {
     allowed_scopes: Vec<String>,
 }
 
-/// The full default delegable OAuth scope set, used when `allowed_scopes` is
-/// omitted or empty on client creation.
-fn default_client_allowed_scopes() -> Vec<&'static str> {
-    oauth_scopes_supported().to_vec()
+/// Exact OAuth permission default that existed before application launch.
+/// Keep this list closed and explicit: adding a scope to the supported registry
+/// must never widen clients that omit or empty `allowed_scopes`.
+const LEGACY_DEFAULT_CLIENT_ALLOWED_SCOPES: &[&str] = &[
+    "runtime:read",
+    "project:read",
+    "project:write",
+    "job:run",
+    "computer:read",
+    "computer:control",
+    "account:manage",
+];
+
+fn default_client_allowed_scopes() -> &'static [&'static str] {
+    LEGACY_DEFAULT_CLIENT_ALLOWED_SCOPES
 }
 
 /// Validate a redirect URI for OAuth client registration.
@@ -66,7 +77,7 @@ fn validate_redirect_uri(uri: &str) -> Result<(), String> {
 }
 
 /// Normalize an `allowed_scopes` input for client registration. When `input`
-/// is `None` or empty, returns the full default delegable OAuth scope set.
+/// is `None` or empty, returns the stable legacy default scope set.
 /// Otherwise every scope must be a member of the global OAuth scope registry.
 /// Output is deduplicated and ordered by the global registry.
 fn normalize_client_allowed_scopes(input: Option<&[String]>) -> Result<Vec<String>, String> {

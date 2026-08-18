@@ -206,33 +206,190 @@ async fn oauth_client_create_trims_redirect_uris_before_storing() {
 }
 
 #[tokio::test]
-async fn oauth_client_create_defaults_to_full_delegable_scopes() {
+async fn oauth_client_create_omitted_and_empty_scopes_use_exact_legacy_default() {
+    const LEGACY_DEFAULT_SCOPES: &[&str] = &[
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run",
+        "computer:read",
+        "computer:control",
+        "account:manage",
+    ];
     let config = test_config(oauth2_enabled());
     let (_tmp, db) = test_db();
     let user = seed_user(&db, "alice");
     let token = seed_user_token(&db, &user);
     let service = Service::new(build_router(config, db.clone()));
+    let cases: [(&str, Option<&[&str]>); 2] = [
+        ("Omitted Default Scopes", None),
+        ("Empty Default Scopes", Some(&[])),
+    ];
+    let non_legacy_supported = oauth_scopes_supported()
+        .iter()
+        .copied()
+        .filter(|scope| !LEGACY_DEFAULT_SCOPES.contains(scope))
+        .collect::<Vec<_>>();
+    assert!(non_legacy_supported.contains(&"computer:launch"));
+    assert!(non_legacy_supported.contains(&"computer:display_read"));
+    assert!(non_legacy_supported.contains(&"computer:pointer_control"));
+    assert!(non_legacy_supported.contains(&"computer:clipboard_read"));
+    assert!(non_legacy_supported.contains(&"computer:clipboard_write"));
+
+    for (name, requested_scopes) in cases {
+        let mut resp = authorized_post_json(
+            "http://localhost/api/oauth/clients/create",
+            create_client_json(name, &["https://example.com/callback"], requested_scopes),
+            &token,
+        )
+        .send(&service)
+        .await;
+        assert_eq!(resp.status_code, Some(StatusCode::OK));
+        let body: serde_json::Value = resp.take_json().await.unwrap();
+        let scopes = body["client"]["allowed_scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|scope| scope.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(scopes.as_slice(), LEGACY_DEFAULT_SCOPES);
+        assert!(!scopes.contains(&"computer:launch"));
+        // Any current or future supported permission outside the literal legacy
+        // set must remain opt-in rather than silently joining this default.
+        for scope in &non_legacy_supported {
+            assert!(
+                !scopes.contains(scope),
+                "non-legacy scope {scope} entered default"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn oauth_client_create_accepts_explicit_computer_launch_scope() {
+    let config = test_config(oauth2_enabled());
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let token = seed_user_token(&db, &user);
+    let service = Service::new(build_router(config, db));
 
     let mut resp = authorized_post_json(
         "http://localhost/api/oauth/clients/create",
-        create_client_json("Default Scopes", &["https://example.com/callback"], None),
+        create_client_json(
+            "Launch Opt In",
+            &["https://example.com/callback"],
+            Some(&["computer:read", "computer:launch"]),
+        ),
         &token,
     )
     .send(&service)
     .await;
+    assert_eq!(resp.status_code, Some(StatusCode::OK));
     let body: serde_json::Value = resp.take_json().await.unwrap();
-    let scopes: Vec<String> = body["client"]["allowed_scopes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|s| s.as_str().unwrap().to_string())
-        .collect();
     assert_eq!(
-        scopes,
-        oauth_scopes_supported()
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
+        body["client"]["allowed_scopes"],
+        serde_json::json!(["computer:read", "computer:launch"])
+    );
+}
+
+#[tokio::test]
+async fn oauth_client_create_accepts_explicit_display_read_scope() {
+    let config = test_config(oauth2_enabled());
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let token = seed_user_token(&db, &user);
+    let service = Service::new(build_router(config, db));
+
+    let mut resp = authorized_post_json(
+        "http://localhost/api/oauth/clients/create",
+        create_client_json(
+            "Display Opt In",
+            &["https://example.com/callback"],
+            Some(&["computer:read", "computer:display_read"]),
+        ),
+        &token,
+    )
+    .send(&service)
+    .await;
+    assert_eq!(resp.status_code, Some(StatusCode::OK));
+    let body: serde_json::Value = resp.take_json().await.unwrap();
+    assert_eq!(
+        body["client"]["allowed_scopes"],
+        serde_json::json!(["computer:read", "computer:display_read"])
+    );
+}
+
+#[tokio::test]
+async fn oauth_client_create_accepts_explicit_pointer_control_scope() {
+    let config = test_config(oauth2_enabled());
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let token = seed_user_token(&db, &user);
+    let service = Service::new(build_router(config, db));
+
+    let mut resp = authorized_post_json(
+        "http://localhost/api/oauth/clients/create",
+        create_client_json(
+            "Pointer Opt In",
+            &["https://example.com/callback"],
+            Some(&[
+                "computer:read",
+                "computer:display_read",
+                "computer:control",
+                "computer:pointer_control",
+            ]),
+        ),
+        &token,
+    )
+    .send(&service)
+    .await;
+    assert_eq!(resp.status_code, Some(StatusCode::OK));
+    let body: serde_json::Value = resp.take_json().await.unwrap();
+    assert_eq!(
+        body["client"]["allowed_scopes"],
+        serde_json::json!([
+            "computer:read",
+            "computer:control",
+            "computer:display_read",
+            "computer:pointer_control"
+        ])
+    );
+}
+
+#[tokio::test]
+async fn oauth_client_create_accepts_explicit_clipboard_scopes() {
+    let config = test_config(oauth2_enabled());
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let token = seed_user_token(&db, &user);
+    let service = Service::new(build_router(config, db));
+
+    let mut resp = authorized_post_json(
+        "http://localhost/api/oauth/clients/create",
+        create_client_json(
+            "Clipboard Opt In",
+            &["https://example.com/callback"],
+            Some(&[
+                "computer:read",
+                "computer:control",
+                "computer:clipboard_read",
+                "computer:clipboard_write",
+            ]),
+        ),
+        &token,
+    )
+    .send(&service)
+    .await;
+    assert_eq!(resp.status_code, Some(StatusCode::OK));
+    let body: serde_json::Value = resp.take_json().await.unwrap();
+    assert_eq!(
+        body["client"]["allowed_scopes"],
+        serde_json::json!([
+            "computer:read",
+            "computer:control",
+            "computer:clipboard_read",
+            "computer:clipboard_write"
+        ])
     );
 }
 
