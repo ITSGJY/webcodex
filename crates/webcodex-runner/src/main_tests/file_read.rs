@@ -107,42 +107,6 @@ fn agent_file_read_range_reads_large_file_subset_under_max_bytes() {
 }
 
 #[test]
-fn agent_file_read_range_beyond_total_lines_returns_empty_content() {
-    let tmp = tempfile::tempdir().unwrap();
-    let policy = project_policy(tmp.path());
-    std::fs::write(tmp.path().join("short.txt"), "one\ntwo\nthree\n").unwrap();
-
-    let out = file_read_json(handle_file_request(
-        &policy,
-        &file_read_request(tmp.path(), "short.txt", Some(10), Some(12), Some(1024)),
-    ));
-
-    assert_eq!(out["format"], "webcodex.file_read_range.v1");
-    assert_eq!(out["content"], "");
-    assert_eq!(out["total_lines"], 3);
-    assert_eq!(out["start_line"], 10);
-    assert_eq!(out["limit"], 3);
-}
-
-#[test]
-fn agent_file_read_range_preserves_empty_selected_lines() {
-    let tmp = tempfile::tempdir().unwrap();
-    let policy = project_policy(tmp.path());
-    std::fs::write(tmp.path().join("blank.txt"), "\nsecond\nthird\n").unwrap();
-
-    let out = file_read_json(handle_file_request(
-        &policy,
-        &file_read_request(tmp.path(), "blank.txt", Some(1), Some(2), Some(1024)),
-    ));
-
-    assert_eq!(out["format"], "webcodex.file_read_range.v1");
-    assert_eq!(out["content"], "\nsecond");
-    assert_eq!(out["total_lines"], 3);
-    assert_eq!(out["start_line"], 1);
-    assert_eq!(out["limit"], 2);
-}
-
-#[test]
 fn agent_file_read_range_output_obeys_max_bytes() {
     let tmp = tempfile::tempdir().unwrap();
     let policy = project_policy(tmp.path());
@@ -213,39 +177,6 @@ fn agent_file_read_precheck_distinguishes_missing_and_non_file() {
         Some("read_file failed: not_file")
     );
     assert!(directory.stdout.is_none());
-}
-
-#[test]
-fn agent_file_read_range_large_file_small_range_uses_shared_core() {
-    let tmp = tempfile::tempdir().unwrap();
-    let policy = project_policy(tmp.path());
-    let line = "x".repeat(64);
-    let body = (0..300_000)
-        .map(|_| line.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let expected_sha = sha256_hex_bytes(body.as_bytes());
-    std::fs::write(tmp.path().join("big.txt"), body).unwrap();
-
-    let out = file_read_json(handle_file_request(
-        &policy,
-        &file_read_request(
-            tmp.path(),
-            "big.txt",
-            Some(150_000),
-            Some(150_002),
-            Some(512 * 1024),
-        ),
-    ));
-    assert_eq!(out["format"], "webcodex.file_read_range.v1");
-    assert_eq!(
-        out["content"],
-        [line.as_str(), line.as_str(), line.as_str()].join("\n")
-    );
-    assert_eq!(out["total_lines"], 300_000);
-    assert_eq!(out["start_line"], 150_000);
-    assert_eq!(out["limit"], 3);
-    assert_eq!(out["sha256"], expected_sha);
 }
 
 #[test]

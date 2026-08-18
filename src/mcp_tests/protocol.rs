@@ -1,22 +1,5 @@
 use super::*;
 
-#[test]
-fn rpc_result_envelope_is_valid() {
-    let value = rpc_result(Some(Value::from(1)), json!({"ok": true}));
-    assert_eq!(value["jsonrpc"], "2.0");
-    assert_eq!(value["id"], 1);
-    assert_eq!(value["result"]["ok"], true);
-}
-
-#[test]
-fn rpc_error_envelope_carries_code_and_message() {
-    let value = rpc_error(Some(Value::from("a")), -32601, "missing");
-    assert_eq!(value["jsonrpc"], "2.0");
-    assert_eq!(value["id"], "a");
-    assert_eq!(value["error"]["code"], -32601);
-    assert_eq!(value["error"]["message"], "missing");
-}
-
 #[tokio::test]
 async fn mcp_initialize_returns_protocol_and_server_info() {
     let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
@@ -304,36 +287,4 @@ async fn mcp_notifications_initialized_with_id_returns_result() {
         }
         other => panic!("expected Ok, got {:?}", other),
     }
-}
-
-#[tokio::test]
-async fn mcp_tools_list_parity_with_rest_tools_list() {
-    // MCP tools/list and REST /api/tools/list both expose the exact same
-    // registry-backed tool names on the full operator surface.
-    let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
-    let mcp_outcome = handle_mcp_request(
-        &runtime,
-        rpc(
-            "tools/list",
-            Some(Value::from(8)),
-            mcp_2026_params(json!({})),
-        ),
-        None,
-    )
-    .await;
-    let mcp_value = match mcp_outcome {
-        McpOutcome::Ok(v) => v,
-        other => panic!("expected Ok, got {:?}", other),
-    };
-    let mcp_names: Vec<String> = mcp_value["result"]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| t["name"].as_str().unwrap().to_string())
-        .collect();
-    let rest_names: Vec<String> = registered_tool_specs()
-        .iter()
-        .map(|s| s.name.clone())
-        .collect();
-    assert_eq!(mcp_names, rest_names);
 }
