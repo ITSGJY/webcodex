@@ -2149,7 +2149,7 @@ fn computer_application_launch_runner_error(
         ),
         "application_failed" => computer_application_effect_not_started(
             "application_failed",
-            "Windows application identity could not be revalidated before native dispatch",
+            "Native application identity could not be revalidated before native dispatch",
             application_id,
         ),
         "outcome_unknown" => computer_application_effect_outcome_unknown(
@@ -2619,7 +2619,10 @@ fn validate_computer_read_clipboard(output: Value) -> ToolResult {
             "clipboard read result is not an object",
         );
     };
-    if output.get("platform").and_then(Value::as_str) != Some("windows") {
+    if !matches!(
+        output.get("platform").and_then(Value::as_str),
+        Some("windows" | "macos")
+    ) {
         return computer_error(
             "invalid_runner_response",
             "clipboard read platform is inconsistent",
@@ -2688,7 +2691,10 @@ fn validate_computer_write_clipboard(output: Value, context: &ClipboardWriteCont
     let allowed = ["platform", "text_bytes", "success"];
     if object.len() != allowed.len()
         || object.keys().any(|key| !allowed.contains(&key.as_str()))
-        || output.get("platform").and_then(Value::as_str) != Some("windows")
+        || !matches!(
+            output.get("platform").and_then(Value::as_str),
+            Some("windows" | "macos")
+        )
         || output.get("success").and_then(Value::as_bool) != Some(true)
         || output.get("text_bytes").and_then(Value::as_u64)
             != context.text_bytes.map(|value| value as u64)
@@ -2717,7 +2723,10 @@ fn validate_computer_launch_application(
     let allowed = ["platform", "application_id", "success"];
     if object.len() != allowed.len()
         || object.keys().any(|key| !allowed.contains(&key.as_str()))
-        || output.get("platform").and_then(Value::as_str) != Some("windows")
+        || !matches!(
+            output.get("platform").and_then(Value::as_str),
+            Some("windows" | "macos")
+        )
         || output.get("application_id").and_then(Value::as_str) != Some(expected_application_id)
         || output.get("success").and_then(Value::as_bool) != Some(true)
     {
@@ -3140,7 +3149,10 @@ fn validate_computer_pointer(mut output: Value, context: &PointerRequestContext)
     ];
     if object.len() != allowed.len()
         || object.keys().any(|key| !allowed.contains(&key.as_str()))
-        || output.get("platform").and_then(Value::as_str) != Some("windows")
+        || !matches!(
+            output.get("platform").and_then(Value::as_str),
+            Some("windows" | "macos")
+        )
         || output.get("display_id").and_then(Value::as_str) != Some(context.display_id.as_str())
         || output.get("snapshot_generation").and_then(Value::as_u64)
             != Some(u64::from(context.snapshot_generation))

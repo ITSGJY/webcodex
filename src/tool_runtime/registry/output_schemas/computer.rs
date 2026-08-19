@@ -186,8 +186,11 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             ("truncated", json!({"type": "boolean"})),
         ])),
-        "computer_launch_application" => Some(wrapped_output_schema(vec![
-            ("platform", json!({"type": "string", "const": "windows"})),
+        "computer_launch_application" => Some(strict_computer_output_schema(vec![
+            (
+                "platform",
+                json!({"type": "string", "enum": ["windows", "macos"]}),
+            ),
             (
                 "application_id",
                 json!({"type": "string", "pattern": "^application_[0-9a-f]{32}$", "maxLength": 128}),
@@ -511,7 +514,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
         ])),
         "computer_read_clipboard" => {
             let mut schema = strict_computer_output_schema(vec![
-                ("platform", json!({"type": "string", "const": "windows"})),
+                (
+                    "platform",
+                    json!({"type": "string", "enum": ["windows", "macos"]}),
+                ),
                 ("available", json!({"type": "boolean"})),
                 ("text", json!({"type": "string", "maxLength": 16384})),
                 (
@@ -532,7 +538,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             Some(schema)
         }
         "computer_write_clipboard" => Some(strict_computer_output_schema(vec![
-            ("platform", json!({"type": "string", "const": "windows"})),
+            (
+                "platform",
+                json!({"type": "string", "enum": ["windows", "macos"]}),
+            ),
             (
                 "text_bytes",
                 json!({"type": "integer", "minimum": 1, "maximum": 16384}),
@@ -547,7 +556,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
         ])),
         "computer_pointer_move" | "computer_pointer_click" => {
             Some(strict_computer_output_schema(vec![
-                ("platform", json!({"type": "string", "const": "windows"})),
+                (
+                    "platform",
+                    json!({"type": "string", "enum": ["windows", "macos"]}),
+                ),
                 (
                     "display_id",
                     json!({"type": "string", "pattern": "^display_[0-9a-f]{32}$", "maxLength": 128}),

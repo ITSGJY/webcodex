@@ -1436,18 +1436,18 @@ pub enum ToolCall {
         modifiers: Option<Vec<String>>,
     },
 
-    /// Read bounded Windows CF_UNICODETEXT from the global clipboard.
+    /// Read bounded native plain Unicode text from the global clipboard.
     ComputerReadClipboard {
         client_id: String,
     },
 
-    /// Replace the Windows global clipboard with bounded CF_UNICODETEXT.
+    /// Replace the global clipboard with bounded native plain Unicode text.
     ComputerWriteClipboard {
         client_id: String,
         text: String,
     },
 
-    /// Move the Windows pointer using one latest unspent full-display snapshot generation.
+    /// Move the native macOS or Windows pointer using one latest unspent full-display snapshot generation.
     ComputerPointerMove {
         client_id: String,
         display_id: String,
@@ -1456,7 +1456,7 @@ pub enum ToolCall {
         y: u32,
     },
 
-    /// Submit one exact single-left-click at a snapshot-fenced display-local coordinate.
+    /// Submit one native macOS or Windows single-left-click at a snapshot-fenced display-local coordinate.
     ComputerPointerClick {
         client_id: String,
         display_id: String,

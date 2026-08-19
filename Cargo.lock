@@ -4892,14 +4892,17 @@ name = "webcodex-runner"
 version = "0.3.9"
 dependencies = [
  "base64",
+ "block2",
  "chrono",
  "flate2",
  "futures-util",
  "image",
  "libc",
+ "objc2-app-kit",
  "objc2-application-services",
  "objc2-core-foundation",
  "objc2-core-graphics",
+ "objc2-foundation",
  "quinn",
  "reqwest 0.12.28",
  "rustls",

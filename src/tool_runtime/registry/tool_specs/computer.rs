@@ -17,22 +17,22 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
     vec![
         tool_spec(
             "computer_read_clipboard",
-            "Read bounded CF_UNICODETEXT from the exact Windows Runner global clipboard. Returns UTF-8 text up to 16 KiB without truncation. This is an independent global privacy authority; it never enumerates formats, accesses windows/focus, pastes, retries, invokes shell fallback, or reads clipboard history.",
+            "Read bounded Unicode text from exact macOS or Windows clipboard using NSPasteboardTypeString or CF_UNICODETEXT. Returns UTF-8 up to 16 KiB without truncation. This privacy authority never enumerates formats, accesses windows/focus, pastes, retries, uses shell fallback, or reads history.",
             computer_read_clipboard_input_schema(),
         ),
         tool_spec(
             "computer_write_clipboard",
-            "Replace the exact Windows Runner global clipboard with bounded CF_UNICODETEXT, clearing formats via EmptyClipboard. It never pastes, focuses, activates, restores old data, retries, or reads back implicitly. Unknown outcomes require explicit reconciliation under separate clipboard-read authority.",
+            "Replace exact macOS or Windows clipboard with bounded Unicode text using NSPasteboardTypeString or CF_UNICODETEXT, clearing prior formats. Never pastes, focuses, activates, restores, retries, or reads back implicitly. Unknown outcomes require separate clipboard-read reconciliation.",
             computer_write_clipboard_input_schema(),
         ),
         tool_spec(
             "computer_pointer_move",
-            "Move the Windows pointer to an exact display-local coordinate using the latest unspent display snapshot generation. The generation is single-use and spent at effect admission. No implicit observation, focus, drag, fallback, or retry. Reconcile unknown outcomes with a fresh snapshot.",
+            "Move the macOS or Windows pointer to an exact display-local source coordinate using the latest unspent snapshot generation. The generation is single-use at effect admission. No implicit observation, focus, drag, fallback, or retry; reconcile unknown outcomes with fresh computer_snapshot_display.",
             computer_pointer_input_schema(),
         ),
         tool_spec(
             "computer_pointer_click",
-            "Send one Windows-native left click at an exact display-local coordinate using the latest unspent display snapshot generation. Held mouse/modifier state fails closed. No other buttons, double click, drag, implicit snapshot, fallback, or retry. Reconcile unknown outcomes with a fresh snapshot.",
+            "Send a macOS or Windows left click at exact display-local source coordinates using the unspent snapshot generation. Held mouse/modifier state fails closed. No other buttons, double click, drag, implicit snapshot, fallback, or retry; reconcile unknown outcomes with fresh computer_snapshot_display.",
             computer_pointer_input_schema(),
         ),
         tool_spec(
@@ -47,17 +47,17 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
         ),
         tool_spec(
             "computer_list_displays",
-            "List bounded fresh full displays under separate display privacy authority. display_id values are opaque, process-local, ephemeral, and replaced on each list. Returns only display-relative dimensions and primary status; native identity, global origin, scale, and topology stay private.",
+            "List bounded fresh full displays on an exact macOS or Windows Runner. IDs are opaque, process-local, ephemeral, and replaced on each list. Returns only display-relative dimensions and primary status; native identity, global origin, scale, and topology stay private.",
             computer_list_displays_input_schema(),
         ),
         tool_spec(
             "computer_list_applications",
-            "List a bounded fresh set of installed applications on an exact Windows Runner. application_id values are opaque, process-local, ephemeral, and replaced by each fresh list; executable paths and native launch identities are never exposed.",
+            "List a bounded fresh set of installed applications on an exact macOS or Windows Runner. application_id values are opaque, process-local, ephemeral, and replaced by each fresh list; application paths, bundle/Shell identities, and native launch targets are never exposed.",
             computer_list_applications_input_schema(),
         ),
         tool_spec(
             "computer_launch_application",
-            "Launch one fresh application_id through Windows native launch. Accepts no path, argv, cwd, environment, shell, URL, fallback, focus, or activation. Success means only that the OS accepted the request, not that a process/window is ready. Reconcile unknown outcomes with fresh computer_list_windows.",
+            "Launch one fresh application_id through its exact macOS or Windows application target. Accepts no path, argv, cwd, environment, shell, URL, fallback, focus, or activation. Success proves only bounded launch completion, not process/window readiness; reconcile unknown outcomes with fresh windows.",
             computer_launch_application_input_schema(),
         ),
         tool_spec(
@@ -112,7 +112,7 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
         ),
         tool_spec(
             "computer_snapshot_display",
-            "Capture one fresh discovered full display after private native-identity revalidation; stale or ambiguous displays fail closed. max_width/max_height only downscale. No global coordinates, regions, activation, input, shell, or fallback. Returns a positive snapshot_generation for freshness fencing.",
+            "Capture one discovered full display on an exact macOS or Windows Runner after private native-identity revalidation. Stale or ambiguous displays fail closed; max dimensions only downscale. No global coordinates, regions, activation, input, shell, or fallback. Returns a positive snapshot generation.",
             computer_snapshot_display_input_schema(),
         ),
         tool_spec(

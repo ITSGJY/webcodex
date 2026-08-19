@@ -78,28 +78,28 @@ fn computer_register_request_announces_platform_capability_and_protocol_version(
     );
     assert_eq!(
         caps.computer_application_discovery,
-        cfg!(windows),
-        "computer application discovery is advertised only by the Windows native implementation"
+        cfg!(any(target_os = "macos", windows)),
+        "computer application discovery is advertised only by native macOS/Windows implementations"
     );
     assert_eq!(
         caps.computer_application_launch,
-        cfg!(windows),
-        "computer application launch is independently advertised only by the Windows native implementation"
+        cfg!(any(target_os = "macos", windows)),
+        "computer application launch is independently advertised only by native macOS/Windows implementations"
     );
     assert_eq!(
         caps.computer_clipboard_read,
-        cfg!(windows),
-        "clipboard read is independently advertised only by the Windows native implementation"
+        cfg!(any(target_os = "macos", windows)),
+        "clipboard read is independently advertised only by native macOS/Windows implementations"
     );
     assert_eq!(
         caps.computer_clipboard_write,
-        cfg!(windows),
-        "clipboard write is independently advertised only by the Windows native implementation"
+        cfg!(any(target_os = "macos", windows)),
+        "clipboard write is independently advertised only by native macOS/Windows implementations"
     );
     assert_eq!(
         caps.computer_display_observe,
-        cfg!(windows),
-        "full-display observation is independently advertised only by the exact Windows display backend"
+        cfg!(any(target_os = "macos", windows)),
+        "full-display observation is independently advertised only by exact native macOS/Windows display backends"
     );
     assert_eq!(
         caps.computer_snapshot_region,

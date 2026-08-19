@@ -311,16 +311,13 @@ fn prepare_clipboard_write_text(text: &str) -> Result<PreparedClipboardText, Str
     })
 }
 
+#[cfg(any(test, windows))]
 fn clipboard_read_result_from_utf16(
     storage: Option<&[u16]>,
     native_storage_bytes: usize,
 ) -> Result<Value, String> {
     let Some(storage) = storage else {
-        return Ok(json!({
-            "platform": "windows",
-            "available": false,
-            "text_bytes": 0,
-        }));
+        return clipboard_read_result("windows", None);
     };
     if native_storage_bytes == 0 {
         return Err("clipboard_malformed: clipboard Unicode storage is empty".to_string());
@@ -348,14 +345,29 @@ fn clipboard_read_result_from_utf16(
     })?;
     let text = String::from_utf16(&storage[..end])
         .map_err(|_| "clipboard_malformed: clipboard Unicode text is invalid UTF-16".to_string())?;
+    clipboard_read_result("windows", Some(&text))
+}
+
+#[cfg(any(test, target_os = "macos", windows))]
+fn clipboard_read_result(platform: &str, text: Option<&str>) -> Result<Value, String> {
+    let Some(text) = text else {
+        return Ok(json!({
+            "platform": platform,
+            "available": false,
+            "text_bytes": 0,
+        }));
+    };
     let text_bytes = text.len();
     if text_bytes > MAX_CLIPBOARD_TEXT_BYTES {
         return Err(
             "clipboard_too_large: clipboard UTF-8 text exceeds the 16 KiB bound".to_string(),
         );
     }
+    if text.contains('\0') {
+        return Err("clipboard_malformed: clipboard text contains NUL".to_string());
+    }
     Ok(json!({
-        "platform": "windows",
+        "platform": platform,
         "available": true,
         "text": text,
         "text_bytes": text_bytes,
@@ -364,11 +376,13 @@ fn clipboard_read_result_from_utf16(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ClipboardWriteEffectState {
+    #[cfg(any(test, windows))]
     NotStarted,
     OutcomeUnknown,
     Success,
 }
 
+#[cfg(any(test, windows))]
 fn run_clipboard_write_effect_steps(
     empty_clipboard: impl FnOnce() -> bool,
     set_clipboard_text: impl FnOnce() -> bool,
@@ -387,6 +401,23 @@ fn run_clipboard_write_effect_steps(
     }
 }
 
+#[cfg(any(test, target_os = "macos"))]
+fn run_macos_clipboard_write_effect_steps(
+    clear_contents: impl FnOnce() -> isize,
+    set_clipboard_text: impl FnOnce() -> bool,
+    current_change_count: impl FnOnce() -> isize,
+) -> ClipboardWriteEffectState {
+    let ownership_change_count = clear_contents();
+    let set_succeeded = set_clipboard_text();
+    let ownership_retained = current_change_count() == ownership_change_count;
+    if set_succeeded && ownership_retained {
+        ClipboardWriteEffectState::Success
+    } else {
+        ClipboardWriteEffectState::OutcomeUnknown
+    }
+}
+
+#[cfg(any(test, windows))]
 fn finish_clipboard_read<T>(
     read_result: Result<T, String>,
     close_clipboard: impl FnOnce() -> bool,
@@ -645,12 +676,49 @@ enum PointerAction {
     Click,
 }
 
+#[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PointerPlan {
     global_x: i32,
     global_y: i32,
     normalized_x: i32,
     normalized_y: i32,
+}
+
+#[cfg(target_os = "macos")]
+struct PointerPlan {
+    display: DisplayRecord,
+    native_display_id: u32,
+    bounds_origin_x: f64,
+    bounds_origin_y: f64,
+    bounds_width: f64,
+    bounds_height: f64,
+    rotation_degrees: f64,
+    target_x: f64,
+    target_y: f64,
+    _source: objc2_core_foundation::CFRetained<objc2_core_graphics::CGEventSource>,
+    move_event: objc2_core_foundation::CFRetained<objc2_core_graphics::CGEvent>,
+    click_down_event: Option<objc2_core_foundation::CFRetained<objc2_core_graphics::CGEvent>>,
+    click_up_event: Option<objc2_core_foundation::CFRetained<objc2_core_graphics::CGEvent>>,
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PointerPlan;
+
+fn pointer_output_platform() -> &'static str {
+    #[cfg(windows)]
+    {
+        return "windows";
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return "macos";
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        "unsupported"
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1051,7 +1119,7 @@ impl ComputerObserver {
         drop(snapshot_registry);
         drop(display_registry);
         Ok(json!({
-            "platform": "windows",
+            "platform": pointer_output_platform(),
             "display_id": display_id,
             "snapshot_generation": snapshot_generation,
             "x": x,
@@ -1060,6 +1128,16 @@ impl ComputerObserver {
         }))
     }
     fn launch_application(&self, application_id: &str) -> Result<Value, String> {
+        self.with_current_application(application_id, |record| {
+            platform::launch_application(application_id, record)
+        })
+    }
+
+    fn with_current_application<T>(
+        &self,
+        application_id: &str,
+        effect: impl FnOnce(&ApplicationRecord) -> Result<T, String>,
+    ) -> Result<T, String> {
         if !valid_application_id(application_id) {
             return Err("invalid_request: application_id is invalid".to_string());
         }
@@ -1072,9 +1150,8 @@ impl ComputerObserver {
             .map_err(|_| "computer_state_error: application registry lock poisoned".to_string())?;
         let record = registry
             .get(application_id)
-            .cloned()
             .ok_or_else(|| "stale_application: unknown or stale application_id".to_string())?;
-        let result = platform::launch_application(application_id, &record);
+        let result = effect(record);
         drop(registry);
         result
     }
@@ -2280,6 +2357,7 @@ fn ensure_exact_payload_fields(payload: &Value, expected: &[&str]) -> Result<(),
 #[cfg(test)]
 mod application_wire_contract_tests {
     use super::*;
+    use std::sync::{mpsc, Arc};
 
     fn candidate(name: &str, marker: u8) -> PlatformApplication {
         PlatformApplication {
@@ -2375,6 +2453,57 @@ mod application_wire_contract_tests {
             .unwrap();
         assert_eq!(second["count"], 1);
         let error = observer.launch_application(&old_id).unwrap_err();
+        assert!(error.starts_with("stale_application:"), "{error}");
+    }
+
+    #[test]
+    fn launch_admission_fences_concurrent_fresh_list_retirement() {
+        let observer = Arc::new(observer());
+        let first = observer
+            .replace_application_candidates(vec![candidate("One", 1)], 1)
+            .unwrap();
+        let application_id = first["applications"][0]["application_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let (effect_entered_tx, effect_entered_rx) = mpsc::channel();
+        let (release_effect_tx, release_effect_rx) = mpsc::channel();
+        let launch_observer = Arc::clone(&observer);
+        let launch_id = application_id.clone();
+        let launch = std::thread::spawn(move || {
+            launch_observer.with_current_application(&launch_id, |_| {
+                effect_entered_tx.send(()).unwrap();
+                release_effect_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        effect_entered_rx.recv().unwrap();
+
+        let (list_started_tx, list_started_rx) = mpsc::channel();
+        let (list_completed_tx, list_completed_rx) = mpsc::channel();
+        let list_observer = Arc::clone(&observer);
+        let fresh_list = std::thread::spawn(move || {
+            list_started_tx.send(()).unwrap();
+            let output = list_observer
+                .replace_application_candidates(vec![candidate("Two", 2)], 1)
+                .unwrap();
+            list_completed_tx.send(output).unwrap();
+        });
+        list_started_rx.recv().unwrap();
+        assert!(matches!(
+            list_completed_rx.recv_timeout(Duration::from_millis(25)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        release_effect_tx.send(()).unwrap();
+        launch.join().unwrap().unwrap();
+        let fresh = list_completed_rx.recv().unwrap();
+        fresh_list.join().unwrap();
+        assert_eq!(fresh["applications"][0]["display_name"], "Two");
+        let error = observer
+            .with_current_application(&application_id, |_| Ok(()))
+            .unwrap_err();
         assert!(error.starts_with("stale_application:"), "{error}");
     }
 }
@@ -2575,6 +2704,16 @@ mod pointer_wire_contract_tests {
     }
 
     #[test]
+    fn pointer_output_platform_matches_native_backend() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(pointer_output_platform(), "macos");
+        #[cfg(windows)]
+        assert_eq!(pointer_output_platform(), "windows");
+        #[cfg(not(any(target_os = "macos", windows)))]
+        assert_eq!(pointer_output_platform(), "unsupported");
+    }
+
+    #[test]
     fn pointer_generation_is_latest_exact_and_single_use() {
         let display = DisplayRecord {
             native_identity: vec![9],
@@ -2610,6 +2749,27 @@ mod pointer_wire_contract_tests {
         assert!(dispatched);
         assert!(snapshots
             .validate_pointer(display_id, second, &display)
+            .unwrap_err()
+            .contains("already consumed"));
+
+        let mut spent_not_started = DisplaySnapshotRegistry::default();
+        let spent_generation = spent_not_started.bind(display_id, &display).unwrap();
+        let error = dispatch_after_spending_pointer_generation(
+            &mut spent_not_started,
+            display_id,
+            spent_generation,
+            &display,
+            |_| {
+                Err(
+                    "not_started: final native preflight failed after generation spend before post"
+                        .to_string(),
+                )
+            },
+        )
+        .expect_err("spent final-preflight failure must remain a definite no-post result");
+        assert!(error.starts_with("not_started:"), "{error}");
+        assert!(spent_not_started
+            .validate_pointer(display_id, spent_generation, &display)
             .unwrap_err()
             .contains("already consumed"));
 
@@ -2803,6 +2963,23 @@ mod clipboard_contract_tests {
         .unwrap_err()
         .starts_with("clipboard_too_large:"));
 
+        assert_eq!(
+            clipboard_read_result("macos", None).unwrap(),
+            json!({"platform":"macos","available":false,"text_bytes":0})
+        );
+        assert_eq!(
+            clipboard_read_result("macos", Some("")).unwrap(),
+            json!({"platform":"macos","available":true,"text":"","text_bytes":0})
+        );
+        assert!(
+            clipboard_read_result("macos", Some(&"a".repeat(MAX_CLIPBOARD_TEXT_BYTES + 1)))
+                .unwrap_err()
+                .starts_with("clipboard_too_large:")
+        );
+        assert!(clipboard_read_result("macos", Some("bad\0text"))
+            .unwrap_err()
+            .starts_with("clipboard_malformed:"));
+
         let two_byte = String::from_utf16(&[0x00E9]).unwrap();
         let oversized_text = two_byte.repeat((MAX_CLIPBOARD_TEXT_BYTES / 2) + 1);
         let oversized_units = utf16_storage(&oversized_text);
@@ -2894,6 +3071,54 @@ mod clipboard_contract_tests {
             (
                 ClipboardWriteEffectState::Success,
                 vec!["empty", "set", "close"]
+            )
+        );
+    }
+
+    #[test]
+    fn macos_clipboard_write_proves_set_and_retained_ownership_after_clear() {
+        fn run(
+            clear_count: isize,
+            set: bool,
+            final_count: isize,
+        ) -> (ClipboardWriteEffectState, Vec<&'static str>) {
+            let calls = RefCell::new(Vec::new());
+            let state = run_macos_clipboard_write_effect_steps(
+                || {
+                    calls.borrow_mut().push("clear");
+                    clear_count
+                },
+                || {
+                    calls.borrow_mut().push("set");
+                    set
+                },
+                || {
+                    calls.borrow_mut().push("change_count");
+                    final_count
+                },
+            );
+            (state, calls.into_inner())
+        }
+
+        assert_eq!(
+            run(7, true, 7),
+            (
+                ClipboardWriteEffectState::Success,
+                vec!["clear", "set", "change_count"]
+            )
+        );
+        assert_eq!(
+            run(7, false, 7),
+            (
+                ClipboardWriteEffectState::OutcomeUnknown,
+                vec!["clear", "set", "change_count"]
+            )
+        );
+        assert_eq!(
+            run(7, true, 8),
+            (
+                ClipboardWriteEffectState::OutcomeUnknown,
+                vec!["clear", "set", "change_count"]
             )
         );
     }

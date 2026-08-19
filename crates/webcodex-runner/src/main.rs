@@ -1914,18 +1914,21 @@ fn agent_register_capabilities(cfg: &AgentConfig) -> ShellClientCapabilities {
     // Native read-only desktop observation is implemented only on macOS and
     // Windows. Unsupported platforms advertise false and fail closed.
     capabilities.computer_observe = cfg!(any(target_os = "macos", windows));
-    // Installed-application discovery and exact launch are Windows-only additive
-    // capabilities. Neither is inferred from observation/control or from each other.
-    capabilities.computer_application_discovery = cfg!(windows);
-    capabilities.computer_application_launch = cfg!(windows);
-    // Exact full-display discovery/snapshot is independently implemented only
-    // by the Windows backend in this slice; unsupported/unproven platforms fail closed.
-    capabilities.computer_display_observe = cfg!(windows);
-    // Snapshot-fenced exact coordinate pointer input is independently implemented on Windows.
-    capabilities.computer_pointer_control = cfg!(windows);
-    // Bounded Unicode-text clipboard observation/replacement are separate Windows-only capabilities.
-    capabilities.computer_clipboard_read = cfg!(windows);
-    capabilities.computer_clipboard_write = cfg!(windows);
+    // Installed-application discovery and exact launch are native macOS/Windows
+    // additive capabilities. Neither is inferred from observation/control or
+    // from each other.
+    capabilities.computer_application_discovery = cfg!(any(target_os = "macos", windows));
+    capabilities.computer_application_launch = cfg!(any(target_os = "macos", windows));
+    // Exact full-display discovery/snapshot is independently implemented by
+    // the native macOS and Windows backends; unsupported platforms fail closed.
+    capabilities.computer_display_observe = cfg!(any(target_os = "macos", windows));
+    // Snapshot-fenced exact coordinate pointer input is independently implemented by
+    // the native macOS and Windows backends; unsupported platforms fail closed.
+    capabilities.computer_pointer_control = cfg!(any(target_os = "macos", windows));
+    // Bounded Unicode-text clipboard observation/replacement are separate
+    // native capabilities on macOS and Windows.
+    capabilities.computer_clipboard_read = cfg!(any(target_os = "macos", windows));
+    capabilities.computer_clipboard_write = cfg!(any(target_os = "macos", windows));
     // Region/downscale snapshot requests use a distinct additive wire fence so
     // old Runners that support only whole-window snapshots fail closed.
     capabilities.computer_snapshot_region = cfg!(any(target_os = "macos", windows));
