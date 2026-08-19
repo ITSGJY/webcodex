@@ -131,6 +131,16 @@ pub(crate) fn work_on_project_input_schema() -> Value {
                 "maxLength": 4000,
                 "description": "Required current user instruction. On a new task it becomes the root task title; when session_id is provided it is appended to the existing Workflow Session ledger and never overwrites the root title."
             },
+            "include_project_instructions": {
+                "type": "boolean",
+                "default": true,
+                "description": "Whether this bootstrap response should include bounded project-instruction bodies such as AGENTS.md. Defaults to true. Set false when the caller's current model context already retains the applicable repository instructions. Instruction files are still observed for Workflow Session state and metadata; this flag controls only model-facing instruction-content projection."
+            },
+            "include_workflow_guidance": {
+                "type": "boolean",
+                "default": true,
+                "description": "Whether this bootstrap response should include the static built-in WebCodex coding-workflow guidance. Defaults to true. Set false when the caller's current model context already retains that workflow guidance. This flag controls only model-facing workflow projection; it does not change Workflow Session state, authority, role selection, or execution semantics."
+            },
             "session_id": {
                 "type": "string",
                 "pattern": "^wc_sess_[A-Za-z0-9_]+$",

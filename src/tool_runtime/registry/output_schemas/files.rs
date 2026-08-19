@@ -108,17 +108,17 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
         "search_project_texts" => Some(search_project_texts_output_schema()),
         "search_project_text" => {
             Some(wrapped_output_schema(vec![
-            ("project", schema_type("string", "Resolved project id.")),
-            ("pattern", schema_type("string", "Search pattern.")),
+            ("project", schema_type("string", "Resolved project id; omitted as request echo in ordinary complete default rg/matches success.")),
+            ("pattern", schema_type("string", "Search pattern; omitted as request echo in ordinary complete default rg/matches success.")),
             (
                 "path",
-                schema_type("string", "Project-relative search root."),
+                schema_type("string", "Project-relative search root; omitted when it is the default project root in ordinary complete default rg/matches success."),
             ),
             (
                 "backend",
                 nullable_schema(
                     "string",
-                    "Search backend used: rg, grep, or native. Null/omitted when unknown (for example outer wait timeout before backend selection).",
+                    "Search backend used: rg, grep, or native. Omitted for ordinary complete default rg/matches success, or null/omitted when unknown (for example outer wait timeout before backend selection).",
                 ),
             ),
             (
@@ -126,12 +126,12 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 json!({
                     "type": "string",
                     "enum": ["matches", "files_with_matches", "count"],
-                    "description": "Effective result mode."
+                    "description": "Effective result mode; omitted when it is the default matches mode in ordinary complete rg success."
                 }),
             ),
             (
                 "effective_timeout_secs",
-                schema_type("integer", "Effective clamped timeout in seconds."),
+                schema_type("integer", "Effective clamped timeout in seconds; omitted when it is the default budget in ordinary complete rg/matches success."),
             ),
             (
                 "matches",
@@ -140,7 +140,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                     "Bounded search matches; present in matches mode.",
                 ),
             ),
-            ("count", schema_type("integer", "Returned match count.")),
+            ("count", schema_type("integer", "Returned match count; omitted in sparse default matches success because it equals matches.length.")),
             (
                 "files",
                 array_schema(
@@ -175,7 +175,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "truncated",
-                schema_type("boolean", "Whether more mode-specific records were available."),
+                schema_type("boolean", "Whether more mode-specific records were available; false is omitted in sparse default matches success."),
             ),
             (
                 "truncation_reason",
@@ -245,36 +245,50 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
 }
 
 fn search_project_texts_output_schema() -> Value {
-    let search_success = json!({
+    let search_success_properties = json!({
+        "path": schema_type("string", "Effective project-relative search root; omitted for the default project root in sparse complete matches success."),
+        "backend": nullable_schema("string", "Search backend: rg, grep, native, or null when unknown; omitted for ordinary complete default rg/matches success."),
+        "result_mode": {"type": "string", "enum": ["matches", "files_with_matches", "count"]},
+        "effective_timeout_secs": {"type": "integer", "minimum": 1, "maximum": 120},
+        "exit_code": nullable_schema("integer", "Search command exit code, when available."),
+        "context_before": {"type": "integer", "minimum": 0, "maximum": 20},
+        "context_after": {"type": "integer", "minimum": 0, "maximum": 20},
+        "matches": {"type": "array", "items": search_match_schema()},
+        "count": {"type": "integer", "minimum": 0},
+        "files": {"type": "array", "items": search_file_result_schema()},
+        "returned_file_count": {"type": "integer", "minimum": 0},
+        "returned_match_count": {"type": "integer", "minimum": 0},
+        "count_complete": {"type": "boolean"},
+        "total_matches": nullable_schema("integer", "Complete total in count mode; null when incomplete."),
+        "truncated": {"type": "boolean"},
+        "truncation_reason": {
+            "anyOf": [
+                {"type": "string", "enum": ["limit", "output_bytes", "timeout", "transport"]},
+                {"type": "null"}
+            ]
+        }
+    });
+    let search_success_full = json!({
         "type": "object",
         "additionalProperties": false,
-        "properties": {
-            "path": schema_type("string", "Effective project-relative search root."),
-            "backend": nullable_schema("string", "Search backend: rg, grep, native, or null when unknown."),
-            "result_mode": {"type": "string", "enum": ["matches", "files_with_matches", "count"]},
-            "effective_timeout_secs": {"type": "integer", "minimum": 1, "maximum": 120},
-            "exit_code": nullable_schema("integer", "Search command exit code, when available."),
-            "context_before": {"type": "integer", "minimum": 0, "maximum": 20},
-            "context_after": {"type": "integer", "minimum": 0, "maximum": 20},
-            "matches": {"type": "array", "items": search_match_schema()},
-            "count": {"type": "integer", "minimum": 0},
-            "files": {"type": "array", "items": search_file_result_schema()},
-            "returned_file_count": {"type": "integer", "minimum": 0},
-            "returned_match_count": {"type": "integer", "minimum": 0},
-            "count_complete": {"type": "boolean"},
-            "total_matches": nullable_schema("integer", "Complete total in count mode; null when incomplete."),
-            "truncated": {"type": "boolean"},
-            "truncation_reason": {
-                "anyOf": [
-                    {"type": "string", "enum": ["limit", "output_bytes", "timeout", "transport"]},
-                    {"type": "null"}
-                ]
-            }
-        },
+        "properties": search_success_properties.clone(),
         "required": [
             "path", "backend", "result_mode", "effective_timeout_secs", "exit_code",
             "context_before", "context_after", "truncated", "truncation_reason"
         ]
+    });
+    let search_success_sparse_matches = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "path": search_success_properties["path"].clone(),
+            "matches": search_success_properties["matches"].clone()
+        },
+        "required": ["matches"],
+        "description": "Sparse model-facing form for ordinary complete rg matches-mode success under the default timeout and zero context. Omitted metadata means the documented boring defaults."
+    });
+    let search_success = json!({
+        "anyOf": [search_success_full, search_success_sparse_matches]
     });
     let search_failure = json!({
         "type": "object",
@@ -309,7 +323,7 @@ fn search_project_texts_output_schema() -> Value {
             "else": {"properties": {"output": search_failure, "error": {"type": "string"}}}
         }]
     });
-    let batch_output = json!({
+    let batch_output_full = json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
@@ -318,7 +332,7 @@ fn search_project_texts_output_schema() -> Value {
             "returned_count": {"type": "integer", "minimum": 0, "maximum": 8},
             "succeeded_count": {"type": "integer", "minimum": 0, "maximum": 8},
             "failed_count": {"type": "integer", "minimum": 0, "maximum": 8},
-            "items": {"type": "array", "maxItems": 8, "items": item_schema},
+            "items": {"type": "array", "maxItems": 8, "items": item_schema.clone()},
             "output_truncated": {"type": "boolean"},
             "next_index": {"anyOf": [{"type": "integer", "minimum": 0, "maximum": 7}, {"type": "null"}]},
             "session_recorded": schema_type("boolean", "True when this batch call was recorded."),
@@ -331,6 +345,35 @@ fn search_project_texts_output_schema() -> Value {
             "project", "requested_count", "returned_count", "succeeded_count",
             "failed_count", "items", "output_truncated", "next_index"
         ]
+    });
+    let sparse_success_item = json!({
+        "allOf": [
+            item_schema,
+            {
+                "properties": {
+                    "success": {"const": true},
+                    "error": {"type": "null"}
+                },
+                "required": ["success", "error"]
+            }
+        ]
+    });
+    let batch_output_sparse = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "items": {"type": "array", "minItems": 1, "maxItems": 8, "items": sparse_success_item},
+            "session_recorded": schema_type("boolean", "True when this batch call was recorded."),
+            "session_id": schema_type("string", "Session id used for outer batch telemetry."),
+            "session_event_id": schema_type("string", "Outer batch Session event id."),
+            "session_hint": session_hint_schema(),
+            "permission": permission_decision_schema()
+        },
+        "required": ["items"],
+        "description": "Sparse model-facing batch form used only when every returned query succeeded and the outer batch was complete. Omitted counts and continuation fields therefore mean all items succeeded and no outer truncation occurred."
+    });
+    let batch_output = json!({
+        "anyOf": [batch_output_full, batch_output_sparse]
     });
     json!({
         "type": "object",
@@ -350,12 +393,13 @@ fn search_project_texts_output_schema() -> Value {
 }
 
 fn read_file_output_schema() -> Value {
+    let default_limit = webcodex_workspace::file_read_range::EffectiveRange::new(None, None).limit;
     let success_properties = json!({
         "text": schema_type("string", "The single primary text representation: plain content or numbered text according to format."),
         "format": {
             "type": "string",
             "enum": ["plain", "numbered"],
-            "description": "Primary text format: plain or numbered."
+            "description": "Primary text format: plain or numbered. Complete default full-file model-facing success may omit plain; numbered remains explicit."
         },
         "path": schema_type("string", "Project-relative path."),
         "sha256": {
@@ -409,7 +453,7 @@ fn read_file_output_schema() -> Value {
         "session_hint": session_hint_schema(),
         "permission": permission_decision_schema()
     });
-    let success_output = json!({
+    let full_success_output = json!({
         "type": "object",
         "additionalProperties": false,
         "properties": success_properties.clone(),
@@ -417,6 +461,47 @@ fn read_file_output_schema() -> Value {
             "text", "format", "path", "sha256", "start_line", "limit",
             "total_lines", "returned_lines", "end_line", "has_more", "next_start_line"
         ]
+    });
+    let mut sparse_success_properties = success_properties
+        .as_object()
+        .expect("read_file success properties")
+        .clone();
+    for key in [
+        "start_line",
+        "limit",
+        "returned_lines",
+        "end_line",
+        "has_more",
+        "next_start_line",
+    ] {
+        sparse_success_properties.remove(key);
+    }
+    sparse_success_properties.insert(
+        "total_lines".to_string(),
+        json!({
+            "type": "integer",
+            "minimum": 0,
+            "maximum": default_limit,
+            "description": "Complete-file line count; sparse default reads cannot exceed the canonical default line limit."
+        }),
+    );
+    sparse_success_properties.insert(
+        "format".to_string(),
+        json!({
+            "type": "string",
+            "const": "numbered",
+            "description": "Present only when the complete full-file sparse projection contains numbered text; omission means plain."
+        }),
+    );
+    let sparse_success_output = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": sparse_success_properties,
+        "required": ["text", "path", "sha256", "total_lines"],
+        "description": "Sparse model-facing form for a provably complete default full-file read. Omitted range fields mean start_line=1, the canonical default limit, returned_lines=total_lines, and no continuation. sha256 and total_lines remain explicit."
+    });
+    let success_output = json!({
+        "anyOf": [full_success_output, sparse_success_output]
     });
     let read_failure_output = json!({
         "type": "object",
@@ -497,26 +582,70 @@ fn read_file_output_schema() -> Value {
 }
 
 fn read_files_output_schema() -> Value {
-    let read_success = json!({
+    let default_limit = webcodex_workspace::file_read_range::EffectiveRange::new(None, None).limit;
+    let read_success_properties = json!({
+        "text": schema_type("string", "The single primary text representation."),
+        "format": {"type": "string", "enum": ["plain", "numbered"]},
+        "path": schema_type("string", "Project-relative path; omitted from a sparse complete item when identical to the outer item path."),
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "start_line": {"type": "integer", "minimum": 1},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 2000},
+        "total_lines": {"type": "integer", "minimum": 0},
+        "returned_lines": {"type": "integer", "minimum": 0, "maximum": 2000},
+        "end_line": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+        "has_more": {"type": "boolean"},
+        "next_start_line": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]}
+    });
+    let read_success_full = json!({
         "type": "object",
         "additionalProperties": false,
-        "properties": {
-            "text": schema_type("string", "The single primary text representation."),
-            "format": {"type": "string", "enum": ["plain", "numbered"]},
-            "path": schema_type("string", "Project-relative path."),
-            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-            "start_line": {"type": "integer", "minimum": 1},
-            "limit": {"type": "integer", "minimum": 1, "maximum": 2000},
-            "total_lines": {"type": "integer", "minimum": 0},
-            "returned_lines": {"type": "integer", "minimum": 0, "maximum": 2000},
-            "end_line": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
-            "has_more": {"type": "boolean"},
-            "next_start_line": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]}
-        },
+        "properties": read_success_properties.clone(),
         "required": [
             "text", "format", "path", "sha256", "start_line", "limit",
             "total_lines", "returned_lines", "end_line", "has_more", "next_start_line"
         ]
+    });
+    let mut read_success_sparse_properties = read_success_properties
+        .as_object()
+        .expect("read_files success properties")
+        .clone();
+    for key in [
+        "path",
+        "start_line",
+        "limit",
+        "returned_lines",
+        "end_line",
+        "has_more",
+        "next_start_line",
+    ] {
+        read_success_sparse_properties.remove(key);
+    }
+    read_success_sparse_properties.insert(
+        "total_lines".to_string(),
+        json!({
+            "type": "integer",
+            "minimum": 0,
+            "maximum": default_limit,
+            "description": "Complete-file line count; sparse default reads cannot exceed the canonical default line limit."
+        }),
+    );
+    read_success_sparse_properties.insert(
+        "format".to_string(),
+        json!({
+            "type": "string",
+            "const": "numbered",
+            "description": "Present only for numbered complete default full-file sparse output; omission means plain."
+        }),
+    );
+    let read_success_sparse = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": read_success_sparse_properties,
+        "required": ["text", "sha256", "total_lines"],
+        "description": "Sparse model-facing item form for a provably complete default full-file read. The outer item path is the only navigation identity; inner path and range fields are omitted, and no continuation exists."
+    });
+    let read_success = json!({
+        "anyOf": [read_success_full, read_success_sparse.clone()]
     });
     let read_failure = json!({
         "type": "object",
@@ -553,7 +682,7 @@ fn read_files_output_schema() -> Value {
             "else": {"properties": {"output": read_failure, "error": {"type": "string"}}}
         }]
     });
-    let batch_output = json!({
+    let batch_output_full = json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
@@ -575,6 +704,35 @@ fn read_files_output_schema() -> Value {
             "project", "requested_count", "returned_count", "succeeded_count",
             "failed_count", "items", "output_truncated", "next_index"
         ]
+    });
+    let sparse_complete_item = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "index": {"type": "integer", "minimum": 0, "maximum": 7},
+            "path": schema_type("string", "Project-relative input path."),
+            "success": {"type": "boolean", "const": true},
+            "output": read_success_sparse,
+            "error": {"type": "null"}
+        },
+        "required": ["index", "path", "success", "output", "error"]
+    });
+    let batch_output_sparse = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "items": {"type": "array", "minItems": 1, "maxItems": 8, "items": sparse_complete_item},
+            "session_recorded": schema_type("boolean", "True when this batch call was recorded."),
+            "session_id": schema_type("string", "Session id used for outer batch telemetry."),
+            "session_event_id": schema_type("string", "Session event id for the outer batch call."),
+            "session_hint": session_hint_schema(),
+            "permission": permission_decision_schema()
+        },
+        "required": ["items"],
+        "description": "Sparse model-facing batch form used only when every requested item succeeded as a complete default full-file read and the batch itself was not truncated. Omitted outer counts/defaults are therefore implied."
+    });
+    let batch_output = json!({
+        "anyOf": [batch_output_full, batch_output_sparse]
     });
     json!({
         "type": "object",

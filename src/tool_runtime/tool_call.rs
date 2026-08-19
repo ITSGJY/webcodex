@@ -346,6 +346,10 @@ pub enum ToolCall {
         #[serde(default)]
         path: Option<String>,
         instruction: String,
+        #[serde(default = "default_true")]
+        include_project_instructions: bool,
+        #[serde(default = "default_true")]
+        include_workflow_guidance: bool,
         #[serde(default)]
         session_id: Option<String>,
     },

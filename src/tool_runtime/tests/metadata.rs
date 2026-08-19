@@ -1389,6 +1389,8 @@ async fn tool_manifest_reports_accepted_flattened_args_without_schemas() {
         "client_id",
         "path",
         "instruction",
+        "include_project_instructions",
+        "include_workflow_guidance",
         "session_id",
         TOOL_CALL_RECORDING_SESSION_ID_FIELD,
     ] {

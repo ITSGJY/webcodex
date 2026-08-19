@@ -1542,6 +1542,30 @@ fn openapi_retained_edit_tools_remain_runtime_only() {
 }
 
 #[test]
+fn openapi_work_on_project_example_keeps_first_use_projection_defaults() {
+    let spec = build_openapi_spec();
+    let request_properties = spec["components"]["schemas"]["ToolCallRequest"]["properties"]
+        .as_object()
+        .expect("ToolCallRequest properties");
+    assert!(
+        request_properties.contains_key("include_workflow_guidance"),
+        "flattened OpenAPI ToolCallRequest must expose include_workflow_guidance"
+    );
+    let example = &spec["paths"]["/api/tools/call"]["post"]["requestBody"]["content"]
+        ["application/json"]["examples"]["workOnAbsolutePath"]["value"];
+    assert_eq!(example["tool"], "work_on_project");
+    assert_eq!(example["instruction"], "Complete the development task");
+    assert!(
+        example.get("include_project_instructions").is_none(),
+        "the generic first-use work_on_project example must preserve the default instruction-body projection"
+    );
+    assert!(
+        example.get("include_workflow_guidance").is_none(),
+        "the generic first-use work_on_project example must preserve the default workflow-guidance projection"
+    );
+}
+
+#[test]
 fn openapi_call_runtime_tool_examples_cover_alias_and_no_params() {
     // Phase 2: callRuntimeTool examples should demonstrate the arguments
     // alias and the argument-less (params omitted) shapes so a custom GPT

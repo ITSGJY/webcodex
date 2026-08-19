@@ -16,6 +16,22 @@ selectors.
 
 - Use `work_on_project` for the normal coding bootstrap. Its task `instruction`
   is the natural place to state what the agent should do.
+- When the caller's current model context already retains the applicable repository
+  instructions, `work_on_project(include_project_instructions=false)` omits their
+  bodies from that bootstrap response. WebCodex still observes the instruction
+  files and records current instruction metadata for the resulting Workflow Session.
+- When the caller's current model context already retains the built-in WebCodex
+  coding-workflow guidance, `work_on_project(include_workflow_guidance=false)`
+  omits that static `workflow` section from the response. This is projection-only:
+  it does not change Workflow Session state, authority, role selection, or execution
+  semantics.
+- `work_on_project` success output is sparse by default. Omitted default sections
+  mean no Session execution defaults, ordinary existing-project resolution, the
+  intentionally skipped repository overview, pass/non-blocking readiness, no
+  noteworthy Jobs, or empty blockers/warnings. Instruction sources always keep
+  path/fingerprint identity; false/null/empty body-projection fields are omitted.
+  Positive warnings, blockers, truncation, non-default resolution, and noteworthy
+  Job state remain explicit.
 - Use `start_coding_task` when you need its advanced continuity controls, such
   as exact `resume_session_id` or deliberate `new_session=true` isolation.
 - Choose behavioral roles in the **task instruction**. For implementation work,

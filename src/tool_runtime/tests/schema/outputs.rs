@@ -287,6 +287,33 @@ fn key_tool_output_schemas_include_expected_fields() {
         .is_err(),
         "an execution-style run_process denial must include the canonical lifecycle tuple"
     );
+    for (tool_name, schema) in [
+        ("run_process", run_process_schema),
+        (
+            "run_script",
+            &spec_named(&specs, "run_script").output_schema,
+        ),
+    ] {
+        assert!(
+            crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
+                &serde_json::json!({
+                    "success": true,
+                    "output": {
+                        "execution_state": "completed",
+                        "command_started": true,
+                        "command_completed": true,
+                        "command_ok": true,
+                        "exit_code": 0,
+                        "observation_token": "orphan-observation"
+                    },
+                    "error": null
+                }),
+                schema,
+            )
+            .is_err(),
+            "{tool_name} must reject an observation_token without the full continuation tuple"
+        );
+    }
     let process_started_description =
         output_schema_property(&specs, "run_process", "command_started")["description"]
             .as_str()
@@ -1365,6 +1392,71 @@ fn read_file_output_schema_matches_real_results_and_strict_tool_payloads() {
     assert!(
         success["output"]["returned_lines"].as_u64().unwrap()
             <= success["output"]["limit"].as_u64().unwrap()
+    );
+
+    let sparse = serde_json::to_value(crate::tool_runtime::tool_result::ToolResult::ok(json!({
+        "text": "hello",
+        "path": "src/lib.rs",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "total_lines": 1
+    })))
+    .unwrap();
+    validate(&sparse).unwrap();
+    let mut sparse_numbered = sparse.clone();
+    sparse_numbered["output"]["format"] = json!("numbered");
+    validate(&sparse_numbered).unwrap();
+
+    let mut sparse_plain = sparse.clone();
+    sparse_plain["output"]["format"] = json!("plain");
+    assert!(
+        validate(&sparse_plain).is_err(),
+        "complete sparse plain output must omit redundant format"
+    );
+    let default_limit = webcodex_workspace::file_read_range::EffectiveRange::new(None, None).limit;
+    let mut sparse_over_default_limit = sparse.clone();
+    sparse_over_default_limit["output"]["total_lines"] = json!(default_limit + 1);
+    assert!(
+        validate(&sparse_over_default_limit).is_err(),
+        "complete sparse read_file output cannot claim more lines than the default range can return"
+    );
+
+    let read_files_schema = crate::tool_runtime::registry::output_schema_for_tool("read_files");
+    let sparse_batch_over_default_limit = json!({
+        "success": true,
+        "output": {
+            "items": [{
+                "index": 0,
+                "path": "src/lib.rs",
+                "success": true,
+                "output": {
+                    "text": "hello",
+                    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "total_lines": default_limit + 1
+                },
+                "error": null
+            }]
+        },
+        "error": null
+    });
+    assert!(
+        crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
+            &sparse_batch_over_default_limit,
+            &read_files_schema,
+        )
+        .is_err(),
+        "complete sparse read_files item cannot claim more lines than the default range can return"
+    );
+    let mut sparse_missing_sha = sparse.clone();
+    sparse_missing_sha["output"]
+        .as_object_mut()
+        .unwrap()
+        .remove("sha256");
+    assert!(validate(&sparse_missing_sha).is_err());
+    let mut sparse_fake_continuation = sparse.clone();
+    sparse_fake_continuation["output"]["has_more"] = json!(true);
+    assert!(
+        validate(&sparse_fake_continuation).is_err(),
+        "sparse complete form must not admit partial-read continuation fields"
     );
 
     let failure = serde_json::to_value(

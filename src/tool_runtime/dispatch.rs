@@ -57,6 +57,433 @@ pub(super) fn decorate_structured_execution_prestart_denial(
     result.output = Value::Object(output);
 }
 
+/// Remove facts that are fully implied by a successful synchronous terminal
+/// structured execution, but only after the complete ToolResult has already
+/// been recorded into the Session ledger. Failure/uncertain/Job projections
+/// remain explicit because they participate in retry and reconciliation safety.
+fn sparsify_terminal_structured_execution_success(tool_name: &str, result: &mut ToolResult) {
+    if !matches!(tool_name, "run_process" | "run_script") || !result.success {
+        return;
+    }
+    let Some(output) = result.output.as_object_mut() else {
+        return;
+    };
+    let terminal_success = output.get("execution_state").and_then(Value::as_str)
+        == Some("completed")
+        && output.get("command_started").and_then(Value::as_bool) == Some(true)
+        && output.get("command_completed").and_then(Value::as_bool) == Some(true)
+        && output.get("command_ok").and_then(Value::as_bool) == Some(true)
+        && output.get("promoted_to_job").and_then(Value::as_bool) == Some(false)
+        && output.get("terminal").and_then(Value::as_bool) == Some(true)
+        && output.get("job_id").map(Value::is_null).unwrap_or(true)
+        && output.get("job_status").map(Value::is_null).unwrap_or(true)
+        && output
+            .get("observation_token")
+            .map(Value::is_null)
+            .unwrap_or(true);
+    if !terminal_success {
+        return;
+    }
+
+    for key in [
+        "promoted_to_job",
+        "terminal",
+        "job_id",
+        "job_status",
+        "observation_token",
+        "effective_timeout_secs",
+        "sync_wait_secs",
+    ] {
+        output.remove(key);
+    }
+    if output
+        .get("async_handoff_available")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        output.remove("async_handoff_available");
+    }
+    if output.get("failure_kind").is_some_and(Value::is_null) {
+        output.remove("failure_kind");
+    }
+    if output.get("tool_failure").and_then(Value::as_bool) == Some(false) {
+        output.remove("tool_failure");
+    }
+    for key in ["stdout_tail", "stderr_tail"] {
+        if output.get(key).and_then(Value::as_str) == Some("") {
+            output.remove(key);
+        }
+    }
+    for key in ["stdout_lines", "stderr_lines"] {
+        if output.get(key).and_then(Value::as_u64) == Some(0) {
+            output.remove(key);
+        }
+    }
+    for key in ["stdout_truncated", "stderr_truncated"] {
+        if output.get(key).and_then(Value::as_bool) == Some(false) {
+            output.remove(key);
+        }
+    }
+
+    let summary_key = match tool_name {
+        "run_process" => "process_summary",
+        "run_script" => "script_summary",
+        _ => unreachable!("structured execution sparsifier is tool-gated"),
+    };
+    let canonical_source =
+        output.get("execution_source").and_then(Value::as_str) == Some(tool_name);
+    let canonical_summary = output
+        .get(summary_key)
+        .and_then(Value::as_str)
+        .is_some_and(|summary| !summary.is_empty());
+    if canonical_source && canonical_summary {
+        output.remove(summary_key);
+        output.remove("execution_source");
+    }
+}
+
+enum SearchModelProjection {
+    None,
+    SingleDefault,
+    Batch { default_queries: Vec<bool> },
+}
+
+impl SearchModelProjection {
+    fn capture(call: &ToolCall) -> Self {
+        match call {
+            ToolCall::SearchProjectText {
+                result_mode,
+                timeout_secs,
+                context_before,
+                context_after,
+                ..
+            } if caller_uses_default_search_controls(
+                result_mode,
+                timeout_secs,
+                context_before,
+                context_after,
+            ) =>
+            {
+                Self::SingleDefault
+            }
+            ToolCall::SearchProjectTexts { queries, .. } => Self::Batch {
+                default_queries: queries
+                    .iter()
+                    .map(|query| {
+                        caller_uses_default_search_controls(
+                            &query.result_mode,
+                            &query.timeout_secs,
+                            &query.context_before,
+                            &query.context_after,
+                        )
+                    })
+                    .collect(),
+            },
+            _ => Self::None,
+        }
+    }
+}
+
+fn caller_uses_default_search_controls(
+    result_mode: &Option<super::SearchResultMode>,
+    timeout_secs: &Option<i64>,
+    context_before: &Option<usize>,
+    context_after: &Option<usize>,
+) -> bool {
+    result_mode
+        .as_ref()
+        .is_none_or(|mode| matches!(mode, super::SearchResultMode::Matches))
+        && timeout_secs
+            .as_ref()
+            .copied()
+            .unwrap_or(super::files::DEFAULT_SEARCH_TIMEOUT_SECS as i64)
+            == super::files::DEFAULT_SEARCH_TIMEOUT_SECS as i64
+        && context_before.as_ref().copied().unwrap_or(0) == 0
+        && context_after.as_ref().copied().unwrap_or(0) == 0
+}
+
+/// Project an ordinary complete default text search down to its actual records.
+/// Session/event extraction sees the complete result before this model-facing
+/// pass. Fallbacks, partial results, non-default modes, timeouts, and context
+/// requests stay explicit. Batch defaults may inherit a smaller remaining
+/// timeout from the shared outer deadline without making that derived value
+/// model-relevant.
+fn sparsify_complete_default_search_output(
+    output: &mut serde_json::Map<String, Value>,
+    allow_batch_deadline_reduction: bool,
+) -> bool {
+    let Some(matches_len) = output
+        .get("matches")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+    else {
+        return false;
+    };
+    let exit_code = output.get("exit_code").and_then(Value::as_i64);
+    let effective_timeout = output.get("effective_timeout_secs").and_then(Value::as_u64);
+    let default_timeout = if allow_batch_deadline_reduction {
+        effective_timeout.is_some_and(|timeout| {
+            (1..=super::files::DEFAULT_SEARCH_TIMEOUT_SECS).contains(&timeout)
+        })
+    } else {
+        effective_timeout == Some(super::files::DEFAULT_SEARCH_TIMEOUT_SECS)
+    };
+    let ordinary_complete = output.get("backend").and_then(Value::as_str) == Some("rg")
+        && output.get("result_mode").and_then(Value::as_str) == Some("matches")
+        && default_timeout
+        && output.get("context_before").and_then(Value::as_u64) == Some(0)
+        && output.get("context_after").and_then(Value::as_u64) == Some(0)
+        && output.get("truncated").and_then(Value::as_bool) == Some(false)
+        && output.get("truncation_reason").is_some_and(Value::is_null)
+        && matches!(exit_code, Some(0 | 1))
+        && output.get("count").and_then(Value::as_u64) == Some(matches_len as u64);
+    if !ordinary_complete {
+        return false;
+    }
+
+    for key in [
+        "project",
+        "pattern",
+        "backend",
+        "result_mode",
+        "effective_timeout_secs",
+        "exit_code",
+        "context_before",
+        "context_after",
+        "count",
+        "truncated",
+        "truncation_reason",
+    ] {
+        output.remove(key);
+    }
+    if output.get("path").and_then(Value::as_str) == Some(".") {
+        output.remove("path");
+    }
+    true
+}
+
+fn sparsify_complete_default_search_success(
+    projection: &SearchModelProjection,
+    result: &mut ToolResult,
+) {
+    if !result.success {
+        return;
+    }
+    let Some(output) = result.output.as_object_mut() else {
+        return;
+    };
+    match projection {
+        SearchModelProjection::SingleDefault => {
+            sparsify_complete_default_search_output(output, false);
+        }
+        SearchModelProjection::Batch { default_queries } => {
+            let complete_batch =
+                output
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| {
+                        let item_count = items.len() as u64;
+                        item_count > 0
+                            && items.iter().all(|item| {
+                                item.get("success").and_then(Value::as_bool) == Some(true)
+                                    && item.get("error").is_some_and(Value::is_null)
+                            })
+                            && output.get("requested_count").and_then(Value::as_u64)
+                                == Some(item_count)
+                            && output.get("returned_count").and_then(Value::as_u64)
+                                == Some(item_count)
+                            && output.get("succeeded_count").and_then(Value::as_u64)
+                                == Some(item_count)
+                            && output.get("failed_count").and_then(Value::as_u64) == Some(0)
+                            && output.get("output_truncated").and_then(Value::as_bool)
+                                == Some(false)
+                            && output.get("next_index").is_some_and(Value::is_null)
+                    });
+            let Some(items) = output.get_mut("items").and_then(Value::as_array_mut) else {
+                return;
+            };
+            for item in items {
+                let Some(item) = item.as_object_mut() else {
+                    continue;
+                };
+                if item.get("success").and_then(Value::as_bool) != Some(true)
+                    || !item.get("error").is_some_and(Value::is_null)
+                {
+                    continue;
+                }
+                let Some(index) = item.get("index").and_then(Value::as_u64) else {
+                    continue;
+                };
+                if default_queries.get(index as usize).copied() != Some(true) {
+                    continue;
+                }
+                let Some(search_output) = item.get_mut("output").and_then(Value::as_object_mut)
+                else {
+                    continue;
+                };
+                sparsify_complete_default_search_output(search_output, true);
+            }
+            if complete_batch {
+                for key in [
+                    "project",
+                    "requested_count",
+                    "returned_count",
+                    "succeeded_count",
+                    "failed_count",
+                    "output_truncated",
+                    "next_index",
+                ] {
+                    output.remove(key);
+                }
+            }
+        }
+        SearchModelProjection::None => {}
+    }
+}
+
+/// Remove range bookkeeping only when the returned text is provably the complete
+/// file. `sha256` and `total_lines` remain explicit freshness/content-shape
+/// evidence. Partial reads and every real continuation keep the canonical full
+/// range tuple. In a batch, the outer item path remains the navigation identity,
+/// so an identical inner path is redundant.
+fn sparsify_complete_file_read_output(
+    output: &mut serde_json::Map<String, Value>,
+    duplicate_outer_path: Option<&str>,
+) -> bool {
+    let format = output.get("format").and_then(Value::as_str);
+    let valid_format = matches!(format, Some("plain" | "numbered"));
+    let plain_format = format == Some("plain");
+    let Some(inner_path) = output.get("path").and_then(Value::as_str) else {
+        return false;
+    };
+    if duplicate_outer_path.is_some_and(|path| path != inner_path) {
+        return false;
+    }
+    let Some(total_lines) = output.get("total_lines").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Some(returned_lines) = output.get("returned_lines").and_then(Value::as_u64) else {
+        return false;
+    };
+    let default_limit =
+        webcodex_workspace::file_read_range::EffectiveRange::new(None, None).limit as u64;
+    let end_line_matches = if total_lines == 0 {
+        output.get("end_line").is_some_and(Value::is_null)
+    } else {
+        output.get("end_line").and_then(Value::as_u64) == Some(total_lines)
+    };
+    let complete_file = output.get("text").and_then(Value::as_str).is_some()
+        && valid_format
+        && output
+            .get("sha256")
+            .and_then(Value::as_str)
+            .is_some_and(|sha| {
+                sha.len() == 64
+                    && sha
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        && output.get("start_line").and_then(Value::as_u64) == Some(1)
+        && output.get("limit").and_then(Value::as_u64) == Some(default_limit)
+        && returned_lines == total_lines
+        && returned_lines <= default_limit
+        && end_line_matches
+        && output.get("has_more").and_then(Value::as_bool) == Some(false)
+        && output.get("next_start_line").is_some_and(Value::is_null);
+    if !complete_file {
+        return false;
+    }
+
+    for key in [
+        "start_line",
+        "limit",
+        "returned_lines",
+        "end_line",
+        "has_more",
+        "next_start_line",
+    ] {
+        output.remove(key);
+    }
+    if plain_format {
+        output.remove("format");
+    }
+    if duplicate_outer_path.is_some() {
+        output.remove("path");
+    }
+    true
+}
+
+fn sparsify_complete_read_success(tool_name: &str, result: &mut ToolResult) {
+    if !result.success || !matches!(tool_name, "read_file" | "read_files") {
+        return;
+    }
+    let Some(output) = result.output.as_object_mut() else {
+        return;
+    };
+    if tool_name == "read_file" {
+        sparsify_complete_file_read_output(output, None);
+        return;
+    }
+
+    let complete_batch = output
+        .get("items")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            let item_count = items.len() as u64;
+            item_count > 0
+                && items.iter().all(|item| {
+                    item.get("success").and_then(Value::as_bool) == Some(true)
+                        && item.get("error").is_some_and(Value::is_null)
+                })
+                && output.get("requested_count").and_then(Value::as_u64) == Some(item_count)
+                && output.get("returned_count").and_then(Value::as_u64) == Some(item_count)
+                && output.get("succeeded_count").and_then(Value::as_u64) == Some(item_count)
+                && output.get("failed_count").and_then(Value::as_u64) == Some(0)
+                && output.get("output_truncated").and_then(Value::as_bool) == Some(false)
+                && output.get("next_index").is_some_and(Value::is_null)
+        });
+    let Some(items) = output.get_mut("items").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut every_item_complete = complete_batch;
+    for item in items {
+        let Some(item) = item.as_object_mut() else {
+            every_item_complete = false;
+            continue;
+        };
+        if item.get("success").and_then(Value::as_bool) != Some(true)
+            || !item.get("error").is_some_and(Value::is_null)
+        {
+            every_item_complete = false;
+            continue;
+        }
+        let Some(outer_path) = item.get("path").and_then(Value::as_str).map(str::to_string) else {
+            every_item_complete = false;
+            continue;
+        };
+        let Some(read_output) = item.get_mut("output").and_then(Value::as_object_mut) else {
+            every_item_complete = false;
+            continue;
+        };
+        if !sparsify_complete_file_read_output(read_output, Some(&outer_path)) {
+            every_item_complete = false;
+        }
+    }
+    if every_item_complete {
+        for key in [
+            "project",
+            "requested_count",
+            "returned_count",
+            "succeeded_count",
+            "failed_count",
+            "output_truncated",
+            "next_index",
+        ] {
+            output.remove(key);
+        }
+    }
+}
+
 /// Snapshot of the activity-relevant request facts, captured before the
 /// `ToolCall` is moved into execution.
 struct WorkspaceActivityContext {
@@ -558,6 +985,7 @@ impl ToolRuntime {
         }
         let activity_context =
             Self::capture_workspace_activity_context(&call, activity_project.as_deref());
+        let search_projection = SearchModelProjection::capture(&call);
         let tool_name = call.tool_name();
         let mut result = self
             .dispatch_authorized_inner(
@@ -630,6 +1058,9 @@ impl ToolRuntime {
                 );
             }
         }
+        sparsify_terminal_structured_execution_success(tool_name, &mut result);
+        sparsify_complete_default_search_success(&search_projection, &mut result);
+        sparsify_complete_read_success(tool_name, &mut result);
         result
     }
 
@@ -797,6 +1228,120 @@ impl ToolRuntime {
             | ToolCall::GotoDefinition { .. }
             | ToolCall::FindReferences { .. }
             | ToolCall::CallHierarchy { .. }) => self.dispatch_lsp_tool(call).await,
+        }
+    }
+}
+
+#[cfg(test)]
+mod structured_execution_sparse_projection_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn terminal_process_result(execution_source: &str) -> ToolResult {
+        ToolResult::ok(json!({
+            "duration_ms": 1,
+            "exit_code": 0,
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "stdout_lines": 0,
+            "stderr_lines": 0,
+            "stdout_truncated": false,
+            "stderr_truncated": false,
+            "command_started": true,
+            "command_completed": true,
+            "command_ok": true,
+            "failure_kind": null,
+            "tool_failure": false,
+            "purpose": "diagnostic",
+            "process_summary": "tool --arg",
+            "cwd": ".",
+            "executor": "agent",
+            "execution_source": execution_source,
+            "execution_state": "completed",
+            "promoted_to_job": false,
+            "terminal": true,
+            "job_id": null,
+            "job_status": null,
+            "observation_token": null,
+            "effective_timeout_secs": 60,
+            "sync_wait_secs": 10,
+            "async_handoff_available": true
+        }))
+    }
+
+    #[test]
+    fn terminal_execution_only_omits_summary_and_source_for_exact_canonical_source() {
+        let mut canonical = terminal_process_result("run_process");
+        sparsify_terminal_structured_execution_success("run_process", &mut canonical);
+        assert!(canonical.output.get("process_summary").is_none());
+        assert!(canonical.output.get("execution_source").is_none());
+        assert_eq!(canonical.output["cwd"], ".");
+        assert_eq!(canonical.output["executor"], "agent");
+
+        let mut alternate = terminal_process_result("alternate_process_source");
+        sparsify_terminal_structured_execution_success("run_process", &mut alternate);
+        assert_eq!(alternate.output["process_summary"], "tool --arg");
+        assert_eq!(
+            alternate.output["execution_source"],
+            "alternate_process_source"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sparse_read_projection_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn complete_batch_item(outer_path: Option<&str>, inner_path: &str) -> Value {
+        let default_limit =
+            webcodex_workspace::file_read_range::EffectiveRange::new(None, None).limit;
+        let mut item = json!({
+            "index": 0,
+            "success": true,
+            "output": {
+                "text": "one",
+                "format": "plain",
+                "path": inner_path,
+                "sha256": "a".repeat(64),
+                "start_line": 1,
+                "limit": default_limit,
+                "total_lines": 1,
+                "returned_lines": 1,
+                "end_line": 1,
+                "has_more": false,
+                "next_start_line": null
+            },
+            "error": null
+        });
+        if let Some(path) = outer_path {
+            item["path"] = json!(path);
+        }
+        item
+    }
+
+    #[test]
+    fn sparse_read_batch_requires_exact_outer_path_identity() {
+        for item in [
+            complete_batch_item(None, "a.rs"),
+            complete_batch_item(Some("other.rs"), "a.rs"),
+        ] {
+            let mut result = ToolResult::ok(json!({
+                "project": "demo",
+                "requested_count": 1,
+                "returned_count": 1,
+                "succeeded_count": 1,
+                "failed_count": 0,
+                "items": [item],
+                "output_truncated": false,
+                "next_index": null
+            }));
+
+            sparsify_complete_read_success("read_files", &mut result);
+
+            assert_eq!(result.output["requested_count"], 1);
+            assert_eq!(result.output["items"][0]["output"]["path"], "a.rs");
+            assert_eq!(result.output["items"][0]["output"]["start_line"], 1);
         }
     }
 }

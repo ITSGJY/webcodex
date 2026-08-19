@@ -107,6 +107,7 @@ pub(crate) struct StartupBriefInput<'a> {
     pub(crate) instructions: &'a ProjectInstructionsSnapshot,
     pub(crate) previous_instructions: Option<&'a ProjectInstructionsSummarySnapshot>,
     pub(crate) force_instruction_load: bool,
+    pub(crate) include_project_instructions: bool,
     pub(crate) git: &'a Value,
     pub(crate) semantic_navigation: &'a Value,
     pub(crate) repository: &'a Value,
@@ -124,7 +125,7 @@ pub(crate) fn build_startup_brief(input: StartupBriefInput<'_>) -> Value {
         input.instructions,
         input.previous_instructions,
         input.force_instruction_load,
-        !minimal,
+        !minimal && input.include_project_instructions,
         minimal,
     );
     let continuation = continuation_projection(
@@ -1048,7 +1049,7 @@ fn startup_issues(
     if workspace.get("git_available").and_then(Value::as_bool) == Some(false) {
         push_unique(&mut warnings, "git_unavailable");
     }
-    if !input.binding_available {
+    if !input.binding_available && input.binding_reason_code != Some("binding_disabled") {
         push_unique(&mut warnings, "current_binding_unavailable");
     }
     if instructions.get("status").and_then(Value::as_str) == Some("unavailable") {
@@ -2088,6 +2089,7 @@ mod tests {
                 instructions: &instructions,
                 previous_instructions: None,
                 force_instruction_load: true,
+                include_project_instructions: true,
                 git: &git,
                 semantic_navigation: &semantic_navigation,
                 repository: &large_repository(),

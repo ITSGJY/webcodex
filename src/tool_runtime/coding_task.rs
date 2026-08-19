@@ -86,6 +86,7 @@ enum CodingProjectSource {
 struct CodingStartupOptions {
     detail: StartupDetail,
     include_repository_overview: bool,
+    include_project_instructions: bool,
 }
 
 impl CodingStartupOptions {
@@ -93,13 +94,15 @@ impl CodingStartupOptions {
         Self {
             detail,
             include_repository_overview: true,
+            include_project_instructions: true,
         }
     }
 
-    fn work_on_project() -> Self {
+    fn work_on_project(include_project_instructions: bool) -> Self {
         Self {
             detail: StartupDetail::Standard,
             include_repository_overview: false,
+            include_project_instructions,
         }
     }
 }
@@ -1106,6 +1109,7 @@ impl ToolRuntime {
             instructions: &project_instructions,
             previous_instructions,
             force_instruction_load,
+            include_project_instructions: startup.include_project_instructions,
             git: &git,
             semantic_navigation: &semantic_navigation,
             repository: &repository_overview,
@@ -1141,6 +1145,8 @@ impl ToolRuntime {
         path: Option<String>,
         instruction: String,
         session_id: Option<String>,
+        include_project_instructions: bool,
+        include_workflow_guidance: bool,
         auth: Option<&AuthContext>,
         transport: SessionTransport,
         window: Option<&crate::client_window::ClientWindow>,
@@ -1211,7 +1217,7 @@ impl ToolRuntime {
                 SessionMode::Normal,
                 false,
                 false,
-                CodingStartupOptions::work_on_project(),
+                CodingStartupOptions::work_on_project(include_project_instructions),
                 session_id.clone(),
                 false,
                 new_session,
@@ -1236,7 +1242,11 @@ impl ToolRuntime {
         } else {
             project
         };
-        project_work_on_project_output(projected_project, result.output)
+        project_work_on_project_output_with_workflow(
+            projected_project,
+            result.output,
+            include_workflow_guidance,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1961,10 +1971,119 @@ struct WorkOnProjectStartupVerdictProjection {
     suggested_next_actions: Vec<String>,
 }
 
+fn sparse_work_on_project_instruction_source(
+    source: WorkOnProjectInstructionSourceProjection,
+) -> Value {
+    let WorkOnProjectInstructionSourceProjection {
+        path,
+        fingerprint,
+        truncated,
+        headings,
+        content,
+        read_more,
+    } = source;
+    let mut projected = json!({
+        "path": path,
+        "fingerprint": fingerprint,
+    });
+    if truncated {
+        projected["truncated"] = json!(true);
+    }
+    if let Some(content) = content.0 {
+        if !headings.is_empty() {
+            projected["headings"] = json!(headings);
+        }
+        projected["content"] = json!(content);
+    }
+    if let Some(read_more) = read_more.0 {
+        projected["read_more"] = json!(read_more);
+    }
+    projected
+}
+
+fn sparse_work_on_project_workspace(workspace: WorkOnProjectWorkspaceProjection) -> Value {
+    let WorkOnProjectWorkspaceProjection {
+        status,
+        git_available,
+        branch,
+        head,
+        clean,
+        conflicts,
+    } = workspace;
+    let status_unavailable = status == "unavailable";
+    let mut projected = json!({"status": status});
+    if git_available.0 == Some(false) {
+        projected["git_available"] = json!(false);
+    }
+    if let Some(branch) = branch.0 {
+        projected["branch"] = json!(branch);
+    }
+    if let Some(head) = head.0 {
+        projected["head"] = json!(head);
+    }
+    if status_unavailable {
+        if let Some(clean) = clean.0 {
+            projected["clean"] = json!(clean);
+        }
+    }
+    if conflicts > 0 {
+        projected["conflicts"] = json!(conflicts);
+    }
+    projected
+}
+
+fn sparse_work_on_project_jobs(jobs: WorkOnProjectJobsProjection) -> Option<Value> {
+    let mut projected = json!({});
+    for (key, count) in [
+        ("active_count", jobs.active_count),
+        ("blocking_active_count", jobs.blocking_active_count),
+        ("nonblocking_active_count", jobs.nonblocking_active_count),
+        ("recovering_count", jobs.recovering_count),
+        ("terminal_pending_count", jobs.terminal_pending_count),
+    ] {
+        if count > 0 {
+            projected[key] = json!(count);
+        }
+    }
+    if jobs.latest_status != "not_observed" {
+        projected["latest_status"] = json!(jobs.latest_status);
+    }
+    projected.as_object().filter(|object| !object.is_empty())?;
+    Some(projected)
+}
+
+fn is_default_work_on_project_resolution(
+    resolution: &ProjectResolutionMetadata,
+    resolved_project: &str,
+) -> bool {
+    resolution.source == "project"
+        && resolution.outcome == "resolved_existing_project"
+        && resolution.resolved_project == resolved_project
+        && !resolution.registered
+}
+
+fn is_default_work_on_project_repository(repository: &Value) -> bool {
+    repository.as_object().is_some_and(|object| {
+        object.len() == 2
+            && repository.get("status").and_then(Value::as_str) == Some("unavailable")
+            && repository.get("reason_code").and_then(Value::as_str)
+                == Some(REPOSITORY_OVERVIEW_NOT_REQUESTED_REASON)
+    })
+}
+
 /// Convert a successful `start_coding_task` result into the compact
 /// `work_on_project` contract. The delegated call may already have changed
 /// Session state, so protocol drift fails closed with `state_changed=true`.
+#[cfg(test)]
 pub(crate) fn project_work_on_project_output(project: String, output: Value) -> ToolResult {
+    project_work_on_project_output_with_workflow(project, output, true)
+}
+
+pub(crate) fn project_work_on_project_output_with_workflow(
+    project: String,
+    output: Value,
+    include_workflow_guidance: bool,
+) -> ToolResult {
     let permission = output.get("permission").cloned();
     let Some(brief) = startup_brief_from_output(&output) else {
         return work_on_project_projection_failed(
@@ -2048,16 +2167,48 @@ pub(crate) fn project_work_on_project_output(project: String, output: Value) -> 
     } else {
         projection.startup_verdict.suggested_next_actions
     };
+    let generic_begin_action_only = suggested_next_actions.len() == 1
+        && suggested_next_actions[0] == "begin the requested coding task";
+    let project_resolution_is_default = is_default_work_on_project_resolution(
+        &projection.project_resolution,
+        &projection.project.resolved_id,
+    );
+    let repository_is_default = is_default_work_on_project_repository(&projection.repository);
+    let execution_context_is_empty = projection.session.execution_context.is_empty();
+    let jobs = sparse_work_on_project_jobs(projection.continuation.jobs);
+    let workspace = sparse_work_on_project_workspace(projection.workspace);
+
+    let WorkOnProjectInstructionsProjection {
+        status,
+        sources,
+        changed_sources,
+        content_included,
+        truncated,
+        total_chars,
+    } = projection.instructions;
     let mut instructions = json!({
-        "status": projection.instructions.status,
-        "sources": projection.instructions.sources,
-        "content_included": projection.instructions.content_included,
-        "truncated": projection.instructions.truncated,
-        "total_chars": projection.instructions.total_chars,
+        "status": status,
+        "sources": sources
+            .into_iter()
+            .map(sparse_work_on_project_instruction_source)
+            .collect::<Vec<_>>(),
     });
-    if let Some(changed_sources) = projection.instructions.changed_sources {
+    if changed_sources
+        .as_ref()
+        .is_some_and(|sources| !sources.is_empty())
+    {
         instructions["changed_sources"] = json!(changed_sources);
     }
+    if content_included {
+        instructions["content_included"] = json!(true);
+    }
+    if truncated {
+        instructions["truncated"] = json!(true);
+        if total_chars > 0 {
+            instructions["total_chars"] = json!(total_chars);
+        }
+    }
+
     let semantic_navigation = json!({
         "supported": projection.semantic_navigation.supported,
         "available": projection.semantic_navigation.available,
@@ -2069,39 +2220,41 @@ pub(crate) fn project_work_on_project_output(project: String, output: Value) -> 
         "session_id": projection.session.session_id,
         "project": project,
         "resolved_project": projection.project.resolved_id,
-        "project_resolution": projection.project_resolution,
         "continuation": projection.session.continuation,
-        "execution_context": projection.session.execution_context,
-        "readiness": {
-            "status": projection.startup_verdict.status,
-            "blocking": projection.startup_verdict.blocking,
-        },
-        "workspace": {
-            "status": projection.workspace.status,
-            "git_available": projection.workspace.git_available,
-            "branch": projection.workspace.branch,
-            "head": projection.workspace.head,
-            "clean": projection.workspace.clean,
-            "conflicts": projection.workspace.conflicts,
-        },
-        "workflow": projection.workflow,
-        "repository": projection.repository,
+        "workspace": workspace,
         "instructions": instructions,
         "semantic_navigation": semantic_navigation,
-        "jobs": {
-            "active_count": projection.continuation.jobs.active_count,
-            "blocking_active_count": projection.continuation.jobs.blocking_active_count,
-            "nonblocking_active_count": projection.continuation.jobs.nonblocking_active_count,
-            "recovering_count": projection.continuation.jobs.recovering_count,
-            "terminal_pending_count": projection.continuation.jobs.terminal_pending_count,
-            "latest_status": projection.continuation.jobs.latest_status,
-        },
-        "blockers": projection.blockers,
-        "warnings": projection.warnings,
-        "suggested_next_actions": suggested_next_actions,
-        "deterministic": true,
-        "llm_summary": false,
     }));
+    if include_workflow_guidance {
+        result.output["workflow"] = projection.workflow;
+    }
+    if !project_resolution_is_default {
+        result.output["project_resolution"] = json!(projection.project_resolution);
+    }
+    if !execution_context_is_empty {
+        result.output["execution_context"] = json!(projection.session.execution_context);
+    }
+    if projection.startup_verdict.status != "pass" || projection.startup_verdict.blocking {
+        result.output["readiness"] = json!({
+            "status": projection.startup_verdict.status,
+            "blocking": projection.startup_verdict.blocking,
+        });
+    }
+    if !repository_is_default {
+        result.output["repository"] = projection.repository;
+    }
+    if let Some(jobs) = jobs {
+        result.output["jobs"] = jobs;
+    }
+    if !projection.blockers.is_empty() {
+        result.output["blockers"] = json!(projection.blockers);
+    }
+    if !projection.warnings.is_empty() {
+        result.output["warnings"] = json!(projection.warnings);
+    }
+    if !suggested_next_actions.is_empty() && !generic_begin_action_only {
+        result.output["suggested_next_actions"] = json!(suggested_next_actions);
+    }
     if let Some(permission) = permission {
         result.output["permission"] = permission;
     }
