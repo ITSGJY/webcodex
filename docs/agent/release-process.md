@@ -56,8 +56,12 @@ Only when **all** of the following hold:
 3. The worktree is clean before the release starts, except for release files
    intentionally created during that task.
 4. The agent verifies that the remote tag, GitHub Release, and npm package
-   version do **not** already exist.
-5. No force-push, tag overwrite, published-commit amend, or release replacement.
+   version do **not** already exist, unless an explicitly approved failed
+   pre-publication tag has first been reclaimed through `release_operator.py
+   reclaim-tag` under the bounded exception below.
+5. No force-push, published-tag movement, published-commit amend, or release
+   replacement. Reclaiming an eligible failed pre-publication tag is a distinct
+   recovery operation, not permission to rewrite a published release identity.
 6. Relevant release gates run; stop on the first failed gate.
 7. Secrets, tokens, npm/GitHub tokens, `.env` contents, and credential files
    are never printed.
@@ -74,6 +78,33 @@ results (if any), and any deferred checks.
 
 ---
 
+### Failed pre-publication tag reclaim
+
+A version tag may be reclaimed only when the human requester explicitly names that
+version and authorizes the destructive recovery, and all of these facts hold at the
+time of deletion:
+
+- the checkout is clean, its Cargo/npm version is the requested version, and its
+  `HEAD` equals current remote `main`;
+- the remote tag is an annotated commit tag;
+- no GitHub Release exists for the tag and the npm version is absent;
+- every matching authoritative `release-build` run is terminal and none concluded
+  successfully.
+
+Use `python3 scripts/release_operator.py reclaim-tag --version <VERSION> --confirm
+v<VERSION> --root <EXACT_MAIN_WORKTREE>` rather than a naked `git push --delete`.
+The operator fences the repository/source/version, scans bounded release-build
+history, deletes the remote tag, reconciles the remote ref, and removes the matching
+local tag. Its normal GitHub Release check is authenticated so draft releases are
+visible. `--allow-public-release-check` is an explicit degraded mode for a public
+repository only after the human operator separately confirms that no draft Release
+exists; it is never an automatic fallback.
+
+A successful authoritative release-build, any GitHub Release (including draft), or
+an existing npm version closes this exception permanently for that version. Failed
+historical workflow runs remain as audit evidence after a reclaim and are not
+deleted or rewritten.
+
 ## 3. Operator checklist pointer
 
 Before tagging or publishing, follow sections in
@@ -82,8 +113,10 @@ Before tagging or publishing, follow sections in
 `scripts/release_operator.py readiness-start` for one exact merged `main` SHA and
 observed through the same durable state with `readiness-status`. It runs the canonical
 release check, locked full workspace suite, frontend checks, both zero-config E2E
-transports, the coding-loop compare eval, and a parallel native macOS production-surface
-compile plus Runner suite without producing release candidates.
+transports, the coding-loop compare eval, and parallel disposable release-profile native
+validation for all five published platforms without uploading or producing formal release
+candidates. Linux preserves the release ABI/dependency gates, macOS adds the Runner suite,
+and Windows includes the local npm-install smoke.
 Product-documentation consistency and allowed legacy-term matches remain part of the
 release-prep review rather than being guessed by an automated semantic checker.
 
@@ -123,4 +156,6 @@ targets and operations described in section 1; it does not imply release or
 publication. An explicit release prompt may override only the default no-tag /
 no-push / no-GitHub-Release / no-npm-publish defaults when the explicit delivery
 rules in `AGENTS.md` are satisfied. It does **not** override no-force-push,
-no-tag-overwrite, no-secrets, no-history-rewrite, or validation gates.
+published-tag immutability, no-secrets, no-history-rewrite, or validation gates;
+the only tag-reuse exception is the guarded failed pre-publication reclaim defined
+above.
