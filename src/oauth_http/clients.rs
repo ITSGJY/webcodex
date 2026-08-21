@@ -63,13 +63,19 @@ mod detached_scope_tests {
 /// - Scheme must be `http` or `https`.
 /// - `http` is only allowed for loopback hosts (`localhost`, `127.0.0.1`,
 ///   `[::1]`). All other hosts must use `https`.
-fn validate_redirect_uri(uri: &str) -> Result<(), String> {
+pub(crate) fn validate_redirect_uri(uri: &str) -> Result<(), String> {
     let trimmed = uri.trim();
     if trimmed.is_empty() {
         return Err("redirect_uri cannot be empty".to_string());
     }
     let parsed =
         url::Url::parse(trimmed).map_err(|_| "redirect_uri is not a valid URL".to_string())?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("redirect_uri must not contain userinfo".to_string());
+    }
+    if parsed.fragment().is_some() {
+        return Err("redirect_uri must not contain a fragment".to_string());
+    }
     let scheme = parsed.scheme().to_ascii_lowercase();
     if scheme != "http" && scheme != "https" {
         return Err("redirect_uri must use http or https".to_string());
@@ -116,6 +122,14 @@ fn normalize_client_allowed_scopes(input: Option<&[String]>) -> Result<Vec<Strin
         }
     }
     Ok(out)
+}
+
+fn auth_can_manage_managed_oauth_client(
+    auth: &AuthContext,
+    client: &crate::models::OAuthClientRecord,
+) -> bool {
+    client.is_managed_user_owned()
+        && (auth.is_bootstrap() || auth.user_id.as_deref() == client.owner_user_id.as_deref())
 }
 
 #[handler]
@@ -238,7 +252,9 @@ pub(crate) async fn oauth_clients_create(req: &mut Request, depot: &mut Depot, r
         client_id: crate::auth::generate_oauth_client_id(),
         client_secret_hash: secret_hash,
         name: name.clone(),
-        owner_user_id,
+        owner_user_id: Some(owner_user_id),
+        owner_project_grant_id: None,
+        owner_shared_key_hash: None,
         redirect_uris: redirect_uris_str,
         allowed_scopes: allowed_scopes_str,
         created_at: now,
@@ -300,6 +316,7 @@ pub(crate) async fn oauth_clients_list(depot: &mut Depot, res: &mut Response) {
 
     let clients_json: Vec<serde_json::Value> = clients
         .into_iter()
+        .filter(|client| auth_can_manage_managed_oauth_client(auth, client))
         .map(|c| {
             serde_json::json!({
                 "client_id": c.client_id,
@@ -399,6 +416,11 @@ pub(crate) async fn oauth_clients_update_scopes(
             return;
         }
     };
+    if !auth_can_manage_managed_oauth_client(auth, &current) {
+        res.status_code(StatusCode::NOT_FOUND);
+        res.render(Json(serde_json::json!({"error": "OAuth client not found"})));
+        return;
+    }
 
     let now = chrono::Utc::now().timestamp();
     let (changed, access_tokens, refresh_tokens, authorization_codes) = match db
@@ -485,6 +507,23 @@ pub(crate) async fn oauth_clients_revoke(req: &mut Request, depot: &mut Depot, r
         res.status_code(StatusCode::BAD_REQUEST);
         res.render(Json(serde_json::json!({"error": "client_id is required"})));
         return;
+    }
+
+    match db.get_oauth_client_by_client_id(&client_id) {
+        Ok(Some(client)) if !auth_can_manage_managed_oauth_client(auth, &client) => {
+            res.status_code(StatusCode::NOT_FOUND);
+            res.render(Json(serde_json::json!({"error": "OAuth client not found"})));
+            return;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(serde_json::json!({
+                "error": "failed to read client",
+                "detail": e.to_string()
+            })));
+            return;
+        }
     }
 
     let now = chrono::Utc::now().timestamp();

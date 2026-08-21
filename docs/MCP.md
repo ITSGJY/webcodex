@@ -20,23 +20,24 @@ http://127.0.0.1:<configured-port>/mcp
 Hosted clients need HTTPS. There are three paths:
 
 - **Hosted:** `webcodex connect <server>` uses an existing hosted Server; only
-  the Runner runs locally. The MCP URL is `https://your-server.example/mcp`
-  and the bearer credential is the generated shared key. The exposed tool set
-  comes from that Server's configured MCP model surface; `connect` does not
-  turn the remote Server into a project-bound Connector.
-- **Local Share:** `webcodex share` starts the local Server + Agent and a
-  Cloudflare Quick Tunnel, then prints a temporary HTTPS `/mcp` URL and a
-  separate temporary Bearer credential. Ctrl-C revokes that access by stopping
-  the runtime/tunnel and removing the temporary share state. Use `--tunnel
-  none` only for local testing.
+  the Runner runs locally. Shared-key authentication remains the default.
+  `webcodex connect <server> --auth oauth --oauth-redirect-uri <URL>` bridges
+  that same shared-key group into OAuth for ChatGPT without login, pairing, PAT,
+  or account identity. The Runner keeps using the direct shared key; ChatGPT
+  receives only OAuth client credentials/tokens. The exposed tool set starts
+  from that Server's configured MCP model surface; for OAuth callers, `tools/list`
+  is additionally projected by the access token's actual scopes.
+- **Local Share:** `webcodex share` starts the local Server + Agent and, by
+  default, a Cloudflare Quick Tunnel with a separate temporary Bearer
+  credential. `webcodex share --auth oauth --oauth-redirect-uri <URL>` instead
+  exposes project-bound OAuth 2.0 Authorization Code + PKCE. The OAuth client
+  remains bound to the same project grant, while every code/access/refresh
+  grant is fenced to the current share process. Use `--tunnel none` for local
+  testing or with an operator-managed `--public-url`.
 - **Self-hosted:** use a stable HTTPS domain/tunnel, durable service
   management, and OAuth or scoped credentials for long-lived operation.
 
-For a managed or self-hosted Server, use a user API token (`wc_pat_*`) as the
-bearer credential, or OAuth when enabled. Do not use the bootstrap/admin
-token, account credentials, Runner tokens, or the persistent project-first
-Connector credential as a public sharing secret. `share` creates and prints
-its own temporary credential for that session.
+For ordinary hosted `connect`, use its generated/provided shared key directly or bridge that same identity through OAuth. Managed-user deployments may instead use a scoped user API token (`wc_pat_*`) or the explicit `--auth managed-oauth` flow. Do not use the bootstrap/admin token, account credentials, Runner tokens, or the persistent project-first Connector credential as a public sharing secret. `share` creates and prints its own temporary credential for that session.
 
 In ChatGPT Developer Mode, create a custom app with the printed `/mcp` URL.
 If the authentication menu offers **Access token/API key**, choose it, paste
@@ -45,12 +46,16 @@ availability can vary by workspace and rollout.
 
 ### OAuth2
 
-When OAuth is enabled on a managed or self-hosted Server, MCP clients can use
+When OAuth is enabled on a managed/self-hosted Server, or by `webcodex share --auth oauth`, MCP clients can use
 the authorization-code flow instead of a static token. Register the exact
 ChatGPT callback URL as an OAuth client redirect URI; keep `offline_access`
 enabled when offered (it is a protocol-level refresh-token scope and grants no
 extra permission). Server-side OAuth setup is in
 [Deployment](DEPLOYMENT.md#oauth2).
+
+For project-first sharing, the authorization page asks for the temporary Project share credential and issues an `oauth2_project` identity carrying only `runtime:read`, `project:read`, `project:write`, and `job:run`. It does not create a managed user and OAuth tokens cannot be used on Agent transport. Quick Tunnel issuer URLs change between runs; use `--tunnel none --public-url https://...` behind your own stable HTTPS proxy/tunnel when the OAuth issuer must remain stable.
+
+For an existing hosted Server, ordinary `connect --auth oauth` uses the shared-key OAuth bridge. The OAuth client and every code/access/refresh grant remain bound to the same `shared_key_hash` that groups the direct shared-key Runner/projects/jobs. Direct shared-key bearer authority stays fixed at `runtime:read`, `project:read`, `project:write`, `job:run`, `computer:read`, and `computer:control`. A fresh OAuth client starts with that full baseline, but a protected existing client may retain a narrower valid baseline subset. `--oauth-computer-permissions` appends only `computer:launch`, `computer:display_read`, `computer:pointer_control`, `computer:clipboard_read`, and `computer:clipboard_write` to that existing baseline subset; it never restores an absent baseline scope. The browser consent page leaves every optional permission unchecked and grants only selected permissions that the OAuth request actually requested. Launch consent requires both `computer:read` and `computer:launch`; display requires `computer:read` plus `computer:display_read`; pointer requires `computer:read`, `computer:control`, `computer:display_read`, and `computer:pointer_control`; clipboard read/write likewise require their baseline read/control prerequisite plus the matching optional scope. Missing request prerequisites are unavailable rather than auto-added, so consent, token projection, and runtime scope gates remain statically aligned. A real ceiling change revokes prior grants. `account:manage`, `admin`, `job:detach`, every `agent:*` transport scope, and future scopes remain outside this bridge. `offline_access` is protocol-only. Consent-page Runner capability is evaluated per same connected Runner and is rechecked on POST; it is backend availability, not a promise of OS/native permission or call success. At runtime, OAuth `tools/list` hides tools whose required scopes are absent, while direct `tools/call` authorization and live Runner/native checks remain authoritative. The managed-user flow remains separate as `connect --auth managed-oauth`.
 
 ### Grok custom connector (OAuth)
 

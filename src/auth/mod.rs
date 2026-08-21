@@ -46,6 +46,7 @@ pub mod scopes;
 // `pat` is `pub(crate)` — its functions are internal utilities.
 pub(crate) mod middleware;
 pub(crate) mod pat;
+pub(crate) mod project_share;
 pub(crate) mod shared_key;
 pub(crate) mod tokens;
 
@@ -60,6 +61,12 @@ pub(crate) use project_credential::{
     read_protected_secret, validate_agent_token as validate_project_agent_token,
     validate_credential as validate_project_credential, ProjectAgentTokenVerifier,
     ProjectCredentialVerifier,
+};
+pub(crate) use project_share::{
+    configured_project_share_subject, generate_project_share_session_id,
+    parse_project_share_subject_id, project_share_scopes_are_bounded, validate_project_grant_id,
+    validate_project_share_grant_subject, PROJECT_SHARE_OAUTH_SCOPES,
+    PROJECT_SHARE_OAUTH_SUBJECT_KIND, PROJECT_SHARE_OAUTH_TOKEN_KIND,
 };
 
 pub use scopes::{
@@ -94,7 +101,7 @@ pub(crate) use pat::{
 };
 pub(crate) use shared_key::{
     allow_anonymous_enabled, is_managed_token_prefix, open_anonymous_context, shared_key_context,
-    shared_key_enabled, shared_key_hash_of,
+    shared_key_enabled, shared_key_hash_of, DIRECT_SHARED_KEY_MODEL_SCOPES,
 };
 
 pub(crate) use tokens::{authenticate, is_oauth2_access_token};

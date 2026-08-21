@@ -928,7 +928,12 @@ pub(crate) async fn oauth_authorize(req: &mut Request, depot: &mut Depot, res: &
             else {
                 return;
             };
-            render_bridge_authorize_form(res, &validated, &query, None);
+            let registry = depot
+                .obtain::<std::sync::Arc<crate::ShellClientRegistry>>()
+                .ok()
+                .cloned();
+            render_bridge_authorize_form(res, &validated, &query, None, registry.as_deref(), &[])
+                .await;
             return;
         }
         Ok(false) => {}
@@ -938,6 +943,30 @@ pub(crate) async fn oauth_authorize(req: &mut Request, depot: &mut Depot, res: &
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
                 "unsupported bridge",
+            );
+            return;
+        }
+    }
+
+    match crate::auth::configured_project_share_subject(&config) {
+        Ok(Some(_)) => {
+            let Some(validated) = super::project_share::validate_project_share_authorize_request(
+                res, &config, &db, &query,
+            ) else {
+                return;
+            };
+            super::project_share::render_project_share_authorize_form(
+                res, &validated, &query, None,
+            );
+            return;
+        }
+        Ok(None) => {}
+        Err(_) => {
+            oauth_authorize_direct_error(
+                res,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "project share OAuth configuration is incomplete",
             );
             return;
         }

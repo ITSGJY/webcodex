@@ -28,9 +28,17 @@ Server API 完成。
 | `webcodex doctor` | 当前项目的只读就绪检查 | 输出稳定的 `next action`；用 `--json` 获取结构化结果。 |
 | `webcodex run` | 启动 project-bound loopback Server 与本地 Runner | 前台运行；Ctrl-C 同时停止两者。 |
 | `webcodex status` | 简洁的项目 coding 就绪状态 | `doctor` 提供完整检查。 |
-| `webcodex share` | 临时把本地项目通过 HTTPS 分享出去 | 启动 Cloudflare Quick Tunnel，输出临时 URL 与 credential。 |
-| `webcodex connect <server>` | 把当前项目接入已有的 Server | 创建 profile、启动 detached Runner、输出 MCP URL 与 key。 |
+| `webcodex share` | 通过 HTTPS 分享本地项目 | 默认使用临时 Bearer credential；`--auth oauth --oauth-redirect-uri <URL>` 可启用 project-bound OAuth。 |
+| `webcodex connect <server>` | 把当前项目接入已有的 Server | 默认使用 hosted shared-key；`--auth oauth --oauth-redirect-uri <URL>` 可把同一个 shared-key 身份桥接成 ChatGPT OAuth，不需要 managed login。 |
 | `webcodex disconnect [--project PATH] [--profile NAME]` | 移除一个 hosted 项目注册 | 是该仓库 `connect` 的精确逆操作；绝不删除仓库或 `.git`。 |
+
+`webcodex share --auth oauth --oauth-redirect-uri <精确回调地址>` 使用 OAuth 2.0 Authorization Code + PKCE S256。OAuth client ID/secret 会按“项目 + 回调地址”保存在受保护的 project state 中；authorization code、access token、refresh token 与临时 Project Credential 则都被 fenced 到当前 `share` 进程。重启 `share` 会让旧 OAuth grant 失效，但不会改变 Connector 的稳定 project identity。OAuth access token 永远不能用于 Runner/Agent transport。
+
+Cloudflare Quick Tunnel 的公网 origin 仍然是临时的。如需稳定 HTTPS origin，可使用 `--tunnel none --public-url https://share.example`，并由 operator 自己把该 origin 反向代理/隧道到 loopback WebCodex Server；`--public-url` 只声明外部 origin/issuer，不会创建代理或 tunnel。
+
+`webcodex connect <server> --auth oauth --oauth-redirect-uri <精确回调地址>` 是普通 hosted connect 面向 ChatGPT 的 OAuth 路径。它继续使用 Runner 的同一个 `wck_*` shared-key 身份，并保持 direct shared-key baseline 不变：`runtime:read`、`project:read`、`project:write`、`job:run`、`computer:read`、`computer:control`。fresh OAuth client 从完整 baseline 开始，但已有受保护 client 可以合法持有更窄的 baseline subset。只有显式增加 `--oauth-computer-permissions`，client ceiling 才在**现有 baseline subset**上追加固定的 `computer:launch`、`computer:display_read`、`computer:pointer_control`、`computer:clipboard_read`、`computer:clipboard_write`；不会恢复此前缺失的 baseline scope，该 flag 本身也不会 grant optional scope。WebCodex authorize 页面只把当前合法且可用的 Additional Computer permissions 以默认未勾选 checkbox 展示，真正进入 authorization code/access/refresh grant 的只有用户选择项。Launch consent 要求本次 OAuth request 同时包含 `computer:read` 与 `computer:launch`；缺失 prerequisite 时页面会禁用，而不是由 Server 偷偷补 scope。client ceiling 真正扩大时会撤销旧 grant 并要求重新授权；普通 reconnect 不会静默扩大 baseline client。`account:manage`、`admin`、`job:detach`、任何 `agent:*` 与未来新增 scope 永远不进入 picker。授权页显示的 Runner capability 只表示当前 backend support，不保证 OS/native permission 一定成功；runtime 调用仍会实时重新检查 capability 与 native preflight。OAuth access token 仍不能用于 Agent transport。
+
+高级 managed identity 流程仍保留为 `--auth managed-oauth --oauth-redirect-uri <精确回调地址>`，它才要求先 `webcodex login`；`--user` 也只用于该模式。
 
 `disconnect` 按 canonical 仓库路径匹配，不根据 basename 或 project id 猜测。如果同一仓库
 注册在多个 hosted profile 中，必须显式指定 `--profile`。managed Runner 在线时，它先执行

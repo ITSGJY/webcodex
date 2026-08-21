@@ -1,24 +1,176 @@
 use salvo::prelude::*;
 
-use crate::auth::{generate_oauth_authorization_code, hash_token, scopes, shared_key_hash_of};
+use crate::auth::{
+    generate_oauth_authorization_code, hash_token, shared_key_hash_of, AuthContext,
+    DIRECT_SHARED_KEY_MODEL_SCOPES, SCOPE_COMPUTER_CLIPBOARD_READ, SCOPE_COMPUTER_CLIPBOARD_WRITE,
+    SCOPE_COMPUTER_CONTROL, SCOPE_COMPUTER_DISPLAY_READ, SCOPE_COMPUTER_LAUNCH,
+    SCOPE_COMPUTER_POINTER_CONTROL, SCOPE_COMPUTER_READ, SCOPE_JOB_RUN, SCOPE_PROJECT_READ,
+    SCOPE_PROJECT_WRITE, SCOPE_RUNTIME_READ,
+};
 use crate::models::OAuthAuthorizationCodeRecord;
+use crate::shell_protocol::ShellClientCapabilities;
 
 use super::{
-    authorize_bridge_html, decoded_authorize_param, form_field, normalize_oauth_scopes,
-    oauth_authorize_direct_error, parse_authorize_query, parse_form_body,
+    apply_oauth_no_store_headers, authorize_bridge_html, decoded_authorize_param, form_field,
+    normalize_oauth_scopes, oauth_authorize_direct_error, parse_authorize_query, parse_form_body,
     redirect_with_authorization_code, redirect_with_oauth_error, validate_authorize_resource,
-    OAuthAuthorizeError, OAuthAuthorizeRequest, OAUTH_OFFLINE_ACCESS_SCOPE,
+    validate_redirect_uri, BridgePermissionView, OAuthAuthorizeError, OAuthAuthorizeRequest,
+    OAUTH_OFFLINE_ACCESS_SCOPE,
 };
 
-const OAUTH_BRIDGE_SCOPES_SUPPORTED: &[&str] = &[
-    scopes::SCOPE_RUNTIME_READ,
-    scopes::SCOPE_PROJECT_READ,
-    scopes::SCOPE_PROJECT_WRITE,
-    scopes::SCOPE_JOB_RUN,
+pub(crate) const OAUTH_BRIDGE_INVALID_SCOPE_MESSAGE: &str =
+    "bridge tokens exceed the ordinary shared-key OAuth scope ceiling";
+
+pub(crate) const SHARED_KEY_OAUTH_OPTIONAL_COMPUTER_SCOPES: &[&str] = &[
+    SCOPE_COMPUTER_LAUNCH,
+    SCOPE_COMPUTER_DISPLAY_READ,
+    SCOPE_COMPUTER_POINTER_CONTROL,
+    SCOPE_COMPUTER_CLIPBOARD_READ,
+    SCOPE_COMPUTER_CLIPBOARD_WRITE,
 ];
 
-pub(crate) const OAUTH_BRIDGE_INVALID_SCOPE_MESSAGE: &str =
-    "bridge tokens are limited to runtime:read, project:read, project:write, job:run";
+/// Canonical ceiling for a fresh Computer-enabled shared-key OAuth client.
+/// Existing clients may retain a narrower non-empty baseline subset and add the
+/// same fixed optional Computer scopes.
+pub(crate) const SHARED_KEY_OAUTH_COMPUTER_ENABLED_SCOPES: &[&str] = &[
+    SCOPE_RUNTIME_READ,
+    SCOPE_PROJECT_READ,
+    SCOPE_PROJECT_WRITE,
+    SCOPE_JOB_RUN,
+    SCOPE_COMPUTER_READ,
+    SCOPE_COMPUTER_CONTROL,
+    SCOPE_COMPUTER_LAUNCH,
+    SCOPE_COMPUTER_DISPLAY_READ,
+    SCOPE_COMPUTER_POINTER_CONTROL,
+    SCOPE_COMPUTER_CLIPBOARD_READ,
+    SCOPE_COMPUTER_CLIPBOARD_WRITE,
+];
+
+#[derive(Debug, Clone, Copy)]
+struct BridgePermissionSpec {
+    id: &'static str,
+    label: &'static str,
+    scopes: &'static [&'static str],
+    request_scopes: &'static [&'static str],
+}
+
+const BRIDGE_PERMISSION_SPECS: &[BridgePermissionSpec] = &[
+    BridgePermissionSpec {
+        id: "launch",
+        label: "Launch applications",
+        scopes: &[SCOPE_COMPUTER_LAUNCH],
+        request_scopes: &[SCOPE_COMPUTER_READ, SCOPE_COMPUTER_LAUNCH],
+    },
+    BridgePermissionSpec {
+        id: "display",
+        label: "Full-display observation",
+        scopes: &[SCOPE_COMPUTER_DISPLAY_READ],
+        request_scopes: &[SCOPE_COMPUTER_READ, SCOPE_COMPUTER_DISPLAY_READ],
+    },
+    BridgePermissionSpec {
+        id: "pointer",
+        label: "Pointer control",
+        scopes: &[SCOPE_COMPUTER_DISPLAY_READ, SCOPE_COMPUTER_POINTER_CONTROL],
+        request_scopes: &[
+            SCOPE_COMPUTER_READ,
+            SCOPE_COMPUTER_CONTROL,
+            SCOPE_COMPUTER_DISPLAY_READ,
+            SCOPE_COMPUTER_POINTER_CONTROL,
+        ],
+    },
+    BridgePermissionSpec {
+        id: "clipboard_read",
+        label: "Read clipboard",
+        scopes: &[SCOPE_COMPUTER_CLIPBOARD_READ],
+        request_scopes: &[SCOPE_COMPUTER_READ, SCOPE_COMPUTER_CLIPBOARD_READ],
+    },
+    BridgePermissionSpec {
+        id: "clipboard_write",
+        label: "Write clipboard",
+        scopes: &[SCOPE_COMPUTER_CLIPBOARD_WRITE],
+        request_scopes: &[SCOPE_COMPUTER_CONTROL, SCOPE_COMPUTER_CLIPBOARD_WRITE],
+    },
+];
+
+pub(crate) fn bridge_oauth_scopes() -> &'static [&'static str] {
+    DIRECT_SHARED_KEY_MODEL_SCOPES
+}
+
+#[cfg(test)]
+pub(crate) fn bridge_oauth_computer_enabled_scopes() -> &'static [&'static str] {
+    SHARED_KEY_OAUTH_COMPUTER_ENABLED_SCOPES
+}
+
+fn bridge_permission_spec(id: &str) -> Option<&'static BridgePermissionSpec> {
+    BRIDGE_PERMISSION_SPECS
+        .iter()
+        .find(|permission| permission.id == id)
+}
+
+fn bridge_scope_list_is_unique(scopes: &[String]) -> bool {
+    scopes
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        == scopes.len()
+}
+
+fn bridge_baseline_scope_ceiling_is_valid(scopes: &[String]) -> bool {
+    !scopes.is_empty()
+        && bridge_scope_list_is_unique(scopes)
+        && scopes
+            .iter()
+            .all(|scope| bridge_oauth_scopes().contains(&scope.as_str()))
+}
+
+fn bridge_computer_scope_ceiling_is_valid(scopes: &[String]) -> bool {
+    if scopes.is_empty() || !bridge_scope_list_is_unique(scopes) {
+        return false;
+    }
+
+    let mut has_baseline_scope = false;
+    for scope in scopes {
+        if bridge_oauth_scopes().contains(&scope.as_str()) {
+            has_baseline_scope = true;
+        } else if !SHARED_KEY_OAUTH_OPTIONAL_COMPUTER_SCOPES.contains(&scope.as_str()) {
+            return false;
+        }
+    }
+
+    has_baseline_scope
+        && SHARED_KEY_OAUTH_OPTIONAL_COMPUTER_SCOPES
+            .iter()
+            .all(|required| scopes.iter().any(|scope| scope == required))
+}
+
+fn bridge_computer_enabled_scope_ceiling(scopes: &[String]) -> Option<Vec<String>> {
+    if bridge_computer_scope_ceiling_is_valid(scopes) {
+        return Some(scopes.to_vec());
+    }
+    if !bridge_baseline_scope_ceiling_is_valid(scopes) {
+        return None;
+    }
+
+    let mut expanded = scopes.to_vec();
+    expanded.extend(
+        SHARED_KEY_OAUTH_OPTIONAL_COMPUTER_SCOPES
+            .iter()
+            .map(|scope| (*scope).to_string()),
+    );
+    Some(expanded)
+}
+
+fn bridge_client_is_computer_enabled(client: &crate::models::OAuthClientRecord) -> bool {
+    client.is_shared_key_owned()
+        && bridge_computer_scope_ceiling_is_valid(&client.allowed_scopes_vec())
+}
+
+fn bridge_client_has_optional_computer_scope(client: &crate::models::OAuthClientRecord) -> bool {
+    client
+        .allowed_scopes_vec()
+        .iter()
+        .any(|scope| SHARED_KEY_OAUTH_OPTIONAL_COMPUTER_SCOPES.contains(&scope.as_str()))
+}
 
 fn is_managed_credential_like(value: &str) -> bool {
     value.starts_with("wc_")
@@ -42,7 +194,8 @@ pub(crate) fn normalize_bridge_oauth_scopes(
 ) -> Result<String, OAuthAuthorizeError> {
     let normalized = normalize_oauth_scopes(requested, client_allowed)?;
     if normalized.split_whitespace().any(|scope| {
-        scope != OAUTH_OFFLINE_ACCESS_SCOPE && !OAUTH_BRIDGE_SCOPES_SUPPORTED.contains(&scope)
+        scope != OAUTH_OFFLINE_ACCESS_SCOPE
+            && !SHARED_KEY_OAUTH_COMPUTER_ENABLED_SCOPES.contains(&scope)
     }) {
         return Err(OAuthAuthorizeError::InvalidScope(
             OAUTH_BRIDGE_INVALID_SCOPE_MESSAGE,
@@ -55,8 +208,122 @@ pub(crate) fn normalize_bridge_oauth_scopes(
 pub(super) struct BridgeAuthorizeValidated {
     parsed: OAuthAuthorizeRequest,
     client: crate::models::OAuthClientRecord,
-    scopes: String,
+    requestable_scopes: String,
     resource: Option<String>,
+    computer_permissions_enabled: bool,
+}
+
+impl BridgeAuthorizeValidated {
+    fn standard_grant_scopes(&self) -> Vec<String> {
+        self.requestable_scopes
+            .split_whitespace()
+            .filter(|scope| bridge_oauth_scopes().contains(scope))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn requested_scope_contains(&self, scope: &str) -> bool {
+        self.requestable_scopes
+            .split_whitespace()
+            .any(|requested| requested == scope)
+    }
+}
+
+fn bridge_permission_capable(permission_id: &str, capabilities: &ShellClientCapabilities) -> bool {
+    match permission_id {
+        "launch" => {
+            capabilities.computer_application_discovery && capabilities.computer_application_launch
+        }
+        "display" => capabilities.computer_display_observe,
+        "pointer" => capabilities.computer_display_observe && capabilities.computer_pointer_control,
+        "clipboard_read" => capabilities.computer_clipboard_read,
+        "clipboard_write" => capabilities.computer_clipboard_write,
+        _ => false,
+    }
+}
+
+async fn bridge_permission_views(
+    validated: &BridgeAuthorizeValidated,
+    registry: Option<&crate::ShellClientRegistry>,
+    selected_permissions: &[String],
+) -> Vec<BridgePermissionView> {
+    if !validated.computer_permissions_enabled {
+        return Vec::new();
+    }
+    let capabilities = match (registry, validated.client.owner_shared_key_hash.as_deref()) {
+        (Some(registry), Some(owner_hash)) => {
+            registry
+                .connected_shared_key_group_capabilities(owner_hash)
+                .await
+        }
+        _ => Vec::new(),
+    };
+    BRIDGE_PERMISSION_SPECS
+        .iter()
+        .map(|permission| {
+            let request_allowed = permission
+                .request_scopes
+                .iter()
+                .all(|scope| validated.requested_scope_contains(scope));
+            let capability_available = capabilities
+                .iter()
+                .any(|runner| bridge_permission_capable(permission.id, runner));
+            let available = request_allowed && capability_available;
+            let availability = if !request_allowed {
+                "Not requested by this OAuth authorization request"
+            } else if capability_available {
+                "Available on a connected Runner"
+            } else {
+                "Not currently supported by a connected Runner"
+            };
+            BridgePermissionView {
+                id: permission.id,
+                label: permission.label,
+                available,
+                selected: selected_permissions
+                    .iter()
+                    .any(|selected| selected == permission.id),
+                availability,
+            }
+        })
+        .collect()
+}
+
+fn selected_bridge_grant_scopes(
+    validated: &BridgeAuthorizeValidated,
+    selected_permissions: &[String],
+) -> Result<String, &'static str> {
+    let mut optional_scopes = std::collections::HashSet::new();
+    let mut seen_permissions = std::collections::HashSet::new();
+    for permission_id in selected_permissions {
+        if !seen_permissions.insert(permission_id.as_str()) {
+            return Err("duplicate Computer permission selection");
+        }
+        let permission =
+            bridge_permission_spec(permission_id).ok_or("invalid Computer permission selection")?;
+        if !validated.computer_permissions_enabled {
+            return Err("Computer permissions are not enabled for this OAuth client");
+        }
+        if !permission
+            .request_scopes
+            .iter()
+            .all(|scope| validated.requested_scope_contains(scope))
+        {
+            return Err("Computer permission was not fully requested by this OAuth request");
+        }
+        optional_scopes.extend(permission.scopes.iter().copied());
+    }
+
+    Ok(validated
+        .requestable_scopes
+        .split_whitespace()
+        .filter(|scope| {
+            *scope == OAUTH_OFFLINE_ACCESS_SCOPE
+                || bridge_oauth_scopes().contains(scope)
+                || optional_scopes.contains(scope)
+        })
+        .collect::<Vec<_>>()
+        .join(" "))
 }
 
 pub(super) fn is_shared_key_bridge_query(query: &str) -> Result<bool, OAuthAuthorizeError> {
@@ -167,7 +434,7 @@ pub(super) fn validate_bridge_authorize_request(
         return None;
     }
 
-    let scopes =
+    let requestable_scopes =
         match normalize_bridge_oauth_scopes(parsed.scope.as_deref(), &client.allowed_scopes) {
             Ok(scopes) => scopes,
             Err(_) => {
@@ -181,6 +448,25 @@ pub(super) fn validate_bridge_authorize_request(
                 return None;
             }
         };
+    let computer_permissions_enabled = bridge_client_is_computer_enabled(&client);
+    let client_bridge_ceiling = if computer_permissions_enabled {
+        SHARED_KEY_OAUTH_COMPUTER_ENABLED_SCOPES
+    } else {
+        bridge_oauth_scopes()
+    };
+    if requestable_scopes
+        .split_whitespace()
+        .any(|scope| scope != OAUTH_OFFLINE_ACCESS_SCOPE && !client_bridge_ceiling.contains(&scope))
+    {
+        redirect_with_oauth_error(
+            res,
+            config,
+            &parsed.redirect_uri,
+            "invalid_scope",
+            parsed.state.as_deref(),
+        );
+        return None;
+    }
 
     let resource = match validate_authorize_resource(parsed.resource.as_deref(), config) {
         Ok(resource) => resource,
@@ -199,27 +485,28 @@ pub(super) fn validate_bridge_authorize_request(
     Some(BridgeAuthorizeValidated {
         parsed,
         client,
-        scopes,
+        requestable_scopes,
         resource,
+        computer_permissions_enabled,
     })
 }
 
-pub(super) fn render_bridge_authorize_form(
+pub(super) async fn render_bridge_authorize_form(
     res: &mut Response,
     validated: &BridgeAuthorizeValidated,
     query: &str,
     error: Option<&str>,
+    registry: Option<&crate::ShellClientRegistry>,
+    selected_permissions: &[String],
 ) {
-    let scopes = validated
-        .scopes
-        .split_whitespace()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
+    let standard_scopes = validated.standard_grant_scopes();
+    let permissions = bridge_permission_views(validated, registry, selected_permissions).await;
     let html = authorize_bridge_html(
         &validated.client.name,
         &validated.client.client_id,
         &validated.parsed.redirect_uri,
-        &scopes,
+        &standard_scopes,
+        &permissions,
         validated.resource.as_deref(),
         query,
         error,
@@ -238,6 +525,7 @@ fn issue_bridge_authorization_code(
     db: &crate::Database,
     validated: &BridgeAuthorizeValidated,
     shared_key_hash: String,
+    granted_scopes: String,
 ) {
     let now = chrono::Utc::now().timestamp();
     let plaintext_code = generate_oauth_authorization_code();
@@ -250,7 +538,7 @@ fn issue_bridge_authorization_code(
         subject_id: shared_key_hash.clone(),
         user_id: None,
         redirect_uri: validated.parsed.redirect_uri.clone(),
-        scopes: validated.scopes.clone(),
+        scopes: granted_scopes,
         resource: validated.resource.clone(),
         code_challenge: Some(validated.parsed.code_challenge.clone()),
         code_challenge_method: Some("S256".to_string()),
@@ -281,6 +569,275 @@ fn issue_bridge_authorization_code(
         &plaintext_code,
         validated.parsed.state.as_deref(),
     );
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ProvisionSharedKeyOAuthClientRequest {
+    redirect_uri: String,
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    previous_allowed_scopes: Option<Vec<String>>,
+    #[serde(default)]
+    computer_permissions: bool,
+}
+
+fn bridge_client_scopes_are_current(client: &crate::models::OAuthClientRecord) -> bool {
+    let scopes = client.allowed_scopes_vec();
+    bridge_baseline_scope_ceiling_is_valid(&scopes)
+        || bridge_computer_scope_ceiling_is_valid(&scopes)
+}
+
+#[handler]
+pub(crate) async fn oauth_shared_key_client_provision(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) {
+    let Some(config) = crate::auth::get_config(depot) else {
+        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+        res.render(Json(serde_json::json!({"error": "no config"})));
+        return;
+    };
+    if !config.oauth2.enabled || !config.oauth2.shared_key_bridge_enabled {
+        res.status_code(StatusCode::NOT_FOUND);
+        res.render(Json(
+            serde_json::json!({"error": "shared-key OAuth bridge is not enabled"}),
+        ));
+        return;
+    }
+    let Some(auth) = depot.obtain::<AuthContext>().ok() else {
+        res.status_code(StatusCode::UNAUTHORIZED);
+        res.render(Json(
+            serde_json::json!({"error": "direct shared key required"}),
+        ));
+        return;
+    };
+    if !auth.is_shared_key() {
+        res.status_code(StatusCode::FORBIDDEN);
+        res.render(Json(
+            serde_json::json!({"error": "direct shared key required"}),
+        ));
+        return;
+    }
+    let Some(shared_key_hash) = auth.shared_key_hash.as_deref() else {
+        res.status_code(StatusCode::FORBIDDEN);
+        res.render(Json(
+            serde_json::json!({"error": "direct shared key identity is unavailable"}),
+        ));
+        return;
+    };
+    let Some(db) = crate::auth::get_db(depot) else {
+        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+        res.render(Json(serde_json::json!({"error": "DB not available"})));
+        return;
+    };
+    let Some(registry) = depot
+        .obtain::<std::sync::Arc<crate::ShellClientRegistry>>()
+        .ok()
+    else {
+        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+        res.render(Json(
+            serde_json::json!({"error": "Runner registry unavailable"}),
+        ));
+        return;
+    };
+    if !registry
+        .has_connected_shared_key_group(shared_key_hash)
+        .await
+    {
+        res.status_code(StatusCode::CONFLICT);
+        res.render(Json(serde_json::json!({
+            "error": "shared-key Runner group is not connected"
+        })));
+        return;
+    }
+    let body: ProvisionSharedKeyOAuthClientRequest = match req.parse_json().await {
+        Ok(body) => body,
+        Err(_) => {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(serde_json::json!({"error": "invalid request body"})));
+            return;
+        }
+    };
+    let redirect_uri = body.redirect_uri.trim().to_string();
+    if let Err(error) = validate_redirect_uri(&redirect_uri) {
+        res.status_code(StatusCode::BAD_REQUEST);
+        res.render(Json(serde_json::json!({"error": error})));
+        return;
+    }
+
+    if let Some(client_id) = body
+        .client_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        match db.get_oauth_client_by_client_id(client_id) {
+            Ok(Some(mut client)) => {
+                if !client.is_shared_key_owned()
+                    || client.owner_shared_key_hash.as_deref() != Some(shared_key_hash)
+                {
+                    res.status_code(StatusCode::FORBIDDEN);
+                    res.render(Json(serde_json::json!({"error": "OAuth client belongs to a different shared-key group"})));
+                    return;
+                }
+                if client.redirect_uris_vec() != vec![redirect_uri.clone()] {
+                    res.status_code(StatusCode::CONFLICT);
+                    res.render(Json(
+                        serde_json::json!({"error": "OAuth client redirect URI does not match"}),
+                    ));
+                    return;
+                }
+                if !bridge_client_scopes_are_current(&client) {
+                    res.status_code(StatusCode::CONFLICT);
+                    res.render(Json(serde_json::json!({"error": "persisted OAuth client exceeds the current ordinary shared-key OAuth scope ceiling"})));
+                    return;
+                }
+                if !body.computer_permissions && bridge_client_has_optional_computer_scope(&client)
+                {
+                    res.status_code(StatusCode::CONFLICT);
+                    res.render(Json(serde_json::json!({
+                        "error": "OAuth client has optional Computer permissions enabled; reconnect with --oauth-computer-permissions to reuse this client"
+                    })));
+                    return;
+                }
+
+                let desired_scopes = if body.computer_permissions {
+                    let current_scopes = client.allowed_scopes_vec();
+                    if bridge_computer_scope_ceiling_is_valid(&current_scopes) {
+                        // Preserve an already Computer-enabled ceiling byte-for-byte so a
+                        // semantic no-op cannot revoke grants merely by canonicalizing scope
+                        // ordering or whitespace.
+                        client.allowed_scopes.clone()
+                    } else {
+                        let Some(scopes) = bridge_computer_enabled_scope_ceiling(&current_scopes)
+                        else {
+                            res.status_code(StatusCode::CONFLICT);
+                            res.render(Json(serde_json::json!({
+                                "error": "persisted OAuth scope ceiling is not valid for Computer opt-in"
+                            })));
+                            return;
+                        };
+                        scopes.join(" ")
+                    }
+                } else {
+                    client.allowed_scopes.clone()
+                };
+                let update = match db.update_oauth_client_allowed_scopes_and_revoke_grants(
+                    &client.client_id,
+                    &client.allowed_scopes,
+                    &desired_scopes,
+                    chrono::Utc::now().timestamp(),
+                ) {
+                    Ok(Some(update)) => update,
+                    Ok(None) => {
+                        res.status_code(StatusCode::CONFLICT);
+                        res.render(Json(serde_json::json!({
+                            "error": "OAuth client changed while reconnecting; retry the explicit connect operation"
+                        })));
+                        return;
+                    }
+                    Err(_) => {
+                        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                        res.render(Json(serde_json::json!({
+                            "error": "failed to update OAuth client scope ceiling"
+                        })));
+                        return;
+                    }
+                };
+                let scope_ceiling_changed = update.0;
+                client.allowed_scopes = desired_scopes;
+                apply_oauth_no_store_headers(res);
+                res.render(Json(serde_json::json!({
+                    "success": true,
+                    "reused": true,
+                    "scope_ceiling_changed": scope_ceiling_changed,
+                    "client": {
+                        "client_id": client.client_id,
+                        "redirect_uri": redirect_uri,
+                        "allowed_scopes": client.allowed_scopes_vec(),
+                    }
+                })));
+                return;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                res.render(Json(serde_json::json!({
+                    "error": "failed to read existing OAuth client"
+                })));
+                return;
+            }
+        }
+    }
+
+    let create_scopes = if let Some(previous) = body.previous_allowed_scopes.as_ref() {
+        if body.computer_permissions {
+            let Some(scopes) = bridge_computer_enabled_scope_ceiling(previous) else {
+                res.status_code(StatusCode::CONFLICT);
+                res.render(Json(serde_json::json!({
+                    "error": "persisted OAuth scope ceiling is not valid for Computer opt-in"
+                })));
+                return;
+            };
+            scopes
+        } else {
+            if !bridge_baseline_scope_ceiling_is_valid(previous) {
+                res.status_code(StatusCode::CONFLICT);
+                let error = if bridge_computer_scope_ceiling_is_valid(previous) {
+                    "persisted OAuth profile is Computer-enabled; reconnect with --oauth-computer-permissions"
+                } else {
+                    "persisted OAuth scope ceiling is not valid for ordinary shared-key OAuth"
+                };
+                res.render(Json(serde_json::json!({"error": error})));
+                return;
+            }
+            previous.clone()
+        }
+    } else if body.computer_permissions {
+        SHARED_KEY_OAUTH_COMPUTER_ENABLED_SCOPES
+            .iter()
+            .map(|scope| (*scope).to_string())
+            .collect()
+    } else {
+        bridge_oauth_scopes()
+            .iter()
+            .map(|scope| (*scope).to_string())
+            .collect()
+    };
+
+    let plaintext_secret = crate::auth::generate_oauth_client_secret();
+    let record = crate::models::OAuthClientRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        client_id: crate::auth::generate_oauth_client_id(),
+        client_secret_hash: hash_token(&plaintext_secret),
+        name: "WebCodex hosted shared-key bridge".to_string(),
+        owner_user_id: None,
+        owner_project_grant_id: None,
+        owner_shared_key_hash: Some(shared_key_hash.to_string()),
+        redirect_uris: redirect_uri.clone(),
+        allowed_scopes: create_scopes.join(" "),
+        created_at: chrono::Utc::now().timestamp(),
+        revoked_at: None,
+    };
+    if db.insert_oauth_client(&record).is_err() {
+        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+        res.render(Json(
+            serde_json::json!({"error": "failed to create OAuth client"}),
+        ));
+        return;
+    }
+    apply_oauth_no_store_headers(res);
+    res.render(Json(serde_json::json!({
+        "success": true,
+        "reused": false,
+        "client": {
+            "client_id": record.client_id,
+            "redirect_uri": redirect_uri,
+            "allowed_scopes": record.allowed_scopes_vec(),
+        },
+        "client_secret": plaintext_secret,
+    })));
 }
 
 #[handler]
@@ -342,11 +899,21 @@ pub(crate) async fn oauth_authorize_bridge(
         }
     };
 
-    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-    for (key, value) in pairs.iter().filter(|(key, _)| key != "shared_key") {
-        serializer.append_pair(key, value);
-    }
-    let query = serializer.finish();
+    let selected_permissions = pairs
+        .iter()
+        .filter(|(key, _)| key == "computer_permission")
+        .map(|(_, value)| value.clone())
+        .collect::<Vec<_>>();
+    let query = {
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        for (key, value) in pairs
+            .iter()
+            .filter(|(key, _)| key != "shared_key" && key != "computer_permission")
+        {
+            serializer.append_pair(key, value);
+        }
+        serializer.finish()
+    };
 
     match is_shared_key_bridge_query(&query) {
         Ok(true) => {}
@@ -365,14 +932,103 @@ pub(crate) async fn oauth_authorize_bridge(
         return;
     };
 
+    let registry = depot
+        .obtain::<std::sync::Arc<crate::ShellClientRegistry>>()
+        .ok()
+        .cloned();
     let submitted = form_field(&pairs, "shared_key").unwrap_or("");
     let shared_key_hash = match bridge_shared_key_hash(submitted) {
         Ok(hash) => hash,
         Err(message) => {
-            render_bridge_authorize_form(res, &validated, &query, Some(message));
+            render_bridge_authorize_form(
+                res,
+                &validated,
+                &query,
+                Some(message),
+                registry.as_deref(),
+                &selected_permissions,
+            )
+            .await;
             return;
         }
     };
+    if let Some(owner_hash) = validated.client.owner_shared_key_hash.clone() {
+        if !crate::config::constant_time_eq(shared_key_hash.as_bytes(), owner_hash.as_bytes()) {
+            render_bridge_authorize_form(
+                res,
+                &validated,
+                &query,
+                Some("shared key is not valid for this OAuth client"),
+                registry.as_deref(),
+                &selected_permissions,
+            )
+            .await;
+            return;
+        }
+        let Some(registry) = registry.as_deref() else {
+            oauth_authorize_direct_error(
+                res,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "Runner registry unavailable",
+            );
+            return;
+        };
+        if !registry.has_connected_shared_key_group(&owner_hash).await {
+            render_bridge_authorize_form(
+                res,
+                &validated,
+                &query,
+                Some("shared-key Runner group is no longer connected"),
+                Some(registry),
+                &selected_permissions,
+            )
+            .await;
+            return;
+        }
+    }
 
-    issue_bridge_authorization_code(res, &config, &db, &validated, shared_key_hash);
+    let granted_scopes = match selected_bridge_grant_scopes(&validated, &selected_permissions) {
+        Ok(scopes) => scopes,
+        Err(message) => {
+            render_bridge_authorize_form(
+                res,
+                &validated,
+                &query,
+                Some(message),
+                registry.as_deref(),
+                &selected_permissions,
+            )
+            .await;
+            return;
+        }
+    };
+    if !selected_permissions.is_empty() {
+        let permission_views =
+            bridge_permission_views(&validated, registry.as_deref(), &selected_permissions).await;
+        if selected_permissions.iter().any(|selected| {
+            !permission_views
+                .iter()
+                .any(|permission| permission.id == selected && permission.available)
+        }) {
+            render_bridge_authorize_form(
+                res,
+                &validated,
+                &query,
+                Some("connected Runner capability changed or the selected Computer permission is no longer available for this OAuth request"),
+                registry.as_deref(),
+                &selected_permissions,
+            )
+            .await;
+            return;
+        }
+    }
+    issue_bridge_authorization_code(
+        res,
+        &config,
+        &db,
+        &validated,
+        shared_key_hash,
+        granted_scopes,
+    );
 }

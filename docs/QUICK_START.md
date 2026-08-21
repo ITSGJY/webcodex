@@ -89,14 +89,40 @@ Quick Tunnel and a separate temporary Connector credential. It prints a
 temporary `https://*.trycloudflare.com/mcp` URL and Bearer token; both stop
 being usable when the command exits.
 
-`webcodex share --tunnel none` starts the same runtime without a public tunnel
-for local debugging. Quick Tunnels are not a production deployment mechanism.
+For an MCP client that requires OAuth, register its exact callback and run:
+
+```bash
+webcodex share --auth oauth --oauth-redirect-uri https://client.example/callback
+```
+
+The command prints the temporary Project share credential plus a project-bound OAuth client ID/secret. Enter the Project share credential only on the WebCodex authorization page. OAuth grants are fenced to that `share` process, so a restart invalidates old access and refresh tokens. The client ID/secret remain in protected project state for reuse with the same callback.
+
+`webcodex share --tunnel none` starts the same runtime without a public tunnel for local debugging. For a stable operator-managed OAuth origin, combine it with `--public-url https://share.example` and route that HTTPS origin to the local WebCodex port yourself. Quick Tunnels are not a stable-origin or production deployment mechanism.
 
 ### Connect to an existing Server
 
-For a stable, long-lived setup against an existing Server, use
-`webcodex connect` (hosted shared-key) or `webcodex login` (managed). See
-[Deployment](DEPLOYMENT.md).
+For a stable, long-lived setup against an existing Server, shared-key connect remains available:
+
+```bash
+webcodex connect https://webcodex.example --project .
+```
+
+For ChatGPT OAuth, use the same hosted shared-key identity; no login, pairing, PAT, or account identity is required:
+
+```bash
+webcodex connect https://webcodex.example --auth oauth \
+  --oauth-redirect-uri https://client.example/callback --project .
+```
+
+To opt the OAuth client into the optional Computer consent ceiling, use:
+
+```bash
+webcodex connect https://webcodex.example --auth oauth \
+  --oauth-redirect-uri https://client.example/callback \
+  --oauth-computer-permissions --project .
+```
+
+The Runner keeps the direct shared key and its fixed baseline authority while ChatGPT receives only OAuth credentials/tokens. A fresh ordinary shared-key OAuth client starts with the full baseline (`runtime/project/job`, `computer:read`, `computer:control`), but an existing protected client may retain a narrower valid baseline subset. To let the browser offer the fixed optional launch/full-display/pointer/clipboard permissions, reconnect explicitly with `--oauth-computer-permissions`; the flag appends only those optional scopes to the existing baseline subset and never restores missing baseline authority. All optional permissions remain unchecked until selected on WebCodex's authorize page. Launch can be selected only when the OAuth request already contains both `computer:read` and `computer:launch`; WebCodex never fills a missing request scope. `account:manage`, `admin`, `job:detach`, Agent scopes, and future scopes are never offered. Existing baseline clients are not widened by normal reconnect. Runner capability and OS/native permission are rechecked at runtime, so consent-page availability is not a success guarantee. Advanced managed-user OAuth remains separate as `--auth managed-oauth` after `webcodex login`. See [Deployment](DEPLOYMENT.md).
 
 To remove only this repository from a hosted `connect` profile later, run from the repository:
 

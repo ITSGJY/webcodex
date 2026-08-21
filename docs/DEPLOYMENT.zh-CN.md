@@ -224,13 +224,34 @@ max_output_bytes = 262144
 
 ## OAuth2
 
-OAuth2 默认关闭。为使用 authorization-code 流程的 GPT Actions / MCP 客户端启用：
+Server 没有公网 origin 时 OAuth2 仍默认关闭。使用 `webcodex server init --public-url https://your-domain.example` 时，初始化会写入 public URL、以该 URL 作为 issuer 启用 OAuth，并为普通 hosted connect 启用 shared-key OAuth bridge。手工维护 env 时等价配置为：
 
 ```text
+WEBCODEX_PUBLIC_URL=https://your-domain.example
 WEBCODEX_OAUTH2_ENABLED=true
 WEBCODEX_OAUTH2_ISSUER=https://your-domain.example
-WEBCODEX_PUBLIC_URL=https://your-domain.example
+WEBCODEX_OAUTH2_SHARED_KEY_BRIDGE=true
 ```
+
+普通仓库机器不需要 managed login，直接使用 MCP 客户端要求的精确 callback：
+
+```bash
+cd /path/to/your/repository
+webcodex connect https://your-domain.example --auth oauth \
+  --oauth-redirect-uri https://client.example/callback --project .
+```
+
+如需让这个 ordinary shared-key OAuth client 提供固定的 optional Computer consent 集合，必须显式 opt in：
+
+```bash
+webcodex connect https://your-domain.example --auth oauth \
+  --oauth-redirect-uri https://client.example/callback \
+  --oauth-computer-permissions --project .
+```
+
+Runner 继续使用 hosted shared key，其 model-facing authority 始终保持固定 baseline（runtime/project/job 加 `computer:read`、`computer:control`）。`connect` 创建绑定该 shared-key hash 的独立 OAuth client。fresh client 从完整 baseline 开始；历史受保护 client 可以合法保留更窄的 baseline subset。`--oauth-computer-permissions` 只在该现有 subset 上追加固定的 launch/full-display/pointer/clipboard-read/clipboard-write scopes，不会恢复此前缺失的 baseline scope，本身也不 grant。WebCodex authorize 页面中的这些 permission 默认全部未勾选，browser selection 按固定 bundle 映射且受本次 OAuth request 限制。Launch 只有在 request 已同时包含 `computer:read` 与 `computer:launch` 时才可选择，Server 不会补缺失 prerequisite。普通 reconnect 永远不会静默扩大已有 baseline client；revoked/missing client rotation 也保留同一个受保护 baseline subset。显式 ceiling 真正变化会原子撤销旧 access/refresh/code grant，必须重新授权。picker 永远不包含 account/admin/Agent、`job:detach` 或未来 scope。页面只显示安全的“同一个在线 Runner” capability availability，不执行任何隐藏 Computer observation/effect；OS/native permission 与当前 capability 仍由 runtime 调用实时检查。shared key 只输入 WebCodex authorize 页面，ChatGPT 不会获得它，OAuth access token 仍不能用于 Agent transport。
+
+只有明确需要 managed-user OAuth identity 时，才使用高级 `webcodex login` 流程，再执行 `webcodex connect ... --auth managed-oauth --oauth-redirect-uri ...`；`--user` 仅用于该模式。
 
 创建 OAuth client（`client_secret` 只返回一次；服务端只存其 hash）：
 

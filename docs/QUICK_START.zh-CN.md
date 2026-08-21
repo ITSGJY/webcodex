@@ -81,13 +81,40 @@ webcodex share
 一把独立的临时 Connector credential。它输出临时 `https://*.trycloudflare.com/mcp`
 URL 与 Bearer token；命令退出后两者都失效。
 
-`webcodex share --tunnel none` 在不开放公网 tunnel 的情况下启动同一 runtime，
-用于本地调试。Quick Tunnel 不适合作为生产部署。
+如果 MCP 客户端要求 OAuth，先确定它的精确 callback，然后运行：
+
+```bash
+webcodex share --auth oauth --oauth-redirect-uri https://client.example/callback
+```
+
+命令会输出临时 Project share credential，以及 project-bound OAuth client ID/secret。Project share credential 只应输入 WebCodex 自己的授权页。OAuth grant 被 fenced 到本次 `share` 进程，因此重启后旧 access/refresh token 失效；同一项目与 callback 的 client ID/secret 会保存在受保护的 project state 中以便复用。
+
+`webcodex share --tunnel none` 在不开放公网 tunnel 的情况下启动同一 runtime，用于本地调试。如需稳定、由 operator 管理的 OAuth origin，可再加 `--public-url https://share.example`，并自行把该 HTTPS origin 反向代理/隧道到本地 WebCodex 端口。Quick Tunnel 不提供稳定 origin，也不适合作为生产部署。
 
 ### 接入已有 Server
 
-如需接入已有 Server 的稳定长期环境，用 `webcodex connect`（hosted shared-key）
-或 `webcodex login`（managed）。见[部署指南](DEPLOYMENT.zh-CN.md)。
+如需接入已有 Server 的稳定长期环境，仍可使用 shared-key：
+
+```bash
+webcodex connect https://webcodex.example --project .
+```
+
+ChatGPT OAuth 直接复用同一个 hosted shared-key identity，不需要 login、pairing、PAT 或 account identity：
+
+```bash
+webcodex connect https://webcodex.example --auth oauth \
+  --oauth-redirect-uri https://client.example/callback --project .
+```
+
+如需显式把 OAuth client 升级到可提供 optional Computer consent 的 ceiling：
+
+```bash
+webcodex connect https://webcodex.example --auth oauth \
+  --oauth-redirect-uri https://client.example/callback \
+  --oauth-computer-permissions --project .
+```
+
+Runner 继续使用 direct shared key 及其固定 baseline authority，ChatGPT 只获得 OAuth credential/token。fresh ordinary shared-key OAuth client 从完整 baseline（runtime/project/job、`computer:read`、`computer:control`）开始，但已有受保护 client 可以继续保留合法的窄 baseline subset。只有显式使用 `--oauth-computer-permissions`，浏览器才会提供固定的 launch/full-display/pointer/clipboard optional consent；该 flag 只在现有 baseline subset 上追加这些 optional scopes，不会恢复此前缺失的 baseline authority。所有 optional permission 在 WebCodex authorize 页面仍默认未勾选；Launch 只有在本次 OAuth request 已同时包含 `computer:read` 与 `computer:launch` 时才可选择，Server 不会补缺失 scope。`account:manage`、`admin`、`job:detach`、Agent scope 与未来 scope 永远不会出现。普通 reconnect 不会静默扩大已有 baseline client。Runner capability 与 OS/native permission 会在 runtime 调用时重新检查，因此授权页的 available 不代表操作保证成功。高级 managed-user OAuth 仍与此分离，在 `webcodex login` 后使用 `--auth managed-oauth`。见[部署指南](DEPLOYMENT.zh-CN.md)。
 
 以后如果只想从 hosted `connect` profile 中注销当前仓库，可在仓库中运行：
 

@@ -39,12 +39,20 @@ Options:\n\
 
 pub(crate) fn connect_usage() -> &'static str {
     "Usage: webcodex connect <SERVER_URL> [OPTIONS]\n\n\
-Connect a local project to a hosted WebCodex Server with one shared key.\n\
+Connect a local project to a hosted WebCodex Server. Shared-key auth is the default;\n\
+`--auth oauth` bridges that same shared-key identity through browser OAuth for ChatGPT.\n\
+`--auth managed-oauth` retains the advanced managed-user OAuth flow.\n\
 The command writes a reusable local profile, starts one background Runner,\n\
 and waits until the Runner and project are visible through the Server.\n\n\
 Options:\n\
   --proxy http://HOST:PORT   Override standard proxy environment for CLI Server requests\n\
   --no-system-proxy          Ignore proxy environment and connect directly\n\
+  --auth bearer|oauth|managed-oauth\n\
+                             MCP authentication mode [default: bearer]\n\
+  --oauth-redirect-uri URL   Exact OAuth callback URL; required with OAuth modes\n\
+  --oauth-computer-permissions\n\
+                             Allow ordinary OAuth browser consent to offer optional Computer permissions\n\
+  --user USER                Select a logged-in managed user; managed-oauth only\n\
   --key KEY                  Shared key (use --key-file to avoid shell history)\n\
   --key-file PATH            Read the shared key from a file\n\
   --project PATH             Local project directory [default: .]\n\
@@ -52,10 +60,14 @@ Options:\n\
   --client-id ID             Override the persistent Runner client id\n\
   --project-id ID            Override the derived project id\n\
   -h, --help                 Print help and exit\n\n\
-When neither --key nor --key-file is supplied, a strong key is generated and\n\
-printed once. Hosted shared keys must not start with wc_; managed credentials\n\
-use `webcodex login` instead. Proxy flags apply only to this command's Server\n\
-HTTP probes; Runner proxy configuration remains independent.\n"
+In bearer mode, omitting --key/--key-file generates a strong hosted shared key.\n\
+OAuth mode uses that same key for Runner transport and provisions a bridge client only\n\
+after the matching Runner group is connected. Enter the shared key only on WebCodex's\n\
+browser authorize page; ChatGPT receives OAuth client credentials/tokens, never the key.\n\
+Without --oauth-computer-permissions the bridge keeps the direct shared-key model-facing\n\
+baseline. With that explicit opt-in, the client may request only the fixed launch/display/\n\
+pointer/clipboard Computer scopes; browser checkboxes decide the actual grant. The picker\n\
+never includes account/admin/Agent authority. managed-oauth remains a separate managed-user flow.\n"
 }
 
 pub(crate) fn disconnect_usage() -> &'static str {

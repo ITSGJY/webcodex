@@ -1,3 +1,5 @@
+use super::BridgePermissionView;
+
 /// Minimal HTML-escaping for interpolating untrusted text into an HTML page.
 fn html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -111,7 +113,7 @@ pub(super) fn authorize_consent_html(
     )
 }
 
-pub(super) fn authorize_bridge_html(
+pub(super) fn authorize_project_share_html(
     client_name: &str,
     client_id: &str,
     redirect_uri: &str,
@@ -122,22 +124,115 @@ pub(super) fn authorize_bridge_html(
 ) -> String {
     let scope_items = scopes
         .iter()
-        .map(|s| format!("<li>{}</li>", html_escape(s)))
+        .map(|scope| format!("<li>{}</li>", html_escape(scope)))
         .collect::<Vec<_>>()
         .join("\n");
     let resource_html = resource
-        .map(|r| format!("<p>Resource: <code>{}</code></p>", html_escape(r)))
+        .map(|resource| format!("<p>Resource: <code>{}</code></p>", html_escape(resource)))
+        .unwrap_or_default();
+    let error_html = error
+        .map(|message| format!(r#"<p class="error">{}</p>"#, html_escape(message)))
+        .unwrap_or_default();
+    let hidden_fields = url::form_urlencoded::parse(original_query.as_bytes())
+        .map(|(key, value)| {
+            format!(
+                r#"  <input type="hidden" name="{}" value="{}">"#,
+                html_escape(key.as_ref()),
+                html_escape(value.as_ref())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authorize WebCodex project share</title>
+</head>
+<body>
+<h1>Authorize WebCodex project share</h1>
+<p>Client: <strong>{client_name}</strong> ({client_id})</p>
+<p>Redirect URI: <code>{redirect_uri}</code></p>
+{resource_html}
+<p>This session grants access only to the currently shared project.</p>
+<p>The application is requesting the following scopes:</p>
+<ul>
+{scope_items}
+</ul>
+{error_html}
+<form method="post" action="/oauth/authorize/project">
+{hidden_fields}
+  <label>Project share credential<br>
+    <input type="password" name="project_credential" autocomplete="current-password" required>
+  </label>
+  <button type="submit">Authorize</button>
+</form>
+</body>
+</html>"#,
+        client_name = html_escape(client_name),
+        client_id = html_escape(client_id),
+        redirect_uri = html_escape(redirect_uri),
+        resource_html = resource_html,
+        scope_items = scope_items,
+        error_html = error_html,
+        hidden_fields = hidden_fields,
+    )
+}
+
+pub(super) fn authorize_bridge_html(
+    client_name: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    standard_scopes: &[String],
+    permissions: &[BridgePermissionView],
+    resource: Option<&str>,
+    original_query: &str,
+    error: Option<&str>,
+) -> String {
+    let scope_items = standard_scopes
+        .iter()
+        .map(|scope| format!("<li>{}</li>", html_escape(scope)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let permission_html = if permissions.is_empty() {
+        String::new()
+    } else {
+        let items = permissions
+            .iter()
+            .map(|permission| {
+                let checked = if permission.selected { " checked" } else { "" };
+                let disabled = if permission.available { "" } else { " disabled" };
+                format!(
+                    r#"<div class="computer-permission">
+  <label><input type="checkbox" name="computer_permission" value="{id}"{checked}{disabled}> {label}</label>
+  <div class="availability">{availability}</div>
+</div>"#,
+                    id = html_escape(permission.id),
+                    label = html_escape(permission.label),
+                    availability = html_escape(permission.availability),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "<h2>Additional Computer permissions</h2>\n<p>Optional permissions are granted only when selected here.</p>\n{items}"
+        )
+    };
+    let resource_html = resource
+        .map(|resource| format!("<p>Resource: <code>{}</code></p>", html_escape(resource)))
         .unwrap_or_default();
     let error_html = match error {
-        Some(msg) => format!(r#"<p class="error">{}</p>"#, html_escape(msg)),
+        Some(message) => format!(r#"<p class="error">{}</p>"#, html_escape(message)),
         None => String::new(),
     };
     let hidden_fields: String = url::form_urlencoded::parse(original_query.as_bytes())
-        .map(|(k, v)| {
+        .map(|(key, value)| {
             format!(
                 r#"  <input type="hidden" name="{}" value="{}">"#,
-                html_escape(k.as_ref()),
-                html_escape(v.as_ref())
+                html_escape(key.as_ref()),
+                html_escape(value.as_ref())
             )
         })
         .collect::<Vec<_>>()
@@ -155,13 +250,15 @@ pub(super) fn authorize_bridge_html(
 <p>Client: <strong>{client_name}</strong> ({client_id})</p>
 <p>Redirect URI: <code>{redirect_uri}</code></p>
 {resource_html}
-<p>The application is requesting the following scopes:</p>
+<h2>Standard access</h2>
+<p>The OAuth request includes the following standard WebCodex access:</p>
 <ul>
 {scope_items}
 </ul>
 {error_html}
 <form method="post" action="/oauth/authorize/bridge">
 {hidden_fields}
+{permission_html}
   <label>Shared key<br>
     <input type="password" name="shared_key" autocomplete="current-password" required>
   </label>
@@ -176,5 +273,6 @@ pub(super) fn authorize_bridge_html(
         scope_items = scope_items,
         error_html = error_html,
         hidden_fields = hidden_fields,
+        permission_html = permission_html,
     )
 }

@@ -248,14 +248,34 @@ manual config generation uses `webcodex agent init`.
 
 ## OAuth2
 
-OAuth2 is disabled by default. Enable it for GPT Actions / MCP clients that
-use the authorization-code flow:
+OAuth2 remains disabled by default when a Server has no public origin. `webcodex server init --public-url https://your-domain.example` writes the public URL, enables OAuth with that exact issuer, and enables the shared-key OAuth bridge for ordinary hosted connect. For a hand-managed env file, the equivalent settings are:
 
 ```text
+WEBCODEX_PUBLIC_URL=https://your-domain.example
 WEBCODEX_OAUTH2_ENABLED=true
 WEBCODEX_OAUTH2_ISSUER=https://your-domain.example
-WEBCODEX_PUBLIC_URL=https://your-domain.example
+WEBCODEX_OAUTH2_SHARED_KEY_BRIDGE=true
 ```
+
+For ordinary repository machines, no managed login is required. Connect with the MCP client's exact callback:
+
+```bash
+cd /path/to/your/repository
+webcodex connect https://your-domain.example --auth oauth \
+  --oauth-redirect-uri https://client.example/callback --project .
+```
+
+To let this ordinary shared-key OAuth client offer the fixed optional Computer consent set, explicitly opt in:
+
+```bash
+webcodex connect https://your-domain.example --auth oauth \
+  --oauth-redirect-uri https://client.example/callback \
+  --oauth-computer-permissions --project .
+```
+
+The Runner continues to authenticate with the hosted shared key, whose model-facing authority remains the fixed baseline (`runtime/project/job` plus `computer:read` and `computer:control`). `connect` provisions a separate OAuth client bound to that shared-key hash. A fresh client starts with the full baseline; a protected historical client may legitimately retain a narrower baseline subset. `--oauth-computer-permissions` appends only launch, full-display, pointer, clipboard-read, and clipboard-write scopes to that existing subset and never restores baseline scopes that were previously absent; the flag itself grants nothing. The WebCodex authorize page leaves those permissions unchecked and maps browser selections to the fixed scope bundles, constrained by the OAuth request. Launch is selectable only when the request already contains both `computer:read` and `computer:launch`; the Server never fills a missing prerequisite. Existing baseline clients are never widened by ordinary reconnect, and revoked/missing-client rotation preserves the same protected baseline subset. A real ceiling change atomically revokes prior access/refresh/code grants so reauthorization is required. The picker never contains account/admin/Agent, `job:detach`, or future scopes. It reports only safe per-same-Runner capability availability and performs no hidden Computer observation/effect; native/OS permission and current capability are still checked by the runtime call. ChatGPT never receives the shared key, and OAuth access tokens remain invalid on Agent transport.
+
+If a managed-user OAuth identity is specifically required, use the advanced `webcodex login` flow followed by `webcodex connect ... --auth managed-oauth --oauth-redirect-uri ...`; `--user` applies only there.
 
 Create an OAuth client (the `client_secret` is returned only once; only its
 hash is stored):

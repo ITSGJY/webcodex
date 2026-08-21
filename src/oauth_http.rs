@@ -28,16 +28,27 @@ mod clients;
 mod html;
 mod managed_authorize;
 mod metadata;
+mod project_share;
 mod responses;
 mod revoke;
 mod scope_registry;
 mod shared_key_bridge;
 mod token;
 
+pub(crate) use clients::validate_redirect_uri;
 pub(crate) use clients::{
     oauth_clients_create, oauth_clients_list, oauth_clients_revoke, oauth_clients_update_scopes,
 };
 use html::authorize_bridge_html;
+
+#[derive(Debug, Clone)]
+struct BridgePermissionView {
+    id: &'static str,
+    label: &'static str,
+    available: bool,
+    selected: bool,
+    availability: &'static str,
+}
 #[cfg(test)]
 use managed_authorize::AUTHORIZE_SESSION_COOKIE;
 use managed_authorize::{
@@ -50,17 +61,23 @@ pub(crate) use managed_authorize::{
     oauth_authorize, oauth_authorize_consent, oauth_authorize_login, AuthorizeSessionStore,
 };
 pub(crate) use metadata::{oauth_authorization_server_metadata, oauth_metadata};
+pub(crate) use project_share::oauth_authorize_project;
+#[cfg(test)]
+pub(crate) use project_share::{
+    normalize_project_share_oauth_scopes, PROJECT_SHARE_OAUTH_INVALID_SCOPE_MESSAGE,
+};
 use responses::{apply_oauth_no_store_headers, oauth_error};
 pub(crate) use revoke::oauth_revoke;
 pub(crate) use scope_registry::{
     normalize_oauth_scopes, oauth_discovery_scopes_supported, oauth_scopes_supported,
     OAUTH_OFFLINE_ACCESS_SCOPE,
 };
-pub(crate) use shared_key_bridge::oauth_authorize_bridge;
 #[cfg(test)]
 pub(crate) use shared_key_bridge::{
-    bridge_shared_key_hash, normalize_bridge_oauth_scopes, OAUTH_BRIDGE_INVALID_SCOPE_MESSAGE,
+    bridge_oauth_computer_enabled_scopes, bridge_oauth_scopes, bridge_shared_key_hash,
+    normalize_bridge_oauth_scopes, OAUTH_BRIDGE_INVALID_SCOPE_MESSAGE,
 };
+pub(crate) use shared_key_bridge::{oauth_authorize_bridge, oauth_shared_key_client_provision};
 pub(crate) use token::oauth_token;
 #[cfg(test)]
 pub(crate) use token::verify_pkce_s256;

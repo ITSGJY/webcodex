@@ -1,15 +1,17 @@
 mod disconnect;
+mod oauth;
 mod output;
 mod probe;
 mod process;
 mod profile;
+mod shared_key_oauth;
 
 pub(crate) use disconnect::{run_disconnect, DisconnectOptions};
 pub(crate) use process::{
     local_runner_profile_marker, local_runner_state_summary, run_hosted_log_writer,
     run_local_runner_logs, run_local_runner_service, LocalRunnerServiceAction,
 };
-pub(crate) use profile::ConnectOptions;
+pub(crate) use profile::{ConnectAuth, ConnectOptions};
 
 use super::connections::{canonical_server_url, ensure_real_directory_tree};
 use super::login::validate_client_id;
@@ -38,7 +40,7 @@ const DEFAULT_CONNECT_WAIT_MS: u64 = 15_000;
 #[derive(Debug)]
 pub(crate) struct ConnectResult {
     output: String,
-    disclosure_marker: Option<PathBuf>,
+    disclosure_markers: Vec<PathBuf>,
 }
 
 pub(crate) fn write_connect_result(
@@ -52,11 +54,11 @@ pub(crate) fn write_connect_result(
     stdout
         .flush()
         .map_err(|error| format!("failed to flush connect output: {error}"))?;
-    if let Some(marker) = result.disclosure_marker {
+    for marker in result.disclosure_markers {
         if let Err(error) = atomic_write(&marker, b"disclosed = true\n", false) {
             let _ = writeln!(
                 stderr,
-                "Warning: the connection is healthy, but WebCodex could not record that the generated key was displayed ({error}). The key may be displayed again on the next connect."
+                "Warning: the connection is healthy, but WebCodex could not record that a generated credential was displayed ({error}). It may be displayed again on the next connect."
             );
             let _ = stderr.flush();
         }
@@ -65,6 +67,13 @@ pub(crate) fn write_connect_result(
 }
 
 pub(crate) async fn run_connect(opts: ConnectOptions) -> Result<ConnectResult, String> {
+    if opts.auth == ConnectAuth::ManagedOAuth {
+        return oauth::run_oauth_connect(opts).await;
+    }
+    run_shared_key_connect(opts).await
+}
+
+async fn run_shared_key_connect(opts: ConnectOptions) -> Result<ConnectResult, String> {
     let canonical_server = canonical_server_url(&opts.server_url)?;
     let canonical_project = opts.project.canonicalize().map_err(|error| {
         format!(
@@ -212,6 +221,20 @@ pub(crate) async fn run_connect(opts: ConnectOptions) -> Result<ConnectResult, S
         }
         return Err(format!("{error}. Runner logs: {}", log_path.display()));
     }
+    if opts.auth == ConnectAuth::SharedKeyOAuth {
+        return shared_key_oauth::finish_shared_key_oauth_connect(
+            &opts,
+            &canonical_server.url,
+            &profile,
+            &client_id,
+            &runtime_project_id,
+            &config_path,
+            &log_path,
+            &profile_dir,
+            &resolved_key,
+        )
+        .await;
+    }
     Ok(ConnectResult {
         output: render_connect_output(
             &canonical_server.url,
@@ -222,9 +245,11 @@ pub(crate) async fn run_connect(opts: ConnectOptions) -> Result<ConnectResult, S
             &log_path,
             &resolved_key,
         ),
-        disclosure_marker: resolved_key
+        disclosure_markers: resolved_key
             .generated
-            .then(|| profile_dir.join(profile::KEY_DISCLOSED_FILE)),
+            .then(|| profile_dir.join(profile::KEY_DISCLOSED_FILE))
+            .into_iter()
+            .collect(),
     })
 }
 
@@ -292,7 +317,7 @@ mod tests {
     fn generated_result(marker: PathBuf) -> ConnectResult {
         ConnectResult {
             output: "Connected\nMCP key: wck_test_generated_secret\n".to_string(),
-            disclosure_marker: Some(marker),
+            disclosure_markers: vec![marker],
         }
     }
 
@@ -359,7 +384,7 @@ mod tests {
         let marker = tmp.path().join(profile::KEY_DISCLOSED_FILE);
         let result = ConnectResult {
             output: "Connected with an explicitly supplied key\n".to_string(),
-            disclosure_marker: None,
+            disclosure_markers: Vec::new(),
         };
         write_connect_result(result, &mut Vec::new(), &mut Vec::new()).unwrap();
         assert!(!marker.exists());

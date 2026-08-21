@@ -20,20 +20,22 @@ http://127.0.0.1:<configured-port>/mcp
 Hosted 客户端需要 HTTPS。有三种路径：
 
 - **Hosted：** `webcodex connect <server>` 使用已有 hosted Server；本地只运行
-  Runner。MCP URL 为 `https://your-server.example/mcp`，bearer 凭据为生成的共享
-  key。暴露的工具集合由该 Server 配置的 MCP model surface 决定；`connect` 不会
-  把远端 Server 变成 project-bound Connector。
-- **本地分享：** `webcodex share` 启动本地 Server + Agent 与 Cloudflare Quick
-  Tunnel，并输出临时 HTTPS `/mcp` URL 与独立的临时 Bearer credential。Ctrl-C
-  通过停止 runtime/tunnel 并删除临时分享状态来撤销访问。`--tunnel none` 只用于
-  本地测试。
+  Runner。默认仍使用 shared-key。`webcodex connect <server> --auth oauth
+  --oauth-redirect-uri <URL>` 会把同一个 shared-key group 桥接成 ChatGPT OAuth，
+  不需要 login、pairing、PAT 或 account identity。Runner 继续使用 direct shared key，
+  ChatGPT 只获得 OAuth client credential/token；工具集合先由远端 Server 的 MCP
+  model surface 决定，OAuth caller 的 `tools/list` 还会按 access token 的实际 scopes
+  进一步投影。
+- **本地分享：** `webcodex share` 启动本地 Server + Agent；默认启动 Cloudflare
+  Quick Tunnel 并使用独立的临时 Bearer credential。`webcodex share --auth oauth
+  --oauth-redirect-uri <URL>` 则暴露 project-bound OAuth 2.0 Authorization Code +
+  PKCE。OAuth client 仍绑定同一个 project grant，而 code/access/refresh grant
+  都 fenced 到当前 share 进程。`--tunnel none` 可用于本地测试，或配合 operator
+  管理的 `--public-url` 使用。
 - **自托管：** 使用稳定 HTTPS 域名/tunnel、持久服务管理与 OAuth 或受限凭据进行
   长期运行。
 
-对于 managed 或自托管 Server，用 user API token（`wc_pat_*`）作为 bearer
-凭据；启用 OAuth 时用 OAuth。不要把 bootstrap/admin token、account credential、
-Runner token 或持久 project-first Connector credential 当作公开分享 secret。
-`share` 会为该会话创建并打印自己的临时 credential。
+普通 hosted `connect` 直接使用其生成/提供的 shared key，或把同一个身份桥接成 OAuth。managed-user 部署也可使用受限 user API token（`wc_pat_*`）或显式 `--auth managed-oauth` 流程。不要把 bootstrap/admin token、account credential、Runner token 或持久 project-first Connector credential 当作公开分享 secret。`share` 会为该会话创建并打印自己的临时 credential。
 
 在 ChatGPT Developer Mode 中，用输出的 `/mcp` URL 创建自定义 app。如果认证菜单
 提供 **访问令牌/API 密钥**，选择它并粘贴 bearer credential，然后执行 **Scan
@@ -42,10 +44,14 @@ Tools / 扫描工具**。ChatGPT 的 UI 文案与可用范围可能随 workspace
 
 ### OAuth2
 
-当 managed 或自托管 Server 启用 OAuth 时，MCP 客户端可以使用 authorization-code
+当 managed/自托管 Server 启用 OAuth，或使用 `webcodex share --auth oauth` 时，MCP 客户端可以使用 authorization-code
 流程而非静态 token。把精确的 ChatGPT callback URL 注册为 OAuth client redirect
 URI；宿主提供 `offline_access` 时保持勾选（它是协议级 refresh-token scope，不授予
 额外权限）。服务端 OAuth 设置见[部署指南](DEPLOYMENT.zh-CN.md#oauth2)。
+
+对于 project-first share，授权页要求输入本次临时 Project share credential，并签发只带 `runtime:read`、`project:read`、`project:write`、`job:run` 的 `oauth2_project` 身份；它不会创建 managed user，OAuth token 也不能用于 Agent transport。Quick Tunnel 的 issuer URL 每次运行都会变化；如果 OAuth issuer 必须稳定，请使用 `--tunnel none --public-url https://...` 并在外部配置稳定 HTTPS proxy/tunnel。
+
+对于已有 hosted Server，普通 `connect --auth oauth` 使用 shared-key OAuth bridge。OAuth client 以及 code/access/refresh grant 都绑定到 direct shared-key Runner/projects/jobs 所使用的同一个 `shared_key_hash`。direct shared-key bearer authority 始终固定为 `runtime:read`、`project:read`、`project:write`、`job:run`、`computer:read`、`computer:control`。fresh OAuth client 从完整 baseline 开始，但已有受保护 client 可以保留合法的窄 baseline subset。`--oauth-computer-permissions` 只在该现有 baseline subset 上追加 `computer:launch`、`computer:display_read`、`computer:pointer_control`、`computer:clipboard_read`、`computer:clipboard_write`，不会恢复缺失的 baseline scope。浏览器授权页仍默认全部未勾选，并且只能 grant 本次 OAuth request 实际请求且用户选择的 permission。Launch consent 要求 `computer:read` + `computer:launch`；display 要求 `computer:read` + `computer:display_read`；pointer 要求 `computer:read`、`computer:control`、`computer:display_read`、`computer:pointer_control`；clipboard read/write 也分别要求 baseline read/control prerequisite 与对应 optional scope。缺失的 request prerequisite 会 unavailable，而不是自动补齐，因此 consent、token projection 与 runtime scope gate 静态一致。ceiling 真正变化会撤销旧 grant。`account:manage`、`admin`、`job:detach`、任何 `agent:*` 与未来 scope 始终在 bridge 之外；`offline_access` 仍只是协议 scope。授权页按同一个在线 Runner 判断 capability，并在 POST 重新计算；这只代表 backend 当前可用，不保证 OS/native permission 或调用一定成功。runtime 中 OAuth `tools/list` 会隐藏 token scope 不足的工具，直接 `tools/call` scope gate 与 Runner/native 实时检查仍是最终 authority。managed-user identity 仍单独使用 `connect --auth managed-oauth`。
 
 ### Grok Custom Connector（OAuth）
 
