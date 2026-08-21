@@ -21,6 +21,7 @@ The V1 formal product surface is feature-frozen by default: ordinary V1 work sho
 - Do not build a general framework for one use case. Wait for a second concrete use case before extracting shared machinery.
 - Do not design for hypothetical consumers, tenants, deployment scales, or trust boundaries that the product does not have.
 - Protect real boundaries—credentials, public entry points, destructive actions, wrong-target execution, repository history, and published artifacts—without adding policy machinery for imaginary ones.
+- A feature that introduces a new externally reachable authority, credential audience, or replaceable runtime target creates a concrete present boundary. Model it explicitly when reusing an existing scope, identity, or lease would broaden existing credentials or allow stale requests to retarget; fewer concepts is not a reason to collapse distinct authority.
 - When two designs satisfy the current need, choose the one with fewer concepts, states, configuration paths, and maintenance costs.
 - For model-facing execution, prefer structured process/argv and durable Job/observation primitives over shell-text orchestration. Keep shell as an escape hatch; structured lifecycle state is the source of truth for retry safety.
 - Treat demonstrated host features such as MCP App orchestration as optional adapters. Core execution and Job semantics must remain protocol-, UI-, transport-, and OS-neutral.
@@ -37,7 +38,7 @@ Product direction: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - Minimize new concepts rather than the number of touched files. A coherent vertical slice may update several existing layers when each is part of the same current capability.
 - Use compiler, type, schema, and exhaustiveness failures to find missing enum, registry, adapter, and projection closure before broadening validation.
 - After focused tests pass, perform a separate completeness audit and then a trust/bounds/privacy/replay audit before considering the implementation finished.
-- Implementation ownership and independent adversarial review are separate passes. In an implementation-owner pass, prioritize a complete authoritative vertical slice and strong first delivery within the current contract; resolve known correctness issues, but do not fragment the implementation around speculative reviewer concerns. A later review pass independently challenges the resulting design and implementation.
+- Implementation ownership and independent adversarial review are separate passes. In an implementation-owner pass, prioritize a complete authoritative vertical slice and strong first delivery within the current contract; resolve known correctness issues, including concrete authority/identity boundaries created by the feature, but do not fragment the implementation around speculative reviewer concerns. A later review pass independently challenges the resulting design and implementation.
 - Keep only the interfaces actually affected by the change consistent. Do not touch or revalidate unrelated projections merely because they exist.
 - Add focused tests for changed behavior when practical. Update documentation when public behavior or operations change.
 - Ask only when required information cannot be discovered, instructions materially conflict, or proceeding could destroy work. Otherwise continue and report any material deviation.

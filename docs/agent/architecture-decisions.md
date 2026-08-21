@@ -28,7 +28,7 @@ Full naming, lifecycle, compatibility, and non-goals:
 
 Do **not** change `wc_sess_*` ID format, ledger event shape, or lifecycle
 semantics casually. Session / guard / current-session work must preserve the
-invariants listed in `AGENTS.md` §6 (Architecture) and the session section.
+invariants in [`session-model.md`](session-model.md) and the applicable hard-boundary and work-preservation rules in [`AGENTS.md`](../../AGENTS.md).
 
 ### Action audit session (HTTP / operator audit)
 
