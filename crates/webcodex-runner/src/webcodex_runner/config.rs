@@ -93,6 +93,10 @@ pub(crate) struct McpBridgeProviderConfig {
     pub(crate) executable: String,
     #[serde(default)]
     pub(crate) args: Vec<String>,
+    /// Optional per-provider request deadline. When absent, inherit
+    /// `mcp_bridge.request_timeout_secs`.
+    #[serde(default)]
+    pub(crate) timeout_secs: Option<u64>,
 }
 
 fn default_mcp_bridge_request_timeout_secs() -> u64 {
@@ -1025,6 +1029,15 @@ fn validate_mcp_bridge_config(config: &McpBridgeConfig) -> Result<(), String> {
             .map_err(|error| format!("mcp_bridge provider id is invalid: {error}"))?;
         validate_provider_name(&provider.name)
             .map_err(|error| format!("mcp_bridge provider name is invalid: {error}"))?;
+        if provider
+            .timeout_secs
+            .is_some_and(|timeout| !(1..=120).contains(&timeout))
+        {
+            return Err(format!(
+                "mcp_bridge provider '{}' timeout_secs must be between 1 and 120",
+                provider.id
+            ));
+        }
         if !ids.insert(provider.id.as_str()) {
             return Err("mcp_bridge provider ids must be unique".to_string());
         }

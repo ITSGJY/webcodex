@@ -362,8 +362,7 @@ async fn oauth_token_exchange_rejects_stale_hosted_bridge_resource() {
     let user = seed_user(&db, "alice");
     let (client, secret) = seed_client(&db, &user, "Test App");
     let registry = Arc::new(crate::ShellClientRegistry::default());
-    let (provider_instance, runner) =
-        start_test_hosted_bridge(&registry, "provider-instance-old").await;
+    start_test_hosted_bridge(&registry, "provider-instance-old").await;
     let stale_resource = test_hosted_bridge_resource(&config, "provider-instance-old");
     let (_, code) = seed_auth_code_with_resource(
         &db,
@@ -375,7 +374,15 @@ async fn oauth_token_exchange_rejects_stale_hosted_bridge_resource() {
         None,
         Some(&stale_resource),
     );
-    *provider_instance.lock().unwrap() = "provider-instance-new".to_string();
+    registry
+        .reconcile_disconnect(TEST_BRIDGE_CLIENT_ID, TEST_BRIDGE_AGENT_INSTANCE_ID)
+        .await;
+    register_test_hosted_bridge(
+        &registry,
+        "oauth-bridge-replacement-agent",
+        "provider-instance-new",
+    )
+    .await;
     let service = Service::new(build_router_with_session_and_registry(
         config,
         db.clone(),
@@ -399,7 +406,6 @@ async fn oauth_token_exchange_rejects_stale_hosted_bridge_resource() {
     let body: serde_json::Value = response.take_json().await.unwrap();
     assert_eq!(body["error"], "invalid_target");
     assert_eq!(oauth_token_counts(&db), before);
-    runner.abort();
 }
 
 #[tokio::test]
@@ -1659,8 +1665,7 @@ async fn oauth_refresh_rotation_preserves_exact_hosted_bridge_audience() {
     let user = seed_user(&db, "alice");
     let (client, secret) = seed_client(&db, &user, "Test App");
     let registry = Arc::new(crate::ShellClientRegistry::default());
-    let (_provider_instance, runner) =
-        start_test_hosted_bridge(&registry, "provider-instance-refresh").await;
+    start_test_hosted_bridge(&registry, "provider-instance-refresh").await;
     let resource = test_hosted_bridge_resource(&config, "provider-instance-refresh");
     let (_old_rt, old_rt_plaintext) =
         seed_refresh_token_with_resource(&db, &client, &user, "runtime:read", Some(&resource));
@@ -1691,7 +1696,6 @@ async fn oauth_refresh_rotation_preserves_exact_hosted_bridge_audience() {
             .as_deref(),
         Some(resource.as_str())
     );
-    runner.abort();
 }
 
 #[tokio::test]

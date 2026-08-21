@@ -1135,6 +1135,8 @@ async fn terminal_observed_future_inventory_ended_at_cannot_bypass_prune() {
                 expected_project_cwd: None,
                 expected_mcp_bridge_agent_instance_id: None,
                 dispatched: true,
+                expected_mcp_bridge_provider_id: None,
+                expected_mcp_bridge_provider_instance_id: None,
             },
         );
         inner
@@ -1151,6 +1153,8 @@ async fn terminal_observed_future_inventory_ended_at_cannot_bypass_prune() {
                 expected_project_cwd: None,
                 expected_mcp_bridge_agent_instance_id: None,
                 dispatched: false,
+                expected_mcp_bridge_provider_id: None,
+                expected_mcp_bridge_provider_instance_id: None,
             },
         );
         let queue = inner

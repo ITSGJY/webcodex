@@ -645,8 +645,7 @@ async fn exact_hosted_bridge_resource_survives_authorize_and_token_exchange() {
         crate::auth::SCOPE_MCP_BRIDGE,
     );
     let registry = Arc::new(crate::ShellClientRegistry::default());
-    let (_provider_instance, runner) =
-        start_test_hosted_bridge(&registry, "provider-instance-a").await;
+    start_test_hosted_bridge(&registry, "provider-instance-a").await;
     let resource = test_hosted_bridge_resource(&config, "provider-instance-a");
     let code_verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
     let code_challenge = pkce_s256_challenge(code_verifier);
@@ -654,7 +653,7 @@ async fn exact_hosted_bridge_resource_survives_authorize_and_token_exchange() {
         config,
         db.clone(),
         Arc::new(AuthorizeSessionStore::new()),
-        registry,
+        Arc::clone(&registry),
     ));
     let url = authorize_url(&[
         ("response_type", "code"),
@@ -693,11 +692,15 @@ async fn exact_hosted_bridge_resource_survives_authorize_and_token_exchange() {
         Some(resource.as_str())
     );
     assert_eq!(
+        registry.list_clients().await[0].pending_requests,
+        0,
+        "exact OAuth authorize/token validation must not enqueue Runner discovery work"
+    );
+    assert_eq!(
         refresh_token_resource_by_plaintext(&db, body["refresh_token"].as_str().unwrap())
             .as_deref(),
         Some(resource.as_str())
     );
-    runner.abort();
 }
 
 #[tokio::test]

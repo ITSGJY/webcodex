@@ -79,15 +79,13 @@ id = "local-tools"
 name = "Local tools"
 executable = "/opt/local-tools/bin/local-tools-mcp"
 args = ["--stdio", "--profile", "default"]
+# Optional override; otherwise inherits mcp_bridge.request_timeout_secs.
+timeout_secs = 5
 ```
 
 The executable is started directly with the listed argv and a cleared
 environment; this is not a shell command and values such as `$HOME` are not
-expanded. V1 has no provider-specific environment injection. Provider ids must
-be unique on one Runner, and the
-configured provider count, ids, names, executable/argv lengths, and timeout are
-bounded and validated when the configuration loads. Changing `[mcp_bridge]`
-requires a Runner restart.
+expanded. V1 has no provider-specific environment injection. Provider ids must be unique on one Runner. `request_timeout_secs` is the bridge-level default; an optional provider `timeout_secs` overrides it only for that provider. Both forms are bounded to 1–120 seconds. The configured provider count, ids, names, executable/argv lengths, and timeouts are validated when the configuration loads. Changing `[mcp_bridge]` requires a Runner restart.
 
 The process starts lazily on first tool discovery/call, completes MCP
 `initialize` plus `notifications/initialized` once, and remains alive for
@@ -96,6 +94,8 @@ response, stdout EOF, or child exit invalidates that process-local provider
 identity. WebCodex does not silently restart it under the old hosted endpoint;
 restart the Runner to create a fresh identity. Provider stderr is diagnostic
 only and is never parsed as MCP or returned through the hosted endpoint.
+
+The Runner projects only `{provider_id, provider_instance_id, name}` in its normal authenticated registration. Hosted discovery and exact OAuth resource validation resolve that bounded registration inventory; they do not start a provider or issue a Runner-side discovery RPC. Executable paths, argv, environment values, process ids, and stderr are not registered with the Server.
 
 See [MCP: Runner stdio bridge](MCP.md#runner-stdio-bridge) for endpoint,
 authentication, supported-method, and retry behavior.

@@ -154,6 +154,8 @@ pub(super) fn enqueue_pending_request_locked(
             expected_project_id: None,
             expected_project_cwd: None,
             expected_mcp_bridge_agent_instance_id: None,
+            expected_mcp_bridge_provider_id: None,
+            expected_mcp_bridge_provider_instance_id: None,
             dispatched: false,
         },
     );
@@ -1090,6 +1092,8 @@ impl ShellClientRegistry {
     ) -> Result<(String, oneshot::Receiver<McpBridgeResponse>), String> {
         validate_mcp_bridge_request(&operation)
             .map_err(|_| "invalid MCP bridge request".to_string())?;
+        let expected_provider_id = operation.provider_id().to_string();
+        let expected_provider_instance_id = operation.provider_instance_id().to_string();
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
         let request = ShellAgentShellRequest {
@@ -1133,6 +1137,19 @@ impl ShellClientRegistry {
         if client.agent_instance_id != expected_agent_instance_id {
             return Err("stale Runner identity; request was not started".to_string());
         }
+        let provider_is_current = client
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.mcp_bridge_providers.as_ref())
+            .is_some_and(|providers| {
+                providers.iter().any(|provider| {
+                    provider.provider_id == expected_provider_id
+                        && provider.provider_instance_id == expected_provider_instance_id
+                })
+            });
+        if !provider_is_current {
+            return Err("stale provider identity; request was not started".to_string());
+        }
         if now_ts().saturating_sub(client.last_seen) > super::CLIENT_ONLINE_WINDOW_SECS {
             return Err("exact Runner is offline; request was not started".to_string());
         }
@@ -1144,11 +1161,14 @@ impl ShellClientRegistry {
             None,
             None,
         )?;
-        inner
+        let pending = inner
             .pending_by_id
             .get_mut(&request_id)
-            .expect("MCP bridge request was just enqueued")
-            .expected_mcp_bridge_agent_instance_id = Some(expected_agent_instance_id.to_string());
+            .expect("MCP bridge request was just enqueued");
+        pending.expected_mcp_bridge_agent_instance_id =
+            Some(expected_agent_instance_id.to_string());
+        pending.expected_mcp_bridge_provider_id = Some(expected_provider_id);
+        pending.expected_mcp_bridge_provider_instance_id = Some(expected_provider_instance_id);
         inner.mcp_bridge_waiters.insert(request_id.clone(), tx);
         notify_client_locked(&inner, client_id);
         Ok((request_id, rx))

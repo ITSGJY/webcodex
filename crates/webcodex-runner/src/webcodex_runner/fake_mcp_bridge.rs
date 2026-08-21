@@ -68,6 +68,15 @@ fn main() -> io::Result<()> {
                     )?;
                     continue;
                 }
+                if scenario == "paginated_list" {
+                    send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"tools":[],"nextCursor":"more"}}}}"#
+                        ),
+                    )?;
+                    continue;
+                }
                 let description = if scenario == "bad_tools" {
                     "x".repeat(5 * 1024)
                 } else {
@@ -96,6 +105,21 @@ fn main() -> io::Result<()> {
                     "timeout" => {
                         thread::sleep(Duration::from_secs(3));
                     }
+                    "slow" => {
+                        thread::sleep(Duration::from_millis(1_250));
+                        send(
+                            &mut writer,
+                            &format!(
+                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"text","text":"slow"}}],"isError":false}}}}"#
+                            ),
+                        )?;
+                    }
+                    "rpc_error" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":-32001,"message":"fixture error"}}}}"#
+                        ),
+                    )?,
                     "bad_result" => send(
                         &mut writer,
                         &format!(

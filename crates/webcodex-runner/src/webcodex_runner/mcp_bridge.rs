@@ -57,7 +57,7 @@ enum ReaderFault {
 
 struct ProviderFailure {
     code: &'static str,
-    after_send: bool,
+    dispatch_state: McpBridgeDispatchState,
     fatal: bool,
 }
 
@@ -65,7 +65,7 @@ impl ProviderFailure {
     fn before_send(code: &'static str) -> Self {
         Self {
             code,
-            after_send: false,
+            dispatch_state: McpBridgeDispatchState::NotStarted,
             fatal: true,
         }
     }
@@ -73,7 +73,15 @@ impl ProviderFailure {
     fn after_send(code: &'static str) -> Self {
         Self {
             code,
-            after_send: true,
+            dispatch_state: McpBridgeDispatchState::OutcomeUnknown,
+            fatal: true,
+        }
+    }
+
+    fn completed(code: &'static str) -> Self {
+        Self {
+            code,
+            dispatch_state: McpBridgeDispatchState::Completed,
             fatal: true,
         }
     }
@@ -81,7 +89,7 @@ impl ProviderFailure {
     fn rpc_error() -> Self {
         Self {
             code: "provider_rpc_error",
-            after_send: true,
+            dispatch_state: McpBridgeDispatchState::Completed,
             fatal: false,
         }
     }
@@ -111,6 +119,16 @@ impl McpBridgeManager {
         }
     }
 
+    /// Exact process-lifetime provider inventory projected in normal Runner
+    /// registration. Reading it does not start a provider process and does not
+    /// expose executable, argv, environment, PID, stderr, or secret material.
+    pub(crate) fn provider_inventory(&self) -> Vec<McpBridgeProvider> {
+        self.providers
+            .values()
+            .map(ProviderEntry::advertisement)
+            .collect()
+    }
+
     pub(crate) fn handle(&self, request: McpBridgeRequest) -> McpBridgeResponse {
         if self.stopping.load(Ordering::SeqCst) {
             return bridge_error(
@@ -127,14 +145,6 @@ impl McpBridgeManager {
             );
         }
         match request {
-            McpBridgeRequest::Discover => {
-                let providers = self
-                    .providers
-                    .values()
-                    .map(ProviderEntry::advertisement)
-                    .collect();
-                McpBridgeResponse::success(McpBridgeResponsePayload::Providers { providers })
-            }
             McpBridgeRequest::ToolsList {
                 provider_id,
                 provider_instance_id,
@@ -143,9 +153,10 @@ impl McpBridgeManager {
                 else {
                     return stale_provider();
                 };
-                match provider.with_connection(self.request_timeout, |connection, timeout| {
-                    connection.tools_list(timeout)
-                }) {
+                match provider.with_connection(
+                    provider.request_timeout(self.request_timeout),
+                    |connection, timeout| connection.tools_list(timeout),
+                ) {
                     Ok(tools) => {
                         McpBridgeResponse::success(McpBridgeResponsePayload::Tools { tools })
                     }
@@ -162,9 +173,10 @@ impl McpBridgeManager {
                 else {
                     return stale_provider();
                 };
-                match provider.with_connection(self.request_timeout, |connection, timeout| {
-                    connection.tools_call(&name, arguments, timeout)
-                }) {
+                match provider.with_connection(
+                    provider.request_timeout(self.request_timeout),
+                    |connection, timeout| connection.tools_call(&name, arguments, timeout),
+                ) {
                     Ok(result) => {
                         McpBridgeResponse::success(McpBridgeResponsePayload::ToolResult { result })
                     }
@@ -211,8 +223,14 @@ impl ProviderEntry {
             provider_id: self.config.id.clone(),
             provider_instance_id: self.instance_id.clone(),
             name: self.config.name.clone(),
-            available: self.failed.load(Ordering::SeqCst) == PROVIDER_AVAILABLE,
         }
+    }
+
+    fn request_timeout(&self, default: Duration) -> Duration {
+        self.config
+            .timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(default)
     }
 
     fn with_connection<T>(
@@ -228,7 +246,7 @@ impl ProviderEntry {
             Err(TryLockError::WouldBlock) => {
                 return Err(ProviderFailure {
                     code: "provider_busy",
-                    after_send: false,
+                    dispatch_state: McpBridgeDispatchState::NotStarted,
                     fatal: false,
                 })
             }
@@ -245,7 +263,7 @@ impl ProviderEntry {
                     // Initialization is provider lifecycle setup, not the
                     // requested tools/list or tools/call. Even if initialize
                     // reached the child, the caller's operation did not.
-                    error.after_send = false;
+                    error.dispatch_state = McpBridgeDispatchState::NotStarted;
                     self.failed.store(PROVIDER_FAILED, Ordering::SeqCst);
                     return Err(error);
                 }
@@ -348,52 +366,51 @@ impl ProviderConnection {
             MCP_BRIDGE_MAX_MESSAGE_BYTES,
             "provider tools response",
         )
-        .map_err(|_| ProviderFailure::after_send("invalid_provider_tools"))?;
+        .map_err(|_| ProviderFailure::completed("invalid_provider_tools"))?;
         let object = result
             .as_object()
-            .ok_or_else(|| ProviderFailure::after_send("invalid_provider_tools"))?;
+            .ok_or_else(|| ProviderFailure::completed("invalid_provider_tools"))?;
         if object
             .get("nextCursor")
             .is_some_and(|cursor| !cursor.is_null())
         {
-            return Err(ProviderFailure::after_send(
+            return Err(ProviderFailure::completed(
                 "provider_pagination_unsupported",
             ));
         }
         let raw_tools = object
             .get("tools")
             .and_then(Value::as_array)
-            .ok_or_else(|| ProviderFailure::after_send("invalid_provider_tools"))?;
+            .ok_or_else(|| ProviderFailure::completed("invalid_provider_tools"))?;
         let mut tools = Vec::with_capacity(raw_tools.len());
         for raw in raw_tools {
             let object = raw
                 .as_object()
-                .ok_or_else(|| ProviderFailure::after_send("invalid_provider_tools"))?;
+                .ok_or_else(|| ProviderFailure::completed("invalid_provider_tools"))?;
             let name = object
                 .get("name")
                 .and_then(Value::as_str)
-                .ok_or_else(|| ProviderFailure::after_send("invalid_provider_tools"))?;
+                .ok_or_else(|| ProviderFailure::completed("invalid_provider_tools"))?;
             let description = object
                 .get("description")
                 .map(|value| {
                     value
                         .as_str()
                         .map(str::to_string)
-                        .ok_or_else(|| ProviderFailure::after_send("invalid_provider_tools"))
+                        .ok_or_else(|| ProviderFailure::completed("invalid_provider_tools"))
                 })
                 .transpose()?;
             let input_schema = object
                 .get("inputSchema")
                 .cloned()
-                .ok_or_else(|| ProviderFailure::after_send("invalid_provider_tools"))?;
+                .ok_or_else(|| ProviderFailure::completed("invalid_provider_tools"))?;
             tools.push(McpBridgeTool {
                 name: name.to_string(),
                 description,
                 input_schema,
             });
         }
-        validate_tools(&tools)
-            .map_err(|_| ProviderFailure::after_send("invalid_provider_tools"))?;
+        validate_tools(&tools).map_err(|_| ProviderFailure::completed("invalid_provider_tools"))?;
         Ok(tools)
     }
 
@@ -413,26 +430,26 @@ impl ProviderConnection {
             MCP_BRIDGE_MAX_MESSAGE_BYTES,
             "provider tool result",
         )
-        .map_err(|_| ProviderFailure::after_send("invalid_provider_result"))?;
+        .map_err(|_| ProviderFailure::completed("invalid_provider_result"))?;
         let object = result
             .as_object()
-            .ok_or_else(|| ProviderFailure::after_send("invalid_provider_result"))?;
+            .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
         let raw_content = object
             .get("content")
             .and_then(Value::as_array)
-            .ok_or_else(|| ProviderFailure::after_send("invalid_provider_result"))?;
+            .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
         let mut content = Vec::with_capacity(raw_content.len());
         for item in raw_content {
             let item = item
                 .as_object()
-                .ok_or_else(|| ProviderFailure::after_send("invalid_provider_result"))?;
+                .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
             if item.get("type").and_then(Value::as_str) != Some("text") {
-                return Err(ProviderFailure::after_send("unsupported_provider_content"));
+                return Err(ProviderFailure::completed("unsupported_provider_content"));
             }
             let text = item
                 .get("text")
                 .and_then(Value::as_str)
-                .ok_or_else(|| ProviderFailure::after_send("invalid_provider_result"))?;
+                .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
             content.push(McpBridgeContent::Text {
                 text: text.to_string(),
             });
@@ -445,13 +462,13 @@ impl ProviderConnection {
                 .map(|value| {
                     value
                         .as_bool()
-                        .ok_or_else(|| ProviderFailure::after_send("invalid_provider_result"))
+                        .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))
                 })
                 .transpose()?
                 .unwrap_or(false),
         };
         validate_tool_result(&result)
-            .map_err(|_| ProviderFailure::after_send("invalid_provider_result"))?;
+            .map_err(|_| ProviderFailure::completed("invalid_provider_result"))?;
         Ok(result)
     }
 
@@ -634,12 +651,6 @@ fn read_bounded_line(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>, Reade
 }
 
 fn validate_rpc_response(response: Value, expected_id: u64) -> Result<Value, ProviderFailure> {
-    validate_json_value(
-        &response,
-        MCP_BRIDGE_MAX_MESSAGE_BYTES,
-        "provider JSON-RPC response",
-    )
-    .map_err(|_| ProviderFailure::after_send("provider_protocol_error"))?;
     let object = response
         .as_object()
         .ok_or_else(|| ProviderFailure::after_send("provider_protocol_error"))?;
@@ -718,15 +729,7 @@ fn validate_initialize_result(result: &Value) -> Result<(), ProviderFailure> {
 }
 
 fn provider_failure_response(error: ProviderFailure) -> McpBridgeResponse {
-    let state = if error.after_send {
-        if error.code == "provider_rpc_error" {
-            McpBridgeDispatchState::Completed
-        } else {
-            McpBridgeDispatchState::OutcomeUnknown
-        }
-    } else {
-        McpBridgeDispatchState::NotStarted
-    };
+    let state = error.dispatch_state;
     let message = match state {
         McpBridgeDispatchState::NotStarted => {
             "Provider request was not started; no downstream effect was dispatched"
@@ -735,7 +738,7 @@ fn provider_failure_response(error: ProviderFailure) -> McpBridgeResponse {
             "Provider request may have been dispatched; outcome is unknown and must not be retried automatically"
         }
         McpBridgeDispatchState::Completed => {
-            "Provider rejected the request with a bounded JSON-RPC error"
+            "Provider completed the request-response exchange but returned a downstream error or unsupported/invalid bounded result"
         }
     };
     bridge_error(state, error.code, message)

@@ -11,7 +11,6 @@ use crate::mcp_bridge::{
 };
 use crate::shell_client::requested_by_from_auth;
 use crate::shell_client::ShellClientRegistry;
-use futures_util::future::join_all;
 use salvo::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -24,7 +23,6 @@ const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 const BRIDGE_ID_PREFIX: &str = "wc_mcpb_";
 const MAX_DISCOVERY_RUNNERS: usize = 16;
 const MAX_HOSTED_PROVIDERS: usize = 64;
-const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const BRIDGE_CALL_TIMEOUT: Duration = Duration::from_secs(125);
 
 #[derive(Debug, Deserialize)]
@@ -156,7 +154,6 @@ pub async fn bridge_list(req: &mut Request, depot: &mut Depot, res: &mut Respons
                     json!({
                         "bridge_id": target.bridge_id,
                         "name": target.provider.name,
-                        "available": target.provider.available,
                         "endpoint": format!("/mcp/bridge/{}", target.bridge_id),
                     })
                 })
@@ -579,47 +576,20 @@ async fn discover_targets(
     if clients.len() > MAX_DISCOVERY_RUNNERS {
         return Err("MCP bridge Runner discovery bound exceeded");
     }
-    let requested_by = requested_by_from_auth(auth);
-    let calls = clients.into_iter().map(|client| {
-        let registry = Arc::clone(registry);
-        let auth = auth.cloned();
-        let requested_by = requested_by.clone();
-        async move {
-            let (request_id, receiver) = registry
-                .enqueue_mcp_bridge(
-                    &client.client_id,
-                    &client.agent_instance_id,
-                    McpBridgeRequest::Discover,
-                    auth.as_ref(),
-                    requested_by,
-                )
-                .await
-                .ok()?;
-            let response = match tokio::time::timeout(DISCOVERY_TIMEOUT, receiver).await {
-                Ok(Ok(response)) => response,
-                _ => {
-                    let _ = registry.cancel_request_dispatch_state(&request_id).await;
-                    return None;
-                }
-            };
-            let McpBridgeResponsePayload::Providers { providers } = response.payload? else {
-                return None;
-            };
-            Some((client, providers))
-        }
-    });
+
     let mut targets = Vec::new();
-    for (client, providers) in join_all(calls).await.into_iter().flatten() {
+    for client in clients {
+        let providers = client
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.mcp_bridge_providers.as_ref())
+            .ok_or("MCP bridge Runner inventory is unavailable")?;
         for provider in providers {
             targets.push(BridgeTarget {
-                bridge_id: opaque_bridge_id(
-                    &client.client_id,
-                    &client.agent_instance_id,
-                    &provider,
-                ),
+                bridge_id: opaque_bridge_id(&client.client_id, &client.agent_instance_id, provider),
                 client_id: client.client_id.clone(),
                 agent_instance_id: client.agent_instance_id.clone(),
-                provider,
+                provider: provider.clone(),
             });
             if targets.len() > MAX_HOSTED_PROVIDERS {
                 return Err("MCP bridge provider discovery bound exceeded");
@@ -643,9 +613,10 @@ async fn resolve_target(
 
 /// Resolve an opaque hosted bridge as internal resource-server state. This is
 /// used by public RFC 9728 metadata and OAuth grant validation, where there is
-/// not yet a bearer-token `AuthContext`. The opaque id is still checked
-/// against fresh Runner/provider discovery, so a restarted Runner or provider
-/// cannot inherit an older audience.
+/// not yet a bearer-token `AuthContext`. The opaque id is checked against the
+/// exact provider inventory on the current registered Runner lease, so this
+/// public/resource-validation path never executes a Runner RPC and a restarted
+/// Runner or provider cannot inherit an older audience.
 pub(crate) async fn hosted_bridge_is_current(
     registry: &Arc<ShellClientRegistry>,
     bridge_id: &str,

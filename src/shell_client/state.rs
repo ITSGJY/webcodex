@@ -145,6 +145,11 @@ pub(super) struct PendingShellRequest {
     /// revalidated under the registry lock immediately before dequeue so a
     /// replacement Runner cannot consume stale bridge work.
     pub(super) expected_mcp_bridge_agent_instance_id: Option<String>,
+    /// Exact provider lease captured with the Runner lease. Both logical id
+    /// and opaque provider instance must still match registration immediately
+    /// before dequeue.
+    pub(super) expected_mcp_bridge_provider_id: Option<String>,
+    pub(super) expected_mcp_bridge_provider_instance_id: Option<String>,
     pub(super) dispatched: bool,
 }
 

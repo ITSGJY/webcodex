@@ -1,7 +1,7 @@
 use super::*;
 use crate::mcp_bridge::{McpBridgeContent, McpBridgeTool, McpBridgeToolResult};
 use crate::shell_protocol::{
-    ShellAgentPollRequest, ShellAgentResultPayload, ShellAgentResultRequest,
+    AgentPolicySummary, ShellAgentPollRequest, ShellAgentResultPayload, ShellAgentResultRequest,
     ShellClientCapabilities, ShellClientRegisterRequest,
 };
 use crate::test_support::{seed_oauth_client, seed_user, test_config, test_config_oauth2, test_db};
@@ -50,7 +50,19 @@ fn test_router_with_runtime(
         )
 }
 
-async fn register_runner_with_owner(registry: &ShellClientRegistry, owner: Option<&str>) {
+fn default_bridge_provider() -> McpBridgeProvider {
+    McpBridgeProvider {
+        provider_id: "local-test".to_string(),
+        provider_instance_id: "provider-instance".to_string(),
+        name: "Local test provider".to_string(),
+    }
+}
+
+async fn register_runner_with_owner_and_providers(
+    registry: &ShellClientRegistry,
+    owner: Option<&str>,
+    providers: Vec<McpBridgeProvider>,
+) {
     registry
         .register(ShellClientRegisterRequest {
             client_id: "bridge-http-runner".to_string(),
@@ -65,7 +77,10 @@ async fn register_runner_with_owner(registry: &ShellClientRegistry, owner: Optio
             host_context: None,
             projects: None,
             agent_protocol_version: Some("polling-v1".to_string()),
-            policy: None,
+            policy: Some(AgentPolicySummary {
+                mcp_bridge_providers: Some(providers),
+                ..Default::default()
+            }),
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -75,6 +90,11 @@ async fn register_runner_with_owner(registry: &ShellClientRegistry, owner: Optio
         .unwrap();
 }
 
+async fn register_runner_with_owner(registry: &ShellClientRegistry, owner: Option<&str>) {
+    register_runner_with_owner_and_providers(registry, owner, vec![default_bridge_provider()])
+        .await;
+}
+
 async fn register_runner(registry: &ShellClientRegistry) {
     register_runner_with_owner(registry, None).await;
 }
@@ -82,23 +102,6 @@ async fn register_runner(registry: &ShellClientRegistry) {
 fn spawn_fake_runner(
     registry: Arc<ShellClientRegistry>,
     calls: Arc<AtomicUsize>,
-) -> tokio::task::JoinHandle<()> {
-    spawn_fake_runner_with_providers(
-        registry,
-        calls,
-        vec![McpBridgeProvider {
-            provider_id: "local-test".to_string(),
-            provider_instance_id: "provider-instance".to_string(),
-            name: "Local test provider".to_string(),
-            available: true,
-        }],
-    )
-}
-
-fn spawn_fake_runner_with_providers(
-    registry: Arc<ShellClientRegistry>,
-    calls: Arc<AtomicUsize>,
-    providers: Vec<McpBridgeProvider>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -115,11 +118,6 @@ fn spawn_fake_runner_with_providers(
                 continue;
             };
             let response = match request.mcp_bridge.unwrap() {
-                McpBridgeRequest::Discover => {
-                    McpBridgeResponse::success(McpBridgeResponsePayload::Providers {
-                        providers: providers.clone(),
-                    })
-                }
                 McpBridgeRequest::ToolsList { .. } => {
                     McpBridgeResponse::success(McpBridgeResponsePayload::Tools {
                         tools: vec![McpBridgeTool {
@@ -197,6 +195,41 @@ async fn rpc(service: &Service, endpoint: &str, id: u64, method: &str, params: V
     response.take_json::<Value>().await.unwrap()
 }
 
+#[test]
+fn completed_invalid_provider_result_is_non_retryable() {
+    let error = bridge_rpc_error(
+        Some(json!(7)),
+        McpBridgeResponse::error(
+            McpBridgeDispatchState::Completed,
+            "invalid_provider_result",
+            "correlated provider result failed bounded V1 validation",
+        ),
+    );
+    assert_eq!(error["error"]["data"]["dispatchState"], "completed");
+    assert_eq!(error["error"]["data"]["retryable"], false);
+    assert_eq!(error["error"]["data"]["reconciliationRequired"], false);
+}
+
+#[test]
+fn bridge_id_binds_runner_and_provider_instances_independently() {
+    let provider = default_bridge_provider();
+    let base = opaque_bridge_id("runner", "runner-instance-a", &provider);
+    assert_ne!(
+        base,
+        opaque_bridge_id("runner", "runner-instance-b", &provider),
+        "Runner instance changes must produce a new hosted resource"
+    );
+    let replacement_provider = McpBridgeProvider {
+        provider_instance_id: "provider-instance-b".to_string(),
+        ..provider
+    };
+    assert_ne!(
+        base,
+        opaque_bridge_id("runner", "runner-instance-a", &replacement_provider),
+        "provider instance changes must produce a new hosted resource"
+    );
+}
+
 #[tokio::test]
 async fn hosted_bridge_runs_initialize_list_and_repeated_calls_without_changing_mcp() {
     let config = test_config(None);
@@ -204,12 +237,14 @@ async fn hosted_bridge_runs_initialize_list_and_repeated_calls_without_changing_
     let registry = Arc::new(ShellClientRegistry::default());
     register_runner(&registry).await;
     let calls = Arc::new(AtomicUsize::new(0));
-    let runner = spawn_fake_runner(Arc::clone(&registry), Arc::clone(&calls));
-    let service = Service::new(test_router(config, db, registry));
+    let service = Service::new(test_router(config, db, Arc::clone(&registry)));
 
-    let mut discovery = TestClient::get("http://localhost/mcp/bridge")
-        .send(&service)
-        .await;
+    let mut discovery = tokio::time::timeout(
+        Duration::from_millis(250),
+        TestClient::get("http://localhost/mcp/bridge").send(&service),
+    )
+    .await
+    .expect("registration-based bridge discovery must not wait for Runner RPC");
     assert_eq!(
         discovery.status_code.unwrap_or(StatusCode::OK),
         StatusCode::OK
@@ -222,6 +257,7 @@ async fn hosted_bridge_runs_initialize_list_and_repeated_calls_without_changing_
     assert!(endpoint.starts_with("/mcp/bridge/wc_mcpb_"));
     assert!(!endpoint.contains("bridge-http-runner"));
     assert!(!endpoint.contains("local-test"));
+    assert_eq!(registry.list_clients().await[0].pending_requests, 0);
 
     let exact_get = TestClient::get(format!("http://localhost{endpoint}"))
         .send(&service)
@@ -294,6 +330,7 @@ async fn hosted_bridge_runs_initialize_list_and_repeated_calls_without_changing_
         StatusCode::PAYLOAD_TOO_LARGE
     );
 
+    let runner = spawn_fake_runner(Arc::clone(&registry), Arc::clone(&calls));
     let listed = rpc(&service, &endpoint, 2, "tools/list", json!({})).await;
     assert_eq!(listed["result"]["tools"][0]["name"], "echo");
 
@@ -473,21 +510,19 @@ async fn hosted_bridge_oauth_audience_is_exact_without_affecting_first_party_cre
         Some("https://codex.example.com".to_string());
     let (_temp, db) = test_db();
     let registry = Arc::new(ShellClientRegistry::default());
-    register_runner_with_owner(&registry, Some("alice")).await;
     let providers = vec![
         McpBridgeProvider {
             provider_id: "provider-a".to_string(),
             provider_instance_id: "instance-a".to_string(),
             name: "Provider A".to_string(),
-            available: true,
         },
         McpBridgeProvider {
             provider_id: "provider-b".to_string(),
             provider_instance_id: "instance-b".to_string(),
             name: "Provider B".to_string(),
-            available: true,
         },
     ];
+    register_runner_with_owner_and_providers(&registry, Some("alice"), providers.clone()).await;
     let bridge_a = opaque_bridge_id("bridge-http-runner", "bridge-http-instance", &providers[0]);
     let bridge_b = opaque_bridge_id("bridge-http-runner", "bridge-http-instance", &providers[1]);
     let endpoint_a = format!("/mcp/bridge/{bridge_a}");
@@ -519,8 +554,6 @@ async fn hosted_bridge_oauth_audience_is_exact_without_affecting_first_party_cre
         ),
         Some(resource_mcp),
     );
-    let calls = Arc::new(AtomicUsize::new(0));
-    let runner = spawn_fake_runner_with_providers(Arc::clone(&registry), calls, providers);
     let service = Service::new(test_router(config, db, registry));
 
     let matching = TestClient::get(format!("http://localhost{endpoint_a}"))
@@ -617,5 +650,4 @@ async fn hosted_bridge_oauth_audience_is_exact_without_affecting_first_party_cre
         Some(StatusCode::METHOD_NOT_ALLOWED),
         "first-party PAT credentials must not be subjected to OAuth audience binding"
     );
-    runner.abort();
 }

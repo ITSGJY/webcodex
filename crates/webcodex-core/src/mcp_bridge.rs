@@ -1,7 +1,8 @@
 //! Bounded, transport-neutral protocol for the Runner-owned stdio MCP bridge.
 //!
-//! This is intentionally not a raw JSON-RPC tunnel. The Server and Runner can
-//! exchange only provider discovery, `tools/list`, and `tools/call`.
+//! This is intentionally not a raw JSON-RPC tunnel. Provider inventory rides
+//! normal Runner registration; request traffic contains only `tools/list` and
+//! `tools/call`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -27,7 +28,6 @@ pub const MCP_BRIDGE_MAX_JSON_STRING_BYTES: usize = 64 * 1024;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum McpBridgeRequest {
-    Discover,
     ToolsList {
         provider_id: String,
         provider_instance_id: String,
@@ -38,6 +38,29 @@ pub enum McpBridgeRequest {
         name: String,
         arguments: Value,
     },
+}
+
+impl McpBridgeRequest {
+    pub fn provider_id(&self) -> &str {
+        match self {
+            Self::ToolsList { provider_id, .. } | Self::ToolsCall { provider_id, .. } => {
+                provider_id
+            }
+        }
+    }
+
+    pub fn provider_instance_id(&self) -> &str {
+        match self {
+            Self::ToolsList {
+                provider_instance_id,
+                ..
+            }
+            | Self::ToolsCall {
+                provider_instance_id,
+                ..
+            } => provider_instance_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,7 +77,6 @@ pub struct McpBridgeProvider {
     pub provider_id: String,
     pub provider_instance_id: String,
     pub name: String,
-    pub available: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -90,7 +112,6 @@ pub struct McpBridgeToolResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum McpBridgeResponsePayload {
-    Providers { providers: Vec<McpBridgeProvider> },
     Tools { tools: Vec<McpBridgeTool> },
     ToolResult { result: McpBridgeToolResult },
 }
@@ -199,7 +220,6 @@ pub fn validate_provider_name(value: &str) -> Result<(), String> {
 
 pub fn validate_request(request: &McpBridgeRequest) -> Result<(), String> {
     match request {
-        McpBridgeRequest::Discover => Ok(()),
         McpBridgeRequest::ToolsList {
             provider_id,
             provider_instance_id,
@@ -244,7 +264,6 @@ pub fn validate_response(response: &McpBridgeResponse) -> Result<(), String> {
         _ => {}
     }
     match response.payload.as_ref() {
-        Some(McpBridgeResponsePayload::Providers { providers }) => validate_providers(providers),
         Some(McpBridgeResponsePayload::Tools { tools }) => validate_tools(tools),
         Some(McpBridgeResponsePayload::ToolResult { result }) => validate_tool_result(result),
         None => Ok(()),
@@ -266,16 +285,17 @@ pub fn validate_providers(providers: &[McpBridgeProvider]) -> Result<(), String>
             MCP_BRIDGE_MAX_PROVIDERS
         ));
     }
-    let mut identities = HashSet::new();
+    let mut provider_ids = HashSet::new();
+    let mut instance_ids = HashSet::new();
     for provider in providers {
         validate_provider_id(&provider.provider_id)?;
         validate_provider_instance_id(&provider.provider_instance_id)?;
         validate_provider_name(&provider.name)?;
-        if !identities.insert((
-            provider.provider_id.as_str(),
-            provider.provider_instance_id.as_str(),
-        )) {
-            return Err("duplicate bridge provider identity".to_string());
+        if !provider_ids.insert(provider.provider_id.as_str()) {
+            return Err("duplicate bridge provider id".to_string());
+        }
+        if !instance_ids.insert(provider.provider_instance_id.as_str()) {
+            return Err("duplicate bridge provider instance identity".to_string());
         }
     }
     Ok(())

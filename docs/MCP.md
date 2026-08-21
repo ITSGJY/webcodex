@@ -63,8 +63,7 @@ Use that provider-specific URL as the MCP server URL. Tools from different
 providers are never merged with each other or into `/mcp`. The opaque id binds
 the exact Runner process and provider process identity; if either disappears or
 is replaced, the old resource fails closed instead of routing to a replacement.
-The discovery response does not expose executable paths, process ids, provider
-argv, environment values, or stderr.
+The Runner advertises only bounded `{provider_id, provider_instance_id, name}` inventory during its normal authenticated registration. Hosted discovery reads that current registration lease directly; it does not fan out a `Discover` request to Runners or start provider code. The discovery response does not expose executable paths, process ids, provider argv, environment values, or stderr.
 
 V1 is stateless JSON Streamable HTTP using MCP protocol version `2025-06-18`.
 It supports `initialize`, `notifications/initialized`, `ping`, `tools/list`,
@@ -101,18 +100,9 @@ the metadata `resource` value is that same complete canonical URL. WebCodex
 binds the exact value through the authorization code, access token, and refresh
 token, and refresh rotation preserves it. A token for one bridge, or for the
 ordinary `/mcp` resource, cannot be used at another exact bridge endpoint.
-Metadata lookup, authorization, token exchange/refresh, and request dispatch
-all re-resolve the opaque identity and fail closed after a Runner or provider
-restart; an old OAuth audience is never redirected to the replacement.
+Metadata lookup, authorization, and token exchange/refresh resolve the opaque identity from the exact current registered Runner/provider lease and therefore do not execute Runner RPCs. Request admission and dequeue independently revalidate that same Runner `agent_instance_id` plus `provider_id + provider_instance_id`. A Runner or provider restart makes the old resource stale; an old OAuth audience is never redirected to the replacement.
 
-Every third-party `tools/call` is treated as potentially effectful. WebCodex
-never automatically retries it after Runner dispatch. If the local provider
-may have received the call but its result is lost, the JSON-RPC error data
-reports `dispatchState: "outcome_unknown"`, `retryable: false`, and
-`reconciliationRequired: true`; inspect current external state and issue a new
-explicit call only when appropriate. Failures proven to occur before dispatch
-report `not_started`. Read-only discovery and `tools/list` are also bounded and
-do not silently change an opaque target identity.
+Every third-party `tools/call` is treated as potentially effectful. WebCodex never automatically retries it after Runner dispatch. Failures proven before provider dispatch report `not_started`. Timeout, EOF/crash, transport loss, malformed/uncorrelatable responses, and wrong/unknown response ids after request bytes may have reached the provider report `outcome_unknown`, `retryable: false`, and require reconciliation before any explicit new call. Once a trustworthy matching JSON-RPC response is correlated, the request-response exchange is `completed`: a provider JSON-RPC error or a subsequently rejected V1 result (for example unsupported image/binary content, pagination, or invalid bounded result schema) remains a completed, non-retryable failure. `completed` does not mean successful. Read-only registration discovery and `tools/list` remain bounded and never silently retarget an opaque identity.
 
 Runner-side configuration is documented in
 [Runner: Local stdio MCP providers](RUNNER.md#local-stdio-mcp-providers).

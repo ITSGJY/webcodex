@@ -1,26 +1,26 @@
 use super::*;
-use crate::mcp_bridge::{
-    McpBridgeProvider, McpBridgeRequest, McpBridgeResponse, McpBridgeResponsePayload,
-};
+use crate::mcp_bridge::McpBridgeProvider;
 use crate::shell_protocol::{
-    ShellAgentPollRequest, ShellAgentResultPayload, ShellAgentResultRequest,
-    ShellClientCapabilities, ShellClientRegisterRequest,
+    AgentPolicySummary, ShellClientCapabilities, ShellClientRegisterRequest,
 };
 
 pub(super) const TEST_BRIDGE_CLIENT_ID: &str = "oauth-bridge-runner";
 pub(super) const TEST_BRIDGE_AGENT_INSTANCE_ID: &str = "oauth-bridge-agent-instance";
 pub(super) const TEST_BRIDGE_PROVIDER_ID: &str = "oauth-test-provider";
 
+pub(super) fn test_bridge_provider(provider_instance_id: &str) -> McpBridgeProvider {
+    McpBridgeProvider {
+        provider_id: TEST_BRIDGE_PROVIDER_ID.to_string(),
+        provider_instance_id: provider_instance_id.to_string(),
+        name: "OAuth test provider".to_string(),
+    }
+}
+
 pub(super) fn test_hosted_bridge_id(provider_instance_id: &str) -> String {
     crate::mcp_bridge_http::opaque_bridge_id(
         TEST_BRIDGE_CLIENT_ID,
         TEST_BRIDGE_AGENT_INSTANCE_ID,
-        &McpBridgeProvider {
-            provider_id: TEST_BRIDGE_PROVIDER_ID.to_string(),
-            provider_instance_id: provider_instance_id.to_string(),
-            name: "OAuth test provider".to_string(),
-            available: true,
-        },
+        &test_bridge_provider(provider_instance_id),
     )
 }
 
@@ -35,14 +35,15 @@ pub(super) fn test_hosted_bridge_resource(
     .unwrap()
 }
 
-pub(super) async fn start_test_hosted_bridge(
+pub(super) async fn register_test_hosted_bridge(
     registry: &Arc<crate::ShellClientRegistry>,
+    agent_instance_id: &str,
     provider_instance_id: &str,
-) -> (Arc<std::sync::Mutex<String>>, tokio::task::JoinHandle<()>) {
+) {
     registry
         .register(ShellClientRegisterRequest {
             client_id: TEST_BRIDGE_CLIENT_ID.to_string(),
-            agent_instance_id: TEST_BRIDGE_AGENT_INSTANCE_ID.to_string(),
+            agent_instance_id: agent_instance_id.to_string(),
             display_name: None,
             owner: None,
             hostname: None,
@@ -53,7 +54,10 @@ pub(super) async fn start_test_hosted_bridge(
             host_context: None,
             projects: None,
             agent_protocol_version: Some("polling-v1".to_string()),
-            policy: None,
+            policy: Some(AgentPolicySummary {
+                mcp_bridge_providers: Some(vec![test_bridge_provider(provider_instance_id)]),
+                ..Default::default()
+            }),
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -61,64 +65,18 @@ pub(super) async fn start_test_hosted_bridge(
         })
         .await
         .unwrap();
-    let provider_instance_id = Arc::new(std::sync::Mutex::new(provider_instance_id.to_string()));
-    let runner_provider_instance_id = Arc::clone(&provider_instance_id);
-    let runner_registry = Arc::clone(registry);
-    let runner = tokio::spawn(async move {
-        loop {
-            let request = match runner_registry
-                .poll(ShellAgentPollRequest {
-                    client_id: TEST_BRIDGE_CLIENT_ID.to_string(),
-                    agent_instance_id: TEST_BRIDGE_AGENT_INSTANCE_ID.to_string(),
-                    projects: None,
-                })
-                .await
-            {
-                Ok(Some(request)) => request,
-                Ok(None) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    continue;
-                }
-                Err(_) => return,
-            };
-            let response = match request.mcp_bridge {
-                Some(McpBridgeRequest::Discover) => {
-                    let provider_instance_id = runner_provider_instance_id.lock().unwrap().clone();
-                    McpBridgeResponse::success(McpBridgeResponsePayload::Providers {
-                        providers: vec![McpBridgeProvider {
-                            provider_id: TEST_BRIDGE_PROVIDER_ID.to_string(),
-                            provider_instance_id,
-                            name: "OAuth test provider".to_string(),
-                            available: true,
-                        }],
-                    })
-                }
-                _ => McpBridgeResponse::error(
-                    crate::mcp_bridge::McpBridgeDispatchState::NotStarted,
-                    "unsupported_test_operation",
-                    "OAuth bridge fixture only supports discovery",
-                ),
-            };
-            runner_registry
-                .complete(ShellAgentResultPayload {
-                    result: ShellAgentResultRequest {
-                        client_id: TEST_BRIDGE_CLIENT_ID.to_string(),
-                        agent_instance_id: TEST_BRIDGE_AGENT_INSTANCE_ID.to_string(),
-                        request_id: request.request_id,
-                        exit_code: None,
-                        stdout: None,
-                        stderr: None,
-                        duration_ms: None,
-                        error: None,
-                    },
-                    command_execution_state: None,
-                    mcp_bridge: Some(response),
-                })
-                .await
-                .unwrap();
-        }
-    });
-    (provider_instance_id, runner)
+}
+
+pub(super) async fn start_test_hosted_bridge(
+    registry: &Arc<crate::ShellClientRegistry>,
+    provider_instance_id: &str,
+) {
+    register_test_hosted_bridge(
+        registry,
+        TEST_BRIDGE_AGENT_INSTANCE_ID,
+        provider_instance_id,
+    )
+    .await;
 }
 
 pub(super) fn test_config(oauth2: OAuth2Config) -> Arc<crate::Config> {

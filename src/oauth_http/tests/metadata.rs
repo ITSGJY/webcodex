@@ -71,8 +71,7 @@ async fn exact_hosted_bridge_metadata_uses_rfc9728_path_and_fails_closed_when_st
     let config = test_config(oauth2_enabled_with_issuer("https://codex.example.com/base"));
     let (_tmp, db) = test_db();
     let registry = Arc::new(crate::ShellClientRegistry::default());
-    let (provider_instance, runner) =
-        start_test_hosted_bridge(&registry, "provider-instance-metadata").await;
+    start_test_hosted_bridge(&registry, "provider-instance-metadata").await;
     let resource = test_hosted_bridge_resource(&config, "provider-instance-metadata");
     let metadata_uri = crate::oauth_resource::protected_resource_metadata_uri(&resource).unwrap();
     assert!(metadata_uri.contains("/.well-known/oauth-protected-resource/base/mcp/bridge/wc_mcpb_"));
@@ -80,7 +79,7 @@ async fn exact_hosted_bridge_metadata_uses_rfc9728_path_and_fails_closed_when_st
         config,
         db,
         Arc::new(AuthorizeSessionStore::new()),
-        registry,
+        Arc::clone(&registry),
     ));
 
     let mut response = TestClient::get(metadata_uri.clone()).send(&service).await;
@@ -96,10 +95,18 @@ async fn exact_hosted_bridge_metadata_uses_rfc9728_path_and_fails_closed_when_st
         "exact metadata must not expand any OAuth scope ceiling"
     );
 
-    *provider_instance.lock().unwrap() = "provider-instance-restarted".to_string();
+    assert_eq!(registry.list_clients().await[0].pending_requests, 0);
+    registry
+        .reconcile_disconnect(TEST_BRIDGE_CLIENT_ID, TEST_BRIDGE_AGENT_INSTANCE_ID)
+        .await;
+    register_test_hosted_bridge(
+        &registry,
+        "oauth-bridge-replacement-agent",
+        "provider-instance-restarted",
+    )
+    .await;
     let response = TestClient::get(metadata_uri).send(&service).await;
     assert_eq!(response.status_code, Some(StatusCode::NOT_FOUND));
-    runner.abort();
 }
 
 #[tokio::test]

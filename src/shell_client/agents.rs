@@ -14,6 +14,7 @@ use super::{
     now_ts, ShellClientRegistry, CLIENT_ONLINE_WINDOW_SECS, MAX_RETIRED_INSTANCES_PER_CLIENT,
     TRANSPORT_POLLING,
 };
+use crate::mcp_bridge::validate_providers;
 use crate::shell_protocol::{
     ShellClientCapabilities, ShellClientRegisterRequest, ShellClientView,
     JOB_INVENTORY_MAX_ACTIVE_JOBS,
@@ -72,6 +73,24 @@ impl ShellClientRegistry {
         let mut policy = body.policy;
         if let Some(policy) = policy.as_mut() {
             policy.tool_providers = normalize_tool_providers(policy.tool_providers.take());
+        }
+        let bridge_inventory = policy
+            .as_ref()
+            .and_then(|policy| policy.mcp_bridge_providers.as_ref());
+        match (capabilities.mcp_bridge, bridge_inventory) {
+            (true, Some(providers)) => validate_providers(providers)
+                .map_err(|error| format!("invalid MCP bridge provider inventory: {error}"))?,
+            (true, None) => {
+                return Err(
+                    "mcp_bridge capability requires a registered provider inventory".to_string(),
+                )
+            }
+            (false, Some(_)) => {
+                return Err(
+                    "MCP bridge provider inventory requires mcp_bridge capability".to_string(),
+                )
+            }
+            (false, None) => {}
         }
         let now = now_ts();
         let record = ShellClientRecord {
@@ -212,6 +231,30 @@ impl ShellClientRegistry {
             return Err(
                 "same runner instance cannot downgrade internal_posix_script capability"
                     .to_string(),
+            );
+        }
+        if inner.clients.get(&client_id).is_some_and(|existing| {
+            existing.agent_instance_id == agent_instance_id
+                && existing.capabilities.mcp_bridge
+                && !capabilities.mcp_bridge
+        }) {
+            return Err("same runner instance cannot downgrade mcp_bridge capability".to_string());
+        }
+        if inner.clients.get(&client_id).is_some_and(|existing| {
+            existing.agent_instance_id == agent_instance_id
+                && existing.capabilities.mcp_bridge
+                && capabilities.mcp_bridge
+                && existing
+                    .policy
+                    .as_ref()
+                    .and_then(|policy| policy.mcp_bridge_providers.as_ref())
+                    != record
+                        .policy
+                        .as_ref()
+                        .and_then(|policy| policy.mcp_bridge_providers.as_ref())
+        }) {
+            return Err(
+                "same runner instance cannot change MCP bridge provider inventory".to_string(),
             );
         }
         // This optimized export request kind is process-lifetime binary support.

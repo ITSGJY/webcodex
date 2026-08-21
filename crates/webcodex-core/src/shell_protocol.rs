@@ -753,6 +753,12 @@ pub struct AgentPolicySummary {
     /// Read-only provider state captured when the agent registers/reconnects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_providers: Option<ToolProvidersStatus>,
+    /// Bounded, non-secret inventory of exact Runner-owned MCP provider
+    /// instances captured at registration. This is liveness/capability
+    /// metadata only; executable paths, argv, environment, PIDs, and stderr
+    /// are never projected to the Server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_bridge_providers: Option<Vec<crate::mcp_bridge::McpBridgeProvider>>,
 }
 
 impl Default for AgentPolicySummary {
@@ -765,6 +771,7 @@ impl Default for AgentPolicySummary {
             max_output_bytes: default_policy_max_output_bytes(),
             shell_profiles: None,
             tool_providers: None,
+            mcp_bridge_providers: None,
         }
     }
 }

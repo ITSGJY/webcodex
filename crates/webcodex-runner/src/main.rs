@@ -2031,6 +2031,7 @@ fn build_register_request_with_provider_status(
                 &hot,
                 prepared_cache_count,
                 tool_providers,
+                runtime.mcp_bridge().provider_inventory(),
             )),
             process_started_at: Some(process_started_at()),
             build: Some(runner_build_info()),
@@ -2154,6 +2155,7 @@ fn register_policy_summary(
     cfg: &HotAgentConfig,
     prepared_cache_count: usize,
     tool_providers: shell_protocol::ToolProvidersStatus,
+    mcp_bridge_providers: Vec<crate::mcp_bridge::McpBridgeProvider>,
 ) -> AgentPolicySummary {
     AgentPolicySummary {
         allow_raw_shell: cfg.policy.allow_raw_shell,
@@ -2166,6 +2168,7 @@ fn register_policy_summary(
             prepared_cache_count,
         )),
         tool_providers: Some(tool_providers),
+        mcp_bridge_providers: Some(mcp_bridge_providers),
     }
 }
 

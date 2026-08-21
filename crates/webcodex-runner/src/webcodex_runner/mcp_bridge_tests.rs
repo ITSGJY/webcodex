@@ -60,16 +60,25 @@ struct Fixture {
 
 impl Fixture {
     fn new(scenario: &str, timeout_secs: u64) -> Self {
+        Self::with_provider_timeout(scenario, timeout_secs, None)
+    }
+
+    fn with_provider_timeout(
+        scenario: &str,
+        default_timeout_secs: u64,
+        provider_timeout_secs: Option<u64>,
+    ) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let marker = temp.path().join("marker.log");
         let fake = fake_binary();
         let manager = McpBridgeManager::new(&McpBridgeConfig {
-            request_timeout_secs: timeout_secs,
+            request_timeout_secs: default_timeout_secs,
             providers: vec![McpBridgeProviderConfig {
                 id: "fake".to_string(),
                 name: "Fake provider".to_string(),
                 executable: fake.path.to_string_lossy().to_string(),
                 args: vec![scenario.to_string(), marker.to_string_lossy().to_string()],
+                timeout_secs: provider_timeout_secs,
             }],
         });
         Self {
@@ -81,11 +90,11 @@ impl Fixture {
     }
 
     fn provider(&self) -> McpBridgeProvider {
-        let response = self.manager.handle(McpBridgeRequest::Discover);
-        let Some(McpBridgeResponsePayload::Providers { providers }) = response.payload else {
-            panic!("discover payload missing");
-        };
-        providers.into_iter().next().unwrap()
+        self.manager
+            .provider_inventory()
+            .into_iter()
+            .next()
+            .unwrap()
     }
 
     fn list(&self, provider: &McpBridgeProvider) -> McpBridgeResponse {
@@ -222,11 +231,37 @@ fn timeout_and_invalid_untrusted_outputs_are_bounded() {
         McpBridgeDispatchState::OutcomeUnknown
     );
 
-    for (scenario, operation, code) in [
-        ("bad_tools", "list", "invalid_provider_tools"),
-        ("oversized_message", "list", "provider_message_too_large"),
-        ("bad_result", "call", "unsupported_provider_content"),
-        ("oversized_result", "call", "provider_protocol_error"),
+    for (scenario, operation, code, state) in [
+        (
+            "bad_tools",
+            "list",
+            "invalid_provider_tools",
+            McpBridgeDispatchState::Completed,
+        ),
+        (
+            "oversized_message",
+            "list",
+            "provider_message_too_large",
+            McpBridgeDispatchState::OutcomeUnknown,
+        ),
+        (
+            "bad_result",
+            "call",
+            "unsupported_provider_content",
+            McpBridgeDispatchState::Completed,
+        ),
+        (
+            "oversized_result",
+            "call",
+            "invalid_provider_result",
+            McpBridgeDispatchState::Completed,
+        ),
+        (
+            "paginated_list",
+            "list",
+            "provider_pagination_unsupported",
+            McpBridgeDispatchState::Completed,
+        ),
     ] {
         let fixture = Fixture::new(scenario, 2);
         let provider = fixture.provider();
@@ -237,11 +272,37 @@ fn timeout_and_invalid_untrusted_outputs_are_bounded() {
             fixture.call(&provider)
         };
         assert_eq!(response.error.as_ref().unwrap().code, code, "{scenario}");
-        assert_eq!(
-            response.dispatch_state,
-            McpBridgeDispatchState::OutcomeUnknown
-        );
+        assert_eq!(response.dispatch_state, state, "{scenario}");
     }
+}
+
+#[test]
+fn provider_timeout_override_and_default_fallback_are_enforced() {
+    let inherited = Fixture::new("slow", 2);
+    let inherited_provider = inherited.provider();
+    assert!(inherited.list(&inherited_provider).error.is_none());
+    assert!(inherited.call(&inherited_provider).error.is_none());
+
+    let overridden = Fixture::with_provider_timeout("slow", 2, Some(1));
+    let overridden_provider = overridden.provider();
+    assert!(overridden.list(&overridden_provider).error.is_none());
+    let response = overridden.call(&overridden_provider);
+    assert_eq!(
+        response.dispatch_state,
+        McpBridgeDispatchState::OutcomeUnknown
+    );
+    assert_eq!(response.error.as_ref().unwrap().code, "provider_timeout");
+}
+
+#[test]
+fn correlated_jsonrpc_error_is_completed_without_retry() {
+    let fixture = Fixture::new("rpc_error", 2);
+    let provider = fixture.provider();
+    assert!(fixture.list(&provider).error.is_none());
+    let response = fixture.call(&provider);
+    assert_eq!(response.dispatch_state, McpBridgeDispatchState::Completed);
+    assert_eq!(response.error.as_ref().unwrap().code, "provider_rpc_error");
+    assert_eq!(fixture.marker_count("call"), 1);
 }
 
 #[test]

@@ -782,6 +782,7 @@ id = "local-tools"
 name = "Local tools"
 executable = "/usr/bin/example-mcp"
 args = ["--stdio", "$HOME", "$(id)"]
+timeout_secs = 5
 "#,
     )
     .unwrap();
@@ -789,10 +790,38 @@ args = ["--stdio", "$HOME", "$(id)"]
     let config = load_config(&path).unwrap();
     assert_eq!(config.mcp_bridge.request_timeout_secs, 7);
     assert_eq!(config.mcp_bridge.providers.len(), 1);
+    assert_eq!(config.mcp_bridge.providers[0].timeout_secs, Some(5));
     assert_eq!(
         config.mcp_bridge.providers[0].args,
         ["--stdio", "$HOME", "$(id)"]
     );
+}
+
+#[test]
+fn agent_config_mcp_bridge_provider_timeout_defaults_to_bridge_timeout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("agent.toml");
+    std::fs::write(
+        &path,
+        r#"
+server_url = "http://127.0.0.1:8000"
+token = "t"
+client_id = "oe"
+
+[mcp_bridge]
+request_timeout_secs = 11
+
+[[mcp_bridge.providers]]
+id = "inherits"
+name = "Inherits"
+executable = "/usr/bin/example-mcp"
+"#,
+    )
+    .unwrap();
+
+    let config = load_config(&path).unwrap();
+    assert_eq!(config.mcp_bridge.request_timeout_secs, 11);
+    assert_eq!(config.mcp_bridge.providers[0].timeout_secs, None);
 }
 
 #[test]
@@ -806,6 +835,16 @@ name = "Local"
 executable = "relative-mcp"
 "#,
             "executable must be an absolute path",
+        ),
+        (
+            r#"
+[[mcp_bridge.providers]]
+id = "bad-timeout"
+name = "Bad timeout"
+executable = "/usr/bin/example-mcp"
+timeout_secs = 121
+"#,
+            "timeout_secs must be between 1 and 120",
         ),
         (
             r#"
